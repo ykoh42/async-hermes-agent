@@ -2,6 +2,7 @@
 
 import inspect
 
+import httpx
 import pytest
 
 from async_service import (
@@ -54,3 +55,16 @@ def test_fastapi_routes_are_async():
     app = create_app(lambda request: FakeAgent())
     route = next(route for route in app.routes if route.path == "/v1/conversations")
     assert inspect.iscoroutinefunction(route.endpoint)
+
+
+@pytest.mark.asyncio
+async def test_fastapi_route_returns_async_trajectory_payload():
+    app = create_app(lambda request: FakeAgent())
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post("/v1/conversations", json={"message": "hello"})
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["final_response"] == "done"
+    assert payload["trajectory"][0]["value"] == "hello"
