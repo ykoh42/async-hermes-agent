@@ -768,6 +768,7 @@ def build_anthropic_client(
     timeout: float = None,
     *,
     drop_context_1m_beta: bool = False,
+    async_mode: bool = False,
 ):
     """Create an Anthropic client, auto-detecting setup-tokens vs API keys.
 
@@ -794,7 +795,8 @@ def build_anthropic_client(
     its default on fresh clients so 1M-capable subscriptions keep the
     capability.
 
-    Returns an anthropic.Anthropic instance.
+    Returns an ``anthropic.Anthropic`` instance, or an
+    ``anthropic.AsyncAnthropic`` instance when ``async_mode`` is true.
     """
     _anthropic_sdk = _get_anthropic_sdk()
     if _anthropic_sdk is None:
@@ -888,7 +890,12 @@ def build_anthropic_client(
         if common_betas:
             kwargs["default_headers"] = {"anthropic-beta": ",".join(common_betas)}
 
-    client = _anthropic_sdk.Anthropic(**kwargs)
+    client_class = (
+        getattr(_anthropic_sdk, "AsyncAnthropic", _anthropic_sdk.Anthropic)
+        if async_mode
+        else _anthropic_sdk.Anthropic
+    )
+    client = client_class(**kwargs)
     # Bearer-only construction leaves ``api_key`` unset, so the SDK fills it
     # from ``ANTHROPIC_API_KEY`` (Hermes loads that into the process env from
     # ``~/.hermes/.env``). The result is dual auth —
@@ -900,7 +907,7 @@ def build_anthropic_client(
     return client
 
 
-def build_anthropic_bedrock_client(region: str):
+def build_anthropic_bedrock_client(region: str, *, async_mode: bool = False):
     """Create an AnthropicBedrock client for Bedrock Claude models.
 
     Uses the Anthropic SDK's native Bedrock adapter, which provides full
@@ -929,7 +936,12 @@ def build_anthropic_bedrock_client(region: str):
         )
     from httpx import Timeout
 
-    return _anthropic_sdk.AnthropicBedrock(
+    client_class = (
+        getattr(_anthropic_sdk, "AsyncAnthropicBedrock", _anthropic_sdk.AnthropicBedrock)
+        if async_mode
+        else _anthropic_sdk.AnthropicBedrock
+    )
+    return client_class(
         aws_region=region,
         timeout=Timeout(timeout=900.0, connect=10.0),
         # Delegate retry to hermes's outer loop (honors Retry-After); the SDK
@@ -3048,3 +3060,70 @@ def create_anthropic_message(
     create_kwargs = dict(api_kwargs)
     create_kwargs.pop("stream", None)
     return messages_api.create(**create_kwargs)
+
+
+async def create_anthropic_message_async(
+    client: Any,
+    api_kwargs: dict,
+    *,
+    log_prefix: str = "",
+    prefer_stream: bool = True,
+    on_stream_event=None,
+    on_response=None,
+) -> Any:
+    """Async counterpart to :func:`create_anthropic_message`.
+
+    This uses the Anthropic SDK's native async context manager and iterator;
+    it does not run the synchronous Messages adapter in a worker thread.
+    Callbacks remain deliberately synchronous because they only update
+    in-memory agent/UI state and are not transport operations.
+    """
+    import inspect
+
+    sanitize_anthropic_kwargs(api_kwargs, log_prefix=log_prefix)
+    messages_api = getattr(client, "messages", None)
+    stream_fn = getattr(messages_api, "stream", None)
+    if prefer_stream and callable(stream_fn):
+        stream_kwargs = dict(api_kwargs)
+        stream_kwargs.pop("stream", None)
+        try:
+            async with stream_fn(**stream_kwargs) as stream:
+                if callable(on_response):
+                    try:
+                        on_response(getattr(stream, "response", None))
+                    except Exception:
+                        logger.debug(
+                            "%son_response callback failed",
+                            log_prefix,
+                            exc_info=True,
+                        )
+                async for event in stream:
+                    if callable(on_stream_event):
+                        try:
+                            on_stream_event(event)
+                        except Exception:
+                            logger.debug(
+                                "%son_stream_event callback failed",
+                                log_prefix,
+                                exc_info=True,
+                            )
+                final_message = stream.get_final_message()
+                if inspect.isawaitable(final_message):
+                    final_message = await final_message
+                return final_message
+        except Exception as exc:
+            if not _is_stream_unavailable_error(exc):
+                raise
+            logger.debug(
+                "%sAnthropic Messages async stream unavailable; falling back "
+                "to messages.create(): %s",
+                log_prefix,
+                exc,
+            )
+
+    create_kwargs = dict(api_kwargs)
+    create_kwargs.pop("stream", None)
+    result = messages_api.create(**create_kwargs)
+    if inspect.isawaitable(result):
+        result = await result
+    return result

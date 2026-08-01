@@ -2244,8 +2244,6 @@ async def run_conversation(
                         on_first_delta=_stop_spinner,
                     )
 
-                from hermes_cli.middleware import run_llm_execution_middleware
-
                 _model_request_active = getattr(agent, "_model_request_active", None)
                 _redirect_lock = getattr(agent, "_pending_redirect_lock", None)
                 if _redirect_lock is not None:
@@ -2256,12 +2254,29 @@ async def run_conversation(
                     _model_request_active.set()
                 _redirect_crossed_response = False
                 try:
-                    # The async core executes the provider request directly.
-                    # Request middleware has already produced the immutable
-                    # payload above; execution middleware remains a sync
-                    # compatibility seam and is intentionally bypassed here
-                    # until its callbacks gain an async contract.
-                    response = await _perform_api_call(api_kwargs)
+                    # Preserve the execution-middleware contract on the async
+                    # path.  The chain accepts both sync and async plugin
+                    # callbacks, while the provider terminal call remains a
+                    # native awaitable.
+                    from hermes_cli.middleware import (
+                        run_llm_execution_middleware_async,
+                    )
+
+                    response = await run_llm_execution_middleware_async(
+                        api_kwargs,
+                        _perform_api_call,
+                        original_request=_original_api_kwargs,
+                        task_id=effective_task_id,
+                        turn_id=turn_id,
+                        api_request_id=api_request_id,
+                        session_id=agent.session_id or "",
+                        platform=agent.platform or "",
+                        model=agent.model,
+                        provider=agent.provider,
+                        base_url=agent.base_url,
+                        api_mode=agent.api_mode,
+                        api_call_count=api_call_count,
+                    )
                 finally:
                     if _redirect_lock is not None:
                         with _redirect_lock:

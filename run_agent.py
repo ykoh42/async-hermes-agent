@@ -15,9 +15,12 @@ Features:
 
 Usage:
     from run_agent import AIAgent
+    import asyncio
     
     agent = AIAgent(base_url="http://localhost:30000/v1", model="claude-opus-4-20250514")
-    response = agent.run_conversation("Tell me about the latest Python updates")
+    response = asyncio.run(
+        agent.run_conversation("Tell me about the latest Python updates")
+    )
 """
 
 # IMPORTANT: hermes_bootstrap must be the very first import — UTF-8 stdio
@@ -5415,6 +5418,52 @@ class AIAgent:
         polling worker for the common path.
         """
         import inspect
+
+        if self.api_mode == "anthropic_messages":
+            # Anthropic ships a native async SDK.  Use it directly for static
+            # credentials instead of routing the Messages call through the
+            # synchronous interrupt worker.  Callable Entra credentials still
+            # use the compatibility path until an AsyncClient-aware bearer
+            # hook is available (the token provider itself is synchronous).
+            anthropic_key = getattr(self, "_anthropic_api_key", None)
+            if not callable(anthropic_key):
+                from agent.anthropic_adapter import (
+                    build_anthropic_client,
+                    create_anthropic_message_async,
+                )
+
+                async_source = (
+                    anthropic_key,
+                    getattr(self, "_anthropic_base_url", None),
+                    bool(getattr(self, "_oauth_1m_beta_disabled", False)),
+                )
+                if getattr(self, "_async_anthropic_source", None) != async_source:
+                    self._async_anthropic_client = build_anthropic_client(
+                        anthropic_key,
+                        getattr(self, "_anthropic_base_url", None),
+                        timeout=get_provider_request_timeout(self.provider, self.model),
+                        drop_context_1m_beta=async_source[2],
+                        async_mode=True,
+                    )
+                    self._async_anthropic_source = async_source
+
+                first_event = True
+
+                def _on_anthropic_event(_event: Any) -> None:
+                    nonlocal first_event
+                    if first_event:
+                        first_event = False
+                        if on_first_delta is not None:
+                            on_first_delta()
+
+                return await create_anthropic_message_async(
+                    self._async_anthropic_client,
+                    api_kwargs,
+                    log_prefix=getattr(self, "log_prefix", ""),
+                    prefer_stream=use_streaming,
+                    on_stream_event=_on_anthropic_event if use_streaming else None,
+                    on_response=self._capture_anthropic_response_headers,
+                )
 
         if self.api_mode != "chat_completions":
             # Optional transports still have provider-specific lifecycle code

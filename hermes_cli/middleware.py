@@ -8,6 +8,7 @@ contract helpers here so agent-loop call sites and plugins share one vocabulary.
 from __future__ import annotations
 
 import logging
+import inspect
 from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List
@@ -203,6 +204,33 @@ def run_llm_execution_middleware(
     )
 
 
+async def run_llm_execution_middleware_async(
+    request: Dict[str, Any],
+    next_call: Callable[[Dict[str, Any]], Any],
+    **context: Any,
+) -> Any:
+    """Async execution chain for the coroutine-native agent loop.
+
+    A middleware callback may be synchronous or asynchronous.  Synchronous
+    callbacks are kept synchronous because they are policy/observation code;
+    the terminal provider call is awaited directly and is never hidden inside
+    a thread.  The single-use ``next_call`` contract and failure fallback
+    match :func:`run_llm_execution_middleware`.
+    """
+    callbacks = _get_middleware_callbacks(LLM_EXECUTION_MIDDLEWARE)
+    if not callbacks:
+        result = next_call(request)
+        return await result if inspect.isawaitable(result) else result
+    return await _run_execution_chain_async(
+        LLM_EXECUTION_MIDDLEWARE,
+        callbacks,
+        next_call,
+        request=request,
+        original_request=context.pop("original_request", request),
+        **context,
+    )
+
+
 def run_tool_execution_middleware(
     tool_name: str,
     args: Dict[str, Any],
@@ -314,6 +342,73 @@ def _run_execution_chain(
             return call_at(index + 1, payload)
 
     return call_at(0, kwargs[payload_key])
+
+
+async def _run_execution_chain_async(
+    kind: str,
+    callbacks: List[Callable],
+    terminal_call: Callable[[Any], Any],
+    **kwargs: Any,
+) -> Any:
+    """Coroutine-native equivalent of :func:`_run_execution_chain`."""
+    payload_key = "request" if "request" in kwargs else "args"
+
+    class _DownstreamExecutionError(Exception):
+        def __init__(self, original: BaseException) -> None:
+            super().__init__(str(original))
+            self.original = original
+
+    async def call_at(index: int, payload: Any) -> Any:
+        if index >= len(callbacks):
+            result = terminal_call(payload)
+            return await result if inspect.isawaitable(result) else result
+
+        callback = callbacks[index]
+        next_called = False
+        next_succeeded = False
+        next_result: Any = None
+
+        async def next_call(next_payload: Any = None) -> Any:
+            nonlocal next_called, next_succeeded, next_result
+            if next_called:
+                raise RuntimeError(
+                    f"Middleware '{kind}' callback "
+                    f"{getattr(callback, '__name__', repr(callback))} called "
+                    "next_call() more than once; downstream execution is single-use"
+                )
+            next_called = True
+            try:
+                next_result = await call_at(
+                    index + 1,
+                    payload if next_payload is None else next_payload,
+                )
+                next_succeeded = True
+                return next_result
+            except Exception as exc:
+                raise _DownstreamExecutionError(exc) from exc
+
+        call_kwargs = middleware_payload(**kwargs)
+        call_kwargs[payload_key] = payload
+        call_kwargs["next_call"] = next_call
+        try:
+            result = callback(**call_kwargs)
+            return await result if inspect.isawaitable(result) else result
+        except _DownstreamExecutionError as exc:
+            raise exc.original
+        except Exception as exc:
+            logger.warning(
+                "Middleware '%s' callback %s raised: %s",
+                kind,
+                getattr(callback, "__name__", repr(callback)),
+                exc,
+            )
+            if next_succeeded:
+                return next_result
+            if next_called:
+                raise
+            return await call_at(index + 1, payload)
+
+    return await call_at(0, kwargs[payload_key])
 
 
 def _trace_entry(result: Dict[str, Any]) -> Dict[str, Any]:
