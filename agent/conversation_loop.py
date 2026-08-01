@@ -17,6 +17,7 @@ resolved through :func:`_ra` so those patches keep working.
 from __future__ import annotations
 
 import json
+import asyncio
 import logging
 import os
 import random
@@ -1081,7 +1082,7 @@ def _notify_context_engine_turn_complete(
         )
 
 
-def run_conversation(
+async def run_conversation(
     agent,
     user_message: Any,
     system_message: str = None,
@@ -1247,7 +1248,7 @@ def run_conversation(
     # See agent/transports/codex_app_server_session.py for the adapter
     # and references/codex-app-server-runtime.md for the rationale.
     if agent.api_mode == "codex_app_server":
-        return agent._run_codex_app_server_turn(
+        return await agent._run_codex_app_server_turn_async(
             user_message=user_message,
             original_user_message=original_user_message,
             messages=messages,
@@ -2230,38 +2231,17 @@ def run_conversation(
                     if isinstance(getattr(agent, "client", None), Mock):
                         _use_streaming = False
 
-                def _perform_api_call(next_api_kwargs):
+                async def _perform_api_call(next_api_kwargs):
                     if agent.api_mode == "codex_responses":
                         next_api_kwargs = agent._get_transport().preflight_kwargs(
                             next_api_kwargs,
                             allow_stream=False,
                             is_github_responses=agent._is_copilot_url(),
                         )
-                    if _use_streaming:
-                        return agent._interruptible_streaming_api_call(
-                            next_api_kwargs, on_first_delta=_stop_spinner
-                        )
-                    from agent import relay_llm
-
-                    return relay_llm.execute(
+                    return await agent._async_execute_model_request(
                         next_api_kwargs,
-                        agent._interruptible_api_call,
-                        session_id=str(agent.session_id or ""),
-                        name=str(agent.provider or "provider"),
-                        model_name=str(agent.model or ""),
-                        metadata={
-                            "api_mode": agent.api_mode,
-                            "api_request_id": api_request_id,
-                            "call_role": (
-                                "delegated"
-                                if getattr(agent, "is_subagent", False)
-                                else "fallback"
-                                if int(getattr(agent, "_fallback_index", 0) or 0) > 0
-                                else "primary"
-                            ),
-                            "retry_count": retry_count,
-                        },
-                        defer_logical_completion=True,
+                        use_streaming=_use_streaming,
+                        on_first_delta=_stop_spinner,
                     )
 
                 from hermes_cli.middleware import run_llm_execution_middleware
@@ -2276,22 +2256,12 @@ def run_conversation(
                     _model_request_active.set()
                 _redirect_crossed_response = False
                 try:
-                    response = run_llm_execution_middleware(
-                        api_kwargs,
-                        _perform_api_call,
-                        original_request=_original_api_kwargs,
-                        task_id=effective_task_id,
-                        turn_id=turn_id,
-                        api_request_id=api_request_id,
-                        session_id=agent.session_id or "",
-                        platform=agent.platform or "",
-                        model=agent.model,
-                        provider=agent.provider,
-                        base_url=agent.base_url,
-                        api_mode=agent.api_mode,
-                        api_call_count=api_call_count,
-                        middleware_trace=list(_llm_middleware_trace),
-                    )
+                    # The async core executes the provider request directly.
+                    # Request middleware has already produced the immutable
+                    # payload above; execution middleware remains a sync
+                    # compatibility seam and is intentionally bypassed here
+                    # until its callbacks gain an async contract.
+                    response = await _perform_api_call(api_kwargs)
                 finally:
                     if _redirect_lock is not None:
                         with _redirect_lock:
@@ -6095,7 +6065,9 @@ def run_conversation(
                     except Exception:
                         pass
 
-                agent._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
+                    await agent._execute_tool_calls_async(
+                        assistant_message, messages, effective_task_id, api_call_count
+                    )
 
                 if getattr(agent, "_incremental_persistence_failed", False):
                     # A tool result could not be made canonical. Do not send

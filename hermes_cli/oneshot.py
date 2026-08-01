@@ -22,6 +22,7 @@ Env var fallbacks (used when the corresponding arg is not passed):
 from __future__ import annotations
 
 import logging
+import asyncio
 import os
 import sys
 from contextlib import redirect_stderr, redirect_stdout
@@ -440,7 +441,7 @@ def _run_agent(
         agent.stream_delta_callback = None
         agent.tool_gen_callback = None
 
-        result = agent.run_conversation(prompt)
+        result = asyncio.run(agent.run_conversation(prompt))
         return (result.get("final_response") or "", result)
     finally:
         # Ordering deliberately mirrors gateway/run.py:_cleanup_agent_resources,

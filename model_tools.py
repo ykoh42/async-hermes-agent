@@ -24,6 +24,7 @@ import os
 import json
 import re
 import asyncio
+import inspect
 import logging
 import threading
 import time
@@ -1305,6 +1306,53 @@ def handle_function_call(
         error_msg = f"Error executing {function_name}: {str(e)}"
         logger.exception(error_msg)
         return tool_error(_sanitize_tool_error(error_msg))
+
+
+async def async_handle_function_call(
+    function_name: str,
+    function_args: Dict[str, Any],
+    task_id: Optional[str] = None,
+    *,
+    session_id: Optional[str] = None,
+    user_task: Optional[str] = None,
+    enabled_tools: Optional[List[str]] = None,
+) -> str | dict:
+    """Coroutine-native dispatcher for registry tools.
+
+    Async handlers (web/vision and future MCP handlers) are awaited directly.
+    Synchronous handlers deliberately remain on the legacy dispatcher; the
+    async conversation loop only uses this entry point for handlers that have
+    declared ``is_async=True``. This keeps the boundary explicit and avoids
+    hiding blocking tool code behind a blanket thread wrapper.
+    """
+    function_args = coerce_tool_args(function_name, function_args)
+    if not isinstance(function_args, dict):
+        function_args = {}
+    entry = registry.get_entry(function_name)
+    if entry is None:
+        return tool_error(f"Unknown tool: {function_name}")
+    if not entry.is_async:
+        return handle_function_call(
+            function_name,
+            function_args,
+            task_id,
+            session_id=session_id,
+            user_task=user_task,
+            enabled_tools=enabled_tools,
+        )
+    try:
+        result = entry.handler(
+            function_args,
+            task_id=task_id,
+            session_id=session_id,
+            user_task=user_task,
+        )
+        if inspect.isawaitable(result):
+            result = await result
+        return registry._normalize_handler_result(function_name, result)
+    except Exception as exc:
+        logger.exception("Async tool %s dispatch error: %s", function_name, exc)
+        return tool_error(f"Tool execution failed: {type(exc).__name__}: {exc}")
 
 
 # =============================================================================

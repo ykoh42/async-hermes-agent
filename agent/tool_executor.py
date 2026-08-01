@@ -13,6 +13,7 @@ extracted functions reach back through the ``run_agent`` module via
 from __future__ import annotations
 
 import concurrent.futures
+import asyncio
 import json
 from pathlib import Path
 import logging
@@ -1987,6 +1988,67 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
     # applied to sequential execution as well.
     if finalize and num_tools_seq > 0:
         agent._apply_pending_steer_to_tool_results(messages, num_tools_seq)
+
+
+async def execute_tool_calls_async(
+    agent,
+    assistant_message,
+    messages: list,
+    effective_task_id: str,
+    api_call_count: int = 0,
+) -> None:
+    """Coroutine-native tool execution for async registry handlers.
+
+    Async registry entries are scheduled with ``asyncio.gather`` and their
+    results are appended in model emission order. Stateful/interactive tools
+    still use the established executor as an explicit compatibility boundary;
+    this keeps terminal and approval semantics intact while MCP/web/vision
+    handlers can remain on the event loop.
+    """
+    from tools.registry import registry
+
+    tool_calls = list(getattr(assistant_message, "tool_calls", None) or [])
+    if not tool_calls:
+        return
+    async_only = all(
+        registry.get_entry(getattr(tc.function, "name", "")) is not None
+        and registry.get_entry(getattr(tc.function, "name", "")).is_async
+        for tc in tool_calls
+    )
+    if not async_only:
+        await asyncio.to_thread(
+            agent._execute_tool_calls,
+            assistant_message,
+            messages,
+            effective_task_id,
+            api_call_count,
+        )
+        return
+
+    from agent.agent_runtime_helpers import invoke_tool_async
+
+    async def _one(tc):
+        name = getattr(tc.function, "name", "")
+        try:
+            args = json.loads(getattr(tc.function, "arguments", "") or "{}")
+        except (TypeError, json.JSONDecodeError):
+            args = {}
+        if not isinstance(args, dict):
+            args = {}
+        result = await invoke_tool_async(
+            agent,
+            name,
+            args,
+            effective_task_id,
+            tool_call_id=getattr(tc, "id", "") or "",
+            messages=messages,
+        )
+        return make_tool_result_message(name, result, getattr(tc, "id", "") or "")
+
+    results = await asyncio.gather(*(_one(tc) for tc in tool_calls))
+    messages.extend(results)
+    if tool_calls:
+        agent._apply_pending_steer_to_tool_results(messages, len(tool_calls))
 
 
 

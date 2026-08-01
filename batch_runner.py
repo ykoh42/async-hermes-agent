@@ -32,6 +32,7 @@ except ModuleNotFoundError:
     pass
 
 import json
+import asyncio
 import logging
 import os
 import time
@@ -379,7 +380,7 @@ def _process_single_prompt(
         )
 
         # Run the agent with task_id to ensure each task gets its own isolated VM
-        result = agent.run_conversation(prompt, task_id=task_id)
+        result = asyncio.run(agent.run_conversation(prompt, task_id=task_id))
         
         # Extract tool usage statistics
         tool_stats = _extract_tool_stats(result["messages"])

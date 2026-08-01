@@ -2759,6 +2759,48 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
     )
 
 
+async def invoke_tool_async(
+    agent,
+    function_name: str,
+    function_args: dict,
+    effective_task_id: str,
+    tool_call_id: Optional[str] = None,
+    messages: list = None,
+    **kwargs,
+) -> str:
+    """Invoke an async registry tool without entering the sync bridge.
+
+    Agent-owned tools (memory, todo, delegation and interactive prompts) are
+    still handled by the established dispatcher because their stateful
+    contracts are synchronous. Registry entries that declare ``is_async`` are
+    dispatched through ``model_tools.async_handle_function_call`` and awaited
+    directly, which is the path used by the async conversation loop.
+    """
+    from model_tools import async_handle_function_call
+    from tools.registry import registry
+
+    entry = registry.get_entry(function_name)
+    if entry is None or not entry.is_async:
+        return invoke_tool(
+            agent,
+            function_name,
+            function_args,
+            effective_task_id,
+            tool_call_id=tool_call_id,
+            messages=messages,
+            **kwargs,
+        )
+    result = await async_handle_function_call(
+        function_name,
+        function_args,
+        effective_task_id,
+        session_id=getattr(agent, "session_id", "") or "",
+        user_task=getattr(agent, "_current_user_task", None),
+        enabled_tools=list(getattr(agent, "valid_tool_names", None) or []) or None,
+    )
+    return result if isinstance(result, str) else json.dumps(result, ensure_ascii=False)
+
+
 
 def repair_tool_call(agent, tool_name: str) -> str | None:
     """Attempt to repair a mismatched tool name before aborting.

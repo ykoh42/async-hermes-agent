@@ -18,6 +18,7 @@ never the child's intermediate tool calls or reasoning.
 """
 
 import enum
+import asyncio
 import contextvars
 import json
 import logging
@@ -2176,11 +2177,11 @@ def _run_single_child(
             from agent.delegation_context import delegated_child_context
 
             with delegated_child_context():
-                return child.run_conversation(
+                return asyncio.run(child.run_conversation(
                     user_message=goal,
                     task_id=child_task_id,
                     stream_callback=_relay_child_text,
-                )
+                ))
 
         _child_context = contextvars.copy_context()
         _child_future = _timeout_executor.submit(

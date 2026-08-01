@@ -5397,6 +5397,93 @@ class AIAgent:
                 drop_context_1m_beta=_drop_1m,
             )
 
+    async def _async_execute_model_request(
+        self,
+        api_kwargs: dict,
+        *,
+        use_streaming: bool = False,
+        on_first_delta: Optional[Callable[[], None]] = None,
+    ):
+        """Execute one model request without blocking the event loop.
+
+        The async repository owns an async client per agent runtime.  Standard
+        OpenAI-compatible providers use ``AsyncOpenAI`` directly; the legacy
+        Codex/Bedrock/native-Anthropic transports are kept behind their
+        existing compatibility boundary until those SDKs expose equivalent
+        cancellation primitives.  This method is deliberately separate from
+        ``_interruptible_api_call`` so an async turn never enters the legacy
+        polling worker for the common path.
+        """
+        import inspect
+
+        if self.api_mode != "chat_completions":
+            # Optional transports still have provider-specific lifecycle code
+            # that is not yet coroutine-native. Isolate only that transport,
+            # never the conversation loop or tool scheduler.
+            return await asyncio.to_thread(
+                self._interruptible_streaming_api_call
+                if use_streaming
+                else self._interruptible_api_call,
+                api_kwargs,
+                **({"on_first_delta": on_first_delta} if use_streaming else {}),
+            )
+
+        client = getattr(self, "_async_client", None)
+        if getattr(self, "_async_client_source", None) is not self.client:
+            from agent.auxiliary_client import _to_async_client
+
+            client, resolved_model = _to_async_client(self.client, self.model)
+            self._async_client = client
+            self._async_client_source = self.client
+            if resolved_model and not getattr(self, "model", None):
+                self.model = resolved_model
+
+        request = dict(api_kwargs)
+        if use_streaming:
+            request["stream"] = True
+            request.setdefault("stream_options", {"include_usage": True})
+
+        result = client.chat.completions.create(**request)
+        if inspect.isawaitable(result):
+            result = await result
+
+        if not use_streaming or hasattr(result, "choices"):
+            return result
+
+        from agent.auxiliary_client import _ChatStreamAccumulator
+
+        accumulator = _ChatStreamAccumulator(
+            model=str(request.get("model") or self.model or "")
+        )
+        first_delta = True
+        async for chunk in result:
+            if first_delta:
+                first_delta = False
+                if on_first_delta is not None:
+                    on_first_delta()
+            # Preserve the existing streaming display contract while the
+            # accumulator reconstructs tool calls/reasoning for the loop.
+            try:
+                choices = getattr(chunk, "choices", None) or []
+                delta = getattr(choices[0], "delta", None) if choices else None
+                text = getattr(delta, "content", None) if delta is not None else None
+                if isinstance(text, str) and text:
+                    self._fire_stream_delta(text)
+            except Exception:
+                pass
+            accumulator.feed(chunk)
+
+        close = getattr(result, "aclose", None) or getattr(result, "close", None)
+        if callable(close):
+            maybe = close()
+            if inspect.isawaitable(maybe):
+                await maybe
+        return accumulator.finish()
+
+    async def _run_codex_app_server_turn_async(self, **kwargs):
+        """Compatibility boundary for the optional Codex app-server mode."""
+        return await asyncio.to_thread(self._run_codex_app_server_turn, **kwargs)
+
     def _interruptible_api_call(self, api_kwargs: dict):
         """Forwarder — see ``agent.chat_completion_helpers.interruptible_api_call``."""
         from agent.chat_completion_helpers import interruptible_api_call
@@ -6918,6 +7005,20 @@ class AIAgent:
         from agent.tool_executor import execute_tool_calls_sequential
         return execute_tool_calls_sequential(self, assistant_message, messages, effective_task_id, api_call_count)
 
+    async def _execute_tool_calls_async(
+        self,
+        assistant_message,
+        messages: list,
+        effective_task_id: str,
+        api_call_count: int = 0,
+    ) -> None:
+        """Coroutine-native tool executor used by the async conversation loop."""
+        from agent.tool_executor import execute_tool_calls_async
+
+        return await execute_tool_calls_async(
+            self, assistant_message, messages, effective_task_id, api_call_count
+        )
+
     def _handle_max_iterations(self, messages: list, api_call_count: int) -> str:
         """Forwarder — see ``agent.chat_completion_helpers.handle_max_iterations``."""
         from agent.chat_completion_helpers import handle_max_iterations
@@ -6952,7 +7053,7 @@ class AIAgent:
                 logger.debug("Conversation root lineage walk failed", exc_info=True)
         return start
 
-    def run_conversation(
+    async def run_conversation(
         self,
         user_message: Any,
         system_message: str = None,
@@ -7043,7 +7144,7 @@ class AIAgent:
             # Keep the scope local instead of storing ContextVar tokens on the agent,
             # which may be observed from another thread.
             with bind_subagent_parent(self), scoped_runtime_main({}):
-                result = run_conversation(
+                result = await run_conversation(
                     self,
                     user_message,
                     system_message,
@@ -7107,7 +7208,7 @@ class AIAgent:
                     if token is not None:
                         reset_conversation_context(token)
 
-    def chat(self, message: str, stream_callback: Optional[callable] = None) -> str:
+    async def chat(self, message: str, stream_callback: Optional[callable] = None) -> str:
         """
         Simple chat interface that returns just the final response.
 
@@ -7118,7 +7219,7 @@ class AIAgent:
         Returns:
             str: Final assistant response
         """
-        result = self.run_conversation(message, stream_callback=stream_callback)
+        result = await self.run_conversation(message, stream_callback=stream_callback)
         return result["final_response"]
 
     def _run_codex_app_server_turn(
@@ -7303,7 +7404,7 @@ def main(
     print("\n" + "=" * 50)
     
     # Run conversation
-    result = agent.run_conversation(user_query)
+    result = asyncio.run(agent.run_conversation(user_query))
     
     print("\n" + "=" * 50)
     print("📋 CONVERSATION SUMMARY")
