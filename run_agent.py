@@ -5419,6 +5419,36 @@ class AIAgent:
         """
         import inspect
 
+        if self.api_mode == "codex_responses":
+            # OpenAI Responses has a native async client as well.  Convert the
+            # already-resolved client once per agent and keep the event stream
+            # on the current loop; app-server mode is handled separately below.
+            from agent.auxiliary_client import _to_async_client
+
+            if getattr(self, "_async_codex_client_source", None) is not self.client:
+                async_client, resolved_model = _to_async_client(self.client, self.model)
+                self._async_codex_client = async_client
+                self._async_codex_client_source = self.client
+                if resolved_model and not getattr(self, "model", None):
+                    self.model = resolved_model
+
+            if use_streaming:
+                from agent.codex_runtime import run_codex_stream_async
+
+                return await run_codex_stream_async(
+                    self,
+                    api_kwargs,
+                    client=self._async_codex_client,
+                    on_first_delta=on_first_delta,
+                )
+
+            request = dict(api_kwargs)
+            request.pop("stream", None)
+            result = self._async_codex_client.responses.create(**request)
+            if inspect.isawaitable(result):
+                result = await result
+            return result
+
         if self.api_mode == "anthropic_messages":
             # Anthropic ships a native async SDK.  Use it directly for static
             # credentials instead of routing the Messages call through the

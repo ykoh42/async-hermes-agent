@@ -1190,6 +1190,69 @@ def _consume_codex_event_stream(
     return final
 
 
+async def run_codex_stream_async(
+    agent,
+    api_kwargs: dict,
+    client: Any = None,
+    on_first_delta=None,
+):
+    """Consume an OpenAI Responses stream through an async client.
+
+    The event normalization is shared with the established sync path, while
+    socket reads use the SDK's native async iterator.  This keeps the response
+    shape identical for tool-loop parsing without placing the whole stream in
+    ``asyncio.to_thread``.
+    """
+    import inspect
+
+    active_client = client or getattr(agent, "_async_codex_client", None)
+    if active_client is None:
+        raise RuntimeError("Async Codex client is not initialized")
+
+    request = dict(api_kwargs)
+    request["stream"] = True
+    stream = active_client.responses.create(**request)
+    if inspect.isawaitable(stream):
+        stream = await stream
+
+    if not hasattr(stream, "__aiter__"):
+        return stream
+
+    events = []
+    first_text = True
+    try:
+        async for event in stream:
+            events.append(event)
+            event_type = _event_field(event, "type", "")
+            if "output_text.delta" in str(event_type):
+                delta = _event_field(event, "delta", "")
+                if delta:
+                    if first_text and on_first_delta is not None:
+                        first_text = False
+                        on_first_delta()
+                    try:
+                        agent._fire_stream_delta(delta)
+                    except Exception:
+                        logger.debug("Async Codex text callback failed", exc_info=True)
+            elif "reasoning" in str(event_type) and "delta" in str(event_type):
+                delta = _event_field(event, "delta", "")
+                if delta:
+                    try:
+                        agent._fire_reasoning_delta(delta)
+                    except Exception:
+                        logger.debug(
+                            "Async Codex reasoning callback failed", exc_info=True
+                        )
+    finally:
+        close = getattr(stream, "aclose", None) or getattr(stream, "close", None)
+        if callable(close):
+            maybe = close()
+            if inspect.isawaitable(maybe):
+                await maybe
+
+    return _consume_codex_event_stream(events, model=request.get("model"))
+
+
 def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta=None):
     """Execute one streaming Responses API request and return the final response.
 
@@ -1395,6 +1458,7 @@ def run_codex_create_stream_fallback(agent, api_kwargs: dict, client: Any = None
 __all__ = [
     "run_codex_app_server_turn",
     "run_codex_stream",
+    "run_codex_stream_async",
     "run_codex_create_stream_fallback",
     "_consume_codex_event_stream",
     "make_codex_app_server_event_bridge",
