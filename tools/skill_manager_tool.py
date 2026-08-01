@@ -663,37 +663,8 @@ def _find_skill(name: str) -> Optional[Dict[str, Any]]:
 
 
 def _maybe_auto_propose_org_edit(name: str, skill_path: Path) -> Optional[str]:
-    """Submit an org-skill edit upstream when `sync.org_auto_propose` is on.
-
-    Returns a short note for the tool result, or None when nothing happened.
-    Never raises: an offline/failed submission must not fail the edit itself —
-    the change is already saved locally and can be proposed later.
-    """
-    try:
-        from agent.skill_utils import is_org_mirror_path
-        from tools import skills_sync_client as ssc
-
-        if not is_org_mirror_path(skill_path, _skills_dir()):
-            return None
-        if not ssc.sync_org_auto_propose():
-            return (
-                f"This skill is shared by your organisation. Your edit is "
-                f"saved locally and will not be overwritten by org updates. "
-                f"Run `hermes sync propose {name}` to share it back."
-            )
-        result = ssc.propose_skill(name)
-        if result.get("proposal_pending"):
-            return (
-                f"Auto-proposed to your organisation as proposal "
-                f"#{result.get('proposal_id')} (pending admin review)."
-            )
-        return "Auto-proposed to your organisation (merged into the shared set)."
-    except Exception as e:
-        logger.debug("auto-propose skipped for %s: %s", name, e)
-        return (
-            f"Edit saved locally. Could not submit it to your organisation "
-            f"right now — run `hermes sync propose {name}` to retry."
-        )
+    """The training runtime keeps skill edits local."""
+    return None
 
 
 def _org_mirror_write_guard(name: str, skill_path: Path, action: str) -> Optional[Dict[str, Any]]:
@@ -1460,54 +1431,9 @@ def apply_skill_pending(payload: Dict[str, Any]) -> str:
         _skill_gate_bypass.reset(token)
 
 
-# Debounce state for the sync push hook. A burst of skill_manage writes
-# (e.g. create + several write_file calls) collapses into a single push after
-# a short quiet window, on a daemon timer so the agent write never blocks.
-_sync_push_timer = None
-_sync_push_lock = None
-_SYNC_PUSH_DEBOUNCE_S = 5.0
-
-
 def _maybe_debounced_sync_push(skill_name: str) -> None:
-    """Schedule a debounced best-effort sync push after a skill write.
-
-    Cheap fast-path: if the skill isn't opted into sync, do nothing (no auth,
-    no network). Otherwise (re)arm a daemon timer; the actual push runs through
-    ``skills_sync_client.maybe_push_skills`` which enforces the access gate
-    and swallows all errors. Never blocks the caller (M1-C: agent never blocks
-    on sync).
-    """
-    global _sync_push_timer, _sync_push_lock
-    try:
-        from tools.skill_usage import is_sync_enabled
-
-        if not is_sync_enabled(skill_name):
-            return
-    except Exception:
-        return
-
-    import threading
-
-    if _sync_push_lock is None:
-        _sync_push_lock = threading.Lock()
-
-    def _fire():
-        try:
-            from tools.skills_sync_client import maybe_push_skills
-
-            maybe_push_skills(message=f"sync: {skill_name}")
-        except Exception:
-            pass
-
-    with _sync_push_lock:
-        if _sync_push_timer is not None:
-            try:
-                _sync_push_timer.cancel()
-            except Exception:
-                pass
-        _sync_push_timer = threading.Timer(_SYNC_PUSH_DEBOUNCE_S, _fire)
-        _sync_push_timer.daemon = True
-        _sync_push_timer.start()
+    """The training runtime never publishes skill edits automatically."""
+    return None
 
 
 def skill_manage(

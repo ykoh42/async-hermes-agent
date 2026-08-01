@@ -72,24 +72,6 @@ class TestWebToolsSynthesisContentNone:
         assert content == ""
 
 
-# ── vision_tools (line 350) ───────────────────────────────────────────────
-
-class TestVisionToolsContentNone:
-    """tools/vision_tools.py — analyze_image() analysis extraction"""
-
-    def test_none_content_raises_before_fix(self):
-        response = _make_response(None)
-
-        with pytest.raises(AttributeError):
-            response.choices[0].message.content.strip()
-
-    def test_none_content_safe_with_or_guard(self):
-        response = _make_response(None)
-
-        content = (response.choices[0].message.content or "").strip()
-        assert content == ""
-
-
 # ── skills_guard (line 963) ───────────────────────────────────────────────
 
 class TestSkillsGuardContentNone:
@@ -128,13 +110,6 @@ class TestSourceLinesAreGuarded:
         src = self._read_file("tools/web_tools.py")
         assert ".message.content.strip()" not in src, (
             "tools/web_tools.py still has unguarded "
-            ".content.strip() — apply `(... or \"\").strip()` guard"
-        )
-
-    def test_vision_tools_guarded(self):
-        src = self._read_file("tools/vision_tools.py")
-        assert ".message.content.strip()" not in src, (
-            "tools/vision_tools.py still has unguarded "
             ".content.strip() — apply `(... or \"\").strip()` guard"
         )
 

@@ -487,7 +487,7 @@ def build_turn_context(
         agent._replay_compression_warning()
         agent._compression_warning = None  # send once
 
-    # NOTE: _turns_since_memory and _iters_since_skill are NOT reset here.
+    # NOTE: _turns_since_memory is intentionally not reset here.
     agent.iteration_budget = IterationBudget(agent.max_iterations)
 
     # Log conversation turn start for debugging/observability.
@@ -588,20 +588,6 @@ def build_turn_context(
         if agent._turns_since_memory >= agent._memory_nudge_interval:
             should_review_memory = True
             agent._turns_since_memory = 0
-
-    # Cosmetic side-signal: detect an affection "reaction" (ily / <3 / good bot)
-    # and notify the host so it can play hearts. Token-free, never touches the
-    # conversation, and never fatal — a purely optional UI beat.
-    reaction_callback = getattr(agent, "reaction_callback", None)
-    if reaction_callback is not None:
-        try:
-            from agent.reactions import detect_reaction
-
-            kind = detect_reaction(original_user_message)
-            if kind:
-                reaction_callback(kind)
-        except Exception:
-            pass
 
     if not agent.quiet_mode:
         _print_preview = summarize_user_message_for_log(user_message)
@@ -1047,59 +1033,7 @@ def build_turn_context(
         )
         agent._persist_user_message_idx = current_turn_user_idx
 
-    # Plugin hook: pre_llm_call (context injected into user message, not system prompt).
     plugin_user_context = ""
-    try:
-        from hermes_cli.lifecycle import invoke_hook as _invoke_hook
-        _pre_results = _invoke_hook(
-            "pre_llm_call",
-            session_id=agent.session_id,
-            task_id=effective_task_id,
-            turn_id=turn_id,
-            user_message=original_user_message,
-            conversation_history=list(messages),
-            is_first_turn=(not bool(conversation_history)),
-            model=agent.model,
-            platform=getattr(agent, "platform", None) or "",
-            parent_session_id=getattr(agent, "_parent_session_id", None) or "",
-            sender_id=getattr(agent, "_user_id", None) or "",
-        )
-        _ctx_parts: list[str] = []
-        # Spill oversized per-hook context to disk so a runaway plugin
-        # can't inflate every subsequent turn's prompt. Ported from
-        # openai/codex PR #21069 ("Spill large hook outputs from context").
-        try:
-            from tools.hook_output_spill import (
-                get_spill_config as _spill_cfg,
-                spill_if_oversized as _spill_if_oversized,
-            )
-            _spill_config_cached = _spill_cfg()
-        except Exception:
-            _spill_if_oversized = None  # type: ignore[assignment]
-            _spill_config_cached = None
-        for r in _pre_results:
-            _piece: str = ""
-            if isinstance(r, dict) and r.get("context"):
-                _piece = str(r["context"])
-            elif isinstance(r, str) and r.strip():
-                _piece = r
-            else:
-                continue
-            if _spill_if_oversized is not None:
-                try:
-                    _piece = _spill_if_oversized(
-                        _piece,
-                        session_id=agent.session_id,
-                        source="plugin hook",
-                        config=_spill_config_cached,
-                    )
-                except Exception as _spill_exc:
-                    logger.warning("hook context spill failed: %s", _spill_exc)
-            _ctx_parts.append(_piece)
-        if _ctx_parts:
-            plugin_user_context = "\n\n".join(_ctx_parts)
-    except Exception as exc:
-        logger.warning("pre_llm_call hook failed: %s", exc)
 
     # Gateway must-deliver notes (auto-reset note, first-contact intro,
     # voice-channel change) ride the same user-message injection channel as

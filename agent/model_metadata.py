@@ -27,8 +27,8 @@ from hermes_constants import OPENROUTER_MODELS_URL
 
 logger = logging.getLogger(__name__)
 
-# ``requests`` (with urllib3) costs ~27 ms of the `import cli` waterfall and
-# is only used inside the fetch functions below. It's resolved lazily:
+# ``requests`` (with urllib3) is only used inside the fetch functions below,
+# so it is resolved lazily:
 # ``_ensure_requests()`` populates the module global on the runtime path, and
 # the PEP 562 ``__getattr__`` covers external attribute access — notably
 # ``patch("agent.model_metadata.requests.get")`` in tests, which resolves the

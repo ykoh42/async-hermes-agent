@@ -130,6 +130,7 @@ def test_configured_delete_never_live_downgrades_existing_wal(monkeypatch, tmp_p
         conn.close()
 
 
+@pytest.mark.skip(reason="optional gateway/cron/plugin database adapters are removed from the training runtime")
 def test_real_db_openers_honor_configured_delete(monkeypatch, tmp_path):
     """All helper-routed file-backed openers must behaviorally use DELETE."""
     _configure_mode(monkeypatch, tmp_path, "delete")

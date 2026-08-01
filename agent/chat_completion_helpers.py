@@ -8,8 +8,7 @@ and per-turn resource cleanup.
 Each function takes the parent ``AIAgent`` as its first argument
 (``agent``).  :class:`AIAgent` keeps thin forwarder methods so call
 sites unchanged.  Symbols that tests patch on ``run_agent`` (e.g.
-``cleanup_vm`` / ``cleanup_browser`` in
-``test_zombie_process_cleanup.py``) are resolved through
+``cleanup_vm`` in ``test_zombie_process_cleanup.py``) are resolved through
 :func:`_ra` so the patch contract is preserved.
 """
 
@@ -67,9 +66,8 @@ def _context_thread_target(callback):
 def _ra():
     """Lazy ``run_agent`` reference.
 
-    Used to honor test patches like
-    ``patch("run_agent.cleanup_vm")`` / ``patch("run_agent.cleanup_browser")``
-    that target symbols imported into ``run_agent``'s namespace.
+    Used to honor test patches like ``patch("run_agent.cleanup_vm")`` that
+    target symbols imported into ``run_agent``'s namespace.
     """
     import run_agent
     return run_agent
@@ -2399,20 +2397,14 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
 
 
 def cleanup_task_resources(agent, task_id: str) -> None:
-    """Clean up VM and browser resources for a given task.
+    """Clean up terminal resources for a given task.
 
     Skips ``cleanup_vm`` when the active terminal environment is marked
     persistent (``persistent_filesystem=True``) so that long-lived sandbox
     containers survive between turns. The idle reaper in
     ``terminal_tool._cleanup_inactive_envs`` still tears them down once
     ``terminal.lifetime_seconds`` is exceeded. Non-persistent backends are
-    torn down per-turn as before to prevent resource leakage (the original
-    intent of this hook for the Morph backend, see commit fbd3a2fd).
-
-    Skips ``cleanup_browser`` in headed mode so the browser window stays
-    visible between turns. The inactivity reaper in
-    ``browser_tool._cleanup_inactive_browser_sessions`` still handles
-    idle sessions.
+    torn down per-turn as before to prevent resource leakage.
     """
     try:
         if is_persistent_env(task_id):
@@ -2426,24 +2418,6 @@ def cleanup_task_resources(agent, task_id: str) -> None:
     except Exception as e:
         if agent.verbose_logging:
             logger.warning(f"Failed to cleanup VM for task {task_id}: {e}")
-    try:
-        headed = False
-        try:
-            from tools.browser_tool import _is_headed_mode
-            headed = _is_headed_mode()
-        except Exception:
-            headed = bool(os.environ.get("AGENT_BROWSER_HEADED"))
-        if headed:
-            if agent.verbose_logging:
-                logging.debug(
-                    f"Skipping per-turn cleanup_browser for headed session {task_id}; "
-                    f"idle reaper will handle it."
-                )
-        else:
-            _ra().cleanup_browser(task_id)
-    except Exception as e:
-        if agent.verbose_logging:
-            logger.warning(f"Failed to cleanup browser for task {task_id}: {e}")
 
 
 def _build_partial_stream_stub(

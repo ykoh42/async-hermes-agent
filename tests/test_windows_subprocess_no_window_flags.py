@@ -184,10 +184,9 @@ def test_shell_hooks_hide_hook_command_windows(monkeypatch):
 
 # ── #56747 GUI-reachable exec paths + provider transports (PR #56877) ──────
 #
-# These six sites are the desktop-GUI-reachable spawns that still flashed a
-# console on Windows after the #54220 sweep: the TUI gateway's cli.exec /
-# shell.exec / quick-command exec RPCs, the interactive CLI's quick-command
-# exec handler, and the Copilot ACP + Codex app-server stdio transports.
+# These are desktop-GUI-reachable spawns that still flashed a console on
+# Windows after the #54220 sweep: the interactive CLI's quick-command exec
+# handler and the Copilot ACP + Codex app-server stdio transports.
 # All are hide-only (creationflags) — PIPE stdio must stay intact.
 
 
@@ -196,93 +195,6 @@ def _patch_hide_flags(monkeypatch):
 
     monkeypatch.setattr(subprocess_compat, "IS_WINDOWS", True)
     monkeypatch.setattr(subprocess_compat, "windows_hide_flags", lambda: _CREATE_NO_WINDOW)
-
-
-
-
-def test_tui_shell_exec_rpc_hides_console_window(monkeypatch):
-    from tui_gateway import server
-
-    captured = []
-
-    def fake_run(cmd, **kwargs):
-        captured.append((cmd, kwargs))
-        return _Completed(stdout="ok\n")
-
-    _patch_hide_flags(monkeypatch)
-    monkeypatch.setattr(server.subprocess, "run", fake_run)
-
-    resp = server.handle_request(
-        {"id": "2", "method": "shell.exec", "params": {"command": "echo shellexec-56747"}}
-    )
-    assert resp["result"]["code"] == 0
-
-    spawns = _spawns(captured, "shellexec-56747")
-    assert len(spawns) == 1, captured
-    assert spawns[0][1]["creationflags"] == _CREATE_NO_WINDOW
-
-
-
-
-
-
-
-
-
-
-# ── #47971 LSP spawn + installer paths (salvage) ────────────────────────────
-#
-# The LSP language-server spawn (agent/lsp/client.py::_spawn) and the
-# npm/go LSP auto-installers (agent/lsp/install.py) are reachable from
-# console-less parents — a VS Code/Zed extension host running the ACP
-# adapter — where a .cmd-wrapped server (pyright-langserver.CMD via
-# cmd.exe /c) or an npm/go console app flashes a window on Windows.
-# All are hide-only (creationflags); PIPE stdio must stay intact and the
-# POSIX start_new_session detach must be preserved on the client spawn.
-
-
-def test_lsp_client_spawn_hides_console_window(monkeypatch):
-    import asyncio
-
-    from agent.lsp import client as lsp_client
-
-    captured = []
-
-    class _FakeProc:
-        stdin = None
-        stdout = None
-        stderr = None
-
-    async def fake_exec(*cmd, **kwargs):
-        captured.append((list(cmd), kwargs))
-        return _FakeProc()
-
-    monkeypatch.setattr(lsp_client, "windows_hide_flags", lambda: _CREATE_NO_WINDOW)
-    monkeypatch.setattr(
-        lsp_client.asyncio, "create_subprocess_exec", fake_exec
-    )
-
-    client = lsp_client.LSPClient(
-        server_id="test-server",
-        workspace_root="/tmp/ws",
-        command=["fake-langserver", "--stdio"],
-    )
-    asyncio.run(client._spawn())
-
-    assert len(captured) == 1, captured
-    cmd, kwargs = captured[0]
-    assert cmd == ["fake-langserver", "--stdio"]
-    assert kwargs["creationflags"] == _CREATE_NO_WINDOW
-    # Hide-only: the LSP wire still needs its pipes, and the POSIX
-    # process-group detach (mcp orphan-sweep guard) must survive.
-    assert kwargs["stdin"] == asyncio.subprocess.PIPE
-    assert kwargs["stdout"] == asyncio.subprocess.PIPE
-    assert kwargs["start_new_session"] is True
-
-
-
-
-
 
 # ── #67690 env probes, lazy installs, platform.win32_ver() (@m4r13y) ───────
 #

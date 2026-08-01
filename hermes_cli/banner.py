@@ -51,16 +51,12 @@ def cprint(text: str):
 
 
 # =========================================================================
-# Skin-aware color helpers
+# Fixed color helpers
 # =========================================================================
 
 def _skin_color(key: str, fallback: str) -> str:
-    """Get a color from the active skin, or return fallback."""
-    try:
-        from hermes_cli.skin_engine import get_active_skin
-        return get_active_skin().get_color(key, fallback)
-    except Exception:
-        return fallback
+    """Return the fixed fallback color."""
+    return fallback
 # =========================================================================
 # ASCII Art & Branding
 # =========================================================================
@@ -627,14 +623,7 @@ def build_welcome_banner(console: "Console", model: str, cwd: str,
     text = _skin_color("banner_text", "#FFF8DC")
     session_color = _skin_color("session_border", "#8B8682")
 
-    # Use skin's custom caduceus art if provided
-    try:
-        from hermes_cli.skin_engine import get_active_skin
-        _bskin = get_active_skin()
-        _hero = _bskin.banner_hero if hasattr(_bskin, 'banner_hero') and _bskin.banner_hero else HERMES_CADUCEUS
-    except Exception:
-        _bskin = None
-        _hero = HERMES_CADUCEUS
+    _hero = HERMES_CADUCEUS
     left_lines = ["", _hero, ""]
     if (provider or "").strip().lower() == "moa":
         # MoA virtual provider: ``model`` is a preset name. Show the preset and
@@ -892,7 +881,6 @@ def build_welcome_banner(console: "Console", model: str, cwd: str,
     console.print()
     term_width = shutil.get_terminal_size().columns
     if term_width >= 95:
-        _logo = _bskin.banner_logo if _bskin and hasattr(_bskin, 'banner_logo') and _bskin.banner_logo else HERMES_AGENT_LOGO
-        console.print(_logo)
+        console.print(HERMES_AGENT_LOGO)
         console.print()
     console.print(outer_panel)

@@ -202,10 +202,7 @@ class TestEntryPointsImportBootstrap:
     ENTRY_POINTS = [
         "hermes_cli/main.py",   # hermes CLI (console_script)
         "run_agent.py",          # hermes-agent (console_script)
-        "acp_adapter/entry.py",  # hermes-acp (console_script)
-        "gateway/run.py",        # gateway
         "batch_runner.py",       # batch mode
-        "cli.py",                # legacy direct-launch CLI
     ]
 
     @pytest.mark.parametrize("path", ENTRY_POINTS)
@@ -367,4 +364,3 @@ class TestSuppressPlatformVerConsole:
         finally:
             if original is not None:
                 platform._syscmd_ver = original
-

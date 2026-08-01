@@ -94,7 +94,6 @@ def test_ambient_context_propagates_via_thread_context_helper():
             ).result()
     finally:
         reset_conversation_context(token)
-
     # Bare submit loses the ContextVar; the propagation wrapper keeps it.
     assert not any(t.startswith("conversation=") for t in plain)
     assert conversation_tag("moa-root") in propagated

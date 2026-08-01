@@ -35,14 +35,12 @@ def _display_url(value: Any) -> str:
     return value.strip() if isinstance(value, str) else ""
 
 
-# Diff colors — resolved lazily from the skin engine so they adapt
-# to light/dark themes.  Falls back to sensible defaults on import
-# failure.  We cache after first resolution for performance.
+# Fixed diff colors, independent of UI themes.
 _diff_colors_cached: dict[str, str] | None = None
 
 
 def _diff_ansi() -> dict[str, str]:
-    """Return ANSI escapes for diff display, resolved from the active skin."""
+    """Return fixed ANSI escapes for diff display."""
     global _diff_colors_cached
     if _diff_colors_cached is not None:
         return _diff_colors_cached
@@ -53,34 +51,6 @@ def _diff_ansi() -> dict[str, str]:
     hunk = "\033[38;2;120;120;140m"
     minus = "\033[38;2;255;255;255;48;2;120;20;20m"
     plus = "\033[38;2;255;255;255;48;2;20;90;20m"
-
-    try:
-        from hermes_cli.skin_engine import get_active_skin
-        skin = get_active_skin()
-
-        def _hex_fg(key: str, fallback_rgb: tuple[int, int, int]) -> str:
-            h = skin.get_color(key, "")
-            if h and len(h) == 7 and h[0] == "#":
-                r, g, b = int(h[1:3], 16), int(h[3:5], 16), int(h[5:7], 16)
-                return f"\033[38;2;{r};{g};{b}m"
-            r, g, b = fallback_rgb
-            return f"\033[38;2;{r};{g};{b}m"
-
-        dim = _hex_fg("banner_dim", (150, 150, 150))
-        file_c = _hex_fg("session_label", (180, 160, 255))
-        hunk = _hex_fg("session_border", (120, 120, 140))
-        # minus/plus use background colors — derive from ui_error/ui_ok
-        err_h = skin.get_color("ui_error", "#ef5350")
-        ok_h = skin.get_color("ui_ok", "#4caf50")
-        if err_h and len(err_h) == 7:
-            er, eg, eb = int(err_h[1:3], 16), int(err_h[3:5], 16), int(err_h[5:7], 16)
-            # Use a dark tinted version as background
-            minus = f"\033[38;2;255;255;255;48;2;{max(er//2,20)};{max(eg//4,10)};{max(eb//4,10)}m"
-        if ok_h and len(ok_h) == 7:
-            or_, og, ob = int(ok_h[1:3], 16), int(ok_h[3:5], 16), int(ok_h[5:7], 16)
-            plus = f"\033[38;2;255;255;255;48;2;{max(or_//4,10)};{max(og//2,20)};{max(ob//4,10)}m"
-    except Exception:
-        pass
 
     _diff_colors_cached = {
         "dim": dim, "file": file_c, "hunk": hunk,
@@ -124,41 +94,25 @@ def get_tool_preview_max_len() -> int:
 
 
 # =========================================================================
-# Skin-aware helpers (lazy import to avoid circular deps)
+# Fixed display defaults
 # =========================================================================
 
 def _get_skin():
-    """Get the active skin config, or None if not available."""
-    try:
-        from hermes_cli.skin_engine import get_active_skin
-        return get_active_skin()
-    except Exception:
-        return None
+    """Compatibility shim for display callers; UI skins are not included."""
+    return None
 
 
 def get_skin_tool_prefix() -> str:
-    """Get tool output prefix character from active skin."""
-    skin = _get_skin()
-    if skin:
-        return skin.tool_prefix
+    """Get the fixed tool output prefix."""
     return "┊"
 
 
 def get_tool_emoji(tool_name: str, default: str = "⚡") -> str:
     """Get the display emoji for a tool.
 
-    Resolution order:
-    1. Active skin's ``tool_emojis`` overrides (if a skin is loaded)
-    2. Tool registry's per-tool ``emoji`` field
-    3. *default* fallback
+    Resolution order: tool registry emoji, then *default* fallback.
     """
-    # 1. Skin override
-    skin = _get_skin()
-    if skin and skin.tool_emojis:
-        override = skin.tool_emojis.get(tool_name)
-        if override:
-            return override
-    # 2. Registry default
+    # Registry default
     try:
         from tools.registry import registry
         emoji = registry.get_emoji(tool_name, default="")
@@ -166,7 +120,7 @@ def get_tool_emoji(tool_name: str, default: str = "⚡") -> str:
             return emoji
     except Exception:
         pass
-    # 3. Hardcoded fallback
+    # Hardcoded fallback
     return default
 
 
@@ -436,7 +390,6 @@ def build_tool_preview(tool_name: str, args: dict, max_len: int | None = None) -
         "image_generate": "prompt", "text_to_speech": "text",
         "vision_analyze": "question",
         "skill_view": "name", "skills_list": "category",
-        "cronjob": "action",
         "execute_code": "code", "delegate_task": "goal",
         "clarify": "question", "skill_manage": "name",
     }
@@ -589,7 +542,6 @@ _TOOL_VERBS: dict[str, str] = {
     "skills_list": "Listing skills",
     "skill_manage": "Updating skill",
     "delegate_task": "Delegating",
-    "cronjob": "Scheduling",
     "clarify": "Asking",
     "memory": "Updating memory",
     "todo": "Updating tasks",
@@ -1464,15 +1416,6 @@ def _get_cute_tool_message(
         return _wrap(f"┊ 👁️  vision    {_trunc(args.get('question', ''), 30)}  {dur}")
     if tool_name == "send_message":
         return _wrap(f"┊ 📨 send      {args.get('target', '?')}: \"{_trunc(args.get('message', ''), 25)}\"  {dur}")
-    if tool_name == "cronjob":
-        action = args.get("action", "?")
-        if action == "create":
-            skills = args.get("skills") or ([] if not args.get("skill") else [args.get("skill")])
-            label = args.get("name") or (skills[0] if skills else None) or args.get("prompt", "task")
-            return _wrap(f"┊ ⏰ cron      create {_trunc(label, 24)}  {dur}")
-        if action == "list":
-            return _wrap(f"┊ ⏰ cron      listing  {dur}")
-        return _wrap(f"┊ ⏰ cron      {action} {args.get('job_id', '')}  {dur}")
     if tool_name == "execute_code":
         code = args.get("code", "")
         first_line = code.strip().split("\n")[0] if code.strip() else ""
@@ -1506,5 +1449,3 @@ def get_cute_tool_message(
 # =========================================================================
 # Honcho session line (one-liner with clickable OSC 8 hyperlink)
 # =========================================================================
-
-

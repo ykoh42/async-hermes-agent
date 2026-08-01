@@ -17,70 +17,7 @@ from unittest.mock import MagicMock, patch
 
 
 # ---------------------------------------------------------------------------
-# 1. CLI _resolve_turn_agent_config includes credential_pool
-# ---------------------------------------------------------------------------
-
-class TestCliTurnRoutePool:
-    def test_resolve_turn_includes_pool(self):
-        """CLI's _resolve_turn_agent_config must pass credential_pool in runtime."""
-        fake_pool = MagicMock(name="FakePool")
-        shell = SimpleNamespace(
-            model="gpt-5.4",
-            api_key="sk-test",
-            base_url=None,
-            provider="openai-codex",
-            requested_provider="my-named-provider",
-            api_mode="codex_responses",
-            acp_command=None,
-            acp_args=[],
-            _credential_pool=fake_pool,
-            service_tier=None,
-        )
-
-        from cli import HermesCLI
-        bound = HermesCLI._resolve_turn_agent_config.__get__(shell)
-        route = bound("test message")
-
-        assert route["runtime"]["credential_pool"] is fake_pool
-        assert route["runtime"]["requested_provider"] == "my-named-provider"
-        assert "my-named-provider" in route["signature"]
-
-        shell.requested_provider = "other-named-provider"
-        other_route = bound("test message")
-        assert other_route["signature"] != route["signature"]
-
-
-# ---------------------------------------------------------------------------
-# 2. Gateway _resolve_turn_agent_config includes credential_pool
-# ---------------------------------------------------------------------------
-
-class TestGatewayTurnRoutePool:
-    def test_resolve_turn_includes_pool(self):
-        """Gateway's _resolve_turn_agent_config must pass credential_pool."""
-        from gateway.run import GatewayRunner
-
-        fake_pool = MagicMock(name="FakePool")
-        runner = SimpleNamespace(_service_tier=None)
-        runtime_kwargs = {
-            "api_key": "***",
-            "base_url": None,
-            "provider": "openai-codex",
-            "requested_provider": "openai-codex",
-            "api_mode": "codex_responses",
-            "command": None,
-            "args": [],
-            "credential_pool": fake_pool,
-        }
-
-        bound = GatewayRunner._resolve_turn_agent_config.__get__(runner)
-        route = bound("test message", "gpt-5.4", runtime_kwargs)
-
-        assert route["runtime"]["credential_pool"] is fake_pool
-        assert route["runtime"]["requested_provider"] == "openai-codex"
-
-
-# ---------------------------------------------------------------------------
-# 3 & 4. Eager fallback deferred/fires based on credential pool
+# Credential-pool behavior in the core AIAgent runtime
 # ---------------------------------------------------------------------------
 
 class TestEagerFallbackWithPool:
@@ -491,4 +428,3 @@ class TestFailureAttribution:
         assert recovered is False
         assert self._statuses(pool)["cred-0"] != "exhausted"
         agent._swap_credential.assert_not_called()
-

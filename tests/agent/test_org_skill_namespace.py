@@ -216,20 +216,6 @@ class TestOrgPullIsWiredIn:
     SITES exist, so the feature can't silently become dead code again.
     """
 
-    def test_session_startup_calls_maybe_pull_org_skills(self):
-        import pathlib
-
-        cli_src = (
-            pathlib.Path(__file__).resolve().parents[2] / "cli.py"
-        ).read_text(encoding="utf-8")
-        assert "maybe_pull_org_skills" in cli_src, (
-            "cli.py session startup must call maybe_pull_org_skills() — "
-            "without a call site the org mirror is never populated and org "
-            "skills never load (the function being importable is not enough)."
-        )
-        # It must sit alongside the personal pull, not replace it.
-        assert "maybe_pull_skills" in cli_src
-
     def test_sync_pull_command_refreshes_org_mirror(self):
         import pathlib
 

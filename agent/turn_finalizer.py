@@ -349,6 +349,46 @@ def finalize_turn(
         _apply_override = getattr(agent, "_apply_persist_user_message_override", None)
         if callable(_apply_override):
             _apply_override(messages)
+
+        # ── Post-turn micro-compaction ────────────────────────────
+        # After the assistant response is finalized but before the session is
+        # persisted, run micro-compaction to absorb the oldest uncompacted
+        # exchange into the rolling summary.  This amortizes compression
+        # across turns rather than batching it into one big pause.
+        if not interrupted and not failed:
+            try:
+                _compressor = getattr(agent, "context_compressor", None)
+                # Strict `is True` + isinstance gates: plugin context engines
+                # (and MagicMock compressors in tests) satisfy getattr/duck
+                # checks with truthy auto-attributes — a bare truthiness check
+                # here called _micro_compact on a mock and spliced its (empty-
+                # iterating) return value over the transcript, wiping it.
+                if (
+                    _compressor
+                    and getattr(_compressor, '_micro_compact_enabled', False) is True
+                    and callable(getattr(_compressor, '_micro_compact', None))
+                    and final_response
+                    # Persistence-isolated agents (background review fork)
+                    # must not micro-compact: the pass burns a real aux-LLM
+                    # call on a throwaway replay transcript, and if the
+                    # compressor ever holds a session_db binding it would
+                    # archive_and_compact the CANONICAL session rows — the
+                    # exact write class _persist_disabled exists to stop.
+                    and not getattr(agent, "_persist_disabled", False)
+                ):
+                    _before = len(messages)
+                    _compacted = _compressor._micro_compact(messages)
+                    if isinstance(_compacted, list) and _compacted:
+                        messages[:] = _compacted
+                    _after = len(messages)
+                    if _before != _after:
+                        logger.info(
+                            "Micro-compaction: %d -> %d messages",
+                            _before, _after,
+                        )
+            except Exception as _mc_err:
+                logger.info("Micro-compaction failed: %s", _mc_err)
+
         agent._persist_session(messages, conversation_history)
     except Exception as _persist_err:
         _cleanup_errors.append(f"persist_session: {_persist_err}")
@@ -630,14 +670,6 @@ def finalize_turn(
     # Clear stream callback so it doesn't leak into future calls
     agent._stream_callback = None
 
-    # Check skill trigger NOW — based on how many tool iterations THIS turn used.
-    _should_review_skills = False
-    if (agent._skill_nudge_interval > 0
-            and agent._iters_since_skill >= agent._skill_nudge_interval
-            and "skill_manage" in agent.valid_tool_names):
-        _should_review_skills = True
-        agent._iters_since_skill = 0
-
     # External memory provider: sync the completed turn + queue next prefetch.
     agent._sync_external_memory_for_turn(
         original_user_message=original_user_message,
@@ -645,18 +677,6 @@ def finalize_turn(
         interrupted=interrupted,
         messages=messages,
     )
-
-    # Background memory/skill review — runs AFTER the response is delivered
-    # so it never competes with the user's task for model attention.
-    if final_response and not interrupted and (_should_review_memory or _should_review_skills):
-        try:
-            agent._spawn_background_review(
-                messages_snapshot=list(messages),
-                review_memory=_should_review_memory,
-                review_skills=_should_review_skills,
-            )
-        except Exception:
-            pass  # Background review is best-effort
 
     # Note: Memory provider on_session_end() + shutdown_all() are NOT
     # called here — run_conversation() is called once per user message in

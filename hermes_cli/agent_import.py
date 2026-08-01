@@ -33,7 +33,7 @@ codex (~/.codex):
 Secrets are NEVER imported: credential files (.credentials.json, auth.json)
 are ignored, and MCP server env vars with secret-looking names (KEY, TOKEN,
 SECRET, PASSWORD, ...) are stripped and reported so the user can re-add them
-deliberately via ``hermes setup`` or config.yaml.
+deliberately via ``hermes auth`` or config.yaml.
 """
 
 from __future__ import annotations
@@ -827,7 +827,7 @@ def import_agent_command(args) -> None:
     print_info(f"Source:      {source_dir}")
     print_info(f"Target:      {hermes_home}")
     print_info(f"Overwrite:   {'yes' if overwrite else 'no (skip conflicts)'}")
-    print_info("Secrets:     never imported — run 'hermes setup' for credentials")
+    print_info("Secrets:     never imported — configure credentials with 'hermes auth'")
 
     # Ensure config.yaml exists before the import tries to merge into it
     config_path = get_config_path()
@@ -892,8 +892,8 @@ def import_agent_command(args) -> None:
     print_import_report(report, dry_run=False)
     print()
     print_success("Import complete.")
-    print_info("API keys and credentials were NOT imported — run 'hermes setup' "
-               "to configure providers, or add them to ~/.hermes/.env.")
+    print_info("API keys and credentials were NOT imported — run 'hermes auth' "
+               "or add them to ~/.hermes/.env.")
 
 
 def print_import_report(report: Dict[str, Any], dry_run: bool) -> None:
@@ -937,7 +937,7 @@ def print_import_report(report: Dict[str, Any], dry_run: bool) -> None:
         print(color("  ⚷ Secrets stripped (never imported):", Colors.YELLOW))
         for name in stripped:
             print(f"      {name}")
-        print_info("Re-add credentials deliberately via 'hermes setup' or ~/.hermes/.env.")
+        print_info("Re-add credentials deliberately via 'hermes auth' or ~/.hermes/.env.")
         print()
 
     parts = []

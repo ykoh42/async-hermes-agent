@@ -21,9 +21,8 @@ Hermes' message-alternation invariants (system → user → assistant → user/t
 multiple consecutive (assistant, tool) pairs, which is the same shape Hermes
 already produces for parallel tool calls.
 
-Counters tracked alongside projection:
-  - tool_iterations: ticks once per completed tool-shaped item. Used by
-    AIAgent._iters_since_skill (skill nudge gate, default threshold 10).
+Projection tracks ``tool_iterations`` once per completed tool-shaped item so
+trajectory consumers can account for tool work consistently across runtimes.
 """
 
 from __future__ import annotations

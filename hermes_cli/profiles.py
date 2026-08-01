@@ -250,7 +250,7 @@ _RESERVED_NAMES = frozenset({
 
 # Hermes subcommands that cannot be used as profile names/aliases
 _HERMES_SUBCOMMANDS = frozenset({
-    "chat", "model", "gateway", "setup", "whatsapp", "login", "logout",
+    "chat", "login", "logout",
     "status", "cron", "doctor", "dump", "config", "pairing", "skills", "tools",
     "mcp", "sessions", "insights", "version", "update", "uninstall",
     "profile", "plugins", "honcho", "acp",

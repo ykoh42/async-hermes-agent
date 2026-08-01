@@ -158,36 +158,3 @@ def test_update_from_response_forwards_canonical_cache_buckets():
     assert usage_dict["reasoning_tokens"] == 50
     assert usage_dict["input_tokens"] == 1000
     assert usage_dict["output_tokens"] == 500
-
-
-
-
-
-
-def test_engine_collector_forwards_register_command_to_plugin_manager():
-    """A plugin context engine can register a slash command via ``ctx.register_command``."""
-    from plugins.context_engine import _EngineCollector
-    from hermes_cli.plugins import get_plugin_manager
-
-    handler = lambda raw_args: f"echo: {raw_args}"
-
-    collector = _EngineCollector(engine_name="my-lcm")
-    collector.register_command(
-        "my-lcm-test-cmd",
-        handler,
-        description="test command from a context engine",
-        args_hint="<msg>",
-    )
-
-    manager = get_plugin_manager()
-    try:
-        assert "my-lcm-test-cmd" in manager._plugin_commands
-        entry = manager._plugin_commands["my-lcm-test-cmd"]
-        assert entry["handler"] is handler
-        assert entry["args_hint"] == "<msg>"
-        assert entry["plugin"] == "context-engine:my-lcm"
-    finally:
-        # Clean up so we don't leak the registration across tests.
-        manager._plugin_commands.pop("my-lcm-test-cmd", None)
-
-

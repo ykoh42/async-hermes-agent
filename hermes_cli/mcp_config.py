@@ -1,8 +1,8 @@
 """
 MCP Server Management CLI — ``hermes mcp`` subcommand.
 
-Implements ``hermes mcp add/remove/list/test/configure`` for interactive
-MCP server lifecycle management (issue #690 Phase 2).
+Implements ``hermes mcp add/remove/list/test/login/reauth`` for MCP server
+lifecycle management (issue #690 Phase 2).
 
 Relies on tools/mcp_tool.py for connection/discovery and keeps
 configuration in ~/.hermes/config.yaml under the ``mcp_servers`` key.
@@ -582,27 +582,11 @@ def cmd_mcp_add(args):
         return
 
     if choice in {"s", "select"}:
-        # Interactive tool selection
-        from hermes_cli.curses_ui import curses_checklist
-
-        labels = [f"{t[0]}  —  {t[1]}" for t in tools]
-        pre_selected = set(range(len(tools)))
-
-        chosen = curses_checklist(
-            f"Select tools for '{name}'",
-            labels,
-            pre_selected,
+        _info(
+            "Interactive tool selection is not part of the runtime CLI. "
+            "Set mcp_servers.<name>.tools.include in config.yaml and retry."
         )
-
-        if not chosen:
-            _info("No tools selected — server not saved.")
-            return
-
-        chosen_names = [tools[i][0] for i in sorted(chosen)]
-        server_config.setdefault("tools", {})["include"] = chosen_names
-
-        tool_count = len(chosen_names)
-        total = len(tools)
+        return
     else:
         # Enable all (no filter needed — default behaviour)
         tool_count = len(tools)
@@ -959,143 +943,11 @@ def cmd_mcp_reauth(args):
     _reauth_oauth_server(name, servers[name])
 
 
-# ─── hermes mcp configure ────────────────────────────────────────────────────
-
-def cmd_mcp_configure(args):
-    """Reconfigure which tools are enabled for an existing MCP server."""
-    import sys as _sys
-    if not _sys.stdin.isatty():
-        print("Error: 'hermes mcp configure' requires an interactive terminal.", file=_sys.stderr)
-        _sys.exit(1)
-    name = args.name
-    servers = _get_mcp_servers()
-
-    if name not in servers:
-        _error(f"Server '{name}' not found in config.")
-        available = list(servers.keys())
-        if available:
-            _info(f"Available: {', '.join(available)}")
-        return
-
-    cfg = servers[name]
-
-    # Discover all available tools
-    print()
-    print(color(f"  Connecting to '{name}' to discover tools...", Colors.CYAN))
-
-    try:
-        all_tools = _probe_single_server(name, cfg)
-    except Exception as exc:
-        _error(f"Failed to connect: {exc}")
-        return
-
-    if not all_tools:
-        _warning("Server reports no tools.")
-        return
-
-    # Determine which are currently enabled
-    tools_cfg = cfg.get("tools", {})
-    if isinstance(tools_cfg, dict):
-        include = tools_cfg.get("include")
-        exclude = tools_cfg.get("exclude")
-    else:
-        include = None
-        exclude = None
-
-    tool_names = [t[0] for t in all_tools]
-
-    # Same matching semantics as runtime registration (tools/mcp_tool.py):
-    # exact names or fnmatch globs.
-    try:
-        from tools.mcp_tool import matches_name_filter
-    except ImportError:  # pragma: no cover — defensive fallback
-        def matches_name_filter(tool_name, patterns):
-            return tool_name in patterns
-
-    if include and isinstance(include, list):
-        include_set = {str(p) for p in include}
-        pre_selected = {
-            i for i, tn in enumerate(tool_names)
-            if matches_name_filter(tn, include_set)
-        }
-    elif exclude and isinstance(exclude, list):
-        exclude_set = {str(p) for p in exclude}
-        pre_selected = {
-            i for i, tn in enumerate(tool_names)
-            if not matches_name_filter(tn, exclude_set)
-        }
-    else:
-        pre_selected = set(range(len(all_tools)))
-
-    currently = len(pre_selected)
-    total = len(all_tools)
-    _info(f"Currently {currently}/{total} tools enabled for '{name}'.")
-    print()
-
-    # Interactive checklist
-    from hermes_cli.curses_ui import curses_checklist
-
-    labels = [f"{t[0]}  —  {t[1]}" for t in all_tools]
-
-    chosen = curses_checklist(
-        f"Select tools for '{name}'",
-        labels,
-        pre_selected,
-    )
-
-    if chosen == pre_selected:
-        _info("No changes made.")
-        return
-
-    # Update config
-    config = load_config()
-    server_entry = cfg_get(config, "mcp_servers", name, default={})
-
-    if len(chosen) == total:
-        # All selected → remove include/exclude (register all)
-        server_entry.pop("tools", None)
-    else:
-        chosen_names = [tool_names[i] for i in sorted(chosen)]
-        server_entry.setdefault("tools", {})
-        server_entry["tools"]["include"] = chosen_names
-        server_entry["tools"].pop("exclude", None)
-
-    config.setdefault("mcp_servers", {})[name] = server_entry
-    save_config(config)
-
-    new_count = len(chosen)
-    _success(f"Updated config: {new_count}/{total} tools enabled")
-    _info("Start a new session for changes to take effect.")
-
-
 # ─── Dispatcher ───────────────────────────────────────────────────────────────
 
 def mcp_command(args):
     """Main dispatcher for ``hermes mcp`` subcommands."""
     action = getattr(args, "mcp_action", None)
-
-    if action == "serve":
-        from mcp_serve import run_mcp_server
-        run_mcp_server(verbose=getattr(args, "verbose", False))
-        return
-
-    # Catalog subcommands live in mcp_picker / mcp_catalog. Import lazily so
-    # the original `mcp_config` module stays import-cheap.
-    if action == "picker":
-        from hermes_cli.mcp_picker import run_picker
-        run_picker()
-        return
-    if action == "catalog":
-        from hermes_cli.mcp_picker import show_catalog
-        show_catalog()
-        return
-    if action == "install":
-        from hermes_cli.mcp_picker import install_by_name
-        import sys as _sys
-        rc = install_by_name(getattr(args, "identifier", "") or "")
-        if rc:
-            _sys.exit(rc)
-        return
 
     handlers = {
         "add": cmd_mcp_add,
@@ -1104,8 +956,6 @@ def mcp_command(args):
         "list": cmd_mcp_list,
         "ls": cmd_mcp_list,
         "test": cmd_mcp_test,
-        "configure": cmd_mcp_configure,
-        "config": cmd_mcp_configure,
         "login": cmd_mcp_login,
         "reauth": cmd_mcp_reauth,
     }
@@ -1114,22 +964,13 @@ def mcp_command(args):
     if handler:
         handler(args)
     else:
-        # No subcommand — drop the user into the catalog picker. This is the
-        # "try enabling and it flows you into setup" UX matching `hermes plugin`.
-        from hermes_cli.mcp_picker import run_picker
-        run_picker()
         print(color("  Commands:", Colors.CYAN))
-        _info("hermes mcp                                    Open the catalog picker (default)")
-        _info("hermes mcp catalog                            List Nous-approved MCPs")
-        _info("hermes mcp install <name>                     Install a catalog MCP")
-        _info("hermes mcp serve                              Run as MCP server")
         _info("hermes mcp add <name> --url <endpoint>        Add a custom MCP server")
         _info("hermes mcp add <name> --command <cmd>         Add a stdio server")
         _info("hermes mcp add <name> --preset <preset>       Add from a known preset")
         _info("hermes mcp remove <name>                      Remove a server")
         _info("hermes mcp list                               List configured servers")
         _info("hermes mcp test <name>                        Test connection")
-        _info("hermes mcp configure <name>                   Toggle tools")
         _info("hermes mcp login <name>                       Re-authenticate OAuth")
         _info("hermes mcp reauth <name> | --all              Re-auth one or all OAuth servers")
         print()

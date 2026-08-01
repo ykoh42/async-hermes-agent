@@ -142,7 +142,6 @@ from model_tools import (
 )
 from tools.terminal_tool import cleanup_vm, get_active_env
 from tools.interrupt import set_interrupt as _set_interrupt
-from tools.browser_tool import cleanup_browser
 
 
 # Agent internals extracted to agent/ package for modularity
@@ -474,7 +473,6 @@ class AIAgent:
         notice_callback: callable = None,
         notice_clear_callback: callable = None,
         event_callback: Optional[Callable[[str, dict], None]] = None,
-        reaction_callback: Optional[Callable[[str], None]] = None,
         max_tokens: int = None,
         reasoning_config: Dict[str, Any] = None,
         service_tier: str = None,
@@ -558,7 +556,6 @@ class AIAgent:
             notice_callback=notice_callback,
             notice_clear_callback=notice_clear_callback,
             event_callback=event_callback,
-            reaction_callback=reaction_callback,
             max_tokens=max_tokens,
             reasoning_config=reasoning_config,
             service_tier=service_tier,
@@ -1702,58 +1699,6 @@ class AIAgent:
         from agent.chat_completion_helpers import cleanup_task_resources
         return cleanup_task_resources(self, task_id)
 
-    # ------------------------------------------------------------------
-    # Background memory/skill review — prompts live in agent.background_review
-    # ------------------------------------------------------------------
-    from agent.background_review import (
-        _MEMORY_REVIEW_PROMPT,
-        _SKILL_REVIEW_PROMPT,
-        _COMBINED_REVIEW_PROMPT,
-    )
-
-    @staticmethod
-    def _summarize_background_review_actions(
-        review_messages: List[Dict],
-        prior_snapshot: List[Dict],
-        notification_mode: str = "on",
-    ) -> List[str]:
-        """Forwarder — see ``agent.background_review.summarize_background_review_actions``."""
-        from agent.background_review import summarize_background_review_actions
-        return summarize_background_review_actions(
-            review_messages,
-            prior_snapshot,
-            notification_mode=notification_mode,
-        )
-
-    def _spawn_background_review(
-        self,
-        messages_snapshot: List[Dict],
-        review_memory: bool = False,
-        review_skills: bool = False,
-    ) -> None:
-        """Spawn the background memory/skill review thread.
-
-        Thin wrapper — the heavy lifting lives in
-        ``agent.background_review.spawn_background_review_thread`` which
-        returns the thread target.  ``threading.Thread`` is constructed
-        here so existing tests that patch ``run_agent.threading.Thread``
-        keep working.
-        """
-        from agent.background_review import spawn_background_review_thread
-        from tools.thread_context import propagate_context_to_thread
-        target, _prompt = spawn_background_review_thread(
-            self,
-            messages_snapshot,
-            review_memory=review_memory,
-            review_skills=review_skills,
-        )
-        # Carry the active profile into the review thread so MEMORY.md / skill
-        # review writes land in the right profile (#54937).
-        t = threading.Thread(
-            target=propagate_context_to_thread(target), daemon=True, name="bg-review"
-        )
-        t.start()
-
     def _build_memory_write_metadata(
         self,
         *,
@@ -1762,15 +1707,24 @@ class AIAgent:
         task_id: Optional[str] = None,
         tool_call_id: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Forwarder — see ``agent.background_review.build_memory_write_metadata``."""
-        from agent.background_review import build_memory_write_metadata
-        return build_memory_write_metadata(
-            self,
-            write_origin=write_origin,
-            execution_context=execution_context,
-            task_id=task_id,
-            tool_call_id=tool_call_id,
-        )
+        """Build provenance metadata for external memory-provider mirrors."""
+        metadata: Dict[str, Any] = {
+            "write_origin": write_origin or getattr(
+                self, "_memory_write_origin", "assistant_tool"
+            ),
+            "execution_context": execution_context or getattr(
+                self, "_memory_write_context", "foreground"
+            ),
+            "session_id": self.session_id or "",
+            "parent_session_id": self._parent_session_id or "",
+            "platform": self.platform or os.environ.get("HERMES_SESSION_SOURCE", "cli"),
+            "tool_name": "memory",
+        }
+        if task_id:
+            metadata["task_id"] = task_id
+        if tool_call_id:
+            metadata["tool_call_id"] = tool_call_id
+        return {key: value for key, value in metadata.items() if value not in {None, ""}}
 
     def _apply_persist_user_message_override(self, messages: List[Dict]) -> None:
         """Rewrite the current-turn user message before persistence/return.
@@ -1848,7 +1802,14 @@ class AIAgent:
             # finalize + error exits) so a crash after this line loses at most
             # the in-flight API call's delta. Cheap no-op when nothing queued.
             if self._session_db is not None:
-                self._session_db.flush_token_counts()
+                # Keep persistence duck-typed for lightweight session-store
+                # adapters used by the batch/training harness.  The built-in
+                # SessionDB implements this drain, while an adapter that only
+                # supports message writes should not make an otherwise
+                # durable turn fail on exit.
+                flush_token_counts = getattr(self._session_db, "flush_token_counts", None)
+                if callable(flush_token_counts):
+                    flush_token_counts()
             note_turn_persisted(self)
 
         if persist_lock is None:
@@ -3979,25 +3940,7 @@ class AIAgent:
         except Exception:
             pass
 
-        # 3. Clean browser daemon sessions
-        try:
-            cleanup_browser(task_id)
-        except Exception:
-            pass
-
-        # 4. Release the session-owned computer-use backend.  This ends the
-        # exact cua-driver session, drops typed-browser refs/grants, and stops
-        # a private embedded daemon when Hermes YOLO selected unrestricted
-        # mode.  The import is lazy so sessions without computer_use retain
-        # the narrow core footprint.
-        try:
-            from tools.computer_use import release_computer_use_session
-
-            release_computer_use_session(task_id)
-        except Exception:
-            pass
-
-        # 5. Close active child agents
+        # 3. Close active child agents
         try:
             with self._active_children_lock:
                 children = list(self._active_children)
@@ -4010,7 +3953,7 @@ class AIAgent:
         except Exception:
             pass
 
-        # 6. Close the OpenAI/httpx client
+        # 4. Close the OpenAI/httpx client
         try:
             client = getattr(self, "client", None)
             if client is not None:

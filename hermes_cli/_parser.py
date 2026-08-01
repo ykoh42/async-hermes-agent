@@ -39,46 +39,10 @@ def _inherited_flag(parser, *args, **kwargs):
 
 _EPILOGUE = """
 Examples:
-    hermes                        Start interactive chat
-    hermes chat -q "Hello"        Single query mode
-    hermes --tui                  Launch the modern TUI (or set display.interface: tui)
-    hermes --cli                  Force the classic REPL (overrides display.interface: tui)
-    hermes -c                     Resume the most recent session
-    hermes -c "my project"        Resume a session by name (latest in lineage)
-    hermes --resume <session_id>  Resume a specific session by ID
-    hermes setup                  Run setup wizard
-    hermes logout                 Clear stored authentication
-    hermes auth add <provider>    Add a pooled credential
-    hermes auth list              List pooled credentials
-    hermes auth remove <p> <t>    Remove pooled credential by index, id, or label
-    hermes auth reset <provider>  Clear exhaustion status for a provider
-    hermes model                  Select default model
-    hermes fallback [list]        Show fallback provider chain
-    hermes fallback add           Add a fallback provider (same picker as `hermes model`)
-    hermes fallback remove        Remove a fallback provider from the chain
-    hermes config                 View configuration
-    hermes config edit            Edit config in $EDITOR
-    hermes config set model gpt-4 Set a config value
-    hermes gateway                Run messaging gateway
-    hermes -s hermes-agent-dev,github-auth
-    hermes -w                     Start in isolated git worktree
-    hermes gateway install        Install gateway background service
-    hermes sessions list          List past sessions
-    hermes sessions browse        Interactive session picker
-    hermes sessions rename ID T   Rename/title a session
-    hermes logs                   View agent.log (last 50 lines)
-    hermes logs -f                Follow agent.log in real time
-    hermes logs errors            View errors.log
-    hermes logs --since 1h        Lines from the last hour
-    hermes debug share             Upload debug report for support
-    hermes console                Open the safe Hermes command console
-    hermes update                 Update to latest version
-    hermes dashboard              Start web UI dashboard (port 9119)
-    hermes dashboard --stop       Stop running dashboard processes
-    hermes dashboard --status     List running dashboard processes
-
-For more help on a command:
-    hermes <command> --help
+    hermes -z "Hello"            Single core turn
+    hermes -z "Hello" -t coding  Select a toolset
+    python -m run_agent           Run the synchronous core runner
+    python batch_runner.py        Generate a batch of trajectories
 """
 
 
@@ -134,7 +98,7 @@ def build_top_level_parser():
         default=None,
         help=(
             "Model override for this invocation (e.g. anthropic/claude-sonnet-4.6). "
-            "Applies to -z/--oneshot and --tui. Also settable via HERMES_INFERENCE_MODEL env var."
+            "Applies to -z/--oneshot. Also settable via HERMES_INFERENCE_MODEL env var."
         ),
     )
     _inherited_flag(
@@ -143,15 +107,15 @@ def build_top_level_parser():
         default=None,
         help=(
             "Provider override for this invocation (e.g. openrouter, anthropic). "
-            "Applies to -z/--oneshot and --tui. The persistent provider lives in config.yaml "
-            "under model.provider — use `hermes setup` or edit the file to change it."
+            "Applies to -z/--oneshot. The persistent provider lives in config.yaml "
+            "under model.provider; edit that value or use `hermes auth`."
         ),
     )
     parser.add_argument(
         "-t",
         "--toolsets",
         default=None,
-        help="Comma-separated toolsets to enable for this invocation. Applies to -z/--oneshot and --tui.",
+        help="Comma-separated toolsets to enable for this invocation. Applies to -z/--oneshot.",
     )
     parser.add_argument(
         "--resume",
@@ -238,28 +202,6 @@ def build_top_level_parser():
         default=False,
         help="Troubleshooting mode: disable ALL customizations — user config, AGENTS.md/memory injection, plugins, and MCP servers (implies --ignore-user-config and --ignore-rules)",
     )
-    _inherited_flag(
-        parser,
-        "--tui",
-        action="store_true",
-        default=False,
-        help="Launch the modern TUI instead of the classic REPL",
-    )
-    _inherited_flag(
-        parser,
-        "--cli",
-        action="store_true",
-        default=False,
-        help="Force the classic prompt_toolkit REPL (overrides display.interface=tui)",
-    )
-    _inherited_flag(
-        parser,
-        "--dev",
-        dest="tui_dev",
-        action="store_true",
-        default=False,
-        help="With --tui: run TypeScript sources via tsx (skip dist build)",
-    )
 
     subparsers = parser.add_subparsers(dest="command", help="Command to run")
 
@@ -268,7 +210,7 @@ def build_top_level_parser():
     # =========================================================================
     chat_parser = subparsers.add_parser(
         "chat",
-        help="Interactive chat with the agent",
+        help="Legacy interactive chat entry (frontend removed from the slim runtime)",
         description="Start an interactive chat session with Hermes Agent",
     )
     chat_parser.add_argument(
@@ -423,28 +365,6 @@ def build_top_level_parser():
         "--source",
         default=None,
         help="Session source tag for filtering (default: cli). Use 'tool' for third-party integrations that should not appear in user session lists.",
-    )
-    _inherited_flag(
-        chat_parser,
-        "--tui",
-        action="store_true",
-        default=argparse.SUPPRESS,
-        help="Launch the modern TUI instead of the classic REPL",
-    )
-    _inherited_flag(
-        chat_parser,
-        "--cli",
-        action="store_true",
-        default=argparse.SUPPRESS,
-        help="Force the classic prompt_toolkit REPL (overrides display.interface=tui)",
-    )
-    _inherited_flag(
-        chat_parser,
-        "--dev",
-        dest="tui_dev",
-        action="store_true",
-        default=argparse.SUPPRESS,
-        help="With --tui: run TypeScript sources via tsx (skip dist build)",
     )
 
     return parser, subparsers, chat_parser

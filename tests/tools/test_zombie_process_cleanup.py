@@ -108,17 +108,13 @@ class TestAgentCloseMethod:
             agent.client = None
 
             with patch("tools.process_registry.process_registry") as mock_registry, \
-                 patch("run_agent.cleanup_vm") as mock_cleanup_vm, \
-                 patch("run_agent.cleanup_browser") as mock_cleanup_browser, \
-                 patch("tools.computer_use.release_computer_use_session") as mock_cleanup_cua:
+                 patch("run_agent.cleanup_vm") as mock_cleanup_vm:
                 agent.close()
 
                 mock_registry.kill_all.assert_called_once_with(
                     task_id="test-close-cleanup"
                 )
                 mock_cleanup_vm.assert_called_once_with("test-close-cleanup")
-                mock_cleanup_browser.assert_called_once_with("test-close-cleanup")
-                mock_cleanup_cua.assert_called_once_with("test-close-cleanup")
 
     def test_close_is_idempotent(self):
         """close() can be called multiple times without error."""
@@ -135,49 +131,6 @@ class TestAgentCloseMethod:
             agent.close()
             agent.close()
             agent.close()
-
-    def test_close_releases_computer_use_when_earlier_cleanup_fails(self):
-        """One failed cleanup step must not strand the computer-use session."""
-        from unittest.mock import patch
-
-        with patch("run_agent.AIAgent.__init__", return_value=None):
-            from run_agent import AIAgent
-            agent = AIAgent.__new__(AIAgent)
-            agent.session_id = "test-close-after-failure"
-            agent._active_children = []
-            agent._active_children_lock = threading.Lock()
-            agent.client = None
-
-            with patch(
-                "tools.process_registry.process_registry.kill_all",
-                side_effect=RuntimeError("process cleanup failed"),
-            ), patch(
-                "tools.computer_use.release_computer_use_session",
-            ) as mock_cleanup_cua:
-                agent.close()
-
-            mock_cleanup_cua.assert_called_once_with(
-                "test-close-after-failure"
-            )
-
-    def test_soft_client_release_preserves_computer_use_session(self):
-        """Cache eviction is not a hard session boundary."""
-        from unittest.mock import patch
-
-        with patch("run_agent.AIAgent.__init__", return_value=None):
-            from run_agent import AIAgent
-            agent = AIAgent.__new__(AIAgent)
-            agent.session_id = "test-soft-release"
-            agent._active_children = []
-            agent._active_children_lock = threading.Lock()
-            agent.client = None
-
-            with patch(
-                "tools.computer_use.release_computer_use_session",
-            ) as mock_cleanup_cua:
-                agent.release_clients()
-
-            mock_cleanup_cua.assert_not_called()
 
     def test_close_propagates_to_children(self):
         """close() should call close() on all active child agents."""
@@ -269,15 +222,12 @@ class TestAgentCloseMethod:
                 "tools.process_registry.process_registry"
             ) as mock_reg, patch(
                 "run_agent.cleanup_vm"
-            ) as mock_vm, patch(
-                "run_agent.cleanup_browser"
-            ) as mock_browser:
+            ) as mock_vm:
                 mock_reg.kill_all.side_effect = RuntimeError("boom")
 
                 agent.close()
 
                 mock_vm.assert_called_once()
-                mock_browser.assert_called_once()
 
 
 class TestGatewayCleanupWiring:

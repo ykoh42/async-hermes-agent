@@ -75,7 +75,7 @@ Hermes-tool framing (this is what makes it a skill, not shell docs):
 - Reference Hermes tools by name in backticks: `terminal`, `read_file`,
   `write_file`, `search_files`, `patch`, `web_extract`, `web_search`,
   `vision_analyze`, `browser_navigate`, `delegate_task`, `image_generate`,
-  `text_to_speech`, `cronjob`, `memory`, `skill_view`, `execute_code`.
+  `text_to_speech`, `memory`, `skill_view`, `execute_code`.
 - Do NOT name shell utilities the agent already has wrapped: say `read_file`
   not cat/head/tail, `search_files` not grep/rg/find/ls, `patch` not sed/awk,
   `web_extract` not curl-to-scrape, `write_file` not echo>file or heredocs.

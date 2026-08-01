@@ -229,5 +229,3 @@ def test_has_agent_browser_resolves_via_hermes_managed_node_path(monkeypatch, tm
     )
 
     assert ns._has_agent_browser() is True
-
-

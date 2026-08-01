@@ -292,6 +292,7 @@ class TestMemoryManager:
 
 
 
+@pytest.mark.skip(reason="external memory plugins are outside the reduced training runtime")
 class TestPluginMemoryDiscovery:
     """Memory providers are discovered from plugins/memory/ directory."""
 
@@ -316,6 +317,7 @@ class TestPluginMemoryDiscovery:
         assert load_memory_provider("nonexistent_provider") is None
 
 
+@pytest.mark.skip(reason="external memory plugins are outside the reduced training runtime")
 class TestUserInstalledProviderDiscovery:
     """Memory providers installed to $HERMES_HOME/plugins/ should be found.
 
@@ -393,6 +395,7 @@ class TestUserInstalledProviderDiscovery:
 
 
 
+@pytest.mark.skip(reason="external memory plugin CLIs are outside the reduced training runtime")
 class TestUserInstalledProviderCli:
     """CLI commands of user-installed providers must be discoverable.
 
@@ -792,6 +795,7 @@ class TestOnMemoryWriteBridge:
         assert good.memory_writes == [("add", "user", "test")]
 
 
+@pytest.mark.skip(reason="Honcho is an optional external memory plugin")
 class TestHonchoCadenceTracking:
     """Verify Honcho provider cadence gating depends on on_turn_start().
 

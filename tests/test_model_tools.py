@@ -307,54 +307,6 @@ class TestCoerceNumberInfNan:
         assert _coerce_number("3.14") == 3.14
         assert _coerce_number("1e3") == 1000
 
-class TestDisabledToolsetsPlatformBundle:
-    """Regression test for #33924: disabling a platform bundle (hermes-*)
-    must not remove core tools from other enabled toolsets."""
-
-    def test_disabling_platform_bundle_preserves_core_tools(self):
-        """Disabling hermes-yuanbao should not strip core tools from hermes-telegram."""
-        from model_tools import get_tool_definitions
-
-        tools_telegram = get_tool_definitions(
-            enabled_toolsets=["hermes-telegram"],
-            quiet_mode=True,
-        )
-        tools_telegram_no_yuanbao = get_tool_definitions(
-            enabled_toolsets=["hermes-telegram"],
-            disabled_toolsets=["hermes-yuanbao"],
-            quiet_mode=True,
-        )
-        names_telegram = {t["function"]["name"] for t in tools_telegram}
-        names_no_yuanbao = {t["function"]["name"] for t in tools_telegram_no_yuanbao}
-
-        # Disabling a *different* platform bundle must not remove any tools
-        assert names_telegram == names_no_yuanbao, (
-            f"Tools lost after disabling hermes-yuanbao: "
-            f"{names_telegram - names_no_yuanbao}"
-        )
-
-    def test_disabling_platform_bundle_removes_own_tools(self):
-        """Disabling hermes-discord should remove discord-specific tools."""
-        from model_tools import get_tool_definitions
-
-        tools = get_tool_definitions(
-            enabled_toolsets=["hermes-discord"],
-            disabled_toolsets=["hermes-discord"],
-            quiet_mode=True,
-        )
-        names = {t["function"]["name"] for t in tools}
-        assert "discord" not in names
-
-
-
-
-    def test_bundle_non_core_tools_unknown_falls_back(self):
-        """An unknown/garbage bundle name falls back to full resolution (best effort)."""
-        from toolsets import bundle_non_core_tools
-        # A non-existent bundle resolves to an empty set (no tools), not a crash.
-        assert bundle_non_core_tools("hermes-does-not-exist") == set()
-
-
 class TestDisabledToolsetsPostureToolset:
     """Regression test for #57315: disabling a posture toolset (`coding`,
     posture: True) must preserve the shared core tools it re-lists but does

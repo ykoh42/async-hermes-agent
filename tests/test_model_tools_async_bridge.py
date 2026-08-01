@@ -1,7 +1,7 @@
 """Regression tests for the _run_async() event-loop lifecycle.
 
-These tests verify the fix for GitHub issue #2104:
-  "Event loop is closed" after vision_analyze used as first call in session.
+These tests verify the persistent event-loop bridge used by asynchronous
+tool/model calls.
 
 Root cause: asyncio.run() creates and *closes* a fresh event loop on every
 call.  Cached httpx/AsyncOpenAI clients that were bound to the now-dead loop
@@ -11,10 +11,8 @@ The fix replaces asyncio.run() with a persistent event loop in _run_async().
 """
 
 import asyncio
-import json
 import threading
-from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import patch
 
 import pytest
 
@@ -334,114 +332,3 @@ class TestRunAsyncWithRunningLoop:
             "(ThreadPoolExecutor.cancel() is a no-op on a running future; "
             "_run_async must cancel the task inside its worker loop)"
         )
-
-
-# ---------------------------------------------------------------------------
-# Integration: full vision_analyze dispatch chain
-# ---------------------------------------------------------------------------
-
-def _mock_vision_response():
-    """Build a fake LLM response matching async_call_llm's return shape."""
-    message = SimpleNamespace(content="A cat sitting on a chair.")
-    choice = SimpleNamespace(index=0, message=message, finish_reason="stop")
-    return SimpleNamespace(choices=[choice], model="test/vision", usage=None)
-
-
-class TestVisionDispatchLoopSafety:
-    """Simulate the full registry.dispatch('vision_analyze') chain and
-    verify the event loop stays alive afterwards — the exact scenario
-    from issue #2104."""
-
-    def test_vision_dispatch_keeps_loop_alive(self, tmp_path):
-        """After dispatching vision_analyze via the registry, the event
-        loop must remain open so cached async clients don't crash on GC."""
-        from model_tools import _get_tool_loop
-        from tools.registry import registry
-
-        fake_response = _mock_vision_response()
-
-        with (
-            patch(
-                "tools.vision_tools.async_call_llm",
-                new_callable=AsyncMock,
-                return_value=fake_response,
-            ),
-            patch(
-                "tools.vision_tools._download_image",
-                new_callable=AsyncMock,
-                side_effect=lambda url, dest, **kw: _write_fake_image(dest),
-            ),
-            patch(
-                "tools.vision_tools._validate_image_url_async",
-                new_callable=AsyncMock,
-                return_value=True,
-            ),
-            patch(
-                "tools.vision_tools._image_to_base64_data_url",
-                return_value="data:image/jpeg;base64,abc",
-            ),
-        ):
-            result_json = registry.dispatch(
-                "vision_analyze",
-                {"image_url": "https://example.com/cat.png", "question": "What is this?"},
-            )
-
-        result = json.loads(result_json)
-        assert result.get("success") is True, f"dispatch failed: {result}"
-        assert "cat" in result.get("analysis", "").lower()
-
-        loop = _get_tool_loop()
-        assert not loop.is_closed(), (
-            "Event loop closed after vision_analyze dispatch — cached async "
-            "clients will crash with 'Event loop is closed' (issue #2104)"
-        )
-
-    def test_two_consecutive_vision_dispatches(self, tmp_path):
-        """Two back-to-back vision_analyze dispatches must both succeed
-        and share the same loop (simulates 'first call fails, second
-        works' from the issue report)."""
-        from model_tools import _get_tool_loop
-        from tools.registry import registry
-
-        fake_response = _mock_vision_response()
-
-        with (
-            patch(
-                "tools.vision_tools.async_call_llm",
-                new_callable=AsyncMock,
-                return_value=fake_response,
-            ),
-            patch(
-                "tools.vision_tools._download_image",
-                new_callable=AsyncMock,
-                side_effect=lambda url, dest, **kw: _write_fake_image(dest),
-            ),
-            patch(
-                "tools.vision_tools._validate_image_url_async",
-                new_callable=AsyncMock,
-                return_value=True,
-            ),
-            patch(
-                "tools.vision_tools._image_to_base64_data_url",
-                return_value="data:image/jpeg;base64,abc",
-            ),
-        ):
-            args = {"image_url": "https://example.com/cat.png", "question": "Describe"}
-
-            r1 = json.loads(registry.dispatch("vision_analyze", args))
-            loop_after_first = _get_tool_loop()
-
-            r2 = json.loads(registry.dispatch("vision_analyze", args))
-            loop_after_second = _get_tool_loop()
-
-        assert r1.get("success") is True
-        assert r2.get("success") is True
-        assert loop_after_first is loop_after_second, "Loop changed between dispatches"
-        assert not loop_after_second.is_closed()
-
-
-def _write_fake_image(dest):
-    """Write minimal bytes so vision_analyze_tool thinks download succeeded."""
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    dest.write_bytes(b"\xff\xd8\xff" + b"\x00" * 16)
-    return dest

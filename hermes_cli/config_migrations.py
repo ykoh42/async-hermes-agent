@@ -60,8 +60,8 @@ def support_floor_message() -> str:
     return (
         f"This config predates version {SUPPORT_FLOOR_VERSION} (~2 years old) "
         "and can no longer be auto-migrated. Back up "
-        f"{display_hermes_home()}/config.yaml and run `hermes setup` to "
-        f"regenerate, or manually set _config_version: {SUPPORT_FLOOR_VERSION} "
+        f"{display_hermes_home()}/config.yaml and run `hermes doctor --fix` "
+        f"or configure it manually. You may also set _config_version: {SUPPORT_FLOOR_VERSION} "
         "after reviewing the changelog."
     )
 
@@ -381,94 +381,12 @@ def _migrate_to_21(results: Dict[str, Any], quiet: bool) -> None:
 
 
 def _migrate_to_23(results: Dict[str, Any], quiet: bool) -> None:
-    # ── Version 22 → 23: seed curator defaults + create logs/curator/ ──
-    # The curator (background skill maintenance) was added in PR #16049, but
-    # existing configs from before that PR (or before the April 2026
-    # unification under `auxiliary.curator`) never wrote the curator section
-    # to disk. The runtime deep-merge in `load_config()` fills defaults at
-    # read time, so the curator *functions*; but users can't see/edit the
-    # settings in their `config.yaml`, and `hermes curator status` has no
-    # stable logs dir to point at until the first run mkdir's it.
-    #
-    # This migration:
-    #   1. Writes the `curator` top-level section to config.yaml (enabled,
-    #      interval_hours, min_idle_hours, stale_after_days, archive_after_days)
-    #      — only keys the user hasn't already overridden.
-    #   2. Writes the `auxiliary.curator` aux-task slot (provider, model,
-    #      base_url, api_key, timeout, extra_body) — canonical slot for
-    #      routing the curator fork to a cheaper aux model.
-    #   3. Creates `~/.hermes/logs/curator/` if missing (belt-and-suspenders
-    #      on top of ensure_hermes_home() — old profiles that predate this
-    #      migration still benefit).
-    _c = _cfg()
-    read_raw_config = _c.read_raw_config
-    _persist_migration = _c._persist_migration
-    get_hermes_home = _c.get_hermes_home
-    DEFAULT_CONFIG = _c.DEFAULT_CONFIG
+    """Preserve the historical migration number after deferring curation.
 
-    try:
-        curator_dir = get_hermes_home() / "logs" / "curator"
-        curator_dir.mkdir(parents=True, exist_ok=True)
-    except Exception as e:
-        results["warnings"].append(f"Could not create {curator_dir}: {e}")
-
-    config = read_raw_config()
-    touched = False
-
-    # (1) Top-level curator section — only add missing keys
-    _curator_defaults = DEFAULT_CONFIG.get("curator", {})
-    raw_curator = config.get("curator")
-    if not isinstance(raw_curator, dict):
-        raw_curator = {}
-    added_curator: List[str] = []
-    for k, v in _curator_defaults.items():
-        if k not in raw_curator:
-            raw_curator[k] = copy.deepcopy(v)
-            added_curator.append(k)
-    if added_curator:
-        config["curator"] = raw_curator
-        touched = True
-
-    # (2) auxiliary.curator task slot
-    _aux_curator_defaults = (
-        DEFAULT_CONFIG.get("auxiliary", {}).get("curator", {})
-    )
-    raw_aux = config.get("auxiliary")
-    if not isinstance(raw_aux, dict):
-        raw_aux = {}
-    raw_aux_curator = raw_aux.get("curator")
-    if not isinstance(raw_aux_curator, dict):
-        raw_aux_curator = {}
-    added_aux: List[str] = []
-    for k, v in _aux_curator_defaults.items():
-        if k not in raw_aux_curator:
-            raw_aux_curator[k] = copy.deepcopy(v)
-            added_aux.append(k)
-    if added_aux:
-        raw_aux["curator"] = raw_aux_curator
-        config["auxiliary"] = raw_aux
-        touched = True
-
-    if touched:
-        _persist_migration(config)
-        if added_curator:
-            results["config_added"].append(
-                f"curator ({len(added_curator)} default key(s))"
-            )
-            if not quiet:
-                print(
-                    "  ✓ Curator settings now available "
-                    f"({', '.join(added_curator)}) — edit via `hermes config set`"
-                )
-        if added_aux:
-            results["config_added"].append(
-                f"auxiliary.curator ({len(added_aux)} default key(s))"
-            )
-            if not quiet:
-                print(
-                    "  ✓ auxiliary.curator settings now available "
-                    f"({', '.join(added_aux)}) — edit via `hermes config set`"
-                )
+    Existing installations may retain their old ``curator`` settings; they are
+    intentionally ignored by the lean training runtime and are not rewritten.
+    """
+    del results, quiet
 
 
 def _migrate_to_25(results: Dict[str, Any], quiet: bool) -> None:
@@ -523,17 +441,6 @@ def _migrate_to_29(results: Dict[str, Any], quiet: bool) -> None:
         _persist_migration(config)
         if not quiet:
             print("  ✓ Renamed write_mode → write_approval (boolean gate)")
-
-
-# ── Version 29 → 30: curator.consolidate defaults to false ──
-# Consolidation (the LLM umbrella-building fork) is opt-in, OFF by default;
-# the deterministic inactivity prune still runs whenever the curator is
-# enabled. No write is needed: the schema default (curator.consolidate=false)
-# is supplied by load_config()'s deep-merge at read time, and persisting a
-# default-valued key would only bloat a lean config (it gets stripped on
-# save anyway). Existing installs that WANT the old always-consolidate
-# behavior set it to true explicitly via `hermes config set`.
-# (No registry entry: this version bump has no migration step.)
 
 
 def _migrate_to_31(results: Dict[str, Any], quiet: bool) -> None:

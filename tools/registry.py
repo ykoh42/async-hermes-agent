@@ -27,6 +27,33 @@ from typing import Callable, Dict, List, Optional, Set
 logger = logging.getLogger(__name__)
 
 
+# This checkout uses the registry as the synchronous training/runtime waist.
+# Keep the model-visible built-ins to the local harness capabilities needed for
+# trajectories (terminal, files, memory, skills, web, and delegation).  MCP
+# tools are registered separately by ``tools.mcp_tool`` from configured
+# servers.
+#
+# Keeping the restriction here (before imports) matters: tool modules register
+# their schemas as import side effects, so filtering later would still load
+# optional SDKs and their operational dependencies on every worker.
+_TRAINING_RUNTIME_TOOL_MODULES = frozenset({
+    "clarify_tool",
+    "code_execution_tool",
+    "delegate_tool",
+    "file_tools",
+    "memory_tool",
+    "process_registry",
+    "read_terminal_tool",
+    "session_search_tool",
+    "skill_manager_tool",
+    "skills_tool",
+    "terminal_tool",
+    "todo_tool",
+    "vision_tools",
+    "web_tools",
+})
+
+
 def _is_registry_register_call(node: ast.AST) -> bool:
     """Return True when *node* is a ``registry.register(...)`` call expression."""
     if not isinstance(node, ast.Expr) or not isinstance(node.value, ast.Call):
@@ -83,6 +110,8 @@ def discover_builtin_tools(tools_dir: Optional[Path] = None) -> List[str]:
     module_names: List[str] = []
     for path in sorted(tools_path.glob("*.py")):
         if path.name in {"__init__.py", "registry.py", "mcp_tool.py"}:
+            continue
+        if path.stem not in _TRAINING_RUNTIME_TOOL_MODULES:
             continue
         abs_path = str(path.resolve())
         try:

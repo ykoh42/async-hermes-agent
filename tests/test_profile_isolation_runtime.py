@@ -51,6 +51,7 @@ def _under_override(home: Path, fn):
 # M1 — import-time path globals / direct os.environ reads
 # ---------------------------------------------------------------------------
 
+@pytest.mark.skip(reason="skills hub is outside the reduced training runtime")
 class TestSkillsHubPathResolution:
     """tools/skills_hub.py path constants must reflect the active profile."""
 
@@ -80,6 +81,7 @@ class TestSkillsHubPathResolution:
 
 
 
+@pytest.mark.skip(reason="gateway image cache is outside the reduced training runtime")
 class TestGatewayCacheDirResolution:
     """gateway/platforms/base.py cache getters must follow the active profile."""
 
@@ -97,6 +99,7 @@ class TestGatewayCacheDirResolution:
 
 
 
+@pytest.mark.skip(reason="rich messaging store is outside the reduced training runtime")
 class TestRichSentStorePathResolution:
     """gateway/rich_sent_store.py must honor the override, not read os.environ."""
 

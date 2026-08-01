@@ -19,10 +19,8 @@ from hermes_cli.tools_config import (
     _reconfigure_tool,
     _run_post_setup,
     _save_platform_tools,
-    _toolset_has_keys,
     _toolset_needs_configuration_prompt,
     CONFIGURABLE_TOOLSETS,
-    TOOL_CATEGORIES,
     gui_toolset_label,
     _visible_providers,
     provider_readiness_status,
@@ -123,23 +121,6 @@ def test_discord_toolsets_do_not_leak_to_other_platforms():
 
 
 
-def test_toolset_has_keys_for_vision_accepts_codex_auth(tmp_path, monkeypatch):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    (tmp_path / "auth.json").write_text(
-        '{"active_provider":"openai-codex","providers":{"openai-codex":{"tokens":{"access_token": "codex-...oken","refresh_token": "codex-...oken"}}}}'
-    )
-    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
-    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
-    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-
-    monkeypatch.setattr(
-        "agent.auxiliary_client.resolve_vision_provider_client",
-        lambda: ("openai-codex", object(), "gpt-4.1"),
-    )
-
-    assert _toolset_has_keys("vision") is True
-
-
 def test_save_platform_tools_preserves_mcp_server_names():
     """Ensure MCP server names are preserved when saving platform tools.
 
@@ -186,64 +167,6 @@ def test_save_platform_tools_preserves_mcp_server_names():
 
 
 
-def test_first_install_nous_auto_configures_video_gen(monkeypatch):
-    """When a Nous subscriber checks video_gen in the toolset checklist,
-    apply_nous_managed_defaults must write video_gen.provider and
-    video_gen.use_gateway so the FAL plugin can route through the gateway
-    at runtime.  Regression test for the bug where video_gen was marked as
-    auto-configured but no config was actually written."""
-    monkeypatch.setattr("hermes_cli.nous_subscription.managed_nous_tools_enabled", lambda: True)
-    config = {
-        "model": {"provider": "nous"},
-        "platform_toolsets": {"cli": []},
-    }
-    for env_var in (
-        "VOICE_TOOLS_OPENAI_KEY",
-        "OPENAI_API_KEY",
-        "ELEVENLABS_API_KEY",
-        "FIRECRAWL_API_KEY",
-        "FIRECRAWL_API_URL",
-        "TAVILY_API_KEY",
-        "PARALLEL_API_KEY",
-        "BROWSERBASE_API_KEY",
-        "BROWSERBASE_PROJECT_ID",
-        "BROWSER_USE_API_KEY",
-        "FAL_KEY",
-    ):
-        monkeypatch.delenv(env_var, raising=False)
-
-    monkeypatch.setattr(
-        "hermes_cli.tools_config._prompt_toolset_checklist",
-        lambda *args, **kwargs: {"video_gen"},
-    )
-    monkeypatch.setattr("hermes_cli.tools_config.save_config", lambda config: None)
-    monkeypatch.setattr(
-        "hermes_cli.tools_config._get_enabled_platforms",
-        lambda: ["cli"],
-    )
-    monkeypatch.setattr(
-        "hermes_cli.nous_subscription.get_nous_portal_account_info",
-        lambda *args, **kwargs: NousPortalAccountInfo(
-            logged_in=True,
-            source="jwt",
-            fresh=False,
-            paid_service_access=True,
-        ),
-    )
-
-    configured = []
-    monkeypatch.setattr(
-        "hermes_cli.tools_config._configure_toolset",
-        lambda ts_key, config: configured.append(ts_key),
-    )
-
-    tools_command(first_install=True, config=config)
-
-    assert config["video_gen"]["provider"] == "fal"
-    assert config["video_gen"]["use_gateway"] is True
-    # video_gen should NOT appear in the manual configure list — it's auto-configured
-    assert "video_gen" not in configured
-
 # ── Platform / toolset consistency ────────────────────────────────────────────
 
 
@@ -279,21 +202,6 @@ class TestPlatformToolsetConsistency:
                 f"hermes-gateway includes"
             )
 
-    def test_skills_config_covers_tools_config_platforms(self):
-        """skills_config.PLATFORMS should have entries for all gateway platforms."""
-        from hermes_cli.tools_config import PLATFORMS as TOOLS_PLATFORMS
-        from hermes_cli.skills_config import PLATFORMS as SKILLS_PLATFORMS
-
-        non_messaging = {"api_server"}
-        for platform in TOOLS_PLATFORMS:
-            if platform in non_messaging:
-                continue
-            assert platform in SKILLS_PLATFORMS, (
-                f"Platform {platform!r} in tools_config but missing from "
-                f"skills_config PLATFORMS"
-            )
-
-
 def test_numeric_mcp_server_name_does_not_crash_sorted():
     """YAML parses bare numeric keys (e.g. ``12306:``) as int.
 
@@ -320,98 +228,6 @@ def test_numeric_mcp_server_name_does_not_crash_sorted():
 
     # sorted() must not raise TypeError
     sorted(enabled)
-
-
-# ─── Imagegen Backend Picker Wiring ────────────────────────────────────────
-
-
-
-
-
-
-
-class TestImagegenBackendRegistry:
-    """IMAGEGEN_BACKENDS tags drive the model picker flow in tools_config."""
-
-    def test_fal_backend_registered(self):
-        from hermes_cli.tools_config import IMAGEGEN_BACKENDS
-        assert "fal" in IMAGEGEN_BACKENDS
-
-    def test_fal_catalog_loads_lazily(self):
-        """catalog_fn should defer import to avoid import cycles."""
-        from hermes_cli.tools_config import IMAGEGEN_BACKENDS
-        catalog, default = IMAGEGEN_BACKENDS["fal"]["catalog_fn"]()
-        assert default == "fal-ai/flux-2/klein/9b"
-        assert "fal-ai/flux-2/klein/9b" in catalog
-        assert "fal-ai/flux-2-pro" in catalog
-
-    def test_image_gen_providers_tagged_with_fal_backend(self):
-        """Both Nous Subscription and FAL.ai providers must carry the
-        imagegen_backend tag so _configure_provider fires the picker."""
-        from hermes_cli.tools_config import TOOL_CATEGORIES
-        providers = TOOL_CATEGORIES["image_gen"]["providers"]
-        for p in providers:
-            assert p.get("imagegen_backend") == "fal", (
-                f"{p['name']} missing imagegen_backend tag"
-            )
-
-
-class TestImagegenModelPicker:
-    """_configure_imagegen_model writes selection to config and respects
-    curses fallback semantics (returns default when stdin isn't a TTY)."""
-
-    def test_picker_writes_chosen_model_to_config(self):
-        from hermes_cli.tools_config import _configure_imagegen_model
-        config = {}
-        # Force _prompt_choice to pick index 1 (second-in-ordered-list).
-        with patch("hermes_cli.tools_config._prompt_choice", return_value=1):
-            _configure_imagegen_model("fal", config)
-        # ordered[0] == current (default klein), ordered[1] == first non-default
-        assert config["image_gen"]["model"] != "fal-ai/flux-2/klein/9b"
-        assert config["image_gen"]["model"].startswith("fal-ai/")
-
-    def test_picker_with_gpt_image_does_not_prompt_quality(self):
-        """GPT-Image quality is pinned to medium in the tool's defaults —
-        no follow-up prompt, no config write for quality_setting."""
-        from hermes_cli.tools_config import (
-            _configure_imagegen_model,
-            IMAGEGEN_BACKENDS,
-        )
-        catalog, default_model = IMAGEGEN_BACKENDS["fal"]["catalog_fn"]()
-        model_ids = list(catalog.keys())
-        ordered = [default_model] + [m for m in model_ids if m != default_model]
-        gpt_idx = ordered.index("fal-ai/gpt-image-1.5")
-
-        # Only ONE picker call is expected (for model) — not two (model + quality).
-        call_count = {"n": 0}
-        def fake_prompt(*a, **kw):
-            call_count["n"] += 1
-            return gpt_idx
-
-        config = {}
-        with patch("hermes_cli.tools_config._prompt_choice", side_effect=fake_prompt):
-            _configure_imagegen_model("fal", config)
-
-        assert call_count["n"] == 1, (
-            f"Expected 1 picker call (model only), got {call_count['n']}"
-        )
-        assert config["image_gen"]["model"] == "fal-ai/gpt-image-1.5"
-        assert "quality_setting" not in config["image_gen"]
-
-
-    def test_picker_repairs_corrupt_config_section(self):
-        """When image_gen is a non-dict (user-edit YAML), the picker should
-        replace it with a fresh dict rather than crash."""
-        from hermes_cli.tools_config import _configure_imagegen_model
-        config = {"image_gen": "some-garbage-string"}
-        with patch("hermes_cli.tools_config._prompt_choice", return_value=0):
-            _configure_imagegen_model("fal", config)
-        assert isinstance(config["image_gen"], dict)
-        assert config["image_gen"]["model"] == "fal-ai/flux-2/klein/9b"
-
-
-
-
 
 
 def test_get_effective_configurable_toolsets_dedupes_bundled_plugins():
@@ -482,30 +298,6 @@ def test_kanban_not_reported_as_removed_in_diff():
     assert ((current - new_enabled) & universe) == set()
 
 
-
-
-
-
-def test_vision_picker_custom_endpoint(tmp_path, monkeypatch):
-    """Custom endpoint writes base_url+model to config and the key to env."""
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    import hermes_cli.tools_config as tc
-    from hermes_cli.config import load_config
-
-    seq = iter([2])  # Custom OpenAI-compatible endpoint
-    prompts = iter(["https://my.endpoint/v1", "sk-secret", "my-vision-model"])
-    with patch.object(tc, "_prompt_choice", side_effect=lambda *a, **k: next(seq)), \
-         patch.object(tc, "_prompt", side_effect=lambda *a, **k: next(prompts)), \
-         patch.object(tc, "save_env_value") as save_env, \
-         patch.object(tc, "_toolset_has_keys", return_value=False):
-        tc._configure_vision_backend()
-
-    v = load_config().get("auxiliary", {}).get("vision", {})
-    assert v.get("base_url") == "https://my.endpoint/v1"
-    assert v.get("model") == "my-vision-model"
-    # provider pinned to "custom" so the resolver routes through base_url.
-    assert v.get("provider") == "custom"
-    save_env.assert_called_once_with("OPENAI_API_KEY", "sk-secret")
 
 
 

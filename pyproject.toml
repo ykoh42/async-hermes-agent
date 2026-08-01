@@ -53,10 +53,9 @@ dependencies = [
   # Responses API resource is exercised from a non-main thread, which is the
   # codex_responses dispatch in agent/chat_completion_helpers.py:_call.
   "pydantic==2.13.4",
-  # Interactive CLI (prompt_toolkit is used directly by cli.py)
-  "prompt_toolkit==3.0.52",
-  # Cron scheduler (built-in feature — scheduled cron/interval jobs use croniter).
-  "croniter==6.0.0",
+  # External MCP is part of the retained agent tool surface, not an optional
+  # UI integration. Keep the client SDK available in every slim installation.
+  "mcp==1.26.0",
   # ``packaging`` is imported directly on three production paths but was never
   # declared, so it only reached users transitively (pip/uv pull it for other
   # tools). The slim official Docker image ships without it, where the
@@ -164,7 +163,6 @@ vercel = ["vercel==0.7.2"]
 hindsight = ["hindsight-client==0.6.1"]
 dev = ["debugpy==1.8.20", "pytest==9.0.2", "pytest-asyncio==1.3.0", "mcp==1.26.0", "starlette==1.3.1", "ty==0.0.21", "ruff==0.15.10", "setuptools==81.0.0"]  # starlette: CVE-2026-48710; setuptools: latest <82 (torch >=2.11 caps setuptools<82)
 messaging = ["python-telegram-bot[webhooks]==22.6", "discord.py[voice]==2.7.1", "aiohttp==3.14.1", "brotlicffi==1.2.0.1", "slack-bolt==1.29.0", "slack-sdk==3.43.0", "qrcode==7.4.2"]  # aiohttp 3.14.1: CVE-2026-34513/34518/34519/34520/34525 + 34993(RCE)/47265
-cron = []  # croniter is now a core dependency; this extra kept for back-compat
 slack = ["slack-bolt==1.29.0", "slack-sdk==3.43.0", "aiohttp==3.14.1"]
 matrix = ["mautrix[encryption]==0.21.0", "aiosqlite==0.22.1", "asyncpg==0.31.0", "aiohttp-socks==0.11.0", "aiohttp==3.14.1"]  # aiohttp 3.14.1: CVE-2026-34993(RCE)/47265 + 34513/34518/34519/34520/34525 (mautrix/aiohttp-socks only cap aiohttp<4 / >=3.10, so pin the patched floor directly)
 # WeCom callback-mode adapter — parses untrusted XML POST bodies from
@@ -227,7 +225,7 @@ pty = []
 # `request.url` can be bypassed. We pin a patched Starlette directly in every
 # extra that exposes a Starlette-backed server surface so pip/uv can't resolve
 # a vulnerable pre-1.0.1 transitive. Bump in lockstep with uv.lock.
-mcp = ["mcp==1.26.0", "starlette==1.3.1"]  # starlette: CVE-2026-48710
+mcp = []  # External MCP is a retained core dependency; compatibility extra.
 # Backwards-compatible no-op alias. Relay is a core dependency on supported
 # wheel targets and intentionally unavailable on other platforms.
 nemo-relay = []
@@ -260,7 +258,6 @@ azure-identity = ["azure-identity==1.25.3"]
 termux = [
   # Baseline Android / Termux path for reliable fresh installs.
   "python-telegram-bot[webhooks]==22.6",
-  "hermes-agent[cron]",
   "hermes-agent[cli]",
   "hermes-agent[mcp]",
   "hermes-agent[honcho]",
@@ -284,7 +281,7 @@ google = [
   # Required by the google-workspace skill (Gmail, Calendar, Drive, Contacts,
   # Sheets, Docs).  Declared here so dev environments (`uv sync --extra google`)
   # and packagers ship them without hitting runtime `pip install` paths that
-  # fail in environments without pip (e.g. Nix-managed Python).
+  # fail in environments without pip.
   "google-api-python-client==2.194.0",
   "google-auth-oauthlib==1.3.1",
   "google-auth-httplib2==0.3.1",
@@ -322,7 +319,6 @@ all = [
   # [all], `uv sync --locked` on Windows tried to build it from sdist
   # and failed on `make`. Lazy-install routes that build to first use,
   # where the user is expected to have a toolchain available.
-  "hermes-agent[cron]",
   "hermes-agent[cli]",
   "hermes-agent[pty]",
   "hermes-agent[mcp]",
@@ -341,11 +337,9 @@ build-backend = "setuptools.build_meta"
 [project.scripts]
 hermes = "hermes_cli.main:main"
 hermes-agent = "run_agent:main"
-hermes-acp = "acp_adapter.entry:main"
 
 [tool.setuptools]
-# Top-level single-file modules (not packages). Without this, uv2nix's
-# sealed venv is missing hermes_constants, run_agent, etc.
+# Top-level single-file modules (not packages).
 py-modules = [
   "run_agent",
   "model_tools",
@@ -353,7 +347,6 @@ py-modules = [
   "batch_runner",
   "trajectory_compressor",
   "toolset_distributions",
-  "cli",
   "hermes_bootstrap",
   "hermes_constants",
   "hermes_state",
@@ -364,20 +357,13 @@ py-modules = [
   "hermes_time",
   "hermes_logging",
   "utils",
-  "mcp_serve",
 ]
 
 [tool.setuptools.packages.find]
-include = ["agent", "agent.*", "tools", "tools.*", "hermes_cli", "hermes_cli.*", "gateway", "gateway.*", "tui_gateway", "tui_gateway.*", "cron", "cron.*", "acp_adapter", "plugins", "plugins.*", "providers", "providers.*"]
+include = ["agent", "agent.*", "tools", "tools.*", "hermes_cli", "hermes_cli.*", "plugins", "plugins.*", "providers", "providers.*"]
 
 [tool.setuptools.package-data]
 hermes_cli = ["observability/schemas/*.json"]
-# gateway/assets/ ships status_phrases.yaml and the Telegram BotFather
-# screenshot. Without this, sealed venvs (uv2nix) silently lose both —
-# status phrases fall back to the tiny hardcoded set and the Telegram
-# topic-setup image disappears. Loaded via Path(__file__).parent / "assets"
-# in gateway/status_phrases.py and gateway/run.py.
-gateway = ["assets/**/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

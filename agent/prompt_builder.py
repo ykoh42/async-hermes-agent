@@ -765,13 +765,6 @@ PLATFORM_HINTS = {
         "is preserved for threading. Do not include greetings or sign-offs unless "
         "contextually appropriate."
     ),
-    "cron": (
-        "You are running as a scheduled cron job. There is no user present — you "
-        "cannot ask questions, request clarification, or wait for follow-up. Execute "
-        "the task fully and autonomously, making reasonable decisions where needed. "
-        "Your final response is automatically delivered to the job's configured "
-        "destination — put the primary content directly in your response."
-    ),
     "cli": (
         "You are a CLI AI Agent. Try not to use markdown but simple text "
         "renderable inside a terminal. "
@@ -780,24 +773,7 @@ PLATFORM_HINTS = {
         "(those are only intercepted on messaging platforms like Telegram, "
         "Discord, Slack, etc.; on the CLI they render as literal text). "
         "When referring to a file you created or changed, just state its "
-        "absolute path in plain text; the user can open it from there. "
-        "Cron jobs scheduled from this session are LOCAL-ONLY: their output is "
-        "saved (viewable via cronjob action='list') but is NOT delivered back "
-        "into this terminal — there is no live-delivery channel here. If the "
-        "user wants to be notified when a job runs, the job's `deliver` must "
-        "target a gateway-connected messaging platform (e.g. deliver='telegram' "
-        "or 'all'). Do not promise the user that a deliver='origin' or "
-        "default-deliver cron job will message them in this session."
-    ),
-    "tui": (
-        "You are running in the Hermes terminal UI (TUI). "
-        "Cron jobs scheduled from this session are LOCAL-ONLY: their output is "
-        "saved (viewable via cronjob action='list') but is NOT delivered back "
-        "into this TUI session — there is no live-delivery channel here. If the "
-        "user wants to be notified when a job runs, the job's `deliver` must "
-        "target a gateway-connected messaging platform (e.g. deliver='telegram' "
-        "or 'all'). Do not promise the user that a deliver='origin' or "
-        "default-deliver cron job will message them in this session."
+        "absolute path in plain text; the user can open it from there."
     ),
     "desktop": (
         "You are chatting inside the Hermes desktop app — a graphical chat "

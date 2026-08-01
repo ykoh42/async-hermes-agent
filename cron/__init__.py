@@ -1,42 +1,21 @@
-"""
-Cron job scheduling system for Hermes Agent.
+"""Compatibility namespace for the deferred scheduler subsystem.
 
-This module provides scheduled task execution, allowing the agent to:
-- Run automated tasks on schedules (cron expressions, intervals, one-shot)
-- Self-schedule reminders and follow-up tasks
-- Execute tasks in isolated sessions (no prior context)
-
-Cron jobs are executed automatically by the gateway daemon:
-    hermes gateway install    # Install as a user service
-    sudo hermes gateway install --system  # Linux servers: boot-time system service
-    hermes gateway            # Or run in foreground
-
-The gateway ticks the scheduler every 60 seconds. A file lock prevents
-duplicate execution if multiple processes overlap.
+The training runtime does not start scheduled jobs.  The scheduler
+implementation is intentionally kept out of this checkout's runtime surface,
+but the package path remains so an upstream update can restore it without a
+module rename.  Callers that still try to start cron receive a clear error
+instead of a transitive import failure during normal agent startup.
 """
 
-from cron.jobs import (
-    create_job,
-    get_job,
-    list_jobs,
-    remove_job,
-    update_job,
-    pause_job,
-    resume_job,
-    trigger_job,
-    JOBS_FILE,
-)
-from cron.scheduler import tick
+from __future__ import annotations
 
-__all__ = [
-    "create_job",
-    "get_job", 
-    "list_jobs",
-    "remove_job",
-    "update_job",
-    "pause_job",
-    "resume_job",
-    "trigger_job",
-    "tick",
-    "JOBS_FILE",
-]
+
+def tick(*_args, **_kwargs) -> None:
+    """Fail explicitly when the deferred scheduler is invoked."""
+    raise RuntimeError(
+        "Hermes cron scheduling is not included in the training runtime; "
+        "restore the cron scheduler package before enabling scheduled jobs."
+    )
+
+
+__all__ = ["tick"]

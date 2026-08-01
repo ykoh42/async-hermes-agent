@@ -206,78 +206,6 @@ def _gateway_prompt(prompt_text: str, default: str = "", timeout: float = 300.0)
     print(f"  (no response after {int(timeout)}s, using default: {default!r})")
     return default
 
-def _npm_bin_exists(bin_dir: Path, name: str) -> bool:
-    """True when an npm bin shim for *name* exists (POSIX or Windows)."""
-    return any(
-        (bin_dir / candidate).exists()
-        for candidate in (name, f"{name}.cmd", f"{name}.ps1", f"{name}.exe")
-    )
-
-def _web_build_toolchain_ready(*roots: Path) -> bool:
-    """True when ``tsc`` and ``vite`` shims are reachable from any of *roots*.
-
-    Callers must pass every root the build would search; checking only one
-    reports a healthy tree as broken.
-    """
-    bin_dirs = [
-        bin_dir
-        for bin_dir in (root / "node_modules" / ".bin" for root in roots)
-        if bin_dir.is_dir()
-    ]
-    return bool(bin_dirs) and all(
-        any(_npm_bin_exists(bin_dir, tool) for bin_dir in bin_dirs)
-        for tool in ("tsc", "vite")
-    )
-
-def _web_toolchain_roots(web_dir: Path) -> tuple[Path, ...]:
-    """Roots whose ``node_modules/.bin`` can satisfy the web build.
-
-    ``npm run build`` prepends ``node_modules/.bin`` for the package and each
-    of its ancestors, so shims hoisted to the workspace root and shims nested
-    under a package that owns its lockfile (#42973) are equally valid.
-    """
-    return (web_dir, web_dir.parent)
-
-def _print_curator_first_run_notice() -> None:
-    """Print a short heads-up about the skill curator after `hermes update`.
-
-    Only fires when the curator is enabled AND has no recorded run yet, which
-    is exactly the window where the gateway ticker used to fire Curator
-    against a fresh skill library immediately after an update. We defer the
-    first real pass by one ``interval_hours``; this notice tells the user how
-    to preview or disable before then. Silent on steady state.
-    """
-    try:
-        from agent import curator
-    except Exception:
-        return
-    try:
-        if not curator.is_enabled():
-            return
-        state = curator.load_state()
-    except Exception:
-        return
-    if state.get("last_run_at"):
-        # Curator has run before (real or already seeded) — no notice needed.
-        return
-    try:
-        hours = curator.get_interval_hours()
-    except Exception:
-        hours = 24 * 7
-    days = max(1, hours // 24)
-    print()
-    print("ℹ Skill curator")
-    print(
-        f"  Background skill maintenance is enabled. First pass is deferred "
-        f"~{days}d after installation; only agent-created skills are in "
-        f"scope and nothing is ever auto-deleted (archive is recoverable)."
-    )
-    print("  Preview now:  hermes curator run --dry-run")
-    print("  Pause it:     hermes curator pause")
-    print(
-        "  Docs:         https://hermes-agent.nousresearch.com/docs/user-guide/features/curator"
-    )
-
 def _print_fts_optimize_available_notice() -> None:
     """Advertise the opt-in v23 search-index optimization after `hermes update`.
 
@@ -391,71 +319,6 @@ def _print_fts_optimize_available_notice() -> None:
         "interrupt/re-run, and never changes your conversations."
     )
 
-def _print_curator_recent_run_notice() -> None:
-    """Print the most recent curator run summary, exactly once.
-
-    The curator runs in the background (gateway tick + CLI session start),
-    so users learn about skill consolidations only by stumbling into a
-    rename. ``hermes update`` is a high-attention surface — surface the
-    most recent run's rename map here, once.
-
-    Show-once: state stamps ``last_run_summary_shown_at`` after printing.
-    Subsequent ``hermes update`` invocations skip the block until a newer
-    curator run lands. Silent when the curator has never run, when the
-    most recent summary has already been shown, or when the summary has
-    no rename information to display (no archives).
-    """
-    try:
-        from agent import curator
-    except Exception:
-        return
-    try:
-        state = curator.load_state()
-    except Exception:
-        return
-
-    last_run_at = state.get("last_run_at")
-    if not last_run_at:
-        return  # no curator run yet — first-run notice handles this case
-
-    if state.get("last_run_summary_shown_at") == last_run_at:
-        return  # already shown for this run
-
-    summary = state.get("last_run_summary") or ""
-    if not summary:
-        return
-
-    # Only print when there's something interesting to show — i.e. the
-    # rename map block was appended (multi-line summary). A bare "auto:
-    # no changes; llm: no change" doesn't warrant interrupting the
-    # update flow.
-    if "\n" not in summary:
-        # Still stamp it shown so we don't reconsider it on every update.
-        try:
-            state["last_run_summary_shown_at"] = last_run_at
-            curator.save_state(state)
-        except Exception:
-            pass
-        return
-
-    # Format the timestamp as "Xh ago" for readability.
-    when = _format_time_ago(last_run_at)
-    print()
-    print(f"ℹ Skill curator — last run {when}")
-    for line in summary.splitlines():
-        print(f"  {line}")
-    print(
-        "  (This message shows once per curator run. "
-        "View anytime: hermes curator status)"
-    )
-
-    # Stamp shown so we don't repeat on the next update.
-    try:
-        state["last_run_summary_shown_at"] = last_run_at
-        curator.save_state(state)
-    except Exception:
-        pass
-
 def _format_time_ago(iso_ts: str) -> str:
     """Render an ISO timestamp as `Xh ago` / `Xd ago` / `Xm ago`. Best effort."""
     try:
@@ -475,26 +338,6 @@ def _format_time_ago(iso_ts: str) -> str:
     except Exception:
         return "recently"
 
-def _finish_dashboard_update_cleanup(node_failures: list[str]) -> None:
-    """Refresh managed dashboards or stop stale manual ones after an update."""
-    if node_failures:
-        print()
-        print("  ℹ Leaving running dashboard process(es) untouched because the")
-        print("    Node.js dependency refresh did not complete.")
-        return
-
-    stop_result = _m()._kill_stale_dashboard_processes(restart_managed=True)
-    if not stop_result.get("unrecovered"):
-        return
-
-    print()
-    print(
-        "⚠ A web dashboard/serve process was stopped during update and could "
-        "not be auto-restarted."
-    )
-    print("  Re-launch it when you want the web UI back:")
-    print("    hermes dashboard --port <port>")
-
 def _atomic_replace_dir(src: str, dst: str) -> None:
     """Replace directory *dst* with *src* without leaving *dst* half-deleted.
 
@@ -502,7 +345,7 @@ def _atomic_replace_dir(src: str, dst: str) -> None:
     the copy fails partway (common on the Windows ZIP-update path, which only
     runs because file I/O is already flaky on that machine), the old directory
     is already gone and nothing replaced it — the install is left with a
-    deleted tree (issue #49145, where ``ui-tui/`` vanished and broke the TUI).
+    deleted tree during an interrupted update.
 
     Instead, stage the new copy into a sibling temp dir first; only once that
     fully succeeds do we swap it in. A failure during staging raises with the
@@ -685,9 +528,6 @@ def _update_via_zip(args):
     # #70636).
     _m()._refresh_active_memory_provider_dependencies()
 
-    node_failures = _update_node_dependencies()
-    _m()._build_web_ui(_m().PROJECT_ROOT / "web")
-
     # Sync skills
     try:
         from tools.skills_sync import sync_skills
@@ -789,26 +629,7 @@ def _update_via_zip(args):
         )
 
     print()
-    if node_failures:
-        print(
-            "⚠ Update partially complete — Node.js dependencies for "
-            f"{', '.join(node_failures)} did not refresh."
-        )
-        print("  Code and Python deps are updated, but the dashboard/TUI may")
-        print("  be in a mixed state until the Node deps are rebuilt.")
-    else:
-        print("✓ Update complete!")
-    try:
-        _print_curator_first_run_notice()
-    except Exception as e:
-        logger.debug("Curator first-run notice failed: %s", e)
-    try:
-        _print_curator_recent_run_notice()
-    except Exception as e:
-        logger.debug("Curator recent-run notice failed: %s", e)
-    # Don't stop a working dashboard when the Node refresh failed — see the
-    # git-update path for rationale (#30271).
-    _finish_dashboard_update_cleanup(node_failures)
+    print("✓ Update complete!")
 
 def _stash_local_changes_if_needed(git_cmd: list[str], cwd: Path) -> Optional[str]:
     status = subprocess.run(
@@ -1679,201 +1500,6 @@ def _ensure_uv_for_termux(pip_cmd: list[str]) -> str | None:
         pass
     # After pip install, check managed path first, then PATH
     return resolve_uv() or shutil.which("uv")
-
-def _npm_manifest_paths() -> tuple[Path, ...]:
-    """Manifests whose changes must defeat the update-skip.
-
-    The lockfile alone is NOT a sufficient key: on a local checkout a dev
-    can edit package.json (root or a workspace) without running npm — the
-    lockfile is then unchanged but `hermes update` is exactly the step
-    expected to sync node_modules (via the `npm install` fallback in
-    _run_npm_install_deterministic).
-
-    The workspace list is pulled from the root package.json's `workspaces`
-    globs (npm's own source of truth) rather than hardcoded, so adding a
-    workspace can never silently escape the skip key. The root install
-    (step 1, --workspaces=false) still hoists shared deps for EVERY
-    workspace — desktop included — so all of them belong in the key, not
-    just the ones step 2 installs. Falls back to hashing just root
-    manifests if package.json is unreadable (never skips more than main
-    would have installed).
-    """
-    root_pkg = _m().PROJECT_ROOT / "package.json"
-    paths = [_m().PROJECT_ROOT / "package-lock.json", root_pkg]
-    try:
-        workspaces = json.loads(root_pkg.read_text(encoding="utf-8")).get(
-            "workspaces", []
-        )
-        if isinstance(workspaces, dict):  # legacy {"packages": [...]} form
-            workspaces = workspaces.get("packages", [])
-        for pattern in workspaces:
-            for match in sorted(_m().PROJECT_ROOT.glob(str(pattern))):
-                manifest = match / "package.json"
-                if manifest.is_file():
-                    paths.append(manifest)
-    except (OSError, json.JSONDecodeError, TypeError):
-        pass
-    return tuple(paths)
-
-def _npm_manifests_digest() -> str | None:
-    """Combined sha256 over the lockfile + all workspace package.json files.
-
-    Returns None when the lockfile is missing (never skip then).
-    """
-    if not (_m().PROJECT_ROOT / "package-lock.json").exists():
-        return None
-    h = hashlib.sha256()
-    for p in _npm_manifest_paths():
-        h.update(str(p.relative_to(_m().PROJECT_ROOT)).encode())
-        try:
-            h.update(p.read_bytes())
-        except OSError:
-            h.update(b"<missing>")
-    return h.hexdigest()
-
-def _npm_lockfile_changed(hermes_root: Path) -> bool:
-    current = _npm_manifests_digest()
-    if current is None:
-        return True
-    # Also check that node_modules exists; a matching hash with missing
-    # node_modules means the cache was recorded by another checkout.
-    if not (_m().PROJECT_ROOT / "node_modules").is_dir():
-        return True
-    # A matching lockfile hash over a tree whose web build toolchain never
-    # landed must NOT skip the reinstall — otherwise every later `hermes
-    # update` keeps rebuilding against a half-installed tree and serving a
-    # stale dist.
-    web_dir = _m().PROJECT_ROOT / "web"
-    if (web_dir / "package.json").is_file() and not _web_build_toolchain_ready(
-        *_web_toolchain_roots(web_dir)
-    ):
-        return True
-    try:
-        # Key the cache by PROJECT_ROOT so parallel worktrees don't collide.
-        cache_key = hashlib.sha256(str(_m().PROJECT_ROOT).encode()).hexdigest()[:12]
-        cache_file = hermes_root / f".npm_lock_hash_{cache_key}"
-        if not cache_file.exists():
-            return True
-        return cache_file.read_text(encoding="utf-8").strip() != current
-    except OSError:
-        return True
-
-def _record_npm_lockfile_hash(hermes_root: Path) -> None:
-    digest = _npm_manifests_digest()
-    if digest is None:
-        return
-    try:
-        cache_key = hashlib.sha256(str(_m().PROJECT_ROOT).encode()).hexdigest()[:12]
-        cache_file = hermes_root / f".npm_lock_hash_{cache_key}"
-        cache_file.write_text(digest, encoding="utf-8")
-    except OSError:
-        logger.debug("Could not write npm lockfile hash cache")
-
-def _update_node_dependencies() -> list[str]:
-    """Refresh Node deps in the repo root and update workspaces.
-
-    Returns the list of labels whose npm install failed (empty on success),
-    so the caller can treat a Node refresh failure as a partial update rather
-    than silently reporting ``Update complete!`` (#30271).
-    """
-    if not (_m().PROJECT_ROOT / "package.json").exists():
-        return []
-
-    npm = _m()._resolve_node_runtime_npm()
-    if not npm:
-        # If the only npm reachable inside this WSL shell is the Windows one,
-        # flag it loudly: silently skipping leaves ui-tui deps stale while the
-        # rest of the update proceeds, and running it would corrupt the tree.
-        from hermes_constants import is_wsl
-
-        path_npm = shutil.which("npm")
-        if is_wsl() and path_npm and _m()._is_windows_npm_path(path_npm):
-            print("→ Updating Node.js dependencies...")
-            print("  ⚠ Skipped: only a Windows npm is reachable from this WSL shell.")
-            print("    Install Node.js inside the WSL distro (nvm, or your distro's")
-            print("    package manager), then re-run `hermes update`.")
-            failed = ["repo root"]
-            if any(
-                (_m().PROJECT_ROOT / workspace / "package.json").exists()
-                for workspace in ("ui-tui", "web")
-            ):
-                failed.append("ui-tui, web workspaces")
-            return failed
-        return []
-
-    from hermes_constants import get_default_hermes_root
-
-    # This cache describes PROJECT_ROOT/node_modules, which is shared by every
-    # Hermes profile using this checkout. Keep one per-checkout cache under the
-    # shared Hermes root rather than rerunning npm once per named profile.
-    shared_hermes_root = get_default_hermes_root()
-    if not _m()._npm_lockfile_changed(shared_hermes_root):
-        logger.info("npm lockfile unchanged, skipping npm install")
-        return []
-
-    # With a single workspace lockfile the root install would cover ALL
-    # workspaces — but apps/desktop pulls in Electron as a devDependency,
-    # and its postinstall downloads a ~200MB binary.  Most users don't
-    # need desktop during `hermes update`, so we install root-only first
-    # then add just the workspaces the CLI/TUI/web build actually requires.
-    # Desktop deps are installed on demand by the desktop launcher
-    # (see _desktop_build_needed).
-    print("→ Updating Node.js dependencies...")
-
-    def _partial_update_failure(*labels: str) -> list[str]:
-        print()
-        print("  ⚠ Node.js dependency refresh did not complete cleanly; the")
-        print("    installation may be in a mixed state (updated code, stale Node")
-        print("    deps). Fix npm and re-run `hermes update`.")
-        return list(labels)
-
-    extra_args = ["--no-fund", "--no-audit", "--progress=false"]
-
-    from hermes_constants import with_hermes_node_path
-
-    nixos_env = with_hermes_node_path(_m()._nixos_build_env())
-
-    # Step 1: root install (no workspace recursion).
-    # NOTE: capture_output=False here is deliberate (#18840) — optional
-    # postinstall scripts (e.g. @askjo/camofox-browser's browser-binary fetch)
-    # print download progress, and capturing it makes a long download look
-    # hung. The chatty npm-deprecation noise during `hermes update` comes from
-    # the *desktop* build, not this step; that one is captured to update.log.
-    root_args = [*extra_args, "--workspaces=false"]
-    root_result = _m()._run_npm_install_deterministic(
-        npm,
-        _m().PROJECT_ROOT,
-        extra_args=tuple(root_args),
-        capture_output=False,
-        env=nixos_env,
-    )
-    if root_result.returncode != 0:
-        print("  ⚠ npm install failed in repo root")
-        stderr = (root_result.stderr or "").strip() if root_result.stderr else ""
-        if stderr:
-            print(f"    {stderr.splitlines()[-1]}")
-        return _partial_update_failure("repo root")
-
-    # Step 2: install only the workspaces update needs (ui-tui, web).
-    # --workspace selects specific workspaces; the rest (desktop) are skipped.
-    ws_args = [*extra_args, "--workspace", "ui-tui", "--workspace", "web"]
-    ws_result = _m()._run_npm_install_deterministic(
-        npm,
-        _m().PROJECT_ROOT,
-        extra_args=tuple(ws_args),
-        capture_output=False,
-        env=nixos_env,
-    )
-    if ws_result.returncode == 0:
-        _record_npm_lockfile_hash(shared_hermes_root)
-        print("  ✓ repo root + ui-tui, web workspaces (desktop skipped)")
-        return []
-
-    print("  ⚠ npm workspace install failed")
-    stderr = (ws_result.stderr or "").strip() if ws_result.stderr else ""
-    if stderr:
-        print(f"    {stderr.splitlines()[-1]}")
-    return _partial_update_failure("ui-tui, web workspaces")
 
 def _log_only_write(text: str) -> None:
     """Write ``text`` to ``~/.hermes/logs/update.log`` only, never the terminal.
@@ -3729,66 +3355,6 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # plugin.yaml-declared deps that aren't in extras (#53272, #70636).
         _m()._refresh_active_memory_provider_dependencies()
 
-        node_failures = _update_node_dependencies()
-        _m()._build_web_ui(_m().PROJECT_ROOT / "web")
-
-        # Rebuild the desktop app if the source tree changed since the last
-        # build.  ``hermes desktop --build-only`` uses the content-hash stamp
-        # internally, so this is effectively a no-op when nothing changed.
-        # Only bother if the user has a desktop app installed (indicated by
-        # an existing packaged executable or desktop dist); people who have
-        # never run ``hermes desktop`` shouldn't be forced into a full
-        # Electron build by ``hermes update``.
-        desktop_dir = _m().PROJECT_ROOT / "apps" / "desktop"
-        has_desktop_app = _m()._desktop_packaged_executable(desktop_dir) is not None or _m()._desktop_dist_exists(desktop_dir)
-        if (desktop_dir / "package.json").exists() and _m()._resolve_node_runtime_npm() and has_desktop_app:
-            print("→ Checking if desktop app needs rebuilding...")
-            # Consult the content-hash stamp IN-PROCESS first. The spawned
-            # `hermes desktop --build-only` subprocess re-imports the whole
-            # CLI stack (~1-3 s) just to reach the same _m()._desktop_build_needed
-            # check; when the stamp already says "up to date" we can skip the
-            # spawn entirely. The update path never passes --source, so the
-            # subprocess would run with source_mode=False — mirror that here.
-            # Any error in the pre-check falls through to the subprocess.
-            _skip_desktop_build = False
-            try:
-                _skip_desktop_build = not _m()._desktop_build_needed(
-                    desktop_dir, _m().PROJECT_ROOT, source_mode=False
-                )
-            except Exception:
-                _skip_desktop_build = False
-            if _skip_desktop_build:
-                print("  ✓ Desktop app up to date")
-            else:
-                _desktop_build_cmd = [sys.executable, "-m", "hermes_cli.main", "desktop", "--build-only"]
-                # Capture the (very loud) Electron/vite build output into
-                # update.log instead of streaming it to the terminal. On the rare
-                # nonzero exit, retry once after waiting again for the venv — this
-                # covers a still-settling rebuild window the first wait didn't fully
-                # catch — then surface the captured tail so the failure is
-                # debuggable.
-                #
-                # Start the build subprocess with the Hermes-managed Node on PATH:
-                # when `hermes update` runs inside the desktop updater chain
-                # (Desktop → hermes-setup → hermes update), the shell PATH
-                # customizations are lost, so a bare-PATH child would fail with
-                # `node: not found` before cmd_gui can self-heal.
-                from hermes_constants import with_hermes_node_path
-
-                _build_env = with_hermes_node_path()
-                build_result = _m()._run_logged_subprocess(_desktop_build_cmd, cwd=_m().PROJECT_ROOT, env=_build_env)
-                if build_result.returncode != 0:
-                    build_result = _m()._run_logged_subprocess(_desktop_build_cmd, cwd=_m().PROJECT_ROOT, env=_build_env)
-                if build_result.returncode != 0:
-                    print("  ⚠ Desktop build failed (non-fatal; run `hermes desktop` to retry)")
-                    tail = "\n".join((build_result.stdout or "").strip().splitlines()[-15:])
-                    if tail:
-                        print(tail)
-                    from hermes_constants import display_hermes_home as _dhh
-                    print(f"  Full build log: {_dhh()}/logs/update.log")
-                else:
-                    print("  ✓ Desktop app up to date")
-
         print()
         print("✓ Code updated!")
 
@@ -4123,15 +3689,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
             logger.debug("Cron jobs auto-restore check failed: %s", exc)
 
         print()
-        if node_failures:
-            print(
-                "⚠ Update partially complete — Node.js dependencies for "
-                f"{', '.join(node_failures)} did not refresh."
-            )
-            print("  Code and Python deps are updated, but the dashboard/TUI may")
-            print("  be in a mixed state until the Node deps are rebuilt.")
-        else:
-            print("✓ Update complete!")
+        print("✓ Update complete!")
 
         # Search-index optimization notice (v23). Existing installs keep their
         # working search index untouched on update; the compact v23 layout —
@@ -4143,25 +3701,6 @@ def _cmd_update_impl(args, gateway_mode: bool):
             _print_fts_optimize_available_notice()
         except Exception as e:
             logger.debug("FTS optimize notice failed: %s", e)
-
-        # Curator first-run heads-up. Only prints when curator is enabled AND
-        # has never run — i.e. the window where the ticker would otherwise
-        # have fired against a fresh skill library. Kept silent on steady
-        # state so we don't nag.
-        try:
-            _print_curator_first_run_notice()
-        except Exception as e:
-            logger.debug("Curator first-run notice failed: %s", e)
-
-        # Most-recent curator run notice — show-once per run. Surfaces the
-        # rename map (`old-name → umbrella`) on the high-attention update
-        # surface so users learn about consolidations without having to
-        # check `hermes curator status`. Self-stamps after printing so it
-        # never repeats for the same run.
-        try:
-            _print_curator_recent_run_notice()
-        except Exception as e:
-            logger.debug("Curator recent-run notice failed: %s", e)
 
         # Repair RHEL-family root installs where /usr/local/bin isn't on PATH
         # for non-login interactive shells.  No-op on every other platform.
@@ -4954,13 +4493,6 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 print("  (add `sudo` if any are in system scope)")
         except Exception as e:
             logger.debug("Legacy unit check during update failed: %s", e)
-
-        # Restart a managed dashboard through systemd, or stop stale manual
-        # dashboard processes. Raw-killing a systemd-owned dashboard PID makes
-        # systemd treat it as a clean stop, leaving the Cloudflare origin dead.
-        # Preserve the safety rule above: a failed Node refresh leaves the
-        # currently running dashboard untouched.
-        _finish_dashboard_update_cleanup(node_failures)
 
         print()
         print("Tip: You can now select a provider and model:")

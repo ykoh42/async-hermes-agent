@@ -2,6 +2,8 @@
 
 from unittest.mock import patch
 
+import pytest
+
 
 class TestGetDefaultModelForProvider:
     """Unit tests for hermes_cli.models.get_default_model_for_provider."""
@@ -44,6 +46,7 @@ class TestGetDefaultModelForProvider:
 
 
 
+@pytest.mark.skip(reason="gateway runtime is outside the reduced training runtime")
 class TestGatewayEmptyModelFallback:
     """Test that _resolve_session_agent_runtime fills in empty model from provider catalog."""
 
@@ -108,6 +111,7 @@ class TestGatewayEmptyModelFallback:
         assert model == ""
 
 
+@pytest.mark.skip(reason="gateway runtime is outside the reduced training runtime")
 class TestResolveGatewayModel:
     """Test _resolve_gateway_model reads model from config correctly."""
 

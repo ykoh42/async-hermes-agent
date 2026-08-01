@@ -270,7 +270,7 @@ def show_status(args):
     codex_logged_in = bool(codex_status.get("logged_in"))
     print(
         f"  {'OpenAI Codex':<12}  {check_mark(codex_logged_in)} "
-        f"{'logged in' if codex_logged_in else 'not logged in (run: hermes model)'}"
+        f"{'logged in' if codex_logged_in else 'not logged in (run: hermes auth)'}"
     )
     codex_auth_file = codex_status.get("auth_store")
     if codex_auth_file:
@@ -389,7 +389,7 @@ def show_status(args):
             if key_val:
                 break
         configured = bool(key_val)
-        label = "configured" if configured else "not configured (run: hermes model)"
+        label = "configured" if configured else "not configured (run: hermes auth)"
         print(f"  {pname:<16} {check_mark(configured)} {label}")
 
     # LM Studio reachability — only probe when it's the active provider so
@@ -676,5 +676,5 @@ def show_status(args):
     print()
     print(color("─" * 60, Colors.DIM))
     print(color("  Run 'hermes doctor' for detailed diagnostics", Colors.DIM))
-    print(color("  Run 'hermes setup' to configure", Colors.DIM))
+    print(color("  Run 'hermes auth' to configure provider credentials", Colors.DIM))
     print()

@@ -142,10 +142,6 @@ COMMAND_REGISTRY: list[CommandDef] = [
                aliases=("bg", "btw"), args_hint="<prompt>", busy_policy="dispatch"),
     CommandDef("agents", "Show active agents and running tasks", "Session",
                aliases=("tasks",), busy_policy="dispatch"),
-    CommandDef("journey", "Open the learning journey timeline",
-               "Session", aliases=("learning", "memory-graph"), cli_only=True,
-               args_hint="[list|delete <id>|edit <id>]",
-               subcommands=("list", "delete", "edit")),
     CommandDef("queue", "Queue a prompt for the next turn (doesn't interrupt)", "Session",
                aliases=("q",), args_hint="<prompt>",
                busy_policy="dispatch", busy_handler="queue"),
@@ -206,9 +202,6 @@ COMMAND_REGISTRY: list[CommandDef] = [
                "Configuration", cli_only=True,
                gateway_config_gate="display.tool_progress_command",
                busy_policy="dispatch"),
-    CommandDef("focus", "Toggle focus view — show only your prompt and the final response",
-               "Configuration", cli_only=True, args_hint="[on|off|status]",
-               subcommands=("on", "off", "status")),
     CommandDef("footer", "Toggle gateway runtime-metadata footer on final replies",
                "Configuration", args_hint="[on|off|status]",
                subcommands=("on", "off", "status"), busy_policy="dispatch"),
@@ -223,8 +216,6 @@ COMMAND_REGISTRY: list[CommandDef] = [
     CommandDef("fast", "Toggle fast mode — OpenAI Priority Processing / Anthropic Fast Mode (Normal/Fast)", "Configuration",
                args_hint="[normal|fast|status] [--global]",
                subcommands=("normal", "fast", "status", "on", "off", "--global")),
-    CommandDef("skin", "Show or change the display skin/theme", "Configuration",
-               cli_only=True, args_hint="[name]"),
     CommandDef("indicator", "Pick the TUI busy-indicator style", "Configuration",
                cli_only=True, args_hint="[kaomoji|emoji|unicode|ascii]",
                subcommands=("kaomoji", "emoji", "unicode", "ascii")),
@@ -242,36 +233,16 @@ COMMAND_REGISTRY: list[CommandDef] = [
                args_hint="[list|disable|enable] [name...]", cli_only=True),
     CommandDef("toolsets", "List available toolsets", "Tools & Skills",
                cli_only=True),
-    CommandDef("skills", "Search, install, inspect, or manage skills",
-               "Tools & Skills", cli_only=True,
-               gateway_config_gate="skills.write_approval",
-               subcommands=("search", "browse", "inspect", "install", "audit",
-                            "pending", "approve", "reject", "diff", "approval")),
     CommandDef("memory", "Review pending memory writes / toggle the approval gate",
                "Tools & Skills",
                args_hint="[pending|approve|reject|approval] [id|on|off]",
                subcommands=("pending", "approve", "reject", "approval")),
     CommandDef("bundles", "List skill bundles (aliases /<name> for multiple skills)",
                "Tools & Skills", execute="bundles"),
-    CommandDef("pet", "Toggle or adopt a petdex mascot (/pet, /pet list, /pet <slug>)", "Tools & Skills",
-               cli_only=True, args_hint="[toggle|list|scale <n>|<slug>]", subcommands=("toggle", "list", "scale", "off")),
-    CommandDef("hatch", "Generate a new petdex pet from a description",
-               "Tools & Skills", cli_only=True, aliases=("generate-pet",), args_hint="[description]"),
     CommandDef("learn", "Learn a reusable skill from anything you describe (dirs, URLs, this chat, notes)",
                "Tools & Skills", args_hint="<what to learn from>"),
     CommandDef("init", "Generate or update AGENTS.md project instructions from a repo scan",
                "Tools & Skills", args_hint="[notes]"),
-    CommandDef("cron", "Manage scheduled tasks", "Tools & Skills",
-               cli_only=True, args_hint="[subcommand]",
-               subcommands=("list", "add", "create", "edit", "pause", "resume", "run", "remove")),
-    CommandDef("suggestions", "Review suggested automations (accept/dismiss)",
-               "Tools & Skills", aliases=("suggest",), args_hint="[accept|dismiss N | catalog]",
-               subcommands=("accept", "dismiss", "catalog", "clear")),
-    CommandDef("blueprint", "Set up an automation from a blueprint template",
-               "Tools & Skills", aliases=("bp",), args_hint="[name] [slot=value ...]"),
-    CommandDef("curator", "Background skill maintenance (status, run, pin, archive, list-archived)",
-               "Tools & Skills", args_hint="[subcommand]",
-               subcommands=("status", "run", "pause", "resume", "pin", "unpin", "restore", "list-archived")),
     CommandDef("kanban", "Multi-profile collaboration board (tasks, links, comments)",
                "Tools & Skills", args_hint="[subcommand]",
                subcommands=("init", "boards", "create", "list", "ls", "show", "assign",
@@ -312,10 +283,6 @@ COMMAND_REGISTRY: list[CommandDef] = [
                cli_only=True, aliases=("gateway",)),
     CommandDef("platform", "Pause, resume, or list a failing gateway platform", "Info",
                gateway_only=True, args_hint="<pause|resume|list> [name]"),
-    CommandDef("copy", "Copy the last assistant response to clipboard", "Info",
-               cli_only=True, args_hint="[number]"),
-    CommandDef("paste", "Attach clipboard image from your clipboard", "Info",
-               cli_only=True),
     CommandDef("image", "Attach a local image file for your next prompt", "Info",
                cli_only=True, args_hint="<path>"),
     CommandDef("update", "Update Hermes Agent to the latest version", "Info",
@@ -1523,7 +1490,7 @@ class SlashCommandCompleter(Completer):
     # These should NOT receive a trailing space in completions because:
     # - The TUI's submit handler applies completions on Enter if input differs
     # - Adding space makes "/model" → "/model " which blocks picker execution
-    _PICKER_COMMANDS = frozenset({"model", "skin", "personality"})
+    _PICKER_COMMANDS = frozenset({"model", "personality"})
 
     @staticmethod
     def _completion_text(cmd_name: str, word: str) -> str:
@@ -1534,7 +1501,7 @@ class SlashCommandCompleter(Completer):
         menu. Appending a trailing space keeps the dropdown visible and makes
         backspacing retrigger it naturally.
 
-        However, commands that open pickers (model, skin, personality) should
+        However, commands that open pickers (model, personality) should
         NOT get a trailing space — the TUI would apply the completion on Enter
         and block the picker from opening.
         """
@@ -1860,23 +1827,6 @@ class SlashCommandCompleter(Completer):
             )
 
     @staticmethod
-    def _skin_completions(sub_text: str, sub_lower: str):
-        """Yield completions for /skin from available skins."""
-        try:
-            from hermes_cli.skin_engine import list_skins
-            for s in list_skins():
-                name = s["name"]
-                if name.startswith(sub_lower) and name != sub_lower:
-                    yield Completion(
-                        name,
-                        start_position=-len(sub_text),
-                        display=name,
-                        display_meta=s.get("description", "") or s.get("source", ""),
-                    )
-        except Exception:
-            pass
-
-    @staticmethod
     def _tools_completions(sub_text: str, sub_lower: str):
         """Yield completions for /tools — subcommand + toolset/MCP-server name.
 
@@ -2003,13 +1953,9 @@ class SlashCommandCompleter(Completer):
     def _personality_completions(sub_text: str, sub_lower: str):
         """Yield completions for /personality from configured personalities."""
         try:
-            # Resolve from the same source the runtime applies personalities —
-            # agent.personalities via the CLI config (which ships the built-ins).
-            # load_config()'s schema has no agent.personalities, so the completer
-            # used to come back empty even with personalities available.
-            from cli import load_cli_config
+            from hermes_cli.config import load_config_readonly
 
-            personalities = (load_cli_config().get("agent") or {}).get("personalities", {}) or {}
+            personalities = (load_config_readonly().get("agent") or {}).get("personalities", {}) or {}
             if "none".startswith(sub_lower) and "none" != sub_lower:
                 yield Completion(
                     "none",
@@ -2064,9 +2010,6 @@ class SlashCommandCompleter(Completer):
 
             # Dynamic completions for commands with runtime lists
             if " " not in sub_text:
-                if base_cmd == "/skin":
-                    yield from self._skin_completions(sub_text, sub_lower)
-                    return
                 if base_cmd == "/personality":
                     yield from self._personality_completions(sub_text, sub_lower)
                     return

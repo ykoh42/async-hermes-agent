@@ -927,7 +927,7 @@ def run_doctor(args):
             check_ok("API key or custom endpoint configured")
         else:
             check_warn(f"No API key found in {_DHH}/.env")
-            issues.append("Run 'hermes setup' to configure API keys")
+            issues.append("Run 'hermes auth' to configure provider credentials")
     else:
         # Also check project root as fallback
         fallback_env = PROJECT_ROOT / '.env'
@@ -946,11 +946,11 @@ def run_doctor(args):
                 except OSError:
                     pass
                 check_ok(f"Created empty {_DHH}/.env")
-                check_info("Run 'hermes setup' to configure API keys")
+                check_info("Run 'hermes auth' to configure provider credentials")
                 fixed_count += 1
             else:
-                check_info("Run 'hermes setup' to create one")
-                issues.append("Run 'hermes setup' to create .env")
+                check_info("Create .env and add provider credentials")
+                issues.append("Create .env and add provider credentials")
     
     # Check ~/.hermes/config.yaml (primary) or project cli-config.yaml (fallback)
     config_path = HERMES_HOME / 'config.yaml'
@@ -980,11 +980,13 @@ def run_doctor(args):
             try:
                 from hermes_cli.config import get_compatible_custom_providers as _compatible_custom_providers
                 from hermes_cli.providers import (
+                    custom_provider_aliases as _custom_provider_aliases,
                     normalize_provider as _normalize_catalog_provider,
                     resolve_provider_full as _resolve_provider_full,
                 )
             except Exception:
                 _compatible_custom_providers = None
+                _custom_provider_aliases = None
                 _normalize_catalog_provider = None
                 _resolve_provider_full = None
 
@@ -1007,8 +1009,11 @@ def run_doctor(args):
                 if not isinstance(entry, dict):
                     continue
                 name = str(entry.get("name") or "").strip()
-                if name:
-                    known_providers.add("custom:" + name.lower().replace(" ", "-"))
+                provider_key = str(entry.get("provider_key") or "").strip()
+                if name and _custom_provider_aliases is not None:
+                    known_providers.update(
+                        _custom_provider_aliases(name, provider_key)
+                    )
 
             valid_provider_ids = set(known_providers)
             provider_ids_to_accept = {provider} if provider else set()
@@ -1134,10 +1139,10 @@ def run_doctor(args):
                     if not configured:
                         _fail_and_issue(
                             f"model.provider '{runtime_provider}' is set but no API key is configured",
-                            "(check ~/.hermes/.env or run 'hermes setup')",
+                            "(check ~/.hermes/.env or run 'hermes auth')",
                             (
                                 f"No credentials found for provider '{runtime_provider}'. "
-                                f"Run 'hermes setup' or set the provider's API key in {_DHH}/.env, "
+                                f"Run 'hermes auth' or set the provider's API key in {_DHH}/.env, "
                                 f"or switch providers with 'hermes config set model.provider <name>'"
                             ),
                             issues,
@@ -1184,9 +1189,9 @@ def run_doctor(args):
                         fixed_count += 1
                     except Exception as mig_err:
                         check_warn(f"Auto-migration failed: {mig_err}")
-                        issues.append("Run 'hermes setup' to migrate config")
+                        issues.append("Run 'hermes doctor --fix' to migrate config")
                 else:
-                    issues.append("Run 'hermes doctor --fix' or 'hermes setup' to migrate config")
+                    issues.append("Run 'hermes doctor --fix' to migrate config")
             else:
                 check_ok(f"Config version up to date (v{current_ver})")
         except Exception:
@@ -1994,31 +1999,12 @@ def run_doctor(args):
     # npm audit for all Node.js packages
     _npm_bin = _safe_which("npm")
     if _npm_bin:
-        # Each entry: (cwd, label, extra_audit_args)
-        # PROJECT_ROOT is audited with --workspaces=false so that the apps/*
-        # glob (which pulls in Electron, node-pty, etc.) is never resolved
-        # for a routine security check. The web and ui-tui workspaces are
-        # audited separately via --workspace flags. See #38772.
-        # The WhatsApp bridge may live under a writable HERMES_HOME mirror
-        # instead of the (possibly read-only) install tree in Docker — resolve
-        # it through the shared helper so we audit the dir that actually holds
-        # node_modules. See #49561.
-        try:
-            from gateway.platforms.whatsapp_common import resolve_whatsapp_bridge_dir
-            _whatsapp_bridge_dir = resolve_whatsapp_bridge_dir()
-        except Exception:
-            _whatsapp_bridge_dir = PROJECT_ROOT / "scripts" / "whatsapp-bridge"
+        # The repository workspace is the only Node package in this runtime.
         npm_audit_targets = [
             (PROJECT_ROOT, "Browser tools (agent-browser)", ["--workspaces=false"]),
-            (PROJECT_ROOT, "web workspace", ["--workspace", "web"]),
-            (PROJECT_ROOT, "ui-tui workspace", ["--workspace", "ui-tui"]),
-            (_whatsapp_bridge_dir, "WhatsApp bridge", []),
         ]
         for npm_dir, label, audit_extra in npm_audit_targets:
-            # For workspace-scoped audits run from PROJECT_ROOT the
-            # node_modules check must use the workspace root; standalone dirs
-            # (whatsapp-bridge) check their own node_modules.
-            check_dir = PROJECT_ROOT if audit_extra else npm_dir
+            check_dir = PROJECT_ROOT
             if not (check_dir / "node_modules").exists():
                 continue
             try:
@@ -2067,8 +2053,7 @@ def run_doctor(args):
                         f"({vuln_detail})"
                     )
                     if audit_extra and audit_extra[0] == "--workspace":
-                        # The web/ui-tui workspace advisories are in build-time
-                        # tooling (esbuild/vite, etc.), not runtime code that ships
+                        # Workspace advisories are in build-time tooling, not runtime code that ships
                         # to users. Manual npm remediation may error with a known
                         # arborist crash (edgesOut / isDescendantOf) on this monorepo
                         # tree — in that case it is an npm bug, not a Hermes one.
@@ -2550,7 +2535,7 @@ def run_doctor(args):
         # still show warnings above, but should not pollute the final summary.
         api_disabled = _missing_api_key_toolsets_for_summary(unavailable)
         if api_disabled:
-            issues.append("Run 'hermes setup' to configure missing API keys for full tool access")
+            issues.append("Run 'hermes auth' to configure missing provider credentials for full tool access")
     except Exception as e:
         check_warn("Could not check tool availability", f"({e})")
     
@@ -2629,14 +2614,14 @@ def run_doctor(args):
                         f"config file {_honcho_cfg_path} not found, using HONCHO_API_KEY env var",
                     )
                 else:
-                    check_warn("Honcho config not found", "run: hermes memory setup")
+                    check_warn("Honcho config not found", "configure HONCHO_API_KEY or the memory section")
             elif not hcfg.enabled:
                 check_info(f"Honcho disabled (set enabled: true in {_honcho_cfg_path} to activate)")
             elif not (hcfg.api_key or hcfg.base_url):
                 _fail_and_issue(
                     "Honcho API key or base URL not set",
-                    "run: hermes memory setup",
-                    "No Honcho API key — run 'hermes memory setup'",
+                    "configure HONCHO_API_KEY or the memory section",
+                    "No Honcho API key — configure HONCHO_API_KEY or the memory section",
                     issues,
                 )
             else:
@@ -2670,7 +2655,7 @@ def run_doctor(args):
             else:
                 _fail_and_issue(
                     "Mem0 API key not set",
-                    "(set MEM0_API_KEY in .env or run hermes memory setup)",
+                    "(set MEM0_API_KEY in .env or the memory section)",
                     "Mem0 is set as memory provider but API key is missing",
                     issues,
                 )
@@ -2693,7 +2678,7 @@ def run_doctor(args):
             elif _provider:
                 check_warn(f"{_active_memory_provider} configured but not available", "run: hermes memory status")
             else:
-                check_warn(f"{_active_memory_provider} plugin not found", "run: hermes memory setup")
+                check_warn(f"{_active_memory_provider} plugin not found", "install the provider plugin and configure it")
         except Exception as _e:
             check_warn(f"{_active_memory_provider} check failed", str(_e))
 

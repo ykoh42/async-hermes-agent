@@ -6,7 +6,6 @@ Also tests the vision_tools and browser_tool model override env vars.
 
 import os
 import sys
-from pathlib import Path
 from unittest.mock import patch, MagicMock, AsyncMock
 
 import pytest
@@ -116,50 +115,6 @@ class TestAuxiliaryConfigBridge:
 
 
 
-# ── Gateway bridge parity test ───────────────────────────────────────────────
-
-
-class TestGatewayBridgeCodeParity:
-    """Verify the gateway/run.py config bridge contains the auxiliary section."""
-
-    def test_gateway_has_auxiliary_bridge(self):
-        """The gateway config bridge must include auxiliary.* bridging.
-
-        After the plugin-aux-task API refactor (2026-05), gateway env-var
-        names are derived dynamically (``AUXILIARY_<KEY_UPPER>_*``) so the
-        literal strings ``AUXILIARY_VISION_PROVIDER`` etc. no longer appear
-        in source. Assert the dynamic shape and the canonical built-in keys
-        bridged set instead.
-        """
-        gateway_path = Path(__file__).parent.parent.parent / "gateway" / "run.py"
-        # Pin encoding to UTF-8: source files in this repo are UTF-8, but
-        # Path.read_text() defaults to the system locale — which is cp1252
-        # on most Western Windows installs and crashes as soon as the file
-        # contains any non-ASCII byte (e.g. an em-dash in a comment).
-        content = gateway_path.read_text(encoding="utf-8")
-        # Dynamic env-var derivation present
-        assert 'f"AUXILIARY_{_upper}_PROVIDER"' in content
-        assert 'f"AUXILIARY_{_upper}_MODEL"' in content
-        assert 'f"AUXILIARY_{_upper}_BASE_URL"' in content
-        assert 'f"AUXILIARY_{_upper}_API_KEY"' in content
-        # Built-in bridged keys present
-        assert "_aux_bridged_keys" in content
-        assert '"vision"' in content
-        assert '"web_extract"' in content
-        assert '"approval"' in content
-        # Plugin-aux-task discovery hooked into bridging
-        assert "get_plugin_auxiliary_tasks" in content
-
-    def test_gateway_no_compression_env_bridge(self):
-        """Gateway should NOT bridge compression config to env vars (config-only)."""
-        gateway_path = Path(__file__).parent.parent.parent / "gateway" / "run.py"
-        # See note in test_gateway_has_auxiliary_bridge — pin UTF-8 so the
-        # test runs on Windows where the default locale is cp1252.
-        content = gateway_path.read_text(encoding="utf-8")
-        assert "CONTEXT_COMPRESSION_PROVIDER" not in content
-        assert "CONTEXT_COMPRESSION_MODEL" not in content
-
-
 # ── Vision model override tests ──────────────────────────────────────────────
 
 
@@ -221,26 +176,3 @@ class TestDefaultConfigShape:
         assert "model" in web
         assert web["provider"] == "auto"
         assert web["model"] == ""
-
-
-# ── CLI defaults parity ─────────────────────────────────────────────────────
-
-
-class TestCLIDefaultsHaveAuxiliaryKeys:
-    """Verify cli.py load_cli_config() defaults dict does NOT include auxiliary
-    (it comes from config.yaml deep merge, not hardcoded defaults)."""
-
-    def test_cli_defaults_can_merge_auxiliary(self):
-        """The load_cli_config deep merge logic handles keys not in defaults.
-        Verify auxiliary would be picked up from config.yaml."""
-        # This is a structural assertion: cli.py's second-pass loop
-        # carries over keys from file_config that aren't in defaults.
-        # So auxiliary config from config.yaml gets merged even though
-        # cli.py's defaults dict doesn't define it.
-        import cli as _cli_mod
-        # See note in test_gateway_has_auxiliary_bridge — pin UTF-8 so the
-        # test runs on Windows where the default locale is cp1252.
-        source = Path(_cli_mod.__file__).read_text(encoding="utf-8")
-        assert "auxiliary_config = defaults.get(\"auxiliary\"" in source
-        assert "AUXILIARY_VISION_PROVIDER" in source
-        assert "AUXILIARY_VISION_MODEL" in source

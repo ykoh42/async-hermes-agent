@@ -50,7 +50,6 @@ DELEGATE_BLOCKED_TOOLS = frozenset(
         "clarify",  # no user interaction
         "memory",  # no writes to shared MEMORY.md
         "send_message",  # no cross-platform side effects
-        "cronjob",  # no scheduling more work in the parent's name
     ]
 )
 
@@ -68,7 +67,7 @@ DELEGATE_BLOCKED_TOOLS = frozenset(
 # via ThreadPoolExecutor(initializer=_set_subagent_approval_cb, initargs=(cb,)).
 # The callback is chosen by the `delegation.subagent_auto_approve` config:
 #   false (default) → _subagent_auto_deny (safe; matches leaf tool blocklist)
-#   true            → _subagent_auto_approve (opt-in YOLO for cron/batch)
+#   true            → _subagent_auto_approve (opt-in YOLO for batch work)
 # Both emit a logger.warning for audit; gateway sessions are unaffected
 # because they resolve approvals via tools/approval.py's per-session queue,
 # not through these TLS callbacks.
@@ -3618,26 +3617,16 @@ def _load_config() -> dict:
     rebuild via ``_get_max_concurrent_children``, so skipping the defensive
     deepcopy matters. Do NOT mutate the returned dict.
 
-    ``HERMES_IGNORE_USER_CONFIG=1`` (``hermes chat --ignore-user-config``) is
-    only honored by the legacy ``cli`` loader, not the shared one, so when the
-    flag is set we keep ``cli.CLI_CONFIG`` authoritative to preserve the
-    flag's contract of suppressing user config.yaml settings.
+    ``HERMES_IGNORE_USER_CONFIG=1`` suppresses user configuration for the
+    runtime, so delegation defaults to an empty configuration in that mode.
     """
-    prefer_legacy = os.environ.get("HERMES_IGNORE_USER_CONFIG") == "1"
-    if not prefer_legacy:
-        try:
-            from hermes_cli.config import load_config_readonly
-
-            full = load_config_readonly()
-            cfg = full.get("delegation") or {}
-            if isinstance(cfg, dict):
-                return cfg
-        except Exception:
-            pass
+    if os.environ.get("HERMES_IGNORE_USER_CONFIG") == "1":
+        return {}
     try:
-        from cli import CLI_CONFIG
+        from hermes_cli.config import load_config_readonly
 
-        cfg = CLI_CONFIG.get("delegation") or {}
+        full = load_config_readonly()
+        cfg = full.get("delegation") or {}
         return cfg if isinstance(cfg, dict) else {}
     except Exception:
         return {}
@@ -3724,8 +3713,8 @@ def _build_top_level_description() -> str:
         "- Single tool call -> just call the tool directly\n"
         "- Tasks needing user interaction -> subagents cannot use clarify\n"
         "- Durable long-running work that must outlive the current turn -> "
-        "use cronjob (action='create') or terminal(background=True, "
-        "notify_on_complete=True) instead. Background delegations are NOT "
+        "use terminal(background=True, notify_on_complete=True) instead. "
+        "Background delegations are NOT "
         "durable: if the parent session is closed (/new) or the process exits "
         "before a subagent finishes, that subagent's work is discarded, and "
         "/stop cancels every running background subagent.\n\n"

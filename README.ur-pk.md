@@ -1,9 +1,5 @@
 <div dir="rtl">
 
-<p align="center">
-  <img src="assets/banner.png" alt="Hermes Agent" width="100%">
-</p>
-
 # ہرمیس ایجنٹ ☤ (Hermes Agent)
 
 <p align="center">

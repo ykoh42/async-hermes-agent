@@ -475,8 +475,6 @@ def _run_agent_tool_execution_middleware(
 
         if function_name == "memory":
             agent._turns_since_memory = 0
-        elif function_name == "skill_manage":
-            agent._iters_since_skill = 0
 
         _advance_start_order(_begin)
         return execute(final_args)

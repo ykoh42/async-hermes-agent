@@ -488,7 +488,6 @@ def init_agent(
     notice_callback: callable = None,
     notice_clear_callback: callable = None,
     event_callback: Optional[Callable[[str, dict], None]] = None,
-    reaction_callback: Optional[Callable[[str], None]] = None,
     max_tokens: int = None,
     reasoning_config: Dict[str, Any] = None,
     service_tier: str = None,
@@ -752,7 +751,6 @@ def init_agent(
     agent.notice_callback = notice_callback
     agent.notice_clear_callback = notice_clear_callback
     agent.event_callback = event_callback
-    agent.reaction_callback = reaction_callback
     agent.tool_gen_callback = tool_gen_callback
 
     
@@ -1379,6 +1377,19 @@ def init_agent(
             print(f"🔄 Fallback chain ({len(agent._fallback_chain)} providers): " +
                   " → ".join(f"{f['model']} ({f['provider']})" for f in agent._fallback_chain))
 
+    # Discover configured MCP tools before taking the immutable tool snapshot.
+    # MCP is deliberately explicit here (rather than imported as a registry
+    # side effect) so the synchronous baseline has deterministic startup and
+    # callers can still opt out by leaving ``mcp_servers`` empty.
+    try:
+        from hermes_cli.config import load_config_readonly as _load_mcp_cfg
+        _mcp_cfg = _load_mcp_cfg()
+        if isinstance(_mcp_cfg, dict) and _mcp_cfg.get("mcp_servers"):
+            from tools.mcp_tool import discover_mcp_tools
+            discover_mcp_tools()
+    except Exception:
+        logger.debug("MCP discovery skipped during agent initialization", exc_info=True)
+
     # Get available tools with filtering. Capture the registry generation this
     # snapshot is derived from FIRST, so a later concurrent refresh can tell
     # whether it holds a newer or staler view (see refresh_agent_mcp_tools).
@@ -1606,109 +1617,36 @@ def init_agent(
     agent._memory_nudge_interval = 10
     agent._turns_since_memory = 0
     agent._iters_since_skill = 0
-    # A flush/background agent may pass skip_memory=True to avoid spinning up an
-    # external memory *provider*, but if the caller also explicitly enables the
-    # "memory" toolset it still needs the built-in file-backed store — otherwise
-    # the memory tool dispatches with store=None and every call fails (#65429).
-    # So the built-in store is created unless memory is globally disabled, while
-    # the external-provider block below stays gated on skip_memory.
+    # ``skip_memory`` suppresses the persistent store for isolated batch
+    # samples, but an explicitly requested memory tool still needs a store so
+    # its calls can be represented in the trajectory.
     _memory_toolset_requested = "memory" in (agent.enabled_toolsets or [])
     if not skip_memory or _memory_toolset_requested:
         try:
             mem_config = _agent_cfg.get("memory", {})
-            agent._memory_enabled = mem_config.get("memory_enabled", False)
-            agent._user_profile_enabled = mem_config.get("user_profile_enabled", False)
+            if not isinstance(mem_config, dict):
+                mem_config = {}
+            agent._memory_enabled = bool(mem_config.get("memory_enabled", False))
+            agent._user_profile_enabled = bool(mem_config.get("user_profile_enabled", False))
             agent._memory_nudge_interval = int(mem_config.get("nudge_interval", 10))
             if agent._memory_enabled or agent._user_profile_enabled:
                 from tools.memory_tool import MemoryStore
+
                 agent._memory_store = MemoryStore(
                     memory_char_limit=mem_config.get("memory_char_limit", 2200),
                     user_char_limit=mem_config.get("user_char_limit", 1375),
                 )
                 agent._memory_store.load_from_disk()
         except Exception:
-            pass  # Memory is optional -- don't break agent init
-    
+            logger.debug("Persistent memory initialization skipped", exc_info=True)
 
-
-    # Memory provider plugin (external — one at a time, alongside built-in)
-    # Reads memory.provider from config to select which plugin to activate.
+    # External memory providers are optional extensions.  The built-in
+    # file-backed USER.md/MEMORY.md path above remains available even when no
+    # provider plugin is installed.
     agent._memory_manager = None
-    if not skip_memory:
-        try:
-            _mem_provider_name = mem_config.get("provider", "") if mem_config else ""
-
-            if _mem_provider_name and _mem_provider_name.strip():
-                from agent.memory_manager import MemoryManager as _MemoryManager
-                from plugins.memory import load_memory_provider as _load_mem
-                agent._memory_manager = _MemoryManager()
-                _mp = _load_mem(_mem_provider_name)
-                if _mp and _mp.is_available():
-                    agent._memory_manager.add_provider(_mp)
-                if agent._memory_manager.providers:
-                    _init_kwargs = {
-                        "session_id": agent.session_id,
-                        "platform": platform or "cli",
-                        "hermes_home": str(get_hermes_home()),
-                        "agent_context": "primary",
-                    }
-                    if _init_kwargs["platform"] == "cli":
-                        _init_kwargs["warning_callback"] = agent._emit_warning
-                        _init_kwargs["status_callback"] = agent._emit_status
-                    # Thread session title for memory provider scoping
-                    # (e.g. honcho uses this to derive chat-scoped session keys)
-                    if agent._session_db:
-                        try:
-                            _st = agent._session_db.get_session_title(agent.session_id)
-                            if _st:
-                                _init_kwargs["session_title"] = _st
-                        except Exception:
-                            pass
-                    # Thread gateway user identity for per-user memory scoping
-                    if agent._user_id:
-                        _init_kwargs["user_id"] = agent._user_id
-                    if agent._user_id_alt:
-                        _init_kwargs["user_id_alt"] = agent._user_id_alt
-                    if agent._user_name:
-                        _init_kwargs["user_name"] = agent._user_name
-                    if agent._chat_id:
-                        _init_kwargs["chat_id"] = agent._chat_id
-                    if agent._chat_name:
-                        _init_kwargs["chat_name"] = agent._chat_name
-                    if agent._chat_type:
-                        _init_kwargs["chat_type"] = agent._chat_type
-                    if agent._thread_id:
-                        _init_kwargs["thread_id"] = agent._thread_id
-                    # Thread gateway session key for stable per-chat Honcho session isolation
-                    if agent._gateway_session_key:
-                        _init_kwargs["gateway_session_key"] = agent._gateway_session_key
-                    # Profile identity for per-profile provider scoping
-                    try:
-                        from hermes_cli.profiles import get_active_profile_name
-                        _profile = get_active_profile_name()
-                        _init_kwargs["agent_identity"] = _profile
-                        _init_kwargs["agent_workspace"] = "hermes"
-                    except Exception:
-                        pass
-                    agent._memory_manager.initialize_all(**_init_kwargs)
-                    _ra().logger.info("Memory provider '%s' activated", _mem_provider_name)
-                else:
-                    _ra().logger.debug("Memory provider '%s' not found or not available", _mem_provider_name)
-                    agent._memory_manager = None
-        except Exception as _mpe:
-            _ra().logger.warning("Memory provider plugin init failed: %s", _mpe)
-            agent._memory_manager = None
 
     from agent.memory_manager import inject_memory_provider_tools as _inject_memory_provider_tools
     _inject_memory_provider_tools(agent)
-
-    # Skills config: nudge interval for skill creation reminders
-    agent._skill_nudge_interval = 10
-    try:
-        skills_config = _agent_cfg.get("skills", {})
-        agent._skill_nudge_interval = int(skills_config.get("creation_nudge_interval", 10))
-    except Exception:
-        pass
 
     # Tool-use enforcement config: "auto" (default — matches hardcoded
     # model list), true (always), false (never), or list of substrings.
@@ -1745,7 +1683,13 @@ def init_agent(
     # prompt build, which sits on the time-to-first-token critical path.
     # The warm runs during agent init (network/credential setup dominates),
     # so by the time the first prompt is built the line is already cached.
-    if agent._environment_probe:
+    # Training/batch agents commonly set ``skip_context_files`` and build
+    # prompts synchronously.  Do not leave a probe subprocess/thread running
+    # in that mode: besides being unnecessary for trajectory generation, its
+    # subprocess wait loop can interfere with callers that intentionally
+    # patch ``time.sleep`` around the core tool loop.  Interactive agents keep
+    # the existing warm-up behavior.
+    if agent._environment_probe and not agent.skip_context_files:
         try:
             from tools.env_probe import warm_environment_probe_async
             warm_environment_probe_async()
@@ -1962,6 +1906,31 @@ def init_agent(
     # load_config failure → {}), re-arming the pre-lease drift abort.
     compression_in_place = is_truthy_value(
         _compression_cfg.get("in_place"), default=True
+    )
+    # Opt-in (default False): a micro-compaction pass rewrites already-sent
+    # history every turn, which breaks the provider prompt-cache prefix on a
+    # per-turn cadence rather than at an episodic boundary. That is the cost
+    # `proactive_prune_min_reclaim_tokens` exists to amortize, so the feature
+    # stays off until an operator opts in and accepts the tradeoff.
+    compression_micro_compact = is_truthy_value(
+        _compression_cfg.get("micro_compact"), default=False
+    )
+    # How often a pass runs, in completed turns. Each pass rewrites
+    # already-sent history and costs one prompt-cache break, so this is the
+    # dial for how often that cost is paid: 1 = every turn (most aggressive
+    # reclaim), 5 = one break per five turns. Clamped to >= 1.
+    compression_micro_compact_every_n_turns = max(
+        1,
+        _parse_prune_int(_compression_cfg.get("micro_compact_every_n_turns", 1), 1),
+    )
+    # Rolling-summary defrag threshold, in tokens. Lived on the compressor as
+    # a hardcoded attribute with no path from config until now.
+    compression_micro_compact_defrag_tokens = max(
+        1,
+        _parse_prune_int(
+            _compression_cfg.get("micro_compact_defrag_threshold_tokens", 2000),
+            2000,
+        ),
     )
     codex_app_server_auto_compaction = str(
         _compression_cfg.get("codex_app_server_auto", "native") or "native"
@@ -2418,6 +2387,16 @@ def init_agent(
             pass
     agent.compression_enabled = compression_enabled
     agent.compression_in_place = compression_in_place
+    # Apply micro-compaction settings to the compressor (feature is opt-in)
+    _cc = getattr(agent, "context_compressor", None)
+    if _cc is not None and hasattr(_cc, "_micro_compact_enabled"):
+        _cc._micro_compact_enabled = compression_micro_compact
+    if _cc is not None and hasattr(_cc, "_micro_compact_every_n_turns"):
+        _cc._micro_compact_every_n_turns = compression_micro_compact_every_n_turns
+    if _cc is not None and hasattr(_cc, "_micro_compact_defrag_threshold_tokens"):
+        _cc._micro_compact_defrag_threshold_tokens = (
+            compression_micro_compact_defrag_tokens
+        )
     agent.codex_app_server_auto_compaction = codex_app_server_auto_compaction
     agent.max_compression_attempts = compression_max_attempts
     agent.compression_idle_compact_after_seconds = (

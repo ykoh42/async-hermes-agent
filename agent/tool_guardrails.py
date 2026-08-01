@@ -53,7 +53,6 @@ MUTATING_TOOL_NAMES = frozenset(
         "browser_scroll",
         "browser_navigate",
         "send_message",
-        "cronjob",
         "delegate_task",
         "process",
     }
