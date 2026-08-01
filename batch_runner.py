@@ -36,10 +36,11 @@ import asyncio
 import logging
 import os
 import time
+import inspect
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
 from datetime import datetime
-from multiprocessing import Pool, Lock
+from threading import Lock
 import traceback
 from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeRemainingColumn, MofNCompleteColumn
 from rich.console import Console
@@ -273,7 +274,62 @@ def _extract_reasoning_stats(messages: List[Dict[str, Any]]) -> Dict[str, int]:
     }
 
 
-def _process_single_prompt(
+async def _check_container_image(container_image: str, prompt_index: int, config: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Check/pull a Docker image without blocking the event loop.
+
+    The batch scheduler is asyncio-native, so even the optional preflight
+    subprocess must use the asynchronous subprocess API.  ``None`` means the
+    image is ready (or the configured backend does not need a local check).
+    A result dictionary is returned only for a terminal preflight failure.
+    """
+    if os.getenv("TERMINAL_ENV", "local") != "docker":
+        return None
+
+    try:
+        probe = await asyncio.wait_for(
+            asyncio.create_subprocess_exec(
+                "docker", "image", "inspect", container_image,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            ),
+            timeout=10,
+        )
+        _, _ = await asyncio.wait_for(probe.communicate(), timeout=10)
+        if probe.returncode == 0:
+            return None
+
+        if config.get("verbose"):
+            print(f"   Prompt {prompt_index}: Pulling docker image {container_image}...", flush=True)
+        pull = await asyncio.wait_for(
+            asyncio.create_subprocess_exec(
+                "docker", "pull", container_image,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            ),
+            timeout=600,
+        )
+        _, stderr = await asyncio.wait_for(pull.communicate(), timeout=600)
+        if pull.returncode != 0:
+            error_text = stderr.decode("utf-8", errors="replace")[:500]
+            return {
+                "success": False,
+                "prompt_index": prompt_index,
+                "error": f"Docker image not available: {container_image}\n{error_text}",
+                "trajectory": None,
+                "tool_stats": {},
+                "toolsets_used": [],
+                "metadata": {"timestamp": datetime.now().isoformat()},
+            }
+    except FileNotFoundError:
+        # Docker CLI is optional (for example when the backend is Modal).
+        return None
+    except Exception as img_err:
+        if config.get("verbose"):
+            print(f"   Prompt {prompt_index}: Docker image check failed: {img_err}", flush=True)
+    return None
+
+
+async def _process_single_prompt(
     prompt_index: int,
     prompt_data: Dict[str, Any],
     batch_num: int,
@@ -301,36 +357,10 @@ def _process_single_prompt(
         # Verify the image is accessible before spending tokens on the agent loop.
         # For Docker: check local cache, then try pulling.
         # For Modal: skip local check (Modal pulls server-side).
-        env_type = os.getenv("TERMINAL_ENV", "local")
-        if env_type == "docker":
-            import subprocess as _sp
-            try:
-                probe = _sp.run(
-                    ["docker", "image", "inspect", container_image],
-                    capture_output=True, timeout=10,
-                )
-                if probe.returncode != 0:
-                    if config.get("verbose"):
-                        print(f"   Prompt {prompt_index}: Pulling docker image {container_image}...", flush=True)
-                    pull = _sp.run(
-                        ["docker", "pull", container_image],
-                        capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=600,
-                    )
-                    if pull.returncode != 0:
-                        return {
-                            "success": False,
-                            "prompt_index": prompt_index,
-                            "error": f"Docker image not available: {container_image}\n{pull.stderr[:500]}",
-                            "trajectory": None,
-                            "tool_stats": {},
-                            "toolsets_used": [],
-                            "metadata": {"batch_num": batch_num, "timestamp": datetime.now().isoformat()},
-                        }
-            except FileNotFoundError:
-                pass  # Docker CLI not installed — skip check (e.g., Modal backend)
-            except Exception as img_err:
-                if config.get("verbose"):
-                    print(f"   Prompt {prompt_index}: Docker image check failed: {img_err}", flush=True)
+        preflight_failure = await _check_container_image(container_image, prompt_index, config)
+        if preflight_failure is not None:
+            preflight_failure["metadata"]["batch_num"] = batch_num
+            return preflight_failure
 
         from tools.terminal_tool import register_task_env_overrides
         overrides = {
@@ -380,7 +410,7 @@ def _process_single_prompt(
         )
 
         # Run the agent with task_id to ensure each task gets its own isolated VM
-        result = asyncio.run(agent.run_conversation(prompt, task_id=task_id))
+        result = await agent.run_conversation(prompt, task_id=task_id)
         
         # Extract tool usage statistics
         tool_stats = _extract_tool_stats(result["messages"])
@@ -431,7 +461,7 @@ def _process_single_prompt(
         }
 
 
-def _process_batch_worker(args: Tuple) -> Dict[str, Any]:
+async def _process_batch_worker_async(args: Tuple) -> Dict[str, Any]:
     """
     Worker function to process a single batch of prompts.
     
@@ -482,6 +512,8 @@ def _process_batch_worker(args: Tuple) -> Dict[str, Any]:
             batch_num,
             config
         )
+        if inspect.isawaitable(result):
+            result = await result
         
         # Save trajectory if successful
         if result["success"] and result["trajectory"]:
@@ -556,6 +588,17 @@ def _process_batch_worker(args: Tuple) -> Dict[str, Any]:
         "discarded_no_reasoning": discarded_no_reasoning,
         "completed_prompts": completed_in_batch
     }
+
+
+def _process_batch_worker(args: Tuple) -> Dict[str, Any]:
+    """Synchronous compatibility seam for legacy unit tests/tools.
+
+    The production scheduler calls :func:`_process_batch_worker_async`
+    directly.  Keeping this private helper avoids forcing old, stand-alone
+    test utilities to create an event loop; it is not part of the async agent
+    package API.
+    """
+    return asyncio.run(_process_batch_worker_async(args))
 
 
 class BatchRunner:
@@ -841,7 +884,7 @@ class BatchRunner:
         
         return filtered_dataset, skipped_indices
     
-    def run(self, resume: bool = False):
+    async def run(self, resume: bool = False):
         """
         Run the batch processing pipeline.
         
@@ -896,21 +939,18 @@ class BatchRunner:
                 "last_updated": None
             }
         
-        # Prepare configuration for workers.
+        # Prepare configuration for batch tasks.
         #
         # ``self.api_key`` may be a zero-arg callable (Azure Foundry Entra ID
-        # bearer provider returned by ``agent.azure_identity_adapter``). Such
-        # closures are not safely picklable across the multiprocessing.Pool
-        # boundary. Drop the callable here and let each worker rebuild its
-        # own provider via ``resolve_runtime_provider()``, which reads
-        # ``model.auth_mode`` from ``config.yaml`` and constructs a fresh
-        # token provider in the worker process (azure-identity caches
-        # in-process so each worker gets its own short-lived cache).
+        # bearer provider returned by ``agent.azure_identity_adapter``). Batch
+        # tasks share the event loop, so keep the callable out of the task
+        # configuration and let the agent resolve credentials from config when
+        # needed, just as the old process worker did.
         if callable(self.api_key) and not isinstance(self.api_key, str):
             worker_api_key = None
             print(
-                "ℹ️  Detected Entra ID bearer provider — workers will rebuild "
-                "credentials from config.yaml in each process.",
+                "ℹ️  Detected Entra ID bearer provider — batch tasks will rebuild "
+                "credentials from config.yaml.",
                 flush=True,
             )
         else:
@@ -943,80 +983,89 @@ class BatchRunner:
         
         start_time = time.time()
         
-        print(f"\n🔧 Initializing {self.num_workers} worker processes...")
-        
-        # Checkpoint writes happen in the parent process; keep a lock for safety.
-        checkpoint_lock = Lock()
+        print(f"\n🔧 Initializing {self.num_workers} async batch workers...")
 
-        # Process batches in parallel
-        with Pool(processes=self.num_workers) as pool:
-            # Create tasks for each batch
-            tasks = [
-                (
-                    batch_num,
-                    batch_data,
-                    str(self.output_dir),  # Convert Path to string for pickling
-                    completed_prompts_set,
-                    config
-                )
-                for batch_num, batch_data in enumerate(self.batches)
-            ]
-            
-            print(f"✅ Created {len(tasks)} batch tasks")
-            print("🚀 Starting parallel batch processing...\n")
-            
-            # Use rich Progress for better visual tracking with persistent bottom bar
-            # redirect_stdout/stderr lets rich manage all output so progress bar stays clean
-            results = []
-            console = Console(force_terminal=True)
-            with Progress(
-                SpinnerColumn(),
-                TextColumn("[bold blue]📦 Batches"),
-                BarColumn(bar_width=40),
-                MofNCompleteColumn(),
-                TextColumn("•"),
-                TimeRemainingColumn(),
-                console=console,
-                refresh_per_second=2,
-                transient=False,
-                redirect_stdout=False,
-                redirect_stderr=False,
-            ) as progress:
-                task = progress.add_task("Processing", total=len(tasks))
-                
-                # Temporarily suppress DEBUG logging to avoid bar interference
-                root_logger = logging.getLogger()
-                original_level = root_logger.level
-                root_logger.setLevel(logging.WARNING)
-                
-                try:
-                    for result in pool.imap_unordered(_process_batch_worker, tasks):
-                        results.append(result)
-                        progress.update(task, advance=1)
+        # Each worker is an asyncio task.  A worker processes the prompts in
+        # its batch sequentially (preserving per-batch JSONL ordering), while
+        # up to ``num_workers`` batches overlap their model/tool I/O.  Nothing
+        # wraps the agent loop in ``to_thread``.
+        tasks = [
+            (
+                batch_num,
+                batch_data,
+                str(self.output_dir),
+                completed_prompts_set,
+                config,
+            )
+            for batch_num, batch_data in enumerate(self.batches)
+        ]
+        print(f"✅ Created {len(tasks)} async batch tasks")
+        print("🚀 Starting async batch processing...\n")
 
-                        # Incremental checkpoint update (so resume works after crash)
-                        try:
-                            batch_num = result.get('batch_num')
-                            completed = result.get('completed_prompts', []) or []
-                            completed_prompts_set.update(completed)
+        semaphore = asyncio.Semaphore(max(1, self.num_workers))
 
-                            if isinstance(batch_num, int):
-                                checkpoint_data.setdefault('batch_stats', {})[str(batch_num)] = {
-                                    'processed': result.get('processed', 0),
-                                    'skipped': result.get('skipped', 0),
-                                    'discarded_no_reasoning': result.get('discarded_no_reasoning', 0),
-                                }
+        async def run_batch(task_args: Tuple) -> Dict[str, Any]:
+            async with semaphore:
+                return await _process_batch_worker_async(task_args)
 
-                            checkpoint_data['completed_prompts'] = sorted(completed_prompts_set)
-                            self._save_checkpoint(checkpoint_data, lock=checkpoint_lock)
-                        except Exception as ckpt_err:
-                            # Don't fail the run if checkpoint write fails
-                            print(f"⚠️  Warning: Failed to save incremental checkpoint: {ckpt_err}")
-                except Exception as e:
-                    logger.error("Batch worker failed: %s", e, exc_info=True)
-                    raise
-                finally:
-                    root_logger.setLevel(original_level)
+        batch_tasks = [asyncio.create_task(run_batch(task_args)) for task_args in tasks]
+        results = []
+        console = Console(force_terminal=True)
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[bold blue]📦 Batches"),
+            BarColumn(bar_width=40),
+            MofNCompleteColumn(),
+            TextColumn("•"),
+            TimeRemainingColumn(),
+            console=console,
+            refresh_per_second=2,
+            transient=False,
+            redirect_stdout=False,
+            redirect_stderr=False,
+        ) as progress:
+            progress_task = progress.add_task("Processing", total=len(batch_tasks))
+            root_logger = logging.getLogger()
+            original_level = root_logger.level
+            root_logger.setLevel(logging.WARNING)
+            try:
+                for completed_task in asyncio.as_completed(batch_tasks):
+                    try:
+                        result = await completed_task
+                    except Exception as exc:
+                        logger.error("Async batch worker failed: %s", exc, exc_info=True)
+                        for pending in batch_tasks:
+                            if not pending.done():
+                                pending.cancel()
+                        await asyncio.gather(*batch_tasks, return_exceptions=True)
+                        raise
+
+                    results.append(result)
+                    progress.update(progress_task, advance=1)
+
+                    # Checkpoint writes happen only in this parent coroutine,
+                    # so no process/thread lock is needed.  The atomic write is
+                    # a deliberately narrow synchronous filesystem boundary;
+                    # model and tool execution remain on the event loop.
+                    try:
+                        batch_num = result.get("batch_num")
+                        completed = result.get("completed_prompts", []) or []
+                        completed_prompts_set.update(completed)
+
+                        if isinstance(batch_num, int):
+                            checkpoint_data.setdefault("batch_stats", {})[str(batch_num)] = {
+                                "processed": result.get("processed", 0),
+                                "skipped": result.get("skipped", 0),
+                                "discarded_no_reasoning": result.get("discarded_no_reasoning", 0),
+                            }
+
+                        checkpoint_data["completed_prompts"] = sorted(completed_prompts_set)
+                        self._save_checkpoint(checkpoint_data)
+                    except Exception as ckpt_err:
+                        # Don't fail the run if checkpoint write fails.
+                        print(f"⚠️  Warning: Failed to save incremental checkpoint: {ckpt_err}")
+            finally:
+                root_logger.setLevel(original_level)
         
         # Aggregate all batch statistics and update checkpoint
         total_reasoning_stats = {"total_assistant_turns": 0, "turns_with_reasoning": 0, "turns_without_reasoning": 0}
@@ -1042,7 +1091,7 @@ class BatchRunner:
         # Save final checkpoint (best-effort; incremental writes already happened)
         try:
             checkpoint_data["completed_prompts"] = sorted(completed_prompts_set)
-            self._save_checkpoint(checkpoint_data, lock=checkpoint_lock)
+            self._save_checkpoint(checkpoint_data)
         except Exception as ckpt_err:
             print(f"âš ï¸  Warning: Failed to save final checkpoint: {ckpt_err}")
         
@@ -1341,7 +1390,7 @@ def main(
             max_samples=max_samples,
         )
 
-        runner.run(resume=resume)
+        asyncio.run(runner.run(resume=resume))
     
     except Exception as e:
         print(f"\n❌ Fatal error: {e}")
