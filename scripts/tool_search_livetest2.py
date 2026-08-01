@@ -11,6 +11,7 @@ Runs each scenario N_REPS times in each mode (on/off). Output:
 """
 from __future__ import annotations
 
+import asyncio
 import json, os, shutil, sys, tempfile, time, traceback
 from pathlib import Path
 from typing import Any, Dict, List
@@ -56,7 +57,7 @@ SCENARIOS: List[Dict[str, Any]] = base.SCENARIOS + [
 ]
 
 
-def run_one(scenario: Dict[str, Any], mode: str, rep: int, out_dir: Path) -> Dict[str, Any]:
+async def run_one(scenario: Dict[str, Any], mode: str, rep: int, out_dir: Path) -> Dict[str, Any]:
     """mode: 'enabled' (bare bridge) | 'listing' (bridge + catalog listing) | 'disabled' (eager)."""
     enabled = mode in ("enabled", "listing")
     hermes_home = base.setup_isolated_home(enabled, listing=("auto" if mode == "listing" else "off"))
@@ -125,7 +126,7 @@ def run_one(scenario: Dict[str, Any], mode: str, rep: int, out_dir: Path) -> Dic
                 pass
             return cu
         _cl.normalize_usage = _norm_spy
-        result = agent.run_conversation(
+        result = await agent.run_conversation(
             user_message=scenario["prompt"],
             system_message=("You are a test agent. Complete the user's task using available "
                             "tools. Be concise; don't add commentary beyond what's needed."),
@@ -192,7 +193,7 @@ def run_one(scenario: Dict[str, Any], mode: str, rep: int, out_dir: Path) -> Dic
     return rec
 
 
-def main():
+async def main():
     out_dir = _THIS_DIR / "out2"
     out_dir.mkdir(exist_ok=True)
     modes = [m for m in os.environ.get("TS_BENCH_MODES", "enabled,listing,disabled").split(",") if m]
@@ -200,7 +201,7 @@ def main():
     for scenario in SCENARIOS:
         for mode in modes:
             for rep in range(1, N_REPS + 1):
-                rec = run_one(scenario, mode, rep, out_dir)
+                rec = await run_one(scenario, mode, rep, out_dir)
                 print(f"{scenario['id']:24} {mode:8} rep{rep}: "
                       f"api={rec['api_calls']} in={rec['prompt_tokens_total']:>7} "
                       f"out={rec['completion_tokens_total']:>5} cached={rec['cached_tokens_total']:>7} "
@@ -215,4 +216,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
