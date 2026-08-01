@@ -345,6 +345,7 @@ py-modules = [
   "model_tools",
   "toolsets",
   "batch_runner",
+  "async_service",
   "trajectory_compressor",
   "toolset_distributions",
   "hermes_bootstrap",
