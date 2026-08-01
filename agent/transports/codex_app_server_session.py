@@ -265,9 +265,10 @@ class _ServerRequestRouting:
 class CodexAppServerSession:
     """One Codex thread per Hermes session, lifetime owned by AIAgent.
 
-    Not thread-safe — one caller drives it at a time, matching how AIAgent's
-    run_conversation() loop is structured today. The codex client itself can
-    handle interleaved reads/writes via its own threads, but the adapter's
+    Not thread-safe — one caller drives it at a time. The async AIAgent path
+    treats this optional adapter as a compatibility boundary while the native
+    Responses transport handles coroutine-native calls. The codex client itself
+    can handle interleaved reads/writes via its own threads, but the adapter's
     state (projector, thread_id, turn counter) is owned by the caller thread.
     """
 

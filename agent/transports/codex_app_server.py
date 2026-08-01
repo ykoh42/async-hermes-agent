@@ -62,10 +62,11 @@ class CodexAppServerClient:
       - One reader thread captures stderr for diagnostics; codex emits
         tracing logs there at RUST_LOG-controlled levels.
 
-    Intentionally NOT async. AIAgent.run_conversation() is synchronous and
-    runs on the main thread; layering asyncio just to drive a stdio child
-    creates surprising interrupt semantics. We use blocking queues with
-    timeouts and rely on `turn/interrupt` for cancellation.
+    Intentionally remains a synchronous transport. The async AIAgent boundary
+    isolates this optional app-server mode behind its compatibility adapter;
+    layering asyncio into the blocking stdio protocol would change interrupt
+    semantics. We use blocking queues with timeouts and rely on
+    ``turn/interrupt`` for cancellation.
     """
 
     def __init__(
