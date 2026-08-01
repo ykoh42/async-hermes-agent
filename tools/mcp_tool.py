@@ -4519,6 +4519,56 @@ def _run_on_mcp_loop(coro_or_factory, timeout: float = 30):
             continue
 
 
+async def _run_on_mcp_loop_async(coro_or_factory, timeout: float = 30):
+    """Await MCP work scheduled on the dedicated MCP event loop.
+
+    The MCP SDK keeps long-lived transport contexts on ``_mcp_loop``.  Async
+    Hermes callers therefore bridge with ``asyncio.wrap_future`` rather than
+    blocking on ``Future.result()`` or dispatching the whole tool through a
+    worker thread.  The timeout/cancellation boundary is limited to this
+    cross-loop RPC and does not surround the conversation loop.
+    """
+    from tools.interrupt import is_interrupted
+    from agent.async_utils import safe_schedule_threadsafe
+
+    with _lock:
+        loop = _mcp_loop
+    if loop is None or not loop.is_running():
+        if asyncio.iscoroutine(coro_or_factory):
+            coro_or_factory.close()
+        raise RuntimeError("MCP event loop is not running")
+
+    if is_interrupted():
+        raise InterruptedError("User sent a new message")
+
+    coro = coro_or_factory() if callable(coro_or_factory) else coro_or_factory
+    coro = _wrap_with_home_override(coro)
+    coro = _wrap_with_dashboard_oauth_flow(coro)
+    future = safe_schedule_threadsafe(
+        coro,
+        loop,
+        logger=logger,
+        log_message="MCP scheduling failed",
+    )
+    if future is None:
+        raise RuntimeError("MCP event loop unavailable (failed to schedule)")
+
+    wrapped = asyncio.wrap_future(future)
+    try:
+        if timeout is None:
+            return await wrapped
+        return await asyncio.wait_for(wrapped, timeout=float(timeout))
+    except asyncio.TimeoutError as exc:
+        future.cancel()
+        raise TimeoutError(
+            f"MCP call timed out after {float(timeout):.1f}s "
+            f"(configured timeout: {float(timeout):.1f}s)"
+        ) from exc
+    except asyncio.CancelledError:
+        future.cancel()
+        raise
+
+
 def _interrupted_call_result() -> str:
     """Standardized JSON error for a user-interrupted MCP tool call."""
     return tool_error("MCP call interrupted: user sent a new message")
@@ -4722,6 +4772,81 @@ def _mark_server_call_started(server: Any) -> None:
     mark_tool_call = getattr(server, "mark_tool_call", None)
     if callable(mark_tool_call):
         mark_tool_call()
+
+
+async def _call_mcp_tool_async(
+    server_name: str,
+    tool_name: str,
+    server: Any,
+    args: dict,
+) -> str:
+    """Perform and render one MCP ``tools/call`` RPC on the MCP loop."""
+    _mark_server_call_started(server)
+    async with server._rpc_lock:
+        # Snapshot the agent's context so an elicitation callback triggered
+        # during this call can replay the gateway platform/session context.
+        server._pending_call_context = contextvars.copy_context()
+        try:
+            result = await server.session.call_tool(tool_name, arguments=args)
+        finally:
+            server._pending_call_context = None
+
+    _mark_proven = getattr(server, "_mark_session_proven", None)
+    if _mark_proven is not None:
+        _mark_proven()
+
+    if result.isError:
+        error_text = ""
+        for block in (result.content or []):
+            if getattr(block, "text", None):
+                error_text += block.text
+                continue
+            res_text = getattr(getattr(block, "resource", None), "text", None)
+            if res_text:
+                error_text += str(res_text)
+        return tool_error(_sanitize_error(error_text or "MCP tool returned an error"))
+
+    parts: List[str] = []
+    for block in (result.content or []):
+        if hasattr(block, "text") and block.text:
+            parts.append(block.text)
+            continue
+        image_tag = _cache_mcp_image_block(block)
+        if image_tag:
+            parts.append(image_tag)
+            continue
+        audio_tag = _cache_mcp_audio_block(block)
+        if audio_tag:
+            parts.append(audio_tag)
+            continue
+        resource_text = _render_mcp_resource_block(block, server_name)
+        if resource_text:
+            parts.append(resource_text)
+            continue
+        block_type = getattr(block, "type", None) or type(block).__name__
+        if block_type in {"text", "resource", "audio", "image"}:
+            logger.debug(
+                "MCP %s: content block type %r rendered empty",
+                server_name,
+                block_type,
+            )
+        else:
+            logger.warning(
+                "MCP %s: dropping unsupported content block type %r",
+                server_name,
+                block_type,
+            )
+
+    text_result = "\n".join(parts) if parts else ""
+    structured = getattr(result, "structuredContent", None)
+    if structured is not None:
+        if text_result:
+            return json.dumps(
+                {"result": text_result, "structuredContent": structured},
+                ensure_ascii=False,
+            )
+        return json.dumps({"result": structured}, ensure_ascii=False)
+    return json.dumps({"result": text_result}, ensure_ascii=False)
 
 
 def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
@@ -4935,6 +5060,105 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
             return tool_error(_sanitize_error(
                 f"MCP call failed: {type(exc).__name__}: {_exc_str(exc)}"
             ))
+
+    return _handler
+
+
+def _make_async_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
+    """Return a coroutine-native handler for a discovered MCP tool."""
+
+    async def _handler(args: dict, **kwargs) -> str:
+        if _server_error_counts.get(server_name, 0) >= _CIRCUIT_BREAKER_THRESHOLD:
+            opened_at = _server_breaker_opened_at.get(server_name, 0.0)
+            age = time.monotonic() - opened_at
+            if age < _CIRCUIT_BREAKER_COOLDOWN_SEC:
+                remaining = max(1, int(_CIRCUIT_BREAKER_COOLDOWN_SEC - age))
+                return tool_error(
+                    f"MCP server '{server_name}' is unreachable after "
+                    f"{_server_error_counts[server_name]} consecutive failures. "
+                    f"Auto-retry available in ~{remaining}s."
+                )
+
+        with _lock:
+            server = _servers.get(server_name)
+        if not server:
+            _bump_server_error(server_name)
+            return tool_error(f"MCP server '{server_name}' is not connected")
+
+        # A recycled stdio server is woken without waiting synchronously on
+        # the caller's event loop.  The normal connected path never enters
+        # this branch.
+        if server.session is None and server._is_recycled_stdio():
+            with _lock:
+                mcp_loop = _mcp_loop
+            if mcp_loop is not None and mcp_loop.is_running():
+                mcp_loop.call_soon_threadsafe(
+                    lambda: (server._ready.clear(), server._reconnect_event.set())
+                )
+
+        if server.session is None:
+            deadline = time.monotonic() + min(5.0, float(tool_timeout or 5.0))
+            while server.session is None and time.monotonic() < deadline:
+                await asyncio.sleep(0.05)
+            if server.session is None:
+                _bump_server_error(server_name)
+                return tool_error(
+                    f"MCP server '{server_name}' transport is down; "
+                    "reconnect requested. Do NOT retry immediately."
+                )
+
+        try:
+            result = await _run_on_mcp_loop_async(
+                lambda: _call_mcp_tool_async(server_name, tool_name, server, args),
+                timeout=tool_timeout,
+            )
+            try:
+                parsed = json.loads(result)
+                if "error" in parsed:
+                    _bump_server_error(server_name)
+                else:
+                    _reset_server_error(server_name)
+            except (json.JSONDecodeError, TypeError):
+                _reset_server_error(server_name)
+            return result
+        except InterruptedError:
+            return _interrupted_call_result()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # Recovery helpers predate the coroutine API and are only entered
+            # on a failed transport. Keep the successful RPC path fully async;
+            # use their established retry policy as a narrow compatibility
+            # boundary for auth/session renewal.
+            def _retry_sync():
+                call_once = lambda: _run_on_mcp_loop(
+                    lambda: _call_mcp_tool_async(server_name, tool_name, server, args),
+                    timeout=tool_timeout,
+                )
+                recovered = _handle_auth_error_and_retry(
+                    server_name, exc, call_once, f"tools/call {tool_name}"
+                )
+                if recovered is not None:
+                    return recovered
+                return _handle_session_expired_and_retry(
+                    server_name, exc, call_once, f"tools/call {tool_name}"
+                )
+
+            recovered = await asyncio.to_thread(_retry_sync)
+            if recovered is not None:
+                return recovered
+            _bump_server_error(server_name)
+            logger.error(
+                "MCP async tool %s/%s call failed: %s",
+                server_name,
+                tool_name,
+                exc,
+            )
+            return tool_error(
+                _sanitize_error(
+                    f"MCP call failed: {type(exc).__name__}: {_exc_str(exc)}"
+                )
+            )
 
     return _handler
 
@@ -5709,6 +5933,10 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
                 "handler": _make_tool_handler(
                     name, mcp_tool.name, server.tool_timeout
                 ),
+                "async_handler": _make_async_tool_handler(
+                    name, mcp_tool.name, server.tool_timeout
+                ),
+                "is_async": True,
                 "check_fn": check_fn,
             }
         )
@@ -5732,6 +5960,7 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
                 "handler": handler_factories[handler_key](
                     name, server.tool_timeout
                 ),
+                "is_async": False,
                 "check_fn": check_fn,
             }
         )
@@ -5805,8 +6034,9 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
             toolset=toolset_name,
             schema=candidate["schema"],
             handler=candidate["handler"],
+            async_handler=candidate.get("async_handler"),
             check_fn=candidate["check_fn"],
-            is_async=False,
+            is_async=bool(candidate.get("is_async", False)),
             description=candidate["schema"]["description"],
         )
 

@@ -1341,7 +1341,8 @@ async def async_handle_function_call(
             enabled_tools=enabled_tools,
         )
     try:
-        result = entry.handler(
+        async_handler = entry.async_handler or entry.handler
+        result = async_handler(
             function_args,
             task_id=task_id,
             session_id=session_id,

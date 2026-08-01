@@ -191,17 +191,19 @@ class ToolEntry:
 
     __slots__ = (
         "name", "toolset", "schema", "handler", "check_fn",
-        "requires_env", "is_async", "description", "emoji",
+        "async_handler", "requires_env", "is_async", "description", "emoji",
         "max_result_size_chars", "dynamic_schema_overrides",
     )
 
     def __init__(self, name, toolset, schema, handler, check_fn,
                  requires_env, is_async, description, emoji,
+                 async_handler=None,
                  max_result_size_chars=None, dynamic_schema_overrides=None):
         self.name = name
         self.toolset = toolset
         self.schema = schema
         self.handler = handler
+        self.async_handler = async_handler
         self.check_fn = check_fn
         self.requires_env = requires_env
         self.is_async = is_async
@@ -477,6 +479,7 @@ class ToolRegistry:
         emoji: str = "",
         max_result_size_chars: int | float | None = None,
         dynamic_schema_overrides: Callable = None,
+        async_handler: Callable = None,
         override: bool = False,
     ):
         """Register a tool.  Called at module-import time by each tool file.
@@ -530,6 +533,7 @@ class ToolRegistry:
                 toolset=toolset,
                 schema=schema,
                 handler=handler,
+                async_handler=async_handler,
                 check_fn=check_fn,
                 requires_env=requires_env or [],
                 is_async=is_async,
@@ -718,7 +722,8 @@ class ToolRegistry:
         try:
             if entry.is_async:
                 from model_tools import _run_async
-                result = _run_async(entry.handler(args, **kwargs))
+                async_handler = entry.async_handler or entry.handler
+                result = _run_async(async_handler(args, **kwargs))
             else:
                 result = entry.handler(args, **kwargs)
             return self._normalize_handler_result(name, result)
