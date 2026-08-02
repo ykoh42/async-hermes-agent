@@ -105,11 +105,12 @@ class TestGoalMigratesOnRotation:
         with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path / ".hermes")}):
             (tmp_path / ".hermes").mkdir(exist_ok=True)
             import hermes_cli.goals as goals
-            goals._DB_CACHE.clear()
             # Point the goal DB at the same state.db the agent uses.
-            async_db = AsyncSessionDB(db)
             with patch.object(
-                goals, "_get_session_db", new_callable=AsyncMock, return_value=async_db
+                goals,
+                "_get_session_db",
+                new_callable=AsyncMock,
+                side_effect=lambda: AsyncSessionDB(db),
             ):
                 await goals.save_goal(parent, goals.GoalState(goal="finish the migration"))
 
@@ -122,8 +123,6 @@ class TestGoalMigratesOnRotation:
                 migrated = await goals.load_goal(child)
                 assert migrated is not None
                 assert migrated.goal == "finish the migration"
-            await async_db.close()
-            goals._DB_CACHE.clear()
         await agent.close()
         db.close()
 

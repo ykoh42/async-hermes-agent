@@ -500,35 +500,25 @@ def _meta_key(session_id: str) -> str:
     return f"goal:{session_id}"
 
 
-_DB_CACHE: Dict[str, Any] = {}
-
-
 async def _get_session_db() -> Optional[Any]:
     """Return the native async session store for the current HERMES_HOME.
 
     ``AsyncSessionDB`` opens its aiosqlite connection lazily, so constructing
-    the cached instance here does not perform blocking I/O. One store is
-    retained per home path so repeated goal updates reuse the same connection.
+    the instance here does not perform blocking I/O. Callers own the returned
+    store and must close it after the operation so an aiosqlite worker cannot
+    outlive the agent or command that used it.
     """
     try:
-        from hermes_constants import get_hermes_home
         from hermes_state import AsyncSessionDB, _default_db_path
-
-        home = str(get_hermes_home())
     except Exception as exc:  # pragma: no cover
         logger.debug("GoalManager: AsyncSessionDB bootstrap failed (%s)", exc)
         return None
 
-    cached = _DB_CACHE.get(home)
-    if cached is not None:
-        return cached
     try:
-        db = AsyncSessionDB(_default_db_path())
+        return AsyncSessionDB(_default_db_path())
     except Exception as exc:  # pragma: no cover
         logger.debug("GoalManager: AsyncSessionDB construction failed (%s)", exc)
         return None
-    _DB_CACHE[home] = db
-    return db
 
 
 async def load_goal(session_id: str) -> Optional[GoalState]:
@@ -543,6 +533,8 @@ async def load_goal(session_id: str) -> Optional[GoalState]:
     except Exception as exc:
         logger.debug("GoalManager: get_meta failed: %s", exc)
         return None
+    finally:
+        await db.close()
     if not raw:
         return None
     try:
@@ -563,6 +555,8 @@ async def save_goal(session_id: str, state: GoalState) -> None:
         await db.set_meta(_meta_key(session_id), state.to_json())
     except Exception as exc:
         logger.debug("GoalManager: set_meta failed: %s", exc)
+    finally:
+        await db.close()
 
 
 async def clear_goal(session_id: str) -> None:
