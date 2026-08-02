@@ -44,7 +44,7 @@ def _make_agent(session_db=None, prebuilt_prompt: str = "BUILT_PROMPT"):
     # reconstruction is gated on _use_prompt_caching, so default it off
     # for the legacy restore tests (the reconstruction tests enable it).
     agent._use_prompt_caching = False
-    agent._build_system_prompt = MagicMock(return_value=prebuilt_prompt)
+    agent._build_system_prompt = AsyncMock(return_value=prebuilt_prompt)
     return agent
 
 
@@ -343,7 +343,8 @@ class TestReconstructStaticPrefixMemoization:
         agent._cached_system_prompt_static = None
         return agent
 
-    def test_failed_rebuild_is_memoized_per_stored_prompt(self):
+    @pytest.mark.asyncio
+    async def test_failed_rebuild_is_memoized_per_stored_prompt(self):
         from unittest.mock import patch as _patch
 
         from agent.system_prompt import reconstruct_static_prefix
@@ -354,13 +355,14 @@ class TestReconstructStaticPrefixMemoization:
             "agent.system_prompt.build_system_prompt_parts",
             return_value={"stable": "MISMATCH", "context": "", "volatile": ""},
         ) as build:
-            reconstruct_static_prefix(agent)
-            reconstruct_static_prefix(agent)
-            reconstruct_static_prefix(agent)
+            await reconstruct_static_prefix(agent)
+            await reconstruct_static_prefix(agent)
+            await reconstruct_static_prefix(agent)
         assert build.call_count == 1
         assert agent._cached_system_prompt_static is None
 
-    def test_changed_stored_prompt_retries_once(self):
+    @pytest.mark.asyncio
+    async def test_changed_stored_prompt_retries_once(self):
         from unittest.mock import patch as _patch
 
         from agent.system_prompt import reconstruct_static_prefix
@@ -370,15 +372,16 @@ class TestReconstructStaticPrefixMemoization:
             "agent.system_prompt.build_system_prompt_parts",
             return_value={"stable": "MISMATCH", "context": "", "volatile": ""},
         ) as build:
-            reconstruct_static_prefix(agent)
+            await reconstruct_static_prefix(agent)
             # A new stored prompt (e.g. after compression) invalidates the
             # failure memo and gets exactly one fresh attempt.
             agent._cached_system_prompt = "NEW STORED"
-            reconstruct_static_prefix(agent)
-            reconstruct_static_prefix(agent)
+            await reconstruct_static_prefix(agent)
+            await reconstruct_static_prefix(agent)
         assert build.call_count == 2
 
-    def test_success_clears_failure_memo_and_early_returns(self):
+    @pytest.mark.asyncio
+    async def test_success_clears_failure_memo_and_early_returns(self):
         from unittest.mock import patch as _patch
 
         from agent.system_prompt import reconstruct_static_prefix
@@ -390,8 +393,8 @@ class TestReconstructStaticPrefixMemoization:
             "agent.system_prompt.build_system_prompt_parts",
             return_value={"stable": stable, "context": "", "volatile": ""},
         ) as build:
-            reconstruct_static_prefix(agent)
-            reconstruct_static_prefix(agent)
+            await reconstruct_static_prefix(agent)
+            await reconstruct_static_prefix(agent)
         # Second call early-returns on the already-valid static prefix.
         assert build.call_count == 1
         assert agent._cached_system_prompt_static == stable
