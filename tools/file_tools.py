@@ -860,28 +860,6 @@ def _update_read_timestamp(filepath: str, task_id: str) -> None:
             _cap_read_tracker_data(state)
 
 
-def _check_file_staleness(filepath: str, task_id: str) -> str | None:
-    """Return a warning when a file changed since this task last read it."""
-    try:
-        resolved = str(_resolve_path(filepath, task_id))
-    except (OSError, ValueError):
-        return None
-    with _read_tracker_lock:
-        state = _read_tracker.get(task_id) or {}
-        read_mtime = state.get("read_timestamps", {}).get(resolved)
-    if read_mtime is None:
-        return None
-    try:
-        current_mtime = os.path.getmtime(resolved)
-    except OSError:
-        return None
-    if current_mtime == read_mtime:
-        return None
-    return (
-        f"Warning: {filepath} was modified since you last read it "
-        "(external edit or concurrent agent). The content you read may be "
-        "stale. Consider re-reading the file to verify before writing."
-    )
 
 
 def _search_result_read_block_error(
@@ -1092,7 +1070,7 @@ def _native_file_path(path: str, task_id: str) -> Path | str:
     return resolved
 
 
-async def _async_file_mtime(path: Path) -> float | None:
+async def _file_mtime(path: Path) -> float | None:
     try:
         stat_result = await aiofiles.os.stat(path)
     except OSError:
@@ -1100,7 +1078,7 @@ async def _async_file_mtime(path: Path) -> float | None:
     return stat_result.st_mtime
 
 
-async def _check_file_staleness_async(path: str, task_id: str) -> str | None:
+async def _check_file_staleness(path: str, task_id: str) -> str | None:
     try:
         resolved = str(_resolve_path(path, task_id))
     except (OSError, ValueError):
@@ -1110,7 +1088,7 @@ async def _check_file_staleness_async(path: str, task_id: str) -> str | None:
         read_mtime = state.get("read_timestamps", {}).get(resolved)
     if read_mtime is None:
         return None
-    current_mtime = await _async_file_mtime(Path(resolved))
+    current_mtime = await _file_mtime(Path(resolved))
     if current_mtime is None or current_mtime == read_mtime:
         return None
     return (
@@ -1120,14 +1098,14 @@ async def _check_file_staleness_async(path: str, task_id: str) -> str | None:
     )
 
 
-async def _refresh_read_timestamp_async(path: str, task_id: str) -> None:
+async def _refresh_read_timestamp(path: str, task_id: str) -> None:
     """Invalidate cached ranges and record the post-write mtime asynchronously."""
     _invalidate_dedup_for_path(path, task_id)
     try:
         resolved = str(_resolve_path(path, task_id))
     except (OSError, ValueError):
         return
-    mtime = await _async_file_mtime(Path(resolved))
+    mtime = await _file_mtime(Path(resolved))
     if mtime is None:
         return
     with _read_tracker_lock:
@@ -1195,7 +1173,7 @@ async def _handle_read_file(args, **kw):
     resolved_str = str(resolved)
     dedup_key = (resolved_str, offset, limit)
     state = _read_state(task_id)
-    mtime = await _async_file_mtime(resolved)
+    mtime = await _file_mtime(resolved)
     with _read_tracker_lock:
         cached_mtime = state.setdefault("dedup", {}).get(dedup_key)
     if mtime is not None and cached_mtime == mtime:
@@ -1268,7 +1246,7 @@ async def _handle_read_file(args, **kw):
         path=resolved_str,
         offset=offset,
         limit=limit,
-        mtime=mtime if mtime is not None else await _async_file_mtime(resolved),
+        mtime=mtime if mtime is not None else await _file_mtime(resolved),
         truncated=truncated,
     )
     try:
@@ -1337,7 +1315,7 @@ async def _handle_write_file(args, **kw):
     if isinstance(resolved, str):
         return resolved
     cross_warning = file_state.check_stale(task_id, str(resolved))
-    stale_warning = await _check_file_staleness_async(path, task_id)
+    stale_warning = await _check_file_staleness(path, task_id)
     lock = await _async_file_lock(resolved)
     try:
         async with lock:
@@ -1345,7 +1323,7 @@ async def _handle_write_file(args, **kw):
     except OSError as exc:
         return tool_error(f"Failed to write {path}: {exc}")
 
-    await _refresh_read_timestamp_async(path, task_id)
+    await _refresh_read_timestamp(path, task_id)
     file_state.note_write(task_id, str(resolved))
     result = {
         "bytes_written": len(content.encode("utf-8")),
@@ -1559,7 +1537,7 @@ async def _handle_v4a_patch(args: dict, task_id: str) -> str:
             )
 
     for path in changed_paths:
-        await _refresh_read_timestamp_async(str(path), task_id)
+        await _refresh_read_timestamp(str(path), task_id)
         file_state.note_write(task_id, str(path))
     _reset_patch_failures(task_id, [str(path) for path in changed_paths])
     diffs: list[str] = []
@@ -1605,7 +1583,7 @@ async def _handle_patch(args, **kw):
     if isinstance(resolved, str):
         return resolved
     cross_warning = file_state.check_stale(task_id, str(resolved))
-    stale_warning = await _check_file_staleness_async(path, task_id)
+    stale_warning = await _check_file_staleness(path, task_id)
     lock = await _async_file_lock(resolved)
     try:
         async with lock:
@@ -1630,7 +1608,7 @@ async def _handle_patch(args, **kw):
         return tool_error(f"Failed to patch {path}: {exc}")
 
     _reset_patch_failures(task_id, [str(resolved)])
-    await _refresh_read_timestamp_async(path, task_id)
+    await _refresh_read_timestamp(path, task_id)
     file_state.note_write(task_id, str(resolved))
     result = {
         "success": True,
