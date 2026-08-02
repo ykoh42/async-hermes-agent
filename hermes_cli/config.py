@@ -270,8 +270,6 @@ _EXTRA_ENV_KEYS = frozenset({
     "SIGNAL_ALLOWED_USERS", "SIGNAL_GROUP_ALLOWED_USERS",
     "SIGNAL_HOME_CHANNEL", "SIGNAL_HOME_CHANNEL_NAME",
     "SMS_HOME_CHANNEL", "SMS_HOME_CHANNEL_NAME",
-    "DINGTALK_CLIENT_ID", "DINGTALK_CLIENT_SECRET",
-    "DINGTALK_HOME_CHANNEL", "DINGTALK_HOME_CHANNEL_NAME",
     "FEISHU_APP_ID", "FEISHU_APP_SECRET", "FEISHU_ENCRYPT_KEY", "FEISHU_VERIFICATION_TOKEN",
     "FEISHU_HOME_CHANNEL", "FEISHU_HOME_CHANNEL_NAME",
     "YUANBAO_HOME_CHANNEL", "YUANBAO_HOME_CHANNEL_NAME",
@@ -3142,6 +3140,61 @@ def load_config_readonly() -> Dict[str, Any]:
     return _load_config_impl(want_deepcopy=False)
 
 
+async def load_config_readonly_async() -> Dict[str, Any]:
+    """Load behavioral configuration without synchronous file I/O.
+
+    This is intentionally a read-only, uncached async snapshot for the agent
+    turn.  CLI/setup code keeps using :func:`load_config_readonly`, whose
+    process-wide cache and synchronous lock are useful there.  Async callers
+    must not enter that lock while the event loop is serving model/tool work.
+    """
+    import aiofiles
+    import aiofiles.os
+
+    config_path = get_config_path()
+    config = copy.deepcopy(DEFAULT_CONFIG)
+
+    async def _read_yaml(path: Path) -> Dict[str, Any]:
+        try:
+            if not await aiofiles.os.path.isfile(path):
+                return {}
+            async with aiofiles.open(path, encoding="utf-8") as handle:
+                data = fast_safe_load(await handle.read()) or {}
+            return data if isinstance(data, dict) else {}
+        except FileNotFoundError:
+            return {}
+        except Exception as exc:
+            logger.debug("Async config read failed for %s: %s", path, exc)
+            return {}
+
+    user_config = await _read_yaml(config_path)
+    if "max_turns" in user_config:
+        agent_user_config = dict(user_config.get("agent") or {})
+        if agent_user_config.get("max_turns") is None:
+            agent_user_config["max_turns"] = user_config["max_turns"]
+        user_config["agent"] = agent_user_config
+        user_config.pop("max_turns", None)
+    config = _deep_merge(config, user_config)
+
+    normalized = _normalize_root_model_keys(_normalize_max_turns_config(config))
+    expanded = _expand_env_vars(normalized)
+
+    # Managed configuration is an optional policy overlay.  Read it through
+    # the same async helper when present; never call managed_scope's blocking
+    # loader from an active turn.
+    try:
+        from hermes_cli import managed_scope
+
+        managed_dir = managed_scope.get_managed_dir()
+    except Exception:
+        managed_dir = None
+    if managed_dir:
+        managed_config = await _read_yaml(Path(managed_dir) / "config.yaml")
+        if managed_config:
+            expanded = _deep_merge(expanded, _expand_env_vars(managed_config))
+    return expanded
+
+
 def write_platform_config_field(
     platform_key: str,
     field_key: str,
@@ -4122,7 +4175,60 @@ def get_env_value_prefer_dotenv(key: str) -> Optional[str]:
         )
     except Exception:
         return os.environ.get(key)
+    try:
+        return _get_secret(key)
+    except UnscopedSecretError:
+        raise
+    except Exception:
+        return os.environ.get(key)
 
+
+async def get_env_value_prefer_dotenv_async(key: str) -> Optional[str]:
+    """Async credential lookup for agent/provider execution paths.
+
+    The CLI-facing :func:`get_env_value_prefer_dotenv` intentionally remains
+    synchronous. Provider resolution on the event loop must not call it,
+    because it reparses ``~/.hermes/.env`` with a blocking file read. This
+    counterpart keeps the same precedence and secret-scope behavior while
+    reading the dotenv file through ``aiofiles``.
+    """
+    try:
+        import aiofiles
+
+        env_path = get_env_path()
+        env_vars: Dict[str, str] = {}
+        try:
+            async with aiofiles.open(
+                env_path, "r", encoding="utf-8-sig", errors="replace"
+            ) as handle:
+                raw_lines = await handle.readlines()
+        except FileNotFoundError:
+            raw_lines = []
+        for line in _sanitize_env_lines(raw_lines):
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#") or "=" not in stripped:
+                continue
+            if stripped.startswith("export "):
+                stripped = stripped[7:]
+            env_key, raw_value = stripped.split("=", 1)
+            env_key = env_key.strip()
+            if env_key:
+                env_vars[env_key] = _parse_env_value(raw_value)
+        value = env_vars.get(key)
+        if value:
+            return value
+    except Exception:
+        # A credential read should remain best-effort; the scoped environment
+        # fallback below preserves the same behavior as the sync helper.
+        pass
+
+    try:
+        from agent.secret_scope import (
+            UnscopedSecretError,
+            get_secret as _get_secret,
+        )
+    except Exception:
+        return os.environ.get(key)
     try:
         return _get_secret(key)
     except UnscopedSecretError:
@@ -4628,7 +4734,7 @@ _SCHEMA_DEFINED_DICT_KEYS = frozenset({
     # Platform configs — PlatformConfig dataclass + dynamic extras
     "discord", "telegram", "slack", "whatsapp", "signal", "mattermost",
     "matrix", "feishu", "wecom", "weixin", "bluebubbles", "qqbot", "yuanbao",
-    "email", "sms", "dingtalk",
+    "email", "sms",
     # MCP server template / dynamic auth dicts
     "sessions", "checkpoints",
 })

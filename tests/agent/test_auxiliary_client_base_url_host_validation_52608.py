@@ -7,7 +7,10 @@ non-Anthropic provider's endpoint while keeping `provider: anthropic` would
 otherwise have every side-channel call (memory extractors, reflection,
 vision, title generation) 401 from the foreign host.
 """
-from unittest.mock import MagicMock, patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
 
 
 def _extract_base_url_passed_to_build(mock_build):
@@ -21,7 +24,8 @@ def _extract_base_url_passed_to_build(mock_build):
 class TestTryAnthropicBaseUrlHostValidation:
     """Issue #52608: side-channel calls must not be sent to a non-Anthropic host."""
 
-    def test_openrouter_base_url_does_not_leak_into_auxiliary(self, tmp_path, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_openrouter_base_url_does_not_leak_into_auxiliary(self, tmp_path, monkeypatch):
         """cfg.model.base_url=https://openrouter.ai/api/v1 must NOT override aux base_url."""
         import yaml
         from agent.auxiliary_client import _try_anthropic
@@ -36,18 +40,16 @@ class TestTryAnthropicBaseUrlHostValidation:
 
         with (
             patch(
-                "agent.auxiliary_client._select_pool_entry", return_value=(False, None)
-            ),
-            patch(
                 "agent.anthropic_adapter.resolve_anthropic_token",
-                return_value="***",
+                new=AsyncMock(return_value="***"),
             ),
+            patch("agent.credential_pool.load_pool", new=AsyncMock(return_value=SimpleNamespace(entries = MagicMock(return_value=[])))),
             patch(
                 "agent.anthropic_adapter.build_anthropic_client"
             ) as mock_build,
         ):
             mock_build.return_value = MagicMock()
-            client, _model = _try_anthropic()
+            client, _model = await _try_anthropic()
 
         assert client is not None, "auxiliary client must still be created"
         actual = _extract_base_url_passed_to_build(mock_build)
@@ -56,7 +58,8 @@ class TestTryAnthropicBaseUrlHostValidation:
             f"not the operator's main-session override. Got: {actual!r}"
         )
 
-    def test_anthropic_default_host_is_preserved(self, tmp_path, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_anthropic_default_host_is_preserved(self, tmp_path, monkeypatch):
         """The common case (operator sets model.base_url to api.anthropic.com) must still apply."""
         import yaml
         from agent.auxiliary_client import _try_anthropic
@@ -71,24 +74,23 @@ class TestTryAnthropicBaseUrlHostValidation:
 
         with (
             patch(
-                "agent.auxiliary_client._select_pool_entry", return_value=(False, None)
-            ),
-            patch(
                 "agent.anthropic_adapter.resolve_anthropic_token",
-                return_value="***",
+                new=AsyncMock(return_value="***"),
             ),
+            patch("agent.credential_pool.load_pool", new=AsyncMock(return_value=SimpleNamespace(entries = MagicMock(return_value=[])))),
             patch(
                 "agent.anthropic_adapter.build_anthropic_client"
             ) as mock_build,
         ):
             mock_build.return_value = MagicMock()
-            client, _model = _try_anthropic()
+            client, _model = await _try_anthropic()
 
         assert client is not None
         actual = _extract_base_url_passed_to_build(mock_build)
         assert actual == "https://api.anthropic.com"
 
-    def test_openai_base_url_does_not_leak(self, tmp_path, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_openai_base_url_does_not_leak(self, tmp_path, monkeypatch):
         """Generic non-Anthropic host must not be applied as auxiliary base_url."""
         import yaml
         from agent.auxiliary_client import _try_anthropic
@@ -103,23 +105,20 @@ class TestTryAnthropicBaseUrlHostValidation:
 
         with (
             patch(
-                "agent.auxiliary_client._select_pool_entry", return_value=(False, None)
-            ),
-            patch(
                 "agent.anthropic_adapter.resolve_anthropic_token",
-                return_value="***",
+                new=AsyncMock(return_value="***"),
             ),
+            patch("agent.credential_pool.load_pool", new=AsyncMock(return_value=SimpleNamespace(entries = MagicMock(return_value=[])))),
             patch(
                 "agent.anthropic_adapter.build_anthropic_client"
             ) as mock_build,
         ):
             mock_build.return_value = MagicMock()
-            client, _model = _try_anthropic()
+            client, _model = await _try_anthropic()
 
         assert client is not None
         actual = _extract_base_url_passed_to_build(mock_build)
         assert actual == "https://api.anthropic.com", (
             f"Non-Anthropic host must not be applied. Got: {actual!r}"
         )
-
 

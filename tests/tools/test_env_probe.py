@@ -129,6 +129,11 @@ class TestCaching:
         # Two calls (python3 + python) on first invocation, zero after.
         assert len(calls) == 2
 
+    def test_cached_peek_does_not_start_a_probe(self):
+        """Async prompt construction may read the cache but never wait on it."""
+        assert env_probe.get_cached_environment_probe_line() == ""
+        assert env_probe._PROBE_THREAD is None
+
 
 class TestRobustness:
     """The probe must NEVER crash the prompt build."""
@@ -169,7 +174,7 @@ class TestStuckProbeNeverBlocksCallers:
         # Keep the test fast — the bound just has to exist, not be 10s.
         monkeypatch.setattr(env_probe, "_PROBE_WAIT_TIMEOUT", 0.5)
 
-        env_probe.warm_environment_probe_async()
+        env_probe.warm_environment_probe()
 
         results: list[str] = []
         errors: list[BaseException] = []

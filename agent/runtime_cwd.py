@@ -12,6 +12,7 @@ contextvar; CLI/cron fall through to `TERMINAL_CWD`/launch cwd.
 
 import logging
 import os
+import aiofiles.os
 from contextvars import ContextVar, Token
 from pathlib import Path
 from typing import Any
@@ -73,6 +74,28 @@ def resolve_agent_cwd() -> Path:
     return Path(os.getcwd())
 
 
+async def resolve_agent_cwd_async() -> Path:
+    """Resolve the agent cwd without synchronous filesystem probes.
+
+    The synchronous resolver remains for CLI/bootstrap callers.  Agent turns
+    use this counterpart so validating a configured ``TERMINAL_CWD`` cannot
+    block the event loop.
+    """
+    override = _session_cwd_override()
+    if override:
+        p = Path(override).expanduser()
+        if await aiofiles.os.path.isdir(p):
+            return p
+        logger.warning("configured working directory does not exist: %s", override)
+    raw = os.environ.get("TERMINAL_CWD", "").strip()
+    if raw:
+        p = Path(raw).expanduser()
+        if await aiofiles.os.path.isdir(p):
+            return p
+        logger.warning("TERMINAL_CWD does not exist: %s", raw)
+    return Path(os.getcwd())
+
+
 def resolve_context_cwd() -> Path | None:
     # None means "no configured cwd": build_context_files_prompt then falls back
     # to the launch dir (os.getcwd()), correct for a local CLI launched inside a
@@ -94,6 +117,26 @@ def resolve_context_cwd() -> Path | None:
     if raw:
         p = Path(raw).expanduser()
         if not p.is_dir():
+            logger.warning("TERMINAL_CWD does not exist: %s", raw)
+        else:
+            return p
+    return None
+
+
+async def resolve_context_cwd_async() -> Path | None:
+    """Async counterpart of :func:`resolve_context_cwd` for agent turns."""
+    override = _session_cwd_override()
+    if override:
+        p = Path(override).expanduser()
+        if not await aiofiles.os.path.isdir(p):
+            logger.warning("configured working directory does not exist: %s", override)
+        else:
+            return p
+        return None
+    raw = os.environ.get("TERMINAL_CWD", "").strip()
+    if raw:
+        p = Path(raw).expanduser()
+        if not await aiofiles.os.path.isdir(p):
             logger.warning("TERMINAL_CWD does not exist: %s", raw)
         else:
             return p

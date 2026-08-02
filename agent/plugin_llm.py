@@ -22,8 +22,8 @@ The plugin gets ``ctx.llm`` exposed on its
 * ``complete_structured(instructions=..., input=[...], json_schema=...)``
   — bounded structured inference with optional image inputs, JSON
   schema validation, and parsed JSON output.
-* async siblings ``acomplete()`` / ``acomplete_structured()`` for
-  plugins running on asyncio loops (gateway adapters, hooks).
+* native async methods for plugins running on asyncio loops (gateway
+  adapters, hooks).
 
 Provider/model/agent_id/profile are explicit keyword arguments — no
 embedded slugs, no shorthands. This mirrors Hermes' main config
@@ -60,6 +60,7 @@ supports.
 from __future__ import annotations
 
 import base64
+import inspect
 import json
 import logging
 import re
@@ -199,7 +200,7 @@ def _coerce_allowlist(raw: Any) -> tuple[Optional[frozenset], bool]:
     return frozenset(), allow_any
 
 
-def _resolve_trust_policy(plugin_id: str) -> _TrustPolicy:
+async def _resolve_trust_policy(plugin_id: str) -> _TrustPolicy:
     """Read ``plugins.entries.<plugin_id>.llm`` from config.yaml.
 
     Missing config → fully restrictive policy (default deny on every
@@ -210,8 +211,8 @@ def _resolve_trust_policy(plugin_id: str) -> _TrustPolicy:
         return _TrustPolicy(plugin_id="")
 
     try:
-        from hermes_cli.config import load_config_readonly
-        config = load_config_readonly() or {}
+        from hermes_cli.config import load_config_readonly_async
+        config = await load_config_readonly_async() or {}
     except Exception:  # pragma: no cover — config IO failure
         return _TrustPolicy(plugin_id=plugin_id)
 
@@ -540,7 +541,7 @@ def _extract_text(response: Any) -> str:
     return ""
 
 
-def _resolve_attribution(
+async def _resolve_attribution(
     *,
     provider_override: Optional[str],
     model_override: Optional[str],
@@ -570,8 +571,8 @@ def _resolve_attribution(
         provider = provider_override
     else:
         try:
-            from agent.auxiliary_client import _read_main_provider
-            provider = (_read_main_provider() or "").strip() or "auto"
+            from agent.auxiliary_client import _read_main_provider_async
+            provider = (await _read_main_provider_async() or "").strip() or "auto"
         except Exception:  # pragma: no cover — defensive
             provider = "auto"
 
@@ -582,8 +583,8 @@ def _resolve_attribution(
         model = model_override
     else:
         try:
-            from agent.auxiliary_client import _read_main_model
-            model = (_read_main_model() or "").strip() or "default"
+            from agent.auxiliary_client import _read_main_model_async
+            model = (await _read_main_model_async() or "").strip() or "default"
         except Exception:  # pragma: no cover — defensive
             model = "default"
 
@@ -609,17 +610,13 @@ class PluginLlm:
         *,
         plugin_id: str,
         policy_loader: Optional[Callable[[str], _TrustPolicy]] = None,
-        sync_caller: Optional[Callable[..., Any]] = None,
-        async_caller: Optional[Callable[..., Awaitable[Any]]] = None,
+        caller: Optional[Callable[..., Awaitable[Any]]] = None,
     ) -> None:
         self._plugin_id = plugin_id
         self._policy_loader = policy_loader or _resolve_trust_policy
-        self._sync_caller = sync_caller
-        self._async_caller = async_caller
+        self._caller = caller
 
-    # -- public sync API ----------------------------------------------------
-
-    def complete(
+    async def complete(
         self,
         messages: List[Dict[str, Any]],
         *,
@@ -632,16 +629,10 @@ class PluginLlm:
         profile: Optional[str] = None,
         purpose: Optional[str] = None,
     ) -> PluginLlmCompleteResult:
-        """Run a host-owned chat completion against the user's active model.
-
-        ``messages`` is the standard OpenAI shape. ``provider``,
-        ``model``, ``agent_id``, and ``profile`` follow the same
-        explicit shape as the host's main config (``model.provider``
-        + ``model.model``). Each is independently gated by
-        ``plugins.entries.<id>.llm.allow_*_override`` (see module
-        docstring).
-        """
+        """Run a host-owned completion against the active model."""
         policy = self._policy_loader(self._plugin_id)
+        if inspect.isawaitable(policy):
+            policy = await policy
         eff_provider, eff_model, eff_agent, eff_profile = _check_overrides(
             policy,
             requested_provider=provider,
@@ -649,154 +640,7 @@ class PluginLlm:
             requested_agent_id=agent_id,
             requested_profile=profile,
         )
-        real_provider, real_model, response = self._invoke_sync(
-            messages=messages,
-            provider_override=eff_provider,
-            model_override=eff_model,
-            profile_override=eff_profile,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            timeout=timeout,
-        )
-        text = _extract_text(response)
-        usage = _extract_usage(response)
-        result = PluginLlmCompleteResult(
-            text=text,
-            provider=real_provider,
-            model=real_model,
-            agent_id=eff_agent or "default",
-            usage=usage,
-            audit={
-                "plugin_id": self._plugin_id,
-                "purpose": purpose or "",
-                "profile": eff_profile or "",
-            },
-        )
-        logger.info(
-            "plugin_llm.complete plugin=%s provider=%s model=%s purpose=%s "
-            "tokens=%d",
-            self._plugin_id, real_provider, real_model, purpose or "",
-            usage.total_tokens,
-        )
-        return result
-
-    def complete_structured(
-        self,
-        *,
-        instructions: str,
-        input: Sequence[PluginLlmInput],
-        json_schema: Optional[Any] = None,
-        json_mode: bool = False,
-        schema_name: Optional[str] = None,
-        system_prompt: Optional[str] = None,
-        provider: Optional[str] = None,
-        model: Optional[str] = None,
-        temperature: Optional[float] = None,
-        max_tokens: Optional[int] = None,
-        timeout: Optional[float] = None,
-        agent_id: Optional[str] = None,
-        profile: Optional[str] = None,
-        purpose: Optional[str] = None,
-    ) -> PluginLlmStructuredResult:
-        """Run a bounded host-owned structured completion.
-
-        ``input`` accepts text and image blocks (see
-        :class:`PluginLlmTextInput` / :class:`PluginLlmImageInput`). When
-        ``json_mode=True`` or ``json_schema`` is provided, the response
-        is parsed and (if a schema is given) validated; the parsed value
-        is returned in :attr:`PluginLlmStructuredResult.parsed`.
-
-        Validation requires the optional ``jsonschema`` package. When it
-        isn't installed, JSON mode still works but schema enforcement is
-        skipped with a debug log.
-        """
-        if not instructions or not instructions.strip():
-            raise ValueError("complete_structured requires non-empty instructions")
-        if not input:
-            raise ValueError("complete_structured requires at least one input block")
-
-        policy = self._policy_loader(self._plugin_id)
-        eff_provider, eff_model, eff_agent, eff_profile = _check_overrides(
-            policy,
-            requested_provider=provider,
-            requested_model=model,
-            requested_agent_id=agent_id,
-            requested_profile=profile,
-        )
-
-        messages = _build_structured_messages(
-            instructions=instructions,
-            inputs=list(input),
-            json_mode=json_mode,
-            json_schema=json_schema,
-            schema_name=schema_name,
-            system_prompt=system_prompt,
-        )
-        extra_body = self._json_response_format(json_mode=json_mode, json_schema=json_schema)
-
-        real_provider, real_model, response = self._invoke_sync(
-            messages=messages,
-            provider_override=eff_provider,
-            model_override=eff_model,
-            profile_override=eff_profile,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            timeout=timeout,
-            extra_body=extra_body,
-        )
-        text = _extract_text(response)
-        usage = _extract_usage(response)
-        parsed, content_type = _parse_structured_text(
-            text=text, json_mode=json_mode, json_schema=json_schema
-        )
-        result = PluginLlmStructuredResult(
-            text=text,
-            provider=real_provider,
-            model=real_model,
-            agent_id=eff_agent or "default",
-            usage=usage,
-            parsed=parsed,
-            content_type=content_type,
-            audit={
-                "plugin_id": self._plugin_id,
-                "purpose": purpose or "",
-                "profile": eff_profile or "",
-                "schema_name": schema_name or "",
-            },
-        )
-        logger.info(
-            "plugin_llm.complete_structured plugin=%s provider=%s model=%s "
-            "purpose=%s content_type=%s tokens=%d",
-            self._plugin_id, real_provider, real_model, purpose or "",
-            content_type, usage.total_tokens,
-        )
-        return result
-
-    # -- public async API ---------------------------------------------------
-
-    async def acomplete(
-        self,
-        messages: List[Dict[str, Any]],
-        *,
-        provider: Optional[str] = None,
-        model: Optional[str] = None,
-        temperature: Optional[float] = None,
-        max_tokens: Optional[int] = None,
-        timeout: Optional[float] = None,
-        agent_id: Optional[str] = None,
-        profile: Optional[str] = None,
-        purpose: Optional[str] = None,
-    ) -> PluginLlmCompleteResult:
-        """Async sibling of :meth:`complete`."""
-        policy = self._policy_loader(self._plugin_id)
-        eff_provider, eff_model, eff_agent, eff_profile = _check_overrides(
-            policy,
-            requested_provider=provider,
-            requested_model=model,
-            requested_agent_id=agent_id,
-            requested_profile=profile,
-        )
-        real_provider, real_model, response = await self._invoke_async(
+        real_provider, real_model, response = await self._invoke(
             messages=messages,
             provider_override=eff_provider,
             model_override=eff_model,
@@ -820,7 +664,7 @@ class PluginLlm:
             },
         )
 
-    async def acomplete_structured(
+    async def complete_structured(
         self,
         *,
         instructions: str,
@@ -838,13 +682,15 @@ class PluginLlm:
         profile: Optional[str] = None,
         purpose: Optional[str] = None,
     ) -> PluginLlmStructuredResult:
-        """Async sibling of :meth:`complete_structured`."""
+        """Run a bounded host-owned structured completion."""
         if not instructions or not instructions.strip():
-            raise ValueError("acomplete_structured requires non-empty instructions")
+            raise ValueError("complete_structured requires non-empty instructions")
         if not input:
-            raise ValueError("acomplete_structured requires at least one input block")
+            raise ValueError("complete_structured requires at least one input block")
 
         policy = self._policy_loader(self._plugin_id)
+        if inspect.isawaitable(policy):
+            policy = await policy
         eff_provider, eff_model, eff_agent, eff_profile = _check_overrides(
             policy,
             requested_provider=provider,
@@ -861,7 +707,7 @@ class PluginLlm:
             system_prompt=system_prompt,
         )
         extra_body = self._json_response_format(json_mode=json_mode, json_schema=json_schema)
-        real_provider, real_model, response = await self._invoke_async(
+        real_provider, real_model, response = await self._invoke(
             messages=messages,
             provider_override=eff_provider,
             model_override=eff_model,
@@ -916,7 +762,7 @@ class PluginLlm:
             return {"response_format": {"type": "json_object"}}
         return None
 
-    def _invoke_sync(
+    async def _invoke(
         self,
         *,
         messages: List[Dict[str, Any]],
@@ -928,11 +774,8 @@ class PluginLlm:
         timeout: Optional[float],
         extra_body: Optional[Dict[str, Any]] = None,
     ) -> tuple[str, str, Any]:
-        """Invoke the host's ``call_llm``. Lazy-imports
-        ``agent.auxiliary_client`` to avoid circular deps at plugin
-        discovery time."""
-        if self._sync_caller is not None:
-            return self._sync_caller(
+        if self._caller is not None:
+            return await self._caller(
                 messages=messages,
                 provider_override=provider_override,
                 model_override=model_override,
@@ -946,7 +789,7 @@ class PluginLlm:
         merged_extra = dict(extra_body or {})
         if profile_override:
             merged_extra.setdefault("metadata", {})["auth_profile"] = profile_override
-        response = call_llm(
+        response = await call_llm(
             task=None,
             provider=provider_override,
             model=model_override,
@@ -956,51 +799,7 @@ class PluginLlm:
             timeout=timeout,
             extra_body=merged_extra or None,
         )
-        provider, model = _resolve_attribution(
-            provider_override=provider_override,
-            model_override=model_override,
-            response=response,
-        )
-        return provider, model, response
-
-    async def _invoke_async(
-        self,
-        *,
-        messages: List[Dict[str, Any]],
-        provider_override: Optional[str],
-        model_override: Optional[str],
-        profile_override: Optional[str],
-        temperature: Optional[float],
-        max_tokens: Optional[int],
-        timeout: Optional[float],
-        extra_body: Optional[Dict[str, Any]] = None,
-    ) -> tuple[str, str, Any]:
-        if self._async_caller is not None:
-            return await self._async_caller(
-                messages=messages,
-                provider_override=provider_override,
-                model_override=model_override,
-                profile_override=profile_override,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                timeout=timeout,
-                extra_body=extra_body,
-            )
-        from agent.auxiliary_client import async_call_llm
-        merged_extra = dict(extra_body or {})
-        if profile_override:
-            merged_extra.setdefault("metadata", {})["auth_profile"] = profile_override
-        response = await async_call_llm(
-            task=None,
-            provider=provider_override,
-            model=model_override,
-            messages=messages,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            timeout=timeout,
-            extra_body=merged_extra or None,
-        )
-        provider, model = _resolve_attribution(
+        provider, model = await _resolve_attribution(
             provider_override=provider_override,
             model_override=model_override,
             response=response,
@@ -1017,8 +816,7 @@ def make_plugin_llm_for_test(
     *,
     plugin_id: str,
     policy: _TrustPolicy,
-    sync_caller: Optional[Callable[..., Any]] = None,
-    async_caller: Optional[Callable[..., Awaitable[Any]]] = None,
+    caller: Optional[Callable[..., Awaitable[Any]]] = None,
 ) -> PluginLlm:
     """Construct a :class:`PluginLlm` with an injected policy and caller.
 
@@ -1028,8 +826,7 @@ def make_plugin_llm_for_test(
     return PluginLlm(
         plugin_id=plugin_id,
         policy_loader=lambda _pid: policy,
-        sync_caller=sync_caller,
-        async_caller=async_caller,
+        caller=caller,
     )
 
 

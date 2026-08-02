@@ -27,6 +27,7 @@ import time
 from typing import Any, Dict, List, Optional
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
+from agent.agent_runtime_helpers import AsyncCapabilityError
 from agent.conversation_compression import (
     COMPRESSION_RETRY_CONTEXT_REDUCED_STATUS_TEMPLATE,
     COMPRESSION_RETRY_MESSAGES_STATUS_TEMPLATE,
@@ -81,7 +82,11 @@ from agent.retry_utils import (
     zai_coding_overload_retry_ceiling,
 )
 from agent.trajectory import has_incomplete_scratchpad
-from agent.usage_pricing import estimate_usage_cost, normalize_usage
+from agent.usage_pricing import (
+    estimate_usage_cost,
+    estimate_usage_cost_async,
+    normalize_usage,
+)
 from hermes_constants import PARTIAL_STREAM_STUB_ID
 from hermes_logging import set_session_context
 from tools.skill_provenance import set_current_write_origin
@@ -277,14 +282,14 @@ def _ra():
     return run_agent
 
 
-def _nous_entitlement_message(capability: str) -> str:
+async def _nous_entitlement_message(capability: str) -> str:
     try:
         from hermes_cli.nous_account import (
             format_nous_portal_entitlement_message,
             get_nous_portal_account_info,
         )
 
-        account_info = get_nous_portal_account_info(force_fresh=True)
+        account_info = await get_nous_portal_account_info(force_fresh=True)
         message = format_nous_portal_entitlement_message(
             account_info,
             capability=capability,
@@ -294,8 +299,8 @@ def _nous_entitlement_message(capability: str) -> str:
         return ""
 
 
-def _print_nous_entitlement_guidance(agent, capability: str) -> bool:
-    message = _nous_entitlement_message(capability)
+async def _print_nous_entitlement_guidance(agent, capability: str) -> bool:
+    message = await _nous_entitlement_message(capability)
     if not message:
         return False
     for line in message.splitlines():
@@ -313,7 +318,7 @@ def _is_nous_inference_route(provider: str, base_url: str) -> bool:
     )
 
 
-def _billing_or_entitlement_message(
+async def _billing_or_entitlement_message(
     *,
     capability: str,
     provider: str,
@@ -321,7 +326,7 @@ def _billing_or_entitlement_message(
     model: str,
 ) -> str:
     if _is_nous_inference_route(provider, base_url):
-        return _nous_entitlement_message(capability)
+        return await _nous_entitlement_message(capability)
 
     provider_label = (provider or "").strip() or "the selected provider"
     model_label = (model or "").strip() or "the selected model"
@@ -383,7 +388,7 @@ def _billing_block_dict(provider, base_url, model, message="") -> Optional[dict]
         return None
 
 
-def _print_billing_or_entitlement_guidance(
+async def _print_billing_or_entitlement_guidance(
     agent,
     *,
     capability: str,
@@ -391,7 +396,7 @@ def _print_billing_or_entitlement_guidance(
     base_url: str,
     model: str,
 ) -> bool:
-    message = _billing_or_entitlement_message(
+    message = await _billing_or_entitlement_message(
         capability=capability,
         provider=provider,
         base_url=base_url,
@@ -404,22 +409,7 @@ def _print_billing_or_entitlement_guidance(
     return True
 
 
-def _try_refresh_nous_paid_entitlement_credentials(agent) -> bool:
-    """Refresh Nous runtime credentials after a fresh paid-entitlement check."""
-    try:
-        from hermes_cli.nous_account import get_nous_portal_account_info
-
-        account_info = get_nous_portal_account_info(force_fresh=True)
-        if account_info.paid_service_access is not True:
-            return False
-        return agent._try_refresh_nous_client_credentials(
-            force=True,
-        )
-    except Exception:
-        return False
-
-
-def _restore_or_build_system_prompt(agent, system_message, conversation_history):
+async def _restore_or_build_system_prompt(agent, system_message, conversation_history):
     """Restore the cached system prompt from the session DB or build it fresh.
 
     Mutates ``agent._cached_system_prompt`` and persists a freshly-built
@@ -450,7 +440,12 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
     stored_state = "missing"
     if conversation_history and agent._session_db:
         try:
-            session_row = agent._session_db.get_session(agent.session_id)
+            session_db = agent._get_async_session_db()
+            session_row = (
+                await session_db.get_session(agent.session_id)
+                if session_db is not None
+                else None
+            )
             if session_row is not None:
                 raw_prompt = session_row.get("system_prompt")
                 if raw_prompt is None:
@@ -485,7 +480,7 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
         # fails open to the legacy cache layout.
         from agent.system_prompt import reconstruct_static_prefix
 
-        reconstruct_static_prefix(agent, system_message=system_message)
+        await reconstruct_static_prefix(agent, system_message=system_message)
         return
     if stored_prompt:
         stored_state = "stale_runtime"
@@ -512,14 +507,14 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
 
     # First turn of a new session (or recovering from a broken stored
     # prompt) — build from scratch.
-    agent._cached_system_prompt = agent._build_system_prompt(system_message)
+    agent._cached_system_prompt = await agent._build_system_prompt(system_message)
 
     # Plugin hook: on_session_start — fired once when a brand-new
     # session is created (not on continuation).  Plugins can use this
     # to initialise session-scoped state (e.g. warm a memory cache).
     try:
-        from hermes_cli.lifecycle import invoke_hook as _invoke_hook
-        _invoke_hook(
+        from hermes_cli.lifecycle import invoke_hook_async as _invoke_hook
+        await _invoke_hook(
             "on_session_start",
             session_id=agent.session_id,
             model=agent.model,
@@ -537,7 +532,7 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
     try:
         from agent.credits_tracker import seed_credits_at_session_start
 
-        seed_credits_at_session_start(agent)
+        await seed_credits_at_session_start(agent)
     except Exception:
         logger.debug("cold-start credits seed failed (fail-open)", exc_info=True)
 
@@ -547,7 +542,12 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
     # subsequent turn).
     if agent._session_db:
         try:
-            agent._session_db.update_system_prompt(agent.session_id, agent._cached_system_prompt)
+            session_db = agent._get_async_session_db()
+            if session_db is not None:
+                await session_db.update_system_prompt(
+                    agent.session_id,
+                    agent._cached_system_prompt,
+                )
         except Exception as exc:
             logger.warning(
                 "Session DB update_system_prompt failed for session %s: "
@@ -854,7 +854,7 @@ def _sync_failover_system_message(agent, api_messages, active_system_prompt):
     return sp
 
 
-def _ensure_cached_system_prompt_static(agent, system_message=None) -> None:
+async def _ensure_cached_system_prompt_static(agent, system_message=None) -> None:
     """Rebuild ``_cached_system_prompt_static`` when caching becomes active.
 
     Sessions restored under a cache-off primary skip the static-prefix rebuild
@@ -868,7 +868,7 @@ def _ensure_cached_system_prompt_static(agent, system_message=None) -> None:
     """
     from agent.system_prompt import reconstruct_static_prefix
 
-    reconstruct_static_prefix(
+    await reconstruct_static_prefix(
         agent, system_message=system_message, log_label="failover redecoration"
     )
 
@@ -888,7 +888,7 @@ def _peel_moa_guidance(
     return peel_reference_guidance(messages, guidance)
 
 
-def _redecorate_prompt_cache_for_provider(
+async def _redecorate_prompt_cache_for_provider(
     agent,
     api_messages: List[Dict[str, Any]],
     *,
@@ -923,7 +923,7 @@ def _redecorate_prompt_cache_for_provider(
     # flags are unconditionally initialized on AIAgent, and a getattr
     # default here would mask a real init bug as silent cache-off.
     if agent._use_prompt_caching:
-        _ensure_cached_system_prompt_static(agent, system_message=system_message)
+        await _ensure_cached_system_prompt_static(agent, system_message=system_message)
         static = getattr(agent, "_cached_system_prompt_static", None)
         messages = apply_anthropic_cache_control(
             messages,
@@ -1151,7 +1151,7 @@ async def run_conversation(
     # ``build_turn_context``.  It mutates ``agent`` exactly as the inline code
     # did and returns the locals the loop below reads back.  See
     # ``agent/turn_context.py``.
-    _ctx = build_turn_context(
+    _ctx = await build_turn_context(
         agent,
         user_message,
         system_message,
@@ -1248,7 +1248,7 @@ async def run_conversation(
     # See agent/transports/codex_app_server_session.py for the adapter
     # and references/codex-app-server-runtime.md for the rationale.
     if agent.api_mode == "codex_app_server":
-        return await agent._run_codex_app_server_turn_async(
+        return await agent._run_codex_app_server_turn(
             user_message=user_message,
             original_user_message=original_user_message,
             messages=messages,
@@ -1265,10 +1265,7 @@ async def run_conversation(
                     f"{original_user_message}\n\n"
                     f"User correction during the turn: {_redirect_text}"
                 )
-            agent._persist_session(messages, conversation_history)
-
-        # Reset per-turn checkpoint dedup so each iteration can take one snapshot
-        agent._checkpoint_mgr.new_turn()
+            await agent._persist_session(messages, conversation_history)
 
         # Check for interrupt request (e.g., user sent new message)
         if agent._interrupt_requested:
@@ -1555,7 +1552,7 @@ async def run_conversation(
                 from agent.message_content import flatten_message_text as _flatten_mt
                 from agent.moa_loop import _preset_temperature, aggregate_moa_context
 
-                _moa_context = aggregate_moa_context(
+                _moa_context = await aggregate_moa_context(
                     user_prompt=(
                         original_user_message
                         if isinstance(original_user_message, str)
@@ -1747,7 +1744,7 @@ async def run_conversation(
             if _moa_prepared_request is None:
                 _prepare_moa_request = getattr(_moa_completions, "prepare", None)
                 if callable(_prepare_moa_request):
-                    _moa_prepared_request = _prepare_moa_request(api_messages)
+                    _moa_prepared_request = await _prepare_moa_request(api_messages)
             if _moa_prepared_request is not None:
                 api_messages = _moa_prepared_request["messages"]
 
@@ -1797,9 +1794,28 @@ async def run_conversation(
         # LLM cooldown + anti-thrash guards (#11529). compression_attempts is a
         # hard per-turn backstop shared with the overflow error handlers.
         _compressor = agent.context_compressor
-        _preflight_threshold = int(
-            getattr(_compressor, "threshold_tokens", 0) or 0
-        )
+        if agent.compression_enabled:
+            _preflight_threshold = int(
+                getattr(_compressor, "threshold_tokens", 0) or 0
+            )
+            _defer_preflight = getattr(
+                _compressor,
+                "should_defer_preflight_to_real_usage",
+                lambda _tokens: False,
+            )
+            _compression_cooldown = getattr(
+                _compressor,
+                "get_active_compression_failure_cooldown",
+                lambda: None,
+            )()
+        else:
+            # Resolving ContextCompressor.threshold_tokens can live-probe a
+            # provider's /models endpoint. A disabled compressor must be a
+            # true no-op in an async turn, not an accidental sync probe just
+            # to calculate a branch that cannot run.
+            _preflight_threshold = 0
+            _defer_preflight = lambda _tokens: False
+            _compression_cooldown = None
         # A previous mid-turn preflight pass deliberately continued the loop so
         # API-only context and all sanitization could be rebuilt. Compare that
         # fully assembled request with the fully assembled request that caused
@@ -1809,6 +1825,8 @@ async def run_conversation(
         _previous_preflight_pressure = _last_preflight_pressure
         _last_preflight_pressure = None
         if (
+            agent.compression_enabled
+            and
             _previous_preflight_pressure is not None
             and request_pressure_tokens >= _preflight_threshold
             and not _compression_warrants_another_preflight_pass(
@@ -1828,12 +1846,6 @@ async def run_conversation(
                 f"{_previous_preflight_pressure:,}",
                 f"{request_pressure_tokens:,}",
             )
-        _defer_preflight = getattr(
-            _compressor, "should_defer_preflight_to_real_usage", lambda _t: False
-        )
-        _compression_cooldown = getattr(
-            _compressor, "get_active_compression_failure_cooldown", lambda: None
-        )()
         if (
             agent.compression_enabled
             and len(messages) > 1
@@ -1886,7 +1898,7 @@ async def run_conversation(
                 agent._emit_status(_pre_api_status)
             _last_preflight_pressure = request_pressure_tokens
             _pre_api_input = messages
-            messages, active_system_prompt = agent._compress_context(
+            messages, active_system_prompt = await agent._compress_context(
                 messages,
                 system_message,
                 approx_tokens=request_pressure_tokens,
@@ -2019,7 +2031,7 @@ async def run_conversation(
                             f"⏳ {_nous_msg} Trying fallback..."
                         )
                         agent._buffer_status(f"⏳ {_nous_msg}")
-                        if agent._try_activate_fallback():
+                        if await agent._try_activate_fallback():
                             active_system_prompt = _sync_failover_system_message(
                                 agent, api_messages, active_system_prompt)
                             retry_count = 0
@@ -2029,7 +2041,7 @@ async def run_conversation(
                         # No fallback available — surface buffered context
                         # so user sees the rate-limit message that led here.
                         agent._flush_status_buffer()
-                        agent._persist_session(messages, conversation_history)
+                        await agent._persist_session(messages, conversation_history)
                         return {
                             "final_response": (
                                 f"⏳ {_nous_msg}\n\n"
@@ -2063,14 +2075,14 @@ async def run_conversation(
                 # still carries the primary's breakpoints (or none). Strip and
                 # re-render for the current provider before building kwargs.
                 api_messages, _moa_prepared_request = (
-                    _redecorate_prompt_cache_for_provider(
+                    await _redecorate_prompt_cache_for_provider(
                         agent,
                         api_messages,
                         system_message=system_message,
                         moa_prepared=_moa_prepared_request,
                     )
                 )
-                api_kwargs = agent._build_api_kwargs(api_messages)
+                api_kwargs = await agent._build_api_kwargs(api_messages)
                 if agent._force_ascii_payload:
                     _sanitize_structure_non_ascii(api_kwargs)
                 if agent.api_mode == "codex_responses":
@@ -2090,7 +2102,7 @@ async def run_conversation(
                 try:
                     from hermes_cli.middleware import apply_llm_request_middleware
 
-                    _llm_request_mw = apply_llm_request_middleware(
+                    _llm_request_mw = await apply_llm_request_middleware(
                         api_kwargs,
                         task_id=effective_task_id,
                         turn_id=turn_id,
@@ -2113,7 +2125,7 @@ async def run_conversation(
                 try:
                     from hermes_cli.lifecycle import (
                         has_hook,
-                        invoke_hook as _invoke_hook,
+                        invoke_hook_async as _invoke_hook,
                     )
                     if has_hook("pre_api_request"):
                         request_messages = api_kwargs.get("messages")
@@ -2138,7 +2150,7 @@ async def run_conversation(
                         # provider client.  New consumers should read the
                         # sanitised view from ``request["body"]["messages"]``.
                         _request_payload = agent._api_request_payload_for_hook(api_kwargs)
-                        _invoke_hook(
+                        await _invoke_hook(
                             "pre_api_request",
                             task_id=effective_task_id,
                             turn_id=turn_id,
@@ -2202,27 +2214,6 @@ async def run_conversation(
                 # session instead of re-failing every retry.
                 if getattr(agent, "_disable_streaming", False):
                     _use_streaming = False
-                # CopilotACPClient communicates via subprocess stdio and
-                # returns a plain SimpleNamespace — not an iterable
-                # stream.  Mirror the ACP exclusion used for Responses
-                # API upgrade (lines ~1083-1085).
-                elif (
-                    agent.provider in {"copilot-acp"}
-                    or str(agent.base_url or "").lower().startswith("acp://copilot")
-                    or str(agent.base_url or "").lower().startswith("acp+tcp://")
-                ):
-                    _use_streaming = False
-                # MoA streams only when a display/TTS consumer is present to
-                # receive the deltas. MoAChatCompletions.create() honors
-                # stream=True (runs the references, then returns the aggregator's
-                # raw token stream) and is reached here because, for provider
-                # "moa", _create_request_openai_client returns the MoA facade
-                # itself. Without consumers (quiet mode, subagents, health-check
-                # probes) we keep the complete-response path: the facade returns a
-                # whole response when stream is not requested, preserving the
-                # prior behavior for those callers.
-                elif agent.provider == "moa" and not agent._has_stream_consumers():
-                    _use_streaming = False
                 elif not agent._has_stream_consumers():
                     # No display/TTS consumer. Still prefer streaming for
                     # health checking, but skip for Mock clients in tests
@@ -2238,7 +2229,7 @@ async def run_conversation(
                             allow_stream=False,
                             is_github_responses=agent._is_copilot_url(),
                         )
-                    return await agent._async_execute_model_request(
+                    return await agent._execute_model_request(
                         next_api_kwargs,
                         use_streaming=_use_streaming,
                         on_first_delta=_stop_spinner,
@@ -2255,14 +2246,13 @@ async def run_conversation(
                 _redirect_crossed_response = False
                 try:
                     # Preserve the execution-middleware contract on the async
-                    # path.  The chain accepts both sync and async plugin
-                    # callbacks, while the provider terminal call remains a
-                    # native awaitable.
+                    # path. The chain and provider terminal call are native
+                    # awaitables.
                     from hermes_cli.middleware import (
-                        run_llm_execution_middleware_async,
+                        run_llm_execution_middleware,
                     )
 
-                    response = await run_llm_execution_middleware_async(
+                    response = await run_llm_execution_middleware(
                         api_kwargs,
                         _perform_api_call,
                         original_request=_original_api_kwargs,
@@ -2404,7 +2394,7 @@ async def run_conversation(
                             error_details.append("response.choices is empty")
 
                 if response_invalid:
-                    agent._invoke_api_request_error_hook(
+                    await agent._invoke_api_request_error_hook(
                         task_id=effective_task_id,
                         turn_id=turn_id,
                         api_request_id=api_request_id,
@@ -2436,7 +2426,7 @@ async def run_conversation(
                     # rather than retrying with extended backoff.
                     if agent._fallback_index < len(agent._fallback_chain):
                         agent._buffer_status("⚠️ Empty/malformed response — switching to fallback...")
-                    if agent._try_activate_fallback():
+                    if await agent._try_activate_fallback():
                         active_system_prompt = _sync_failover_system_message(
                             agent, api_messages, active_system_prompt)
                         retry_count = 0
@@ -2509,7 +2499,7 @@ async def run_conversation(
                         # Try fallback before giving up
                         if agent._has_pending_fallback():
                             agent._buffer_status(f"⚠️ Max retries ({max_retries}) for invalid responses — trying fallback...")
-                        if agent._try_activate_fallback():
+                        if await agent._try_activate_fallback():
                             active_system_prompt = _sync_failover_system_message(
                                 agent, api_messages, active_system_prompt)
                             retry_count = 0
@@ -2520,7 +2510,7 @@ async def run_conversation(
                         agent._flush_status_buffer()
                         agent._emit_status(f"❌ Max retries ({max_retries}) exceeded for invalid responses. Giving up.")
                         logger.error(f"{agent.log_prefix}Invalid API response after {max_retries} retries.")
-                        agent._persist_session(messages, conversation_history)
+                        await agent._persist_session(messages, conversation_history)
                         _final_response = f"Invalid API response after {max_retries} retries: {_failure_hint}"
                         return {
                             "final_response": _final_response,
@@ -2555,7 +2545,7 @@ async def run_conversation(
                             agent._vprint(f"{agent.log_prefix}⚡ Interrupt detected during retry wait, aborting.", force=True)
                             _interrupt_text = f"Operation interrupted during retry ({_failure_hint}, attempt {retry_count}/{max_retries})."
                             close_interrupted_tool_sequence(messages, _interrupt_text)
-                            agent._persist_session(messages, conversation_history)
+                            await agent._persist_session(messages, conversation_history)
                             agent.clear_interrupt()
                             return {
                                 "final_response": _interrupt_text,
@@ -2564,7 +2554,7 @@ async def run_conversation(
                                 "completed": False,
                                 "interrupted": True,
                             }
-                        time.sleep(0.2)
+                        await asyncio.sleep(0.2)
                         # Touch activity every ~30s so the gateway's inactivity
                         # monitor knows we're alive during backoff waits.
                         _backoff_touch_counter += 1
@@ -2657,7 +2647,7 @@ async def run_conversation(
                     if not _refusal_text:
                         _refusal_text = (agent._extract_reasoning(_refusal_result) or "").strip()
 
-                    agent._invoke_api_request_error_hook(
+                    await agent._invoke_api_request_error_hook(
                         task_id=effective_task_id,
                         turn_id=turn_id,
                         api_request_id=api_request_id,
@@ -2686,7 +2676,7 @@ async def run_conversation(
                         agent._buffer_status(
                             "⚠️ Model declined to respond (safety refusal) — trying fallback..."
                         )
-                    if agent._try_activate_fallback():
+                    if await agent._try_activate_fallback():
                         active_system_prompt = _sync_failover_system_message(
                             agent, api_messages, active_system_prompt)
                         retry_count = 0
@@ -2722,8 +2712,8 @@ async def run_conversation(
                         f"{_CONTENT_POLICY_RECOVERY_HINT}"
                     )
 
-                    agent._cleanup_task_resources(effective_task_id)
-                    agent._persist_session(messages, conversation_history)
+                    await agent._cleanup_task_resources(effective_task_id)
+                    await agent._persist_session(messages, conversation_history)
                     return _content_policy_blocked_result(
                         messages,
                         api_call_count,
@@ -2815,8 +2805,8 @@ async def run_conversation(
                             "→ Lower reasoning effort: `/thinkon low` or `/thinkon minimal`\n"
                             "→ Or switch to a larger/non-reasoning model with `/model`"
                         )
-                        agent._cleanup_task_resources(effective_task_id)
-                        agent._persist_session(messages, conversation_history)
+                        await agent._cleanup_task_resources(effective_task_id)
+                        await agent._persist_session(messages, conversation_history)
                         return {
                             "final_response": _exhaust_response,
                             "messages": messages,
@@ -2855,7 +2845,7 @@ async def run_conversation(
                             agent._emit_status(
                                 "Content filter terminated stream; switching to fallback..."
                             )
-                            if agent._try_activate_fallback():
+                            if await agent._try_activate_fallback():
                                 # Roll the partial content (if any was already
                                 # appended in a prior continuation pass) back to
                                 # the last clean turn so the fallback provider
@@ -2943,8 +2933,8 @@ async def run_conversation(
                                 break
 
                             partial_response = agent._strip_think_blocks("".join(truncated_response_parts)).strip()
-                            agent._cleanup_task_resources(effective_task_id)
-                            agent._persist_session(messages, conversation_history)
+                            await agent._cleanup_task_resources(effective_task_id)
+                            await agent._persist_session(messages, conversation_history)
                             return {
                                 "final_response": partial_response or None,
                                 "messages": messages,
@@ -3003,7 +2993,7 @@ async def run_conversation(
                                     f"{agent.log_prefix}⚠️  Truncated tool call response detected again — refusing to execute incomplete tool arguments.",
                                     force=True,
                                 )
-                            agent._cleanup_task_resources(effective_task_id)
+                            await agent._cleanup_task_resources(effective_task_id)
                             _final_response = (
                                 "Stream repeatedly dropped mid tool-call (network); "
                                 "the tool was not executed"
@@ -3014,7 +3004,7 @@ async def run_conversation(
                             # errors) can leave a tool-result tail; this path
                             # never reaches finalize_turn (#48879 class).
                             close_interrupted_tool_sequence(messages, _final_response)
-                            agent._persist_session(messages, conversation_history)
+                            await agent._persist_session(messages, conversation_history)
                             return {
                                 "final_response": _final_response,
                                 "messages": messages,
@@ -3029,8 +3019,8 @@ async def run_conversation(
                         agent._vprint(f"{agent.log_prefix}   ⏪ Rolling back to last complete assistant turn")
                         rolled_back_messages = agent._get_messages_up_to_last_assistant(messages)
 
-                        agent._cleanup_task_resources(effective_task_id)
-                        agent._persist_session(messages, conversation_history)
+                        await agent._cleanup_task_resources(effective_task_id)
+                        await agent._persist_session(messages, conversation_history)
 
                         return {
                             "final_response": "Response truncated due to output length limit",
@@ -3044,7 +3034,7 @@ async def run_conversation(
                         # First message was truncated - mark as failed
                         agent._flush_status_buffer()
                         agent._vprint(f"{agent.log_prefix}❌ First response truncated - cannot recover", force=True)
-                        agent._persist_session(messages, conversation_history)
+                        await agent._persist_session(messages, conversation_history)
                         return {
                             "final_response": "First response truncated due to output length limit",
                             "messages": messages,
@@ -3186,7 +3176,7 @@ async def run_conversation(
                         _agg_cost_model = _agg_slot["model"]
                         _agg_cost_provider = _agg_slot.get("provider") or agent.provider
                         _agg_cost_base_url = _agg_slot.get("base_url") or agent.base_url
-                    cost_result = estimate_usage_cost(
+                    cost_result = await estimate_usage_cost_async(
                         _agg_cost_model,
                         aggregator_usage,
                         provider=_agg_cost_provider,
@@ -3221,7 +3211,7 @@ async def run_conversation(
                             # not silently lost (UPDATE on a non-existent row
                             # affects 0 rows without error).
                             if not agent._session_db_created:
-                                agent._ensure_db_session()
+                                await agent._ensure_db_session()
                             # Per-call cost delta = aggregator cost + MoA
                             # advisor cost (each priced at its own rate). Folded
                             # here so state.db's estimated_cost_usd includes the
@@ -3234,12 +3224,10 @@ async def run_conversation(
                                     _cost_delta = (_cost_delta or 0.0) + float(_moa_ref_cost)
                                 except (TypeError, ValueError):  # pragma: no cover
                                     pass
-                            # Enqueued, not written: the background writer
-                            # applies the delta off the turn thread (a cold
-                            # state.db UPDATE here stalled the tool loop for
-                            # up to hundreds of ms per API call). Drained at
-                            # turn finalize via _persist_session.
-                            agent._session_db.queue_token_counts(
+                            session_db = agent._get_async_session_db()
+                            if session_db is None:
+                                raise RuntimeError("Async session DB is unavailable")
+                            await session_db.update_token_counts(
                                 agent.session_id,
                                 input_tokens=canonical_usage.input_tokens,
                                 output_tokens=canonical_usage.output_tokens,
@@ -3307,7 +3295,7 @@ async def run_conversation(
                         pass
                 from agent import relay_llm
 
-                relay_llm.complete_logical_call(
+                await relay_llm.complete_logical_call(
                     api_request_id,
                     outcome="success",
                 )
@@ -3345,7 +3333,7 @@ async def run_conversation(
                     final_response = _partial
                 else:
                     final_response = f"{INTERRUPT_WAITING_FOR_MODEL_PREFIX}{api_elapsed:.1f}s elapsed)."
-                agent._persist_session(messages, conversation_history)
+                await agent._persist_session(messages, conversation_history)
                 break
 
             except Exception as api_error:
@@ -3659,7 +3647,7 @@ async def run_conversation(
                     classified.retryable, classified.should_compress,
                     classified.should_rotate_credential, classified.should_fallback,
                 )
-                agent._invoke_api_request_error_hook(
+                await agent._invoke_api_request_error_hook(
                     task_id=effective_task_id,
                     turn_id=turn_id,
                     api_request_id=api_request_id,
@@ -3684,22 +3672,34 @@ async def run_conversation(
                     and not _retry.nous_paid_entitlement_refresh_attempted
                 ):
                     _retry.nous_paid_entitlement_refresh_attempted = True
-                    if _try_refresh_nous_paid_entitlement_credentials(agent):
-                        agent._vprint(
-                            f"{agent.log_prefix}🔐 Nous paid access verified — "
-                            "refreshed runtime credentials and retrying request...",
-                            force=True,
-                        )
-                        continue
+                    raise AsyncCapabilityError(
+                        "Nous paid-entitlement credential renewal has no native async "
+                        "implementation. Refresh credentials before starting the async agent."
+                    )
 
-                recovered_with_pool, _retry.has_retried_429 = agent._recover_with_credential_pool(
-                    status_code=status_code,
-                    has_retried_429=_retry.has_retried_429,
-                    classified_reason=classified.reason,
-                    error_context=error_context,
-                )
-                if recovered_with_pool:
-                    continue
+                # API-key pool rotation is native async: it mutates the pool
+                # under its task lock and persists via aiofiles. OAuth refresh
+                # still fails explicitly inside that path until its provider
+                # transport has been converted; it is never sent through a
+                # worker thread.
+                if (
+                    getattr(agent, "_credential_pool", None) is not None
+                    and classified.reason
+                    in {
+                        FailoverReason.billing,
+                        FailoverReason.rate_limit,
+                        FailoverReason.auth,
+                    }
+                ):
+                    recovered, _retry.has_retried_429 = await agent._recover_with_credential_pool(
+                        status_code=classified.status_code,
+                        has_retried_429=_retry.has_retried_429,
+                        classified_reason=classified.reason,
+                        error_context=classified.error_context,
+                    )
+                    if recovered:
+                        retry_count = 0
+                        continue
 
                 # Image-too-large recovery: shrink oversized native image
                 # parts in-place and retry once.  Triggered by Anthropic's
@@ -3713,7 +3713,7 @@ async def run_conversation(
                 ):
                     _retry.image_shrink_retry_attempted = True
                     image_max_dimension = _image_error_max_dimension(api_error) or 8000
-                    if agent._try_shrink_image_parts_in_messages(
+                    if await agent._try_shrink_image_parts_in_messages(
                         api_messages,
                         max_dimension=image_max_dimension,
                     ):
@@ -3772,11 +3772,26 @@ async def run_conversation(
                     _retry.oauth_1m_beta_retry_attempted = True
                     if not getattr(agent, "_oauth_1m_beta_disabled", False):
                         agent._oauth_1m_beta_disabled = True
-                        try:
-                            agent._anthropic_client.close()
-                        except Exception:
-                            pass
-                        agent._rebuild_anthropic_client()
+                        # The async request path owns this client.  Discarding
+                        # its source marker makes _execute_model_request()
+                        # construct the replacement with the reduced beta set
+                        # on the next iteration; do not touch the legacy sync
+                        # Anthropic client from the event loop.
+                        async_client = getattr(agent, "_async_anthropic_client", None)
+                        if async_client is not None:
+                            try:
+                                close = getattr(async_client, "aclose", None) or getattr(
+                                    async_client, "close", None
+                                )
+                                if callable(close):
+                                    await close()
+                            except Exception:
+                                logger.debug(
+                                    "Async Anthropic client close failed during 1M beta recovery",
+                                    exc_info=True,
+                                )
+                        agent._async_anthropic_client = None
+                        agent._async_anthropic_source = None
                         agent._vprint(
                             f"{agent.log_prefix}🔕 OAuth subscription doesn't support "
                             f"the 1M-context beta — disabled for this session and retrying...",
@@ -3791,10 +3806,10 @@ async def run_conversation(
                     and not _retry.codex_auth_retry_attempted
                 ):
                     _retry.codex_auth_retry_attempted = True
-                    if agent._try_refresh_codex_client_credentials(force=True):
-                        _label = "xAI OAuth" if agent.provider == "xai-oauth" else "Codex"
-                        agent._buffer_vprint(f"🔐 {_label} auth refreshed after 401. Retrying request...")
-                        continue
+                    raise AsyncCapabilityError(
+                        f"{agent.provider} OAuth renewal has no native async implementation. "
+                        "Refresh credentials before starting the async agent."
+                    )
                 if (
                     agent.api_mode == "chat_completions"
                     and agent.provider == "vertex"
@@ -3802,9 +3817,10 @@ async def run_conversation(
                     and not _retry.vertex_auth_retry_attempted
                 ):
                     _retry.vertex_auth_retry_attempted = True
-                    if agent._try_refresh_vertex_client_credentials():
-                        agent._buffer_vprint("🔐 Vertex AI token refreshed after 401. Retrying request...")
-                        continue
+                    raise AsyncCapabilityError(
+                        "Vertex OAuth renewal has no native async implementation. "
+                        "Refresh credentials before starting the async agent."
+                    )
                 if (
                     agent.api_mode in ("chat_completions", "anthropic_messages")
                     and agent.provider == "nous"
@@ -3812,40 +3828,20 @@ async def run_conversation(
                     and not _retry.nous_auth_retry_attempted
                 ):
                     _retry.nous_auth_retry_attempted = True
-                    if agent._try_refresh_nous_client_credentials(force=True):
-                        print(f"{agent.log_prefix}🔐 Nous agent key refreshed after 401. Retrying request...")
-                        continue
-                    # Credential refresh didn't help — show diagnostic info.
-                    # Most common causes: Portal OAuth expired/revoked,
-                    # account out of credits, or agent key blocked.
-                    from hermes_constants import display_hermes_home as _dhh_fn
-                    _dhh = _dhh_fn()
-                    _body_text = ""
-                    try:
-                        _body = getattr(api_error, "body", None) or getattr(api_error, "response", None)
-                        if _body is not None:
-                            _body_text = str(_body)[:200]
-                    except Exception:
-                        pass
-                    print(f"{agent.log_prefix}🔐 Nous 401 — Portal authentication failed.")
-                    if _body_text:
-                        print(f"{agent.log_prefix}   Response: {_body_text}")
-                    if not _print_nous_entitlement_guidance(agent, "Nous model access"):
-                        print(f"{agent.log_prefix}   Most likely: Portal OAuth expired, account out of credits, or agent key revoked.")
-                    print(f"{agent.log_prefix}   Troubleshooting:")
-                    print(f"{agent.log_prefix}     • Re-authenticate: hermes auth add nous")
-                    print(f"{agent.log_prefix}     • Check credits / billing: https://portal.nousresearch.com")
-                    print(f"{agent.log_prefix}     • Verify stored credentials: {_dhh}/auth.json")
-                    print(f"{agent.log_prefix}     • Switch providers temporarily: /model <model> --provider openrouter")
+                    raise AsyncCapabilityError(
+                        "Nous credential renewal has no native async implementation. "
+                        "Refresh credentials before starting the async agent."
+                    )
                 if (
                     agent.provider == "copilot"
                     and status_code == 401
                     and not _retry.copilot_auth_retry_attempted
                 ):
                     _retry.copilot_auth_retry_attempted = True
-                    if agent._try_refresh_copilot_client_credentials():
-                        agent._buffer_vprint("🔐 Copilot credentials refreshed after 401. Retrying request...")
-                        continue
+                    raise AsyncCapabilityError(
+                        "Copilot credential renewal has no native async implementation. "
+                        "Refresh credentials before starting the async agent."
+                    )
                 if (
                     agent.api_mode == "anthropic_messages"
                     and status_code == 401
@@ -3855,9 +3851,11 @@ async def run_conversation(
                     _retry.anthropic_auth_retry_attempted = True
                     from agent.anthropic_adapter import _is_oauth_token
                     from agent.azure_identity_adapter import is_token_provider
-                    if agent._try_refresh_anthropic_client_credentials():
-                        print(f"{agent.log_prefix}🔐 Anthropic credentials refreshed after 401. Retrying request...")
-                        continue
+                    if getattr(agent, "_is_anthropic_oauth", False):
+                        raise AsyncCapabilityError(
+                            "Anthropic OAuth renewal has no native async implementation. "
+                            "Refresh credentials before starting the async agent."
+                        )
                     # Credential refresh didn't help — show diagnostic info
                     key = agent._anthropic_api_key
                     print(f"{agent.log_prefix}🔐 Anthropic 401 — authentication failed.")
@@ -4087,7 +4085,7 @@ async def run_conversation(
                     agent._vprint(f"{agent.log_prefix}⚡ Interrupt detected during error handling, aborting retries.", force=True)
                     _interrupt_text = f"Operation interrupted: handling API error ({error_type}: {agent._clean_error_message(str(api_error))})."
                     close_interrupted_tool_sequence(messages, _interrupt_text)
-                    agent._persist_session(messages, conversation_history)
+                    await agent._persist_session(messages, conversation_history)
                     agent.clear_interrupt()
                     return {
                         "final_response": _interrupt_text,
@@ -4152,7 +4150,7 @@ async def run_conversation(
                         f"{agent.log_prefix}Context overflow ({classified.reason.value}) with "
                         f"auto-compaction disabled — not compressing."
                     )
-                    agent._persist_session(messages, conversation_history)
+                    await agent._persist_session(messages, conversation_history)
                     _final_response = (
                         "Context overflow and auto-compaction is disabled "
                         "(compression.enabled: false). Run /compress to compact manually, "
@@ -4207,7 +4205,7 @@ async def run_conversation(
                     compression_attempts += 1
                     if compression_attempts <= max_compression_attempts:
                         original_len = len(messages)
-                        messages, active_system_prompt = agent._compress_context(
+                        messages, active_system_prompt = await agent._compress_context(
                             messages, system_message,
                             approx_tokens=approx_tokens,
                             task_id=effective_task_id,
@@ -4221,7 +4219,7 @@ async def run_conversation(
                                     new_ctx=_reduced_ctx, old_ctx=old_ctx
                                 )
                             )
-                            time.sleep(2)
+                            await asyncio.sleep(2)
                             _retry.restart_with_compressed_messages = True
                             break
                     # Fall through to normal error handling if compression
@@ -4269,10 +4267,9 @@ async def run_conversation(
                     # different model regardless of pool state.
                     _is_upstream = classified.reason == FailoverReason.upstream_rate_limit
                     pool_may_recover = (
-                        False if _is_upstream
-                        else _ra()._pool_may_recover_from_rate_limit(
-                            agent._credential_pool,
-                        )
+                        False
+                        if _is_upstream
+                        else await agent._credential_pool_may_recover_rate_limit()
                     )
                     if not pool_may_recover:
                         if _is_upstream:
@@ -4293,7 +4290,7 @@ async def run_conversation(
                             )
                         else:
                             agent._buffer_status("⚠️ Rate limited — switching to fallback provider...")
-                        if agent._try_activate_fallback(reason=classified.reason):
+                        if await agent._try_activate_fallback(reason=classified.reason):
                             active_system_prompt = _sync_failover_system_message(
                                 agent, api_messages, active_system_prompt)
                             retry_count = 0
@@ -4326,7 +4323,7 @@ async def run_conversation(
                         "🔐 Authentication failed and could not be refreshed — "
                         "switching to fallback provider..."
                     )
-                    if agent._try_activate_fallback(reason=classified.reason):
+                    if await agent._try_activate_fallback(reason=classified.reason):
                         active_system_prompt = _sync_failover_system_message(
                             agent, api_messages, active_system_prompt)
                         retry_count = 0
@@ -4447,7 +4444,7 @@ async def run_conversation(
                         agent._vprint(f"{agent.log_prefix}❌ Max compression attempts ({max_compression_attempts}) reached for payload-too-large error.", force=True)
                         agent._vprint(f"{agent.log_prefix}   💡 Try /new to start a fresh conversation, or /compress to retry compression.", force=True)
                         logger.error(f"{agent.log_prefix}413 compression failed after {max_compression_attempts} attempts.")
-                        agent._persist_session(messages, conversation_history)
+                        await agent._persist_session(messages, conversation_history)
                         _final_response = f"Request payload too large: max compression attempts ({max_compression_attempts}) reached."
                         return {
                             "final_response": _final_response,
@@ -4464,7 +4461,7 @@ async def run_conversation(
                     original_len = len(messages)
                     original_tokens = estimate_messages_tokens_rough(messages)
                     _overflow_input = messages
-                    messages, active_system_prompt = agent._compress_context(
+                    messages, active_system_prompt = await agent._compress_context(
                         messages, system_message, approx_tokens=approx_tokens,
                         task_id=effective_task_id,
                     )
@@ -4476,7 +4473,7 @@ async def run_conversation(
                         # attempt and end the turn softly so the gateway does
                         # NOT auto-reset the session (#9893/#35809).
                         compression_attempts -= 1
-                        agent._persist_session(messages, conversation_history)
+                        await agent._persist_session(messages, conversation_history)
                         return _compression_deferred_result(
                             agent, messages, api_call_count
                         )
@@ -4496,7 +4493,7 @@ async def run_conversation(
                             agent._buffer_status(COMPRESSION_RETRY_MESSAGES_STATUS_TEMPLATE.format(before=original_len, after=len(messages)))
                         else:
                             agent._buffer_status(COMPRESSION_RETRY_TOKENS_STATUS_TEMPLATE.format(before=original_tokens, after=new_tokens))
-                        time.sleep(2)  # Brief pause between compression retries
+                        await asyncio.sleep(2)  # Brief pause between compression retries
                         _retry.restart_with_compressed_messages = True
                         break
                     else:
@@ -4516,7 +4513,7 @@ async def run_conversation(
                         agent._vprint(f"{agent.log_prefix}❌ Payload too large and cannot compress further.", force=True)
                         agent._vprint(f"{agent.log_prefix}   💡 Try /new to start a fresh conversation, or /compress to retry compression.", force=True)
                         logger.error(f"{agent.log_prefix}413 payload too large. Cannot compress further.")
-                        agent._persist_session(messages, conversation_history)
+                        await agent._persist_session(messages, conversation_history)
                         _final_response = "Request payload too large (413). Cannot compress further."
                         return {
                             "final_response": _final_response,
@@ -4589,7 +4586,7 @@ async def run_conversation(
                             agent._vprint(f"{agent.log_prefix}❌ Max compression attempts ({max_compression_attempts}) reached.", force=True)
                             agent._vprint(f"{agent.log_prefix}   💡 Try /new to start a fresh conversation, or /compress to retry compression.", force=True)
                             logger.error(f"{agent.log_prefix}Context compression failed after {max_compression_attempts} attempts.")
-                            agent._persist_session(messages, conversation_history)
+                            await agent._persist_session(messages, conversation_history)
                             _final_response = f"Context length exceeded: max compression attempts ({max_compression_attempts}) reached."
                             return {
                                 "final_response": _final_response,
@@ -4630,7 +4627,7 @@ async def run_conversation(
                             f"{agent.log_prefix}Output-cap error not routed into compression "
                             f"(max_tokens over provider cap): {error_msg[:200]}"
                         )
-                        agent._persist_session(messages, conversation_history)
+                        await agent._persist_session(messages, conversation_history)
                         _final_response = (
                             "max_tokens exceeds the provider's output cap for this model. "
                             "Lower model.max_tokens in config.yaml."
@@ -4701,7 +4698,7 @@ async def run_conversation(
                         agent._vprint(f"{agent.log_prefix}❌ Max compression attempts ({max_compression_attempts}) reached.", force=True)
                         agent._vprint(f"{agent.log_prefix}   💡 Try /new to start a fresh conversation, or /compress to retry compression.", force=True)
                         logger.error(f"{agent.log_prefix}Context compression failed after {max_compression_attempts} attempts.")
-                        agent._persist_session(messages, conversation_history)
+                        await agent._persist_session(messages, conversation_history)
                         _final_response = f"Context length exceeded: max compression attempts ({max_compression_attempts}) reached."
                         return {
                             "final_response": _final_response,
@@ -4718,7 +4715,7 @@ async def run_conversation(
                     original_len = len(messages)
                     original_tokens = estimate_messages_tokens_rough(messages)
                     _overflow_input = messages
-                    messages, active_system_prompt = agent._compress_context(
+                    messages, active_system_prompt = await agent._compress_context(
                         messages, system_message, approx_tokens=approx_tokens,
                         task_id=effective_task_id,
                     )
@@ -4730,7 +4727,7 @@ async def run_conversation(
                         # attempt and end the turn softly so the gateway does
                         # NOT auto-reset the session (#9893/#35809).
                         compression_attempts -= 1
-                        agent._persist_session(messages, conversation_history)
+                        await agent._persist_session(messages, conversation_history)
                         return _compression_deferred_result(
                             agent, messages, api_call_count
                         )
@@ -4750,7 +4747,7 @@ async def run_conversation(
                             agent._buffer_status(COMPRESSION_RETRY_MESSAGES_STATUS_TEMPLATE.format(before=original_len, after=len(messages)))
                         elif new_tokens > 0 and new_tokens < original_tokens * 0.95:
                             agent._buffer_status(COMPRESSION_RETRY_TOKENS_STATUS_TEMPLATE.format(before=original_tokens, after=new_tokens))
-                        time.sleep(2)  # Brief pause between compression retries
+                        await asyncio.sleep(2)  # Brief pause between compression retries
                         _retry.restart_with_compressed_messages = True
                         break
                     else:
@@ -4759,7 +4756,7 @@ async def run_conversation(
                         agent._vprint(f"{agent.log_prefix}❌ Context length exceeded and cannot compress further.", force=True)
                         agent._vprint(f"{agent.log_prefix}   💡 The conversation has accumulated too much content. Try /new to start fresh, or /compress to manually trigger compression.", force=True)
                         logger.error(f"{agent.log_prefix}Context length exceeded: {new_tokens:,} tokens. Cannot compress further.")
-                        agent._persist_session(messages, conversation_history)
+                        await agent._persist_session(messages, conversation_history)
                         _final_response = f"Context length exceeded ({new_tokens:,} tokens). Cannot compress further."
                         return {
                             "final_response": _final_response,
@@ -4857,7 +4854,7 @@ async def run_conversation(
                             agent._buffer_status("⚠️ TLS certificate verification failed — trying fallback...")
                         else:
                             agent._buffer_status(f"⚠️ Non-retryable error (HTTP {status_code}) — trying fallback...")
-                    if agent._try_activate_fallback():
+                    if await agent._try_activate_fallback():
                         active_system_prompt = _sync_failover_system_message(
                             agent, api_messages, active_system_prompt)
                         retry_count = 0
@@ -4898,7 +4895,7 @@ async def run_conversation(
                     agent._vprint(f"{agent.log_prefix}   🌐 Endpoint: {_base}", force=True)
                     # Actionable guidance for common auth errors
                     if classified.is_auth or classified.reason == FailoverReason.billing:
-                        if classified.reason == FailoverReason.billing and _print_billing_or_entitlement_guidance(
+                        if classified.reason == FailoverReason.billing and await _print_billing_or_entitlement_guidance(
                             agent,
                             capability="model access",
                             provider=_provider,
@@ -4906,7 +4903,7 @@ async def run_conversation(
                             model=_model,
                         ):
                             pass
-                        elif _provider == "nous" and _print_nous_entitlement_guidance(
+                        elif _provider == "nous" and await _print_nous_entitlement_guidance(
                             agent,
                             "Nous model access",
                         ):
@@ -5011,7 +5008,7 @@ async def run_conversation(
                             force=True,
                         )
                     else:
-                        agent._persist_session(messages, conversation_history)
+                        await agent._persist_session(messages, conversation_history)
                     if classified.reason == FailoverReason.content_policy_blocked:
                         _policy_response = (
                             "⚠️  The model provider's safety filter blocked this request "
@@ -5030,7 +5027,7 @@ async def run_conversation(
                     # the max-retries path so every surface (CLI, TUI, desktop)
                     # renders one consistent billing signal.
                     if classified.reason == FailoverReason.billing:
-                        _ce_guidance = _billing_or_entitlement_message(
+                        _ce_guidance = await _billing_or_entitlement_message(
                             capability="model access",
                             provider=_provider,
                             base_url=str(_base),
@@ -5064,7 +5061,7 @@ async def run_conversation(
                     # client once for transient transport errors (stale
                     # connection pool, TCP reset).  Only attempted once
                     # per API call block.
-                    if not _retry.primary_recovery_attempted and agent._try_recover_primary_transport(
+                    if not _retry.primary_recovery_attempted and await agent._try_recover_primary_transport(
                         api_error, retry_count=retry_count, max_retries=max_retries,
                     ):
                         _retry.primary_recovery_attempted = True
@@ -5080,7 +5077,7 @@ async def run_conversation(
                     # Try fallback before giving up entirely
                     if agent._has_pending_fallback():
                         agent._buffer_status(f"⚠️ Max retries ({max_retries}) exhausted — trying fallback...")
-                    if agent._try_activate_fallback():
+                    if await agent._try_activate_fallback():
                         active_system_prompt = _sync_failover_system_message(
                             agent, api_messages, active_system_prompt)
                         retry_count = 0
@@ -5093,13 +5090,13 @@ async def run_conversation(
                     _billing_guidance = ""
                     if classified.reason == FailoverReason.billing:
                         agent._emit_status(f"❌ Billing or credits exhausted — {_final_summary}")
-                        _billing_guidance = _billing_or_entitlement_message(
+                        _billing_guidance = await _billing_or_entitlement_message(
                             capability="model access",
                             provider=_provider,
                             base_url=str(_base),
                             model=_model,
                         )
-                        _print_billing_or_entitlement_guidance(
+                        await _print_billing_or_entitlement_guidance(
                             agent,
                             capability="model access",
                             provider=_provider,
@@ -5209,7 +5206,7 @@ async def run_conversation(
                         agent._dump_api_request_debug(
                             api_kwargs, reason="max_retries_exhausted", error=api_error,
                         )
-                    agent._persist_session(messages, conversation_history)
+                    await agent._persist_session(messages, conversation_history)
                     _billing_block = None
                     if classified.reason == FailoverReason.billing:
                         _final_response = f"Billing or credits exhausted: {_final_summary}"
@@ -5329,7 +5326,7 @@ async def run_conversation(
                         agent._vprint(f"{agent.log_prefix}⚡ Interrupt detected during retry wait, aborting.", force=True)
                         _interrupt_text = f"Operation interrupted: retrying API call after error (retry {retry_count}/{max_retries})."
                         close_interrupted_tool_sequence(messages, _interrupt_text)
-                        agent._persist_session(messages, conversation_history)
+                        await agent._persist_session(messages, conversation_history)
                         agent.clear_interrupt()
                         return {
                             "final_response": _interrupt_text,
@@ -5338,7 +5335,7 @@ async def run_conversation(
                             "completed": False,
                             "interrupted": True,
                         }
-                    time.sleep(0.2)  # Check interrupt every 200ms
+                    await asyncio.sleep(0.2)  # Check interrupt every 200ms
                     # Touch activity every ~30s so the gateway's inactivity
                     # monitor knows we're alive during backoff waits.
                     _backoff_touch_counter += 1
@@ -5421,7 +5418,7 @@ async def run_conversation(
         if response is None:
             _turn_exit_reason = "all_retries_exhausted_no_response"
             print(f"{agent.log_prefix}❌ All API retries exhausted with no successful response.")
-            agent._persist_session(messages, conversation_history)
+            await agent._persist_session(messages, conversation_history)
             break
 
         try:
@@ -5457,7 +5454,7 @@ async def run_conversation(
             try:
                 from hermes_cli.lifecycle import (
                     has_hook,
-                    invoke_hook as _invoke_hook,
+                    invoke_hook_async as _invoke_hook,
                 )
                 if has_hook("post_api_request"):
                     _assistant_tool_calls = (
@@ -5465,7 +5462,7 @@ async def run_conversation(
                     )
                     _assistant_text = assistant_message.content or ""
                     _api_ended_at = api_start_time + api_duration
-                    _invoke_hook(
+                    await _invoke_hook(
                         "post_api_request",
                         task_id=effective_task_id,
                         turn_id=turn_id,
@@ -5543,8 +5540,8 @@ async def run_conversation(
                     agent._incomplete_scratchpad_retries = 0
                     
                     rolled_back_messages = agent._get_messages_up_to_last_assistant(messages)
-                    agent._cleanup_task_resources(effective_task_id)
-                    agent._persist_session(messages, conversation_history)
+                    await agent._cleanup_task_resources(effective_task_id)
+                    await agent._persist_session(messages, conversation_history)
                     
                     return {
                         "final_response": "Incomplete REASONING_SCRATCHPAD after 2 retries",
@@ -5674,7 +5671,7 @@ async def run_conversation(
                     continue
 
                 agent._codex_incomplete_retries = 0
-                agent._persist_session(messages, conversation_history)
+                await agent._persist_session(messages, conversation_history)
                 return {
                     "final_response": "Codex response remained incomplete after 3 continuation attempts",
                     "messages": messages,
@@ -5763,7 +5760,7 @@ async def run_conversation(
                         # interrupt aborts (#48879 / #52592) so the next user
                         # turn is not tool→user for strict providers.
                         close_interrupted_tool_sequence(messages, _final_response)
-                        agent._persist_session(messages, conversation_history)
+                        await agent._persist_session(messages, conversation_history)
                         return {
                             "final_response": _final_response,
                             "messages": messages,
@@ -5842,12 +5839,12 @@ async def run_conversation(
                             force=True,
                         )
                         agent._invalid_json_retries = 0
-                        agent._cleanup_task_resources(effective_task_id)
+                        await agent._cleanup_task_resources(effective_task_id)
                         _final_response = "Response truncated due to output length limit"
                         # Same tool-tail close as interrupt / invalid-tool
                         # exhaustion — this path never reaches finalize_turn.
                         close_interrupted_tool_sequence(messages, _final_response)
-                        agent._persist_session(messages, conversation_history)
+                        await agent._persist_session(messages, conversation_history)
                         return {
                             "final_response": _final_response,
                             "messages": messages,
@@ -6040,7 +6037,7 @@ async def run_conversation(
                     # side effects run. If a destructive tool restarts or
                     # terminates Hermes mid-turn, resume logic still sees the
                     # exact tool-call block that already executed.
-                    _tool_turn_persisted = agent._flush_messages_to_session_db(
+                    _tool_turn_persisted = await agent._flush_messages_to_session_db(
                         messages, conversation_history
                     )
                 except Exception as exc:
@@ -6080,9 +6077,12 @@ async def run_conversation(
                     except Exception:
                         pass
 
-                    await agent._execute_tool_calls_async(
-                        assistant_message, messages, effective_task_id, api_call_count
-                    )
+                # Tool execution is independent of UI streaming. Batch and
+                # quiet agents deliberately have no stream callback, but they
+                # must still emit the model → tool → observation trajectory.
+                await agent._execute_tool_calls(
+                    assistant_message, messages, effective_task_id, api_call_count
+                )
 
                 if getattr(agent, "_incremental_persistence_failed", False):
                     # A tool result could not be made canonical. Do not send
@@ -6189,7 +6189,7 @@ async def run_conversation(
                         _clear_warn()
                     agent._safe_print("  ⟳ compacting context…")
                     _post_tool_input = messages
-                    messages, active_system_prompt = agent._compress_context(
+                    messages, active_system_prompt = await agent._compress_context(
                         messages, system_message,
                         approx_tokens=agent.context_compressor.last_prompt_tokens,
                         task_id=effective_task_id,
@@ -6506,7 +6506,7 @@ async def run_conversation(
                             "⚠️ Model returning empty responses — "
                             "switching to fallback provider..."
                         )
-                        if agent._try_activate_fallback():
+                        if await agent._try_activate_fallback():
                             active_system_prompt = _sync_failover_system_message(
                                 agent, api_messages, active_system_prompt)
                             agent._empty_content_retries = 0
@@ -6728,6 +6728,49 @@ async def run_conversation(
                     agent._safe_print(f"🎉 Conversation completed after {api_call_count} OpenAI-compatible API call(s)")
                 break
             
+        except asyncio.CancelledError:
+            # External request cancellation is a normal lifecycle event for
+            # an async service.  Persist the partial transcript/trajectory
+            # through the same finalizer used by completed turns, then
+            # re-raise so the caller still observes cancellation.  The
+            # finalizer task is shielded so a second cancellation cannot leave
+            # an unmatched tool call or half-written session row behind.
+            interrupted = True
+            _turn_exit_reason = "cancelled"
+            agent._session_messages = messages
+            from agent.turn_finalizer import finalize_turn
+
+            finalizer_task = asyncio.create_task(
+                finalize_turn(
+                    agent,
+                    final_response=final_response,
+                    api_call_count=api_call_count,
+                    interrupted=True,
+                    failed=failed,
+                    messages=messages,
+                    conversation_history=conversation_history,
+                    effective_task_id=effective_task_id,
+                    turn_id=turn_id,
+                    user_message=user_message,
+                    original_user_message=original_user_message,
+                    _should_review_memory=_should_review_memory,
+                    _turn_exit_reason=_turn_exit_reason,
+                    _pending_verification_response=_pending_verification_response,
+                    _pending_verification_response_previewed=(
+                        _pending_verification_response_previewed
+                    ),
+                )
+            )
+            try:
+                await asyncio.shield(finalizer_task)
+            except asyncio.CancelledError:
+                await asyncio.shield(finalizer_task)
+            except Exception:
+                logger.error(
+                    "Cancelled turn finalization failed",
+                    exc_info=True,
+                )
+            raise
         except Exception as e:
             # Phase-aware error classification. The huge outer try/except spans
             # both the actual API request and all local post-processing of the
@@ -6827,7 +6870,7 @@ async def run_conversation(
     # (god-file decomposition Phase 1 step 4). Behavior-neutral: the assembled
     # result dict is returned exactly as before.
     from agent.turn_finalizer import finalize_turn
-    return finalize_turn(
+    return await finalize_turn(
         agent,
         final_response=final_response,
         api_call_count=api_call_count,

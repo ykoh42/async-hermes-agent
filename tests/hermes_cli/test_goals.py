@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import time
-from unittest.mock import patch, MagicMock
+from unittest.mock import AsyncMock, patch, MagicMock
 
 import pytest
 
@@ -71,7 +71,8 @@ class TestParseJudgeResponse:
 class TestJudgeGoal:
 
 
-    def test_api_error_continues(self):
+    @pytest.mark.asyncio
+    async def test_api_error_continues(self):
         """Judge exception → fail-open continue (don't wedge progress on judge bugs)."""
         from hermes_cli import goals
 
@@ -79,11 +80,12 @@ class TestJudgeGoal:
             "agent.auxiliary_client.call_llm",
             side_effect=RuntimeError("boom"),
         ):
-            verdict, reason, _, _wd, _tf = goals.judge_goal("goal", "response")
+            verdict, reason, _, _wd, _tf = await goals.judge_goal("goal", "response")
         assert verdict == "continue"
         assert "judge error" in reason.lower()
 
-    def test_judge_says_done(self):
+    @pytest.mark.asyncio
+    async def test_judge_says_done(self):
         from hermes_cli import goals
 
         with patch(
@@ -92,7 +94,7 @@ class TestJudgeGoal:
                 choices=[MagicMock(message=MagicMock(content='{"done": true, "reason": "achieved"}'))]
             ),
         ):
-            verdict, reason, _, _wd, _tf = goals.judge_goal("goal", "agent response")
+            verdict, reason, _, _wd, _tf = await goals.judge_goal("goal", "agent response")
         assert verdict == "done"
         assert reason == "achieved"
 
@@ -104,11 +106,12 @@ class TestJudgeGoal:
 
 class TestGoalManager:
 
-    def test_set_then_status(self, hermes_home):
+    @pytest.mark.asyncio
+    async def test_set_then_status(self, hermes_home):
         from hermes_cli.goals import GoalManager
 
         mgr = GoalManager(session_id="test-sid-2", default_max_turns=5)
-        state = mgr.set("port the thing")
+        state = await mgr.set("port the thing")
         assert state.goal == "port the thing"
         assert state.status == "active"
         assert state.max_turns == 5
@@ -124,14 +127,15 @@ class TestGoalManager:
 
 
 
-    def test_continuation_prompt_shape(self, hermes_home):
+    @pytest.mark.asyncio
+    async def test_continuation_prompt_shape(self, hermes_home):
         """The continuation prompt must include the goal text verbatim —
         and must be safe to inject as a user-role message (prompt-cache
         invariants: no system-prompt mutation)."""
         from hermes_cli.goals import GoalManager
 
         mgr = GoalManager(session_id="cont-sid")
-        mgr.set("port goal command to hermes")
+        await mgr.set("port goal command to hermes")
         prompt = mgr.next_continuation_prompt()
         assert prompt is not None
         assert "port goal command to hermes" in prompt
@@ -173,7 +177,8 @@ class TestJudgeParseFailureAutoPause:
 
 
 
-    def test_api_error_does_not_count_as_parse_failure(self):
+    @pytest.mark.asyncio
+    async def test_api_error_does_not_count_as_parse_failure(self):
         """Transient network/API errors must not trip the auto-pause guard."""
         from hermes_cli import goals
 
@@ -181,7 +186,7 @@ class TestJudgeParseFailureAutoPause:
             "agent.auxiliary_client.call_llm",
             side_effect=RuntimeError("connection reset"),
         ):
-            verdict, _, parse_failed, _wd, transport_failed = goals.judge_goal(
+            verdict, _, parse_failed, _wd, transport_failed = await goals.judge_goal(
                 "goal", "response"
             )
         assert verdict == "continue"
@@ -189,27 +194,29 @@ class TestJudgeParseFailureAutoPause:
         assert transport_failed is True
 
 
-    def test_auto_pause_after_three_consecutive_parse_failures(self, hermes_home):
+    @pytest.mark.asyncio
+    async def test_auto_pause_after_three_consecutive_parse_failures(self, hermes_home):
         """N=3 consecutive parse failures → auto-pause with config pointer."""
         from hermes_cli import goals
         from hermes_cli.goals import GoalManager, DEFAULT_MAX_CONSECUTIVE_PARSE_FAILURES
 
         assert DEFAULT_MAX_CONSECUTIVE_PARSE_FAILURES == 3
         mgr = GoalManager(session_id="parse-fail-sid-1", default_max_turns=20)
-        mgr.set("do a thing")
+        await mgr.set("do a thing")
 
         with patch.object(
-            goals, "judge_goal", return_value=("continue", "judge returned empty response", True, None, False)
+            goals, "judge_goal", new_callable=AsyncMock,
+            return_value=("continue", "judge returned empty response", True, None, False),
         ):
-            d1 = mgr.evaluate_after_turn("step 1")
+            d1 = await mgr.evaluate_after_turn("step 1")
             assert d1["should_continue"] is True
             assert mgr.state.consecutive_parse_failures == 1
 
-            d2 = mgr.evaluate_after_turn("step 2")
+            d2 = await mgr.evaluate_after_turn("step 2")
             assert d2["should_continue"] is True
             assert mgr.state.consecutive_parse_failures == 2
 
-            d3 = mgr.evaluate_after_turn("step 3")
+            d3 = await mgr.evaluate_after_turn("step 3")
             assert d3["should_continue"] is False
             assert d3["status"] == "paused"
             assert mgr.state.consecutive_parse_failures == 3
@@ -253,49 +260,54 @@ class TestMigrateGoalToSession:
     per-session lookup with no lineage walk, so without migration an active
     goal silently dies when compression rotates session_id."""
 
-    def test_migrates_active_goal_to_child(self, hermes_home):
+    @pytest.mark.asyncio
+    async def test_migrates_active_goal_to_child(self, hermes_home):
         from hermes_cli.goals import save_goal, load_goal, migrate_goal_to_session, GoalState
-        save_goal("parent-sid", GoalState(goal="ship the feature"))
-        assert migrate_goal_to_session("parent-sid", "child-sid", reason="compression") is True
-        child = load_goal("child-sid")
+        await save_goal("parent-sid", GoalState(goal="ship the feature"))
+        assert await migrate_goal_to_session("parent-sid", "child-sid", reason="compression") is True
+        child = await load_goal("child-sid")
         assert child is not None and child.goal == "ship the feature"
         # Parent row archived (cleared) so only the child is active.
-        parent = load_goal("parent-sid")
+        parent = await load_goal("parent-sid")
         assert parent is not None and parent.status == "cleared"
 
 
-    def test_does_not_clobber_existing_child_goal(self, hermes_home):
+    @pytest.mark.asyncio
+    async def test_does_not_clobber_existing_child_goal(self, hermes_home):
         from hermes_cli.goals import save_goal, load_goal, migrate_goal_to_session, GoalState
-        save_goal("p3", GoalState(goal="parent goal"))
-        save_goal("c3", GoalState(goal="child already has one"))
-        assert migrate_goal_to_session("p3", "c3") is False
-        assert load_goal("c3").goal == "child already has one"
+        await save_goal("p3", GoalState(goal="parent goal"))
+        await save_goal("c3", GoalState(goal="child already has one"))
+        assert await migrate_goal_to_session("p3", "c3") is False
+        assert (await load_goal("c3")).goal == "child already has one"
 
 
 class TestGoalManagerSubgoals:
-    def test_add_subgoal(self, hermes_home):
+    @pytest.mark.asyncio
+    async def test_add_subgoal(self, hermes_home):
         from hermes_cli.goals import GoalManager
         mgr = GoalManager(session_id="sub-add")
-        mgr.set("main goal")
-        text = mgr.add_subgoal("  use bullet points  ")
+        await mgr.set("main goal")
+        text = await mgr.add_subgoal("  use bullet points  ")
         assert text == "use bullet points"
         assert mgr.state.subgoals == ["use bullet points"]
 
 
-    def test_remove_subgoal_out_of_range(self, hermes_home):
+    @pytest.mark.asyncio
+    async def test_remove_subgoal_out_of_range(self, hermes_home):
         import pytest
         from hermes_cli.goals import GoalManager
         mgr = GoalManager(session_id="sub-oob")
-        mgr.set("g")
-        mgr.add_subgoal("only")
+        await mgr.set("g")
+        await mgr.add_subgoal("only")
         with pytest.raises(IndexError):
-            mgr.remove_subgoal(5)
+            await mgr.remove_subgoal(5)
         with pytest.raises(IndexError):
-            mgr.remove_subgoal(0)
+            await mgr.remove_subgoal(0)
 
 
 class TestJudgeGoalWithSubgoals:
-    def test_judge_uses_subgoals_template_when_provided(self, hermes_home):
+    @pytest.mark.asyncio
+    async def test_judge_uses_subgoals_template_when_provided(self, hermes_home):
         """judge_goal switches templates when subgoals is non-empty.
 
         We don't actually call the model — we patch the aux client to
@@ -316,8 +328,12 @@ class TestJudgeGoalWithSubgoals:
             captured.update(kwargs)
             return _FakeResp()
 
-        with patch("agent.auxiliary_client.call_llm", side_effect=_fake_call_llm):
-            verdict, reason, parse_failed, _wd, _tf = goals.judge_goal(
+        with patch(
+            "agent.auxiliary_client.call_llm",
+            new_callable=AsyncMock,
+            side_effect=_fake_call_llm,
+        ):
+            verdict, reason, parse_failed, _wd, _tf = await goals.judge_goal(
                 "ship the feature",
                 "ok shipped",
                 subgoals=["write tests", "update docs"],
@@ -332,7 +348,8 @@ class TestJudgeGoalWithSubgoals:
         assert "every additional criterion" in user_msg
         assert verdict == "done"
 
-    def test_judge_uses_original_template_when_no_subgoals(self, hermes_home):
+    @pytest.mark.asyncio
+    async def test_judge_uses_original_template_when_no_subgoals(self, hermes_home):
         from unittest.mock import patch
         from hermes_cli import goals
 
@@ -348,8 +365,12 @@ class TestJudgeGoalWithSubgoals:
             captured.update(kwargs)
             return _FakeResp()
 
-        with patch("agent.auxiliary_client.call_llm", side_effect=_fake_call_llm):
-            goals.judge_goal("ship it", "done", subgoals=None)
+        with patch(
+            "agent.auxiliary_client.call_llm",
+            new_callable=AsyncMock,
+            side_effect=_fake_call_llm,
+        ):
+            await goals.judge_goal("ship it", "done", subgoals=None)
 
         sent_messages = captured.get("messages") or []
         user_msg = next((m["content"] for m in sent_messages if m["role"] == "user"), "")
@@ -359,12 +380,13 @@ class TestJudgeGoalWithSubgoals:
 
 class TestStatusLineSubgoalCount:
 
-    def test_status_line_with_subgoals(self, hermes_home):
+    @pytest.mark.asyncio
+    async def test_status_line_with_subgoals(self, hermes_home):
         from hermes_cli.goals import GoalManager
         mgr = GoalManager(session_id="sl-with")
-        mgr.set("ship it")
-        mgr.add_subgoal("a")
-        mgr.add_subgoal("b")
+        await mgr.set("ship it")
+        await mgr.add_subgoal("a")
+        await mgr.add_subgoal("b")
         line = mgr.status_line()
         assert "2 subgoals" in line
 
@@ -391,21 +413,22 @@ class TestWaitBarrier:
         return 2_000_000_000
 
 
-    def test_parked_on_live_pid_does_not_continue_or_judge(self, hermes_home):
+    @pytest.mark.asyncio
+    async def test_parked_on_live_pid_does_not_continue_or_judge(self, hermes_home):
         from hermes_cli import goals
         from hermes_cli.goals import GoalManager
 
         proc = self._spawn_sleeper()
         try:
             mgr = GoalManager(session_id="wb-live")
-            mgr.set("ship it", max_turns=5)
-            mgr.wait_on(proc.pid, reason="CI green")
+            await mgr.set("ship it", max_turns=5)
+            await mgr.wait_on(proc.pid, reason="CI green")
             assert mgr.is_waiting() is True
 
             # The judge must NOT be called while parked, and no turn is burned.
-            judge = MagicMock(return_value=("continue", "x", False, None, False))
+            judge = AsyncMock(return_value=("continue", "x", False, None, False))
             with patch.object(goals, "judge_goal", judge):
-                decision = mgr.evaluate_after_turn("still waiting on CI")
+                decision = await mgr.evaluate_after_turn("still waiting on CI")
 
             judge.assert_not_called()
             assert decision["verdict"] == "waiting"
@@ -419,19 +442,20 @@ class TestWaitBarrier:
             proc.wait(timeout=10)
 
 
-    def test_stop_waiting_clears_barrier(self, hermes_home):
+    @pytest.mark.asyncio
+    async def test_stop_waiting_clears_barrier(self, hermes_home):
         from hermes_cli.goals import GoalManager
 
         proc = self._spawn_sleeper()
         try:
             mgr = GoalManager(session_id="wb-stop")
-            mgr.set("g")
-            mgr.wait_on(proc.pid)
+            await mgr.set("g")
+            await mgr.wait_on(proc.pid)
             assert mgr.is_waiting() is True
-            assert mgr.stop_waiting() is True
+            assert await mgr.stop_waiting() is True
             assert mgr.state.waiting_on_pid is None
             assert mgr.is_waiting() is False
-            assert mgr.stop_waiting() is False  # idempotent
+            assert await mgr.stop_waiting() is False  # idempotent
         finally:
             proc.terminate()
             proc.wait(timeout=10)
@@ -451,20 +475,21 @@ class TestJudgeDrivenWait:
         import subprocess, sys
         return subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
 
-    def test_judge_wait_pid_parks_loop(self, hermes_home):
+    @pytest.mark.asyncio
+    async def test_judge_wait_pid_parks_loop(self, hermes_home):
         from hermes_cli import goals
         from hermes_cli.goals import GoalManager
 
         proc = self._spawn_sleeper()
         try:
             mgr = GoalManager(session_id="jw-pid", default_max_turns=10)
-            mgr.set("ship the PR")
+            await mgr.set("ship the PR")
             # Judge sees the running process and says wait-on-pid.
             with patch.object(
-                goals, "judge_goal",
+                goals, "judge_goal", new_callable=AsyncMock,
                 return_value=("wait", "CI watcher still running", False, {"pid": proc.pid}, False),
             ):
-                decision = mgr.evaluate_after_turn(
+                decision = await mgr.evaluate_after_turn(
                     "Pushed the PR, watching CI.",
                     background_processes=[{
                         "pid": proc.pid, "command": "wait_for_pr_green.sh",
@@ -478,9 +503,9 @@ class TestJudgeDrivenWait:
             assert mgr.is_waiting() is True
 
             # Next turn while still parked: judge must NOT be called again.
-            judge = MagicMock()
+            judge = AsyncMock()
             with patch.object(goals, "judge_goal", judge):
-                d2 = mgr.evaluate_after_turn("still going")
+                d2 = await mgr.evaluate_after_turn("still going")
             judge.assert_not_called()
             assert d2["verdict"] == "waiting"
             assert d2["should_continue"] is False
@@ -489,30 +514,32 @@ class TestJudgeDrivenWait:
             proc.wait(timeout=10)
 
 
-    def test_time_barrier_clears_after_deadline(self, hermes_home):
+    @pytest.mark.asyncio
+    async def test_time_barrier_clears_after_deadline(self, hermes_home):
         from hermes_cli.goals import GoalManager
 
         mgr = GoalManager(session_id="jw-deadline")
-        mgr.set("g")
-        mgr.wait_for_seconds(120, reason="backoff")
+        await mgr.set("g")
+        await mgr.wait_for_seconds(120, reason="backoff")
         assert mgr.is_waiting() is True
         # Force the deadline into the past → barrier auto-clears.
         mgr.state.waiting_until = time.time() - 1
         assert mgr.is_waiting() is False
         assert mgr.state.waiting_until == 0.0
 
-    def test_continue_verdict_still_continues_with_background(self, hermes_home):
+    @pytest.mark.asyncio
+    async def test_continue_verdict_still_continues_with_background(self, hermes_home):
         """A running process present but judge says continue → normal loop."""
         from hermes_cli import goals
         from hermes_cli.goals import GoalManager
 
         mgr = GoalManager(session_id="jw-cont", default_max_turns=10)
-        mgr.set("do work")
+        await mgr.set("do work")
         with patch.object(
-            goals, "judge_goal",
+            goals, "judge_goal", new_callable=AsyncMock,
             return_value=("continue", "more to do", False, None, False),
         ):
-            decision = mgr.evaluate_after_turn(
+            decision = await mgr.evaluate_after_turn(
                 "made progress",
                 background_processes=[{"pid": 999999, "command": "x", "status": "running"}],
             )
@@ -557,18 +584,19 @@ class TestSessionTriggerBarrier:
         assert reg.is_session_waiting("proc_t2") is False
 
 
-    def test_wait_on_session_validation(self, hermes_home):
+    @pytest.mark.asyncio
+    async def test_wait_on_session_validation(self, hermes_home):
         from hermes_cli.goals import GoalManager
         mgr = GoalManager(session_id="st-val")
         # No active goal → RuntimeError
         try:
-            mgr.wait_on_session("proc_x")
+            await mgr.wait_on_session("proc_x")
             assert False, "expected RuntimeError"
         except RuntimeError:
             pass
-        mgr.set("g")
+        await mgr.set("g")
         try:
-            mgr.wait_on_session("")
+            await mgr.wait_on_session("")
             assert False, "expected ValueError"
         except ValueError:
             pass
@@ -651,25 +679,30 @@ class TestGoalManagerContract:
 
 
 
-    def test_set_contract_after_the_fact(self, hermes_home):
+    @pytest.mark.asyncio
+    async def test_set_contract_after_the_fact(self, hermes_home):
         from hermes_cli.goals import GoalManager, GoalContract
 
         mgr = GoalManager(session_id="c-after")
-        mgr.set("ship it")
+        await mgr.set("ship it")
         assert not mgr.has_contract()
-        mgr.set_contract(GoalContract(verification="x"))
+        await mgr.set_contract(GoalContract(verification="x"))
         assert mgr.has_contract()
         # Survives reload.
         from hermes_cli.goals import GoalManager as GM2
-        assert GM2(session_id="c-after").has_contract()
+        reloaded = GM2(session_id="c-after")
+        await reloaded.load()
+        assert reloaded.has_contract()
 
-    def test_persistence_roundtrip(self, hermes_home):
+    @pytest.mark.asyncio
+    async def test_persistence_roundtrip(self, hermes_home):
         from hermes_cli.goals import GoalManager, GoalContract
 
-        GoalManager(session_id="c-persist").set(
+        await GoalManager(session_id="c-persist").set(
             "ship it", contract=GoalContract(outcome="O", verification="V")
         )
         reloaded = GoalManager(session_id="c-persist")
+        await reloaded.load()
         assert reloaded.state.contract.outcome == "O"
         assert reloaded.state.contract.verification == "V"
 
@@ -690,15 +723,19 @@ class TestJudgeWithContract:
             return _FakeResp()
         return _fake
 
-    def test_judge_uses_contract_template(self, hermes_home):
+    @pytest.mark.asyncio
+    async def test_judge_uses_contract_template(self, hermes_home):
         from unittest.mock import patch
         from hermes_cli import goals
         from hermes_cli.goals import GoalContract
 
         captured = {}
-        with patch("agent.auxiliary_client.call_llm",
-                   side_effect=self._fake_call_llm(captured)):
-            goals.judge_goal(
+        with patch(
+            "agent.auxiliary_client.call_llm",
+            new_callable=AsyncMock,
+            side_effect=self._fake_call_llm(captured),
+        ):
+            await goals.judge_goal(
                 "ship it", "I think it's done",
                 contract=GoalContract(verification="pytest -q passes"),
             )
@@ -711,7 +748,8 @@ class TestJudgeWithContract:
 
 
 class TestDraftContract:
-    def test_draft_parses_json(self, hermes_home):
+    @pytest.mark.asyncio
+    async def test_draft_parses_json(self, hermes_home):
         from unittest.mock import patch
         from hermes_cli import goals
 
@@ -725,22 +763,29 @@ class TestDraftContract:
             message = _FakeMsg()
         class _FakeResp:
             choices = [_FakeChoice()]
-        with patch("agent.auxiliary_client.call_llm",
-                   return_value=_FakeResp()):
-            contract = goals.draft_contract("Migrate auth to JWT")
+        with patch(
+            "agent.auxiliary_client.call_llm",
+            new_callable=AsyncMock,
+            return_value=_FakeResp(),
+        ):
+            contract = await goals.draft_contract("Migrate auth to JWT")
         assert contract is not None
         assert contract.outcome == "auth on JWT"
         assert contract.verification == "auth suite green"
         assert not contract.is_empty()
 
 
-    def test_draft_returns_none_when_no_client(self, hermes_home):
+    @pytest.mark.asyncio
+    async def test_draft_returns_none_when_no_client(self, hermes_home):
         from unittest.mock import patch
         from hermes_cli import goals
 
-        with patch("agent.auxiliary_client.call_llm",
-                   side_effect=RuntimeError("No LLM provider configured")):
-            assert goals.draft_contract("anything") is None
+        with patch(
+            "agent.auxiliary_client.call_llm",
+            new_callable=AsyncMock,
+            side_effect=RuntimeError("No LLM provider configured"),
+        ):
+            assert await goals.draft_contract("anything") is None
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -768,7 +813,8 @@ class TestContractAndBackgroundCompose:
             return _FakeResp()
         return _fake
 
-    def test_judge_prompt_carries_contract_and_background(self, hermes_home):
+    @pytest.mark.asyncio
+    async def test_judge_prompt_carries_contract_and_background(self, hermes_home):
         from unittest.mock import patch
         from hermes_cli import goals
         from hermes_cli.goals import GoalContract
@@ -778,9 +824,12 @@ class TestContractAndBackgroundCompose:
             "session_id": "ci-watch", "pid": 4242, "status": "running",
             "command": "wait_for_pr_green.sh 50501", "trigger": "exit",
         }]
-        with patch("agent.auxiliary_client.call_llm",
-                   side_effect=self._capture_call_llm(captured)):
-            verdict, reason, parse_failed, wait_directive, _tf = goals.judge_goal(
+        with patch(
+            "agent.auxiliary_client.call_llm",
+            new_callable=AsyncMock,
+            side_effect=self._capture_call_llm(captured),
+        ):
+            verdict, reason, parse_failed, wait_directive, _tf = await goals.judge_goal(
                 "ship the PR",
                 "I pushed and started the CI watcher; waiting on it now.",
                 contract=GoalContract(verification="PR CI goes green"),
@@ -797,4 +846,3 @@ class TestContractAndBackgroundCompose:
         # The judge can return a wait verdict on a contract goal.
         assert verdict == "wait"
         assert wait_directive and wait_directive.get("pid") == 4242
-

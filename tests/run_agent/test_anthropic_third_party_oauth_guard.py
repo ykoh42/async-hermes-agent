@@ -81,7 +81,8 @@ class TestOAuthFlagOnRefresh:
 class TestOAuthFlagOnCredentialSwap:
     """Site 4 — _swap_credential (credential pool rotation)."""
 
-    def test_pool_swap_on_third_party_never_flips_oauth(self, agent):
+    @pytest.mark.asyncio
+    async def test_pool_swap_on_third_party_never_flips_oauth(self, agent):
         agent.api_mode = "anthropic_messages"
         agent.provider = "glm"              # ← Zhipu GLM via /anthropic
         agent._anthropic_api_key = "old-key"
@@ -95,7 +96,7 @@ class TestOAuthFlagOnCredentialSwap:
 
         with patch("agent.anthropic_adapter.build_anthropic_client",
                    return_value=MagicMock()):
-            agent._swap_credential(entry)
+            await agent._swap_credential(entry)
 
         assert agent._is_anthropic_oauth is False
 
@@ -155,4 +156,3 @@ class TestApiKeyTokensAlwaysSafe:
     def test_native_anthropic_with_api_key_token(self):
         from agent.anthropic_adapter import _is_oauth_token
         assert _is_oauth_token(_API_KEY_TOKEN) is False
-

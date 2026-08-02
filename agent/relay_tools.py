@@ -1,5 +1,4 @@
 """Core NeMo Relay adapter for Hermes tool execution."""
-
 from __future__ import annotations
 
 import asyncio
@@ -15,7 +14,7 @@ from agent import relay_runtime
 logger = logging.getLogger(__name__)
 
 
-def execute(
+async def execute(
     tool_name: str,
     args: dict[str, Any],
     callback: Callable[[dict[str, Any]], Any],
@@ -23,21 +22,35 @@ def execute(
     session_id: str,
     metadata: dict[str, Any] | None = None,
 ) -> tuple[Any, dict[str, Any]]:
-    """Run one tool call through Relay and return its final arguments."""
+    """Run one coroutine-native tool call through Relay."""
     runtime, session, parent = relay_runtime.resolve_execution_context(session_id)
     if runtime is None or session is None or not runtime.managed_execution_enabled():
-        return callback(args), args
+        result = callback(args)
+        if not inspect.isawaitable(result):
+            raise RuntimeError(
+                "Async Hermes Relay tools require a coroutine callback"
+            )
+        return await result, args
 
     observed_args = args
     raw_result: dict[str, Any] = {}
     callback_error: BaseException | None = None
     callback_context = contextvars.copy_context()
 
-    def invoke(next_args: Any) -> Any:
+    async def invoke(next_args: Any) -> Any:
         nonlocal callback_error, observed_args
         observed_args = next_args if isinstance(next_args, dict) else args
         try:
             result = callback_context.copy().run(callback, observed_args)
+            if not inspect.isawaitable(result):
+                raise RuntimeError(
+                    "Async Hermes Relay tools require a coroutine callback"
+                )
+            task = callback_context.copy().run(
+                asyncio.create_task,
+                result,
+            )
+            result = await task
         except BaseException as exc:
             callback_error = exc
             raise
@@ -46,16 +59,14 @@ def execute(
         return raw_result["json"]
 
     try:
-        managed = _run_awaitable(
-            runtime.run_in_session_async(
-                session,
-                runtime.relay.tools.execute,
-                tool_name,
-                _jsonable(args),
-                invoke,
-                handle=parent,
-                metadata=_jsonable(metadata or {}),
-            )
+        managed = await runtime.run_in_session_async(
+            session,
+            runtime.relay.tools.execute,
+            tool_name,
+            _jsonable(args),
+            invoke,
+            handle=parent,
+            metadata=_jsonable(metadata or {}),
         )
     except BaseException as exc:
         if (
@@ -109,15 +120,3 @@ def _json_equal(left: Any, right: Any) -> bool:
         ) == json.dumps(_jsonable(right), sort_keys=True, separators=(",", ":"))
     except (TypeError, ValueError):
         return left == right
-
-
-def _run_awaitable(value: Any) -> Any:
-    if not inspect.isawaitable(value):
-        return value
-    try:
-        asyncio.get_running_loop()
-    except RuntimeError:
-        return asyncio.run(value)
-    raise RuntimeError(
-        "Synchronous Hermes Relay tool execution cannot run on an active event-loop thread"
-    )

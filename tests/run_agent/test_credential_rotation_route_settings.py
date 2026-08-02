@@ -1,105 +1,94 @@
-"""Credential rotation must not carry route-scoped TLS policy."""
+"""Native async credential rotation contracts."""
 
-from types import MethodType, SimpleNamespace
-from unittest.mock import MagicMock, patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
 
 from run_agent import AIAgent
 
 
-def test_credential_rotation_replaces_route_scoped_tls_settings():
-    agent = SimpleNamespace(
-        api_mode="chat_completions",
-        provider="custom",
-        model="shared-model",
-        api_key="old",
-        base_url="https://a.example/v1",
-        _client_kwargs={
-            "api_key": "old",
-            "base_url": "https://a.example/v1",
-            "ssl_verify": False,
-            "ssl_ca_cert": "/a.pem",
-        },
-        _apply_client_headers_for_base_url=MagicMock(),
-        _replace_primary_openai_client=MagicMock(),
-    )
-    entry = SimpleNamespace(
-        runtime_api_key="new",
-        access_token="",
-        runtime_base_url="https://b.example/v1",
-        base_url="https://b.example/v1",
-    )
-    config = {
-        "custom_providers": [
-            {
-                "name": "b",
-                "base_url": "https://b.example/v1",
-                "ssl_verify": True,
-            }
-        ]
-    }
-
-    with patch("hermes_cli.config.load_config_readonly", return_value=config):
-        AIAgent._swap_credential(agent, entry)
-
-    assert agent._client_kwargs["ssl_verify"] is True
-    assert "ssl_ca_cert" not in agent._client_kwargs
-    agent._replace_primary_openai_client.assert_called_once_with(
-        reason="credential_rotation"
-    )
+class _NativeClient:
+    def __init__(self):
+        self._platform = None
+        self.close = AsyncMock()
 
 
-def test_credential_rotation_does_not_carry_global_headers_across_routes():
-    agent = SimpleNamespace(
-        api_mode="chat_completions",
-        provider="custom",
-        model="shared-model",
-        api_key="old",
-        base_url="https://a.example/v1",
-        _client_kwargs={
-            "api_key": "old",
-            "base_url": "https://a.example/v1",
-            "default_headers": {"Authorization": "old-secret"},
-        },
-        _replace_primary_openai_client=MagicMock(),
-    )
-    agent._apply_client_headers_for_base_url = MethodType(
-        AIAgent._apply_client_headers_for_base_url,
-        agent,
-    )
-    agent._apply_user_default_headers = MethodType(
-        AIAgent._apply_user_default_headers,
-        agent,
-    )
-    entry = SimpleNamespace(
-        runtime_api_key="new",
-        access_token="",
-        runtime_base_url="https://b.example/v1",
-        base_url="https://b.example/v1",
-    )
-    config = {
-        "model": {
-            "default_headers": {"Authorization": "global-secret"},
-        },
-        "custom_providers": [
-            {
-                "name": "b",
-                "base_url": "https://b.example/v1",
-                "extra_headers": {"X-Route": "b"},
-            }
-        ],
-    }
+@pytest.mark.asyncio
+async def test_credential_rotation_rebuilds_natively_without_sync_settings_io():
+    """A pool rotation replaces the client without re-reading config.yaml.
 
+    Route-scoped TLS and user-header policy is resolved when the async runtime
+    is initialized; the retry path must not perform synchronous settings I/O
+    merely to rotate an API credential.
+    """
+    native_client = _NativeClient()
     with (
-        patch("hermes_cli.config.load_config_readonly", return_value=config),
+        patch("run_agent.get_tool_definitions", return_value=[]),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI", return_value=MagicMock()),
+        patch("openai.AsyncOpenAI", return_value=native_client) as async_openai,
         patch(
-            "hermes_cli.config.get_compatible_custom_providers",
-            return_value=config["custom_providers"],
+            "hermes_cli.config.load_config_readonly",
+            side_effect=AssertionError("credential rotation must not read settings"),
         ),
     ):
-        AIAgent._swap_credential(agent, entry)
+        agent = AIAgent(
+            provider="custom",
+            model="shared-model",
+            api_key="old-key",
+            base_url="https://a.example/v1",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+        entry = SimpleNamespace(
+            id="pool-entry-b",
+            runtime_api_key="new-key",
+            access_token="",
+            runtime_base_url="https://b.example/v1",
+            base_url="https://b.example/v1",
+        )
 
-    headers = agent._client_kwargs["default_headers"]
-    assert "Authorization" not in headers
-    assert headers["X-Route"] == "b"
+        await agent._swap_credential(entry)
+
+    assert agent.api_key == "new-key"
+    assert agent.base_url == "https://b.example/v1"
+    assert agent._credential_pool_entry_id == "pool-entry-b"
+    assert agent.client is native_client
+    assert agent.client._platform == "Unknown"
+    async_openai.assert_called_once()
+    await agent.close()
 
 
+@pytest.mark.asyncio
+async def test_credential_rotation_drops_previous_route_headers():
+    native_client = _NativeClient()
+    with (
+        patch("run_agent.get_tool_definitions", return_value=[]),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI", return_value=MagicMock()),
+        patch("openai.AsyncOpenAI", return_value=native_client),
+    ):
+        agent = AIAgent(
+            provider="custom",
+            model="shared-model",
+            api_key="old-key",
+            base_url="https://a.example/v1",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+        agent._client_kwargs["default_headers"] = {"Authorization": "old-secret"}
+        entry = SimpleNamespace(
+            id="pool-entry-b",
+            runtime_api_key="new-key",
+            access_token="",
+            runtime_base_url="https://b.example/v1",
+            base_url="https://b.example/v1",
+        )
+
+        await agent._swap_credential(entry)
+
+    assert "default_headers" not in agent._client_kwargs
+    await agent.close()

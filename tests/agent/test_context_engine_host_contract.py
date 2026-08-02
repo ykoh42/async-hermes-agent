@@ -84,7 +84,13 @@ def test_transition_skips_optional_hooks_when_engine_lacks_them():
 
 
 def test_reset_session_state_rebinds_builtin_compressor_after_session_switch(tmp_path, monkeypatch):
-    """Reset-only session switches must rebind durable cooldown state to the new session."""
+    """Reset-only session switches must rebind local compression state.
+
+    Native turn persistence goes through ``conversation_compression`` and the
+    async session adapter.  ``reset_session_state`` itself only changes the
+    compressor's active session identity; it must not issue a legacy
+    synchronous SQLite write.
+    """
     db = SessionDB(db_path=tmp_path / "state.db")
     db.create_session("old-sid", source="cli")
     db.create_session("new-sid", source="cli")
@@ -92,7 +98,7 @@ def test_reset_session_state_rebinds_builtin_compressor_after_session_switch(tmp
     db.set_compression_fallback_streak("old-sid", 2)
 
     monkeypatch.setattr(
-        "agent.context_compressor.get_model_context_length",
+        "agent.context_compressor.get_static_context_length",
         lambda *_a, **_k: 100_000,
     )
     compressor = ContextCompressor(
@@ -102,7 +108,7 @@ def test_reset_session_state_rebinds_builtin_compressor_after_session_switch(tmp
         protect_last_n=2,
         quiet_mode=True,
     )
-    compressor.bind_session_state(db, "old-sid")
+    compressor.bind_session_state(None, "old-sid")
 
     agent = _bare_agent()
     agent._session_db = db
@@ -119,7 +125,8 @@ def test_reset_session_state_rebinds_builtin_compressor_after_session_switch(tmp
 
     compressor._record_compression_failure_cooldown(30.0, "new-timeout")
 
-    assert db.get_compression_failure_cooldown("new-sid") is not None
+    assert compressor.get_active_compression_failure_cooldown() is not None
+    assert db.get_compression_failure_cooldown("new-sid") is None
     assert db.get_compression_failure_cooldown("old-sid")["error"] == "old-timeout"
 
 

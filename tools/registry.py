@@ -16,6 +16,7 @@ Import chain (circular-import safe):
 
 import ast
 import importlib
+import inspect
 import json
 import logging
 import sys
@@ -27,10 +28,10 @@ from typing import Callable, Dict, List, Optional, Set
 logger = logging.getLogger(__name__)
 
 
-# This checkout uses the registry as the synchronous training/runtime waist.
-# Keep the model-visible built-ins to the local harness capabilities needed for
-# trajectories (terminal, files, memory, skills, web, and delegation).  MCP
-# tools are registered separately by ``tools.mcp_tool`` from configured
+# This checkout uses the registry as the async training/runtime waist. Keep the
+# model-visible built-ins to the local harness capabilities needed for
+# trajectories (terminal, files, memory, skills, planning, and clarification).
+# MCP tools are registered separately by ``tools.mcp_tool`` from configured
 # servers.
 #
 # Keeping the restriction here (before imports) matters: tool modules register
@@ -38,19 +39,30 @@ logger = logging.getLogger(__name__)
 # optional SDKs and their operational dependencies on every worker.
 _TRAINING_RUNTIME_TOOL_MODULES = frozenset({
     "clarify_tool",
-    "code_execution_tool",
-    "delegate_tool",
     "file_tools",
     "memory_tool",
-    "process_registry",
-    "read_terminal_tool",
-    "session_search_tool",
-    "skill_manager_tool",
     "skills_tool",
+    "session_search_tool",
     "terminal_tool",
     "todo_tool",
-    "vision_tools",
-    "web_tools",
+})
+
+# A few legacy modules are imported for helpers (for example compression resets
+# file-read deduplication) and historically registered a synchronous model tool
+# as an import side effect. Discovery filtering alone cannot prevent that. Keep
+# the async training surface closed at the registration point, where the module
+# that owns a handler is unambiguous. This is a capability policy, not an async
+# compatibility wrapper: a tool joins the model schema only after its original
+# handler has been converted to native async and its module is added here.
+_ASYNC_RUNTIME_HANDLER_MODULES = frozenset({
+    "tools.clarify_tool",
+    "tools.file_tools",
+    "tools.mcp_tool",
+    "tools.memory_tool",
+    "tools.skills_tool",
+    "tools.session_search_tool",
+    "tools.terminal_tool",
+    "tools.todo_tool",
 })
 
 
@@ -190,23 +202,21 @@ class ToolEntry:
     """Metadata for a single registered tool."""
 
     __slots__ = (
-        "name", "toolset", "schema", "handler", "check_fn",
-        "async_handler", "requires_env", "is_async", "description", "emoji",
+        "name", "toolset", "schema", "handler", "is_async", "check_fn",
+        "requires_env", "description", "emoji",
         "max_result_size_chars", "dynamic_schema_overrides",
     )
 
-    def __init__(self, name, toolset, schema, handler, check_fn,
-                 requires_env, is_async, description, emoji,
-                 async_handler=None,
+    def __init__(self, name, toolset, schema, handler, is_async, check_fn,
+                 requires_env, description, emoji,
                  max_result_size_chars=None, dynamic_schema_overrides=None):
         self.name = name
         self.toolset = toolset
         self.schema = schema
         self.handler = handler
-        self.async_handler = async_handler
+        self.is_async = is_async
         self.check_fn = check_fn
         self.requires_env = requires_env
-        self.is_async = is_async
         self.description = description
         self.emoji = emoji
         self.max_result_size_chars = max_result_size_chars
@@ -474,12 +484,11 @@ class ToolRegistry:
         handler: Callable,
         check_fn: Callable = None,
         requires_env: list = None,
-        is_async: bool = False,
+        is_async: bool = True,
         description: str = "",
         emoji: str = "",
         max_result_size_chars: int | float | None = None,
         dynamic_schema_overrides: Callable = None,
-        async_handler: Callable = None,
         override: bool = False,
     ):
         """Register a tool.  Called at module-import time by each tool file.
@@ -490,6 +499,17 @@ class ToolRegistry:
         registrations that would shadow an existing tool from a different
         toolset are rejected to prevent accidental overwrites.
         """
+        handler_module = getattr(handler, "__module__", "") or ""
+        if (
+            handler_module.startswith("tools.")
+            and handler_module not in _ASYNC_RUNTIME_HANDLER_MODULES
+        ):
+            logger.debug(
+                "Tool %s from %s is not registered: native async migration is pending",
+                name,
+                handler_module,
+            )
+            return
         with self._lock:
             existing = self._tools.get(name)
             if existing and existing.toolset != toolset:
@@ -533,10 +553,9 @@ class ToolRegistry:
                 toolset=toolset,
                 schema=schema,
                 handler=handler,
-                async_handler=async_handler,
+                is_async=bool(is_async),
                 check_fn=check_fn,
                 requires_env=requires_env or [],
-                is_async=is_async,
                 description=description or schema.get("description", ""),
                 emoji=emoji,
                 max_result_size_chars=max_result_size_chars,
@@ -707,10 +726,10 @@ class ToolRegistry:
             result_type=result_type,
         )
 
-    def dispatch(self, name: str, args: dict, **kwargs) -> str | dict:
+    async def dispatch(self, name: str, args: dict, **kwargs) -> str | dict:
         """Execute a tool handler by name.
 
-        * Async handlers are bridged automatically via ``_run_async()``.
+        * Every active handler is awaited directly.
         * Handler results are normalized to a string or supported multimodal
           envelope before leaving the registry.
         * All exceptions are caught and returned as ``{"error": "..."}``
@@ -720,12 +739,17 @@ class ToolRegistry:
         if not entry:
             return tool_error(f"Unknown tool: {name}")
         try:
-            if entry.is_async:
-                from model_tools import _run_async
-                async_handler = entry.async_handler or entry.handler
-                result = _run_async(async_handler(args, **kwargs))
-            else:
-                result = entry.handler(args, **kwargs)
+            if not entry.is_async:
+                raise RuntimeError(
+                    f"Tool '{name}' is synchronous and unavailable in async-hermes-agent"
+                )
+            result = entry.handler(args, **kwargs)
+            if not inspect.isawaitable(result):
+                raise RuntimeError(
+                    f"Tool '{name}' declared native async but returned a "
+                    f"{type(result).__name__} instead of an awaitable"
+                )
+            result = await result
             return self._normalize_handler_result(name, result)
         except Exception as e:
             logger.exception("Tool %s dispatch error: %s", name, e)

@@ -98,7 +98,7 @@ def test_model_thresholds_key_in_default_config():
 class TestFloorInteractionOnModelSwitch:
     """The small-context floor stacks on per-model overrides at switch time."""
 
-    @patch("agent.context_compressor.get_model_context_length")
+    @patch("agent.context_compressor.get_static_context_length")
     def test_switch_override_below_floor_is_raised_to_floor(self, mock_ctx):
         """Switching to a small-context model with a sub-floor override → floor."""
         mock_ctx.return_value = 1_000_000

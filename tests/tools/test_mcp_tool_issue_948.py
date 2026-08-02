@@ -86,13 +86,11 @@ def _stdio_mocks():
 
 
 def test_run_stdio_malware_check_does_not_block_event_loop():
-    """The blocking OSV check runs off the loop (asyncio.to_thread), so a
-    concurrent coroutine keeps making progress while it runs."""
-    import time
+    """The native OSV check yields to concurrent work while it waits."""
     mock_stdio_cm, mock_session_cm = _stdio_mocks()
 
-    def slow_check(_command, _args):
-        time.sleep(0.3)  # simulate a slow OSV HTTPS call
+    async def slow_check(_command, _args):
+        await asyncio.sleep(0.3)
         return None
 
     ticks = {"n": 0}
@@ -115,21 +113,20 @@ def test_run_stdio_malware_check_does_not_block_event_loop():
             ticks_during = ticks["n"]
             await ticker
             await server.shutdown()
-        # The loop kept ticking DURING the 0.3s blocking check -> not blocked.
+        # The loop kept ticking while the native async check was in flight.
         assert ticks_during >= 3, f"event loop appeared blocked (ticks={ticks_during})"
 
     asyncio.run(_test())
 
 
 def test_run_stdio_malware_check_times_out_fail_open():
-    """A check that hangs past the timeout must NOT freeze startup: it times
-    out, logs, and proceeds (fail-open) so the server still starts."""
+    """A slow native OSV check times out and lets startup proceed."""
     import time
     mock_stdio_cm, mock_session_cm = _stdio_mocks()
 
-    def hung_check(_command, _args):
-        time.sleep(0.5)  # outlasts the 0.2s timeout 2.5x; short enough not to stall teardown
-        return "MALWARE"  # would block startup if awaited to completion
+    async def hung_check(_command, _args):
+        await asyncio.sleep(0.5)
+        return "MALWARE"
 
     async def _test():
         with patch("tools.osv_check.check_package_for_malware", side_effect=hung_check), \

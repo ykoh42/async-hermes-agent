@@ -1,6 +1,8 @@
 """Tests for MiniMax provider hardening — context lengths, thinking, catalog, beta headers, transport."""
 
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
+
+import pytest
 
 
 class TestMinimaxContextLengths:
@@ -291,9 +293,10 @@ class TestMinimaxSwitchModelCredentialGuard:
     to the MiniMax endpoint.
     """
 
-    def test_switch_to_minimax_does_not_resolve_anthropic_token(self):
-        """switch_model() should NOT call resolve_anthropic_token() for MiniMax."""
-        from unittest.mock import patch, MagicMock
+    @pytest.mark.asyncio
+    async def test_switch_to_minimax_does_not_resolve_anthropic_token(self):
+        """switch_model() passes only the MiniMax key to its async runtime."""
+        from unittest.mock import MagicMock
 
         with patch("run_agent.AIAgent.__init__", return_value=None):
             from run_agent import AIAgent
@@ -311,19 +314,36 @@ class TestMinimaxSwitchModelCredentialGuard:
             agent._anthropic_client = MagicMock()
             agent._fallback_chain = []
 
-        with patch("agent.anthropic_adapter.build_anthropic_client") as mock_build, \
-             patch("agent.anthropic_adapter.resolve_anthropic_token", return_value="sk-ant-leaked") as mock_resolve, \
-             patch("agent.anthropic_adapter._is_oauth_token", return_value=False):
+        async def apply_deferred_runtime():
+            runtime = agent._deferred_provider_runtime
+            assert runtime["provider"] == "minimax"
+            assert runtime["api_key"] == "mm-key-123"
+            assert runtime["base_url"] == "https://api.minimax.io/anthropic"
+            agent.provider = runtime["provider"]
+            agent.requested_provider = runtime["provider"]
+            agent.model = runtime["model"]
+            agent.api_key = runtime["api_key"]
+            agent.base_url = runtime["base_url"]
+            agent.api_mode = runtime["api_mode"]
+            agent._anthropic_api_key = runtime["api_key"]
+            agent._anthropic_base_url = runtime["base_url"]
+            agent._is_anthropic_oauth = False
 
-            agent.switch_model(
+        agent._ensure_provider_runtime = AsyncMock(side_effect=apply_deferred_runtime)
+        agent._persist_pending_billing_route = AsyncMock()
+
+        with patch(
+            "agent.anthropic_adapter.resolve_anthropic_token",
+            return_value="sk-ant-leaked",
+        ) as mock_resolve:
+            await agent.switch_model(
                 new_model="MiniMax-M2.7",
                 new_provider="minimax",
                 api_mode="anthropic_messages",
                 api_key="mm-key-123",
                 base_url="https://api.minimax.io/anthropic",
             )
-            # resolve_anthropic_token should NOT be called for non-Anthropic providers
-            mock_resolve.assert_not_called()
-            # The key passed to build_anthropic_client should be the MiniMax key
-            build_args = mock_build.call_args
-            assert build_args[0][0] == "mm-key-123"
+
+        mock_resolve.assert_not_called()
+        agent._ensure_provider_runtime.assert_awaited_once()
+        assert agent._primary_runtime["anthropic_api_key"] == "mm-key-123"

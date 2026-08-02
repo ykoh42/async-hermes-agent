@@ -384,7 +384,7 @@ def _explicit_aux_vision_override(cfg: Optional[Dict[str, Any]]) -> bool:
     return True
 
 
-def _lookup_supports_vision(
+async def _lookup_supports_vision(
     provider: str,
     model: str,
     cfg: Optional[Dict[str, Any]] = None,
@@ -431,8 +431,8 @@ def _lookup_supports_vision(
         return None
     caps = None
     try:
-        from agent.models_dev import get_model_capabilities
-        caps = get_model_capabilities(provider, model)
+        from agent.models_dev import get_model_capabilities_async
+        caps = await get_model_capabilities_async(provider, model)
     except Exception as exc:  # pragma: no cover - defensive
         logger.debug("image_routing: caps lookup failed for %s:%s — %s", provider, model, exc)
     if caps is not None:
@@ -441,11 +441,18 @@ def _lookup_supports_vision(
     base_url = _resolve_inference_base_url(cfg, provider)
     if not base_url and (provider or "").strip().lower() == "ollama":
         base_url = "http://localhost:11434/v1"
-    if _should_probe_ollama_vision(provider, base_url):
+    # Do not run the synchronous local-server probe here: it performs a
+    # blocking HTTP request.  Provider identity and the conventional Ollama
+    # port are sufficient to select the native async capability probe.
+    looks_like_ollama = (
+        (provider or "").strip().lower() == "ollama"
+        or "11434" in (base_url or "")
+    )
+    if looks_like_ollama:
         try:
-            from agent.model_metadata import query_ollama_supports_vision
+            from agent.model_metadata import query_ollama_supports_vision_async
 
-            ollama_vision = query_ollama_supports_vision(model, base_url)
+            ollama_vision = await query_ollama_supports_vision_async(model, base_url)
             if ollama_vision is not None:
                 return ollama_vision
         except Exception as exc:  # pragma: no cover - defensive
@@ -458,7 +465,7 @@ def _lookup_supports_vision(
     return None
 
 
-def decide_image_input_mode(
+async def decide_image_input_mode(
     provider: str,
     model: str,
     cfg: Optional[Dict[str, Any]],
@@ -489,7 +496,7 @@ def decide_image_input_mode(
     # main models — it should not preempt native vision on a model that
     # can natively inspect the pixels (issue #29135).
     if requested_provider:
-        supports = _lookup_supports_vision(
+        supports = await _lookup_supports_vision(
             provider,
             model,
             cfg,
@@ -498,7 +505,7 @@ def decide_image_input_mode(
     else:
         # Keep the long-standing three-argument call contract for callers and
         # tests that replace the capability lookup hook.
-        supports = _lookup_supports_vision(provider, model, cfg)
+        supports = await _lookup_supports_vision(provider, model, cfg)
     if supports is True:
         return "native"
     if _explicit_aux_vision_override(cfg):

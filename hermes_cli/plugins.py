@@ -33,7 +33,6 @@ so plugin-defined tools appear alongside the built-in tools.
 
 from __future__ import annotations
 
-import asyncio
 import importlib.metadata
 import importlib.util
 import inspect
@@ -601,7 +600,7 @@ class PluginContext:
 
     # -- tool dispatch -------------------------------------------------------
 
-    def dispatch_tool(self, tool_name: str, args: dict, **kwargs) -> str:
+    async def dispatch_tool(self, tool_name: str, args: dict, **kwargs) -> str:
         """Dispatch a tool call through the registry, with parent agent context.
 
         This is the public interface for plugin slash commands that need to call
@@ -628,7 +627,7 @@ class PluginContext:
             if agent is not None:
                 kwargs["parent_agent"] = agent
 
-        return registry.dispatch(tool_name, args, **kwargs)
+        return await registry.dispatch(tool_name, args, **kwargs)
 
     # -- context engine registration -----------------------------------------
 
@@ -1905,6 +1904,38 @@ class PluginManager:
                 )
         return results
 
+    async def invoke_hook_async(self, hook_name: str, **kwargs: Any) -> List[Any]:
+        """Invoke lifecycle hooks through the native async plugin contract.
+
+        An async agent cannot safely guess whether a third-party synchronous
+        callback performs I/O.  Such callbacks are rejected explicitly rather
+        than being hidden in a worker thread or allowed to stall every turn.
+        """
+        kwargs.setdefault("telemetry_schema_version", OBSERVER_SCHEMA_VERSION)
+        callbacks = self._hooks.get(hook_name, [])
+        results: List[Any] = []
+        for callback in callbacks:
+            try:
+                result = callback(**kwargs)
+                if not inspect.isawaitable(result):
+                    raise AsyncPluginCapabilityError(
+                        "Async Hermes requires coroutine lifecycle hooks; "
+                        f"{getattr(callback, '__name__', repr(callback))} is synchronous"
+                    )
+                result = await result
+                if result is not None:
+                    results.append(result)
+            except AsyncPluginCapabilityError:
+                raise
+            except Exception as exc:
+                logger.warning(
+                    "Hook '%s' callback %s raised: %s",
+                    hook_name,
+                    getattr(callback, "__name__", repr(callback)),
+                    exc,
+                )
+        return results
+
     def has_hook(self, hook_name: str) -> bool:
         """Return True when at least one callback is registered for a hook."""
         return bool(self._hooks.get(hook_name))
@@ -2033,6 +2064,15 @@ def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
     return get_plugin_manager().invoke_hook(hook_name, **kwargs)
 
 
+class AsyncPluginCapabilityError(RuntimeError):
+    """Raised when an unconverted plugin reaches the native async runtime."""
+
+
+async def invoke_hook_async(hook_name: str, **kwargs: Any) -> List[Any]:
+    """Await native lifecycle hooks without a sync compatibility bridge."""
+    return await get_plugin_manager().invoke_hook_async(hook_name, **kwargs)
+
+
 def invoke_middleware(kind: str, **kwargs: Any) -> List[Any]:
     """Invoke registered middleware callbacks.
 
@@ -2133,6 +2173,11 @@ def _get_pre_tool_call_directive_details(
         middleware_trace=list(middleware_trace or []),
     )
 
+    return _first_pre_tool_call_directive(hook_results)
+
+
+def _first_pre_tool_call_directive(hook_results: List[Any]) -> _PreToolCallDirective:
+    """Return the first valid policy directive from hook results."""
     for result in hook_results:
         if not isinstance(result, dict):
             continue
@@ -2152,6 +2197,39 @@ def _get_pre_tool_call_directive_details(
         return _PreToolCallDirective(action=action, message=message, rule_key=rule_key)
 
     return _PreToolCallDirective()
+
+
+async def _get_pre_tool_call_directive_details_async(
+    tool_name: str,
+    args: Optional[Dict[str, Any]],
+    task_id: str = "",
+    session_id: str = "",
+    tool_call_id: str = "",
+    turn_id: str = "",
+    api_request_id: str = "",
+    middleware_trace: Optional[List[Dict[str, Any]]] = None,
+) -> _PreToolCallDirective:
+    """Async equivalent of the policy hook lookup used by tool dispatch."""
+    allowed = getattr(_thread_tool_whitelist, "allowed", None)
+    if allowed is not None and tool_name not in allowed:
+        fmt = getattr(_thread_tool_whitelist, "fmt", "Tool '{tool_name}' denied")
+        return _PreToolCallDirective(
+            action="block",
+            message=fmt.format(tool_name=tool_name),
+        )
+
+    hook_results = await invoke_hook_async(
+        "pre_tool_call",
+        tool_name=tool_name,
+        args=args if isinstance(args, dict) else {},
+        task_id=task_id,
+        session_id=session_id,
+        tool_call_id=tool_call_id,
+        turn_id=turn_id,
+        api_request_id=api_request_id,
+        middleware_trace=list(middleware_trace or []),
+    )
+    return _first_pre_tool_call_directive(hook_results)
 
 
 def get_pre_tool_call_directive(
@@ -2255,6 +2333,42 @@ def resolve_pre_tool_block(
     return None
 
 
+async def resolve_pre_tool_block_async(
+    tool_name: str,
+    args: Optional[Dict[str, Any]],
+    task_id: str = "",
+    session_id: str = "",
+    tool_call_id: str = "",
+    turn_id: str = "",
+    api_request_id: str = "",
+    middleware_trace: Optional[List[Dict[str, Any]]] = None,
+) -> Optional[str]:
+    """Resolve a native pre-tool policy directive without blocking the loop.
+
+    Approval escalation stays fail-closed until the approval callback itself
+    has been migrated.  A synchronous prompt must never freeze all other
+    conversations on the shared event loop.
+    """
+    details = await _get_pre_tool_call_directive_details_async(
+        tool_name,
+        args,
+        task_id=task_id,
+        session_id=session_id,
+        tool_call_id=tool_call_id,
+        turn_id=turn_id,
+        api_request_id=api_request_id,
+        middleware_trace=middleware_trace,
+    )
+    if details.action == "block":
+        return details.message
+    if details.action == "approve":
+        return (
+            f"BLOCKED: plugin approval for {tool_name} requires an async "
+            "approval callback"
+        )
+    return None
+
+
 def get_pre_verify_continue_message(
     *,
     session_id: str = "",
@@ -2325,55 +2439,6 @@ def get_plugin_command_handler(name: str) -> Optional[Callable]:
     """Return the handler for a plugin-registered slash command, or ``None``."""
     entry = _ensure_plugins_discovered()._plugin_commands.get(name)
     return entry["handler"] if entry else None
-
-
-_PLUGIN_COMMAND_AWAIT_TIMEOUT_SECS = 30.0
-
-
-def resolve_plugin_command_result(result: Any) -> Any:
-    """Resolve a plugin command return value, awaiting async handlers when needed.
-
-    Sync CLI/TUI dispatch sites call plugin handlers from plain functions.
-    If a handler is async, await it directly when no loop is running; if
-    we're already inside an active loop, run it in a helper thread with its
-    own loop so the caller still gets a concrete result synchronously. The
-    threaded path is bounded by a 30s timeout so a hung async handler cannot
-    wedge the terminal indefinitely.
-    """
-    if not inspect.isawaitable(result):
-        return result
-
-    try:
-        asyncio.get_running_loop()
-    except RuntimeError:
-        return asyncio.run(result)
-
-    outcome: Dict[str, Any] = {}
-    failure: Dict[str, BaseException] = {}
-    done = threading.Event()
-
-    def _runner() -> None:
-        try:
-            outcome["value"] = asyncio.run(result)
-        except BaseException as exc:  # pragma: no cover - re-raised below
-            failure["exc"] = exc
-        finally:
-            done.set()
-
-    thread = threading.Thread(
-        target=_runner,
-        name="hermes-plugin-command-await",
-        daemon=True,
-    )
-    thread.start()
-    if not done.wait(timeout=_PLUGIN_COMMAND_AWAIT_TIMEOUT_SECS):
-        raise TimeoutError(
-            "Plugin command async handler did not complete within "
-            f"{_PLUGIN_COMMAND_AWAIT_TIMEOUT_SECS:.0f}s"
-        )
-    if "exc" in failure:
-        raise failure["exc"]
-    return outcome.get("value")
 
 
 def get_plugin_commands() -> Dict[str, dict]:

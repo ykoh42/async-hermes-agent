@@ -11,7 +11,8 @@ Defense against context-window overflow operates at three levels:
    (registry.get_max_result_size), the full output is written INTO THE
    SANDBOX temp dir (for example /tmp/hermes-results/{tool_use_id}.txt on
    standard Linux, or $TMPDIR/hermes-results/{tool_use_id}.txt on Termux)
-   via env.execute(). The in-context content is replaced with a preview +
+   via the environment's native ``execute_async()`` method. The in-context
+   content is replaced with a preview +
    file path reference. The model can read_file to access the full output
    on any backend.
 
@@ -97,8 +98,8 @@ def _heredoc_marker(content: str) -> str:
     return f"HERMES_PERSIST_{uuid.uuid4().hex[:8]}"
 
 
-def _write_to_sandbox(content: str, remote_path: str, env) -> bool:
-    """Write content into the sandbox via env.execute(). Returns True on success.
+async def _write_to_sandbox(content: str, remote_path: str, env) -> bool:
+    """Write content through a native async environment transport.
 
     Pushes ``content`` through stdin rather than embedding it in the command
     string. Linux's ``MAX_ARG_STRLEN`` caps any single argv element at 128 KB
@@ -112,7 +113,10 @@ def _write_to_sandbox(content: str, remote_path: str, env) -> bool:
     """
     storage_dir = os.path.dirname(remote_path)
     cmd = f"mkdir -p {shlex.quote(storage_dir)} && cat > {shlex.quote(remote_path)}"
-    result = env.execute(cmd, timeout=30, stdin_data=content)
+    execute_async = getattr(env, "execute_async", None)
+    if not callable(execute_async):
+        return False
+    result = await execute_async(cmd, timeout=30, stdin_data=content)
     return result.get("returncode", 1) == 0
 
 
@@ -141,7 +145,7 @@ def _build_persisted_message(
     return msg
 
 
-def maybe_persist_tool_result(
+async def maybe_persist_tool_result(
     content: str,
     tool_name: str,
     tool_use_id: str,
@@ -180,7 +184,7 @@ def maybe_persist_tool_result(
 
     if env is not None:
         try:
-            if _write_to_sandbox(content, remote_path, env):
+            if await _write_to_sandbox(content, remote_path, env):
                 logger.info(
                     "Persisted large tool result: %s (%s, %d chars -> %s)",
                     tool_name, tool_use_id, len(content), remote_path,
@@ -200,7 +204,7 @@ def maybe_persist_tool_result(
     )
 
 
-def enforce_turn_budget(
+async def enforce_turn_budget(
     tool_messages: list[dict],
     env=None,
     config: BudgetConfig = DEFAULT_BUDGET,
@@ -234,7 +238,7 @@ def enforce_turn_budget(
         content = msg["content"]
         tool_use_id = msg.get("tool_call_id", f"budget_{idx}")
 
-        replacement = maybe_persist_tool_result(
+        replacement = await maybe_persist_tool_result(
             content=content,
             tool_name=_BUDGET_TOOL_NAME,
             tool_use_id=tool_use_id,

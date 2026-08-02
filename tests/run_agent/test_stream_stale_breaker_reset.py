@@ -129,29 +129,33 @@ def test_switch_model_failure_does_not_reset_streak():
     assert agent._consecutive_stale_streams == 7
 
 
-def test_fallback_activation_resets_stale_streak():
+@pytest.mark.asyncio
+async def test_fallback_activation_resets_stale_streak():
     """Automatic provider fallback swaps to a different backend; the streak
     measured the OLD provider and must not wedge the new one."""
-    fbs = [{"provider": "openai", "model": "gpt-4o"}]
+    fbs = [{
+        "provider": "openai",
+        "model": "gpt-4o",
+        "api_key": "fb-key",
+        "base_url": "https://api.openai.com/v1",
+    }]
     agent = _make_fallback_agent(fallback_model=fbs)
     agent._consecutive_stale_streams = 7
 
-    with patch(
-        "agent.auxiliary_client.resolve_provider_client",
-        return_value=(_mock_client(), "resolved"),
-    ):
-        assert agent._try_activate_fallback() is True
+    with patch("openai.AsyncOpenAI", return_value=_mock_client()):
+        assert await agent._try_activate_fallback() is True
 
     assert agent._consecutive_stale_streams == 0
 
 
-def test_fallback_exhaustion_keeps_stale_streak():
+@pytest.mark.asyncio
+async def test_fallback_exhaustion_keeps_stale_streak():
     """When the chain is exhausted (no swap happened), the streak stays
     latched — the session is still wedged on the same provider."""
     agent = _make_fallback_agent(fallback_model=[])
     agent._consecutive_stale_streams = 7
 
-    assert agent._try_activate_fallback() is False
+    assert await agent._try_activate_fallback() is False
     assert agent._consecutive_stale_streams == 7
 
 

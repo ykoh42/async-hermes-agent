@@ -1078,22 +1078,6 @@ class KawaiiSpinner:
         except (ValueError, OSError):
             return False
 
-    def _is_patch_stdout_proxy(self) -> bool:
-        """Return True when stdout is prompt_toolkit's StdoutProxy.
-
-        patch_stdout wraps sys.stdout in a StdoutProxy that queues writes and
-        injects newlines around each flush().  The \\r overwrite never lands on
-        the correct line — each spinner frame ends up on its own line.
-
-        The CLI already drives a TUI widget (_spinner_text) for spinner display,
-        so KawaiiSpinner's \\r-based animation is redundant under StdoutProxy.
-        """
-        try:
-            from prompt_toolkit.patch_stdout import StdoutProxy
-            return isinstance(self._out, StdoutProxy)
-        except ImportError:
-            return False
-
     def _animate(self):
         # When stdout is not a real terminal (e.g. Docker, systemd, pipe),
         # skip the animation entirely — it creates massive log bloat.
@@ -1102,16 +1086,6 @@ class KawaiiSpinner:
             self._write(f"  [tool] {self.message}", flush=True)
             while self.running:
                 time.sleep(0.5)
-            return
-
-        # When running inside prompt_toolkit's patch_stdout context the CLI
-        # renders spinner state via a dedicated TUI widget (_spinner_text).
-        # Driving a \r-based animation here too causes visual overdraw: the
-        # StdoutProxy injects newlines around each flush, so every frame lands
-        # on a new line and overwrites the status bar.
-        if self._is_patch_stdout_proxy():
-            while self.running:
-                time.sleep(0.1)
             return
 
         # Cache skin wings at start (avoid per-frame imports)

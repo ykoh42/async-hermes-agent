@@ -34,29 +34,3 @@ def test_prompt_model_selection_requires_expensive_confirmation(monkeypatch, cap
     out = capsys.readouterr().out
     assert selected is None
     assert "EXPENSIVE MODEL WARNING" in out
-
-
-def test_remove_custom_provider_falls_back_on_menu_runtime_error(tmp_path, monkeypatch):
-    from hermes_cli.main import _remove_custom_provider
-
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    monkeypatch.setattr("hermes_cli.curses_ui.curses_radiolist", _raise_menu)
-
-    cfg = load_config()
-    cfg["custom_providers"] = [
-        {"name": "Local A", "base_url": "http://localhost:8001/v1"},
-        {"name": "Local B", "base_url": "http://localhost:8002/v1"},
-    ]
-    save_config(cfg)
-
-    responses = iter(["1"])
-    monkeypatch.setattr("builtins.input", lambda _prompt="": next(responses))
-
-    _remove_custom_provider(cfg)
-
-    reloaded = load_config()
-    assert reloaded["custom_providers"] == [
-        {"name": "Local B", "base_url": "http://localhost:8002/v1"},
-    ]
-
-

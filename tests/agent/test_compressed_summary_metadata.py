@@ -12,7 +12,7 @@ Two invariants:
    opencode-go) reject unknown message keys with "Extra inputs are not
    permitted", poisoning the session.
 """
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -25,7 +25,7 @@ from agent.context_compressor import (
 
 def _make_compressor():
     with patch(
-        "agent.context_compressor.get_model_context_length", return_value=8000
+        "agent.context_compressor.get_static_context_length", return_value=8000
     ):
         return ContextCompressor(
             model="test-model", quiet_mode=True, config_context_length=8000
@@ -40,17 +40,22 @@ def _make_messages(n_turns=30):
     return msgs
 
 
-def _compress(cc, msgs):
+async def _compress(cc, msgs):
     resp = MagicMock()
     resp.choices[0].message.content = "## Active Task\nstuff"
-    with patch("agent.context_compressor.call_llm", return_value=resp):
-        return cc.compress(msgs, current_tokens=100_000, force=True)
+    with patch(
+        "agent.context_compressor.call_llm",
+        new_callable=AsyncMock,
+        return_value=resp,
+    ):
+        return await cc.compress(msgs, current_tokens=100_000, force=True)
 
 
 class TestMetadataFlagSet:
-    def test_exactly_one_flagged_message_after_compress(self):
+    @pytest.mark.asyncio
+    async def test_exactly_one_flagged_message_after_compress(self):
         cc = _make_compressor()
-        out = _compress(cc, _make_messages())
+        out = await _compress(cc, _make_messages())
         flagged = [
             m for m in out
             if isinstance(m, dict) and m.get(COMPRESSED_SUMMARY_METADATA_KEY)
@@ -78,11 +83,12 @@ class TestMetadataFlagNeverReachesWire:
         assert COMPRESSED_SUMMARY_METADATA_KEY.startswith("_")
         assert COMPRESSED_SUMMARY_HAS_USER_TURN_KEY.startswith("_")
 
-    def test_chat_completions_transport_strips_flag(self):
+    @pytest.mark.asyncio
+    async def test_chat_completions_transport_strips_flag(self):
         from agent.transports.chat_completions import ChatCompletionsTransport
 
         cc = _make_compressor()
-        out = _compress(cc, _make_messages())
+        out = await _compress(cc, _make_messages())
         wire = ChatCompletionsTransport().convert_messages(out, model="some-model")
         assert not any(
             isinstance(m, dict)
@@ -147,12 +153,12 @@ class TestClassifyAgreesWithPredicatesOnLiveEmissions:
     """
 
     @staticmethod
-    def _live_compress(msgs):
+    async def _live_compress(msgs):
         # Match the emission-probe compressor shape (wide context, minimal
         # protection) so the transcript geometry — not protection budgets —
         # decides the merge-vs-standalone path deterministically.
         with patch(
-            "agent.context_compressor.get_model_context_length",
+            "agent.context_compressor.get_static_context_length",
             return_value=100_000,
         ):
             cc = ContextCompressor(
@@ -162,7 +168,7 @@ class TestClassifyAgreesWithPredicatesOnLiveEmissions:
                 protect_last_n=1,
                 quiet_mode=True,
             )
-        out = _compress(cc, msgs)
+        out = await _compress(cc, msgs)
         flagged = [
             m for m in out
             if isinstance(m, dict) and m.get(COMPRESSED_SUMMARY_METADATA_KEY)
@@ -189,15 +195,17 @@ class TestClassifyAgreesWithPredicatesOnLiveEmissions:
         assert is_compaction_summary_message(stripped) == (kind is not None)
         return kind
 
-    def test_merged_emission_classifies_merged_and_predicates_agree(self):
+    @pytest.mark.asyncio
+    async def test_merged_emission_classifies_merged_and_predicates_agree(self):
         """Alternating transcripts take the merge-into-tail path on current
         main — the emitted handoff must classify 'merged'."""
-        flagged = self._live_compress(_make_messages())
+        flagged = await self._live_compress(_make_messages())
         assert len(flagged) == 1
         kind = self._assert_agreement(flagged[0])
         assert kind == "merged"
 
-    def test_standalone_emission_classifies_standalone_and_predicates_agree(self):
+    @pytest.mark.asyncio
+    async def test_standalone_emission_classifies_standalone_and_predicates_agree(self):
         """A degenerate all-user transcript forces the standalone-insertion
         path — the emitted handoff must classify 'standalone'."""
         msgs = [{"role": "system", "content": "sys"}]
@@ -205,7 +213,7 @@ class TestClassifyAgreesWithPredicatesOnLiveEmissions:
             {"role": "user", "content": f"user only {i} " + "x" * 400}
             for i in range(60)
         )
-        flagged = self._live_compress(msgs)
+        flagged = await self._live_compress(msgs)
         assert len(flagged) == 1
         kind = self._assert_agreement(flagged[0])
         assert kind == "standalone"

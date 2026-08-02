@@ -43,7 +43,7 @@ Pinned here:
 
 from __future__ import annotations
 
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -54,7 +54,7 @@ def compressor():
     the helpers' anchor behaviour is observable."""
     from agent.context_compressor import ContextCompressor
     with patch(
-        "agent.context_compressor.get_model_context_length",
+        "agent.context_compressor.get_static_context_length",
         return_value=100_000,
     ):
         c = ContextCompressor(
@@ -297,7 +297,8 @@ class TestCompactionRollupReproduction:
     reply renders as a separate bubble — see ``splitCompactionContent``
     in ``web/src/pages/SessionsPage.tsx``)."""
 
-    def test_compress_keeps_visible_reply_text(self, compressor):
+    @pytest.mark.asyncio
+    async def test_compress_keeps_visible_reply_text(self, compressor):
         from agent.context_compressor import (
             SUMMARY_PREFIX,
             COMPRESSED_SUMMARY_METADATA_KEY,
@@ -333,9 +334,9 @@ class TestCompactionRollupReproduction:
         )
         with patch.object(
             c, "_generate_summary",
-            return_value=_mocked,
+            new=AsyncMock(return_value=_mocked),
         ):
-            result = c.compress(messages, current_tokens=90_000)
+            result = await c.compress(messages, current_tokens=90_000)
         # 1. A summary message exists (compression actually ran). Detect via
         # the canonical metadata key rather than a content prefix: merge-into-
         # tail summaries wrap prior content before the summary, so the prefix
@@ -357,7 +358,8 @@ class TestCompactionRollupReproduction:
             f"{[(m.get('role'), str(m.get('content'))[:50]) for m in result]}"
         )
 
-    def test_standalone_summary_case_keeps_reply_as_own_message(
+    @pytest.mark.asyncio
+    async def test_standalone_summary_case_keeps_reply_as_own_message(
         self, compressor
     ):
         """When the head and tail roles allow a standalone summary
@@ -395,9 +397,9 @@ class TestCompactionRollupReproduction:
         )
         with patch.object(
             c, "_generate_summary",
-            return_value=_mocked,
+            new=AsyncMock(return_value=_mocked),
         ):
-            result = c.compress(messages, current_tokens=90_000)
+            result = await c.compress(messages, current_tokens=90_000)
         # Summary present (detect via the canonical metadata key — merge-into-
         # tail summaries no longer start with SUMMARY_PREFIX after #56372):
         summary_rows = [
@@ -501,5 +503,4 @@ class TestSourceGuardrail:
             "``_find_tail_cut_by_tokens`` — each anchor walks cut_idx "
             "backward, and ordering keeps the chain monotonic."
         )
-
 

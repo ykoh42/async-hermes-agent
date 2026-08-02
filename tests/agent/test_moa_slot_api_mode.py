@@ -8,7 +8,7 @@ so reference slots using providers that require a specific API surface
 from __future__ import annotations
 
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -22,8 +22,9 @@ def _response(content="ok"):
 class TestSlotRuntimeApiMode:
     """_slot_runtime should include api_mode when resolve_runtime_provider returns it."""
 
-    @patch("hermes_cli.runtime_provider.resolve_runtime_provider")
-    def test_slot_runtime_includes_api_mode(self, mock_resolve):
+    @patch("hermes_cli.runtime_provider.resolve_runtime_provider", new_callable=AsyncMock)
+    @pytest.mark.asyncio
+    async def test_slot_runtime_includes_api_mode(self, mock_resolve):
         """api_mode from resolve_runtime_provider is forwarded in output dict."""
         mock_resolve.return_value = {
             "provider": "copilot",
@@ -34,14 +35,15 @@ class TestSlotRuntimeApiMode:
         }
         from agent.moa_loop import _slot_runtime
 
-        result = _slot_runtime({"provider": "copilot", "model": "gpt-5.5"})
+        result = await _slot_runtime({"provider": "copilot", "model": "gpt-5.5"})
         assert result["api_mode"] == "codex_responses"
         assert result["base_url"] == "https://api.githubcopilot.com"
         assert result["api_key"] == "test-key"
 
 
-    @patch("hermes_cli.runtime_provider.resolve_runtime_provider")
-    def test_slot_runtime_omits_api_mode_when_empty(self, mock_resolve):
+    @patch("hermes_cli.runtime_provider.resolve_runtime_provider", new_callable=AsyncMock)
+    @pytest.mark.asyncio
+    async def test_slot_runtime_omits_api_mode_when_empty(self, mock_resolve):
         """Empty string api_mode is treated as absent."""
         mock_resolve.return_value = {
             "provider": "copilot",
@@ -52,36 +54,36 @@ class TestSlotRuntimeApiMode:
         }
         from agent.moa_loop import _slot_runtime
 
-        result = _slot_runtime({"provider": "copilot", "model": "gpt-5.5"})
+        result = await _slot_runtime({"provider": "copilot", "model": "gpt-5.5"})
         assert "api_mode" not in result
 
 
 
-def test_run_reference_passes_slot_extra_body(monkeypatch):
+@pytest.mark.asyncio
+async def test_run_reference_passes_slot_extra_body(monkeypatch):
     """Reference advisors should receive custom provider extra_body."""
     from agent import moa_loop
 
     captured = {}
 
-    def fake_call_llm(**kwargs):
+    async def fake_call_llm(**kwargs):
         captured.update(kwargs)
         return _response("advisor")
 
-    monkeypatch.setattr(
-        moa_loop,
-        "_slot_runtime",
-        lambda slot: {
+    async def fake_slot_runtime(slot):
+        return {
             "provider": "custom",
             "model": "qwen3.7-max",
             "base_url": "https://dashscope.example/v1",
             "api_key": "test-key",
             "extra_body": {"enable_thinking": False},
-        },
-    )
+        }
+
+    monkeypatch.setattr(moa_loop, "_slot_runtime", fake_slot_runtime)
     monkeypatch.setattr(moa_loop, "call_llm", fake_call_llm)
     monkeypatch.setattr(moa_loop, "_maybe_apply_moa_cache_control", lambda messages, runtime: messages)
 
-    label, text, _usage = moa_loop._run_reference(
+    label, text, _usage = await moa_loop._run_reference(
         {"provider": "dashscope", "model": "qwen3.7-max"},
         [{"role": "user", "content": "hello"}],
     )
@@ -91,7 +93,8 @@ def test_run_reference_passes_slot_extra_body(monkeypatch):
     assert captured["extra_body"] == {"enable_thinking": False}
 
 
-def test_moa_aggregator_merges_slot_extra_body_with_caller_override(tmp_path, monkeypatch):
+@pytest.mark.asyncio
+async def test_moa_aggregator_merges_slot_extra_body_with_caller_override(tmp_path, monkeypatch):
     """Aggregator calls should merge slot defaults without duplicate kwargs."""
     home = tmp_path / ".hermes"
     home.mkdir()
@@ -115,14 +118,12 @@ moa:
 
     captured = {}
 
-    def fake_call_llm(**kwargs):
+    async def fake_call_llm(**kwargs):
         captured.update(kwargs)
         return _response("acted")
 
-    monkeypatch.setattr(
-        moa_loop,
-        "_slot_runtime",
-        lambda slot: {
+    async def fake_slot_runtime(slot):
+        return {
             "provider": "custom",
             "model": "qwen3.7-max",
             "base_url": "https://dashscope.example/v1",
@@ -131,12 +132,13 @@ moa:
                 "enable_thinking": False,
                 "metadata": {"source": "slot"},
             },
-        },
-    )
+        }
+
+    monkeypatch.setattr(moa_loop, "_slot_runtime", fake_slot_runtime)
     monkeypatch.setattr(moa_loop, "call_llm", fake_call_llm)
 
     facade = moa_loop.MoAChatCompletions("closed")
-    facade.create(
+    await facade.create(
         model="closed",
         messages=[{"role": "user", "content": "hello"}],
         extra_body={
@@ -152,7 +154,8 @@ moa:
     }
 
 
-def test_one_shot_aggregate_moa_context_passes_slot_extra_body(monkeypatch):
+@pytest.mark.asyncio
+async def test_one_shot_aggregate_moa_context_passes_slot_extra_body(monkeypatch):
     """The one-shot `/moa <prompt>` synthesis call (aggregate_moa_context) is
     the third independent MoA call path — its aggregator call receives the
     slot runtime via **agg_runtime, so custom-provider extra_body must flow
@@ -161,27 +164,26 @@ def test_one_shot_aggregate_moa_context_passes_slot_extra_body(monkeypatch):
 
     captured_calls = []
 
-    def fake_call_llm(**kwargs):
+    async def fake_call_llm(**kwargs):
         captured_calls.append(kwargs)
         return _response("synthesis")
 
-    monkeypatch.setattr(
-        moa_loop,
-        "_slot_runtime",
-        lambda slot: {
+    async def fake_slot_runtime(slot):
+        return {
             "provider": "custom",
             "model": "qwen3.7-max",
             "base_url": "https://dashscope.example/v1",
             "api_key": "test-key",
             "extra_body": {"enable_thinking": False},
-        },
-    )
+        }
+
+    monkeypatch.setattr(moa_loop, "_slot_runtime", fake_slot_runtime)
     monkeypatch.setattr(moa_loop, "call_llm", fake_call_llm)
     monkeypatch.setattr(
         moa_loop, "_maybe_apply_moa_cache_control", lambda messages, runtime: messages
     )
 
-    result = moa_loop.aggregate_moa_context(
+    result = await moa_loop.aggregate_moa_context(
         user_prompt="hello",
         api_messages=[{"role": "user", "content": "hello"}],
         reference_models=[{"provider": "dashscope", "model": "qwen3.7-max"}],

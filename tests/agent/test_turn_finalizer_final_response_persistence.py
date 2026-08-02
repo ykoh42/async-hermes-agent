@@ -1,6 +1,8 @@
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
+
 from agent.turn_finalizer import finalize_turn
 
 
@@ -77,15 +79,9 @@ class FakeAgent:
     def clear_interrupt(self):
         pass
 
-    def _sync_external_memory_for_turn(self, **_kwargs):
-        pass
 
-
-
-
-
-
-def test_final_response_closes_tool_tail_before_persistence(monkeypatch):
+@pytest.mark.asyncio
+async def test_final_response_closes_tool_tail_before_persistence(monkeypatch):
     """A recovered/previewed final response must be durable in session history.
 
     Regression for turns where the caller receives a non-empty final_response,
@@ -107,7 +103,7 @@ def test_final_response_closes_tool_tail_before_persistence(monkeypatch):
         {"role": "tool", "tool_call_id": "call-1", "name": "terminal", "content": "ok"},
     ]
 
-    result = finalize_turn(
+    result = await finalize_turn(
         agent,
         final_response="Done.",
         api_call_count=2,
@@ -128,7 +124,8 @@ def test_final_response_closes_tool_tail_before_persistence(monkeypatch):
     assert agent.persisted_messages[-1] == {"role": "assistant", "content": "Done."}
 
 
-def test_final_response_fills_pure_tool_call_tail(monkeypatch):
+@pytest.mark.asyncio
+async def test_final_response_fills_pure_tool_call_tail(monkeypatch):
     """A tail assistant row that is a *pure tool-call turn* carries no answer.
 
     The role check alone ("tail is assistant ⇒ nothing to do") leaves the
@@ -151,7 +148,7 @@ def test_final_response_fills_pure_tool_call_tail(monkeypatch):
         },
     ]
 
-    result = finalize_turn(
+    result = await finalize_turn(
         agent,
         final_response="Here is your answer.",
         api_call_count=3,
@@ -176,7 +173,4 @@ def test_final_response_fills_pure_tool_call_tail(monkeypatch):
     assert persisted[-1]["content"] == "Here is your answer."
     assert persisted[-1]["tool_calls"]
     assert sum(1 for m in persisted if m.get("role") == "assistant") == 1
-
-
-
 

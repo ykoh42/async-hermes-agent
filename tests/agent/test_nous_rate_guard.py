@@ -151,7 +151,8 @@ class TestParseResetSeconds:
 class TestAuxiliaryClientIntegration:
     """Test that the auxiliary client respects the rate guard."""
 
-    def test_try_nous_skips_when_rate_limited(self, rate_guard_env, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_try_nous_skips_when_rate_limited(self, rate_guard_env, monkeypatch):
         from agent.nous_rate_guard import record_nous_rate_limit
 
         # Record a rate limit
@@ -159,22 +160,29 @@ class TestAuxiliaryClientIntegration:
 
         # Mock _read_nous_auth to return valid creds (would normally succeed)
         import agent.auxiliary_client as aux
-        monkeypatch.setattr(aux, "_read_nous_auth", lambda: {
-            "access_token": "test-token",
-            "inference_base_url": "https://api.nous.test/v1",
-        })
+        async def read_nous_auth():
+            return {
+                "access_token": "test-token",
+                "inference_base_url": "https://api.nous.test/v1",
+            }
 
-        result = aux._try_nous()
+        monkeypatch.setattr(aux, "_read_nous_auth", read_nous_auth)
+
+        result = await aux._try_nous()
         assert result == (None, None)
 
-    def test_try_nous_works_when_not_rate_limited(self, rate_guard_env, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_try_nous_works_when_not_rate_limited(self, rate_guard_env, monkeypatch):
         import agent.auxiliary_client as aux
 
         # No rate limit recorded — _try_nous should proceed normally
         # (will return None because no real creds, but won't be blocked
         # by the rate guard)
-        monkeypatch.setattr(aux, "_read_nous_auth", lambda: None)
-        result = aux._try_nous()
+        async def read_nous_auth():
+            return None
+
+        monkeypatch.setattr(aux, "_read_nous_auth", read_nous_auth)
+        result = await aux._try_nous()
         assert result == (None, None)
 
 

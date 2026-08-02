@@ -7,9 +7,6 @@ from unittest.mock import patch
 
 import pytest
 
-from hermes_cli.models import get_copilot_model_context
-
-
 # Sample catalog items mimicking the Copilot /models API response
 _SAMPLE_CATALOG = [
     {
@@ -64,26 +61,30 @@ class TestGetCopilotModelContext:
 
     @patch("hermes_cli.models.fetch_github_model_catalog", return_value=_SAMPLE_CATALOG)
     def test_returns_max_prompt_tokens(self, mock_fetch):
-        assert get_copilot_model_context("claude-opus-4.6-1m") == 1_000_000
-        assert get_copilot_model_context("gpt-4.1") == 128_000
+        import hermes_cli.models as mod
+
+        assert mod.get_copilot_model_context("claude-opus-4.6-1m") == 1_000_000
+        assert mod.get_copilot_model_context("gpt-4.1") == 128_000
 
 
     @patch("hermes_cli.models.fetch_github_model_catalog", return_value=_SAMPLE_CATALOG)
     def test_cache_expires(self, mock_fetch):
         import hermes_cli.models as mod
 
-        get_copilot_model_context("gpt-4.1")
+        mod.get_copilot_model_context("gpt-4.1")
         assert mock_fetch.call_count == 1
 
         # Expire the cache
         mod._copilot_context_cache_time = time.time() - 7200
-        get_copilot_model_context("gpt-4.1")
+        mod.get_copilot_model_context("gpt-4.1")
         assert mock_fetch.call_count == 2
 
 
     @patch("hermes_cli.models.fetch_github_model_catalog", return_value=[])
     def test_returns_none_for_empty_catalog(self, mock_fetch):
-        assert get_copilot_model_context("gpt-4.1") is None
+        import hermes_cli.models as mod
+
+        assert mod.get_copilot_model_context("gpt-4.1") is None
 
 
 class TestModelMetadataCopilotIntegration:
@@ -95,5 +96,4 @@ class TestModelMetadataCopilotIntegration:
 
         ctx = get_model_context_length("claude-opus-4.6-1m", provider="copilot")
         assert ctx == 1_000_000
-
 

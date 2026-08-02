@@ -16,6 +16,7 @@ from agent import relay_runtime, relay_tools
 def relay_turn(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile"))
     relay_runtime._reset_for_tests()
+    relay_runtime.get_host()
     lease = relay_runtime.SESSION_COORDINATOR.acquire_conversation(
         profile_key=relay_runtime.current_profile_key(),
         session_id="session-1",
@@ -36,7 +37,8 @@ def relay_turn(tmp_path, monkeypatch):
         relay_runtime._reset_for_tests()
 
 
-def test_tool_adapter_bypasses_relay_without_an_active_consumer(
+@pytest.mark.asyncio
+async def test_tool_adapter_bypasses_relay_without_an_active_consumer(
     relay_turn, monkeypatch
 ):
     relay = relay_turn
@@ -53,10 +55,13 @@ def test_tool_adapter_bypasses_relay_without_an_active_consumer(
         ),
     )
 
-    result, final_args = relay_tools.execute(
+    async def callback(value):
+        return value
+
+    result, final_args = await relay_tools.execute(
         "terminal",
         args,
-        lambda value: value,
+        callback,
         session_id="session-1",
     )
 
@@ -66,7 +71,8 @@ def test_tool_adapter_bypasses_relay_without_an_active_consumer(
 
 
 
-def test_request_rewrite_reaches_authorized_callback_once(relay_turn):
+@pytest.mark.asyncio
+async def test_request_rewrite_reaches_authorized_callback_once(relay_turn):
     relay = relay_turn
     callback_args = []
 
@@ -83,11 +89,15 @@ def test_request_rewrite_reaches_authorized_callback_once(relay_turn):
     relay.intercepts.register_tool_execution(
         "hermes-test-tool-execution", 1, wrap_execution
     )
+    async def callback(args):
+        callback_args.append(args)
+        return {"ok": True}
+
     try:
-        result, observed_args = relay_tools.execute(
+        result, observed_args = await relay_tools.execute(
             "write_file",
             {"path": "/original/path"},
-            lambda args: callback_args.append(args) or {"ok": True},
+            callback,
             session_id="session-1",
             metadata={"tool_call_id": "call-1"},
         )
@@ -105,7 +115,8 @@ def test_request_rewrite_reaches_authorized_callback_once(relay_turn):
 
 
 
-def test_tool_error_is_preserved_from_relay_wrapper_suffix(relay_turn, monkeypatch):
+@pytest.mark.asyncio
+async def test_tool_error_is_preserved_from_relay_wrapper_suffix(relay_turn, monkeypatch):
     relay = relay_turn
 
     class ToolError(Exception):
@@ -115,7 +126,7 @@ def test_tool_error_is_preserved_from_relay_wrapper_suffix(relay_turn, monkeypat
 
     async def wrapping_execute(_name, args, callback, **_kwargs):
         try:
-            return callback(args)
+            return await callback(args)
         except Exception as exc:
             raise RuntimeError(
                 f"internal error: {type(exc).__name__}: {exc} (worker trace)"
@@ -124,16 +135,17 @@ def test_tool_error_is_preserved_from_relay_wrapper_suffix(relay_turn, monkeypat
     monkeypatch.setattr(relay.tools, "execute", wrapping_execute)
 
     with pytest.raises(ToolError) as caught:
-        relay_tools.execute(
+        async def callback(_args):
+            raise tool_error
+
+        await relay_tools.execute(
             "terminal",
             {"command": "false"},
-            lambda _args: (_ for _ in ()).throw(tool_error),
+            callback,
             session_id="session-1",
         )
 
     assert caught.value is tool_error
-
-
 
 
 

@@ -11,6 +11,7 @@ quickly without re-reading the file on every URL check.
 from __future__ import annotations
 
 import fnmatch
+import asyncio
 import logging
 import threading
 import time
@@ -281,3 +282,146 @@ def check_website_access(url: str, config_path: Optional[Path] = None) -> Option
                 ),
             }
     return None
+
+
+async def async_check_website_access(
+    url: str,
+    config_path: Optional[Path] = None,
+) -> Optional[Dict[str, str]]:
+    """Async policy check for network-capable tool handlers.
+
+    The cached-policy fast path is shared with :func:`check_website_access`.
+    On a cold cache, YAML and optional shared blocklist files are read through
+    ``aiofiles``; parsing/matching stays local and deterministic.  No async
+    caller needs to invoke the synchronous policy loader or a thread fallback.
+    """
+    if config_path is None:
+        with _cache_lock:
+            if _cached_policy is not None:
+                if not _cached_policy.get("enabled"):
+                    return None
+                policy = _cached_policy
+            else:
+                policy = None
+    else:
+        policy = None
+
+    host = _extract_host_from_urlish(url)
+    if not host:
+        return None
+
+    if policy is None:
+        try:
+            policy = await _load_policy_config_async(config_path)
+        except WebsitePolicyError as exc:
+            if config_path is not None:
+                raise
+            logger.warning("Website policy config error (failing open): %s", exc)
+            return None
+        except Exception as exc:
+            logger.warning(
+                "Unexpected error loading website policy (failing open): %s", exc
+            )
+            return None
+
+    if not policy.get("enabled"):
+        return None
+    for rule in policy.get("rules", []):
+        pattern = rule.get("pattern", "")
+        if _match_host_against_rule(host, pattern):
+            logger.info(
+                "Blocked URL %s — matched rule '%s' from %s",
+                url,
+                pattern,
+                rule.get("source", "config"),
+            )
+            return {
+                "url": url,
+                "host": host,
+                "rule": pattern,
+                "source": rule.get("source", "config"),
+                "message": (
+                    f"Blocked by website policy: '{host}' matched rule '{pattern}'"
+                    f" from {rule.get('source', 'config')}"
+                ),
+            }
+    return None
+
+
+async def _load_policy_config_async(config_path: Optional[Path] = None) -> Dict[str, Any]:
+    """Async counterpart of ``load_website_blocklist`` used on cold cache."""
+    import aiofiles
+
+    global _cached_policy, _cached_policy_path, _cached_policy_time
+    config_path = config_path or _get_default_config_path()
+    resolved_path = str(config_path)
+    if not await aiofiles.os.path.exists(config_path):
+        policy = dict(_DEFAULT_WEBSITE_BLOCKLIST)
+    else:
+        try:
+            import yaml
+        except ImportError:
+            return dict(_DEFAULT_WEBSITE_BLOCKLIST)
+        async with aiofiles.open(config_path, encoding="utf-8") as handle:
+            raw_config = await handle.read()
+        try:
+            config = yaml.safe_load(raw_config) or {}
+        except yaml.YAMLError as exc:
+            raise WebsitePolicyError(f"Invalid config YAML at {config_path}: {exc}") from exc
+        if not isinstance(config, dict):
+            raise WebsitePolicyError("config root must be a mapping")
+        security = config.get("security") or {}
+        if not isinstance(security, dict):
+            raise WebsitePolicyError("security must be a mapping")
+        blocklist = security.get("website_blocklist") or {}
+        if not isinstance(blocklist, dict):
+            raise WebsitePolicyError("security.website_blocklist must be a mapping")
+        policy = dict(_DEFAULT_WEBSITE_BLOCKLIST)
+        policy.update(blocklist)
+
+    raw_domains = policy.get("domains", []) or []
+    if not isinstance(raw_domains, list):
+        raise WebsitePolicyError("security.website_blocklist.domains must be a list")
+    raw_shared_files = policy.get("shared_files", []) or []
+    if not isinstance(raw_shared_files, list):
+        raise WebsitePolicyError("security.website_blocklist.shared_files must be a list")
+    enabled = policy.get("enabled", True)
+    if not isinstance(enabled, bool):
+        raise WebsitePolicyError("security.website_blocklist.enabled must be a boolean")
+
+    rules: List[Dict[str, str]] = []
+    seen: set[Tuple[str, str]] = set()
+    for raw_rule in raw_domains:
+        normalized = _normalize_rule(raw_rule)
+        if normalized and ("config", normalized) not in seen:
+            rules.append({"pattern": normalized, "source": "config"})
+            seen.add(("config", normalized))
+    for shared_file in raw_shared_files:
+        if not isinstance(shared_file, str) or not shared_file.strip():
+            continue
+        path = Path(shared_file).expanduser()
+        if not path.is_absolute():
+            path = (get_hermes_home() / path).resolve()
+        try:
+            async with aiofiles.open(path, encoding="utf-8") as handle:
+                raw_rules = (await handle.read()).splitlines()
+        except FileNotFoundError:
+            logger.warning("Shared blocklist file not found (skipping): %s", path)
+            raw_rules = []
+        except (OSError, UnicodeDecodeError) as exc:
+            logger.warning("Failed to read shared blocklist file %s (skipping): %s", path, exc)
+            raw_rules = []
+        for line in raw_rules:
+            normalized = _normalize_rule(line)
+            key = (str(path), normalized) if normalized else None
+            if normalized and key not in seen:
+                rules.append({"pattern": normalized, "source": str(path)})
+                seen.add(key)
+
+    result = {"enabled": enabled, "rules": rules}
+    if config_path == _get_default_config_path():
+        with _cache_lock:
+            _cached_policy = result
+            _cached_policy_path = resolved_path
+            _cached_policy_time = time.monotonic()
+    return result

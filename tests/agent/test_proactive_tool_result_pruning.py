@@ -26,7 +26,7 @@ def _compressor(**kw):
     )
     defaults.update(kw)
     with patch(
-        "agent.context_compressor.get_model_context_length",
+        "agent.context_compressor.get_static_context_length",
         return_value=LARGE_WINDOW,
     ):
         return ContextCompressor(**defaults)

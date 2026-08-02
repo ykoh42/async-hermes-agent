@@ -64,8 +64,9 @@ class TestGetAllSkillsDirs:
         assert result[1] == external_skills_dir.resolve()
 
 
+@pytest.mark.asyncio
 class TestExternalSkillsInFindAll:
-    def test_external_skills_found(self, hermes_home, external_skills_dir):
+    async def test_external_skills_found(self, hermes_home, external_skills_dir):
         (hermes_home / "config.yaml").write_text(
             f"skills:\n  external_dirs:\n    - {external_skills_dir}\n"
         )
@@ -75,11 +76,11 @@ class TestExternalSkillsInFindAll:
             patch("tools.skills_tool.SKILLS_DIR", local_skills),
         ):
             from tools.skills_tool import _find_all_skills
-            skills = _find_all_skills()
+            skills = await _find_all_skills()
         names = [s["name"] for s in skills]
         assert "my-external-skill" in names
 
-    def test_local_takes_precedence(self, hermes_home, external_skills_dir):
+    async def test_local_takes_precedence(self, hermes_home, external_skills_dir):
         """If the same skill name exists locally and externally, local wins."""
         local_skills = hermes_home / "skills"
         local_skill = local_skills / "my-external-skill"
@@ -95,14 +96,15 @@ class TestExternalSkillsInFindAll:
             patch("tools.skills_tool.SKILLS_DIR", local_skills),
         ):
             from tools.skills_tool import _find_all_skills
-            skills = _find_all_skills()
+            skills = await _find_all_skills()
         matching = [s for s in skills if s["name"] == "my-external-skill"]
         assert len(matching) == 1
         assert matching[0]["description"] == "Local version"
 
 
 class TestExternalSkillView:
-    def test_skill_view_finds_external(self, hermes_home, external_skills_dir):
+    @pytest.mark.asyncio
+    async def test_skill_view_finds_external(self, hermes_home, external_skills_dir):
         (hermes_home / "config.yaml").write_text(
             f"skills:\n  external_dirs:\n    - {external_skills_dir}\n"
         )
@@ -112,6 +114,6 @@ class TestExternalSkillView:
             patch("tools.skills_tool.SKILLS_DIR", local_skills),
         ):
             from tools.skills_tool import skill_view
-            result = json.loads(skill_view("my-external-skill"))
+            result = json.loads(await skill_view("my-external-skill"))
         assert result["success"] is True
         assert "external things" in result["content"]

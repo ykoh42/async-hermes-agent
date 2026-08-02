@@ -34,10 +34,23 @@ class DashboardOAuthFlow:
     expected_state: str | None = field(default=None, init=False)
     _callback: tuple[str, str | None] | None = field(default=None, init=False, repr=False)
     _callback_error: str | None = field(default=None, init=False, repr=False)
-    _authorization_ready: threading.Event = field(default_factory=threading.Event, init=False, repr=False)
-    _callback_ready: threading.Event = field(default_factory=threading.Event, init=False, repr=False)
+    _authorization_ready: asyncio.Event = field(default_factory=asyncio.Event, init=False, repr=False)
+    _callback_ready: asyncio.Event = field(default_factory=asyncio.Event, init=False, repr=False)
     _worker_done: threading.Event = field(default_factory=threading.Event, init=False, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
+    _event_loop: asyncio.AbstractEventLoop | None = field(default=None, init=False, repr=False)
+
+    def _signal(self, event: asyncio.Event) -> None:
+        """Wake an async waiter safely when a dashboard callback uses a thread."""
+        loop = self._event_loop
+        try:
+            current_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            current_loop = None
+        if loop is not None and loop.is_running() and loop is not current_loop:
+            loop.call_soon_threadsafe(event.set)
+        else:
+            event.set()
 
     async def publish_authorization_url(self, url: str) -> None:
         state = parse_qs(urlparse(url).query).get("state", [None])[0]
@@ -49,11 +62,13 @@ class DashboardOAuthFlow:
             self.expected_state = state
             self.authorization_url = url
             self.status = "authorization_required"
-            self._authorization_ready.set()
+            self._signal(self._authorization_ready)
 
     async def wait_for_authorization_url(self, timeout: float = 30.0) -> str:
-        ready = await asyncio.to_thread(self._authorization_ready.wait, timeout)
-        if not ready:
+        self._event_loop = asyncio.get_running_loop()
+        try:
+            await asyncio.wait_for(self._authorization_ready.wait(), timeout)
+        except asyncio.TimeoutError:
             raise TimeoutError("Timed out waiting for MCP authorization URL")
         if not self.authorization_url:
             raise RuntimeError(self.error or "MCP OAuth flow ended before authorization")
@@ -81,11 +96,13 @@ class DashboardOAuthFlow:
                 self._callback = (code, state)
             else:
                 self._callback_error = "OAuth callback did not include code or error"
-            self._callback_ready.set()
+            self._signal(self._callback_ready)
 
     async def wait_for_callback(self, timeout: float = 300.0) -> tuple[str, str | None]:
-        ready = await asyncio.to_thread(self._callback_ready.wait, timeout)
-        if not ready:
+        self._event_loop = asyncio.get_running_loop()
+        try:
+            await asyncio.wait_for(self._callback_ready.wait(), timeout)
+        except asyncio.TimeoutError:
             raise TimeoutError("Timed out waiting for MCP OAuth callback")
         if self._callback_error:
             raise RuntimeError(f"OAuth authorization failed: {self._callback_error}")
@@ -106,8 +123,8 @@ class DashboardOAuthFlow:
                 return
             self.status = "error"
             self.error = error
-            self._authorization_ready.set()
-            self._callback_ready.set()
+            self._signal(self._authorization_ready)
+            self._signal(self._callback_ready)
 
     def snapshot(self) -> dict:
         with self._lock:

@@ -52,6 +52,7 @@ Activation (config ``agent.coding_context``):
 from __future__ import annotations
 
 import json
+import asyncio
 import logging
 import os
 import re
@@ -59,6 +60,9 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
+
+import aiofiles
+import aiofiles.os
 
 from hermes_cli._subprocess_compat import bounded_git_probe
 
@@ -136,6 +140,41 @@ def _has_code_files(root: Path) -> bool:
                         continue
         except OSError:
             continue
+    return False
+
+
+async def _has_code_files_async(root: Path) -> bool:
+    """Bounded async source-file check for a git workspace."""
+    seen = 0
+    stack = [(root, True)]
+    while stack:
+        directory, is_root = stack.pop()
+        try:
+            entries = await aiofiles.os.scandir(directory)
+        except OSError:
+            continue
+        try:
+            for entry in entries:
+                seen += 1
+                if seen > _CODE_SCAN_MAX_ENTRIES:
+                    return False
+                name = entry.name
+                path = Path(entry.path)
+                try:
+                    if await aiofiles.os.path.isfile(path):
+                        if os.path.splitext(name)[1].lower() in _CODE_EXTENSIONS:
+                            return True
+                    elif (
+                        is_root
+                        and name not in _CODE_SCAN_SKIP_DIRS
+                        and not name.startswith(".")
+                        and await aiofiles.os.path.isdir(path)
+                    ):
+                        stack.append((path, False))
+                except OSError:
+                    continue
+        finally:
+            entries.close()
     return False
 
 # Lockfile → package manager, checked in priority order.
@@ -376,6 +415,38 @@ def _coding_instructions(config: Optional[dict[str, Any]]) -> str:
     return str(raw or "").strip()
 
 
+async def _load_coding_config_async(config: Optional[dict[str, Any]]) -> dict[str, Any]:
+    if config is not None:
+        return config
+    try:
+        from hermes_cli.config import load_config_readonly_async
+
+        loaded = await load_config_readonly_async()
+        return loaded if isinstance(loaded, dict) else {}
+    except Exception:
+        return {}
+
+
+def _coding_mode_from_config(config: Optional[dict[str, Any]]) -> str:
+    """Pure mode normalization shared by sync and async resolution."""
+    raw = ((config or {}).get("agent", {}) or {}).get("coding_context", "auto")
+    mode = str(raw).strip().lower()
+    if mode in {"focus", "strict", "lean"}:
+        return "focus"
+    if mode in {"on", "true", "yes", "1", "always"}:
+        return "on"
+    if mode in {"off", "false", "no", "0", "never"}:
+        return "off"
+    return "auto"
+
+
+def _coding_instructions_from_config(config: Optional[dict[str, Any]]) -> str:
+    raw = ((config or {}).get("agent", {}) or {}).get("coding_instructions", "")
+    if isinstance(raw, (list, tuple)):
+        return "\n".join(str(item).strip() for item in raw if str(item).strip())
+    return str(raw or "").strip()
+
+
 def _resolve_cwd(cwd: Optional[str | Path]) -> Path:
     if cwd:
         return Path(cwd).expanduser()
@@ -383,6 +454,18 @@ def _resolve_cwd(cwd: Optional[str | Path]) -> Path:
         from agent.runtime_cwd import resolve_agent_cwd
 
         return resolve_agent_cwd()
+    except Exception:
+        return Path(os.getcwd())
+
+
+async def _resolve_cwd_async(cwd: Optional[str | Path]) -> Path:
+    """Resolve a session cwd without synchronous directory validation."""
+    if cwd:
+        return Path(cwd).expanduser()
+    try:
+        from agent.runtime_cwd import resolve_agent_cwd_async
+
+        return await resolve_agent_cwd_async()
     except Exception:
         return Path(os.getcwd())
 
@@ -398,6 +481,25 @@ def _git_root(cwd: Path) -> Optional[Path]:
 def _home() -> Optional[Path]:
     try:
         return Path.home().resolve()
+    except (OSError, RuntimeError):
+        return None
+
+
+async def _git_root_async(cwd: Path) -> Optional[Path]:
+    """Find a git root using awaitable metadata checks."""
+    current = cwd.absolute()
+    for parent in [current, *current.parents]:
+        try:
+            if await aiofiles.os.path.exists(parent / ".git"):
+                return parent
+        except OSError:
+            continue
+    return None
+
+
+async def _home_async() -> Optional[Path]:
+    try:
+        return Path.home().absolute()
     except (OSError, RuntimeError):
         return None
 
@@ -428,6 +530,28 @@ def _marker_root(cwd: Path) -> Optional[Path]:
         for marker in _PROJECT_MARKERS:
             if (parent / marker).exists():
                 return parent
+    return None
+
+
+async def _marker_root_async(cwd: Path) -> Optional[Path]:
+    """Find the nearest project marker without blocking metadata calls."""
+    current = cwd.absolute()
+    home = await _home_async()
+    try:
+        temp_root = Path(tempfile.gettempdir()).absolute()
+    except Exception:
+        temp_root = None
+    for depth, parent in enumerate([current, *current.parents]):
+        if depth > 6:
+            break
+        if parent == home or (temp_root is not None and parent == temp_root):
+            continue
+        for marker in _PROJECT_MARKERS:
+            try:
+                if await aiofiles.os.path.exists(parent / marker):
+                    return parent
+            except OSError:
+                continue
     return None
 
 
@@ -464,6 +588,24 @@ def _detect_profile_name(mode: str, platform: str, cwd_str: str) -> str:
     # A bare git repo only counts when it actually holds code, so `git init` on a
     # notes/writing/research folder stays in the general posture.
     if git_root is not None and _has_code_files(git_root):
+        return CODING_PROFILE.name
+    return GENERAL_PROFILE.name
+
+
+async def _detect_profile_name_async(mode: str, platform: str, cwd: Path) -> str:
+    """Async counterpart of :func:`_detect_profile_name`."""
+    if mode == "off":
+        return GENERAL_PROFILE.name
+    if mode == "on":
+        return CODING_PROFILE.name
+    if platform and platform.strip().lower() not in INTERACTIVE_CODING_PLATFORMS:
+        return GENERAL_PROFILE.name
+    if await _marker_root_async(cwd) is not None:
+        return CODING_PROFILE.name
+    git_root = await _git_root_async(cwd)
+    if git_root is not None and git_root == await _home_async():
+        git_root = None
+    if git_root is not None and await _has_code_files_async(git_root):
         return CODING_PROFILE.name
     return GENERAL_PROFILE.name
 
@@ -552,6 +694,26 @@ class RuntimeMode:
             trailing.append(f"Operator instructions (from config):\n{self.instructions}")
         return prefix, workspace_parts, trailing
 
+    async def system_prompt_parts_async(self) -> tuple[list[str], list[str], list[str]]:
+        """Build the prompt parts without synchronous git or file I/O."""
+        if not self.is_coding:
+            return [], [], []
+        prefix: list[str] = []
+        workspace_parts: list[str] = []
+        trailing: list[str] = []
+        if self.profile.guidance:
+            brief = self.profile.guidance
+            edit_line = _edit_format_line(self.model)
+            if edit_line:
+                brief = f"{brief}\n{edit_line}"
+            prefix.append(brief)
+        workspace = await build_coding_workspace_block_async(self.cwd)
+        if workspace:
+            workspace_parts.append(workspace)
+        if self.instructions:
+            trailing.append(f"Operator instructions (from config):\n{self.instructions}")
+        return prefix, workspace_parts, trailing
+
     def system_blocks(self) -> list[str]:
         """Return posture blocks in their historical display order.
 
@@ -583,6 +745,10 @@ class RuntimeMode:
             return frozenset()
         return frozenset(self.profile.compact_skill_categories)
 
+    async def compact_skill_categories_async(self) -> frozenset[str]:
+        """Async-safe counterpart for active prompt assembly."""
+        return self.compact_skill_categories()
+
 
 def resolve_runtime_mode(
     *,
@@ -612,6 +778,30 @@ def resolve_runtime_mode(
         config_mode=mode,
         model=model,
         instructions=_coding_instructions(config),
+    )
+
+
+async def resolve_runtime_mode_async(
+    *,
+    platform: Optional[str] = None,
+    cwd: Optional[str | Path] = None,
+    config: Optional[dict[str, Any]] = None,
+    model: Optional[str] = None,
+) -> RuntimeMode:
+    """Resolve a runtime mode without blocking the active event loop."""
+    resolved_config = await _load_coding_config_async(config)
+    resolved_cwd = await _resolve_cwd_async(cwd)
+    mode = _coding_mode_from_config(resolved_config)
+    name = await _detect_profile_name_async(
+        mode, (platform or "").strip().lower(), resolved_cwd
+    )
+    return RuntimeMode(
+        profile=get_profile(name),
+        surface=platform or "",
+        cwd=resolved_cwd,
+        config_mode=mode,
+        model=model,
+        instructions=_coding_instructions_from_config(resolved_config),
     )
 
 
@@ -690,6 +880,31 @@ def coding_compact_skill_categories(
     return resolve_runtime_mode(
         platform=platform, cwd=cwd, config=config
     ).compact_skill_categories()
+
+
+async def coding_system_prompt_parts_async(
+    *,
+    platform: Optional[str] = None,
+    cwd: Optional[str | Path] = None,
+    config: Optional[dict[str, Any]] = None,
+    model: Optional[str] = None,
+) -> tuple[list[str], list[str], list[str]]:
+    """Async prompt parts used by the agent's active system-prompt path."""
+    mode = await resolve_runtime_mode_async(
+        platform=platform, cwd=cwd, config=config, model=model
+    )
+    return await mode.system_prompt_parts_async()
+
+
+async def coding_compact_skill_categories_async(
+    *,
+    platform: Optional[str] = None,
+    cwd: Optional[str | Path] = None,
+    config: Optional[dict[str, Any]] = None,
+) -> frozenset[str]:
+    """Async skill-index policy for active prompt assembly."""
+    mode = await resolve_runtime_mode_async(platform=platform, cwd=cwd, config=config)
+    return mode.compact_skill_categories()
 
 
 def _enabled_mcp_servers(config: Optional[dict[str, Any]]) -> list[str]:
@@ -913,4 +1128,196 @@ def build_coding_workspace_block(cwd: Optional[str | Path] = None) -> str:
             lines.extend(f"    {c}" for c in recent.splitlines())
 
     lines.extend(_project_facts(root))
+    return "\n".join(lines)
+
+
+# ── Native-async agent prompt probes ───────────────────────────────────────
+
+
+async def _git_async(cwd: Path, *args: str) -> str:
+    """Run a bounded git probe without occupying the event-loop thread."""
+    process = await asyncio.create_subprocess_exec(
+        "git",
+        "-C",
+        str(cwd),
+        *args,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    try:
+        stdout, _ = await asyncio.wait_for(process.communicate(), timeout=_GIT_TIMEOUT)
+    except asyncio.TimeoutError:
+        process.kill()
+        await process.communicate()
+        return ""
+    except asyncio.CancelledError:
+        process.kill()
+        await process.communicate()
+        raise
+    return stdout.decode("utf-8", errors="replace").strip()
+
+
+async def _is_file_async(path: Path) -> bool:
+    try:
+        return await aiofiles.os.path.isfile(path)
+    except OSError:
+        return False
+
+
+async def _read_small_async(path: Path) -> str:
+    """Read a bounded text file through aiofiles."""
+    try:
+        stat = await aiofiles.os.stat(path)
+        if stat.st_size > _MAX_FACT_FILE_BYTES:
+            return ""
+        async with aiofiles.open(path, "r", encoding="utf-8", errors="replace") as handle:
+            return await handle.read()
+    except (OSError, UnicodeError):
+        return ""
+
+
+async def detect_project_facts_async(root: Path) -> ProjectFacts:
+    """Async project-fact detection used by the active system prompt."""
+    marker_paths = [root / marker for marker in _PROJECT_MARKERS]
+    marker_exists = await asyncio.gather(*(_is_file_async(path) for path in marker_paths))
+    manifests = [
+        marker
+        for marker, exists in zip(_PROJECT_MARKERS, marker_exists)
+        if marker not in _CONTEXT_FILES and exists
+    ]
+
+    lock_paths = [root / lock for lock, _ in (*_PY_LOCKFILES, *_JS_LOCKFILES)]
+    lock_exists = await asyncio.gather(*(_is_file_async(path) for path in lock_paths))
+    all_lockfiles = (*_PY_LOCKFILES, *_JS_LOCKFILES)
+    package_managers = list(
+        dict.fromkeys(
+            pm for (lock, pm), exists in zip(all_lockfiles, lock_exists) if exists
+        )
+    )
+
+    run_tests_path = root / "scripts" / "run_tests.sh"
+    package_json_path = root / "package.json"
+    pytest_ini_path = root / "pytest.ini"
+    pyproject_path = root / "pyproject.toml"
+    makefile_path = root / "Makefile"
+    run_tests, package_json, pytest_ini, pyproject, makefile = await asyncio.gather(
+        _is_file_async(run_tests_path),
+        _is_file_async(package_json_path),
+        _is_file_async(pytest_ini_path),
+        _is_file_async(pyproject_path),
+        _is_file_async(makefile_path),
+    )
+    package_text = await _read_small_async(package_json_path) if package_json else ""
+    pyproject_text = await _read_small_async(pyproject_path) if pyproject else ""
+    makefile_text = await _read_small_async(makefile_path) if makefile else ""
+
+    verify: list[str] = []
+    if run_tests:
+        verify.append("scripts/run_tests.sh")
+    if package_json:
+        try:
+            scripts = json.loads(package_text or "{}").get("scripts") or {}
+        except (json.JSONDecodeError, AttributeError):
+            scripts = {}
+        js_pm = next(
+            (pm for (lock, pm), exists in zip(_JS_LOCKFILES, lock_exists[len(_PY_LOCKFILES):]) if exists),
+            "npm",
+        )
+        verify.extend(f"{js_pm} run {name}" for name in _VERIFY_TARGETS if name in scripts)
+    if pytest_ini or "[tool.pytest" in pyproject_text:
+        verify.append("pytest")
+    if makefile_text:
+        verify.extend(
+            f"make {name}"
+            for name in _VERIFY_TARGETS
+            if re.search(rf"^{re.escape(name)}\s*:", makefile_text, re.MULTILINE)
+        )
+
+    context_exists = await asyncio.gather(
+        *(_is_file_async(root / context_file) for context_file in _CONTEXT_FILES)
+    )
+    return ProjectFacts(
+        manifests=manifests,
+        package_managers=package_managers,
+        verify_commands=list(dict.fromkeys(verify))[:_MAX_VERIFY_COMMANDS],
+        context_files=[
+            context_file
+            for context_file, exists in zip(_CONTEXT_FILES, context_exists)
+            if exists
+        ],
+    )
+
+
+def _render_project_facts(facts: ProjectFacts) -> list[str]:
+    lines: list[str] = []
+    if facts.manifests:
+        line = f"- Project: {', '.join(facts.manifests[:6])}"
+        if facts.package_managers:
+            line += f" ({'/'.join(facts.package_managers)})"
+        lines.append(line)
+    if facts.verify_commands:
+        lines.append(f"- Verify: {'; '.join(facts.verify_commands)}")
+    if facts.context_files:
+        lines.append(f"- Context files: {', '.join(facts.context_files)}")
+    return lines
+
+
+async def build_coding_workspace_block_async(cwd: Optional[str | Path] = None) -> str:
+    """Async workspace snapshot preserving the synchronous output format."""
+    resolved = await _resolve_cwd_async(cwd)
+    git_root = await _git_root_async(resolved)
+    root = git_root or await _marker_root_async(resolved)
+    if root is None:
+        return ""
+
+    lines = [
+        "Workspace (snapshot at session start — re-check with `git` before acting on it):",
+        f"- Root: {root}",
+    ]
+    if git_root is not None:
+        branch, counts = _parse_status(
+            await _git_async(root, "status", "--porcelain=2", "--branch")
+        )
+        head = branch.get("head", "")
+        if head and head != "(detached)":
+            line = f"- Branch: {head}"
+            if branch.get("upstream"):
+                line += f" → {branch['upstream']}"
+                ahead, behind = branch.get("ahead", "0"), branch.get("behind", "0")
+                if ahead != "0" or behind != "0":
+                    line += f" (ahead {ahead}, behind {behind})"
+            lines.append(line)
+        elif head == "(detached)":
+            lines.append("- Branch: (detached HEAD)")
+
+        git_dir, common_dir = await asyncio.gather(
+            _git_async(root, "rev-parse", "--git-dir"),
+            _git_async(root, "rev-parse", "--git-common-dir"),
+        )
+
+        def _git_path(value: str) -> Path:
+            path = Path(value)
+            return (root / path if not path.is_absolute() else path).absolute()
+
+        if git_dir and common_dir and _git_path(git_dir) != _git_path(common_dir):
+            lines.append("- Worktree: linked (git state shared with primary tree)")
+
+        dirty = [
+            f"{n} {label}"
+            for label, n in (
+                ("staged", counts["staged"]),
+                ("modified", counts["modified"]),
+                ("untracked", counts["untracked"]),
+                ("conflicts", counts["conflicts"]),
+            )
+            if n
+        ]
+        lines.append(f"- Status: {', '.join(dirty) if dirty else 'clean'}")
+
+        recent = await _git_async(root, "log", "-3", "--pretty=%h %s")
+        if recent:
+            lines.append("- Recent commits:")
+            lines.extend(f"    {commit}" for commit in recent.splitlines())
+
+    lines.extend(_render_project_facts(await detect_project_facts_async(root)))
     return "\n".join(lines)

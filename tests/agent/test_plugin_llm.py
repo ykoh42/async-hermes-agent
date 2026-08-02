@@ -8,7 +8,6 @@ so we don't hit real providers.
 
 from __future__ import annotations
 
-import asyncio
 import base64
 from types import SimpleNamespace
 from typing import Any
@@ -271,19 +270,20 @@ class TestJsonParsing:
 
 
 class TestPluginLlmFacade:
-    def test_complete_uses_active_model_by_default(self):
+    @pytest.mark.asyncio
+    async def test_complete_uses_active_model_by_default(self):
         captured: dict = {}
 
-        def fake_caller(**kwargs):
+        async def fake_caller(**kwargs):
             captured.update(kwargs)
             return "auto", "default", _fake_response("Hello world.")
 
         llm = make_plugin_llm_for_test(
             plugin_id="my-plugin",
             policy=_TrustPolicy(plugin_id="my-plugin"),
-            sync_caller=fake_caller,
+            caller=fake_caller,
         )
-        result = llm.complete([{"role": "user", "content": "hi"}])
+        result = await llm.complete([{"role": "user", "content": "hi"}])
         assert isinstance(result, PluginLlmCompleteResult)
         assert result.text == "Hello world."
         assert captured["provider_override"] is None
@@ -294,19 +294,20 @@ class TestPluginLlmFacade:
 
 
 
-    def test_complete_passes_through_trusted_overrides(self):
+    @pytest.mark.asyncio
+    async def test_complete_passes_through_trusted_overrides(self):
         captured: dict = {}
 
-        def fake_caller(**kwargs):
+        async def fake_caller(**kwargs):
             captured.update(kwargs)
             return "anthropic", "claude-3-opus", _fake_response("ok")
 
         llm = make_plugin_llm_for_test(
             plugin_id="my-plugin",
             policy=_trusted_policy("my-plugin"),
-            sync_caller=fake_caller,
+            caller=fake_caller,
         )
-        result = llm.complete(
+        result = await llm.complete(
             [{"role": "user", "content": "hi"}],
             provider="anthropic",
             model="claude-3-opus",
@@ -328,8 +329,9 @@ class TestPluginLlmFacade:
         assert captured["max_tokens"] == 128
         assert captured["timeout"] == 10.0
 
-    def test_complete_structured_returns_parsed_json(self):
-        def fake_caller(**_kwargs):
+    @pytest.mark.asyncio
+    async def test_complete_structured_returns_parsed_json(self):
+        async def fake_caller(**_kwargs):
             return "openai", "gpt-4o", _fake_response(
                 '{"language": "French", "is_question": true, "confidence": 0.99}'
             )
@@ -337,9 +339,9 @@ class TestPluginLlmFacade:
         llm = make_plugin_llm_for_test(
             plugin_id="my-plugin",
             policy=_TrustPolicy(plugin_id="my-plugin"),
-            sync_caller=fake_caller,
+            caller=fake_caller,
         )
-        result = llm.complete_structured(
+        result = await llm.complete_structured(
             instructions="Detect language",
             input=[PluginLlmTextInput(text="Comment ça va?")],
             json_mode=True,
@@ -357,20 +359,21 @@ class TestPluginLlmFacade:
 
 
 
-    def test_complete_structured_with_image_passes_image_url_part(self):
+    @pytest.mark.asyncio
+    async def test_complete_structured_with_image_passes_image_url_part(self):
         captured: dict = {}
 
-        def fake_caller(**kwargs):
+        async def fake_caller(**kwargs):
             captured.update(kwargs)
             return "openai", "gpt-4o", _fake_response('{"caption": "ok"}')
 
         llm = make_plugin_llm_for_test(
             plugin_id="my-plugin",
             policy=_TrustPolicy(plugin_id="my-plugin"),
-            sync_caller=fake_caller,
+            caller=fake_caller,
         )
         png = b"fake-bytes"
-        llm.complete_structured(
+        await llm.complete_structured(
             instructions="Caption this",
             input=[PluginLlmImageInput(data=png, mime_type="image/png")],
             json_mode=True,
@@ -388,41 +391,35 @@ class TestPluginLlmFacade:
 
 
 class TestAsyncSurface:
-    def test_acomplete_uses_async_caller(self):
+    @pytest.mark.asyncio
+    async def test_complete_uses_async_caller(self):
         async def fake_async(**_kwargs):
             return "openai", "gpt-4o", _fake_response("async hello")
 
         llm = make_plugin_llm_for_test(
             plugin_id="my-plugin",
             policy=_TrustPolicy(plugin_id="my-plugin"),
-            async_caller=fake_async,
+            caller=fake_async,
         )
-
-        async def _run() -> PluginLlmCompleteResult:
-            return await llm.acomplete([{"role": "user", "content": "hi"}])
-
-        result = asyncio.run(_run())
+        result = await llm.complete([{"role": "user", "content": "hi"}])
         assert result.text == "async hello"
         assert result.provider == "openai"
 
-    def test_acomplete_structured_parses_json(self):
+    @pytest.mark.asyncio
+    async def test_complete_structured_parses_json(self):
         async def fake_async(**_kwargs):
             return "openai", "gpt-4o", _fake_response('{"x": 42}')
 
         llm = make_plugin_llm_for_test(
             plugin_id="my-plugin",
             policy=_TrustPolicy(plugin_id="my-plugin"),
-            async_caller=fake_async,
+            caller=fake_async,
         )
-
-        async def _run() -> PluginLlmStructuredResult:
-            return await llm.acomplete_structured(
-                instructions="Extract x",
-                input=[PluginLlmTextInput(text="data")],
-                json_mode=True,
-            )
-
-        result = asyncio.run(_run())
+        result = await llm.complete_structured(
+            instructions="Extract x",
+            input=[PluginLlmTextInput(text="data")],
+            json_mode=True,
+        )
         assert result.parsed == {"x": 42}
         assert result.content_type == "json"
 
@@ -572,7 +569,8 @@ class TestHookMode:
     callback that calls ``ctx.llm.complete``, fire the hook through
     the real ``invoke_hook`` machinery, and check the call landed."""
 
-    def test_complete_works_from_post_tool_call_hook(self):
+    @pytest.mark.asyncio
+    async def test_complete_works_from_post_tool_call_hook(self):
         from hermes_cli.plugins import PluginContext, PluginManifest, PluginManager
 
         manifest = PluginManifest(name="hook-plugin", source="test", key="hook-plugin")
@@ -582,20 +580,20 @@ class TestHookMode:
         # Replace ctx.llm with a stub that records what the hook called.
         captured: list = []
 
-        def fake_caller(**kwargs):
+        async def fake_caller(**kwargs):
             captured.append(kwargs)
             return "openrouter", "openai/gpt-4o", _fake_response("rewrote it")
 
         ctx._llm = make_plugin_llm_for_test(  # type: ignore[attr-defined]
             plugin_id="hook-plugin",
             policy=_TrustPolicy(plugin_id="hook-plugin"),
-            sync_caller=fake_caller,
+            caller=fake_caller,
         )
 
         # Plugin registers a hook that runs ctx.llm.complete on every tool call.
-        def rewrite_error_hook(*, tool_name, args, result, **_):
+        async def rewrite_error_hook(*, tool_name, args, result, **_):
             if "Traceback" in (result or ""):
-                rewritten = ctx.llm.complete(
+                rewritten = await ctx.llm.complete(
                     messages=[
                         {"role": "system", "content": "Rewrite errors plainly."},
                         {"role": "user", "content": result},
@@ -610,7 +608,7 @@ class TestHookMode:
         ctx.register_hook("post_tool_call", rewrite_error_hook)
 
         # Fire the hook the same way the agent core does it.
-        manager.invoke_hook(
+        await manager.invoke_hook_async(
             "post_tool_call",
             tool_name="terminal",
             args={"command": "boom"},
@@ -626,30 +624,30 @@ class TestHookMode:
         hook_record = captured[1]
         assert hook_record["hook_returned"] == "rewrote it"
 
-    def test_complete_works_from_post_tool_call_hook_when_async_caller_set(self):
-        """Hooks fired synchronously should still work with sync
-        ctx.llm.complete even if other callsites use async."""
+    @pytest.mark.asyncio
+    async def test_complete_works_from_post_tool_call_hook_when_async_caller_set(self):
+        """Async lifecycle hooks can await the native plugin LLM facade."""
         from hermes_cli.plugins import PluginContext, PluginManifest, PluginManager
 
         manifest = PluginManifest(name="hook-async", source="test", key="hook-async")
         manager = PluginManager()
         ctx = PluginContext(manifest, manager)
 
-        def fake_caller(**_):
+        async def fake_caller(**_):
             return "openrouter", "model-x", _fake_response("ok")
 
         ctx._llm = make_plugin_llm_for_test(  # type: ignore[attr-defined]
             plugin_id="hook-async",
             policy=_TrustPolicy(plugin_id="hook-async"),
-            sync_caller=fake_caller,
+            caller=fake_caller,
         )
 
         called: list = []
 
-        def hook(**kwargs):
-            r = ctx.llm.complete(messages=[{"role": "user", "content": "x"}])
+        async def hook(**kwargs):
+            r = await ctx.llm.complete(messages=[{"role": "user", "content": "x"}])
             called.append(r.text)
 
         ctx.register_hook("post_tool_call", hook)
-        manager.invoke_hook("post_tool_call", tool_name="x", args={}, result="y")
+        await manager.invoke_hook_async("post_tool_call", tool_name="x", args={}, result="y")
         assert called == ["ok"]

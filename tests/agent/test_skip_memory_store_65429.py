@@ -54,7 +54,8 @@ def test_skip_memory_with_memory_toolset_creates_store(monkeypatch, tmp_path):
 
 
 
-def test_skip_memory_memory_tool_handler_works_and_provider_skipped(
+@pytest.mark.asyncio
+async def test_skip_memory_memory_tool_handler_works_and_provider_skipped(
     monkeypatch, tmp_path
 ):
     """End-to-end behavioral check for #65429.
@@ -79,7 +80,7 @@ def test_skip_memory_memory_tool_handler_works_and_provider_skipped(
     # (agent/tool_executor.py wires store=agent._memory_store).
     from tools.memory_tool import memory_tool
 
-    raw = memory_tool(
+    raw = await memory_tool(
         action="add",
         target="memory",
         content="User prefers concise answers.",
@@ -96,3 +97,4 @@ def test_skip_memory_memory_tool_handler_works_and_provider_skipped(
     memory_md = tmp_path / "hm" / "memories" / "MEMORY.md"
     assert memory_md.exists()
     assert "User prefers concise answers." in memory_md.read_text()
+    await agent.close()

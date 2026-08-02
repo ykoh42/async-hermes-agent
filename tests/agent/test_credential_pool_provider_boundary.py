@@ -3,6 +3,8 @@
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+
 from agent.credential_pool import credential_pool_matches_provider
 from hermes_cli import runtime_provider as rp
 
@@ -26,7 +28,8 @@ def test_custom_pool_match_is_scoped_by_endpoint():
         )
 
 
-def test_runtime_ignores_pool_loaded_for_different_provider(monkeypatch):
+@pytest.mark.asyncio
+async def test_runtime_ignores_pool_loaded_for_different_provider(monkeypatch):
     entry = SimpleNamespace(
         provider="openai-codex",
         access_token="wrong-token",
@@ -34,12 +37,17 @@ def test_runtime_ignores_pool_loaded_for_different_provider(monkeypatch):
         runtime_base_url="https://chatgpt.com/backend-api/codex",
         base_url="https://chatgpt.com/backend-api/codex",
     )
-    pool = SimpleNamespace(
-        provider="openai-codex",
-        has_credentials=lambda: True,
-        select=lambda: entry,
-    )
-    monkeypatch.setattr(rp, "load_pool", lambda _provider: pool)
+    async def select():
+        return entry
+
+    async def load_pool(_provider):
+        return SimpleNamespace(
+            provider="openai-codex",
+            has_credentials=lambda: True,
+            select=select,
+        )
+
+    monkeypatch.setattr(rp, "load_pool", load_pool)
     monkeypatch.setattr(rp, "resolve_provider", lambda *_a, **_kw: "deepseek")
     monkeypatch.setattr(
         rp,
@@ -57,7 +65,7 @@ def test_runtime_ignores_pool_loaded_for_different_provider(monkeypatch):
         },
     )
 
-    resolved = rp.resolve_runtime_provider(requested="deepseek")
+    resolved = await rp.resolve_runtime_provider(requested="deepseek")
 
     assert resolved["provider"] == "deepseek"
     assert resolved["api_key"] == "deepseek-key"

@@ -1,4 +1,4 @@
-"""Local terminal tool used by the synchronous training harness.
+"""Local terminal tool used by the async training harness.
 
 Hermes' original terminal module also contained Docker, SSH, Modal, Daytona,
 and Vercel backends.  Those transports are intentionally outside this fork's
@@ -13,12 +13,17 @@ import os
 import json
 import re
 import shlex
-import subprocess
+import asyncio
+import signal
 import threading
 import time
+import weakref
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+import aiofiles.os
+
+from tools.environments.local import build_subprocess_env
 from tools.registry import registry, tool_error
 
 _active_environments: dict[str, "LocalEnvironment"] = {}
@@ -26,9 +31,18 @@ _env_lock = threading.RLock()
 _last_activity: dict[str, float] = {}
 _creation_locks: dict[str, threading.Lock] = {}
 _creation_locks_lock = threading.Lock()
+_async_creation_locks: weakref.WeakKeyDictionary[
+    asyncio.AbstractEventLoop, dict[str, asyncio.Lock]
+] = weakref.WeakKeyDictionary()
 _task_env_overrides: dict[str, dict[str, Any]] = {}
 _session_cwds: dict[str, str] = {}
 _CONTAINER_BACKENDS = frozenset()
+# Native ``background=true`` commands are owned by the running event loop,
+# not the legacy ProcessRegistry (which is backed by blocking Popen readers).
+# Keeping their handles here lets ``AIAgent.close()`` terminate and reap them
+# without leaking child processes when a service request/session ends.
+_async_background_processes: dict[str, set[asyncio.subprocess.Process]] = {}
+_async_background_reapers: dict[asyncio.subprocess.Process, asyncio.Task] = {}
 
 _approval_callback: Callable[..., Any] | None = None
 _sudo_password_callback: Callable[..., Any] | None = None
@@ -79,6 +93,35 @@ def _get_env_config() -> dict[str, Any]:
     return {
         "env_type": "local",
         "cwd": cwd,
+        "timeout": _parse_env_var("TERMINAL_TIMEOUT", "120"),
+        "docker_forward_env": _parse_env_var(
+            "TERMINAL_DOCKER_FORWARD_ENV", "[]", json.loads, "valid JSON"
+        ),
+        "docker_image": "",
+        "singularity_image": "",
+        "modal_image": "",
+        "daytona_image": "",
+        "local_persistent": True,
+    }
+
+
+async def _get_env_config_async() -> dict[str, Any]:
+    """Read local terminal configuration without synchronous filesystem I/O.
+
+    The synchronous configuration helper remains for legacy code-execution
+    callers.  The registered terminal tool uses this coroutine so a first
+    tool call cannot perform ``os.path.isdir`` while the event loop is serving
+    another agent.
+    """
+    raw_cwd = os.getenv("TERMINAL_CWD", "").strip()
+    expanded_cwd = os.path.expanduser(raw_cwd) if raw_cwd else ""
+    if expanded_cwd and os.path.isabs(expanded_cwd):
+        cwd = expanded_cwd if await aiofiles.os.path.isdir(expanded_cwd) else os.getcwd()
+    else:
+        cwd = os.getcwd()
+    return {
+        "env_type": "local",
+        "cwd": os.path.abspath(cwd),
         "timeout": _parse_env_var("TERMINAL_TIMEOUT", "120"),
         "docker_forward_env": _parse_env_var(
             "TERMINAL_DOCKER_FORWARD_ENV", "[]", json.loads, "valid JSON"
@@ -163,9 +206,62 @@ def get_session_cwd(task_id: str | None = None) -> str:
         return _session_cwds.get(key, _get_env_config()["cwd"])
 
 
+async def get_session_cwd_async(task_id: str | None = None) -> str:
+    """Return a session cwd using the async terminal configuration path."""
+    key = str(task_id or "default")
+    with _env_lock:
+        env = _active_environments.get(key)
+        if env is not None and env.cwd:
+            return env.cwd
+        recorded = _session_cwds.get(key)
+    if recorded:
+        return recorded
+    return (await _get_env_config_async())["cwd"]
+
+
 def record_session_cwd(task_id: str | None, cwd: str) -> None:
     if cwd:
         _session_cwds[str(task_id or "default")] = os.path.abspath(os.path.expanduser(cwd))
+
+
+def clear_session_cwd(task_id: str | None = None) -> None:
+    """Forget the durable working-directory anchor for one local session."""
+    _session_cwds.pop(str(task_id or "default"), None)
+
+
+async def _terminate_process(process: asyncio.subprocess.Process) -> None:
+    """Terminate and reap a foreground shell process.
+
+    Commands run in their own POSIX process group so a shell that launched a
+    child (for example ``sleep`` or a compiler) cannot survive a timeout or a
+    cancelled turn.  Windows has no portable process-group equivalent here,
+    so it uses the asyncio process primitives directly.
+    """
+    if process.returncode is not None:
+        return
+    try:
+        if os.name == "posix":
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+        else:
+            process.terminate()
+        try:
+            await asyncio.wait_for(process.wait(), timeout=2.0)
+        except TimeoutError:
+            if process.returncode is None:
+                if os.name == "posix":
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                else:
+                    process.kill()
+            await process.wait()
+    except ProcessLookupError:
+        # The child exited between the return-code check and the signal.
+        return
 
 
 class LocalEnvironment:
@@ -174,9 +270,9 @@ class LocalEnvironment:
     def __init__(self, cwd: str, timeout: int = 120):
         self.cwd = os.path.abspath(cwd)
         self.timeout = timeout
-        self._lock = threading.RLock()
+        self._lock = asyncio.Lock()
 
-    def execute(
+    async def execute(
         self,
         command: str,
         cwd: str | None = None,
@@ -184,40 +280,61 @@ class LocalEnvironment:
         stdin_data: str | None = None,
         **_kwargs: Any,
     ) -> dict[str, Any]:
+        """Run a local shell command without blocking the agent event loop."""
         workdir = os.path.abspath(os.path.expanduser(cwd or self.cwd))
-        if not os.path.isdir(workdir):
+        if not await aiofiles.os.path.isdir(workdir):
             return {"output": f"Working directory does not exist: {workdir}", "returncode": 1}
         limit = float(timeout or self.timeout)
         shell = os.environ.get("SHELL") or "/bin/sh"
         marker = "__HERMES_LOCAL_CWD_7F3A__"
-        wrapped = f"cd {shlex.quote(workdir)} && {{ {command}; }}; _rc=$?; printf '\\n{marker}%s\\n' \"$PWD\"; exit $_rc"
+        wrapped = (
+            f"cd {shlex.quote(workdir)} && {{ {command}; }}; _rc=$?; "
+            f"printf '\\n{marker}%s\\n' \"$PWD\"; exit $_rc"
+        )
         try:
-            completed = subprocess.run(
+            process = await asyncio.create_subprocess_shell(
                 wrapped,
-                shell=True,
                 executable=shell,
                 cwd=workdir,
-                input=stdin_data,
-                text=True,
-                capture_output=True,
-                timeout=limit,
-                env=os.environ.copy(),
+                **({"start_new_session": True} if os.name == "posix" else {}),
+                stdin=asyncio.subprocess.PIPE if stdin_data is not None else None,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=build_subprocess_env(
+                    scrub_secrets=False,
+                    inherit_profile_home=False,
+                ),
             )
-        except subprocess.TimeoutExpired as exc:
-            output = (exc.stdout or "") if isinstance(exc.stdout, str) else ""
-            return {"output": output + f"\nCommand timed out after {limit:g}s", "returncode": 124}
+            input_bytes = stdin_data.encode() if stdin_data is not None else None
+            try:
+                stdout, stderr = await asyncio.wait_for(
+                    process.communicate(input_bytes), timeout=limit
+                )
+            except TimeoutError:
+                await _terminate_process(process)
+                return {
+                    "output": f"Command timed out after {limit:g}s",
+                    "returncode": 124,
+                }
+            except asyncio.CancelledError:
+                # A cancelled turn must not leave the shell (or its pipe
+                # reader) alive after the caller has moved on.  Re-raise only
+                # after the child has been reaped so cancellation cannot leak
+                # a process or file descriptors into the next turn.
+                await _terminate_process(process)
+                raise
         except OSError as exc:
             return {"output": f"Failed to execute command: {exc}", "returncode": 1}
 
-        output = (completed.stdout or "") + (completed.stderr or "")
+        output = (stdout or b"").decode(errors="replace") + (stderr or b"").decode(errors="replace")
         match = re.search(rf"\n{re.escape(marker)}([^\n]*)\n?$", output)
         if match:
             new_cwd = match.group(1).strip()
             output = output[: match.start()].rstrip("\n")
-            if new_cwd and os.path.isdir(new_cwd):
-                with self._lock:
+            if new_cwd and await aiofiles.os.path.isdir(new_cwd):
+                async with self._lock:
                     self.cwd = new_cwd
-        return {"output": output, "returncode": completed.returncode}
+        return {"output": output, "returncode": process.returncode}
 
 
 def _create_environment(*, cwd: str | None = None, timeout: int | None = None, **_kwargs: Any) -> LocalEnvironment:
@@ -252,13 +369,98 @@ def _get_or_create_environment(task_id: str | None = None) -> LocalEnvironment:
     return env
 
 
-def cleanup_vm(task_id: str | None = None) -> None:
+def _get_async_creation_lock(task_id: str) -> asyncio.Lock:
+    """Get the per-task async environment creation lock."""
+    loop = asyncio.get_running_loop()
+    with _creation_locks_lock:
+        per_loop = _async_creation_locks.setdefault(loop, {})
+        return per_loop.setdefault(task_id, asyncio.Lock())
+
+
+async def _get_or_create_environment_async(
+    task_id: str | None = None,
+) -> LocalEnvironment:
+    """Get or create a local environment without blocking filesystem calls."""
+    raw_key = _resolve_container_task_id(task_id)
+    creation_lock = _get_async_creation_lock(raw_key)
+    async with creation_lock:
+        with _env_lock:
+            env = _active_environments.get(raw_key)
+            if env is not None:
+                _last_activity[raw_key] = time.time()
+                return env
+        overrides = resolve_task_overrides(raw_key)
+        config = await _get_env_config_async()
+        cwd = overrides.get("cwd") or await get_session_cwd_async(raw_key)
+        env = LocalEnvironment(cwd or config["cwd"], int(config["timeout"]))
+        with _env_lock:
+            # A legacy synchronous caller may have created the environment
+            # while the async config was being read. Reuse that object rather
+            # than replacing its cwd/state.
+            existing = _active_environments.get(raw_key)
+            if existing is not None:
+                env = existing
+            else:
+                _active_environments[raw_key] = env
+                _last_activity[raw_key] = time.time()
+        record_session_cwd(raw_key, env.cwd)
+        return env
+
+
+async def cleanup_vm(task_id: str | None = None) -> None:
+    """Terminate and reap native background commands for one task.
+
+    Native asyncio subprocesses need an awaited lifecycle so they cannot outlive a
+    closed agent or remain as zombies after their parent request is cancelled.
+    """
     key = _resolve_container_task_id(task_id)
+    processes = list(_async_background_processes.pop(key, set()))
+    reapers = [
+        _async_background_reapers.pop(process, None)
+        for process in processes
+    ]
+    if processes:
+        # Use the same process-group aware termination path as foreground
+        # commands; terminating only the shell can strand its child command.
+        await asyncio.gather(
+            *(_terminate_process(process) for process in processes),
+            return_exceptions=True,
+        )
+    for reaper in reapers:
+        if reaper is not None and not reaper.done():
+            reaper.cancel()
+    if reapers:
+        await asyncio.gather(
+            *(reaper for reaper in reapers if reaper is not None),
+            return_exceptions=True,
+        )
     with _env_lock:
         env = _active_environments.pop(key, None)
         if env is not None:
             record_session_cwd(key, env.cwd)
         _last_activity.pop(key, None)
+
+
+def _track_async_background_process(
+    task_id: str | None,
+    process: asyncio.subprocess.Process,
+) -> None:
+    """Register a native child and remove it once its awaited reaper exits."""
+    key = _resolve_container_task_id(task_id)
+    _async_background_processes.setdefault(key, set()).add(process)
+
+    async def _reap() -> None:
+        try:
+            await process.wait()
+        finally:
+            processes = _async_background_processes.get(key)
+            if processes is not None:
+                processes.discard(process)
+                if not processes:
+                    _async_background_processes.pop(key, None)
+            _async_background_reapers.pop(process, None)
+
+    _async_background_reapers[process] = asyncio.create_task(_reap())
 
 
 def cleanup_all_environments() -> None:
@@ -269,32 +471,34 @@ def cleanup_all_environments() -> None:
         _last_activity.clear()
 
 
-def terminal_tool(
+
+
+async def terminal_tool(
     command: str,
     timeout: int | None = None,
     background: bool = False,
     task_id: str | None = None,
     **_kwargs: Any,
 ) -> str:
-    """Execute one local shell command and return a JSON-compatible result."""
+    """Native-async terminal handler used by the async conversation loop."""
     if not isinstance(command, str) or not command.strip():
         return tool_error("terminal requires a non-empty command")
-    env = _get_or_create_environment(task_id)
+    env = await _get_or_create_environment_async(task_id)
     if background:
         try:
-            proc = subprocess.Popen(
+            process = await asyncio.create_subprocess_shell(
                 command,
-                shell=True,
                 executable=os.environ.get("SHELL") or "/bin/sh",
                 cwd=env.cwd,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
                 start_new_session=True,
             )
-            return f"Background process started (pid={proc.pid})"
+            _track_async_background_process(task_id, process)
+            return f"Background process started (pid={process.pid})"
         except OSError as exc:
             return tool_error(f"Failed to start background command: {exc}")
-    result = env.execute(command, timeout=timeout)
+    result = await env.execute(command, timeout=timeout)
     return str(result.get("output", "")) if result.get("returncode", 0) == 0 else tool_error(
         f"Command exited with code {result.get('returncode')}:\n{result.get('output', '')}"
     )
@@ -348,16 +552,21 @@ TERMINAL_SCHEMA = {
 }
 
 
+async def _handle_terminal(args: dict, **kwargs) -> str:
+    """Adapt the registry's JSON-object contract to ``terminal_tool``."""
+    return await terminal_tool(
+        command=args.get("command", ""),
+        timeout=args.get("timeout"),
+        background=bool(args.get("background", False)),
+        task_id=kwargs.get("task_id"),
+    )
+
+
 registry.register(
     name="terminal",
     toolset="terminal",
     schema=TERMINAL_SCHEMA,
-    handler=lambda args, **kw: terminal_tool(
-        command=args.get("command", ""),
-        timeout=args.get("timeout"),
-        background=bool(args.get("background", False)),
-        task_id=kw.get("task_id"),
-    ),
+    handler=_handle_terminal,
     check_fn=check_terminal_requirements,
     emoji="💻",
     max_result_size_chars=100_000,

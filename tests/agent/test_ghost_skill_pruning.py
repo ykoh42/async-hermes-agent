@@ -18,7 +18,9 @@ Test patterns for the marker emit checks adapted from PR #32375
 (@LeonSGP43) with credit.
 """
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
 
 from agent.context_compressor import (
     SKILL_PRUNED_MARKER_PREFIX,
@@ -42,7 +44,7 @@ def _make_compressor(**overrides):
     )
     kwargs.update(overrides)
     with patch(
-        "agent.context_compressor.get_model_context_length", return_value=100000
+        "agent.context_compressor.get_static_context_length", return_value=100000
     ):
         return ContextCompressor(**kwargs)
 
@@ -212,7 +214,8 @@ class TestMarkerSurvivesRealCompress:
                 return msg["content"]
         raise AssertionError(f"no summary message found in {result!r}")
 
-    def test_marker_reinjected_when_summarizer_drops_it(self):
+    @pytest.mark.asyncio
+    async def test_marker_reinjected_when_summarizer_drops_it(self):
         c = _make_compressor(protect_first_n=1, protect_last_n=2)
         msgs = self._messages_with_pruned_skill_in_middle()
         drop_response = self._mock_response(
@@ -222,10 +225,11 @@ class TestMarkerSurvivesRealCompress:
         with (
             patch.object(c, "_find_tail_cut_by_tokens", return_value=7),
             patch(
-                "agent.context_compressor.call_llm", return_value=drop_response
+                "agent.context_compressor.call_llm",
+                new=AsyncMock(return_value=drop_response),
             ) as mock_call,
         ):
-            result = c.compress(msgs, force=True)
+            result = await c.compress(msgs, force=True)
         assert mock_call.called
         summary_text = self._summary_text_of(result)
         assert _skill_pruned_marker("pdf") in summary_text
@@ -235,7 +239,8 @@ class TestMarkerSurvivesRealCompress:
 
 
 
-    def test_marker_survives_iterative_recompression(self):
+    @pytest.mark.asyncio
+    async def test_marker_survives_iterative_recompression(self):
         """Markers in a rehydrated handoff summary survive iterative rewrites.
 
         On re-compression the previous handoff (carrying the marker) is
@@ -258,9 +263,12 @@ class TestMarkerSurvivesRealCompress:
         drop_response = self._mock_response("## Goal\nNext task in flight.")
         with (
             patch.object(c, "_find_tail_cut_by_tokens", return_value=8),
-            patch("agent.context_compressor.call_llm", return_value=drop_response),
+            patch(
+                "agent.context_compressor.call_llm",
+                new=AsyncMock(return_value=drop_response),
+            ),
         ):
-            result = c.compress(msgs, force=True)
+            result = await c.compress(msgs, force=True)
         summary_text = self._summary_text_of(result)
         assert _skill_pruned_marker("pdf") in summary_text
 

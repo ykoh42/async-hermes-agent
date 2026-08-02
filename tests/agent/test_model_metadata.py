@@ -23,6 +23,7 @@ from agent.model_metadata import (
     _strip_provider_prefix,
     estimate_tokens_rough,
     estimate_messages_tokens_rough,
+    get_static_context_length,
     get_model_context_length,
     get_next_probe_tier,
     get_cached_context_length,
@@ -32,6 +33,24 @@ from agent.model_metadata import (
     _MODEL_CACHE_TTL,
     estimate_request_tokens_rough,
 )
+
+
+class TestStaticContextLength:
+    def test_static_resolution_uses_catalog_without_live_resolver(self, monkeypatch):
+        monkeypatch.setattr(
+            "agent.model_metadata._ensure_requests",
+            lambda: (_ for _ in ()).throw(AssertionError("static lookup performed I/O")),
+        )
+
+        assert get_static_context_length("gpt-5.6-sol") == 1_050_000
+        assert get_static_context_length(
+            "gpt-5.6-sol", provider="openai-codex"
+        ) == 272_000
+
+    def test_static_resolution_preserves_explicit_configuration(self):
+        assert get_static_context_length(
+            "unknown-model", config_context_length=123_456
+        ) == 123_456
 
 
 # =========================================================================
@@ -1040,6 +1059,7 @@ class TestMoAContextLength:
     def test_moa_custom_context_configures_compressor_threshold(
         self, tmp_path, monkeypatch
     ):
+        from agent.agent_init import _moa_aggregator_context_length
         from agent.context_compressor import ContextCompressor
 
         configured_context = 600_000
@@ -1061,19 +1081,16 @@ class TestMoAContextLength:
             },
         )
 
-        with patch(
-            "agent.model_metadata._resolve_endpoint_context_length",
-            return_value=None,
-        ) as endpoint_probe:
-            compressor = ContextCompressor(
-                model="p",
-                base_url="http://127.0.0.1/v1",
-                provider="moa",
-                threshold_percent=0.50,
-                quiet_mode=True,
-            )
+        config = yaml.safe_load((tmp_path / ".hermes" / "config.yaml").read_text())
+        moa_context = _moa_aggregator_context_length(config, "p", [])
+        compressor = ContextCompressor(
+            model="p",
+            base_url="http://127.0.0.1/v1",
+            provider="moa",
+            config_context_length=moa_context,
+            threshold_percent=0.50,
+            quiet_mode=True,
+        )
 
         assert compressor.context_length == configured_context
         assert compressor.threshold_tokens == configured_context // 2
-        endpoint_probe.assert_not_called()
-

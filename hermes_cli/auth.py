@@ -18,6 +18,7 @@ Nous authentication paths:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -33,7 +34,7 @@ import threading
 import time
 import uuid
 import webbrowser
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -42,6 +43,7 @@ from typing import Any, Callable, Dict, FrozenSet, Iterable, List, Optional, Tup
 from urllib.parse import parse_qs, urlencode, urlparse
 
 import httpx
+import aiofiles
 
 from hermes_cli.config import (
     get_hermes_home,
@@ -611,21 +613,90 @@ def _resolve_api_key_provider_secret(
         if has_usable_secret(val):
             return val, env_var
 
-    # Fallback: try credential pool (e.g. zai key stored via auth.json)
-    try:
-        from agent.credential_pool import load_pool
-        pool = load_pool(provider_id)
-        if pool and pool.has_credentials():
-            entry = pool.peek()
-            if entry:
-                key = getattr(entry, "access_token", "") or getattr(entry, "runtime_api_key", "")
-                key = str(key).strip()
-                if has_usable_secret(key):
-                    return key, f"credential_pool:{provider_id}"
-    except Exception:
-        pass
-
+    # Credential pools are an async runtime concern.  Do not synchronously
+    # load one from this auth/config helper: callers on the event loop would
+    # otherwise create an unawaited coroutine (and legacy pool I/O would block
+    # the loop).  ``resolve_runtime_provider`` performs the awaited pool
+    # lookup before reaching this fallback.
     return "", ""
+
+
+async def _resolve_api_key_provider_secret_async(
+    provider_id: str,
+    pconfig: ProviderConfig,
+) -> tuple[str, str]:
+    """Resolve API credentials without blocking the running event loop."""
+    if provider_id == "copilot":
+        # The fallback ``gh auth token`` lookup is a synchronous subprocess.
+        # Async agent turns intentionally use environment credentials only;
+        # callers can configure COPILOT_GITHUB_TOKEN/GH_TOKEN/GITHUB_TOKEN or
+        # use the CLI login flow before starting the service.
+        from hermes_cli.copilot_auth import validate_copilot_token
+
+        for env_var in ("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"):
+            value = os.getenv(env_var, "").strip()
+            if value:
+                valid, message = validate_copilot_token(value)
+                if valid:
+                    return value, env_var
+                logger.warning("Token from %s is not supported: %s", env_var, message)
+        return "", ""
+
+    from hermes_cli.config import get_env_value_prefer_dotenv_async
+
+    for env_var in pconfig.api_key_env_vars:
+        value = (
+            await get_env_value_prefer_dotenv_async(env_var) or ""
+        ).strip()
+        if has_usable_secret(value):
+            return value, env_var
+    return "", ""
+
+
+async def resolve_api_key_provider_credentials_async(
+    provider_id: str,
+) -> Dict[str, Any]:
+    """Async counterpart used by native provider/client resolution."""
+    pconfig = PROVIDER_REGISTRY.get(provider_id)
+    if not pconfig or pconfig.auth_type != "api_key":
+        raise AuthError(
+            f"Provider '{provider_id}' is not an API-key provider.",
+            provider=provider_id,
+            code="invalid_provider",
+        )
+
+    api_key, key_source = await _resolve_api_key_provider_secret_async(
+        provider_id, pconfig,
+    )
+    if not api_key and provider_id == "lmstudio":
+        api_key = LMSTUDIO_NOAUTH_PLACEHOLDER
+        key_source = key_source or "default"
+
+    env_url = ""
+    if pconfig.base_url_env_var:
+        env_url = os.getenv(pconfig.base_url_env_var, "").strip()
+    if provider_id in {"kimi-coding", "kimi-coding-cn"}:
+        base_url = _resolve_kimi_base_url(
+            api_key, pconfig.inference_base_url, env_url,
+        )
+    elif provider_id == "zai":
+        base_url = _resolve_zai_base_url(
+            api_key, pconfig.inference_base_url, env_url,
+        )
+    elif env_url:
+        base_url = env_url.rstrip("/")
+    else:
+        base_url = pconfig.inference_base_url
+    if provider_id == "lmstudio":
+        base_url = _normalize_lmstudio_runtime_base_url(base_url)
+    if not isinstance(base_url, str) or not base_url.strip():
+        base_url = pconfig.inference_base_url
+    return {
+        "provider": provider_id,
+        "api_key": api_key,
+        "base_url": base_url.rstrip("/"),
+        "source": key_source or "default",
+    }
 
 
 # =============================================================================
@@ -801,10 +872,14 @@ def is_rate_limited_auth_error(error: Exception) -> bool:
     callers should surface a "retry later" notice and prefer a fallback chain
     instead of prompting the operator to run ``hermes auth``.
     """
+    # ``auth`` may be reloaded by long-lived hosts while an exception from the
+    # previous module instance is still in flight.  Its class is semantically
+    # the same ``AuthError`` but no longer passes ``isinstance`` against the
+    # newly imported class.  The structured fields are the public contract for
+    # this classification, so use them directly.
     return (
-        isinstance(error, AuthError)
-        and not error.relogin_required
-        and error.code == CODEX_RATE_LIMITED_CODE
+        not bool(getattr(error, "relogin_required", True))
+        and getattr(error, "code", None) == CODEX_RATE_LIMITED_CODE
     )
 
 
@@ -997,6 +1072,8 @@ def _auth_lock_path() -> Path:
 
 _auth_target_lock_holders: Dict[str, threading.local] = {}
 _auth_target_lock_holders_guard = threading.Lock()
+_async_auth_store_locks: Dict[Tuple[int, str], asyncio.Lock] = {}
+_async_auth_store_locks_guard = threading.Lock()
 
 
 def _same_path(left: Path, right: Path) -> bool:
@@ -1014,6 +1091,69 @@ def _auth_lock_holder_for(target_path: Path) -> threading.local:
         key = str(target_path)
     with _auth_target_lock_holders_guard:
         return _auth_target_lock_holders.setdefault(key, threading.local())
+
+
+def _async_auth_store_lock_for(target_path: Path) -> asyncio.Lock:
+    """Return this event loop's lock for one auth-store path.
+
+    The synchronous CLI still owns ``_auth_store_lock``.  The async agent must
+    not acquire that blocking lock from its turn loop, so its native path uses
+    a task lock plus a non-blocking ``flock`` transaction below.  Locks are
+    keyed by event loop as well as path: test suites and embedding hosts often
+    create more than one loop in a process.
+    """
+    loop = asyncio.get_running_loop()
+    try:
+        path_key = str(target_path.resolve(strict=False))
+    except Exception:
+        path_key = str(target_path)
+    key = (id(loop), path_key)
+    with _async_auth_store_locks_guard:
+        return _async_auth_store_locks.setdefault(key, asyncio.Lock())
+
+
+@asynccontextmanager
+async def _async_auth_store_transaction(
+    target_path: Optional[Path] = None,
+    *,
+    timeout_seconds: float = AUTH_LOCK_TIMEOUT_SECONDS,
+):
+    """Awaitable cross-process transaction guard for ``auth.json``.
+
+    ``fcntl.flock(..., LOCK_NB)`` is retried with ``asyncio.sleep`` so another
+    process holding the auth-store transaction never stalls the event loop.
+    Windows has no compatible non-blocking primitive in the stdlib; the
+    process-local asyncio lock still serializes all async-hermes writers there
+    and the atomic replace below prevents torn JSON files.
+    """
+    auth_path = target_path or _auth_file_path()
+    task_lock = _async_auth_store_lock_for(auth_path)
+    async with task_lock:
+        lock_path = auth_path.with_suffix(".lock")
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        fd: Optional[int] = None
+        acquired = False
+        try:
+            if fcntl is not None:
+                fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
+                deadline = time.monotonic() + max(0.0, float(timeout_seconds))
+                while True:
+                    try:
+                        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        acquired = True
+                        break
+                    except BlockingIOError:
+                        if time.monotonic() >= deadline:
+                            raise TimeoutError("Timed out waiting for auth store lock")
+                        await asyncio.sleep(0.05)
+            yield
+        finally:
+            if fd is not None:
+                try:
+                    if acquired:
+                        fcntl.flock(fd, fcntl.LOCK_UN)
+                finally:
+                    os.close(fd)
 
 
 @contextmanager
@@ -1458,6 +1598,94 @@ def read_credential_pool(provider_id: Optional[str] = None) -> Dict[str, Any]:
     return list(global_entries) if isinstance(global_entries, list) else []
 
 
+async def _load_auth_store_async(auth_file: Optional[Path] = None) -> Dict[str, Any]:
+    """Native-async counterpart of the auth-store read boundary.
+
+    This intentionally performs the same schema normalization as
+    ``_load_auth_store`` without calling the synchronous helper from an agent
+    turn.  Corrupt files remain untouched here: the synchronous CLI keeps the
+    repair/copy workflow, while a running agent must only log and fail closed.
+    """
+    auth_file = auth_file or _auth_file_path()
+    if not auth_file.exists():
+        return {"version": AUTH_STORE_VERSION, "providers": {}}
+    try:
+        async with aiofiles.open(auth_file, "r", encoding="utf-8") as handle:
+            raw = json.loads(await handle.read())
+    except Exception as exc:
+        logger.warning("auth: failed to parse %s (%s) — using empty store", auth_file, exc)
+        return {"version": AUTH_STORE_VERSION, "providers": {}}
+
+    if isinstance(raw, dict) and (
+        isinstance(raw.get("providers"), dict)
+        or isinstance(raw.get("credential_pool"), dict)
+    ):
+        raw.setdefault("providers", {})
+        if isinstance(raw.get("providers"), dict):
+            _migrate_stale_nous_portal_url(raw["providers"])
+        return raw
+    if isinstance(raw, dict) and isinstance(raw.get("systems"), dict):
+        systems = raw["systems"]
+        providers = {}
+        if "nous_portal" in systems:
+            providers["nous"] = systems["nous_portal"]
+        return {
+            "version": AUTH_STORE_VERSION,
+            "providers": providers,
+            "active_provider": "nous" if providers else None,
+        }
+    return {"version": AUTH_STORE_VERSION, "providers": {}}
+
+
+async def _load_global_auth_store_async() -> Dict[str, Any]:
+    """Read the profile fallback store without blocking an async turn."""
+    global_path = _global_auth_file_path()
+    if global_path is None or not global_path.exists():
+        return {}
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        real_home_env = os.environ.get("HOME", "")
+        if real_home_env:
+            real_root = Path(real_home_env) / ".hermes" / "auth.json"
+            try:
+                if global_path.resolve(strict=False) == real_root.resolve(strict=False):
+                    return {}
+            except Exception:
+                pass
+    try:
+        return await _load_auth_store_async(global_path)
+    except Exception:
+        return {}
+
+
+async def read_credential_pool_async(provider_id: Optional[str] = None) -> Dict[str, Any]:
+    """Awaitably read one credential-pool slice with profile shadowing."""
+    auth_store, global_store = await asyncio.gather(
+        _load_auth_store_async(), _load_global_auth_store_async(),
+    )
+    pool = auth_store.get("credential_pool")
+    if not isinstance(pool, dict):
+        pool = {}
+    global_pool = global_store.get("credential_pool")
+    if not isinstance(global_pool, dict):
+        global_pool = {}
+
+    if provider_id is None:
+        merged = dict(pool)
+        for provider_key, entries in global_pool.items():
+            if not isinstance(entries, list) or not entries:
+                continue
+            current = merged.get(provider_key)
+            if not isinstance(current, list) or not current:
+                merged[provider_key] = list(entries)
+        return merged
+
+    provider_entries = pool.get(provider_id)
+    if isinstance(provider_entries, list) and provider_entries:
+        return list(provider_entries)
+    global_entries = global_pool.get(provider_id)
+    return list(global_entries) if isinstance(global_entries, list) else []
+
+
 _POOL_STATUS_FIELDS = (
     "last_status",
     "last_status_at",
@@ -1590,6 +1818,97 @@ def write_credential_pool(
             merged.append(sanitize_borrowed_credential_payload(disk_entry, provider_id))
         pool[provider_id] = merged
         return _save_auth_store(auth_store)
+
+
+async def _save_auth_store_async(
+    auth_store: Dict[str, Any], target_path: Optional[Path] = None,
+) -> Path:
+    """Atomically persist ``auth.json`` through ``aiofiles``.
+
+    The temporary file is created with owner-only permissions before any
+    credential bytes are written.  ``os.replace`` is intentionally the final
+    tiny synchronous syscall: it is atomic and cannot wait on filesystem I/O.
+    """
+    auth_file = target_path or _auth_file_path()
+    auth_file.parent.mkdir(parents=True, exist_ok=True)
+    secure_parent_dir(auth_file)
+    auth_store["version"] = AUTH_STORE_VERSION
+    auth_store["updated_at"] = datetime.now(timezone.utc).isoformat()
+    payload = json.dumps(auth_store, indent=2) + "\n"
+    tmp_path = auth_file.with_name(f"{auth_file.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}")
+    fd = os.open(
+        str(tmp_path),
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+        stat.S_IRUSR | stat.S_IWUSR,
+    )
+    os.close(fd)
+    try:
+        async with aiofiles.open(tmp_path, "w", encoding="utf-8") as handle:
+            await handle.write(payload)
+            await handle.flush()
+        os.replace(tmp_path, auth_file)
+        return auth_file
+    finally:
+        try:
+            if tmp_path.exists():
+                tmp_path.unlink()
+        except OSError:
+            pass
+
+
+async def write_credential_pool_async(
+    provider_id: str,
+    entries: List[Dict[str, Any]],
+    *,
+    removed_ids: Optional[Iterable[str]] = None,
+) -> Path:
+    """Awaitably merge and persist one provider's pool slice.
+
+    The merge is identical to ``write_credential_pool``: concurrent entries
+    are retained and a newer on-disk cooldown wins over stale in-memory state.
+    The transaction itself is non-blocking for the event loop.
+    """
+    removed = {rid for rid in (removed_ids or ()) if rid}
+    async with _async_auth_store_transaction():
+        auth_store = await _load_auth_store_async()
+        pool = auth_store.get("credential_pool")
+        if not isinstance(pool, dict):
+            pool = {}
+            auth_store["credential_pool"] = pool
+        sanitized_entries = [
+            sanitize_borrowed_credential_payload(entry, provider_id)
+            if isinstance(entry, dict) else entry
+            for entry in entries
+        ]
+        existing = pool.get(provider_id)
+        existing_list = existing if isinstance(existing, list) else []
+        existing_by_id = {
+            entry.get("id"): entry
+            for entry in existing_list
+            if isinstance(entry, dict) and entry.get("id")
+        }
+        new_ids = {
+            entry.get("id")
+            for entry in sanitized_entries
+            if isinstance(entry, dict) and entry.get("id")
+        }
+        merged: List[Dict[str, Any]] = [
+            _merge_disk_cooldown_state(
+                entry, existing_by_id.get(entry.get("id")), provider_id
+            )
+            if isinstance(entry, dict)
+            else entry
+            for entry in sanitized_entries
+        ]
+        for disk_entry in existing_list:
+            if not isinstance(disk_entry, dict):
+                continue
+            disk_id = disk_entry.get("id")
+            if not disk_id or disk_id in new_ids or disk_id in removed:
+                continue
+            merged.append(sanitize_borrowed_credential_payload(disk_entry, provider_id))
+        pool[provider_id] = merged
+        return await _save_auth_store_async(auth_store)
 
 
 def suppress_credential_source(provider_id: str, source: str) -> None:
@@ -1970,20 +2289,10 @@ def resolve_provider(
     if has_usable_secret(os.getenv("OPENAI_API_KEY")) or has_usable_secret(os.getenv("OPENROUTER_API_KEY")):
         return "openrouter"
 
-    # Auto-detect an OpenRouter credential added via `hermes auth add openrouter`
-    # (manual pool entry, no env var). Without this, a key that only lives in
-    # the credential pool is invisible to auto-detection — the user sees
-    # `hermes auth list` showing the credential while requests go out with no
-    # Authorization header ("HTTP 401: Missing Authentication header"). The
-    # env-var check above only covers keys exported as OPENROUTER_API_KEY /
-    # OPENAI_API_KEY. See issue #42130.
-    try:
-        from agent.credential_pool import load_pool as _load_pool
-
-        if _load_pool("openrouter").has_credentials():
-            return "openrouter"
-    except Exception as e:
-        logger.debug("Could not check OpenRouter credential pool: %s", e)
+    # Credential-pool discovery belongs to the native-async runtime resolver.
+    # This synchronous config/env classifier must not instantiate the async
+    # pool coroutine and silently discard it; callers that need pool-only
+    # credentials resolve them through ``await load_pool("openrouter")``.
 
     # Determine the logged-in OAuth provider up front so the env-key loop below
     # can WARN when an exported API key preempts it (#29285 transparency). The
@@ -5930,8 +6239,7 @@ def persist_nous_credentials(
     *,
     label: Optional[str] = None,
 ):
-    """Persist Nous OAuth credentials as the singleton provider state
-    and ensure the credential pool is in sync.
+    """Persist Nous OAuth credentials as the singleton provider state.
 
     Nous credentials are read at runtime from two independent locations:
 
@@ -5945,10 +6253,9 @@ def persist_nous_credentials(
     expired, the recovery path read the empty singleton state and raised
     ``AuthError`` silently (``logger.debug`` at INFO level).
 
-    This helper writes ``providers.nous`` then calls ``load_pool("nous")`` so
-    ``_seed_from_singletons`` materialises the canonical ``device_code`` pool
-    entry from the singleton.  Re-running login upserts the same entry in
-    place; the pool never accumulates duplicate device_code rows.
+    The native-async pool materialises its canonical ``device_code`` entry
+    from this singleton on its next awaited load. Persisting credentials must
+    not force that I/O through the old synchronous login path.
 
     ``label`` is an optional user-chosen display name (from
     ``hermes auth add nous --label <name>``).  It gets embedded in the
@@ -5957,11 +6264,9 @@ def persist_nous_credentials(
     auto-derived token fingerprint.  When ``None``, the auto-derived label
     via ``label_from_token`` is used (unchanged default behaviour).
 
-    Returns the upserted :class:`PooledCredential` entry (or ``None`` if
-    seeding somehow produced no match — shouldn't happen).
+    Returns ``None``. Callers that need a pool entry must await
+    :func:`agent.credential_pool.load_pool` from an async runtime path.
     """
-    from agent.credential_pool import load_pool
-
     state = dict(creds)
     if label and str(label).strip():
         state["label"] = str(label).strip()
@@ -5977,21 +6282,7 @@ def persist_nous_credentials(
     # auth.json is still the source of truth).
     _write_shared_nous_state(state)
 
-    pool = load_pool("nous")
-    return next(
-        (e for e in pool.entries() if e.source == NOUS_DEVICE_CODE_SOURCE),
-        None,
-    )
-
-
-def _sync_nous_pool_from_auth_store() -> None:
-    """Best-effort pool reseed after providers.nous changes; never fail login."""
-    try:
-        from agent.credential_pool import load_pool
-
-        load_pool("nous")
-    except Exception as exc:
-        logger.debug("Failed to sync Nous credential pool from auth store: %s", exc)
+    return None
 
 
 def resolve_nous_runtime_credentials(
@@ -6287,9 +6578,6 @@ def resolve_nous_runtime_credentials(
             }
 
         _persist_state("resolve_nous_runtime_credentials_final")
-
-    if state_persisted:
-        _sync_nous_pool_from_auth_store()
 
     api_key = state.get("agent_key")
     if not isinstance(api_key, str) or not api_key:
@@ -8696,16 +8984,11 @@ def step_up_nous_billing_scope(
         _save_provider_state(auth_store, "nous", auth_state)
         _save_auth_store(auth_store)
 
-    # Mirror to shared store + reseed the pool (best-effort), same as _login_nous.
+    # Mirror to shared store (best-effort), same as _login_nous.
     try:
         _write_shared_nous_state(auth_state)
     except Exception:
         pass
-    try:
-        _sync_nous_pool_from_auth_store()
-    except Exception:
-        pass
-
     granted = auth_state.get("scope")
     return isinstance(granted, str) and NOUS_BILLING_MANAGE_SCOPE in granted.split()
 
@@ -8780,8 +9063,6 @@ def _login_nous(args, pconfig: ProviderConfig) -> None:
         # these credentials. Best-effort: any I/O failure is logged and
         # swallowed inside the helper.
         _write_shared_nous_state(auth_state)
-        _sync_nous_pool_from_auth_store()
-
         print()
         print("Login successful!")
         print(f"  Auth state: {saved_to}")

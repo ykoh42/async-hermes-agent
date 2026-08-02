@@ -323,3 +323,75 @@ def resolve_xai_http_credentials(
         "api_key": api_key,
         "base_url": base_url,
     }
+
+
+async def resolve_xai_http_credentials_async(
+    *,
+    force_refresh: bool = False,
+    api_key_hint: Optional[str] = None,
+) -> Dict[str, str]:
+    """Resolve xAI credentials without entering the synchronous pool path.
+
+    The credential pool already exposes coroutine-native selection and refresh
+    operations.  Web/tool handlers use this variant so an OAuth refresh never
+    blocks the conversation event loop or falls back to a worker thread.  The
+    synchronous resolver above remains for setup/CLI callers that are outside
+    the async turn runtime.
+    """
+    try:
+        from agent.credential_pool import load_pool
+        import hermes_cli.auth as auth_mod
+
+        pool = await load_pool("xai-oauth")
+        entry = (
+            await pool.try_refresh_matching(api_key_hint)
+            if force_refresh
+            else await pool.select()
+        )
+        if force_refresh and entry is None:
+            entry = await pool.select()
+        access_token = str(
+            getattr(entry, "runtime_api_key", None)
+            or getattr(entry, "access_token", "")
+        ).strip()
+        fallback_base_url = str(
+            getattr(entry, "runtime_base_url", None)
+            or getattr(entry, "base_url", "")
+            or auth_mod.DEFAULT_XAI_OAUTH_BASE_URL
+        ).strip().rstrip("/")
+        from hermes_cli.config import get_env_value_prefer_dotenv_async
+
+        override_base_url = str(
+            await get_env_value_prefer_dotenv_async("HERMES_XAI_BASE_URL")
+            or await get_env_value_prefer_dotenv_async("XAI_BASE_URL")
+            or ""
+        ).strip().rstrip("/")
+        base_url = auth_mod._xai_validate_inference_base_url(
+            override_base_url,
+            fallback=fallback_base_url,
+        )
+        if access_token:
+            return {
+                "provider": "xai-oauth",
+                "api_key": access_token,
+                "base_url": base_url,
+            }
+    except Exception:
+        # Match the synchronous resolver's contract: an unavailable OAuth
+        # pool falls through to the explicit API-key resolver.
+        pass
+
+    from hermes_cli.config import get_env_value_prefer_dotenv_async
+
+    api_key = str(
+        await get_env_value_prefer_dotenv_async("XAI_API_KEY") or ""
+    ).strip()
+    base_url = str(
+        await get_env_value_prefer_dotenv_async("XAI_BASE_URL")
+        or "https://api.x.ai/v1"
+    ).strip().rstrip("/")
+    return {
+        "provider": "xai",
+        "api_key": api_key,
+        "base_url": base_url,
+    }

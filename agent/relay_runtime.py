@@ -548,7 +548,11 @@ class RelaySessionCoordinator:
         parent_session_id: str = "",
         model: str = "",
     ) -> ConversationLease:
-        host = self.registry.for_profile(profile_key)
+        # A plain async agent turn must not instantiate NeMo Relay and execute
+        # its synchronous scope API just because instrumentation is installed.
+        # A Relay consumer (shared metrics or an explicit managed adapter) owns
+        # host creation first; otherwise this lease is intentionally no-op.
+        host = self.registry.for_profile(profile_key, create=False)
         if host is None:
             host = NoopRelayRuntime(profile_key, "Relay host creation was disabled")
         session = None

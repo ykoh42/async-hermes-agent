@@ -141,7 +141,7 @@ def test_search_tool_filters_credential_results(fake_home, tmp_path, monkeypatch
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(ft, "_get_file_ops", lambda task_id="default": FakeFileOps())
     monkeypatch.setattr(
-        terminal_tool, "_session_cwd", {}
+        terminal_tool, "_session_cwds", {}
     )
 
     search_response = ft.search_tool(

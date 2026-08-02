@@ -2,6 +2,8 @@
 
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from run_agent import AIAgent
 from agent.context_compressor import ContextCompressor
 
@@ -44,7 +46,8 @@ def _make_agent_with_compressor() -> AIAgent:
 
 @patch("agent.auxiliary_client.resolve_provider_client")
 @patch("agent.model_metadata.get_model_context_length", return_value=128_000)
-def test_compressor_updated_on_fallback(mock_ctx_len, mock_resolve):
+@pytest.mark.asyncio
+async def test_compressor_updated_on_fallback(mock_ctx_len, mock_resolve):
     """After fallback activation, the compressor must reflect the fallback model."""
     agent = _make_agent_with_compressor()
 
@@ -58,7 +61,7 @@ def test_compressor_updated_on_fallback(mock_ctx_len, mock_resolve):
     agent._is_direct_openai_url = lambda url: "api.openai.com" in url
     agent._emit_status = lambda msg: None
 
-    result = agent._try_activate_fallback()
+    result = await agent._try_activate_fallback()
 
     assert result is True
     assert agent._fallback_activated is True
@@ -70,5 +73,4 @@ def test_compressor_updated_on_fallback(mock_ctx_len, mock_resolve):
     assert c.provider == "openai"
     assert c.context_length == 128_000
     assert c.threshold_tokens == int(128_000 * c.threshold_percent)
-
 

@@ -99,9 +99,6 @@ class _StubAgent:
     def clear_interrupt(self):
         pass
 
-    def _sync_external_memory_for_turn(self, **k):
-        pass
-
 
 def _interrupted_tool_tail():
     """A transcript interrupted after a successful tool, before any
@@ -119,8 +116,8 @@ def _interrupted_tool_tail():
     ]
 
 
-def _finalize(agent, messages, *, interrupted, final_response=None):
-    return finalize_turn(
+async def _finalize(agent, messages, *, interrupted, final_response=None):
+    return await finalize_turn(
         agent,
         final_response=final_response,
         api_call_count=1,
@@ -145,10 +142,11 @@ def _assert_no_tool_then_user(messages):
             )
 
 
-def test_interrupt_after_tool_closes_sequence_with_placeholder():
+@pytest.mark.asyncio
+async def test_interrupt_after_tool_closes_sequence_with_placeholder():
     agent = _StubAgent()
     messages = _interrupted_tool_tail()
-    _finalize(agent, messages, interrupted=True, final_response=None)
+    await _finalize(agent, messages, interrupted=True, final_response=None)
 
     # Tail must now be an assistant message, not a raw tool result.
     assert messages[-1]["role"] == "assistant"
@@ -168,7 +166,8 @@ def test_interrupt_after_tool_closes_sequence_with_placeholder():
 
 
 
-def test_interrupt_without_tool_tail_adds_nothing():
+@pytest.mark.asyncio
+async def test_interrupt_without_tool_tail_adds_nothing():
     # Interrupt while the tail is already an assistant/user message: no
     # synthetic close needed.
     agent = _StubAgent()
@@ -177,6 +176,6 @@ def test_interrupt_without_tool_tail_adds_nothing():
         {"role": "assistant", "content": "partial reply"},
     ]
     before = len(messages)
-    _finalize(agent, messages, interrupted=True, final_response="partial reply")
+    await _finalize(agent, messages, interrupted=True, final_response="partial reply")
     assert len(messages) == before
     assert messages[-1]["role"] == "assistant"

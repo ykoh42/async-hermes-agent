@@ -20,12 +20,12 @@ from __future__ import annotations
 import os
 import time
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from agent.context_compressor import ContextCompressor
-from hermes_state import SessionDB
+from hermes_state import AsyncSessionDB, SessionDB
 
 
 def _build_agent_with_db(db: SessionDB, session_id: str, platform: str = "telegram"):
@@ -45,10 +45,10 @@ def _build_agent_with_db(db: SessionDB, session_id: str, platform: str = "telegr
         )
 
     compressor = MagicMock()
-    compressor.compress.return_value = [
+    compressor.compress = AsyncMock(return_value=[
         {"role": "user", "content": "[CONTEXT COMPACTION] summary"},
         {"role": "user", "content": "tail"},
-    ]
+    ])
     compressor.compression_count = 1
     compressor.last_prompt_tokens = 0
     compressor.last_completion_tokens = 0
@@ -70,7 +70,7 @@ def _msgs(n=20):
 
 def _bound_context_compressor(db: SessionDB, session_id: str) -> ContextCompressor:
     with patch(
-        "agent.context_compressor.get_model_context_length",
+        "agent.context_compressor.get_static_context_length",
         return_value=100_000,
     ):
         compressor = ContextCompressor(
@@ -94,7 +94,8 @@ def refresh_state_db(tmp_path: Path):
 
 
 class TestGoalMigratesOnRotation:
-    def test_goal_follows_compression_rotation(self, tmp_path: Path):
+    @pytest.mark.asyncio
+    async def test_goal_follows_compression_rotation(self, tmp_path: Path):
         db = SessionDB(db_path=tmp_path / "state.db")
         parent = "PARENT_GOAL_ROT"
         db.create_session(parent, source="cli")
@@ -106,21 +107,30 @@ class TestGoalMigratesOnRotation:
             import hermes_cli.goals as goals
             goals._DB_CACHE.clear()
             # Point the goal DB at the same state.db the agent uses.
-            with patch.object(goals, "_get_session_db", return_value=db):
-                goals.save_goal(parent, goals.GoalState(goal="finish the migration"))
+            async_db = AsyncSessionDB(db)
+            with patch.object(
+                goals, "_get_session_db", new_callable=AsyncMock, return_value=async_db
+            ):
+                await goals.save_goal(parent, goals.GoalState(goal="finish the migration"))
 
-                agent._compress_context(_msgs(), "sys", approx_tokens=120_000)
+                await agent._compress_context(
+                    _msgs(), "sys", approx_tokens=120_000
+                )
                 child = agent.session_id
                 assert child != parent  # rotation happened
 
-                migrated = goals.load_goal(child)
+                migrated = await goals.load_goal(child)
                 assert migrated is not None
                 assert migrated.goal == "finish the migration"
+            await async_db.close()
             goals._DB_CACHE.clear()
+        await agent.close()
+        db.close()
 
 
 class TestOrphanRollbackOnCreateFailure:
-    def test_rolls_back_to_parent_when_child_create_fails(self, tmp_path: Path):
+    @pytest.mark.asyncio
+    async def test_rolls_back_to_parent_when_child_create_fails(self, tmp_path: Path):
         db = SessionDB(db_path=tmp_path / "state.db")
         parent = "PARENT_ORPHAN_ROT"
         db.create_session(parent, source="cli")
@@ -130,7 +140,7 @@ class TestOrphanRollbackOnCreateFailure:
         # original list untouched even when a plugin compressor mutates in place.
         original = _msgs()
 
-        def _mutating_compress(live_messages, **_kwargs):
+        async def _mutating_compress(live_messages, **_kwargs):
             live_messages[:] = [
                 {"role": "user", "content": "mutated compacted snapshot"}
             ]
@@ -141,8 +151,11 @@ class TestOrphanRollbackOnCreateFailure:
         def _boom(*a, **k):
             raise RuntimeError("simulated atomic publication failure")
 
-        with patch.object(db, "publish_compression_child", side_effect=_boom):
-            returned, _system_prompt = agent._compress_context(
+        with patch(
+            "hermes_state.AsyncSessionDB.publish_compression_child",
+            side_effect=_boom,
+        ):
+            returned, _system_prompt = await agent._compress_context(
                 original, "sys", approx_tokens=120_000
             )
 
@@ -155,10 +168,13 @@ class TestOrphanRollbackOnCreateFailure:
         assert parent_row is not None
         assert parent_row["ended_at"] is None
         assert db.find_live_compression_child(parent) is None
+        await agent.close()
+        db.close()
 
 
 class TestWorkspaceMetadataFollowsRotation:
-    def test_child_row_inherits_cwd_repo_and_origin_on_rotation(self, tmp_path: Path):
+    @pytest.mark.asyncio
+    async def test_child_row_inherits_cwd_repo_and_origin_on_rotation(self, tmp_path: Path):
         """Behavioral #64709/#59527: drive the REAL compression rotation path
         and assert the child session row carries the parent's workspace and
         gateway-origin metadata, so the project sidebar entry and the peer
@@ -178,7 +194,7 @@ class TestWorkspaceMetadataFollowsRotation:
         )
         agent = _build_agent_with_db(db, parent, platform="telegram")
 
-        agent._compress_context(_msgs(), "sys", approx_tokens=120_000)
+        await agent._compress_context(_msgs(), "sys", approx_tokens=120_000)
         child = agent.session_id
         assert child != parent  # rotation happened
 
@@ -195,16 +211,19 @@ class TestWorkspaceMetadataFollowsRotation:
         assert row["chat_id"] == "c1"
         assert row["chat_type"] == "private"
         assert row["user_id"] == "u1"
+        await agent.close()
+        db.close()
 
 
 class TestPlatformForwardedAtBoundary:
-    def test_on_session_start_receives_platform(self, tmp_path: Path):
+    @pytest.mark.asyncio
+    async def test_on_session_start_receives_platform(self, tmp_path: Path):
         db = SessionDB(db_path=tmp_path / "state.db")
         parent = "PARENT_PLATFORM_ROT"
         db.create_session(parent, source="telegram")
         agent = _build_agent_with_db(db, parent, platform="telegram")
 
-        agent._compress_context(_msgs(), "sys", approx_tokens=120_000)
+        await agent._compress_context(_msgs(), "sys", approx_tokens=120_000)
 
         # The boundary notify must forward the platform so context-engine
         # plugins don't fall back to source=unknown (#27633).
@@ -213,6 +232,8 @@ class TestPlatformForwardedAtBoundary:
         kwargs = calls[-1].kwargs
         assert kwargs.get("platform") == "telegram"
         assert kwargs.get("boundary_reason") == "compression"
+        await agent.close()
+        db.close()
 
 
 class TestFallbackStreakFollowsRotation:
@@ -221,7 +242,7 @@ class TestFallbackStreakFollowsRotation:
         parent = "PARENT_FALLBACK_ROT"
         db.create_session(parent, source="telegram")
         with patch(
-            "agent.context_compressor.get_model_context_length",
+            "agent.context_compressor.get_static_context_length",
             return_value=100_000,
         ):
             compressor = ContextCompressor(
@@ -264,14 +285,15 @@ class TestFallbackStreakFollowsRotation:
         resumed.bind_session_state(db, "CHILD_FALLBACK_ROT")
         assert resumed._fallback_compression_streak == 2
 
-    def test_real_rotation_records_fallback_after_lifecycle_rebind(self, tmp_path: Path):
+    @pytest.mark.asyncio
+    async def test_real_rotation_records_fallback_after_lifecycle_rebind(self, tmp_path: Path):
         db = SessionDB(db_path=tmp_path / "state.db")
         parent = "PARENT_REAL_FALLBACK_ROT"
         db.create_session(parent, source="telegram")
         agent = _build_agent_with_db(db, parent, platform="telegram")
 
         with patch(
-            "agent.context_compressor.get_model_context_length",
+            "agent.context_compressor.get_static_context_length",
             return_value=100_000,
         ):
             compressor = ContextCompressor(
@@ -287,7 +309,7 @@ class TestFallbackStreakFollowsRotation:
             {"role": "assistant", "content": "tail"},
         ]
 
-        def _fallback_compress(*_args, **_kwargs):
+        async def _fallback_compress(*_args, **_kwargs):
             compressor._last_summary_error = "empty summary"
             compressor._last_summary_fallback_used = True
             compressor._last_compression_made_progress = True
@@ -300,16 +322,19 @@ class TestFallbackStreakFollowsRotation:
         ):
             compressor.compression_count = 1
             setattr(agent, "context_compressor", compressor)
-            agent._compress_context(_msgs(), "sys", approx_tokens=120_000)
+            await agent._compress_context(_msgs(), "sys", approx_tokens=120_000)
         child = getattr(agent, "session_id")
 
         assert child != parent
         assert compressor._fallback_compression_streak == 1
         assert db.get_compression_fallback_streak(child) == 1
+        await agent.close()
+        db.close()
 
 
 class TestAutomaticCompressionStateRefreshAfterLock:
-    def test_prebound_agent_rejects_parent_rotated_before_lock_acquisition(
+    @pytest.mark.asyncio
+    async def test_prebound_agent_rejects_parent_rotated_before_lock_acquisition(
         self,
         refresh_state_db: SessionDB,
     ):
@@ -322,18 +347,19 @@ class TestAutomaticCompressionStateRefreshAfterLock:
 
         # A competing path completes rotation after this call's initial checks
         # but before it acquires the parent lock.
-        real_acquire = db.try_acquire_compression_lock
+        async_db = agent._get_async_session_db()
+        real_acquire = async_db.try_acquire_compression_lock
 
-        def _acquire_after_rotation(*args, **kwargs):
+        async def _acquire_after_rotation(*args, **kwargs):
             db.end_session(parent_id, "compression")
             db.create_session(
                 child_id,
                 source="telegram",
                 parent_session_id=parent_id,
             )
-            return real_acquire(*args, **kwargs)
+            return await real_acquire(*args, **kwargs)
 
-        db.try_acquire_compression_lock = _acquire_after_rotation
+        async_db.try_acquire_compression_lock = _acquire_after_rotation
         agent.context_compressor = compressor
         agent.compression_in_place = False
         agent._compression_feasibility_checked = True
@@ -344,7 +370,7 @@ class TestAutomaticCompressionStateRefreshAfterLock:
             "compress",
             side_effect=AssertionError("stale parent was compressed again"),
         ) as compress:
-            returned, _ = agent._compress_context(
+            returned, _ = await agent._compress_context(
                 messages,
                 "sys",
                 approx_tokens=120_000,
@@ -360,11 +386,13 @@ class TestAutomaticCompressionStateRefreshAfterLock:
         assert [row["id"] for row in children] == [child_id]
         compress.assert_not_called()
         assert db.get_compression_lock_holder(parent_id) is None
+        await agent.close()
 
 
 
 
-    def test_prebound_agent_drops_stale_cooldown_before_initial_gate(
+    @pytest.mark.asyncio
+    async def test_prebound_agent_drops_stale_cooldown_before_initial_gate(
         self,
         refresh_state_db: SessionDB,
     ):
@@ -388,8 +416,13 @@ class TestAutomaticCompressionStateRefreshAfterLock:
         agent._compression_feasibility_checked = True
         messages = _msgs()
 
-        with patch.object(compressor, "compress", return_value=messages) as compress:
-            returned, _ = agent._compress_context(
+        with patch.object(
+            compressor,
+            "compress",
+            new_callable=AsyncMock,
+            return_value=messages,
+        ) as compress:
+            returned, _ = await agent._compress_context(
                 messages,
                 "sys",
                 approx_tokens=120_000,
@@ -399,6 +432,7 @@ class TestAutomaticCompressionStateRefreshAfterLock:
         assert compressor.get_active_compression_failure_cooldown() is None
         compress.assert_called_once()
         assert db.get_compression_lock_holder(session_id) is None
+        await agent.close()
 
 
 
@@ -511,7 +545,8 @@ class TestCooldownPersistFailureIsNotAClearedRow:
 class TestTodoSnapshotMergedNotDuplicated:
     """Todo snapshots preserve tail content without duplicate user turns."""
 
-    def test_snapshot_merges_into_trailing_user(self, tmp_path: Path):
+    @pytest.mark.asyncio
+    async def test_snapshot_merges_into_trailing_user(self, tmp_path: Path):
         db = SessionDB(db_path=tmp_path / "state.db")
         parent = "PARENT_TODO_MERGE"
         db.create_session(parent, source="cli")
@@ -529,7 +564,7 @@ class TestTodoSnapshotMergedNotDuplicated:
             lambda: "## Current Tasks\n- [ ] task A"
         )
 
-        compressed, _ = agent._compress_context(
+        compressed, _ = await agent._compress_context(
             _msgs(), "sys", approx_tokens=120_000
         )
 
@@ -542,11 +577,14 @@ class TestTodoSnapshotMergedNotDuplicated:
             previous.get("role") == current.get("role") == "user"
             for previous, current in zip(compressed, compressed[1:])
         )
+        await agent.close()
+        db.close()
 
 
 
 
-    def test_multimodal_snapshot_merge_is_persisted_in_place(self, tmp_path: Path):
+    @pytest.mark.asyncio
+    async def test_multimodal_snapshot_merge_is_persisted_in_place(self, tmp_path: Path):
         db = SessionDB(db_path=tmp_path / "state.db")
         parent = "PARENT_TODO_MULTIMODAL_INPLACE"
         db.create_session(parent, source="cli")
@@ -572,7 +610,7 @@ class TestTodoSnapshotMergedNotDuplicated:
             lambda: "## Current Tasks\n- [ ] inspect image"
         )
 
-        compressed, _ = agent._compress_context(
+        compressed, _ = await agent._compress_context(
             _msgs(), "sys", approx_tokens=120_000
         )
 
@@ -602,6 +640,8 @@ class TestTodoSnapshotMergedNotDuplicated:
             previous.get("role") == current.get("role") == "user"
             for previous, current in zip(db_msgs, db_msgs[1:])
         )
+        await agent.close()
+        db.close()
 
 
 class TestTodoSnapshotScaffoldingTails:
@@ -624,7 +664,8 @@ class TestTodoSnapshotScaffoldingTails:
 
 
 
-    def test_previously_merged_snapshot_is_stripped_before_reinjection(
+    @pytest.mark.asyncio
+    async def test_previously_merged_snapshot_is_stripped_before_reinjection(
         self, tmp_path: Path
     ):
         from tools.todo_tool import TODO_INJECTION_HEADER
@@ -640,7 +681,7 @@ class TestTodoSnapshotScaffoldingTails:
             {"role": "user", "content": previously_merged},
         )
 
-        compressed, _ = agent._compress_context(
+        compressed, _ = await agent._compress_context(
             _msgs(), "sys", approx_tokens=120_000
         )
 
@@ -654,8 +695,11 @@ class TestTodoSnapshotScaffoldingTails:
             previous.get("role") == current.get("role") == "user"
             for previous, current in zip(compressed, compressed[1:])
         )
+        await agent.close()
+        db.close()
 
-    def test_empty_todo_store_injects_nothing(self, tmp_path: Path):
+    @pytest.mark.asyncio
+    async def test_empty_todo_store_injects_nothing(self, tmp_path: Path):
         from tools.todo_tool import TODO_INJECTION_HEADER
 
         db = SessionDB(db_path=tmp_path / "state.db")
@@ -674,7 +718,7 @@ class TestTodoSnapshotScaffoldingTails:
             [{"id": "t1", "content": "done thing", "status": "completed"}]
         )
 
-        compressed, _ = agent._compress_context(
+        compressed, _ = await agent._compress_context(
             _msgs(), "sys", approx_tokens=120_000
         )
 
@@ -683,3 +727,5 @@ class TestTodoSnapshotScaffoldingTails:
             TODO_INJECTION_HEADER in str(message.get("content") or "")
             for message in compressed
         )
+        await agent.close()
+        db.close()

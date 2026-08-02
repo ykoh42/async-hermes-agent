@@ -1986,15 +1986,14 @@ def _run_single_child(
 
     child_pool = getattr(child, "_credential_pool", None)
     leased_cred_id = None
+    leased_entry = None
     if child_pool is not None:
         leased_cred_id = child_pool.acquire_lease()
         if leased_cred_id is not None:
             try:
                 leased_entry = child_pool.current()
-                if leased_entry is not None and hasattr(child, "_swap_credential"):
-                    child._swap_credential(leased_entry)
             except Exception as exc:
-                logger.debug("Failed to bind child to leased credential: %s", exc)
+                logger.debug("Failed to select child leased credential: %s", exc)
 
     # Heartbeat: periodically propagate child activity to the parent so the
     # gateway inactivity timeout doesn't fire while the subagent is working.
@@ -2176,12 +2175,17 @@ def _run_single_child(
             _worker_thread_holder["t"] = threading.current_thread()
             from agent.delegation_context import delegated_child_context
 
-            with delegated_child_context():
-                return asyncio.run(child.run_conversation(
+            async def _run_child():
+                if leased_entry is not None and hasattr(child, "_swap_credential"):
+                    await child._swap_credential(leased_entry)
+                return await child.run_conversation(
                     user_message=goal,
                     task_id=child_task_id,
                     stream_callback=_relay_child_text,
-                ))
+                )
+
+            with delegated_child_context():
+                return asyncio.run(_run_child())
 
         _child_context = contextvars.copy_context()
         _child_future = _timeout_executor.submit(

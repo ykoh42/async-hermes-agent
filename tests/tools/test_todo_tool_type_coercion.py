@@ -8,28 +8,32 @@ Covers three crash patterns:
 
 import json
 
+import pytest
+
 from tools.todo_tool import TodoStore, todo_tool
 
 
 class TestJsonStringCoercion:
     """Guard 1: todo_tool() recovers when LLM sends todos as a JSON string."""
 
-    def test_json_string_is_parsed_into_list(self):
+    @pytest.mark.asyncio
+    async def test_json_string_is_parsed_into_list(self):
         store = TodoStore()
         todos_str = json.dumps([
             {"id": "t1", "content": "Do A", "status": "pending"},
             {"id": "t2", "content": "Do B", "status": "in_progress"},
         ])
-        result = json.loads(todo_tool(todos=todos_str, store=store))
+        result = json.loads(await todo_tool(todos=todos_str, store=store))
         assert "error" not in result
         assert result["summary"]["total"] == 2
         assert result["todos"][0]["id"] == "t1"
         assert result["todos"][1]["status"] == "in_progress"
 
 
-    def test_non_list_non_string_returns_error(self):
+    @pytest.mark.asyncio
+    async def test_non_list_non_string_returns_error(self):
         store = TodoStore()
-        result = json.loads(todo_tool(todos=42, store=store))
+        result = json.loads(await todo_tool(todos=42, store=store))
         assert "error" in result
 
 
@@ -45,10 +49,11 @@ class TestNonDictListItems:
         assert result[0]["status"] == "pending"
 
 
-    def test_non_dict_items_via_todo_tool(self):
+    @pytest.mark.asyncio
+    async def test_non_dict_items_via_todo_tool(self):
         """End-to-end: non-dict list items produce valid output, not a crash."""
         store = TodoStore()
-        result = json.loads(todo_tool(todos=["bad", "also bad"], store=store))
+        result = json.loads(await todo_tool(todos=["bad", "also bad"], store=store))
         assert "error" not in result
         assert result["summary"]["total"] == 2
         assert result["summary"]["pending"] == 2
@@ -57,13 +62,14 @@ class TestNonDictListItems:
 class TestWellFormedInputUnchanged:
     """Regression: normal usage must not be affected by the guards."""
 
-    def test_normal_write_and_read(self):
+    @pytest.mark.asyncio
+    async def test_normal_write_and_read(self):
         store = TodoStore()
         items = [
             {"id": "a", "content": "First", "status": "pending"},
             {"id": "b", "content": "Second", "status": "in_progress"},
         ]
-        result = json.loads(todo_tool(todos=items, store=store))
+        result = json.loads(await todo_tool(todos=items, store=store))
         assert result["summary"]["total"] == 2
         assert result["summary"]["pending"] == 1
         assert result["summary"]["in_progress"] == 1

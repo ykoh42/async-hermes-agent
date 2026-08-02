@@ -16,6 +16,8 @@ Rate-limit / billing failures keep their own 60s cooldown and are unaffected.
 """
 
 from unittest.mock import MagicMock, patch
+
+import pytest
 from run_agent import AIAgent
 from agent.error_classifier import FailoverReason
 from agent.chat_completion_helpers import _FALLBACK_EXHAUSTED_COOLDOWN_S
@@ -46,8 +48,21 @@ def _mock_client(base_url="https://openrouter.ai/api/v1", api_key="fb-key"):
     return mock
 
 
+def _native_fallback(provider: str, model: str) -> dict:
+    return {
+        "provider": provider,
+        "model": model,
+        "api_key": "fallback-key",
+        "base_url": {
+            "openai": "https://api.openai.com/v1",
+            "zai": "https://api.z.ai/api/paas/v4",
+        }[provider],
+    }
+
+
 class TestExhaustionArmsCooldown:
-    def test_non_retryable_exhaustion_arms_cooldown(self):
+    @pytest.mark.asyncio
+    async def test_non_retryable_exhaustion_arms_cooldown(self):
         """Walking a non-empty chain to exhaustion on a non-rate-limit
         failure arms a short ``_rate_limited_until`` cooldown.
 
@@ -57,76 +72,61 @@ class TestExhaustionArmsCooldown:
         loaded runners when the three activation calls took longer than 1s.
         """
         fbs = [
-            {"provider": "openai", "model": "gpt-4o"},
-            {"provider": "zai", "model": "glm-4.7"},
+            _native_fallback("openai", "gpt-4o"),
+            _native_fallback("zai", "glm-4.7"),
         ]
         agent = _make_agent(fallback_model=fbs)
         agent._rate_limited_until = 0
         frozen = 1_000.0
-        with (
-            patch("agent.chat_completion_helpers.time.monotonic", return_value=frozen),
-            patch(
-                "agent.auxiliary_client.resolve_provider_client",
-                return_value=(_mock_client(), "resolved"),
-            ),
-        ):
-            assert agent._try_activate_fallback() is True   # -> entry 0
-            assert agent._try_activate_fallback() is True   # -> entry 1
+        with patch("agent.chat_completion_helpers.time.monotonic", return_value=frozen):
+            assert await agent._try_activate_fallback() is True   # -> entry 0
+            assert await agent._try_activate_fallback() is True   # -> entry 1
             # Chain now exhausted; a non-rate-limit failure must arm cooldown.
-            assert agent._try_activate_fallback() is False
+            assert await agent._try_activate_fallback() is False
             cooldown = getattr(agent, "_rate_limited_until", 0)
         # Cooldown is exactly the short exhaustion window past the frozen clock,
         # not the 60s rate-limit one.
         assert cooldown == frozen + _FALLBACK_EXHAUSTED_COOLDOWN_S
 
-    def test_no_chain_does_not_arm_cooldown(self):
+    @pytest.mark.asyncio
+    async def test_no_chain_does_not_arm_cooldown(self):
         """An empty chain (no fallback configured) must not arm a cooldown —
         there is no chain to storm, and gating primary restoration would be
         pointless punishment."""
         agent = _make_agent(fallback_model=None)
         agent._rate_limited_until = 0
-        assert agent._try_activate_fallback() is False
+        assert await agent._try_activate_fallback() is False
         assert getattr(agent, "_rate_limited_until", 0) == 0
 
-    def test_rate_limit_exhaustion_keeps_60s_cooldown(self):
+    @pytest.mark.asyncio
+    async def test_rate_limit_exhaustion_keeps_60s_cooldown(self):
         """A rate-limit failure already arms its own 60s cooldown; the short
         exhaustion window must not shrink it."""
-        fbs = [{"provider": "openai", "model": "gpt-4o"}]
+        fbs = [_native_fallback("openai", "gpt-4o")]
         agent = _make_agent(fallback_model=fbs)
         agent._rate_limited_until = 0
         frozen = 1_000.0
-        with (
-            patch("agent.chat_completion_helpers.time.monotonic", return_value=frozen),
-            patch(
-                "agent.auxiliary_client.resolve_provider_client",
-                return_value=(_mock_client(), "resolved"),
-            ),
-        ):
+        with patch("agent.chat_completion_helpers.time.monotonic", return_value=frozen):
             # First activation with rate_limit reason arms the 60s cooldown.
-            assert agent._try_activate_fallback(reason=FailoverReason.rate_limit) is True
+            assert await agent._try_activate_fallback(reason=FailoverReason.rate_limit) is True
             # Chain exhausted on the next call (also rate_limit) -> still False,
             # and the 60s cooldown must survive (max(), not overwritten down).
-            assert agent._try_activate_fallback(reason=FailoverReason.rate_limit) is False
+            assert await agent._try_activate_fallback(reason=FailoverReason.rate_limit) is False
             cooldown = getattr(agent, "_rate_limited_until", 0)
         # ~60s past the frozen clock, far past the short exhaustion window.
         assert cooldown == frozen + 60
 
-    def test_cooldown_never_shrinks_existing_window(self):
+    @pytest.mark.asyncio
+    async def test_cooldown_never_shrinks_existing_window(self):
         """If a longer cooldown is already armed, exhaustion must not reduce
         it (we take the max)."""
-        fbs = [{"provider": "openai", "model": "gpt-4o"}]
+        fbs = [_native_fallback("openai", "gpt-4o")]
         agent = _make_agent(fallback_model=fbs)
         frozen = 1_000.0
         far_future = frozen + 999
         agent._rate_limited_until = far_future
-        with (
-            patch("agent.chat_completion_helpers.time.monotonic", return_value=frozen),
-            patch(
-                "agent.auxiliary_client.resolve_provider_client",
-                return_value=(_mock_client(), "resolved"),
-            ),
-        ):
-            assert agent._try_activate_fallback() is True
-            assert agent._try_activate_fallback() is False
+        with patch("agent.chat_completion_helpers.time.monotonic", return_value=frozen):
+            assert await agent._try_activate_fallback() is True
+            assert await agent._try_activate_fallback() is False
             cooldown = getattr(agent, "_rate_limited_until", 0)
         assert cooldown == far_future

@@ -24,8 +24,8 @@ def _model_cfg(**overrides):
 
 
 class TestResolveActiveContextLengthProviderAware:
-    def test_passes_provider_base_url_and_key_from_runtime(self):
-        """Resolved runtime credentials must reach get_model_context_length."""
+    def test_uses_configured_provider_and_endpoint_without_runtime_io(self):
+        """The synchronous schema gate never resolves async credentials."""
         import model_tools
 
         captured = {}
@@ -37,20 +37,15 @@ class TestResolveActiveContextLengthProviderAware:
             )
             return 272_000
 
-        with patch("hermes_cli.config.load_config", return_value=_model_cfg()), \
-             patch("hermes_cli.runtime_provider.resolve_runtime_provider",
-                   return_value={"base_url": "https://chatgpt.com/backend-api/codex",
-                                 "api_key": "tok-live"}) as mock_rt, \
+        with patch("hermes_cli.config.load_config", return_value=_model_cfg(
+                   base_url="https://chatgpt.com/backend-api/codex")), \
              patch("agent.model_metadata.get_model_context_length", side_effect=fake_get_ctx):
             ctx = model_tools._resolve_active_context_length()
 
         assert ctx == 272_000
         assert captured["provider"] == "openai-codex"
         assert captured["base_url"] == "https://chatgpt.com/backend-api/codex"
-        assert captured["api_key"] == "tok-live"
-        mock_rt.assert_called_once_with(
-            requested="openai-codex", target_model="gpt-5.6-sol"
-        )
+        assert captured["api_key"] == ""
 
     def test_offline_credential_failure_degrades_to_config_values(self):
         """Runtime resolution raising must not zero the gate — the resolver is

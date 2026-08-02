@@ -22,10 +22,12 @@ the single new turn.
 
 from __future__ import annotations
 
+import asyncio
 import os
-import time
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
 
 from hermes_state import SessionDB
 
@@ -54,14 +56,14 @@ def _build_agent_with_db(db: SessionDB, session_id: str):
 
     compressor = MagicMock()
 
-    def _compress(*_a, **_kw):
-        time.sleep(0.01)
+    async def _compress(*_a, **_kw):
+        await asyncio.sleep(0)
         return [
             {"role": "user", "content": "[CONTEXT COMPACTION] summary"},
             {"role": "user", "content": "tail"},
         ]
 
-    compressor.compress.side_effect = _compress
+    compressor.compress = AsyncMock(side_effect=_compress)
     compressor.compression_count = 1
     compressor.last_prompt_tokens = 0
     compressor.last_completion_tokens = 0
@@ -78,7 +80,8 @@ def _contents(rows):
     return [r.get("content") for r in rows]
 
 
-def test_rotation_flush_does_not_duplicate_persisted_prefix(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_rotation_flush_does_not_duplicate_persisted_prefix(tmp_path: Path) -> None:
     """Cold-resume + rotating preflight compression keeps the parent transcript
     at (persisted prefix + one new turn) — no second copy of the durable rows."""
     db = SessionDB(db_path=tmp_path / "state.db")
@@ -101,18 +104,22 @@ def test_rotation_flush_does_not_duplicate_persisted_prefix(tmp_path: Path) -> N
     # compression runs; emulate that anchor.
     agent._persist_user_message_idx = len(messages) - 1
 
-    agent._compress_context(messages, "sys", approx_tokens=120_000)
+    try:
+        await agent._compress_context(messages, "sys", approx_tokens=120_000)
 
-    # The flush at the rotation boundary lands on the OLD (parent) session,
-    # which is then ended. Read it back verbatim (include_inactive to be robust
-    # to the end_session bookkeeping).
-    parent_rows = db.get_messages_as_conversation(parent_sid, include_inactive=True)
-    contents = _contents(parent_rows)
+        # The flush at the rotation boundary lands on the OLD (parent) session,
+        # which is then ended. Read it back verbatim (include_inactive to be robust
+        # to the end_session bookkeeping).
+        parent_rows = db.get_messages_as_conversation(parent_sid, include_inactive=True)
+        contents = _contents(parent_rows)
 
-    assert contents.count("persisted question") == 1, (
-        "Rotation flush re-appended the already-persisted prefix to the parent "
-        f"(#68196). Parent transcript is {contents!r}; expected the two durable "
-        "rows plus only the new turn."
-    )
-    assert contents.count("persisted answer") == 1
-    assert contents == ["persisted question", "persisted answer", "new turn"]
+        assert contents.count("persisted question") == 1, (
+            "Rotation flush re-appended the already-persisted prefix to the parent "
+            f"(#68196). Parent transcript is {contents!r}; expected the two durable "
+            "rows plus only the new turn."
+        )
+        assert contents.count("persisted answer") == 1
+        assert contents == ["persisted question", "persisted answer", "new turn"]
+    finally:
+        await agent.close()
+        db.close()

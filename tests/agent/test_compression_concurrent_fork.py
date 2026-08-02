@@ -29,15 +29,28 @@ fixture deterministically produces 2 children; with the lock, exactly 1.
 from __future__ import annotations
 
 import inspect
+import asyncio
 import os
 import threading
 import time
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+import pytest_asyncio
 
-from hermes_state import SessionDB
+from hermes_state import AsyncSessionDB, SessionDB
+
+
+_BUILT_AGENTS = []
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def _close_async_agents():
+    yield
+    for agent in _BUILT_AGENTS:
+        await agent.close()
+    _BUILT_AGENTS.clear()
 
 
 def _build_agent_with_db(db: SessionDB, session_id: str):
@@ -62,14 +75,14 @@ def _build_agent_with_db(db: SessionDB, session_id: str):
     # and hide the bug.
     compressor = MagicMock()
 
-    def _compress_with_overlap(*_a, **_kw):
-        time.sleep(0.15)
+    async def _compress_with_overlap(*_a, **_kw):
+        await asyncio.sleep(0.15)
         return [
             {"role": "user", "content": "[CONTEXT COMPACTION] summary"},
             {"role": "user", "content": "tail"},
         ]
 
-    compressor.compress.side_effect = _compress_with_overlap
+    compressor.compress = AsyncMock(side_effect=_compress_with_overlap)
     compressor.compression_count = 1
     compressor.last_prompt_tokens = 0
     compressor.last_completion_tokens = 0
@@ -82,6 +95,7 @@ def _build_agent_with_db(db: SessionDB, session_id: str):
     # lock contention) — pin in_place=False so they keep exercising it
     # regardless of the global default (which flipped to True in #38763).
     agent.compression_in_place = False
+    _BUILT_AGENTS.append(agent)
     return agent
 
 
@@ -129,7 +143,8 @@ def _wait_for_touch(touch_calls: list[str], value: str, timeout: float = 1.0) ->
 
 
 
-def test_concurrent_compression_does_not_fork_session(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_concurrent_compression_does_not_fork_session(tmp_path: Path) -> None:
     """Two AIAgents that share a session_id MUST NOT both rotate it.
 
     Without the per-session compression lock this fixture deterministically
@@ -151,19 +166,10 @@ def test_concurrent_compression_does_not_fork_session(tmp_path: Path) -> None:
     agent_b = _build_agent_with_db(db, parent_sid)
     messages = [{"role": "user", "content": f"m{i}"} for i in range(20)]
 
-    def run(agent):
-        try:
-            agent._compress_context(messages, "sys", approx_tokens=120_000)
-        except Exception:
-            # Surface to the test if either raises — should not happen.
-            raise
-
-    t_a = threading.Thread(target=run, args=(agent_a,), name="main_turn")
-    t_b = threading.Thread(target=run, args=(agent_b,), name="review_fork")
-    t_a.start()
-    t_b.start()
-    t_a.join(timeout=10)
-    t_b.join(timeout=10)
+    await asyncio.gather(
+        agent_a._compress_context(messages, "sys", approx_tokens=120_000),
+        agent_b._compress_context(messages, "sys", approx_tokens=120_000),
+    )
 
     # The invariant Damien's incident is about: the parent must NEVER end up
     # with two (or more) children — that is the transcript fork. The lock
@@ -216,9 +222,13 @@ def test_concurrent_compression_does_not_fork_session(tmp_path: Path) -> None:
     assert db.get_compression_lock_holder(parent_sid) is None, (
         "Compression lock leaked: still held after both paths completed."
     )
+    await agent_a.close()
+    await agent_b.close()
+    db.close()
 
 
-def test_durable_message_committed_before_lease_is_adopted(
+@pytest.mark.asyncio
+async def test_durable_message_committed_before_lease_is_adopted(
     tmp_path: Path,
 ) -> None:
     """A durable row absent from the caller snapshot must still be compressed.
@@ -240,7 +250,7 @@ def test_durable_message_committed_before_lease_is_adopted(
     db.append_message(parent_sid, "assistant", "late committed before lease")
     agent = _build_agent_with_db(db, parent_sid)
 
-    returned, _system_prompt = agent._compress_context(
+    returned, _system_prompt = await agent._compress_context(
         stale_snapshot, "sys", approx_tokens=120_000
     )
 
@@ -263,7 +273,8 @@ def test_durable_message_committed_before_lease_is_adopted(
 
 
 
-def test_fence_cancelled_compression_leaves_lock_reacquirable(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_fence_cancelled_compression_leaves_lock_reacquirable(tmp_path: Path) -> None:
     """A fence-cancelled attempt must not poison the per-session lock.
 
     Lock-release verification for the hygiene-timeout path: after the gateway
@@ -282,50 +293,47 @@ def test_fence_cancelled_compression_leaves_lock_reacquirable(tmp_path: Path) ->
     agent = _build_agent_with_db(db, session_id)
     agent.compression_in_place = True
     agent._cached_system_prompt = "sys"
-    summary_started = threading.Event()
-    release_summary = threading.Event()
+    summary_started = asyncio.Event()
+    release_summary = asyncio.Event()
 
-    def _slow_summary(*_args, **_kwargs):
+    async def _slow_summary(*_args, **_kwargs):
         summary_started.set()
-        assert release_summary.wait(timeout=5)
+        await asyncio.wait_for(release_summary.wait(), timeout=5)
         return [
             {"role": "user", "content": "[CONTEXT COMPACTION] summary"},
             {"role": "user", "content": "tail"},
         ]
 
-    agent.context_compressor.compress.side_effect = _slow_summary
+    agent.context_compressor.compress = AsyncMock(side_effect=_slow_summary)
     messages = [{"role": "user", "content": f"m{i}"} for i in range(20)]
     fence = CompressionCommitFence()
-    result = {}
-
-    def _run_compression() -> None:
-        result["value"] = agent._compress_context(
+    task = asyncio.create_task(
+        agent._compress_context(
             messages,
             "sys",
             approx_tokens=120_000,
             commit_fence=fence,
         )
-
-    worker = threading.Thread(target=_run_compression, name="fenced-hygiene")
-    worker.start()
-    assert summary_started.wait(timeout=2)
+    )
+    await asyncio.wait_for(summary_started.wait(), timeout=2)
     assert fence.cancel_before_commit() is True
     release_summary.set()
-    worker.join(timeout=5)
-    assert not worker.is_alive()
+    result = await asyncio.wait_for(task, timeout=5)
 
     # Cancelled attempt: no mutation, and — the invariant under test — the
     # per-session compression lock is fully released.
-    assert result["value"][0] is messages
+    assert result[0] is messages
     assert db.get_compression_lock_holder(session_id) is None
 
     # The NEXT attempt (no fence — a manual /compress retry) must be able to
     # acquire the lock and commit an in-place compaction normally.
-    agent.context_compressor.compress.side_effect = lambda *_a, **_kw: [
+    agent.context_compressor.compress = AsyncMock(return_value=[
         {"role": "user", "content": "[CONTEXT COMPACTION] retry summary"},
         {"role": "user", "content": "tail"},
-    ]
-    retried, _sp = agent._compress_context(messages, "sys", approx_tokens=120_000)
+    ])
+    retried, _sp = await agent._compress_context(
+        messages, "sys", approx_tokens=120_000
+    )
 
     assert retried is not messages
     assert len(retried) < len(messages)
@@ -363,7 +371,8 @@ def test_commit_fence_waits_for_an_active_commit() -> None:
     assert result["cancelled"] is False
 
 
-def test_delayed_contender_adopts_unique_rotated_child(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_delayed_contender_adopts_unique_rotated_child(tmp_path: Path) -> None:
     """A stale agent must continue on the winner's compacted child transcript."""
     db = SessionDB(db_path=tmp_path / "state.db")
     parent_sid = "STALE_PARENT"
@@ -382,7 +391,7 @@ def test_delayed_contender_adopts_unique_rotated_child(tmp_path: Path) -> None:
         {"role": "user", "content": "stale"},
         {"role": "assistant", "content": "x" * 1000},
     ]
-    recovered, _system_prompt = agent._compress_context(
+    recovered, _system_prompt = await agent._compress_context(
         stale_messages, "sys", approx_tokens=120_000
     )
 
@@ -399,7 +408,9 @@ def test_delayed_contender_adopts_unique_rotated_child(tmp_path: Path) -> None:
     assert lifecycle_args == (child_sid,)
     assert lifecycle_kwargs["boundary_reason"] == "compression"
     assert lifecycle_kwargs["old_session_id"] == parent_sid
-    assert lifecycle_kwargs["session_db"] is db
+    # The async turn owns persistence separately through AsyncSessionDB; a
+    # synchronous context-engine lifecycle hook receives no raw SessionDB.
+    assert lifecycle_kwargs["session_db"] is None
 
 
 
@@ -463,7 +474,8 @@ def test_restored_anchor_never_creates_consecutive_user_roles() -> None:
 
 
 
-def test_compression_persists_child_handoff_immediately(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_compression_persists_child_handoff_immediately(tmp_path: Path) -> None:
     db = SessionDB(db_path=tmp_path / "state.db")
     parent_sid = "HEADLESS_PREFLIGHT_PARENT"
     db.create_session(parent_sid, source="cli")
@@ -471,21 +483,24 @@ def test_compression_persists_child_handoff_immediately(tmp_path: Path) -> None:
     agent = _build_agent_with_db(db, parent_sid)
     messages = [{"role": "user", "content": f"m{i}"} for i in range(20)]
 
-    compressed, _sp = agent._compress_context(messages, "sys", approx_tokens=120_000)
+    compressed, _sp = await agent._compress_context(
+        messages, "sys", approx_tokens=120_000
+    )
     child_sid = agent.session_id
 
     assert child_sid != parent_sid
     assert db.get_session(parent_sid)["end_reason"] == "compression"
     assert len(db.get_messages(child_sid)) == len(compressed)
 
-    agent._flush_messages_to_session_db(compressed, None)
+    await agent._flush_messages_to_session_db(compressed, None)
     assert len(db.get_messages(child_sid)) == len(compressed)
 
 
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("in_place", [False, True])
-def test_equal_copy_compression_result_does_not_rewrite_session(
+async def test_equal_copy_compression_result_does_not_rewrite_session(
     tmp_path: Path,
     in_place: bool,
 ) -> None:
@@ -497,14 +512,14 @@ def test_equal_copy_compression_result_does_not_rewrite_session(
     setattr(agent, "compression_in_place", in_place)
     messages = [{"role": "user", "content": f"m{i}"} for i in range(20)]
     compressor = getattr(agent, "context_compressor")
-    compressor.compress.side_effect = lambda incoming, **_kw: list(incoming)
+    compressor.compress = AsyncMock(side_effect=lambda incoming, **_kw: list(incoming))
 
     with patch.object(
         db,
         "archive_and_compact",
         wraps=db.archive_and_compact,
     ) as archive_and_compact:
-        returned, _sp = agent._compress_context(
+        returned, _sp = await agent._compress_context(
             messages,
             "sys",
             approx_tokens=120_000,
@@ -522,14 +537,15 @@ def test_equal_copy_compression_result_does_not_rewrite_session(
 
 
 
-def test_post_compress_exception_stops_lock_refresher(tmp_path: Path, monkeypatch) -> None:
+@pytest.mark.asyncio
+async def test_post_compress_exception_stops_lock_refresher(tmp_path: Path, monkeypatch) -> None:
     """A warning-path exception after compress() returns must still release the lock."""
-    real_try_acquire = SessionDB.try_acquire_compression_lock
+    real_try_acquire = AsyncSessionDB.try_acquire_compression_lock
 
-    def _short_ttl(self, session_id: str, holder: str, ttl_seconds: float = 300.0) -> bool:
-        return real_try_acquire(self, session_id, holder, ttl_seconds=0.15)
+    async def _short_ttl(self, session_id: str, holder: str, ttl_seconds: float = 300.0) -> bool:
+        return await real_try_acquire(self, session_id, holder, ttl_seconds=0.15)
 
-    monkeypatch.setattr(SessionDB, "try_acquire_compression_lock", _short_ttl)
+    monkeypatch.setattr(AsyncSessionDB, "try_acquire_compression_lock", _short_ttl)
 
     db = SessionDB(db_path=tmp_path / "state.db")
     parent_sid = "REFRESH_EXCEPTION_TEST"
@@ -544,38 +560,23 @@ def test_post_compress_exception_stops_lock_refresher(tmp_path: Path, monkeypatc
     messages = [{"role": "user", "content": f"m{i}"} for i in range(20)]
 
     with pytest.raises(RuntimeError, match="warn boom"):
-        agent._compress_context(messages, "sys", approx_tokens=120_000)
+        await agent._compress_context(messages, "sys", approx_tokens=120_000)
 
-    time.sleep(0.25)
-    assert db.try_acquire_compression_lock(parent_sid, "probe", ttl_seconds=1.0) is True
-
-
+    async_db = agent._get_async_session_db()
+    assert await async_db.try_acquire_compression_lock(parent_sid, "probe", ttl_seconds=1.0)
 
 
 
 
 
 
-def test_signature_introspection_exception_releases_lock_and_refresher(
+
+
+@pytest.mark.asyncio
+async def test_signature_introspection_exception_releases_lock_and_refresher(
     tmp_path: Path, monkeypatch
 ) -> None:
     """Capability inspection failures must not leak the acquired lock lease."""
-    from agent.conversation_compression import (
-        _CompressionLockLeaseRefresher as RealLeaseRefresher,
-    )
-
-    refreshers = []
-
-    class RecordingLeaseRefresher(RealLeaseRefresher):
-        def start(self):
-            refreshers.append(self)
-            return super().start()
-
-    monkeypatch.setattr(
-        "agent.conversation_compression._CompressionLockLeaseRefresher",
-        RecordingLeaseRefresher,
-    )
-
     db = SessionDB(db_path=tmp_path / "state.db")
     parent_sid = "SIGNATURE_EXCEPTION_TEST"
     db.create_session(parent_sid, source="discord")
@@ -599,12 +600,10 @@ def test_signature_introspection_exception_releases_lock_and_refresher(
     messages = [{"role": "user", "content": f"m{i}"} for i in range(20)]
 
     with pytest.raises(RuntimeError, match="signature boom"):
-        agent._compress_context(messages, "sys", approx_tokens=120_000)
+        await agent._compress_context(messages, "sys", approx_tokens=120_000)
 
     assert bomb.calls == 0
-    assert db.get_compression_lock_holder(parent_sid) is None
-    assert len(refreshers) == 1
-    assert not refreshers[0]._thread.is_alive()
+    assert await agent._get_async_session_db().get_compression_lock_holder(parent_sid) is None
 
 
 
@@ -702,7 +701,8 @@ class _NonCallableLockAPI:
         TypeError("simulated internal lock type error"),
     ],
 )
-def test_real_lock_api_internal_errors_fail_closed_skips_compression(
+@pytest.mark.asyncio
+async def test_real_lock_api_internal_errors_fail_closed_skips_compression(
     tmp_path: Path, monkeypatch, error: Exception
 ) -> None:
     """Errors after a real lock API resolves must preserve session lineage.
@@ -716,14 +716,16 @@ def test_real_lock_api_internal_errors_fail_closed_skips_compression(
     parent_sid = "ERRORING_LOCK_TEST"
     db.create_session(parent_sid, source="discord")
 
-    def _fail_lock_write(_fn):
+    async def _fail_lock_write(_self, _fn):
         raise error
 
-    monkeypatch.setattr(db, "_execute_write", _fail_lock_write)
+    monkeypatch.setattr(AsyncSessionDB, "_write", _fail_lock_write)
     agent = _build_agent_with_db(db, parent_sid)
     messages = [{"role": "user", "content": f"m{i}"} for i in range(20)]
 
-    compressed, _sp = agent._compress_context(messages, "sys", approx_tokens=120_000)
+    compressed, _sp = await agent._compress_context(
+        messages, "sys", approx_tokens=120_000
+    )
 
     # Skipped: messages returned verbatim, no rotation, compressor never ran.
     assert compressed is messages or compressed == messages
@@ -799,8 +801,3 @@ def test_lease_refresher_failure_window_is_bounded_by_ttl() -> None:
     assert cap * interval <= ttl, (
         f"give-up window {cap * interval}s must not exceed the lease TTL {ttl}s"
     )
-
-
-
-
-

@@ -58,7 +58,7 @@ def agent_db():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-def _build(agent, **overrides):
+async def _build(agent, **overrides):
     kwargs = dict(
         agent=agent,
         user_message=NOTE,
@@ -77,13 +77,14 @@ def _build(agent, **overrides):
     )
     kwargs.update(overrides)
     with patch("agent.auxiliary_client.set_runtime_main", lambda *a, **k: None):
-        return build_turn_context(**kwargs)
+        return await build_turn_context(**kwargs)
 
 
-def test_row_is_typed_by_the_turn_start_persist(agent_db):
+@pytest.mark.asyncio
+async def test_row_is_typed_by_the_turn_start_persist(agent_db):
     agent, db, sid = agent_db
 
-    _build(
+    await _build(
         agent,
         persist_user_display_kind="auto_continue",
         persist_user_display_metadata={"attempt": 2},
@@ -97,10 +98,11 @@ def test_row_is_typed_by_the_turn_start_persist(agent_db):
     assert row["content"] == NOTE
 
 
-def test_a_real_user_turn_stays_untyped(agent_db):
+@pytest.mark.asyncio
+async def test_a_real_user_turn_stays_untyped(agent_db):
     agent, db, sid = agent_db
 
-    _build(agent, user_message="keep going")
+    await _build(agent, user_message="keep going")
 
     row, = [r for r in db.get_messages_as_conversation(sid) if r["role"] == "user"]
     assert row.get("display_kind") is None

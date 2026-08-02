@@ -433,7 +433,9 @@ class TestSanitizeEnvLines:
 
 
     def test_migrate_reports_normalized_line_formatting(self, capsys):
-        latest_version = DEFAULT_CONFIG["_config_version"]
+        import hermes_cli.config as config_mod
+
+        latest_version = config_mod.DEFAULT_CONFIG["_config_version"]
         with (
             patch("hermes_cli.config.sanitize_env_file", return_value=2),
             patch(
@@ -445,7 +447,7 @@ class TestSanitizeEnvLines:
             patch("hermes_cli.config.get_missing_config_fields", return_value=[]),
             patch("hermes_cli.config.get_missing_skill_config_vars", return_value=[]),
         ):
-            migrate_config(interactive=False)
+            config_mod.migrate_config(interactive=False)
 
         assert capsys.readouterr().out == (
             "  ✓ Normalized .env line formatting (2 line(s) changed)\n"
@@ -659,7 +661,7 @@ class TestConfigSupportFloor:
         )
         assert expected_fragment in captured.out
         assert expected_fragment in captured.err
-        assert "run `hermes setup` to regenerate" in captured.out
+        assert "run `hermes doctor --fix`" in captured.out
         assert "_config_version: 12" in captured.out
         assert any(expected_fragment in w for w in results["warnings"])
         # No 'Config version: X → Y' line — nothing was migrated.
@@ -1174,7 +1176,7 @@ class TestMigrationWriteInvariant:
         # No default-only top-level section the user never wrote lands on disk —
         # neither from per-version seeds nor the catch-all finalizer.
         for default_key in (
-            "timezone", "curator", "auxiliary", "tts", "compression",
+            "timezone", "auxiliary", "tts", "compression",
             "whatsapp", "bedrock",
         ):
             assert default_key not in raw, (
@@ -1182,7 +1184,6 @@ class TestMigrationWriteInvariant:
                 f"version bump — the default-dump regression returned"
             )
         # Defaults still take effect transparently via the read-time merge.
-        assert loaded["curator"]["enabled"] == DEFAULT_CONFIG["curator"]["enabled"]
         assert loaded["display"]["compact"] == DEFAULT_CONFIG["display"]["compact"]
 
 

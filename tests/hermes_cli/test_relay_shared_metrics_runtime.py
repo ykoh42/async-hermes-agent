@@ -492,7 +492,8 @@ def test_real_binding_drives_lifecycle_aggregation_export_and_snapshot(
 
 
 
-def test_execution_adapters_do_not_create_relay_host_without_a_consumer(
+@pytest.mark.asyncio
+async def test_execution_adapters_do_not_create_relay_host_without_a_consumer(
     monkeypatch,
 ):
     from agent import relay_llm, relay_tools
@@ -510,20 +511,26 @@ def test_execution_adapters_do_not_create_relay_host_without_a_consumer(
     tool_args = {"command": "true"}
     tool_result = object()
 
+    async def llm_callback(observed):
+        return response if observed is request else None
+
     assert (
-        relay_llm.execute(
+        await relay_llm.execute(
             request,
-            lambda observed: response if observed is request else None,
+            llm_callback,
             session_id="llm-session",
             name="test-provider",
             model_name="test-model",
         )
         is response
     )
-    result, observed_args = relay_tools.execute(
+    async def tool_callback(observed):
+        return tool_result if observed is tool_args else None
+
+    result, observed_args = await relay_tools.execute(
         "terminal",
         tool_args,
-        lambda observed: tool_result if observed is tool_args else None,
+        tool_callback,
         session_id="tool-session",
     )
 
@@ -967,7 +974,6 @@ def test_failed_flush_keeps_daily_export_open_for_later_task(
     assert metrics["hermes.task_run.finished"]["value"] == 2
     assert flush_attempts == 2
     assert "Hermes shared-metrics task flush failed" in caplog.text
-
 
 
 

@@ -168,7 +168,6 @@ _CREDENTIAL_NAMES = frozenset({
     "FEISHU_APP_SECRET",
     "FEISHU_ENCRYPT_KEY",
     "FEISHU_VERIFICATION_TOKEN",
-    "DINGTALK_CLIENT_SECRET",
     "QQ_CLIENT_SECRET",
     "QQ_STT_API_KEY",
     "WECOM_SECRET",
@@ -308,7 +307,6 @@ _HERMES_BEHAVIORAL_VARS = frozenset({
     "SMS_ALLOWED_USERS",
     "MATTERMOST_ALLOWED_USERS",
     "MATRIX_ALLOWED_USERS",
-    "DINGTALK_ALLOWED_USERS",
     "FEISHU_ALLOWED_USERS",
     "WECOM_ALLOWED_USERS",
     "PHOTON_ALLOWED_USERS",
@@ -353,9 +351,6 @@ _HERMES_BEHAVIORAL_VARS = frozenset({
     "MATRIX_HOME_CHANNEL",
     "MATRIX_HOME_CHANNEL_THREAD_ID",
     "MATRIX_HOME_CHANNEL_NAME",
-    "DINGTALK_HOME_CHANNEL",
-    "DINGTALK_HOME_CHANNEL_THREAD_ID",
-    "DINGTALK_HOME_CHANNEL_NAME",
     "FEISHU_HOME_CHANNEL",
     "FEISHU_HOME_CHANNEL_THREAD_ID",
     "FEISHU_HOME_CHANNEL_NAME",
@@ -393,7 +388,6 @@ _HERMES_BEHAVIORAL_VARS = frozenset({
     "DISCORD_FREE_RESPONSE_CHANNELS",
     "TELEGRAM_REQUIRE_MENTION",
     "WHATSAPP_REQUIRE_MENTION",
-    "DINGTALK_REQUIRE_MENTION",
     "MATRIX_REQUIRE_MENTION",
 })
 
@@ -546,10 +540,13 @@ def _neutralize_macos_keychain_creds(request, monkeypatch):
     except Exception:
         return None
 
+    async def no_keychain_credentials(*_args, **_kwargs):
+        return None
+
     monkeypatch.setattr(
         _anthropic_adapter,
         "_read_claude_code_credentials_from_keychain",
-        lambda *_args, **_kwargs: None,
+        no_keychain_credentials,
         raising=False,
     )
     return None

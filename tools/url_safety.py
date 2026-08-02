@@ -520,12 +520,53 @@ def is_safe_url(url: str) -> bool:
 
 
 async def async_is_safe_url(url: str) -> bool:
-    """Same rules as :func:`is_safe_url`, but run the DNS work off the event loop.
+    """Async version of :func:`is_safe_url` with native asyncio DNS lookup."""
+    try:
+        parsed = urlparse(url)
+        hostname = (parsed.hostname or "").strip().lower().rstrip(".")
+        scheme = (parsed.scheme or "").strip().lower()
+        if scheme not in {"http", "https"} or not hostname:
+            return False
+        if hostname in _BLOCKED_HOSTNAMES:
+            logger.warning("Blocked request to internal hostname: %s", hostname)
+            return False
 
-    ``socket.getaddrinfo`` can block; call this from async code paths (gateway,
-    ``web_extract_tool``, vision download hooks) instead of ``is_safe_url``.
-    """
-    return await asyncio.to_thread(is_safe_url, url)
+        allow_all_private = _global_allow_private_urls()
+        allow_private_ip = _allows_private_ip_resolution(hostname, scheme)
+        try:
+            addr_info = await asyncio.get_running_loop().getaddrinfo(
+                hostname,
+                None,
+                family=socket.AF_UNSPEC,
+                type=socket.SOCK_STREAM,
+            )
+        except socket.gaierror:
+            try:
+                ipaddress.ip_address(hostname)
+                literal_ip = True
+            except ValueError:
+                literal_ip = False
+            if not literal_ip and _proxy_is_configured():
+                return True
+            logger.warning("Blocked request — DNS resolution failed for: %s", hostname)
+            return False
+
+        for _family, _, _, _, sockaddr in addr_info:
+            ip_str = sockaddr[0].split("%", 1)[0]
+            try:
+                ip = ipaddress.ip_address(ip_str)
+            except ValueError:
+                return False
+            if ip in _ALWAYS_BLOCKED_IPS or any(
+                ip in net for net in _ALWAYS_BLOCKED_NETWORKS
+            ):
+                return False
+            if not allow_all_private and not allow_private_ip and _is_blocked_ip(ip):
+                return False
+        return True
+    except Exception as exc:
+        logger.warning("Blocked request — URL safety check error for %s: %s", url, exc)
+        return False
 
 
 class SSRFConnectionBlocked(ValueError):
@@ -595,6 +636,61 @@ def _resolved_http_connect_ips(host: str, port: int, scheme: str) -> list[str]:
     return safe_ips
 
 
+async def _resolved_http_connect_ips_async(
+    host: str, port: int, scheme: str
+) -> list[str]:
+    """Async counterpart used by the guarded httpx transport."""
+    hostname = (host or "").strip().lower().rstrip(".")
+    if not hostname:
+        raise SSRFConnectionBlocked("Blocked request with empty hostname")
+    if hostname in _BLOCKED_HOSTNAMES:
+        raise SSRFConnectionBlocked(f"Blocked request to internal hostname: {hostname}")
+
+    allow_all_private = _global_allow_private_urls()
+    allow_private_ip = _allows_private_ip_resolution(hostname, scheme)
+    try:
+        addr_info = await asyncio.get_running_loop().getaddrinfo(
+            hostname,
+            port,
+            family=socket.AF_UNSPEC,
+            type=socket.SOCK_STREAM,
+        )
+    except socket.gaierror as exc:
+        raise SSRFConnectionBlocked(
+            f"Blocked request - DNS resolution failed for: {hostname}"
+        ) from exc
+
+    safe_ips: list[str] = []
+    seen: set[str] = set()
+    for _family, _, _, _, sockaddr in addr_info:
+        ip_str = sockaddr[0].split("%", 1)[0]
+        try:
+            ip = ipaddress.ip_address(ip_str)
+        except ValueError as exc:
+            raise SSRFConnectionBlocked(
+                f"Blocked request - unparseable IP address {sockaddr[0]!r} "
+                f"for hostname {hostname}"
+            ) from exc
+        if ip in _ALWAYS_BLOCKED_IPS or any(ip in net for net in _ALWAYS_BLOCKED_NETWORKS):
+            raise SSRFConnectionBlocked(
+                f"Blocked request to cloud metadata address during connect: "
+                f"{hostname} -> {ip_str}"
+            )
+        if not allow_all_private and not allow_private_ip and _is_blocked_ip(ip):
+            raise SSRFConnectionBlocked(
+                f"Blocked request to private/internal address during connect: "
+                f"{hostname} -> {ip_str}"
+            )
+        if ip_str not in seen and len(safe_ips) < _MAX_SSRF_CONNECT_IPS:
+            safe_ips.append(ip_str)
+            seen.add(ip_str)
+    if not safe_ips:
+        raise SSRFConnectionBlocked(
+            f"Blocked request - DNS returned no results for: {hostname}"
+        )
+    return safe_ips
+
+
 class _SSRFGuardedAsyncNetworkBackend:
     def __init__(self, schemes_by_origin_var: Any):
         from httpcore._backends.auto import AutoBackend
@@ -614,7 +710,7 @@ class _SSRFGuardedAsyncNetworkBackend:
 
         schemes_by_origin = self._schemes_by_origin_var.get({})
         scheme = _safe_connect_scheme(host, port, schemes_by_origin)
-        ips = await asyncio.to_thread(_resolved_http_connect_ips, host, port, scheme)
+        ips = await _resolved_http_connect_ips_async(host, port, scheme)
 
         last_exc: Exception | None = None
         for ip in ips:

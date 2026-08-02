@@ -3,7 +3,7 @@
 import json
 import pytest
 import time
-from unittest.mock import patch, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from agent.context_compressor import (
     ContextCompressor,
@@ -26,7 +26,7 @@ class StubProviderError(Exception):
 @pytest.fixture()
 def compressor():
     """Create a ContextCompressor with mocked dependencies."""
-    with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+    with patch("agent.context_compressor.get_static_context_length", return_value=100000):
         c = ContextCompressor(
             model="test/model",
             threshold_percent=0.85,
@@ -139,7 +139,7 @@ class TestCompress:
         context only — never re-presented as unfulfilled in-progress/pending
         work.
         """
-        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+        with patch("agent.context_compressor.get_static_context_length", return_value=100000):
             c = ContextCompressor(model="test/model", quiet_mode=True)
 
         unique_ask = "PLEASE_COMPUTE_THE_ARITHMETIC_CHAIN_XYZ"
@@ -198,7 +198,7 @@ class TestCompress:
         # then `MagicMock <= 0`). int(MagicMock()) returns 1, so coercion
         # yields a harmless positive int rather than crashing — the threshold
         # is computed cleanly with a 1-token reservation.
-        with patch("agent.context_compressor.get_model_context_length", return_value=200000):
+        with patch("agent.context_compressor.get_static_context_length", return_value=200000):
             c = ContextCompressor(model="m", quiet_mode=True, max_tokens=MagicMock())
         assert isinstance(c.max_tokens, int)
         assert isinstance(c.threshold_tokens, int)
@@ -206,18 +206,20 @@ class TestCompress:
 
 
 
-    def test_compress_strips_db_persisted_from_assembled_messages(self, compressor):
+    @pytest.mark.asyncio
+    async def test_compress_strips_db_persisted_from_assembled_messages(self, compressor):
         """Regression for #57491: shallow copies must not carry flush markers."""
         msgs = [
             {"role": "user" if i % 2 == 0 else "assistant", "content": f"m{i}", "_db_persisted": True}
             for i in range(10)
         ]
-        with patch("agent.context_compressor.call_llm", side_effect=RuntimeError("no provider")):
-            result = compressor.compress(msgs)
+        with patch("agent.context_compressor.call_llm", new=AsyncMock(side_effect=RuntimeError("no provider"))):
+            result = await compressor.compress(msgs)
         assert len(result) < len(msgs)
         assert all("_db_persisted" not in msg for msg in result)
 
-    def test_compress_terminal_sweep_strips_markers_even_if_a_copy_site_leaks(self, compressor):
+    @pytest.mark.asyncio
+    async def test_compress_terminal_sweep_strips_markers_even_if_a_copy_site_leaks(self, compressor):
         """Regression for #57491, structural: even if a copy site fails to strip
         the marker (simulating a future refactor that adds/reintroduces a leaky
         copy), the single terminal sweep in compress() guarantees no compacted
@@ -231,8 +233,8 @@ class TestCompress:
         ]
         # Make the per-site helper leak the marker (dict.copy keeps it).
         with patch.object(_cc, "_fresh_compaction_message_copy", lambda m: m.copy()), \
-             patch("agent.context_compressor.call_llm", side_effect=RuntimeError("no provider")):
-            result = compressor.compress(msgs)
+             patch("agent.context_compressor.call_llm", new=AsyncMock(side_effect=RuntimeError("no provider"))):
+            result = await compressor.compress(msgs)
         assert len(result) < len(msgs)
         assert all("_db_persisted" not in msg for msg in result), (
             "terminal sweep must strip _db_persisted even when a copy site leaks"
@@ -244,7 +246,7 @@ class TestCompress:
         messages don't get re-copied verbatim into every child session and
         fossilize (grow immortal) across a long, repeatedly-compressed
         session. The system prompt is always protected separately."""
-        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+        with patch("agent.context_compressor.get_static_context_length", return_value=100000):
             c = ContextCompressor(model="test", quiet_mode=True, protect_first_n=3)
 
         msgs = [{"role": "system", "content": "sys"}] + [
@@ -274,7 +276,7 @@ class TestTailBudgetCodexReplayFields:
         tail-cut budget must count them too; otherwise compression preserves an
         oversized tail and immediately starts the next session near the limit.
         """
-        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+        with patch("agent.context_compressor.get_static_context_length", return_value=100000):
             c = ContextCompressor(
                 model="test/model",
                 protect_first_n=1,
@@ -345,7 +347,7 @@ class TestTailBudgetCodexReplayFields:
     )
     def test_tail_cut_counts_each_hidden_replay_field(self, field_name, field_value):
         """Each provider replay/reasoning field should affect tail budgeting."""
-        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+        with patch("agent.context_compressor.get_static_context_length", return_value=100000):
             c = ContextCompressor(
                 model="test/model",
                 protect_first_n=1,
@@ -375,12 +377,13 @@ class TestTailBudgetCodexReplayFields:
 class TestGenerateSummaryNoneContent:
     """Regression: content=None (from tool-call-only assistant messages) must not crash."""
 
-    def test_none_content_does_not_crash(self):
+    @pytest.mark.asyncio
+    async def test_none_content_does_not_crash(self):
         mock_response = MagicMock()
         mock_response.choices = [MagicMock()]
         mock_response.choices[0].message.content = "[CONTEXT SUMMARY]: tool calls happened"
 
-        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+        with patch("agent.context_compressor.get_static_context_length", return_value=100000):
             c = ContextCompressor(model="test", quiet_mode=True)
 
         messages = [
@@ -393,22 +396,23 @@ class TestGenerateSummaryNoneContent:
             {"role": "user", "content": "thanks"},
         ]
 
-        with patch("agent.context_compressor.call_llm", return_value=mock_response):
-            summary = c._generate_summary(messages)
+        with patch("agent.context_compressor.call_llm", new=AsyncMock(return_value=mock_response)):
+            summary = await c._generate_summary(messages)
         assert isinstance(summary, str)
         assert summary.startswith(SUMMARY_PREFIX)
 
-    def test_none_content_in_system_message_compress(self):
+    @pytest.mark.asyncio
+    async def test_none_content_in_system_message_compress(self):
         """System message with content=None should not crash during compress."""
-        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+        with patch("agent.context_compressor.get_static_context_length", return_value=100000):
             c = ContextCompressor(model="test", quiet_mode=True, protect_first_n=2, protect_last_n=2)
 
         msgs = [{"role": "system", "content": None}] + [
             {"role": "user" if i % 2 == 0 else "assistant", "content": f"msg {i}"}
             for i in range(10)
         ]
-        with patch("agent.context_compressor.call_llm", side_effect=RuntimeError("no provider")):
-            result = c.compress(msgs)
+        with patch("agent.context_compressor.call_llm", new=AsyncMock(side_effect=RuntimeError("no provider"))):
+            result = await c.compress(msgs)
         assert len(result) < len(msgs)
 
 
@@ -416,7 +420,8 @@ class TestNonStringContent:
     """Regression: content as dict (e.g., llama.cpp tool calls) must not crash."""
 
 
-    def test_none_content_treated_as_failure_not_empty_summary(self):
+    @pytest.mark.asyncio
+    async def test_none_content_treated_as_failure_not_empty_summary(self):
         """Regression #11978/#11914: a well-formed response with ``content=None``
         (some OpenAI-compatible proxies, e.g. cmkey.cn, return HTTP 200 with
         null/empty content) must NOT be stored as a prefix-only summary that
@@ -427,7 +432,7 @@ class TestNonStringContent:
         mock_response.choices = [MagicMock()]
         mock_response.choices[0].message.content = None
 
-        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+        with patch("agent.context_compressor.get_static_context_length", return_value=100000):
             # summary_model == model here, so no fallback path: straight to cooldown.
             c = ContextCompressor(model="test", quiet_mode=True)
 
@@ -436,8 +441,8 @@ class TestNonStringContent:
             {"role": "assistant", "content": "ok"},
         ]
 
-        with patch("agent.context_compressor.call_llm", return_value=mock_response):
-            summary = c._generate_summary(messages)
+        with patch("agent.context_compressor.call_llm", new=AsyncMock(return_value=mock_response)):
+            summary = await c._generate_summary(messages)
         # Empty content → failure → None (drop turns), NOT a prefix-only summary.
         assert summary is None
         assert summary != SUMMARY_PREFIX
@@ -446,12 +451,13 @@ class TestNonStringContent:
 
 
 
-    def test_string_message_coerced_to_summary_content(self):
+    @pytest.mark.asyncio
+    async def test_string_message_coerced_to_summary_content(self):
         mock_response = MagicMock()
         mock_response.choices = [MagicMock()]
         mock_response.choices[0].message = "plain summary text"
 
-        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+        with patch("agent.context_compressor.get_static_context_length", return_value=100000):
             c = ContextCompressor(model="test", quiet_mode=True)
 
         messages = [
@@ -459,8 +465,8 @@ class TestNonStringContent:
             {"role": "assistant", "content": "ok"},
         ]
 
-        with patch("agent.context_compressor.call_llm", return_value=mock_response):
-            summary = c._generate_summary(messages)
+        with patch("agent.context_compressor.call_llm", new=AsyncMock(return_value=mock_response)):
+            summary = await c._generate_summary(messages)
 
         assert summary.startswith(f"{SUMMARY_PREFIX}\n{HISTORICAL_TASK_HEADING}\n")
         assert "do something" in summary
@@ -477,7 +483,7 @@ class TestNonStringContent:
         those, the deterministic snapshot must look past it to the real ask
         (and return None when no real ask exists at all).
         """
-        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+        with patch("agent.context_compressor.get_static_context_length", return_value=100000):
             c = ContextCompressor(model="test", quiet_mode=True)
 
         messages = [
@@ -509,7 +515,7 @@ class TestNonStringContent:
         """
         import re as _re
 
-        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+        with patch("agent.context_compressor.get_static_context_length", return_value=100000):
             c = ContextCompressor(model="test", quiet_mode=True)
 
         summary = (
@@ -531,8 +537,9 @@ class TestNonStringContent:
 
 
 class TestSummaryFailureCooldown:
-    def test_summary_failure_enters_cooldown_and_skips_retry(self):
-        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+    @pytest.mark.asyncio
+    async def test_summary_failure_enters_cooldown_and_skips_retry(self):
+        with patch("agent.context_compressor.get_static_context_length", return_value=100000):
             c = ContextCompressor(model="test", quiet_mode=True)
 
         messages = [
@@ -540,9 +547,9 @@ class TestSummaryFailureCooldown:
             {"role": "assistant", "content": "ok"},
         ]
 
-        with patch("agent.context_compressor.call_llm", side_effect=Exception("boom")) as mock_call:
-            first = c._generate_summary(messages)
-            second = c._generate_summary(messages)
+        with patch("agent.context_compressor.call_llm", new=AsyncMock(side_effect=Exception("boom"))) as mock_call:
+            first = await c._generate_summary(messages)
+            second = await c._generate_summary(messages)
 
         assert first is None
         assert second is None
@@ -584,13 +591,14 @@ class TestAuthFailureAborts:
 
 
 
-    def test_400_out_of_extra_usage_aborts_instead_of_dropping_context(self):
+    @pytest.mark.asyncio
+    async def test_400_out_of_extra_usage_aborts_instead_of_dropping_context(self):
         """Quota exhaustion preserves the original messages for a later retry."""
         err = StubProviderError(
             "Error code: 400 - {'error': {'message': 'out of extra usage'}}",
             status_code=400,
         )
-        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+        with patch("agent.context_compressor.get_static_context_length", return_value=100000):
             c = ContextCompressor(
                 model="test",
                 quiet_mode=True,
@@ -599,15 +607,16 @@ class TestAuthFailureAborts:
                 abort_on_summary_failure=False,
             )
         msgs = self._msgs(12)
-        with patch("agent.context_compressor.call_llm", side_effect=err):
-            result = c.compress(msgs, current_tokens=999999, force=True)
+        with patch("agent.context_compressor.call_llm", new=AsyncMock(side_effect=err)):
+            result = await c.compress(msgs, current_tokens=999999, force=True)
 
         assert result == msgs
         assert c._last_summary_auth_failure is True
         assert c._last_compress_aborted is True
         assert c._last_summary_fallback_used is False
 
-    def test_missing_provider_api_key_preserves_original_messages(self):
+    @pytest.mark.asyncio
+    async def test_missing_provider_api_key_preserves_original_messages(self):
         """A configured auxiliary provider without a visible key preserves context."""
         err = RuntimeError(
             "Provider 'opencode-zen' is set in config.yaml but no API key was "
@@ -615,7 +624,7 @@ class TestAuthFailureAborts:
             "to a different provider with hermes model."
         )
         with patch(
-            "agent.context_compressor.get_model_context_length", return_value=100000
+            "agent.context_compressor.get_static_context_length", return_value=100000
         ):
             c = ContextCompressor(
                 model="test",
@@ -625,8 +634,8 @@ class TestAuthFailureAborts:
                 abort_on_summary_failure=False,
             )
         msgs = self._msgs(12)
-        with patch("agent.context_compressor.call_llm", side_effect=err):
-            result = c.compress(msgs, current_tokens=999999, force=True)
+        with patch("agent.context_compressor.call_llm", new=AsyncMock(side_effect=err)):
+            result = await c.compress(msgs, current_tokens=999999, force=True)
 
         assert result == msgs
         assert c._last_summary_error == str(err)
@@ -635,13 +644,14 @@ class TestAuthFailureAborts:
         assert c._last_summary_fallback_used is False
         assert c._last_summary_dropped_count == 0
 
-    def test_402_quota_with_retry_uses_existing_fallback(self):
+    @pytest.mark.asyncio
+    async def test_402_quota_with_retry_uses_existing_fallback(self):
         """A reset-window quota remains transient instead of aborting compression."""
         err = StubProviderError(
             "quota exceeded, please retry after the window resets",
             status_code=402,
         )
-        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+        with patch("agent.context_compressor.get_static_context_length", return_value=100000):
             c = ContextCompressor(
                 model="test",
                 quiet_mode=True,
@@ -650,8 +660,8 @@ class TestAuthFailureAborts:
                 abort_on_summary_failure=False,
             )
         msgs = self._msgs(12)
-        with patch("agent.context_compressor.call_llm", side_effect=err):
-            result = c.compress(msgs, current_tokens=999999, force=True)
+        with patch("agent.context_compressor.call_llm", new=AsyncMock(side_effect=err)):
+            result = await c.compress(msgs, current_tokens=999999, force=True)
 
         assert result != msgs
         assert c._last_summary_auth_failure is False
@@ -659,25 +669,24 @@ class TestAuthFailureAborts:
         assert c._last_summary_fallback_used is True
 
 
-    def test_403_also_flags_auth_failure(self):
-        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+    @pytest.mark.asyncio
+    async def test_403_also_flags_auth_failure(self):
+        with patch("agent.context_compressor.get_static_context_length", return_value=100000):
             c = ContextCompressor(model="test", quiet_mode=True)
-        with patch("agent.context_compressor.call_llm", side_effect=self._auth_err(403)):
-            c._generate_summary(self._msgs())
+        with patch("agent.context_compressor.call_llm", new=AsyncMock(side_effect=self._auth_err(403))):
+            await c._generate_summary(self._msgs())
         assert c._last_summary_auth_failure is True
 
 
 
-    def test_generate_summary_flags_network_failure(self):
+    @pytest.mark.asyncio
+    async def test_generate_summary_flags_network_failure(self):
         """A connection/network error on the summary call flags
         _last_summary_network_failure (#29559)."""
-        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+        with patch("agent.context_compressor.get_static_context_length", return_value=100000):
             c = ContextCompressor(model="test", quiet_mode=True)
-        with patch(
-            "agent.context_compressor.call_llm",
-            side_effect=ConnectionError("Connection error."),
-        ):
-            result = c._generate_summary(self._msgs())
+        with patch("agent.context_compressor.call_llm", new=AsyncMock(side_effect=ConnectionError("Connection error."))):
+            result = await c._generate_summary(self._msgs())
         assert result is None
         assert c._last_summary_network_failure is True
         assert c._last_summary_auth_failure is False
@@ -698,7 +707,8 @@ class TestSummaryFallbackToMainModel:
             {"role": "assistant", "content": "ok"},
         ]
 
-    def test_model_not_found_404_falls_back_to_main_and_succeeds(self):
+    @pytest.mark.asyncio
+    async def test_model_not_found_404_falls_back_to_main_and_succeeds(self):
         """Classic misconfiguration: ``auxiliary.compression.model`` points at
         a model the main provider doesn't serve → 404 → retry on main."""
         mock_ok = MagicMock()
@@ -708,18 +718,15 @@ class TestSummaryFallbackToMainModel:
         err_404 = Exception("404 model_not_found: no such model")
         err_404.status_code = 404
 
-        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+        with patch("agent.context_compressor.get_static_context_length", return_value=100000):
             c = ContextCompressor(
                 model="main-model",
                 summary_model_override="broken-aux-model",
                 quiet_mode=True,
             )
 
-        with patch(
-            "agent.context_compressor.call_llm",
-            side_effect=[err_404, mock_ok],
-        ) as mock_call:
-            result = c._generate_summary(self._msgs())
+        with patch("agent.context_compressor.call_llm", new=AsyncMock(side_effect=[err_404, mock_ok])) as mock_call:
+            result = await c._generate_summary(self._msgs())
 
         assert mock_call.call_count == 2
         # First call used the misconfigured aux model
@@ -736,23 +743,21 @@ class TestSummaryFallbackToMainModel:
         assert "404" in c._last_aux_model_failure_error
 
 
-    def test_no_fallback_when_summary_model_equals_main_model(self):
+    @pytest.mark.asyncio
+    async def test_no_fallback_when_summary_model_equals_main_model(self):
         """If the aux model IS the main model, there's nowhere to fall back
         to — go straight to cooldown, don't loop retrying the same call."""
         err = Exception("500 internal error")
 
-        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+        with patch("agent.context_compressor.get_static_context_length", return_value=100000):
             c = ContextCompressor(
                 model="main-model",
                 summary_model_override="main-model",  # same as main
                 quiet_mode=True,
             )
 
-        with patch(
-            "agent.context_compressor.call_llm",
-            side_effect=err,
-        ) as mock_call:
-            result = c._generate_summary(self._msgs())
+        with patch("agent.context_compressor.call_llm", new=AsyncMock(side_effect=err)) as mock_call:
+            result = await c._generate_summary(self._msgs())
 
         # Only one attempt — retry gate blocks fallback when models match
         assert mock_call.call_count == 1
@@ -761,7 +766,8 @@ class TestSummaryFallbackToMainModel:
         assert getattr(c, "_summary_model_fallen_back", False) is False
 
 
-    def test_json_decode_error_falls_back_to_main_and_succeeds(self):
+    @pytest.mark.asyncio
+    async def test_json_decode_error_falls_back_to_main_and_succeeds(self):
         """JSONDecodeError from the OpenAI SDK's ``response.json()`` (raised
         when a misconfigured proxy returns HTML/plain-text with
         ``Content-Type: application/json``) should trigger the same
@@ -778,18 +784,15 @@ class TestSummaryFallbackToMainModel:
             "Expecting value", "<!DOCTYPE html><html>...</html>", 0
         )
 
-        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+        with patch("agent.context_compressor.get_static_context_length", return_value=100000):
             c = ContextCompressor(
                 model="main-model",
                 summary_model_override="aux-via-broken-proxy",
                 quiet_mode=True,
             )
 
-        with patch(
-            "agent.context_compressor.call_llm",
-            side_effect=[err_json, mock_ok],
-        ) as mock_call:
-            result = c._generate_summary(self._msgs())
+        with patch("agent.context_compressor.call_llm", new=AsyncMock(side_effect=[err_json, mock_ok])) as mock_call:
+            result = await c._generate_summary(self._msgs())
 
         assert mock_call.call_count == 2
         assert mock_call.call_args_list[0].kwargs.get("model") == "aux-via-broken-proxy"
@@ -823,7 +826,8 @@ class TestStreamingClosedFallback:
             {"role": "assistant", "content": "ok"},
         ]
 
-    def test_incomplete_chunked_read_falls_back_to_main(self):
+    @pytest.mark.asyncio
+    async def test_incomplete_chunked_read_falls_back_to_main(self):
         """``httpcore.RemoteProtocolError: incomplete chunked read`` triggers
         the retry-on-main path when ``_is_connection_error`` returns True."""
         mock_ok = MagicMock()
@@ -832,21 +836,18 @@ class TestStreamingClosedFallback:
 
         err = Exception("RemoteProtocolError: incomplete chunked read")
 
-        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+        with patch("agent.context_compressor.get_static_context_length", return_value=100000):
             c = ContextCompressor(
                 model="main-model",
                 summary_model_override="aux-stream-model",
                 quiet_mode=True,
             )
 
-        with patch(
-            "agent.context_compressor.call_llm",
-            side_effect=[err, mock_ok],
-        ) as mock_call, patch(
+        with patch("agent.context_compressor.call_llm", new=AsyncMock(side_effect=[err, mock_ok])) as mock_call, patch(
             "agent.context_compressor._is_connection_error",
             return_value=True,
         ):
-            result = c._generate_summary(self._msgs())
+            result = await c._generate_summary(self._msgs())
 
         assert mock_call.call_count == 2
         assert mock_call.call_args_list[0].kwargs.get("model") == "aux-stream-model"
@@ -855,26 +856,24 @@ class TestStreamingClosedFallback:
         assert "summary via main model" in result
 
 
-    def test_streaming_closed_on_main_uses_short_cooldown(self):
+    @pytest.mark.asyncio
+    async def test_streaming_closed_on_main_uses_short_cooldown(self):
         """When already on the main model, a streaming-closed error should use
         the 30s cooldown, not the default 60s — these errors are transient."""
         err = Exception("RemoteProtocolError: response ended prematurely")
 
-        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+        with patch("agent.context_compressor.get_static_context_length", return_value=100000):
             c = ContextCompressor(
                 model="main-model",
                 # No summary_model_override → no fallback path.
                 quiet_mode=True,
             )
 
-        with patch(
-            "agent.context_compressor.call_llm",
-            side_effect=err,
-        ), patch(
+        with patch("agent.context_compressor.call_llm", new=AsyncMock(side_effect=err)), patch(
             "agent.context_compressor._is_connection_error",
             return_value=True,
         ), patch("agent.context_compressor.time.monotonic", return_value=1000.0):
-            result = c._generate_summary(self._msgs())
+            result = await c._generate_summary(self._msgs())
 
         assert result is None
         # Streaming-closed should use the 30s short cooldown.
@@ -901,14 +900,15 @@ class TestAuxModelFallbackSurfacedToCallers:
             {"role": "user", "content": "msg 7"},
         ]
 
-    def test_compress_exposes_aux_failure_fields_after_successful_fallback(self):
+    @pytest.mark.asyncio
+    async def test_compress_exposes_aux_failure_fields_after_successful_fallback(self):
         mock_ok = MagicMock()
         mock_ok.choices = [MagicMock()]
         mock_ok.choices[0].message.content = "summary via main"
         err_400 = Exception("400 provider rejected configured model")
         err_400.status_code = 400
 
-        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+        with patch("agent.context_compressor.get_static_context_length", return_value=100000):
             c = ContextCompressor(
                 model="main-model",
                 summary_model_override="broken-aux-model",
@@ -917,11 +917,8 @@ class TestAuxModelFallbackSurfacedToCallers:
                 protect_last_n=2,
             )
 
-        with patch(
-            "agent.context_compressor.call_llm",
-            side_effect=[err_400, mock_ok],
-        ):
-            result = c.compress(self._make_msgs())
+        with patch("agent.context_compressor.call_llm", new=AsyncMock(side_effect=[err_400, mock_ok])):
+            result = await c.compress(self._make_msgs())
 
         # Recovery succeeded → no fallback placeholder
         assert c._last_summary_fallback_used is False
@@ -935,7 +932,8 @@ class TestAuxModelFallbackSurfacedToCallers:
             for m in result
         )
 
-    def test_compress_clears_aux_failure_fields_at_start_of_next_call(self):
+    @pytest.mark.asyncio
+    async def test_compress_clears_aux_failure_fields_at_start_of_next_call(self):
         """A subsequent successful compression must clear the aux-failure
         fields so the warning doesn't persist forever."""
         mock_ok = MagicMock()
@@ -944,7 +942,7 @@ class TestAuxModelFallbackSurfacedToCallers:
         err_400 = Exception("400 aux model busted")
         err_400.status_code = 400
 
-        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+        with patch("agent.context_compressor.get_static_context_length", return_value=100000):
             c = ContextCompressor(
                 model="main-model",
                 summary_model_override="broken-aux-model",
@@ -954,21 +952,15 @@ class TestAuxModelFallbackSurfacedToCallers:
             )
 
         # Call 1: aux fails, retry-on-main succeeds
-        with patch(
-            "agent.context_compressor.call_llm",
-            side_effect=[err_400, mock_ok],
-        ):
-            c.compress(self._make_msgs())
+        with patch("agent.context_compressor.call_llm", new=AsyncMock(side_effect=[err_400, mock_ok])):
+            await c.compress(self._make_msgs())
         assert c._last_aux_model_failure_model == "broken-aux-model"
 
         # Call 2: clean run on main (summary_model was cleared to "" after
         # first fallback).  Aux-failure fields MUST reset at compress() start
         # so the old warning state doesn't leak into this call.
-        with patch(
-            "agent.context_compressor.call_llm",
-            return_value=mock_ok,
-        ):
-            c.compress(self._make_msgs())
+        with patch("agent.context_compressor.call_llm", new=AsyncMock(return_value=mock_ok)):
+            await c.compress(self._make_msgs())
         assert c._last_aux_model_failure_model is None
         assert c._last_aux_model_failure_error is None
 
@@ -979,8 +971,9 @@ class TestSummaryFailureTrackingForGatewayWarning:
     records dropped count + fallback flag so gateway hygiene & /compress
     can surface a visible warning."""
 
-    def test_compress_records_fallback_and_dropped_count_on_summary_failure(self):
-        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+    @pytest.mark.asyncio
+    async def test_compress_records_fallback_and_dropped_count_on_summary_failure(self):
+        with patch("agent.context_compressor.get_static_context_length", return_value=100000):
             c = ContextCompressor(model="test", quiet_mode=True, protect_first_n=2, protect_last_n=2)
 
         msgs = [
@@ -994,8 +987,8 @@ class TestSummaryFailureTrackingForGatewayWarning:
             {"role": "user", "content": "msg 7"},
         ]
 
-        with patch("agent.context_compressor.call_llm", side_effect=Exception("404 model not found")):
-            result = c.compress(msgs)
+        with patch("agent.context_compressor.call_llm", new=AsyncMock(side_effect=Exception("404 model not found"))):
+            result = await c.compress(msgs)
 
         assert c._last_summary_fallback_used is True
         assert c._last_summary_dropped_count > 0
@@ -1007,8 +1000,9 @@ class TestSummaryFailureTrackingForGatewayWarning:
             for m in result
         )
 
-    def test_summary_failure_fallback_preserves_tool_paths_and_redacts_secret_context(self):
-        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+    @pytest.mark.asyncio
+    async def test_summary_failure_fallback_preserves_tool_paths_and_redacts_secret_context(self):
+        with patch("agent.context_compressor.get_static_context_length", return_value=100000):
             c = ContextCompressor(model="test", quiet_mode=True, protect_first_n=1, protect_last_n=1)
 
         secret = "ghp_" + ("a" * 36)
@@ -1035,8 +1029,8 @@ class TestSummaryFailureTrackingForGatewayWarning:
             {"role": "user", "content": "current live request should stay in tail"},
         ]
 
-        with patch("agent.context_compressor.call_llm", side_effect=Exception("timeout")):
-            result = c.compress(msgs)
+        with patch("agent.context_compressor.call_llm", new=AsyncMock(side_effect=Exception("timeout"))):
+            result = await c.compress(msgs)
 
         fallback = next(m["content"] for m in result if "Summary generation was unavailable" in m.get("content", ""))
         assert "Called tool(s): read_file" in fallback
@@ -1068,7 +1062,7 @@ class TestAbortOnSummaryFailure:
         ]
 
     def _make_compressor(self):
-        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+        with patch("agent.context_compressor.get_static_context_length", return_value=100000):
             return ContextCompressor(
                 model="test",
                 quiet_mode=True,
@@ -1077,11 +1071,12 @@ class TestAbortOnSummaryFailure:
                 abort_on_summary_failure=True,
             )
 
-    def test_compress_aborts_and_preserves_messages_on_summary_failure(self):
+    @pytest.mark.asyncio
+    async def test_compress_aborts_and_preserves_messages_on_summary_failure(self):
         c = self._make_compressor()
         msgs = self._make_msgs()
-        with patch("agent.context_compressor.call_llm", side_effect=Exception("404 model not found")):
-            result = c.compress(msgs)
+        with patch("agent.context_compressor.call_llm", new=AsyncMock(side_effect=Exception("404 model not found"))):
+            result = await c.compress(msgs)
 
         assert c._last_compress_aborted is True
         assert c._last_summary_error is not None
@@ -1114,7 +1109,8 @@ class TestAbortOnSummaryFailure:
         assert c._summary_failure_cooldown_until == 0.0
         assert db.get_compression_failure_cooldown("s1") is None
 
-    def test_success_clears_persisted_session_cooldown(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_success_clears_persisted_session_cooldown(self, tmp_path):
         mock_response = MagicMock()
         mock_response.choices = [MagicMock()]
         mock_response.choices[0].message.content = "summary text"
@@ -1128,8 +1124,8 @@ class TestAbortOnSummaryFailure:
         c._summary_failure_cooldown_until = 0.0
         msgs = self._make_msgs()
 
-        with patch("agent.context_compressor.call_llm", return_value=mock_response) as mock_llm:
-            result = c.compress(msgs, current_tokens=999999)
+        with patch("agent.context_compressor.call_llm", new=AsyncMock(return_value=mock_response)) as mock_llm:
+            result = await c.compress(msgs, current_tokens=999999)
 
         mock_llm.assert_called()
         assert c._last_compress_aborted is False
@@ -1176,7 +1172,8 @@ class TestCompressWithClient:
             "call_123"
         ]
 
-    def test_user_role_summary_carries_end_marker(self):
+    @pytest.mark.asyncio
+    async def test_user_role_summary_carries_end_marker(self):
         """When the summary lands as standalone role='user' (e.g. head ends
         with assistant/tool), the message body must include the explicit
         '--- END OF CONTEXT SUMMARY ---' marker. Without it, weak models
@@ -1188,7 +1185,7 @@ class TestCompressWithClient:
         mock_response.choices = [MagicMock()]
         mock_response.choices[0].message.content = "summary text"
 
-        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+        with patch("agent.context_compressor.get_static_context_length", return_value=100000):
             c = ContextCompressor(model="test", quiet_mode=True, protect_first_n=2, protect_last_n=2)
 
         # head_last=assistant, tail_first=assistant (same shape as the
@@ -1203,8 +1200,8 @@ class TestCompressWithClient:
             {"role": "user", "content": "msg 6"},
             {"role": "assistant", "content": "msg 7"},
         ]
-        with patch("agent.context_compressor.call_llm", return_value=mock_response):
-            result = c.compress(msgs)
+        with patch("agent.context_compressor.call_llm", new=AsyncMock(return_value=mock_response)):
+            result = await c.compress(msgs)
 
         summary_msg = next(
             m for m in result if (m.get("content") or "").startswith(SUMMARY_PREFIX)
@@ -1215,7 +1212,8 @@ class TestCompressWithClient:
             "respond to the message below, not the summary above ---"
         )
 
-    def test_assistant_role_summary_carries_end_marker(self):
+    @pytest.mark.asyncio
+    async def test_assistant_role_summary_carries_end_marker(self):
         """When the summary lands as standalone role='assistant' (head ends
         with user), the message body must include the explicit
         '--- END OF CONTEXT SUMMARY ---' marker. Without it, models may
@@ -1227,7 +1225,7 @@ class TestCompressWithClient:
         mock_response.choices[0].message.content = "[CONTEXT SUMMARY]: stuff happened"
         mock_client.chat.completions.create.return_value = mock_response
 
-        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+        with patch("agent.context_compressor.get_static_context_length", return_value=100000):
             c = ContextCompressor(model="test", quiet_mode=True, protect_first_n=2, protect_last_n=2)
 
         # head_last=user → summary_role="assistant" (same setup as
@@ -1245,8 +1243,8 @@ class TestCompressWithClient:
             {"role": "assistant", "content": "msg 6"},
             {"role": "user", "content": "msg 7"},
         ]
-        with patch("agent.context_compressor.call_llm", return_value=mock_response):
-            result = c.compress(msgs)
+        with patch("agent.context_compressor.call_llm", new=AsyncMock(return_value=mock_response)):
+            result = await c.compress(msgs)
 
         summary_msg = next(
             m for m in result if (m.get("content") or "").startswith(SUMMARY_PREFIX)
@@ -1257,7 +1255,8 @@ class TestCompressWithClient:
             "respond to the message below, not the summary above ---"
         )
 
-    def test_summary_role_avoids_consecutive_user_messages(self):
+    @pytest.mark.asyncio
+    async def test_summary_role_avoids_consecutive_user_messages(self):
         """Summary role should alternate with the last head message to avoid consecutive same-role messages."""
         mock_client = MagicMock()
         mock_response = MagicMock()
@@ -1265,7 +1264,7 @@ class TestCompressWithClient:
         mock_response.choices[0].message.content = "[CONTEXT SUMMARY]: stuff happened"
         mock_client.chat.completions.create.return_value = mock_response
 
-        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+        with patch("agent.context_compressor.get_static_context_length", return_value=100000):
             c = ContextCompressor(model="test", quiet_mode=True, protect_first_n=2, protect_last_n=2)
 
         # Last head message (index 1) is "assistant" → summary should be "user".
@@ -1282,8 +1281,8 @@ class TestCompressWithClient:
             {"role": "user", "content": "msg 6"},
             {"role": "assistant", "content": "msg 7"},
         ]
-        with patch("agent.context_compressor.call_llm", return_value=mock_response):
-            result = c.compress(msgs)
+        with patch("agent.context_compressor.call_llm", new=AsyncMock(return_value=mock_response)):
+            result = await c.compress(msgs)
         summary_msg = [
             m for m in result if (m.get("content") or "").startswith(SUMMARY_PREFIX)
         ]
@@ -1292,7 +1291,8 @@ class TestCompressWithClient:
 
 
 
-    def test_double_collision_merges_summary_into_tail(self):
+    @pytest.mark.asyncio
+    async def test_double_collision_merges_summary_into_tail(self):
         """When neither role avoids collision with both neighbors, the summary
         should be merged into the first tail message rather than creating a
         standalone message that breaks role alternation.
@@ -1304,7 +1304,7 @@ class TestCompressWithClient:
         mock_response.choices = [MagicMock()]
         mock_response.choices[0].message.content = "summary text"
 
-        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+        with patch("agent.context_compressor.get_static_context_length", return_value=100000):
             c = ContextCompressor(model="test", quiet_mode=True, protect_first_n=2, protect_last_n=3)
 
         # Head: [system, user, assistant]  →  last head = assistant
@@ -1323,8 +1323,8 @@ class TestCompressWithClient:
             {"role": "assistant", "content": "msg 7"},
             {"role": "user", "content": "msg 8"},
         ]
-        with patch("agent.context_compressor.call_llm", return_value=mock_response):
-            result = c.compress(msgs)
+        with patch("agent.context_compressor.call_llm", new=AsyncMock(return_value=mock_response)):
+            result = await c.compress(msgs)
 
         # Verify no consecutive user or assistant messages
         for i in range(1, len(result)):
@@ -1339,7 +1339,8 @@ class TestCompressWithClient:
         assert "summary text" in first_tail[0]["content"]
 
 
-    def test_merge_into_tail_end_marker_is_last(self):
+    @pytest.mark.asyncio
+    async def test_merge_into_tail_end_marker_is_last(self):
         """Regression for #56372: in a merge-into-tail summary, the END MARKER
         must come AFTER the preserved prior tail content, not before it.
 
@@ -1357,7 +1358,7 @@ class TestCompressWithClient:
         mock_response.choices = [MagicMock()]
         mock_response.choices[0].message.content = "SUMMARY_BODY"
 
-        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+        with patch("agent.context_compressor.get_static_context_length", return_value=100000):
             c = ContextCompressor(model="test", quiet_mode=True, protect_first_n=2, protect_last_n=3)
 
         msgs = [
@@ -1372,8 +1373,8 @@ class TestCompressWithClient:
             {"role": "user", "content": "msg 8"},
         ]
 
-        with patch("agent.context_compressor.call_llm", return_value=mock_response):
-            result = c.compress(msgs)
+        with patch("agent.context_compressor.call_llm", new=AsyncMock(return_value=mock_response)):
+            result = await c.compress(msgs)
 
         merged = next(m for m in result if m.get(COMPRESSED_SUMMARY_METADATA_KEY))
         content = merged["content"]
@@ -1442,7 +1443,7 @@ class TestSummaryTargetRatio:
 
     def test_default_threshold_floored_at_75_percent_below_512k(self):
         """Sub-512K models get the 75% small-context threshold floor."""
-        with patch("agent.context_compressor.get_model_context_length", return_value=100_000):
+        with patch("agent.context_compressor.get_static_context_length", return_value=100_000):
             c = ContextCompressor(model="test", quiet_mode=True)
             _ = c.context_length
         assert c.threshold_percent == 0.75
@@ -1453,7 +1454,8 @@ class TestSummaryTargetRatio:
 
 
 
-    def test_protect_first_n_0_preserves_only_system_prompt(self):
+    @pytest.mark.asyncio
+    async def test_protect_first_n_0_preserves_only_system_prompt(self):
         """End-to-end: when protect_first_n=0, compression should treat only
         the system prompt as head.  All user/assistant messages between the
         system prompt and the protected tail become summarization candidates.
@@ -1461,7 +1463,7 @@ class TestSummaryTargetRatio:
         This is the cleanest configuration for long-running rolling-compaction
         sessions — no user/assistant turn gets pinned verbatim forever just
         because it happened to be early in the session."""
-        with patch("agent.context_compressor.get_model_context_length", return_value=100_000):
+        with patch("agent.context_compressor.get_static_context_length", return_value=100_000):
             c = ContextCompressor(
                 model="test",
                 quiet_mode=True,
@@ -1473,8 +1475,8 @@ class TestSummaryTargetRatio:
             + [{"role": "user" if i % 2 == 0 else "assistant", "content": f"msg {i}"}
                for i in range(8)]
         )
-        with patch("agent.context_compressor.call_llm", side_effect=RuntimeError("no provider")):
-            result = c.compress(msgs)
+        with patch("agent.context_compressor.call_llm", new=AsyncMock(side_effect=RuntimeError("no provider"))):
+            result = await c.compress(msgs)
         # System prompt (msg[0]) survives as head
         assert result[0]["role"] == "system"
         assert result[0]["content"].startswith("System prompt")
@@ -1499,7 +1501,7 @@ class TestSummaryTargetRatio:
         session forever — a user-reported complaint that a week-old
         resolved question kept getting reinserted into every compaction
         summary."""
-        with patch("agent.context_compressor.get_model_context_length", return_value=100_000):
+        with patch("agent.context_compressor.get_static_context_length", return_value=100_000):
             c = ContextCompressor(
                 model="test",
                 quiet_mode=True,
@@ -1533,7 +1535,7 @@ class TestTokenBudgetTailProtection:
     @pytest.fixture()
     def budget_compressor(self):
         """Compressor with known token budget for tail protection tests."""
-        with patch("agent.context_compressor.get_model_context_length", return_value=200_000):
+        with patch("agent.context_compressor.get_static_context_length", return_value=200_000):
             c = ContextCompressor(
                 model="test/model",
                 threshold_percent=0.50,  # 100K threshold
@@ -1580,7 +1582,8 @@ class TestTokenBudgetTailProtection:
         assert messages[-1]["content"] == "latest ask"
 
 
-    def test_small_conversation_still_compresses(self, budget_compressor):
+    @pytest.mark.asyncio
+    async def test_small_conversation_still_compresses(self, budget_compressor):
         """With the new min of 8 messages (head=2 + 3 + 1 guard + 2 middle),
         a small but compressible conversation should still compress."""
         c = budget_compressor
@@ -1593,7 +1596,7 @@ class TestTokenBudgetTailProtection:
         # Should not early-return (needs > protect_first_n + 3 + 1 = 6)
         # Mock the summary generation to avoid real API call
         with patch.object(c, "_generate_summary", return_value="Summary of conversation"):
-            result = c.compress(messages, current_tokens=90_000)
+            result = await c.compress(messages, current_tokens=90_000)
         # Should have compressed (fewer messages than original)
         assert len(result) < len(messages)
 
@@ -1676,7 +1679,7 @@ class TestUpdateModelBudgets:
     def test_tail_budget_recalculated(self):
         """tail_token_budget must change after switching to a different context length."""
         from unittest.mock import patch
-        with patch("agent.context_compressor.get_model_context_length", return_value=200_000):
+        with patch("agent.context_compressor.get_static_context_length", return_value=200_000):
             comp = ContextCompressor("model-a", threshold_percent=0.50, quiet_mode=True)
         old_tail = comp.tail_token_budget
         old_max_summary = comp.max_summary_tokens
@@ -1689,7 +1692,7 @@ class TestUpdateModelBudgets:
     def test_budgets_proportional(self):
         """Budgets should be proportional to context_length after update."""
         from unittest.mock import patch
-        with patch("agent.context_compressor.get_model_context_length", return_value=100_000):
+        with patch("agent.context_compressor.get_static_context_length", return_value=100_000):
             comp = ContextCompressor("model-a", threshold_percent=0.50, quiet_mode=True)
         comp.update_model("model-b", context_length=10_000)
         assert comp.tail_token_budget == int(comp.threshold_tokens * comp.summary_target_ratio)
@@ -1705,7 +1708,7 @@ class TestUpdateModelResetsCalibration:
 
     def _comp(self):
         from unittest.mock import patch
-        with patch("agent.context_compressor.get_model_context_length", return_value=200_000):
+        with patch("agent.context_compressor.get_static_context_length", return_value=200_000):
             return ContextCompressor("big-model", threshold_percent=0.50, quiet_mode=True)
 
     def test_real_usage_state_cleared(self):
@@ -1758,7 +1761,7 @@ class TestThresholdTokensCap:
 
     def test_no_cap_uses_ratio_only(self):
         """Without a cap, the ratio-based threshold is used."""
-        with patch("agent.context_compressor.get_model_context_length", return_value=1_000_000):
+        with patch("agent.context_compressor.get_static_context_length", return_value=1_000_000):
             comp = ContextCompressor(
                 "model-a", threshold_percent=0.50, quiet_mode=True,
             )
@@ -1773,7 +1776,7 @@ class TestThresholdTokensCap:
 
     def test_invalid_cap_treated_as_none(self):
         """Non-numeric, zero, or negative cap values are treated as None."""
-        with patch("agent.context_compressor.get_model_context_length", return_value=1_000_000):
+        with patch("agent.context_compressor.get_static_context_length", return_value=1_000_000):
             comp0 = ContextCompressor(
                 "model-a", threshold_percent=0.50, quiet_mode=True,
                 threshold_tokens_cap=0,
@@ -1797,7 +1800,7 @@ class TestThresholdTokensCap:
         """Behavioral: with a cap below the ratio-based threshold,
         should_compress() fires once usage crosses the cap — even though
         the percentage threshold has not been reached (first-fires-wins)."""
-        with patch("agent.context_compressor.get_model_context_length", return_value=1_000_000):
+        with patch("agent.context_compressor.get_static_context_length", return_value=1_000_000):
             comp = ContextCompressor(
                 "model-a", threshold_percent=0.50, quiet_mode=True,
                 threshold_tokens_cap=200_000,
@@ -1813,7 +1816,7 @@ class TestThresholdTokensCap:
         from hermes_cli.config import DEFAULT_CONFIG
         assert DEFAULT_CONFIG["compression"]["threshold_tokens"] is None
 
-        with patch("agent.context_compressor.get_model_context_length", return_value=1_000_000):
+        with patch("agent.context_compressor.get_static_context_length", return_value=1_000_000):
             baseline = ContextCompressor(
                 "model-a", threshold_percent=0.50, quiet_mode=True,
             )
@@ -1890,7 +1893,7 @@ class TestTruncateToolCallArgsJson:
         """End-to-end: Pass 3 must never produce the exact failure payload
         that caused the 400 loop (unterminated string, missing brace)."""
         import json as _json
-        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+        with patch("agent.context_compressor.get_static_context_length", return_value=100000):
             c = ContextCompressor(
                 model="test/model",
                 threshold_percent=0.85,
@@ -1924,26 +1927,24 @@ class TestTruncateToolCallArgsJson:
 
 
 class TestLazyContextResolution:
-    """Verify that ContextCompressor defers get_model_context_length until
-    context_length is first accessed, so construction never blocks on network
-    I/O or blocks startup when the model metadata service is slow."""
+    """Verify that ContextCompressor resolves static metadata lazily.
+
+    Construction stays cheap while accesses on the async turn path avoid
+    provider metadata I/O entirely.
+    """
 
 
     def test_init_does_not_probe_when_not_quiet(self, caplog):
         """quiet_mode=False must ALSO stay non-blocking in __init__.
 
-        Regression for the lazy-init defect: the "Context compressor
-        initialized" log reads context_length/threshold_tokens/tail_token_budget,
-        so emitting it in __init__ forced the deferred get_model_context_length()
-        probe to run during construction whenever quiet_mode was False (the
-        interactive CLI path) — silently re-introducing the #32221 blocking that
-        the original PR set out to remove. The informative line must instead be
-        emitted once, on first context-length resolution.
+        The "Context compressor initialized" log reads
+        context_length/threshold_tokens/tail_token_budget, so it must remain
+        lazy. The informative line is emitted once, on first resolution.
         """
         import logging
 
         with patch(
-            "agent.context_compressor.get_model_context_length",
+            "agent.context_compressor.get_static_context_length",
             return_value=200_000,
         ) as mock_get:
             c = ContextCompressor(model="test/model", quiet_mode=False)
@@ -1977,7 +1978,7 @@ class TestLazyContextResolution:
         """When config_context_length is provided, the resolver must use it
         as the cached value and not make a network call."""
         with patch(
-            "agent.context_compressor.get_model_context_length",
+            "agent.context_compressor.get_static_context_length",
             side_effect=lambda model, **kwargs: kwargs.get("config_context_length"),
         ) as mock_get:
             c = ContextCompressor(
@@ -2241,11 +2242,12 @@ class TestCooldownReentryAbort:
             for i in range(n)
         ]
 
-    def test_network_failure_cooldown_reentry_still_aborts(self):
+    @pytest.mark.asyncio
+    async def test_network_failure_cooldown_reentry_still_aborts(self):
         """ConnectionError → first compress aborts (PR #51881).  Second
         compress within the 30s cooldown must ALSO abort — not drop the
         middle window via the static-fallback path."""
-        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+        with patch("agent.context_compressor.get_static_context_length", return_value=100000):
             c = ContextCompressor(
                 model="test",
                 quiet_mode=True,
@@ -2255,16 +2257,13 @@ class TestCooldownReentryAbort:
             )
         msgs = self._msgs(12)
 
-        with patch(
-            "agent.context_compressor.call_llm",
-            side_effect=ConnectionError("Connection error."),
-        ):
-            first = c.compress(msgs, current_tokens=999999, force=True)
+        with patch("agent.context_compressor.call_llm", new=AsyncMock(side_effect=ConnectionError("Connection error."))):
+            first = await c.compress(msgs, current_tokens=999999, force=True)
         assert first == msgs
         assert c._last_compress_aborted is True
         assert c._last_summary_network_failure is True
 
-        second = c.compress(msgs, current_tokens=999999)
+        second = await c.compress(msgs, current_tokens=999999)
         assert second == msgs, (
             "Second compress during cooldown must abort (preserve messages), "
             "not drop the middle window via static-fallback"
@@ -2272,12 +2271,13 @@ class TestCooldownReentryAbort:
         assert c._last_compress_aborted is True
         assert c._last_summary_fallback_used is False
 
-    def test_auth_failure_cooldown_reentry_still_aborts(self):
+    @pytest.mark.asyncio
+    async def test_auth_failure_cooldown_reentry_still_aborts(self):
         """Same re-entry hole for auth failures: a 401 sets the flag, cooldown
         returns None, second compress must still abort."""
         err = Exception("Error code: 401 - invalid api key")
         err.status_code = 401
-        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+        with patch("agent.context_compressor.get_static_context_length", return_value=100000):
             c = ContextCompressor(
                 model="test",
                 quiet_mode=True,
@@ -2287,13 +2287,13 @@ class TestCooldownReentryAbort:
             )
         msgs = self._msgs(12)
 
-        with patch("agent.context_compressor.call_llm", side_effect=err):
-            first = c.compress(msgs, current_tokens=999999, force=True)
+        with patch("agent.context_compressor.call_llm", new=AsyncMock(side_effect=err)):
+            first = await c.compress(msgs, current_tokens=999999, force=True)
         assert first == msgs
         assert c._last_compress_aborted is True
         assert c._last_summary_auth_failure is True
 
-        second = c.compress(msgs, current_tokens=999999)
+        second = await c.compress(msgs, current_tokens=999999)
         assert second == msgs, (
             "Second compress during cooldown must abort (preserve messages), "
             "not drop the middle window via static-fallback"
@@ -2307,7 +2307,8 @@ class TestDoubleCompactionSummaryRole:
     protected, the summary must lead with role=user (Anthropic/Bedrock send
     system as a separate param, so the summary is the first visible message)."""
 
-    def test_double_compaction_summary_must_be_user_when_only_system_protected(self):
+    @pytest.mark.asyncio
+    async def test_double_compaction_summary_must_be_user_when_only_system_protected(self):
         """After the first compression, protect_first_n decays to 0.
 
         On the second compression the only protected head message is the
@@ -2321,7 +2322,7 @@ class TestDoubleCompactionSummaryRole:
         mock_response.choices = [MagicMock()]
         mock_response.choices[0].message.content = "summary of earlier turns"
 
-        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+        with patch("agent.context_compressor.get_static_context_length", return_value=100000):
             c = ContextCompressor(
                 model="test", quiet_mode=True, protect_first_n=2, protect_last_n=2,
             )
@@ -2339,8 +2340,8 @@ class TestDoubleCompactionSummaryRole:
             {"role": "user", "content": "msg 5"},
             {"role": "assistant", "content": "msg 6"},
         ]
-        with patch("agent.context_compressor.call_llm", return_value=mock_response):
-            result = c.compress(msgs)
+        with patch("agent.context_compressor.call_llm", new=AsyncMock(return_value=mock_response)):
+            result = await c.compress(msgs)
 
         # The system message must still be at index 0.
         assert result[0]["role"] == "system"
@@ -2352,7 +2353,8 @@ class TestDoubleCompactionSummaryRole:
             f"compatibility, got role={non_system[0]['role']!r}"
         )
 
-    def test_restart_handoff_without_system_still_starts_with_user(self):
+    @pytest.mark.asyncio
+    async def test_restart_handoff_without_system_still_starts_with_user(self):
         """When decayed head protection leaves no head, the visible transcript
         must still begin with a user role for Anthropic/Bedrock compatibility.
         """
@@ -2360,7 +2362,7 @@ class TestDoubleCompactionSummaryRole:
         mock_response.choices = [MagicMock()]
         mock_response.choices[0].message.content = "summary of resumed turns"
 
-        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+        with patch("agent.context_compressor.get_static_context_length", return_value=100000):
             c = ContextCompressor(
                 model="test", quiet_mode=True, protect_first_n=3, protect_last_n=2,
             )
@@ -2375,13 +2377,14 @@ class TestDoubleCompactionSummaryRole:
             {"role": "user", "content": "tail request"},
             {"role": "assistant", "content": "tail answer"},
         ]
-        with patch("agent.context_compressor.call_llm", return_value=mock_response):
-            result = c.compress(msgs)
+        with patch("agent.context_compressor.call_llm", new=AsyncMock(return_value=mock_response)):
+            result = await c.compress(msgs)
 
         assert result[0]["role"] == "user"
         assert "summary of resumed turns" in (result[0].get("content") or "")
 
-    def test_double_compaction_user_tail_merges_into_tail(self):
+    @pytest.mark.asyncio
+    async def test_double_compaction_user_tail_merges_into_tail(self):
         """When the summary is forced to role=user (system-only head) and
         the first tail message is also user, the summary must merge into
         the tail rather than flipping back to assistant (#52160).
@@ -2390,7 +2393,7 @@ class TestDoubleCompactionSummaryRole:
         mock_response.choices = [MagicMock()]
         mock_response.choices[0].message.content = "summary of earlier turns"
 
-        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+        with patch("agent.context_compressor.get_static_context_length", return_value=100000):
             c = ContextCompressor(
                 model="test", quiet_mode=True, protect_first_n=2, protect_last_n=2,
             )
@@ -2408,8 +2411,8 @@ class TestDoubleCompactionSummaryRole:
             {"role": "assistant", "content": "msg 6"},
             {"role": "user", "content": "msg 7"},
         ]
-        with patch("agent.context_compressor.call_llm", return_value=mock_response):
-            result = c.compress(msgs)
+        with patch("agent.context_compressor.call_llm", new=AsyncMock(return_value=mock_response)):
+            result = await c.compress(msgs)
 
         # No standalone summary message should exist (merged into tail).
         summary_msgs = [
@@ -2434,14 +2437,15 @@ class TestSummaryPromptBounding:
 
 
 
-    def test_iterative_update_path_is_bounded(self):
+    @pytest.mark.asyncio
+    async def test_iterative_update_path_is_bounded(self):
         """The iterative prompt (previous summary + new turns) must be bounded
         too — a pathological rehydrated handoff must not blow up the prompt."""
         mock_response = MagicMock()
         mock_response.choices = [MagicMock()]
         mock_response.choices[0].message.content = "updated summary"
 
-        with patch("agent.context_compressor.get_model_context_length", return_value=272000):
+        with patch("agent.context_compressor.get_static_context_length", return_value=272000):
             c = ContextCompressor(model="test", quiet_mode=True)
         cap = c._SUMMARY_INPUT_MAX_CHARS
         c._previous_summary = "PREV_HEAD " + ("p" * (cap * 2)) + " PREV_TAIL"
@@ -2451,8 +2455,8 @@ class TestSummaryPromptBounding:
             for i in range(80)
         ]
 
-        with patch("agent.context_compressor.call_llm", return_value=mock_response) as mock_call:
-            summary = c._generate_summary(messages)
+        with patch("agent.context_compressor.call_llm", new=AsyncMock(return_value=mock_response)) as mock_call:
+            summary = await c._generate_summary(messages)
 
         prompt = mock_call.call_args.kwargs["messages"][0]["content"]
         assert summary.startswith(SUMMARY_PREFIX)
@@ -2490,7 +2494,7 @@ class TestMinTailUserMessages:
         user message (a clean boundary).  The preceding tool group stays
         together — it is either entirely in the compressed region or
         entirely in the tail, never split across the boundary."""
-        with patch("agent.context_compressor.get_model_context_length", return_value=200_000):
+        with patch("agent.context_compressor.get_static_context_length", return_value=200_000):
             c = ContextCompressor(
                 model="test/model",
                 threshold_percent=0.50,
@@ -2544,7 +2548,7 @@ class TestMinTailUserMessages:
         tail budget covers only the last turn, so the default is gated to 1
         (= the existing single last-user anchor) and N>1 is opt-in.
         """
-        with patch("agent.context_compressor.get_model_context_length", return_value=200_000):
+        with patch("agent.context_compressor.get_static_context_length", return_value=200_000):
             c_default = ContextCompressor(
                 model="test/model",
                 threshold_percent=0.50,
@@ -2580,7 +2584,7 @@ class TestMinTailUserMessages:
         """A blank platform echo (empty user row) must not consume one of the
         N slots — otherwise the guarantee silently degrades to N-1 real turns
         (the #69291 bug class the single anchor already fixed)."""
-        with patch("agent.context_compressor.get_model_context_length", return_value=200_000):
+        with patch("agent.context_compressor.get_static_context_length", return_value=200_000):
             c = ContextCompressor(
                 model="test/model",
                 threshold_percent=0.50,
@@ -2631,7 +2635,7 @@ class TestMinTailUserMessages:
         the summary, and the floor remains a lower bound, not a cap, on the
         anchored tail.
         """
-        with patch("agent.context_compressor.get_model_context_length", return_value=200_000):
+        with patch("agent.context_compressor.get_static_context_length", return_value=200_000):
             c = ContextCompressor(
                 model="test/model",
                 threshold_percent=0.50,
@@ -2671,7 +2675,7 @@ class TestContextLengthSetterCoherence:
     from the same window."""
 
     def test_same_value_reassignment_preserves_threshold_override(self):
-        with patch("agent.context_compressor.get_model_context_length", return_value=200_000):
+        with patch("agent.context_compressor.get_static_context_length", return_value=200_000):
             c = ContextCompressor(model="test", quiet_mode=True)
             _ = c.context_length
         # Runtime correction (aux-context threshold sync pattern).
@@ -2683,7 +2687,7 @@ class TestContextLengthSetterCoherence:
         assert c.tail_token_budget == 8_400
 
     def test_new_value_assignment_refloors_and_invalidates(self):
-        with patch("agent.context_compressor.get_model_context_length", return_value=1_000_000):
+        with patch("agent.context_compressor.get_static_context_length", return_value=1_000_000):
             c = ContextCompressor(model="test", quiet_mode=True)
             _ = c.context_length
         assert c.threshold_percent == 0.50  # 1M >= 512K: configured value
@@ -2693,4 +2697,3 @@ class TestContextLengthSetterCoherence:
         assert c.threshold_percent == 0.75
         # ...and budgets recompute from the same window+percent.
         assert c.threshold_tokens == 150_000
-

@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
 
 
 def _response(content="ok"):
@@ -25,19 +26,20 @@ def test_slot_reasoning_config_parses_effort_and_none():
 
 
 
-def test_moa_reference_passes_per_slot_reasoning_config(monkeypatch):
+@pytest.mark.asyncio
+async def test_moa_reference_passes_per_slot_reasoning_config(monkeypatch):
     from agent.moa_loop import _run_reference
 
     captured = {}
 
-    def fake_call_llm(**kwargs):
+    async def fake_call_llm(**kwargs):
         captured.update(kwargs)
         return _response("advice")
 
     monkeypatch.setattr("agent.moa_loop.call_llm", fake_call_llm)
     with patch("hermes_cli.runtime_provider.resolve_runtime_provider") as mock_resolve:
         mock_resolve.return_value = {"provider": "openai-codex", "model": "gpt-5.6-sol"}
-        _run_reference(
+        await _run_reference(
             {"provider": "openai-codex", "model": "gpt-5.6-sol", "reasoning_effort": "low"},
             [{"role": "user", "content": "judge this"}],
         )

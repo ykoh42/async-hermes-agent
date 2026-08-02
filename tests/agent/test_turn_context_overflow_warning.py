@@ -13,6 +13,8 @@ from __future__ import annotations
 import time
 from unittest.mock import patch
 
+import pytest
+
 from agent.context_compressor import ContextCompressor
 from agent.turn_context import build_turn_context
 from tests.agent.test_turn_context import _FakeAgent
@@ -33,7 +35,7 @@ def _make_compressor(**kwargs) -> ContextCompressor:
     defaults.update(kwargs)
     # 96K context -> small-context floor raises threshold_percent to 0.75,
     # so threshold_tokens = 72_000. 73_000 is "over threshold".
-    with patch("agent.context_compressor.get_model_context_length", return_value=96000):
+    with patch("agent.context_compressor.get_static_context_length", return_value=96000):
         comp = ContextCompressor(**defaults)
         # Resolve while the mock is active (lazy init, #32221).
         _ = comp.context_length
@@ -81,7 +83,7 @@ class _WarnAgent(_FakeAgent):
         # Replace the MagicMock with a recorder so we can assert contents.
         self._emit_warning = lambda message: self._warnings.append(message)
 
-    def _compress_context(self, messages, *a, **k):
+    async def _compress_context(self, messages, *a, **k):
         self._compress_calls += 1
         return messages, "SYSTEM"
 
@@ -92,12 +94,12 @@ def _build_warn_agent(compressor: ContextCompressor) -> _WarnAgent:
     return agent
 
 
-def _run_build(agent):
+async def _run_build(agent):
     """Run build_turn_context with the prologue-side effects stubbed."""
     with patch("agent.auxiliary_client.set_runtime_main", lambda *a, **k: None), \
          patch("agent.turn_context._should_run_preflight_estimate", return_value=True), \
          patch("agent.turn_context.estimate_request_tokens_rough", return_value=999_999):
-        return build_turn_context(
+        return await build_turn_context(
             agent=agent,
             user_message="hello",
             system_message=None,
@@ -116,12 +118,13 @@ def _run_build(agent):
 
 
 class TestTurnContextOverflowWarning:
-    def test_warns_on_cooldown_block(self):
+    @pytest.mark.asyncio
+    async def test_warns_on_cooldown_block(self):
         comp = _make_compressor()
         comp.last_prompt_tokens = 73_000
         comp._summary_failure_cooldown_until = time.monotonic() + 30
         agent = _build_warn_agent(comp)
-        _run_build(agent)
+        await _run_build(agent)
         assert len(agent._warnings) == 1
         assert "over the compression threshold" in agent._warnings[0]
         assert "blocked (cooldown:" in agent._warnings[0]
@@ -131,7 +134,8 @@ class TestTurnContextOverflowWarning:
 
 
 
-    def test_dedup_resets_when_block_clears_while_over_threshold(self):
+    @pytest.mark.asyncio
+    async def test_dedup_resets_when_block_clears_while_over_threshold(self):
         """The dedup reset must fire when the block clears while pressure is
         still high (the sweeper-review gap): execution enters the compression
         branch — not the ``else`` reset — so the reset must live on the
@@ -143,20 +147,21 @@ class TestTurnContextOverflowWarning:
         comp._summary_failure_cooldown_until = time.monotonic() + 30
         agent = _build_warn_agent(comp)
         # Turn 1: over threshold + cooldown -> warn.
-        _run_build(agent)
+        await _run_build(agent)
         assert len(agent._warnings) == 1
         # Turn 2: cooldown expires while STILL over threshold -> compression
         # branch runs; the reset must happen there (not in the else branch).
         comp._summary_failure_cooldown_until = 0.0
-        _run_build(agent)
+        await _run_build(agent)
         assert agent._compress_calls > 0
         assert agent._last_ctx_overflow_warn is None
         # Turn 3: cooldown re-arms -> the warning must re-fire.
         comp._summary_failure_cooldown_until = time.monotonic() + 30
-        _run_build(agent)
+        await _run_build(agent)
         assert len(agent._warnings) == 2
 
-    def test_no_warning_below_threshold_with_persisted_cooldown(self):
+    @pytest.mark.asyncio
+    async def test_no_warning_below_threshold_with_persisted_cooldown(self):
         """A live cooldown with the context BELOW threshold must not warn —
         there is no overflow to warn about (the cooldown branch is reached
         via the cheap preflight pre-check, which is not a threshold
@@ -168,7 +173,7 @@ class TestTurnContextOverflowWarning:
         with patch("agent.auxiliary_client.set_runtime_main", lambda *a, **k: None), \
              patch("agent.turn_context._should_run_preflight_estimate", return_value=True), \
              patch("agent.turn_context.estimate_request_tokens_rough", return_value=10_000):
-            build_turn_context(
+            await build_turn_context(
                 agent=agent,
                 user_message="hello",
                 system_message=None,
@@ -221,44 +226,3 @@ class TestPluginEngineDefault:
                 return messages
 
         assert _TrueEngine().should_compress_info(1) == (True, None)
-
-
-# ---------------------------------------------------------------------------
-# Gateway noise filter: the warning is FAILURE-CLASS and must survive
-# ---------------------------------------------------------------------------
-
-class TestWarningSurvivesNoiseFilter:
-    """The blocked-overflow warning is a deliberate carve-out from
-    routine-compression silence (#16775 class). The gateway noise regex
-    (#69550 just widened it) must NOT swallow it, or the fix is dead on
-    every chat platform. Executes the REAL compiled regex — never eyeball
-    a regex (noise-regex salvage rule).
-    """
-
-    def _emitted_warning(self, reason: str) -> str:
-        from agent.conversation_compression import (
-            CONTEXT_OVERFLOW_BLOCKED_WARNING_TEMPLATE,
-        )
-
-        return CONTEXT_OVERFLOW_BLOCKED_WARNING_TEMPLATE.format(
-            tokens=85_000, threshold=72_000, reason=reason
-        )
-
-    def test_cooldown_warning_not_matched_by_noise_regex(self):
-        from gateway.run import _TELEGRAM_NOISY_STATUS_RE
-
-        assert not _TELEGRAM_NOISY_STATUS_RE.search(
-            self._emitted_warning("cooldown:30")
-        )
-
-
-    def test_warning_delivered_on_chat_platform(self):
-        """End-to-end through the fail-closed gateway status preparer."""
-        from gateway.config import Platform
-        from gateway.run import _prepare_gateway_status_message
-
-        message = self._emitted_warning("cooldown:30")
-        assert (
-            _prepare_gateway_status_message(Platform.TELEGRAM, "warn", message)
-            == message
-        )

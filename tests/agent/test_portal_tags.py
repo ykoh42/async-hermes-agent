@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import pytest
 
 
 
@@ -144,7 +145,8 @@ def test_nous_sticky_key_matches_conversation_tag():
 
 
 
-def test_compress_context_preserves_ambient_context(monkeypatch):
+@pytest.mark.asyncio
+async def test_compress_context_preserves_ambient_context(monkeypatch):
     """In-turn compaction inherits the turn's root and restores it untouched."""
     import agent.conversation_compression as cc
     from agent.portal_tags import (
@@ -156,20 +158,20 @@ def test_compress_context_preserves_ambient_context(monkeypatch):
 
     seen = {}
 
-    def _fake_compress(agent, messages, system_message, **kwargs):
+    async def _fake_compress(agent, messages, system_message, **kwargs):
         seen["conversation"] = get_conversation_context()
         return ([], "")
 
     monkeypatch.setattr(cc, "compress_context", _fake_compress)
 
     class _Agent:
-        def _conversation_root_id(self):
+        async def _conversation_root_id(self):
             # A rotated segment id must never win over the ambient root.
             return "segment-after-compaction"
 
     token = set_conversation_context("outer-root")
     try:
-        AIAgent._compress_context(_Agent(), [], "sys")
+        await AIAgent._compress_context(_Agent(), [], "sys")
         assert seen["conversation"] == "outer-root"
         assert get_conversation_context() == "outer-root"
     finally:

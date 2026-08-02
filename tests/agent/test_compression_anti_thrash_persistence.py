@@ -22,13 +22,15 @@ The counter now round-trips the durable session-state channel exactly like
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 from agent.context_compressor import ContextCompressor
 from hermes_state import SessionDB
 
 
 def _compressor(db: SessionDB | None = None, session_id: str = "") -> ContextCompressor:
     with patch(
-        "agent.context_compressor.get_model_context_length",
+        "agent.context_compressor.get_static_context_length",
         return_value=100_000,
     ):
         cc = ContextCompressor(
@@ -144,7 +146,8 @@ class TestResetSemanticsPreserved:
 
 
 class TestStrikesPersistFromEveryVerdictSite:
-    def test_no_op_compaction_branches_write_through(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_no_op_compaction_branches_write_through(self, tmp_path):
         """The insufficient-messages no-op branch records its strike durably."""
         db = _db(tmp_path)
         db.create_session("s1", source="cli")
@@ -156,7 +159,7 @@ class TestStrikesPersistFromEveryVerdictSite:
             {"role": "user", "content": "hi"},
             {"role": "assistant", "content": "hello"},
         ]
-        out = cc.compress(msgs, current_tokens=10**9)
+        out = await cc.compress(msgs, current_tokens=10**9)
         assert out == msgs
         assert cc._ineffective_compression_count == 1
         assert db.get_compression_ineffective_count("s1") == 1

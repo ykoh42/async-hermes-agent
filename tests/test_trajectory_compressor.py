@@ -30,7 +30,8 @@ def test_import_loads_env_from_hermes_home(tmp_path, monkeypatch):
     assert os.getenv("OPENROUTER_API_KEY") == "from-hermes-home"
 
 
-def test_generate_summary_kimi_omits_temperature():
+@pytest.mark.asyncio
+async def test_generate_summary_kimi_omits_temperature():
     """Kimi models should have temperature omitted — server manages it."""
     config = CompressionConfig(
         summarization_model="kimi-for-coding",
@@ -42,16 +43,17 @@ def test_generate_summary_kimi_omits_temperature():
     compressor.config = config
     compressor.logger = MagicMock()
     compressor._use_call_llm = False
-    compressor.client = MagicMock()
-    compressor.client.chat.completions.create.return_value = SimpleNamespace(
+    async_client = MagicMock()
+    async_client.chat.completions.create = AsyncMock(return_value=SimpleNamespace(
         choices=[SimpleNamespace(message=SimpleNamespace(content="[CONTEXT SUMMARY]: summary"))]
-    )
+    ))
+    compressor._get_async_client = MagicMock(return_value=async_client)
 
     metrics = TrajectoryMetrics()
-    result = compressor._generate_summary("tool output", metrics)
+    result = await compressor._generate_summary("tool output", metrics)
 
     assert result.startswith("[CONTEXT SUMMARY]:")
-    assert "temperature" not in compressor.client.chat.completions.create.call_args.kwargs
+    assert "temperature" not in async_client.chat.completions.create.call_args.kwargs
 
 
 
@@ -330,15 +332,17 @@ class TestTokenCounting:
 
 
 class TestGenerateSummary:
-    def test_generate_summary_handles_none_content(self):
+    @pytest.mark.asyncio
+    async def test_generate_summary_handles_none_content(self):
         tc = _make_compressor()
-        tc.client = MagicMock()
-        tc.client.chat.completions.create.return_value = SimpleNamespace(
+        async_client = MagicMock()
+        async_client.chat.completions.create = AsyncMock(return_value=SimpleNamespace(
             choices=[SimpleNamespace(message=SimpleNamespace(content=None))]
-        )
+        ))
+        tc._get_async_client = MagicMock(return_value=async_client)
         metrics = TrajectoryMetrics()
 
-        summary = tc._generate_summary("Turn content", metrics)
+        summary = await tc._generate_summary("Turn content", metrics)
 
         assert summary == "[CONTEXT SUMMARY]:"
 
@@ -406,15 +410,16 @@ class TestCompressionToolPairIntegrity:
         config.summary_target_tokens = 4
         return config
 
-    def test_sync_compression_does_not_orphan_tool_markers(self):
+    @pytest.mark.asyncio
+    async def test_compression_does_not_orphan_tool_markers(self):
         tc = _make_compressor(self._config())
-        tc._generate_summary = MagicMock(
+        tc._generate_summary = AsyncMock(
             return_value="[CONTEXT SUMMARY]: middle turns summarized."
         )
         trajectory = _paired_trajectory()
         tc.config.target_max_tokens = _target_that_splits_after_index_4(tc, trajectory)
 
-        compressed, metrics = tc.compress_trajectory(trajectory)
+        compressed, metrics = await tc.compress_trajectory(trajectory)
 
         assert metrics.was_compressed
         # Every <tool_call> must keep its matching <tool_response>.
@@ -479,18 +484,18 @@ class TestCompressionNetSavingsGuard:
         config.target_max_tokens = 100  # trajectory is far over this
         return config
 
-    def test_sync_skips_compression_when_middle_smaller_than_summary(self):
+    @pytest.mark.asyncio
+    async def test_skips_compression_when_middle_smaller_than_summary(self):
         tc = _make_compressor(self._config())
-        tc._generate_summary = MagicMock(
+        tc._generate_summary = AsyncMock(
             return_value="[CONTEXT SUMMARY]: " + "blah " * 30
         )
         trajectory = self._tiny_middle_trajectory()
         before = sum(tc.count_turn_tokens(trajectory))
 
-        compressed, metrics = tc.compress_trajectory(trajectory)
+        compressed, metrics = await tc.compress_trajectory(trajectory)
 
         assert metrics.was_compressed is False
         assert compressed == trajectory
         assert sum(tc.count_turn_tokens(compressed)) == before
         tc._generate_summary.assert_not_called()
-

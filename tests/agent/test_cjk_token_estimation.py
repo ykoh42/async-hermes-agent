@@ -19,7 +19,7 @@ def test_message_estimate_counts_korean_content_as_token_dense():
 
 
 def test_cjk_tail_does_not_expand_to_english_char_budget():
-    with patch("agent.context_compressor.get_model_context_length", return_value=65536):
+    with patch("agent.context_compressor.get_static_context_length", return_value=65536):
         compressor = ContextCompressor(
             "test/model",
             protect_first_n=3,

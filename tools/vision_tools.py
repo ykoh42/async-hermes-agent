@@ -31,6 +31,8 @@ Usage:
 import base64
 import contextlib
 import asyncio
+import aiofiles
+import aiofiles.os
 import json
 from concurrent.futures import ThreadPoolExecutor
 import logging
@@ -43,28 +45,27 @@ import httpx
 
 # ``agent.auxiliary_client`` pulls credential_pool → hermes_cli.auth → httpx
 # → rich (~50 ms cold); only vision handlers need it. Loaded lazily; both
-# names stay module attributes so tests can keep patching
-# ``tools.vision_tools.async_call_llm``. Truthy-skip: injected mocks win.
-async_call_llm: Any = None
+# Names stay module attributes so callers can inject native async test doubles.
+call_llm: Any = None
 extract_content_or_reasoning: Any = None
 
 
 def _load_auxiliary_client() -> None:
-    global async_call_llm, extract_content_or_reasoning
-    if async_call_llm is None or extract_content_or_reasoning is None:
+    global call_llm, extract_content_or_reasoning
+    if call_llm is None or extract_content_or_reasoning is None:
         from agent.auxiliary_client import (
-            async_call_llm as _acl,
+            call_llm as _call_llm,
             extract_content_or_reasoning as _ecr,
         )
-        if async_call_llm is None:
-            async_call_llm = _acl
+        if call_llm is None:
+            call_llm = _call_llm
         if extract_content_or_reasoning is None:
             extract_content_or_reasoning = _ecr
 
 
 from hermes_constants import get_hermes_dir
 from tools.debug_helpers import DebugSession
-from tools.website_policy import check_website_access
+from tools.website_policy import async_check_website_access
 import sys
 
 logger = logging.getLogger(__name__)
@@ -124,9 +125,9 @@ _VISION_MAX_DOWNLOAD_BYTES = 50 * 1024 * 1024
 # and the loop always keeps a core. No fixed ceiling: the limit tracks the host.
 #
 # A threading primitive (NOT asyncio) is required: each vision call is dispatched
-# through model_tools._run_async on a PER-THREAD event loop, so an asyncio
-# executor/semaphore bound to one loop cannot coordinate across them. A
-# ThreadPoolExecutor is loop- and thread-agnostic.
+# through separate agent turns, so an asyncio executor/semaphore bound to one
+# loop cannot coordinate across them. A ThreadPoolExecutor is loop- and
+# thread-agnostic.
 import threading  # noqa: F401  (kept for downstream importers / patch targets)
 
 
@@ -420,8 +421,8 @@ async def _download_image(image_url: str, destination: Path, max_retries: int = 
     """
     import asyncio
     
-    # Create parent directories if they don't exist
-    destination.parent.mkdir(parents=True, exist_ok=True)
+    # Create parent directories without blocking the agent loop.
+    await aiofiles.os.makedirs(destination.parent, exist_ok=True)
     
     async def _ssrf_redirect_guard(response):
         """Re-validate each redirect target to prevent redirect-based SSRF.
@@ -441,7 +442,7 @@ async def _download_image(image_url: str, destination: Path, max_retries: int = 
     last_error = None
     for attempt in range(max_retries):
         try:
-            blocked = check_website_access(image_url)
+            blocked = await async_check_website_access(image_url)
             if blocked:
                 raise PermissionError(blocked["message"])
 
@@ -473,7 +474,7 @@ async def _download_image(image_url: str, destination: Path, max_retries: int = 
                     )
 
                 final_url = str(response.url)
-                blocked = check_website_access(final_url)
+                blocked = await async_check_website_access(final_url)
                 if blocked:
                     raise PermissionError(blocked["message"])
                 
@@ -483,7 +484,8 @@ async def _download_image(image_url: str, destination: Path, max_retries: int = 
                     raise ValueError(
                         f"Image too large ({len(body)} bytes, max {_VISION_MAX_DOWNLOAD_BYTES})"
                     )
-                destination.write_bytes(body)
+                async with aiofiles.open(destination, "wb") as image_file:
+                    await image_file.write(body)
             
             return destination
         except Exception as e:
@@ -853,7 +855,7 @@ def _supports_media_in_tool_results(provider: str, model: str) -> bool:
     return False
 
 
-def _should_use_native_vision_fast_path() -> bool:
+async def _should_use_native_vision_fast_path() -> bool:
     """Whether vision tools should attach the image to the main model directly
     instead of routing through the auxiliary vision LLM.
 
@@ -865,18 +867,27 @@ def _should_use_native_vision_fast_path() -> bool:
     the caller falls back to the legacy aux-LLM path.
     """
     try:
-        from agent.auxiliary_client import _read_main_provider, _read_main_model
+        from agent.auxiliary_client import (
+            _read_main_provider_async,
+            _read_main_model_async,
+        )
         from agent.image_routing import decide_image_input_mode, _lookup_supports_vision
-        from hermes_cli.config import load_config
+        from hermes_cli.config import get_config_path
+        import aiofiles
+        from utils import fast_safe_load
 
-        provider = _read_main_provider()
-        model = _read_main_model()
-        cfg = load_config()
-        if decide_image_input_mode(provider, model, cfg) != "native":
+        provider = await _read_main_provider_async()
+        model = await _read_main_model_async()
+        try:
+            async with aiofiles.open(get_config_path(), encoding="utf-8") as fh:
+                cfg = fast_safe_load(await fh.read()) or {}
+        except FileNotFoundError:
+            cfg = {}
+        if await decide_image_input_mode(provider, model, cfg) != "native":
             return False
         return (
             _supports_media_in_tool_results(provider, model)
-            or _lookup_supports_vision(provider, model, cfg) is True
+            or await _lookup_supports_vision(provider, model, cfg) is True
         )
     except Exception as exc:
         logger.debug("Native vision fast-path check failed: %s", exc)
@@ -998,9 +1009,10 @@ async def _vision_analyze_native(
         detected_mime_type = resolved.mime
         image_size_bytes = len(resolved.data)
         temp_dir = get_hermes_dir("cache/vision", "temp_vision_images")
-        temp_dir.mkdir(parents=True, exist_ok=True)
+        await aiofiles.os.makedirs(temp_dir, exist_ok=True)
         temp_image_path = temp_dir / f"temp_image_{uuid.uuid4()}.img"
-        await asyncio.to_thread(temp_image_path.write_bytes, resolved.data)
+        async with aiofiles.open(temp_image_path, "wb") as output:
+            await output.write(resolved.data)
         should_cleanup = True
 
         # Normalize unsupported formats (SVG, BMP, ...) to PNG BEFORE embedding.
@@ -1008,7 +1020,7 @@ async def _vision_analyze_native(
         # baked into immutable history wedges the session with a 400 on every
         # resume.  Convert here so it can never enter history. Offloaded — the
         # rasterizers/Pillow are blocking.
-        normalized_path, detected_mime_type, _norm_err = await asyncio.to_thread(
+        normalized_path, detected_mime_type, _norm_err = await _run_encode_on_cpu_executor(
             _normalize_to_supported_image, temp_image_path, detected_mime_type,
         )
         if _norm_err or normalized_path is None:
@@ -1017,14 +1029,14 @@ async def _vision_analyze_native(
             )
         if normalized_path != temp_image_path:
             # We created a temp PNG — swap to it and ensure it's cleaned up.
-            if should_cleanup and temp_image_path.exists():
+            if should_cleanup and await aiofiles.os.path.exists(temp_image_path):
                 try:
-                    temp_image_path.unlink()
+                    await aiofiles.os.remove(temp_image_path)
                 except Exception:
                     pass
             temp_image_path = normalized_path
             should_cleanup = True
-            image_size_bytes = temp_image_path.stat().st_size
+            image_size_bytes = (await aiofiles.os.stat(temp_image_path)).st_size
 
         image_data_url = await _run_encode_on_cpu_executor(
             _image_to_base64_data_url,
@@ -1078,8 +1090,8 @@ async def _vision_analyze_native(
         # Only delete temp files we created — never user-provided paths.
         if should_cleanup and temp_image_path is not None:
             try:
-                if temp_image_path.exists():
-                    temp_image_path.unlink()
+                if await aiofiles.os.path.exists(temp_image_path):
+                    await aiofiles.os.remove(temp_image_path)
             except Exception:
                 pass
 
@@ -1168,9 +1180,10 @@ async def vision_analyze_tool(
 
         detected_mime_type = resolved.mime
         temp_dir = get_hermes_dir("cache/vision", "temp_vision_images")
-        temp_dir.mkdir(parents=True, exist_ok=True)
+        await aiofiles.os.makedirs(temp_dir, exist_ok=True)
         temp_image_path = temp_dir / f"temp_image_{uuid.uuid4()}.img"
-        await asyncio.to_thread(temp_image_path.write_bytes, resolved.data)
+        async with aiofiles.open(temp_image_path, "wb") as output:
+            await output.write(resolved.data)
         should_cleanup = True
 
         # Get image file size for logging
@@ -1180,15 +1193,15 @@ async def vision_analyze_tool(
         # Normalize unsupported formats (SVG, BMP, ...) to PNG. Vision providers
         # reject these media types; convert before encoding. Offloaded — the
         # rasterizers/Pillow are blocking.
-        normalized_path, detected_mime_type, _norm_err = await asyncio.to_thread(
+        normalized_path, detected_mime_type, _norm_err = await _run_encode_on_cpu_executor(
             _normalize_to_supported_image, temp_image_path, detected_mime_type,
         )
         if _norm_err or normalized_path is None:
             raise ValueError(_norm_err or "Image normalization failed.")
         if normalized_path != temp_image_path:
-            if should_cleanup and temp_image_path.exists():
+            if should_cleanup and await aiofiles.os.path.exists(temp_image_path):
                 try:
-                    temp_image_path.unlink()
+                    await aiofiles.os.remove(temp_image_path)
                 except Exception:
                     pass
             temp_image_path = normalized_path
@@ -1252,8 +1265,8 @@ async def vision_analyze_tool(
         vision_timeout = 120.0
         vision_temperature = 0.1
         try:
-            from hermes_cli.config import cfg_get, load_config
-            _cfg = load_config()
+            from hermes_cli.config import cfg_get, load_config_readonly_async
+            _cfg = await load_config_readonly_async()
             _vision_cfg = cfg_get(_cfg, "auxiliary", "vision", default={})
             _vt = _vision_cfg.get("timeout")
             if _vt is not None:
@@ -1275,7 +1288,7 @@ async def vision_analyze_tool(
         _load_auxiliary_client()
         # Try full-size image first; on size-related rejection, downscale and retry.
         try:
-            response = await async_call_llm(**call_kwargs)
+            response = await call_llm(**call_kwargs)
         except Exception as _api_err:
             if (_is_image_size_error(_api_err)
                     and len(image_data_url) > _RESIZE_TARGET_BYTES):
@@ -1289,7 +1302,7 @@ async def vision_analyze_tool(
                     _resize_image_for_vision,
                     temp_image_path, mime_type=detected_mime_type)
                 messages[0]["content"][1]["image_url"]["url"] = image_data_url
-                response = await async_call_llm(**call_kwargs)
+                response = await call_llm(**call_kwargs)
             else:
                 raise
         
@@ -1299,7 +1312,7 @@ async def vision_analyze_tool(
         # Retry once on empty content (reasoning-only response)
         if not analysis:
             logger.warning("Vision LLM returned empty content, retrying once")
-            response = await async_call_llm(**call_kwargs)
+            response = await call_llm(**call_kwargs)
             analysis = extract_content_or_reasoning(response)
 
         analysis_length = len(analysis)
@@ -1372,9 +1385,13 @@ async def vision_analyze_tool(
     
     finally:
         # Clean up temporary image file (but NOT local/cached files)
-        if should_cleanup and temp_image_path and temp_image_path.exists():
+        if (
+            should_cleanup
+            and temp_image_path
+            and await aiofiles.os.path.exists(temp_image_path)
+        ):
             try:
-                temp_image_path.unlink()
+                await aiofiles.os.remove(temp_image_path)
                 logger.debug("Cleaned up temporary image file")
             except Exception as cleanup_error:
                 logger.warning(
@@ -1382,7 +1399,7 @@ async def vision_analyze_tool(
                 )
 
 
-def check_vision_requirements() -> bool:
+async def check_vision_requirements() -> bool:
     """Check if the configured runtime vision path can resolve a client.
 
     Mirrors the fallback chain that ``call_llm(task="vision")`` actually uses
@@ -1397,12 +1414,12 @@ def check_vision_requirements() -> bool:
     except ImportError:
         return False
     try:
-        _provider, client, _model = resolve_vision_provider_client()
+        _provider, client, _model = await resolve_vision_provider_client()
         if client is not None:
             return True
         # Same fallback to "auto" that call_llm performs when the configured
         # provider can't be resolved.
-        _provider, client, _model = resolve_vision_provider_client(provider="auto")
+        _provider, client, _model = await resolve_vision_provider_client(provider="auto")
         return client is not None
     except Exception:
         return False
@@ -1417,7 +1434,9 @@ if __name__ == "__main__":
     print("=" * 40)
     
     # Check if vision model is available
-    api_available = check_vision_requirements()
+    import asyncio
+
+    api_available = asyncio.run(check_vision_requirements())
     
     if not api_available:
         print("❌ No auxiliary vision model available")
@@ -1511,7 +1530,7 @@ async def _handle_vision_analyze(args: Dict[str, Any], **kw: Any) -> str:
     # return the image bytes as a multimodal tool-result envelope. The main
     # model sees the pixels directly on its next turn — no aux call, no
     # information loss, no extra latency.
-    if _should_use_native_vision_fast_path():
+    if await _should_use_native_vision_fast_path():
         logger.info("vision_analyze: native fast path")
         return await _vision_analyze_native(image_url, question, task_id=task_id)
 
@@ -1523,8 +1542,8 @@ async def _handle_vision_analyze(args: Dict[str, Any], **kw: Any) -> str:
     # Prefer config.yaml auxiliary.vision.model; env var is a legacy override.
     model = None
     try:
-        from hermes_cli.config import cfg_get, load_config
-        _cfg = load_config()
+        from hermes_cli.config import cfg_get, load_config_readonly_async
+        _cfg = await load_config_readonly_async()
         _vmodel = cfg_get(_cfg, "auxiliary", "vision", "model")
         if _vmodel:
             model = str(_vmodel).strip() or None
@@ -1541,7 +1560,6 @@ registry.register(
     schema=VISION_ANALYZE_SCHEMA,
     handler=_handle_vision_analyze,
     check_fn=check_vision_requirements,
-    is_async=True,
     emoji="👁️",
 )
 
@@ -1571,9 +1589,12 @@ def _detect_video_mime_type(video_path: Path) -> Optional[str]:
     return _VIDEO_MIME_TYPES.get(ext)
 
 
-def _video_to_base64_data_url(video_path: Path, mime_type: Optional[str] = None) -> str:
+async def _video_to_base64_data_url(
+    video_path: Path, mime_type: Optional[str] = None,
+) -> str:
     """Convert a video file to a base64-encoded data URL."""
-    data = video_path.read_bytes()
+    async with aiofiles.open(video_path, "rb") as video_file:
+        data = await video_file.read()
     encoded = base64.b64encode(data).decode("ascii")
     mime = mime_type or _VIDEO_MIME_TYPES.get(video_path.suffix.lower(), "video/mp4")
     return f"data:{mime};base64,{encoded}"
@@ -1583,7 +1604,7 @@ async def _download_video(video_url: str, destination: Path, max_retries: int = 
     """Download video from URL with SSRF protection and retry."""
     import asyncio
 
-    destination.parent.mkdir(parents=True, exist_ok=True)
+    await aiofiles.os.makedirs(destination.parent, exist_ok=True)
 
     async def _ssrf_redirect_guard(response):
         from tools.url_safety import async_is_safe_url, redirect_target_from_response
@@ -1596,7 +1617,7 @@ async def _download_video(video_url: str, destination: Path, max_retries: int = 
     last_error = None
     for attempt in range(max_retries):
         try:
-            blocked = check_website_access(video_url)
+            blocked = await async_check_website_access(video_url)
             if blocked:
                 raise PermissionError(blocked["message"])
 
@@ -1623,7 +1644,7 @@ async def _download_video(video_url: str, destination: Path, max_retries: int = 
                     )
 
                 final_url = str(response.url)
-                blocked = check_website_access(final_url)
+                blocked = await async_check_website_access(final_url)
                 if blocked:
                     raise PermissionError(blocked["message"])
 
@@ -1632,7 +1653,8 @@ async def _download_video(video_url: str, destination: Path, max_retries: int = 
                     raise ValueError(
                         f"Video too large ({len(body)} bytes, max {_MAX_VIDEO_BASE64_BYTES})"
                     )
-                destination.write_bytes(body)
+                async with aiofiles.open(destination, "wb") as video_file:
+                    await video_file.write(body)
 
             return destination
         except Exception as e:
@@ -1692,14 +1714,14 @@ async def video_analyze_tool(
             resolved_url = resolved_url[len("file://"):]
         local_path = Path(os.path.expanduser(resolved_url))
 
-        if local_path.is_file():
+        if await aiofiles.os.path.isfile(local_path):
             from agent.file_safety import raise_if_read_blocked
             raise_if_read_blocked(str(local_path))
             logger.info("Using local video file: %s", video_url)
             temp_video_path = local_path
             should_cleanup = False
         elif await _validate_image_url_async(video_url):
-            blocked = check_website_access(video_url)
+            blocked = await async_check_website_access(video_url)
             if blocked:
                 raise PermissionError(blocked["message"])
             temp_dir = get_hermes_dir("cache/video", "temp_video_files")
@@ -1711,7 +1733,7 @@ async def video_analyze_tool(
                 "Invalid video source. Provide an HTTP/HTTPS URL or a valid local file path."
             )
 
-        video_size_bytes = temp_video_path.stat().st_size
+        video_size_bytes = (await aiofiles.os.stat(temp_video_path)).st_size
         video_size_mb = video_size_bytes / (1024 * 1024)
         logger.info("Video ready (%.1f MB)", video_size_mb)
 
@@ -1725,7 +1747,9 @@ async def video_analyze_tool(
         if video_size_bytes > _VIDEO_SIZE_WARN_BYTES:
             logger.warning("Video is %.1f MB — may be slow or rejected", video_size_mb)
 
-        video_data_url = _video_to_base64_data_url(temp_video_path, mime_type=detected_mime)
+        video_data_url = await _video_to_base64_data_url(
+            temp_video_path, mime_type=detected_mime
+        )
         data_size_mb = len(video_data_url) / (1024 * 1024)
 
         if len(video_data_url) > _MAX_VIDEO_BASE64_BYTES:
@@ -1758,8 +1782,8 @@ async def video_analyze_tool(
         vision_timeout = 180.0
         vision_temperature = 0.1
         try:
-            from hermes_cli.config import cfg_get, load_config
-            _cfg = load_config()
+            from hermes_cli.config import cfg_get, load_config_readonly_async
+            _cfg = await load_config_readonly_async()
             _vision_cfg = cfg_get(_cfg, "auxiliary", "vision", default={})
             _vt = _vision_cfg.get("timeout")
             if _vt is not None:
@@ -1781,12 +1805,12 @@ async def video_analyze_tool(
             call_kwargs["model"] = model
 
         _load_auxiliary_client()
-        response = await async_call_llm(**call_kwargs)
+        response = await call_llm(**call_kwargs)
         analysis = extract_content_or_reasoning(response)
 
         if not analysis:
             logger.warning("Empty video response, retrying once")
-            response = await async_call_llm(**call_kwargs)
+            response = await call_llm(**call_kwargs)
             analysis = extract_content_or_reasoning(response)
 
         analysis_length = len(analysis) if analysis else 0
@@ -1854,9 +1878,13 @@ async def video_analyze_tool(
         return json.dumps(result, indent=2, ensure_ascii=False)
 
     finally:
-        if should_cleanup and temp_video_path and temp_video_path.exists():
+        if (
+            should_cleanup
+            and temp_video_path
+            and await aiofiles.os.path.exists(temp_video_path)
+        ):
             try:
-                temp_video_path.unlink()
+                await aiofiles.os.remove(temp_video_path)
                 logger.debug("Cleaned up temporary video file")
             except Exception as cleanup_error:
                 logger.warning(
@@ -1920,6 +1948,5 @@ registry.register(
     schema=VIDEO_ANALYZE_SCHEMA,
     handler=_handle_video_analyze,
     check_fn=check_vision_requirements,
-    is_async=True,
     emoji="🎬",
 )

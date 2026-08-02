@@ -195,7 +195,7 @@ def test_codex_gpt55_autoraise_still_applies_to_builtin_compressor():
 
     with (
         patch("hermes_cli.config.load_config", return_value=cfg), patch("hermes_cli.config.load_config_readonly", return_value=cfg),
-        patch("agent.context_compressor.get_model_context_length", return_value=272_000),
+        patch("agent.context_compressor.get_static_context_length", return_value=272_000),
         patch("run_agent.get_tool_definitions", return_value=[]),
         patch("run_agent.check_toolset_requirements", return_value={}),
         patch("run_agent.OpenAI"),

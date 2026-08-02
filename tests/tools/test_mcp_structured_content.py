@@ -31,7 +31,7 @@ class _FakeCallToolResult:
         self.structuredContent = structuredContent
 
 
-def _fake_run_on_mcp_loop(coro_or_factory, timeout=30):
+def _fake_await_mcp_operation(coro_or_factory, timeout=30):
     coro = coro_or_factory() if callable(coro_or_factory) else coro_or_factory
     """Run an MCP coroutine directly in a fresh event loop."""
     loop = asyncio.new_event_loop()
@@ -55,10 +55,10 @@ def _patch_mcp_server():
     fake_session = MagicMock()
     # `_rpc_lock` is acquired by _make_tool_handler's call path (mcp_tool.py
     # ~L2008) to serialize JSON-RPC against the server — build it inside the
-    # fresh loop that _fake_run_on_mcp_loop spins up, not at fixture import.
+    # fresh loop that _fake_await_mcp_operation spins up, not at fixture import.
     fake_server = SimpleNamespace(session=fake_session, _rpc_lock=None)
     with patch.dict(mcp_tool._servers, {"test-server": fake_server}), \
-         patch("tools.mcp_tool._run_on_mcp_loop", side_effect=_fake_run_on_mcp_loop):
+         patch("tools.mcp_tool._await_mcp_operation", side_effect=_fake_await_mcp_operation):
         yield fake_session
 
 

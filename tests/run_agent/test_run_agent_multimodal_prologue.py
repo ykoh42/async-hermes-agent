@@ -13,8 +13,10 @@ They do NOT boot the full AIAgent — the prologue-fix guarantees are pure
 function contracts at module scope.
 """
 
-from run_agent import _summarize_user_message_for_log
-from agent.codex_responses_adapter import _chat_content_to_responses_parts
+from agent.codex_responses_adapter import (
+    _chat_content_to_responses_parts,
+    _summarize_user_message_for_log,
+)
 
 
 class TestSummarizeUserMessageForLog:
@@ -40,7 +42,6 @@ class TestChatContentToResponsesParts:
     def test_text_parts_become_input_text(self):
         content = [{"type": "text", "text": "hello"}]
         assert _chat_content_to_responses_parts(content) == [{"type": "input_text", "text": "hello"}]
-
 
 
 

@@ -194,7 +194,7 @@ def _make_hermes_provider_class() -> Optional[type]:
                 isinstance(storage, HermesTokenStorage)
                 and self.context.oauth_metadata is None
             ):
-                meta = storage.load_oauth_metadata()
+                meta = await storage.load_oauth_metadata()
                 if meta is not None:
                     self.context.oauth_metadata = meta
                     logger.debug(
@@ -290,7 +290,7 @@ def _make_hermes_provider_class() -> Optional[type]:
                         storage = self.context.storage
                         from tools.mcp_oauth import HermesTokenStorage
                         if isinstance(storage, HermesTokenStorage):
-                            storage.save_oauth_metadata(asm)
+                            await storage.save_oauth_metadata(asm)
                         logger.debug(
                             "MCP OAuth '%s': pre-flight ASM discovered "
                             "token_endpoint=%s",
@@ -298,7 +298,7 @@ def _make_hermes_provider_class() -> Optional[type]:
                         )
                         break
 
-        def _persist_oauth_metadata_if_changed(self) -> None:
+        async def _persist_oauth_metadata_if_changed(self) -> None:
             """Persist discovered OAuth metadata for future process restarts.
 
             Called after the SDK's normal 401-branch auth flow completes so
@@ -312,12 +312,12 @@ def _make_hermes_provider_class() -> Optional[type]:
             from tools.mcp_oauth import HermesTokenStorage
             if not isinstance(storage, HermesTokenStorage):
                 return
-            existing = storage.load_oauth_metadata()
+            existing = await storage.load_oauth_metadata()
             if (
                 existing is None
                 or str(existing.token_endpoint) != str(meta.token_endpoint)
             ):
-                storage.save_oauth_metadata(meta)
+                await storage.save_oauth_metadata(meta)
 
         async def _maybe_flag_poisoned_client(self, response: Any) -> None:
             """Detect a dead client registration and force re-registration.
@@ -377,7 +377,7 @@ def _make_hermes_provider_class() -> Optional[type]:
                 storage = self.context.storage
                 from tools.mcp_oauth import HermesTokenStorage
                 if isinstance(storage, HermesTokenStorage):
-                    storage.poison_client_registration()
+                    await storage.poison_client_registration()
                 # Drop the in-memory client so the SDK re-registers next flow.
                 self.context.client_info = None
                 self._initialized = False
@@ -428,7 +428,7 @@ def _make_hermes_provider_class() -> Optional[type]:
             except StopAsyncIteration:
                 # Persist any metadata the SDK discovered lazily during the
                 # 401 branch so a subsequent cold-load skips discovery.
-                self._persist_oauth_metadata_if_changed()
+                await self._persist_oauth_metadata_if_changed()
                 return
 
     return HermesMCPOAuthProvider
@@ -497,6 +497,41 @@ class MCPOAuthManager:
                 if entry.provider is not None:
                     entry.provider._hermes_home = key[0]
 
+            return entry.provider
+
+    async def get_or_build_provider_async(
+        self,
+        server_name: str,
+        server_url: str,
+        oauth_config: Optional[dict],
+    ) -> Optional[Any]:
+        """Return/build a provider using only native async persistence.
+
+        MCP transport startup runs on the agent event loop.  The historical
+        synchronous method remains for CLI/setup callers, while this method
+        owns the active runtime path and serializes construction per server.
+        """
+        key = self._key(server_name)
+        with self._entries_lock:
+            entry = self._entries.get(key)
+            if entry is not None and entry.server_url != server_url:
+                logger.info(
+                    "MCP OAuth '%s': URL changed from %s to %s, discarding cache",
+                    server_name, entry.server_url, server_url,
+                )
+                entry = None
+            if entry is None:
+                entry = _ProviderEntry(
+                    server_url=server_url,
+                    oauth_config=oauth_config,
+                )
+                self._entries[key] = entry
+
+        async with entry.lock:
+            if entry.provider is None:
+                entry.provider = await self._build_provider_async(server_name, entry)
+                if entry.provider is not None:
+                    entry.provider._hermes_home = key[0]
             return entry.provider
 
     @staticmethod
@@ -587,6 +622,74 @@ class MCPOAuthManager:
             timeout=float(cfg.get("timeout", 300)),
         )
 
+    async def _build_provider_async(
+        self,
+        server_name: str,
+        entry: _ProviderEntry,
+    ) -> Optional[Any]:
+        """Build an OAuth provider without blocking filesystem operations."""
+        if _HERMES_PROVIDER_CLS is None:
+            logger.warning(
+                "MCP OAuth '%s': SDK auth module unavailable", server_name,
+            )
+            return None
+
+        from tools.mcp_oauth import (
+            HermesTokenStorage,
+            OAuthNonInteractiveError,
+            _OAUTH_AVAILABLE,
+            _build_client_metadata,
+            _configure_callback_port,
+            _is_interactive,
+            _maybe_preregister_client_async,
+            _make_callback_waiter,
+            _make_redirect_handler,
+            apply_oauth_provider_defaults,
+        )
+
+        if not _OAUTH_AVAILABLE:
+            return None
+
+        cfg = dict(entry.oauth_config or {})
+        apply_oauth_provider_defaults(
+            cfg, server_name=server_name, server_url=entry.server_url
+        )
+        storage = HermesTokenStorage(server_name)
+
+        from tools.mcp_dashboard_oauth import get_dashboard_oauth_flow
+
+        if (
+            get_dashboard_oauth_flow() is None
+            and not _is_interactive()
+            and not await storage.has_cached_tokens_async()
+        ):
+            raise OAuthNonInteractiveError(
+                "MCP OAuth for "
+                f"'{server_name}': non-interactive environment and no "
+                "cached tokens found. Run `hermes mcp login "
+                f"{server_name}` interactively first to complete initial "
+                "authorization."
+            )
+
+        _configure_callback_port(cfg, storage)
+        client_metadata = _build_client_metadata(cfg)
+        await _maybe_preregister_client_async(storage, cfg, client_metadata)
+
+        resolved_port = cfg.get("_resolved_port", 0)
+        redirect_handler = _make_redirect_handler(resolved_port)
+        callback_handler = _make_callback_waiter(resolved_port)
+
+        return _HERMES_PROVIDER_CLS(
+            server_name=server_name,
+            preregistered=bool(cfg.get("client_id")),
+            server_url=entry.server_url,
+            client_metadata=client_metadata,
+            storage=storage,
+            redirect_handler=redirect_handler,
+            callback_handler=callback_handler,
+            timeout=float(cfg.get("timeout", 300)),
+        )
+
     def remove(
         self,
         server_name: str,
@@ -649,6 +752,7 @@ class MCPOAuthManager:
         session picks them up without a restart.
         """
         from tools.mcp_oauth import _get_token_dir, _safe_filename
+        import aiofiles.os
 
         entry = self._entries.get(self._key(server_name, hermes_home))
         if entry is None or entry.provider is None:
@@ -657,7 +761,7 @@ class MCPOAuthManager:
         async with entry.lock:
             tokens_path = _get_token_dir(hermes_home) / f"{_safe_filename(server_name)}.json"
             try:
-                mtime_ns = tokens_path.stat().st_mtime_ns
+                mtime_ns = (await aiofiles.os.stat(tokens_path)).st_mtime_ns
             except (FileNotFoundError, OSError):
                 return False
 

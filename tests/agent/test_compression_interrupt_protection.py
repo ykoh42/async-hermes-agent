@@ -15,6 +15,7 @@ from __future__ import annotations
 from unittest.mock import patch
 
 import agent.auxiliary_client as aux
+import pytest
 
 
 class TestAuxInterruptProtection:
@@ -43,7 +44,8 @@ class TestCompressionProtectsSummaryCall:
     """The compressor must wrap its summary call_llm in aux_interrupt_protection
     so a mid-flight interrupt doesn't abort it (#23975)."""
 
-    def test_compressor_call_site_uses_protection(self):
+    @pytest.mark.asyncio
+    async def test_compressor_call_site_uses_protection(self):
         # The summary call must run inside aux_interrupt_protection. We assert
         # the protection flag is ACTIVE at the moment call_llm is invoked.
         from agent.context_compressor import ContextCompressor
@@ -57,13 +59,13 @@ class TestCompressionProtectsSummaryCall:
                 message = _Msg()
             choices = [_Choice()]
 
-        def fake_call_llm(**kwargs):
+        async def fake_call_llm(**kwargs):
             # Capture whether protection was active during the call.
             seen["protected"] = aux._aux_interrupt_protected()
             seen["task"] = kwargs.get("task")
             return _Resp()
 
-        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+        with patch("agent.context_compressor.get_static_context_length", return_value=100000):
             c = ContextCompressor(model="test", quiet_mode=True)
 
         msgs = [
@@ -73,7 +75,7 @@ class TestCompressionProtectsSummaryCall:
             {"role": "assistant", "content": "done"},
         ]
         with patch("agent.context_compressor.call_llm", side_effect=fake_call_llm):
-            summary = c._generate_summary(msgs)
+            summary = await c._generate_summary(msgs)
 
         assert summary is not None
         assert seen.get("task") == "compression"

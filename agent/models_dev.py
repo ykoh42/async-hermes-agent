@@ -26,6 +26,7 @@ import json
 import logging
 import threading
 import time
+import asyncio
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -47,6 +48,7 @@ _models_dev_retry_after: float = 0
 _models_dev_fetch_lock = threading.Lock()
 _models_dev_refresh_lock = threading.Lock()
 _models_dev_refresh_in_flight = False
+_models_dev_async_lock: Optional[asyncio.Lock] = None
 
 
 # ---------------------------------------------------------------------------
@@ -674,6 +676,128 @@ def get_model_capabilities(provider: str, model: str) -> Optional[ModelCapabilit
         context_window=context_window,
         max_output_tokens=max_output_tokens,
         model_family=model_family,
+    )
+
+
+async def fetch_models_dev_async(
+    force_refresh: bool = False,
+    *,
+    allow_network: bool = True,
+) -> Dict[str, Any]:
+    """Fetch the models.dev registry without blocking the event loop.
+
+    CLI/setup callers continue to use :func:`fetch_models_dev`, while the
+    agent turn uses this native transport.  Stale capability data is safe to
+    serve, so the async path never starts a background thread as a side
+    effect of a request.
+    """
+    global _models_dev_cache, _models_dev_cache_time, _models_dev_retry_after
+    global _models_dev_async_lock
+
+    if (
+        not force_refresh
+        and _models_dev_cache
+        and (time.time() - _models_dev_cache_time) < _MODELS_DEV_CACHE_TTL
+    ):
+        return _models_dev_cache
+
+    if _models_dev_async_lock is None:
+        _models_dev_async_lock = asyncio.Lock()
+
+    async with _models_dev_async_lock:
+        if (
+            not force_refresh
+            and _models_dev_cache
+            and (time.time() - _models_dev_cache_time) < _MODELS_DEV_CACHE_TTL
+        ):
+            return _models_dev_cache
+
+        import aiofiles
+        import aiofiles.os
+
+        cache_path = _get_cache_path()
+        if not force_refresh:
+            try:
+                if await aiofiles.os.path.exists(cache_path):
+                    async with aiofiles.open(cache_path, encoding="utf-8") as fh:
+                        disk_data = json.loads(await fh.read())
+                    if isinstance(disk_data, dict) and disk_data:
+                        _models_dev_cache = disk_data
+                        _models_dev_cache_time = time.time()
+                        return _models_dev_cache
+            except Exception as exc:
+                logger.debug("Failed to load async models.dev cache: %s", exc)
+
+        if not allow_network or (
+            not force_refresh and time.time() < _models_dev_retry_after
+        ):
+            return _models_dev_cache
+
+        import httpx
+
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=5.0)) as client:
+                response = await client.get(MODELS_DEV_URL)
+                response.raise_for_status()
+                data = response.json()
+            if not isinstance(data, dict) or not data:
+                raise ValueError("models.dev returned an empty or invalid registry")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            _models_dev_retry_after = time.time() + _MODELS_DEV_RETRY_DELAY
+            logger.debug("Async models.dev refresh failed: %s", exc)
+            return _models_dev_cache
+
+        _models_dev_cache = data
+        _models_dev_cache_time = time.time()
+        _models_dev_retry_after = 0
+        try:
+            await aiofiles.os.makedirs(cache_path.parent, exist_ok=True)
+            async with aiofiles.open(cache_path, "w", encoding="utf-8") as fh:
+                await fh.write(json.dumps(data, separators=(",", ":")))
+        except Exception as exc:
+            logger.debug("Failed to persist async models.dev cache: %s", exc)
+        return _models_dev_cache
+
+
+async def get_model_capabilities_async(
+    provider: str,
+    model: str,
+) -> Optional[ModelCapabilities]:
+    """Async counterpart of :func:`get_model_capabilities`."""
+    mdev_provider_id = PROVIDER_TO_MODELS_DEV.get(provider)
+    if not mdev_provider_id:
+        return None
+    data = await fetch_models_dev_async()
+    provider_data = data.get(mdev_provider_id)
+    if not isinstance(provider_data, dict):
+        return None
+    models = provider_data.get("models", {})
+    if not isinstance(models, dict):
+        return None
+    entry = _find_model_entry(models, model)
+    if entry is None:
+        return None
+
+    input_mods = entry.get("modalities", {})
+    input_mods = input_mods.get("input") if isinstance(input_mods, dict) else None
+    supports_vision = (
+        "image" in input_mods
+        if isinstance(input_mods, list)
+        else bool(entry.get("attachment", False))
+    )
+    limit = entry.get("limit", {})
+    limit = limit if isinstance(limit, dict) else {}
+    context = limit.get("context")
+    output = limit.get("output")
+    return ModelCapabilities(
+        supports_tools=bool(entry.get("tool_call", False)),
+        supports_vision=supports_vision,
+        supports_reasoning=bool(entry.get("reasoning", False)),
+        context_window=int(context) if isinstance(context, (int, float)) and context > 0 else 200000,
+        max_output_tokens=int(output) if isinstance(output, (int, float)) and output > 0 else 8192,
+        model_family=entry.get("family", "") or "",
     )
 
 

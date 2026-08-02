@@ -145,10 +145,11 @@ def _get_proxy_for_base_url(base_url: Optional[str]) -> Optional[str]:
 def build_keepalive_http_client(
     base_url: str = "",
     *,
-    async_mode: bool = False,
     verify: Any = True,
 ) -> Optional[Any]:
-    """Build an httpx client for OpenAI SDK calls with env-only proxy policy.
+    """Build the native async httpx client for OpenAI SDK calls.
+
+    The Hermes runtime never hides a blocking transport behind an async API.
 
     Uses explicit ``HTTPS_PROXY`` / ``NO_PROXY`` env vars via
     ``_get_proxy_for_base_url``. Plain no-proxy mounts disable httpx's default
@@ -182,8 +183,8 @@ def build_keepalive_http_client(
         # Generous read=None for SSE streaming endpoints.
         timeout = httpx.Timeout(connect=15.0, read=None, write=15.0, pool=10.0)
 
-        transport_cls = httpx.AsyncHTTPTransport if async_mode else httpx.HTTPTransport
-        client_cls = httpx.AsyncClient if async_mode else httpx.Client
+        transport_cls = httpx.AsyncHTTPTransport
+        client_cls = httpx.AsyncClient
         mounts = {}
         if proxy is None:
             mounts = {

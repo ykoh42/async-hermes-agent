@@ -10,8 +10,9 @@ Verifies that:
 """
 
 import time
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
 
 from run_agent import AIAgent
 
@@ -56,6 +57,20 @@ def _mock_resolve(base_url="https://openrouter.ai/api/v1", api_key="fallback-key
     mock_client.api_key = api_key
     mock_client.base_url = base_url
     return mock_client
+
+
+def _native_fallback(provider: str, model: str, *, base_url: str | None = None) -> dict:
+    """A fallback entry usable without the synchronous provider router."""
+    return {
+        "provider": provider,
+        "model": model,
+        "api_key": "fallback-key-1234",
+        "base_url": base_url or {
+            "anthropic": "https://api.anthropic.com",
+            "deepseek": "https://api.deepseek.com/v1",
+            "openrouter": "https://openrouter.ai/api/v1",
+        }.get(provider, "https://fallback.example/v1"),
+    }
 
 
 # =============================================================================
@@ -116,22 +131,22 @@ class TestPrimaryRuntimeSnapshot:
 # =============================================================================
 
 class TestRestorePrimaryRuntime:
-    def test_noop_when_not_fallback(self):
+    @pytest.mark.asyncio
+    async def test_noop_when_not_fallback(self):
         agent = _make_agent()
         assert agent._fallback_activated is False
-        assert agent._restore_primary_runtime() is False
+        assert await agent._restore_primary_runtime() is False
 
-    def test_restores_model_and_provider(self):
+    @pytest.mark.asyncio
+    async def test_restores_model_and_provider(self):
         agent = _make_agent(
-            fallback_model={"provider": "openrouter", "model": "anthropic/claude-sonnet-4"},
+            fallback_model=_native_fallback("openrouter", "anthropic/claude-sonnet-4"),
         )
         original_model = agent.model
         original_provider = agent.provider
 
         # Simulate fallback activation
-        mock_client = _mock_resolve()
-        with patch("agent.auxiliary_client.resolve_provider_client", return_value=(mock_client, None)):
-            agent._try_activate_fallback()
+        await agent._try_activate_fallback()
 
         assert agent._fallback_activated is True
         assert agent.model == "anthropic/claude-sonnet-4"
@@ -139,56 +154,55 @@ class TestRestorePrimaryRuntime:
 
         # Restore should bring back the primary
         with patch("run_agent.OpenAI", return_value=MagicMock()):
-            result = agent._restore_primary_runtime()
+            result = await agent._restore_primary_runtime()
 
         assert result is True
         assert agent._fallback_activated is False
         assert agent.model == original_model
         assert agent.provider == original_provider
 
-    def test_resets_fallback_index(self):
+    @pytest.mark.asyncio
+    async def test_resets_fallback_index(self):
         """After restore, the full fallback chain should be available again."""
         agent = _make_agent(
             fallback_model=[
-                {"provider": "openrouter", "model": "model-a"},
-                {"provider": "anthropic", "model": "model-b"},
+                _native_fallback("openrouter", "model-a"),
+                _native_fallback("anthropic", "model-b"),
             ],
         )
         # Advance through the chain
-        mock_client = _mock_resolve()
-        with patch("agent.auxiliary_client.resolve_provider_client", return_value=(mock_client, None)):
-            agent._try_activate_fallback()
+        await agent._try_activate_fallback()
 
         assert agent._fallback_index == 1  # consumed one entry
 
         with patch("run_agent.OpenAI", return_value=MagicMock()):
-            agent._restore_primary_runtime()
+            await agent._restore_primary_runtime()
 
         assert agent._fallback_index == 0  # reset for next turn
 
-    def test_restores_compressor_state(self):
+    @pytest.mark.asyncio
+    async def test_restores_compressor_state(self):
         agent = _make_agent(
-            fallback_model={"provider": "openrouter", "model": "anthropic/claude-sonnet-4"},
+            fallback_model=_native_fallback("openrouter", "anthropic/claude-sonnet-4"),
         )
         original_ctx_len = agent.context_compressor.context_length
         original_threshold = agent.context_compressor.threshold_tokens
 
         # Simulate fallback modifying compressor
-        mock_client = _mock_resolve()
-        with patch("agent.auxiliary_client.resolve_provider_client", return_value=(mock_client, None)):
-            agent._try_activate_fallback()
+        await agent._try_activate_fallback()
 
         # Manually simulate compressor being changed (as _try_activate_fallback does)
         agent.context_compressor.context_length = 32000
         agent.context_compressor.threshold_tokens = 25600
 
         with patch("run_agent.OpenAI", return_value=MagicMock()):
-            agent._restore_primary_runtime()
+            await agent._restore_primary_runtime()
 
         assert agent.context_compressor.context_length == original_ctx_len
         assert agent.context_compressor.threshold_tokens == original_threshold
 
-    def test_restores_prompt_caching_flag(self):
+    @pytest.mark.asyncio
+    async def test_restores_prompt_caching_flag(self):
         agent = _make_agent()
         original_caching = agent._use_prompt_caching
 
@@ -197,11 +211,12 @@ class TestRestorePrimaryRuntime:
         agent._use_prompt_caching = not original_caching
 
         with patch("run_agent.OpenAI", return_value=MagicMock()):
-            agent._restore_primary_runtime()
+            await agent._restore_primary_runtime()
 
         assert agent._use_prompt_caching == original_caching
 
-    def test_restore_skips_cross_provider_pool_entry(self):
+    @pytest.mark.asyncio
+    async def test_restore_skips_cross_provider_pool_entry(self):
         """Restore must not swap in a fallback provider credential for the primary runtime."""
 
         class _Entry:
@@ -215,33 +230,32 @@ class TestRestorePrimaryRuntime:
         class _Pool:
             provider = "openrouter"
 
-            def has_available(self):
+            async def has_available(self):
                 return True
 
-            def select(self):
+            async def select(self):
                 return _Entry()
 
         agent = _make_agent(
             provider="custom",
             base_url="https://primary.example.com/v1",
-            fallback_model={"provider": "openrouter", "model": "anthropic/claude-sonnet-4"},
+            fallback_model=_native_fallback("openrouter", "anthropic/claude-sonnet-4"),
         )
         original_base_url = agent.base_url
-        mock_client = _mock_resolve()
-        with patch("agent.auxiliary_client.resolve_provider_client", return_value=(mock_client, None)):
-            agent._try_activate_fallback()
+        await agent._try_activate_fallback()
         agent._credential_pool = _Pool()
-        agent._swap_credential = MagicMock()
+        agent._swap_credential = AsyncMock()
 
         with patch("run_agent.OpenAI", return_value=MagicMock()):
-            result = agent._restore_primary_runtime()
+            result = await agent._restore_primary_runtime()
 
         assert result is True
         assert agent.provider == "custom"
         assert agent.base_url == original_base_url
-        agent._swap_credential.assert_not_called()
+        agent._swap_credential.assert_not_awaited()
 
-    def test_restore_keeps_primary_base_url_when_fallback_pool_attached(self):
+    @pytest.mark.asyncio
+    async def test_restore_keeps_primary_base_url_when_fallback_pool_attached(self):
         """Issue #56885: plain-provider primary must not inherit a fallback
         provider's base_url via the restore-path pool reselect.
 
@@ -263,37 +277,35 @@ class TestRestorePrimaryRuntime:
         class _DeepseekPool:
             provider = "deepseek"
 
-            def has_available(self):
+            async def has_available(self):
                 return True
 
-            def select(self):
+            async def select(self):
                 return _DeepseekEntry()
 
         agent = _make_agent(
             provider="openai-api",
             base_url="https://api.openai.com/v1",
-            fallback_model={"provider": "deepseek", "model": "deepseek-v4-flash"},
+            fallback_model=_native_fallback("deepseek", "deepseek-v4-flash"),
         )
         primary_base_url = agent.base_url
         primary_provider = agent.provider
-        mock_client = _mock_resolve(base_url="https://api.deepseek.com/v1")
-        with patch(
-            "agent.auxiliary_client.resolve_provider_client",
-            return_value=(mock_client, None),
-        ):
-            agent._try_activate_fallback()
+        await agent._try_activate_fallback()
         # Fallback attached deepseek's pool; simulate it surviving into the next turn.
         agent._credential_pool = _DeepseekPool()
-        agent._swap_credential = MagicMock()
+        agent._swap_credential = AsyncMock()
 
         primary_pool = MagicMock()
         primary_pool.provider = primary_provider
-        primary_pool.has_available.return_value = False
+        primary_pool.has_available = AsyncMock(return_value=False)
         with (
             patch("run_agent.OpenAI", return_value=MagicMock()),
-            patch("agent.credential_pool.load_pool", return_value=primary_pool) as load_pool,
+            patch(
+                "agent.credential_pool.load_pool",
+                new=AsyncMock(return_value=primary_pool),
+            ) as load_pool,
         ):
-            result = agent._restore_primary_runtime()
+            result = await agent._restore_primary_runtime()
 
         assert result is True
         assert agent.provider == primary_provider
@@ -301,9 +313,10 @@ class TestRestorePrimaryRuntime:
         assert "deepseek" not in str(agent.base_url)
         assert agent._credential_pool is primary_pool
         load_pool.assert_called_once_with(primary_provider)
-        agent._swap_credential.assert_not_called()
+        agent._swap_credential.assert_not_awaited()
 
-    def test_restore_clears_fallback_pool_when_primary_pool_reload_fails(self):
+    @pytest.mark.asyncio
+    async def test_restore_clears_fallback_pool_when_primary_pool_reload_fails(self):
         """A fallback pool must never remain attached to the restored primary."""
         agent = _make_agent(
             provider="openai-api",
@@ -318,16 +331,17 @@ class TestRestorePrimaryRuntime:
             patch("run_agent.OpenAI", return_value=MagicMock()),
             patch(
                 "agent.credential_pool.load_pool",
-                side_effect=RuntimeError("auth store unavailable"),
+                new=AsyncMock(side_effect=RuntimeError("auth store unavailable")),
             ),
         ):
-            result = agent._restore_primary_runtime()
+            result = await agent._restore_primary_runtime()
 
         assert result is True
         assert agent.provider == "openai-api"
         assert agent._credential_pool is None
 
-    def test_restore_swaps_matching_custom_pool_entry(self):
+    @pytest.mark.asyncio
+    async def test_restore_swaps_matching_custom_pool_entry(self):
         """Custom primary + custom:<name> entry whose base_url resolves to the
         SAME custom key must swap (legitimate same-endpoint rotation)."""
 
@@ -342,16 +356,16 @@ class TestRestorePrimaryRuntime:
         class _Pool:
             provider = "custom:myllm"
 
-            def has_available(self):
+            async def has_available(self):
                 return True
 
-            def select(self):
+            async def select(self):
                 return _Entry()
 
         agent = _make_agent(provider="custom", base_url="https://my-llm.example.com/v1")
         agent._fallback_activated = True
         agent._credential_pool = _Pool()
-        agent._swap_credential = MagicMock()
+        agent._swap_credential = AsyncMock()
 
         with (
             patch(
@@ -360,10 +374,10 @@ class TestRestorePrimaryRuntime:
             ),
             patch("run_agent.OpenAI", return_value=MagicMock()),
         ):
-            result = agent._restore_primary_runtime()
+            result = await agent._restore_primary_runtime()
 
         assert result is True
-        agent._swap_credential.assert_called_once()
+        agent._swap_credential.assert_awaited_once()
 
 
 
@@ -380,13 +394,14 @@ def _make_transport_error(error_type="ReadTimeout"):
 
 class TestTryRecoverPrimaryTransport:
 
-    def test_recovers_on_read_timeout(self):
+    @pytest.mark.asyncio
+    async def test_recovers_on_read_timeout(self):
         agent = _make_agent(provider="custom")
         error = _make_transport_error("ReadTimeout")
 
         with patch("run_agent.OpenAI", return_value=MagicMock()), \
-             patch("time.sleep"):
-            result = agent._try_recover_primary_transport(
+             patch("agent.agent_runtime_helpers.asyncio.sleep", new_callable=AsyncMock):
+            result = await agent._try_recover_primary_transport(
                 error, retry_count=3, max_retries=3,
             )
 
@@ -396,12 +411,13 @@ class TestTryRecoverPrimaryTransport:
 
 
 
-    def test_skipped_when_already_on_fallback(self):
+    @pytest.mark.asyncio
+    async def test_skipped_when_already_on_fallback(self):
         agent = _make_agent(provider="custom")
         agent._fallback_activated = True
         error = _make_transport_error("ReadTimeout")
 
-        result = agent._try_recover_primary_transport(
+        result = await agent._try_recover_primary_transport(
             error, retry_count=3, max_retries=3,
         )
         assert result is False
@@ -409,7 +425,8 @@ class TestTryRecoverPrimaryTransport:
 
 
 
-    def test_allowed_for_nous_anthropic_messages(self):
+    @pytest.mark.asyncio
+    async def test_allowed_for_nous_anthropic_messages(self):
         """Portal Claude holds a local Anthropic SDK client — rebuild it."""
         agent = _make_agent(
             provider="nous",
@@ -433,9 +450,9 @@ class TestTryRecoverPrimaryTransport:
                 "agent.anthropic_adapter.build_anthropic_client",
                 return_value=rebuilt,
             ),
-            patch("time.sleep"),
+            patch("agent.agent_runtime_helpers.asyncio.sleep", new_callable=AsyncMock),
         ):
-            result = agent._try_recover_primary_transport(
+            result = await agent._try_recover_primary_transport(
                 error, retry_count=3, max_retries=3,
             )
 
@@ -444,39 +461,42 @@ class TestTryRecoverPrimaryTransport:
 
 
 
-    def test_wait_time_scales_with_retry_count(self):
+    @pytest.mark.asyncio
+    async def test_wait_time_scales_with_retry_count(self):
         agent = _make_agent(provider="custom")
         error = _make_transport_error("ReadTimeout")
 
         with patch("run_agent.OpenAI", return_value=MagicMock()), \
-             patch("time.sleep") as mock_sleep:
-            agent._try_recover_primary_transport(
+             patch("agent.agent_runtime_helpers.asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+            await agent._try_recover_primary_transport(
                 error, retry_count=3, max_retries=3,
             )
             # wait_time = min(3 + retry_count, 8) = min(6, 8) = 6
-            mock_sleep.assert_called_once_with(6)
+            mock_sleep.assert_awaited_once_with(6)
 
-    def test_wait_time_capped_at_8(self):
+    @pytest.mark.asyncio
+    async def test_wait_time_capped_at_8(self):
         agent = _make_agent(provider="custom")
         error = _make_transport_error("ReadTimeout")
 
         with patch("run_agent.OpenAI", return_value=MagicMock()), \
-             patch("time.sleep") as mock_sleep:
-            agent._try_recover_primary_transport(
+             patch("agent.agent_runtime_helpers.asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+            await agent._try_recover_primary_transport(
                 error, retry_count=10, max_retries=3,
             )
             # wait_time = min(3 + 10, 8) = 8
-            mock_sleep.assert_called_once_with(8)
+            mock_sleep.assert_awaited_once_with(8)
 
 
-    def test_survives_rebuild_failure(self):
+    @pytest.mark.asyncio
+    async def test_survives_rebuild_failure(self):
         """If client rebuild fails, returns False gracefully."""
         agent = _make_agent(provider="custom")
         error = _make_transport_error("ReadTimeout")
 
-        with patch("run_agent.OpenAI", side_effect=Exception("socket error")), \
-             patch("time.sleep"):
-            result = agent._try_recover_primary_transport(
+        with patch("openai.AsyncOpenAI", side_effect=Exception("socket error")), \
+             patch("agent.agent_runtime_helpers.asyncio.sleep", new_callable=AsyncMock):
+            result = await agent._try_recover_primary_transport(
                 error, retry_count=3, max_retries=3,
             )
 
@@ -490,28 +510,28 @@ class TestTryRecoverPrimaryTransport:
 class TestRestoreInRunConversation:
     """Verify the hook in run_conversation() calls _restore_primary_runtime."""
 
-    def test_restore_called_at_turn_start(self):
+    @pytest.mark.asyncio
+    async def test_restore_called_at_turn_start(self):
         agent = _make_agent()
         agent._fallback_activated = True
 
-        with patch.object(agent, "_restore_primary_runtime", return_value=True) as mock_restore, \
-             patch.object(agent, "run_conversation", wraps=None) as _:
+        with patch.object(agent, "_restore_primary_runtime", new=AsyncMock(return_value=True)) as mock_restore, \
+            patch.object(agent, "run_conversation", wraps=None) as _:
             # We can't easily run the full conversation, but we can verify
             # the method exists and is callable
-            agent._restore_primary_runtime()
-            mock_restore.assert_called_once()
+            await agent._restore_primary_runtime()
+            mock_restore.assert_awaited_once()
 
-    def test_full_cycle_fallback_then_restore(self):
+    @pytest.mark.asyncio
+    async def test_full_cycle_fallback_then_restore(self):
         """Simulate: turn 1 activates fallback, turn 2 restores primary."""
         agent = _make_agent(
-            fallback_model={"provider": "openrouter", "model": "anthropic/claude-sonnet-4"},
+            fallback_model=_native_fallback("openrouter", "anthropic/claude-sonnet-4"),
             provider="custom",
         )
 
         # Turn 1: activate fallback
-        mock_client = _mock_resolve()
-        with patch("agent.auxiliary_client.resolve_provider_client", return_value=(mock_client, None)):
-            assert agent._try_activate_fallback() is True
+        assert await agent._try_activate_fallback() is True
 
         assert agent._fallback_activated is True
         assert agent.model == "anthropic/claude-sonnet-4"
@@ -520,7 +540,7 @@ class TestRestoreInRunConversation:
 
         # Turn 2: restore primary
         with patch("run_agent.OpenAI", return_value=MagicMock()):
-            assert agent._restore_primary_runtime() is True
+            assert await agent._restore_primary_runtime() is True
 
         assert agent._fallback_activated is False
         assert agent._fallback_index == 0
@@ -535,57 +555,54 @@ class TestRestoreInRunConversation:
 class TestRateLimitCooldown:
     """Verify _restore_primary_runtime() respects the 60s rate-limit cooldown."""
 
-    def test_restore_blocked_during_cooldown(self):
+    @pytest.mark.asyncio
+    async def test_restore_blocked_during_cooldown(self):
         """While _rate_limited_until is in the future, restore returns False."""
         agent = _make_agent(
-            fallback_model={"provider": "openrouter", "model": "anthropic/claude-sonnet-4"},
+            fallback_model=_native_fallback("openrouter", "anthropic/claude-sonnet-4"),
         )
-        mock_client = _mock_resolve()
-        with patch("agent.auxiliary_client.resolve_provider_client", return_value=(mock_client, None)):
-            agent._try_activate_fallback()
+        await agent._try_activate_fallback()
 
         assert agent._fallback_activated is True
 
         # Manually set cooldown well into the future
         agent._rate_limited_until = time.monotonic() + 60
 
-        result = agent._restore_primary_runtime()
+        result = await agent._restore_primary_runtime()
         assert result is False
         assert agent._fallback_activated is True  # still on fallback
 
 
-    def test_cooldown_set_on_rate_limit_reason(self):
+    @pytest.mark.asyncio
+    async def test_cooldown_set_on_rate_limit_reason(self):
         """_try_activate_fallback with rate_limit reason sets _rate_limited_until."""
         from run_agent import FailoverReason
         agent = _make_agent(
-            fallback_model={"provider": "openrouter", "model": "anthropic/claude-sonnet-4"},
+            fallback_model=_native_fallback("openrouter", "anthropic/claude-sonnet-4"),
         )
         before = time.monotonic()
-        mock_client = _mock_resolve()
-        with patch("agent.auxiliary_client.resolve_provider_client", return_value=(mock_client, None)):
-            agent._try_activate_fallback(reason=FailoverReason.rate_limit)
+        await agent._try_activate_fallback(reason=FailoverReason.rate_limit)
 
         assert hasattr(agent, "_rate_limited_until")
         assert agent._rate_limited_until > before + 50  # ~60s from now
 
-    def test_cooldown_not_set_when_already_on_fallback(self):
+    @pytest.mark.asyncio
+    async def test_cooldown_not_set_when_already_on_fallback(self):
         """Chain-switching while already on fallback must not reset cooldown."""
         from run_agent import FailoverReason
         agent = _make_agent(
             fallback_model=[
-                {"provider": "openrouter", "model": "model-a"},
-                {"provider": "anthropic", "model": "model-b"},
+                _native_fallback("openrouter", "model-a"),
+                _native_fallback("anthropic", "model-b"),
             ],
         )
-        mock_client = _mock_resolve()
-        with patch("agent.auxiliary_client.resolve_provider_client", return_value=(mock_client, None)):
-            # First call: leaving primary → cooldown should be set
-            agent._try_activate_fallback(reason=FailoverReason.rate_limit)
-            first_cooldown = getattr(agent, "_rate_limited_until", 0)
+        # First call: leaving primary → cooldown should be set
+        await agent._try_activate_fallback(reason=FailoverReason.rate_limit)
+        first_cooldown = getattr(agent, "_rate_limited_until", 0)
 
-            # Second call: already on fallback (provider != primary) → cooldown must not advance
-            agent._try_activate_fallback(reason=FailoverReason.rate_limit)
-            second_cooldown = getattr(agent, "_rate_limited_until", 0)
+        # Second call: already on fallback (provider != primary) → cooldown must not advance
+        await agent._try_activate_fallback(reason=FailoverReason.rate_limit)
+        second_cooldown = getattr(agent, "_rate_limited_until", 0)
 
         # second call should not have extended the cooldown
         assert second_cooldown == first_cooldown

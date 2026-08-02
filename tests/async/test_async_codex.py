@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from agent.codex_runtime import run_codex_stream_async
+from agent.codex_runtime import run_codex_stream
 
 
 class _Stream:
@@ -26,7 +26,7 @@ class _Responses:
     def __init__(self, events):
         self.events = events
 
-    def create(self, **kwargs):
+    async def create(self, **kwargs):
         assert kwargs["stream"] is True
         return _Stream(self.events)
 
@@ -61,7 +61,7 @@ async def test_codex_responses_stream_reads_async_iterator():
         _fire_reasoning_delta=lambda _text: None,
     )
 
-    response = await run_codex_stream_async(
+    response = await run_codex_stream(
         agent,
         {"model": "gpt-test"},
         client=_Client(events),

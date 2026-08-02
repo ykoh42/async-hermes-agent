@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -16,7 +16,7 @@ from agent.context_compressor import (
 @pytest.fixture()
 def compressor() -> ContextCompressor:
     with patch(
-        "agent.context_compressor.get_model_context_length",
+        "agent.context_compressor.get_static_context_length",
         return_value=100_000,
     ):
         instance = ContextCompressor(
@@ -54,13 +54,13 @@ def _append_tool_run(messages: list[dict], prefix: str, count: int = 6) -> None:
         )
 
 
-def _compress(compressor: ContextCompressor, messages: list[dict]) -> list[dict]:
+async def _compress(compressor: ContextCompressor, messages: list[dict]) -> list[dict]:
     with patch.object(
         compressor,
         "_generate_summary",
-        return_value=f"{SUMMARY_PREFIX}\nsummary of older work",
+        new=AsyncMock(return_value=f"{SUMMARY_PREFIX}\nsummary of older work"),
     ):
-        return compressor.compress(messages, current_tokens=90_000)
+        return await compressor.compress(messages, current_tokens=90_000)
 
 
 def _assert_no_adjacent_user_roles(messages: list[dict]) -> None:
@@ -84,7 +84,8 @@ def test_leading_blank_without_actionable_user_is_not_removed(compressor):
 
 
 
-def test_completion_survives_compaction_verbatim_after_blank_echo(compressor):
+@pytest.mark.asyncio
+async def test_completion_survives_compaction_verbatim_after_blank_echo(compressor):
     completion = (
         "[ASYNC DELEGATION BATCH COMPLETE — deleg_current]\n"
         "The newest result that must remain actionable."
@@ -107,7 +108,7 @@ def test_completion_survives_compaction_verbatim_after_blank_echo(compressor):
     ]
     _append_tool_run(messages, "tail")
 
-    result = _compress(compressor, messages)
+    result = await _compress(compressor, messages)
 
     completion_rows = [message for message in result if message.get("content") == completion]
     assert len(completion_rows) == 1
@@ -120,7 +121,7 @@ def test_completion_survives_compaction_verbatim_after_blank_echo(compressor):
     assert all(not compressor._is_blank_user_turn(message) for message in result)
     _assert_no_adjacent_user_roles(result)
 
-    second_result = _compress(compressor, result)
+    second_result = await _compress(compressor, result)
     second_completion_rows = [
         message for message in second_result if message.get("content") == completion
     ]
@@ -128,7 +129,8 @@ def test_completion_survives_compaction_verbatim_after_blank_echo(compressor):
     assert not second_completion_rows[0].get(COMPRESSED_SUMMARY_METADATA_KEY)
 
 
-def test_completion_at_compress_start_survives_when_blank_echo_is_compress_end(
+@pytest.mark.asyncio
+async def test_completion_at_compress_start_survives_when_blank_echo_is_compress_end(
     compressor,
 ):
     completion = "latest actionable completion at the compression boundary"
@@ -157,7 +159,7 @@ def test_completion_at_compress_start_survives_when_blank_echo_is_compress_end(
         patch.object(compressor, "_find_tail_cut_by_tokens", return_value=3),
         patch.object(compressor, "_generate_summary") as generate_summary,
     ):
-        result = compressor.compress(messages, current_tokens=90_000)
+        result = await compressor.compress(messages, current_tokens=90_000)
 
     completion_rows = [message for message in result if message.get("content") == completion]
     assert len(completion_rows) == 1
@@ -181,5 +183,4 @@ def test_completion_at_compress_start_survives_when_blank_echo_is_compress_end(
         "assistant",
     ]
     _assert_no_adjacent_user_roles(result)
-
 

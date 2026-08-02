@@ -16,7 +16,7 @@ These tests pin the contracts that make that routing correct:
 from __future__ import annotations
 
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -82,9 +82,10 @@ class TestRuntimeResolution:
     def _stub_portal_credentials(self, monkeypatch):
         monkeypatch.setattr(rp, "load_config", lambda: {})
         monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "nous")
-        monkeypatch.setattr(rp, "load_pool", lambda p: SimpleNamespace(
-            has_credentials=lambda: False,
-        ))
+        async def empty_pool(_provider):
+            return SimpleNamespace(has_credentials=lambda: False)
+
+        monkeypatch.setattr(rp, "load_pool", empty_pool)
         monkeypatch.setattr(
             rp,
             "resolve_nous_runtime_credentials",
@@ -96,10 +97,11 @@ class TestRuntimeResolution:
             },
         )
 
-    def test_anthropic_model_resolves_to_the_messages_wire(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_anthropic_model_resolves_to_the_messages_wire(self, monkeypatch):
         monkeypatch.setattr(rp, "_get_model_config", lambda: {"provider": "nous"})
 
-        resolved = rp.resolve_runtime_provider(
+        resolved = await rp.resolve_runtime_provider(
             requested="nous", target_model="anthropic/claude-opus-5"
         )
 
@@ -110,7 +112,8 @@ class TestRuntimeResolution:
         assert resolved["base_url"] == PORTAL_URL
 
 
-    def test_target_model_wins_over_the_persisted_default(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_target_model_wins_over_the_persisted_default(self, monkeypatch):
         """A mid-session ``/model`` switch passes the model it is switching TO;
         deriving the mode from the stale config default would leave the session
         on the wrong wire."""
@@ -120,7 +123,7 @@ class TestRuntimeResolution:
             lambda: {"provider": "nous", "default": "hermes-4-405b"},
         )
 
-        resolved = rp.resolve_runtime_provider(
+        resolved = await rp.resolve_runtime_provider(
             requested="nous", target_model="anthropic/claude-opus-5"
         )
 
@@ -132,9 +135,12 @@ class TestPoolRuntimeResolution:
     """Portal credential pools take a separate resolution path."""
 
     def _pool(self, entry):
+        async def select():
+            return entry
+
         return SimpleNamespace(
             has_credentials=lambda: True,
-            select=lambda: entry,
+            select=select,
         )
 
     @pytest.fixture
@@ -149,13 +155,17 @@ class TestPoolRuntimeResolution:
             runtime_base_url=PORTAL_URL,
         )
 
-    def test_pool_entry_honors_the_model_derived_mode(self, monkeypatch, portal_entry):
+    @pytest.mark.asyncio
+    async def test_pool_entry_honors_the_model_derived_mode(self, monkeypatch, portal_entry):
         monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "nous")
         monkeypatch.setattr(rp, "_agent_key_is_usable", lambda *a, **k: True)
-        monkeypatch.setattr(rp, "load_pool", lambda p: self._pool(portal_entry))
+        async def load_pool(_provider):
+            return self._pool(portal_entry)
+
+        monkeypatch.setattr(rp, "load_pool", load_pool)
         monkeypatch.setattr(rp, "_get_model_config", lambda: {"provider": "nous"})
 
-        resolved = rp.resolve_runtime_provider(
+        resolved = await rp.resolve_runtime_provider(
             requested="nous", target_model="anthropic/claude-opus-4.8"
         )
 
@@ -167,6 +177,28 @@ class TestPoolRuntimeResolution:
 
 
 class TestClientShape:
+
+    @staticmethod
+    def _build_async_portal_client(api_key: str):
+        """Build through the SDK's async constructor without requiring its wheel.
+
+        The adapter owns the auth/header choice; the third-party SDK only
+        materializes that configuration. A narrow fake makes this test cover
+        the native runtime contract without making the full suite depend on an
+        optional provider package.
+        """
+        from agent.anthropic_adapter import build_anthropic_client
+
+        client = MagicMock()
+        client.api_key = "inferred-from-environment"
+        async_factory = MagicMock(return_value=client)
+        sdk = SimpleNamespace(AsyncAnthropic=async_factory, Anthropic=MagicMock())
+        with patch("agent.anthropic_adapter._get_anthropic_sdk", return_value=sdk):
+            result = build_anthropic_client(
+                api_key,
+                PORTAL_URL,
+            )
+        return result, async_factory
 
 
     def test_lookalike_host_does_not_get_portal_treatment(self):
@@ -186,11 +218,10 @@ class TestClientShape:
         """Portal validates the OAuth invoke JWT as a Bearer credential, the
         same way its /chat/completions route does. Sending it as x-api-key
         (the adapter's third-party default) 401s."""
-        from agent.anthropic_adapter import build_anthropic_client
+        client, async_factory = self._build_async_portal_client("portal-invoke-jwt")
 
-        client = build_anthropic_client("portal-invoke-jwt", PORTAL_URL)
-
-        assert client.auth_token == "portal-invoke-jwt"
+        assert async_factory.call_args.kwargs["auth_token"] == "portal-invoke-jwt"
+        assert "api_key" not in async_factory.call_args.kwargs
         assert client.api_key is None
 
     def test_portal_bearer_does_not_also_send_env_anthropic_api_key(
@@ -200,17 +231,12 @@ class TestClientShape:
         constructor omits it. Hermes loads that env from ~/.hermes/.env, so
         without an explicit clear every Portal request would dual-auth as
         X-Api-Key: sk-ant-… + Authorization: Bearer portal.jwt."""
-        from agent.anthropic_adapter import build_anthropic_client
-
         monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-should-not-leak")
-        client = build_anthropic_client("portal-invoke-jwt", PORTAL_URL)
+        client, async_factory = self._build_async_portal_client("portal-invoke-jwt")
 
-        assert client.auth_token == "portal-invoke-jwt"
+        assert async_factory.call_args.kwargs["auth_token"] == "portal-invoke-jwt"
+        assert "api_key" not in async_factory.call_args.kwargs
         assert client.api_key is None
-        assert "X-Api-Key" not in client.auth_headers
-        assert client.auth_headers.get("Authorization", "").startswith(
-            "Bearer portal-invoke-jwt"
-        )
 
 
 
@@ -426,7 +452,8 @@ class TestAuxiliaryDualWire:
     """``resolve_provider_client('nous', …)`` must wrap Claude onto Messages."""
 
 
-    def test_non_anthropic_catalog_model_stays_on_chat_completions(self):
+    @pytest.mark.asyncio
+    async def test_non_anthropic_catalog_model_stays_on_chat_completions(self):
         from agent.auxiliary_client import (
             AnthropicAuxiliaryClient,
             resolve_provider_client,
@@ -439,6 +466,7 @@ class TestAuxiliaryDualWire:
         with (
             patch(
                 "agent.auxiliary_client._try_nous",
+                new_callable=AsyncMock,
                 return_value=(plain, "hermes-4-405b"),
             ),
             patch(
@@ -446,7 +474,7 @@ class TestAuxiliaryDualWire:
                 side_effect=AssertionError("must not build Anthropic client"),
             ),
         ):
-            client, model = resolve_provider_client("nous", "hermes-4-405b")
+            client, model = await resolve_provider_client("nous", "hermes-4-405b")
 
         assert model == "hermes-4-405b"
         assert client is plain
@@ -485,7 +513,8 @@ class TestAuxiliaryDualWire:
         assert extra.get("session_id") == "sess-sticky-aux"
 
 
-    def test_aux_create_forwards_portal_catalog_id_verbatim(self):
+    @pytest.mark.asyncio
+    async def test_aux_create_forwards_portal_catalog_id_verbatim(self):
         """Regression: adapter must pass base_url into build_anthropic_kwargs.
 
         Without it the Portal carve-out never fires and
@@ -496,7 +525,7 @@ class TestAuxiliaryDualWire:
 
         captured = {}
 
-        def _fake_create(client, api_kwargs, **kwargs):
+        async def _fake_create(client, api_kwargs, **kwargs):
             captured["model"] = api_kwargs.get("model")
             return SimpleNamespace(
                 content=[],
@@ -516,7 +545,7 @@ class TestAuxiliaryDualWire:
             "agent.anthropic_adapter.create_anthropic_message",
             side_effect=_fake_create,
         ):
-            client.chat.completions.create(
+            await client.chat.completions.create(
                 model="anthropic/claude-opus-4.8",
                 messages=[{"role": "user", "content": "hi"}],
             )

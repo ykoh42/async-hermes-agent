@@ -59,7 +59,7 @@ class BraveFreeWebSearchProvider(WebSearchProvider):
     def supports_extract(self) -> bool:
         return False
 
-    def search(self, query: str, limit: int = 5) -> Dict[str, Any]:
+    async def search(self, query: str, limit: int = 5) -> Dict[str, Any]:
         """Execute a search against the Brave Search API.
 
         Returns ``{"success": True, "data": {"web": [{"title", "url", "description", "position"}]}}``
@@ -77,16 +77,16 @@ class BraveFreeWebSearchProvider(WebSearchProvider):
         count = max(1, min(int(limit), 20))
 
         try:
-            resp = httpx.get(
-                _BRAVE_ENDPOINT,
-                params={"q": query, "count": count},
-                headers={
-                    "X-Subscription-Token": api_key,
-                    "Accept": "application/json",
-                },
-                timeout=15,
-            )
-            resp.raise_for_status()
+            async with httpx.AsyncClient(timeout=15) as client:
+                resp = await client.get(
+                    _BRAVE_ENDPOINT,
+                    params={"q": query, "count": count},
+                    headers={
+                        "X-Subscription-Token": api_key,
+                        "Accept": "application/json",
+                    },
+                )
+                resp.raise_for_status()
         except httpx.HTTPStatusError as exc:
             logger.warning("Brave Search HTTP error: %s", exc)
             return {

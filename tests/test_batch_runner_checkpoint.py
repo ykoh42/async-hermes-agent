@@ -1,8 +1,8 @@
 """Tests for batch_runner checkpoint behavior — incremental writes, resume, atomicity."""
 
+import asyncio
 import json
 from pathlib import Path
-from threading import Lock
 
 import pytest
 
@@ -10,7 +10,7 @@ import pytest
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from batch_runner import BatchRunner, _process_batch_worker
+from batch_runner import BatchRunner, _append_jsonl_line, _process_batch_worker
 
 
 @pytest.fixture
@@ -31,72 +31,86 @@ def runner(tmp_path):
 class TestSaveCheckpoint:
     """Verify _save_checkpoint writes valid, atomic JSON."""
 
-    def test_writes_valid_json(self, runner):
+    @pytest.mark.asyncio
+    async def test_writes_valid_json(self, runner):
         data = {"run_name": "test", "completed_prompts": [1, 2, 3], "batch_stats": {}}
-        runner._save_checkpoint(data)
+        await runner._save_checkpoint(data)
 
         result = json.loads(runner.checkpoint_file.read_text())
         assert result["run_name"] == "test"
         assert result["completed_prompts"] == [1, 2, 3]
 
-    def test_adds_last_updated(self, runner):
+    @pytest.mark.asyncio
+    async def test_adds_last_updated(self, runner):
         data = {"run_name": "test", "completed_prompts": []}
-        runner._save_checkpoint(data)
+        await runner._save_checkpoint(data)
 
         result = json.loads(runner.checkpoint_file.read_text())
         assert "last_updated" in result
         assert result["last_updated"] is not None
 
-    def test_overwrites_previous_checkpoint(self, runner):
-        runner._save_checkpoint({"run_name": "test", "completed_prompts": [1]})
-        runner._save_checkpoint({"run_name": "test", "completed_prompts": [1, 2, 3]})
+    @pytest.mark.asyncio
+    async def test_overwrites_previous_checkpoint(self, runner):
+        await runner._save_checkpoint({"run_name": "test", "completed_prompts": [1]})
+        await runner._save_checkpoint({"run_name": "test", "completed_prompts": [1, 2, 3]})
 
         result = json.loads(runner.checkpoint_file.read_text())
         assert result["completed_prompts"] == [1, 2, 3]
 
-    def test_with_lock(self, runner):
-        lock = Lock()
-        data = {"run_name": "test", "completed_prompts": [42]}
-        runner._save_checkpoint(data, lock=lock)
-
-        result = json.loads(runner.checkpoint_file.read_text())
-        assert result["completed_prompts"] == [42]
-
-
-    def test_creates_parent_dirs(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_creates_parent_dirs(self, tmp_path):
         runner_deep = BatchRunner.__new__(BatchRunner)
         runner_deep.checkpoint_file = tmp_path / "deep" / "nested" / "checkpoint.json"
 
         data = {"run_name": "test", "completed_prompts": []}
-        runner_deep._save_checkpoint(data)
+        await runner_deep._save_checkpoint(data)
 
         assert runner_deep.checkpoint_file.exists()
 
-    def test_no_temp_files_left(self, runner):
-        runner._save_checkpoint({"run_name": "test", "completed_prompts": []})
+    @pytest.mark.asyncio
+    async def test_no_temp_files_left(self, runner):
+        await runner._save_checkpoint({"run_name": "test", "completed_prompts": []})
 
         tmp_files = [f for f in runner.checkpoint_file.parent.iterdir()
                      if ".tmp" in f.name]
         assert len(tmp_files) == 0
 
 
+@pytest.mark.asyncio
+async def test_jsonl_append_completes_current_row_before_cancellation(tmp_path):
+    """A cancelled batch worker must leave either no row or a whole JSON row."""
+    shard = tmp_path / "batch_0.jsonl"
+    task = asyncio.create_task(_append_jsonl_line(shard, {"prompt_index": 7}))
+    await asyncio.sleep(0)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    if shard.exists():
+        rows = shard.read_text(encoding="utf-8").splitlines()
+        assert rows == ['{"prompt_index": 7}']
+        assert json.loads(rows[0]) == {"prompt_index": 7}
+
+
 class TestLoadCheckpoint:
     """Verify _load_checkpoint reads existing data or returns defaults."""
 
 
-    def test_loads_existing_checkpoint(self, runner):
+    @pytest.mark.asyncio
+    async def test_loads_existing_checkpoint(self, runner):
         data = {"run_name": "test_run", "completed_prompts": [5, 10, 15],
                 "batch_stats": {"0": {"processed": 3}}}
         runner.checkpoint_file.write_text(json.dumps(data))
 
-        result = runner._load_checkpoint()
+        result = await runner._load_checkpoint()
         assert result["completed_prompts"] == [5, 10, 15]
         assert result["batch_stats"]["0"]["processed"] == 3
 
-    def test_handles_corrupt_json(self, runner):
+    @pytest.mark.asyncio
+    async def test_handles_corrupt_json(self, runner):
         runner.checkpoint_file.write_text("{broken json!!")
 
-        result = runner._load_checkpoint()
+        result = await runner._load_checkpoint()
         # Should return empty/default, not crash
         assert isinstance(result, dict)
 
@@ -104,7 +118,8 @@ class TestLoadCheckpoint:
 class TestResumePreservesProgress:
     """Verify that initializing a run with resume=True loads prior checkpoint."""
 
-    def test_completed_prompts_loaded_from_checkpoint(self, runner):
+    @pytest.mark.asyncio
+    async def test_completed_prompts_loaded_from_checkpoint(self, runner):
         # Simulate a prior run that completed prompts 0-4
         prior = {
             "run_name": "test_run",
@@ -115,7 +130,7 @@ class TestResumePreservesProgress:
         runner.checkpoint_file.write_text(json.dumps(prior))
 
         # Load checkpoint like run() does
-        checkpoint_data = runner._load_checkpoint()
+        checkpoint_data = await runner._load_checkpoint()
         if checkpoint_data.get("run_name") != runner.run_name:
             checkpoint_data = {
                 "run_name": runner.run_name,
@@ -127,7 +142,8 @@ class TestResumePreservesProgress:
         completed_set = set(checkpoint_data.get("completed_prompts", []))
         assert completed_set == {0, 1, 2, 3, 4}
 
-    def test_different_run_name_starts_fresh(self, runner):
+    @pytest.mark.asyncio
+    async def test_different_run_name_starts_fresh(self, runner):
         prior = {
             "run_name": "different_run",
             "completed_prompts": [0, 1, 2],
@@ -135,7 +151,7 @@ class TestResumePreservesProgress:
         }
         runner.checkpoint_file.write_text(json.dumps(prior))
 
-        checkpoint_data = runner._load_checkpoint()
+        checkpoint_data = await runner._load_checkpoint()
         if checkpoint_data.get("run_name") != runner.run_name:
             checkpoint_data = {
                 "run_name": runner.run_name,
@@ -149,7 +165,8 @@ class TestResumePreservesProgress:
 
 
 class TestBatchWorkerResumeBehavior:
-    def test_discarded_no_reasoning_prompts_are_marked_completed(self, tmp_path, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_discarded_no_reasoning_prompts_are_marked_completed(self, tmp_path, monkeypatch):
         batch_file = tmp_path / "batch_1.jsonl"
         prompt_result = {
             "success": True,
@@ -162,9 +179,12 @@ class TestBatchWorkerResumeBehavior:
             "toolsets_used": [],
         }
 
-        monkeypatch.setattr("batch_runner._process_single_prompt", lambda *args, **kwargs: prompt_result)
+        async def process_single_prompt(*_args, **_kwargs):
+            return prompt_result
 
-        result = _process_batch_worker((
+        monkeypatch.setattr("batch_runner._process_single_prompt", process_single_prompt)
+
+        result = await _process_batch_worker((
             1,
             [(0, {"prompt": "hi"})],
             tmp_path,
@@ -205,7 +225,8 @@ class TestFinalCheckpointNoDuplicates:
         assert final == [0, 1, 2, 3, 4, 5]
         assert len(final) == len(set(final))  # no duplicates
 
-    def test_persisted_checkpoint_has_unique_prompts(self, runner):
+    @pytest.mark.asyncio
+    async def test_persisted_checkpoint_has_unique_prompts(self, runner):
         """Write what run()'s fixed aggregation produces to disk; the file
         must load back with no duplicate indices."""
         batch_results = [
@@ -213,7 +234,7 @@ class TestFinalCheckpointNoDuplicates:
             {"completed_prompts": [2, 3]},
         ]
         final = self._simulate_final_aggregation_fixed(batch_results)
-        runner._save_checkpoint({
+        await runner._save_checkpoint({
             "run_name": runner.run_name,
             "completed_prompts": final,
             "batch_stats": {},

@@ -24,7 +24,7 @@ import json
 import pytest
 
 
-def _seed_pool(tmp_path, monkeypatch, entries, provider="openrouter"):
+async def _seed_pool(tmp_path, monkeypatch, entries, provider="openrouter"):
     hermes_home = tmp_path / "hermes"
     hermes_home.mkdir(parents=True, exist_ok=True)
     (hermes_home / "auth.json").write_text(
@@ -33,7 +33,7 @@ def _seed_pool(tmp_path, monkeypatch, entries, provider="openrouter"):
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
     from agent.credential_pool import load_pool
 
-    return load_pool(provider)
+    return await load_pool(provider)
 
 
 def _entry(idx, key):
@@ -49,20 +49,21 @@ def _entry(idx, key):
 
 class TestUnmatchedHintRotationIsBounded:
 
-    def test_multi_entry_pool_unmatched_hint_loop_terminates(
+    @pytest.mark.asyncio
+    async def test_multi_entry_pool_unmatched_hint_loop_terminates(
         self, tmp_path, monkeypatch
     ):
         """Multi-entry pool: consecutive unmatched-hint rotations must reach
         None within one lap of the pool instead of ping-ponging forever."""
-        pool = _seed_pool(
+        pool = await _seed_pool(
             tmp_path, monkeypatch,
             [_entry(0, "key-a"), _entry(1, "key-b"), _entry(2, "key-c")],
         )
-        assert pool.select() is not None
+        assert await pool.select() is not None
 
         results = []
         for _ in range(10):  # caller's retry loop
-            nxt = pool.mark_exhausted_and_rotate(
+            nxt = await pool.mark_exhausted_and_rotate(
                 status_code=401,
                 error_context={"reason": "unauthorized"},
                 api_key_hint="oauth-runtime-token-that-matches-nothing",
@@ -88,16 +89,17 @@ class TestUnmatchedHintRotationIsBounded:
 
 
 
-    def test_matched_hint_path_unaffected(self, tmp_path, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_matched_hint_path_unaffected(self, tmp_path, monkeypatch):
         """Regression guard: the normal matched-hint path still marks the
         failing entry and rotates to the healthy one."""
-        pool = _seed_pool(
+        pool = await _seed_pool(
             tmp_path, monkeypatch,
             [_entry(0, "key-healthy"), _entry(1, "key-failed")],
         )
-        assert pool.select().access_token == "key-healthy"
+        assert (await pool.select()).access_token == "key-healthy"
 
-        nxt = pool.mark_exhausted_and_rotate(
+        nxt = await pool.mark_exhausted_and_rotate(
             status_code=401,
             error_context={"reason": "unauthorized"},
             api_key_hint="key-failed",

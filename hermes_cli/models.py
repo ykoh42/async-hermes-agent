@@ -8,12 +8,16 @@ Add, remove, or reorder entries here — both `hermes setup` and
 from __future__ import annotations
 
 import json
+import asyncio
 import os
 import re
 import urllib.parse
 import urllib.request
 import urllib.error
 import time
+import aiofiles
+import aiofiles.os
+import httpx
 from difflib import get_close_matches
 from pathlib import Path
 from typing import Any, NamedTuple, Optional
@@ -858,6 +862,33 @@ def check_nous_free_tier(*, force_fresh: bool = False) -> bool:
         return False  # default to paid on error — don't block users
 
 
+async def check_nous_free_tier_async(*, force_fresh: bool = False) -> bool:
+    """Resolve Nous entitlement without entering the synchronous model picker.
+
+    ``check_nous_free_tier`` remains the synchronous CLI/admin helper.  The
+    agent and auxiliary paths use this coroutine so account discovery stays on
+    the same event loop as the provider request.
+    """
+    global _free_tier_cache
+    now = time.monotonic()
+    if not force_fresh and _free_tier_cache is not None:
+        cached_result, cached_at = _free_tier_cache
+        if now - cached_at < _FREE_TIER_CACHE_TTL:
+            return cached_result
+
+    try:
+        from hermes_cli.nous_account import get_nous_portal_account_info
+
+        account_info = await get_nous_portal_account_info(force_fresh=force_fresh)
+        result = bool(account_info.is_free_tier)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        result = False
+    _free_tier_cache = (result, now)
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Nous Portal recommended models
 #
@@ -1004,6 +1035,83 @@ def fetch_nous_recommended_models(
     return data
 
 
+async def fetch_nous_recommended_models_async(
+    portal_base_url: str = "",
+    timeout: float = 5.0,
+    *,
+    force_refresh: bool = False,
+) -> dict[str, Any]:
+    """Fetch Portal recommendations with native async HTTP and file I/O.
+
+    The synchronous function above is retained for model-picker/admin callers.
+    Runtime auxiliary calls must use this path; it deliberately does not call
+    the synchronous urllib or disk-cache helpers.
+    """
+    base = (portal_base_url or "https://portal.nousresearch.com").rstrip("/")
+    now = time.monotonic()
+    cached = _nous_recommended_cache.get(base)
+    if not force_refresh and cached is not None:
+        payload, cached_at = cached
+        if now - cached_at < _NOUS_RECOMMENDED_CACHE_TTL:
+            return payload
+
+    data: dict[str, Any] = {}
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            response = await client.get(
+                f"{base}{NOUS_RECOMMENDED_MODELS_PATH}",
+                headers={"Accept": "application/json"},
+            )
+            response.raise_for_status()
+            payload = response.json()
+            if isinstance(payload, dict):
+                data = payload
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        data = {}
+
+    if data:
+        _nous_recommended_cache[base] = (data, now)
+        path = _nous_recommended_disk_path()
+        try:
+            blob: dict[str, Any] = {}
+            async with aiofiles.open(path, encoding="utf-8") as handle:
+                existing = json.loads(await handle.read())
+                if isinstance(existing, dict):
+                    blob = existing
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+            pass
+        blob[base] = {"data": data, "ts": time.time()}
+        try:
+            await aiofiles.os.makedirs(path.parent, exist_ok=True)
+            temporary = path.with_suffix(path.suffix + ".tmp")
+            async with aiofiles.open(temporary, "w", encoding="utf-8") as handle:
+                await handle.write(json.dumps(blob, indent=2) + "\n")
+            await aiofiles.os.replace(temporary, path)
+        except (OSError, UnicodeError) as exc:
+            import logging
+
+            logging.getLogger(__name__).debug(
+                "nous recommended-models async disk cache write failed: %s", exc
+            )
+        return data
+
+    path = _nous_recommended_disk_path()
+    try:
+        async with aiofiles.open(path, encoding="utf-8") as handle:
+            blob = json.loads(await handle.read())
+        entry = blob.get(base) if isinstance(blob, dict) else None
+        disk = entry.get("data") if isinstance(entry, dict) else None
+        if isinstance(disk, dict) and disk:
+            _nous_recommended_cache[base] = (disk, now)
+            return disk
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        pass
+    _nous_recommended_cache[base] = (data, now)
+    return data
+
+
 def _resolve_nous_portal_url() -> str:
     """Best-effort lookup of the Portal base URL the user is authed against."""
     try:
@@ -1081,6 +1189,33 @@ def get_nous_recommended_aux_model(
     #   paid tier  → paid, then free (if paid field is null)
     candidates = [free_key] if free_tier else [paid_key, free_key]
     for key in candidates:
+        name = _extract_model_name(payload.get(key))
+        if name:
+            return name
+    return None
+
+
+async def get_nous_recommended_aux_model_async(
+    *,
+    vision: bool = False,
+    free_tier: Optional[bool] = None,
+    portal_base_url: str = "",
+    force_refresh: bool = False,
+) -> Optional[str]:
+    """Return the Portal recommendation for an async auxiliary call."""
+    base = portal_base_url or _resolve_nous_portal_url()
+    payload = await fetch_nous_recommended_models_async(
+        base, force_refresh=force_refresh
+    )
+    if not payload:
+        return None
+    if free_tier is None:
+        free_tier = await check_nous_free_tier_async()
+    if vision:
+        paid_key, free_key = "paidRecommendedVisionModel", "freeRecommendedVisionModel"
+    else:
+        paid_key, free_key = "paidRecommendedCompactionModel", "freeRecommendedCompactionModel"
+    for key in ([free_key] if free_tier else [paid_key, free_key]):
         name = _extract_model_name(payload.get(key))
         if name:
             return name

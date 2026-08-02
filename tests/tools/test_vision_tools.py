@@ -222,7 +222,7 @@ class TestErrorLoggingExcInfo:
             mock_response.choices = [mock_choice]
 
             with (
-                patch("tools.vision_tools.async_call_llm", new_callable=AsyncMock, return_value=mock_response),
+                patch("tools.vision_tools.call_llm", new_callable=AsyncMock, return_value=mock_response),
             ):
                 # Make unlink fail to trigger the cleanup warning.
                 def failing_unlink(self, *args, **kwargs):
@@ -260,7 +260,7 @@ class TestVisionConfig:
                     return_value="data:image/png;base64,abc",
                 ),
                 patch(
-                    "tools.vision_tools.async_call_llm",
+                    "tools.vision_tools.call_llm",
                     new_callable=AsyncMock,
                     return_value=mock_response,
                 ) as mock_llm,
@@ -289,7 +289,7 @@ class TestVisionSafetyGuards:
         secret = tmp_path / "secret.txt"
         secret.write_text("TOP-SECRET=1\n", encoding="utf-8")
 
-        with patch("tools.vision_tools.async_call_llm", new_callable=AsyncMock) as mock_llm:
+        with patch("tools.vision_tools.call_llm", new_callable=AsyncMock) as mock_llm:
             result = json.loads(await vision_analyze_tool(str(secret), "extract text"))
 
         assert result["success"] is False
@@ -309,7 +309,7 @@ class TestVisionSafetyGuards:
         secret = tmp_path / ".env"
         secret.write_text("OPENAI_API_KEY=sk-super-secret\n", encoding="utf-8")
 
-        with patch("tools.vision_tools.async_call_llm", new_callable=AsyncMock) as mock_llm:
+        with patch("tools.vision_tools.call_llm", new_callable=AsyncMock) as mock_llm:
             result = json.loads(await vision_analyze_tool(str(secret), "extract text"))
 
         assert result["success"] is False
@@ -395,7 +395,8 @@ class TestVisionSafetyGuards:
 
 
 class TestVisionRequirements:
-    def test_check_requirements_accepts_codex_auth(self, monkeypatch, tmp_path):
+    @pytest.mark.asyncio
+    async def test_check_requirements_accepts_codex_auth(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         (tmp_path / "auth.json").write_text(
             '{"active_provider":"openai-codex","providers":{"openai-codex":{"tokens":{"access_token":"codex-access-token","refresh_token":"codex-refresh-token"}}}}'
@@ -409,7 +410,7 @@ class TestVisionRequirements:
         monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
         monkeypatch.delenv("OPENAI_API_KEY", raising=False)
 
-        assert check_vision_requirements() is True
+        assert await check_vision_requirements() is True
 
 
 # ---------------------------------------------------------------------------
@@ -443,7 +444,7 @@ class TestLocalPathForms:
                 return_value="data:image/png;base64,abc",
             ),
             patch(
-                "tools.vision_tools.async_call_llm",
+                "tools.vision_tools.call_llm",
                 new_callable=AsyncMock,
                 return_value=mock_response,
             ),
@@ -476,7 +477,7 @@ class TestLocalPathForms:
                 return_value="data:image/png;base64,abc",
             ),
             patch(
-                "tools.vision_tools.async_call_llm",
+                "tools.vision_tools.call_llm",
                 new_callable=AsyncMock,
                 return_value=mock_response,
             ),
@@ -508,7 +509,7 @@ class TestBase64SizeLimit:
 
         # Patch the hard limit to a small value so the test runs fast.
         with patch("tools.vision_tools._MAX_BASE64_BYTES", 1000), \
-             patch("tools.vision_tools.async_call_llm", new_callable=AsyncMock) as mock_llm:
+             patch("tools.vision_tools.call_llm", new_callable=AsyncMock) as mock_llm:
             result = json.loads(await vision_analyze_tool(str(img), "describe this"))
 
         assert result["success"] is False
@@ -525,7 +526,7 @@ class TestBase64SizeLimit:
         mock_response.choices = [mock_choice]
 
         with patch(
-            "tools.vision_tools.async_call_llm",
+            "tools.vision_tools.call_llm",
             new_callable=AsyncMock,
             return_value=mock_response,
         ):
@@ -561,7 +562,7 @@ class TestErrorClassification:
                 return_value="data:image/png;base64,abc",
             ),
             patch(
-                "tools.vision_tools.async_call_llm",
+                "tools.vision_tools.call_llm",
                 new_callable=AsyncMock,
                 side_effect=api_error,
             ),
@@ -574,18 +575,11 @@ class TestErrorClassification:
 
 
 class TestVisionRegistration:
-    def test_vision_analyze_registered_with_schema(self):
+    def test_vision_analyze_is_excluded_from_the_minimal_training_toolset(self):
         from tools.registry import registry
 
         entry = registry._tools.get("vision_analyze")
-        assert entry is not None
-        assert entry.toolset == "vision"
-        assert entry.is_async is True
-        assert callable(entry.handler)
-
-        props = entry.schema.get("parameters", {}).get("properties", {})
-        assert "image_url" in props
-        assert "question" in props
+        assert entry is None
 
 
 # ---------------------------------------------------------------------------

@@ -87,10 +87,39 @@ def _reset_client_for_tests() -> None:
 class ExaWebSearchProvider(WebSearchProvider):
     """Exa search + extract provider.
 
-    Both methods are sync — Exa's SDK is sync-only. The web_extract_tool
-    dispatcher wraps sync extracts via ``asyncio.to_thread`` when it
-    needs to keep the event loop responsive.
+    The provider uses Exa's JSON HTTP API directly.  This keeps both
+    operations native async even when the optional ``exa-py`` SDK is not
+    installed; the SDK remains available through ``_get_exa_client`` for
+    legacy introspection only and is never used on the active path.
     """
+
+    @staticmethod
+    async def _request(endpoint: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        from agent.web_search_provider import get_provider_env
+
+        api_key = get_provider_env("EXA_API_KEY")
+        if not api_key:
+            raise ValueError(
+                "EXA_API_KEY environment variable not set. "
+                "Get your API key at https://exa.ai"
+            )
+        import httpx
+
+        async with httpx.AsyncClient(timeout=60) as client:
+            response = await client.post(
+                f"https://api.exa.ai/{endpoint.lstrip('/')}",
+                headers={
+                    "x-api-key": api_key,
+                    "Content-Type": "application/json",
+                    "User-Agent": "Hermes-Agent",
+                },
+                json=payload,
+            )
+            response.raise_for_status()
+            data = response.json()
+            if not isinstance(data, dict):
+                raise ValueError("Exa API returned a non-object response")
+            return data
 
     @property
     def name(self) -> str:
@@ -112,7 +141,7 @@ class ExaWebSearchProvider(WebSearchProvider):
     def supports_extract(self) -> bool:
         return True
 
-    def search(self, query: str, limit: int = 5) -> Dict[str, Any]:
+    async def search(self, query: str, limit: int = 5) -> Dict[str, Any]:
         """Execute an Exa search.
 
         Returns ``{"success": True, "data": {"web": [{...}, ...]}}`` on
@@ -126,19 +155,22 @@ class ExaWebSearchProvider(WebSearchProvider):
                 return {"success": False, "error": "Interrupted"}
 
             logger.info("Exa search: '%s' (limit=%d)", query, limit)
-            response = _get_exa_client().search(
-                query,
-                num_results=limit,
-                contents={"highlights": True},
+            response = await self._request(
+                "search",
+                {
+                    "query": query,
+                    "numResults": max(1, min(int(limit), 100)),
+                    "contents": {"highlights": {"maxCharacters": 1000}},
+                },
             )
 
             web_results = []
-            for i, result in enumerate(response.results or []):
-                highlights = result.highlights or []
+            for i, result in enumerate(response.get("results") or []):
+                highlights = result.get("highlights") or []
                 web_results.append(
                     {
-                        "url": result.url or "",
-                        "title": result.title or "",
+                        "url": result.get("url") or "",
+                        "title": result.get("title") or "",
                         "description": " ".join(highlights) if highlights else "",
                         "position": i + 1,
                     }
@@ -154,7 +186,7 @@ class ExaWebSearchProvider(WebSearchProvider):
             logger.warning("Exa search error: %s", exc)
             return {"success": False, "error": f"Exa search failed: {exc}"}
 
-    def extract(self, urls: List[str], **kwargs: Any) -> List[Dict[str, Any]]:
+    async def extract(self, urls: List[str], **kwargs: Any) -> List[Dict[str, Any]]:
         """Extract content from one or more URLs via Exa.
 
         Returns a list of result dicts shaped for the legacy LLM
@@ -170,13 +202,16 @@ class ExaWebSearchProvider(WebSearchProvider):
                 ]
 
             logger.info("Exa extract: %d URL(s)", len(urls))
-            response = _get_exa_client().get_contents(urls, text=True)
+            response = await self._request(
+                "contents",
+                {"ids": urls, "text": True},
+            )
 
             results: List[Dict[str, Any]] = []
-            for result in response.results or []:
-                content = result.text or ""
-                url = result.url or ""
-                title = result.title or ""
+            for result in response.get("results") or []:
+                content = result.get("text") or ""
+                url = result.get("url") or ""
+                title = result.get("title") or ""
                 results.append(
                     {
                         "url": url,

@@ -138,25 +138,3 @@ class TestThreadContextPropagation:
         # A bare thread falls back to the process default — this is WHY the fix
         # primitive is needed.  (Asserted as the hazard, not the desired state.)
         assert seen["home"] != str(prof_b)
-
-
-    def test_run_async_worker_preserves_override(self, two_profiles):
-        """model_tools._run_async's worker-thread branch must keep the override.
-
-        This is the generic sync->async bridge for every async tool; if it
-        leaks, every async tool that resolves get_hermes_home() leaks.
-        """
-        import asyncio
-
-        _prof_a, prof_b = two_profiles
-        import model_tools
-
-        async def reads_home():
-            return str(get_hermes_home())
-
-        async def driver():
-            # Inside a running loop, _run_async spawns a worker thread + loop.
-            return model_tools._run_async(reads_home())
-
-        seen = _under_override(prof_b, lambda: asyncio.run(driver()))
-        assert seen == str(prof_b)

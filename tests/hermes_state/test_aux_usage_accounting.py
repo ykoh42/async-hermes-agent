@@ -10,7 +10,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from hermes_state import SessionDB
+from hermes_state import AsyncSessionDB, SessionDB
 
 
 @pytest.fixture
@@ -156,19 +156,23 @@ class TestSchemaMigrationV22:
 
 
 class TestAmbientAccountingContext:
-    def test_record_aux_usage_writes_through_context(self, db):
+    @pytest.mark.asyncio
+    async def test_record_aux_usage_writes_through_context(self, db):
         from agent.aux_accounting import (
             record_aux_usage,
             reset_accounting_context,
             set_accounting_context,
         )
 
-        db.create_session("s1", source="cli")
-        token = set_accounting_context(db, "s1")
+        async_db = AsyncSessionDB(db)
+        token = set_accounting_context(async_db, "s1")
         try:
-            record_aux_usage(_mk_response(model="aux-m"), "vision", provider="gemini")
+            await record_aux_usage(
+                _mk_response(model="aux-m"), "vision", provider="gemini"
+            )
         finally:
             reset_accounting_context(token)
+            await async_db.close()
         rows = _usage_rows(db, "s1")
         assert len(rows) == 1
         assert rows[0]["task"] == "vision"
@@ -177,7 +181,8 @@ class TestAmbientAccountingContext:
         assert rows[0]["output_tokens"] == 20
 
 
-    def test_moa_tasks_excluded(self, db):
+    @pytest.mark.asyncio
+    async def test_moa_tasks_excluded(self, db):
         """MoA advisor usage is already folded into the main-loop delta by
         conversation_loop — recording it here would double-count."""
         from agent.aux_accounting import (
@@ -186,18 +191,20 @@ class TestAmbientAccountingContext:
             set_accounting_context,
         )
 
-        db.create_session("s1", source="cli")
-        token = set_accounting_context(db, "s1")
+        async_db = AsyncSessionDB(db)
+        token = set_accounting_context(async_db, "s1")
         try:
-            record_aux_usage(_mk_response(), "moa_reference")
-            record_aux_usage(_mk_response(), "moa_aggregator")
+            await record_aux_usage(_mk_response(), "moa_reference")
+            await record_aux_usage(_mk_response(), "moa_aggregator")
         finally:
             reset_accounting_context(token)
+            await async_db.close()
         assert _usage_rows(db, "s1") == []
 
 
 
-    def test_validate_llm_response_records(self, db):
+    @pytest.mark.asyncio
+    async def test_validate_llm_response_records(self, db):
         """The aux client's validation chokepoint feeds the recorder."""
         from agent.aux_accounting import (
             reset_accounting_context,
@@ -205,12 +212,15 @@ class TestAmbientAccountingContext:
         )
         from agent.auxiliary_client import _validate_llm_response
 
-        db.create_session("s1", source="cli")
-        token = set_accounting_context(db, "s1")
+        async_db = AsyncSessionDB(db)
+        token = set_accounting_context(async_db, "s1")
         try:
-            out = _validate_llm_response(_mk_response(), "web_extract", provider="openrouter")
+            out = await _validate_llm_response(
+                _mk_response(), "web_extract", provider="openrouter"
+            )
         finally:
             reset_accounting_context(token)
+            await async_db.close()
         assert out is not None
         rows = _usage_rows(db, "s1")
         assert len(rows) == 1
@@ -221,6 +231,7 @@ class TestAmbientAccountingContext:
 
 class TestAnalyticsAuxRows:
     def test_aux_usage_rows_and_merge(self, db):
+        pytest.importorskip("hermes_cli.web_server")
         from hermes_cli.web_server import (
             _aux_task_summary,
             _aux_usage_rows,
@@ -265,6 +276,7 @@ class TestInsightsAuxTotals:
     def test_overview_totals_include_aux_usage(self, db):
         """`hermes insights` overview must count aux tokens, not just the
         sessions counters (issues #58592, #9979)."""
+        pytest.importorskip("agent.insights")
         from agent.insights import InsightsEngine
 
         db.create_session("s1", source="cli")
@@ -282,4 +294,3 @@ class TestInsightsAuxTotals:
         assert ov["total_output_tokens"] == 600
         models = {m["model"] for m in report["models"]}
         assert {"main-model", "glm-5"} <= models
-

@@ -96,7 +96,8 @@ class TestFilterMCPChildren:
 
 class TestLoadMCPConfig:
 
-    def test_valid_config_parsed(self):
+    @pytest.mark.asyncio
+    async def test_valid_config_parsed(self, monkeypatch, tmp_path):
         """Valid mcp_servers config is returned as-is."""
         servers = {
             "filesystem": {
@@ -105,22 +106,30 @@ class TestLoadMCPConfig:
                 "env": {},
             }
         }
-        with patch("hermes_cli.config.load_config", return_value={"mcp_servers": servers}):
-            from tools.mcp_tool import _load_mcp_config
-            result = _load_mcp_config()
-            assert "filesystem" in result
-            assert result["filesystem"]["command"] == "npx"
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        (tmp_path / "config.yaml").write_text(
+            json.dumps({"mcp_servers": servers}), encoding="utf-8"
+        )
+        from tools.mcp_tool import _load_mcp_config
+        result = await _load_mcp_config()
+        assert "filesystem" in result
+        assert result["filesystem"]["command"] == "npx"
 
-    def test_mcp_servers_not_dict_returns_empty(self):
+    @pytest.mark.asyncio
+    async def test_mcp_servers_not_dict_returns_empty(self, monkeypatch, tmp_path):
         """mcp_servers set to non-dict value -> empty dict."""
-        with patch("hermes_cli.config.load_config", return_value={"mcp_servers": "invalid"}):
-            from tools.mcp_tool import _load_mcp_config
-            result = _load_mcp_config()
-            assert result == {}
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        (tmp_path / "config.yaml").write_text(
+            json.dumps({"mcp_servers": "invalid"}), encoding="utf-8"
+        )
+        from tools.mcp_tool import _load_mcp_config
+        result = await _load_mcp_config()
+        assert result == {}
 
 
 class TestMCPParallelSafetyProvenance:
-    def test_parallel_safe_servers_keep_exact_raw_names(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_parallel_safe_servers_keep_exact_raw_names(self, monkeypatch):
         import tools.mcp_tool as mcp_tool
 
         first = SimpleNamespace(session=object(), _registered_tool_names=[])
@@ -138,7 +147,7 @@ class TestMCPParallelSafetyProvenance:
             monkeypatch.setattr(
                 mcp_tool, "_filter_suspicious_mcp_servers", lambda servers: servers
             )
-            mcp_tool.register_mcp_servers(
+            await mcp_tool.register_mcp_servers(
                 {
                     "foo-bar": {"supports_parallel_tool_calls": True},
                     "foo_bar": {"supports_parallel_tool_calls": False},
@@ -184,21 +193,21 @@ class TestMCPParallelSafetyProvenance:
                 mcp_tool._parallel_safe_servers.update(saved_parallel)
 
 class TestMCPStatus:
-    def test_status_distinguishes_configured_connecting_failed_and_disabled(
+    @pytest.mark.asyncio
+    async def test_status_distinguishes_configured_connecting_failed_and_disabled(
         self, monkeypatch
     ):
         import tools.mcp_tool as mcp_tool
 
-        monkeypatch.setattr(
-            mcp_tool,
-            "_load_mcp_config",
-            lambda: {
+        async def _mock_load_config():
+            return {
                 "configured": {"command": "docker", "args": ["mcp", "gateway", "run"]},
                 "connecting": {"command": "slow-mcp"},
                 "failed": {"command": "bad-mcp"},
                 "disabled": {"command": "off-mcp", "enabled": False},
-            },
-        )
+            }
+
+        monkeypatch.setattr(mcp_tool, "_load_mcp_config", _mock_load_config)
         with mcp_tool._lock:
             saved_servers = dict(mcp_tool._servers)
             saved_connecting = set(mcp_tool._server_connecting)
@@ -212,7 +221,7 @@ class TestMCPStatus:
         try:
             statuses = {
                 entry["name"]: entry
-                for entry in mcp_tool.get_mcp_status()
+                for entry in await mcp_tool.get_mcp_status()
             }
         finally:
             with mcp_tool._lock:
@@ -394,71 +403,6 @@ class TestCheckFunction:
 # MCP loop runner
 # ---------------------------------------------------------------------------
 
-class TestRunOnMcpLoop:
-    def test_scheduler_failure_closes_factory_coroutine(self):
-        """If run_coroutine_threadsafe raises, the factory's coroutine is closed."""
-        import gc
-        import warnings
-        import tools.mcp_tool as mcp
-
-        created = {"coro": None}
-
-        async def _sample():
-            return "ok"
-
-        def factory():
-            created["coro"] = _sample()
-            return created["coro"]
-
-        fake_loop = MagicMock()
-        fake_loop.is_running.return_value = True
-
-        with patch.object(mcp, "_mcp_loop", fake_loop):
-            with warnings.catch_warnings(record=True) as caught:
-                warnings.simplefilter("always")
-                with patch(
-                    "agent.async_utils.asyncio.run_coroutine_threadsafe",
-                    side_effect=RuntimeError("scheduler down"),
-                ):
-                    with pytest.raises(RuntimeError):
-                        mcp._run_on_mcp_loop(factory)
-                gc.collect()
-
-        assert created["coro"] is not None
-        assert created["coro"].cr_frame is None
-        runtime_warnings = [
-            w for w in caught
-            if issubclass(w.category, RuntimeWarning)
-            and "was never awaited" in str(w.message)
-            and "_sample" in str(w.message)
-        ]
-        assert runtime_warnings == []
-
-    def test_dead_loop_closes_passed_coroutine(self):
-        """If loop is None, a passed coroutine (not factory) is closed."""
-        import gc
-        import warnings
-        import tools.mcp_tool as mcp
-
-        async def _sample():
-            return "ok"
-
-        coro = _sample()
-        with patch.object(mcp, "_mcp_loop", None):
-            with warnings.catch_warnings(record=True) as caught:
-                warnings.simplefilter("always")
-                with pytest.raises(RuntimeError, match="not running"):
-                    mcp._run_on_mcp_loop(coro)
-                gc.collect()
-
-        assert coro.cr_frame is None
-        runtime_warnings = [
-            w for w in caught
-            if issubclass(w.category, RuntimeWarning)
-            and "was never awaited" in str(w.message)
-            and "_sample" in str(w.message)
-        ]
-        assert runtime_warnings == []
 
 
 # ---------------------------------------------------------------------------
@@ -466,18 +410,10 @@ class TestRunOnMcpLoop:
 # ---------------------------------------------------------------------------
 
 class TestToolHandler:
-    """Tool handlers are sync functions that schedule work on the MCP loop."""
+    """Tool handlers are coroutine-native and execute on the caller's loop."""
 
-    def _patch_mcp_loop(self, coro_side_effect=None):
-        """Return a patch for _run_on_mcp_loop that runs the coroutine directly."""
-        def fake_run(coro_or_factory, timeout=30):
-            coro = coro_or_factory() if callable(coro_or_factory) else coro_or_factory
-            return asyncio.run(coro)
-        if coro_side_effect:
-            return patch("tools.mcp_tool._run_on_mcp_loop", side_effect=coro_side_effect)
-        return patch("tools.mcp_tool._run_on_mcp_loop", side_effect=fake_run)
-
-    def test_successful_call(self):
+    @pytest.mark.asyncio
+    async def test_successful_call(self):
         from tools.mcp_tool import _make_tool_handler, _servers
 
         mock_session = MagicMock()
@@ -489,15 +425,15 @@ class TestToolHandler:
 
         try:
             handler = _make_tool_handler("test_srv", "greet", 120)
-            with self._patch_mcp_loop():
-                result = json.loads(handler({"name": "world"}))
+            result = json.loads(await handler({"name": "world"}))
             assert result["result"] == "hello world"
             mock_session.call_tool.assert_called_once_with("greet", arguments={"name": "world"})
         finally:
             _servers.pop("test_srv", None)
 
 
-    def test_recycled_stdio_server_reconnects_lazily_on_tool_call(self):
+    @pytest.mark.asyncio
+    async def test_recycled_stdio_server_reconnects_lazily_on_tool_call(self):
         from tools.mcp_tool import _make_tool_handler, _servers
 
         mock_session = MagicMock()
@@ -509,52 +445,52 @@ class TestToolHandler:
         server._recycled_reason = "idle_timeout_seconds"
         _servers["test_srv"] = server
 
-        def fake_lazy_reconnect(server_name, srv):
-            assert server_name == "test_srv"
-            assert srv is server
-            srv.session = mock_session
-            srv._recycled_reason = None
-            return True
+        async def reconnect_after_signal():
+            await server._reconnect_event.wait()
+            server.session = mock_session
+            server._recycled_reason = None
+
+        reconnect_task = asyncio.create_task(reconnect_after_signal())
 
         try:
             handler = _make_tool_handler("test_srv", "greet", 120)
-            with patch("tools.mcp_tool._request_lazy_reconnect", side_effect=fake_lazy_reconnect) as reconnect, \
-                 self._patch_mcp_loop():
-                result = json.loads(handler({"name": "world"}))
+            result = json.loads(await handler({"name": "world"}))
             assert result["result"] == "reconnected"
-            reconnect.assert_called_once()
             mock_session.call_tool.assert_called_once_with("greet", arguments={"name": "world"})
         finally:
+            if not reconnect_task.done():
+                reconnect_task.cancel()
+            await asyncio.gather(reconnect_task, return_exceptions=True)
             _servers.pop("test_srv", None)
 
 
 class TestRunOnMCPLoopInterrupts:
-    @staticmethod
-    def _run_with_future(mcp_mod, future):
-        loop = MagicMock()
-        loop.is_running.return_value = True
-
-        async def _unused_call():
-            return "unused"
-
-        def _schedule(coro, scheduled_loop, **_kwargs):
-            assert scheduled_loop is loop
-            coro.close()
-            return future
-
-        with patch.object(mcp_mod, "_mcp_loop", loop):
-            with patch("agent.async_utils.safe_schedule_threadsafe", side_effect=_schedule):
-                return mcp_mod._run_on_mcp_loop(_unused_call(), timeout=1)
-
-    def test_interrupt_cancels_waiting_mcp_call(self):
+    @pytest.mark.asyncio
+    async def test_cancellation_cancels_waiting_mcp_call(self):
         import tools.mcp_tool as mcp_mod
-        from tools.interrupt import set_interrupt
+        started = asyncio.Event()
+        cancelled = asyncio.Event()
 
-        loop = asyncio.new_event_loop()
-        thread = threading.Thread(target=loop.run_forever, daemon=True)
-        thread.start()
+        async def _slow_call():
+            try:
+                started.set()
+                await asyncio.Event().wait()
+                return "done"
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
 
-        cancelled = threading.Event()
+        task = asyncio.create_task(mcp_mod._await_mcp_operation(_slow_call(), timeout=10))
+        await asyncio.wait_for(started.wait(), timeout=1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert cancelled.is_set()
+
+    @pytest.mark.asyncio
+    async def test_timeout_cancels_the_native_mcp_call(self):
+        import tools.mcp_tool as mcp_mod
+        cancelled = asyncio.Event()
 
         async def _slow_call():
             try:
@@ -564,73 +500,9 @@ class TestRunOnMCPLoopInterrupts:
                 cancelled.set()
                 raise
 
-        old_loop = mcp_mod._mcp_loop
-        old_thread = mcp_mod._mcp_thread
-        mcp_mod._mcp_loop = loop
-        mcp_mod._mcp_thread = thread
-
-        waiter_tid = threading.current_thread().ident
-
-        def _interrupt_soon():
-            time.sleep(0.02)
-            set_interrupt(True, waiter_tid)
-
-        interrupter = threading.Thread(target=_interrupt_soon, daemon=True)
-        interrupter.start()
-
-        try:
-            with pytest.raises(InterruptedError, match="User sent a new message"):
-                mcp_mod._run_on_mcp_loop(_slow_call(), timeout=10)
-
-            deadline = time.time() + 2
-            while time.time() < deadline and not cancelled.is_set():
-                time.sleep(0.01)
-            assert cancelled.is_set()
-        finally:
-            set_interrupt(False, waiter_tid)
-            loop.call_soon_threadsafe(loop.stop)
-            thread.join(timeout=10)
-            loop.close()
-            mcp_mod._mcp_loop = old_loop
-            mcp_mod._mcp_thread = old_thread
-
-    def test_timeout_reports_elapsed_and_configured_timeout(self):
-        import tools.mcp_tool as mcp_mod
-
-        loop = asyncio.new_event_loop()
-        thread = threading.Thread(target=loop.run_forever, daemon=True)
-        thread.start()
-
-        cancelled = threading.Event()
-
-        async def _slow_call():
-            try:
-                await asyncio.sleep(5)
-                return "done"
-            except asyncio.CancelledError:
-                cancelled.set()
-                raise
-
-        old_loop = mcp_mod._mcp_loop
-        old_thread = mcp_mod._mcp_thread
-        mcp_mod._mcp_loop = loop
-        mcp_mod._mcp_thread = thread
-
-        try:
-            # 0.1s is the floor the MCP loop clamps short timeouts to.
-            with pytest.raises(TimeoutError, match=r"MCP call timed out after .*configured timeout: 0.1s"):
-                mcp_mod._run_on_mcp_loop(_slow_call(), timeout=0.1)
-
-            deadline = time.time() + 2
-            while time.time() < deadline and not cancelled.is_set():
-                time.sleep(0.01)
-            assert cancelled.is_set()
-        finally:
-            loop.call_soon_threadsafe(loop.stop)
-            thread.join(timeout=10)
-            loop.close()
-            mcp_mod._mcp_loop = old_loop
-            mcp_mod._mcp_thread = old_thread
+        with pytest.raises(TimeoutError, match=r"configured timeout: 0.1s"):
+            await mcp_mod._await_mcp_operation(_slow_call(), timeout=0.1)
+        assert cancelled.is_set()
 
 # ---------------------------------------------------------------------------
 # Tool registration (discovery + register)
@@ -775,7 +647,8 @@ class TestMCPServerTask:
 # ---------------------------------------------------------------------------
 
 class TestToolsetInjection:
-    def test_mcp_tools_resolve_through_server_aliases(self):
+    @pytest.mark.asyncio
+    async def test_mcp_tools_resolve_through_server_aliases(self):
         """Discovered MCP tools resolve through raw server-name aliases."""
         from tools.mcp_tool import MCPServerTask
         from tools.registry import ToolRegistry
@@ -801,7 +674,7 @@ class TestToolsetInjection:
              patch("tools.mcp_tool._connect_server", side_effect=fake_connect), \
              patch("tools.registry.registry", mock_registry):
             from tools.mcp_tool import discover_mcp_tools
-            result = discover_mcp_tools()
+            result = await discover_mcp_tools()
 
             assert "mcp__fs__list_files" in result
             assert validate_toolset("fs") is True
@@ -809,7 +682,8 @@ class TestToolsetInjection:
             assert "mcp__fs__list_files" in resolve_toolset("fs")
             assert "mcp__fs__list_files" in resolve_toolset("mcp-fs")
 
-    def test_partial_failure_retry_on_second_call(self):
+    @pytest.mark.asyncio
+    async def test_partial_failure_retry_on_second_call(self):
         """Failed servers are retried on subsequent discover_mcp_tools() calls."""
         from tools.mcp_tool import MCPServerTask
 
@@ -847,7 +721,7 @@ class TestToolsetInjection:
             from tools.mcp_tool import discover_mcp_tools
 
             # First call: good connects, broken fails
-            result1 = discover_mcp_tools()
+            result1 = await discover_mcp_tools()
             assert "mcp__good__ping" in result1
             assert "mcp__broken__ping" not in result1
             first_attempts = call_count
@@ -864,7 +738,7 @@ class TestToolsetInjection:
             _mcp_mod._server_connect_retry_after.pop("broken", None)
 
             # Next call after the cooldown: should retry broken, skip good
-            result2 = discover_mcp_tools()
+            result2 = await discover_mcp_tools()
             assert "mcp__good__ping" in result2
             assert "mcp__broken__ping" in result2
             assert call_count == 1  # Only broken retried
@@ -875,11 +749,12 @@ class TestToolsetInjection:
 # ---------------------------------------------------------------------------
 
 class TestGracefulFallback:
-    def test_mcp_unavailable_returns_empty(self):
+    @pytest.mark.asyncio
+    async def test_mcp_unavailable_returns_empty(self):
         """When _MCP_AVAILABLE is False, discover_mcp_tools is a no-op."""
         with patch("tools.mcp_tool._MCP_AVAILABLE", False):
             from tools.mcp_tool import discover_mcp_tools
-            result = discover_mcp_tools()
+            result = await discover_mcp_tools()
             assert result == []
 
 # ---------------------------------------------------------------------------
@@ -888,87 +763,49 @@ class TestGracefulFallback:
 
 class TestShutdown:
 
-    def test_shutdown_drains_parked_server_after_bounded_wait_expires(self):
-        """The public shutdown path drains a parked server if graceful shutdown stalls.
-
-        This exercises the production ownership path: a real ``MCPServerTask``
-        is registered, its parked waiter owns child tasks on the shared loop,
-        and the bounded wait for the scheduled shutdown expires. The loop owner
-        must still cancel and drain that waiter before closing the loop.
-        """
+    @pytest.mark.asyncio
+    async def test_shutdown_cancellation_drains_a_stalled_server(self):
+        """Cancelling lifecycle cleanup cancels every native MCP shutdown task."""
         import tools.mcp_tool as mcp_mod
         from tools.mcp_tool import MCPServerTask, shutdown_mcp_servers
 
-        shutdown_started = threading.Event()
-        parked_task_done = threading.Event()
-        scheduled_shutdown = {}
-        schedule_count = 0
+        shutdown_started = asyncio.Event()
+        shutdown_cancelled = asyncio.Event()
 
         class StalledShutdownServer(MCPServerTask):
             async def shutdown(self):
-                shutdown_started.set()
-                await asyncio.Event().wait()
+                try:
+                    shutdown_started.set()
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    shutdown_cancelled.set()
+                    raise
 
         server = StalledShutdownServer("parked")
         with mcp_mod._lock:
             mcp_mod._servers.clear()
             mcp_mod._server_connecting.clear()
-        mcp_mod._ensure_mcp_loop()
-        with mcp_mod._lock:
-            loop = mcp_mod._mcp_loop
-        assert loop is not None
-
-        async def install_parked_waiter():
-            task = asyncio.create_task(server._wait_for_reconnect_or_shutdown())
-            server._task = task
-            task.add_done_callback(lambda _task: parked_task_done.set())
-            await asyncio.sleep(0)
-            return task
-
-        parked_task = asyncio.run_coroutine_threadsafe(
-            install_parked_waiter(), loop
-        ).result(timeout=2)
         with mcp_mod._lock:
             mcp_mod._servers[server.name] = server
 
-        def schedule_then_report_timeout(coro, target_loop, **_kwargs):
-            nonlocal schedule_count
-            schedule_count += 1
-            future = asyncio.run_coroutine_threadsafe(coro, target_loop)
-            if schedule_count > 1:
-                return future
-
-            scheduled_shutdown["future"] = future
-
-            class TimedOutFuture:
-                def result(self, timeout):
-                    assert timeout > 0
-                    assert shutdown_started.wait(timeout=2)
-                    raise TimeoutError("simulated bounded MCP shutdown timeout")
-
-            return TimedOutFuture()
-
+        shutdown = asyncio.create_task(shutdown_mcp_servers())
         try:
-            with patch(
-                "agent.async_utils.safe_schedule_threadsafe",
-                side_effect=schedule_then_report_timeout,
-            ):
-                shutdown_mcp_servers()
-
-            assert loop.is_closed()
-            assert parked_task_done.is_set(), (
-                "parked MCPServerTask was not drained before its loop closed"
-            )
-            assert parked_task.done()
-            assert scheduled_shutdown["future"].done()
-            assert schedule_count == 2
+            await asyncio.wait_for(shutdown_started.wait(), timeout=1)
+            shutdown.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await shutdown
+            assert shutdown_cancelled.is_set()
+            assert not mcp_mod._servers
         finally:
+            if not shutdown.done():
+                shutdown.cancel()
+                await asyncio.gather(shutdown, return_exceptions=True)
             with mcp_mod._lock:
                 mcp_mod._servers.clear()
                 mcp_mod._server_connecting.clear()
-            mcp_mod._stop_mcp_loop()
 
-    def test_shutdown_deregisters_registered_tools(self):
+    @pytest.mark.asyncio
+    async def test_shutdown_deregisters_registered_tools(self):
         """shutdown_mcp_servers removes MCP tools and their raw alias."""
         import tools.mcp_tool as mcp_mod
         from tools.mcp_tool import MCPServerTask, shutdown_mcp_servers, _servers
@@ -992,19 +829,15 @@ class TestShutdown:
         server._registered_tool_names = ["mcp__test__ping"]
         _servers["test"] = server
 
-        mcp_mod._ensure_mcp_loop()
-        try:
-            assert validate_toolset("test") is True
-            assert "mcp__test__ping" in resolve_toolset("test")
-            shutdown_mcp_servers()
-        finally:
-            mcp_mod._mcp_loop = None
-            mcp_mod._mcp_thread = None
+        assert validate_toolset("test") is True
+        assert "mcp__test__ping" in resolve_toolset("test")
+        await shutdown_mcp_servers()
 
         assert "mcp__test__ping" not in registry.get_all_tool_names()
         assert validate_toolset("test") is False
 
-    def test_shutdown_is_parallel(self):
+    @pytest.mark.asyncio
+    async def test_shutdown_is_parallel(self):
         """Multiple servers are shut down in parallel via asyncio.gather."""
         import tools.mcp_tool as mcp_mod
         from tools.mcp_tool import shutdown_mcp_servers, _servers
@@ -1022,14 +855,9 @@ class TestShutdown:
             mock_server.shutdown = slow_shutdown
             _servers[f"srv_{i}"] = mock_server
 
-        mcp_mod._ensure_mcp_loop()
-        try:
-            start = time.monotonic()
-            shutdown_mcp_servers()
-            elapsed = time.monotonic() - start
-        finally:
-            mcp_mod._mcp_loop = None
-            mcp_mod._mcp_thread = None
+        start = time.monotonic()
+        await shutdown_mcp_servers()
+        elapsed = time.monotonic() - start
 
         assert len(_servers) == 0
         # Parallel: ~1 delay, not 4. Margin covers scheduling jitter but stays
@@ -1343,7 +1171,8 @@ class TestConfigurableTimeouts:
 
         asyncio.run(_test())
 
-    def test_timeout_passed_to_handler(self):
+    @pytest.mark.asyncio
+    async def test_timeout_passed_to_handler(self):
         """The tool handler uses the server's configured timeout."""
         from tools.mcp_tool import _make_tool_handler, _servers
 
@@ -1357,13 +1186,18 @@ class TestConfigurableTimeouts:
 
         try:
             handler = _make_tool_handler("test_srv", "my_tool", 180)
-            with patch("tools.mcp_tool._run_on_mcp_loop") as mock_run:
-                def fake_run(coro, timeout=30):
+            with patch("tools.mcp_tool._await_mcp_operation") as mock_run:
+                async def fake_run(coro_or_factory, timeout=30):
+                    coro = (
+                        coro_or_factory()
+                        if callable(coro_or_factory)
+                        else coro_or_factory
+                    )
                     coro.close()
                     return json.dumps({"result": "ok"})
 
                 mock_run.side_effect = fake_run
-                handler({})
+                await handler({})
                 # Verify timeout=180 was passed
                 call_kwargs = mock_run.call_args
                 assert call_kwargs.kwargs.get("timeout") == 180 or \
@@ -1409,15 +1243,16 @@ class TestUtilityHandlers:
     """Tests for the MCP Resources & Prompts handler functions."""
 
     def _patch_mcp_loop(self):
-        """Return a patch for _run_on_mcp_loop that runs the coroutine directly."""
-        def fake_run(coro_or_factory, timeout=30):
+        """Run the awaited MCP RPC in this test's event loop."""
+        async def fake_run(coro_or_factory, timeout=30):
             coro = coro_or_factory() if callable(coro_or_factory) else coro_or_factory
-            return asyncio.run(coro)
-        return patch("tools.mcp_tool._run_on_mcp_loop", side_effect=fake_run)
+            return await coro
+        return patch("tools.mcp_tool._await_mcp_operation", side_effect=fake_run)
 
     # -- list_resources --
 
-    def test_list_resources_success(self):
+    @pytest.mark.asyncio
+    async def test_list_resources_success(self):
         from tools.mcp_tool import _make_list_resources_handler, _servers
 
         mock_resource = SimpleNamespace(
@@ -1434,7 +1269,7 @@ class TestUtilityHandlers:
         try:
             handler = _make_list_resources_handler("srv", 120)
             with self._patch_mcp_loop():
-                result = json.loads(handler({}))
+                result = json.loads(await handler({}))
             assert "resources" in result
             assert len(result["resources"]) == 1
             assert result["resources"][0]["uri"] == "file:///tmp/test.txt"
@@ -1450,7 +1285,8 @@ class TestUtilityHandlers:
 
     # -- get_prompt --
 
-    def test_get_prompt_success(self):
+    @pytest.mark.asyncio
+    async def test_get_prompt_success(self):
         from tools.mcp_tool import _make_get_prompt_handler, _servers
 
         mock_msg = SimpleNamespace(
@@ -1467,7 +1303,7 @@ class TestUtilityHandlers:
         try:
             handler = _make_get_prompt_handler("srv", 120)
             with self._patch_mcp_loop():
-                result = json.loads(handler({"name": "summarize", "arguments": {"text": "hello"}}))
+                result = json.loads(await handler({"name": "summarize", "arguments": {"text": "hello"}}))
             assert "messages" in result
             assert len(result["messages"]) == 1
             assert result["messages"][0]["role"] == "assistant"
@@ -1819,7 +1655,7 @@ class TestSamplingCallbackText:
             params = _make_sampling_params(tools=[server_tool])
             asyncio.run(self.handler(None, params))
 
-        tools = mock_call.call_args.kwargs["tools"]
+        tools = mock_call.await_args.kwargs["tools"]
         assert tools == [{
             "type": "function",
             "function": {
@@ -1929,12 +1765,10 @@ class TestSamplingErrors:
         handler = SamplingHandler("to", {})
         handler.timeout = 0.05
 
-        def slow_call(**kwargs):
-            import threading
-            evt = threading.Event()
-            # Outlives the 0.05s handler timeout, but short enough that the
-            # abandoned worker thread doesn't stall loop shutdown.
-            evt.wait(0.15)
+        async def slow_call(**kwargs):
+            # Outlives the 0.05s handler timeout without creating an
+            # abandoned worker thread.
+            await asyncio.sleep(0.15)
             return _make_llm_response()
 
         with patch(
@@ -2106,9 +1940,10 @@ class TestMCPServerTaskSamplingIntegration:
 class TestDiscoveryFailedCount:
     """Verify discover_mcp_tools() correctly tracks failed server connections."""
 
-    def test_failed_server_increments_failed_count(self):
+    @pytest.mark.asyncio
+    async def test_failed_server_increments_failed_count(self):
         """When _discover_and_register_server raises, failed_count increments."""
-        from tools.mcp_tool import discover_mcp_tools, _servers, _ensure_mcp_loop
+        from tools.mcp_tool import discover_mcp_tools, _servers
 
         fake_config = {
             "good_server": {"command": "npx", "args": ["good"]},
@@ -2130,11 +1965,9 @@ class TestDiscoveryFailedCount:
              patch("tools.mcp_tool._discover_and_register_server", side_effect=fake_register), \
              patch("tools.mcp_tool._MCP_AVAILABLE", True), \
              patch("tools.mcp_tool._existing_tool_names", return_value=["mcp__good_server__tool_a"]):
-            _ensure_mcp_loop()
-
             # Capture the logger to verify failed_count in summary
             with patch("tools.mcp_tool.logger") as mock_logger:
-                discover_mcp_tools()
+                await discover_mcp_tools()
 
                 # Find the summary info call
                 info_calls = [
@@ -2150,9 +1983,10 @@ class TestDiscoveryFailedCount:
         _servers.pop("good_server", None)
         _servers.pop("bad_server", None)
 
-    def test_ok_servers_excludes_failures(self):
+    @pytest.mark.asyncio
+    async def test_ok_servers_excludes_failures(self):
         """ok_servers count correctly excludes failed servers."""
-        from tools.mcp_tool import discover_mcp_tools, _servers, _ensure_mcp_loop
+        from tools.mcp_tool import discover_mcp_tools, _servers
 
         fake_config = {
             "ok1": {"command": "npx", "args": ["ok1"]},
@@ -2174,10 +2008,8 @@ class TestDiscoveryFailedCount:
              patch("tools.mcp_tool._discover_and_register_server", side_effect=selective_register), \
              patch("tools.mcp_tool._MCP_AVAILABLE", True), \
              patch("tools.mcp_tool._existing_tool_names", return_value=["mcp__ok1__t", "mcp__ok2__t"]):
-            _ensure_mcp_loop()
-
             with patch("tools.mcp_tool.logger") as mock_logger:
-                discover_mcp_tools()
+                await discover_mcp_tools()
 
                 info_calls = [str(call) for call in mock_logger.info.call_args_list]
                 # Should say "2 server(s)" not "3 server(s)"
@@ -2243,7 +2075,8 @@ class TestMCPSelectiveToolLoading:
         assert registered == ["mcp__ink__create_service"]
 
 
-    def test_enabled_false_skips_connection_attempt(self):
+    @pytest.mark.asyncio
+    async def test_enabled_false_skips_connection_attempt(self):
         from tools.mcp_tool import discover_mcp_tools
 
         connect_called = []
@@ -2267,7 +2100,7 @@ class TestMCPSelectiveToolLoading:
              patch("tools.mcp_tool._load_mcp_config", return_value=fake_config), \
              patch("tools.mcp_tool._connect_server", side_effect=fake_connect), \
              patch("toolsets.TOOLSETS", fake_toolsets):
-            result = discover_mcp_tools()
+            result = await discover_mcp_tools()
 
         assert connect_called == []
         assert result == []
@@ -2426,16 +2259,18 @@ class TestSanitizeMcpNameComponent:
 class TestRegisterMcpServers:
     """Verify the new register_mcp_servers() public API."""
 
-    def test_mcp_not_available_returns_empty(self):
+    @pytest.mark.asyncio
+    async def test_mcp_not_available_returns_empty(self):
         from tools.mcp_tool import register_mcp_servers
 
         with patch("tools.mcp_tool._MCP_AVAILABLE", False):
-            result = register_mcp_servers({"srv": {"command": "test"}})
+            result = await register_mcp_servers({"srv": {"command": "test"}})
         assert result == []
 
 
-    def test_connects_new_servers(self):
-        from tools.mcp_tool import register_mcp_servers, _servers, _ensure_mcp_loop
+    @pytest.mark.asyncio
+    async def test_connects_new_servers(self):
+        from tools.mcp_tool import register_mcp_servers, _servers
 
         fake_config = {"my_server": {"command": "npx", "args": ["test"]}}
 
@@ -2448,8 +2283,7 @@ class TestRegisterMcpServers:
         with patch("tools.mcp_tool._MCP_AVAILABLE", True), \
              patch("tools.mcp_tool._discover_and_register_server", side_effect=fake_register), \
              patch("tools.mcp_tool._existing_tool_names", return_value=["mcp__my_server__tool1"]):
-            _ensure_mcp_loop()
-            result = register_mcp_servers(fake_config)
+            result = await register_mcp_servers(fake_config)
 
         assert "mcp__my_server__tool1" in result
         _servers.pop("my_server", None)
@@ -2483,40 +2317,6 @@ class TestMcpParallelToolCalls:
                 _mcp_tool_server_names.pop("mcp__docs__search", None)
                 _mcp_tool_server_names.pop("mcp__docs__read_file", None)
                 _mcp_tool_server_names.pop("mcp__github__list_repos", None)
-
-
-    def test_register_mcp_servers_tracks_parallel_flag(self):
-        """register_mcp_servers populates _parallel_safe_servers from config."""
-        from tools.mcp_tool import (
-            register_mcp_servers, _parallel_safe_servers, _lock,
-            sanitize_mcp_name_component,
-        )
-        fake_config = {
-            "parallel_srv": {
-                "command": "echo",
-                "supports_parallel_tool_calls": True,
-            },
-            "serial_srv": {
-                "command": "echo",
-                "supports_parallel_tool_calls": False,
-            },
-            "default_srv": {
-                "command": "echo",
-                # no supports_parallel_tool_calls key
-            },
-        }
-        with patch("tools.mcp_tool._MCP_AVAILABLE", True), \
-             patch("tools.mcp_tool._ensure_mcp_loop"), \
-             patch("tools.mcp_tool._run_on_mcp_loop"), \
-             patch("tools.mcp_tool._existing_tool_names", return_value=[]):
-            register_mcp_servers(fake_config)
-
-        with _lock:
-            assert sanitize_mcp_name_component("parallel_srv") in _parallel_safe_servers
-            assert sanitize_mcp_name_component("serial_srv") not in _parallel_safe_servers
-            assert sanitize_mcp_name_component("default_srv") not in _parallel_safe_servers
-            # Cleanup
-            _parallel_safe_servers.discard(sanitize_mcp_name_component("parallel_srv"))
 
 # ---------------------------------------------------------------------------
 # Cross-process MCP discovery lock (issue #62771)
@@ -2554,7 +2354,8 @@ class TestMCPDiscoveryCrossProcessLock:
         mcp_tool._MCP_DISCOVERY_LOCK_MAX_RETRIES = orig_max
         mcp_tool._MCP_DISCOVERY_LOCK_RETRY_DELAY_S = orig_delay
 
-    def test_lock_acquired_path(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_lock_acquired_path(self, tmp_path):
         """Lock acquired -> discovery runs normally, lock released at end."""
         from tools.mcp_tool import (
             _LockCookie,
@@ -2565,20 +2366,21 @@ class TestMCPDiscoveryCrossProcessLock:
         fh = open(lock_file, "w", encoding="utf-8")
         cookie = _LockCookie(fh)
 
-        def mock_acquire():
+        async def mock_acquire():
             return cookie
 
         mock_config = {"test_srv": {"command": "echo", "enabled": True}}
         with patch.object(cookie, "release", wraps=cookie.release) as release_spy:
             with patch("tools.mcp_tool._try_acquire_mcp_discovery_lock", mock_acquire), \
                  patch("tools.mcp_tool._MCP_AVAILABLE", True), \
-                 patch("tools.mcp_tool._load_mcp_config", return_value=mock_config), \
-                 patch("tools.mcp_tool.register_mcp_servers", return_value=["mcp__test_srv__ping"]) as reg_spy:
-                result = discover_mcp_tools()
+                 patch("tools.mcp_tool._load_mcp_config", new_callable=AsyncMock, return_value=mock_config), \
+                 patch("tools.mcp_tool.register_mcp_servers", new_callable=AsyncMock, return_value=["mcp__test_srv__ping"]) as reg_spy:
+                result = await discover_mcp_tools()
             assert result == ["mcp__test_srv__ping"]
             release_spy.assert_called_once()
 
-    def test_lock_held_retries_exhausted_fallback(self):
+    @pytest.mark.asyncio
+    async def test_lock_held_retries_exhausted_fallback(self):
         """All retry attempts see lock held -> runs discovery unguarded."""
         from tools.mcp_tool import (
             _LOCK_UNAVAILABLE,
@@ -2593,9 +2395,9 @@ class TestMCPDiscoveryCrossProcessLock:
              patch("tools.mcp_tool._load_mcp_config", return_value=mock_config), \
              patch("tools.mcp_tool.register_mcp_servers") as reg_spy, \
              patch("tools.mcp_tool._existing_tool_names", return_value=[]):
-            result = discover_mcp_tools()
+            await discover_mcp_tools()
         # Must still run local discovery
-        reg_spy.assert_called_once_with(mock_config)
+        reg_spy.assert_awaited_once_with(mock_config)
 
     def test_posix_flock_acquire_and_release(self):
         """_acquire_lock_on_fh uses fcntl.flock on POSIX."""

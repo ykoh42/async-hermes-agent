@@ -1123,7 +1123,7 @@ class TestBearerTokenRoutesToConverse:
     AWS_BEARER_TOKEN_BEDROCK. Ref: #28156.
     """
 
-    def _resolve(self, monkeypatch, *, bearer: bool):
+    async def _resolve(self, monkeypatch, *, bearer: bool):
         import os
 
         from hermes_cli import runtime_provider as rp
@@ -1144,16 +1144,18 @@ class TestBearerTokenRoutesToConverse:
             },
         )
         monkeypatch.setattr(rp, "load_config", lambda: {"bedrock": {}})
-        return rp.resolve_runtime_provider(requested="bedrock")
+        return await rp.resolve_runtime_provider(requested="bedrock")
 
-    def test_bearer_token_forces_converse_for_claude(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_bearer_token_forces_converse_for_claude(self, monkeypatch):
         """Claude model + Bearer Token → bedrock_converse, not anthropic_messages."""
-        runtime = self._resolve(monkeypatch, bearer=True)
+        runtime = await self._resolve(monkeypatch, bearer=True)
         assert runtime["api_mode"] == "bedrock_converse"
         assert "bedrock_anthropic" not in runtime
 
-    def test_sigv4_claude_still_uses_anthropic_bedrock_sdk(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_sigv4_claude_still_uses_anthropic_bedrock_sdk(self, monkeypatch):
         """Without a bearer token, Claude keeps the AnthropicBedrock SDK path."""
-        runtime = self._resolve(monkeypatch, bearer=False)
+        runtime = await self._resolve(monkeypatch, bearer=False)
         assert runtime["api_mode"] == "anthropic_messages"
         assert runtime.get("bedrock_anthropic") is True

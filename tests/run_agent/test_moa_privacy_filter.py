@@ -13,6 +13,8 @@ adds conservative email + formatted-phone patterns and wires two modes:
 
 from types import SimpleNamespace
 
+import pytest
+
 from agent.moa_loop import _redact_reference_text
 
 
@@ -90,7 +92,7 @@ moa:
 def _install_fake_llm(monkeypatch):
     calls = []
 
-    def fake_call_llm(**kwargs):
+    async def fake_call_llm(**kwargs):
         calls.append(kwargs)
         if kwargs["task"] == "moa_reference":
             return _response(SENSITIVE_ADVICE)
@@ -100,7 +102,7 @@ def _install_fake_llm(monkeypatch):
     return calls
 
 
-def _run_facade(monkeypatch, tmp_path, privacy_filter):
+async def _run_facade(monkeypatch, tmp_path, privacy_filter):
     home = tmp_path / ".hermes"
     _privacy_config(home, privacy_filter)
     monkeypatch.setenv("HERMES_HOME", str(home))
@@ -112,7 +114,7 @@ def _run_facade(monkeypatch, tmp_path, privacy_filter):
     facade = MoAChatCompletions(
         "review", reference_callback=lambda ev, **kw: events.append((ev, kw))
     )
-    prepared = facade.create(
+    prepared = await facade.create(
         messages=[{"role": "user", "content": "review this"}],
         tools=[],
         _moa_prepare_only=True,
@@ -121,14 +123,16 @@ def _run_facade(monkeypatch, tmp_path, privacy_filter):
     return prepared, ref_events, facade
 
 
-def test_privacy_off_by_default_everything_raw(monkeypatch, tmp_path):
-    prepared, ref_events, _ = _run_facade(monkeypatch, tmp_path, None)
+@pytest.mark.asyncio
+async def test_privacy_off_by_default_everything_raw(monkeypatch, tmp_path):
+    prepared, ref_events, _ = await _run_facade(monkeypatch, tmp_path, None)
     assert "ceo@example.com" in prepared["guidance"]
     assert "ceo@example.com" in ref_events[0]["text"]
 
 
-def test_display_mode_redacts_display_but_not_aggregator(monkeypatch, tmp_path):
-    prepared, ref_events, facade = _run_facade(monkeypatch, tmp_path, "display")
+@pytest.mark.asyncio
+async def test_display_mode_redacts_display_but_not_aggregator(monkeypatch, tmp_path):
+    prepared, ref_events, facade = await _run_facade(monkeypatch, tmp_path, "display")
     # User-visible reference block: redacted.
     assert "ceo@example.com" not in ref_events[0]["text"]
     assert "[redacted email]" in ref_events[0]["text"]
@@ -140,8 +144,9 @@ def test_display_mode_redacts_display_but_not_aggregator(monkeypatch, tmp_path):
     assert all("ceo@example.com" not in text for _l, text, _a in trace_refs)
 
 
-def test_full_mode_redacts_aggregator_input_too(monkeypatch, tmp_path):
-    prepared, ref_events, _ = _run_facade(monkeypatch, tmp_path, "full")
+@pytest.mark.asyncio
+async def test_full_mode_redacts_aggregator_input_too(monkeypatch, tmp_path):
+    prepared, ref_events, _ = await _run_facade(monkeypatch, tmp_path, "full")
     assert "ceo@example.com" not in prepared["guidance"]
     assert "[redacted email]" in prepared["guidance"]
     assert "(555) 867-5309" not in prepared["guidance"]
@@ -155,15 +160,17 @@ def test_full_mode_redacts_aggregator_input_too(monkeypatch, tmp_path):
 
 
 
-def test_cache_keeps_raw_text_redaction_applied_per_surface(monkeypatch, tmp_path):
+@pytest.mark.asyncio
+async def test_cache_keeps_raw_text_redaction_applied_per_surface(monkeypatch, tmp_path):
     """The reference cache must hold RAW advisor text — redaction happens at
     each consuming surface. Otherwise a mid-session mode change would leak
     (cache pre-redacted with weaker mode) or double-redact."""
-    _prepared, _ref_events, facade = _run_facade(monkeypatch, tmp_path, "full")
+    _prepared, _ref_events, facade = await _run_facade(monkeypatch, tmp_path, "full")
     assert any("ceo@example.com" in text for _l, text, _a in facade._ref_cache_outputs)
 
 
-def test_full_mode_covers_one_shot_aggregate_moa_context(monkeypatch, tmp_path):
+@pytest.mark.asyncio
+async def test_full_mode_covers_one_shot_aggregate_moa_context(monkeypatch, tmp_path):
     """The /moa one-shot synthesis path also honors full mode."""
     home = tmp_path / ".hermes"
     _privacy_config(home, "full")
@@ -172,7 +179,7 @@ def test_full_mode_covers_one_shot_aggregate_moa_context(monkeypatch, tmp_path):
 
     from agent.moa_loop import aggregate_moa_context
 
-    aggregate_moa_context(
+    await aggregate_moa_context(
         user_prompt="review this",
         api_messages=[{"role": "user", "content": "review this"}],
         reference_models=[{"provider": "openai-codex", "model": "gpt-5.5"}],

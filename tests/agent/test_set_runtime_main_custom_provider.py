@@ -4,7 +4,7 @@ so that _resolve_auto() can route custom: providers in Step 1.
 Fixes https://github.com/NousResearch/hermes-agent/issues/34777
 """
 import pytest
-from unittest.mock import patch, MagicMock
+from unittest.mock import AsyncMock, patch, MagicMock
 
 
 def _get_globals(mod):
@@ -37,7 +37,8 @@ class TestSetRuntimeMainCustomProvider:
         for v in g.values():
             assert v == "", f"Expected empty, got {v!r}"
 
-    def test_resolve_auto_uses_globals_for_custom_provider(self):
+    @pytest.mark.asyncio
+    async def test_resolve_auto_uses_globals_for_custom_provider(self):
         """_resolve_auto reads base_url/api_key from globals when main_runtime is None."""
         import agent.auxiliary_client as mod
 
@@ -52,7 +53,7 @@ class TestSetRuntimeMainCustomProvider:
 
             with patch.object(mod, "resolve_provider_client") as mock_resolve:
                 mock_resolve.return_value = (MagicMock(), "test-model")
-                client, resolved = mod._resolve_auto(main_runtime=None)
+                client, resolved = await mod._resolve_auto(main_runtime=None)
 
                 mock_resolve.assert_called_once()
                 call_args = mock_resolve.call_args
@@ -85,7 +86,8 @@ class TestResolveAutoCustomEndToEnd:
                 continue
         return None
 
-    def test_config_less_custom_endpoint_routes_via_global(self, tmp_path, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_config_less_custom_endpoint_routes_via_global(self, tmp_path, monkeypatch):
         """custom:<name> with NO config entry: the live base_url carried by
         set_runtime_main() must build a real client at that endpoint — not
         fall through to Step 2 (the regression in #34777)."""
@@ -113,7 +115,7 @@ class TestResolveAutoCustomEndToEnd:
                 base_url="https://ephemeral.live/v1",
                 api_key="sk-live",
             )
-            client, resolved = mod.resolve_provider_client("auto", None)
+            client, resolved = await mod.resolve_provider_client("auto", None)
             assert client is not None, (
                 "config-less custom endpoint fell through to Step 2 — "
                 "the #34777 bug is back"
@@ -124,7 +126,8 @@ class TestResolveAutoCustomEndToEnd:
         finally:
             mod.clear_runtime_main()
 
-    def test_named_custom_with_config_entry_still_routes(self, tmp_path, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_named_custom_with_config_entry_still_routes(self, tmp_path, monkeypatch):
         """Regression guard: custom:<name> WITH a custom_providers entry must
         still resolve to that entry's endpoint.  An earlier competing fix
         collapsed the provider to bare ``custom`` before resolution, which
@@ -154,14 +157,15 @@ class TestResolveAutoCustomEndToEnd:
         mod.clear_runtime_main()
         try:
             mod.set_runtime_main("custom:openclaw", "glm-5.1")
-            client, resolved = mod.resolve_provider_client("auto", None)
+            client, resolved = await mod.resolve_provider_client("auto", None)
             assert client is not None
             base = self._client_base_url(client)
             assert base and base.rstrip("/") == "https://withcfg.example/v1"
         finally:
             mod.clear_runtime_main()
 
-    def test_named_custom_anthropic_messages_keeps_full_name_and_url(
+    @pytest.mark.asyncio
+    async def test_named_custom_anthropic_messages_keeps_full_name_and_url(
             self, tmp_path, monkeypatch):
         """PR #36043: a ``custom:<name>`` main provider whose config entry
         declares ``api_mode: anthropic_messages`` must reach the
@@ -205,11 +209,18 @@ class TestResolveAutoCustomEndToEnd:
                 api_key="foundry-token",
                 api_mode="anthropic_messages",
             )
-            client, resolved = mod.resolve_provider_client("auto", None)
+            # The adapter owns route selection; avoid making this resolver
+            # contract depend on the optional Anthropic SDK wheel.
+            with patch(
+                "agent.anthropic_adapter.build_anthropic_client",
+                return_value=MagicMock(),
+            ) as mock_build:
+                client, resolved = await mod.resolve_provider_client("auto", None)
             assert client is not None, (
                 "custom:<name> with anthropic_messages entry resolved to None"
             )
             assert resolved == "claude-4-6-opus"
+            mock_build.assert_called_once_with("foundry-token", proxy_base)
             assert client.__class__.__name__ == "AnthropicAuxiliaryClient", (
                 f"expected AnthropicAuxiliaryClient, got {client.__class__.__name__}"
                 " — the custom:<name> main provider was collapsed to the"
@@ -221,9 +232,9 @@ class TestResolveAutoCustomEndToEnd:
             # Wiring check: _resolve_auto must hand the FULL custom:<name>
             # string to resolve_provider_client, with no explicit_base_url
             # override (the named arm reads base_url/api_key from config).
-            with patch.object(mod, "resolve_provider_client") as mock_resolve:
+            with patch.object(mod, "resolve_provider_client", new_callable=AsyncMock) as mock_resolve:
                 mock_resolve.return_value = (MagicMock(), "claude-4-6-opus")
-                mod._resolve_auto(main_runtime=None)
+                await mod._resolve_auto(main_runtime=None)
             mock_resolve.assert_called_once()
             assert mock_resolve.call_args.args[0] == "custom:palantir"
             assert mock_resolve.call_args.kwargs["explicit_base_url"] is None

@@ -2,14 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
-import threading
 import time
-import urllib.request
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Literal, Optional
+
+import httpx
 
 
 NousAccountInfoSource = Literal["jwt", "account_api", "inference_key", "none", "error"]
@@ -30,7 +31,7 @@ TOOL_COVERAGE_CATEGORIES = (
 
 _ACCOUNT_INFO_CACHE_TTL = 60
 _account_info_cache: tuple[str, float, "NousPortalAccountInfo"] | None = None
-_ACCOUNT_INFO_CACHE_LOCK = threading.Lock()
+_ACCOUNT_INFO_CACHE_LOCK = asyncio.Lock()
 
 
 @dataclass(frozen=True)
@@ -319,7 +320,7 @@ def reset_nous_portal_account_info_cache() -> None:
     _account_info_cache = None
 
 
-def get_nous_portal_account_info(
+async def get_nous_portal_account_info(
     *,
     force_fresh: bool = False,
     min_jwt_ttl_seconds: int = 60,
@@ -332,23 +333,21 @@ def get_nous_portal_account_info(
     decoded locally for UX gating only; server APIs remain authoritative.
     """
     try:
-        from hermes_cli.auth import get_provider_auth_state
-
-        state = get_provider_auth_state("nous") or {}
+        state = await _load_nous_auth_state()
     except Exception as exc:
         return _error_info(error=exc, logged_in=False)
 
     access_token = state.get("access_token")
     portal_base_url = _portal_base_url(state)
     if not isinstance(access_token, str) or not access_token.strip():
-        pool_oauth_info = _info_from_oauth_pool(
+        pool_oauth_info = await _info_from_oauth_pool(
             force_fresh=force_fresh,
             min_jwt_ttl_seconds=min_jwt_ttl_seconds,
             portal_base_url=portal_base_url,
         )
         if pool_oauth_info is not None:
             return pool_oauth_info
-        pool_info = _info_from_inference_key_pool(portal_base_url)
+        pool_info = await _info_from_inference_key_pool(portal_base_url)
         if pool_info is not None:
             return pool_info
         return NousPortalAccountInfo(
@@ -368,14 +367,14 @@ def get_nous_portal_account_info(
         if jwt_info is not None:
             return jwt_info
 
-    return _fresh_account_info(
+    return await _fresh_account_info(
         state=state,
         force_fresh=force_fresh,
         portal_base_url=portal_base_url,
     )
 
 
-def _fresh_account_info(
+async def _fresh_account_info(
     *,
     state: dict[str, Any],
     force_fresh: bool,
@@ -384,20 +383,24 @@ def _fresh_account_info(
     global _account_info_cache
 
     try:
-        from hermes_cli.auth import get_provider_auth_state, resolve_nous_access_token
-
-        access_token = resolve_nous_access_token()
-        refreshed_state = get_provider_auth_state("nous") or state
+        refreshed_state = await _load_nous_auth_state() or state
+        access_token = refreshed_state.get("access_token")
+        if not isinstance(access_token, str) or not access_token.strip():
+            return _error_info(
+                error="missing_access_token",
+                logged_in=False,
+                portal_base_url=portal_base_url,
+            )
         portal_base_url = _portal_base_url(refreshed_state) or portal_base_url
         cache_key = _cache_key(access_token, portal_base_url)
 
-        with _ACCOUNT_INFO_CACHE_LOCK:
+        async with _ACCOUNT_INFO_CACHE_LOCK:
             if not force_fresh and _account_info_cache is not None:
                 cached_key, cached_at, cached_info = _account_info_cache
                 if cached_key == cache_key and (time.monotonic() - cached_at) < _ACCOUNT_INFO_CACHE_TTL:
                     return cached_info
 
-        payload = _fetch_nous_account_info(access_token, portal_base_url)
+        payload = await _fetch_nous_account_info(access_token, portal_base_url)
         if not payload:
             return _error_info(
                 error="empty_account_response",
@@ -417,7 +420,7 @@ def _fresh_account_info(
             state=refreshed_state,
             portal_base_url=portal_base_url,
         )
-        with _ACCOUNT_INFO_CACHE_LOCK:
+        async with _ACCOUNT_INFO_CACHE_LOCK:
             _account_info_cache = (cache_key, time.monotonic(), info)
         return info
     except Exception as exc:
@@ -428,12 +431,12 @@ def _fresh_account_info(
         )
 
 
-def _info_from_inference_key_pool(
+async def _info_from_inference_key_pool(
     portal_base_url: Optional[str],
 ) -> Optional[NousPortalAccountInfo]:
     """Return an explicit unknown-entitlement snapshot for opaque Nous keys."""
     try:
-        entry = _select_nous_pool_entry()
+        entry = await _select_nous_pool_entry()
         if entry is None:
             return None
         runtime_key = getattr(entry, "runtime_api_key", None) or getattr(entry, "access_token", "")
@@ -461,14 +464,14 @@ def _info_from_inference_key_pool(
         return None
 
 
-def _info_from_oauth_pool(
+async def _info_from_oauth_pool(
     *,
     force_fresh: bool,
     min_jwt_ttl_seconds: int,
     portal_base_url: Optional[str],
 ) -> Optional[NousPortalAccountInfo]:
     try:
-        entry = _select_nous_pool_entry()
+        entry = await _select_nous_pool_entry()
     except Exception:
         return None
     if entry is None or not _pool_entry_is_portal_oauth(entry):
@@ -505,7 +508,7 @@ def _info_from_oauth_pool(
             return jwt_info
 
     try:
-        payload = _fetch_nous_account_info(access_token, entry_portal_url)
+        payload = await _fetch_nous_account_info(access_token, entry_portal_url)
     except Exception as exc:
         return _error_info(
             error=exc,
@@ -532,10 +535,10 @@ def _info_from_oauth_pool(
     )
 
 
-def _select_nous_pool_entry() -> Optional[Any]:
+async def _select_nous_pool_entry() -> Optional[Any]:
     from agent.credential_pool import load_pool
 
-    pool = load_pool("nous")
+    pool = await load_pool("nous")
     if not pool or not pool.has_credentials():
         return None
     entries = list(pool.entries())
@@ -560,7 +563,7 @@ def _pool_entry_is_portal_oauth(entry: Any) -> bool:
     return auth_type.startswith("oauth") or bool(refresh_token)
 
 
-def _fetch_nous_account_info(
+async def _fetch_nous_account_info(
     access_token: str,
     portal_base_url: Optional[str] = None,
 ) -> dict[str, Any]:
@@ -570,10 +573,30 @@ def _fetch_nous_account_info(
         "Authorization": f"Bearer {access_token}",
         "Accept": "application/json",
     }
-    req = urllib.request.Request(url, headers=headers)
-    with urllib.request.urlopen(req, timeout=8) as resp:
-        payload = json.loads(resp.read().decode())
+    async with httpx.AsyncClient(timeout=8.0) as client:
+        response = await client.get(url, headers=headers)
+        response.raise_for_status()
+        payload = response.json()
     return payload if isinstance(payload, dict) else {}
+
+
+async def _load_nous_auth_state() -> dict[str, Any]:
+    """Read the profile-aware Nous auth snapshot without blocking a turn."""
+    from hermes_cli.auth import (
+        _load_auth_store_async,
+        _load_global_auth_store_async,
+        _load_provider_state,
+    )
+
+    auth_store, global_store = await asyncio.gather(
+        _load_auth_store_async(),
+        _load_global_auth_store_async(),
+    )
+    return (
+        _load_provider_state(auth_store, "nous")
+        or _load_provider_state(global_store, "nous")
+        or {}
+    )
 
 
 def _info_from_valid_jwt(

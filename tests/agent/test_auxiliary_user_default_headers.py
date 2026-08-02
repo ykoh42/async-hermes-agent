@@ -56,7 +56,8 @@ class TestApplyUserDefaultHeadersHelper:
 class TestAuxClientHonorsUserDefaultHeaders:
     """Integration: resolve_provider_client must pass overridden headers to OpenAI."""
 
-    def test_custom_provider_overrides_sdk_user_agent(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_custom_provider_overrides_sdk_user_agent(self, tmp_path):
         """The #40033 reproduction on the auxiliary path."""
         _write_config(tmp_path, {
             "model": {
@@ -66,10 +67,10 @@ class TestAuxClientHonorsUserDefaultHeaders:
                 "default_headers": {"User-Agent": "curl/8.7.1", "X-Extra": "1"},
             },
         })
-        with patch("agent.auxiliary_client.OpenAI") as mock_openai:
+        with patch("agent.auxiliary_client._create_openai_client") as mock_openai:
             mock_openai.return_value = MagicMock()
             from agent.auxiliary_client import resolve_provider_client
-            client, model = resolve_provider_client("main", "my-custom-model")
+            client, model = await resolve_provider_client("main", "my-custom-model")
 
         assert client is not None
         assert mock_openai.called
@@ -77,7 +78,8 @@ class TestAuxClientHonorsUserDefaultHeaders:
         assert headers.get("User-Agent") == "curl/8.7.1"
         assert headers.get("X-Extra") == "1"
 
-    def test_custom_provider_no_override_sends_no_user_agent(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_custom_provider_no_override_sends_no_user_agent(self, tmp_path):
         """Without config, the aux client injects nothing — SDK defaults apply."""
         _write_config(tmp_path, {
             "model": {
@@ -86,16 +88,17 @@ class TestAuxClientHonorsUserDefaultHeaders:
                 "base_url": "http://localhost:8080/v1",
             },
         })
-        with patch("agent.auxiliary_client.OpenAI") as mock_openai:
+        with patch("agent.auxiliary_client._create_openai_client") as mock_openai:
             mock_openai.return_value = MagicMock()
             from agent.auxiliary_client import resolve_provider_client
-            client, model = resolve_provider_client("main", "my-custom-model")
+            client, model = await resolve_provider_client("main", "my-custom-model")
 
         assert client is not None
         headers = mock_openai.call_args.kwargs.get("default_headers", {}) or {}
         assert "User-Agent" not in headers
 
-    def test_named_custom_provider_honors_override(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_named_custom_provider_honors_override(self, tmp_path):
         """A `custom_providers:` entry's aux calls also honor model.default_headers.
 
         This is a distinct construction path (_extra2) from the config-level
@@ -110,10 +113,10 @@ class TestAuxClientHonorsUserDefaultHeaders:
                 {"name": "my-gw", "base_url": "http://my-gw.local/v1", "api_key": "k"},
             ],
         })
-        with patch("agent.auxiliary_client.OpenAI") as mock_openai:
+        with patch("agent.auxiliary_client._create_openai_client") as mock_openai:
             mock_openai.return_value = MagicMock()
             from agent.auxiliary_client import resolve_provider_client
-            client, model = resolve_provider_client("my-gw", "test-model")
+            client, model = await resolve_provider_client("my-gw", "test-model")
 
         assert client is not None
         headers = mock_openai.call_args.kwargs.get("default_headers", {}) or {}

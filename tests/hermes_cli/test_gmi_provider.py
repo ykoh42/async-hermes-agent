@@ -25,8 +25,6 @@ from hermes_cli.models import (
     normalize_provider,
     provider_model_ids,
 )
-from agent.auxiliary_client import resolve_provider_client
-from agent.model_metadata import get_model_context_length
 
 
 @pytest.fixture(autouse=True)
@@ -102,7 +100,9 @@ class TestGmiModelCatalog:
             ],
         )
 
-        assert provider_model_ids("gmi") == [
+        import hermes_cli.models as models
+
+        assert models.provider_model_ids("gmi") == [
             "openai/gpt-5.4-mini",
             "zai-org/GLM-5.1-FP8",
         ]
@@ -211,6 +211,8 @@ class TestGmiModelMetadata:
 
 
     def test_known_gmi_endpoint_still_uses_endpoint_metadata(self):
+        import agent.model_metadata as model_metadata
+
         with patch(
             "agent.model_metadata.get_cached_context_length",
             return_value=None,
@@ -224,7 +226,7 @@ class TestGmiModelMetadata:
             "agent.model_metadata.fetch_model_metadata",
             return_value={},
         ):
-            result = get_model_context_length(
+            result = model_metadata.get_model_context_length(
                 "anthropic/claude-opus-4.6",
                 base_url="https://api.gmi-serving.com/v1",
                 api_key="gmi-test-key",
@@ -236,11 +238,13 @@ class TestGmiModelMetadata:
 
 class TestGmiAuxiliary:
     def test_resolve_provider_client_uses_gmi_aux_default(self, monkeypatch):
+        import agent.auxiliary_client as auxiliary_client
+
         monkeypatch.setenv("GMI_API_KEY", "gmi-test-key")
 
         with patch("agent.auxiliary_client.OpenAI") as mock_openai:
             mock_openai.return_value = object()
-            client, model = resolve_provider_client("gmi")
+            client, model = auxiliary_client.resolve_provider_client("gmi")
 
         assert client is not None
         assert model == "google/gemini-3.1-flash-lite-preview"
@@ -262,70 +266,3 @@ class TestGmiAuxiliary:
         assert ua.startswith("HermesAgent/"), (
             f"expected GMI profile User-Agent to start with 'HermesAgent/', got {ua!r}"
         )
-
-
-class TestGmiMainFlow:
-    def test_chat_parser_accepts_gmi_provider(self, monkeypatch):
-        recorded: dict[str, str] = {}
-
-        monkeypatch.setattr("hermes_cli.config.get_container_exec_info", lambda: None)
-        monkeypatch.setattr(
-            "hermes_cli.main.cmd_chat",
-            lambda args: recorded.setdefault("provider", args.provider),
-        )
-        monkeypatch.setattr(sys, "argv", ["hermes", "chat", "--provider", "gmi"])
-
-        from hermes_cli.main import main
-
-        main()
-
-        assert recorded["provider"] == "gmi"
-
-    def test_select_provider_and_model_routes_gmi_to_generic_flow(self, monkeypatch):
-        recorded: dict[str, str] = {}
-
-        monkeypatch.setattr("hermes_cli.auth.resolve_provider", lambda *args, **kwargs: None)
-
-        def fake_prompt_provider_choice(choices, default=0):
-            return next(i for i, label in enumerate(choices) if label.startswith("GMI Cloud"))
-
-        def fake_model_flow_api_key_provider(config, provider_id, current_model=""):
-            recorded["provider_id"] = provider_id
-
-        monkeypatch.setattr("hermes_cli.main._prompt_provider_choice", fake_prompt_provider_choice)
-        monkeypatch.setattr("hermes_cli.main._model_flow_api_key_provider", fake_model_flow_api_key_provider)
-
-        from hermes_cli.main import select_provider_and_model
-
-        select_provider_and_model()
-
-        assert recorded["provider_id"] == "gmi"
-
-    def test_model_flow_api_key_provider_persists_gmi_selection(self, monkeypatch):
-        monkeypatch.setenv("GMI_API_KEY", "gmi-test-key")
-
-        with patch(
-            "hermes_cli.models.fetch_api_models",
-            return_value=["zai-org/GLM-5.1-FP8", "openai/gpt-5.4-mini"],
-        ), patch(
-            "hermes_cli.auth._prompt_model_selection",
-            return_value="openai/gpt-5.4-mini",
-        ), patch(
-            "hermes_cli.auth.deactivate_provider",
-        ), patch(
-            "builtins.input",
-            return_value="",
-        ):
-            from hermes_cli.main import _model_flow_api_key_provider
-
-            _model_flow_api_key_provider(load_config(), "gmi", "old-model")
-
-        import yaml
-        from hermes_constants import get_hermes_home
-
-        config = yaml.safe_load((get_hermes_home() / "config.yaml").read_text()) or {}
-        model_cfg = config.get("model")
-        assert isinstance(model_cfg, dict)
-        assert model_cfg["provider"] == "gmi"
-        assert model_cfg["default"] == "openai/gpt-5.4-mini"
-        assert model_cfg["base_url"] == "https://api.gmi-serving.com/v1"

@@ -662,11 +662,6 @@ def _find_skill(name: str) -> Optional[Dict[str, Any]]:
     return None
 
 
-def _maybe_auto_propose_org_edit(name: str, skill_path: Path) -> Optional[str]:
-    """The training runtime keeps skill edits local."""
-    return None
-
-
 def _org_mirror_write_guard(name: str, skill_path: Path, action: str) -> Optional[Dict[str, Any]]:
     """Org-shared skills are EDITABLE IN PLACE — this only blocks deletion.
 
@@ -999,10 +994,6 @@ def _edit_skill(name: str, content: str) -> Dict[str, Any]:
         "path": str(existing["path"]),
         "_change": {"description": _desc},
     }
-    org_note = _maybe_auto_propose_org_edit(name, existing["path"])
-    if org_note:
-        result["org_sharing"] = org_note
-        result["message"] = f"{result['message']} {org_note}"
     _add_description_prompt_preview(result, content)
     return result
 
@@ -1120,10 +1111,6 @@ def _patch_skill(
         "old": old_string[:200] + ("…" if len(old_string) > 200 else ""),
         "new": new_string[:200] + ("…" if len(new_string) > 200 else ""),
     }
-    org_note = _maybe_auto_propose_org_edit(name, skill_dir)
-    if org_note:
-        result["org_sharing"] = org_note
-        result["message"] = f"{result['message']} {org_note}"
     return result
 
 
@@ -1298,10 +1285,6 @@ def _write_file(name: str, file_path: str, file_content: str) -> Dict[str, Any]:
         "message": f"File '{file_path}' written to skill '{name}'.",
         "path": str(target),
     }
-    org_note = _maybe_auto_propose_org_edit(name, existing["path"])
-    if org_note:
-        result["org_sharing"] = org_note
-        result["message"] = f"{result['message']} {org_note}"
     return result
 
 

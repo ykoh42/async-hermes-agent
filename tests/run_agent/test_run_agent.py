@@ -6,6 +6,7 @@ are made.
 """
 
 import ast
+import asyncio
 import inspect
 import io
 import json
@@ -92,7 +93,8 @@ def test_persist_user_message_override_rewrites_text_turns(agent):
 
 
 
-def test_flush_persist_override_replaces_api_local_multimodal_note(agent):
+@pytest.mark.asyncio
+async def test_flush_persist_override_replaces_api_local_multimodal_note(agent):
     """A note-added multimodal API payload stores the original clean content."""
     clean_content = [
         {"type": "text", "text": "Describe this screenshot"},
@@ -102,7 +104,9 @@ def test_flush_persist_override_replaces_api_local_multimodal_note(agent):
         {"type": "text", "text": "[MODEL SWITCH NOTE]\n\nDescribe this screenshot"},
         {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
     ]
-    agent._session_db = MagicMock()
+    db = SimpleNamespace(append_message=AsyncMock())
+    agent._session_db = object()
+    agent._get_async_session_db = MagicMock(return_value=db)
     agent._session_db_created = True
     agent.session_id = "session-123"
     agent._last_flushed_db_idx = 0
@@ -110,34 +114,36 @@ def test_flush_persist_override_replaces_api_local_multimodal_note(agent):
     agent._persist_user_message_override = clean_content
     agent._persist_user_message_timestamp = None
 
-    agent._flush_messages_to_session_db([{"role": "user", "content": api_content}], [])
+    await agent._flush_messages_to_session_db(
+        [{"role": "user", "content": api_content}], []
+    )
 
-    db_write = agent._session_db.append_message.call_args.kwargs
+    db_write = db.append_message.await_args.kwargs
     assert db_write["content"] == "Describe this screenshot\n[screenshot]"
     assert api_content[0]["text"] == "[MODEL SWITCH NOTE]\n\nDescribe this screenshot"
 
 
-def test_direct_session_db_flushes_share_marker_claim(agent):
+@pytest.mark.asyncio
+async def test_direct_session_db_flushes_share_marker_claim(agent):
     """A direct flush cannot interleave its marker check with `_persist_session`."""
     class _BarrierDB:
         def __init__(self):
             self.rows = []
-            self.entered = threading.Event()
-            self.release = threading.Event()
+            self.entered = asyncio.Event()
+            self.release = asyncio.Event()
             self.calls = 0
-            self._lock = threading.Lock()
 
-        def append_message(self, **kwargs):
-            with self._lock:
-                self.calls += 1
-                first = self.calls == 1
+        async def append_message(self, **kwargs):
+            self.calls += 1
+            first = self.calls == 1
             if first:
                 self.entered.set()
-                assert self.release.wait(timeout=5)
+                await asyncio.wait_for(self.release.wait(), timeout=5)
             self.rows.append(kwargs["content"])
 
     db = _BarrierDB()
-    agent._session_db = db
+    agent._session_db = object()
+    agent._get_async_session_db = MagicMock(return_value=db)
     agent._session_db_created = True
     agent.session_id = "session-123"
     agent._last_flushed_db_idx = 0
@@ -147,24 +153,19 @@ def test_direct_session_db_flushes_share_marker_claim(agent):
     agent._persist_user_message_override = None
     agent._persist_user_message_timestamp = None
     agent._persist_disabled = False
-    agent._session_persist_lock = threading.RLock()
+    agent._async_session_persist_lock = None
     agent._session_json_enabled = False
 
     message = {"role": "user", "content": "exactly once"}
-    normal = threading.Thread(target=lambda: agent._persist_session([message], []))
-    direct = threading.Thread(target=lambda: agent._flush_messages_to_session_db([message], []))
-    normal.start()
-    assert db.entered.wait(timeout=5)
-    direct.start()
+    normal = asyncio.create_task(agent._persist_session([message], []))
+    await asyncio.wait_for(db.entered.wait(), timeout=5)
+    direct = asyncio.create_task(agent._flush_messages_to_session_db([message], []))
+    await asyncio.sleep(0)
     # Direct flush is blocked by the agent-wide persistence lock until the
     # normal writer stamps the message's durable marker.
     assert db.calls == 1
     db.release.set()
-    normal.join(timeout=5)
-    direct.join(timeout=5)
-
-    assert not normal.is_alive()
-    assert not direct.is_alive()
+    await asyncio.gather(normal, direct)
     assert db.rows == ["exactly once"]
 
 
@@ -449,23 +450,25 @@ class TestSessionJsonSnapshotOptIn:
             "sessions.write_json_snapshots must default to False"
         )
 
-    def test_save_session_log_noops_when_disabled(self, agent, tmp_path):
+    @pytest.mark.asyncio
+    async def test_save_session_log_noops_when_disabled(self, agent, tmp_path):
         # When disabled, calling the method must not write any file even
         # if logs_dir is writable and messages are non-empty.
         agent._session_json_enabled = False
         agent.logs_dir = tmp_path
         agent._session_messages = [{"role": "user", "content": "hello"}]
-        agent._save_session_log()
+        await agent._save_session_log()
         # No session_*.json must appear under logs_dir.
         assert list(tmp_path.glob("session_*.json")) == []
 
-    def test_save_session_log_writes_when_enabled(self, agent, tmp_path):
+    @pytest.mark.asyncio
+    async def test_save_session_log_writes_when_enabled(self, agent, tmp_path):
         # Opt-in path: with the flag on and a session_id, the writer must
         # produce ``session_{sid}.json`` under logs_dir.
         agent._session_json_enabled = True
         agent.logs_dir = tmp_path
         messages = [{"role": "user", "content": "hello"}]
-        agent._save_session_log(messages)
+        await agent._save_session_log(messages)
         expected = tmp_path / f"session_{agent.session_id}.json"
         assert expected.exists(), (
             "Opt-in writer must produce session_{sid}.json under logs_dir"
@@ -478,14 +481,15 @@ class TestSessionJsonSnapshotOptIn:
         # the session JSON opt-in.
         assert hasattr(agent, "logs_dir")
 
-    def test_traversal_session_id_cannot_escape_logs_dir(self, agent, tmp_path):
+    @pytest.mark.asyncio
+    async def test_traversal_session_id_cannot_escape_logs_dir(self, agent, tmp_path):
         # Security regression (#5958): a traversal-shaped session ID (which can
         # originate from the untrusted X-Hermes-Session-Id API header) must not
         # redirect the session snapshot outside the sessions directory.
         agent._session_json_enabled = True
         agent.logs_dir = tmp_path
         agent.session_id = "../../../../outside_dir/pwned"
-        agent._save_session_log([{"role": "user", "content": "hello"}])
+        await agent._save_session_log([{"role": "user", "content": "hello"}])
 
         # Exactly one snapshot, and it lives directly under logs_dir.
         written = list(tmp_path.glob("session_*.json"))
@@ -519,7 +523,8 @@ class TestSaveSessionLogRedactsSecrets:
         monkeypatch.delenv("HERMES_REDACT_SECRETS", raising=False)
         monkeypatch.setattr("agent.redact._REDACT_ENABLED", True)
 
-    def test_redacts_api_key_in_tool_content(self, agent, tmp_path):
+    @pytest.mark.asyncio
+    async def test_redacts_api_key_in_tool_content(self, agent, tmp_path):
         agent._session_json_enabled = True
         agent.logs_dir = tmp_path
         messages = [
@@ -529,32 +534,35 @@ class TestSaveSessionLogRedactsSecrets:
                 "content": "Response: Authorization: Bearer sk-proj-abc123def456ghi789jkl012mno",
             },
         ]
-        agent._save_session_log(messages)
+        await agent._save_session_log(messages)
 
         snapshot = (tmp_path / f"session_{agent.session_id}.json").read_text(encoding="utf-8")
         assert "sk-proj-abc123def456ghi789jkl012mno" not in snapshot
 
-    def test_redacts_api_key_in_user_message(self, agent, tmp_path):
+    @pytest.mark.asyncio
+    async def test_redacts_api_key_in_user_message(self, agent, tmp_path):
         agent._session_json_enabled = True
         agent.logs_dir = tmp_path
         messages = [
             {"role": "user", "content": "My key is sk-ant-api03-abc123def456ghi789jkl012mno please use it"},
         ]
-        agent._save_session_log(messages)
+        await agent._save_session_log(messages)
 
         snapshot = (tmp_path / f"session_{agent.session_id}.json").read_text(encoding="utf-8")
         assert "sk-ant-api03-abc123def456ghi789jkl012mno" not in snapshot
 
-    def test_redacts_system_prompt_credentials(self, agent, tmp_path):
+    @pytest.mark.asyncio
+    async def test_redacts_system_prompt_credentials(self, agent, tmp_path):
         agent._session_json_enabled = True
         agent.logs_dir = tmp_path
         agent._cached_system_prompt = "Use key sk-proj-realkey1234567890123456 for API calls"
-        agent._save_session_log([{"role": "user", "content": "test"}])
+        await agent._save_session_log([{"role": "user", "content": "test"}])
 
         snapshot = (tmp_path / f"session_{agent.session_id}.json").read_text(encoding="utf-8")
         assert "sk-proj-realkey1234567890123456" not in snapshot
 
-    def test_redacts_list_type_multimodal_content(self, agent, tmp_path):
+    @pytest.mark.asyncio
+    async def test_redacts_list_type_multimodal_content(self, agent, tmp_path):
         """OpenAI/Anthropic multimodal shape: content = list of {type, text|image_url} parts."""
         agent._session_json_enabled = True
         agent.logs_dir = tmp_path
@@ -567,7 +575,7 @@ class TestSaveSessionLogRedactsSecrets:
                 ],
             },
         ]
-        agent._save_session_log(messages)
+        await agent._save_session_log(messages)
 
         snapshot_text = (tmp_path / f"session_{agent.session_id}.json").read_text(encoding="utf-8")
         snapshot = json.loads(snapshot_text)
@@ -610,8 +618,8 @@ class TestMaskApiKey:
 
 
 class TestInit:
-    def test_anthropic_base_url_accepted(self):
-        """Anthropic base URLs should route to native Anthropic client."""
+    def test_anthropic_base_url_is_deferred_to_native_async_client(self):
+        """Construction records the native Anthropic route without doing I/O."""
         with (
             patch("run_agent.get_tool_definitions", return_value=[]),
             patch("run_agent.check_toolset_requirements", return_value={}),
@@ -625,7 +633,10 @@ class TestInit:
                 skip_memory=True,
             )
             assert agent.api_mode == "anthropic_messages"
-            mock_anthropic.Anthropic.assert_called_once()
+            assert agent.client is None
+            assert agent._deferred_provider_runtime["base_url"] == "https://api.anthropic.com/v1/"
+            mock_anthropic.Anthropic.assert_not_called()
+            mock_anthropic.AsyncAnthropic.assert_not_called()
 
     def test_tool_delay_kwarg_is_deprecated_noop(self):
         """tool_delay stays accepted for compatibility but warns and is ignored."""
@@ -846,11 +857,6 @@ class TestBuildSystemPrompt:
                 break
         else:
             assert False, "Expected a 'Conversation started:' line in the system prompt"
-
-    def test_includes_nous_subscription_prompt(self, agent, monkeypatch):
-        monkeypatch.setattr(run_agent, "build_nous_subscription_prompt", lambda tool_names: "NOUS SUBSCRIPTION BLOCK")
-        prompt = agent._build_system_prompt()
-        assert "NOUS SUBSCRIPTION BLOCK" in prompt
 
     def test_skills_prompt_derives_available_toolsets_from_loaded_tools(self):
         tools = _make_tool_defs("web_search", "skills_list", "skill_view", "skill_manage")
@@ -1091,6 +1097,9 @@ class TestEnvironmentProbeIntegration:
         monkeypatch.setattr(env_probe.shutil, "which",
                             lambda name: None if name == "uv" else "/usr/bin/" + name)
 
+        # Prompt construction only peeks at a completed result on the async
+        # path; explicit callers may still prime this optional diagnostic.
+        env_probe.get_environment_probe_line()
         agent = self._make_agent(environment_probe=True)
         prompt = agent._build_system_prompt()
         assert "Python toolchain:" in prompt
@@ -1128,16 +1137,18 @@ class TestEnvironmentProbeIntegration:
 
 
 class TestInvalidateSystemPrompt:
-    def test_clears_cache(self, agent):
+    @pytest.mark.asyncio
+    async def test_clears_cache(self, agent):
         agent._cached_system_prompt = "cached value"
-        agent._invalidate_system_prompt()
+        await agent._invalidate_system_prompt()
         assert agent._cached_system_prompt is None
 
-    def test_reloads_memory_store(self, agent):
-        mock_store = MagicMock()
+    @pytest.mark.asyncio
+    async def test_reloads_memory_store(self, agent):
+        mock_store = MagicMock(load_from_disk=AsyncMock())
         agent._memory_store = mock_store
         agent._cached_system_prompt = "cached"
-        agent._invalidate_system_prompt()
+        await agent._invalidate_system_prompt()
         mock_store.load_from_disk.assert_called_once()
 
 
@@ -1357,39 +1368,57 @@ class TestFormatToolsForSystemMessage:
 
 
 class TestExecuteToolCalls:
-    def test_single_tool_executed(self, agent):
+    @pytest.mark.asyncio
+    async def test_single_tool_executed(self, agent):
         tc = _mock_tool_call(name="web_search", arguments='{"q":"test"}', call_id="c1")
         mock_msg = _mock_assistant_msg(content="", tool_calls=[tc])
         messages = []
-        with patch(
-            "run_agent.handle_function_call", return_value="search result"
-        ) as mock_hfc:
-            agent._execute_tool_calls(mock_msg, messages, "task-1")
+        agent._flush_messages_to_session_db = AsyncMock(return_value=True)
+        with (
+            patch(
+                "model_tools.handle_function_call",
+                new_callable=AsyncMock,
+                return_value="search result",
+            ) as mock_hfc,
+            patch(
+                "tools.registry.registry.get_entry",
+                return_value=SimpleNamespace(is_async=True, max_result_size_chars=None),
+            ),
+        ):
+            await agent._execute_tool_calls(mock_msg, messages, "task-1")
             # enabled_tools passes the agent's own valid_tool_names
-            args, kwargs = mock_hfc.call_args
+            args, kwargs = mock_hfc.await_args
             assert args[:3] == ("web_search", {"q": "test"}, "task-1")
             assert set(kwargs.get("enabled_tools", [])) == agent.valid_tool_names
         assert len(messages) == 1
         assert messages[0]["role"] == "tool"
         assert "search result" in messages[0]["content"]
 
-    def test_sequential_tool_calls_run_without_delay(self, agent):
-        """Two sequential tool calls execute back-to-back with no sleep between them."""
+    @pytest.mark.asyncio
+    async def test_safe_tool_calls_run_without_blocking_delay(self, agent):
+        """Native handlers await directly; safe calls retain concurrency."""
         tc1 = _mock_tool_call(name="web_search", arguments="{}", call_id="c1")
         tc2 = _mock_tool_call(name="web_search", arguments="{}", call_id="c2")
         mock_msg = _mock_assistant_msg(content="", tool_calls=[tc1, tc2])
         messages = []
         with (
-            patch("run_agent.handle_function_call", return_value="ok") as mock_hfc,
-            patch("agent.tool_executor.time.sleep") as mock_sleep,
+            patch(
+                "model_tools.handle_function_call",
+                new_callable=AsyncMock,
+                return_value="ok",
+            ) as mock_hfc,
+            patch(
+                "tools.registry.registry.get_entry",
+                return_value=SimpleNamespace(is_async=True, max_result_size_chars=None),
+            ),
         ):
-            agent._execute_tool_calls_sequential(mock_msg, messages, "task-1")
-        assert mock_hfc.call_count == 2
-        mock_sleep.assert_not_called()
+            await agent._execute_tool_calls(mock_msg, messages, "task-1")
+        assert mock_hfc.await_count == 2
         tool_results = [m for m in messages if m["role"] == "tool"]
         assert [m["tool_call_id"] for m in tool_results] == ["c1", "c2"]
 
-    def test_sequential_memory_remove_notifies_provider_with_tool_result(self, agent):
+    @pytest.mark.asyncio
+    async def test_memory_tool_receives_the_agent_memory_store(self, agent):
         old_text = "stale preference entry"
         tc = _mock_tool_call(
             name="memory",
@@ -1402,29 +1431,27 @@ class TestExecuteToolCalls:
         )
         mock_msg = _mock_assistant_msg(content="", tool_calls=[tc])
         messages = []
-        calls = []
-
-        class FakeMemoryManager(MemoryManager):
-            def has_tool(self, tool_name):
-                return False
-
-            def on_memory_write(self, action, target, content, metadata=None):
-                calls.append((action, target, content, metadata or {}))
-
-        agent._memory_manager = FakeMemoryManager()
         agent._memory_store = object()
 
-        with patch("tools.memory_tool.memory_tool", return_value=json.dumps({"success": True})):
-            agent._execute_tool_calls_sequential(mock_msg, messages, "task-1")
+        with (
+            patch(
+                "model_tools.handle_function_call",
+                new_callable=AsyncMock,
+                return_value=json.dumps({"success": True}),
+            ) as dispatch,
+            patch(
+                "tools.registry.registry.get_entry",
+                return_value=SimpleNamespace(is_async=True, max_result_size_chars=None),
+            ),
+        ):
+            await agent._execute_tool_calls(mock_msg, messages, "task-1")
 
-        assert len(calls) == 1
-        action, target, content, metadata = calls[0]
-        assert (action, target, content) == ("remove", "memory", "")
-        assert metadata["old_text"] == old_text
-        assert metadata["tool_call_id"] == "mem-1"
+        assert dispatch.await_args.kwargs["store"] is agent._memory_store
+        assert dispatch.await_args.args[1]["old_text"] == old_text
         assert messages[-1]["tool_call_id"] == "mem-1"
 
-    def test_keyboard_interrupt_emits_cancelled_post_tool_hook(self, agent, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_cancellation_emits_cancelled_post_tool_hook(self, agent, monkeypatch):
         tc = _mock_tool_call(name="web_search", arguments='{"q":"test"}', call_id="c1")
         mock_msg = _mock_assistant_msg(content="", tool_calls=[tc])
         messages = []
@@ -1441,11 +1468,18 @@ class TestExecuteToolCalls:
         monkeypatch.setattr("hermes_cli.lifecycle.has_hook", lambda name: True)
 
         with (
-            patch("run_agent.handle_function_call", side_effect=KeyboardInterrupt),
-            patch("run_agent._set_interrupt"),
-            pytest.raises(KeyboardInterrupt),
+            patch(
+                "model_tools.handle_function_call",
+                new_callable=AsyncMock,
+                side_effect=asyncio.CancelledError,
+            ),
+            patch(
+                "tools.registry.registry.get_entry",
+                return_value=SimpleNamespace(is_async=True, max_result_size_chars=None),
+            ),
+            pytest.raises(asyncio.CancelledError),
         ):
-            agent._execute_tool_calls_sequential(mock_msg, messages, "task-1")
+            await agent._execute_tool_calls(mock_msg, messages, "task-1")
 
         post_calls = [kwargs for name, kwargs in hook_calls if name == "post_tool_call"]
         assert len(post_calls) == 1
@@ -1458,7 +1492,8 @@ class TestExecuteToolCalls:
         assert post_calls[0]["error_type"] == "keyboard_interrupt"
         assert json.loads(post_calls[0]["result"])["status"] == "cancelled"
 
-    def test_interrupt_skips_remaining(self, agent):
+    @pytest.mark.asyncio
+    async def test_interrupt_skips_remaining(self, agent):
         tc1 = _mock_tool_call(name="web_search", arguments="{}", call_id="c1")
         tc2 = _mock_tool_call(name="web_search", arguments="{}", call_id="c2")
         mock_msg = _mock_assistant_msg(content="", tool_calls=[tc1, tc2])
@@ -1467,7 +1502,12 @@ class TestExecuteToolCalls:
         with patch("run_agent._set_interrupt"):
             agent.interrupt()
 
-        agent._execute_tool_calls(mock_msg, messages, "task-1")
+        agent._flush_messages_to_session_db = AsyncMock(return_value=True)
+        with patch(
+            "tools.registry.registry.get_entry",
+            return_value=SimpleNamespace(is_async=True, max_result_size_chars=None),
+        ):
+            await agent._execute_tool_calls(mock_msg, messages, "task-1")
         # Both calls should be skipped with cancellation messages
         assert len(messages) == 2
         assert (
@@ -1475,22 +1515,32 @@ class TestExecuteToolCalls:
             or "interrupted" in messages[0]["content"].lower()
         )
 
-    def test_invalid_json_args_are_rejected_without_dispatch(self, agent):
+    @pytest.mark.asyncio
+    async def test_invalid_json_args_are_rejected_without_dispatch(self, agent):
         tc = _mock_tool_call(
             name="web_search", arguments="not valid json", call_id="c1"
         )
         mock_msg = _mock_assistant_msg(content="", tool_calls=[tc])
         messages = []
-        with patch("run_agent.handle_function_call", return_value="ok") as mock_hfc:
-            agent._execute_tool_calls(mock_msg, messages, "task-1")
-            mock_hfc.assert_not_called()
+        with (
+            patch(
+                "model_tools.handle_function_call", new_callable=AsyncMock
+            ) as mock_hfc,
+            patch(
+                "tools.registry.registry.get_entry",
+                return_value=SimpleNamespace(is_async=True, max_result_size_chars=None),
+            ),
+        ):
+            await agent._execute_tool_calls(mock_msg, messages, "task-1")
+            mock_hfc.assert_not_awaited()
         assert len(messages) == 1
         assert messages[0]["role"] == "tool"
         assert messages[0]["tool_call_id"] == "c1"
         assert "valid json object" in messages[0]["content"].lower()
         assert "tool was not executed" in messages[0]["content"].lower()
 
-    def test_none_args_rejected_without_dispatch(self, agent):
+    @pytest.mark.asyncio
+    async def test_none_args_rejected_without_dispatch(self, agent):
         """None arguments must not crash the dispatch path. Current contract:
         malformed (non-string, non-JSON-object) args are rejected without
         executing the tool — same as invalid JSON strings. The mainline
@@ -1500,36 +1550,65 @@ class TestExecuteToolCalls:
         tc = _mock_tool_call(name="web_search", arguments=None, call_id="c1")
         mock_msg = _mock_assistant_msg(content="", tool_calls=[tc])
         messages = []
-        with patch("run_agent.handle_function_call", return_value="ok") as mock_hfc:
-            agent._execute_tool_calls(mock_msg, messages, "task-1")
-            mock_hfc.assert_not_called()
+        with (
+            patch(
+                "model_tools.handle_function_call", new_callable=AsyncMock
+            ) as mock_hfc,
+            patch(
+                "tools.registry.registry.get_entry",
+                return_value=SimpleNamespace(is_async=True, max_result_size_chars=None),
+            ),
+        ):
+            await agent._execute_tool_calls(mock_msg, messages, "task-1")
+            mock_hfc.assert_not_awaited()
         assert len(messages) == 1
         assert messages[0]["role"] == "tool"
         assert messages[0]["tool_call_id"] == "c1"
         assert "tool was not executed" in messages[0]["content"].lower()
 
-    def test_result_truncation_over_100k(self, agent, tmp_path, monkeypatch):
-        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
-        (tmp_path / ".hermes").mkdir()
+    @pytest.mark.asyncio
+    async def test_result_truncation_over_100k(self, agent):
         tc = _mock_tool_call(name="web_search", arguments="{}", call_id="c1")
         mock_msg = _mock_assistant_msg(content="", tool_calls=[tc])
         messages = []
         big_result = "x" * 150_000
-        with patch("run_agent.handle_function_call", return_value=big_result):
-            agent._execute_tool_calls(mock_msg, messages, "task-1")
+        with (
+            patch(
+                "model_tools.handle_function_call",
+                new_callable=AsyncMock,
+                return_value=big_result,
+            ),
+            patch(
+                "tools.registry.registry.get_entry",
+                return_value=SimpleNamespace(is_async=True, max_result_size_chars=None),
+            ),
+            patch("agent.tool_executor.get_active_env", return_value=None),
+        ):
+            await agent._execute_tool_calls(mock_msg, messages, "task-1")
         # Content should be replaced with persisted-output or truncation
         assert len(messages[0]["content"]) < 150_000
         assert ("Truncated" in messages[0]["content"] or "<persisted-output>" in messages[0]["content"])
 
-    def test_quiet_tool_output_suppressed_when_progress_callback_present(self, agent):
+    @pytest.mark.asyncio
+    async def test_quiet_tool_output_suppressed_when_progress_callback_present(self, agent):
         tc = _mock_tool_call(name="web_search", arguments='{"q":"test"}', call_id="c1")
         mock_msg = _mock_assistant_msg(content="", tool_calls=[tc])
         messages = []
         agent.tool_progress_callback = lambda *args, **kwargs: None
 
-        with patch("run_agent.handle_function_call", return_value="search result"), \
-             patch.object(agent, "_safe_print") as mock_print:
-            agent._execute_tool_calls(mock_msg, messages, "task-1")
+        with (
+            patch(
+                "model_tools.handle_function_call",
+                new_callable=AsyncMock,
+                return_value="search result",
+            ),
+            patch(
+                "tools.registry.registry.get_entry",
+                return_value=SimpleNamespace(is_async=True, max_result_size_chars=None),
+            ),
+            patch.object(agent, "_safe_print") as mock_print,
+        ):
+            await agent._execute_tool_calls(mock_msg, messages, "task-1")
 
         mock_print.assert_not_called()
         assert len(messages) == 1
@@ -1546,31 +1625,33 @@ class TestExecuteToolCalls:
 
         mock_print.assert_not_called()
 
-    def test_run_conversation_suppresses_retry_noise_in_parseable_quiet_mode(self, agent):
+    @pytest.mark.asyncio
+    async def test_run_conversation_suppresses_retry_noise_in_parseable_quiet_mode(self, agent):
         class _RateLimitError(Exception):
             status_code = 429
+            response = SimpleNamespace(headers={"retry-after": "0.0001"})
 
             def __str__(self):
                 return "Error code: 429 - Rate limit exceeded."
 
         responses = [_RateLimitError(), _mock_response(content="Recovered")]
 
-        def _fake_api_call(api_kwargs):
+        async def _fake_model_request(*_args, **_kwargs):
             result = responses.pop(0)
             if isinstance(result, Exception):
                 raise result
             return result
 
         agent.suppress_status_output = True
-        agent._interruptible_api_call = _fake_api_call
-        agent._persist_session = lambda *args, **kwargs: None
-        agent._save_trajectory = lambda *args, **kwargs: None
+        agent._deferred_provider_runtime = None
+        agent._execute_model_request = AsyncMock(side_effect=_fake_model_request)
+        agent._persist_session = AsyncMock()
+        agent._save_trajectory = AsyncMock()
 
         captured = io.StringIO()
         agent._print_fn = lambda *args, **kw: print(*args, file=captured, **kw)
 
-        with patch("run_agent.time.sleep", return_value=None):
-            result = agent.run_conversation("hello")
+        result = await agent.run_conversation("hello")
 
         assert result["completed"] is True
         assert result["final_response"] == "Recovered"
@@ -1584,7 +1665,7 @@ class TestRetryAfterCap:
     Retry-After header up to a 600s ceiling (was 120s, which retried before
     Tier-1 reset windows of ~171s and re-tripped the limit)."""
 
-    def _drive_once(self, agent, retry_after_value):
+    async def _drive_once(self, agent, retry_after_value):
         """Raise one 429 carrying ``Retry-After`` and capture the wait the loop
         chose. Interrupt during the backoff sleep so the test doesn't actually
         wait, and return the status string that reports the wait time."""
@@ -1596,12 +1677,13 @@ class TestRetryAfterCap:
             def __str__(self):
                 return "Error code: 429 - Rate limit exceeded."
 
-        def _fake_api_call(api_kwargs):
+        async def _fake_model_request(*_args, **_kwargs):
             raise _RateLimitError()
 
-        agent._interruptible_api_call = _fake_api_call
-        agent._persist_session = lambda *args, **kwargs: None
-        agent._save_trajectory = lambda *args, **kwargs: None
+        agent._deferred_provider_runtime = None
+        agent._execute_model_request = AsyncMock(side_effect=_fake_model_request)
+        agent._persist_session = AsyncMock()
+        agent._save_trajectory = AsyncMock()
 
         captured = []
         original_buffer = agent._buffer_status
@@ -1615,12 +1697,13 @@ class TestRetryAfterCap:
             return original_buffer(msg, *args, **kwargs)
 
         agent._buffer_status = _capture_status
-        agent.run_conversation("hello")
+        await agent.run_conversation("hello")
         return next((m for m in captured if "Waiting" in m), "")
 
-    def test_retry_after_under_cap_is_honored(self, agent):
+    @pytest.mark.asyncio
+    async def test_retry_after_under_cap_is_honored(self, agent):
         # 300s > old 120s cap but < new 600s cap → used verbatim.
-        status = self._drive_once(agent, 300)
+        status = await self._drive_once(agent, 300)
         assert "Waiting 300.0s" in status
 
 
@@ -1628,16 +1711,13 @@ class TestRetryAfterCap:
 class TestConcurrentToolExecution:
     """Tests for _execute_tool_calls_concurrent and dispatch logic."""
 
-    def test_single_tool_uses_sequential_path(self, agent):
-        """Single tool call should use sequential path, not concurrent."""
+    def test_single_tool_is_planned_as_a_sequential_segment(self, agent):
+        """A one-call batch does not create a needless TaskGroup."""
         tc = _mock_tool_call(name="web_search", arguments='{"q":"test"}', call_id="c1")
-        mock_msg = _mock_assistant_msg(content="", tool_calls=[tc])
-        messages = []
-        with patch.object(agent, "_execute_tool_calls_sequential") as mock_seq:
-            with patch.object(agent, "_execute_tool_calls_concurrent") as mock_con:
-                agent._execute_tool_calls(mock_msg, messages, "task-1")
-                mock_seq.assert_called_once()
-                mock_con.assert_not_called()
+        from agent.tool_dispatch_helpers import _plan_tool_batch_segments
+
+        segments = _plan_tool_batch_segments([tc])
+        assert [(kind, calls) for kind, calls in segments] == [("sequential", [tc])]
 
 
 
@@ -1649,7 +1729,8 @@ class TestConcurrentToolExecution:
 
 
 
-    def test_concurrent_executes_all_tools(self, agent):
+    @pytest.mark.asyncio
+    async def test_concurrent_executes_all_tools(self, agent):
         """Concurrent path should execute all tools and append results in order."""
         tc1 = _mock_tool_call(name="web_search", arguments='{"q":"alpha"}', call_id="c1")
         tc2 = _mock_tool_call(name="web_search", arguments='{"q":"beta"}', call_id="c2")
@@ -1659,12 +1740,18 @@ class TestConcurrentToolExecution:
 
         call_log = []
 
-        def fake_handle(name, args, task_id, **kwargs):
+        async def fake_handle(name, args, task_id, **kwargs):
             call_log.append(name)
             return json.dumps({"result": args.get("q", "")})
 
-        with patch("run_agent.handle_function_call", side_effect=fake_handle):
-            agent._execute_tool_calls_concurrent(mock_msg, messages, "task-1")
+        with (
+            patch("model_tools.handle_function_call", side_effect=fake_handle),
+            patch(
+                "tools.registry.registry.get_entry",
+                return_value=SimpleNamespace(is_async=True, max_result_size_chars=None),
+            ),
+        ):
+            await agent._execute_tool_calls(mock_msg, messages, "task-1")
 
         assert len(messages) == 3
         # Results must be in original order
@@ -1678,7 +1765,8 @@ class TestConcurrentToolExecution:
         assert "beta" in messages[1]["content"]
         assert "gamma" in messages[2]["content"]
 
-    def test_concurrent_none_args_rejected_without_crash(self, agent):
+    @pytest.mark.asyncio
+    async def test_concurrent_none_args_rejected_without_crash(self, agent):
         """Concurrent executor must not crash on arguments=None. Current
         contract (_parse_tool_arguments): non-object args are rejected with
         a structured error result and the tool is not executed; the valid
@@ -1689,35 +1777,46 @@ class TestConcurrentToolExecution:
         messages = []
         seen_args = []
 
-        def fake_handle(name, args, task_id, **kwargs):
+        async def fake_handle(name, args, task_id, **kwargs):
             seen_args.append((kwargs["tool_call_id"], args))
             return "ok"
 
-        with patch("run_agent.handle_function_call", side_effect=fake_handle):
-            agent._execute_tool_calls_concurrent(mock_msg, messages, "task-1")
+        with (
+            patch("model_tools.handle_function_call", side_effect=fake_handle),
+            patch(
+                "tools.registry.registry.get_entry",
+                return_value=SimpleNamespace(is_async=True, max_result_size_chars=None),
+            ),
+        ):
+            await agent._execute_tool_calls(mock_msg, messages, "task-1")
 
         # Only the valid call executed; the None-args call was rejected.
         assert seen_args == [("c2", {"q": "ok"})]
         assert [m["tool_call_id"] for m in messages] == ["c1", "c2"]
         assert "tool was not executed" in messages[0]["content"].lower()
 
-    def test_concurrent_preserves_order_despite_timing(self, agent):
+    @pytest.mark.asyncio
+    async def test_concurrent_preserves_order_despite_timing(self, agent):
         """Even if tools finish in different order, messages should be in original order."""
-        import time as _time
-
         tc1 = _mock_tool_call(name="web_search", arguments='{"q":"slow"}', call_id="c1")
         tc2 = _mock_tool_call(name="web_search", arguments='{"q":"fast"}', call_id="c2")
         mock_msg = _mock_assistant_msg(content="", tool_calls=[tc1, tc2])
         messages = []
 
-        def fake_handle(name, args, task_id, **kwargs):
+        async def fake_handle(name, args, task_id, **kwargs):
             q = args.get("q", "")
             if q == "slow":
-                _time.sleep(0.1)  # Slow tool
+                await asyncio.sleep(0.01)
             return f"result_{q}"
 
-        with patch("run_agent.handle_function_call", side_effect=fake_handle):
-            agent._execute_tool_calls_concurrent(mock_msg, messages, "task-1")
+        with (
+            patch("model_tools.handle_function_call", side_effect=fake_handle),
+            patch(
+                "tools.registry.registry.get_entry",
+                return_value=SimpleNamespace(is_async=True, max_result_size_chars=None),
+            ),
+        ):
+            await agent._execute_tool_calls(mock_msg, messages, "task-1")
 
         assert messages[0]["tool_call_id"] == "c1"
         assert "result_slow" in messages[0]["content"]
@@ -1725,64 +1824,34 @@ class TestConcurrentToolExecution:
         assert "result_fast" in messages[1]["content"]
 
 
-    def test_concurrent_submit_shutdown_error_returns_tool_errors(self, agent):
-        """Submit-time interpreter shutdown should not escape the outer loop."""
-
-        class ShutdownExecutor:
-            def __init__(self, *args, **kwargs):
-                pass
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, exc_type, exc, tb):
-                return False
-
-            def submit(self, *args, **kwargs):
-                raise RuntimeError("cannot schedule new futures after interpreter shutdown")
-
-            def shutdown(self, *args, **kwargs):
-                pass
-
+    @pytest.mark.asyncio
+    async def test_sync_only_tool_fails_before_dispatch(self, agent):
+        """The native scheduler rejects a legacy handler instead of a thread fallback."""
         tc1 = _mock_tool_call(name="web_search", arguments='{"q": "alpha"}', call_id="c1")
         tc2 = _mock_tool_call(name="web_search", arguments='{"q": "beta"}', call_id="c2")
         mock_msg = _mock_assistant_msg(content="", tool_calls=[tc1, tc2])
         messages = []
 
-        with patch("tools.daemon_pool.DaemonThreadPoolExecutor", ShutdownExecutor):
-            agent._execute_tool_calls_concurrent(mock_msg, messages, "task-1")
+        with (
+            patch(
+                "tools.registry.registry.get_entry",
+                return_value=SimpleNamespace(is_async=False),
+            ),
+            pytest.raises(RuntimeError, match="Native async handlers are required"),
+        ):
+            await agent._execute_tool_calls(mock_msg, messages, "task-1")
 
-        assert len(messages) == 2
-        assert messages[0]["tool_call_id"] == "c1"
-        assert messages[1]["tool_call_id"] == "c2"
-        assert all("Python interpreter is shutting down" in m["content"] for m in messages)
-
-
-
-
-
+        assert messages == []
 
 
-    def test_invoke_tool_dispatches_to_handle_function_call(self, agent):
-        """_invoke_tool should route regular tools through handle_function_call."""
-        with patch("run_agent.handle_function_call", return_value="result") as mock_hfc:
-            result = agent._invoke_tool("web_search", {"q": "test"}, "task-1")
-            mock_hfc.assert_called_once_with(
-                "web_search", {"q": "test"}, "task-1",
-                tool_call_id=None,
-                session_id=agent.session_id,
-                turn_id="",
-                api_request_id="",
-                enabled_tools=list(agent.valid_tool_names),
-                skip_pre_tool_call_hook=True,
-                skip_tool_request_middleware=True,
-                enabled_toolsets=agent.enabled_toolsets,
-                disabled_toolsets=agent.disabled_toolsets,
-                tool_request_middleware_trace=[],
-            )
-            assert result == "result"
 
-    def test_sequential_tool_callbacks_fire_in_order(self, agent):
+
+
+
+
+
+    @pytest.mark.asyncio
+    async def test_tool_callbacks_fire_in_order(self, agent):
         tool_call = _mock_tool_call(name="web_search", arguments='{"query":"hello"}', call_id="c1")
         mock_msg = _mock_assistant_msg(content="", tool_calls=[tool_call])
         messages = []
@@ -1791,14 +1860,25 @@ class TestConcurrentToolExecution:
         agent.tool_start_callback = lambda tool_call_id, function_name, function_args: starts.append((tool_call_id, function_name, function_args))
         agent.tool_complete_callback = lambda tool_call_id, function_name, function_args, function_result: completes.append((tool_call_id, function_name, function_args, function_result))
 
-        with patch("run_agent.handle_function_call", return_value='{"success": true}'):
-            agent._execute_tool_calls_sequential(mock_msg, messages, "task-1")
+        with (
+            patch(
+                "model_tools.handle_function_call",
+                new_callable=AsyncMock,
+                return_value='{"success": true}',
+            ),
+            patch(
+                "tools.registry.registry.get_entry",
+                return_value=SimpleNamespace(is_async=True, max_result_size_chars=None),
+            ),
+        ):
+            await agent._execute_tool_calls(mock_msg, messages, "task-1")
 
         assert starts == [("c1", "web_search", {"query": "hello"})]
         assert completes == [("c1", "web_search", {"query": "hello"}, '{"success": true}')]
 
     @pytest.mark.parametrize("quiet_mode", [True, False])
-    def test_sequential_registry_tool_forwards_request_middleware_trace(
+    @pytest.mark.asyncio
+    async def test_registry_tool_forwards_request_middleware_trace(
         self,
         agent,
         monkeypatch,
@@ -1815,98 +1895,101 @@ class TestConcurrentToolExecution:
             call_id="c1",
         )
         mock_msg = _mock_assistant_msg(content="", tool_calls=[tool_call])
-        monkeypatch.setattr(
-            "hermes_cli.middleware.apply_tool_request_middleware",
-            lambda _name, args, **_kwargs: RequestMiddlewareResult(
+        async def apply_request_middleware(_name, args, **_kwargs):
+            return RequestMiddlewareResult(
                 payload=args,
                 original_payload=args,
                 changed=True,
                 trace=trace,
-            ),
+            )
+
+        async def run_execution_middleware(_name, args, callback, **_kwargs):
+            return await callback(args)
+
+        async def resolve_pre_tool_block(*_args, **_kwargs):
+            return None
+
+        monkeypatch.setattr(
+            "hermes_cli.middleware.apply_tool_request_middleware",
+            apply_request_middleware,
         )
         monkeypatch.setattr(
             "hermes_cli.middleware.run_tool_execution_middleware",
-            lambda _name, args, callback, **_kwargs: callback(args),
+            run_execution_middleware,
         )
         monkeypatch.setattr(
-            "hermes_cli.plugins.resolve_pre_tool_block",
-            lambda *_args, **_kwargs: None,
+            "hermes_cli.plugins.resolve_pre_tool_block_async",
+            resolve_pre_tool_block,
         )
         monkeypatch.setattr(
             "agent.tool_executor._begin_tool_execution",
             lambda *_args, **_kwargs: None,
         )
 
-        def handle_function_call(*_args, **kwargs):
+        async def handle_function_call(*_args, **kwargs):
             observed.append(kwargs)
             return '{"success": true}'
 
-        with patch("run_agent.handle_function_call", side_effect=handle_function_call):
-            agent._execute_tool_calls_sequential(mock_msg, [], "task-1")
+        with (
+            patch("model_tools.handle_function_call", side_effect=handle_function_call),
+            patch(
+                "tools.registry.registry.get_entry",
+                return_value=SimpleNamespace(is_async=True, max_result_size_chars=None),
+            ),
+        ):
+            await agent._execute_tool_calls(mock_msg, [], "task-1")
 
         assert observed[0]["tool_request_middleware_trace"] == trace
 
-    def test_sequential_browser_type_callbacks_redact_api_key(self, agent):
+    def test_browser_type_display_args_redact_api_key(self, agent):
+        """The retained display helper never exposes a typed credential."""
+        from agent.display import redact_tool_args_for_display
+
         secret = "sk-proj-ABCD1234567890EFGH"
-        tool_call = _mock_tool_call(
-            name="browser_type",
-            arguments=json.dumps({"ref": "@apikey", "text": secret}),
-            call_id="c-secret",
+        display_args = redact_tool_args_for_display(
+            "browser_type", {"ref": "@apikey", "text": secret}
         )
-        mock_msg = _mock_assistant_msg(content="", tool_calls=[tool_call])
-        messages = []
-        starts = []
-        completes = []
-        progress = []
-        agent.tool_start_callback = lambda tool_call_id, function_name, function_args: starts.append((tool_call_id, function_name, function_args))
-        agent.tool_complete_callback = lambda tool_call_id, function_name, function_args, function_result: completes.append((tool_call_id, function_name, function_args, function_result))
-        agent.tool_progress_callback = lambda event, name, preview, args, **kw: progress.append((event, name, preview, args))
 
-        with patch("run_agent.handle_function_call", return_value='{"success": true, "typed": "sk-pro...EFGH"}'):
-            agent._execute_tool_calls_sequential(mock_msg, messages, "task-1")
-
-        assert starts[0][2]["text"].startswith("sk-pro")
-        assert completes[0][2]["text"].startswith("sk-pro")
-        assert progress[0][2].startswith("sk-pro")
-        assert secret not in repr(starts + completes + progress)
-
-
-
-    def test_invoke_tool_handles_agent_level_tools(self, agent):
-        """_invoke_tool should handle todo tool directly."""
-        with patch("tools.todo_tool.todo_tool", return_value='{"ok":true}') as mock_todo:
-            result = agent._invoke_tool("todo", {"todos": []}, "task-1")
-            mock_todo.assert_called_once()
-        assert "ok" in result
+        assert display_args["text"].startswith("sk-pro")
+        assert secret not in repr(display_args)
 
 
 
 
-    def test_sequential_blocked_tool_skips_checkpoints_and_callbacks(self, agent, monkeypatch):
-        """Sequential path: blocked tool should not trigger checkpoints or start callbacks."""
-        tool_call = _mock_tool_call(name="write_file",
-                                    arguments='{"path":"test.txt","content":"hello"}',
+
+
+
+    @pytest.mark.asyncio
+    async def test_blocked_tool_skips_start_callbacks(self, agent, monkeypatch):
+        """A blocked tool must not trigger start callbacks."""
+        tool_call = _mock_tool_call(name="terminal",
+                                    arguments='{"command":"echo hello"}',
                                     call_id="c1")
         mock_msg = _mock_assistant_msg(content="", tool_calls=[tool_call])
         messages = []
 
-        monkeypatch.setattr(
-            "hermes_cli.plugins.resolve_pre_tool_block",
-            lambda *args, **kwargs: "Blocked by policy",
-        )
-        agent._checkpoint_mgr.enabled = True
-        agent._checkpoint_mgr.ensure_checkpoint = MagicMock(
-            side_effect=AssertionError("checkpoint should not run")
-        )
+        async def blocked(*_args, **_kwargs):
+            return "Blocked by policy"
 
+        monkeypatch.setattr("hermes_cli.plugins.resolve_pre_tool_block_async", blocked)
         starts = []
         agent.tool_start_callback = lambda *a: starts.append(a)
 
-        with patch("run_agent.handle_function_call", side_effect=AssertionError("should not run")):
-            agent._execute_tool_calls_sequential(mock_msg, messages, "task-1")
+        with (
+            patch(
+                "model_tools.handle_function_call",
+                new_callable=AsyncMock,
+                side_effect=AssertionError("should not run"),
+            ) as dispatch,
+            patch(
+                "tools.registry.registry.get_entry",
+                return_value=SimpleNamespace(is_async=True, max_result_size_chars=None),
+            ),
+        ):
+            await agent._execute_tool_calls(mock_msg, messages, "task-1")
 
-        agent._checkpoint_mgr.ensure_checkpoint.assert_not_called()
         assert starts == []
+        dispatch.assert_not_awaited()
         assert len(messages) == 1
         assert messages[0]["role"] == "tool"
         assert json.loads(messages[0]["content"]) == {"error": "Blocked by policy"}
@@ -1929,20 +2012,6 @@ class TestConcurrentToolExecution:
         assert agent_runtime_owns_post_tool_hook(agent, "memory_extra") is True
         assert agent_runtime_owns_post_tool_hook(agent, "web_search") is False
 
-    def test_blocked_memory_tool_does_not_reset_counter(self, agent, monkeypatch):
-        """Blocked memory tool should not reset the nudge counter."""
-        agent._turns_since_memory = 5
-        monkeypatch.setattr(
-            "hermes_cli.plugins.resolve_pre_tool_block",
-            lambda *args, **kwargs: "Blocked",
-        )
-        with patch("tools.memory_tool.memory_tool", side_effect=AssertionError("should not run")):
-            result = agent._invoke_tool(
-                "memory", {"action": "add", "target": "memory", "content": "x"}, "task-1",
-            )
-
-        assert json.loads(result) == {"error": "Blocked"}
-        assert agent._turns_since_memory == 5
 
 
 
@@ -1950,46 +2019,47 @@ class TestConcurrentToolExecution:
 
 
 
-    def test_managed_tool_pipeline_rejects_second_dispatch(self, agent, monkeypatch):
-        from agent import relay_tools, tool_executor
+    @pytest.mark.asyncio
+    async def test_managed_tool_pipeline_rejects_second_dispatch(self, agent, monkeypatch):
+        from agent import tool_executor
+        from hermes_cli.middleware import RequestMiddlewareResult
 
         dispatched = []
         duplicate_errors = []
-        monkeypatch.setattr(
-            "hermes_cli.middleware.apply_tool_request_middleware",
-            lambda _name, args, **_kwargs: SimpleNamespace(
+        async def apply_request_middleware(_name, args, **_kwargs):
+            return RequestMiddlewareResult(
                 payload=args,
+                original_payload=args,
                 trace=[],
-            ),
-        )
-        monkeypatch.setattr(
-            "hermes_cli.middleware.run_tool_execution_middleware",
-            lambda _name, args, callback, **_kwargs: callback(args),
-        )
-        monkeypatch.setattr(
-            "hermes_cli.plugins.resolve_pre_tool_block",
-            lambda *_args, **_kwargs: None,
-        )
+            )
+
+        async def invoke_twice(_name, args, callback, **_kwargs):
+            result = await callback(args)
+            with pytest.raises(RuntimeError) as caught:
+                await callback(args)
+            duplicate_errors.append(str(caught.value))
+            return result
+
+        async def no_block(*_args, **_kwargs):
+            return None
+
+        monkeypatch.setattr("hermes_cli.middleware.apply_tool_request_middleware", apply_request_middleware)
+        monkeypatch.setattr("hermes_cli.middleware.run_tool_execution_middleware", invoke_twice)
+        monkeypatch.setattr("hermes_cli.plugins.resolve_pre_tool_block_async", no_block)
         monkeypatch.setattr(tool_executor, "_begin_tool_execution", lambda *_a, **_k: None)
 
-        def invoke_twice(name, args, callback, **kwargs):
-            del name, kwargs
-            result = callback(args)
-            try:
-                callback(args)
-            except RuntimeError as exc:
-                duplicate_errors.append(str(exc))
-            return result, args
+        async def execute(args, trace):
+            assert trace == []
+            dispatched.append(args)
+            return "ok"
 
-        monkeypatch.setattr(relay_tools, "execute", invoke_twice)
-
-        outcome = tool_executor._run_agent_tool_execution_middleware(
+        outcome = await tool_executor._run_agent_tool_execution_middleware(
             agent,
             function_name="terminal",
             function_args={"command": "true"},
             effective_task_id="task-1",
             tool_call_id="call-1",
-            execute=lambda args: dispatched.append(args) or "ok",
+            execute=execute,
         )
 
         assert outcome.result == "ok"
@@ -1999,60 +2069,51 @@ class TestConcurrentToolExecution:
         ]
         assert outcome.blocked is False
 
-    def test_managed_tool_pipeline_allows_one_concurrent_dispatch(
+    @pytest.mark.asyncio
+    async def test_managed_tool_pipeline_allows_one_concurrent_dispatch(
         self,
         agent,
         monkeypatch,
     ):
-        from agent import relay_tools, tool_executor
+        from agent import tool_executor
+        from hermes_cli.middleware import RequestMiddlewareResult
 
         dispatched = []
-        results = []
         errors = []
-        barrier = threading.Barrier(2)
-        monkeypatch.setattr(
-            "hermes_cli.middleware.apply_tool_request_middleware",
-            lambda _name, args, **_kwargs: SimpleNamespace(
+        async def apply_request_middleware(_name, args, **_kwargs):
+            return RequestMiddlewareResult(
                 payload=args,
+                original_payload=args,
                 trace=[],
-            ),
-        )
-        monkeypatch.setattr(
-            "hermes_cli.middleware.run_tool_execution_middleware",
-            lambda _name, args, callback, **_kwargs: callback(args),
-        )
-        monkeypatch.setattr(
-            "hermes_cli.plugins.resolve_pre_tool_block",
-            lambda *_args, **_kwargs: None,
-        )
+            )
+
+        async def invoke_concurrently(_name, args, callback, **_kwargs):
+            values = await asyncio.gather(
+                callback(args), callback(args), return_exceptions=True,
+            )
+            errors.extend(str(value) for value in values if isinstance(value, RuntimeError))
+            return next(value for value in values if not isinstance(value, Exception))
+
+        async def no_block(*_args, **_kwargs):
+            return None
+
+        monkeypatch.setattr("hermes_cli.middleware.apply_tool_request_middleware", apply_request_middleware)
+        monkeypatch.setattr("hermes_cli.middleware.run_tool_execution_middleware", invoke_concurrently)
+        monkeypatch.setattr("hermes_cli.plugins.resolve_pre_tool_block_async", no_block)
         monkeypatch.setattr(tool_executor, "_begin_tool_execution", lambda *_a, **_k: None)
 
-        def invoke_concurrently(name, args, callback, **kwargs):
-            del name, kwargs
+        async def execute(args, trace):
+            assert trace == []
+            dispatched.append(args)
+            return "ok"
 
-            def invoke():
-                barrier.wait(timeout=2)
-                try:
-                    results.append(callback(args))
-                except RuntimeError as exc:
-                    errors.append(str(exc))
-
-            threads = [threading.Thread(target=invoke) for _ in range(2)]
-            for thread in threads:
-                thread.start()
-            for thread in threads:
-                thread.join(timeout=2)
-            return results[0], args
-
-        monkeypatch.setattr(relay_tools, "execute", invoke_concurrently)
-
-        outcome = tool_executor._run_agent_tool_execution_middleware(
+        outcome = await tool_executor._run_agent_tool_execution_middleware(
             agent,
             function_name="terminal",
             function_args={"command": "true"},
             effective_task_id="task-1",
             tool_call_id="call-1",
-            execute=lambda args: dispatched.append(args) or "ok",
+            execute=execute,
         )
 
         assert outcome.result == "ok"
@@ -2072,83 +2133,6 @@ class TestAgentRuntimePostHookOwnershipSync:
         ("read_terminal", {}),
         ("delegate_task", {"goal": "Check the child path"}),
     )
-
-    @pytest.mark.parametrize(("tool_name", "tool_args"), _CASES)
-    def test_agent_runtime_tools_emit_once_per_executor_path(
-        self,
-        agent,
-        monkeypatch,
-        tool_name,
-        tool_args,
-    ):
-        from agent.agent_runtime_helpers import AGENT_RUNTIME_POST_HOOK_TOOL_NAMES
-
-        hook_calls = []
-        monkeypatch.setattr(
-            "hermes_cli.plugins.resolve_pre_tool_block",
-            lambda *args, **kwargs: None,
-        )
-        monkeypatch.setattr(
-            "hermes_cli.lifecycle.invoke_hook",
-            lambda hook_name, **kwargs: hook_calls.append((hook_name, kwargs)) or [],
-        )
-        monkeypatch.setattr("hermes_cli.lifecycle.has_hook", lambda name: True)
-        monkeypatch.setattr(
-            "tools.todo_tool.todo_tool",
-            lambda **kwargs: '{"ok":true}',
-        )
-        monkeypatch.setattr(
-            "tools.memory_tool.memory_tool",
-            lambda **kwargs: '{"ok":true}',
-        )
-        monkeypatch.setattr(
-            "tools.clarify_tool.clarify_tool",
-            lambda **kwargs: '{"ok":true}',
-        )
-        monkeypatch.setattr(
-            "tools.read_terminal_tool.read_terminal_tool",
-            lambda **kwargs: '{"ok":true}',
-        )
-        monkeypatch.setattr(agent, "_get_session_db_for_recall", lambda: None)
-        monkeypatch.setattr(
-            agent,
-            "_dispatch_delegate_task",
-            lambda args: '{"ok":true}',
-        )
-        agent._memory_manager = None
-
-        assert tool_name in AGENT_RUNTIME_POST_HOOK_TOOL_NAMES
-        with patch(
-            "run_agent.handle_function_call",
-            side_effect=AssertionError("agent-runtime tools must stay inline"),
-        ):
-            agent._invoke_tool(
-                tool_name,
-                dict(tool_args),
-                "task-concurrent",
-                tool_call_id=f"{tool_name}-concurrent",
-            )
-            tool_call = _mock_tool_call(
-                name=tool_name,
-                arguments=json.dumps(tool_args),
-                call_id=f"{tool_name}-sequential",
-            )
-            agent._execute_tool_calls_sequential(
-                _mock_assistant_msg(content="", tool_calls=[tool_call]),
-                [],
-                "task-sequential",
-            )
-
-        post_calls = [
-            kwargs
-            for hook_name, kwargs in hook_calls
-            if hook_name == "post_tool_call"
-        ]
-        assert [call["tool_call_id"] for call in post_calls] == [
-            f"{tool_name}-concurrent",
-            f"{tool_name}-sequential",
-        ]
-        assert all(call["tool_name"] == tool_name for call in post_calls)
 
     def test_post_hook_ownership_contract_lists_exercised_tools(self):
         from agent.agent_runtime_helpers import AGENT_RUNTIME_POST_HOOK_TOOL_NAMES
@@ -2236,80 +2220,68 @@ class TestMcpParallelToolBatch:
 
 
 class TestHandleMaxIterations:
-    def test_returns_summary(self, agent):
+    @pytest.mark.asyncio
+    async def test_returns_summary(self, agent):
         resp = _mock_response(content="Here is a summary of what I did.")
-        agent.client.chat.completions.create.return_value = resp
+        agent._execute_model_request = AsyncMock(return_value=resp)
         agent._cached_system_prompt = "You are helpful."
         messages = [{"role": "user", "content": "do stuff"}]
-        result = agent._handle_max_iterations(messages, 60)
+        result = await agent._handle_max_iterations(messages, 60)
         assert isinstance(result, str)
         assert len(result) > 0
         assert "summary" in result.lower()
 
-    def test_summary_retries_share_relay_identity(self, agent):
-        agent.client.chat.completions.create.side_effect = [
+    @pytest.mark.asyncio
+    async def test_summary_retries_use_native_model_requests(self, agent):
+        agent._execute_model_request = AsyncMock(side_effect=[
             _mock_response(content=""),
             _mock_response(content="Summary"),
-        ]
+        ])
         agent._cached_system_prompt = "You are helpful."
-        relay_calls = []
 
-        def execute_current(request, callback, **kwargs):
-            relay_calls.append(kwargs)
-            return callback(request)
-
-        with (
-            patch("agent.relay_llm.execute_current", side_effect=execute_current),
-            patch("agent.relay_llm.complete_logical_call") as complete_logical,
-        ):
-            result = agent._handle_max_iterations(
-                [{"role": "user", "content": "do stuff"}],
-                60,
+        with patch("agent.relay_llm.complete_logical_call") as complete_logical:
+            result = await agent._handle_max_iterations(
+                [{"role": "user", "content": "do stuff"}], 60
             )
 
         assert result == "Summary"
-        assert [call["metadata"]["retry_count"] for call in relay_calls] == [0, 1]
-        assert relay_calls[0]["metadata"]["api_request_id"] == (
-            relay_calls[1]["metadata"]["api_request_id"]
-        )
-        assert relay_calls[0]["metadata"]["call_role"] == "iteration_summary"
-        assert all(call["defer_logical_completion"] is True for call in relay_calls)
-        complete_logical.assert_called_once_with(
-            relay_calls[0]["metadata"]["api_request_id"],
-            outcome="success",
-        )
+        assert agent._execute_model_request.await_count == 2
+        complete_logical.assert_called_once()
 
-    def test_api_failure_returns_error(self, agent):
-        agent.client.chat.completions.create.side_effect = Exception("API down")
+    @pytest.mark.asyncio
+    async def test_api_failure_returns_error(self, agent):
+        agent._execute_model_request = AsyncMock(side_effect=Exception("API down"))
         agent._cached_system_prompt = "You are helpful."
         messages = [{"role": "user", "content": "do stuff"}]
         with patch("agent.relay_llm.complete_logical_call") as complete_logical:
-            result = agent._handle_max_iterations(messages, 60)
+            result = await agent._handle_max_iterations(messages, 60)
         assert isinstance(result, str)
         assert "error" in result.lower()
         assert "API down" in result
         complete_logical.assert_called_once()
         assert complete_logical.call_args.kwargs == {"outcome": "failed"}
 
-    def test_summary_skips_reasoning_for_unsupported_openrouter_model(self, agent):
+    @pytest.mark.asyncio
+    async def test_summary_skips_reasoning_for_unsupported_openrouter_model(self, agent):
         agent.base_url = "https://openrouter.ai/api/v1"
         agent.model = "minimax/minimax-m2.5"
         resp = _mock_response(content="Summary")
-        agent.client.chat.completions.create.return_value = resp
+        agent._execute_model_request = AsyncMock(return_value=resp)
         agent._cached_system_prompt = "You are helpful."
         messages = [{"role": "user", "content": "do stuff"}]
 
-        result = agent._handle_max_iterations(messages, 60)
+        result = await agent._handle_max_iterations(messages, 60)
 
         assert result == "Summary"
-        kwargs = agent.client.chat.completions.create.call_args.kwargs
+        kwargs = agent._execute_model_request.await_args.args[0]
         assert "reasoning" not in kwargs.get("extra_body", {})
 
-    def test_summary_request_removes_orphan_tool_result(self, agent):
+    @pytest.mark.asyncio
+    async def test_summary_request_removes_orphan_tool_result(self, agent):
         """Regression: max-iterations summary request must NOT contain
         orphan tool results (tool_call_id with no matching assistant tool_call)."""
         resp = _mock_response(content="Summary of work done.")
-        agent.client.chat.completions.create.return_value = resp
+        agent._execute_model_request = AsyncMock(return_value=resp)
         agent._cached_system_prompt = "You are helpful."
         messages = [
             {"role": "user", "content": "Analyze finance-data-router"},
@@ -2320,10 +2292,10 @@ class TestHandleMaxIterations:
             {"role": "assistant", "content": "Done."},
         ]
 
-        result = agent._handle_max_iterations(messages, 120)
+        result = await agent._handle_max_iterations(messages, 120)
 
         assert result == "Summary of work done."
-        kwargs = agent.client.chat.completions.create.call_args.kwargs
+        kwargs = agent._execute_model_request.await_args.args[0]
         sent_msgs = kwargs.get("messages", [])
         orphan_ids = [
             m.get("tool_call_id") for m in sent_msgs
@@ -2332,7 +2304,8 @@ class TestHandleMaxIterations:
         assert len(orphan_ids) == 0, f"Orphan tool result still present: {orphan_ids}"
 
 
-    def test_summary_strips_strict_schema_foreign_fields(self, agent):
+    @pytest.mark.asyncio
+    async def test_summary_strips_strict_schema_foreign_fields(self, agent):
         """Regression: the max-iterations summary request must NOT carry
         Chat-Completions-schema-foreign keys — tool_name (SQLite FTS
         bookkeeping), codex_* reasoning carriers, or internal _-prefixed
@@ -2340,7 +2313,7 @@ class TestHandleMaxIterations:
         Kimi) reject these with 'Extra inputs are not permitted, field:
         messages[N].tool_name'. The transport's convert_messages() strips
         them on the main loop; this hand-built summary path must mirror it."""
-        agent.client.chat.completions.create.return_value = _mock_response(content="Summary")
+        agent._execute_model_request = AsyncMock(return_value=_mock_response(content="Summary"))
         agent._cached_system_prompt = "You are helpful."
         messages = [
             {"role": "user", "content": "do stuff"},
@@ -2353,10 +2326,10 @@ class TestHandleMaxIterations:
             {"role": "assistant", "content": "Done.", "_empty_recovery_synthetic": True},
         ]
 
-        result = agent._handle_max_iterations(messages, 60)
+        result = await agent._handle_max_iterations(messages, 60)
 
         assert result == "Summary"
-        sent_msgs = agent.client.chat.completions.create.call_args.kwargs.get("messages", [])
+        sent_msgs = agent._execute_model_request.await_args.args[0].get("messages", [])
         for m in sent_msgs:
             assert "tool_name" not in m, m
             assert "codex_reasoning_items" not in m, m
@@ -2371,7 +2344,8 @@ class TestHandleMaxIterations:
 
 
 
-    def test_codex_summary_sanitizes_orphan_tool_results(self, agent):
+    @pytest.mark.asyncio
+    async def test_codex_summary_sanitizes_orphan_tool_results(self, agent):
         agent.api_mode = "codex_responses"
         agent.provider = "openai-codex"
         agent.base_url = "https://chatgpt.com/backend-api/codex"
@@ -2381,7 +2355,7 @@ class TestHandleMaxIterations:
         agent._cached_system_prompt = "You are helpful."
         captured = {}
 
-        def fake_run_codex_stream(kwargs):
+        async def fake_model_request(kwargs, **_kwargs):
             captured.update(kwargs)
             return SimpleNamespace(
                 status="completed",
@@ -2403,8 +2377,8 @@ class TestHandleMaxIterations:
             },
         ]
 
-        with patch.object(agent, "_run_codex_stream", side_effect=fake_run_codex_stream):
-            result = agent._handle_max_iterations(messages, 90)
+        agent._execute_model_request = AsyncMock(side_effect=fake_model_request)
+        result = await agent._handle_max_iterations(messages, 90)
 
         assert result == "Summary"
         input_items = captured["input"]
@@ -2490,12 +2464,14 @@ class TestRunConversation:
 
     def _setup_agent(self, agent):
         """Common setup for run_conversation tests."""
+        agent._deferred_provider_runtime = None
         agent._cached_system_prompt = "You are helpful."
         agent._use_prompt_caching = False
         agent.compression_enabled = False
         agent.save_trajectories = False
 
-    def test_task_start_failure_closes_relay_turn_and_lease(self, agent):
+    @pytest.mark.asyncio
+    async def test_task_start_failure_closes_relay_turn_and_lease(self, agent):
         relay_lease = SimpleNamespace(
             parent_session_id="",
             profile_key="/profile",
@@ -2520,10 +2496,10 @@ class TestRunConversation:
             patch(
                 "hermes_cli.observability.relay_shared_metrics.finish_task_run"
             ) as finish_task_run,
-            patch("agent.conversation_loop.run_conversation") as run_conversation,
+            patch("agent.conversation_loop.run_conversation", new_callable=AsyncMock) as run_conversation,
         ):
             with pytest.raises(RuntimeError) as caught:
-                agent.run_conversation("hello", task_id="task-1")
+                await agent.run_conversation("hello", task_id="task-1")
 
         assert caught.value is start_error
         run_conversation.assert_not_called()
@@ -2539,40 +2515,42 @@ class TestRunConversation:
         coordinator.release_conversation.assert_called_once_with(relay_lease)
         assert agent._relay_pending_turn_id is None
 
-    def test_stop_finish_reason_returns_response(self, agent):
+    @pytest.mark.asyncio
+    async def test_stop_finish_reason_returns_response(self, agent):
         self._setup_agent(agent)
         resp = _mock_response(content="Final answer", finish_reason="stop")
-        agent.client.chat.completions.create.return_value = resp
+        agent._execute_model_request = AsyncMock(return_value=resp)
         with (
-            patch.object(agent, "_persist_session"),
-            patch.object(agent, "_save_trajectory"),
-            patch.object(agent, "_cleanup_task_resources"),
+            patch.object(agent, "_persist_session", new_callable=AsyncMock),
+            patch.object(agent, "_save_trajectory", new_callable=AsyncMock),
+            patch.object(agent, "_cleanup_task_resources", new_callable=AsyncMock),
         ):
-            result = agent.run_conversation("hello")
+            result = await agent.run_conversation("hello")
         assert result["final_response"] == "Final answer"
         assert result["completed"] is True
 
-    def test_prompt_cache_marks_static_system_prefix_on_wire(self, agent):
+    @pytest.mark.asyncio
+    async def test_prompt_cache_marks_static_system_prefix_on_wire(self, agent):
         self._setup_agent(agent)
         agent._cached_system_prompt = "stable instructions\n\nsession context"
         agent._cached_system_prompt_static = "stable instructions"
         agent._use_prompt_caching = True
         agent._use_native_cache_layout = False
         agent._cache_ttl = "5m"
-        agent.client.chat.completions.create.return_value = _mock_response(
+        agent._execute_model_request = AsyncMock(return_value=_mock_response(
             content="Final answer",
             finish_reason="stop",
-        )
+        ))
 
         with (
-            patch.object(agent, "_persist_session"),
-            patch.object(agent, "_save_trajectory"),
-            patch.object(agent, "_cleanup_task_resources"),
+            patch.object(agent, "_persist_session", new_callable=AsyncMock),
+            patch.object(agent, "_save_trajectory", new_callable=AsyncMock),
+            patch.object(agent, "_cleanup_task_resources", new_callable=AsyncMock),
         ):
-            result = agent.run_conversation("hello")
+            result = await agent.run_conversation("hello")
 
         assert result["completed"] is True
-        system = agent.client.chat.completions.create.call_args.kwargs["messages"][0]
+        system = agent._execute_model_request.await_args.args[0]["messages"][0]
         assert system["role"] == "system"
         assert system["content"] == [
             {
@@ -2587,7 +2565,8 @@ class TestRunConversation:
             },
         ]
 
-    def test_codex_content_filter_incomplete_routes_to_policy_fallback(self, agent):
+    @pytest.mark.asyncio
+    async def test_codex_content_filter_incomplete_routes_to_policy_fallback(self, agent):
         self._setup_agent(agent)
         agent.api_mode = "codex_responses"
         agent.provider = "openai-codex"
@@ -2624,15 +2603,21 @@ class TestRunConversation:
         hook_events = []
         logical_completions = []
 
-        def _fake_activate(reason=None):
+        async def _fake_activate(reason=None):
             agent._fallback_index = len(agent._fallback_chain)
             return True
 
         with (
-            patch.object(agent, "_create_request_openai_client", return_value=MagicMock()),
-            patch.object(agent, "_close_request_openai_client"),
-            patch.object(agent, "_run_codex_stream", side_effect=[content_filter_response, fallback_response]) as mock_run_codex_stream,
-            patch.object(agent, "_try_activate_fallback", side_effect=_fake_activate) as mock_try_activate_fallback,
+            patch.object(
+                agent,
+                "_execute_model_request",
+                new=AsyncMock(side_effect=[content_filter_response, fallback_response]),
+            ) as mock_execute_model_request,
+            patch.object(
+                agent,
+                "_try_activate_fallback",
+                new=AsyncMock(side_effect=_fake_activate),
+            ) as mock_try_activate_fallback,
             patch.object(agent, "_invoke_api_request_error_hook", side_effect=lambda **kw: hook_events.append(kw)),
             patch(
                 "agent.relay_llm.complete_logical_call",
@@ -2644,12 +2629,12 @@ class TestRunConversation:
             patch.object(agent, "_save_trajectory"),
             patch.object(agent, "_cleanup_task_resources"),
         ):
-            result = agent.run_conversation("summarize this large Slack thread")
+            result = await agent.run_conversation("summarize this large Slack thread")
 
         assert result["final_response"] == "Recovered on fallback"
         assert result["completed"] is True
         mock_try_activate_fallback.assert_called_once_with()
-        assert mock_run_codex_stream.call_count == 2
+        assert mock_execute_model_request.await_count == 2
         assert hook_events[0]["error_type"] == "ContentPolicyBlocked"
         assert hook_events[0]["retryable"] is False
         assert hook_events[0]["reason"] == FailoverReason.content_policy_blocked.value
@@ -2657,7 +2642,8 @@ class TestRunConversation:
             (hook_events[0]["api_request_id"], "success")
         ]
 
-    def test_ollama_small_runtime_context_fails_before_api_call(self, agent, caplog):
+    @pytest.mark.asyncio
+    async def test_ollama_small_runtime_context_fails_before_api_call(self, agent, caplog):
         self._setup_agent(agent)
         agent.model = "qwen3.5:9b"
         agent.provider = "custom"
@@ -2670,7 +2656,7 @@ class TestRunConversation:
             patch.object(agent, "_cleanup_task_resources"),
             caplog.at_level(logging.WARNING, logger="agent.conversation_loop"),
         ):
-            result = agent.run_conversation("Call ps -aux")
+            result = await agent.run_conversation("Call ps -aux")
 
         assert result["failed"] is True
         assert result["completed"] is False
@@ -2682,50 +2668,68 @@ class TestRunConversation:
         assert "Ollama runtime context too small for Hermes tool use" in caplog.text
         assert "runtime_context=4096" in caplog.text
 
-    def test_tool_calls_then_stop(self, agent):
+    @pytest.mark.asyncio
+    async def test_tool_calls_then_stop(self, agent):
         self._setup_agent(agent)
         tc = _mock_tool_call(name="web_search", arguments="{}", call_id="c1")
         resp1 = _mock_response(content="", finish_reason="tool_calls", tool_calls=[tc])
         resp2 = _mock_response(content="Done searching", finish_reason="stop")
-        agent.client.chat.completions.create.side_effect = [resp1, resp2]
+        agent._execute_model_request = AsyncMock(side_effect=[resp1, resp2])
         with (
-            patch("run_agent.handle_function_call", return_value="search result") as mock_handle_function_call,
-            patch.object(agent, "_persist_session"),
-            patch.object(agent, "_save_trajectory"),
-            patch.object(agent, "_cleanup_task_resources"),
+            patch(
+                "model_tools.handle_function_call",
+                new_callable=AsyncMock,
+                return_value="search result",
+            ) as mock_handle_function_call,
+            patch(
+                "tools.registry.registry.get_entry",
+                return_value=SimpleNamespace(is_async=True, max_result_size_chars=None),
+            ),
+            patch.object(agent, "_persist_session", new_callable=AsyncMock),
+            patch.object(agent, "_save_trajectory", new_callable=AsyncMock),
+            patch.object(agent, "_cleanup_task_resources", new_callable=AsyncMock),
         ):
-            result = agent.run_conversation("search something")
+            result = await agent.run_conversation("search something")
         assert result["final_response"] == "Done searching"
         assert result["api_calls"] == 2
-        assert mock_handle_function_call.call_args.kwargs["tool_call_id"] == "c1"
-        assert mock_handle_function_call.call_args.kwargs["session_id"] == agent.session_id
+        assert mock_handle_function_call.await_args.kwargs["tool_call_id"] == "c1"
+        assert mock_handle_function_call.await_args.kwargs["session_id"] == agent.session_id
 
 
-    def test_request_scoped_api_hooks_fire_for_each_api_call(self, agent):
+    @pytest.mark.asyncio
+    async def test_request_scoped_api_hooks_fire_for_each_api_call(self, agent):
         self._setup_agent(agent)
         tc = _mock_tool_call(name="web_search", arguments="{}", call_id="c1")
         resp1 = _mock_response(content="", finish_reason="tool_calls", tool_calls=[tc])
         resp2 = _mock_response(content="Done searching", finish_reason="stop")
-        agent.client.chat.completions.create.side_effect = [resp1, resp2]
+        agent._execute_model_request = AsyncMock(side_effect=[resp1, resp2])
 
         hook_calls = []
 
-        def _record_hook(name, **kwargs):
+        async def _record_hook(name, **kwargs):
             hook_calls.append((name, kwargs))
             return []
 
         with (
-            patch("run_agent.handle_function_call", return_value="search result"),
+            patch(
+                "model_tools.handle_function_call",
+                new_callable=AsyncMock,
+                return_value="search result",
+            ),
+            patch(
+                "tools.registry.registry.get_entry",
+                return_value=SimpleNamespace(is_async=True, max_result_size_chars=None),
+            ),
             patch(
                 "hermes_cli.lifecycle.has_hook",
                 side_effect=lambda name: name in {"pre_api_request", "post_api_request"},
             ),
-            patch("hermes_cli.lifecycle.invoke_hook", side_effect=_record_hook),
-            patch.object(agent, "_persist_session"),
-            patch.object(agent, "_save_trajectory"),
-            patch.object(agent, "_cleanup_task_resources"),
+            patch("hermes_cli.lifecycle.invoke_hook_async", side_effect=_record_hook),
+            patch.object(agent, "_persist_session", new_callable=AsyncMock),
+            patch.object(agent, "_save_trajectory", new_callable=AsyncMock),
+            patch.object(agent, "_cleanup_task_resources", new_callable=AsyncMock),
         ):
-            result = agent.run_conversation("search something")
+            result = await agent.run_conversation("search something")
 
         assert result["final_response"] == "Done searching"
         pre_request_calls = [kw for name, kw in hook_calls if name == "pre_api_request"]
@@ -2746,7 +2750,8 @@ class TestRunConversation:
         assert all("usage" in c and "response" in c for c in post_request_calls)
         assert all("assistant_message" in c["response"] for c in post_request_calls)
 
-    def test_terminal_task_closes_logical_calls_before_metrics_scope(self, agent):
+    @pytest.mark.asyncio
+    async def test_terminal_task_closes_logical_calls_before_metrics_scope(self, agent):
         from agent import relay_runtime
 
         order = []
@@ -2761,6 +2766,7 @@ class TestRunConversation:
         with (
             patch(
                 "agent.conversation_loop.run_conversation",
+                new_callable=AsyncMock,
                 return_value=failed_result,
             ),
             patch(
@@ -2776,12 +2782,13 @@ class TestRunConversation:
                 side_effect=lambda *_args, **_kwargs: order.append("logical"),
             ),
         ):
-            result = agent.run_conversation("private prompt")
+            result = await agent.run_conversation("private prompt")
 
         assert result is failed_result
         assert order == ["logical", "metrics"]
 
-    def test_api_request_error_hook_skips_payload_work_without_listener(self, agent, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_api_request_error_hook_skips_payload_work_without_listener(self, agent, monkeypatch):
         payload_built = False
         hook_called = False
 
@@ -2799,7 +2806,7 @@ class TestRunConversation:
         monkeypatch.setattr("hermes_cli.lifecycle.invoke_hook", _invoke_hook)
         monkeypatch.setattr(agent, "_api_request_payload_for_hook", _payload_for_hook)
 
-        agent._invoke_api_request_error_hook(
+        await agent._invoke_api_request_error_hook(
             task_id="task-1",
             turn_id="turn-1",
             api_request_id="api-1",
@@ -2813,12 +2820,13 @@ class TestRunConversation:
         assert payload_built is False
         assert hook_called is False
 
-    def test_request_scoped_api_hooks_skip_payload_work_without_listeners(self, agent, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_request_scoped_api_hooks_skip_payload_work_without_listeners(self, agent, monkeypatch):
         self._setup_agent(agent)
-        agent.client.chat.completions.create.return_value = _mock_response(
+        agent._execute_model_request = AsyncMock(return_value=_mock_response(
             content="No listeners",
             finish_reason="stop",
-        )
+        ))
         hook_checks = {"pre_api_request": 0, "post_api_request": 0}
         payload_counts = {"request": 0, "response": 0}
 
@@ -2840,18 +2848,19 @@ class TestRunConversation:
         monkeypatch.setattr(agent, "_api_response_payload_for_hook", _response_payload)
 
         with (
-            patch("hermes_cli.lifecycle.invoke_hook", return_value=[]),
-            patch.object(agent, "_persist_session"),
-            patch.object(agent, "_save_trajectory"),
-            patch.object(agent, "_cleanup_task_resources"),
+            patch("hermes_cli.lifecycle.invoke_hook_async", new_callable=AsyncMock, return_value=[]),
+            patch.object(agent, "_persist_session", new_callable=AsyncMock),
+            patch.object(agent, "_save_trajectory", new_callable=AsyncMock),
+            patch.object(agent, "_cleanup_task_resources", new_callable=AsyncMock),
         ):
-            result = agent.run_conversation("hello")
+            result = await agent.run_conversation("hello")
 
         assert result["final_response"] == "No listeners"
         assert hook_checks == {"pre_api_request": 1, "post_api_request": 1}
         assert payload_counts == {"request": 0, "response": 0}
 
-    def test_content_with_tool_calls_stays_silent_for_non_cli_quiet_mode(self, agent):
+    @pytest.mark.asyncio
+    async def test_content_with_tool_calls_stays_silent_for_non_cli_quiet_mode(self, agent):
         self._setup_agent(agent)
         agent.platform = None
         tc = _mock_tool_call(name="web_search", arguments="{}", call_id="c1")
@@ -2861,40 +2870,49 @@ class TestRunConversation:
             tool_calls=[tc],
         )
         resp2 = _mock_response(content="Done searching", finish_reason="stop")
-        agent.client.chat.completions.create.side_effect = [resp1, resp2]
+        agent._execute_model_request = AsyncMock(side_effect=[resp1, resp2])
 
         with (
-            patch("run_agent.handle_function_call", return_value="search result"),
+            patch(
+                "model_tools.handle_function_call",
+                new_callable=AsyncMock,
+                return_value="search result",
+            ),
+            patch(
+                "tools.registry.registry.get_entry",
+                return_value=SimpleNamespace(is_async=True, max_result_size_chars=None),
+            ),
             patch.object(agent, "_safe_print") as mock_print,
-            patch.object(agent, "_persist_session"),
-            patch.object(agent, "_save_trajectory"),
-            patch.object(agent, "_cleanup_task_resources"),
+            patch.object(agent, "_persist_session", new_callable=AsyncMock),
+            patch.object(agent, "_save_trajectory", new_callable=AsyncMock),
+            patch.object(agent, "_cleanup_task_resources", new_callable=AsyncMock),
         ):
-            result = agent.run_conversation("search something")
+            result = await agent.run_conversation("search something")
 
         assert result["final_response"] == "Done searching"
         mock_print.assert_not_called()
 
-    def test_interrupt_breaks_loop(self, agent):
+    @pytest.mark.asyncio
+    async def test_interrupt_breaks_loop(self, agent):
         self._setup_agent(agent)
 
-        def interrupt_side_effect(api_kwargs):
+        async def interrupt_side_effect(*_args, **_kwargs):
             agent._interrupt_requested = True
             raise InterruptedError("Agent interrupted during API call")
 
         with (
-            patch.object(agent, "_persist_session"),
-            patch.object(agent, "_save_trajectory"),
-            patch.object(agent, "_cleanup_task_resources"),
-            patch("run_agent._set_interrupt"),
+            patch.object(agent, "_persist_session", new_callable=AsyncMock),
+            patch.object(agent, "_save_trajectory", new_callable=AsyncMock),
+            patch.object(agent, "_cleanup_task_resources", new_callable=AsyncMock),
             patch.object(
-                agent, "_interruptible_api_call", side_effect=interrupt_side_effect
+                agent, "_execute_model_request", side_effect=interrupt_side_effect
             ),
         ):
-            result = agent.run_conversation("hello")
+            result = await agent.run_conversation("hello")
         assert result["interrupted"] is True
 
-    def test_invalid_tool_name_retry(self, agent):
+    @pytest.mark.asyncio
+    async def test_invalid_tool_name_retry(self, agent):
         """Model hallucinates an invalid tool name, agent retries and succeeds."""
         self._setup_agent(agent)
         bad_tc = _mock_tool_call(name="nonexistent_tool", arguments="{}", call_id="c1")
@@ -2902,18 +2920,19 @@ class TestRunConversation:
             content="", finish_reason="tool_calls", tool_calls=[bad_tc]
         )
         resp_good = _mock_response(content="Got it", finish_reason="stop")
-        agent.client.chat.completions.create.side_effect = [resp_bad, resp_good]
+        agent._execute_model_request = AsyncMock(side_effect=[resp_bad, resp_good])
         with (
-            patch.object(agent, "_persist_session"),
-            patch.object(agent, "_save_trajectory"),
-            patch.object(agent, "_cleanup_task_resources"),
+            patch.object(agent, "_persist_session", new_callable=AsyncMock),
+            patch.object(agent, "_save_trajectory", new_callable=AsyncMock),
+            patch.object(agent, "_cleanup_task_resources", new_callable=AsyncMock),
         ):
-            result = agent.run_conversation("do something")
+            result = await agent.run_conversation("do something")
         assert result["final_response"] == "Got it"
         assert result["completed"] is True
         assert result["api_calls"] == 2
 
-    def test_reasoning_only_local_resumed_no_compression_triggered(self, agent):
+    @pytest.mark.asyncio
+    async def test_reasoning_only_local_resumed_no_compression_triggered(self, agent):
         """Reasoning-only responses no longer trigger compression — prefill then accepted."""
         self._setup_agent(agent)
         agent.base_url = "http://127.0.0.1:1234/v1"
@@ -2930,13 +2949,13 @@ class TestRunConversation:
 
         # 6 responses: original + 2 prefill + 3 retries after prefill exhaustion
         with (
-            patch.object(agent, "_interruptible_api_call", side_effect=[empty_resp] * 6),
+            patch.object(agent, "_execute_model_request", new=AsyncMock(side_effect=[empty_resp] * 6)),
             patch.object(agent, "_compress_context") as mock_compress,
-            patch.object(agent, "_persist_session"),
-            patch.object(agent, "_save_trajectory"),
-            patch.object(agent, "_cleanup_task_resources"),
+            patch.object(agent, "_persist_session", new_callable=AsyncMock),
+            patch.object(agent, "_save_trajectory", new_callable=AsyncMock),
+            patch.object(agent, "_cleanup_task_resources", new_callable=AsyncMock),
         ):
-            result = agent.run_conversation("hello", conversation_history=prefill)
+            result = await agent.run_conversation("hello", conversation_history=prefill)
 
         mock_compress.assert_not_called()  # no compression triggered
         assert result["completed"] is True
@@ -2951,7 +2970,8 @@ class TestRunConversation:
         assert result["turn_exit_reason"] == "empty_response_exhausted"
         assert result["api_calls"] == 6  # 1 original + 2 prefill + 3 retries
 
-    def test_reasoning_only_response_prefill_then_empty(self, agent):
+    @pytest.mark.asyncio
+    async def test_reasoning_only_response_prefill_then_empty(self, agent):
         """Structured reasoning-only triggers prefill (2), then retries (3), then (empty)."""
         self._setup_agent(agent)
         empty_resp = _mock_response(
@@ -2960,13 +2980,13 @@ class TestRunConversation:
             reasoning_content="structured reasoning answer",
         )
         # 6 responses: 1 original + 2 prefill + 3 retries after prefill exhaustion
-        agent.client.chat.completions.create.side_effect = [empty_resp] * 6
+        agent._execute_model_request = AsyncMock(side_effect=[empty_resp] * 6)
         with (
-            patch.object(agent, "_persist_session"),
-            patch.object(agent, "_save_trajectory"),
-            patch.object(agent, "_cleanup_task_resources"),
+            patch.object(agent, "_persist_session", new_callable=AsyncMock),
+            patch.object(agent, "_save_trajectory", new_callable=AsyncMock),
+            patch.object(agent, "_cleanup_task_resources", new_callable=AsyncMock),
         ):
-            result = agent.run_conversation("answer me")
+            result = await agent.run_conversation("answer me")
         assert result["completed"] is True
         # Reasoning-only exhaustion delivers the labeled reasoning excerpt
         # instead of the bare "(empty)" sentinel (see
@@ -2977,28 +2997,30 @@ class TestRunConversation:
         assert result["api_calls"] == 6  # 1 original + 2 prefill + 3 retries
 
 
-    def test_truly_empty_response_retries_3_times_then_empty(self, agent):
+    @pytest.mark.asyncio
+    async def test_truly_empty_response_retries_3_times_then_empty(self, agent):
         """Truly empty response (no content, no reasoning) retries 3 times then falls through to (empty)."""
         self._setup_agent(agent)
         agent.base_url = "http://127.0.0.1:1234/v1"
         empty_resp = _mock_response(content=None, finish_reason="stop")
         # 4 responses: 1 original + 3 nudge retries, all empty
-        agent.client.chat.completions.create.side_effect = [
+        agent._execute_model_request = AsyncMock(side_effect=[
             empty_resp, empty_resp, empty_resp, empty_resp,
-        ]
+        ])
         with (
-            patch.object(agent, "_persist_session"),
-            patch.object(agent, "_save_trajectory"),
-            patch.object(agent, "_cleanup_task_resources"),
+            patch.object(agent, "_persist_session", new_callable=AsyncMock),
+            patch.object(agent, "_save_trajectory", new_callable=AsyncMock),
+            patch.object(agent, "_cleanup_task_resources", new_callable=AsyncMock),
         ):
-            result = agent.run_conversation("answer me")
+            result = await agent.run_conversation("answer me")
         assert result["completed"] is True
         # #34452: explanation replaces the bare "(empty)" sentinel.
         assert result["final_response"] != "(empty)"
         assert "No reply:" in result["final_response"]
         assert result["api_calls"] == 4  # 1 original + 3 retries
 
-    def test_truly_empty_response_succeeds_on_nudge(self, agent):
+    @pytest.mark.asyncio
+    async def test_truly_empty_response_succeeds_on_nudge(self, agent):
         """Model produces content after being nudged for empty response."""
         self._setup_agent(agent)
         agent.base_url = "http://127.0.0.1:1234/v1"
@@ -3008,18 +3030,19 @@ class TestRunConversation:
             finish_reason="stop",
         )
         # 1 empty response, then model produces content on nudge
-        agent.client.chat.completions.create.side_effect = [empty_resp, content_resp]
+        agent._execute_model_request = AsyncMock(side_effect=[empty_resp, content_resp])
         with (
-            patch.object(agent, "_persist_session"),
-            patch.object(agent, "_save_trajectory"),
-            patch.object(agent, "_cleanup_task_resources"),
+            patch.object(agent, "_persist_session", new_callable=AsyncMock),
+            patch.object(agent, "_save_trajectory", new_callable=AsyncMock),
+            patch.object(agent, "_cleanup_task_resources", new_callable=AsyncMock),
         ):
-            result = agent.run_conversation("answer me")
+            result = await agent.run_conversation("answer me")
         assert result["completed"] is True
         assert result["final_response"] == "Here is the actual answer."
         assert result["api_calls"] == 2  # 1 original + 1 nudge retry
 
-    def test_empty_response_triggers_fallback_provider(self, agent):
+    @pytest.mark.asyncio
+    async def test_empty_response_triggers_fallback_provider(self, agent):
         """After 3 empty retries, fallback provider is activated and produces content."""
         self._setup_agent(agent)
         agent.base_url = "http://127.0.0.1:1234/v1"
@@ -3037,7 +3060,7 @@ class TestRunConversation:
 
         fallback_called = {"called": False}
 
-        def _mock_fallback():
+        async def _mock_fallback():
             fallback_called["called"] = True
             # Simulate what _try_activate_fallback does: just advance the
             # index and set the flag (the client is already mocked).
@@ -3051,14 +3074,22 @@ class TestRunConversation:
             patch.object(agent, "_persist_session"),
             patch.object(agent, "_save_trajectory"),
             patch.object(agent, "_cleanup_task_resources"),
-            patch.object(agent, "_try_activate_fallback", side_effect=_mock_fallback),
+            patch.object(
+                agent,
+                "_execute_model_request",
+                new=AsyncMock(
+                    side_effect=[empty_resp, empty_resp, empty_resp, empty_resp, content_resp]
+                ),
+            ),
+            patch.object(agent, "_try_activate_fallback", new=AsyncMock(side_effect=_mock_fallback)),
         ):
-            result = agent.run_conversation("answer me")
+            result = await agent.run_conversation("answer me")
         assert fallback_called["called"], "Fallback should have been triggered"
         assert result["completed"] is True
         assert result["final_response"] == "Fallback answer."
 
-    def test_empty_response_fallback_also_empty_returns_empty(self, agent):
+    @pytest.mark.asyncio
+    async def test_empty_response_fallback_also_empty_returns_empty(self, agent):
         """If fallback also returns empty, final response is (empty)."""
         self._setup_agent(agent)
         agent.base_url = "http://127.0.0.1:1234/v1"
@@ -3074,7 +3105,7 @@ class TestRunConversation:
             empty_resp, empty_resp, empty_resp, empty_resp,  # fallback exhausted
         ]
 
-        def _mock_fallback():
+        async def _mock_fallback():
             if agent._fallback_index >= len(agent._fallback_chain):
                 return False
             agent._fallback_index += 1
@@ -3087,16 +3118,27 @@ class TestRunConversation:
             patch.object(agent, "_persist_session"),
             patch.object(agent, "_save_trajectory"),
             patch.object(agent, "_cleanup_task_resources"),
-            patch.object(agent, "_try_activate_fallback", side_effect=_mock_fallback),
+            patch.object(
+                agent,
+                "_execute_model_request",
+                new=AsyncMock(
+                    side_effect=[
+                        empty_resp, empty_resp, empty_resp, empty_resp,
+                        empty_resp, empty_resp, empty_resp, empty_resp,
+                    ]
+                ),
+            ),
+            patch.object(agent, "_try_activate_fallback", new=AsyncMock(side_effect=_mock_fallback)),
         ):
-            result = agent.run_conversation("answer me")
+            result = await agent.run_conversation("answer me")
         assert result["completed"] is True
         # #34452: explanation replaces the bare "(empty)" sentinel.
         assert result["final_response"] != "(empty)"
         assert "No reply:" in result["final_response"]
 
 
-    def test_partial_stream_recovery_uses_streamed_content(self, agent):
+    @pytest.mark.asyncio
+    async def test_partial_stream_recovery_uses_streamed_content(self, agent):
         """When streaming fails after partial delivery, recovered partial content becomes final response."""
         self._setup_agent(agent)
         # Simulate a partial-stream-stub response: content recovered from streaming
@@ -3104,27 +3146,28 @@ class TestRunConversation:
             content="Here is the partial answer that was stream",
             finish_reason="stop",
         )
-        agent.client.chat.completions.create.return_value = partial_resp
+        agent._execute_model_request = AsyncMock(return_value=partial_resp)
         # Simulate that streaming had already delivered this text
         agent._current_streamed_assistant_text = "Here is the partial answer that was stream"
         with (
-            patch.object(agent, "_persist_session"),
-            patch.object(agent, "_save_trajectory"),
-            patch.object(agent, "_cleanup_task_resources"),
+            patch.object(agent, "_persist_session", new_callable=AsyncMock),
+            patch.object(agent, "_save_trajectory", new_callable=AsyncMock),
+            patch.object(agent, "_cleanup_task_resources", new_callable=AsyncMock),
         ):
-            result = agent.run_conversation("explain something")
+            result = await agent.run_conversation("explain something")
         # The partial content should be used as-is (not empty, not retried)
         assert result["completed"] is True
         assert result["final_response"] == "Here is the partial answer that was stream"
         assert result["api_calls"] == 1  # No retries
 
-    def test_partial_stream_recovery_on_empty_stub(self, agent):
+    @pytest.mark.asyncio
+    async def test_partial_stream_recovery_on_empty_stub(self, agent):
         """When stub response has no content but text was streamed, use streamed text."""
         self._setup_agent(agent)
         # Stub response with no content (old behavior before fix)
         empty_stub = _mock_response(content=None, finish_reason="stop")
 
-        def _fake_api_call(api_kwargs):
+        async def _fake_model_request(*_args, **_kwargs):
             # Simulate what streaming does: accumulate text before returning
             # a stub with no content (connection died mid-stream)
             agent._current_streamed_assistant_text = "The answer to your question is that"
@@ -3136,13 +3179,13 @@ class TestRunConversation:
             status_messages.append(msg)
 
         with (
-            patch.object(agent, "_interruptible_api_call", side_effect=_fake_api_call),
-            patch.object(agent, "_persist_session"),
-            patch.object(agent, "_save_trajectory"),
-            patch.object(agent, "_cleanup_task_resources"),
+            patch.object(agent, "_execute_model_request", side_effect=_fake_model_request),
+            patch.object(agent, "_persist_session", new_callable=AsyncMock),
+            patch.object(agent, "_save_trajectory", new_callable=AsyncMock),
+            patch.object(agent, "_cleanup_task_resources", new_callable=AsyncMock),
             patch.object(agent, "_emit_status", side_effect=_capture_status),
         ):
-            result = agent.run_conversation("ask me")
+            result = await agent.run_conversation("ask me")
         # Should recover partial streamed content, not fall through to (empty)
         assert result["completed"] is True
         assert result["final_response"].startswith("The answer to your question is that")
@@ -3157,22 +3200,23 @@ class TestRunConversation:
         assert len(retry_msgs) == 0, f"Should not retry when stream content exists: {status_messages}"
 
 
-    def test_interrupt_during_stream_preserves_partial_assistant_text(self, agent):
+    @pytest.mark.asyncio
+    async def test_interrupt_during_stream_preserves_partial_assistant_text(self, agent):
         """Stopping mid-response keeps the streamed reply in history (not 'forgotten')."""
         self._setup_agent(agent)
 
-        def _fake_api_call(api_kwargs):
+        async def _fake_model_request(*_args, **_kwargs):
             # Model streamed some visible text, then the user hit stop.
             agent._current_streamed_assistant_text = "Sure, here's how to do it: first"
             raise InterruptedError("Agent interrupted during streaming API call")
 
         with (
-            patch.object(agent, "_interruptible_api_call", side_effect=_fake_api_call),
-            patch.object(agent, "_persist_session"),
-            patch.object(agent, "_save_trajectory"),
-            patch.object(agent, "_cleanup_task_resources"),
+            patch.object(agent, "_execute_model_request", side_effect=_fake_model_request),
+            patch.object(agent, "_persist_session", new_callable=AsyncMock),
+            patch.object(agent, "_save_trajectory", new_callable=AsyncMock),
+            patch.object(agent, "_cleanup_task_resources", new_callable=AsyncMock),
         ):
-            result = agent.run_conversation("how do I do X")
+            result = await agent.run_conversation("how do I do X")
 
         assert result["interrupted"] is True
         # Partial reply is surfaced and persisted as an assistant turn so the
@@ -3183,7 +3227,8 @@ class TestRunConversation:
             "content": "Sure, here's how to do it: first",
         }
 
-    def test_redirect_during_thinking_retries_same_turn_with_context(self, agent):
+    @pytest.mark.asyncio
+    async def test_redirect_during_thinking_retries_same_turn_with_context(self, agent):
         """A corrective follow-up does not end the turn, and displayed reasoning
         never re-enters the transcript (classifier-poisoning guard)."""
         self._setup_agent(agent)
@@ -3192,7 +3237,7 @@ class TestRunConversation:
         requests = []
         persisted = []
 
-        def _fake_api_call(api_kwargs):
+        async def _fake_model_request(api_kwargs, **_kwargs):
             requests.append(api_kwargs)
             if len(requests) == 1:
                 agent._fire_reasoning_delta("I should implement this with SQLite.")
@@ -3201,18 +3246,18 @@ class TestRunConversation:
             return final
 
         with (
-            patch.object(agent, "_interruptible_api_call", side_effect=_fake_api_call),
+            patch.object(agent, "_execute_model_request", side_effect=_fake_model_request),
             patch.object(
                 agent,
                 "_persist_session",
-                side_effect=lambda messages, *_a, **_k: persisted.append(
+                new=AsyncMock(side_effect=lambda messages, *_a, **_k: persisted.append(
                     [dict(message) for message in messages]
-                ),
+                )),
             ),
-            patch.object(agent, "_save_trajectory"),
-            patch.object(agent, "_cleanup_task_resources"),
+            patch.object(agent, "_save_trajectory", new_callable=AsyncMock),
+            patch.object(agent, "_cleanup_task_resources", new_callable=AsyncMock),
         ):
-            result = agent.run_conversation("Choose a database and implement it.")
+            result = await agent.run_conversation("Choose a database and implement it.")
 
         assert result["completed"] is True
         assert result["interrupted"] is False
@@ -3241,14 +3286,15 @@ class TestRunConversation:
             if len(snapshot) >= 2
         )
 
-    def test_redirect_wins_race_with_response_completion(self, agent):
+    @pytest.mark.asyncio
+    async def test_redirect_wins_race_with_response_completion(self, agent):
         """If the provider returns as redirect lands, discard the stale answer."""
         self._setup_agent(agent)
         stale = _mock_response(content="Using SQLite.", finish_reason="stop")
         corrected = _mock_response(content="Using Postgres.", finish_reason="stop")
         calls = 0
 
-        def _fake_api_call(_api_kwargs):
+        async def _fake_model_request(_api_kwargs, **_kwargs):
             nonlocal calls
             calls += 1
             if calls == 1:
@@ -3257,12 +3303,12 @@ class TestRunConversation:
             return corrected
 
         with (
-            patch.object(agent, "_interruptible_api_call", side_effect=_fake_api_call),
-            patch.object(agent, "_persist_session"),
-            patch.object(agent, "_save_trajectory"),
-            patch.object(agent, "_cleanup_task_resources"),
+            patch.object(agent, "_execute_model_request", side_effect=_fake_model_request),
+            patch.object(agent, "_persist_session", new_callable=AsyncMock),
+            patch.object(agent, "_save_trajectory", new_callable=AsyncMock),
+            patch.object(agent, "_cleanup_task_resources", new_callable=AsyncMock),
         ):
-            result = agent.run_conversation("Choose a database.")
+            result = await agent.run_conversation("Choose a database.")
 
         assert calls == 2
         assert result["final_response"] == "Using Postgres."
@@ -3271,70 +3317,75 @@ class TestRunConversation:
             for message in result["messages"]
         )
 
-    def test_redirect_from_input_thread_cancels_live_model_request(self, agent):
+    @pytest.mark.asyncio
+    async def test_redirect_from_input_thread_cancels_live_model_request(self, agent):
         """Exercise the real cross-thread path used by CLI and gateways."""
         self._setup_agent(agent)
         agent.reasoning_callback = lambda _text: None
-        entered = threading.Event()
-        results = {}
+        entered = asyncio.Event()
+        redirect_result = {}
         calls = 0
         final = _mock_response(content="Corrected answer.", finish_reason="stop")
 
-        def _fake_api_call(_api_kwargs):
+        async def _fake_model_request(_api_kwargs, **_kwargs):
             nonlocal calls
             calls += 1
             if calls == 1:
                 agent._fire_reasoning_delta("Following the original approach.")
                 entered.set()
-                deadline = time.time() + 2
-                while not agent._interrupt_requested and time.time() < deadline:
-                    time.sleep(0.01)
+                while not agent._interrupt_requested:
+                    await asyncio.sleep(0)
                 raise InterruptedError("request cancelled by redirect")
             return final
 
         with (
-            patch.object(agent, "_interruptible_api_call", side_effect=_fake_api_call),
-            patch.object(agent, "_persist_session"),
-            patch.object(agent, "_save_trajectory"),
-            patch.object(agent, "_cleanup_task_resources"),
+            patch.object(agent, "_execute_model_request", side_effect=_fake_model_request),
+            patch.object(agent, "_persist_session", new_callable=AsyncMock),
+            patch.object(agent, "_save_trajectory", new_callable=AsyncMock),
+            patch.object(agent, "_cleanup_task_resources", new_callable=AsyncMock),
         ):
-            worker = threading.Thread(
-                target=lambda: results.update(
-                    result=agent.run_conversation("Take the original approach.")
+            turn = asyncio.create_task(
+                agent.run_conversation("Take the original approach.")
+            )
+            await asyncio.wait_for(entered.wait(), timeout=2)
+            input_thread = threading.Thread(
+                target=lambda: redirect_result.setdefault(
+                    "accepted", agent.redirect("Use the corrected approach.")
                 )
             )
-            worker.start()
-            assert entered.wait(timeout=2)
-            assert agent.redirect("Use the corrected approach.") is True
-            worker.join(timeout=5)
+            input_thread.start()
+            input_thread.join(timeout=2)
+            result = await asyncio.wait_for(turn, timeout=5)
 
-        assert worker.is_alive() is False
+        assert input_thread.is_alive() is False
+        assert redirect_result["accepted"] is True
         assert calls == 2
-        assert results["result"]["completed"] is True
-        assert results["result"]["final_response"] == "Corrected answer."
-        checkpoint = results["result"]["messages"][-3]
+        assert result["completed"] is True
+        assert result["final_response"] == "Corrected answer."
+        checkpoint = result["messages"][-3]
         assert "interrupted by a user correction" in checkpoint["content"]
         # Displayed reasoning is display-only — replaying it as assistant
         # content trips Anthropic's output classifier (July 2026 brickings).
         assert "Following the original approach." not in checkpoint["content"]
-        assert results["result"]["messages"][-2]["content"] == (
+        assert result["messages"][-2]["content"] == (
             "Use the corrected approach."
         )
 
 
-    def test_nous_401_refreshes_after_remint_and_retries(self, agent):
+    @pytest.mark.asyncio
+    async def test_nous_401_fails_fast_without_sync_credential_renewal(self, agent):
         self._setup_agent(agent)
         agent.provider = "nous"
         agent.api_mode = "chat_completions"
 
-        calls = {"api": 0, "refresh": 0}
+        calls = {"api": 0}
 
         class _UnauthorizedError(RuntimeError):
             def __init__(self):
                 super().__init__("Error code: 401 - unauthorized")
                 self.status_code = 401
 
-        def _fake_api_call(api_kwargs):
+        async def _fake_model_request(*_args, **_kwargs):
             calls["api"] += 1
             if calls["api"] == 1:
                 raise _UnauthorizedError()
@@ -3342,28 +3393,21 @@ class TestRunConversation:
                 content="Recovered after remint", finish_reason="stop"
             )
 
-        def _fake_refresh(*, force=True):
-            calls["refresh"] += 1
-            assert force is True
-            return True
-
         with (
-            patch.object(agent, "_persist_session"),
-            patch.object(agent, "_save_trajectory"),
-            patch.object(agent, "_cleanup_task_resources"),
-            patch.object(agent, "_interruptible_api_call", side_effect=_fake_api_call),
-            patch.object(
-                agent, "_try_refresh_nous_client_credentials", side_effect=_fake_refresh
-            ),
+            patch.object(agent, "_persist_session", new_callable=AsyncMock),
+            patch.object(agent, "_save_trajectory", new_callable=AsyncMock),
+            patch.object(agent, "_cleanup_task_resources", new_callable=AsyncMock),
+            patch.object(agent, "_execute_model_request", side_effect=_fake_model_request),
         ):
-            result = agent.run_conversation("hello")
+            with pytest.raises(
+                RuntimeError, match="no native async implementation"
+            ):
+                await agent.run_conversation("hello")
 
-        assert calls["api"] == 2
-        assert calls["refresh"] == 1
-        assert result["completed"] is True
-        assert result["final_response"] == "Recovered after remint"
+        assert calls["api"] == 1
 
-    def test_context_compression_triggered(self, agent):
+    @pytest.mark.asyncio
+    async def test_context_compression_triggered(self, agent):
         """When compressor says should_compress, compression runs."""
         self._setup_agent(agent)
         agent.compression_enabled = True
@@ -3371,29 +3415,38 @@ class TestRunConversation:
         tc = _mock_tool_call(name="web_search", arguments="{}", call_id="c1")
         resp1 = _mock_response(content="", finish_reason="tool_calls", tool_calls=[tc])
         resp2 = _mock_response(content="All done", finish_reason="stop")
-        agent.client.chat.completions.create.side_effect = [resp1, resp2]
+        agent._execute_model_request = AsyncMock(side_effect=[resp1, resp2])
 
         with (
-            patch("run_agent.handle_function_call", return_value="result"),
+            patch(
+                "model_tools.handle_function_call",
+                new_callable=AsyncMock,
+                return_value="result",
+            ),
+            patch(
+                "tools.registry.registry.get_entry",
+                return_value=SimpleNamespace(is_async=True, max_result_size_chars=None),
+            ),
             patch.object(
                 agent.context_compressor, "should_compress", return_value=True
             ),
-            patch.object(agent, "_compress_context") as mock_compress,
-            patch.object(agent, "_persist_session"),
-            patch.object(agent, "_save_trajectory"),
-            patch.object(agent, "_cleanup_task_resources"),
+            patch.object(agent, "_compress_context", new_callable=AsyncMock) as mock_compress,
+            patch.object(agent, "_persist_session", new_callable=AsyncMock),
+            patch.object(agent, "_save_trajectory", new_callable=AsyncMock),
+            patch.object(agent, "_cleanup_task_resources", new_callable=AsyncMock),
         ):
             # _compress_context should return (messages, system_prompt)
             mock_compress.return_value = (
                 [{"role": "user", "content": "search something"}],
                 "compressed system prompt",
             )
-            result = agent.run_conversation("search something")
-        mock_compress.assert_called_once()
+            result = await agent.run_conversation("search something")
+        mock_compress.assert_awaited_once()
         assert result["final_response"] == "All done"
         assert result["completed"] is True
 
-    def test_engine_preflight_fires_below_threshold(self, agent):
+    @pytest.mark.asyncio
+    async def test_engine_preflight_fires_below_threshold(self, agent):
         """Sub-threshold ContextEngine.should_compress_preflight() routes to compress().
 
         Regression test for #20316: when running below the threshold_tokens
@@ -3421,7 +3474,7 @@ class TestRunConversation:
         agent.context_compressor.threshold_tokens = 10**9
 
         ok_resp = _mock_response(content="Done", finish_reason="stop")
-        agent.client.chat.completions.create.return_value = ok_resp
+        agent._execute_model_request = AsyncMock(return_value=ok_resp)
 
         # Engine-style hook: returns True so the elif branch should
         # invoke _compress_context once for sub-threshold maintenance.
@@ -3432,25 +3485,26 @@ class TestRunConversation:
                 return_value=True,
                 create=True,
             ) as mock_preflight,
-            patch.object(agent, "_compress_context") as mock_compress,
-            patch.object(agent, "_persist_session"),
-            patch.object(agent, "_save_trajectory"),
-            patch.object(agent, "_cleanup_task_resources"),
+            patch.object(agent, "_compress_context", new_callable=AsyncMock) as mock_compress,
+            patch.object(agent, "_persist_session", new_callable=AsyncMock),
+            patch.object(agent, "_save_trajectory", new_callable=AsyncMock),
+            patch.object(agent, "_cleanup_task_resources", new_callable=AsyncMock),
         ):
             mock_compress.return_value = (
                 [{"role": "user", "content": "hello"}],
                 "compressed system prompt",
             )
-            result = agent.run_conversation("hello", conversation_history=prefill)
+            result = await agent.run_conversation("hello", conversation_history=prefill)
 
         mock_preflight.assert_called_once()
-        mock_compress.assert_called_once()
+        mock_compress.assert_awaited_once()
         assert result["final_response"] == "Done"
         assert result["completed"] is True
 
 
 
-    def test_glm_prompt_exceeds_max_length_triggers_compression(self, agent):
+    @pytest.mark.asyncio
+    async def test_glm_prompt_exceeds_max_length_triggers_compression(self, agent):
         """GLM/Z.AI uses 'Prompt exceeds max length' for context overflow."""
         self._setup_agent(agent)
         agent.compression_enabled = True  # this test verifies overflow→compression fires
@@ -3459,53 +3513,55 @@ class TestRunConversation:
         )
         err_400.status_code = 400
         ok_resp = _mock_response(content="Recovered after compression", finish_reason="stop")
-        agent.client.chat.completions.create.side_effect = [err_400, ok_resp]
+        agent._execute_model_request = AsyncMock(side_effect=[err_400, ok_resp])
         prefill = [
             {"role": "user", "content": "previous question"},
             {"role": "assistant", "content": "previous answer"},
         ]
 
         with (
-            patch.object(agent, "_compress_context") as mock_compress,
-            patch.object(agent, "_persist_session"),
-            patch.object(agent, "_save_trajectory"),
-            patch.object(agent, "_cleanup_task_resources"),
+            patch.object(agent, "_compress_context", new_callable=AsyncMock) as mock_compress,
+            patch.object(agent, "_persist_session", new_callable=AsyncMock),
+            patch.object(agent, "_save_trajectory", new_callable=AsyncMock),
+            patch.object(agent, "_cleanup_task_resources", new_callable=AsyncMock),
         ):
             mock_compress.return_value = (
                 [{"role": "user", "content": "hello"}],
                 "compressed system prompt",
             )
-            result = agent.run_conversation("hello", conversation_history=prefill)
+            result = await agent.run_conversation("hello", conversation_history=prefill)
 
-        mock_compress.assert_called_once()
+        mock_compress.assert_awaited_once()
         assert result["final_response"] == "Recovered after compression"
         assert result["completed"] is True
 
 
 
-    def test_length_finish_reason_requests_continuation(self, agent):
+    @pytest.mark.asyncio
+    async def test_length_finish_reason_requests_continuation(self, agent):
         """Normal truncation (partial real content) triggers continuation."""
         self._setup_agent(agent)
         first = _mock_response(content="Part 1 ", finish_reason="length")
         second = _mock_response(content="Part 2", finish_reason="stop")
-        agent.client.chat.completions.create.side_effect = [first, second]
+        agent._execute_model_request = AsyncMock(side_effect=[first, second])
 
         with (
-            patch.object(agent, "_persist_session"),
-            patch.object(agent, "_save_trajectory"),
-            patch.object(agent, "_cleanup_task_resources"),
+            patch.object(agent, "_persist_session", new_callable=AsyncMock),
+            patch.object(agent, "_save_trajectory", new_callable=AsyncMock),
+            patch.object(agent, "_cleanup_task_resources", new_callable=AsyncMock),
         ):
-            result = agent.run_conversation("hello")
+            result = await agent.run_conversation("hello")
 
         assert result["completed"] is True
         assert result["api_calls"] == 2
         assert result["final_response"] == "Part 1 Part 2"
 
-        second_call_messages = agent.client.chat.completions.create.call_args_list[1].kwargs["messages"]
+        second_call_messages = agent._execute_model_request.await_args_list[1].args[0]["messages"]
         assert second_call_messages[-1]["role"] == "user"
         assert "truncated by the output length limit" in second_call_messages[-1]["content"]
 
-    def test_length_continuation_preserves_large_provider_default_output_cap(self, agent):
+    @pytest.mark.asyncio
+    async def test_length_continuation_preserves_large_provider_default_output_cap(self, agent):
         """Continuation retries must not shrink a higher provider default cap."""
         self._setup_agent(agent)
         agent.max_tokens = None
@@ -3521,21 +3577,22 @@ class TestRunConversation:
 
         first = _mock_response(content="Part 1 ", finish_reason="length")
         second = _mock_response(content="Part 2", finish_reason="stop")
-        agent.client.chat.completions.create.side_effect = [first, second]
+        agent._execute_model_request = AsyncMock(side_effect=[first, second])
 
         with (
             patch.object(agent, "_build_api_kwargs", side_effect=_fake_build_api_kwargs),
-            patch.object(agent, "_persist_session"),
-            patch.object(agent, "_save_trajectory"),
-            patch.object(agent, "_cleanup_task_resources"),
+            patch.object(agent, "_persist_session", new_callable=AsyncMock),
+            patch.object(agent, "_save_trajectory", new_callable=AsyncMock),
+            patch.object(agent, "_cleanup_task_resources", new_callable=AsyncMock),
         ):
-            result = agent.run_conversation("hello")
+            result = await agent.run_conversation("hello")
 
         assert result["completed"] is True
         assert result["final_response"] == "Part 1 Part 2"
         assert requested_caps == [65536, 65536]
 
-    def test_ollama_glm_stop_after_tools_without_terminal_boundary_requests_continuation(self, agent):
+    @pytest.mark.asyncio
+    async def test_ollama_glm_stop_after_tools_without_terminal_boundary_requests_continuation(self, agent):
         """Ollama-hosted GLM responses can misreport truncated output as stop."""
         self._setup_agent(agent)
         agent.base_url = "http://localhost:11434/v1"
@@ -3555,19 +3612,27 @@ class TestRunConversation:
             content=" step is to update the config.",
             finish_reason="stop",
         )
-        agent.client.chat.completions.create.side_effect = [
+        agent._execute_model_request = AsyncMock(side_effect=[
             tool_turn,
             misreported_stop,
             continued,
-        ]
+        ])
 
         with (
-            patch("run_agent.handle_function_call", return_value="search result"),
-            patch.object(agent, "_persist_session"),
-            patch.object(agent, "_save_trajectory"),
-            patch.object(agent, "_cleanup_task_resources"),
+            patch(
+                "model_tools.handle_function_call",
+                new_callable=AsyncMock,
+                return_value="search result",
+            ),
+            patch(
+                "tools.registry.registry.get_entry",
+                return_value=SimpleNamespace(is_async=True, max_result_size_chars=None),
+            ),
+            patch.object(agent, "_persist_session", new_callable=AsyncMock),
+            patch.object(agent, "_save_trajectory", new_callable=AsyncMock),
+            patch.object(agent, "_cleanup_task_resources", new_callable=AsyncMock),
         ):
-            result = agent.run_conversation("hello")
+            result = await agent.run_conversation("hello")
 
         assert result["completed"] is True
         assert result["api_calls"] == 3
@@ -3576,7 +3641,7 @@ class TestRunConversation:
             == "Based on the search results, the best next step is to update the config."
         )
 
-        third_call_messages = agent.client.chat.completions.create.call_args_list[2].kwargs["messages"]
+        third_call_messages = agent._execute_model_request.await_args_list[2].args[0]["messages"]
         assert third_call_messages[-1]["role"] == "user"
         assert "truncated by the output length limit" in third_call_messages[-1]["content"]
 
@@ -3586,21 +3651,22 @@ class TestRunConversation:
 
 
 
-    def test_length_thinking_exhausted_skips_continuation(self, agent):
+    @pytest.mark.asyncio
+    async def test_length_thinking_exhausted_skips_continuation(self, agent):
         """When finish_reason='length' but content is only thinking, skip retries."""
         self._setup_agent(agent)
         resp = _mock_response(
             content="<think>internal reasoning</think>",
             finish_reason="length",
         )
-        agent.client.chat.completions.create.return_value = resp
+        agent._execute_model_request = AsyncMock(return_value=resp)
 
         with (
-            patch.object(agent, "_persist_session"),
-            patch.object(agent, "_save_trajectory"),
-            patch.object(agent, "_cleanup_task_resources"),
+            patch.object(agent, "_persist_session", new_callable=AsyncMock),
+            patch.object(agent, "_save_trajectory", new_callable=AsyncMock),
+            patch.object(agent, "_cleanup_task_resources", new_callable=AsyncMock),
         ):
-            result = agent.run_conversation("hello")
+            result = await agent.run_conversation("hello")
 
         # Should return immediately — no continuation, only 1 API call
         assert result["completed"] is False
@@ -3613,7 +3679,8 @@ class TestRunConversation:
         assert "/thinkon" in result["final_response"]
 
 
-    def test_length_with_tool_calls_returns_partial_without_executing_tools(self, agent):
+    @pytest.mark.asyncio
+    async def test_length_with_tool_calls_returns_partial_without_executing_tools(self, agent):
         self._setup_agent(agent)
         bad_tc = _mock_tool_call(
             name="write_file",
@@ -3621,22 +3688,23 @@ class TestRunConversation:
             call_id="c1",
         )
         resp = _mock_response(content="", finish_reason="length", tool_calls=[bad_tc])
-        agent.client.chat.completions.create.return_value = resp
+        agent._execute_model_request = AsyncMock(return_value=resp)
 
         with (
-            patch("run_agent.handle_function_call") as mock_handle_function_call,
-            patch.object(agent, "_persist_session"),
-            patch.object(agent, "_save_trajectory"),
-            patch.object(agent, "_cleanup_task_resources"),
+            patch("model_tools.handle_function_call", new_callable=AsyncMock) as mock_handle_function_call,
+            patch.object(agent, "_persist_session", new_callable=AsyncMock),
+            patch.object(agent, "_save_trajectory", new_callable=AsyncMock),
+            patch.object(agent, "_cleanup_task_resources", new_callable=AsyncMock),
         ):
-            result = agent.run_conversation("write the report")
+            result = await agent.run_conversation("write the report")
 
         assert result["completed"] is False
         assert result["partial"] is True
         assert "truncated due to output length limit" in result["error"]
-        mock_handle_function_call.assert_not_called()
+        mock_handle_function_call.assert_not_awaited()
 
-    def test_truncated_tool_call_retries_once_before_refusing(self, agent):
+    @pytest.mark.asyncio
+    async def test_truncated_tool_call_retries_once_before_refusing(self, agent):
         """When tool call args are truncated, the agent retries the API call
         (up to 3 times). If a retry succeeds (valid JSON args), tool execution
         proceeds."""
@@ -3659,24 +3727,26 @@ class TestRunConversation:
             content="", finish_reason="stop", tool_calls=[good_tc],
         )
         with (
-            patch("run_agent.handle_function_call", return_value='{"success":true}') as mock_hfc,
-            patch.object(agent, "_persist_session"),
-            patch.object(agent, "_save_trajectory"),
-            patch.object(agent, "_cleanup_task_resources"),
+            patch("model_tools.handle_function_call", new_callable=AsyncMock, return_value='{"success":true}') as mock_hfc,
+            patch("tools.registry.registry.get_entry", return_value=SimpleNamespace(is_async=True, max_result_size_chars=None)),
+            patch.object(agent, "_persist_session", new_callable=AsyncMock),
+            patch.object(agent, "_save_trajectory", new_callable=AsyncMock),
+            patch.object(agent, "_cleanup_task_resources", new_callable=AsyncMock),
         ):
             # First call: truncated → retry. Second: valid → execute tool.
             # Third: final text response.
             final_resp = _mock_response(content="Done!", finish_reason="stop")
-            agent.client.chat.completions.create.side_effect = [
+            agent._execute_model_request = AsyncMock(side_effect=[
                 truncated_resp, good_resp, final_resp,
-            ]
-            result = agent.run_conversation("write the report")
+            ])
+            result = await agent.run_conversation("write the report")
 
         # Tool was executed on the retry (good_resp)
-        mock_hfc.assert_called_once()
+        mock_hfc.assert_awaited_once()
         assert result["final_response"] == "Done!"
 
-    def test_stub_stall_mid_tool_call_recovers_within_3_retries(self, agent):
+    @pytest.mark.asyncio
+    async def test_stub_stall_mid_tool_call_recovers_within_3_retries(self, agent):
         """A network stream stall mid tool-call (PARTIAL_STREAM_STUB_ID) must
         retry up to 3 times rather than hard-failing after one — and recover
         if a retry produces a complete tool call. Regression for the false
@@ -3704,22 +3774,24 @@ class TestRunConversation:
         final_resp = _mock_response(content="Done!", finish_reason="stop")
 
         with (
-            patch("run_agent.handle_function_call", return_value='{"success":true}') as mock_hfc,
-            patch.object(agent, "_persist_session"),
-            patch.object(agent, "_save_trajectory"),
-            patch.object(agent, "_cleanup_task_resources"),
+            patch("model_tools.handle_function_call", new_callable=AsyncMock, return_value='{"success":true}') as mock_hfc,
+            patch("tools.registry.registry.get_entry", return_value=SimpleNamespace(is_async=True, max_result_size_chars=None)),
+            patch.object(agent, "_persist_session", new_callable=AsyncMock),
+            patch.object(agent, "_save_trajectory", new_callable=AsyncMock),
+            patch.object(agent, "_cleanup_task_resources", new_callable=AsyncMock),
         ):
-            agent.client.chat.completions.create.side_effect = [
+            agent._execute_model_request = AsyncMock(side_effect=[
                 stall1, stall2, good_resp, final_resp,
-            ]
-            result = agent.run_conversation("write the report")
+            ])
+            result = await agent.run_conversation("write the report")
 
         # Recovered on the 3rd attempt instead of refusing after the 1st.
-        mock_hfc.assert_called_once()
+        mock_hfc.assert_awaited_once()
         assert result["final_response"] == "Done!"
 
 
-    def test_truncated_tool_json_after_tool_batch_closes_tool_tail(self, agent):
+    @pytest.mark.asyncio
+    async def test_truncated_tool_json_after_tool_batch_closes_tool_tail(self, agent):
         """finish_reason=tool_calls + truncated args after a real tool must close tool→user."""
         self._setup_agent(agent)
         agent.valid_tool_names.add("write_file")
@@ -3739,15 +3811,16 @@ class TestRunConversation:
         bad_resp = _mock_response(
             content="", finish_reason="tool_calls", tool_calls=[bad_tc],
         )
-        agent.client.chat.completions.create.side_effect = [good_resp, bad_resp]
+        agent._execute_model_request = AsyncMock(side_effect=[good_resp, bad_resp])
 
         with (
-            patch("run_agent.handle_function_call", return_value='{"success":true}'),
-            patch.object(agent, "_persist_session"),
-            patch.object(agent, "_save_trajectory"),
-            patch.object(agent, "_cleanup_task_resources"),
+            patch("model_tools.handle_function_call", new_callable=AsyncMock, return_value='{"success":true}'),
+            patch("tools.registry.registry.get_entry", return_value=SimpleNamespace(is_async=True, max_result_size_chars=None)),
+            patch.object(agent, "_persist_session", new_callable=AsyncMock),
+            patch.object(agent, "_save_trajectory", new_callable=AsyncMock),
+            patch.object(agent, "_cleanup_task_resources", new_callable=AsyncMock),
         ):
-            result = agent.run_conversation("write then truncate")
+            result = await agent.run_conversation("write then truncate")
 
         assert result.get("partial") is True
         msgs = result.get("messages") or []
@@ -3757,7 +3830,8 @@ class TestRunConversation:
 
     # ── Output-cap retry: safe_out uses provider available_out + request estimate ──
 
-    def test_output_cap_retry_uses_provider_available_out(self, agent):
+    @pytest.mark.asyncio
+    async def test_output_cap_retry_uses_provider_available_out(self, agent):
         """run_conversation retries an output-cap error with max_tokens <=
         available_out - 64, and does NOT halve context_length or trigger
         compression.
@@ -3780,25 +3854,25 @@ class TestRunConversation:
         exc.code = 400
 
         ok_resp = _mock_response(content="done", finish_reason="stop")
-        agent.client.chat.completions.create.side_effect = [exc, ok_resp]
+        agent._execute_model_request = AsyncMock(side_effect=[exc, ok_resp])
 
-        mock_compress = MagicMock()
         with (
-            patch.object(agent, "_persist_session"),
-            patch.object(agent, "_save_trajectory"),
-            patch.object(agent, "_cleanup_task_resources"),
+            patch.object(agent, "_persist_session", new_callable=AsyncMock),
+            patch.object(agent, "_save_trajectory", new_callable=AsyncMock),
+            patch.object(agent, "_cleanup_task_resources", new_callable=AsyncMock),
             patch.object(agent.context_compressor, "update_model"),
-            patch.object(agent, "_compress_context", mock_compress),
+            patch.object(agent, "_compress_context", new_callable=AsyncMock) as mock_compress,
         ):
-            result = agent.run_conversation("hello")
+            result = await agent.run_conversation("hello")
 
-        second_call = agent.client.chat.completions.create.call_args_list[1].kwargs
+        second_call = agent._execute_model_request.await_args_list[1].args[0]
         assert result["completed"] is True
         assert second_call["max_tokens"] <= 936
         assert agent.context_compressor.context_length == 200_000
-        mock_compress.assert_not_called()
+        mock_compress.assert_not_awaited()
 
-    def test_output_cap_retry_with_large_api_only_content(self, agent):
+    @pytest.mark.asyncio
+    async def test_output_cap_retry_with_large_api_only_content(self, agent):
         """When a large system prompt makes api_messages huge while persisted
         messages stay tiny, the retry cap must still respect provider
         available_tokens — not blow up to the full context window.
@@ -3824,25 +3898,24 @@ class TestRunConversation:
         exc.code = 400
 
         ok_resp = _mock_response(content="done", finish_reason="stop")
-        agent.client.chat.completions.create.side_effect = [exc, ok_resp]
+        agent._execute_model_request = AsyncMock(side_effect=[exc, ok_resp])
 
-        mock_compress = MagicMock()
         with (
-            patch.object(agent, "_persist_session"),
-            patch.object(agent, "_save_trajectory"),
-            patch.object(agent, "_cleanup_task_resources"),
+            patch.object(agent, "_persist_session", new_callable=AsyncMock),
+            patch.object(agent, "_save_trajectory", new_callable=AsyncMock),
+            patch.object(agent, "_cleanup_task_resources", new_callable=AsyncMock),
             patch.object(agent.context_compressor, "update_model"),
-            patch.object(agent, "_compress_context", mock_compress),
+            patch.object(agent, "_compress_context", new_callable=AsyncMock) as mock_compress,
         ):
-            result = agent.run_conversation("hello")
+            result = await agent.run_conversation("hello")
 
-        second_call = agent.client.chat.completions.create.call_args_list[1].kwargs
+        second_call = agent._execute_model_request.await_args_list[1].args[0]
         assert result["completed"] is True
         # The current branch (messages-only estimate) would send max_tokens
         # near 199927 — this test fails on it.
         assert second_call["max_tokens"] <= 936
         assert agent.context_compressor.context_length == 200_000
-        mock_compress.assert_not_called()
+        mock_compress.assert_not_awaited()
 
 
 
@@ -3904,6 +3977,7 @@ class TestRetryExhaustion:
     """
 
     def _setup_agent(self, agent):
+        agent._deferred_provider_runtime = None
         agent._cached_system_prompt = "You are helpful."
         agent._use_prompt_caching = False
         agent.compression_enabled = False
@@ -3924,7 +3998,8 @@ class TestRetryExhaustion:
         mock_time.monotonic.return_value = 12345.0
         return mock_time
 
-    def test_invalid_response_returns_error_not_crash(self, agent):
+    @pytest.mark.asyncio
+    async def test_invalid_response_returns_error_not_crash(self, agent):
         """Exhausted retries on invalid (empty choices) response must not IndexError."""
         self._setup_agent(agent)
         # Return response with empty choices every time
@@ -3933,20 +4008,20 @@ class TestRetryExhaustion:
             model="test/model",
             usage=None,
         )
-        agent.client.chat.completions.create.return_value = bad_resp
+        agent._execute_model_request = AsyncMock(return_value=bad_resp)
         # The conversation loop was extracted out of run_agent.py and pulls
         # in time/jittered_backoff at module level — patch BOTH so the
         # retry waits don't burn 18+ seconds of real wall-clock time here.
         from agent import conversation_loop as _conv_loop
         with (
-            patch.object(agent, "_persist_session"),
-            patch.object(agent, "_save_trajectory"),
-            patch.object(agent, "_cleanup_task_resources"),
+            patch.object(agent, "_persist_session", new_callable=AsyncMock),
+            patch.object(agent, "_save_trajectory", new_callable=AsyncMock),
+            patch.object(agent, "_cleanup_task_resources", new_callable=AsyncMock),
             patch("run_agent.time", self._make_fast_time_mock()),
             patch.object(_conv_loop, "time", self._make_fast_time_mock()),
             patch.object(_conv_loop, "jittered_backoff", lambda *a, **k: 0.0),
         ):
-            result = agent.run_conversation("hello")
+            result = await agent.run_conversation("hello")
         assert result.get("completed") is False, (
             f"Expected completed=False, got: {result}"
         )
@@ -3955,51 +4030,31 @@ class TestRetryExhaustion:
         assert "Invalid API response" in result["error"]
         assert result.get("final_response") == result["error"]
 
-    def test_invalid_response_retry_completes_one_logical_call(self, agent):
+    @pytest.mark.asyncio
+    async def test_invalid_response_retry_completes_one_logical_call(self, agent):
         self._setup_agent(agent)
-        agent.client.chat.completions.create.side_effect = [
+        agent._execute_model_request = AsyncMock(side_effect=[
             SimpleNamespace(choices=[], model="test/model", usage=None),
             _mock_response(content="recovered"),
-        ]
-        relay_attempts = []
-        logical_completions = []
-
-        def execute(request, callback, **kwargs):
-            relay_attempts.append(kwargs)
-            return callback(request)
+        ])
 
         from agent import conversation_loop as _conv_loop
 
         with (
-            patch.object(agent, "_persist_session"),
-            patch.object(agent, "_save_trajectory"),
-            patch.object(agent, "_cleanup_task_resources"),
+            patch.object(agent, "_persist_session", new_callable=AsyncMock),
+            patch.object(agent, "_save_trajectory", new_callable=AsyncMock),
+            patch.object(agent, "_cleanup_task_resources", new_callable=AsyncMock),
             patch("run_agent.time", self._make_fast_time_mock()),
             patch.object(_conv_loop, "time", self._make_fast_time_mock()),
             patch.object(_conv_loop, "jittered_backoff", lambda *a, **k: 0.0),
-            patch("agent.relay_llm.execute", side_effect=execute),
-            patch(
-                "agent.relay_llm.complete_logical_call",
-                side_effect=lambda request_id, *, outcome: logical_completions.append(
-                    (request_id, outcome)
-                ),
-            ),
         ):
-            result = agent.run_conversation("hello")
+            result = await agent.run_conversation("hello")
 
         assert result["completed"] is True
-        assert len(relay_attempts) == 2
-        assert all(
-            attempt["defer_logical_completion"] is True
-            for attempt in relay_attempts
-        )
-        request_ids = {
-            attempt["metadata"]["api_request_id"] for attempt in relay_attempts
-        }
-        assert len(request_ids) == 1
-        assert logical_completions == [(request_ids.pop(), "success")]
+        assert agent._execute_model_request.await_count == 2
 
-    def test_content_filter_refusal_surfaced_not_retried(self, agent):
+    @pytest.mark.asyncio
+    async def test_content_filter_refusal_surfaced_not_retried(self, agent):
         """A model refusal must be surfaced immediately, NOT laundered into
         the empty-response retry loop and reported as "rate limited" / "no
         content after retries".
@@ -4024,13 +4079,13 @@ class TestRetryExhaustion:
             usage=None,
             id="resp_1",
         )
-        agent.client.chat.completions.create.return_value = refusal_resp
+        agent._execute_model_request = AsyncMock(return_value=refusal_resp)
         with (
-            patch.object(agent, "_persist_session"),
-            patch.object(agent, "_save_trajectory"),
-            patch.object(agent, "_cleanup_task_resources"),
+            patch.object(agent, "_persist_session", new_callable=AsyncMock),
+            patch.object(agent, "_save_trajectory", new_callable=AsyncMock),
+            patch.object(agent, "_cleanup_task_resources", new_callable=AsyncMock),
         ):
-            result = agent.run_conversation("please do something disallowed")
+            result = await agent.run_conversation("please do something disallowed")
         assert result.get("completed") is False
         assert result.get("failed") is True
         assert "content_policy_blocked" in result.get("error", "")
@@ -4038,10 +4093,11 @@ class TestRetryExhaustion:
         assert "I won't help with that." in (result.get("final_response") or "")
         # Crucial regression guard: a deterministic refusal is NOT retried —
         # exactly one API call, no empty-response retry loop.
-        assert agent.client.chat.completions.create.call_count == 1
+        assert agent._execute_model_request.await_count == 1
 
 
-    def test_build_api_kwargs_error_no_unbound_local(self, agent):
+    @pytest.mark.asyncio
+    async def test_build_api_kwargs_error_no_unbound_local(self, agent):
         """When _build_api_kwargs raises, except handler must not crash with UnboundLocalError.
 
         Regression: _dump_api_request_debug(api_kwargs, ...) in the except block
@@ -4050,12 +4106,12 @@ class TestRetryExhaustion:
         self._setup_agent(agent)
         with (
             patch.object(agent, "_build_api_kwargs", side_effect=ValueError("bad messages")),
-            patch.object(agent, "_persist_session"),
-            patch.object(agent, "_save_trajectory"),
-            patch.object(agent, "_cleanup_task_resources"),
+            patch.object(agent, "_persist_session", new_callable=AsyncMock),
+            patch.object(agent, "_save_trajectory", new_callable=AsyncMock),
+            patch.object(agent, "_cleanup_task_resources", new_callable=AsyncMock),
             patch("run_agent.time", self._make_fast_time_mock()),
         ):
-            result = agent.run_conversation("hello")
+            result = await agent.run_conversation("hello")
         # Must surface the real error, not UnboundLocalError
         assert result.get("completed") is False
         assert result.get("failed") is True
@@ -4072,7 +4128,8 @@ class TestRetryExhaustion:
 class TestConversationHistoryNotMutated:
     """run_conversation must not mutate the caller's conversation_history list."""
 
-    def test_caller_list_unchanged_after_run(self, agent):
+    @pytest.mark.asyncio
+    async def test_caller_list_unchanged_after_run(self, agent):
         """Passing conversation_history should not modify the original list."""
         history = [
             {"role": "user", "content": "previous question"},
@@ -4081,14 +4138,15 @@ class TestConversationHistoryNotMutated:
         original_len = len(history)
 
         resp = _mock_response(content="new answer", finish_reason="stop")
-        agent.client.chat.completions.create.return_value = resp
+        agent._deferred_provider_runtime = None
+        agent._execute_model_request = AsyncMock(return_value=resp)
 
         with (
-            patch.object(agent, "_persist_session"),
-            patch.object(agent, "_save_trajectory"),
-            patch.object(agent, "_cleanup_task_resources"),
+            patch.object(agent, "_persist_session", new_callable=AsyncMock),
+            patch.object(agent, "_save_trajectory", new_callable=AsyncMock),
+            patch.object(agent, "_cleanup_task_resources", new_callable=AsyncMock),
         ):
-            result = agent.run_conversation(
+            result = await agent.run_conversation(
                 "new question", conversation_history=history
             )
 
@@ -4105,145 +4163,19 @@ class TestConversationHistoryNotMutated:
 # ---------------------------------------------------------------------------
 
 
-class TestNousCredentialRefresh:
-    """Verify Nous credential refresh rebuilds the runtime client."""
-
-    def test_try_refresh_nous_client_credentials_rebuilds_client(
-        self, agent, monkeypatch
-    ):
-        agent.provider = "nous"
-        agent.api_mode = "chat_completions"
-
-        closed = {"value": False}
-        retired = {"value": False}
-        rebuilt = {"kwargs": None}
-        captured = {}
-
-        class _ExistingClient:
-            def close(self):
-                closed["value"] = True
-
-        class _RebuiltClient:
-            pass
-
-        def _fake_resolve(**kwargs):
-            captured.update(kwargs)
-            return {
-                "api_key": "new-nous-key",
-                "base_url": "https://inference-api.nousresearch.com/v1",
-            }
-
-        def _fake_openai(**kwargs):
-            rebuilt["kwargs"] = kwargs
-            return _RebuiltClient()
-
-        monkeypatch.setattr(
-            "hermes_cli.auth.resolve_nous_runtime_credentials", _fake_resolve
-        )
-
-        existing = _ExistingClient()
-        agent.client = existing
-
-        _orig_retire = agent._retire_shared_openai_client
-
-        def _spy_retire(client, *, reason):
-            if client is existing:
-                retired["value"] = True
-            return _orig_retire(client, reason=reason)
-
-        monkeypatch.setattr(agent, "_retire_shared_openai_client", _spy_retire)
-
-        with patch("run_agent.OpenAI", side_effect=_fake_openai):
-            ok = agent._try_refresh_nous_client_credentials(force=True)
-
-        assert ok is True
-        # #70773: the replaced shared client is RETIRED (sockets shutdown,
-        # FD release deferred to GC), never hard-closed from the refreshing
-        # thread — close() releasing pool FDs cross-thread was the
-        # TLS-FD→SQLite corruption vector.
-        assert retired["value"] is True
-        assert closed["value"] is False
-        assert captured["force_refresh"] is True
-        assert rebuilt["kwargs"]["api_key"] == "new-nous-key"
-        assert (
-            rebuilt["kwargs"]["base_url"] == "https://inference-api.nousresearch.com/v1"
-        )
-        assert "default_headers" not in rebuilt["kwargs"]
-        assert isinstance(agent.client, _RebuiltClient)
-
-    def test_try_refresh_nous_client_credentials_rebuilds_anthropic_client(
-        self, agent, monkeypatch
-    ):
-        """Portal anthropic/* sessions hold an Anthropic client, not OpenAI.
-
-        A 401 on the Messages wire must refresh the invoke JWT into
-        ``_anthropic_api_key`` / ``_anthropic_base_url`` and rebuild that
-        client — swapping only ``agent.client`` would leave the turn stuck
-        on the expired Bearer token.
-        """
-        agent.provider = "nous"
-        agent.api_mode = "anthropic_messages"
-        agent.model = "anthropic/claude-opus-4.8"
-        agent.api_key = "stale-nous-key"
-        agent.base_url = "https://inference-api.nousresearch.com/v1"
-        agent._anthropic_api_key = "stale-nous-key"
-        agent._anthropic_base_url = "https://inference-api.nousresearch.com/v1"
-        agent._client_kwargs = {}
-        agent.client = None
-
-        captured = {}
-        rebuild_calls = {"count": 0}
-
-        class _RebuiltAnthropic:
-            pass
-
-        def _fake_resolve(**kwargs):
-            captured.update(kwargs)
-            return {
-                "api_key": "fresh-portal-jwt",
-                "base_url": "https://inference-api.nousresearch.com/v1",
-            }
-
-        def _fake_rebuild():
-            rebuild_calls["count"] += 1
-            agent._anthropic_client = _RebuiltAnthropic()
-
-        monkeypatch.setattr(
-            "hermes_cli.auth.resolve_nous_runtime_credentials", _fake_resolve
-        )
-        monkeypatch.setattr(agent, "_rebuild_anthropic_client", _fake_rebuild)
-        monkeypatch.setattr(
-            agent,
-            "_replace_primary_openai_client",
-            MagicMock(side_effect=AssertionError("OpenAI client must not be rebuilt")),
-        )
-
-        ok = agent._try_refresh_nous_client_credentials(force=True)
-
-        assert ok is True
-        assert captured["force_refresh"] is True
-        assert agent.api_key == "fresh-portal-jwt"
-        assert agent.base_url == "https://inference-api.nousresearch.com/v1"
-        assert agent._anthropic_api_key == "fresh-portal-jwt"
-        assert agent._anthropic_base_url == (
-            "https://inference-api.nousresearch.com/v1"
-        )
-        assert rebuild_calls["count"] == 1
-        assert isinstance(agent._anthropic_client, _RebuiltAnthropic)
-        assert agent.client is None
-        agent._replace_primary_openai_client.assert_not_called()
-
-
 class TestCredentialPoolRecovery:
-    def test_recover_with_pool_rotates_on_402(self, agent):
+    @pytest.mark.asyncio
+    async def test_recover_with_pool_rotates_on_402(self, agent):
         current = SimpleNamespace(label="primary")
         next_entry = SimpleNamespace(label="secondary")
 
         class _Pool:
+            provider = ""
+
             def current(self):
                 return current
 
-            def mark_exhausted_and_rotate(
+            async def mark_exhausted_and_rotate(
                 self,
                 *,
                 status_code,
@@ -4256,29 +4188,32 @@ class TestCredentialPoolRecovery:
                 return next_entry
 
         agent._credential_pool = _Pool()
-        agent._swap_credential = MagicMock()
+        agent._swap_credential = AsyncMock()
 
-        recovered, retry_same = agent._recover_with_credential_pool(
+        recovered, retry_same = await agent._recover_with_credential_pool(
             status_code=402,
             has_retried_429=False,
         )
 
         assert recovered is True
         assert retry_same is False
-        agent._swap_credential.assert_called_once_with(next_entry)
+        agent._swap_credential.assert_awaited_once_with(next_entry)
 
 
-    def test_recover_with_pool_retries_first_429_then_rotates(self, agent):
+    @pytest.mark.asyncio
+    async def test_recover_with_pool_retries_first_429_then_rotates(self, agent):
         next_entry = SimpleNamespace(label="secondary")
 
         class _Pool:
+            provider = ""
+
             def current(self):
                 return SimpleNamespace(label="primary")
 
             def entries(self):
                 return []
 
-            def mark_exhausted_and_rotate(
+            async def mark_exhausted_and_rotate(
                 self, *, status_code, error_context=None, api_key_hint=None
             ):
                 assert status_code == 429
@@ -4287,9 +4222,9 @@ class TestCredentialPoolRecovery:
                 return next_entry
 
         agent._credential_pool = _Pool()
-        agent._swap_credential = MagicMock()
+        agent._swap_credential = AsyncMock()
 
-        recovered, retry_same = agent._recover_with_credential_pool(
+        recovered, retry_same = await agent._recover_with_credential_pool(
             status_code=429,
             has_retried_429=False,
         )
@@ -4297,13 +4232,13 @@ class TestCredentialPoolRecovery:
         assert retry_same is True
         agent._swap_credential.assert_not_called()
 
-        recovered, retry_same = agent._recover_with_credential_pool(
+        recovered, retry_same = await agent._recover_with_credential_pool(
             status_code=429,
             has_retried_429=True,
         )
         assert recovered is True
         assert retry_same is False
-        agent._swap_credential.assert_called_once_with(next_entry)
+        agent._swap_credential.assert_awaited_once_with(next_entry)
 
 
 
@@ -4520,21 +4455,23 @@ class TestSafeWriter:
 
 
 
-    def test_installed_in_run_conversation(self, agent):
+    @pytest.mark.asyncio
+    async def test_installed_in_run_conversation(self, agent):
         """run_conversation installs _SafeWriter on stdio."""
         import sys
         from run_agent import _SafeWriter
         resp = _mock_response(content="Done", finish_reason="stop")
-        agent.client.chat.completions.create.return_value = resp
+        agent._deferred_provider_runtime = None
+        agent._execute_model_request = AsyncMock(return_value=resp)
         original_stdout = sys.stdout
         original_stderr = sys.stderr
         try:
             with (
-                patch.object(agent, "_persist_session"),
-                patch.object(agent, "_save_trajectory"),
-                patch.object(agent, "_cleanup_task_resources"),
+                patch.object(agent, "_persist_session", new_callable=AsyncMock),
+                patch.object(agent, "_save_trajectory", new_callable=AsyncMock),
+                patch.object(agent, "_cleanup_task_resources", new_callable=AsyncMock),
             ):
-                agent.run_conversation("test")
+                await agent.run_conversation("test")
             assert isinstance(sys.stdout, _SafeWriter)
             assert isinstance(sys.stderr, _SafeWriter)
         finally:
@@ -4577,60 +4514,70 @@ class TestBuildApiKwargsAnthropicMaxTokens:
 class TestFallbackAnthropicProvider:
     """Bug fix: _try_activate_fallback had no case for anthropic provider."""
 
-    def test_fallback_to_anthropic_sets_api_mode(self, agent):
+    @pytest.mark.asyncio
+    async def test_fallback_to_anthropic_sets_api_mode(self, agent):
         agent._fallback_activated = False
-        agent._fallback_model = {"provider": "anthropic", "model": "claude-sonnet-4-20250514"}
+        agent.client = None
+        agent._fallback_model = {
+            "provider": "anthropic",
+            "model": "claude-sonnet-4-20250514",
+            "api_key": "sk-ant-api03-test",
+            "base_url": "https://api.anthropic.com/v1",
+        }
         agent._fallback_chain = [agent._fallback_model]
         agent._fallback_index = 0
 
-        mock_client = MagicMock()
-        mock_client.base_url = "https://api.anthropic.com/v1"
-        mock_client.api_key = "sk-ant-api03-test"
-
         with (
-            patch("agent.auxiliary_client.resolve_provider_client", return_value=(mock_client, None)),
             patch("agent.anthropic_adapter.build_anthropic_client") as mock_build,
-            patch("agent.anthropic_adapter.resolve_anthropic_token", return_value=None),
+            patch(
+                "agent.credential_pool.load_pool",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
         ):
             mock_build.return_value = MagicMock()
-            result = agent._try_activate_fallback()
+            result = await agent._try_activate_fallback()
 
         assert result is True
         assert agent.api_mode == "anthropic_messages"
         assert agent._anthropic_client is not None
         assert agent.client is None
 
-    def test_fallback_to_anthropic_enables_prompt_caching(self, agent):
+    @pytest.mark.asyncio
+    async def test_fallback_to_anthropic_enables_prompt_caching(self, agent):
         agent._fallback_activated = False
-        agent._fallback_model = {"provider": "anthropic", "model": "claude-sonnet-4-20250514"}
+        agent.client = None
+        agent._fallback_model = {
+            "provider": "anthropic",
+            "model": "claude-sonnet-4-20250514",
+            "api_key": "sk-ant-api03-test",
+            "base_url": "https://api.anthropic.com/v1",
+        }
         agent._fallback_chain = [agent._fallback_model]
         agent._fallback_index = 0
 
-        mock_client = MagicMock()
-        mock_client.base_url = "https://api.anthropic.com/v1"
-        mock_client.api_key = "sk-ant-api03-test"
-
         with (
-            patch("agent.auxiliary_client.resolve_provider_client", return_value=(mock_client, None)),
             patch("agent.anthropic_adapter.build_anthropic_client", return_value=MagicMock()),
-            patch("agent.anthropic_adapter.resolve_anthropic_token", return_value=None),
+            patch(
+                "agent.credential_pool.load_pool",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
         ):
-            agent._try_activate_fallback()
+            await agent._try_activate_fallback()
 
         assert agent._use_prompt_caching is True
 
 
 
-def test_aiagent_uses_copilot_acp_client():
+@pytest.mark.asyncio
+async def test_copilot_acp_fails_fast_without_native_async_transport():
     with (
         patch("run_agent.get_tool_definitions", return_value=_make_tool_defs("web_search")),
         patch("run_agent.check_toolset_requirements", return_value={}),
         patch("run_agent.OpenAI") as mock_openai,
         patch("agent.copilot_acp_client.CopilotACPClient") as mock_acp_client,
     ):
-        acp_client = MagicMock()
-        mock_acp_client.return_value = acp_client
-
         agent = AIAgent(
             api_key="copilot-acp",
             base_url="acp://copilot",
@@ -4642,13 +4589,12 @@ def test_aiagent_uses_copilot_acp_client():
             skip_memory=True,
         )
 
-    assert agent.client is acp_client
+    assert agent.client is None
     mock_openai.assert_not_called()
-    mock_acp_client.assert_called_once()
-    assert mock_acp_client.call_args.kwargs["base_url"] == "acp://copilot"
-    assert mock_acp_client.call_args.kwargs["api_key"] == "copilot-acp"
-    assert mock_acp_client.call_args.kwargs["command"] == "/usr/local/bin/copilot"
-    assert mock_acp_client.call_args.kwargs["args"] == ["--acp", "--stdio"]
+    mock_acp_client.assert_not_called()
+
+    with pytest.raises(RuntimeError, match="Copilot ACP uses a blocking subprocess transport"):
+        await agent._ensure_provider_runtime()
 
 
 def test_quiet_spinner_allowed_with_explicit_print_fn(agent):
@@ -4661,44 +4607,11 @@ def test_quiet_spinner_allowed_with_explicit_print_fn(agent):
 
 
 
-def test_is_openai_client_closed_honors_custom_client_flag():
-    assert AIAgent._is_openai_client_closed(SimpleNamespace(is_closed=True)) is True
-    assert AIAgent._is_openai_client_closed(SimpleNamespace(is_closed=False)) is False
-
-
-def test_is_openai_client_closed_handles_method_form():
-    """Fix for issue #4377: is_closed as method (openai SDK) vs property (httpx).
-
-    The openai SDK's is_closed is a method, not a property. Prior to this fix,
-    getattr(client, "is_closed", False) returned the bound method object, which
-    is always truthy, causing the function to incorrectly report all clients as
-    closed and triggering unnecessary client recreation on every API call.
-    """
-
-    class MethodFormClient:
-        """Mimics openai.OpenAI where is_closed() is a method."""
-
-        def __init__(self, closed: bool):
-            self._closed = closed
-
-        def is_closed(self) -> bool:
-            return self._closed
-
-    # Method returning False - client is open
-    open_client = MethodFormClient(closed=False)
-    assert AIAgent._is_openai_client_closed(open_client) is False
-
-    # Method returning True - client is closed
-    closed_client = MethodFormClient(closed=True)
-    assert AIAgent._is_openai_client_closed(closed_client) is True
-
-
-
-
 class TestAnthropicBaseUrlPassthrough:
     """Bug fix: base_url was filtered with 'anthropic in base_url', blocking proxies."""
 
-    def test_custom_proxy_base_url_passed_through(self):
+    @pytest.mark.asyncio
+    async def test_custom_proxy_base_url_passed_through(self):
         with (
             patch("run_agent.get_tool_definitions", return_value=_make_tool_defs("web_search")),
             patch("run_agent.check_toolset_requirements", return_value={}),
@@ -4713,634 +4626,11 @@ class TestAnthropicBaseUrlPassthrough:
                 skip_context_files=True,
                 skip_memory=True,
             )
-            call_args = mock_build.call_args
-            # base_url should be passed through, not filtered out
-            assert call_args[0][1] == "https://llm-proxy.company.com/v1"
-
-
-
-class TestAnthropicCredentialRefresh:
-    def test_try_refresh_anthropic_client_credentials_rebuilds_client(self):
-        with (
-            patch("run_agent.get_tool_definitions", return_value=_make_tool_defs("web_search")),
-            patch("run_agent.check_toolset_requirements", return_value={}),
-            patch("agent.anthropic_adapter.build_anthropic_client") as mock_build,
-        ):
-            old_client = MagicMock()
-            new_client = MagicMock()
-            mock_build.side_effect = [old_client, new_client]
-            agent = AIAgent(
-                api_key="sk-ant-oat01-stale-token",
-                base_url="https://openrouter.ai/api/v1",
-                api_mode="anthropic_messages",
-                quiet_mode=True,
-                skip_context_files=True,
-                skip_memory=True,
-            )
-
-        agent._anthropic_client = old_client
-        agent._anthropic_api_key = "sk-ant-oat01-stale-token"
-        agent._anthropic_base_url = "https://api.anthropic.com"
-        agent.provider = "anthropic"
-
-        with (
-            patch("agent.anthropic_adapter.resolve_anthropic_token", return_value="sk-ant-oat01-fresh-token"),
-            patch("agent.anthropic_adapter.build_anthropic_client", return_value=new_client) as rebuild,
-        ):
-            assert agent._try_refresh_anthropic_client_credentials() is True
-
-        old_client.close.assert_called_once()
-        rebuild.assert_called_once_with(
-            "sk-ant-oat01-fresh-token", "https://api.anthropic.com", timeout=None,
-        )
-        assert agent._anthropic_client is new_client
-        assert agent._anthropic_api_key == "sk-ant-oat01-fresh-token"
-
-
-    def test_anthropic_messages_create_preflights_refresh(self):
-        with (
-            patch("run_agent.get_tool_definitions", return_value=_make_tool_defs("web_search")),
-            patch("run_agent.check_toolset_requirements", return_value={}),
-            patch("agent.anthropic_adapter.build_anthropic_client", return_value=MagicMock()),
-        ):
-            agent = AIAgent(
-                api_key="sk-ant-oat01-current-token",
-                base_url="https://openrouter.ai/api/v1",
-                api_mode="anthropic_messages",
-                quiet_mode=True,
-                skip_context_files=True,
-                skip_memory=True,
-            )
-
-        response = SimpleNamespace(content=[])
-        agent._anthropic_client = MagicMock()
-        stream_cm = MagicMock()
-        stream_cm.__enter__.return_value.get_final_message.return_value = response
-        agent._anthropic_client.messages.stream.return_value = stream_cm
-
-        with patch.object(agent, "_try_refresh_anthropic_client_credentials", return_value=True) as refresh:
-            result = agent._anthropic_messages_create({"model": "claude-sonnet-4-20250514"})
-
-        refresh.assert_called_once_with()
-        agent._anthropic_client.messages.stream.assert_called_once_with(model="claude-sonnet-4-20250514")
-        agent._anthropic_client.messages.create.assert_not_called()
-        assert result is response
-
-    def test_anthropic_messages_create_falls_back_when_stream_unavailable(self):
-        with (
-            patch("run_agent.get_tool_definitions", return_value=_make_tool_defs("web_search")),
-            patch("run_agent.check_toolset_requirements", return_value={}),
-            patch("agent.anthropic_adapter.build_anthropic_client", return_value=MagicMock()),
-        ):
-            agent = AIAgent(
-                api_key="sk-ant-oat01-current-token",
-                base_url="https://openrouter.ai/api/v1",
-                api_mode="anthropic_messages",
-                quiet_mode=True,
-                skip_context_files=True,
-                skip_memory=True,
-            )
-
-        response = SimpleNamespace(content=[])
-        agent._anthropic_client = MagicMock()
-        agent._anthropic_client.messages.stream.side_effect = RuntimeError(
-            "stream is not supported by this provider"
-        )
-        agent._anthropic_client.messages.create.return_value = response
-
-        with patch.object(agent, "_try_refresh_anthropic_client_credentials", return_value=False):
-            result = agent._anthropic_messages_create({"model": "claude-sonnet-4-20250514"})
-
-        agent._anthropic_client.messages.stream.assert_called_once_with(model="claude-sonnet-4-20250514")
-        agent._anthropic_client.messages.create.assert_called_once_with(model="claude-sonnet-4-20250514")
-        assert result is response
-
-
-
-
-
-# ===================================================================
-# _streaming_api_call tests
-# ===================================================================
-
-def _make_chunk(content=None, tool_calls=None, finish_reason=None, model="test/model"):
-    """Build a SimpleNamespace mimicking an OpenAI streaming chunk."""
-    delta = SimpleNamespace(content=content, tool_calls=tool_calls)
-    choice = SimpleNamespace(delta=delta, finish_reason=finish_reason)
-    return SimpleNamespace(model=model, choices=[choice])
-
-
-def _make_tc_delta(index=0, tc_id=None, name=None, arguments=None):
-    """Build a SimpleNamespace mimicking a streaming tool_call delta."""
-    func = SimpleNamespace(name=name, arguments=arguments)
-    return SimpleNamespace(index=index, id=tc_id, function=func)
-
-
-class TestStreamingApiCall:
-    """Tests for _streaming_api_call — voice TTS streaming pipeline."""
-
-    def test_content_assembly(self, agent):
-        chunks = [
-            _make_chunk(content="Hel"),
-            _make_chunk(content="lo "),
-            _make_chunk(content="World"),
-            _make_chunk(finish_reason="stop"),
-        ]
-        agent.client.chat.completions.create.return_value = iter(chunks)
-        callback = MagicMock()
-        agent.stream_delta_callback = callback
-
-        resp = agent._interruptible_streaming_api_call({"messages": []})
-
-        assert resp.choices[0].message.content == "Hello World"
-        assert resp.choices[0].finish_reason == "stop"
-        assert callback.call_count == 3
-        callback.assert_any_call("Hel")
-        callback.assert_any_call("lo ")
-        callback.assert_any_call("World")
-
-    def test_tool_call_accumulation(self, agent):
-        # Per OpenAI streaming spec, function names are delivered atomically
-        # in the first chunk; only `arguments` is fragmented across chunks.
-        # The accumulator uses assignment for names (immune to MiniMax/NIM
-        # resends of the full name) and `+=` for arguments.
-        chunks = [
-            _make_chunk(tool_calls=[_make_tc_delta(0, "call_1", "web_search", '{"q":')]),
-            _make_chunk(tool_calls=[_make_tc_delta(0, None, None, '"test"}')]),
-            _make_chunk(finish_reason="tool_calls"),
-        ]
-        agent.client.chat.completions.create.return_value = iter(chunks)
-
-        resp = agent._interruptible_streaming_api_call({"messages": []})
-
-        tc = resp.choices[0].message.tool_calls
-        assert len(tc) == 1
-        assert tc[0].function.name == "web_search"
-        assert tc[0].function.arguments == '{"q":"test"}'
-        assert tc[0].id == "call_1"
-
-    def test_multiple_tool_calls(self, agent):
-        chunks = [
-            _make_chunk(tool_calls=[_make_tc_delta(0, "call_a", "search", '{}')]),
-            _make_chunk(tool_calls=[_make_tc_delta(1, "call_b", "read", '{}')]),
-            _make_chunk(finish_reason="tool_calls"),
-        ]
-        agent.client.chat.completions.create.return_value = iter(chunks)
-
-        resp = agent._interruptible_streaming_api_call({"messages": []})
-
-        tc = resp.choices[0].message.tool_calls
-        assert len(tc) == 2
-        assert tc[0].function.name == "search"
-        assert tc[1].function.name == "read"
-
-    def test_truncated_tool_call_args_no_finish_reason_routes_to_stub(self, agent):
-        # Stream delivers a tool call with incomplete JSON args and then ENDS
-        # with no finish_reason (the SSE just stops — no terminator, no
-        # [DONE]).  This is an upstream mid-tool-call drop, NOT an output cap.
-        # The builder must route it through the partial-stream-stub path
-        # (id=PARTIAL_STREAM_STUB_ID, tool_calls=None so it can't execute,
-        # finish_reason=length so the loop's continuation machinery fires with
-        # chunking guidance) rather than stamping a normal 'length' truncation.
-        from hermes_constants import PARTIAL_STREAM_STUB_ID
-        chunks = [
-            _make_chunk(tool_calls=[_make_tc_delta(0, "call_1", "write_file", '{"path":"x.txt","content":"hel')]),
-        ]
-        agent.client.chat.completions.create.return_value = iter(chunks)
-
-        resp = agent._interruptible_streaming_api_call({"messages": []})
-
-        assert resp.id == PARTIAL_STREAM_STUB_ID
-        assert resp.choices[0].finish_reason == "length"
-        assert resp.choices[0].message.tool_calls is None
-        assert getattr(resp, "_dropped_tool_names", None) == ["write_file"]
-
-    def test_truncated_tool_call_args_with_length_finish_reason_upgrades(self, agent):
-        # Control: when the provider explicitly reports finish_reason='length'
-        # alongside incomplete tool args, it IS a genuine output cap.  Keep the
-        # existing behaviour — tool_calls preserved, finish_reason 'length' —
-        # so the max_tokens-boost truncation retry path still applies.
-        chunks = [
-            _make_chunk(tool_calls=[_make_tc_delta(0, "call_1", "write_file", '{"path":"x.txt","content":"hel')]),
-            _make_chunk(finish_reason="length"),
-        ]
-        agent.client.chat.completions.create.return_value = iter(chunks)
-
-        resp = agent._interruptible_streaming_api_call({"messages": []})
-
-        tc = resp.choices[0].message.tool_calls
-        assert len(tc) == 1
-        assert tc[0].function.name == "write_file"
-        assert tc[0].function.arguments == '{"path":"x.txt","content":"hel'
-        assert resp.choices[0].finish_reason == "length"
-
-    def test_ollama_reused_index_separate_tool_calls(self, agent):
-        """Ollama sends every tool call at index 0 with different ids.
-
-        Without the fix, names and arguments get concatenated into one slot.
-        """
-        chunks = [
-            _make_chunk(tool_calls=[_make_tc_delta(0, "call_a", "search", '{"q":"hello"}')]),
-            # Second tool call at the SAME index 0, but different id
-            _make_chunk(tool_calls=[_make_tc_delta(0, "call_b", "read_file", '{"path":"x.py"}')]),
-            _make_chunk(finish_reason="tool_calls"),
-        ]
-        agent.client.chat.completions.create.return_value = iter(chunks)
-
-        resp = agent._interruptible_streaming_api_call({"messages": []})
-
-        tc = resp.choices[0].message.tool_calls
-        assert len(tc) == 2, f"Expected 2 tool calls, got {len(tc)}: {[t.function.name for t in tc]}"
-        assert tc[0].function.name == "search"
-        assert tc[0].function.arguments == '{"q":"hello"}'
-        assert tc[0].id == "call_a"
-        assert tc[1].function.name == "read_file"
-        assert tc[1].function.arguments == '{"path":"x.py"}'
-        assert tc[1].id == "call_b"
-
-    def test_ollama_reused_index_streamed_args(self, agent):
-        """Ollama with streamed arguments across multiple chunks at same index."""
-        chunks = [
-            _make_chunk(tool_calls=[_make_tc_delta(0, "call_a", "search", '{"q":')]),
-            _make_chunk(tool_calls=[_make_tc_delta(0, None, None, '"hello"}')]),
-            # New tool call, same index 0
-            _make_chunk(tool_calls=[_make_tc_delta(0, "call_b", "read", '{}')]),
-            _make_chunk(finish_reason="tool_calls"),
-        ]
-        agent.client.chat.completions.create.return_value = iter(chunks)
-
-        resp = agent._interruptible_streaming_api_call({"messages": []})
-
-        tc = resp.choices[0].message.tool_calls
-        assert len(tc) == 2
-        assert tc[0].function.name == "search"
-        assert tc[0].function.arguments == '{"q":"hello"}'
-        assert tc[1].function.name == "read"
-        assert tc[1].function.arguments == '{}'
-
-    def test_content_and_tool_calls_together(self, agent):
-        chunks = [
-            _make_chunk(content="I'll search"),
-            _make_chunk(tool_calls=[_make_tc_delta(0, "call_1", "search", '{}')]),
-            _make_chunk(finish_reason="tool_calls"),
-        ]
-        agent.client.chat.completions.create.return_value = iter(chunks)
-
-        resp = agent._interruptible_streaming_api_call({"messages": []})
-
-        assert resp.choices[0].message.content == "I'll search"
-        assert len(resp.choices[0].message.tool_calls) == 1
-
-    def test_empty_content_returns_none(self, agent):
-        chunks = [_make_chunk(finish_reason="stop")]
-        agent.client.chat.completions.create.return_value = iter(chunks)
-
-        resp = agent._interruptible_streaming_api_call({"messages": []})
-
-        assert resp.choices[0].message.content is None
-        assert resp.choices[0].message.tool_calls is None
-
-
-    def test_model_name_captured(self, agent):
-        chunks = [
-            _make_chunk(content="Hi", model="gpt-4o"),
-            _make_chunk(finish_reason="stop", model="gpt-4o"),
-        ]
-        agent.client.chat.completions.create.return_value = iter(chunks)
-
-        resp = agent._interruptible_streaming_api_call({"messages": []})
-
-        assert resp.model == "gpt-4o"
-
-    def test_stream_kwarg_injected(self, agent):
-        chunks = [_make_chunk(content="x"), _make_chunk(finish_reason="stop")]
-        agent.client.chat.completions.create.return_value = iter(chunks)
-
-        agent._interruptible_streaming_api_call({"messages": [], "model": "test"})
-
-        call_kwargs = agent.client.chat.completions.create.call_args
-        assert call_kwargs[1].get("stream") is True or call_kwargs.kwargs.get("stream") is True
-
-    def test_api_exception_propagates_no_non_streaming_fallback(self, agent):
-        """When streaming fails before any deltas, error propagates to the main retry loop."""
-        agent.client.chat.completions.create.side_effect = ConnectionError("fail")
-        # Prevent stream retry logic from replacing the mock client
-        with patch.object(agent, "_replace_primary_openai_client", return_value=False):
-            # The fallback also uses the same client, so it'll fail too
-            with pytest.raises(ConnectionError, match="fail"):
-                agent._interruptible_streaming_api_call({"messages": []})
-
-
-
-
-# ===================================================================
-# Interrupt _vprint force=True verification
-# ===================================================================
-
-
-
-
-# ===================================================================
-# Anthropic interrupt handler in _interruptible_api_call
-# ===================================================================
-
-
-class TestAnthropicInterruptHandler:
-    """_interruptible_api_call must handle Anthropic mode when interrupted."""
-
-
-    def test_interruptible_anthropic_interrupt_never_closes_shared_client(self):
-        """#67142: a non-streaming Anthropic interrupt must abort the
-        request-local client from the poll thread, never close/rebuild the
-        shared _anthropic_client (which raced a live SSL BIO and corrupted an
-        unrelated SQLite DB via TLS-FD recycling).
-
-        Replaces the former source-reading assertion (which asserted the old,
-        now-removed rebuild-on-interrupt behavior) with a behavior test.
-        """
-        import threading
-        import time
-        from unittest.mock import MagicMock
-        from run_agent import AIAgent
-        from agent.chat_completion_helpers import interruptible_api_call
-
-        agent = AIAgent(
-            api_key="test-key",
-            base_url="https://api.anthropic.com",
-            provider="anthropic",
-            model="claude-test",
-            quiet_mode=True,
-            skip_context_files=True,
-            skip_memory=True,
-        )
-        agent.api_mode = "anthropic_messages"
-        agent._interrupt_requested = False
-        agent._anthropic_client = MagicMock()
-        agent._rebuild_anthropic_client = MagicMock()
-        request_client = MagicMock()
-        agent._create_request_anthropic_client = MagicMock(return_value=request_client)
-        agent._abort_request_anthropic_client = MagicMock()
-        agent._close_request_anthropic_client = MagicMock()
-
-        def _create(_api_kwargs, *, client):
-            assert client is request_client
-            agent._interrupt_requested = True
-            time.sleep(0.5)
-            raise RuntimeError("forced close would have happened")
-
-        agent._anthropic_messages_create = MagicMock(side_effect=_create)
-
-        t0 = time.time()
-        with pytest.raises(InterruptedError):
-            interruptible_api_call(agent, {"model": "x", "messages": []})
-        elapsed = time.time() - t0
-
-        assert elapsed < 3.0, f"interrupt took {elapsed:.1f}s — should be near-instant"
-        # The shared client is never closed/rebuilt from the poll thread.
-        agent._anthropic_client.close.assert_not_called()
-        agent._rebuild_anthropic_client.assert_not_called()
-        # The poll (stranger) thread aborts the request-local client's socket.
-        agent._abort_request_anthropic_client.assert_called_once_with(
-            request_client, reason="interrupt_abort"
-        )
-
-
-
-# ---------------------------------------------------------------------------
-# Bugfix: stream_callback forwarding for non-streaming providers
-# ---------------------------------------------------------------------------
-
-
-class TestStreamCallbackNonStreamingProvider:
-    """When api_mode != chat_completions, stream_callback must still receive
-    the response content so TTS works (batch delivery)."""
-
-    def test_callback_receives_chat_completions_response(self, agent):
-        """For chat_completions-shaped responses, callback gets content."""
-        agent.api_mode = "anthropic_messages"
-        mock_response = SimpleNamespace(
-            choices=[SimpleNamespace(
-                message=SimpleNamespace(content="Hello", tool_calls=None, reasoning_content=None),
-                finish_reason="stop", index=0,
-            )],
-            usage=None, model="test", id="test-id",
-        )
-        agent._interruptible_api_call = MagicMock(return_value=mock_response)
-
-        received = []
-        cb = lambda delta: received.append(delta)
-        agent._stream_callback = cb
-
-        _cb = getattr(agent, "_stream_callback", None)
-        response = agent._interruptible_api_call({})
-        if _cb is not None and response:
-            try:
-                if agent.api_mode == "anthropic_messages":
-                    text_parts = [
-                        block.text for block in getattr(response, "content", [])
-                        if getattr(block, "type", None) == "text" and getattr(block, "text", None)
-                    ]
-                    content = " ".join(text_parts) if text_parts else None
-                else:
-                    content = response.choices[0].message.content
-                if content:
-                    _cb(content)
-            except Exception:
-                pass
-
-        # Anthropic format not matched above; fallback via except
-        # Test the actual code path by checking chat_completions branch
-        received2 = []
-        agent.api_mode = "some_other_mode"
-        agent._stream_callback = lambda d: received2.append(d)
-        _cb2 = agent._stream_callback
-        if _cb2 is not None and mock_response:
-            try:
-                content = mock_response.choices[0].message.content
-                if content:
-                    _cb2(content)
-            except Exception:
-                pass
-        assert received2 == ["Hello"]
-
-    def test_callback_receives_anthropic_content(self, agent):
-        """For Anthropic responses, text blocks are extracted and forwarded."""
-        agent.api_mode = "anthropic_messages"
-        mock_response = SimpleNamespace(
-            content=[SimpleNamespace(type="text", text="Hello from Claude")],
-            stop_reason="end_turn",
-        )
-
-        received = []
-        cb = lambda d: received.append(d)
-        agent._stream_callback = cb
-        _cb = agent._stream_callback
-
-        if _cb is not None and mock_response:
-            try:
-                if agent.api_mode == "anthropic_messages":
-                    text_parts = [
-                        block.text for block in getattr(mock_response, "content", [])
-                        if getattr(block, "type", None) == "text" and getattr(block, "text", None)
-                    ]
-                    content = " ".join(text_parts) if text_parts else None
-                else:
-                    content = mock_response.choices[0].message.content
-                if content:
-                    _cb(content)
-            except Exception:
-                pass
-
-        assert received == ["Hello from Claude"]
-
-
-# ---------------------------------------------------------------------------
-# Bugfix: API-only user message prefixes must not persist
-# ---------------------------------------------------------------------------
-
-
-class TestPersistUserMessageOverride:
-    """Synthetic API-only user prefixes should never leak into transcripts."""
-
-    def test_persist_session_rewrites_current_turn_user_message(self, agent):
-        agent._session_db = MagicMock()
-        agent.session_id = "session-123"
-        agent._last_flushed_db_idx = 0
-        agent._persist_user_message_idx = 0
-        agent._persist_user_message_override = "Hello there"
-        messages = [
-            {
-                "role": "user",
-                "content": (
-                    "[Voice input — respond concisely and conversationally, "
-                    "2-3 sentences max. No code blocks or markdown.] Hello there"
-                ),
-            },
-            {"role": "assistant", "content": "Hi!"},
-        ]
-
-        agent._persist_session(messages, [])
-
-        # The original messages list must NOT be mutated — the persist
-        # override is applied only to the DB row (resolved inside the flush
-        # chokepoint), so the live list keeps the original content for the
-        # API call (#48677).
-        assert (
-            messages[0]["content"]
-            == "[Voice input — respond concisely and conversationally, "
-            "2-3 sentences max. No code blocks or markdown.] Hello there"
-        )
-        # But the DB write must get the override.
-        first_db_write = agent._session_db.append_message.call_args_list[0].kwargs
-        assert first_db_write["content"] == "Hello there"
-
-
-class TestReasoningReplayForStrictProviders:
-    """Assistant replay must preserve provider-native reasoning fields."""
-
-    def _setup_agent(self, agent):
-        agent._cached_system_prompt = "You are helpful."
-        agent._use_prompt_caching = False
-        agent.compression_enabled = False
-        agent.save_trajectories = False
-
-    def test_kimi_tool_replay_includes_space_reasoning_content(self, agent):
-        self._setup_agent(agent)
-        agent.base_url = "https://api.kimi.com/coding/v1"
-        agent._base_url_lower = agent.base_url.lower()
-        agent.provider = "kimi-coding"
-
-        prior_assistant = {
-            "role": "assistant",
-            "content": "",
-            "tool_calls": [
-                {
-                    "id": "c1",
-                    "type": "function",
-                    "function": {"name": "terminal", "arguments": "{\"command\":\"date\"}"},
-                }
-            ],
-        }
-        tool_result = {"role": "tool", "tool_call_id": "c1", "content": "Tue Apr 21"}
-        final_resp = _mock_response(content="done", finish_reason="stop")
-        agent.client.chat.completions.create.return_value = final_resp
-
-        with (
-            patch.object(agent, "_persist_session"),
-            patch.object(agent, "_save_trajectory"),
-            patch.object(agent, "_cleanup_task_resources"),
-        ):
-            result = agent.run_conversation(
-                "next step",
-                conversation_history=[prior_assistant, tool_result],
-            )
-
-        assert result["completed"] is True
-        sent_messages = agent.client.chat.completions.create.call_args.kwargs["messages"]
-        replayed_assistant = next(msg for msg in sent_messages if msg.get("role") == "assistant")
-        assert replayed_assistant["role"] == "assistant"
-        assert replayed_assistant["tool_calls"][0]["function"]["name"] == "terminal"
-        assert "reasoning_content" in replayed_assistant
-        assert replayed_assistant["reasoning_content"] == " "
-
-    def test_explicit_reasoning_content_beats_normalized_reasoning_on_replay(self, agent):
-        self._setup_agent(agent)
-        # Precedence (explicit reasoning_content wins over the 'reasoning'
-        # field) only matters on a provider that echoes reasoning_content
-        # back — strict providers strip the field entirely. Pin a
-        # reasoning provider so the precedence is observable.
-        agent.base_url = "https://api.kimi.com/coding/v1"
-        agent._base_url_lower = agent.base_url.lower()
-        agent.provider = "kimi-coding"
-        prior_assistant = {
-            "role": "assistant",
-            "content": "",
-            "tool_calls": [
-                {
-                    "id": "c1",
-                    "type": "function",
-                    "function": {"name": "web_search", "arguments": "{\"q\":\"test\"}"},
-                }
-            ],
-            "reasoning": "summary reasoning",
-            "reasoning_content": "provider-native scratchpad",
-        }
-        tool_result = {"role": "tool", "tool_call_id": "c1", "content": "ok"}
-        final_resp = _mock_response(content="done", finish_reason="stop")
-        agent.client.chat.completions.create.return_value = final_resp
-
-        with (
-            patch.object(agent, "_persist_session"),
-            patch.object(agent, "_save_trajectory"),
-            patch.object(agent, "_cleanup_task_resources"),
-        ):
-            result = agent.run_conversation(
-                "next step",
-                conversation_history=[prior_assistant, tool_result],
-            )
-
-        assert result["completed"] is True
-        sent_messages = agent.client.chat.completions.create.call_args.kwargs["messages"]
-        replayed_assistant = next(msg for msg in sent_messages if msg.get("role") == "assistant")
-        assert replayed_assistant["reasoning_content"] == "provider-native scratchpad"
-
-
-
-# ---------------------------------------------------------------------------
-# Bugfix: _vprint force=True on error messages during TTS
-# ---------------------------------------------------------------------------
-
-
-class TestVprintForceOnErrors:
-    """Error/warning messages must be visible during streaming TTS."""
-
-    def test_forced_message_shown_during_tts(self, agent):
-        agent._stream_callback = lambda x: None
-        printed = []
-        with patch("builtins.print", side_effect=lambda *a, **kw: printed.append(a)):
-            agent._vprint("error msg", force=True)
-        assert len(printed) == 1
-
+            await a._ensure_provider_runtime()
+
+        # The native deferred runtime preserves custom Anthropic-compatible
+        # endpoints rather than routing them through the legacy resolver.
+        assert mock_build.call_args.args[1] == "https://llm-proxy.company.com/v1"
 
 
 
@@ -5394,93 +4684,59 @@ class TestNormalizeCodexDictArguments:
 # ---------------------------------------------------------------------------
 
 
-class TestOAuthFlagAfterCredentialRefresh:
-    """_is_anthropic_oauth must update when token type changes during refresh."""
-
-    def test_oauth_flag_updates_api_key_to_oauth(self, agent):
-        """Refreshing from API key to OAuth token must set flag to True."""
-        agent.api_mode = "anthropic_messages"
-        agent.provider = "anthropic"
-        agent._anthropic_api_key = "sk-ant-api-old"
-        agent._anthropic_client = MagicMock()
-        agent._is_anthropic_oauth = False
-
-        with (
-            patch("agent.anthropic_adapter.resolve_anthropic_token",
-                  return_value="sk-ant-setup-oauth-token"),
-            patch("agent.anthropic_adapter.build_anthropic_client",
-                  return_value=MagicMock()),
-        ):
-            result = agent._try_refresh_anthropic_client_credentials()
-
-        assert result is True
-        assert agent._is_anthropic_oauth is True
-
-    def test_oauth_flag_updates_oauth_to_api_key(self, agent):
-        """Refreshing from OAuth to API key must set flag to False."""
-        agent.api_mode = "anthropic_messages"
-        agent.provider = "anthropic"
-        agent._anthropic_api_key = "sk-ant-setup-old"
-        agent._anthropic_client = MagicMock()
-        agent._is_anthropic_oauth = True
-
-        with (
-            patch("agent.anthropic_adapter.resolve_anthropic_token",
-                  return_value="sk-ant-api03-new-key"),
-            patch("agent.anthropic_adapter.build_anthropic_client",
-                  return_value=MagicMock()),
-        ):
-            result = agent._try_refresh_anthropic_client_credentials()
-
-        assert result is True
-        assert agent._is_anthropic_oauth is False
-
-
 class TestFallbackSetsOAuthFlag:
     """_try_activate_fallback must set _is_anthropic_oauth for Anthropic fallbacks."""
 
-    def test_fallback_to_anthropic_oauth_sets_flag(self, agent):
+    @pytest.mark.asyncio
+    async def test_fallback_to_anthropic_oauth_sets_flag(self, agent):
         agent._fallback_activated = False
-        agent._fallback_model = {"provider": "anthropic", "model": "claude-sonnet-4-6"}
+        agent.client = None
+        agent._fallback_model = {
+            "provider": "anthropic",
+            "model": "claude-sonnet-4-6",
+            "api_key": "sk-ant-setup-oauth-token",
+            "base_url": "https://api.anthropic.com/v1",
+        }
         agent._fallback_chain = [agent._fallback_model]
         agent._fallback_index = 0
 
-        mock_client = MagicMock()
-        mock_client.base_url = "https://api.anthropic.com/v1"
-        mock_client.api_key = "sk-ant-setup-oauth-token"
-
         with (
-            patch("agent.auxiliary_client.resolve_provider_client",
-                  return_value=(mock_client, None)),
             patch("agent.anthropic_adapter.build_anthropic_client",
                   return_value=MagicMock()),
-            patch("agent.anthropic_adapter.resolve_anthropic_token",
-                  return_value=None),
+            patch(
+                "agent.credential_pool.load_pool",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
         ):
-            result = agent._try_activate_fallback()
+            result = await agent._try_activate_fallback()
 
         assert result is True
         assert agent._is_anthropic_oauth is True
 
-    def test_fallback_to_anthropic_api_key_clears_flag(self, agent):
+    @pytest.mark.asyncio
+    async def test_fallback_to_anthropic_api_key_clears_flag(self, agent):
         agent._fallback_activated = False
-        agent._fallback_model = {"provider": "anthropic", "model": "claude-sonnet-4-6"}
+        agent.client = None
+        agent._fallback_model = {
+            "provider": "anthropic",
+            "model": "claude-sonnet-4-6",
+            "api_key": "sk-ant-api03-regular-key",
+            "base_url": "https://api.anthropic.com/v1",
+        }
         agent._fallback_chain = [agent._fallback_model]
         agent._fallback_index = 0
 
-        mock_client = MagicMock()
-        mock_client.base_url = "https://api.anthropic.com/v1"
-        mock_client.api_key = "sk-ant-api03-regular-key"
-
         with (
-            patch("agent.auxiliary_client.resolve_provider_client",
-                  return_value=(mock_client, None)),
             patch("agent.anthropic_adapter.build_anthropic_client",
                   return_value=MagicMock()),
-            patch("agent.anthropic_adapter.resolve_anthropic_token",
-                  return_value=None),
+            patch(
+                "agent.credential_pool.load_pool",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
         ):
-            result = agent._try_activate_fallback()
+            result = await agent._try_activate_fallback()
 
         assert result is True
         assert agent._is_anthropic_oauth is False

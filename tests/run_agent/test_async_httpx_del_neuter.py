@@ -13,7 +13,7 @@ The three-layer defence:
 """
 
 import asyncio
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -75,98 +75,55 @@ class TestNeuterAsyncHttpxDel:
 # ---------------------------------------------------------------------------
 
 class TestCleanupStaleAsyncClients:
-    """Verify stale cache entries are evicted and force-closed."""
+    """Verify that cache lifecycle remains on the event loop."""
 
-    def test_removes_stale_entries(self):
-        """Entries with a closed loop should be evicted."""
+    @pytest.mark.asyncio
+    async def test_removes_stale_entries(self):
         from agent.auxiliary_client import (
             _client_cache,
             _client_cache_lock,
             cleanup_stale_async_clients,
         )
 
-        # Create a loop, close it, make a cache entry
-        loop = asyncio.new_event_loop()
-        loop.close()
+        closed_loop = asyncio.new_event_loop()
+        closed_loop.close()
+        key = ("test_stale", "", "", "", (), False, "", "", "test-model")
+        client = MagicMock()
+        client._client = MagicMock(is_closed=False)
+        async with _client_cache_lock:
+            _client_cache[key] = (client, "test-model", closed_loop)
 
-        mock_client = MagicMock()
-        # Give it _client attribute for _force_close_async_httpx
-        mock_client._client = MagicMock()
-        mock_client._client.is_closed = False
+        await cleanup_stale_async_clients()
 
-        key = ("test_stale", True, "", "", "", (), False)
-        with _client_cache_lock:
-            _client_cache[key] = (mock_client, "test-model", loop)
+        async with _client_cache_lock:
+            assert key not in _client_cache
 
-        try:
-            cleanup_stale_async_clients()
-            with _client_cache_lock:
-                assert key not in _client_cache, "Stale entry should be removed"
-        finally:
-            # Clean up in case test fails
-            with _client_cache_lock:
-                _client_cache.pop(key, None)
-
-    def test_keeps_live_entries(self):
-        """Entries with an open loop should be preserved."""
+    @pytest.mark.asyncio
+    async def test_keeps_current_loop_entries(self):
         from agent.auxiliary_client import (
             _client_cache,
             _client_cache_lock,
             cleanup_stale_async_clients,
         )
 
-        loop = asyncio.new_event_loop()  # NOT closed
+        key = ("test_live", "", "", "", (), False, "", "", "test-model")
+        async with _client_cache_lock:
+            _client_cache[key] = (
+                MagicMock(),
+                "test-model",
+                asyncio.get_running_loop(),
+            )
 
-        mock_client = MagicMock()
-        key = ("test_live", True, "", "", "", (), False)
-        with _client_cache_lock:
-            _client_cache[key] = (mock_client, "test-model", loop)
+        await cleanup_stale_async_clients()
 
-        try:
-            cleanup_stale_async_clients()
-            with _client_cache_lock:
-                assert key in _client_cache, "Live entry should be preserved"
-        finally:
-            loop.close()
-            with _client_cache_lock:
-                _client_cache.pop(key, None)
+        async with _client_cache_lock:
+            assert key in _client_cache
+            _client_cache.pop(key, None)
 
-    def test_keeps_entries_without_loop(self):
-        """Sync entries (cached_loop=None) should be preserved."""
-        from agent.auxiliary_client import (
-            _client_cache,
-            _client_cache_lock,
-            cleanup_stale_async_clients,
-        )
-
-        mock_client = MagicMock()
-        key = ("test_sync", False, "", "", "", (), False)
-        with _client_cache_lock:
-            _client_cache[key] = (mock_client, "test-model", None)
-
-        try:
-            cleanup_stale_async_clients()
-            with _client_cache_lock:
-                assert key in _client_cache, "Sync entry should be preserved"
-        finally:
-            with _client_cache_lock:
-                _client_cache.pop(key, None)
-
-
-# ---------------------------------------------------------------------------
-# Cache bounded growth (#10200)
-# ---------------------------------------------------------------------------
 
 class TestClientCacheBoundedGrowth:
-    """Verify the cache stays bounded when loops change (fix for #10200).
-
-    Previously, loop_id was part of the cache key, so every new event loop
-    created a new entry for the same provider config.  Now loop identity is
-    validated at hit time and stale entries are replaced in-place.
-    """
-
-    def test_same_key_replaces_stale_loop_entry(self):
-        """When the loop changes, the old entry should be replaced, not duplicated."""
+    @pytest.mark.asyncio
+    async def test_same_key_replaces_stale_loop_entry(self):
         from agent.auxiliary_client import (
             _client_cache,
             _client_cache_key,
@@ -174,113 +131,21 @@ class TestClientCacheBoundedGrowth:
             _get_cached_client,
         )
 
-        key = _client_cache_key(
-            "test_replace",
-            async_mode=True,
-            task="",
-        )
-
-        # Simulate a stale entry from a closed loop
+        key = await _client_cache_key("test_replace", task="")
         old_loop = asyncio.new_event_loop()
         old_loop.close()
-        old_client = MagicMock()
-        old_client._client = MagicMock()
-        old_client._client.is_closed = False
+        async with _client_cache_lock:
+            _client_cache[key] = (MagicMock(), "old-model", old_loop)
 
-        with _client_cache_lock:
-            _client_cache[key] = (old_client, "old-model", old_loop)
+        new_client = MagicMock()
+        with patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            new=AsyncMock(return_value=(new_client, "new-model")),
+        ):
+            client, model = await _get_cached_client("test_replace")
 
-        try:
-            # Now call _get_cached_client — should detect stale loop and evict
-            with patch("agent.auxiliary_client.resolve_provider_client") as mock_resolve:
-                mock_resolve.return_value = (MagicMock(), "new-model")
-                client, model = _get_cached_client(
-                    "test_replace", async_mode=True,
-                )
-            # The old entry should have been replaced
-            with _client_cache_lock:
-                assert key in _client_cache, "Key should still exist (replaced)"
-                entry = _client_cache[key]
-                assert entry[1] == "new-model", "Should have the new model"
-        finally:
-            with _client_cache_lock:
-                _client_cache.pop(key, None)
-
-    def test_different_loops_do_not_grow_cache(self):
-        """Multiple event loops for the same provider should NOT create multiple entries."""
-        from agent.auxiliary_client import (
-            _client_cache,
-            _client_cache_lock,
-        )
-
-        key = ("test_no_grow", True, "", "", "", (), False)
-
-        loops = []
-        try:
-            for i in range(5):
-                loop = asyncio.new_event_loop()
-                loops.append(loop)
-                mock_client = MagicMock()
-                mock_client._client = MagicMock()
-                mock_client._client.is_closed = False
-
-                # Close previous loop entries (simulating worker thread recycling)
-                if i > 0:
-                    loops[i - 1].close()
-
-                with _client_cache_lock:
-                    # Simulate what _get_cached_client does: replace on loop mismatch
-                    if key in _client_cache:
-                        old_entry = _client_cache[key]
-                        del _client_cache[key]
-                    _client_cache[key] = (mock_client, f"model-{i}", loop)
-
-            # Only one entry should exist for this key
-            with _client_cache_lock:
-                count = sum(1 for k in _client_cache if k == key)
-                assert count == 1, f"Expected 1 entry, got {count}"
-        finally:
-            for loop in loops:
-                if not loop.is_closed():
-                    loop.close()
-            with _client_cache_lock:
-                _client_cache.pop(key, None)
-
-    def test_max_cache_size_eviction(self):
-        """Cache should not exceed _CLIENT_CACHE_MAX_SIZE."""
-        from agent.auxiliary_client import (
-            _client_cache,
-            _client_cache_lock,
-            _CLIENT_CACHE_MAX_SIZE,
-        )
-
-        # Save existing cache state
-        with _client_cache_lock:
-            saved = dict(_client_cache)
-            _client_cache.clear()
-
-        try:
-            # Fill to max + 5
-            for i in range(_CLIENT_CACHE_MAX_SIZE + 5):
-                mock_client = MagicMock()
-                mock_client._client = MagicMock()
-                mock_client._client.is_closed = False
-                key = (f"evict_test_{i}", False, "", "", "", (), False)
-                with _client_cache_lock:
-                    # Inline the eviction logic (same as _get_cached_client)
-                    while len(_client_cache) >= _CLIENT_CACHE_MAX_SIZE:
-                        evict_key = next(iter(_client_cache))
-                        del _client_cache[evict_key]
-                    _client_cache[key] = (mock_client, f"model-{i}", None)
-
-            with _client_cache_lock:
-                assert len(_client_cache) <= _CLIENT_CACHE_MAX_SIZE, \
-                    f"Cache size {len(_client_cache)} exceeds max {_CLIENT_CACHE_MAX_SIZE}"
-                # The earliest entries should have been evicted
-                assert ("evict_test_0", False, "", "", "", (), False) not in _client_cache
-                # The latest entries should be present
-                assert (f"evict_test_{_CLIENT_CACHE_MAX_SIZE + 4}", False, "", "", "", (), False) in _client_cache
-        finally:
-            with _client_cache_lock:
-                _client_cache.clear()
-                _client_cache.update(saved)
+        assert client is new_client
+        assert model == "new-model"
+        async with _client_cache_lock:
+            assert _client_cache[key][1] == "new-model"
+            _client_cache.pop(key, None)

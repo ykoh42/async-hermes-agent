@@ -5,7 +5,7 @@ an OAuth2 access token has expired.  These tests verify the three fixes:
 
 1. _is_auth_error detects xAI 403 as an auth failure
 2. _recoverable_pool_provider maps api.x.ai to xai-oauth
-3. _refresh_provider_credentials includes xai-oauth refresh logic
+3. _refresh_provider_credentials rejects xai-oauth's sync refresh path
 """
 
 import pytest
@@ -104,26 +104,18 @@ def _import_refresh_provider_credentials():
 
 
 class TestRefreshProviderCredentialsXaiOAuth:
-    """Verify _refresh_provider_credentials has xai-oauth branch.
-
-    Full integration testing requires live OAuth tokens, so we verify
-    the branch exists and handles the no-credential case gracefully.
-    """
+    """Native async mode rejects sync-only xAI OAuth refresh."""
 
     @pytest.fixture(autouse=True)
     def _import(self):
         self.refresh = _import_refresh_provider_credentials()
 
-    def test_xai_oauth_no_pool_returns_false(self):
-        """When no xai-oauth pool exists, refresh returns False gracefully."""
-        # This tests that the branch exists and doesn't crash.
-        # It may return True if the singleton resolver finds tokens,
-        # or False if neither pool nor singleton has credentials.
-        # Either way, it should not raise an exception.
-        result = self.refresh("xai-oauth")
-        assert isinstance(result, bool)
+    @pytest.mark.asyncio
+    async def test_xai_oauth_no_pool_returns_false(self):
+        assert await self.refresh("xai-oauth") is False
 
-    def test_unknown_provider_returns_false(self):
+    @pytest.mark.asyncio
+    async def test_unknown_provider_returns_false(self):
         """Unknown providers fall through to return False."""
-        result = self.refresh("unknown-provider-xyz")
+        result = await self.refresh("unknown-provider-xyz")
         assert result is False

@@ -3,6 +3,7 @@
 import json
 from typing import List, Optional
 
+import pytest
 
 from tools.clarify_tool import (
     clarify_tool,
@@ -16,22 +17,24 @@ from tools.clarify_tool import (
 class TestClarifyToolBasics:
     """Basic functionality tests for clarify_tool."""
 
-    def test_simple_question_with_callback(self):
+    @pytest.mark.asyncio
+    async def test_simple_question_with_callback(self):
         """Should return user response for simple question."""
-        def mock_callback(question: str, choices: Optional[List[str]]) -> str:
+        async def mock_callback(question: str, choices: Optional[List[str]]) -> str:
             assert question == "What color?"
             assert choices is None
             return "blue"
 
-        result = json.loads(clarify_tool("What color?", callback=mock_callback))
+        result = json.loads(await clarify_tool("What color?", callback=mock_callback))
         assert result["question"] == "What color?"
         assert result["choices_offered"] is None
         assert result["user_response"] == "blue"
 
 
-    def test_no_callback_returns_error(self):
+    @pytest.mark.asyncio
+    async def test_no_callback_returns_error(self):
         """Should return error when no callback is provided."""
-        result = json.loads(clarify_tool("What do you want?"))
+        result = json.loads(await clarify_tool("What do you want?"))
         assert "error" in result
         assert "not available" in result["error"].lower()
 
@@ -39,52 +42,56 @@ class TestClarifyToolBasics:
 class TestClarifyToolChoicesValidation:
     """Tests for choices parameter validation."""
 
-    def test_choices_trimmed_to_max(self):
+    @pytest.mark.asyncio
+    async def test_choices_trimmed_to_max(self):
         """Should trim choices to MAX_CHOICES."""
         choices_passed = []
 
-        def mock_callback(question: str, choices: Optional[List[str]]) -> str:
+        async def mock_callback(question: str, choices: Optional[List[str]]) -> str:
             choices_passed.extend(choices or [])
             return "picked"
 
         many_choices = ["a", "b", "c", "d", "e", "f", "g"]
-        clarify_tool("Pick one", choices=many_choices, callback=mock_callback)
+        await clarify_tool("Pick one", choices=many_choices, callback=mock_callback)
 
         assert len(choices_passed) == MAX_CHOICES
 
 
-    def test_choices_converted_to_strings(self):
+    @pytest.mark.asyncio
+    async def test_choices_converted_to_strings(self):
         """Non-string choices should be converted to strings."""
         choices_received = []
 
-        def mock_callback(question: str, choices: Optional[List[str]]) -> str:
+        async def mock_callback(question: str, choices: Optional[List[str]]) -> str:
             choices_received.extend(choices or [])
             return "answer"
 
-        clarify_tool("Pick", choices=[1, 2, 3], callback=mock_callback)  # type: ignore
+        await clarify_tool("Pick", choices=[1, 2, 3], callback=mock_callback)  # type: ignore
         assert choices_received == ["1", "2", "3"]
 
 
 class TestClarifyToolCallbackHandling:
     """Tests for callback error handling."""
 
-    def test_callback_exception_returns_error(self):
+    @pytest.mark.asyncio
+    async def test_callback_exception_returns_error(self):
         """Should return error if callback raises exception."""
-        def failing_callback(question: str, choices: Optional[List[str]]) -> str:
+        async def failing_callback(question: str, choices: Optional[List[str]]) -> str:
             raise RuntimeError("User cancelled")
 
-        result = json.loads(clarify_tool("Question?", callback=failing_callback))
+        result = json.loads(await clarify_tool("Question?", callback=failing_callback))
         assert "error" in result
         assert "Failed to get user input" in result["error"]
         assert "User cancelled" in result["error"]
 
 
-    def test_user_response_stripped(self):
+    @pytest.mark.asyncio
+    async def test_user_response_stripped(self):
         """User response should be stripped of whitespace."""
-        def mock_callback(question: str, choices: Optional[List[str]]) -> str:
+        async def mock_callback(question: str, choices: Optional[List[str]]) -> str:
             return "  response with spaces  \n"
 
-        result = json.loads(clarify_tool("Q?", callback=mock_callback))
+        result = json.loads(await clarify_tool("Q?", callback=mock_callback))
         assert result["user_response"] == "response with spaces"
 
 
@@ -110,15 +117,16 @@ class TestClarifyDictChoices:
         assert _flatten_choice({"label": "Short", "description": "Long"}) == "Short"
 
 
-    def test_dict_choices_reach_callback_as_clean_text(self):
+    @pytest.mark.asyncio
+    async def test_dict_choices_reach_callback_as_clean_text(self):
         """The whole point: the UI callback never sees a dict repr."""
         seen = []
 
-        def cb(question, choices):
+        async def cb(question, choices):
             seen.extend(choices or [])
             return choices[0]
 
-        result = json.loads(clarify_tool(
+        result = json.loads(await clarify_tool(
             "Pick a layout",
             choices=[
                 {"choice": "Tight", "description": "Tight, covers all 3 points"},
@@ -161,12 +169,13 @@ class TestClarifySchema:
 class TestClarifyToolMultiSelect:
     """Tests for multi_select (checkbox) support added to clarify_tool."""
 
-    def test_multi_select_false_keeps_existing_behavior(self):
+    @pytest.mark.asyncio
+    async def test_multi_select_false_keeps_existing_behavior(self):
         """When multi_select=False, user_response should be a single string."""
-        def mock_callback(question, choices):
+        async def mock_callback(question, choices):
             return "blue"
 
-        result = json.loads(clarify_tool(
+        result = json.loads(await clarify_tool(
             "What color?",
             choices=["red", "blue", "green"],
             multi_select=False,
@@ -175,12 +184,13 @@ class TestClarifyToolMultiSelect:
         assert result["user_response"] == "blue"
         assert isinstance(result["user_response"], str)
 
-    def test_multi_select_true_returns_list(self):
+    @pytest.mark.asyncio
+    async def test_multi_select_true_returns_list(self):
         """When multi_select=True, user_response should be a list of strings."""
-        def mock_callback(question, choices):
+        async def mock_callback(question, choices):
             return "red, blue"
 
-        result = json.loads(clarify_tool(
+        result = json.loads(await clarify_tool(
             "Which colors?",
             choices=["red", "blue", "green"],
             multi_select=True,
@@ -189,12 +199,13 @@ class TestClarifyToolMultiSelect:
         assert result["user_response"] == ["red", "blue"]
         assert isinstance(result["user_response"], list)
 
-    def test_multi_select_single_choice_still_list(self):
+    @pytest.mark.asyncio
+    async def test_multi_select_single_choice_still_list(self):
         """Even a single selection should be a list when multi_select=True."""
-        def mock_callback(question, choices):
+        async def mock_callback(question, choices):
             return "red"
 
-        result = json.loads(clarify_tool(
+        result = json.loads(await clarify_tool(
             "Which color?",
             choices=["red", "blue"],
             multi_select=True,
@@ -204,16 +215,17 @@ class TestClarifyToolMultiSelect:
         assert isinstance(result["user_response"], list)
 
 
-    def test_multi_select_max_choices_enforced(self):
+    @pytest.mark.asyncio
+    async def test_multi_select_max_choices_enforced(self):
         """MAX_CHOICES enforcement should still work with multi_select."""
         choices_passed = []
 
-        def mock_callback(question, choices):
+        async def mock_callback(question, choices):
             choices_passed.extend(choices or [])
             return "a, b, c, d"
 
         many_choices = ["a", "b", "c", "d", "e", "f"]
-        clarify_tool(
+        await clarify_tool(
             "Pick some",
             choices=many_choices,
             multi_select=True,
@@ -257,32 +269,34 @@ class TestInvokeCallbackDispatch:
 class TestRegistryMultiSelectPassThrough:
     """The registered tool handler must forward multi_select from tool args."""
 
-    def test_handler_passes_multi_select(self):
+    @pytest.mark.asyncio
+    async def test_handler_passes_multi_select(self):
         from tools.registry import registry
         entry = registry.get_entry("clarify")
         seen = {}
 
-        def cb(question, choices, multi_select=False):
+        async def cb(question, choices, multi_select=False):
             seen["multi"] = multi_select
             return "a, b"
 
-        result = json.loads(entry.handler(
+        result = json.loads(await entry.handler(
             {"question": "Pick", "choices": ["a", "b"], "multi_select": True},
             callback=cb,
         ))
         assert seen["multi"] is True
         assert result["user_response"] == ["a", "b"]
 
-    def test_handler_default_single_select(self):
+    @pytest.mark.asyncio
+    async def test_handler_default_single_select(self):
         from tools.registry import registry
         entry = registry.get_entry("clarify")
         seen = {}
 
-        def cb(question, choices, multi_select=False):
+        async def cb(question, choices, multi_select=False):
             seen["multi"] = multi_select
             return "a"
 
-        result = json.loads(entry.handler(
+        result = json.loads(await entry.handler(
             {"question": "Pick", "choices": ["a", "b"]},
             callback=cb,
         ))

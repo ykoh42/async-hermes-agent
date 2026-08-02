@@ -477,7 +477,7 @@ def convert_base64_images_to_links(text: str) -> str:
     return out
 
 
-def _store_full_text(url: str, content: str) -> Optional[str]:
+async def _store_full_text(url: str, content: str) -> Optional[str]:
     """Write the full extracted page to cache/web and return its absolute path.
 
     The file is mounted read-only into remote backends (Docker/Modal/SSH) via
@@ -506,14 +506,17 @@ def _store_full_text(url: str, content: str) -> Optional[str]:
                 + f"\n\n[... stored copy truncated at {MAX_STORED_TEXT_CHARS:,} chars "
                 f"of {len(content):,}; re-extract a more specific URL for the rest ...]"
             )
-        path.write_text(content, encoding="utf-8")
+        import aiofiles
+
+        async with aiofiles.open(path, "w", encoding="utf-8") as handle:
+            await handle.write(content)
         return str(path)
     except Exception as exc:  # noqa: BLE001
         logger.debug("Failed to store full web_extract text for %s: %s", url, exc)
         return None
 
 
-def _truncate_with_footer(
+async def _truncate_with_footer(
     content: str,
     url: str,
     char_limit: int,
@@ -544,7 +547,7 @@ def _truncate_with_footer(
         tail = tail[nl + 1:]
 
     total = len(content)
-    stored_path = _store_full_text(url, content)
+    stored_path = await _store_full_text(url, content)
 
     footer_lines = [
         "",
@@ -615,7 +618,7 @@ def _ensure_web_plugins_loaded() -> None:
         logger.warning("Web plugin discovery failed (non-fatal): %s", exc)
 
 
-def web_search_tool(query: str, limit: int = 5) -> str:
+async def web_search_tool(query: str, limit: int = 5) -> str:
     """
     Search the web for information using available search API backend.
 
@@ -674,7 +677,9 @@ def web_search_tool(query: str, limit: int = 5) -> str:
         # Dispatch through the web search registry. All 7 providers
         # (brave-free, ddgs, searxng, exa, parallel, tavily, firecrawl)
         # now live as plugins; the dispatcher is just a registry lookup +
-        # delegation. Sync only — every provider's search() is sync.
+        # delegation. Every provider is native async; sync implementations are
+        # rejected by the provider contract instead of being hidden behind a
+        # thread-pool compatibility bridge.
         _ensure_web_plugins_loaded()
         from agent.web_search_registry import (
             get_active_search_provider,
@@ -719,7 +724,14 @@ def web_search_tool(query: str, limit: int = 5) -> str:
                 "Web search via %s: '%s' (limit: %d)",
                 provider.name, query, limit,
             )
-            response_data = provider.search(query, limit)
+            import inspect
+
+            if not inspect.iscoroutinefunction(provider.search):
+                raise TypeError(
+                    f"Web search provider {provider.name!r} does not implement "
+                    "native async search()"
+                )
+            response_data = await provider.search(query, limit)
 
         debug_call_data["results_count"] = len(response_data.get("data", {}).get("web", []))
         result_json = json.dumps(response_data, indent=2, ensure_ascii=False)
@@ -858,11 +870,9 @@ async def web_extract_tool(
 
             # All seven providers (brave-free, ddgs, searxng, exa, parallel,
             # tavily, firecrawl) now live as plugins. The dispatcher is a
-            # registry lookup + delegation. Some providers' extract() is
-            # async (parallel, firecrawl), others sync (exa, tavily) — we
-            # detect coroutine functions and await; sync functions run
-            # inline (the policy gate, SSRF re-check, etc. live inside the
-            # provider itself for the firecrawl per-URL loop).
+            # registry lookup + delegation. Every provider implements the
+            # native async extract contract; a sync SDK implementation is
+            # rejected instead of hidden behind a worker thread.
             _ensure_web_plugins_loaded()
             from agent.web_search_registry import (
                 get_active_extract_provider,
@@ -930,17 +940,14 @@ async def web_extract_tool(
                 "Web extract via %s: %d URL(s)", provider.name, len(safe_urls)
             )
 
-            # Async-or-sync dispatch: parallel + firecrawl have async
-            # extract(); exa + tavily are sync.
             import inspect
-            if inspect.iscoroutinefunction(provider.extract):
-                results = await provider.extract(safe_urls, format=format)
-            else:
-                # Run sync extract() in a thread so we don't block the
-                # event loop on network I/O.
-                results = await asyncio.to_thread(
-                    provider.extract, safe_urls, format=format
+
+            if not inspect.iscoroutinefunction(provider.extract):
+                raise TypeError(
+                    f"Web extract provider {provider.name!r} does not implement "
+                    "native async extract()"
                 )
+            results = await provider.extract(safe_urls, format=format)
 
         # Reconstruct the original input order across invalid, blocked, and
         # provider-processed entries. Providers are expected to preserve the
@@ -989,7 +996,9 @@ async def web_extract_tool(
             if not raw_content:
                 continue
             clean = convert_base64_images_to_links(raw_content)
-            model_text, truncated = _truncate_with_footer(clean, url, effective_char_limit)
+            model_text, truncated = await _truncate_with_footer(
+                clean, url, effective_char_limit
+            )
             result["content"] = model_text
             if truncated:
                 debug_call_data["pages_truncated"] += 1
@@ -1210,6 +1219,7 @@ WEB_EXTRACT_SCHEMA = {
     }
 }
 
+
 registry.register(
     name="web_search",
     toolset="web",
@@ -1224,14 +1234,13 @@ registry.register(
     name="web_extract",
     toolset="web",
     schema=WEB_EXTRACT_SCHEMA,
-    handler=lambda args, **kw: web_extract_tool(
-        args.get("urls", [])[:5] if isinstance(args.get("urls"), list) else [],
+    handler=lambda args, **_kw: web_extract_tool(
+        (args.get("urls") or [])[:5] if isinstance(args.get("urls"), list) else [],
         "markdown",
         char_limit=args.get("char_limit"),
     ),
     check_fn=check_web_api_key,
     requires_env=_web_requires_env(),
-    is_async=True,
     emoji="📄",
     max_result_size_chars=100_000,
 )

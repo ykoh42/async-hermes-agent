@@ -10,6 +10,7 @@ from pathlib import Path
 import httpx
 import pytest
 
+from agent.credential_pool import load_pool
 from hermes_cli.auth import AuthError, get_provider_auth_state, resolve_nous_runtime_credentials
 
 
@@ -141,7 +142,8 @@ def _invoke_jwt(*, seconds: int = 3600, scope: object = "inference:invoke") -> s
     })
 
 
-def test_resolve_nous_runtime_credentials_prefers_invoke_jwt_and_mirrors(
+@pytest.mark.asyncio
+async def test_resolve_nous_runtime_credentials_prefers_invoke_jwt_and_mirrors(
     tmp_path,
     monkeypatch,
 ):
@@ -169,10 +171,10 @@ def test_resolve_nous_runtime_credentials_prefers_invoke_jwt_and_mirrors(
     assert singleton["agent_key"] == token
     assert datetime.fromisoformat(singleton["agent_key_expires_at"]).timestamp() > time.time() + 300
 
-    pool_entries = payload["credential_pool"]["nous"]
+    pool_entries = (await load_pool("nous")).entries()
     assert len(pool_entries) == 1
-    assert pool_entries[0]["agent_key"] == token
-    assert pool_entries[0]["source"] == auth_mod.NOUS_DEVICE_CODE_SOURCE
+    assert pool_entries[0].agent_key == token
+    assert pool_entries[0].source == auth_mod.NOUS_DEVICE_CODE_SOURCE
 
 
 def test_resolve_nous_runtime_credentials_invoke_jwt_is_idempotent(
@@ -225,14 +227,7 @@ def test_resolve_nous_runtime_credentials_invoke_jwt_is_idempotent(
     def _unexpected_shared_write(*args, **kwargs):
         raise AssertionError("unchanged invoke JWT resolution should not sync shared store")
 
-    sync_calls = []
-
     monkeypatch.setattr(auth_mod, "_write_shared_nous_state", _unexpected_shared_write)
-    monkeypatch.setattr(
-        auth_mod,
-        "_sync_nous_pool_from_auth_store",
-        lambda: sync_calls.append(True),
-    )
 
     creds = auth_mod.resolve_nous_runtime_credentials()
 
@@ -240,7 +235,6 @@ def test_resolve_nous_runtime_credentials_invoke_jwt_is_idempotent(
     assert creds["source"] == auth_mod.NOUS_AUTH_PATH_INVOKE_JWT
     assert auth_path.read_text() == before_content
     assert auth_path.stat().st_mtime_ns == before_mtime
-    assert sync_calls == []
     payload = json.loads(auth_path.read_text())
     assert (
         payload["providers"]["nous"]["agent_key_obtained_at"]
@@ -270,7 +264,7 @@ def test_resolve_nous_runtime_credentials_reauths_when_invoke_scope_missing(
     )
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
 
-    with pytest.raises(AuthError) as exc:
+    with pytest.raises(auth_mod.AuthError) as exc:
         auth_mod.resolve_nous_runtime_credentials()
 
     assert exc.value.code == "missing_inference_invoke_scope"
@@ -649,7 +643,8 @@ def _full_state_fixture() -> dict:
     }
 
 
-def test_persist_nous_credentials_writes_both_pool_and_providers(tmp_path, monkeypatch):
+@pytest.mark.asyncio
+async def test_persist_nous_credentials_writes_provider_and_lazy_pool(tmp_path, monkeypatch):
     """Helper must populate BOTH credential_pool.nous AND providers.nous.
 
     Regression guard: before this helper existed, `hermes auth add nous`
@@ -669,11 +664,7 @@ def test_persist_nous_credentials_writes_both_pool_and_providers(tmp_path, monke
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
 
     state = _full_state_fixture()
-    entry = persist_nous_credentials(state)
-
-    assert entry is not None
-    assert entry.provider == "nous"
-    assert entry.source == NOUS_DEVICE_CODE_SOURCE
+    assert persist_nous_credentials(state) is None
 
     payload = json.loads((hermes_home / "auth.json").read_text())
 
@@ -684,16 +675,18 @@ def test_persist_nous_credentials_writes_both_pool_and_providers(tmp_path, monke
     assert singleton["agent_key"] == state["agent_key"]
     assert singleton["agent_key_expires_at"] == state["agent_key_expires_at"]
 
-    # credential_pool.nous has exactly one canonical device_code entry
-    pool_entries = payload["credential_pool"]["nous"]
+    # The native-async pool creates exactly one canonical device_code entry
+    # when the runtime first awaits its load.
+    pool_entries = (await load_pool("nous")).entries()
     assert len(pool_entries) == 1, pool_entries
     pool_entry = pool_entries[0]
-    assert pool_entry["source"] == NOUS_DEVICE_CODE_SOURCE
-    assert pool_entry["agent_key"] == state["agent_key"]
-    assert pool_entry["inference_base_url"] == "https://inference.example.com/v1"
+    assert pool_entry.source == NOUS_DEVICE_CODE_SOURCE
+    assert pool_entry.agent_key == state["agent_key"]
+    assert pool_entry.inference_base_url == "https://inference.example.com/v1"
 
 
-def test_persist_nous_credentials_idempotent_no_duplicate_pool_entries(tmp_path, monkeypatch):
+@pytest.mark.asyncio
+async def test_persist_nous_credentials_idempotent_no_duplicate_pool_entries(tmp_path, monkeypatch):
     """Re-running persist must upsert — not accumulate duplicate device_code rows.
 
     Regression guard for the review comment on PR #11858: before normalisation,
@@ -728,18 +721,19 @@ def test_persist_nous_credentials_idempotent_no_duplicate_pool_entries(tmp_path,
     assert payload["providers"]["nous"]["access_token"] == second_token
     assert payload["providers"]["nous"]["agent_key"] == second_token
 
-    # credential_pool.nous has exactly one entry, carrying the latest agent_key
-    pool_entries = payload["credential_pool"]["nous"]
+    # The lazy async load has exactly one entry, carrying the latest agent key.
+    pool_entries = (await load_pool("nous")).entries()
     assert len(pool_entries) == 1, pool_entries
-    assert pool_entries[0]["source"] == NOUS_DEVICE_CODE_SOURCE
-    assert pool_entries[0]["agent_key"] == second_token
+    assert pool_entries[0].source == NOUS_DEVICE_CODE_SOURCE
+    assert pool_entries[0].agent_key == second_token
     # And no stray `manual:device_code` / `manual:dashboard_device_code` rows
     assert not any(
-        e["source"].startswith("manual:") for e in pool_entries
+        e.source.startswith("manual:") for e in pool_entries
     )
 
 
-def test_persist_nous_credentials_no_label_uses_auto_derived(tmp_path, monkeypatch):
+@pytest.mark.asyncio
+async def test_persist_nous_credentials_no_label_uses_auto_derived(tmp_path, monkeypatch):
     """When the caller doesn't pass ``label``, the auto-derived fingerprint
     is used (unchanged default behaviour — regression guard).
     """
@@ -752,8 +746,8 @@ def test_persist_nous_credentials_no_label_uses_auto_derived(tmp_path, monkeypat
     }))
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
 
-    entry = persist_nous_credentials(_full_state_fixture())
-    assert entry is not None
+    assert persist_nous_credentials(_full_state_fixture()) is None
+    entry = (await load_pool("nous")).entries()[0]
     # label_from_token derives from the access_token; exact value depends on
     # the fingerprinter but it must not be empty and must not equal an
     # arbitrary user string we never passed.
@@ -776,7 +770,7 @@ def test_refresh_token_reuse_detection_surfaces_actionable_message():
     bug when the true cause is external RT consumption (monitoring scripts,
     custom self-heal hooks).
     """
-    from hermes_cli.auth import _refresh_access_token
+    import hermes_cli.auth as auth_mod
 
     class _FakeResponse:
         status_code = 400
@@ -791,8 +785,8 @@ def test_refresh_token_reuse_detection_surfaces_actionable_message():
         def post(self, *args, **kwargs):
             return _FakeResponse()
 
-    with pytest.raises(AuthError) as exc_info:
-        _refresh_access_token(
+    with pytest.raises(auth_mod.AuthError) as exc_info:
+        auth_mod._refresh_access_token(
             client=_FakeClient(),
             portal_base_url="https://portal.nousresearch.com",
             client_id="hermes-cli",

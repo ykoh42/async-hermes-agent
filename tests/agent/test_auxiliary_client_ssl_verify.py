@@ -28,7 +28,7 @@ def clean_tls_env(monkeypatch):
 def test_build_keepalive_http_client_forwards_verify_context(clean_tls_env):
     ctx = ssl.create_default_context(cafile=certifi.where())
     client = build_keepalive_http_client("https://ollama.example.com/v1", verify=ctx)
-    assert isinstance(client, httpx.Client)
+    assert isinstance(client, httpx.AsyncClient)
     assert client._transport._pool._ssl_context is ctx
 
 
@@ -48,5 +48,4 @@ def test_resolve_aux_verify_ssl_verify_false(clean_tls_env, monkeypatch):
         lambda *a, **k: {"ssl_verify": False},
     )
     assert auxiliary_client._resolve_aux_verify("https://ollama.example.com/v1") is False
-
 

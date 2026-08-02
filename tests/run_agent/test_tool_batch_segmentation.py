@@ -11,10 +11,9 @@ concurrently, barrier calls sequentially — while preserving:
   * side-effect boundaries (no call starts before an earlier barrier ends).
 """
 
+import asyncio
 import json
 import sys
-import threading
-import time
 import uuid
 from pathlib import Path
 from types import SimpleNamespace
@@ -196,144 +195,155 @@ def agent():
 
 
 class TestSegmentedDispatchIntegration:
-    def test_mixed_batch_runs_safe_prefix_concurrently_and_barrier_after(self, agent):
-        """Two web_search calls must overlap in time; terminal must start only
-        after both finish; results land in the model's emission order."""
+    @staticmethod
+    def _native_tool_entry():
+        return patch(
+            "tools.registry.registry.get_entry",
+            return_value=SimpleNamespace(is_async=True, max_result_size_chars=None),
+        )
+
+    @pytest.mark.asyncio
+    async def test_mixed_batch_runs_safe_prefix_concurrently_and_barrier_after(self, agent):
+        """Safe calls overlap; a barrier starts only after their completion."""
         calls = [
             _tc("web_search", '{"query":"a"}', call_id="s1"),
             _tc("web_search", '{"query":"b"}', call_id="s2"),
             _tc("terminal", '{"command":"echo done"}', call_id="t1"),
         ]
-        msg = SimpleNamespace(content="", tool_calls=calls)
-        messages = []
-
-        rendezvous = threading.Barrier(2, timeout=10)
         events = []
-        events_lock = threading.Lock()
+        searches_started = asyncio.Event()
 
-        def fake_handle(name, args, task_id, **kwargs):
-            with events_lock:
-                events.append(("start", name, kwargs["tool_call_id"]))
+        async def dispatch(name, _args, _task_id, **kwargs):
+            events.append(("start", name, kwargs["tool_call_id"]))
             if name == "web_search":
-                # Both searches must be in flight at once to pass this
-                # barrier — proves genuine concurrency for the safe prefix.
-                rendezvous.wait()
-            with events_lock:
-                events.append(("end", name, kwargs["tool_call_id"]))
+                if len([event for event in events if event[:2] == ("start", "web_search")]) == 2:
+                    searches_started.set()
+                await asyncio.wait_for(searches_started.wait(), timeout=1)
+            events.append(("end", name, kwargs["tool_call_id"]))
             return json.dumps({"ok": name})
 
-        with patch("run_agent.handle_function_call", side_effect=fake_handle):
-            agent._execute_tool_calls(msg, messages, "task-1")
-
-        # One result per call, in emission order.
-        assert [m["tool_call_id"] for m in messages] == ["s1", "s2", "t1"]
-        assert all(m["role"] == "tool" for m in messages)
-
-        # The barrier (terminal) started only after BOTH searches ended.
-        terminal_start = events.index(("start", "terminal", "t1"))
-        search_ends = [
-            i for i, e in enumerate(events) if e[0] == "end" and e[1] == "web_search"
-        ]
-        assert len(search_ends) == 2
-        assert all(i < terminal_start for i in search_ends)
-
-    def test_mixed_batch_preserves_order_with_barrier_in_middle(self, agent):
-        calls = [
-            _tc("web_search", '{"query":"a"}', call_id="s1"),
-            _tc("web_search", '{"query":"b"}', call_id="s2"),
-            _tc("terminal", '{"command":"touch x"}', call_id="t1"),
-            _tc("web_search", '{"query":"c"}', call_id="s3"),
-            _tc("web_search", '{"query":"d"}', call_id="s4"),
-        ]
-        msg = SimpleNamespace(content="", tool_calls=calls)
         messages = []
-        executed = []
-        lock = threading.Lock()
+        with (
+            patch("model_tools.handle_function_call", side_effect=dispatch),
+            self._native_tool_entry(),
+        ):
+            await agent._execute_tool_calls(
+                SimpleNamespace(content="", tool_calls=calls), messages, "task-1"
+            )
 
-        def fake_handle(name, args, task_id, **kwargs):
-            with lock:
-                executed.append(kwargs["tool_call_id"])
+        assert [message["tool_call_id"] for message in messages] == ["s1", "s2", "t1"]
+        terminal_start = events.index(("start", "terminal", "t1"))
+        assert all(
+            index < terminal_start
+            for index, event in enumerate(events)
+            if event[0] == "end" and event[1] == "web_search"
+        )
+
+    @pytest.mark.asyncio
+    async def test_mixed_batch_preserves_order_with_barrier_in_middle(self, agent):
+        calls = [
+            _tc("web_search", call_id="s1"),
+            _tc("web_search", call_id="s2"),
+            _tc("terminal", '{"command":"touch x"}', call_id="t1"),
+            _tc("web_search", call_id="s3"),
+            _tc("web_search", call_id="s4"),
+        ]
+        executed = []
+
+        async def dispatch(_name, _args, _task_id, **kwargs):
+            executed.append(kwargs["tool_call_id"])
             return json.dumps({"ok": True})
 
-        with patch("run_agent.handle_function_call", side_effect=fake_handle):
-            agent._execute_tool_calls(msg, messages, "task-1")
+        messages = []
+        with (
+            patch("model_tools.handle_function_call", side_effect=dispatch),
+            self._native_tool_entry(),
+        ):
+            await agent._execute_tool_calls(
+                SimpleNamespace(content="", tool_calls=calls), messages, "task-1"
+            )
 
-        assert [m["tool_call_id"] for m in messages] == ["s1", "s2", "t1", "s3", "s4"]
-        # Barrier ordering: t1 executed after {s1,s2} and before {s3,s4}.
-        t1_pos = executed.index("t1")
-        assert {"s1", "s2"} == set(executed[:t1_pos])
-        assert {"s3", "s4"} == set(executed[t1_pos + 1:])
+        assert [message["tool_call_id"] for message in messages] == ["s1", "s2", "t1", "s3", "s4"]
+        terminal_index = executed.index("t1")
+        assert set(executed[:terminal_index]) == {"s1", "s2"}
+        assert set(executed[terminal_index + 1:]) == {"s3", "s4"}
 
-    def test_homogeneous_safe_batch_still_uses_plain_concurrent_path(self, agent):
-        calls = [_tc("web_search", '{"query":"a"}'), _tc("web_search", '{"query":"b"}')]
-        msg = SimpleNamespace(content="", tool_calls=calls)
+    @pytest.mark.asyncio
+    async def test_homogeneous_safe_batch_runs_concurrently(self, agent):
+        calls = [_tc("web_search", call_id="s1"), _tc("web_search", call_id="s2")]
+        starts = []
+        release = asyncio.Event()
+
+        async def dispatch(_name, _args, _task_id, **kwargs):
+            starts.append(kwargs["tool_call_id"])
+            if len(starts) == 2:
+                release.set()
+            await asyncio.wait_for(release.wait(), timeout=1)
+            return json.dumps({"ok": True})
 
         with (
-            patch.object(agent, "_execute_tool_calls_concurrent") as conc,
-            patch.object(agent, "_execute_tool_calls_sequential") as seq,
+            patch("model_tools.handle_function_call", side_effect=dispatch),
+            self._native_tool_entry(),
         ):
-            agent._execute_tool_calls(msg, [], "task-1")
+            await agent._execute_tool_calls(
+                SimpleNamespace(content="", tool_calls=calls), [], "task-1"
+            )
 
-        conc.assert_called_once()
-        seq.assert_not_called()
+        assert starts == ["s1", "s2"]
 
-
-
-    def test_interrupt_during_barrier_drains_later_segments(self, agent):
-        """Interrupt raised while the barrier tool runs: the trailing parallel
-        segment must be drained with cancelled results — one per call —
-        without executing."""
+    @pytest.mark.asyncio
+    async def test_interrupt_during_barrier_drains_later_segments(self, agent):
         calls = [
-            _tc("web_search", '{"query":"a"}', call_id="s1"),
-            _tc("web_search", '{"query":"b"}', call_id="s2"),
+            _tc("web_search", call_id="s1"),
+            _tc("web_search", call_id="s2"),
             _tc("terminal", '{"command":"long"}', call_id="t1"),
-            _tc("web_search", '{"query":"c"}', call_id="s3"),
-            _tc("web_search", '{"query":"d"}', call_id="s4"),
+            _tc("web_search", call_id="s3"),
+            _tc("web_search", call_id="s4"),
         ]
-        msg = SimpleNamespace(content="", tool_calls=calls)
-        messages = []
         executed = []
-        lock = threading.Lock()
 
-        def fake_handle(name, args, task_id, **kwargs):
-            with lock:
-                executed.append(kwargs["tool_call_id"])
-            if kwargs["tool_call_id"] == "t1":
+        async def dispatch(_name, _args, _task_id, **kwargs):
+            call_id = kwargs["tool_call_id"]
+            executed.append(call_id)
+            if call_id == "t1":
                 agent._interrupt_requested = True
             return json.dumps({"ok": True})
 
-        with patch("run_agent.handle_function_call", side_effect=fake_handle):
-            agent._execute_tool_calls(msg, messages, "task-1")
+        messages = []
+        with (
+            patch("model_tools.handle_function_call", side_effect=dispatch),
+            self._native_tool_entry(),
+        ):
+            await agent._execute_tool_calls(
+                SimpleNamespace(content="", tool_calls=calls), messages, "task-1"
+            )
 
-        # Every call still gets exactly one result, in order.
-        assert [m["tool_call_id"] for m in messages] == ["s1", "s2", "t1", "s3", "s4"]
-        # s3/s4 were never executed.
+        assert [message["tool_call_id"] for message in messages] == ["s1", "s2", "t1", "s3", "s4"]
         assert "s3" not in executed and "s4" not in executed
-        for m in messages[-2:]:
-            assert "cancelled" in m["content"] or "skipped" in m["content"]
+        assert all("cancelled" in message["content"] for message in messages[-2:])
 
-    def test_steer_lands_exactly_once_in_mixed_batch(self, agent):
-        """Steer is drained once (per-tool drains + one dispatcher-level
-        finalize) — the marker must appear exactly once across the batch,
-        never duplicated by segment boundaries."""
+    @pytest.mark.asyncio
+    async def test_steer_lands_exactly_once_in_mixed_batch(self, agent):
         calls = [
-            _tc("web_search", '{"query":"a"}', call_id="s1"),
-            _tc("web_search", '{"query":"b"}', call_id="s2"),
+            _tc("web_search", call_id="s1"),
+            _tc("web_search", call_id="s2"),
             _tc("terminal", '{"command":"echo hi"}', call_id="t1"),
         ]
-        msg = SimpleNamespace(content="", tool_calls=calls)
-        messages = []
 
-        def fake_handle(name, args, task_id, **kwargs):
+        async def dispatch(_name, _args, _task_id, **_kwargs):
             return json.dumps({"ok": True})
 
         agent.steer("focus on the tests")
-        with patch("run_agent.handle_function_call", side_effect=fake_handle):
-            agent._execute_tool_calls(msg, messages, "task-1")
+        messages = []
+        with (
+            patch("model_tools.handle_function_call", side_effect=dispatch),
+            self._native_tool_entry(),
+        ):
+            await agent._execute_tool_calls(
+                SimpleNamespace(content="", tool_calls=calls), messages, "task-1"
+            )
 
-        contents = [m["content"] for m in messages]
-        hits = [c for c in contents if "focus on the tests" in c]
-        assert len(hits) == 1
+        assert sum("focus on the tests" in message["content"] for message in messages) == 1
 
 
 class TestPathCanonicalization:

@@ -18,11 +18,9 @@ firecrawl implementation that previously lived in tools/web_tools.py:
   - Per-URL extract loop with 60s timeout, redirect-aware SSRF re-check,
     website-policy gating, and format-aware content selection.
 
-Async note: the underlying SDK is sync. ``extract()`` is declared
-``async def`` because it performs per-URL I/O that benefits from
-running in an executor; the implementation wraps each scrape in
-:func:`asyncio.to_thread` with :func:`asyncio.wait_for(timeout=60)` to
-guard against hung fetches.
+Async note: the active provider uses Firecrawl's HTTP API through
+``httpx.AsyncClient``. The optional SDK proxy remains only for compatibility
+with callers that import it; no active request is delegated to a thread.
 
 Config keys this provider responds to::
 
@@ -370,6 +368,46 @@ def _extract_scrape_payload(scrape_result: Any) -> Dict[str, Any]:
 class FirecrawlWebSearchProvider(WebSearchProvider):
     """Firecrawl search + extract provider with dual auth paths."""
 
+    @staticmethod
+    def _request_config() -> tuple[str, str]:
+        """Resolve the active Firecrawl HTTP origin and bearer token."""
+        import tools.web_tools as _wt
+
+        direct_config = _get_direct_firecrawl_config()
+        if direct_config is not None and not _wt.prefers_gateway("web"):
+            kwargs, _ = direct_config
+            return (
+                (kwargs.get("api_url") or "https://api.firecrawl.dev/v1").rstrip("/"),
+                kwargs.get("api_key", ""),
+            )
+
+        managed = _wt.resolve_managed_tool_gateway(
+            "firecrawl", token_reader=_wt._read_nous_access_token
+        )
+        if managed is None:
+            _raise_web_backend_configuration_error()
+        return managed.gateway_origin.rstrip("/"), managed.nous_user_token
+
+    @classmethod
+    async def _request(cls, endpoint: str, payload: Dict[str, Any]) -> Any:
+        import httpx
+
+        origin, token = cls._request_config()
+        if not origin.endswith("/v1"):
+            origin = f"{origin}/v1"
+        async with httpx.AsyncClient(timeout=60) as client:
+            response = await client.post(
+                f"{origin}/{endpoint.lstrip('/')}",
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": "application/json",
+                    "User-Agent": "Hermes-Agent",
+                },
+                json=payload,
+            )
+            response.raise_for_status()
+            return response.json()
+
     @property
     def name(self) -> str:
         return "firecrawl"
@@ -388,7 +426,7 @@ class FirecrawlWebSearchProvider(WebSearchProvider):
     def supports_extract(self) -> bool:
         return True
 
-    def search(self, query: str, limit: int = 5) -> Dict[str, Any]:
+    async def search(self, query: str, limit: int = 5) -> Dict[str, Any]:
         """Execute a Firecrawl search.
 
         Sync; matches the legacy ``_get_firecrawl_client().search(...)``
@@ -408,11 +446,11 @@ class FirecrawlWebSearchProvider(WebSearchProvider):
             return {"success": False, "error": "Interrupted"}
 
         logger.info("Firecrawl search: '%s' (limit=%d)", query, limit)
-        # _get_firecrawl_client() raises ValueError on unconfigured systems —
-        # let it propagate so the dispatcher emits the legacy envelope shape.
-        client = _get_firecrawl_client()
         try:
-            response = client.search(query=query, limit=limit)
+            response = await self._request(
+                "search",
+                {"query": query, "limit": max(1, min(int(limit), 100))},
+            )
             web_results = _extract_web_search_results(response)
             logger.info("Firecrawl: found %d search results", len(web_results))
             return {"success": True, "data": {"web": web_results}}
@@ -423,7 +461,7 @@ class FirecrawlWebSearchProvider(WebSearchProvider):
     async def extract(self, urls: List[str], **kwargs: Any) -> List[Dict[str, Any]]:
         """Extract content from one or more URLs via Firecrawl.
 
-        Async; each URL is scraped in a background thread with a 60s
+        Async; each URL is scraped through the native HTTP API with a 60s
         timeout. After scraping, the final URL (post-redirect) is
         re-checked against website-access policy.
 
@@ -487,10 +525,9 @@ class FirecrawlWebSearchProvider(WebSearchProvider):
                 logger.info("Firecrawl scraping: %s", url)
                 try:
                     scrape_result = await asyncio.wait_for(
-                        asyncio.to_thread(
-                            _get_firecrawl_client().scrape,
-                            url=url,
-                            formats=formats,
+                        self._request(
+                            "scrape",
+                            {"url": url, "formats": formats},
                         ),
                         timeout=60,
                     )

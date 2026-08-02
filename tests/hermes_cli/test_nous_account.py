@@ -6,6 +6,7 @@ import base64
 import json
 import time
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -139,13 +140,19 @@ def _reset_cache():
         ),
     ],
 )
-def test_fresh_account_payload_normalization(monkeypatch, payload, expected_paid):
+@pytest.mark.asyncio
+async def test_fresh_account_payload_normalization(monkeypatch, payload, expected_paid):
     token = _jwt({"sub": "user_123", "org_id": "org_123", "exp": int(time.time()) + 900})
-    monkeypatch.setattr("hermes_cli.auth.get_provider_auth_state", lambda provider: _state(token))
-    monkeypatch.setattr("hermes_cli.auth.resolve_nous_access_token", lambda: "fresh-token")
-    monkeypatch.setattr("hermes_cli.nous_account._fetch_nous_account_info", lambda *a, **kw: payload)
+    monkeypatch.setattr(
+        "hermes_cli.nous_account._load_nous_auth_state",
+        AsyncMock(return_value=_state(token)),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.nous_account._fetch_nous_account_info",
+        AsyncMock(return_value=payload),
+    )
 
-    info = get_nous_portal_account_info(force_fresh=True)
+    info = await get_nous_portal_account_info(force_fresh=True)
 
     assert isinstance(info, NousPortalAccountInfo)
     assert info.source == "account_api"
@@ -158,8 +165,12 @@ def test_fresh_account_payload_normalization(monkeypatch, payload, expected_paid
     assert info.is_free_tier is (not expected_paid)
 
 
-def test_no_oauth_token_reports_inference_key_present(monkeypatch):
-    monkeypatch.setattr("hermes_cli.auth.get_provider_auth_state", lambda provider: {})
+@pytest.mark.asyncio
+async def test_no_oauth_token_reports_inference_key_present(monkeypatch):
+    monkeypatch.setattr(
+        "hermes_cli.nous_account._load_nous_auth_state",
+        AsyncMock(return_value={}),
+    )
 
     class _Entry:
         label = "manual-nous"
@@ -186,9 +197,9 @@ def test_no_oauth_token_reports_inference_key_present(monkeypatch):
         def entries(self):
             return [_Entry()]
 
-    monkeypatch.setattr("agent.credential_pool.load_pool", lambda provider: _Pool())
+    monkeypatch.setattr("agent.credential_pool.load_pool", AsyncMock(return_value=_Pool()))
 
-    info = get_nous_portal_account_info()
+    info = await get_nous_portal_account_info()
 
     assert info.logged_in is False
     assert info.source == "inference_key"
@@ -197,7 +208,8 @@ def test_no_oauth_token_reports_inference_key_present(monkeypatch):
     assert info.paid_service_access is None
 
 
-def test_pool_oauth_entry_force_fresh_uses_account_api(monkeypatch):
+@pytest.mark.asyncio
+async def test_pool_oauth_entry_force_fresh_uses_account_api(monkeypatch):
     token = _jwt(
         {
             "sub": "user_123",
@@ -212,8 +224,14 @@ def test_pool_oauth_entry_force_fresh_uses_account_api(monkeypatch):
         subscription_credits=0,
         purchased_credits=3,
     )
-    monkeypatch.setattr("hermes_cli.auth.get_provider_auth_state", lambda provider: {})
-    monkeypatch.setattr("hermes_cli.nous_account._fetch_nous_account_info", lambda *a, **kw: payload)
+    monkeypatch.setattr(
+        "hermes_cli.nous_account._load_nous_auth_state",
+        AsyncMock(return_value={}),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.nous_account._fetch_nous_account_info",
+        AsyncMock(return_value=payload),
+    )
 
     class _Entry:
         label = "dashboard device_code"
@@ -243,9 +261,9 @@ def test_pool_oauth_entry_force_fresh_uses_account_api(monkeypatch):
         def entries(self):
             return [_Entry()]
 
-    monkeypatch.setattr("agent.credential_pool.load_pool", lambda provider: _Pool())
+    monkeypatch.setattr("agent.credential_pool.load_pool", AsyncMock(return_value=_Pool()))
 
-    info = get_nous_portal_account_info(force_fresh=True)
+    info = await get_nous_portal_account_info(force_fresh=True)
 
     assert info.logged_in is True
     assert info.source == "account_api"
@@ -259,7 +277,6 @@ def test_pool_oauth_entry_force_fresh_uses_account_api(monkeypatch):
 
 
 # ── org slug/name parsing + top-up URL builder ──────────────────────────────
-
 
 
 

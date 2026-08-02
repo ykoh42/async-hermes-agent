@@ -37,7 +37,7 @@ def _make_compressor(**kwargs) -> ContextCompressor:
         quiet_mode=True,
     )
     defaults.update(kwargs)
-    with patch("agent.context_compressor.get_model_context_length", return_value=8000):
+    with patch("agent.context_compressor.get_static_context_length", return_value=8000):
         return ContextCompressor(**defaults)
 
 

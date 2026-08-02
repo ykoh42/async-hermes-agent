@@ -34,7 +34,7 @@ def _make_agent(session_db, session_id, *, in_place):
     agent.compression_in_place = in_place
     # Mock the compressor to return a deterministic shrunk transcript so the
     # test exercises the DB-mutation path, not summarization quality.
-    def _fake_compress(messages, current_tokens=None, focus_topic=None, force=False):
+    async def _fake_compress(messages, current_tokens=None, focus_topic=None, force=False):
         return [
             {"role": "user", "content": "[CONTEXT COMPACTION] summary of prior turns"},
             {"role": "assistant", "content": "recent reply"},
@@ -59,7 +59,8 @@ def _seed(db, sid, title, n=8):
 
 
 class TestInPlaceCompaction:
-    def test_in_place_keeps_same_session_id(self):
+    @pytest.mark.asyncio
+    async def test_in_place_keeps_same_session_id(self):
         """In-place mode: id unchanged, no child row, no rename, history kept."""
         from hermes_state import SessionDB
         from agent.conversation_compression import compress_context
@@ -72,7 +73,7 @@ class TestInPlaceCompaction:
             agent._last_flushed_db_idx = 5
 
             messages = [{"role": "user", "content": f"m{i}"} for i in range(8)]
-            compressed, _sp = compress_context(
+            compressed, _sp = await compress_context(
                 agent, messages, approx_tokens=100_000, system_message="sys"
             )
 
@@ -123,8 +124,11 @@ class TestInPlaceCompaction:
             assert agent._last_compaction_in_place is True
             # Live transcript actually shrank.
             assert len(compressed) == 2
+            await agent.close()
+            db.close()
 
-    def test_in_place_alternation_preserved(self):
+    @pytest.mark.asyncio
+    async def test_in_place_alternation_preserved(self):
         """The compacted list must not introduce consecutive same-role messages."""
         from hermes_state import SessionDB
         from agent.conversation_compression import compress_context
@@ -135,14 +139,17 @@ class TestInPlaceCompaction:
             _seed(db, sid, "alt")
             agent = _make_agent(db, sid, in_place=True)
             messages = [{"role": "user", "content": f"m{i}"} for i in range(8)]
-            compressed, _ = compress_context(
+            compressed, _ = await compress_context(
                 agent, messages, approx_tokens=100_000, system_message="sys"
             )
             roles = [m["role"] for m in compressed if m.get("role") != "system"]
             assert all(roles[i] != roles[i + 1] for i in range(len(roles) - 1))
+            await agent.close()
+            db.close()
 
 
-    def test_rotation_still_preflushes(self):
+    @pytest.mark.asyncio
+    async def test_rotation_still_preflushes(self):
         """Rotation MUST pre-flush so current-turn messages survive in the
         preserved old (parent) session before it is ended (#47202)."""
         from hermes_state import SessionDB
@@ -153,18 +160,22 @@ class TestInPlaceCompaction:
             _seed(db, "rot_flush", "f")
             agent = _make_agent(db, "rot_flush", in_place=False)
             calls = {"n": 0}
-            agent._flush_messages_to_session_db = lambda *a, **k: calls.__setitem__(
-                "n", calls["n"] + 1
-            )
-            compress_context(
+            async def _flush(*_args, **_kwargs):
+                calls["n"] += 1
+
+            agent._flush_messages_to_session_db = _flush
+            await compress_context(
                 agent, [{"role": "user", "content": "x"}] * 8,
                 approx_tokens=100_000, system_message="sys",
             )
             assert calls["n"] == 1
+            await agent.close()
+            db.close()
 
 
 class TestRotationFallbackWhenFlagOff:
-    def test_rotation_when_flag_off(self):
+    @pytest.mark.asyncio
+    async def test_rotation_when_flag_off(self):
         """Rotation is now the OPT-OUT fallback (default flipped to in-place in
         #38763). With in_place=False explicitly set, legacy rotation is
         unchanged — forks a renamed continuation session."""
@@ -179,7 +190,7 @@ class TestRotationFallbackWhenFlagOff:
             agent._last_flushed_db_idx = 5
 
             messages = [{"role": "user", "content": f"m{i}"} for i in range(8)]
-            compress_context(
+            await compress_context(
                 agent, messages, approx_tokens=100_000, system_message="sys"
             )
 
@@ -202,13 +213,16 @@ class TestRotationFallbackWhenFlagOff:
             ]
             # Rotation mode does NOT set the in-place signal.
             assert getattr(agent, "_last_compaction_in_place", False) is False
+            await agent.close()
+            db.close()
 
 
 class TestInPlaceSignalForGateway:
     """compress_context must expose a rotation-independent flag the gateway can
     read (instead of an id-change diff) to re-baseline transcript handling."""
 
-    def test_signal_set_on_in_place_unset_on_rotation(self):
+    @pytest.mark.asyncio
+    async def test_signal_set_on_in_place_unset_on_rotation(self):
         from hermes_state import SessionDB
         from agent.conversation_compression import compress_context
 
@@ -217,7 +231,7 @@ class TestInPlaceSignalForGateway:
             # in-place → flag True
             _seed(db, "s_ip", "ip")
             a_ip = _make_agent(db, "s_ip", in_place=True)
-            compress_context(
+            await compress_context(
                 a_ip, [{"role": "user", "content": "x"}] * 8,
                 approx_tokens=100_000, system_message="sys",
             )
@@ -226,11 +240,14 @@ class TestInPlaceSignalForGateway:
             # rotation → flag False
             _seed(db, "s_rot", "rot")
             a_rot = _make_agent(db, "s_rot", in_place=False)
-            compress_context(
+            await compress_context(
                 a_rot, [{"role": "user", "content": "x"}] * 8,
                 approx_tokens=100_000, system_message="sys",
             )
             assert a_rot._last_compaction_in_place is False
+            await a_ip.close()
+            await a_rot.close()
+            db.close()
 
 
 class TestInPlaceConfigDefault:

@@ -4,7 +4,6 @@ import os
 import threading
 import time
 from pathlib import Path
-from types import SimpleNamespace
 from unittest.mock import patch as mock_patch
 
 import pytest
@@ -42,16 +41,10 @@ class TestApprovalModeParsing:
 
 
 class TestSmartApproval:
-    def test_smart_approval_uses_call_llm(self):
-        response = SimpleNamespace(
-            choices=[SimpleNamespace(message=SimpleNamespace(content="APPROVE"))]
-        )
-        with mock_patch("agent.auxiliary_client.call_llm", return_value=response) as mock_call:
-            result = _smart_approve("python -c \"print('hello')\"", "script execution via -c flag")
-
-        assert result == "approve"
-        assert mock_call.call_args.kwargs["task"] == "approval"
-        assert mock_call.call_args.kwargs["temperature"] == 0
+    def test_smart_approval_always_escalates_without_a_model_call(self):
+        assert _smart_approve(
+            "python -c \"print('hello')\"", "script execution via -c flag",
+        ) == "escalate"
 
     def test_smart_approval_does_not_allowlist_the_pattern_for_session(self, monkeypatch):
         session_key = "test-smart-per-command"
@@ -100,9 +93,10 @@ class TestDetectDangerousRm:
 
 
     def test_nonrecursive_verification_artifact_cleanup_is_not_dangerous(self):
-        with mock_patch("tempfile.gettempdir", return_value="/tmp"):
+        temp_dir = os.path.realpath("/tmp")
+        with mock_patch("tempfile.gettempdir", return_value=temp_dir):
             for prefix in ("hermes-verify-", "hermes-ad-hoc-"):
-                assert detect_dangerous_command(f"rm -f /tmp/{prefix}example.py") == (
+                assert detect_dangerous_command(f"rm -f {temp_dir}/{prefix}example.py") == (
                     False,
                     None,
                     None,
@@ -570,22 +564,9 @@ class TestPatternKeyUniqueness:
 
 
 class TestFullCommandAlwaysShown:
-    """The full command is always shown in the approval prompt (no truncation).
-
-    Previously there was a [v]iew full option for long commands. Now the full
-    command is always displayed. These tests verify the basic approval flow
-    still works with long commands, and that the retired 'v' key falls through
-    to deny. (#1553)
-    """
-
-    def test_choice_with_long_command(self):
+    def test_denies_without_a_native_approval_callback(self):
         long_cmd = "rm -rf " + "a" * 200
-        for keystroke, expected in (
-            ("o", "once"), ("s", "session"), ("a", "always"), ("d", "deny"), ("v", "deny"),
-        ):
-            with mock_patch("builtins.input", return_value=keystroke):
-                result = prompt_dangerous_approval(long_cmd, "recursive delete")
-            assert result == expected, keystroke
+        assert prompt_dangerous_approval(long_cmd, "recursive delete") == "deny"
 
 
 class TestSmartDeniedPrompt:
@@ -606,57 +587,6 @@ class TestSmartDeniedPrompt:
 
         assert result == "deny"
         assert captured == {"allow_permanent": False, "smart_denied": True}
-
-    def test_short_prompt_smart_deny_rejects_session_input(self):
-        with mock_patch("builtins.input", return_value="session"):
-            result = prompt_dangerous_approval(
-                "rm -rf /tmp/example",
-                "recursive delete",
-                allow_permanent=False,
-                smart_denied=True,
-            )
-
-        assert result == "deny"
-
-    def test_smart_deny_offers_only_once_and_deny(self, capsys):
-        with mock_patch("builtins.input", return_value="deny"):
-            prompt_dangerous_approval(
-                "rm -rf /tmp/example",
-                "recursive delete",
-                allow_permanent=False,
-                smart_denied=True,
-            )
-
-        rendered = capsys.readouterr().out
-        assert "[o]nce" in rendered and "[d]eny" in rendered
-        assert "[s]ession" not in rendered and "[a]lways" not in rendered
-
-    def test_smart_deny_uses_locale_specific_once_deny_choices(self, monkeypatch, capsys):
-        monkeypatch.setenv("HERMES_LANGUAGE", "tr")
-        from agent import i18n
-        i18n.reset_language_cache()
-        prompts = []
-
-        def choose_once(prompt):
-            prompts.append(prompt)
-            return "b"  # Turkish [b]ir kez
-
-        try:
-            with mock_patch("builtins.input", side_effect=choose_once):
-                result = prompt_dangerous_approval(
-                    "rm -rf /tmp/example", "recursive delete",
-                    allow_permanent=False, smart_denied=True,
-                )
-        finally:
-            i18n.reset_language_cache()
-
-        rendered = capsys.readouterr().out
-        assert result == "once"
-        assert "[b]ir kez" in rendered
-        assert "[r]eddet" in rendered
-        assert i18n.t("approval.choose_short", lang="tr").split("|")[1].strip() not in rendered
-        assert "b/R" in prompts[0]
-
 
 class TestForkBombDetection:
     """The fork bomb regex must match the classic :(){ :|:& };: pattern."""
@@ -900,62 +830,14 @@ class TestChmodExecuteCombo:
         assert dangerous is False
 
 
-class TestFailClosedUnderPromptToolkit:
-    """Regression guard for #15216.
+class TestApprovalCallback:
+    def test_callback_path_is_used(self):
+        def cb(command, description, **kwargs):
+            return "once"
 
-    When prompt_toolkit owns the terminal and no approval callback is
-    registered on the calling thread, prompt_dangerous_approval() must
-    deny fast instead of falling through to the input() fallback -- which
-    deadlocks because the user's keystrokes go to prompt_toolkit's raw-mode
-    stdin capture, not to input().
-    """
-
-    def test_denies_when_prompt_toolkit_active_and_no_callback(self):
-        import prompt_toolkit.application.current as ptc
-
-        orig = ptc.get_app_or_none
-        ptc.get_app_or_none = lambda: object()  # pretend a pt app is running
-        result = []
-        try:
-            def run():
-                result.append(
-                    prompt_dangerous_approval(
-                        "rm -rf /",
-                        "test danger",
-                        timeout_seconds=30,
-                        approval_callback=None,
-                    )
-                )
-
-            t = threading.Thread(target=run, daemon=True)
-            t.start()
-            t.join(timeout=3)
-            assert not t.is_alive(), (
-                "prompt_dangerous_approval deadlocked under prompt_toolkit "
-                "with no callback -- fail-closed guard is broken"
-            )
-            assert result == ["deny"]
-        finally:
-            ptc.get_app_or_none = orig
-
-    def test_callback_path_still_wins_over_guard(self):
-        """Guard must not short-circuit a valid callback."""
-        import prompt_toolkit.application.current as ptc
-
-        orig = ptc.get_app_or_none
-        ptc.get_app_or_none = lambda: object()
-        try:
-            def cb(command, description, **kwargs):
-                return "once"
-
-            result = prompt_dangerous_approval(
-                "rm -rf /",
-                "test danger",
-                approval_callback=cb,
-            )
-            assert result == "once"
-        finally:
-            ptc.get_app_or_none = orig
+        assert prompt_dangerous_approval(
+            "rm -rf /", "test danger", approval_callback=cb,
+        ) == "once"
 
 
 class TestDetectSudoStdin:

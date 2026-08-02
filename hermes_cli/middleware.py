@@ -75,14 +75,15 @@ def _safe_copy(payload: Any) -> Any:
         return payload
 
 
-def apply_llm_request_middleware(
+async def apply_llm_request_middleware(
     request: Dict[str, Any],
     **context: Any,
 ) -> RequestMiddlewareResult:
-    """Apply registered LLM request middleware.
+    """Apply native-async LLM request middleware.
 
     Middleware may return ``{"request": {...}}`` to replace the effective
-    provider kwargs before Hermes sends them.
+    provider kwargs before Hermes sends them. Callbacks must be coroutines;
+    async Hermes does not execute synchronous plugin code in an active turn.
     """
     if not _has_middleware(LLM_REQUEST_MIDDLEWARE):
         return RequestMiddlewareResult(
@@ -96,7 +97,7 @@ def apply_llm_request_middleware(
     current_request = _safe_copy(original_request)
     trace: List[Dict[str, Any]] = []
 
-    for result in _invoke_middleware(
+    for result in await _invoke_middleware_async(
         LLM_REQUEST_MIDDLEWARE,
         request=current_request,
         original_request=original_request,
@@ -118,15 +119,19 @@ def apply_llm_request_middleware(
     )
 
 
-def apply_tool_request_middleware(
+
+
+async def apply_tool_request_middleware(
     tool_name: str,
     args: Dict[str, Any],
     **context: Any,
 ) -> RequestMiddlewareResult:
-    """Apply registered tool request middleware.
+    """Apply native-async tool request middleware.
 
-    Middleware may return ``{"args": {...}}`` to replace the effective tool
-    arguments before hooks, guardrails, approvals, and execution see them.
+    Tool arguments are part of an active conversation turn, so middleware is
+    not permitted to execute synchronously and stall the event loop.  A
+    migrated callback receives the same payload as before and simply returns
+    its directive from an ``async def`` function.
     """
     original_args = _safe_copy(args)
     current_args = _safe_copy(original_args)
@@ -154,7 +159,7 @@ def apply_tool_request_middleware(
             trace=trace,
         )
 
-    for result in _invoke_middleware(
+    for result in await _invoke_middleware_async(
         TOOL_REQUEST_MIDDLEWARE,
         tool_name=tool_name,
         args=current_args,
@@ -175,52 +180,20 @@ def apply_tool_request_middleware(
         changed=bool(trace),
         trace=trace,
     )
-
-
-def apply_api_request_middleware(
-    request: Dict[str, Any],
-    **context: Any,
-) -> RequestMiddlewareResult:
-    """Compatibility wrapper for older ``api_request`` naming."""
-    return apply_llm_request_middleware(request, **context)
-
-
-def run_llm_execution_middleware(
-    request: Dict[str, Any],
-    next_call: Callable[[Dict[str, Any]], Any],
-    **context: Any,
-) -> Any:
-    """Run provider execution through registered LLM execution middleware."""
-    callbacks = _get_middleware_callbacks(LLM_EXECUTION_MIDDLEWARE)
-    if not callbacks:
-        return next_call(request)
-    return _run_execution_chain(
-        LLM_EXECUTION_MIDDLEWARE,
-        callbacks,
-        next_call,
-        request=request,
-        original_request=context.pop("original_request", request),
-        **context,
-    )
-
-
-async def run_llm_execution_middleware_async(
+async def run_llm_execution_middleware(
     request: Dict[str, Any],
     next_call: Callable[[Dict[str, Any]], Any],
     **context: Any,
 ) -> Any:
     """Async execution chain for the coroutine-native agent loop.
 
-    A middleware callback may be synchronous or asynchronous.  Synchronous
-    callbacks are kept synchronous because they are policy/observation code;
-    the terminal provider call is awaited directly and is never hidden inside
-    a thread.  The single-use ``next_call`` contract and failure fallback
-    match :func:`run_llm_execution_middleware`.
+    Middleware callbacks and ``next_call`` are native coroutines. The
+    single-use ``next_call`` contract and failure fallback match the
+    single-use continuation contract of the execution middleware.
     """
     callbacks = _get_middleware_callbacks(LLM_EXECUTION_MIDDLEWARE)
     if not callbacks:
-        result = next_call(request)
-        return await result if inspect.isawaitable(result) else result
+        return await next_call(request)
     return await _run_execution_chain_async(
         LLM_EXECUTION_MIDDLEWARE,
         callbacks,
@@ -231,17 +204,26 @@ async def run_llm_execution_middleware_async(
     )
 
 
-def run_tool_execution_middleware(
+
+
+async def run_tool_execution_middleware(
     tool_name: str,
     args: Dict[str, Any],
     next_call: Callable[[Dict[str, Any]], Any],
     **context: Any,
 ) -> Any:
-    """Run tool execution through registered tool execution middleware."""
+    """Run a tool through coroutine-native execution middleware.
+
+    Async Hermes never hides a tool call in a worker thread.  Middleware that
+    wraps a tool call therefore has the same requirement: it must await its
+    ``next_call`` continuation and return an awaitable itself.  The legacy
+    synchronous chain remains private for code paths not exposed by this
+    package's async agent API.
+    """
     callbacks = _get_middleware_callbacks(TOOL_EXECUTION_MIDDLEWARE)
     if not callbacks:
-        return next_call(args)
-    return _run_execution_chain(
+        return await next_call(args)
+    return await _run_execution_chain_async(
         TOOL_EXECUTION_MIDDLEWARE,
         callbacks,
         next_call,
@@ -252,19 +234,36 @@ def run_tool_execution_middleware(
     )
 
 
-def run_api_execution_middleware(
-    request: Dict[str, Any],
-    next_call: Callable[[Dict[str, Any]], Any],
-    **context: Any,
-) -> Any:
-    """Compatibility wrapper for older ``api_execution`` naming."""
-    return run_llm_execution_middleware(request, next_call, **context)
+class AsyncMiddlewareCapabilityError(RuntimeError):
+    """Raised when a synchronous plugin callback reaches the async agent."""
 
 
-def _invoke_middleware(kind: str, **kwargs: Any) -> List[Any]:
-    from hermes_cli.plugins import invoke_middleware
-
-    return invoke_middleware(kind, **middleware_payload(**kwargs))
+async def _invoke_middleware_async(kind: str, **kwargs: Any) -> List[Any]:
+    """Invoke middleware callbacks without a sync fallback or worker bridge."""
+    callbacks = _get_middleware_callbacks(kind)
+    results: List[Any] = []
+    payload = middleware_payload(**kwargs)
+    for callback in callbacks:
+        try:
+            result = callback(**payload)
+            if not inspect.isawaitable(result):
+                raise AsyncMiddlewareCapabilityError(
+                    "Async Hermes requires coroutine middleware callbacks; "
+                    f"{getattr(callback, '__name__', repr(callback))} is synchronous"
+                )
+            result = await result
+            if result is not None:
+                results.append(result)
+        except AsyncMiddlewareCapabilityError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "Middleware '%s' callback %s raised: %s",
+                kind,
+                getattr(callback, "__name__", repr(callback)),
+                exc,
+            )
+    return results
 
 
 def _has_middleware(kind: str) -> bool:
@@ -360,8 +359,7 @@ async def _run_execution_chain_async(
 
     async def call_at(index: int, payload: Any) -> Any:
         if index >= len(callbacks):
-            result = terminal_call(payload)
-            return await result if inspect.isawaitable(result) else result
+            return await terminal_call(payload)
 
         callback = callbacks[index]
         next_called = False
@@ -392,9 +390,16 @@ async def _run_execution_chain_async(
         call_kwargs["next_call"] = next_call
         try:
             result = callback(**call_kwargs)
-            return await result if inspect.isawaitable(result) else result
+            if not inspect.isawaitable(result):
+                raise AsyncMiddlewareCapabilityError(
+                    "Async Hermes requires coroutine middleware callbacks; "
+                    f"{getattr(callback, '__name__', repr(callback))} is synchronous"
+                )
+            return await result
         except _DownstreamExecutionError as exc:
             raise exc.original
+        except AsyncMiddlewareCapabilityError:
+            raise
         except Exception as exc:
             logger.warning(
                 "Middleware '%s' callback %s raised: %s",

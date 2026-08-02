@@ -9,7 +9,7 @@ session.
 
 from __future__ import annotations
 
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -125,7 +125,7 @@ class TestCompressIntegration:
 
     @pytest.fixture
     def compressor(self):
-        with patch("agent.context_compressor.get_model_context_length", return_value=100_000):
+        with patch("agent.context_compressor.get_static_context_length", return_value=100_000):
             c = ContextCompressor(
                 model="test/model",
                 threshold_percent=0.50,
@@ -135,7 +135,8 @@ class TestCompressIntegration:
             )
             return c
 
-    def test_compress_strips_historical_images(self, compressor):
+    @pytest.mark.asyncio
+    async def test_compress_strips_historical_images(self, compressor):
         # Enough messages to trigger the summarize path. protect_first_n=1 +
         # protect_last_n=2 + a middle window of at least 3 with a summary.
         msgs = [
@@ -150,8 +151,12 @@ class TestCompressIntegration:
             {"role": "assistant", "content": "done"},
         ]
         # Bypass the real LLM summary — return a stub so compress() proceeds.
-        with patch.object(compressor, "_generate_summary", return_value="SUMMARY TEXT"):
-            out = compressor.compress(msgs, current_tokens=60_000)
+        with patch.object(
+            compressor,
+            "_generate_summary",
+            new=AsyncMock(return_value="SUMMARY TEXT"),
+        ):
+            out = await compressor.compress(msgs, current_tokens=60_000)
 
         # Newest user turn with image should still have it (it's in the tail).
         user_imgs = [m for m in out if m.get("role") == "user" and _content_has_images(m.get("content"))]

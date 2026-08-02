@@ -9,10 +9,10 @@ iteration.
 from __future__ import annotations
 
 import hashlib
+import asyncio
 import logging
 import re
 import threading
-from concurrent.futures import ThreadPoolExecutor, wait as _futures_wait
 from typing import Any
 
 from agent.auxiliary_client import call_llm
@@ -280,7 +280,11 @@ def _slot_reasoning_config(slot: dict[str, Any]) -> dict[str, Any] | None:
         return None
 
 
-def _aggregator_reasoning_config(aggregator: dict[str, Any]) -> dict[str, Any] | None:
+async def _aggregator_reasoning_config(
+    aggregator: dict[str, Any],
+    *,
+    config: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
     """Resolve the aggregator's reasoning config: slot > per-model > global.
 
     The aggregator is MoA's ACTING model, so when its slot doesn't pin a
@@ -300,17 +304,19 @@ def _aggregator_reasoning_config(aggregator: dict[str, Any]) -> dict[str, Any] |
     if cfg is not None:
         return cfg
     try:
-        from hermes_cli.config import load_config
+        from hermes_cli.config import load_config_readonly_async
         from hermes_constants import resolve_reasoning_config
 
+        if config is None:
+            config = await load_config_readonly_async()
         return resolve_reasoning_config(
-            load_config() or {}, str(aggregator.get("model") or "")
+            config or {}, str(aggregator.get("model") or "")
         )
     except Exception:  # pragma: no cover - defensive; bad config must not break MoA
         return None
 
 
-def _slot_runtime(slot: dict[str, Any]) -> dict[str, Any]:
+async def _slot_runtime(slot: dict[str, Any]) -> dict[str, Any]:
     """Resolve a reference/aggregator slot to real runtime call kwargs.
 
     A MoA slot is just a model selection — it must be called the same way any
@@ -333,7 +339,7 @@ def _slot_runtime(slot: dict[str, Any]) -> dict[str, Any]:
     try:
         from hermes_cli.runtime_provider import resolve_runtime_provider
 
-        rt = resolve_runtime_provider(requested=provider, target_model=model)
+        rt = await resolve_runtime_provider(requested=provider, target_model=model)
         # Forward the resolved endpoint through to call_llm unconditionally.
         # call_llm's _resolve_task_provider_model() is the single chokepoint that
         # decides whether an explicit base_url collapses a call to the generic
@@ -423,7 +429,7 @@ def _maybe_apply_moa_cache_control(
         return messages
 
 
-def _run_reference(
+async def _run_reference(
     slot: dict[str, Any],
     ref_messages: list[dict[str, Any]],
     *,
@@ -452,14 +458,16 @@ def _run_reference(
     saw the aggregator's usage.
 
     Never raises: a failed reference becomes a labelled note so the aggregator
-    can still act with partial context. Designed to run inside a thread pool —
-    ``call_llm`` is synchronous/blocking, so threads (not asyncio) are the right
-    concurrency primitive, mirroring ``delegate_task``'s batch fan-out.
+    can still act with partial context.
     """
-    from agent.usage_pricing import CanonicalUsage, estimate_usage_cost, normalize_usage
+    from agent.usage_pricing import (
+        CanonicalUsage,
+        estimate_usage_cost_async,
+        normalize_usage,
+    )
 
     label = _slot_label(slot)
-    runtime = _slot_runtime(slot)
+    runtime = await _slot_runtime(slot)
     try:
         # Prepend the advisory-role system prompt so the reference understands
         # it is analyzing state for an aggregator, not acting on the task. The
@@ -473,7 +481,7 @@ def _run_reference(
         # converts to a [failed: …] note (issue #60345). Estimated AFTER the
         # advisory system prompt is prepended so its tokens count against the
         # budget too.
-        messages = _trim_messages_for_reference(
+        messages = await _trim_messages_for_reference(
             messages,
             slot,
             runtime,
@@ -517,7 +525,7 @@ def _run_reference(
             # ``copilot-language-server`` integrator even though standalone
             # Copilot calls work.
             extra_headers = {"x-initiator": "user"}
-        response = call_llm(
+        response = await call_llm(
             task="moa_reference",
             messages=messages,
             temperature=temperature,
@@ -546,7 +554,7 @@ def _run_reference(
         cost_status = None
         cost_source = None
         try:
-            cost = estimate_usage_cost(
+            cost = await estimate_usage_cost_async(
                 slot.get("model") or "",
                 usage,
                 provider=runtime.get("provider"),
@@ -595,7 +603,7 @@ _REFERENCE_DEFAULT_OUTPUT_RESERVE = 8192
 _REFERENCE_TRIM_SAFETY_FRACTION = 0.10
 
 
-def _trim_messages_for_reference(
+async def _trim_messages_for_reference(
     messages: list[dict[str, Any]],
     slot: dict[str, str],
     runtime: dict[str, Any],
@@ -641,7 +649,8 @@ def _trim_messages_for_reference(
 
     from agent.model_metadata import (
         estimate_messages_tokens_rough,
-        get_model_context_length,
+        fetch_endpoint_model_metadata_async,
+        get_static_context_length,
     )
 
     model = str(slot.get("model") or "")
@@ -655,12 +664,23 @@ def _trim_messages_for_reference(
         context_length = context_length_cache[cache_key]
     else:
         try:
-            context_length = get_model_context_length(
-                model=model,
-                base_url=str(runtime.get("base_url") or ""),
-                api_key=str(runtime.get("api_key") or ""),
-                provider=provider,
-            )
+            base_url = str(runtime.get("base_url") or "")
+            metadata = await fetch_endpoint_model_metadata_async(
+                base_url, api_key=str(runtime.get("api_key") or "")
+            ) if base_url else {}
+            entry = metadata.get(model)
+            if entry is None and len(metadata) == 1:
+                entry = next(iter(metadata.values()))
+            if isinstance(entry, dict) and isinstance(entry.get("context_length"), int):
+                context_length = entry["context_length"]
+            else:
+                context_length = get_static_context_length(
+                    model=model,
+                    base_url=base_url,
+                    provider=provider,
+                )
+        except asyncio.CancelledError:
+            raise
         except Exception:
             logger.debug(
                 "MoA reference context-length resolution failed for %s",
@@ -729,7 +749,7 @@ _REFERENCE_POLL_INTERVAL_S = 5.0
 _INTERRUPTED_REFERENCE_NOTE = "[skipped: interrupted by user]"
 
 
-def _run_references_parallel(
+async def _run_references_parallel(
     reference_models: list[dict[str, Any]],
     ref_messages: list[dict[str, Any]],
     *,
@@ -740,38 +760,13 @@ def _run_references_parallel(
     agent: Any = None,
     late_accounting_sink: Any = None,
 ) -> list[tuple[str, str, Any]]:
-    """Fan out all reference models in parallel, returning outputs in order.
+    """Fan out reference calls without blocking the event loop.
 
-    Like ``delegate_task``'s batch mode, every reference is dispatched at once
-    and we block until all of them finish before handing the joined results to
-    the aggregator. Output order matches ``reference_models`` so the
-    ``Reference {idx}`` labelling stays stable. MoA presets that reference
-    another MoA preset are skipped here (recursion guard) with a labelled note.
-
-    If ``progress_callback`` is provided it is invoked as each reference
-    completes: ``progress_callback(refs_done, refs_total, label)``. The total
-    matches ``len(reference_models)`` so listeners can render a status-bar
-    progress like ``MOA: 2/3 refs done``. Best-effort — failures are logged
-    but never break the fan-out (display must never block a turn).
-
-    Each element is ``(label, text, accounting)`` where accounting is a
-    ``_RefAccounting`` object (zeroed for skipped/failed/interrupted
-    references).
-
-    When *agent* is given, the fan-out is interruptible: waiting for the
-    batch is broken into ``_REFERENCE_POLL_INTERVAL_S``-second polls (instead
-    of one blocking ``future.result()`` per reference) so a user interrupt
-    mid-turn can abort the wait — mirroring the same interrupt check
-    ``agent.tool_executor`` already applies to its own concurrent tool
-    batch. This does not add or change any per-reference *timeout* (that is
-    ``reference_timeout`` / ``auxiliary.moa_reference.timeout``, resolved
-    elsewhere) — it only lets the caller stop waiting early. References
-    already in flight cannot be forcibly killed (``call_llm`` is a blocking
-    HTTP call with no interrupt hook of its own, same limitation
-    tool_executor has for tools without an interrupt check); an interrupted
-    reference's own timeout still reaps its thread independently. *agent* is
-    optional and defaults to ``None``, preserving the uninterruptible
-    blocking behavior for any caller that doesn't pass it.
+    Results retain configured-slot order. An internal Hermes interrupt cancels
+    unfinished requests, waits for their cancellation, and returns the same
+    labelled interruption note that the former thread-pool path produced.
+    ``late_accounting_sink`` is retained in the private signature for callers
+    during the migration, but native tasks are cancelled rather than detached.
     """
     from agent.usage_pricing import CanonicalUsage
 
@@ -779,115 +774,74 @@ def _run_references_parallel(
         return []
 
     results: list[tuple[str, str, Any] | None] = [None] * len(reference_models)
-    futures: dict[Any, int] = {}
-    workers = min(_MAX_REFERENCE_WORKERS, len(reference_models))
-    # Reference slots run on bare executor threads, which start with an empty
-    # contextvars.Context — propagate the parent turn's context (approval
-    # callbacks + the Nous Portal conversation tag) into each worker so
-    # advisor calls attribute to the same conversation as the acting turn.
-    from tools.thread_context import propagate_context_to_thread
-
-    total = len(reference_models)
+    tasks: dict[asyncio.Task[tuple[str, str, Any]], int] = {}
     completed = 0
-    executor = ThreadPoolExecutor(max_workers=workers)
     interrupted = False
-    # Per-fan-out context-length cache shared by every reference worker, so
-    # duplicate (provider, model) slots resolve their window once per turn
-    # instead of re-probing metadata sources per reference (dict get/set is
-    # GIL-atomic; a rare duplicate probe on a first-use race is harmless).
-    _ctx_len_cache: dict[tuple[str, str], int | None] = {}
-    try:
-        for idx, slot in enumerate(reference_models):
+    context_length_cache: dict[tuple[str, str], int | None] = {}
+
+    async with asyncio.TaskGroup() as group:
+        for index, slot in enumerate(reference_models):
             if slot.get("provider") == "moa":
-                results[idx] = (
+                results[index] = (
                     _slot_label(slot),
                     "[skipped: MoA presets cannot recursively reference MoA]",
                     _RefAccounting(CanonicalUsage()),
                 )
                 continue
-            futures[
-                executor.submit(
-                    propagate_context_to_thread(_run_reference),
+            task = group.create_task(
+                _run_reference(
                     slot,
                     ref_messages,
                     temperature=temperature,
                     max_tokens=max_tokens,
                     reference_timeout=reference_timeout,
-                    context_length_cache=_ctx_len_cache,
+                    context_length_cache=context_length_cache,
                 )
-            ] = idx
+            )
+            tasks[task] = index
 
-        # Collect every reference before returning — the aggregator needs the
-        # complete set, so there is no early-exit / first-completed path
-        # here, other than a user interrupt. Progress callbacks fire as each
-        # reference completes so frontends can render "MOA: k/n refs done".
-        pending = set(futures)
+        pending = set(tasks)
         while pending:
-            done, pending = _futures_wait(pending, timeout=_REFERENCE_POLL_INTERVAL_S)
-            for future in done:
-                idx = futures[future]
-                results[idx] = future.result()
+            done, pending = await asyncio.wait(
+                pending,
+                timeout=_REFERENCE_POLL_INTERVAL_S,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for task in done:
+                index = tasks[task]
+                try:
+                    # The task is already in ``done``; awaiting it preserves
+                    # cancellation and exception semantics in the async loop.
+                    results[index] = await task
+                except asyncio.CancelledError:
+                    results[index] = (
+                        _slot_label(reference_models[index]),
+                        _INTERRUPTED_REFERENCE_NOTE,
+                        _RefAccounting(CanonicalUsage()),
+                    )
                 completed += 1
                 if progress_callback is not None:
                     try:
-                        label = _slot_label(reference_models[idx])
-                        progress_callback(completed, total, label)
+                        progress_callback(completed, len(reference_models), _slot_label(reference_models[index]))
                     except Exception as exc:  # pragma: no cover - display must never break
                         logger.debug("MoA progress_callback failed: %s", exc)
-            if not pending:
-                break
-            if agent is not None and getattr(agent, "_interrupt_requested", False):
+
+            if pending and agent is not None and getattr(agent, "_interrupt_requested", False):
                 interrupted = True
+                for task in pending:
+                    task.cancel()
+                for task in pending:
+                    index = tasks[task]
+                    results[index] = (
+                        _slot_label(reference_models[index]),
+                        _INTERRUPTED_REFERENCE_NOTE,
+                        _RefAccounting(CanonicalUsage()),
+                    )
                 break
 
-        if interrupted:
-            for future, idx in futures.items():
-                if results[idx] is not None:
-                    continue
-                if future.cancel():
-                    # Never dispatched — genuinely nothing was billed.
-                    results[idx] = (
-                        _slot_label(reference_models[idx]),
-                        _INTERRUPTED_REFERENCE_NOTE,
-                        _RefAccounting(CanonicalUsage()),
-                    )
-                elif future.done():
-                    # Finished between the interrupt check and now — the call
-                    # completed and billed, so keep its REAL output and
-                    # accounting rather than zeroing it with a placeholder.
-                    results[idx] = future.result()
-                else:
-                    # Already running — cannot be force-killed (see
-                    # docstring); leave it be so the caller isn't blocked,
-                    # and note that its output was abandoned. The provider
-                    # call is still in flight and WILL bill when it
-                    # completes, so hand its eventual accounting to the
-                    # caller's sink instead of silently dropping it.
-                    label = _slot_label(reference_models[idx])
-                    results[idx] = (
-                        label,
-                        _INTERRUPTED_REFERENCE_NOTE,
-                        _RefAccounting(CanonicalUsage()),
-                    )
-                    if late_accounting_sink is not None:
-                        def _record_late(f: Any, _label: str = label) -> None:
-                            try:
-                                _lbl, _txt, _acct = f.result()
-                            except Exception:  # pragma: no cover - defensive
-                                return
-                            try:
-                                late_accounting_sink(_label, _acct)
-                            except Exception:  # pragma: no cover - defensive
-                                logger.debug(
-                                    "MoA: late accounting sink failed for %s",
-                                    _label,
-                                )
-                        future.add_done_callback(_record_late)
-    finally:
-        executor.shutdown(wait=not interrupted, cancel_futures=interrupted)
-
-    return [r for r in results if r is not None]
-
+    if interrupted:
+        logger.info("MoA: cancelled unfinished reference calls after user interrupt")
+    return [result for result in results if result is not None]
 
 def _truncate_tool_result(text: str, budget: int = _REFERENCE_TOOL_RESULT_BUDGET) -> str:
     """Head+tail preview of a tool result for the advisory view.
@@ -1158,7 +1112,7 @@ def _degraded_notice(failed_labels: list[str], policy: str) -> str:
     return f"[Reference models unavailable: {', '.join(failed_labels)}]"
 
 
-def aggregate_moa_context(
+async def aggregate_moa_context(
     *,
     user_prompt: str,
     api_messages: list[dict[str, Any]],
@@ -1196,7 +1150,7 @@ def aggregate_moa_context(
     reference_models = [slot for slot in reference_models if slot.get("enabled", True)]
     reference_outputs: list[tuple[str, str, Any]] = []
     ref_messages = _reference_messages(api_messages)
-    reference_outputs = _run_references_parallel(
+    reference_outputs = await _run_references_parallel(
         reference_models,
         ref_messages,
         temperature=temperature,
@@ -1215,9 +1169,9 @@ def aggregate_moa_context(
     # runs on the successful outputs only (failed refs are already filtered
     # into the degraded notice).
     try:
-        from hermes_cli.config import load_config as _load_config
+        from hermes_cli.config import load_config_readonly_async
 
-        if _moa_privacy_mode((_load_config() or {}).get("moa")) == "full":
+        if _moa_privacy_mode((await load_config_readonly_async()).get("moa")) == "full":
             successful_outputs = _redact_reference_outputs(successful_outputs)
     except Exception:  # pragma: no cover - privacy filter must never break a turn
         logger.debug("MoA privacy filter check failed", exc_info=True)
@@ -1260,7 +1214,7 @@ def aggregate_moa_context(
     )
 
     agg_label = _slot_label(aggregator)
-    agg_runtime = _slot_runtime(aggregator)
+    agg_runtime = await _slot_runtime(aggregator)
     try:
         # Same cache_control decoration as _run_reference's advisor calls
         # (see _maybe_apply_moa_cache_control) — this synthesis call is a
@@ -1275,11 +1229,11 @@ def aggregate_moa_context(
         agg_messages = _maybe_apply_moa_cache_control(
             [{"role": "user", "content": synth_prompt}], agg_runtime
         )
-        response = call_llm(
+        response = await call_llm(
             task="moa_aggregator",
             messages=agg_messages,
             temperature=aggregator_temperature,
-            reasoning_config=_aggregator_reasoning_config(aggregator),
+            reasoning_config=await _aggregator_reasoning_config(aggregator),
             **agg_runtime,
         )
         synthesis = _extract_text(response)
@@ -1570,7 +1524,7 @@ class MoAChatCompletions:
         except Exception as exc:  # pragma: no cover - display must never break the turn
             logger.debug("MoA reference_callback failed for %s: %s", event, exc)
 
-    def prepare(self, messages: list[dict[str, Any]]) -> dict[str, Any]:
+    async def prepare(self, messages: list[dict[str, Any]]) -> dict[str, Any]:
         """Run the advisor fan-out and return the exact aggregator request.
 
         The normal agent loop needs to measure this augmented prompt before its
@@ -1578,7 +1532,7 @@ class MoAChatCompletions:
         when the loop supplies the returned private object back to ``create()``,
         the advisor fan-out is not repeated.
         """
-        return self.create(messages=messages, _moa_prepare_only=True)
+        return await self.create(messages=messages, _moa_prepare_only=True)
 
     def rebase_prepared_request(
         self, prepared: dict[str, Any], messages: list[dict[str, Any]]
@@ -1596,7 +1550,7 @@ class MoAChatCompletions:
             _attach_reference_guidance(agg_messages, str(guidance))
         return {**prepared, "messages": agg_messages}
 
-    def _call_prepared_aggregator(
+    async def _call_prepared_aggregator(
         self, prepared: dict[str, Any], api_kwargs: dict[str, Any]
     ) -> Any:
         """Send an already prepared MoA aggregator request exactly once."""
@@ -1649,7 +1603,7 @@ class MoAChatCompletions:
             # actually governs the aggregator stream, not just call_llm's default.
             if api_kwargs.get("timeout") is not None:
                 stream_kwargs["timeout"] = api_kwargs["timeout"]
-        agg_runtime = _slot_runtime(aggregator)
+        agg_runtime = await _slot_runtime(aggregator)
         # _slot_runtime may carry the provider's request_overrides.extra_body;
         # pop it and merge with the caller's extra_body (caller wins) so the
         # explicit kwarg below never collides with **agg_runtime.
@@ -1657,7 +1611,7 @@ class MoAChatCompletions:
             agg_runtime.pop("extra_body", None),
             extra_body,
         )
-        _agg_response = call_llm(
+        _agg_response = await call_llm(
             task="moa_aggregator",
             messages=agg_messages,
             temperature=aggregator_temperature,
@@ -1666,7 +1620,7 @@ class MoAChatCompletions:
             extra_body=agg_extra_body,
             # Prepared requests must retain the acting aggregator's reasoning
             # policy exactly as the direct create() path does (#64187).
-            reasoning_config=_aggregator_reasoning_config(aggregator),
+            reasoning_config=await _aggregator_reasoning_config(aggregator),
             **stream_kwargs,
             **agg_runtime,
         )
@@ -1687,17 +1641,16 @@ class MoAChatCompletions:
                     self._pending_trace["aggregator_output"] = None
         return _agg_response
 
-    def create(self, **api_kwargs: Any) -> Any:
+    async def create(self, **api_kwargs: Any) -> Any:
         prepared_request = api_kwargs.pop("_moa_prepared_request", None)
         if prepared_request is not None:
             if not isinstance(prepared_request, dict):
                 raise TypeError("_moa_prepared_request must be a dict")
-            return self._call_prepared_aggregator(prepared_request, api_kwargs)
+            return await self._call_prepared_aggregator(prepared_request, api_kwargs)
 
-        from hermes_cli.config import load_config
         from hermes_cli.moa_config import resolve_moa_preset
 
-        _moa_raw = load_config().get("moa") or {}
+        _moa_raw = (await load_config_readonly_async()).get("moa") or {}
         preset = resolve_moa_preset(_moa_raw, self.preset_name)
         # Privacy filter mode: '' (off, default) | 'display' | 'full'. See
         # coerce_privacy_filter / the pattern block at the top of this module.
@@ -1883,7 +1836,7 @@ class MoAChatCompletions:
                     label=label,
                 )
 
-            reference_outputs = _run_references_parallel(
+            reference_outputs = await _run_references_parallel(
                 reference_models,
                 ref_messages,
                 temperature=temperature,
@@ -2061,7 +2014,7 @@ class MoAChatCompletions:
         }
         if api_kwargs.pop("_moa_prepare_only", False):
             return prepared_request
-        return self._call_prepared_aggregator(prepared_request, api_kwargs)
+        return await self._call_prepared_aggregator(prepared_request, api_kwargs)
 
 
 class MoAClient:

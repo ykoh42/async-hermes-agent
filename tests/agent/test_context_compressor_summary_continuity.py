@@ -1,6 +1,8 @@
 """Regression tests for iterative context-summary continuity."""
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
 
 from agent.context_compressor import (
     COMPRESSED_SUMMARY_METADATA_KEY,
@@ -14,7 +16,7 @@ from agent.context_compressor import (
 
 
 def _compressor(protect_first_n: int = 1) -> ContextCompressor:
-    with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+    with patch("agent.context_compressor.get_static_context_length", return_value=100000):
         return ContextCompressor(
             model="test/model",
             threshold_percent=0.85,
@@ -94,13 +96,17 @@ def _messages_with_summary_at_index(summary_index: int):
 
 
 
-def test_handoff_in_protected_head_is_replaced_not_duplicated():
+@pytest.mark.asyncio
+async def test_handoff_in_protected_head_is_replaced_not_duplicated():
     """Re-compaction must replace a protected old handoff with the updated one."""
     compressor = _compressor()
     old_summary = "OLD-PROTECTED-HANDOFF unique old summary body"
 
-    with patch("agent.context_compressor.call_llm", return_value=_response("UPDATED summary body")):
-        compressed = compressor.compress(_messages_with_handoff(old_summary))
+    with patch(
+        "agent.context_compressor.call_llm",
+        new=AsyncMock(return_value=_response("UPDATED summary body")),
+    ):
+        compressed = await compressor.compress(_messages_with_handoff(old_summary))
 
     # The summary may be emitted standalone or merged into the first tail
     # message (alternation corner case), so detect it the same way the
@@ -121,7 +127,8 @@ def test_handoff_in_protected_head_is_replaced_not_duplicated():
 
 
 
-def test_recompression_of_current_merged_handoff_preserves_prior_tail_once():
+@pytest.mark.asyncio
+async def test_recompression_of_current_merged_handoff_preserves_prior_tail_once():
     """Current merged handoffs lose only stale summary data on recompression.
 
     Composed contract after #57835 (restart head-protection decay): the
@@ -146,9 +153,9 @@ def test_recompression_of_current_merged_handoff_preserves_prior_tail_once():
     with patch.object(
         compressor,
         "_generate_summary",
-        side_effect=_capture,
+        new=AsyncMock(side_effect=_capture),
     ):
-        result = compressor.compress(
+        result = await compressor.compress(
             _messages_with_merged_handoff(old_summary, prior_tail)
         )
 
@@ -169,13 +176,17 @@ def test_recompression_of_current_merged_handoff_preserves_prior_tail_once():
 
 
 
-def test_resume_handoff_after_default_protected_head_decays_initial_turns():
+@pytest.mark.asyncio
+async def test_resume_handoff_after_default_protected_head_decays_initial_turns():
     """Default protect_first_n=3 should not fossilize old protected head turns."""
     compressor = _compressor(protect_first_n=3)
     old_summary = "DEFAULT-RESTART-SUMMARY durable facts from before restart"
 
-    with patch("agent.context_compressor.call_llm", return_value=_response("fresh summary")) as mock_call:
-        result = compressor.compress(_messages_with_default_handoff(old_summary))
+    with patch(
+        "agent.context_compressor.call_llm",
+        new=AsyncMock(return_value=_response("fresh summary")),
+    ) as mock_call:
+        result = await compressor.compress(_messages_with_default_handoff(old_summary))
 
     prompt = mock_call.call_args.kwargs["messages"][0]["content"]
     assert "PREVIOUS SUMMARY:" in prompt
@@ -203,7 +214,8 @@ def test_resume_handoff_after_default_protected_head_decays_initial_turns():
     )
 
 
-def test_restart_simulation_fresh_compressor_does_not_reprotect_head():
+@pytest.mark.asyncio
+async def test_restart_simulation_fresh_compressor_does_not_reprotect_head():
     """Gateway-restart simulation: a FRESH ContextCompressor (in-memory decay
     state reset — compression_count == 0, _previous_summary is None) over a
     transcript that contains a persisted handoff summary must NOT re-protect
@@ -233,8 +245,11 @@ def test_restart_simulation_fresh_compressor_does_not_reprotect_head():
 
     # End-to-end: the first post-restart compaction must not preserve the
     # pre-restart head turns or the old handoff verbatim.
-    with patch("agent.context_compressor.call_llm", return_value=_response("fresh summary")):
-        result = restarted.compress(msgs)
+    with patch(
+        "agent.context_compressor.call_llm",
+        new=AsyncMock(return_value=_response("fresh summary")),
+    ):
+        result = await restarted.compress(msgs)
     result_text = "\n".join(str(msg.get("content", "")) for msg in result)
     assert "PERSISTED-HANDOFF durable facts" not in result_text
     assert "original task before first compaction" not in result_text
@@ -247,7 +262,8 @@ def test_restart_simulation_fresh_compressor_does_not_reprotect_head():
 
 
 
-def test_zero_protect_first_n_still_folds_restart_fossil():
+@pytest.mark.asyncio
+async def test_zero_protect_first_n_still_folds_restart_fossil():
     """protect_first_n=0 should still self-heal restarted summaries."""
     compressor = _compressor(protect_first_n=0)
     old_summary = "OLD-SUMMARY-ZERO-PROTECT durable facts"
@@ -260,8 +276,11 @@ def test_zero_protect_first_n_still_folds_restart_fossil():
         {"role": "user", "content": "active request"},
     ]
 
-    with patch("agent.context_compressor.call_llm", return_value=_response("fresh summary")):
-        result = compressor.compress(msgs)
+    with patch(
+        "agent.context_compressor.call_llm",
+        new=AsyncMock(return_value=_response("fresh summary")),
+    ):
+        result = await compressor.compress(msgs)
 
     result_text = "\n".join(str(msg.get("content", "")) for msg in result)
     assert old_summary not in result_text
@@ -273,7 +292,8 @@ def test_zero_protect_first_n_still_folds_restart_fossil():
 
 
 
-def test_restart_fossil_survives_summary_abort_then_retry():
+@pytest.mark.asyncio
+async def test_restart_fossil_survives_summary_abort_then_retry():
     """An aborted first compaction must not strand the rehydrated fossil.
 
     Regression for the abort/retry path. The first-compaction self-heal scan
@@ -305,8 +325,12 @@ def test_restart_fossil_survives_summary_abort_then_retry():
     # First compaction aborts on a summary-generation failure. The transcript
     # is returned unchanged AND the self-heal state it rehydrated must be
     # rolled back, so a retry behaves like the original first compaction.
-    with patch.object(compressor, "_generate_summary", return_value=None):
-        aborted = compressor.compress([dict(m) for m in msgs])
+    with patch.object(
+        compressor,
+        "_generate_summary",
+        new=AsyncMock(return_value=None),
+    ):
+        aborted = await compressor.compress([dict(m) for m in msgs])
     assert compressor._last_compress_aborted is True
     assert all(m["content"] for m in aborted)  # returned unchanged
     assert compressor.compression_count == 0
@@ -314,8 +338,11 @@ def test_restart_fossil_survives_summary_abort_then_retry():
 
     # Retry: the fossil beyond the narrow window is still folded, not copied
     # forward as a second stacked summary.
-    with patch("agent.context_compressor.call_llm", return_value=_response("fresh summary")):
-        result = compressor.compress([dict(m) for m in msgs])
+    with patch(
+        "agent.context_compressor.call_llm",
+        new=AsyncMock(return_value=_response("fresh summary")),
+    ):
+        result = await compressor.compress([dict(m) for m in msgs])
 
     assert all(old_summary not in str(msg.get("content", "")) for msg in result)
     assert sum(
@@ -345,7 +372,8 @@ def test_forced_leading_merged_summary_strips_live_tail_from_summary_body():
 
 
 
-def test_empty_post_handoff_window_noops_without_summary_call():
+@pytest.mark.asyncio
+async def test_empty_post_handoff_window_noops_without_summary_call():
     """A latest handoff that consumes the window must not trigger an empty summary.
 
     Regression test from PR #59526 (#59496), fixture adapted to current main:
@@ -368,9 +396,9 @@ def test_empty_post_handoff_window_noops_without_summary_call():
 
     with (
         patch.object(compressor, "_find_tail_cut_by_tokens", return_value=2),
-        patch.object(compressor, "_generate_summary") as mock_generate_summary,
+        patch.object(compressor, "_generate_summary", new_callable=AsyncMock) as mock_generate_summary,
     ):
-        result = compressor.compress(messages, current_tokens=90_000)
+        result = await compressor.compress(messages, current_tokens=90_000)
 
     mock_generate_summary.assert_not_called()
     assert result == messages

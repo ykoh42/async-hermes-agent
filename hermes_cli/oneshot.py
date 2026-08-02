@@ -243,12 +243,14 @@ def run_oneshot(
     try:
         with redirect_stdout(devnull), redirect_stderr(devnull):
             try:
-                response, result = _run_agent(
-                    prompt,
-                    model=model,
-                    provider=provider,
-                    toolsets=explicit_toolsets,
-                    use_config_toolsets=use_config_toolsets,
+                response, result = asyncio.run(
+                    _run_agent(
+                        prompt,
+                        model=model,
+                        provider=provider,
+                        toolsets=explicit_toolsets,
+                        use_config_toolsets=use_config_toolsets,
+                    )
                 )
             except BaseException as exc:  # noqa: BLE001
                 # Capture anything that escapes the agent (including OSError
@@ -303,15 +305,15 @@ def _create_session_db_for_oneshot():
     advertised but every call returns "Session database not available.".
     """
     try:
-        from hermes_state import SessionDB
+        from hermes_state import AsyncSessionDB, _default_db_path
 
-        return SessionDB()
+        return AsyncSessionDB(_default_db_path())
     except Exception as exc:
         logging.debug("SQLite session store not available for oneshot mode: %s", exc)
         return None
 
 
-def _run_agent(
+async def _run_agent(
     prompt: str,
     model: Optional[str] = None,
     provider: Optional[str] = None,
@@ -319,16 +321,20 @@ def _run_agent(
     use_config_toolsets: bool = True,
 ) -> tuple[str, dict]:
     """Build an AIAgent exactly like a normal CLI chat turn would, then
-    run a single conversation.  Returns ``(final_response, run_result)``."""
+    run a single conversation.  Returns ``(final_response, run_result)``.
+
+    The CLI wrapper owns the event loop, while this function stays on the
+    native async provider/session/agent path from resolution through cleanup.
+    """
     # Imports are local so they don't run when hermes is invoked for
     # other commands (keeps top-level CLI startup cheap).
-    from hermes_cli.config import load_config
+    from hermes_cli.config import load_config_readonly_async
     from hermes_cli.models import detect_provider_for_model
     from hermes_cli.runtime_provider import resolve_runtime_provider
     from hermes_cli.tools_config import _get_platform_tools
     from run_agent import AIAgent
 
-    cfg = load_config()
+    cfg = await load_config_readonly_async()
 
     # Resolve effective model: explicit arg → env var → config.
     model_cfg = cfg.get("model") or {}
@@ -383,7 +389,7 @@ def _run_agent(
                 if detected:
                     effective_provider, effective_model = detected
 
-    runtime = resolve_runtime_provider(
+    runtime = await resolve_runtime_provider(
         requested=effective_provider,
         target_model=effective_model or None,
         explicit_base_url=explicit_base_url_from_alias,
@@ -441,31 +447,30 @@ def _run_agent(
         agent.stream_delta_callback = None
         agent.tool_gen_callback = None
 
-        result = asyncio.run(agent.run_conversation(prompt))
+        result = await agent.run_conversation(prompt)
         return (result.get("final_response") or "", result)
     finally:
         # Ordering deliberately mirrors gateway/run.py:_cleanup_agent_resources,
         # NOT cli.py:_run_cleanup — oneshot has no _active_agent_ref and must
         # close the agent explicitly because the hard-exit path skips finalizers.
         if agent is not None:
-            try:
+            async def _cleanup_agent() -> None:
                 session_messages = getattr(agent, "_session_messages", None)
                 if isinstance(session_messages, list):
-                    agent.shutdown_memory_provider(session_messages)
+                    await agent.shutdown_memory_provider(session_messages)
                 else:
-                    agent.shutdown_memory_provider()
-            except Exception:
-                logging.debug("oneshot memory/context cleanup failed", exc_info=True)
+                    await agent.shutdown_memory_provider()
+                await agent.close()
+
             try:
-                agent.close()
+                await _cleanup_agent()
             except Exception:
                 logging.debug("oneshot agent cleanup failed", exc_info=True)
-        # agent.close() calls session_db.end_session() but leaves the connection
-        # open; close it here to checkpoint the WAL before os._exit skips
-        # finalizers.
+        # The async session store owns its connection and must be closed on the
+        # same event loop as the turn before the oneshot process exits.
         if session_db is not None:
             try:
-                session_db.close()
+                await session_db.close()
             except Exception:
                 logging.debug("oneshot session store cleanup failed", exc_info=True)
 

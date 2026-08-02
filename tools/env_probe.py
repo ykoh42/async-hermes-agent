@@ -307,6 +307,19 @@ def get_environment_probe_line(*, force_refresh: bool = False) -> str:
     return _CACHED_LINE or ""
 
 
+def get_cached_environment_probe_line() -> str:
+    """Return a completed probe result without starting or waiting for one.
+
+    System-prompt assembly is part of the async turn prologue. It may include
+    a previously computed diagnostic, but it must never wait for subprocess
+    probes there. Explicit synchronous callers can still use
+    :func:`get_environment_probe_line` when they need a fresh result.
+    """
+    if not _PROBE_DONE.is_set():
+        return ""
+    return _CACHED_LINE or ""
+
+
 def _probe_worker(gen: int) -> None:
     """Body of the single probe thread — computes and publishes the line."""
     global _CACHED_LINE
@@ -339,7 +352,7 @@ def _ensure_probe_started() -> None:
         _PROBE_THREAD.start()
 
 
-def warm_environment_probe_async() -> None:
+def warm_environment_probe() -> None:
     """Kick off the probe in a background thread so the first
     system-prompt build doesn't pay the ~0.5s of subprocess calls
     (python3/pip/PEP-668 version checks) on the time-to-first-token

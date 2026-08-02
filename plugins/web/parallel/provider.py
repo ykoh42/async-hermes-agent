@@ -167,8 +167,8 @@ class ParallelWebSearchProvider(WebSearchProvider):
     def supports_extract(self) -> bool:
         return True
 
-    def search(self, query: str, limit: int = 5) -> Dict[str, Any]:
-        """Execute a Parallel search (sync).
+    async def search(self, query: str, limit: int = 5) -> Dict[str, Any]:
+        """Execute a Parallel search through the native async SDK.
 
         Uses the ``beta.search`` endpoint with the configured mode
         (``PARALLEL_SEARCH_MODE`` env var, default "agentic"). Limit is
@@ -184,7 +184,7 @@ class ParallelWebSearchProvider(WebSearchProvider):
             logger.info(
                 "Parallel search: '%s' (mode=%s, limit=%d)", query, mode, limit
             )
-            response = _get_sync_client().beta.search(
+            response = await _get_async_client().beta.search(
                 search_queries=[query],
                 objective=query,
                 mode=mode,

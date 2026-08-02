@@ -137,7 +137,7 @@ async def test_generate_summary_async_kimi_omits_temperature():
     compressor._get_async_client = MagicMock(return_value=async_client)
 
     metrics = TrajectoryMetrics()
-    result = await compressor._generate_summary_async("tool output", metrics)
+    result = await compressor._generate_summary("tool output", metrics)
 
     assert result.startswith("[CONTEXT SUMMARY]:")
     assert "temperature" not in async_client.chat.completions.create.call_args.kwargs
@@ -166,7 +166,7 @@ async def test_generate_summary_async_public_moonshot_kimi_k2_5_omits_temperatur
     compressor._get_async_client = MagicMock(return_value=async_client)
 
     metrics = TrajectoryMetrics()
-    result = await compressor._generate_summary_async("tool output", metrics)
+    result = await compressor._generate_summary("tool output", metrics)
 
     assert result.startswith("[CONTEXT SUMMARY]:")
     assert "temperature" not in async_client.chat.completions.create.call_args.kwargs
@@ -195,7 +195,7 @@ async def test_generate_summary_async_public_moonshot_cn_kimi_k2_5_omits_tempera
     compressor._get_async_client = MagicMock(return_value=async_client)
 
     metrics = TrajectoryMetrics()
-    result = await compressor._generate_summary_async("tool output", metrics)
+    result = await compressor._generate_summary("tool output", metrics)
 
     assert result.startswith("[CONTEXT SUMMARY]:")
     assert "temperature" not in async_client.chat.completions.create.call_args.kwargs

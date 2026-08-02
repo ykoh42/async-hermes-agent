@@ -8553,17 +8553,1663 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
 
 class AsyncSessionDB:
-    """Async door onto SessionDB: offloads each call via asyncio.to_thread so a blocking SQLite call never freezes the event loop. Generic forwarder — the audit confirms no method returns a live cursor/generator."""
+    """Native-async session store used by the agent turn path.
 
-    def __init__(self, db: "SessionDB") -> None:
-        self._db = db
+    The constructor accepts either the historical ``SessionDB`` object or a
+    database path so existing callers keep working.  Only the path is read
+    from a supplied object; no synchronous connection or method is used by
+    this class.  The SQLite connection and schema are created lazily on the
+    first awaited operation, keeping ``AIAgent.__init__`` state-only.
+
+    Deliberately do not provide a generic ``__getattr__`` bridge: an unknown
+    synchronous database method must fail loudly instead of silently moving
+    work into a thread pool.
+    """
+
+    _WRITE_PATIENCE_S = 60.0
+    _RETRY_MIN_S = 0.02
+    _RETRY_MAX_S = 0.15
+
+    # These aliases point only at pure serialization/replay helpers.  They do
+    # not retain a ``SessionDB`` instance or call its SQLite connection.
+    _CONTENT_JSON_PREFIX = SessionDB._CONTENT_JSON_PREFIX
+    _CONVERSATION_ROW_COLUMNS = SessionDB._CONVERSATION_ROW_COLUMNS
+    _encode_content = SessionDB._encode_content
+    _decode_content = SessionDB._decode_content
+    _encode_display_metadata = staticmethod(SessionDB._encode_display_metadata)
+    _decode_display_metadata = staticmethod(SessionDB._decode_display_metadata)
+    _is_duplicate_replayed_user_message = staticmethod(
+        SessionDB._is_duplicate_replayed_user_message
+    )
+    _rows_to_conversation = SessionDB._rows_to_conversation
+    _sanitize_fts5_query = staticmethod(SessionDB._sanitize_fts5_query)
+
+    def __init__(self, db: "SessionDB | os.PathLike[str] | str") -> None:
+        self._db_path = Path(getattr(db, "db_path", db))
+        self._connection = None
+        self._connect_lock = None
+        self._write_lock = None
+        self._schema_ready = False
+        self._closed = False
+
+    def _get_connect_lock(self) -> asyncio.Lock:
+        if self._connect_lock is None:
+            self._connect_lock = asyncio.Lock()
+        return self._connect_lock
+
+    def _get_write_lock(self) -> asyncio.Lock:
+        if self._write_lock is None:
+            self._write_lock = asyncio.Lock()
+        return self._write_lock
+
+    async def _get_connection(self):
+        if self._closed:
+            raise RuntimeError("AsyncSessionDB is closed")
+        if self._connection is not None:
+            return self._connection
+
+        async with self._get_connect_lock():
+            if self._connection is not None:
+                return self._connection
+            import aiosqlite
+
+            import aiofiles.os
+
+            if not await aiofiles.os.path.exists(self._db_path.parent):
+                await aiofiles.os.makedirs(self._db_path.parent, exist_ok=True)
+            connection = await aiosqlite.connect(
+                self._db_path,
+                timeout=1.0,
+                isolation_level=None,
+            )
+            connection.row_factory = sqlite3.Row
+            try:
+                await connection.execute("PRAGMA foreign_keys=ON")
+                await connection.execute("PRAGMA busy_timeout=1000")
+                await self._ensure_schema(connection)
+            except BaseException:
+                await connection.close()
+                raise
+            self._connection = connection
+            return connection
+
+    async def _ensure_schema(self, connection) -> None:
+        """Create/reconcile the transcript tables without a sync DB hop.
+
+        FTS maintenance remains owned by the optional session-search surface;
+        the active turn only needs the durable session/message tables and their
+        indexes.  Column reconciliation is deliberately performed with
+        ``aiosqlite`` PRAGMA/ALTER statements so a first turn against a fresh
+        or older database never executes synchronous SQLite I/O.
+        """
+        if self._schema_ready:
+            return
+        await connection.executescript(SCHEMA_SQL)
+        expected = SessionSchemaMixin._parse_schema_columns(SCHEMA_SQL)
+        for table_name, declared_columns in expected.items():
+            cursor = await connection.execute(
+                f'PRAGMA table_info("{table_name}")'
+            )
+            live_columns = {row[1] for row in await cursor.fetchall()}
+            for column_name, column_type in declared_columns.items():
+                if column_name in live_columns:
+                    continue
+                safe_name = column_name.replace('"', '""')
+                await connection.execute(
+                    f'ALTER TABLE "{table_name}" ADD COLUMN "{safe_name}" {column_type}'
+                )
+        await connection.executescript(DEFERRED_INDEX_SQL)
+        await connection.execute(
+            "UPDATE messages SET active = 1 WHERE active IS NULL"
+        )
+        await connection.commit()
+        self._schema_ready = True
+
+    @staticmethod
+    def _is_retryable_lock_error(exc: Exception) -> bool:
+        message = str(exc).lower()
+        return "database is locked" in message or "database is busy" in message
+
+    async def _write(self, operation):
+        """Run one short transaction, yielding between SQLite lock retries."""
+        async with self._get_write_lock():
+            connection = await self._get_connection()
+            deadline = time.monotonic() + self._WRITE_PATIENCE_S
+            delay = self._RETRY_MIN_S
+            while True:
+                try:
+                    await connection.execute("BEGIN IMMEDIATE")
+                    result = await operation(connection)
+                    await connection.commit()
+                    return result
+                except asyncio.CancelledError:
+                    # Do not leave a partially-open transaction on the shared
+                    # connection when a turn is cancelled during persistence.
+                    try:
+                        await connection.rollback()
+                    except Exception:
+                        pass
+                    raise
+                except Exception as exc:
+                    try:
+                        await connection.rollback()
+                    except Exception:
+                        pass
+                    if not self._is_retryable_lock_error(exc) or time.monotonic() >= deadline:
+                        raise
+                    await asyncio.sleep(random.uniform(delay / 2, delay))
+                    delay = min(delay * 2, self._RETRY_MAX_S)
+
+    async def create_session(self, session_id: str, source: str, **kwargs) -> str:
+        """Create or enrich the turn's session row without blocking the loop."""
+        model_config = kwargs.get("model_config")
+        parent_session_id = kwargs.get("parent_session_id")
+
+        async def _create(connection):
+            await connection.execute(
+                """INSERT INTO sessions (
+                   id, source, user_id, session_key, chat_id, chat_type, thread_id,
+                   model, model_config, system_prompt, parent_session_id, cwd,
+                   profile_name, git_repo_root, started_at
+                )
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(id) DO UPDATE SET
+                       model = COALESCE(sessions.model, excluded.model),
+                       model_config = COALESCE(sessions.model_config, excluded.model_config),
+                       system_prompt = COALESCE(sessions.system_prompt, excluded.system_prompt),
+                       session_key = COALESCE(sessions.session_key, excluded.session_key),
+                       chat_id = COALESCE(sessions.chat_id, excluded.chat_id),
+                       chat_type = COALESCE(sessions.chat_type, excluded.chat_type),
+                       thread_id = COALESCE(sessions.thread_id, excluded.thread_id),
+                       parent_session_id = COALESCE(sessions.parent_session_id, excluded.parent_session_id),
+                       cwd = COALESCE(sessions.cwd, excluded.cwd),
+                       profile_name = COALESCE(sessions.profile_name, excluded.profile_name),
+                       git_repo_root = COALESCE(sessions.git_repo_root, excluded.git_repo_root)""",
+                (
+                    session_id,
+                    source,
+                    kwargs.get("user_id"),
+                    kwargs.get("session_key"),
+                    kwargs.get("chat_id"),
+                    kwargs.get("chat_type"),
+                    kwargs.get("thread_id"),
+                    kwargs.get("model"),
+                    json.dumps(model_config) if model_config else None,
+                    kwargs.get("system_prompt"),
+                    parent_session_id,
+                    kwargs.get("cwd"),
+                    kwargs.get("profile_name"),
+                    kwargs.get("git_repo_root"),
+                    time.time(),
+                ),
+            )
+            if parent_session_id:
+                await connection.execute(
+                    """UPDATE sessions
+                       SET cwd = COALESCE(sessions.cwd,
+                                 (SELECT p.cwd FROM sessions p
+                                   WHERE p.id = sessions.parent_session_id)),
+                           git_repo_root = COALESCE(sessions.git_repo_root,
+                                           (SELECT p.git_repo_root FROM sessions p
+                                             WHERE p.id = sessions.parent_session_id)),
+                           git_branch = COALESCE(sessions.git_branch,
+                                        (SELECT p.git_branch FROM sessions p
+                                          WHERE p.id = sessions.parent_session_id)),
+                           profile_name = COALESCE(sessions.profile_name,
+                                          (SELECT p.profile_name FROM sessions p
+                                            WHERE p.id = sessions.parent_session_id))
+                     WHERE id = ? AND parent_session_id IS NOT NULL""",
+                    (session_id,),
+                )
+                await connection.execute(
+                    """UPDATE sessions
+                       SET user_id = COALESCE(sessions.user_id,
+                                     (SELECT p.user_id FROM sessions p
+                                       WHERE p.id = sessions.parent_session_id)),
+                           session_key = COALESCE(sessions.session_key,
+                                         (SELECT p.session_key FROM sessions p
+                                           WHERE p.id = sessions.parent_session_id)),
+                           chat_id = COALESCE(sessions.chat_id,
+                                     (SELECT p.chat_id FROM sessions p
+                                       WHERE p.id = sessions.parent_session_id)),
+                           chat_type = COALESCE(sessions.chat_type,
+                                       (SELECT p.chat_type FROM sessions p
+                                         WHERE p.id = sessions.parent_session_id)),
+                           thread_id = COALESCE(sessions.thread_id,
+                                       (SELECT p.thread_id FROM sessions p
+                                         WHERE p.id = sessions.parent_session_id)),
+                           display_name = COALESCE(sessions.display_name,
+                                          (SELECT p.display_name FROM sessions p
+                                            WHERE p.id = sessions.parent_session_id)),
+                           origin_json = COALESCE(sessions.origin_json,
+                                         (SELECT p.origin_json FROM sessions p
+                                           WHERE p.id = sessions.parent_session_id))
+                     WHERE id = ? AND parent_session_id IS NOT NULL
+                       AND EXISTS (
+                           SELECT 1 FROM sessions p
+                           WHERE p.id = sessions.parent_session_id
+                             AND p.end_reason = 'compression'
+                       )""",
+                    (session_id,),
+                )
+
+        await self._write(_create)
+        return session_id
+
+    async def append_message(
+        self,
+        session_id: str,
+        role: str,
+        content: str = None,
+        tool_name: str = None,
+        tool_calls: Any = None,
+        tool_call_id: str = None,
+        token_count: int = None,
+        finish_reason: str = None,
+        reasoning: str = None,
+        reasoning_content: str = None,
+        reasoning_details: Any = None,
+        codex_reasoning_items: Any = None,
+        codex_message_items: Any = None,
+        platform_message_id: str = None,
+        observed: bool = False,
+        effect_disposition: Optional[str] = None,
+        timestamp: Any = None,
+        api_content: Optional[str] = None,
+        display_kind: Optional[str] = None,
+        display_metadata: Optional[Dict[str, Any]] = None,
+        compression_lock_holder: Optional[str] = None,
+    ) -> int:
+        """Append one transcript row using the same wire serialization as SessionDB."""
+        display_metadata_json = self._encode_display_metadata(display_metadata)
+        reasoning_details_json = json.dumps(reasoning_details) if reasoning_details else None
+        codex_items_json = json.dumps(codex_reasoning_items) if codex_reasoning_items else None
+        codex_message_items_json = (
+            json.dumps(codex_message_items) if codex_message_items else None
+        )
+        if isinstance(tool_calls, str):
+            try:
+                tool_calls = json.loads(tool_calls)
+            except (json.JSONDecodeError, TypeError):
+                tool_calls = []
+        tool_calls_json = json.dumps(tool_calls) if tool_calls else None
+        stored_content = self._encode_content(content)
+        message_timestamp = time.time()
+        if timestamp is not None:
+            try:
+                message_timestamp = float(
+                    timestamp.timestamp() if hasattr(timestamp, "timestamp") else timestamp
+                )
+            except (TypeError, ValueError):
+                logger.debug("Ignoring invalid explicit message timestamp: %r", timestamp)
+        num_tool_calls = len(tool_calls) if isinstance(tool_calls, list) else int(tool_calls is not None)
+
+        async def _append(connection):
+            active_lock_cursor = await connection.execute(
+                "SELECT holder FROM compression_locks "
+                "WHERE session_id = ? AND expires_at > ?",
+                (session_id, time.time()),
+            )
+            active_lock = await active_lock_cursor.fetchone()
+            if (
+                active_lock is not None
+                and active_lock["holder"] != compression_lock_holder
+            ):
+                raise CompressionSessionBusyError(
+                    f"Session {session_id!r} is being compressed by another writer"
+                )
+            session_cursor = await connection.execute(
+                "SELECT ended_at, end_reason FROM sessions WHERE id = ?",
+                (session_id,),
+            )
+            session = await session_cursor.fetchone()
+            if (
+                session is not None
+                and session["ended_at"] is not None
+                and session["end_reason"] == "compression"
+            ):
+                raise CompressionSessionClosedError(session_id)
+            cursor = await connection.execute(
+                """INSERT INTO messages (session_id, role, content, tool_call_id,
+                   tool_calls, tool_name, effect_disposition, timestamp, token_count, finish_reason,
+                   reasoning, reasoning_content, reasoning_details, codex_reasoning_items,
+                   codex_message_items, platform_message_id, observed, active, api_content, display_kind, display_metadata)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    session_id, role, stored_content, tool_call_id, tool_calls_json,
+                    _scrub_surrogates(tool_name), effect_disposition, message_timestamp,
+                    token_count, finish_reason, _scrub_surrogates(reasoning),
+                    _scrub_surrogates(reasoning_content), reasoning_details_json,
+                    codex_items_json, codex_message_items_json, platform_message_id,
+                    1 if observed else 0, 1,
+                    _scrub_surrogates(api_content) if isinstance(api_content, str) else None,
+                    _scrub_surrogates(display_kind) if isinstance(display_kind, str) else None,
+                    display_metadata_json,
+                ),
+            )
+            if num_tool_calls:
+                await connection.execute(
+                    "UPDATE sessions SET message_count = message_count + 1, "
+                    "tool_call_count = tool_call_count + ? WHERE id = ?",
+                    (num_tool_calls, session_id),
+                )
+            else:
+                await connection.execute(
+                    "UPDATE sessions SET message_count = message_count + 1 WHERE id = ?",
+                    (session_id,),
+                )
+            return cursor.lastrowid
+
+        return await self._write(_append)
+
+    async def end_session(self, session_id: str, end_reason: str) -> None:
+        async def _end(connection):
+            await connection.execute(
+                "UPDATE sessions SET ended_at = ?, end_reason = ? "
+                "WHERE id = ? AND ended_at IS NULL",
+                (time.time(), end_reason, session_id),
+            )
+
+        await self._write(_end)
+
+    async def try_acquire_compression_lock(
+        self,
+        session_id: str,
+        holder: str,
+        ttl_seconds: float = 300.0,
+    ) -> bool:
+        """Atomically acquire an expiring compression lease."""
+        if not session_id or not holder:
+            return False
+        now = time.time()
+
+        async def _acquire(connection):
+            row = await (
+                await connection.execute(
+                    "SELECT holder, expires_at FROM compression_locks WHERE session_id = ?",
+                    (session_id,),
+                )
+            ).fetchone()
+            if row is not None and (
+                float(row["expires_at"]) < now
+                or _compression_lock_holder_process_is_dead(row["holder"])
+            ):
+                await connection.execute(
+                    "DELETE FROM compression_locks WHERE session_id = ? AND holder = ?",
+                    (session_id, row["holder"]),
+                )
+            await connection.execute(
+                "INSERT OR IGNORE INTO compression_locks "
+                "(session_id, holder, acquired_at, expires_at) VALUES (?, ?, ?, ?)",
+                (session_id, holder, now, now + ttl_seconds),
+            )
+            owner = await (
+                await connection.execute(
+                    "SELECT holder FROM compression_locks WHERE session_id = ?",
+                    (session_id,),
+                )
+            ).fetchone()
+            return owner is not None and owner["holder"] == holder
+
+        try:
+            return bool(await self._write(_acquire))
+        except sqlite3.Error as exc:
+            logger.warning("try_acquire_compression_lock(%s) failed: %s", session_id, exc)
+            return False
+
+    async def refresh_compression_lock(
+        self,
+        session_id: str,
+        holder: str,
+        ttl_seconds: float = 300.0,
+    ) -> bool:
+        """Extend a lease only while its owner still matches."""
+        if not session_id or not holder:
+            return False
+
+        async def _refresh(connection):
+            cursor = await connection.execute(
+                "UPDATE compression_locks SET expires_at = ? "
+                "WHERE session_id = ? AND holder = ?",
+                (time.time() + ttl_seconds, session_id, holder),
+            )
+            return cursor.rowcount > 0
+
+        try:
+            return bool(await self._write(_refresh))
+        except sqlite3.Error as exc:
+            logger.warning("refresh_compression_lock(%s) failed: %s", session_id, exc)
+            return False
+
+    async def release_compression_lock(self, session_id: str, holder: str) -> None:
+        """Release a compression lease iff it is still owned by *holder*."""
+        if not session_id or not holder:
+            return
+
+        async def _release(connection):
+            await connection.execute(
+                "DELETE FROM compression_locks WHERE session_id = ? AND holder = ?",
+                (session_id, holder),
+            )
+
+        try:
+            await self._write(_release)
+        except sqlite3.Error as exc:
+            logger.warning("release_compression_lock(%s) failed: %s", session_id, exc)
+
+    async def get_compression_lock_holder(self, session_id: str) -> Optional[str]:
+        """Return the live compression-lease owner, if any."""
+        if not session_id:
+            return None
+        connection = await self._get_connection()
+        row = await (
+            await connection.execute(
+                "SELECT holder FROM compression_locks "
+                "WHERE session_id = ? AND expires_at >= ?",
+                (session_id, time.time()),
+            )
+        ).fetchone()
+        return row["holder"] if row is not None else None
+
+    async def archive_and_compact(
+        self,
+        session_id: str,
+        compacted_messages: List[Dict[str, Any]],
+    ) -> int:
+        """Atomically archive live rows and insert the compacted transcript."""
+        async def _archive(connection):
+            await connection.execute(
+                "UPDATE messages SET active = 0, compacted = 1 "
+                "WHERE session_id = ? AND active = 1",
+                (session_id,),
+            )
+            now_ts = time.time()
+            tool_calls_total = 0
+            for message in compacted_messages:
+                role = message.get("role", "unknown")
+                tool_calls = message.get("tool_calls")
+                if isinstance(tool_calls, str):
+                    try:
+                        tool_calls = json.loads(tool_calls)
+                    except (json.JSONDecodeError, TypeError):
+                        tool_calls = []
+                timestamp = message.get("timestamp", now_ts)
+                try:
+                    timestamp = float(
+                        timestamp.timestamp()
+                        if hasattr(timestamp, "timestamp")
+                        else timestamp
+                    )
+                except (TypeError, ValueError):
+                    timestamp = now_ts
+                reasoning_details = (
+                    message.get("reasoning_details") if role == "assistant" else None
+                )
+                codex_reasoning_items = (
+                    message.get("codex_reasoning_items") if role == "assistant" else None
+                )
+                codex_message_items = (
+                    message.get("codex_message_items") if role == "assistant" else None
+                )
+                await connection.execute(
+                    """INSERT INTO messages (session_id, role, content, tool_call_id,
+                       tool_calls, tool_name, effect_disposition, timestamp, token_count, finish_reason,
+                       reasoning, reasoning_content, reasoning_details, codex_reasoning_items,
+                       codex_message_items, platform_message_id, observed, active, api_content, display_kind, display_metadata)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        session_id,
+                        role,
+                        self._encode_content(message.get("content")),
+                        message.get("tool_call_id"),
+                        json.dumps(tool_calls) if tool_calls else None,
+                        _scrub_surrogates(message.get("tool_name")),
+                        message.get("effect_disposition"),
+                        timestamp,
+                        message.get("token_count"),
+                        message.get("finish_reason"),
+                        _scrub_surrogates(message.get("reasoning"))
+                        if role == "assistant"
+                        else None,
+                        _scrub_surrogates(message.get("reasoning_content"))
+                        if role == "assistant"
+                        else None,
+                        json.dumps(reasoning_details) if reasoning_details else None,
+                        json.dumps(codex_reasoning_items) if codex_reasoning_items else None,
+                        json.dumps(codex_message_items) if codex_message_items else None,
+                        message.get("platform_message_id") or message.get("message_id"),
+                        1 if message.get("observed") else 0,
+                        1,
+                        _scrub_surrogates(message.get("api_content"))
+                        if isinstance(message.get("api_content"), str)
+                        else None,
+                        _scrub_surrogates(message.get("display_kind"))
+                        if isinstance(message.get("display_kind"), str)
+                        else None,
+                        self._encode_display_metadata(message.get("display_metadata")),
+                    ),
+                )
+                tool_calls_total += (
+                    len(tool_calls) if isinstance(tool_calls, list) else int(tool_calls is not None)
+                )
+                now_ts = max(now_ts + 1e-6, timestamp + 1e-6)
+            await connection.execute(
+                "UPDATE sessions SET message_count = ?, tool_call_count = ? WHERE id = ?",
+                (len(compacted_messages), tool_calls_total, session_id),
+            )
+            return len(compacted_messages)
+
+        return await self._write(_archive)
+
+    async def update_system_prompt(self, session_id: str, system_prompt: str) -> None:
+        """Persist the assembled prompt without a synchronous SQLite call."""
+        async def _update(connection):
+            await connection.execute(
+                "UPDATE sessions SET system_prompt = ? WHERE id = ?",
+                (system_prompt, session_id),
+            )
+
+        await self._write(_update)
+
+    async def set_latest_user_api_content(
+        self, session_id: str, content: Any, api_content: str
+    ) -> int:
+        """Backfill the API sidecar on the newest matching active user row."""
+        encoded = self._encode_content(content)
+
+        async def _update(connection):
+            cursor = await connection.execute(
+                "UPDATE messages SET api_content = ? WHERE id = ("
+                "SELECT id FROM messages "
+                "WHERE session_id = ? AND role = 'user' AND active = 1 "
+                "ORDER BY id DESC LIMIT 1"
+                ") AND content IS ?",
+                (_scrub_surrogates(api_content), session_id, encoded),
+            )
+            return cursor.rowcount
+
+        return await self._write(_update)
+
+    async def record_auxiliary_usage(
+        self,
+        session_id: str,
+        task: str,
+        *,
+        model: Optional[str] = None,
+        billing_provider: Optional[str] = None,
+        billing_base_url: Optional[str] = None,
+        input_tokens: int = 0,
+        output_tokens: int = 0,
+        cache_read_tokens: int = 0,
+        cache_write_tokens: int = 0,
+        reasoning_tokens: int = 0,
+        estimated_cost_usd: Optional[float] = None,
+    ) -> None:
+        """Persist one auxiliary-model usage delta without sync SQLite I/O."""
+        if not session_id or not task:
+            return
+        await self.create_session(session_id, "unknown")
+        now = time.time()
+
+        async def _record(connection):
+            await connection.execute(
+                """INSERT INTO session_model_usage (
+                       session_id, model, billing_provider, billing_base_url,
+                       billing_mode, task, api_call_count, input_tokens,
+                       output_tokens, cache_read_tokens, cache_write_tokens,
+                       reasoning_tokens, estimated_cost_usd, actual_cost_usd,
+                       cost_status, cost_source, first_seen, last_seen
+                   ) VALUES (?, ?, ?, ?, '', ?, 1, ?, ?, ?, ?, ?, ?, 0, NULL, NULL, ?, ?)
+                   ON CONFLICT(session_id, model, billing_provider, billing_base_url,
+                               billing_mode, task)
+                   DO UPDATE SET
+                       api_call_count = api_call_count + 1,
+                       input_tokens = input_tokens + excluded.input_tokens,
+                       output_tokens = output_tokens + excluded.output_tokens,
+                       cache_read_tokens = cache_read_tokens + excluded.cache_read_tokens,
+                       cache_write_tokens = cache_write_tokens + excluded.cache_write_tokens,
+                       reasoning_tokens = reasoning_tokens + excluded.reasoning_tokens,
+                       estimated_cost_usd = estimated_cost_usd + excluded.estimated_cost_usd,
+                       last_seen = excluded.last_seen""",
+                (
+                    session_id,
+                    model or "unknown",
+                    billing_provider or "",
+                    billing_base_url or "",
+                    task,
+                    input_tokens or 0,
+                    output_tokens or 0,
+                    cache_read_tokens or 0,
+                    cache_write_tokens or 0,
+                    reasoning_tokens or 0,
+                    float(estimated_cost_usd or 0.0),
+                    now,
+                    now,
+                ),
+            )
+
+        await self._write(_record)
+
+    async def update_token_counts(
+        self,
+        session_id: str,
+        input_tokens: int = 0,
+        output_tokens: int = 0,
+        model: str = None,
+        cache_read_tokens: int = 0,
+        cache_write_tokens: int = 0,
+        reasoning_tokens: int = 0,
+        estimated_cost_usd: Optional[float] = None,
+        actual_cost_usd: Optional[float] = None,
+        cost_status: Optional[str] = None,
+        cost_source: Optional[str] = None,
+        pricing_version: Optional[str] = None,
+        billing_provider: Optional[str] = None,
+        billing_base_url: Optional[str] = None,
+        billing_mode: Optional[str] = None,
+        api_call_count: int = 0,
+        absolute: bool = False,
+    ) -> None:
+        """Persist one token-accounting update through the async connection."""
+        await self.create_session(session_id, "unknown", model=model)
+        has_accounted_usage = bool(
+            input_tokens or output_tokens or cache_read_tokens
+            or cache_write_tokens or reasoning_tokens or api_call_count
+            or estimated_cost_usd or actual_cost_usd
+        )
+        if absolute:
+            sql = """UPDATE sessions SET
+                   input_tokens = ?, output_tokens = ?,
+                   cache_read_tokens = ?, cache_write_tokens = ?,
+                   reasoning_tokens = ?, estimated_cost_usd = COALESCE(?, 0),
+                   actual_cost_usd = CASE WHEN ? IS NULL THEN actual_cost_usd ELSE ? END,
+                   cost_status = COALESCE(?, cost_status),
+                   cost_source = COALESCE(?, cost_source),
+                   pricing_version = COALESCE(?, pricing_version),
+                   billing_provider = COALESCE(billing_provider, ?),
+                   billing_base_url = COALESCE(billing_base_url, ?),
+                   billing_mode = COALESCE(billing_mode, ?),
+                   model = COALESCE(model, ?), api_call_count = ?
+                   WHERE id = ?"""
+        else:
+            sql = """UPDATE sessions SET
+                   input_tokens = input_tokens + ?, output_tokens = output_tokens + ?,
+                   cache_read_tokens = cache_read_tokens + ?,
+                   cache_write_tokens = cache_write_tokens + ?,
+                   reasoning_tokens = reasoning_tokens + ?,
+                   estimated_cost_usd = COALESCE(estimated_cost_usd, 0) + COALESCE(?, 0),
+                   actual_cost_usd = CASE
+                       WHEN ? IS NULL THEN actual_cost_usd
+                       ELSE COALESCE(actual_cost_usd, 0) + ?
+                   END,
+                   cost_status = COALESCE(?, cost_status),
+                   cost_source = COALESCE(?, cost_source),
+                   pricing_version = COALESCE(?, pricing_version),
+                   billing_provider = COALESCE(billing_provider, ?),
+                   billing_base_url = COALESCE(billing_base_url, ?),
+                   billing_mode = COALESCE(billing_mode, ?),
+                   model = COALESCE(model, ?),
+                   api_call_count = COALESCE(api_call_count, 0) + ?
+                   WHERE id = ?"""
+        params = (
+            input_tokens,
+            output_tokens,
+            cache_read_tokens,
+            cache_write_tokens,
+            reasoning_tokens,
+            estimated_cost_usd,
+            actual_cost_usd,
+            actual_cost_usd,
+            cost_status,
+            cost_source,
+            pricing_version,
+            billing_provider if has_accounted_usage else None,
+            billing_base_url if has_accounted_usage else None,
+            billing_mode if has_accounted_usage else None,
+            model if has_accounted_usage else None,
+            api_call_count,
+            session_id,
+        )
+
+        async def _update(connection):
+            await connection.execute(sql, params)
+            if absolute or not has_accounted_usage:
+                return
+            await connection.execute(
+                """INSERT INTO session_model_usage (
+                       session_id, model, billing_provider, billing_base_url,
+                       billing_mode, task, api_call_count, input_tokens,
+                       output_tokens, cache_read_tokens, cache_write_tokens,
+                       reasoning_tokens, estimated_cost_usd, actual_cost_usd,
+                       cost_status, cost_source, first_seen, last_seen
+                   ) VALUES (?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(session_id, model, billing_provider, billing_base_url,
+                               billing_mode, task)
+                   DO UPDATE SET
+                       api_call_count = api_call_count + excluded.api_call_count,
+                       input_tokens = input_tokens + excluded.input_tokens,
+                       output_tokens = output_tokens + excluded.output_tokens,
+                       cache_read_tokens = cache_read_tokens + excluded.cache_read_tokens,
+                       cache_write_tokens = cache_write_tokens + excluded.cache_write_tokens,
+                       reasoning_tokens = reasoning_tokens + excluded.reasoning_tokens,
+                       estimated_cost_usd = estimated_cost_usd + excluded.estimated_cost_usd,
+                       actual_cost_usd = actual_cost_usd + excluded.actual_cost_usd,
+                       cost_status = COALESCE(excluded.cost_status, cost_status),
+                       cost_source = COALESCE(excluded.cost_source, cost_source),
+                       last_seen = excluded.last_seen""",
+                (
+                    session_id,
+                    model or "unknown",
+                    billing_provider or "",
+                    billing_base_url or "",
+                    billing_mode or "",
+                    api_call_count or 0,
+                    input_tokens or 0,
+                    output_tokens or 0,
+                    cache_read_tokens or 0,
+                    cache_write_tokens or 0,
+                    reasoning_tokens or 0,
+                    float(estimated_cost_usd or 0.0),
+                    float(actual_cost_usd or 0.0),
+                    cost_status,
+                    cost_source,
+                    time.time(),
+                    time.time(),
+                ),
+            )
+
+        await self._write(_update)
+
+    async def update_session_billing_route(
+        self,
+        session_id: str,
+        *,
+        provider: str,
+        base_url: str,
+        billing_mode: Optional[str] = None,
+    ) -> None:
+        """Persist a model-route change through the native async connection."""
+        async def _update_route(connection):
+            await connection.execute(
+                """UPDATE sessions SET
+                   billing_provider = ?,
+                   billing_base_url = ?,
+                   billing_mode = COALESCE(?, billing_mode),
+                   system_prompt = NULL
+                   WHERE id = ?""",
+                (provider, base_url, billing_mode, session_id),
+            )
+
+        await self._write(_update_route)
+
+    async def get_meta(self, key: str) -> Optional[str]:
+        """Read a value from the durable ``state_meta`` store.
+
+        This is the asynchronous counterpart of :meth:`SessionDB.get_meta`.
+        It performs the lookup on the native aiosqlite connection rather than
+        delegating to the compatibility ``SessionDB`` object or a worker
+        thread.
+        """
+        connection = await self._get_connection()
+        cursor = await connection.execute(
+            "SELECT value FROM state_meta WHERE key = ?", (key,)
+        )
+        row = await cursor.fetchone()
+        return row["value"] if row is not None else None
+
+    async def set_meta(self, key: str, value: str) -> None:
+        """Atomically upsert a value in the durable ``state_meta`` store."""
+
+        async def _set(connection):
+            await connection.execute(
+                "INSERT INTO state_meta (key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (key, value),
+            )
+
+        await self._write(_set)
+
+    async def delete_meta(self, key: str) -> bool:
+        """Delete one metadata key and report whether a row was removed."""
+
+        async def _delete(connection):
+            cursor = await connection.execute(
+                "DELETE FROM state_meta WHERE key = ?", (key,)
+            )
+            return cursor.rowcount > 0
+
+        return await self._write(_delete)
+
+    async def list_gateway_sessions(
+        self,
+        *,
+        platform: Optional[str] = None,
+        active_only: bool = True,
+    ) -> list[dict[str, Any]]:
+        """List the newest routed session for each gateway session key.
+
+        The result shape and filtering semantics match
+        :meth:`SessionDB.list_gateway_sessions`; the query is executed on the
+        native async connection so status/dashboard consumers can migrate
+        without reintroducing synchronous SQLite I/O.
+        """
+        connection = await self._get_connection()
+        query = """
+            SELECT sessions.*,
+                   COALESCE(
+                       (SELECT MAX(m.timestamp) FROM messages m
+                        WHERE m.session_id = sessions.id),
+                       sessions.started_at
+                   ) AS last_active
+            FROM sessions
+            WHERE session_key IS NOT NULL
+              AND started_at = (
+                  SELECT MAX(s2.started_at) FROM sessions s2
+                  WHERE s2.session_key = sessions.session_key
+              )
+        """
+        params: list[Any] = []
+        if platform:
+            query += " AND LOWER(source) = LOWER(?)"
+            params.append(platform)
+        if active_only:
+            query += " AND ended_at IS NULL"
+        query += " ORDER BY last_active DESC"
+        cursor = await connection.execute(query, params)
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+
+    async def get_session(self, session_id: str) -> Optional[Dict[str, Any]]:
+        """Return one session row through the adapter's async connection."""
+        connection = await self._get_connection()
+        row = await (
+            await connection.execute("SELECT * FROM sessions WHERE id = ?", (session_id,))
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    @staticmethod
+    def _decode_message_row(row) -> Dict[str, Any]:
+        """Decode one SQLite message row without touching ``SessionDB``."""
+        message = dict(row)
+        if "content" in message:
+            message["content"] = SessionDB._decode_content(message["content"])
+        if message.get("tool_calls"):
+            try:
+                message["tool_calls"] = json.loads(message["tool_calls"])
+            except (json.JSONDecodeError, TypeError):
+                logger.warning(
+                    "Failed to deserialize tool_calls in async session read; "
+                    "falling back to []"
+                )
+                message["tool_calls"] = []
+        if message.get("display_metadata") is not None:
+            message["display_metadata"] = SessionDB._decode_display_metadata(
+                message["display_metadata"]
+            )
+        return message
+
+    async def get_messages(
+        self,
+        session_id: str,
+        include_inactive: bool = False,
+        limit: Optional[int] = None,
+        offset: int = 0,
+    ) -> List[Dict[str, Any]]:
+        """Load a session's messages through the native async connection."""
+        connection = await self._get_connection()
+        active_clause = "" if include_inactive else " AND active = 1"
+        query = (
+            "SELECT * FROM messages WHERE session_id = ?"
+            f"{active_clause} ORDER BY id"
+        )
+        params: list[Any] = [session_id]
+        if limit is not None or offset:
+            query += " LIMIT ? OFFSET ?"
+            params.extend([-1 if limit is None else limit, offset])
+        cursor = await connection.execute(query, params)
+        return [self._decode_message_row(row) for row in await cursor.fetchall()]
+
+    async def get_messages_around(
+        self,
+        session_id: str,
+        around_message_id: int,
+        window: int = 5,
+    ) -> Dict[str, Any]:
+        """Return an async anchored message window with boundary counts."""
+        connection = await self._get_connection()
+        window = max(0, int(window))
+        anchor = await (
+            await connection.execute(
+                "SELECT 1 FROM messages WHERE id = ? AND session_id = ? LIMIT 1",
+                (around_message_id, session_id),
+            )
+        ).fetchone()
+        if anchor is None:
+            return {"window": [], "messages_before": 0, "messages_after": 0}
+        before = await (
+            await connection.execute(
+                "SELECT * FROM messages WHERE session_id = ? AND id <= ? "
+                "ORDER BY id DESC LIMIT ?",
+                (session_id, around_message_id, window + 1),
+            )
+        ).fetchall()
+        after = await (
+            await connection.execute(
+                "SELECT * FROM messages WHERE session_id = ? AND id > ? "
+                "ORDER BY id ASC LIMIT ?",
+                (session_id, around_message_id, window),
+            )
+        ).fetchall()
+        rows = list(reversed(before)) + list(after)
+        return {
+            "window": [self._decode_message_row(row) for row in rows],
+            "messages_before": max(0, len(before) - 1),
+            "messages_after": len(after),
+        }
+
+    async def get_message_storage_state(
+        self, message_id: int
+    ) -> Optional[Dict[str, Any]]:
+        """Return storage flags for one message id without a raw connection."""
+        if not message_id:
+            return None
+        connection = await self._get_connection()
+        row = await (
+            await connection.execute(
+                "SELECT session_id, active, compacted FROM messages WHERE id = ?",
+                (message_id,),
+            )
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    async def get_anchored_view(
+        self,
+        session_id: str,
+        around_message_id: int,
+        window: int = 5,
+        bookend: int = 3,
+        keep_roles: Optional[Tuple[str, ...]] = ("user", "assistant"),
+    ) -> Dict[str, Any]:
+        """Return an anchored window and bookends using only aiosqlite."""
+        primitive = await self.get_messages_around(
+            session_id, around_message_id, window=window
+        )
+        rows = primitive["window"]
+        if not rows:
+            return {
+                "window": [],
+                "messages_before": 0,
+                "messages_after": 0,
+                "bookend_start": [],
+                "bookend_end": [],
+            }
+        if keep_roles is None:
+            filtered = rows
+        else:
+            allowed = set(keep_roles)
+            filtered = [
+                row for row in rows
+                if row.get("id") == around_message_id or row.get("role") in allowed
+            ]
+        bookend = max(0, int(bookend))
+        starts: list[Dict[str, Any]] = []
+        ends: list[Dict[str, Any]] = []
+        if bookend:
+            connection = await self._get_connection()
+            role_sql = ""
+            role_params: list[Any] = []
+            if keep_roles is not None:
+                role_sql = " AND role IN (" + ",".join("?" for _ in keep_roles) + ")"
+                role_params = list(keep_roles)
+            start_rows = await (
+                await connection.execute(
+                    "SELECT * FROM messages WHERE session_id = ? AND id < ?"
+                    f"{role_sql} AND length(content) > 0 ORDER BY id ASC LIMIT ?",
+                    (session_id, rows[0]["id"], *role_params, bookend),
+                )
+            ).fetchall()
+            end_rows = await (
+                await connection.execute(
+                    "SELECT * FROM messages WHERE session_id = ? AND id > ?"
+                    f"{role_sql} AND length(content) > 0 ORDER BY id DESC LIMIT ?",
+                    (session_id, rows[-1]["id"], *role_params, bookend),
+                )
+            ).fetchall()
+            starts = [self._decode_message_row(row) for row in start_rows]
+            ends = [self._decode_message_row(row) for row in reversed(end_rows)]
+        return {
+            "window": filtered,
+            "messages_before": primitive["messages_before"],
+            "messages_after": primitive["messages_after"],
+            "bookend_start": starts,
+            "bookend_end": ends,
+        }
+
+    async def get_session_by_title(self, title: str) -> Optional[Dict[str, Any]]:
+        """Look up a session title through the async connection."""
+        connection = await self._get_connection()
+        row = await (
+            await connection.execute("SELECT * FROM sessions WHERE title = ?", (title,))
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    async def resolve_session_by_title(self, title: str) -> Optional[str]:
+        """Resolve an exact or numbered continuation title asynchronously."""
+        exact = await self.get_session_by_title(title)
+        escaped = title.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        connection = await self._get_connection()
+        rows = await (
+            await connection.execute(
+                "SELECT id FROM sessions WHERE title LIKE ? ESCAPE '\\' "
+                "ORDER BY started_at DESC",
+                (f"{escaped} #%",),
+            )
+        ).fetchall()
+        if rows:
+            return rows[0]["id"]
+        return exact["id"] if exact else None
+
+    async def fts_rebuild_status(self) -> Optional[Dict[str, Any]]:
+        """Return deferred FTS rebuild progress without sync metadata access."""
+        high_water = await self.get_meta("fts_rebuild_high_water")
+        if high_water is None:
+            return None
+        try:
+            total = int(high_water)
+            indexed = int(await self.get_meta("fts_rebuild_progress") or 0)
+        except (TypeError, ValueError):
+            return None
+        if total <= 0:
+            return None
+        return {
+            "pending": True,
+            "total": total,
+            "indexed": indexed,
+            "percent": min(100, int(100 * indexed / total)),
+        }
+
+    async def search_messages(
+        self,
+        query: str,
+        source_filter: List[str] = None,
+        exclude_sources: List[str] = None,
+        role_filter: List[str] = None,
+        limit: int = 20,
+        offset: int = 0,
+        sort: str = None,
+        include_inactive: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """Search message text natively, preferring FTS5 with LIKE fallback."""
+        if not query or not str(query).strip():
+            return []
+        connection = await self._get_connection()
+        limit = max(0, int(limit))
+        offset = max(0, int(offset))
+        sanitized = self._sanitize_fts5_query(str(query))
+        if not sanitized:
+            return []
+        where: list[str] = []
+        params: list[Any] = [sanitized]
+        if not include_inactive:
+            where.append("(m.active = 1 OR m.compacted = 1)")
+        if source_filter:
+            where.append("s.source IN (" + ",".join("?" for _ in source_filter) + ")")
+            params.extend(source_filter)
+        if exclude_sources:
+            where.append("s.source NOT IN (" + ",".join("?" for _ in exclude_sources) + ")")
+            params.extend(exclude_sources)
+        if role_filter:
+            where.append("m.role IN (" + ",".join("?" for _ in role_filter) + ")")
+            params.extend(role_filter)
+        where_sql = " AND ".join(where)
+        order_sql = "ORDER BY rank"
+        if sort == "newest":
+            order_sql = "ORDER BY m.timestamp DESC, rank"
+        elif sort == "oldest":
+            order_sql = "ORDER BY m.timestamp ASC, rank"
+        try:
+            query_sql = f"""
+                SELECT m.id, m.session_id, m.role,
+                       snippet(messages_fts, -1, '>>>', '<<<', '...', 40) AS snippet,
+                       m.content, m.timestamp, m.tool_name,
+                       s.source, s.model, s.started_at AS session_started
+                FROM messages_fts
+                JOIN messages m ON m.id = messages_fts.rowid
+                JOIN sessions s ON s.id = m.session_id
+                WHERE messages_fts MATCH ?
+                {(' AND ' + where_sql) if where_sql else ''}
+                {order_sql} LIMIT ? OFFSET ?
+            """
+            cursor = await connection.execute(query_sql, [*params, limit, offset])
+            rows = await cursor.fetchall()
+        except sqlite3.OperationalError:
+            # Older or partially migrated databases may not have the FTS table.
+            # Keep recall useful with a parameterized text search; no sync
+            # fallback is involved.
+            like = f"%{str(query).strip()}%"
+            like_where = ["(m.content LIKE ? OR m.tool_name LIKE ? OR m.tool_calls LIKE ?)"]
+            like_params: list[Any] = [like, like, like]
+            if not include_inactive:
+                like_where.append("(m.active = 1 OR m.compacted = 1)")
+            if source_filter:
+                like_where.append("s.source IN (" + ",".join("?" for _ in source_filter) + ")")
+                like_params.extend(source_filter)
+            if exclude_sources:
+                like_where.append("s.source NOT IN (" + ",".join("?" for _ in exclude_sources) + ")")
+                like_params.extend(exclude_sources)
+            if role_filter:
+                like_where.append("m.role IN (" + ",".join("?" for _ in role_filter) + ")")
+                like_params.extend(role_filter)
+            fallback_sql = f"""
+                SELECT m.id, m.session_id, m.role, m.content, m.timestamp,
+                       m.tool_name, s.source, s.model,
+                       s.started_at AS session_started
+                FROM messages m JOIN sessions s ON s.id = m.session_id
+                WHERE {' AND '.join(like_where)}
+                ORDER BY m.timestamp {'' if sort == 'oldest' else 'DESC'}
+                LIMIT ? OFFSET ?
+            """
+            cursor = await connection.execute(
+                fallback_sql, [*like_params, limit, offset]
+            )
+            rows = await cursor.fetchall()
+        results: list[Dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            item["content"] = self._decode_message_row(row).get("content")
+            item.setdefault("snippet", item.get("content") or "")
+            results.append(item)
+        return results
+
+    async def list_sessions_rich(
+        self,
+        source: str = None,
+        sources: List[str] = None,
+        exclude_sources: List[str] = None,
+        cwd_prefix: str = None,
+        limit: int = 20,
+        offset: int = 0,
+        include_children: bool = False,
+        min_message_count: int = 0,
+        project_compression_tips: bool = True,
+        order_by_last_active: bool = False,
+        include_archived: bool = False,
+        archived_only: bool = False,
+        **_ignored: Any,
+    ) -> List[Dict[str, Any]]:
+        """Return lightweight recent-session rows for async browse surfaces."""
+        connection = await self._get_connection()
+        where: list[str] = []
+        params: list[Any] = []
+        if not include_children:
+            where.extend([_LISTABLE_CHILD_SQL, f"{_delegate_from_json('s.model_config')} IS NULL"])
+        include_sources = [source] if source else list(sources or [])
+        if include_sources:
+            where.append("s.source IN (" + ",".join("?" for _ in include_sources) + ")")
+            params.extend(include_sources)
+        if exclude_sources:
+            where.append("s.source NOT IN (" + ",".join("?" for _ in exclude_sources) + ")")
+            params.extend(exclude_sources)
+        if cwd_prefix:
+            clause, clause_params = _cwd_prefix_clause(cwd_prefix)
+            where.append(clause)
+            params.extend(clause_params)
+        if min_message_count:
+            where.append("s.message_count >= ?")
+            params.append(min_message_count)
+        if archived_only:
+            where.append("s.archived = 1")
+        elif not include_archived:
+            where.append("s.archived = 0")
+        where_sql = "WHERE " + " AND ".join(where) if where else ""
+        order_sql = "last_active DESC, s.started_at DESC, s.id DESC" if order_by_last_active else "s.started_at DESC, s.id DESC"
+        query_sql = f"""
+            SELECT s.*,
+                   COALESCE((SELECT MAX(m.timestamp) FROM messages m
+                             WHERE m.session_id = s.id), s.started_at) AS last_active,
+                   (SELECT m.content FROM messages m
+                    WHERE m.session_id = s.id AND m.role = 'user' AND m.active = 1
+                    ORDER BY m.id LIMIT 1) AS _preview_raw
+            FROM sessions s {where_sql}
+            ORDER BY {order_sql} LIMIT ? OFFSET ?
+        """
+        cursor = await connection.execute(query_sql, [*params, max(0, int(limit)), max(0, int(offset))])
+        rows = await cursor.fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["preview"] = _shape_preview(self._decode_content(item.pop("_preview_raw", "")))
+            result.append(item)
+        return result
+
+    async def get_compression_failure_cooldown(
+        self, session_id: str
+    ) -> Optional[Dict[str, Any]]:
+        if not session_id:
+            return None
+        connection = await self._get_connection()
+        row = await (
+            await connection.execute(
+                "SELECT compression_failure_cooldown_until, "
+                "compression_failure_error FROM sessions WHERE id = ?",
+                (session_id,),
+            )
+        ).fetchone()
+        if row is None or row["compression_failure_cooldown_until"] is None:
+            return None
+        cooldown_until = float(row["compression_failure_cooldown_until"])
+        remaining_seconds = cooldown_until - time.time()
+        if remaining_seconds <= 0:
+            return None
+        return {
+            "cooldown_until": cooldown_until,
+            "remaining_seconds": remaining_seconds,
+            "error": row["compression_failure_error"],
+        }
+
+    async def record_compression_failure_cooldown(
+        self, session_id: str, cooldown_until: float, error: Optional[str] = None
+    ) -> None:
+        if not session_id:
+            return
+
+        async def _record(connection):
+            await connection.execute(
+                "UPDATE sessions SET compression_failure_cooldown_until = ?, "
+                "compression_failure_error = ? WHERE id = ?",
+                (cooldown_until, error, session_id),
+            )
+
+        await self._write(_record)
+
+    async def clear_compression_failure_cooldown(self, session_id: str) -> None:
+        if not session_id:
+            return
+
+        async def _clear(connection):
+            await connection.execute(
+                "UPDATE sessions SET compression_failure_cooldown_until = NULL, "
+                "compression_failure_error = NULL WHERE id = ?",
+                (session_id,),
+            )
+
+        await self._write(_clear)
+
+    async def get_compression_fallback_streak(self, session_id: str) -> int:
+        if not session_id:
+            return 0
+        connection = await self._get_connection()
+        row = await (
+            await connection.execute(
+                "SELECT compression_fallback_streak FROM sessions WHERE id = ?",
+                (session_id,),
+            )
+        ).fetchone()
+        try:
+            return max(0, int(row["compression_fallback_streak"] or 0)) if row else 0
+        except (TypeError, ValueError):
+            return 0
+
+    async def set_compression_fallback_streak(
+        self, session_id: str, streak: int
+    ) -> None:
+        if not session_id:
+            return
+
+        async def _set(connection):
+            await connection.execute(
+                "UPDATE sessions SET compression_fallback_streak = ? WHERE id = ?",
+                (max(0, int(streak)), session_id),
+            )
+
+        await self._write(_set)
+
+    async def get_compression_ineffective_count(self, session_id: str) -> int:
+        if not session_id:
+            return 0
+        connection = await self._get_connection()
+        row = await (
+            await connection.execute(
+                "SELECT compression_ineffective_count FROM sessions WHERE id = ?",
+                (session_id,),
+            )
+        ).fetchone()
+        try:
+            return max(0, int(row["compression_ineffective_count"] or 0)) if row else 0
+        except (TypeError, ValueError):
+            return 0
+
+    async def set_compression_ineffective_count(
+        self, session_id: str, count: int
+    ) -> None:
+        if not session_id:
+            return
+
+        async def _set(connection):
+            await connection.execute(
+                "UPDATE sessions SET compression_ineffective_count = ? WHERE id = ?",
+                (max(0, int(count)), session_id),
+            )
+
+        await self._write(_set)
+
+    async def get_conversation_root(self, session_id: str) -> str:
+        """Resolve a session lineage root without using ``SessionDB``'s lock."""
+        if not session_id:
+            return session_id
+        connection = await self._get_connection()
+        current = session_id
+        seen = set()
+        for _ in range(100):
+            if not current or current in seen:
+                break
+            seen.add(current)
+            row = await (
+                await connection.execute(
+                    "SELECT parent_session_id FROM sessions WHERE id = ?",
+                    (current,),
+                )
+            ).fetchone()
+            if row is None or not row["parent_session_id"]:
+                break
+            current = row["parent_session_id"]
+        return current or session_id
+
+    async def get_messages_as_conversation(
+        self,
+        session_id: str,
+        include_ancestors: bool = False,
+        include_inactive: bool = False,
+        repair_alternation: bool = False,
+        include_row_ids: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """Load a conversation through the native async SQLite connection."""
+        if not session_id:
+            return []
+        connection = await self._get_connection()
+        session_ids = [session_id]
+        if include_ancestors:
+            current = session_id
+            seen = set()
+            while current and current not in seen:
+                seen.add(current)
+                row = await (
+                    await connection.execute(
+                        "SELECT parent_session_id FROM sessions WHERE id = ?",
+                        (current,),
+                    )
+                ).fetchone()
+                parent = row["parent_session_id"] if row is not None else None
+                if not parent:
+                    break
+                session_ids.insert(0, parent)
+                current = parent
+
+        placeholders = ",".join("?" for _ in session_ids)
+        active_clause = "" if include_inactive else " AND active = 1"
+        rows = await (
+            await connection.execute(
+                f"SELECT {self._CONVERSATION_ROW_COLUMNS} "
+                f"FROM messages WHERE session_id IN ({placeholders})"
+                f"{active_clause} ORDER BY id",
+                tuple(session_ids),
+            )
+        ).fetchall()
+        return self._rows_to_conversation(
+            rows,
+            session_id=session_id,
+            include_ancestors=include_ancestors,
+            repair_alternation=repair_alternation,
+            include_row_ids=include_row_ids,
+        )
+
+    async def find_live_compression_child(
+        self, parent_session_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """Return the one unambiguous live compression child, if it exists."""
+        if not parent_session_id:
+            return None
+        connection = await self._get_connection()
+        parent = await (
+            await connection.execute(
+                "SELECT ended_at, end_reason FROM sessions WHERE id = ?",
+                (parent_session_id,),
+            )
+        ).fetchone()
+        if (
+            parent is None
+            or parent["ended_at"] is None
+            or parent["end_reason"] != "compression"
+        ):
+            return None
+        rows = await (
+            await connection.execute(
+                """SELECT * FROM sessions
+                   WHERE parent_session_id = ?
+                     AND ended_at IS NULL
+                     AND json_extract(COALESCE(model_config, '{}'), '$._branched_from') IS NULL
+                     AND json_extract(COALESCE(model_config, '{}'), '$._delegate_from') IS NULL
+                     AND COALESCE(source, '') != 'tool'
+                   ORDER BY started_at ASC
+                   LIMIT 2""",
+                (parent_session_id,),
+            )
+        ).fetchall()
+        return dict(rows[0]) if len(rows) == 1 else None
+
+    async def get_session_title(self, session_id: str) -> Optional[str]:
+        """Read a title without using the synchronous connection."""
+        connection = await self._get_connection()
+        row = await (
+            await connection.execute(
+                "SELECT title FROM sessions WHERE id = ?", (session_id,)
+            )
+        ).fetchone()
+        return row["title"] if row is not None else None
+
+    async def get_next_title_in_lineage(self, base_title: str) -> str:
+        """Return the next generated continuation title."""
+        match = re.match(r"^(.*?) #(\d+)$", base_title)
+        base = match.group(1) if match else base_title
+        escaped = base.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        connection = await self._get_connection()
+        rows = await (
+            await connection.execute(
+                "SELECT title FROM sessions WHERE title = ? OR title LIKE ? ESCAPE '\\'",
+                (base, f"{escaped} #%"),
+            )
+        ).fetchall()
+        titles = [row["title"] for row in rows]
+        if not titles:
+            return base
+        suffixes = [
+            int(found.group(1))
+            for title in titles
+            if (found := re.match(rf"^{re.escape(base)} #(\d+)$", title or ""))
+        ]
+        return f"{base} #{max(suffixes, default=1) + 1}"
+
+    async def set_session_title(self, session_id: str, title: str) -> bool:
+        """Set a generated continuation title using the async write path."""
+        async def _set(connection):
+            cursor = await connection.execute(
+                "UPDATE sessions SET title = ? WHERE id = ?", (title, session_id)
+            )
+            return cursor.rowcount > 0
+
+        return bool(await self._write(_set))
+
+    async def publish_compression_child(
+        self,
+        *,
+        parent_session_id: str,
+        child_session_id: str,
+        source: str,
+        messages: List[Dict[str, Any]],
+        model: str = None,
+        model_config: Dict[str, Any] = None,
+        system_prompt: str = None,
+        cwd: str = None,
+        profile_name: str = None,
+        compression_lock_holder: str = None,
+        require_compression_lease: bool = True,
+    ) -> None:
+        """Publish a compressed continuation without a sync SQLite bridge."""
+        if not messages:
+            raise RuntimeError("Compression child handoff must not be empty")
+
+        async def _publish(connection):
+            lock_row = await (
+                await connection.execute(
+                    "SELECT holder, expires_at FROM compression_locks WHERE session_id = ?",
+                    (parent_session_id,),
+                )
+            ).fetchone()
+            if require_compression_lease and (
+                lock_row is None
+                or not compression_lock_holder
+                or lock_row["holder"] != compression_lock_holder
+                or float(lock_row["expires_at"]) <= time.time()
+            ):
+                raise CompressionSessionBusyError(
+                    f"Compression lease lost before publication: {parent_session_id}"
+                )
+            parent = await (
+                await connection.execute(
+                    """SELECT ended_at, cwd, git_branch, git_repo_root,
+                              user_id, session_key, chat_id, chat_type,
+                              thread_id, display_name, origin_json, profile_name
+                       FROM sessions WHERE id = ?""",
+                    (parent_session_id,),
+                )
+            ).fetchone()
+            if parent is None:
+                raise RuntimeError(f"Compression parent not found: {parent_session_id}")
+            if parent["ended_at"] is not None:
+                raise RuntimeError(
+                    f"Compression parent already ended: {parent_session_id}"
+                )
+            await connection.execute(
+                """INSERT INTO sessions (
+                   id, source, model, model_config, system_prompt,
+                   parent_session_id, cwd, git_branch, git_repo_root,
+                   profile_name, user_id, session_key, chat_id, chat_type,
+                   thread_id, display_name, origin_json, started_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    child_session_id,
+                    source,
+                    model,
+                    json.dumps(model_config) if model_config else None,
+                    system_prompt,
+                    parent_session_id,
+                    cwd or parent["cwd"],
+                    parent["git_branch"],
+                    parent["git_repo_root"],
+                    profile_name or parent["profile_name"],
+                    parent["user_id"],
+                    parent["session_key"],
+                    parent["chat_id"],
+                    parent["chat_type"],
+                    parent["thread_id"],
+                    parent["display_name"],
+                    parent["origin_json"],
+                    time.time(),
+                ),
+            )
+            now_ts = time.time()
+            tool_calls_total = 0
+            for message in messages:
+                role = message.get("role", "unknown")
+                tool_calls = message.get("tool_calls")
+                if isinstance(tool_calls, str):
+                    try:
+                        tool_calls = json.loads(tool_calls)
+                    except (json.JSONDecodeError, TypeError):
+                        tool_calls = []
+                timestamp = message.get("timestamp", now_ts)
+                try:
+                    timestamp = float(
+                        timestamp.timestamp()
+                        if hasattr(timestamp, "timestamp")
+                        else timestamp
+                    )
+                except (TypeError, ValueError):
+                    timestamp = now_ts
+                reasoning_details = (
+                    message.get("reasoning_details") if role == "assistant" else None
+                )
+                codex_reasoning_items = (
+                    message.get("codex_reasoning_items") if role == "assistant" else None
+                )
+                codex_message_items = (
+                    message.get("codex_message_items") if role == "assistant" else None
+                )
+                await connection.execute(
+                    """INSERT INTO messages (session_id, role, content, tool_call_id,
+                       tool_calls, tool_name, effect_disposition, timestamp, token_count, finish_reason,
+                       reasoning, reasoning_content, reasoning_details, codex_reasoning_items,
+                       codex_message_items, platform_message_id, observed, active, api_content, display_kind, display_metadata)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        child_session_id, role,
+                        self._encode_content(message.get("content")),
+                        message.get("tool_call_id"),
+                        json.dumps(tool_calls) if tool_calls else None,
+                        _scrub_surrogates(message.get("tool_name")),
+                        message.get("effect_disposition"), timestamp,
+                        message.get("token_count"), message.get("finish_reason"),
+                        _scrub_surrogates(message.get("reasoning")) if role == "assistant" else None,
+                        _scrub_surrogates(message.get("reasoning_content")) if role == "assistant" else None,
+                        json.dumps(reasoning_details) if reasoning_details else None,
+                        json.dumps(codex_reasoning_items) if codex_reasoning_items else None,
+                        json.dumps(codex_message_items) if codex_message_items else None,
+                        message.get("platform_message_id") or message.get("message_id"),
+                        1 if message.get("observed") else 0, 1,
+                        _scrub_surrogates(message.get("api_content"))
+                        if isinstance(message.get("api_content"), str) else None,
+                        _scrub_surrogates(message.get("display_kind"))
+                        if isinstance(message.get("display_kind"), str) else None,
+                        self._encode_display_metadata(message.get("display_metadata")),
+                    ),
+                )
+                tool_calls_total += (
+                    len(tool_calls) if isinstance(tool_calls, list) else int(tool_calls is not None)
+                )
+                now_ts = max(now_ts + 1e-6, timestamp + 1e-6)
+            await connection.execute(
+                "UPDATE sessions SET message_count = ?, tool_call_count = ? WHERE id = ?",
+                (len(messages), tool_calls_total, child_session_id),
+            )
+            updated = await connection.execute(
+                "UPDATE sessions SET ended_at = ?, end_reason = 'compression' "
+                "WHERE id = ? AND ended_at IS NULL",
+                (time.time(), parent_session_id),
+            )
+            if updated.rowcount != 1:
+                raise RuntimeError(
+                    f"Compression parent changed during publication: {parent_session_id}"
+                )
+
+        await self._write(_publish)
+
+    async def flush_token_counts(self) -> bool:
+        """Token deltas still use their own async accounting path; no turn-blocking drain."""
+        return True
+
+    async def close(self) -> None:
+        self._closed = True
+        connection = self._connection
+        self._connection = None
+        if connection is not None:
+            close_task = asyncio.create_task(connection.close())
+            try:
+                await asyncio.shield(close_task)
+            except asyncio.CancelledError:
+                await asyncio.shield(close_task)
+                raise
 
     def __getattr__(self, name: str):
-        attr = getattr(self._db, name)
-        if not callable(attr):
-            return attr
-
-        async def _offloaded(*args, **kwargs):
-            return await asyncio.to_thread(attr, *args, **kwargs)
-
-        return _offloaded
+        raise AttributeError(
+            f"AsyncSessionDB does not implement {name!r}; add a native async method instead"
+        )

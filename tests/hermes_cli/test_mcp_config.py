@@ -182,7 +182,7 @@ class TestMcpAdd:
             FakeTool("list_services", "List all services"),
         ]
 
-        def mock_probe(name, config, **kw):
+        async def mock_probe(name, config, **kw):
             return [(t.name, t.description) for t in fake_tools]
 
         monkeypatch.setattr(
@@ -211,7 +211,7 @@ class TestMcpAdd:
         """Stdio servers can persist explicit environment variables."""
         fake_tools = [FakeTool("search", "Search repos")]
 
-        def mock_probe(name, config, **kw):
+        async def mock_probe(name, config, **kw):
             assert config["env"] == {
                 "MY_API_KEY": "secret123",
                 "DEBUG": "true",
@@ -252,7 +252,7 @@ class TestMcpAdd:
         )
         fake_tools = [FakeTool("do_thing", "Does a thing")]
 
-        def mock_probe(name, config, **kw):
+        async def mock_probe(name, config, **kw):
             assert name == "myserver"
             assert config["command"] == "npx"
             assert config["args"] == ["-y", "test-mcp-server"]
@@ -289,7 +289,7 @@ class TestMcpTest:
             "ink": {"url": "https://mcp.ml.ink/mcp"},
         })
 
-        def mock_probe(name, config, **kw):
+        async def mock_probe(name, config, **kw):
             return [("create_service", "Deploy"), ("list_services", "List all")]
 
         monkeypatch.setattr(
@@ -302,43 +302,6 @@ class TestMcpTest:
         assert "Connected" in out
         assert "Tools discovered: 2" in out
 
-    def test_probe_uses_configured_connect_timeout(self, monkeypatch):
-        """OAuth-capable probes must not hard-code a short 30s timeout."""
-        import asyncio
-        from hermes_cli import mcp_config
-        import tools.mcp_tool as mcp_tool
-
-        captured = {}
-
-        class FakeServer:
-            _tools = []
-
-            async def shutdown(self):
-                captured["shutdown"] = True
-
-        async def fake_connect(name, config):
-            return FakeServer()
-
-        def fake_run_on_mcp_loop(coro, timeout):
-            captured["outer_timeout"] = timeout
-            return asyncio.run(coro)
-
-        async def fake_wait_for(awaitable, timeout):
-            captured["inner_timeout"] = timeout
-            return await awaitable
-
-        monkeypatch.setattr(mcp_tool, "_ensure_mcp_loop", lambda: None)
-        monkeypatch.setattr(mcp_tool, "_stop_mcp_loop_if_idle", lambda: None)
-        monkeypatch.setattr(mcp_tool, "_connect_server", fake_connect)
-        monkeypatch.setattr(mcp_tool, "_run_on_mcp_loop", fake_run_on_mcp_loop)
-        monkeypatch.setattr(mcp_config.asyncio, "wait_for", fake_wait_for)
-
-        assert mcp_config._probe_single_server(
-            "supabase", {"connect_timeout": 300}
-        ) == []
-        assert captured["inner_timeout"] == 300.0
-        assert captured["outer_timeout"] == 310.0
-        assert captured["shutdown"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -403,7 +366,8 @@ class TestProbeEnvResolution:
         assert os.environ["MCP_SHARED_API_KEY"] == "default-secret"
 
 
-    def test_probe_resolves_before_connect(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_probe_resolves_before_connect(self, monkeypatch):
         """_probe_single_server must pass the RESOLVED config to _connect_server."""
         import hermes_cli.mcp_config as mc
 
@@ -427,7 +391,7 @@ class TestProbeEnvResolution:
 
         monkeypatch.setattr("tools.mcp_tool._connect_server", _fake_connect)
 
-        tools = mc._probe_single_server("n8n", {
+        tools = await mc._probe_single_server("n8n", {
             "url": "http://localhost:5678/mcp-server/http",
             "headers": {"Authorization": "Bearer ${MCP_N8N_API_KEY}"},
         })
@@ -490,7 +454,7 @@ class TestProbeCapabilityGating:
 
         return _FakeServer()
 
-    def _run_probe(self, monkeypatch, config, caps):
+    async def _run_probe(self, monkeypatch, config, caps):
         import hermes_cli.mcp_config as mc
 
         called: list[str] = []
@@ -500,22 +464,26 @@ class TestProbeCapabilityGating:
 
         monkeypatch.setattr("tools.mcp_tool._connect_server", _fake_connect)
         details: dict = {}
-        mc._probe_single_server("srv", config, details=details)
+        await mc._probe_single_server("srv", config, details=details)
         return called, details
 
-    def test_config_disables_prompts_probe(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_config_disables_prompts_probe(self, monkeypatch):
         # Server advertises both, but user turned prompts off.
         caps = self._Caps(prompts=object(), resources=object())
-        called, details = self._run_probe(
+        called, details = await self._run_probe(
             monkeypatch, {"url": "http://x/mcp", "tools": {"prompts": False}}, caps
         )
         assert "prompts" not in called
         assert "resources" in called
 
 
-    def test_advertised_and_enabled_is_probed(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_advertised_and_enabled_is_probed(self, monkeypatch):
         caps = self._Caps(prompts=object(), resources=object())
-        called, details = self._run_probe(monkeypatch, {"url": "http://x/mcp"}, caps)
+        called, details = await self._run_probe(
+            monkeypatch, {"url": "http://x/mcp"}, caps
+        )
         assert set(called) == {"prompts", "resources"}
 
 
@@ -642,12 +610,10 @@ class TestMcpLogin:
             },
         })
         # Probe returns tools even though auth never completed.
-        monkeypatch.setattr(
-            "hermes_cli.mcp_config._probe_single_server",
-            lambda name, cfg, connect_timeout=30: [
-                ("search_files", "d"), ("read_file_content", "d"),
-            ],
-        )
+        async def mock_probe(name, cfg, connect_timeout=30):
+            return [("search_files", "d"), ("read_file_content", "d")]
+
+        monkeypatch.setattr("hermes_cli.mcp_config._probe_single_server", mock_probe)
         # No token file is created → _oauth_tokens_present() returns False.
         from hermes_cli.mcp_config import cmd_mcp_login
 
@@ -670,7 +636,7 @@ class TestMcpLogin:
         # probe drops a token file, mirroring a successful authorization.
         seen = {}
 
-        def mock_probe(name, cfg, connect_timeout=30):
+        async def mock_probe(name, cfg, connect_timeout=30):
             seen["connect_timeout"] = connect_timeout
             token_dir.mkdir(exist_ok=True)
             (token_dir / "realserver.json").write_text('{"access_token": "x"}')

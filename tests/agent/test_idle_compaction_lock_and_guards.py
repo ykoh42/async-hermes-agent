@@ -23,7 +23,9 @@ from __future__ import annotations
 import time
 import types
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
 
 from hermes_state import SessionDB
 
@@ -53,7 +55,7 @@ def _prep_idle_agent(db: SessionDB, session_id: str, *, idle_after: int = 60,
     return agent
 
 
-def _run_prologue(agent, history, user_message="hello again"):
+async def _run_prologue(agent, history, user_message="hello again"):
     """Invoke ``build_turn_context`` the way ``conversation_loop`` does.
 
     The token-threshold preflight gate is pinned False so these tests
@@ -65,7 +67,7 @@ def _run_prologue(agent, history, user_message="hello again"):
                return_value=False), \
          patch("agent.turn_context.estimate_request_tokens_rough",
                return_value=999_999):
-        return build_turn_context(
+        return await build_turn_context(
             agent=agent,
             user_message=user_message,
             system_message=None,
@@ -91,7 +93,8 @@ def _history(n: int = 20) -> list:
 
 
 
-def test_idle_compaction_status_emitted_by_default(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_idle_compaction_status_emitted_by_default(tmp_path: Path) -> None:
     """Control: the default engine keeps the 💤 idle-resume status line."""
     db = SessionDB(db_path=tmp_path / "state.db")
     sid = "IDLE_LOUD"
@@ -104,15 +107,19 @@ def test_idle_compaction_status_emitted_by_default(tmp_path: Path) -> None:
     events = []
     agent.status_callback = lambda ev, msg: events.append((ev, msg))
 
-    _run_prologue(agent, _history())
+    try:
+        await _run_prologue(agent, _history())
 
-    agent.context_compressor.compress.assert_called_once()
-    assert any(
-        ev == "lifecycle" and "Resumed after" in str(msg) for ev, msg in events
-    ), f"expected idle status line, got: {events}"
+        agent.context_compressor.compress.assert_awaited_once()
+        assert any(
+            ev == "lifecycle" and "Resumed after" in str(msg) for ev, msg in events
+        ), f"expected idle status line, got: {events}"
+    finally:
+        await agent.close()
 
 
-def test_idle_compaction_defers_to_held_compression_lock(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_idle_compaction_defers_to_held_compression_lock(tmp_path: Path) -> None:
     """An idle-triggered compress racing another path must sit the round out.
 
     The per-session lock landed after the idle-compaction PR: when another
@@ -129,23 +136,27 @@ def test_idle_compaction_defers_to_held_compression_lock(tmp_path: Path) -> None
     agent = _prep_idle_agent(db, sid)
     history = _history()
 
-    ctx = _run_prologue(agent, history)
+    try:
+        ctx = await _run_prologue(agent, history)
 
-    # Skipped: the compressor never ran and the session did not rotate.
-    agent.context_compressor.compress.assert_not_called()
-    assert agent.session_id == sid
-    # The external holder still owns the lock (we must not have stolen or
-    # released someone else's lease).
-    assert db.get_compression_lock_holder(sid) == "external_holder"
-    # Turn state untouched: full history + this turn's user message, anchor on
-    # the just-appended message, flush baseline not re-baselined to None-then-
-    # doubled semantics.
-    assert len(ctx.messages) == len(history) + 1
-    assert ctx.current_turn_user_idx == len(ctx.messages) - 1
-    assert ctx.messages[ctx.current_turn_user_idx]["content"] == "hello again"
+        # Skipped: the compressor never ran and the session did not rotate.
+        agent.context_compressor.compress.assert_not_called()
+        assert agent.session_id == sid
+        # The external holder still owns the lock (we must not have stolen or
+        # released someone else's lease).
+        assert db.get_compression_lock_holder(sid) == "external_holder"
+        # Turn state untouched: full history + this turn's user message, anchor on
+        # the just-appended message, flush baseline not re-baselined to None-then-
+        # doubled semantics.
+        assert len(ctx.messages) == len(history) + 1
+        assert ctx.current_turn_user_idx == len(ctx.messages) - 1
+        assert ctx.messages[ctx.current_turn_user_idx]["content"] == "hello again"
+    finally:
+        await agent.close()
 
 
-def test_idle_compaction_respects_anti_thrash_breaker(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_idle_compaction_respects_anti_thrash_breaker(tmp_path: Path) -> None:
     """A tripped ineffective-compression breaker must block the idle trigger.
 
     The breaker lives in ``ContextCompressor._automatic_compression_blocked``
@@ -161,7 +172,7 @@ def test_idle_compaction_respects_anti_thrash_breaker(tmp_path: Path) -> None:
     agent = _prep_idle_agent(db, sid)
 
     with patch(
-        "agent.context_compressor.get_model_context_length", return_value=100_000
+        "agent.context_compressor.get_static_context_length", return_value=100_000
     ):
         compressor = ContextCompressor(
             model="test/model",
@@ -170,20 +181,20 @@ def test_idle_compaction_respects_anti_thrash_breaker(tmp_path: Path) -> None:
             protect_last_n=2,
             quiet_mode=True,
         )
-    compressor.bind_session_state(db, sid)
-    # Trip the breaker durably (#54923: the strike counter now round-trips
-    # state.db, and the gate re-reads durable rows before honoring a block).
+    # Trip the breaker durably. The native runtime does not bind the
+    # synchronous SessionDB to the compressor; it hydrates this state through
+    # the agent-owned AsyncSessionDB immediately before the guarded call.
     db.set_compression_ineffective_count(sid, 2)
-    compressor._ineffective_compression_count = 2  # breaker tripped
-    compressor.compress = MagicMock()
+    compressor.compress = AsyncMock()
     agent.context_compressor = compressor
 
-    ctx = _run_prologue(agent, _history())
+    try:
+        ctx = await _run_prologue(agent, _history())
 
-    compressor.compress.assert_not_called()
-    assert agent.session_id == sid
-    assert len(ctx.messages) == len(_history()) + 1
-
-
+        compressor.compress.assert_not_called()
+        assert agent.session_id == sid
+        assert len(ctx.messages) == len(_history()) + 1
+    finally:
+        await agent.close()
 
 

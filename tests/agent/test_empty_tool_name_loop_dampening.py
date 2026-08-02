@@ -23,9 +23,7 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 import sys
-import tempfile
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -120,7 +118,7 @@ def _text_resp(text: str) -> dict:
 
 
 @pytest.fixture()
-def agent_env():
+def agent_env(tmp_path):
     """Spin up the mock provider + an isolated HERMES_HOME, yield (agent, helpers)."""
     _MockHandler.captured_requests = []
     _MockHandler.response_queue = []
@@ -129,16 +127,11 @@ def agent_env():
     t = threading.Thread(target=srv.serve_forever, daemon=True)
     t.start()
 
-    test_home = tempfile.mkdtemp(prefix="hermes_e2e_47967_")
-    os.makedirs(os.path.join(test_home, ".hermes"))
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir()
     prev_home = os.environ.get("HERMES_HOME")
-    os.environ["HERMES_HOME"] = os.path.join(test_home, ".hermes")
+    os.environ["HERMES_HOME"] = str(hermes_home)
 
-    # Import fresh so the patched conversation_loop is exercised even when the
-    # module was imported earlier in the same worker.
-    for mod in list(sys.modules):
-        if mod == "run_agent" or mod.startswith("agent.") or mod.startswith("tools.") or mod.startswith("hermes_"):
-            del sys.modules[mod]
     from run_agent import AIAgent
 
     agent = AIAgent(
@@ -154,7 +147,6 @@ def agent_env():
         yield agent, _MockHandler
     finally:
         srv.shutdown()
-        shutil.rmtree(test_home, ignore_errors=True)
         if prev_home is None:
             os.environ.pop("HERMES_HOME", None)
         else:
@@ -171,18 +163,20 @@ def _tool_results(handler) -> list[str]:
 
 
 @pytest.mark.parametrize("blank", ["", "   ", "\n", "\t "])
-def test_empty_tool_name_gets_terse_error_no_catalog(agent_env, blank):
+@pytest.mark.asyncio
+async def test_empty_tool_name_gets_terse_error_no_catalog(agent_env, blank):
     """A blank/whitespace tool name must NOT trigger a full tool-catalog dump."""
     agent, handler = agent_env
     handler.response_queue.append(_tc_resp(blank, "{}"))
     handler.response_queue.append(_text_resp("Recovered in plain text."))
 
-    agent.run_conversation("read ./payload and report", conversation_history=[], task_id="t")
+    await agent.run_conversation("read ./payload and report", conversation_history=[], task_id="t")
 
     joined = " ".join(_tool_results(handler))
     assert "tool name was empty" in joined
     # The whole point: do not feed the priming loop the catalog of names.
     assert "Available tools:" not in joined
+    await agent.close()
 
 
 
@@ -198,14 +192,15 @@ def test_empty_tool_name_gets_terse_error_no_catalog(agent_env, blank):
 
 
 
-def test_mixed_batch_preserves_tool_call_result_pairing(agent_env):
+@pytest.mark.asyncio
+async def test_mixed_batch_preserves_tool_call_result_pairing(agent_env):
     """Every emitted tool_call keeps a matching tool result (provider invariant)."""
     agent, handler = agent_env
     agent.valid_tool_names = agent.valid_tool_names | {"todo"}
     handler.response_queue.append(_batch_tc_resp([("todo", "{}"), ("", "{}")]))
     handler.response_queue.append(_text_resp("done"))
 
-    result = agent.run_conversation("track work", conversation_history=[], task_id="t")
+    result = await agent.run_conversation("track work", conversation_history=[], task_id="t")
 
     msgs = result["messages"]
     tc_ids = []
@@ -220,13 +215,15 @@ def test_mixed_batch_preserves_tool_call_result_pairing(agent_env):
     # and each must have exactly one matching tool result.
     assert set(tc_ids) == {"call_0", "call_1"}
     assert sorted(result_ids) == sorted(tc_ids)
+    await agent.close()
 
 
 
 
 
 
-def test_invalid_tool_exhaustion_closes_tool_tail(agent_env):
+@pytest.mark.asyncio
+async def test_invalid_tool_exhaustion_closes_tool_tail(agent_env):
     """Invalid-tool 3-strike partial must not leave a durable tool→user tail (#48879 class).
 
     Retries <3 append assistant+error tool rows, so the transcript already ends
@@ -238,12 +235,11 @@ def test_invalid_tool_exhaustion_closes_tool_tail(agent_env):
     for _ in range(3):
         handler.response_queue.append(_tc_resp("frobnicate_xyz", "{}"))
 
-    result = agent.run_conversation("degenerate", conversation_history=[], task_id="t")
+    result = await agent.run_conversation("degenerate", conversation_history=[], task_id="t")
 
     assert result.get("partial", False)
     msgs = result.get("messages") or []
     assert msgs, "expected persisted conversation messages"
     assert msgs[-1].get("role") == "assistant"
     assert "invalid tool call" in (msgs[-1].get("content") or "").lower()
-
-
+    await agent.close()

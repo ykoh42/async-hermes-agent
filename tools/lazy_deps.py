@@ -230,11 +230,6 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
         # satisfies both — pin the patched floor here too, like platform.discord.
         "aiohttp==3.14.1",  # CVE-2026-34513/34518/34519/34520/34525 + 34993(RCE)/47265
     ),
-    "platform.dingtalk": (
-        "dingtalk-stream==0.24.3",
-        "alibabacloud-dingtalk==2.2.42",
-        "qrcode==7.4.2",
-    ),
     "platform.feishu": (
         "lark-oapi==1.6.8",
         "qrcode==7.4.2",
@@ -265,13 +260,6 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     # ─── Tools ─────────────────────────────────────────────────────────────
     # ACP adapter (VS Code / Zed / JetBrains integration)
     "tool.acp": ("agent-client-protocol==0.9.0",),
-    # Dashboard (`hermes dashboard`)
-    "tool.dashboard": (
-        "fastapi==0.133.1",
-        "uvicorn[standard]==0.41.0",
-        "starlette==1.3.1",  # CVE-2026-48710 (BadHost) — keep lazy-install in sync with pyproject [web]
-        "python-multipart==0.0.32",  # FastAPI UploadFile/Form for streaming uploads (NS-501)
-    ),
     # Vision image-resize recovery (Pillow). Pillow is now a CORE dependency
     # (pyproject `dependencies`), so this entry is a belt-and-suspenders fallback
     # for stripped/source-build installs that somehow dropped it. The vision
@@ -842,23 +830,7 @@ def ensure(feature: str, *, prompt: bool = True) -> None:
             "lazy installs disabled (security.allow_lazy_installs=false)"
         )
 
-    # Only show the interactive confirmation when we own a TTY and
-    # prompt_toolkit isn't running.  A bare input() deadlocks when a
-    # prompt_toolkit app owns the terminal because keystrokes route to
-    # its event loop rather than stdin, so the prompt blocks forever.
-    # Under the TUI we skip the prompt and proceed — lazy installs are
-    # gated by security.allow_lazy_installs, so reaching here is
-    # already user opt-in.
-    _pt_active = False
-    if "prompt_toolkit.application.current" in sys.modules:
-        try:
-            from prompt_toolkit.application.current import get_app_or_none
-            _app = get_app_or_none()
-            _pt_active = _app is not None and getattr(_app, "is_running", False)
-        except Exception:
-            _pt_active = False
-
-    if prompt and not _pt_active and sys.stdin.isatty() and sys.stdout.isatty():
+    if prompt and sys.stdin.isatty() and sys.stdout.isatty():
         spec_list = ", ".join(missing)
         try:
             answer = input(

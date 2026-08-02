@@ -27,7 +27,7 @@ Contracts pinned here:
 from __future__ import annotations
 
 import types
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -71,13 +71,13 @@ def _make_agent(compressor):
     agent.compression_enabled = True
     agent.context_compressor = compressor
     agent._emit_status = MagicMock()
-    agent._compress_context = MagicMock(
+    agent._compress_context = AsyncMock(
         side_effect=lambda messages, *_a, **_k: (messages, "SYSTEM")
     )
     return agent
 
 
-def _build(agent, **overrides):
+async def _build(agent, **overrides):
     kwargs = dict(
         agent=agent,
         user_message="hello",
@@ -95,10 +95,11 @@ def _build(agent, **overrides):
         ra=lambda: types.SimpleNamespace(_set_interrupt=lambda *a, **k: None),
     )
     kwargs.update(overrides)
-    return build_turn_context(**kwargs)
+    return await build_turn_context(**kwargs)
 
 
-def test_default_false_hook_is_byte_identical_noop():
+@pytest.mark.asyncio
+async def test_default_false_hook_is_byte_identical_noop():
     """The default engine (hook returns False) changes nothing sub-threshold."""
     calls = []
 
@@ -108,7 +109,7 @@ def test_default_false_hook_is_byte_identical_noop():
 
     agent = _make_agent(_stub_compressor(preflight=_hook))
 
-    ctx = _build(agent)
+    ctx = await _build(agent)
 
     assert isinstance(ctx, TurnContext)
     assert calls, "sub-threshold path must consult the engine hook"
@@ -123,7 +124,8 @@ def test_default_false_hook_is_byte_identical_noop():
 
 
 
-def test_true_engine_noop_does_not_defeat_retry_loop_blocking():
+@pytest.mark.asyncio
+async def test_true_engine_noop_does_not_defeat_retry_loop_blocking():
     """#64382 interplay: an engine pass that no-ops must not touch the
 
     stale-budget blocking machinery — ``preflight_compression_blocked`` stays
@@ -133,12 +135,12 @@ def test_true_engine_noop_does_not_defeat_retry_loop_blocking():
     hook = MagicMock(return_value=True)
     agent = _make_agent(_stub_compressor(preflight=hook))
     # Skip path: _compress_context returns the INPUT list object.
-    agent._compress_context = MagicMock(
+    agent._compress_context = AsyncMock(
         side_effect=lambda messages, *_a, **_k: (messages, "SYSTEM")
     )
     history = _history()
 
-    ctx = _build(agent, conversation_history=history)
+    ctx = await _build(agent, conversation_history=history)
 
     hook.assert_called_once()
     agent._compress_context.assert_called_once()
@@ -155,7 +157,8 @@ def test_true_engine_noop_does_not_defeat_retry_loop_blocking():
 
 
 
-def test_builtin_compressor_default_sub_threshold_path_unchanged(tmp_path):
+@pytest.mark.asyncio
+async def test_builtin_compressor_default_sub_threshold_path_unchanged(tmp_path):
     """Byte-identical-default pin against the REAL ContextCompressor.
 
     The built-in engine inherits ``should_compress_preflight() -> False``
@@ -173,7 +176,7 @@ def test_builtin_compressor_default_sub_threshold_path_unchanged(tmp_path):
     ) is False
 
     with patch(
-        "agent.context_compressor.get_model_context_length", return_value=1_000_000
+        "agent.context_compressor.get_static_context_length", return_value=1_000_000
     ):
         compressor = ContextCompressor(
             model="test/model",
@@ -184,7 +187,7 @@ def test_builtin_compressor_default_sub_threshold_path_unchanged(tmp_path):
         )
     agent = _make_agent(compressor)
 
-    ctx = _build(agent)
+    ctx = await _build(agent)
 
     agent._compress_context.assert_not_called()
     agent._emit_status.assert_not_called()

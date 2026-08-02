@@ -52,6 +52,9 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
+
+import aiofiles
+import aiofiles.os
 from hermes_constants import secure_parent_dir
 
 logger = logging.getLogger(__name__)
@@ -384,6 +387,18 @@ def _read_json(path: Path) -> dict | None:
         return None
 
 
+async def _read_json_async(path: Path) -> dict | None:
+    """Read a JSON credential file without blocking the MCP event loop."""
+    try:
+        if not await aiofiles.os.path.isfile(path):
+            return None
+        async with aiofiles.open(path, encoding="utf-8") as handle:
+            return json.loads(await handle.read())
+    except (json.JSONDecodeError, OSError) as exc:
+        logger.warning("Failed to read %s: %s", path, exc)
+        return None
+
+
 def _write_json(path: Path, data: dict) -> None:
     """Write a dict as JSON with restricted permissions (0o600).
 
@@ -421,6 +436,30 @@ def _write_json(path: Path, data: dict) -> None:
         raise
 
 
+async def _write_json_async(path: Path, data: dict) -> None:
+    """Atomically write OAuth state through the native async file boundary."""
+    await aiofiles.os.makedirs(path.parent, exist_ok=True)
+    secure_parent_dir(path)
+    tmp = path.with_suffix(f".tmp.{os.getpid()}.{secrets.token_hex(4)}")
+    try:
+        fd = os.open(
+            str(tmp),
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            stat.S_IRUSR | stat.S_IWUSR,
+        )
+        os.close(fd)
+        async with aiofiles.open(tmp, "w", encoding="utf-8") as handle:
+            await handle.write(json.dumps(data, indent=2, default=str))
+            await handle.flush()
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            await aiofiles.os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
 # ---------------------------------------------------------------------------
 # HermesTokenStorage -- persistent token/client-info on disk
 # ---------------------------------------------------------------------------
@@ -452,7 +491,7 @@ class HermesTokenStorage:
     # -- tokens ------------------------------------------------------------
 
     async def get_tokens(self) -> "OAuthToken | None":
-        data = _read_json(self._tokens_path())
+        data = await _read_json_async(self._tokens_path())
         if data is None:
             return None
         if OAuthToken is None and not _ensure_sdk_loaded():
@@ -477,7 +516,9 @@ class HermesTokenStorage:
             data["expires_in"] = int(max(absolute_expiry - time.time(), 0))
         elif data.get("expires_in") is not None:
             try:
-                file_mtime = self._tokens_path().stat().st_mtime
+                file_mtime = (
+                    await aiofiles.os.stat(self._tokens_path())
+                ).st_mtime
             except OSError:
                 file_mtime = None
             if file_mtime is not None:
@@ -509,13 +550,13 @@ class HermesTokenStorage:
                 # Mock tokens or unusual shapes: skip the expires_at write
                 # rather than fail persistence.
                 pass
-        _write_json(self._tokens_path(), payload)
+        await _write_json_async(self._tokens_path(), payload)
         logger.debug("OAuth tokens saved for %s", self._server_name)
 
     # -- client info -------------------------------------------------------
 
     async def get_client_info(self) -> "OAuthClientInformationFull | None":
-        data = _read_json(self._client_info_path())
+        data = await _read_json_async(self._client_info_path())
         if data is None:
             return None
         if OAuthClientInformationFull is None and not _ensure_sdk_loaded():
@@ -527,7 +568,10 @@ class HermesTokenStorage:
             return None
 
     async def set_client_info(self, client_info: "OAuthClientInformationFull") -> None:
-        _write_json(self._client_info_path(), client_info.model_dump(mode="json", exclude_none=True))
+        await _write_json_async(
+            self._client_info_path(),
+            client_info.model_dump(mode="json", exclude_none=True),
+        )
         logger.debug("OAuth client info saved for %s", self._server_name)
 
     # -- oauth server metadata --------------------------------------------
@@ -538,12 +582,14 @@ class HermesTokenStorage:
     # ``{server_url}/token`` which returns 404 on most real providers and
     # forces a full browser re-authorization.
 
-    def save_oauth_metadata(self, metadata: "OAuthMetadata") -> None:
-        _write_json(self._meta_path(), metadata.model_dump(exclude_none=True, mode="json"))
+    async def save_oauth_metadata(self, metadata: "OAuthMetadata") -> None:
+        await _write_json_async(
+            self._meta_path(), metadata.model_dump(exclude_none=True, mode="json")
+        )
         logger.debug("OAuth metadata saved for %s", self._server_name)
 
-    def load_oauth_metadata(self) -> "OAuthMetadata | None":
-        data = _read_json(self._meta_path())
+    async def load_oauth_metadata(self) -> "OAuthMetadata | None":
+        data = await _read_json_async(self._meta_path())
         if data is None:
             return None
         if OAuthMetadata is None and not _ensure_sdk_loaded():
@@ -605,7 +651,7 @@ class HermesTokenStorage:
             except OSError as exc:
                 logger.warning("Failed to restore OAuth state %s: %s", fname, exc)
 
-    def poison_client_registration(self) -> bool:
+    async def poison_client_registration(self) -> bool:
         """Discard a dead dynamically-registered client so it gets re-created.
 
         Called when the IdP rejects our cached ``client_id`` with
@@ -624,15 +670,21 @@ class HermesTokenStorage:
         Returns True if a client file was present and removed.
         """
         client_path = self._client_info_path()
-        if not client_path.exists():
+        if not await aiofiles.os.path.isfile(client_path):
             return False
         backup = client_path.with_name(client_path.name + ".bak")
         try:
-            backup.write_bytes(client_path.read_bytes())
+            async with aiofiles.open(client_path, "rb") as source:
+                data = await source.read()
+            async with aiofiles.open(backup, "wb") as target:
+                await target.write(data)
         except OSError as exc:  # non-fatal — proceed with the removal anyway
             logger.warning("Could not back up client info at %s: %s", client_path, exc)
-        client_path.unlink(missing_ok=True)
-        self._meta_path().unlink(missing_ok=True)
+        for path in (client_path, self._meta_path()):
+            try:
+                await aiofiles.os.remove(path)
+            except FileNotFoundError:
+                pass
         logger.warning(
             "MCP OAuth '%s': cached client registration rejected as invalid_client; "
             "removed client.json + meta.json (backup at %s) to force re-registration",
@@ -643,6 +695,10 @@ class HermesTokenStorage:
     def has_cached_tokens(self) -> bool:
         """Return True if we have tokens on disk (may be expired)."""
         return self._tokens_path().exists()
+
+    async def has_cached_tokens_async(self) -> bool:
+        """Return cached-token presence without a synchronous stat call."""
+        return await aiofiles.os.path.isfile(self._tokens_path())
 
 
 # ---------------------------------------------------------------------------
@@ -1250,6 +1306,36 @@ def _maybe_preregister_client(
 
     client_info = OAuthClientInformationFull.model_validate(info_dict)
     _write_json(storage._client_info_path(), client_info.model_dump(mode="json", exclude_none=True))
+    logger.debug("Pre-registered client_id=%s for '%s'", client_id, storage._server_name)
+
+
+async def _maybe_preregister_client_async(
+    storage: "HermesTokenStorage",
+    cfg: dict,
+    client_metadata: "OAuthClientMetadata",
+) -> None:
+    """Persist a configured client id without synchronous credential I/O."""
+    client_id = cfg.get("client_id")
+    if not client_id:
+        return
+    if OAuthClientInformationFull is None:
+        _ensure_sdk_loaded()
+    redirect_uri = _resolve_redirect_uri(cfg, cfg["_resolved_port"])
+    info_dict: dict[str, Any] = {
+        "client_id": client_id,
+        "redirect_uris": [redirect_uri],
+        "grant_types": client_metadata.grant_types,
+        "response_types": client_metadata.response_types,
+        "token_endpoint_auth_method": client_metadata.token_endpoint_auth_method,
+    }
+    if cfg.get("client_secret"):
+        info_dict["client_secret"] = cfg["client_secret"]
+    if cfg.get("client_name"):
+        info_dict["client_name"] = cfg["client_name"]
+    if cfg.get("scope"):
+        info_dict["scope"] = cfg["scope"]
+    client_info = OAuthClientInformationFull.model_validate(info_dict)
+    await storage.set_client_info(client_info)
     logger.debug("Pre-registered client_id=%s for '%s'", client_id, storage._server_name)
 
 

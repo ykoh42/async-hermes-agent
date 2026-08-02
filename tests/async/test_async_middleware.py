@@ -2,11 +2,12 @@
 
 import pytest
 
-from hermes_cli.middleware import run_llm_execution_middleware_async
-
 
 @pytest.mark.asyncio
 async def test_async_middleware_can_await_next_call(monkeypatch):
+    import importlib
+
+    middleware = importlib.import_module("hermes_cli.middleware")
     seen = []
 
     async def callback(request, next_call, **_context):
@@ -15,14 +16,15 @@ async def test_async_middleware_can_await_next_call(monkeypatch):
         return {"response": response}
 
     monkeypatch.setattr(
-        "hermes_cli.middleware._get_middleware_callbacks",
+        middleware,
+        "_get_middleware_callbacks",
         lambda _kind: [callback],
     )
 
     async def terminal(request):
         return request["value"] * 2
 
-    result = await run_llm_execution_middleware_async(
+    result = await middleware.run_llm_execution_middleware(
         {"value": 2}, terminal, original_request={"value": 1}
     )
 

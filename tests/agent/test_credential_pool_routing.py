@@ -13,7 +13,9 @@ Covers:
 import json
 import time
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
 
 
 # ---------------------------------------------------------------------------
@@ -38,12 +40,13 @@ class TestEagerFallbackWithPool:
 
         agent._fallback_chain = [{"model": "fallback/model"}] if has_fallback else []
         agent._fallback_index = 0
-        agent._try_activate_fallback = MagicMock(return_value=True)
+        agent._try_activate_fallback = AsyncMock(return_value=True)
         agent._emit_status = MagicMock()
 
         return agent
 
-    def test_eager_fallback_deferred_when_pool_has_credentials(self):
+    @pytest.mark.asyncio
+    async def test_eager_fallback_deferred_when_pool_has_credentials(self):
         """429 with active pool should NOT trigger eager fallback."""
         agent = self._make_agent(has_pool=True, pool_has_creds=True, has_fallback=True)
 
@@ -53,11 +56,12 @@ class TestEagerFallbackWithPool:
             pool = agent._credential_pool
             pool_may_recover = pool is not None and pool.has_available()
             if not pool_may_recover:
-                agent._try_activate_fallback()
+                await agent._try_activate_fallback()
 
         agent._try_activate_fallback.assert_not_called()
 
-    def test_eager_fallback_fires_when_no_pool(self):
+    @pytest.mark.asyncio
+    async def test_eager_fallback_fires_when_no_pool(self):
         """429 without pool should trigger eager fallback."""
         agent = self._make_agent(has_pool=False, has_fallback=True)
 
@@ -66,11 +70,12 @@ class TestEagerFallbackWithPool:
             pool = agent._credential_pool
             pool_may_recover = pool is not None and pool.has_available()
             if not pool_may_recover:
-                agent._try_activate_fallback()
+                await agent._try_activate_fallback()
 
         agent._try_activate_fallback.assert_called_once()
 
-    def test_eager_fallback_fires_when_pool_exhausted(self):
+    @pytest.mark.asyncio
+    async def test_eager_fallback_fires_when_pool_exhausted(self):
         """429 with exhausted pool should trigger eager fallback."""
         agent = self._make_agent(has_pool=True, pool_has_creds=False, has_fallback=True)
 
@@ -79,7 +84,7 @@ class TestEagerFallbackWithPool:
             pool = agent._credential_pool
             pool_may_recover = pool is not None and pool.has_available()
             if not pool_may_recover:
-                agent._try_activate_fallback()
+                await agent._try_activate_fallback()
 
         agent._try_activate_fallback.assert_called_once()
 
@@ -101,6 +106,7 @@ class TestPoolRotationCycle:
         for i in range(pool_entries):
             e = MagicMock(name=f"entry_{i}")
             e.id = f"cred-{i}"
+            e.runtime_api_key = f"key-{i}"
             entries.append(e)
 
         pool = MagicMock()
@@ -119,9 +125,11 @@ class TestPoolRotationCycle:
             pool.has_credentials.return_value = False
             return None
 
-        pool.mark_exhausted_and_rotate = MagicMock(side_effect=rotate)
+        pool.current = MagicMock(return_value=entries[0])
+        pool.entries = MagicMock(return_value=entries)
+        pool.mark_exhausted_and_rotate = AsyncMock(side_effect=rotate)
         agent._credential_pool = pool
-        agent._swap_credential = MagicMock()
+        agent._swap_credential = AsyncMock()
         agent.log_prefix = ""
         agent.api_key = "test-api-key"
         agent.provider = "test-provider"
@@ -129,54 +137,59 @@ class TestPoolRotationCycle:
 
         return agent, pool, entries
 
-    def test_first_429_sets_retry_flag_no_rotation(self):
+    @pytest.mark.asyncio
+    async def test_first_429_sets_retry_flag_no_rotation(self):
         """First 429 should just set has_retried_429=True, no rotation."""
         agent, pool, _ = self._make_agent_with_pool(3)
-        recovered, has_retried = agent._recover_with_credential_pool(
+        recovered, has_retried = await agent._recover_with_credential_pool(
             status_code=429, has_retried_429=False
         )
         assert recovered is False
         assert has_retried is True
-        pool.mark_exhausted_and_rotate.assert_not_called()
+        pool.mark_exhausted_and_rotate.assert_not_awaited()
 
-    def test_second_429_rotates_to_next(self):
+    @pytest.mark.asyncio
+    async def test_second_429_rotates_to_next(self):
         """Second consecutive 429 should rotate to next credential."""
         agent, pool, entries = self._make_agent_with_pool(3)
-        recovered, has_retried = agent._recover_with_credential_pool(
+        recovered, has_retried = await agent._recover_with_credential_pool(
             status_code=429, has_retried_429=True
         )
         assert recovered is True
         assert has_retried is False  # reset after rotation
-        pool.mark_exhausted_and_rotate.assert_called_once_with(status_code=429, error_context=None, api_key_hint="test-api-key")
-        agent._swap_credential.assert_called_once_with(entries[1])
+        pool.mark_exhausted_and_rotate.assert_awaited_once_with(status_code=429, error_context=None, api_key_hint="test-api-key")
+        agent._swap_credential.assert_awaited_once_with(entries[1])
 
-    def test_pool_exhaustion_returns_false(self):
+    @pytest.mark.asyncio
+    async def test_pool_exhaustion_returns_false(self):
         """When all credentials exhausted, recovery should return False."""
         agent, pool, _ = self._make_agent_with_pool(1)
         # First 429 sets flag
-        _, has_retried = agent._recover_with_credential_pool(
+        _, has_retried = await agent._recover_with_credential_pool(
             status_code=429, has_retried_429=False
         )
         assert has_retried is True
 
         # Second 429 tries to rotate but pool is exhausted (only 1 entry)
-        recovered, _ = agent._recover_with_credential_pool(
+        recovered, _ = await agent._recover_with_credential_pool(
             status_code=429, has_retried_429=True
         )
         assert recovered is False
 
-    def test_402_immediate_rotation(self):
+    @pytest.mark.asyncio
+    async def test_402_immediate_rotation(self):
         """402 (billing) should immediately rotate, no retry-first."""
         agent, pool, entries = self._make_agent_with_pool(3)
-        recovered, has_retried = agent._recover_with_credential_pool(
+        recovered, has_retried = await agent._recover_with_credential_pool(
             status_code=402, has_retried_429=False
         )
         assert recovered is True
         assert has_retried is False
-        pool.mark_exhausted_and_rotate.assert_called_once_with(status_code=402, error_context=None, api_key_hint="test-api-key")
+        pool.mark_exhausted_and_rotate.assert_awaited_once_with(status_code=402, error_context=None, api_key_hint="test-api-key")
 
 
-    def test_api_key_hint_from_pool_current_when_agent_key_missing(self):
+    @pytest.mark.asyncio
+    async def test_api_key_hint_from_pool_current_when_agent_key_missing(self):
         """api_key_hint should fall back to pool.current().runtime_api_key
         when agent.api_key is not set (#43747)."""
         from run_agent import AIAgent
@@ -197,19 +210,19 @@ class TestPoolRotationCycle:
         # current entry has a runtime_api_key
         cur_entry = MagicMock()
         cur_entry.runtime_api_key = "pool-current-key"
-        pool.current.return_value = cur_entry
+        pool.current = MagicMock(return_value=cur_entry)
 
-        pool.mark_exhausted_and_rotate.return_value = e1
+        pool.mark_exhausted_and_rotate = AsyncMock(return_value=e1)
         agent._credential_pool = pool
-        agent._swap_credential = MagicMock()
+        agent._swap_credential = AsyncMock()
         agent.log_prefix = ""
         # No agent.api_key set — should fall back to pool.current().runtime_api_key
 
-        recovered, has_retried = agent._recover_with_credential_pool(
+        recovered, has_retried = await agent._recover_with_credential_pool(
             status_code=402, has_retried_429=False
         )
         assert recovered is True
-        pool.mark_exhausted_and_rotate.assert_called_once_with(
+        pool.mark_exhausted_and_rotate.assert_awaited_once_with(
             status_code=402, error_context=None, api_key_hint="pool-current-key"
         )
 
@@ -223,7 +236,7 @@ class TestApiKeyHintRealPool:
     when the failed key differs from the pool's current/first entry, only the
     failed entry is marked exhausted (#43747, wrong-entry marking)."""
 
-    def _seed_pool(self, tmp_path, monkeypatch):
+    async def _seed_pool(self, tmp_path, monkeypatch):
         import json
 
         hermes_home = tmp_path / "hermes"
@@ -259,15 +272,16 @@ class TestApiKeyHintRealPool:
         monkeypatch.setenv("HERMES_HOME", str(hermes_home))
         from agent.credential_pool import load_pool
 
-        return load_pool("openrouter")
+        return await load_pool("openrouter")
 
-    def test_hint_marks_failed_entry_not_current(self, tmp_path, monkeypatch):
-        pool = self._seed_pool(tmp_path, monkeypatch)
+    @pytest.mark.asyncio
+    async def test_hint_marks_failed_entry_not_current(self, tmp_path, monkeypatch):
+        pool = await self._seed_pool(tmp_path, monkeypatch)
         # Another process/pool instance issued sk-or-failed; THIS pool's
         # current() would resolve to the first (healthy) entry.
-        assert pool.select().access_token == "sk-or-healthy"
+        assert (await pool.select()).access_token == "sk-or-healthy"
 
-        next_entry = pool.mark_exhausted_and_rotate(
+        next_entry = await pool.mark_exhausted_and_rotate(
             status_code=429,
             error_context={"reason": "rate_limit_exceeded"},
             api_key_hint="sk-or-failed",
@@ -279,12 +293,13 @@ class TestApiKeyHintRealPool:
         assert next_entry is not None
         assert next_entry.access_token == "sk-or-healthy"
 
-    def test_without_hint_current_entry_is_marked(self, tmp_path, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_without_hint_current_entry_is_marked(self, tmp_path, monkeypatch):
         """Baseline: no hint falls back to current() — the pre-fix behavior."""
-        pool = self._seed_pool(tmp_path, monkeypatch)
-        assert pool.select().access_token == "sk-or-healthy"
+        pool = await self._seed_pool(tmp_path, monkeypatch)
+        assert (await pool.select()).access_token == "sk-or-healthy"
 
-        pool.mark_exhausted_and_rotate(status_code=429, error_context=None)
+        await pool.mark_exhausted_and_rotate(status_code=429, error_context=None)
 
         statuses = {e.id: e.last_status for e in pool._entries}
         assert statuses["cred-healthy"] == "exhausted"
@@ -306,7 +321,7 @@ class TestFailureAttribution:
     failing key's error/reset time onto it until the whole pool went offline.
     """
 
-    def _make_pool(self, tmp_path, monkeypatch, entries):
+    async def _make_pool(self, tmp_path, monkeypatch, entries):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
         hermes_home = tmp_path / "hermes"
         hermes_home.mkdir(parents=True, exist_ok=True)
@@ -315,7 +330,7 @@ class TestFailureAttribution:
         )
         from agent.credential_pool import load_pool
 
-        return load_pool("anthropic")
+        return await load_pool("anthropic")
 
     def _entry(self, idx, key, **overrides):
         entry = {
@@ -335,19 +350,20 @@ class TestFailureAttribution:
             api_key=failing_key,
             _credential_pool=pool,
             _credential_pool_entry_id=credential_id,
-            _swap_credential=MagicMock(),
+            _swap_credential=AsyncMock(),
         )
 
-    def _statuses(self, pool):
-        return {e.id: e.last_status for e in pool.entries()}
+    async def _statuses(self, pool):
+        return {entry.id: entry.last_status for entry in pool.entries()}
 
 
 
-    def test_pre_exhausted_check_uses_failing_key(self, tmp_path, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_pre_exhausted_check_uses_failing_key(self, tmp_path, monkeypatch):
         """The 'already exhausted → rotate immediately' check must inspect the
         failing entry, not pool.current(): first 429 on an already-exhausted
         key rotates without burning a retry."""
-        pool = self._make_pool(
+        pool = await self._make_pool(
             tmp_path, monkeypatch,
             [
                 self._entry(0, "key-a"),
@@ -363,30 +379,31 @@ class TestFailureAttribution:
 
         from agent.agent_runtime_helpers import recover_with_credential_pool
 
-        recovered, has_retried = recover_with_credential_pool(
+        recovered, has_retried = await recover_with_credential_pool(
             agent, status_code=429, has_retried_429=False
         )
 
         assert recovered is True
         assert has_retried is False
-        statuses = self._statuses(pool)
+        statuses = await self._statuses(pool)
         assert statuses["cred-0"] != "exhausted"
-        swapped = agent._swap_credential.call_args[0][0]
+        swapped = agent._swap_credential.await_args.args[0]
         assert swapped.id == "cred-0"
 
-    def test_auth_refresh_targets_failing_key_not_pointer(self, tmp_path, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_auth_refresh_targets_failing_key_not_pointer(self, tmp_path, monkeypatch):
         """The auth path must refresh the entry that supplied the failing key,
         not current(). With current() pointing at healthy A while key B failed,
         try_refresh_current() force-refreshes A — for non-OAuth entries a
         forced refresh marks the entry exhausted outright — so healthy A dies,
         the hinted rotation then exhausts B, and the pool has nothing left."""
-        pool = self._make_pool(
+        pool = await self._make_pool(
             tmp_path, monkeypatch,
             [self._entry(0, "key-a"), self._entry(1, "key-b")],
         )
         # Point the shared cursor at the healthy entry, as a concurrent
         # turn's select() would.
-        selected = pool.select()
+        selected = await pool.select()
         assert selected.id == "cred-0"
         assert pool.current().id == "cred-0"
 
@@ -395,24 +412,25 @@ class TestFailureAttribution:
 
         from agent.agent_runtime_helpers import recover_with_credential_pool
 
-        recovered, _ = recover_with_credential_pool(
+        recovered, _ = await recover_with_credential_pool(
             agent, status_code=401, has_retried_429=False
         )
 
         assert recovered is True
-        statuses = self._statuses(pool)
+        statuses = await self._statuses(pool)
         assert statuses["cred-1"] == "exhausted"
         assert statuses["cred-0"] != "exhausted"
-        swapped = agent._swap_credential.call_args[0][0]
+        swapped = agent._swap_credential.await_args.args[0]
         assert swapped.id == "cred-0"
 
 
-    def test_unmatched_key_does_not_retry_only_pool_entry(
+    @pytest.mark.asyncio
+    async def test_unmatched_key_does_not_retry_only_pool_entry(
         self, tmp_path, monkeypatch
     ):
         """Legacy agents without a stable id must stop when an unmatched key
         has no different credential to rotate to."""
-        pool = self._make_pool(
+        pool = await self._make_pool(
             tmp_path, monkeypatch,
             [self._entry(0, "pool-runtime-key")],
         )
@@ -421,10 +439,10 @@ class TestFailureAttribution:
 
         from agent.agent_runtime_helpers import recover_with_credential_pool
 
-        recovered, _ = recover_with_credential_pool(
+        recovered, _ = await recover_with_credential_pool(
             agent, status_code=401, has_retried_429=False
         )
 
         assert recovered is False
-        assert self._statuses(pool)["cred-0"] != "exhausted"
+        assert (await self._statuses(pool))["cred-0"] != "exhausted"
         agent._swap_credential.assert_not_called()

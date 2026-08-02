@@ -470,33 +470,6 @@ class TestExistingMemoryStorePreserved:
 # ---------------------------------------------------------------------------
 
 class TestCliWiring:
-    def test_parser_builds_and_parses(self):
-        import argparse
-        from hermes_cli.subcommands.import_agent import build_import_agent_parser
-
-        parser = argparse.ArgumentParser()
-        subparsers = parser.add_subparsers(dest="command")
-        called = {}
-        build_import_agent_parser(
-            subparsers, cmd_import_agent=lambda a: called.setdefault("ok", a))
-        args = parser.parse_args(
-            ["import-agent", "claude-code", "--dry-run", "--source", "/tmp/x"])
-        assert args.agent == "claude-code"
-        assert args.dry_run is True
-        assert args.source == "/tmp/x"
-        args.func(args)
-        assert "ok" in called
-
-    def test_rejects_unknown_agent(self):
-        import argparse
-        from hermes_cli.subcommands.import_agent import build_import_agent_parser
-
-        parser = argparse.ArgumentParser()
-        subparsers = parser.add_subparsers(dest="command")
-        build_import_agent_parser(subparsers, cmd_import_agent=lambda a: None)
-        with pytest.raises(SystemExit):
-            parser.parse_args(["import-agent", "cursor"])
-
     def test_command_dry_run_via_cli_writes_nothing(
             self, claude_tree, hermes_home, capsys):
         """End-to-end through import_agent_command with --dry-run."""

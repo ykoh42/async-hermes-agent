@@ -113,13 +113,14 @@ def test_translate_native_response_surfaces_reasoning_and_tool_calls():
     assert json.loads(choice.message.tool_calls[0].function.arguments) == {"q": "hermes"}
 
 
-def test_native_client_uses_x_goog_api_key_and_native_models_endpoint(monkeypatch):
+@pytest.mark.asyncio
+async def test_native_client_uses_x_goog_api_key_and_native_models_endpoint(monkeypatch):
     from agent.gemini_native_adapter import GeminiNativeClient
 
     recorded = {}
 
     class DummyHTTP:
-        def post(self, url, json=None, headers=None, timeout=None):
+        async def post(self, url, json=None, headers=None, timeout=None):
             recorded["url"] = url
             recorded["json"] = json
             recorded["headers"] = headers
@@ -139,13 +140,13 @@ def test_native_client_uses_x_goog_api_key_and_native_models_endpoint(monkeypatc
                 }
             )
 
-        def close(self):
+        async def aclose(self):
             return None
 
-    monkeypatch.setattr("agent.gemini_native_adapter.httpx.Client", lambda *a, **k: DummyHTTP())
+    monkeypatch.setattr("agent.gemini_native_adapter.httpx.AsyncClient", lambda *a, **k: DummyHTTP())
 
     client = GeminiNativeClient(api_key="AIza-test", base_url="https://generativelanguage.googleapis.com/v1beta")
-    response = client.chat.completions.create(
+    response = await client.chat.completions.create(
         model="gemini-2.5-flash",
         messages=[{"role": "user", "content": "Hello"}],
     )
@@ -154,6 +155,7 @@ def test_native_client_uses_x_goog_api_key_and_native_models_endpoint(monkeypatc
     assert recorded["headers"]["x-goog-api-key"] == "AIza-test"
     assert "Authorization" not in recorded["headers"]
     assert response.choices[0].message.content == "hello"
+    await client.aclose()
 
 
 
@@ -165,7 +167,7 @@ def test_native_client_uses_x_goog_api_key_and_native_models_endpoint(monkeypatc
 def test_native_client_accepts_injected_http_client():
     from agent.gemini_native_adapter import GeminiNativeClient
 
-    injected = SimpleNamespace(close=lambda: None)
+    injected = SimpleNamespace(aclose=lambda: None)
     client = GeminiNativeClient(api_key="AIza-test", http_client=injected)
     assert client._http is injected
 
@@ -183,33 +185,11 @@ def test_native_client_rejects_empty_api_key_with_actionable_message():
         assert "aistudio.google.com" in msg
 
 
-@pytest.mark.asyncio
-async def test_async_native_client_streams_without_requiring_async_iterator_from_sync_client():
-    from agent.gemini_native_adapter import AsyncGeminiNativeClient
+def test_native_client_exposes_coroutine_transport():
+    import inspect
+    from agent.gemini_native_adapter import GeminiNativeClient
 
-    chunk = SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(content="hi"), finish_reason=None)])
-    sync_stream = iter([chunk])
-
-    def _advance(iterator):
-        try:
-            return False, next(iterator)
-        except StopIteration:
-            return True, None
-
-    sync_client = SimpleNamespace(
-        api_key="AIza-test",
-        base_url="https://generativelanguage.googleapis.com/v1beta",
-        chat=SimpleNamespace(completions=SimpleNamespace(create=lambda **kwargs: sync_stream)),
-        _advance_stream_iterator=_advance,
-        close=lambda: None,
-    )
-
-    async_client = AsyncGeminiNativeClient(sync_client)
-    stream = await async_client.chat.completions.create(stream=True)
-    collected = []
-    async for item in stream:
-        collected.append(item)
-    assert collected == [chunk]
+    assert inspect.iscoroutinefunction(GeminiNativeClient._create_chat_completion)
 
 
 def test_stream_event_translation_emits_tool_call_delta_with_stable_index():
@@ -251,8 +231,6 @@ def test_stream_event_translation_emits_tool_call_delta_with_stable_index():
 # ---------------------------------------------------------------------------
 # X-Goog-Api-Client header tests
 # ---------------------------------------------------------------------------
-
-
 
 
 

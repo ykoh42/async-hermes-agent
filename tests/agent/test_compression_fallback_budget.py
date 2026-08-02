@@ -17,11 +17,11 @@ Two failure amplifiers when the auxiliary compression route times out:
 """
 
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from agent.auxiliary_client import _fallback_entry_timeout, _call_fallback_candidate_sync
+from agent.auxiliary_client import _fallback_entry_timeout, _call_fallback_candidate
 from agent.context_compressor import ContextCompressor
 
 
@@ -41,25 +41,27 @@ def _patch_task_config(chain):
 
 
 
-def test_fallback_candidate_call_uses_entry_timeout():
+@pytest.mark.asyncio
+async def test_fallback_candidate_call_uses_entry_timeout():
     """The wire call for a configured-chain candidate carries the entry's own
     timeout, not the task-level one the primary just burned."""
     seen = {}
 
-    class _FakeCompletions:
-        def create(self, **kwargs):
-            seen.update(kwargs)
-            return SimpleNamespace(
-                choices=[SimpleNamespace(message=SimpleNamespace(content="ok"))]
-            )
-
     fb_client = SimpleNamespace(
         base_url="https://example.invalid/v1",
-        chat=SimpleNamespace(completions=_FakeCompletions()),
     )
     chain = [{"provider": "custom", "timeout": 240}]
-    with _patch_task_config(chain):
-        resp = _call_fallback_candidate_sync(
+    async def _fake_completion(_client, kwargs, **_options):
+        seen.update(kwargs)
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="ok"))]
+        )
+
+    with _patch_task_config(chain), patch(
+        "agent.auxiliary_client._relay_completion",
+        side_effect=_fake_completion,
+    ):
+        resp = await _call_fallback_candidate(
             fb_client, "deepseek-v4-flash", "fallback_chain[0](custom)",
             task="compression", messages=[{"role": "user", "content": "hi"}],
             temperature=None, max_tokens=None, tools=None,
@@ -78,7 +80,7 @@ def test_fallback_candidate_call_uses_entry_timeout():
 
 
 def _make_compressor():
-    with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+    with patch("agent.context_compressor.get_static_context_length", return_value=100000):
         return ContextCompressor(model="main-model", quiet_mode=True)
 
 
@@ -90,20 +92,22 @@ def _msgs():
     ]
 
 
-def _fail_with_timeout(compressor, now):
+async def _fail_with_timeout(compressor, now):
     with patch(
         "agent.context_compressor.call_llm",
+        new_callable=AsyncMock,
         side_effect=TimeoutError("Request timed out."),
     ), patch("agent.context_compressor.time.monotonic", return_value=now):
-        return compressor._generate_summary(_msgs())
+        return await compressor._generate_summary(_msgs())
 
 
 
 
-def test_timeout_streak_resets_on_success():
+@pytest.mark.asyncio
+async def test_timeout_streak_resets_on_success():
     c = _make_compressor()
-    assert _fail_with_timeout(c, 1000.0) is None
-    assert _fail_with_timeout(c, 2000.0) is None
+    assert await _fail_with_timeout(c, 1000.0) is None
+    assert await _fail_with_timeout(c, 2000.0) is None
     assert c._consecutive_timeout_failures == 2
 
     # A successful summary clears the cooldown AND the streak.
@@ -111,22 +115,22 @@ def test_timeout_streak_resets_on_success():
     assert c._consecutive_timeout_failures == 0
 
     # The next timeout starts back at the 60s rung.
-    assert _fail_with_timeout(c, 5000.0) is None
+    assert await _fail_with_timeout(c, 5000.0) is None
     assert c._summary_failure_cooldown_until == 5000.0 + 60
 
 
-def test_non_timeout_transient_errors_keep_flat_cooldown():
+@pytest.mark.asyncio
+async def test_non_timeout_transient_errors_keep_flat_cooldown():
     """Rate-limit / generic connection errors keep the flat 60s cooldown —
     escalation is scoped to timeout-class failures only."""
     c = _make_compressor()
     with patch(
         "agent.context_compressor.call_llm",
+        new_callable=AsyncMock,
         side_effect=RuntimeError("rate limit exceeded"),
     ), patch("agent.context_compressor.time.monotonic", return_value=1000.0):
-        assert c._generate_summary(_msgs()) is None
+        assert await c._generate_summary(_msgs()) is None
     assert c._summary_failure_cooldown_until == 1000.0 + 60
 
     # And it does not advance the timeout streak.
     assert getattr(c, "_consecutive_timeout_failures", 0) == 0
-
-

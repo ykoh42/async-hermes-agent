@@ -36,6 +36,9 @@ import asyncio
 import base64
 import os
 import re
+import aiofiles
+import aiofiles.os
+import aiofiles.tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -105,7 +108,7 @@ async def resolve_image_source(
         data, mime = _resolve_data_url(s)
         return _finalize(data, mime, "data", s, permitted)
     if s.startswith(("http://", "https://")):
-        reason = _http_block_reason(s)
+        reason = await _http_block_reason(s)
         if reason:
             raise SourceUnsafe(reason, src=s)
         return _finalize(await _download_to_bytes(s), "", "http", s, permitted)
@@ -127,7 +130,10 @@ async def resolve_image_source(
     # every other path is read inside the sandbox via exec-read, so a host
     # path outside the caches never yields the host's bytes.
     host_target = _permitted_host_read_target(p, ctx)
-    if host_target is not None and host_target.is_file():
+    if (
+        host_target is not None
+        and await aiofiles.os.path.isfile(host_target)
+    ):
         # Shared credential-read guard (agent.file_safety, #57698): refuse
         # secret-bearing files (.env, auth.json, ...) with an intentional,
         # specific error instead of relying on the magic-byte sniff to
@@ -144,7 +150,10 @@ async def resolve_image_source(
                 raise_if_read_blocked(str(host_target))
             except ValueError as exc:
                 raise SourceUnsafe(str(exc), src=s, origin="file")
-        data = await asyncio.to_thread(host_target.read_bytes)
+        import aiofiles
+
+        async with aiofiles.open(host_target, "rb") as image_file:
+            data = await image_file.read()
         return _finalize(data, "", "file", s, permitted)
     if _is_local_terminal_backend():
         # Local backend: any path was host-readable, so a miss simply means
@@ -171,7 +180,7 @@ def _resolve_data_url(s: str) -> tuple[bytes, str]:
     return data, declared  # real mime verified in _finalize via magic bytes
 
 
-def _http_block_reason(url: str) -> Optional[str]:
+async def _http_block_reason(url: str) -> Optional[str]:
     """Return a human-readable block reason, or None when the URL is allowed.
 
     Pre-flight short-circuit: policy-blocked URLs are refused BEFORE any
@@ -181,32 +190,36 @@ def _http_block_reason(url: str) -> Optional[str]:
     blocked URL; the inner one covers redirects and non-resolver callers.
     Preserves the specific website-policy message so the agent sees *why*.
     """
-    from tools.url_safety import is_safe_url
-    from tools.website_policy import check_website_access
+    from tools.url_safety import async_is_safe_url
+    from tools.website_policy import async_check_website_access
 
-    if not is_safe_url(url):
+    if not await async_is_safe_url(url):
         return "blocked: unsafe or private URL"
-    blocked = check_website_access(url)
+    blocked = await async_check_website_access(url)
     if blocked:
         return blocked.get("message") or "blocked by website policy"
     return None
 
 
 async def _download_to_bytes(url: str) -> bytes:
-    import tempfile
-
     from tools.vision_tools import _download_image
 
-    with tempfile.NamedTemporaryFile(suffix=".img", delete=False) as tf:
+    async with aiofiles.tempfile.NamedTemporaryFile(
+        suffix=".img", delete=False
+    ) as tf:
         tmp = Path(tf.name)
     try:
         # Enforces the 50MB stream cap, redirect SSRF guard, and website policy.
         await _download_image(url, tmp)
-        return await asyncio.to_thread(tmp.read_bytes)
+        async with aiofiles.open(tmp, "rb") as image_file:
+            return await image_file.read()
     except PermissionError as exc:  # website policy block
         raise SourceUnsafe(str(exc), src=url, origin="http")
     finally:
-        tmp.unlink(missing_ok=True)
+        try:
+            await aiofiles.os.remove(tmp)
+        except FileNotFoundError:
+            pass
 
 
 def _is_local_terminal_backend() -> bool:
@@ -296,7 +309,6 @@ async def _resolve_container_fallback(
     Fail-closed: if there is no active sandbox env we refuse rather than falling
     back to a host read, so a non-cache host path under a sandbox never leaks.
     """
-    import asyncio
     import shlex
 
     env = _get_active_env(ctx.task_id)
@@ -312,12 +324,18 @@ async def _resolve_container_fallback(
     # "over the cap" after decode. The input redirect (< path) avoids argv
     # entirely, so leading-dash paths can't be parsed as options; base64
     # -w0 is GNU-only, so pipe through tr -d for BusyBox.
-    # env.execute is a blocking backend exec; keep it off the event loop so a
-    # multi-MB base64 read doesn't stall every other coroutine.
     qp = shlex.quote(str(p))
-    res = await asyncio.to_thread(
-        env.execute,
-        f"head -c {_MAX_INGEST_BYTES + 1} < {qp} | base64 | tr -d '\\n'")
+    async_execute = getattr(env, "aexecute", None)
+    if not callable(async_execute):
+        raise UnsupportedScheme(
+            "The selected terminal backend does not expose native async "
+            "file reads; image resolution cannot fall back to a worker thread.",
+            src=src,
+            origin="container",
+        )
+    res = await async_execute(
+        f"head -c {_MAX_INGEST_BYTES + 1} < {qp} | base64 | tr -d '\\n'"
+    )
     if res.get("returncode", 1) != 0:
         raise SourceNotFound(f"could not read '{p}' inside the sandbox", src=src, origin="container")
     try:

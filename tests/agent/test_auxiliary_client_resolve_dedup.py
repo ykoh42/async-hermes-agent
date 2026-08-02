@@ -8,6 +8,8 @@ lifetime of the process so a retry loop can't spam the logs.
 
 import logging
 
+import pytest
+
 import agent.auxiliary_client as ac
 from agent.auxiliary_client import resolve_provider_client
 
@@ -16,9 +18,10 @@ class TestUnknownProviderDedup:
     def setup_method(self):
         ac._LOGGED_UNKNOWN_PROVIDER_KEYS.clear()
 
-    def test_unknown_provider_logs_debug_once_not_warning(self, caplog):
+    @pytest.mark.asyncio
+    async def test_unknown_provider_logs_debug_once_not_warning(self, caplog):
         with caplog.at_level(logging.DEBUG, logger="agent.auxiliary_client"):
-            client, model = resolve_provider_client("no_such_provider_xyz", "")
+            client, model = await resolve_provider_client("no_such_provider_xyz", "")
         assert (client, model) == (None, None)
         recs = [
             r for r in caplog.records
@@ -29,11 +32,12 @@ class TestUnknownProviderDedup:
         assert recs[0].levelno == logging.DEBUG
         assert not any(r.levelno >= logging.WARNING for r in recs)
 
-    def test_unknown_provider_repeat_is_suppressed(self, caplog):
+    @pytest.mark.asyncio
+    async def test_unknown_provider_repeat_is_suppressed(self, caplog):
         with caplog.at_level(logging.DEBUG, logger="agent.auxiliary_client"):
-            resolve_provider_client("no_such_provider_xyz", "")
-            resolve_provider_client("no_such_provider_xyz", "")
-            resolve_provider_client("no_such_provider_xyz", "")
+            await resolve_provider_client("no_such_provider_xyz", "")
+            await resolve_provider_client("no_such_provider_xyz", "")
+            await resolve_provider_client("no_such_provider_xyz", "")
         recs = [
             r for r in caplog.records
             if "unknown provider" in r.getMessage()
@@ -41,10 +45,11 @@ class TestUnknownProviderDedup:
         # Three calls, one log line — dedup suppressed the repeats.
         assert len(recs) == 1
 
-    def test_distinct_unknown_providers_each_log_once(self, caplog):
+    @pytest.mark.asyncio
+    async def test_distinct_unknown_providers_each_log_once(self, caplog):
         with caplog.at_level(logging.DEBUG, logger="agent.auxiliary_client"):
-            resolve_provider_client("bogus_a", "")
-            resolve_provider_client("bogus_b", "")
+            await resolve_provider_client("bogus_a", "")
+            await resolve_provider_client("bogus_b", "")
         recs = [
             r for r in caplog.records
             if "unknown provider" in r.getMessage()
@@ -56,7 +61,8 @@ class TestUnhandledAuthTypeDedup:
     def setup_method(self):
         ac._LOGGED_UNHANDLED_AUTHTYPE_KEYS.clear()
 
-    def test_unhandled_auth_type_logs_debug_once_not_warning(self, caplog, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_unhandled_auth_type_logs_debug_once_not_warning(self, caplog, monkeypatch):
         import hermes_cli.auth as auth
         from hermes_cli.auth import ProviderConfig
 
@@ -72,8 +78,8 @@ class TestUnhandledAuthTypeDedup:
         monkeypatch.setattr(auth, "PROVIDER_REGISTRY", patched)
 
         with caplog.at_level(logging.DEBUG, logger="agent.auxiliary_client"):
-            client, model = resolve_provider_client("bogus_authtype", "")
-            resolve_provider_client("bogus_authtype", "")  # repeat → suppressed
+            client, model = await resolve_provider_client("bogus_authtype", "")
+            await resolve_provider_client("bogus_authtype", "")  # repeat → suppressed
 
         assert (client, model) == (None, None)
         recs = [
@@ -90,7 +96,8 @@ class TestUnsupportedOAuthDedup:
     def setup_method(self):
         ac._LOGGED_UNSUPPORTED_OAUTH_KEYS.clear()
 
-    def test_unsupported_oauth_provider_logs_debug_once(self, caplog, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_unsupported_oauth_provider_logs_debug_once(self, caplog, monkeypatch):
         import hermes_cli.auth as auth
         from hermes_cli.auth import ProviderConfig
 
@@ -106,8 +113,8 @@ class TestUnsupportedOAuthDedup:
         monkeypatch.setattr(auth, "PROVIDER_REGISTRY", patched)
 
         with caplog.at_level(logging.DEBUG, logger="agent.auxiliary_client"):
-            resolve_provider_client("bogus_oauth", "")
-            resolve_provider_client("bogus_oauth", "")
+            await resolve_provider_client("bogus_oauth", "")
+            await resolve_provider_client("bogus_oauth", "")
 
         recs = [
             r for r in caplog.records

@@ -19,6 +19,7 @@ preserved.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import re
@@ -35,11 +36,11 @@ from agent.iteration_budget import IterationBudget
 from agent.memory_manager import StreamingContextScrubber
 from agent.model_metadata import (
     MINIMUM_CONTEXT_LENGTH,
-    fetch_model_metadata,
+    get_static_context_length,
     is_local_endpoint,
-    query_ollama_num_ctx,
 )
 from agent.process_bootstrap import _install_safe_stdio
+from agent.ssl_verify import resolve_httpx_verify
 from agent.subdirectory_hints import SubdirectoryHintTracker
 from agent.think_scrubber import StreamingThinkScrubber
 from agent.tool_guardrails import (
@@ -49,9 +50,9 @@ from agent.tool_guardrails import (
 )
 from hermes_cli.config import cfg_get
 from hermes_cli.route_identity import normalize_route_base_url
-from hermes_cli.timeouts import get_provider_request_timeout
+from hermes_cli.timeouts import get_provider_request_timeout, get_provider_stale_timeout
 from hermes_constants import get_hermes_home
-from utils import base_url_host_matches, is_truthy_value
+from utils import base_url_host_matches, base_url_hostname, is_truthy_value
 
 # Use the same logger name as run_agent so tests patching ``run_agent.logger``
 # capture our warnings.  (run_agent.py also does
@@ -109,6 +110,39 @@ def _relay_moa_reference_event(agent: Any, event: str, **kwargs: Any) -> None:
 def _normalize_route_base_url(base_url: Any) -> str:
     """Canonicalize an endpoint URL for model-route identity comparisons."""
     return normalize_route_base_url(base_url)
+
+
+def _provider_timeout_from_snapshot(
+    provider_settings: Any,
+    provider: str,
+    model: str,
+    field: str,
+) -> float | None:
+    """Resolve a timeout from the config snapshot without reopening config.yaml."""
+    if not isinstance(provider_settings, dict) or not provider:
+        return None
+    provider_config = provider_settings.get(provider)
+    if not isinstance(provider_config, dict):
+        return None
+    model_config = provider_config.get("models")
+    if isinstance(model_config, dict):
+        model_config = model_config.get(model)
+    if isinstance(model_config, dict):
+        raw = model_config.get(field)
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            value = None
+        if value is not None and value > 0:
+            return value
+    raw = provider_config.get(
+        "request_timeout_seconds" if field == "timeout_seconds" else field
+    )
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
 
 
 def _provider_default_routes(provider: str) -> set[str]:
@@ -227,6 +261,55 @@ def _custom_provider_runtime_ids(value: Any) -> set[str]:
     if not normalized:
         return set()
     return {normalized, f"custom:{normalized}"}
+
+
+def _moa_aggregator_context_length(
+    config: Dict[str, Any],
+    preset_name: str,
+    custom_providers: list[dict[str, Any]],
+) -> int | None:
+    """Return an MoA aggregator's configured/static window without I/O.
+
+    MoA's public model is a preset rather than the model receiving the
+    request. ``init_agent`` already holds parsed configuration, so resolve the
+    aggregator here instead of rediscovering it during an async turn.
+    """
+    try:
+        from hermes_cli.moa_config import resolve_moa_preset
+
+        preset = resolve_moa_preset(config.get("moa") or {}, preset_name)
+    except Exception:
+        return None
+
+    aggregator = preset.get("aggregator") or {}
+    provider = str(aggregator.get("provider") or "").strip()
+    model = str(aggregator.get("model") or "").strip()
+    if not provider or not model or provider.lower() == "moa":
+        return None
+
+    provider_name = provider.removeprefix("custom:").strip().lower()
+    configured_providers = config.get("providers") or {}
+    if isinstance(configured_providers, dict):
+        for key, entry in configured_providers.items():
+            if not isinstance(entry, dict):
+                continue
+            entry_name = str(entry.get("name") or key).strip().lower()
+            if entry_name != provider_name:
+                continue
+            model_config = (entry.get("models") or {}).get(model)
+            if isinstance(model_config, dict):
+                try:
+                    configured_context = int(model_config.get("context_length"))
+                except (TypeError, ValueError):
+                    configured_context = 0
+                if configured_context > 0:
+                    return configured_context
+
+    return get_static_context_length(
+        model,
+        provider=provider,
+        custom_providers=custom_providers,
+    )
 
 
 def _build_codex_gpt5_autoraise_notice(
@@ -609,6 +692,16 @@ def init_agent(
         else agent.provider
     )
     agent._credential_pool = credential_pool
+    agent._credential_pool_entry_id = None
+    agent._async_provider_timeout_settings: dict[str, Any] = {}
+    # TLS configuration is resolved while constructing immutable agent state,
+    # then reused by the native async client initializer.  A conversation turn
+    # must not reopen config.yaml or synchronously inspect CA-bundle paths.
+    agent._async_default_httpx_verify = resolve_httpx_verify()
+    agent._async_tls_verify_by_route: dict[str, Any] = {}
+    # A missing credential is resolved only when the async runtime starts.
+    # ``init_agent`` must not open auth.json or invoke an OAuth refresher.
+    agent._deferred_provider_runtime = None
     agent.acp_command = acp_command or command
     agent.acp_args = list(acp_args or args or [])
     if api_mode in {"chat_completions", "codex_responses", "anthropic_messages", "bedrock_converse", "codex_app_server"}:
@@ -691,9 +784,7 @@ def init_agent(
     # providers have exceptions (for example Copilot's gpt-5-mini still
     # uses chat completions). Also auto-upgrade for direct OpenAI URLs
     # (api.openai.com) since all newer tool-calling models prefer
-    # Responses there. ACP runtimes are excluded: CopilotACPClient
-    # handles its own routing and does not implement the Responses API
-    # surface.
+    # Responses there.
     # When api_mode was explicitly provided, respect it — the user
     # knows what their endpoint supports (#10473).
     # Exception: Azure OpenAI serves gpt-5.x on /chat/completions and
@@ -702,9 +793,6 @@ def init_agent(
     if (
         api_mode is None
         and agent.api_mode == "chat_completions"
-        and agent.provider != "copilot-acp"
-        and not str(agent.base_url or "").lower().startswith("acp://copilot")
-        and not str(agent.base_url or "").lower().startswith("acp+tcp://")
         and not agent._is_azure_openai_url()
         and (
             agent._is_direct_openai_url()
@@ -719,22 +807,6 @@ def init_agent(
         # from chat_completions to codex_responses after the warm at __init__.
         if hasattr(agent, "_transport_cache"):
             agent._transport_cache.clear()
-
-    # Pre-warm OpenRouter model metadata cache in a background thread.
-    # fetch_model_metadata() is cached for 1 hour; this avoids a blocking
-    # HTTP request on the first API response when pricing is estimated.
-    # Use a process-level Event so this thread is only spawned once — a new
-    # AIAgent is created for every gateway request, so without the guard
-    # each message leaks one OS thread and the process eventually exhausts
-    # the system thread limit (RuntimeError: can't start new thread).
-    if (agent.provider == "openrouter" or agent._is_openrouter_url()) and \
-            not _ra()._openrouter_prewarm_done.is_set():
-        _ra()._openrouter_prewarm_done.set()
-        threading.Thread(
-            target=fetch_model_metadata,
-            daemon=True,
-            name="openrouter-prewarm",
-        ).start()
 
     agent.tool_progress_callback = tool_progress_callback
     agent.tool_start_callback = tool_start_callback
@@ -786,20 +858,20 @@ def init_agent(
     agent._pending_redirect: Optional[str] = None
     agent._pending_redirect_lock = threading.Lock()
 
-    # Concurrent-tool worker thread tracking.  `_execute_tool_calls_concurrent`
-    # runs each tool on its own ThreadPoolExecutor worker — those worker
-    # threads have tids distinct from `_execution_thread_id`, so
-    # `_set_interrupt(True, _execution_thread_id)` alone does NOT cause
-    # `is_interrupted()` inside the worker to return True.  Track the
-    # workers here so `interrupt()` / `clear_interrupt()` can fan out to
-    # their tids explicitly.
-    agent._tool_worker_threads: set[int] = set()
-    agent._tool_worker_threads_lock = threading.Lock()
-    
     # Subagent delegation state
     agent._delegate_depth = 0        # 0 = top-level agent, incremented for children
     agent._active_children = []      # Running child AIAgents (for interrupt propagation)
     agent._active_children_lock = threading.Lock()
+    # Async-first runtime ownership. The lock binds to the event loop on first
+    # use, keeping construction itself synchronous and side-effect free.
+    agent._async_turn_lock = None
+    agent._async_close_lock = None
+    agent._active_turn_task = None
+    # Every turn gets an isolated terminal task id.  Keep the ids until hard
+    # close so persistent terminal environments and background commands from
+    # earlier turns are reaped even after a later turn has replaced
+    # ``_current_task_id``.
+    agent._async_task_ids: set[str] = set()
     
     # Store OpenRouter provider preferences
     agent.providers_allowed = providers_allowed
@@ -975,29 +1047,37 @@ def init_agent(
     agent._anthropic_client = None
     agent._is_anthropic_oauth = False
 
-    # Resolve per-provider / per-model request timeout once up front so
-    # every client construction path below (Anthropic native, OpenAI-wire,
-    # router-based implicit auth) can apply it consistently.  Bedrock
-    # Claude uses its own timeout path and is not covered here.
+    # Resolve per-provider / per-model request timeout once up front so the
+    # deferred native-client initializer can apply the already-known value.
     _provider_timeout = get_provider_request_timeout(agent.provider, agent.model)
+    agent._async_provider_request_timeout = _provider_timeout
+    agent._async_provider_stale_timeout = get_provider_stale_timeout(
+        agent.provider, agent.model,
+    )
 
     if agent.api_mode == "anthropic_messages":
-        from agent.anthropic_adapter import build_anthropic_client, resolve_anthropic_token
         # Bedrock + Claude → use AnthropicBedrock SDK for full feature parity
         # (prompt caching, thinking budgets, adaptive thinking).
         _is_bedrock_anthropic = agent.provider == "bedrock"
         if _is_bedrock_anthropic:
-            from agent.anthropic_adapter import build_anthropic_bedrock_client
             _region_match = re.search(r"bedrock-runtime\.([a-z0-9-]+)\.", base_url or "")
             _br_region = _region_match.group(1) if _region_match else "us-east-1"
             agent._bedrock_region = _br_region
-            agent._anthropic_client = build_anthropic_bedrock_client(_br_region)
             agent._anthropic_api_key = "aws-sdk"
             agent._anthropic_base_url = base_url
             agent._is_anthropic_oauth = False
             agent.api_key = "aws-sdk"
             agent.client = None
             agent._client_kwargs = {}
+            agent._deferred_provider_runtime = {
+                "provider": agent.provider,
+                "model": agent.model,
+                "api_key": agent.api_key,
+                "base_url": base_url,
+                "api_mode": agent.api_mode,
+                "request_timeout": agent._async_provider_request_timeout,
+                "stale_timeout": agent._async_provider_stale_timeout,
+            }
             if not agent.quiet_mode:
                 print(f"🤖 AI Agent initialized with model: {agent.model} (AWS Bedrock + AnthropicBedrock SDK, {_br_region})")
         else:
@@ -1005,31 +1085,9 @@ def init_agent(
             # Other anthropic_messages providers (MiniMax, Alibaba, etc.) must use their own API key.
             # Falling back would send Anthropic credentials to third-party endpoints (Fixes #1739, #minimax-401).
             _is_native_anthropic = agent.provider == "anthropic"
-            effective_key = (api_key or resolve_anthropic_token() or "") if _is_native_anthropic else (api_key or "")
-
-            # MiniMax OAuth issues short-lived (~15-min) access tokens. The
-            # Anthropic SDK caches ``api_key`` as a static string at client
-            # construction time, so a session that resolves the bearer once
-            # at startup will keep sending the same token until MiniMax
-            # returns 401 mid-session. Swap the static string for a callable
-            # token provider — ``build_anthropic_client`` recognizes the
-            # callable and installs an httpx event hook that mints a fresh
-            # bearer per outbound request (re-reading auth.json so a refresh
-            # persisted by another process is visible immediately).
-            # The cached refresh path is a no-op when the token still has
-            # ``MINIMAX_OAUTH_REFRESH_SKEW_SECONDS`` of life left, so steady-
-            # state cost is one file read + one timestamp compare per request.
-            if agent.provider == "minimax-oauth" and isinstance(effective_key, str) and effective_key:
-                try:
-                    from hermes_cli.auth import build_minimax_oauth_token_provider
-                    effective_key = build_minimax_oauth_token_provider()
-                except Exception as _mm_exc:  # noqa: BLE001 — never block startup on this
-                    import logging as _logging
-                    _logging.getLogger(__name__).warning(
-                        "MiniMax OAuth: failed to install per-request token provider "
-                        "(%s); falling back to static bearer that will expire ~15min in.",
-                        _mm_exc,
-                    )
+            # Credential lookup and refresh are deliberately deferred to the
+            # native async first-turn lifecycle.
+            effective_key = api_key or ""
 
             agent.api_key = effective_key
             agent._anthropic_api_key = effective_key
@@ -1043,10 +1101,19 @@ def init_agent(
             # the third-party identity-injection bug.
             from agent.anthropic_adapter import _is_oauth_token as _is_oat
             agent._is_anthropic_oauth = _is_oat(effective_key) if (_is_native_anthropic and isinstance(effective_key, str)) else False
-            agent._anthropic_client = build_anthropic_client(effective_key, base_url, timeout=_provider_timeout)
-            # No OpenAI client needed for Anthropic mode
+            # No provider client is constructed in ``__init__``. The deferred
+            # runtime establishes AsyncAnthropic before the first request.
             agent.client = None
             agent._client_kwargs = {}
+            agent._deferred_provider_runtime = {
+                "provider": agent.provider,
+                "model": agent.model,
+                "api_key": effective_key,
+                "base_url": base_url,
+                "api_mode": agent.api_mode,
+                "request_timeout": agent._async_provider_request_timeout,
+                "stale_timeout": agent._async_provider_stale_timeout,
+            }
             if not agent.quiet_mode:
                 print(f"🤖 AI Agent initialized with model: {agent.model} (Anthropic native)")
                 # ``effective_key`` may be a callable Entra ID bearer
@@ -1061,25 +1128,21 @@ def init_agent(
                 elif isinstance(effective_key, str) and len(effective_key) > 12:
                     print(f"🔑 Using token: {effective_key[:8]}...{effective_key[-4:]}")
     elif agent.provider == "moa":
+        # MoA is a virtual provider: the native async facade fans out
+        # reference calls with TaskGroup and sends the acting request through
+        # the configured aggregator.  It has no HTTP credentials of its own,
+        # so initialize the facade directly instead of routing it through the
+        # ordinary provider resolver.
         from agent.moa_loop import build_moa_facade
-        agent.api_mode = "chat_completions"
 
-        # build_moa_facade wires the reference relay that routes
-        # reference-model outputs to the agent's tool_progress_callback so
-        # every surface that already consumes it (CLI spinner/scrollback, TUI,
-        # desktop, gateway) can show each reference's answer as a labelled
-        # block before the aggregator acts. The facade emits "moa.reference",
-        # "moa.progress", "moa.phase", and "moa.aggregating" events, forwarded
-        # through the same callback the tool lifecycle uses. Best-effort and
-        # cache-safe — display-only events, they never touch the message
-        # history. The factory is shared with the fallback-restore/recovery
-        # paths so a restored facade keeps emitting these events (#53802).
+        agent.api_mode = "chat_completions"
         agent.client = build_moa_facade(agent, agent.model)
         agent._client_kwargs = {}
         agent.api_key = api_key or "moa-virtual-provider"
         agent.base_url = "moa://local"
+        agent._deferred_provider_runtime = None
         if not agent.quiet_mode:
-            print(f"🤖 AI Agent initialized with MoA preset: {agent.model}")
+            print(f"🤖 AI Agent initialized with MoA preset: {agent.model} (native async)")
     elif agent.api_mode == "bedrock_converse":
         # AWS Bedrock — uses boto3 directly, no OpenAI client needed.
         # Region is extracted from the base_url or defaults to us-east-1.
@@ -1128,9 +1191,6 @@ def init_agent(
                 client_kwargs = {"api_key": api_key, "base_url": base_url}
             if _provider_timeout is not None:
                 client_kwargs["timeout"] = _provider_timeout
-            if agent.provider == "copilot-acp":
-                client_kwargs["command"] = agent.acp_command
-                client_kwargs["args"] = agent.acp_args
             effective_base = base_url
             if base_url_host_matches(effective_base, "openrouter.ai"):
                 from agent.auxiliary_client import build_or_headers
@@ -1169,98 +1229,26 @@ def init_agent(
                 except Exception:
                     pass
         else:
-            # No explicit creds — use the centralized provider router
-            from agent.auxiliary_client import resolve_provider_client
-            _routed_client, _ = resolve_provider_client(
-                agent.provider or "auto", model=agent.model, raw_codex=True)
-            if _routed_client is not None:
-                client_kwargs = {
-                    "api_key": _routed_client.api_key,
-                    "base_url": str(_routed_client.base_url),
-                }
-                if _provider_timeout is not None:
-                    client_kwargs["timeout"] = _provider_timeout
-                # Preserve provider-specific headers the router set.  The
-                # OpenAI SDK stores caller-provided default_headers in
-                # _custom_headers; older/mocked clients may expose
-                # _default_headers instead.
-                _routed_headers = getattr(_routed_client, "_custom_headers", None)
-                if not _routed_headers:
-                    _routed_headers = getattr(_routed_client, "default_headers", None)
-                if not _routed_headers:
-                    _routed_headers = getattr(_routed_client, "_default_headers", None)
-                if _routed_headers:
-                    client_kwargs["default_headers"] = dict(_routed_headers)
-            else:
-                # When the user explicitly chose a non-OpenRouter provider
-                # but no credentials were found, fail fast with a clear
-                # message instead of silently routing through OpenRouter.
-                _explicit = (agent.provider or "").strip().lower()
-                if _explicit and _explicit not in {"auto", "openrouter", "custom"}:
-                    # Look up the actual env var name from the provider
-                    # config — some providers use non-standard names
-                    # (e.g. alibaba → DASHSCOPE_API_KEY, not ALIBABA_API_KEY).
-                    _env_hint = f"{_explicit.upper()}_API_KEY"
-                    try:
-                        from hermes_cli.auth import PROVIDER_REGISTRY
-                        _pcfg = PROVIDER_REGISTRY.get(_explicit)
-                        if _pcfg and _pcfg.api_key_env_vars:
-                            _env_hint = _pcfg.api_key_env_vars[0]
-                    except Exception:
-                        pass
-                    # --- Init-time fallback (#17929) ---
-                    _fb_entries = []
-                    if isinstance(fallback_model, list):
-                        _fb_entries = [
-                            f for f in fallback_model
-                            if isinstance(f, dict) and f.get("provider") and f.get("model")
-                        ]
-                    elif isinstance(fallback_model, dict) and fallback_model.get("provider") and fallback_model.get("model"):
-                        _fb_entries = [fallback_model]
-                    _fb_resolved = False
-                    for _fb in _fb_entries:
-                        _fb_explicit_key = (_fb.get("api_key") or "").strip() or None
-                        if not _fb_explicit_key:
-                            _fb_key_env = (_fb.get("key_env") or _fb.get("api_key_env") or "").strip()
-                            if _fb_key_env:
-                                _fb_explicit_key = os.getenv(_fb_key_env, "").strip() or None
-                        _fb_client, _fb_model = resolve_provider_client(
-                            _fb["provider"], model=_fb["model"], raw_codex=True,
-                            explicit_base_url=_fb.get("base_url"),
-                            explicit_api_key=_fb_explicit_key,
-                        )
-                        if _fb_client is not None:
-                            agent.provider = _fb["provider"]
-                            agent.model = _fb_model or _fb["model"]
-                            agent._fallback_activated = True
-                            client_kwargs = {
-                                "api_key": _fb_client.api_key,
-                                "base_url": str(_fb_client.base_url),
-                            }
-                            if _provider_timeout is not None:
-                                client_kwargs["timeout"] = _provider_timeout
-                            _fb_headers = getattr(_fb_client, "_custom_headers", None)
-                            if not _fb_headers:
-                                _fb_headers = getattr(_fb_client, "default_headers", None)
-                            if not _fb_headers:
-                                _fb_headers = getattr(_fb_client, "_default_headers", None)
-                            if _fb_headers:
-                                client_kwargs["default_headers"] = dict(_fb_headers)
-                            _fb_resolved = True
-                            break
-                    if not _fb_resolved:
-                        raise RuntimeError(
-                            f"Provider '{_explicit}' is set in config.yaml but no API key "
-                            f"was found. Set the {_env_hint} environment "
-                            f"variable, or switch to a different provider with `hermes model`."
-                        )
-                if not getattr(agent, "_fallback_activated", False):
-                    # No provider configured — reject with a clear message.
-                    raise RuntimeError(
-                        "No LLM provider configured. Run `hermes model` to "
-                        "select a provider, or run `hermes setup` for first-time "
-                        "configuration."
-                    )
+            # The legacy provider router reads auth files and can refresh OAuth
+            # synchronously.  Keep construction state-only and resolve it from
+            # the first async turn instead.  The placeholder client is never
+            # dispatched: ``initialize_deferred_runtime`` replaces it before
+            # the turn reaches the model transport.
+            agent._deferred_provider_runtime = {
+                "provider": agent.provider or "auto",
+                "model": agent.model,
+                # ``custom`` may receive its API key from OPENAI_API_KEY while
+                # callers supply the endpoint directly.  Preserve that state
+                # for the first async resolution instead of forcing
+                # OPENAI_BASE_URL to duplicate the constructor argument.
+                "base_url": base_url or "",
+                "request_timeout": agent._async_provider_request_timeout,
+                "stale_timeout": agent._async_provider_stale_timeout,
+            }
+            client_kwargs = {
+                "api_key": "async-runtime-pending",
+                "base_url": "https://runtime-pending.invalid/v1",
+            }
         
         agent._client_kwargs = client_kwargs  # stored for rebuilding after interrupt
 
@@ -1294,13 +1282,20 @@ def init_agent(
             from hermes_cli.config import (
                 apply_custom_provider_extra_headers_to_client_kwargs,
                 apply_custom_provider_tls_to_client_kwargs,
+                get_custom_provider_tls_settings,
                 get_compatible_custom_providers,
                 load_config,
             )
 
             _cp_config = load_config()
+            _configured_providers = _cp_config.get("providers", {})
+            if isinstance(_configured_providers, dict):
+                # Keep a state-only policy snapshot for provider switches and
+                # credential-pool rotation. Runtime code reads this mapping,
+                # never config.yaml.
+                agent._async_provider_timeout_settings = dict(_configured_providers)
             _cp_entries = get_compatible_custom_providers(_cp_config)
-            _cp_base_url = str(client_kwargs.get("base_url") or agent.base_url or "")
+            _cp_base_url = str(base_url or client_kwargs.get("base_url") or agent.base_url or "")
             apply_custom_provider_tls_to_client_kwargs(
                 client_kwargs,
                 _cp_base_url,
@@ -1315,43 +1310,73 @@ def init_agent(
                 _cp_base_url,
                 _cp_entries,
             )
+
+            # Compile the TLS policy now.  ``resolve_httpx_verify`` can load a
+            # user CA bundle, which belongs outside the async conversation
+            # turn.  Pool credentials can select a different configured route,
+            # so retain a pre-resolved value for every configured endpoint.
+            for _cp_entry in _cp_entries:
+                _cp_route = _normalize_route_base_url(
+                    _cp_entry.get("base_url") if isinstance(_cp_entry, dict) else ""
+                )
+                if not _cp_route:
+                    continue
+                _cp_tls = get_custom_provider_tls_settings(
+                    _cp_route,
+                    custom_providers=_cp_entries,
+                )
+                if _cp_tls:
+                    agent._async_tls_verify_by_route[_cp_route] = resolve_httpx_verify(
+                        ca_bundle=_cp_tls.get("ssl_ca_cert"),
+                        ssl_verify=_cp_tls.get("ssl_verify"),
+                        base_url=_cp_route,
+                    )
+
+            _selected_route = _normalize_route_base_url(_cp_base_url)
+            if _selected_route:
+                agent._async_tls_verify_by_route[_selected_route] = resolve_httpx_verify(
+                    ca_bundle=client_kwargs.get("ssl_ca_cert"),
+                    ssl_verify=client_kwargs.get("ssl_verify"),
+                    base_url=_selected_route,
+                )
         except Exception:
             logger.debug("custom-provider TLS resolution skipped", exc_info=True)
 
-        agent.api_key = client_kwargs.get("api_key", "")
-        agent.base_url = client_kwargs.get("base_url", agent.base_url)
-        try:
-            from agent.ssl_guard import verify_ca_bundle_with_fallback
+        unresolved_credentials = (
+            agent._deferred_provider_runtime is not None
+            and not (api_key and base_url)
+        )
+        if unresolved_credentials:
+            # Keep the user-facing state credential-free until the async pool
+            # resolver selects a real entry. The placeholder must never mask a
+            # persisted credential-pool key.
+            agent.client = None
+            agent._async_client = None
+            agent._async_client_source = None
+        else:
+            agent.api_key = client_kwargs.get("api_key", "")
+            agent.base_url = client_kwargs.get("base_url", agent.base_url)
+            agent.client = None
+            agent._async_client = None
+            agent._async_client_source = None
+            agent._deferred_provider_runtime = {
+                "provider": agent.provider or "auto",
+                "model": agent.model,
+                "api_key": client_kwargs.get("api_key"),
+                "base_url": client_kwargs.get("base_url"),
+                "api_mode": agent.api_mode,
+                "request_timeout": agent._async_provider_request_timeout,
+                "stale_timeout": agent._async_provider_stale_timeout,
+                # Preserve options already derived from explicit constructor
+                # inputs/config while deferring SDK construction to the first
+                # await boundary.
+                "client_kwargs": dict(client_kwargs),
+            }
+        if not agent.quiet_mode:
+            print(f"🤖 AI Agent initialized with model: {agent.model} (async runtime pending)")
+            if base_url:
+                print(f"🔗 Using custom base URL: {base_url}")
 
-            verify_ca_bundle_with_fallback()
-            agent.client = agent._create_openai_client(client_kwargs, reason="agent_init", shared=True)
-            if not agent.quiet_mode:
-                print(f"🤖 AI Agent initialized with model: {agent.model}")
-                if base_url:
-                    print(f"🔗 Using custom base URL: {base_url}")
-                # ``api_key`` may be a callable Entra ID bearer
-                # provider (Azure Foundry). The OpenAI SDK mints a
-                # fresh JWT per request internally — the banner
-                # never invokes or inspects the callable.
-                from agent.azure_identity_adapter import is_token_provider
-
-                key_used = client_kwargs.get("api_key", "none")
-                if is_token_provider(key_used):
-                    print("🔑 Using credentials: Microsoft Entra ID")
-                elif isinstance(key_used, str) and key_used and key_used != "dummy-key" and len(key_used) > 12:
-                    print(f"🔑 Using API key: {key_used[:8]}...{key_used[-4:]}")
-                else:
-                    print("⚠️  Warning: API key appears invalid or missing")
-        except Exception as e:
-            raise RuntimeError(f"Failed to initialize OpenAI client: {e}")
-
-    # Keep a stable identity for the pool entry that supplied this runtime.
-    # OAuth refreshes can replace the runtime token before a failed request is
-    # recovered, so the mutable API-key value alone cannot reliably attribute
-    # the failure to its source entry.
-    from agent.agent_runtime_helpers import sync_credential_pool_entry_id
-    sync_credential_pool_entry_id(agent)
-    
     # Provider fallback chain — ordered list of backup providers tried
     # when the primary is exhausted (rate-limit, overload, connection
     # failure).  Supports both legacy single-dict ``fallback_model`` and
@@ -1377,18 +1402,10 @@ def init_agent(
             print(f"🔄 Fallback chain ({len(agent._fallback_chain)} providers): " +
                   " → ".join(f"{f['model']} ({f['provider']})" for f in agent._fallback_chain))
 
-    # Discover configured MCP tools before taking the immutable tool snapshot.
-    # MCP is deliberately explicit here (rather than imported as a registry
-    # side effect) so the synchronous baseline has deterministic startup and
-    # callers can still opt out by leaving ``mcp_servers`` empty.
-    try:
-        from hermes_cli.config import load_config_readonly as _load_mcp_cfg
-        _mcp_cfg = _load_mcp_cfg()
-        if isinstance(_mcp_cfg, dict) and _mcp_cfg.get("mcp_servers"):
-            from tools.mcp_tool import discover_mcp_tools
-            discover_mcp_tools()
-    except Exception:
-        logger.debug("MCP discovery skipped during agent initialization", exc_info=True)
+    # MCP discovery opens transports and may wait for remote servers.  Keep
+    # construction state-only; ``build_turn_context`` performs the native
+    # async discovery before the first tool snapshot is sent to the model.
+    agent._mcp_discovery_started = False
 
     # Get available tools with filtering. Capture the registry generation this
     # snapshot is derived from FIRST, so a later concurrent refresh can tell
@@ -1514,22 +1531,19 @@ def init_agent(
     # from the persisted string and is used only to place an early cache marker.
     agent._cached_system_prompt_static: Optional[str] = None
     
-    # Filesystem checkpoint manager (transparent — not a tool)
-    from tools.checkpoint_manager import CheckpointManager
-    agent._checkpoint_mgr = CheckpointManager(
-        enabled=checkpoints_enabled,
-        max_snapshots=checkpoint_max_snapshots,
-        max_total_size_mb=checkpoint_max_total_size_mb,
-        max_file_size_mb=checkpoint_max_file_size_mb,
-    )
-    
     # SQLite session store (optional -- provided by CLI or gateway)
     agent._session_db = session_db
+    # ``switch_model()`` remains a synchronous state mutation; its billing
+    # route is durably recorded by the next native async turn boundary.
+    agent._pending_billing_route = None
+    # The async turn path owns its aiosqlite connection lazily.  A historical
+    # SessionDB object, when supplied by an embedding caller, is retained only
+    # as the public injection value; active turns never invoke its sync methods.
+    agent._async_session_db = None
     agent._parent_session_id = parent_session_id
-    # A close flush and the worker's turn-start flush can overlap. The durable
-    # marker is attached to each in-memory message dict, so its test-and-append
-    # sequence must be serialized per agent rather than relying on SQLite alone.
-    agent._session_persist_lock = threading.RLock()
+    # Transcript mutations are serialized by a lazily-created asyncio.Lock.
+    # Construction remains synchronous and does not bind the lock to a loop.
+    agent._async_session_persist_lock = None
     # CLI retains its just-accepted user dict until turn setup can reuse it.
     # This preserves the message-local durable marker if close persistence wins
     # the race before the agent's normal early turn flush.
@@ -1612,6 +1626,7 @@ def init_agent(
 
     # Persistent memory (MEMORY.md + USER.md) -- loaded from disk
     agent._memory_store = None
+    agent._memory_loaded = False
     agent._memory_enabled = False
     agent._user_profile_enabled = False
     agent._memory_nudge_interval = 10
@@ -1636,7 +1651,6 @@ def init_agent(
                     memory_char_limit=mem_config.get("memory_char_limit", 2200),
                     user_char_limit=mem_config.get("user_char_limit", 1375),
                 )
-                agent._memory_store.load_from_disk()
         except Exception:
             logger.debug("Persistent memory initialization skipped", exc_info=True)
 
@@ -1678,23 +1692,10 @@ def init_agent(
     # line).  Useful for users on exotic setups where the probe heuristics
     # are noisy.
     agent._environment_probe = bool(_agent_section.get("environment_probe", True))
-    # Warm the probe off-thread: it shells out to python3/pip (~0.5s of
-    # subprocess round-trips) and its result lands in the FIRST system
-    # prompt build, which sits on the time-to-first-token critical path.
-    # The warm runs during agent init (network/credential setup dominates),
-    # so by the time the first prompt is built the line is already cached.
-    # Training/batch agents commonly set ``skip_context_files`` and build
-    # prompts synchronously.  Do not leave a probe subprocess/thread running
-    # in that mode: besides being unnecessary for trajectory generation, its
-    # subprocess wait loop can interfere with callers that intentionally
-    # patch ``time.sleep`` around the core tool loop.  Interactive agents keep
-    # the existing warm-up behavior.
-    if agent._environment_probe and not agent.skip_context_files:
-        try:
-            from tools.env_probe import warm_environment_probe_async
-            warm_environment_probe_async()
-        except Exception:
-            pass
+    # Do not warm the local toolchain probe here. ``__init__`` is state-only
+    # in the async package; launching subprocess work here would violate the
+    # lazy lifecycle contract. The prompt may use an already-cached result,
+    # but never starts or waits for this optional diagnostic on a turn path.
 
     # Per-platform prompt-hint overrides (config.yaml → platform_hints).
     # Lets an enterprise admin append to or replace Hermes' built-in
@@ -2029,6 +2030,13 @@ def init_agent(
         if not isinstance(_custom_providers, list):
             _custom_providers = []
 
+    if _config_context_length is None and agent.provider == "moa":
+        _config_context_length = _moa_aggregator_context_length(
+            _agent_cfg,
+            agent.model,
+            _custom_providers,
+        )
+
     # ``model.context_length`` describes the configured default model. A
     # process launched directly with ``--model`` / ``-m`` has already replaced
     # ``agent.model`` before this initializer loads config, so carrying the
@@ -2244,14 +2252,11 @@ def init_agent(
     # AFTER the custom_providers branch so per-model overrides aren't lost.
     agent._config_context_length = _config_context_length
 
-    _lmstudio_runtime_context_length = agent._ensure_lmstudio_runtime_loaded(
-        _config_context_length
-    )
-    if agent._lmstudio_load_was_unverified(_lmstudio_runtime_context_length):
-        _ra().logger.warning(
-            "LM Studio model activation was rejected or completed without a "
-            "verifiable active context length; falling back to configured context"
-        )
+    # ``__init__`` is deliberately state-only in the async package.  The
+    # historical explicit LM Studio loader performs blocking management HTTP,
+    # so it is never invoked here; the deferred runtime rejects that mode
+    # explicitly and JIT remains native-transport compatible.
+    _lmstudio_runtime_context_length = None
     _effective_context_length = agent._effective_lmstudio_context_length(
         _config_context_length,
         _lmstudio_runtime_context_length,
@@ -2272,6 +2277,17 @@ def init_agent(
         _engine_name = _ctx_cfg.get("engine", "compressor") or "compressor"
     except Exception:
         pass
+
+    # This distribution only admits the built-in ContextCompressor on the
+    # native async turn path.  Third-party context engines use the historical
+    # synchronous hook contract (selection, lifecycle, and optional tools),
+    # so loading one here would both perform plugin I/O in ``__init__`` and
+    # give it a chance to block a later turn.  Remember the requested engine
+    # and reject it at the async runtime boundary instead.
+    agent._async_unsupported_context_engine = None
+    if _engine_name != "compressor":
+        agent._async_unsupported_context_engine = str(_engine_name)
+        _engine_name = "compressor"
 
     if _engine_name != "compressor":
         # Try loading from plugins/context_engine/<name>/
@@ -2326,12 +2342,11 @@ def init_agent(
         # plugin, so the autoraise notice would announce a change that does
         # not apply. Drop it. (#44439)
         agent._compression_threshold_autoraised = None
-        # Resolve context_length for plugin engines — mirrors switch_model() path
-        from agent.model_metadata import get_model_context_length
-        _plugin_ctx_len = get_model_context_length(
+        # Plugin engines receive the same no-I/O initial bound as the built-in
+        # compressor. Native provider metadata can refine it after a response.
+        _plugin_ctx_len = get_static_context_length(
             agent.model,
             base_url=agent.base_url,
-            api_key=getattr(agent, "api_key", ""),
             config_context_length=_effective_context_length,
             provider=agent.provider,
             custom_providers=_custom_providers,
@@ -2382,7 +2397,7 @@ def init_agent(
     _bind_session_state = getattr(agent.context_compressor, "bind_session_state", None)
     if callable(_bind_session_state):
         try:
-            _bind_session_state(session_db=session_db, session_id=agent.session_id)
+            _bind_session_state(session_db=None, session_id=agent.session_id)
         except Exception:
             pass
     agent.compression_enabled = compression_enabled
@@ -2552,18 +2567,9 @@ def init_agent(
             agent._ollama_num_ctx = int(_ollama_num_ctx_override)
         except (TypeError, ValueError):
             _ra().logger.debug("Invalid ollama_num_ctx config value: %r", _ollama_num_ctx_override)
-    if agent._ollama_num_ctx is None and agent.base_url and is_local_endpoint(agent.base_url):
-        try:
-            # ``agent.api_key`` may be a callable (Entra token provider).
-            # Ollama detection makes a manual HTTP request and expects a
-            # string — Azure Foundry isn't a local endpoint so this branch
-            # never fires for Entra, but guard defensively.
-            _key_for_ollama = agent.api_key if isinstance(agent.api_key, str) else ""
-            _detected = query_ollama_num_ctx(agent.model, agent.base_url, api_key=_key_for_ollama or "")
-            if _detected and _detected > 0:
-                agent._ollama_num_ctx = _detected
-        except Exception as exc:
-            _ra().logger.debug("Ollama num_ctx detection failed: %s", exc)
+    # Local-server metadata is probed lazily by ``initialize_deferred_runtime``
+    # with an async HTTP client.  Do not perform the historical synchronous
+    # /api/show request from ``__init__``.
     # Cap auto-detected ollama_num_ctx to the user's explicit context_length.
     # Without this, GGUF metadata can advertise 256K+ which Ollama honours
     # by allocating that much VRAM — blowing up small GPUs even though the
@@ -2663,6 +2669,8 @@ def init_agent(
         "api_mode": agent.api_mode,
         "api_key": getattr(agent, "api_key", ""),
         "client_kwargs": dict(agent._client_kwargs),
+        "request_timeout": agent._async_provider_request_timeout,
+        "stale_timeout": agent._async_provider_stale_timeout,
         "use_prompt_caching": agent._use_prompt_caching,
         "use_native_cache_layout": agent._use_native_cache_layout,
         # Context engine state that _try_activate_fallback() overwrites.
@@ -2684,4 +2692,448 @@ def init_agent(
 
 
 
-__all__ = ["init_agent"]
+async def initialize_deferred_runtime(agent: Any) -> bool:
+    """Resolve a no-credential constructor through native async primitives.
+
+    ``AIAgent.__init__`` deliberately does not call the legacy provider
+    router: that router may read credential files and refresh OAuth tokens.
+    This function is the first-turn counterpart.  It supports persisted
+    credential-pool entries and API-key environment providers without a
+    thread fallback.  Providers whose only credential source still requires
+    a synchronous resolver fail explicitly instead of silently blocking a
+    conversation turn.
+    """
+    pending = getattr(agent, "_deferred_provider_runtime", None)
+    if not pending:
+        return False
+
+    lock = getattr(agent, "_async_provider_init_lock", None)
+    if lock is None:
+        lock = asyncio.Lock()
+        agent._async_provider_init_lock = lock
+
+    async with lock:
+        pending = getattr(agent, "_deferred_provider_runtime", None)
+        if not pending:
+            return False
+
+        from agent.agent_runtime_helpers import AsyncCapabilityError
+        from agent.credential_pool import load_pool
+        from hermes_cli.auth import PROVIDER_REGISTRY
+        from hermes_constants import OPENROUTER_BASE_URL
+
+        unsupported_context_engine = getattr(
+            agent, "_async_unsupported_context_engine", None
+        )
+        if unsupported_context_engine:
+            raise AsyncCapabilityError(
+                "Context engine "
+                f"{unsupported_context_engine!r} has no native async lifecycle "
+                "contract and is disabled in async-hermes-agent. Use the built-in "
+                "'compressor' engine or provide a native async implementation."
+            )
+        if getattr(agent, "_memory_manager", None) is not None:
+            raise AsyncCapabilityError(
+                "External MemoryManager providers have no native async lifecycle "
+                "contract and are disabled in async-hermes-agent. The built-in "
+                "file-backed memory tool remains available."
+            )
+
+        requested = str(pending.get("provider") or "auto").strip().lower()
+        model = str(pending.get("model") or getattr(agent, "model", "") or "")
+        explicit_base_url = str(pending.get("base_url") or "").strip()
+        if requested == "copilot-acp" or explicit_base_url.startswith(("acp://", "acp+tcp://")):
+            raise AsyncCapabilityError(
+                "Copilot ACP uses a blocking subprocess transport and is disabled "
+                "in async-hermes-agent until it has a native async implementation."
+            )
+        if str(pending.get("api_mode") or "").strip() == "codex_app_server":
+            raise AsyncCapabilityError(
+                "Codex app-server compaction uses a blocking JSON-RPC transport and "
+                "is disabled in async-hermes-agent until a native async session "
+                "implementation is available."
+            )
+        if requested == "moa":
+            # MoA has no external credentials or HTTP endpoint.  Its native
+            # async facade owns the TaskGroup fan-out and the aggregator
+            # transport is resolved inside each reference/acting call.
+            from agent.moa_loop import build_moa_facade
+
+            agent.provider = "moa"
+            agent.requested_provider = "moa"
+            agent.model = model
+            agent.api_mode = "chat_completions"
+            agent.api_key = str(pending.get("api_key") or "moa-virtual-provider")
+            agent.base_url = "moa://local"
+            agent.client = build_moa_facade(agent, model)
+            agent._anthropic_client = None
+            agent._async_client = None
+            agent._async_client_source = None
+            agent._client_kwargs = {}
+            agent._deferred_provider_runtime = None
+            agent._use_prompt_caching, agent._use_native_cache_layout = (
+                agent._anthropic_prompt_cache_policy()
+            )
+            logger.info("Initialized native async MoA runtime for %s", model)
+            return True
+        candidates = ["openrouter"] if requested in {"", "auto"} else [requested]
+        explicit_api_key = str(pending.get("api_key") or "").strip()
+        resolved: tuple[str, str, str, Any, Any] | None = None
+        unavailable: list[str] = []
+
+        if explicit_api_key and explicit_base_url:
+            resolved = (candidates[0], explicit_api_key, explicit_base_url, None, None)
+
+        for provider in (candidates if resolved is None else ()):
+            try:
+                pool = await load_pool(provider)
+                entry = await pool.select()
+            except AsyncCapabilityError:
+                raise
+            except Exception as exc:
+                raise AsyncCapabilityError(
+                    f"Could not load the native async credential pool for {provider!r}: {exc}"
+                ) from exc
+
+            if entry is not None:
+                api_key = str(
+                    getattr(entry, "runtime_api_key", None)
+                    or getattr(entry, "access_token", "")
+                    or ""
+                ).strip()
+                base_url = str(
+                    getattr(entry, "runtime_base_url", None)
+                    or getattr(entry, "base_url", None)
+                    or ""
+                ).strip()
+                if api_key:
+                    config = PROVIDER_REGISTRY.get(provider)
+                    base_url = base_url or str(
+                        getattr(config, "inference_base_url", "") or ""
+                    ).strip()
+                    if provider == "openrouter":
+                        base_url = base_url or OPENROUTER_BASE_URL
+                    if base_url:
+                        resolved = (provider, api_key, base_url, pool, entry)
+                        break
+
+            if provider == "custom":
+                api_key = str(os.getenv("OPENAI_API_KEY") or "").strip()
+                base_url = explicit_base_url or str(
+                    os.getenv("OPENAI_BASE_URL") or ""
+                ).strip()
+                if api_key and base_url:
+                    resolved = (provider, api_key, base_url, None, None)
+                    break
+                unavailable.append("OPENAI_API_KEY + OPENAI_BASE_URL")
+                continue
+
+            config = PROVIDER_REGISTRY.get(provider)
+            if config is None:
+                unavailable.append(provider)
+                continue
+            if getattr(config, "auth_type", "api_key") != "api_key":
+                raise AsyncCapabilityError(
+                    f"Provider {provider!r} requires a native async OAuth resolver. "
+                    "Its synchronous credential source is disabled in async-hermes-agent."
+                )
+
+            api_key = next(
+                (
+                    value
+                    for env_name in getattr(config, "api_key_env_vars", ())
+                    if (value := str(os.getenv(env_name) or "").strip())
+                ),
+                "",
+            )
+            base_url_env = str(getattr(config, "base_url_env_var", "") or "")
+            base_url = (
+                str(os.getenv(base_url_env) or "").strip()
+                if base_url_env
+                else ""
+            ) or str(getattr(config, "inference_base_url", "") or "").strip()
+            if provider == "openrouter":
+                base_url = base_url or OPENROUTER_BASE_URL
+            if api_key and base_url:
+                resolved = (provider, api_key, base_url, None, None)
+                break
+            unavailable.append(
+                "/".join(getattr(config, "api_key_env_vars", ()) or (provider,))
+            )
+
+        if resolved is None:
+            hints = ", ".join(unavailable) or requested
+            raise AsyncCapabilityError(
+                f"No native async credentials are available for provider {requested!r} "
+                f"({hints}). Pass api_key and base_url to AIAgent, persist a credential "
+                "with Hermes auth, or configure an API-key environment variable."
+            )
+
+        provider, api_key, base_url, pool, entry = resolved
+        if str(pending.get("api_mode") or "") == "bedrock_converse" or provider == "bedrock":
+            raise AsyncCapabilityError(
+                "Bedrock has no native async transport in async-hermes-agent yet."
+            )
+        if provider == "lmstudio" and (
+            getattr(agent, "lmstudio_load_mode", "explicit") or "explicit"
+        ).strip().lower() != "jit":
+            raise AsyncCapabilityError(
+                "LM Studio explicit model loading uses a blocking management API "
+                "and is disabled in async-hermes-agent. Set "
+                "model.lmstudio_load_mode to 'jit' or add a native async loader."
+            )
+        if provider == "gemini":
+            from agent.gemini_native_adapter import is_native_gemini_base_url
+
+            if is_native_gemini_base_url(base_url):
+                # The native adapter owns an httpx.AsyncClient and exposes the
+                # same OpenAI-shaped coroutine contract as the other chat
+                # transports.  Keep the provider on this path so Gemini does
+                # not silently regress to a synchronous compatibility client.
+                logger.debug("Using native async Gemini REST transport")
+        previous_client = getattr(agent, "client", None)
+        previous_anthropic_client = getattr(agent, "_anthropic_client", None)
+        deferred_client_kwargs = pending.get("client_kwargs")
+        if not isinstance(deferred_client_kwargs, dict):
+            deferred_client_kwargs = {}
+        explicit_api_mode = str(pending.get("api_mode") or "").strip()
+        if explicit_api_mode:
+            agent.api_mode = explicit_api_mode
+        elif (
+            base_url.rstrip("/").lower().endswith("/anthropic")
+            or provider == "anthropic"
+            or base_url_hostname(base_url) == "api.anthropic.com"
+            or (
+                provider in {"nous", "nous-portal", "nousresearch"}
+                and model.lower().startswith("anthropic/")
+            )
+        ):
+            agent.api_mode = "anthropic_messages"
+        else:
+            agent.api_mode = "chat_completions"
+        agent.provider = provider
+        agent.requested_provider = provider
+        agent.model = model
+        agent.api_key = api_key
+        agent.base_url = base_url.rstrip("/")
+        timeout_settings = getattr(agent, "_async_provider_timeout_settings", {})
+        if provider in timeout_settings:
+            agent._async_provider_request_timeout = _provider_timeout_from_snapshot(
+                timeout_settings, provider, model, "timeout_seconds",
+            )
+            agent._async_provider_stale_timeout = _provider_timeout_from_snapshot(
+                timeout_settings, provider, model, "stale_timeout_seconds",
+            )
+        else:
+            # A fallback has no pending values and must not inherit a primary
+            # provider's timeout. Rotation/restoration carries the current
+            # snapshot explicitly.
+            agent._async_provider_request_timeout = pending.get("request_timeout")
+            agent._async_provider_stale_timeout = pending.get("stale_timeout")
+
+        # Ollama defaults to a 2048-token context unless ``num_ctx`` is sent.
+        # The constructor only records explicit configuration; discover the
+        # server's model metadata here, after the async runtime has started.
+        # This keeps local HTTP I/O off the synchronous initialization path.
+        if (
+            getattr(agent, "_ollama_num_ctx", None) is None
+            and agent.base_url
+            and is_local_endpoint(agent.base_url)
+        ):
+            try:
+                from agent.model_metadata import query_ollama_num_ctx_async
+
+                detected_num_ctx = await query_ollama_num_ctx_async(
+                    agent.model,
+                    agent.base_url,
+                    api_key=agent.api_key if isinstance(agent.api_key, str) else "",
+                )
+                if detected_num_ctx and detected_num_ctx > 0:
+                    configured_context = getattr(agent, "_config_context_length", None)
+                    if configured_context and detected_num_ctx > configured_context:
+                        detected_num_ctx = configured_context
+                    agent._ollama_num_ctx = detected_num_ctx
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.debug("Async Ollama num_ctx detection failed: %s", exc)
+        if pool is not None:
+            agent._credential_pool = pool
+            agent._credential_pool_entry_id = getattr(entry, "id", None)
+
+        # This value was snapshotted before the turn. Never consult the
+        # synchronous settings layer while creating the native client.
+        timeout = agent._async_provider_request_timeout
+        if agent.api_mode == "anthropic_messages":
+            from agent.anthropic_adapter import _is_oauth_token, build_anthropic_client
+
+            agent._anthropic_api_key = api_key
+            agent._anthropic_base_url = agent.base_url
+            agent._anthropic_client = build_anthropic_client(
+                api_key,
+                agent.base_url,
+                timeout=timeout,
+            )
+            agent._async_anthropic_client = agent._anthropic_client
+            agent._async_anthropic_source = (
+                api_key,
+                agent.base_url,
+                bool(getattr(agent, "_oauth_1m_beta_disabled", False)),
+            )
+            agent._is_anthropic_oauth = (
+                _is_oauth_token(api_key) if provider == "anthropic" else False
+            )
+            agent.client = None
+            agent._client_kwargs = {}
+            agent._async_client = None
+            agent._async_client_source = None
+        elif provider == "gemini":
+            from agent.gemini_native_adapter import is_native_gemini_base_url
+
+            if not is_native_gemini_base_url(agent.base_url):
+                raise AsyncCapabilityError(
+                    "Gemini provider resolved to a non-native endpoint without "
+                    "an OpenAI-compatible async route."
+                )
+            from agent.gemini_native_adapter import GeminiNativeClient
+
+            agent.client = GeminiNativeClient(
+                api_key=api_key,
+                base_url=agent.base_url,
+                timeout=timeout,
+            )
+            agent._client_kwargs = {
+                "api_key": api_key,
+                "base_url": agent.base_url,
+                "timeout": timeout,
+            }
+            agent._async_client = agent.client
+            agent._async_client_source = agent.client
+            agent._anthropic_client = None
+        else:
+            from openai import AsyncOpenAI
+            from agent.auxiliary_client import (
+                _AI_GATEWAY_HEADERS,
+                build_nvidia_nim_headers,
+                build_or_headers,
+            )
+            from agent.process_bootstrap import build_keepalive_http_client
+
+            headers = deferred_client_kwargs.get("default_headers")
+            headers = dict(headers) if isinstance(headers, dict) else {}
+            if not headers and base_url_host_matches(agent.base_url, "openrouter.ai"):
+                # Passing an explicit empty config avoids a synchronous config
+                # read in the runtime path while retaining environment policy.
+                headers = build_or_headers(or_config={})
+            elif base_url_host_matches(agent.base_url, "ai-gateway.vercel.sh"):
+                headers = dict(_AI_GATEWAY_HEADERS)
+            elif base_url_host_matches(agent.base_url, "integrate.api.nvidia.com"):
+                headers = build_nvidia_nim_headers(agent.base_url)
+            elif base_url_host_matches(agent.base_url, "api.kimi.com"):
+                headers = {"User-Agent": "claude-code/0.1.0"}
+            elif base_url_host_matches(agent.base_url, "portal.qwen.ai"):
+                headers = _ra()._qwen_portal_headers()
+
+            client_kwargs: dict[str, Any] = {
+                "api_key": api_key,
+                "base_url": agent.base_url,
+                "max_retries": 0,
+            }
+            preloaded_timeout = deferred_client_kwargs.get("timeout")
+            if preloaded_timeout is not None:
+                client_kwargs["timeout"] = preloaded_timeout
+            elif timeout is not None:
+                client_kwargs["timeout"] = timeout
+            default_query = deferred_client_kwargs.get("default_query")
+            if isinstance(default_query, dict) and default_query:
+                client_kwargs["default_query"] = dict(default_query)
+            if headers:
+                client_kwargs["default_headers"] = headers
+            http_client = build_keepalive_http_client(
+                agent.base_url,
+                verify=getattr(agent, "_async_tls_verify_by_route", {}).get(
+                    _normalize_route_base_url(agent.base_url),
+                    getattr(agent, "_async_default_httpx_verify", True),
+                ),
+            )
+            if http_client is not None:
+                client_kwargs["http_client"] = http_client
+            agent.client = AsyncOpenAI(**client_kwargs)
+            # OpenAI>=2 lazily resolves the platform on the first request.
+            # The value only controls an SDK telemetry
+            # header, so use a stable conservative value and keep the agent
+            # turn entirely on the event loop.
+            agent.client._platform = "Unknown"
+            # Do not persist the owned httpx.AsyncClient in the rebuild recipe.
+            agent._client_kwargs = {
+                key: value for key, value in client_kwargs.items() if key != "http_client"
+            }
+            agent._async_client = agent.client
+            agent._async_client_source = agent.client
+
+            # A fallback can leave an Anthropic client attached while the
+            # next selected credential uses the OpenAI wire format.
+            agent._anthropic_client = None
+
+        active_clients = {id(candidate) for candidate in (
+            getattr(agent, "client", None),
+            getattr(agent, "_anthropic_client", None),
+        ) if candidate is not None}
+        closed_client_ids: set[int] = set()
+        for stale_client in (previous_client, previous_anthropic_client):
+            if stale_client is None or id(stale_client) in active_clients:
+                continue
+            if id(stale_client) in closed_client_ids:
+                continue
+            closed_client_ids.add(id(stale_client))
+            aclose = getattr(stale_client, "aclose", None)
+            if aclose is None:
+                # The only expected synchronous client is the constructor's
+                # no-request placeholder. Calling its blocking ``close`` from
+                # a turn would violate the async boundary; let normal object
+                # finalization release it instead.
+                continue
+            await aclose()
+
+        agent._use_prompt_caching, agent._use_native_cache_layout = (
+            agent._anthropic_prompt_cache_policy()
+        )
+        compressor = getattr(agent, "context_compressor", None)
+        if compressor is not None:
+            compressor.update_model(
+                model=agent.model,
+                context_length=compressor.context_length,
+                base_url=agent.base_url,
+                api_key=agent.api_key,
+                provider=agent.provider,
+                api_mode=agent.api_mode,
+            )
+
+        primary = getattr(agent, "_primary_runtime", None)
+        if pending.get("update_primary", True) and isinstance(primary, dict):
+            primary.update({
+                "model": agent.model,
+                "provider": agent.provider,
+                "requested_provider": agent.requested_provider,
+                "base_url": agent.base_url,
+                "api_mode": agent.api_mode,
+                "api_key": agent.api_key,
+                "client_kwargs": dict(agent._client_kwargs),
+                "request_timeout": agent._async_provider_request_timeout,
+                "stale_timeout": agent._async_provider_stale_timeout,
+                "use_prompt_caching": agent._use_prompt_caching,
+                "use_native_cache_layout": agent._use_native_cache_layout,
+            })
+            if agent.api_mode == "anthropic_messages":
+                primary.update({
+                    "anthropic_api_key": agent._anthropic_api_key,
+                    "anthropic_base_url": agent._anthropic_base_url,
+                    "is_anthropic_oauth": agent._is_anthropic_oauth,
+                })
+
+        agent._deferred_provider_runtime = None
+        logger.info("Initialized native async runtime for %s", provider)
+        return True
+
+
+__all__ = ["init_agent", "initialize_deferred_runtime"]

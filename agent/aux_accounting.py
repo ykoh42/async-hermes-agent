@@ -68,7 +68,7 @@ def get_accounting_context() -> Optional[tuple]:
     return _accounting.get()
 
 
-def record_aux_usage(
+async def record_aux_usage(
     response: Any,
     task: Optional[str],
     *,
@@ -100,7 +100,7 @@ def record_aux_usage(
         if raw_usage is None:
             return
 
-        from agent.usage_pricing import estimate_usage_cost, normalize_usage
+        from agent.usage_pricing import estimate_usage_cost_async, normalize_usage
 
         usage = normalize_usage(raw_usage, provider=provider)
         if not (
@@ -113,7 +113,7 @@ def record_aux_usage(
         model = str(getattr(response, "model", "") or "") or "unknown"
         estimated_cost = None
         try:
-            cost = estimate_usage_cost(
+            cost = await estimate_usage_cost_async(
                 model, usage, provider=provider, base_url=base_url
             )
             if cost.amount_usd is not None:
@@ -121,7 +121,12 @@ def record_aux_usage(
         except Exception:
             logger.debug("Aux usage cost estimation failed", exc_info=True)
 
-        session_db.record_auxiliary_usage(
+        record_usage = getattr(session_db, "record_auxiliary_usage", None)
+        if not callable(record_usage):
+            raise RuntimeError(
+                "Async auxiliary accounting requires AsyncSessionDB."
+            )
+        await record_usage(
             session_id,
             task,
             model=model,

@@ -33,14 +33,14 @@ except ModuleNotFoundError:
 
 import json
 import asyncio
+import aiofiles
+import aiofiles.os
 import logging
 import os
 import time
-import inspect
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
 from datetime import datetime
-from threading import Lock
 import traceback
 from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeRemainingColumn, MofNCompleteColumn
 from rich.console import Console
@@ -70,27 +70,97 @@ ALL_POSSIBLE_TOOLS = set(TOOL_TO_TOOLSET_MAP.keys())
 DEFAULT_TOOL_STATS = {'count': 0, 'success': 0, 'failure': 0}
 
 
-def _training_toolsets(selected_toolsets: List[str]) -> List[str]:
+async def _atomic_json_write(path: Path, payload: Dict[str, Any]) -> None:
+    """Atomically publish a JSON checkpoint without blocking batch workers."""
+    await aiofiles.os.makedirs(path.parent, exist_ok=True)
+    temporary_path = path.with_name(f".{path.name}.tmp")
+    serialized = json.dumps(payload, indent=2, ensure_ascii=False, default=str)
+    async with aiofiles.open(temporary_path, "w", encoding="utf-8") as output:
+        await output.write(serialized)
+    await aiofiles.os.replace(temporary_path, path)
+
+
+async def _append_jsonl_line(path: Path, payload: Dict[str, Any]) -> None:
+    """Append one complete trajectory row before propagating cancellation.
+
+    A batch shard has exactly one owning coroutine, so rows cannot interleave.
+    Shielding the short open/write/flush transaction means a cancellation does
+    not leave that owner midway through a JSON object.  The caller still sees
+    ``CancelledError`` as soon as the durable row is complete, and resume can
+    reliably discover it from the shard.
+    """
+    line = json.dumps(payload, ensure_ascii=False) + "\n"
+
+    async def _append() -> None:
+        async with aiofiles.open(path, "a", encoding="utf-8") as output:
+            await output.write(line)
+            await output.flush()
+
+    write_task = asyncio.create_task(_append())
+    try:
+        await asyncio.shield(write_task)
+    except asyncio.CancelledError:
+        # Complete the already-started row before the worker is cancelled.
+        # ``shield`` preserves the write task while this coroutine receives
+        # cancellation, and this await also surfaces an actual write error.
+        await asyncio.shield(write_task)
+        raise
+
+
+async def _list_batch_files(directory: Path) -> List[Path]:
+    """List batch JSONL shards without a synchronous directory glob."""
+    try:
+        iterator = await aiofiles.os.scandir(directory)
+    except OSError:
+        return []
+    paths: list[Path] = []
+    try:
+        for entry in iterator:
+            if (
+                entry.name.startswith("batch_")
+                and entry.name.endswith(".jsonl")
+                and await aiofiles.os.path.isfile(entry.path)
+            ):
+                paths.append(Path(entry.path))
+    finally:
+        iterator.close()
+    return sorted(paths)
+
+
+async def _communicate_with_timeout(
+    process: asyncio.subprocess.Process,
+    timeout: float,
+) -> tuple[bytes, bytes]:
+    """Communicate with an optional batch subprocess without leaking it."""
+    try:
+        return await asyncio.wait_for(process.communicate(), timeout=timeout)
+    except (TimeoutError, asyncio.CancelledError):
+        if process.returncode is None:
+            process.kill()
+        await process.wait()
+        raise
+
+
+async def _training_toolsets(selected_toolsets: List[str]) -> List[str]:
     """Add the harness capabilities that every training trajectory needs.
 
-    Distribution entries describe task-specific extras (web-only, terminal-
-    only, vision, and so on).  They must not silently remove the instruction
-    layer from a co-training sample, however: Skills and delegation are part
-    of the harness being trained, and configured MCP server aliases are the
-    only way their discovered tools enter a scoped agent.  Persistent memory
-    is deliberately not added here because batch workers pass ``skip_memory``
-    to keep samples isolated from the user's on-disk memory.
+    Distribution entries describe task-specific extras.  The async training
+    runtime exposes only its native harness waist, however: terminal, files,
+    skills, planning, and clarify. Configured MCP server aliases are the only
+    way their discovered tools enter a scoped agent. Persistent memory is
+    deliberately not added here because batch workers pass ``skip_memory`` to
+    keep samples isolated from the user's on-disk memory.
     """
     result = list(dict.fromkeys(str(name) for name in (selected_toolsets or [])))
-    for required in ("skills", "delegation"):
+    for required in ("terminal", "file", "skills", "todo", "clarify"):
         if required not in result:
             result.append(required)
 
     try:
-        from hermes_cli.config import load_config_readonly
+        from hermes_cli.config import load_config_readonly_async
         from hermes_cli.tools_config import enabled_mcp_server_names
 
-        config = load_config_readonly()
+        config = await load_config_readonly_async()
         for server_name in sorted(enabled_mcp_server_names(config)):
             if server_name not in result:
                 result.append(server_name)
@@ -294,7 +364,7 @@ async def _check_container_image(container_image: str, prompt_index: int, config
             ),
             timeout=10,
         )
-        _, _ = await asyncio.wait_for(probe.communicate(), timeout=10)
+        _, _ = await _communicate_with_timeout(probe, timeout=10)
         if probe.returncode == 0:
             return None
 
@@ -308,7 +378,7 @@ async def _check_container_image(container_image: str, prompt_index: int, config
             ),
             timeout=600,
         )
-        _, stderr = await asyncio.wait_for(pull.communicate(), timeout=600)
+        _, stderr = await _communicate_with_timeout(pull, timeout=600)
         if pull.returncode != 0:
             error_text = stderr.decode("utf-8", errors="replace")[:500]
             return {
@@ -375,9 +445,10 @@ async def _process_single_prompt(
         if config.get("verbose"):
             print(f"   Prompt {prompt_index}: Using container image {container_image}")
     
+    agent = None
     try:
         # Sample toolsets from distribution for this prompt
-        selected_toolsets = _training_toolsets(
+        selected_toolsets = await _training_toolsets(
             sample_toolsets_from_distribution(config["distribution"])
         )
         
@@ -459,9 +530,12 @@ async def _process_single_prompt(
                 "timestamp": datetime.now().isoformat()
             }
         }
+    finally:
+        if agent is not None:
+            await agent.close()
 
 
-async def _process_batch_worker_async(args: Tuple) -> Dict[str, Any]:
+async def _process_batch_worker(args: Tuple) -> Dict[str, Any]:
     """
     Worker function to process a single batch of prompts.
     
@@ -506,14 +580,12 @@ async def _process_batch_worker_async(args: Tuple) -> Dict[str, Any]:
     # Process each prompt sequentially in this batch
     for prompt_index, prompt_data in prompts_to_process:
         # Process the prompt
-        result = _process_single_prompt(
+        result = await _process_single_prompt(
             prompt_index,
             prompt_data,
             batch_num,
             config
         )
-        if inspect.isawaitable(result):
-            result = await result
         
         # Save trajectory if successful
         if result["success"] and result["trajectory"]:
@@ -548,9 +620,10 @@ async def _process_batch_worker_async(args: Tuple) -> Dict[str, Any]:
                 "tool_error_counts": tool_error_counts  # Simple: {tool: failure_count} - normalized
             }
             
-            # Append to batch output file
-            with open(batch_output_file, 'a', encoding='utf-8') as f:
-                f.write(json.dumps(trajectory_entry, ensure_ascii=False) + "\n")
+            # Each batch owns its own append-only shard, so concurrent batches
+            # cannot interleave a JSONL row.  The helper also completes a row
+            # before cancellation reaches the worker, keeping resume JSONL-safe.
+            await _append_jsonl_line(batch_output_file, trajectory_entry)
         
         # Aggregate tool statistics
         for tool_name, stats in result.get("tool_stats", {}).items():
@@ -588,17 +661,6 @@ async def _process_batch_worker_async(args: Tuple) -> Dict[str, Any]:
         "discarded_no_reasoning": discarded_no_reasoning,
         "completed_prompts": completed_in_batch
     }
-
-
-def _process_batch_worker(args: Tuple) -> Dict[str, Any]:
-    """Synchronous compatibility seam for legacy unit tests/tools.
-
-    The production scheduler calls :func:`_process_batch_worker_async`
-    directly.  Keeping this private helper avoids forcing old, stand-alone
-    test utilities to create an event loop; it is not part of the async agent
-    package API.
-    """
-    return asyncio.run(_process_batch_worker_async(args))
 
 
 class BatchRunner:
@@ -684,9 +746,10 @@ class BatchRunner:
         if not validate_distribution(distribution):
             raise ValueError(f"Unknown distribution: {distribution}. Available: {list(list_distributions().keys())}")
         
-        # Setup output directory
+        # Output paths are resolved synchronously, but directory creation and
+        # dataset/checkpoint reads are deferred to ``run()``.  Constructing a
+        # runner is therefore safe in an async service request path.
         self.output_dir = Path("data") / run_name
-        self.output_dir.mkdir(parents=True, exist_ok=True)
         
         # Checkpoint file
         self.checkpoint_file = self.output_dir / "checkpoint.json"
@@ -694,54 +757,37 @@ class BatchRunner:
         # Statistics file
         self.stats_file = self.output_dir / "statistics.json"
         
-        # Load dataset (and optionally truncate to max_samples)
-        self.dataset = self._load_dataset()
-        if self.max_samples and self.max_samples < len(self.dataset):
-            full_count = len(self.dataset)
-            self.dataset = self.dataset[:self.max_samples]
-            print(f"✂️  Truncated dataset from {full_count} to {self.max_samples} samples (--max_samples)")
-        
-        # Create batches
-        self.batches = self._create_batches()
-        
-        print("📊 Batch Runner Initialized")
-        print(f"   Dataset: {self.dataset_file} ({len(self.dataset)} prompts)")
-        print(f"   Batch size: {self.batch_size}")
-        print(f"   Total batches: {len(self.batches)}")
-        print(f"   Run name: {self.run_name}")
-        print(f"   Distribution: {self.distribution}")
-        print(f"   Output directory: {self.output_dir}")
-        print(f"   Workers: {self.num_workers}")
-        if self.ephemeral_system_prompt:
-            prompt_preview = self.ephemeral_system_prompt[:60] + "..." if len(self.ephemeral_system_prompt) > 60 else self.ephemeral_system_prompt
-            print(f"   🔒 Ephemeral system prompt: '{prompt_preview}'")
+        self.dataset: List[Dict[str, Any]] = []
+        self.batches: List[List[Tuple[int, Dict[str, Any]]]] = []
+        self._initialized = False
     
-    def _load_dataset(self) -> List[Dict[str, Any]]:
+    async def _load_dataset(self) -> List[Dict[str, Any]]:
         """
         Load dataset from JSONL file.
         
         Returns:
             List[Dict]: List of dataset entries
         """
-        if not self.dataset_file.exists():
-            raise FileNotFoundError(f"Dataset file not found: {self.dataset_file}")
-        
         dataset = []
-        with open(self.dataset_file, 'r', encoding='utf-8') as f:
-            for line_num, line in enumerate(f, 1):
-                line = line.strip()
-                if not line:
-                    continue
-                
-                try:
-                    entry = json.loads(line)
-                    if 'prompt' not in entry:
-                        print(f"⚠️  Warning: Line {line_num} missing 'prompt' field, skipping")
+        try:
+            async with aiofiles.open(self.dataset_file, "r", encoding="utf-8") as source:
+                line_num = 0
+                async for line in source:
+                    line_num += 1
+                    line = line.strip()
+                    if not line:
                         continue
-                    dataset.append(entry)
-                except json.JSONDecodeError as e:
-                    print(f"⚠️  Warning: Invalid JSON on line {line_num}: {e}")
-                    continue
+
+                    try:
+                        entry = json.loads(line)
+                        if "prompt" not in entry:
+                            print(f"⚠️  Warning: Line {line_num} missing 'prompt' field, skipping")
+                            continue
+                        dataset.append(entry)
+                    except json.JSONDecodeError as e:
+                        print(f"⚠️  Warning: Invalid JSON on line {line_num}: {e}")
+        except FileNotFoundError as exc:
+            raise FileNotFoundError(f"Dataset file not found: {self.dataset_file}") from exc
         
         if not dataset:
             raise ValueError(f"No valid entries found in dataset file: {self.dataset_file}")
@@ -762,24 +808,23 @@ class BatchRunner:
         
         return batches
     
-    def _load_checkpoint(self) -> Dict[str, Any]:
+    async def _load_checkpoint(self) -> Dict[str, Any]:
         """
         Load checkpoint data if it exists.
         
         Returns:
             Dict: Checkpoint data with completed prompt indices
         """
-        if not self.checkpoint_file.exists():
+        try:
+            async with aiofiles.open(self.checkpoint_file, "r", encoding="utf-8") as source:
+                return json.loads(await source.read())
+        except FileNotFoundError:
             return {
                 "run_name": self.run_name,
                 "completed_prompts": [],
                 "batch_stats": {},
-                "last_updated": None
+                "last_updated": None,
             }
-        
-        try:
-            with open(self.checkpoint_file, 'r', encoding='utf-8') as f:
-                return json.load(f)
         except Exception as e:
             print(f"⚠️  Warning: Failed to load checkpoint: {e}")
             return {
@@ -789,24 +834,17 @@ class BatchRunner:
                 "last_updated": None
             }
     
-    def _save_checkpoint(self, checkpoint_data: Dict[str, Any], lock: Optional[Lock] = None):
+    async def _save_checkpoint(self, checkpoint_data: Dict[str, Any]):
         """
         Save checkpoint data.
         
         Args:
             checkpoint_data (Dict): Checkpoint data to save
-            lock (Lock): Optional lock for thread-safe access
         """
         checkpoint_data["last_updated"] = datetime.now().isoformat()
-
-        from utils import atomic_json_write
-        if lock:
-            with lock:
-                atomic_json_write(self.checkpoint_file, checkpoint_data)
-        else:
-            atomic_json_write(self.checkpoint_file, checkpoint_data)
+        await _atomic_json_write(self.checkpoint_file, checkpoint_data)
     
-    def _scan_completed_prompts_by_content(self) -> set:
+    async def _scan_completed_prompts_by_content(self) -> set:
         """
         Scan all batch files and extract completed prompts by their actual content.
         
@@ -817,7 +855,7 @@ class BatchRunner:
             set: Set of prompt texts that have been successfully processed
         """
         completed_prompts = set()
-        batch_files = sorted(self.output_dir.glob("batch_*.jsonl"))
+        batch_files = await _list_batch_files(self.output_dir)
         
         if not batch_files:
             return completed_prompts
@@ -826,8 +864,8 @@ class BatchRunner:
         
         for batch_file in batch_files:
             try:
-                with open(batch_file, 'r', encoding='utf-8') as f:
-                    for line in f:
+                async with aiofiles.open(batch_file, "r", encoding="utf-8") as source:
+                    async for line in source:
                         try:
                             entry = json.loads(line.strip())
                             
@@ -891,6 +929,28 @@ class BatchRunner:
         Args:
             resume (bool): Whether to resume from checkpoint
         """
+        if not self._initialized:
+            await aiofiles.os.makedirs(self.output_dir, exist_ok=True)
+            self.dataset = await self._load_dataset()
+            if self.max_samples and self.max_samples < len(self.dataset):
+                full_count = len(self.dataset)
+                self.dataset = self.dataset[:self.max_samples]
+                print(f"✂️  Truncated dataset from {full_count} to {self.max_samples} samples (--max_samples)")
+            self.batches = self._create_batches()
+            self._initialized = True
+
+            print("📊 Batch Runner Initialized")
+            print(f"   Dataset: {self.dataset_file} ({len(self.dataset)} prompts)")
+            print(f"   Batch size: {self.batch_size}")
+            print(f"   Total batches: {len(self.batches)}")
+            print(f"   Run name: {self.run_name}")
+            print(f"   Distribution: {self.distribution}")
+            print(f"   Output directory: {self.output_dir}")
+            print(f"   Workers: {self.num_workers}")
+            if self.ephemeral_system_prompt:
+                prompt_preview = self.ephemeral_system_prompt[:60] + "..." if len(self.ephemeral_system_prompt) > 60 else self.ephemeral_system_prompt
+                print(f"   🔒 Ephemeral system prompt: '{prompt_preview}'")
+
         print("\n" + "=" * 70)
         print("🚀 Starting Batch Processing")
         print("=" * 70)
@@ -898,7 +958,7 @@ class BatchRunner:
         # Smart resume: scan batch files by content to find completed prompts
         completed_prompt_texts = set()
         if resume:
-            completed_prompt_texts = self._scan_completed_prompts_by_content()
+            completed_prompt_texts = await self._scan_completed_prompts_by_content()
             if completed_prompt_texts:
                 print(f"   Found {len(completed_prompt_texts)} already-completed prompts by content matching")
         
@@ -930,7 +990,7 @@ class BatchRunner:
             print("=" * 70 + "\n")
         
         # Load existing checkpoint (so resume doesn't clobber prior progress)
-        checkpoint_data = self._load_checkpoint()
+        checkpoint_data = await self._load_checkpoint()
         if checkpoint_data.get("run_name") != self.run_name:
             checkpoint_data = {
                 "run_name": self.run_name,
@@ -1006,7 +1066,7 @@ class BatchRunner:
 
         async def run_batch(task_args: Tuple) -> Dict[str, Any]:
             async with semaphore:
-                return await _process_batch_worker_async(task_args)
+                return await _process_batch_worker(task_args)
 
         batch_tasks = [asyncio.create_task(run_batch(task_args)) for task_args in tasks]
         results = []
@@ -1032,6 +1092,12 @@ class BatchRunner:
                 for completed_task in asyncio.as_completed(batch_tasks):
                     try:
                         result = await completed_task
+                    except asyncio.CancelledError:
+                        for pending in batch_tasks:
+                            if not pending.done():
+                                pending.cancel()
+                        await asyncio.gather(*batch_tasks, return_exceptions=True)
+                        raise
                     except Exception as exc:
                         logger.error("Async batch worker failed: %s", exc, exc_info=True)
                         for pending in batch_tasks:
@@ -1044,9 +1110,9 @@ class BatchRunner:
                     progress.update(progress_task, advance=1)
 
                     # Checkpoint writes happen only in this parent coroutine,
-                    # so no process/thread lock is needed.  The atomic write is
-                    # a deliberately narrow synchronous filesystem boundary;
-                    # model and tool execution remain on the event loop.
+                    # so no process/thread lock is needed. The atomic write
+                    # uses the native async file path and cannot interleave
+                    # with another batch's checkpoint update.
                     try:
                         batch_num = result.get("batch_num")
                         completed = result.get("completed_prompts", []) or []
@@ -1060,7 +1126,7 @@ class BatchRunner:
                             }
 
                         checkpoint_data["completed_prompts"] = sorted(completed_prompts_set)
-                        self._save_checkpoint(checkpoint_data)
+                        await self._save_checkpoint(checkpoint_data)
                     except Exception as ckpt_err:
                         # Don't fail the run if checkpoint write fails.
                         print(f"⚠️  Warning: Failed to save incremental checkpoint: {ckpt_err}")
@@ -1091,7 +1157,7 @@ class BatchRunner:
         # Save final checkpoint (best-effort; incremental writes already happened)
         try:
             checkpoint_data["completed_prompts"] = sorted(completed_prompts_set)
-            self._save_checkpoint(checkpoint_data)
+            await self._save_checkpoint(checkpoint_data)
         except Exception as ckpt_err:
             print(f"âš ï¸  Warning: Failed to save final checkpoint: {ckpt_err}")
         
@@ -1120,15 +1186,16 @@ class BatchRunner:
         batch_files_found = 0
         
         # Find ALL batch files in the output directory (handles resume merging old + new)
-        all_batch_files = sorted(self.output_dir.glob("batch_*.jsonl"))
+        all_batch_files = await _list_batch_files(self.output_dir)
         
-        with open(combined_file, 'w', encoding='utf-8') as outfile:
+        combined_temporary_file = combined_file.with_name(f".{combined_file.name}.tmp")
+        async with aiofiles.open(combined_temporary_file, "w", encoding="utf-8") as outfile:
             for batch_file in all_batch_files:
                 batch_files_found += 1
                 batch_num = batch_file.stem.split("_")[1]  # Extract batch number for logging
                 
-                with open(batch_file, 'r', encoding='utf-8') as infile:
-                    for line in infile:
+                async with aiofiles.open(batch_file, encoding="utf-8") as infile:
+                    async for line in infile:
                         total_entries += 1
                         try:
                             data = json.loads(line)
@@ -1143,10 +1210,11 @@ class BatchRunner:
                                 print(f"   ⚠️  Filtering corrupted entry (batch {batch_num}): invalid tool '{invalid_preview}'")
                                 continue
                             
-                            outfile.write(line)
+                            await outfile.write(line)
                         except json.JSONDecodeError:
                             filtered_entries += 1
                             print(f"   ⚠️  Filtering invalid JSON entry (batch {batch_num})")
+        await aiofiles.os.replace(combined_temporary_file, combined_file)
         
         if filtered_entries > 0:
             print(f"⚠️  Filtered {filtered_entries} corrupted entries out of {total_entries} total")
@@ -1166,8 +1234,7 @@ class BatchRunner:
             "reasoning_statistics": total_reasoning_stats,
         }
         
-        with open(self.stats_file, 'w', encoding='utf-8') as f:
-            json.dump(final_stats, f, indent=2, ensure_ascii=False)
+        await _atomic_json_write(self.stats_file, final_stats)
         
         # Print summary
         print("\n" + "=" * 70)

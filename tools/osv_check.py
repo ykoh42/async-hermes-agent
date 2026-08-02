@@ -10,12 +10,12 @@ Fail-open: network errors allow the package to proceed.
 Inspired by Block/goose's extension malware check.
 """
 
-import json
 import logging
 import os
 import re
-import urllib.request
 from typing import Optional, Tuple
+
+import httpx
 
 logger = logging.getLogger(__name__)
 
@@ -23,37 +23,31 @@ _OSV_ENDPOINT = os.getenv("OSV_ENDPOINT", "https://api.osv.dev/v1/query")
 _TIMEOUT = 10  # seconds
 
 
-def check_package_for_malware(
-    command: str, args: list
+async def check_package_for_malware(
+    command: str,
+    args: list,
 ) -> Optional[str]:
-    """Check if an MCP server package has known malware advisories.
+    """Async OSV malware preflight for native-async MCP startup.
 
-    Inspects the *command* (e.g. ``npx``, ``uvx``) and *args* to infer the
-    package name and ecosystem.  Queries the OSV API for MAL-* advisories.
-
-    Returns:
-        An error message string if malware is found, or None if clean/unknown.
-        Returns None (allow) on network errors or unrecognized commands.
+    The package parsing and response policy intentionally match the legacy
+    helper: unrecognised commands and transport failures are fail-open, while
+    confirmed ``MAL-`` advisories prevent a subprocess from being launched.
     """
     ecosystem = _infer_ecosystem(command)
     if not ecosystem:
-        return None  # not npx/uvx — skip
-
+        return None
     package, version = _parse_package_from_args(args, ecosystem)
     if not package:
         return None
-
     try:
-        malware = _query_osv(package, ecosystem, version)
+        malware = await _query_osv(package, ecosystem, version)
     except Exception as exc:
-        # Fail-open: network errors, timeouts, parse failures → allow
-        logger.debug("OSV check failed for %s/%s (allowing): %s", ecosystem, package, exc)
+        logger.debug("OSV async check failed for %s/%s (allowing): %s", ecosystem, package, exc)
         return None
-
     if malware:
-        ids = ", ".join(m["id"] for m in malware[:3])
+        ids = ", ".join(item["id"] for item in malware[:3])
         summaries = "; ".join(
-            m.get("summary", m["id"])[:100] for m in malware[:3]
+            item.get("summary", item["id"])[:100] for item in malware[:3]
         )
         return (
             f"BLOCKED: Package '{package}' ({ecosystem}) has known malware "
@@ -142,28 +136,24 @@ def _parse_pypi_package(token: str) -> Tuple[Optional[str], Optional[str]]:
     return token, None
 
 
-def _query_osv(
-    package: str, ecosystem: str, version: Optional[str] = None
+async def _query_osv(
+    package: str,
+    ecosystem: str,
+    version: Optional[str] = None,
 ) -> list:
-    """Query the OSV API for MAL-* advisories. Returns list of malware vulns."""
+    """Query OSV without blocking the event loop."""
     payload = {"package": {"name": package, "ecosystem": ecosystem}}
     if version:
         payload["version"] = version
-
-    data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(
-        _OSV_ENDPOINT,
-        data=data,
-        headers={
-            "Content-Type": "application/json",
-            "User-Agent": "hermes-agent-osv-check/1.0",
-        },
-        method="POST",
-    )
-
-    with urllib.request.urlopen(req, timeout=_TIMEOUT) as resp:
-        result = json.loads(resp.read())
-
-    vulns = result.get("vulns", [])
-    # Only malware advisories — ignore regular CVEs
-    return [v for v in vulns if v.get("id", "").startswith("MAL-")]
+    async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+        response = await client.post(
+            _OSV_ENDPOINT,
+            json=payload,
+            headers={
+                "Content-Type": "application/json",
+                "User-Agent": "hermes-agent-osv-check/1.0",
+            },
+        )
+        response.raise_for_status()
+        result = response.json()
+    return [v for v in result.get("vulns", []) if v.get("id", "").startswith("MAL-")]

@@ -36,7 +36,8 @@ def _agent(provider, base_url, pool_provider):
 
 class TestCustomPoolMismatchGuard:
 
-    def test_unrelated_custom_pool_still_guarded(self):
+    @pytest.mark.asyncio
+    async def test_unrelated_custom_pool_still_guarded(self):
         """agent=custom pointed at a DIFFERENT endpoint than the pool's
         custom provider must still skip pool mutation."""
         agent, pool = _agent(
@@ -46,7 +47,7 @@ class TestCustomPoolMismatchGuard:
             "agent.credential_pool.get_custom_provider_pool_key",
             return_value="custom:other",
         ):
-            recovered, _ = recover_with_credential_pool(
+            recovered, _ = await recover_with_credential_pool(
                 agent,
                 status_code=401,
                 has_retried_429=False,
@@ -55,12 +56,13 @@ class TestCustomPoolMismatchGuard:
         assert recovered is False
         assert not pool.method_calls
 
-    def test_fallback_provider_still_guarded(self):
+    @pytest.mark.asyncio
+    async def test_fallback_provider_still_guarded(self):
         """Original #33088/#33163 contract: when a fallback provider is
         active (agent.provider != pool.provider, non-custom), the pool is
         never mutated."""
         agent, pool = _agent("openai-codex", "https://chatgpt.com/backend-api", "custom:fireworks")
-        recovered, _ = recover_with_credential_pool(
+        recovered, _ = await recover_with_credential_pool(
             agent,
             status_code=401,
             has_retried_429=False,
@@ -68,4 +70,3 @@ class TestCustomPoolMismatchGuard:
         )
         assert recovered is False
         assert not pool.method_calls
-

@@ -255,8 +255,8 @@ def get_read_block_error(path: str) -> Optional[str]:
     # Skills .hub: prompt-injection carriers.
     for hd in hermes_dirs:
         blocked_dirs = [
-            hd / "skills" / ".hub" / "index-cache",
-            hd / "skills" / ".hub",
+            (hd / "skills" / ".hub" / "index-cache").resolve(),
+            (hd / "skills" / ".hub").resolve(),
         ]
         for blocked in blocked_dirs:
             try:

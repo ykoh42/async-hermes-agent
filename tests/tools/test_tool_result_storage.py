@@ -1,7 +1,7 @@
 """Tests for tools/tool_result_storage.py -- 3-layer tool result persistence."""
 
 import pytest
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from tools.budget_config import (
     DEFAULT_RESULT_SIZE_CHARS,
@@ -58,58 +58,61 @@ class TestHeredocMarker:
 # ── _write_to_sandbox ─────────────────────────────────────────────────
 
 class TestWriteToSandbox:
-    def test_success(self):
+    @pytest.mark.asyncio
+    async def test_success(self):
         env = MagicMock()
-        env.execute.return_value = {"output": "", "returncode": 0}
-        result = _write_to_sandbox("hello world", "/tmp/hermes-results/abc.txt", env)
+        env.execute_async = AsyncMock(return_value={"output": "", "returncode": 0})
+        result = await _write_to_sandbox("hello world", "/tmp/hermes-results/abc.txt", env)
         assert result is True
-        env.execute.assert_called_once()
-        cmd = env.execute.call_args[0][0]
+        env.execute_async.assert_awaited_once()
+        cmd = env.execute_async.call_args[0][0]
         assert "mkdir -p" in cmd
         # Content travels through stdin, NOT inside the command string —
         # otherwise large content would hit Linux's 128 KB MAX_ARG_STRLEN
         # ceiling on `bash -c <cmd>` (#22906).
         assert "hello world" not in cmd
-        assert env.execute.call_args[1]["stdin_data"] == "hello world"
+        assert env.execute_async.call_args[1]["stdin_data"] == "hello world"
 
-
-    def test_large_content_via_stdin(self):
+    @pytest.mark.asyncio
+    async def test_large_content_via_stdin(self):
         """Regression: 200 KB content exceeds Linux MAX_ARG_STRLEN (128 KB).
         It must travel via stdin, never inside the command string."""
         env = MagicMock()
-        env.execute.return_value = {"output": "", "returncode": 0}
+        env.execute_async = AsyncMock(return_value={"output": "", "returncode": 0})
         big = "x" * 200_000
-        _write_to_sandbox(big, "/tmp/hermes-results/big.txt", env)
-        cmd = env.execute.call_args[0][0]
+        await _write_to_sandbox(big, "/tmp/hermes-results/big.txt", env)
+        cmd = env.execute_async.call_args[0][0]
         assert len(cmd) < 1_000  # cmd is just `mkdir -p X && cat > Y`
-        assert env.execute.call_args[1]["stdin_data"] == big
+        assert env.execute_async.call_args[1]["stdin_data"] == big
 
-
-    def test_path_with_spaces_is_quoted(self):
+    @pytest.mark.asyncio
+    async def test_path_with_spaces_is_quoted(self):
         env = MagicMock()
-        env.execute.return_value = {"output": "", "returncode": 0}
+        env.execute_async = AsyncMock(return_value={"output": "", "returncode": 0})
         remote_path = "/tmp/hermes results/abc file.txt"
-        _write_to_sandbox("content", remote_path, env)
-        cmd = env.execute.call_args[0][0]
+        await _write_to_sandbox("content", remote_path, env)
+        cmd = env.execute_async.call_args[0][0]
         assert "'/tmp/hermes results'" in cmd
         assert "'/tmp/hermes results/abc file.txt'" in cmd
 
-    def test_shell_metacharacters_neutralized(self):
+    @pytest.mark.asyncio
+    async def test_shell_metacharacters_neutralized(self):
         """Paths with shell metacharacters must be quoted to prevent injection."""
         env = MagicMock()
-        env.execute.return_value = {"output": "", "returncode": 0}
+        env.execute_async = AsyncMock(return_value={"output": "", "returncode": 0})
         malicious_path = "/tmp/hermes-results/$(whoami).txt"
-        _write_to_sandbox("content", malicious_path, env)
-        cmd = env.execute.call_args[0][0]
+        await _write_to_sandbox("content", malicious_path, env)
+        cmd = env.execute_async.call_args[0][0]
         # The $() must not appear unquoted — shlex.quote wraps it
         assert "'/tmp/hermes-results/$(whoami).txt'" in cmd
 
-    def test_semicolon_injection_neutralized(self):
+    @pytest.mark.asyncio
+    async def test_semicolon_injection_neutralized(self):
         env = MagicMock()
-        env.execute.return_value = {"output": "", "returncode": 0}
+        env.execute_async = AsyncMock(return_value={"output": "", "returncode": 0})
         malicious_path = "/tmp/x; rm -rf /; echo .txt"
-        _write_to_sandbox("content", malicious_path, env)
-        cmd = env.execute.call_args[0][0]
+        await _write_to_sandbox("content", malicious_path, env)
+        cmd = env.execute_async.call_args[0][0]
         # The semicolons must be inside quotes, not acting as command separators
         assert "'/tmp/x; rm -rf /; echo .txt'" in cmd
 
@@ -169,9 +172,10 @@ class TestBuildPersistedMessage:
 # ── maybe_persist_tool_result ─────────────────────────────────────────
 
 class TestMaybePersistToolResult:
-    def test_below_threshold_returns_unchanged(self):
+    @pytest.mark.asyncio
+    async def test_below_threshold_returns_unchanged(self):
         content = "small result"
-        result = maybe_persist_tool_result(
+        result = await maybe_persist_tool_result(
             content=content,
             tool_name="terminal",
             tool_use_id="tc_123",
@@ -180,11 +184,12 @@ class TestMaybePersistToolResult:
         )
         assert result == content
 
-    def test_above_threshold_with_env_persists(self):
+    @pytest.mark.asyncio
+    async def test_above_threshold_with_env_persists(self):
         env = MagicMock()
-        env.execute.return_value = {"output": "", "returncode": 0}
+        env.execute_async = AsyncMock(return_value={"output": "", "returncode": 0})
         content = "x" * 60_000
-        result = maybe_persist_tool_result(
+        result = await maybe_persist_tool_result(
             content=content,
             tool_name="terminal",
             tool_use_id="tc_456",
@@ -194,16 +199,17 @@ class TestMaybePersistToolResult:
         assert PERSISTED_OUTPUT_TAG in result
         assert "tc_456.txt" in result
         assert len(result) < len(content)
-        env.execute.assert_called_once()
+        env.execute_async.assert_awaited_once()
 
-    def test_persists_full_content_as_is(self):
+    @pytest.mark.asyncio
+    async def test_persists_full_content_as_is(self):
         """Content is persisted verbatim — no JSON extraction."""
         import json
         env = MagicMock()
-        env.execute.return_value = {"output": "", "returncode": 0}
+        env.execute_async = AsyncMock(return_value={"output": "", "returncode": 0})
         raw = "line1\nline2\n" * 5_000
         content = json.dumps({"output": raw, "exit_code": 0, "error": None})
-        result = maybe_persist_tool_result(
+        result = await maybe_persist_tool_result(
             content=content,
             tool_name="terminal",
             tool_use_id="tc_json",
@@ -213,37 +219,36 @@ class TestMaybePersistToolResult:
         assert PERSISTED_OUTPUT_TAG in result
         # Content is delivered through stdin (no longer embedded in the
         # command string — see test_large_content_via_stdin for why).
-        assert env.execute.call_args[1]["stdin_data"] == content
+        assert env.execute_async.call_args[1]["stdin_data"] == content
 
-
-    def test_tool_use_id_cannot_escape_storage_dir(self):
+    @pytest.mark.asyncio
+    async def test_tool_use_id_cannot_escape_storage_dir(self):
         env = MagicMock()
-        env.execute.return_value = {"output": "", "returncode": 0}
+        env.execute_async = AsyncMock(return_value={"output": "", "returncode": 0})
         env.get_temp_dir.return_value = ""
         content = "x" * 60_000
-        result = maybe_persist_tool_result(
+        result = await maybe_persist_tool_result(
             content=content,
             tool_name="terminal",
             tool_use_id="../outside/$(whoami);x",
             env=env,
             threshold=30_000,
         )
-        cmd = env.execute.call_args[0][0]
-        target = cmd.split("cat > ", 1)[1].split(" <<", 1)[0]
+        cmd = env.execute_async.call_args[0][0]
 
         assert "Full output saved to: /tmp/hermes-results/outside_whoami_x_" in result
         assert "/tmp/hermes-results/../" not in result
-        assert target.startswith("/tmp/hermes-results/outside_whoami_x_")
-        assert "/../" not in target
-        assert "$(whoami)" not in target
-        assert ";" not in target
+        assert "/tmp/hermes-results/outside_whoami_x_" in cmd
+        assert "/../" not in cmd
+        assert "$(whoami)" not in cmd
+        assert ";" not in cmd
 
-
-    def test_threshold_zero_forces_persist(self):
+    @pytest.mark.asyncio
+    async def test_threshold_zero_forces_persist(self):
         env = MagicMock()
-        env.execute.return_value = {"output": "", "returncode": 0}
+        env.execute_async = AsyncMock(return_value={"output": "", "returncode": 0})
         content = "even short content"
-        result = maybe_persist_tool_result(
+        result = await maybe_persist_tool_result(
             content=content,
             tool_name="terminal",
             tool_use_id="tc_zero",
@@ -253,30 +258,49 @@ class TestMaybePersistToolResult:
         # Any non-empty content with threshold=0 should be persisted
         assert PERSISTED_OUTPUT_TAG in result
 
+    @pytest.mark.asyncio
+    async def test_sync_only_environment_falls_back_without_blocking_call(self):
+        """The async agent never invokes a legacy synchronous environment."""
+        env = MagicMock(spec=["execute"])
+        env.execute.return_value = {"output": "", "returncode": 0}
+
+        result = await maybe_persist_tool_result(
+            content="x" * 60_000,
+            tool_name="terminal",
+            tool_use_id="sync-only",
+            env=env,
+            threshold=30_000,
+        )
+
+        assert "Truncated" in result
+        env.execute.assert_not_called()
+
 
 # ── enforce_turn_budget ───────────────────────────────────────────────
 
 class TestEnforceTurnBudget:
-    def test_under_budget_no_changes(self):
+    @pytest.mark.asyncio
+    async def test_under_budget_no_changes(self):
         msgs = [
             {"role": "tool", "tool_call_id": "t1", "content": "small"},
             {"role": "tool", "tool_call_id": "t2", "content": "also small"},
         ]
-        result = enforce_turn_budget(msgs, env=None, config=BudgetConfig(turn_budget=200_000))
+        result = await enforce_turn_budget(msgs, env=None, config=BudgetConfig(turn_budget=200_000))
         assert result[0]["content"] == "small"
         assert result[1]["content"] == "also small"
 
 
-    def test_medium_result_regression(self):
+    @pytest.mark.asyncio
+    async def test_medium_result_regression(self):
         """6 results of 42K chars each (252K total) — each under 100K default
         threshold but aggregate exceeds 200K budget. L3 should persist."""
         env = MagicMock()
-        env.execute.return_value = {"output": "", "returncode": 0}
+        env.execute_async = AsyncMock(return_value={"output": "", "returncode": 0})
         msgs = [
             {"role": "tool", "tool_call_id": f"t{i}", "content": "x" * 42_000}
             for i in range(6)
         ]
-        enforce_turn_budget(msgs, env=env, config=BudgetConfig(turn_budget=200_000))
+        await enforce_turn_budget(msgs, env=env, config=BudgetConfig(turn_budget=200_000))
         # At least some results should be persisted to get under 200K
         persisted_count = sum(
             1 for m in msgs if PERSISTED_OUTPUT_TAG in m["content"]
@@ -284,8 +308,9 @@ class TestEnforceTurnBudget:
         assert persisted_count >= 2  # Need to shed at least ~52K
 
 
-    def test_empty_messages(self):
-        result = enforce_turn_budget([], env=None, config=BudgetConfig(turn_budget=200_000))
+    @pytest.mark.asyncio
+    async def test_empty_messages(self):
+        result = await enforce_turn_budget([], env=None, config=BudgetConfig(turn_budget=200_000))
         assert result == []
 
 

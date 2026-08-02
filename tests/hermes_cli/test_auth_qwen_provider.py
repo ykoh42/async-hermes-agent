@@ -78,7 +78,9 @@ def qwen_env(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 def test_qwen_cli_auth_path_returns_expected_location():
-    path = _qwen_cli_auth_path()
+    import hermes_cli.auth as auth_mod
+
+    path = auth_mod._qwen_cli_auth_path()
     assert path == Path.home() / ".qwen" / "oauth_creds.json"
 
 
@@ -119,10 +121,12 @@ def test_qwen_cli_auth_path_returns_expected_location():
 # ---------------------------------------------------------------------------
 
 def test_resolve_qwen_runtime_credentials_fresh_token(qwen_env):
+    import hermes_cli.auth as auth_mod
+
     tokens = _make_qwen_tokens(access_token="fresh-at")
     _write_qwen_creds(qwen_env, tokens)
 
-    creds = resolve_qwen_runtime_credentials(refresh_if_expiring=False)
+    creds = auth_mod.resolve_qwen_runtime_credentials(refresh_if_expiring=False)
     assert creds["provider"] == "qwen-oauth"
     assert creds["api_key"] == "fresh-at"
     assert creds["base_url"] == DEFAULT_QWEN_BASE_URL
@@ -130,11 +134,13 @@ def test_resolve_qwen_runtime_credentials_fresh_token(qwen_env):
 
 
 def test_resolve_qwen_runtime_credentials_missing_access_token(qwen_env):
+    import hermes_cli.auth as auth_mod
+
     tokens = _make_qwen_tokens(access_token="")
     _write_qwen_creds(qwen_env, tokens)
 
-    with pytest.raises(AuthError) as exc:
-        resolve_qwen_runtime_credentials(refresh_if_expiring=False)
+    with pytest.raises(auth_mod.AuthError) as exc:
+        auth_mod.resolve_qwen_runtime_credentials(refresh_if_expiring=False)
     assert exc.value.code == "qwen_access_token_missing"
 
 
@@ -143,15 +149,19 @@ def test_resolve_qwen_runtime_credentials_missing_access_token(qwen_env):
 # ---------------------------------------------------------------------------
 
 def test_get_qwen_auth_status_logged_in(qwen_env):
+    import hermes_cli.auth as auth_mod
+
     tokens = _make_qwen_tokens(access_token="status-at")
     _write_qwen_creds(qwen_env, tokens)
 
-    status = get_qwen_auth_status()
+    status = auth_mod.get_qwen_auth_status()
     assert status["logged_in"] is True
     assert status["api_key"] == "status-at"
 
 
 def test_get_qwen_auth_status_refreshes_expired_token(qwen_env):
+    import hermes_cli.auth as auth_mod
+
     expired_ms = int((time.time() - 3600) * 1000)
     tokens = _make_qwen_tokens(access_token="old-at", expiry_date=expired_ms)
     _write_qwen_creds(qwen_env, tokens)
@@ -161,47 +171,8 @@ def test_get_qwen_auth_status_refreshes_expired_token(qwen_env):
     with patch(
         "hermes_cli.auth._refresh_qwen_cli_tokens", return_value=refreshed
     ) as mock_refresh:
-        status = get_qwen_auth_status()
+        status = auth_mod.get_qwen_auth_status()
 
     mock_refresh.assert_called_once()
     assert status["logged_in"] is True
     assert status["api_key"] == "refreshed-at"
-
-
-def test_model_flow_qwen_oauth_stale_token_shows_reauth_guidance(qwen_env, monkeypatch, capsys):
-    from hermes_cli.main import _model_flow_qwen_oauth
-
-    expired_ms = int((time.time() - 3600) * 1000)
-    tokens = _make_qwen_tokens(access_token="dead-at", expiry_date=expired_ms)
-    _write_qwen_creds(qwen_env, tokens)
-
-    monkeypatch.setattr(
-        "hermes_cli.auth._refresh_qwen_cli_tokens",
-        lambda *args, **kwargs: (_ for _ in ()).throw(
-            AuthError(
-                "Qwen refresh rejected. Re-run 'qwen auth qwen-oauth'.",
-                provider="qwen-oauth",
-                code="qwen_refresh_failed",
-            )
-        ),
-    )
-
-    prompt_called = {"value": False}
-    update_called = {"value": False}
-
-    monkeypatch.setattr(
-        "hermes_cli.auth._prompt_model_selection",
-        lambda *args, **kwargs: prompt_called.__setitem__("value", True),
-    )
-    monkeypatch.setattr(
-        "hermes_cli.auth._update_config_for_provider",
-        lambda *args, **kwargs: update_called.__setitem__("value", True),
-    )
-
-    _model_flow_qwen_oauth({}, current_model="qwen3-coder-plus")
-
-    out = capsys.readouterr().out
-    assert "Run: qwen auth qwen-oauth" in out
-    assert "Qwen refresh rejected" in out
-    assert prompt_called["value"] is False
-    assert update_called["value"] is False

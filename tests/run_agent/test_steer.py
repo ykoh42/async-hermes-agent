@@ -33,8 +33,6 @@ def _bare_agent() -> AIAgent:
     agent._interrupt_message = None
     agent._active_children = []
     agent._active_children_lock = threading.Lock()
-    agent._tool_worker_threads = None
-    agent._tool_worker_threads_lock = None
     agent._current_streamed_assistant_text = ""
     agent._stream_needs_break = False
     agent._strip_think_blocks = lambda content: content
@@ -414,8 +412,6 @@ class TestSteerClearedOnInterrupt:
         agent._interrupt_message = None
         agent._interrupt_thread_signal_pending = False
         agent._execution_thread_id = None
-        agent._tool_worker_threads = None
-        agent._tool_worker_threads_lock = None
 
         agent.steer("will be dropped")
         agent._pending_redirect = "also drop this"

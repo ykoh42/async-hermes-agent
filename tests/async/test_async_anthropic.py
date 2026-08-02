@@ -2,7 +2,7 @@
 
 import pytest
 
-from agent.anthropic_adapter import create_anthropic_message_async
+from agent.anthropic_adapter import create_anthropic_message
 from run_agent import AIAgent
 
 
@@ -40,7 +40,7 @@ class _Client:
 @pytest.mark.asyncio
 async def test_anthropic_stream_is_consumed_without_a_thread():
     events = []
-    response = await create_anthropic_message_async(
+    response = await create_anthropic_message(
         _Client(),
         {"model": "claude-test", "messages": [], "stream": True},
         on_stream_event=events.append,
@@ -71,11 +71,27 @@ async def test_agent_uses_native_async_messages_dispatch(monkeypatch):
         return {"native_async": True}
 
     monkeypatch.setattr("agent.anthropic_adapter.build_anthropic_client", fake_build)
-    monkeypatch.setattr("agent.anthropic_adapter.create_anthropic_message_async", fake_create)
+    monkeypatch.setattr("agent.anthropic_adapter.create_anthropic_message", fake_create)
 
-    result = await agent._async_execute_model_request(
+    result = await agent._execute_model_request(
         {"model": "claude-test", "messages": []}, use_streaming=False
     )
 
     assert result == {"native_async": True}
-    assert built[0]["async_mode"] is True
+
+
+@pytest.mark.asyncio
+async def test_claude_code_credentials_use_native_async_file_io(tmp_path, monkeypatch):
+    from agent.anthropic_adapter import (
+        _write_claude_code_credentials,
+        read_claude_code_credentials,
+    )
+
+    monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
+    await _write_claude_code_credentials("access", "refresh", 4_102_444_800_000)
+
+    credentials = await read_claude_code_credentials()
+
+    assert credentials is not None
+    assert credentials["accessToken"] == "access"
+    assert credentials["refreshToken"] == "refresh"

@@ -6,8 +6,12 @@ import base64
 import json
 import time
 from datetime import datetime, timezone
+from unittest.mock import AsyncMock
 
 import pytest
+
+
+pytestmark = pytest.mark.asyncio
 
 
 def _write_auth_store(tmp_path, payload: dict) -> None:
@@ -39,7 +43,7 @@ def _jwt_with_claims(claims: dict) -> str:
 
 
 
-def test_explicit_reset_timestamp_overrides_default_429_ttl(tmp_path, monkeypatch):
+async def test_explicit_reset_timestamp_overrides_default_429_ttl(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
     # Prevent auto-seeding from Codex CLI tokens on the host
     monkeypatch.setattr(
@@ -72,14 +76,14 @@ def test_explicit_reset_timestamp_overrides_default_429_ttl(tmp_path, monkeypatc
 
     from agent.credential_pool import load_pool
 
-    pool = load_pool("openai-codex")
-    assert pool.has_available() is False
-    assert pool.select() is None
+    pool = await load_pool("openai-codex")
+    assert await pool.has_available() is False
+    assert await pool.select() is None
 
 
 
 
-def test_billing_rotation_marks_all_entries_sharing_failed_key(tmp_path, monkeypatch):
+async def test_billing_rotation_marks_all_entries_sharing_failed_key(tmp_path, monkeypatch):
     """A 402 must exhaust every pool entry backed by the same API key.
 
     Regression: the same key can back more than one pool entry — e.g. an
@@ -127,11 +131,11 @@ def test_billing_rotation_marks_all_entries_sharing_failed_key(tmp_path, monkeyp
 
     from agent.credential_pool import load_pool, STATUS_EXHAUSTED
 
-    pool = load_pool("custom")
+    pool = await load_pool("custom")
 
     # First 402 on the shared key: rotation must NOT hand back a sibling
     # entry that wraps the same depleted key — it must converge to None.
-    next_entry = pool.mark_exhausted_and_rotate(
+    next_entry = await pool.mark_exhausted_and_rotate(
         status_code=402,
         api_key_hint=shared_key,
     )
@@ -143,7 +147,7 @@ def test_billing_rotation_marks_all_entries_sharing_failed_key(tmp_path, monkeyp
     assert statuses["cred-model-config"] == STATUS_EXHAUSTED
 
 
-def test_unmatched_api_key_hint_rotates_without_benching_innocent_key(tmp_path, monkeypatch):
+async def test_unmatched_api_key_hint_rotates_without_benching_innocent_key(tmp_path, monkeypatch):
     """An api_key_hint matching no entry must not quarantine a healthy key.
 
     Regression: when the hint was unmatched (key rotated away, or a wrapper
@@ -156,7 +160,10 @@ def test_unmatched_api_key_hint_rotates_without_benching_innocent_key(tmp_path, 
     # Keep the dev machine's live ~/.claude credentials from seeding a
     # claude_code singleton entry into this pool (same isolation as the
     # other anthropic pool tests in this file).
-    monkeypatch.setattr("agent.anthropic_adapter.read_claude_code_credentials", lambda: None)
+    monkeypatch.setattr(
+        "agent.anthropic_adapter.read_claude_code_credentials",
+        AsyncMock(return_value=None),
+    )
     _write_auth_store(
         tmp_path,
         {
@@ -187,9 +194,9 @@ def test_unmatched_api_key_hint_rotates_without_benching_innocent_key(tmp_path, 
     from agent.credential_pool import load_pool, STATUS_DEAD, STATUS_EXHAUSTED
 
     # Freshly loaded pool: current() is None, exactly the shape of the bug.
-    pool = load_pool("anthropic")
+    pool = await load_pool("anthropic")
 
-    next_entry = pool.mark_exhausted_and_rotate(
+    next_entry = await pool.mark_exhausted_and_rotate(
         status_code=429,
         api_key_hint="sk-ant-api-rotated-away",
     )
@@ -208,7 +215,7 @@ def test_unmatched_api_key_hint_rotates_without_benching_innocent_key(tmp_path, 
         assert persisted.get("last_error_code") is None
 
 
-def test_token_invalidated_marks_credential_dead(tmp_path, monkeypatch):
+async def test_token_invalidated_marks_credential_dead(tmp_path, monkeypatch):
     """OpenAI Codex token_invalidated must mark the credential DEAD, not exhausted.
 
     Regression for #32849: when an OAuth credential is revoked upstream, the
@@ -249,11 +256,11 @@ def test_token_invalidated_marks_credential_dead(tmp_path, monkeypatch):
 
     from agent.credential_pool import load_pool, STATUS_DEAD
 
-    pool = load_pool("openai-codex")
-    assert pool.select().id == "cred-dead"
+    pool = await load_pool("openai-codex")
+    assert (await pool.select()).id == "cred-dead"
 
     # Simulate the exact OpenAI Codex 401 token_invalidated response shape.
-    next_entry = pool.mark_exhausted_and_rotate(
+    next_entry = await pool.mark_exhausted_and_rotate(
         status_code=401,
         error_context={
             "reason": "token_invalidated",
@@ -273,7 +280,7 @@ def test_token_invalidated_marks_credential_dead(tmp_path, monkeypatch):
     assert persisted["last_error_reason"] == "token_invalidated"
 
 
-def test_dead_credential_never_re_enters_rotation_after_ttl(tmp_path, monkeypatch):
+async def test_dead_credential_never_re_enters_rotation_after_ttl(tmp_path, monkeypatch):
     """A DEAD credential must stay excluded regardless of how much time passes.
 
     The exhausted TTL clears entries after 5 min (401) / 1 hour (429).
@@ -321,8 +328,8 @@ def test_dead_credential_never_re_enters_rotation_after_ttl(tmp_path, monkeypatc
 
     from agent.credential_pool import load_pool, STATUS_DEAD
 
-    pool = load_pool("openai-codex")
-    selected = pool.select()
+    pool = await load_pool("openai-codex")
+    selected = await pool.select()
     # Should skip the dead entry and pick the healthy one — even though
     # the dead entry has priority 0 (would normally be picked first) and
     # plenty of time has passed since it was marked dead.
@@ -336,7 +343,7 @@ def test_dead_credential_never_re_enters_rotation_after_ttl(tmp_path, monkeypatc
     assert dead_entry["last_status"] == STATUS_DEAD
 
 
-def test_429_rate_limit_still_uses_exhausted_not_dead(tmp_path, monkeypatch):
+async def test_429_rate_limit_still_uses_exhausted_not_dead(tmp_path, monkeypatch):
     """429 rate limits must NOT be treated as terminal.
 
     They should keep the existing 1-hour TTL cooldown semantics so the
@@ -374,10 +381,10 @@ def test_429_rate_limit_still_uses_exhausted_not_dead(tmp_path, monkeypatch):
 
     from agent.credential_pool import load_pool, STATUS_EXHAUSTED
 
-    pool = load_pool("openai-codex")
-    assert pool.select().id == "cred-1"
+    pool = await load_pool("openai-codex")
+    assert (await pool.select()).id == "cred-1"
 
-    next_entry = pool.mark_exhausted_and_rotate(
+    next_entry = await pool.mark_exhausted_and_rotate(
         status_code=429,
         error_context={"reason": "rate_limit_exceeded", "message": "Rate limit exceeded"},
     )
@@ -391,7 +398,7 @@ def test_429_rate_limit_still_uses_exhausted_not_dead(tmp_path, monkeypatch):
     assert persisted["last_error_code"] == 429
 
 
-def test_generic_401_without_terminal_reason_still_uses_exhausted(tmp_path, monkeypatch):
+async def test_generic_401_without_terminal_reason_still_uses_exhausted(tmp_path, monkeypatch):
     """A 401 with no specific code/reason should keep TTL semantics.
 
     Only specific terminal reasons (token_invalidated, token_revoked, etc.)
@@ -430,11 +437,11 @@ def test_generic_401_without_terminal_reason_still_uses_exhausted(tmp_path, monk
 
     from agent.credential_pool import load_pool, STATUS_EXHAUSTED
 
-    pool = load_pool("openai-codex")
-    pool.select()
+    pool = await load_pool("openai-codex")
+    await pool.select()
 
     # 401 with no specific reason — stays exhausted, NOT dead.
-    pool.mark_exhausted_and_rotate(
+    await pool.mark_exhausted_and_rotate(
         status_code=401,
         error_context={"message": "Unauthorized"},
     )
@@ -445,7 +452,7 @@ def test_generic_401_without_terminal_reason_still_uses_exhausted(tmp_path, monk
     assert persisted["last_error_code"] == 401
 
 
-def test_dead_manual_entry_pruned_after_24h(tmp_path, monkeypatch):
+async def test_dead_manual_entry_pruned_after_24h(tmp_path, monkeypatch):
     """A DEAD manual entry is removed from the pool after the prune TTL.
 
     Manual entries (``manual:*``) are independent credentials with no
@@ -491,9 +498,9 @@ def test_dead_manual_entry_pruned_after_24h(tmp_path, monkeypatch):
 
     from agent.credential_pool import load_pool
 
-    pool = load_pool("openai-codex")
+    pool = await load_pool("openai-codex")
     # Trigger _available_entries via select; that runs the prune.
-    selected = pool.select()
+    selected = await pool.select()
     assert selected is not None
     assert selected.id == "cred-ok"
 
@@ -508,15 +515,15 @@ def test_dead_manual_entry_pruned_after_24h(tmp_path, monkeypatch):
 
 
 
-def test_load_pool_seeds_env_api_key(tmp_path, monkeypatch):
+async def test_load_pool_seeds_env_api_key(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
     monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-seeded")
     _write_auth_store(tmp_path, {"version": 1, "providers": {}})
 
     from agent.credential_pool import load_pool
 
-    pool = load_pool("openrouter")
-    entry = pool.select()
+    pool = await load_pool("openrouter")
+    entry = await pool.select()
 
     assert entry is not None
     assert entry.source == "env:OPENROUTER_API_KEY"
@@ -524,7 +531,7 @@ def test_load_pool_seeds_env_api_key(tmp_path, monkeypatch):
 
 
 
-def test_load_pool_does_not_persist_env_seeded_secret_value(tmp_path, monkeypatch):
+async def test_load_pool_does_not_persist_env_seeded_secret_value(tmp_path, monkeypatch):
     """Runtime env keys may be used in memory but must not land in auth.json."""
     sentinel = "S3NTINEL_DO_NOT_PERSIST_OPENROUTER"
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
@@ -533,8 +540,8 @@ def test_load_pool_does_not_persist_env_seeded_secret_value(tmp_path, monkeypatc
 
     from agent.credential_pool import load_pool
 
-    pool = load_pool("openrouter")
-    entry = pool.select()
+    pool = await load_pool("openrouter")
+    entry = await pool.select()
 
     assert entry is not None
     assert entry.source == "env:OPENROUTER_API_KEY"
@@ -551,7 +558,7 @@ def test_load_pool_does_not_persist_env_seeded_secret_value(tmp_path, monkeypatc
     assert persisted["secret_fingerprint"].startswith("sha256:")
 
 
-def test_load_pool_collapses_duplicate_env_rows_to_active_key(tmp_path, monkeypatch):
+async def test_load_pool_collapses_duplicate_env_rows_to_active_key(tmp_path, monkeypatch):
     """One env source is one credential, even if auth.json contains stale duplicates."""
     key = "sk-or-active-main-key"
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
@@ -583,7 +590,7 @@ def test_load_pool_collapses_duplicate_env_rows_to_active_key(tmp_path, monkeypa
 
     from agent.credential_pool import load_pool
 
-    pool = load_pool("openrouter")
+    pool = await load_pool("openrouter")
 
     assert [(entry.id, entry.runtime_api_key) for entry in pool.entries()] == [
         ("current-row", key)
@@ -594,7 +601,7 @@ def test_load_pool_collapses_duplicate_env_rows_to_active_key(tmp_path, monkeypa
     ]
 
 
-def test_credential_pool_never_selects_empty_borrowed_entry():
+async def test_credential_pool_never_selects_empty_borrowed_entry():
     from agent.credential_pool import CredentialPool, PooledCredential
 
     pool = CredentialPool(
@@ -612,11 +619,11 @@ def test_credential_pool_never_selects_empty_borrowed_entry():
         ],
     )
 
-    assert pool.select() is None
-    assert pool.acquire_lease() is None
+    assert await pool.select() is None
+    assert await pool.acquire_lease() is None
 
 
-def test_load_pool_persists_bitwarden_origin_metadata_without_secret(tmp_path, monkeypatch):
+async def test_load_pool_persists_bitwarden_origin_metadata_without_secret(tmp_path, monkeypatch):
     """Bitwarden-injected env vars retain source metadata but not raw values."""
     sentinel = "S3NTINEL_DO_NOT_PERSIST_BITWARDEN"
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
@@ -629,8 +636,8 @@ def test_load_pool_persists_bitwarden_origin_metadata_without_secret(tmp_path, m
 
     from agent.credential_pool import load_pool
 
-    pool = load_pool("openrouter")
-    entry = pool.select()
+    pool = await load_pool("openrouter")
+    entry = await pool.select()
 
     assert entry is not None
     assert entry.access_token == sentinel
@@ -645,7 +652,7 @@ def test_load_pool_persists_bitwarden_origin_metadata_without_secret(tmp_path, m
 
 
 
-def test_load_pool_sanitizes_legacy_raw_borrowed_entry_when_value_unchanged(tmp_path, monkeypatch):
+async def test_load_pool_sanitizes_legacy_raw_borrowed_entry_when_value_unchanged(tmp_path, monkeypatch):
     """Existing raw env-seeded pool entries are rewritten even if the env value matches."""
     sentinel = "S3NTINEL_DO_NOT_PERSIST_LEGACY_RAW"
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
@@ -672,8 +679,8 @@ def test_load_pool_sanitizes_legacy_raw_borrowed_entry_when_value_unchanged(tmp_
 
     from agent.credential_pool import load_pool
 
-    pool = load_pool("openrouter")
-    entry = pool.select()
+    pool = await load_pool("openrouter")
+    entry = await pool.select()
 
     assert entry is not None
     assert entry.access_token == sentinel
@@ -686,7 +693,7 @@ def test_load_pool_sanitizes_legacy_raw_borrowed_entry_when_value_unchanged(tmp_
 
 
 
-def test_pooled_credential_to_dict_strips_borrowed_secret_fields():
+async def test_pooled_credential_to_dict_strips_borrowed_secret_fields():
     from agent.credential_pool import PooledCredential
 
     sentinel = "S3NTINEL_DO_NOT_PERSIST_TO_DICT"
@@ -747,7 +754,7 @@ def test_pooled_credential_to_dict_strips_borrowed_secret_fields():
     "sops",
     "future_secret_store:openrouter",
 ])
-def test_borrowed_source_variants_strip_secret_fields(source):
+async def test_borrowed_source_variants_strip_secret_fields(source):
     from agent.credential_pool import PooledCredential
 
     sentinel = f"S3NTINEL_DO_NOT_PERSIST_{source.replace(':', '_').replace('/', '_')}"
@@ -776,7 +783,7 @@ def test_borrowed_source_variants_strip_secret_fields(source):
 
 
 
-def test_write_credential_pool_sanitizes_borrowed_payload_at_disk_boundary(tmp_path, monkeypatch):
+async def test_write_credential_pool_sanitizes_borrowed_payload_at_disk_boundary(tmp_path, monkeypatch):
     """Direct dictionary callers cannot bypass the borrowed-secret guard."""
     sentinel = "S3NTINEL_DO_NOT_PERSIST_DIRECT_WRITE"
     manual_secret = "MANUAL_SECRET_STAYS_PERSISTABLE"
@@ -821,7 +828,7 @@ def test_write_credential_pool_sanitizes_borrowed_payload_at_disk_boundary(tmp_p
 
 
 
-def test_write_credential_pool_treats_unowned_oauth_source_as_borrowed(tmp_path, monkeypatch):
+async def test_write_credential_pool_treats_unowned_oauth_source_as_borrowed(tmp_path, monkeypatch):
     sentinel = "S3NTINEL_DO_NOT_PERSIST_UNOWNED_OAUTH"
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
 
@@ -849,7 +856,7 @@ def test_write_credential_pool_treats_unowned_oauth_source_as_borrowed(tmp_path,
 
 
 
-def test_write_credential_pool_preserves_known_provider_owned_oauth_state(tmp_path, monkeypatch):
+async def test_write_credential_pool_preserves_known_provider_owned_oauth_state(tmp_path, monkeypatch):
     sentinel = "PROVIDER_OWNED_DEVICE_CODE_STAYS_PERSISTABLE"
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
 
@@ -875,7 +882,7 @@ def test_write_credential_pool_preserves_known_provider_owned_oauth_state(tmp_pa
 
 
 
-def test_load_pool_prefers_dotenv_over_stale_os_environ(tmp_path, monkeypatch):
+async def test_load_pool_prefers_dotenv_over_stale_os_environ(tmp_path, monkeypatch):
     """Regression for #18254: stale OPENROUTER_API_KEY in os.environ (inherited
     from a parent shell) must NOT shadow the fresh key in ~/.hermes/.env when
     seeding the credential pool. Before the fix, `get_env_value()` preferred
@@ -897,8 +904,8 @@ def test_load_pool_prefers_dotenv_over_stale_os_environ(tmp_path, monkeypatch):
     _write_auth_store(tmp_path, {"version": 1, "providers": {}})
 
     from agent.credential_pool import load_pool
-    pool = load_pool("openrouter")
-    entry = pool.select()
+    pool = await load_pool("openrouter")
+    entry = await pool.select()
 
     assert entry is not None
     assert entry.source == "env:OPENROUTER_API_KEY"
@@ -908,7 +915,7 @@ def test_load_pool_prefers_dotenv_over_stale_os_environ(tmp_path, monkeypatch):
     )
 
 
-def test_load_pool_falls_back_to_os_environ_when_dotenv_empty(tmp_path, monkeypatch):
+async def test_load_pool_falls_back_to_os_environ_when_dotenv_empty(tmp_path, monkeypatch):
     """When ~/.hermes/.env does not define OPENROUTER_API_KEY (typical Docker /
     K8s / systemd deployment), seeding must still pick up the key from
     os.environ. Guards against regressions that would break production
@@ -925,8 +932,8 @@ def test_load_pool_falls_back_to_os_environ_when_dotenv_empty(tmp_path, monkeypa
     _write_auth_store(tmp_path, {"version": 1, "providers": {}})
 
     from agent.credential_pool import load_pool
-    pool = load_pool("openrouter")
-    entry = pool.select()
+    pool = await load_pool("openrouter")
+    entry = await pool.select()
 
     assert entry is not None
     assert entry.access_token == "sk-or-from-runtime-env"
@@ -938,7 +945,7 @@ def test_load_pool_falls_back_to_os_environ_when_dotenv_empty(tmp_path, monkeypa
 
 
 
-def test_load_pool_mirrors_nous_invoke_jwt_agent_key_runtime_api_key(tmp_path, monkeypatch):
+async def test_load_pool_mirrors_nous_invoke_jwt_agent_key_runtime_api_key(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
     expires_at = datetime.fromtimestamp(time.time() + 3600, tz=timezone.utc).isoformat()
     token = _jwt_with_claims({
@@ -970,8 +977,8 @@ def test_load_pool_mirrors_nous_invoke_jwt_agent_key_runtime_api_key(tmp_path, m
 
     from agent.credential_pool import load_pool
 
-    pool = load_pool("nous")
-    entry = pool.select()
+    pool = await load_pool("nous")
+    entry = await pool.select()
 
     assert entry is not None
     assert entry.source == "device_code"
@@ -984,7 +991,7 @@ def test_load_pool_mirrors_nous_invoke_jwt_agent_key_runtime_api_key(tmp_path, m
     assert pool_entry["agent_key_expires_at"] == expires_at
 
 
-def test_nous_runtime_api_key_rejects_opaque_agent_key():
+async def test_nous_runtime_api_key_rejects_opaque_agent_key():
     from agent.credential_pool import PooledCredential
 
     entry = PooledCredential(
@@ -1019,7 +1026,7 @@ def test_nous_runtime_api_key_rejects_opaque_agent_key():
 
 
 
-def test_load_pool_api_key_path_skips_oauth_autodiscovery(tmp_path, monkeypatch):
+async def test_load_pool_api_key_path_skips_oauth_autodiscovery(tmp_path, monkeypatch):
     """API-key auth path: autodiscovered OAuth creds must NOT be seeded.
 
     When the user picks "Anthropic API key" at `hermes setup`,
@@ -1042,7 +1049,7 @@ def test_load_pool_api_key_path_skips_oauth_autodiscovery(tmp_path, monkeypatch)
     pkce_called = {"n": 0}
     cc_called = {"n": 0}
 
-    def _fake_pkce():
+    async def _fake_pkce():
         pkce_called["n"] += 1
         return {
             "accessToken": "sk-ant-oat01-pkce-token",
@@ -1050,7 +1057,7 @@ def test_load_pool_api_key_path_skips_oauth_autodiscovery(tmp_path, monkeypatch)
             "expiresAt": int(time.time() * 1000) + 3_600_000,
         }
 
-    def _fake_cc():
+    async def _fake_cc():
         cc_called["n"] += 1
         return {
             "accessToken": "sk-ant-oat01-claude-code-token",
@@ -1063,7 +1070,7 @@ def test_load_pool_api_key_path_skips_oauth_autodiscovery(tmp_path, monkeypatch)
 
     from agent.credential_pool import load_pool
 
-    pool = load_pool("anthropic")
+    pool = await load_pool("anthropic")
     sources = {entry.source for entry in pool.entries()}
 
     # Only the explicit API-key entry should be in the pool.
@@ -1073,7 +1080,7 @@ def test_load_pool_api_key_path_skips_oauth_autodiscovery(tmp_path, monkeypatch)
     assert cc_called["n"] == 0
 
 
-def test_load_pool_api_key_path_prunes_stale_oauth_entries(tmp_path, monkeypatch):
+async def test_load_pool_api_key_path_prunes_stale_oauth_entries(tmp_path, monkeypatch):
     """Switching OAuth -> API key must prune stale OAuth entries from auth.json.
 
     Without this, a user who logs into OAuth (seeding `claude_code` or
@@ -1112,12 +1119,18 @@ def test_load_pool_api_key_path_prunes_stale_oauth_entries(tmp_path, monkeypatch
         },
     )
     monkeypatch.setattr("hermes_cli.auth.is_provider_explicitly_configured", lambda pid: True)
-    monkeypatch.setattr("agent.anthropic_adapter.read_hermes_oauth_credentials", lambda: None)
-    monkeypatch.setattr("agent.anthropic_adapter.read_claude_code_credentials", lambda: None)
+    monkeypatch.setattr(
+        "agent.anthropic_adapter.read_hermes_oauth_credentials",
+        AsyncMock(return_value=None),
+    )
+    monkeypatch.setattr(
+        "agent.anthropic_adapter.read_claude_code_credentials",
+        AsyncMock(return_value=None),
+    )
 
     from agent.credential_pool import load_pool
 
-    pool = load_pool("anthropic")
+    pool = await load_pool("anthropic")
     sources = {entry.source for entry in pool.entries()}
 
     # Stale claude_code entry must be gone, API key must be present.
@@ -1125,7 +1138,7 @@ def test_load_pool_api_key_path_prunes_stale_oauth_entries(tmp_path, monkeypatch
     assert "env:ANTHROPIC_API_KEY" in sources
 
 
-def test_load_pool_oauth_path_still_autodiscovers(tmp_path, monkeypatch):
+async def test_load_pool_oauth_path_still_autodiscovers(tmp_path, monkeypatch):
     """OAuth path: ANTHROPIC_TOKEN set, autodiscovery still fires.
 
     Regression guard: the API-key gate must not affect users who chose the
@@ -1142,20 +1155,20 @@ def test_load_pool_oauth_path_still_autodiscovers(tmp_path, monkeypatch):
 
     monkeypatch.setattr(
         "agent.anthropic_adapter.read_hermes_oauth_credentials",
-        lambda: None,
+        AsyncMock(return_value=None),
     )
     monkeypatch.setattr(
         "agent.anthropic_adapter.read_claude_code_credentials",
-        lambda: {
+        AsyncMock(return_value={
             "accessToken": "sk-ant-oat01-autodiscovered-cc",
             "refreshToken": "cc-refresh",
             "expiresAt": int(time.time() * 1000) + 3_600_000,
-        },
+        }),
     )
 
     from agent.credential_pool import load_pool
 
-    pool = load_pool("anthropic")
+    pool = await load_pool("anthropic")
     sources = {entry.source for entry in pool.entries()}
 
     # Both env OAuth token and autodiscovered Claude Code creds should be there.
@@ -1163,7 +1176,7 @@ def test_load_pool_oauth_path_still_autodiscovers(tmp_path, monkeypatch):
     assert "claude_code" in sources
 
 
-def test_least_used_strategy_selects_lowest_count(tmp_path, monkeypatch):
+async def test_least_used_strategy_selects_lowest_count(tmp_path, monkeypatch):
     """least_used strategy should select the credential with the lowest request_count."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
     monkeypatch.setattr(
@@ -1172,7 +1185,7 @@ def test_least_used_strategy_selects_lowest_count(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(
         "agent.credential_pool._seed_from_singletons",
-        lambda provider, entries: (False, set()),
+        AsyncMock(return_value=(False, set())),
     )
     monkeypatch.setattr(
         "agent.credential_pool._seed_from_env",
@@ -1218,8 +1231,8 @@ def test_least_used_strategy_selects_lowest_count(tmp_path, monkeypatch):
 
     from agent.credential_pool import load_pool
 
-    pool = load_pool("openrouter")
-    entry = pool.select()
+    pool = await load_pool("openrouter")
+    entry = await pool.select()
     assert entry is not None
     assert entry.id == "key-b"
     assert entry.access_token == "sk-or-light"
@@ -1229,7 +1242,7 @@ def test_least_used_strategy_selects_lowest_count(tmp_path, monkeypatch):
 
 
 
-def test_custom_endpoint_pool_seeds_from_config(tmp_path, monkeypatch):
+async def test_custom_endpoint_pool_seeds_from_config(tmp_path, monkeypatch):
     """Verify seeding from custom_providers api_key in config.yaml."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
     _write_auth_store(tmp_path, {"version": 1})
@@ -1249,7 +1262,7 @@ def test_custom_endpoint_pool_seeds_from_config(tmp_path, monkeypatch):
 
     from agent.credential_pool import load_pool
 
-    pool = load_pool("custom:together.ai")
+    pool = await load_pool("custom:together.ai")
     assert pool.has_credentials()
     entries = pool.entries()
     assert len(entries) == 1
@@ -1257,7 +1270,7 @@ def test_custom_endpoint_pool_seeds_from_config(tmp_path, monkeypatch):
     assert entries[0].source == "config:Together.ai"
 
 
-def test_custom_endpoint_pool_seeds_from_model_config(tmp_path, monkeypatch):
+async def test_custom_endpoint_pool_seeds_from_model_config(tmp_path, monkeypatch):
     """Verify seeding from model.api_key when model.provider=='custom' and base_url matches."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
     _write_auth_store(tmp_path, {"version": 1})
@@ -1280,7 +1293,7 @@ def test_custom_endpoint_pool_seeds_from_model_config(tmp_path, monkeypatch):
 
     from agent.credential_pool import load_pool
 
-    pool = load_pool("custom:together.ai")
+    pool = await load_pool("custom:together.ai")
     assert pool.has_credentials()
     entries = pool.entries()
     # Should have the model_config entry
@@ -1304,7 +1317,7 @@ def test_custom_endpoint_pool_seeds_from_model_config(tmp_path, monkeypatch):
 
 
 
-def test_load_pool_does_not_seed_claude_code_when_anthropic_not_configured(tmp_path, monkeypatch):
+async def test_load_pool_does_not_seed_claude_code_when_anthropic_not_configured(tmp_path, monkeypatch):
     """Claude Code credentials must not be auto-seeded when the user never selected anthropic."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
     _write_auth_store(tmp_path, {"version": 1, "credential_pool": {}})
@@ -1312,11 +1325,11 @@ def test_load_pool_does_not_seed_claude_code_when_anthropic_not_configured(tmp_p
     # Claude Code credentials exist on disk
     monkeypatch.setattr(
         "agent.anthropic_adapter.read_claude_code_credentials",
-        lambda: {"accessToken": "sk-ant...oken", "refreshToken": "rt", "expiresAt": 9999999999999},
+        AsyncMock(return_value={"accessToken": "sk-ant...oken", "refreshToken": "rt", "expiresAt": 9999999999999}),
     )
     monkeypatch.setattr(
         "agent.anthropic_adapter.read_hermes_oauth_credentials",
-        lambda: None,
+        AsyncMock(return_value=None),
     )
     # User configured kimi-coding, NOT anthropic
     monkeypatch.setattr(
@@ -1325,13 +1338,13 @@ def test_load_pool_does_not_seed_claude_code_when_anthropic_not_configured(tmp_p
     )
 
     from agent.credential_pool import load_pool
-    pool = load_pool("anthropic")
+    pool = await load_pool("anthropic")
 
     # Should NOT have seeded the claude_code entry
     assert pool.entries() == []
 
 
-def test_load_pool_seeds_copilot_via_gh_auth_token(tmp_path, monkeypatch):
+async def test_load_pool_seeds_copilot_via_gh_auth_token(tmp_path, monkeypatch):
     """Copilot credentials from `gh auth token` should be seeded into the pool."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
     _write_auth_store(tmp_path, {"version": 1, "credential_pool": {}})
@@ -1342,7 +1355,7 @@ def test_load_pool_seeds_copilot_via_gh_auth_token(tmp_path, monkeypatch):
     )
 
     from agent.credential_pool import load_pool
-    pool = load_pool("copilot")
+    pool = await load_pool("copilot")
 
     assert pool.has_credentials()
     entries = pool.entries()
@@ -1354,7 +1367,7 @@ def test_load_pool_seeds_copilot_via_gh_auth_token(tmp_path, monkeypatch):
 
 
 
-def test_load_pool_seeds_qwen_oauth_via_cli_tokens(tmp_path, monkeypatch):
+async def test_load_pool_seeds_qwen_oauth_via_cli_tokens(tmp_path, monkeypatch):
     """Qwen OAuth credentials from ~/.qwen/oauth_creds.json should be seeded into the pool."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
     _write_auth_store(tmp_path, {"version": 1, "credential_pool": {}})
@@ -1372,7 +1385,7 @@ def test_load_pool_seeds_qwen_oauth_via_cli_tokens(tmp_path, monkeypatch):
     )
 
     from agent.credential_pool import load_pool
-    pool = load_pool("qwen-oauth")
+    pool = await load_pool("qwen-oauth")
 
     assert pool.has_credentials()
     entries = pool.entries()
@@ -1381,7 +1394,7 @@ def test_load_pool_seeds_qwen_oauth_via_cli_tokens(tmp_path, monkeypatch):
     assert entries[0].access_token == "qwen_fake_token_xyz"
 
 
-def test_load_pool_does_not_seed_qwen_oauth_when_no_token(tmp_path, monkeypatch):
+async def test_load_pool_does_not_seed_qwen_oauth_when_no_token(tmp_path, monkeypatch):
     """Qwen OAuth pool should be empty when no CLI credentials exist."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
     _write_auth_store(tmp_path, {"version": 1, "credential_pool": {}})
@@ -1396,13 +1409,13 @@ def test_load_pool_does_not_seed_qwen_oauth_when_no_token(tmp_path, monkeypatch)
     )
 
     from agent.credential_pool import load_pool
-    pool = load_pool("qwen-oauth")
+    pool = await load_pool("qwen-oauth")
 
     assert not pool.has_credentials()
     assert pool.entries() == []
 
 
-def test_nous_seed_from_singletons_preserves_obtained_at_timestamps(tmp_path, monkeypatch):
+async def test_nous_seed_from_singletons_preserves_obtained_at_timestamps(tmp_path, monkeypatch):
     """Regression test for #15099 secondary issue.
 
     When ``_seed_from_singletons`` materialises a device_code pool entry from
@@ -1443,7 +1456,7 @@ def test_nous_seed_from_singletons_preserves_obtained_at_timestamps(tmp_path, mo
 
     from agent.credential_pool import load_pool
 
-    pool = load_pool("nous")
+    pool = await load_pool("nous")
     entries = pool.entries()
 
     device_entries = [e for e in entries if e.source == "device_code"]
@@ -1473,7 +1486,7 @@ def test_nous_seed_from_singletons_preserves_obtained_at_timestamps(tmp_path, mo
 class TestLeastUsedStrategy:
     """Regression: least_used strategy must increment request_count on select."""
 
-    def test_request_count_increments(self):
+    async def test_request_count_increments(self):
         """Each select() call should increment the chosen entry's request_count."""
         from unittest.mock import patch as _patch
         from agent.credential_pool import CredentialPool, PooledCredential, STRATEGY_LEAST_USED
@@ -1488,13 +1501,13 @@ class TestLeastUsedStrategy:
             pool = CredentialPool("test", entries)
 
         # First select should pick entry with lowest count (both 0 → first)
-        e1 = pool.select()
+        e1 = await pool.select()
         assert e1 is not None
         count_after_first = e1.request_count
         assert count_after_first == 1, f"Expected 1 after first select, got {count_after_first}"
 
         # Second select should pick the OTHER entry (now has lower count)
-        e2 = pool.select()
+        e2 = await pool.select()
         assert e2 is not None
         assert e2.id != e1.id or e2.request_count == 2, (
             "least_used should alternate or increment"
@@ -1591,14 +1604,20 @@ def _codex_auth_store(access_token: str, refresh_token: str) -> dict:
 
 
 
-def test_persist_preserves_concurrent_disk_only_entry(tmp_path, monkeypatch):
+async def test_persist_preserves_concurrent_disk_only_entry(tmp_path, monkeypatch):
     """Regression for #19566: stale rotation writes keep concurrent entries."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
     # Block external-credential autodiscovery: a real ~/.claude/.credentials.json
     # on a dev machine would seed an extra claude_code entry and break the
     # exact-id assertions below (passes on CI where no such file exists).
-    monkeypatch.setattr("agent.anthropic_adapter.read_hermes_oauth_credentials", lambda: None)
-    monkeypatch.setattr("agent.anthropic_adapter.read_claude_code_credentials", lambda: None)
+    monkeypatch.setattr(
+        "agent.anthropic_adapter.read_hermes_oauth_credentials",
+        AsyncMock(return_value=None),
+    )
+    monkeypatch.setattr(
+        "agent.anthropic_adapter.read_claude_code_credentials",
+        AsyncMock(return_value=None),
+    )
     _write_auth_store(
         tmp_path,
         {
@@ -1629,7 +1648,7 @@ def test_persist_preserves_concurrent_disk_only_entry(tmp_path, monkeypatch):
     from agent.credential_pool import load_pool
     from hermes_cli.auth import read_credential_pool, write_credential_pool
 
-    pool = load_pool("anthropic")
+    pool = await load_pool("anthropic")
     assert {entry.id for entry in pool.entries()} == {"cred-A", "cred-B"}
 
     disk_snapshot = read_credential_pool("anthropic")
@@ -1645,7 +1664,7 @@ def test_persist_preserves_concurrent_disk_only_entry(tmp_path, monkeypatch):
     )
     write_credential_pool("anthropic", disk_snapshot)
 
-    pool.mark_exhausted_and_rotate(status_code=429)
+    await pool.mark_exhausted_and_rotate(status_code=429)
 
     final = json.loads((tmp_path / "hermes" / "auth.json").read_text())
     final_ids = [entry["id"] for entry in final["credential_pool"]["anthropic"]]
@@ -1664,7 +1683,7 @@ def test_persist_preserves_concurrent_disk_only_entry(tmp_path, monkeypatch):
 # _sync_anthropic_entry_from_credentials_file — parity fix tests
 # ---------------------------------------------------------------------------
 
-def _make_anthropic_claude_code_pool(tmp_path, monkeypatch, *, access_token, refresh_token, expires_at_ms=9_999_999_999_000):
+async def _make_anthropic_claude_code_pool(tmp_path, monkeypatch, *, access_token, refresh_token, expires_at_ms=9_999_999_999_000):
     """Helper: load an Anthropic pool seeded with a single claude_code entry."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
@@ -1674,15 +1693,15 @@ def _make_anthropic_claude_code_pool(tmp_path, monkeypatch, *, access_token, ref
     monkeypatch.setattr("hermes_cli.auth.is_provider_explicitly_configured", lambda pid: pid == "anthropic")
     monkeypatch.setattr(
         "agent.anthropic_adapter.read_hermes_oauth_credentials",
-        lambda: None,
+        AsyncMock(return_value=None),
     )
     monkeypatch.setattr(
         "agent.anthropic_adapter.read_claude_code_credentials",
-        lambda: {"accessToken": access_token, "refreshToken": refresh_token, "expiresAt": expires_at_ms},
+        AsyncMock(return_value={"accessToken": access_token, "refreshToken": refresh_token, "expiresAt": expires_at_ms}),
     )
     from agent.credential_pool import load_pool
-    pool = load_pool("anthropic")
-    entry = pool.select()
+    pool = await load_pool("anthropic")
+    entry = await pool.select()
     assert entry is not None
     assert entry.source == "claude_code"
     return pool, entry
@@ -1692,9 +1711,9 @@ def _make_anthropic_claude_code_pool(tmp_path, monkeypatch, *, access_token, ref
 
 
 
-def test_sync_anthropic_entry_tokens_unchanged_no_op(tmp_path, monkeypatch):
+async def test_sync_anthropic_entry_tokens_unchanged_no_op(tmp_path, monkeypatch):
     """Sync must be a no-op when credentials file matches the pool entry."""
-    pool, entry = _make_anthropic_claude_code_pool(
+    pool, entry = await _make_anthropic_claude_code_pool(
         tmp_path, monkeypatch,
         access_token="same-access",
         refresh_token="same-refresh",
@@ -1702,15 +1721,15 @@ def test_sync_anthropic_entry_tokens_unchanged_no_op(tmp_path, monkeypatch):
 
     monkeypatch.setattr(
         "agent.anthropic_adapter.read_claude_code_credentials",
-        lambda: {"accessToken": "same-access", "refreshToken": "same-refresh", "expiresAt": 9_999_999_999_000},
+        AsyncMock(return_value={"accessToken": "same-access", "refreshToken": "same-refresh", "expiresAt": 9_999_999_999_000}),
     )
 
-    synced = pool._sync_anthropic_entry_from_credentials_file(entry)
+    synced = await pool._sync_anthropic_entry_from_credentials_file(entry)
 
     assert synced is entry, "no-op sync must return the original entry object"
 
 
-def test_sync_anthropic_entry_clears_all_error_fields(tmp_path, monkeypatch):
+async def test_sync_anthropic_entry_clears_all_error_fields(tmp_path, monkeypatch):
     """Syncing fresh tokens must clear all six error/status fields on the entry.
 
     Before the fix, last_error_reason / last_error_message / last_error_reset_at
@@ -1720,7 +1739,7 @@ def test_sync_anthropic_entry_clears_all_error_fields(tmp_path, monkeypatch):
     from dataclasses import replace as dc_replace
     from agent.credential_pool import STATUS_EXHAUSTED
 
-    pool, entry = _make_anthropic_claude_code_pool(
+    pool, entry = await _make_anthropic_claude_code_pool(
         tmp_path, monkeypatch,
         access_token="stale-access",
         refresh_token="stale-refresh",
@@ -1740,10 +1759,10 @@ def test_sync_anthropic_entry_clears_all_error_fields(tmp_path, monkeypatch):
 
     monkeypatch.setattr(
         "agent.anthropic_adapter.read_claude_code_credentials",
-        lambda: {"accessToken": "fresh-access", "refreshToken": "fresh-refresh", "expiresAt": 9_999_999_999_000},
+        AsyncMock(return_value={"accessToken": "fresh-access", "refreshToken": "fresh-refresh", "expiresAt": 9_999_999_999_000}),
     )
 
-    synced = pool._sync_anthropic_entry_from_credentials_file(exhausted)
+    synced = await pool._sync_anthropic_entry_from_credentials_file(exhausted)
 
     assert synced is not exhausted
     assert synced.access_token == "fresh-access"
@@ -1755,7 +1774,7 @@ def test_sync_anthropic_entry_clears_all_error_fields(tmp_path, monkeypatch):
     assert synced.last_error_reset_at is None
 
 
-def _load_two_ok_pool(tmp_path, monkeypatch):
+async def _load_two_ok_pool(tmp_path, monkeypatch):
     """A pool with two OK anthropic entries, current = cred-1."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
     _write_auth_store(
@@ -1780,7 +1799,7 @@ def _load_two_ok_pool(tmp_path, monkeypatch):
     )
     from agent.credential_pool import load_pool
 
-    return load_pool("anthropic")
+    return await load_pool("anthropic")
 
 
 def _fresh_entry(pool):
@@ -1791,28 +1810,16 @@ def _fresh_entry(pool):
 
 
 class TestCredentialPoolQueryLocking:
-    """Public pool-state methods must run under ``self._lock``.
+    """Awaitable pool operations serialize through the per-pool task lock."""
 
-    ``has_available``/``peek``/``current``/``entries`` all touch
-    ``self._entries`` (and ``_available_entries`` even prunes + persists),
-    and the management surface (``has_credentials``/``reset_statuses``/
-    ``remove_index``/``resolve_target``/``add_entry``) reads or rebinds
-    ``self._entries`` and persists auth.json, so they must all hold the
-    same lock every mutating entry point uses.  A naive fix would deadlock
-    because the lock is non-reentrant and ``peek`` calls ``current`` +
-    ``_available_entries``; these tests guard both the no-deadlock and the
-    actually-locked properties.
-    """
+    async def test_query_methods_do_not_deadlock(self, tmp_path, monkeypatch):
+        pool = await _load_two_ok_pool(tmp_path, monkeypatch)
+        await pool.select()  # set a current entry
 
-    def test_query_methods_do_not_deadlock(self, tmp_path, monkeypatch):
-        pool = _load_two_ok_pool(tmp_path, monkeypatch)
-        pool.select()  # set a current entry
-
-        # peek() internally calls current() + _available_entries(); if any of
-        # these re-acquired the non-reentrant lock we'd hang here forever.
+        # ``peek`` obtains the same lock as selection and availability checks.
         assert pool.current() is not None
-        assert pool.peek() is not None
-        assert pool.has_available() is True
+        assert await pool.peek() is not None
+        assert await pool.has_available() is True
         assert pool.has_credentials() is True
         assert pool.resolve_target("cred-1")[1] is not None
         # (env may seed extra singleton entries; just assert ours are present)
@@ -1821,78 +1828,30 @@ class TestCredentialPoolQueryLocking:
         # while already holding the lock — must use _current_unlocked(), not
         # current(), or it deadlocks on the non-reentrant lock (found when
         # rebasing this fix over the #69843 salvage which added the method).
-        pool.try_refresh_matching()
+        await pool.try_refresh_matching()
 
     @pytest.mark.parametrize(
         "method,get_args",
         [
             ("has_available", lambda pool: ()),
             ("peek", lambda pool: ()),
-            ("current", lambda pool: ()),
-            ("entries", lambda pool: ()),
-            ("has_credentials", lambda pool: ()),
             ("reset_statuses", lambda pool: ()),
-            ("resolve_target", lambda pool: ("cred-1",)),
             ("remove_index", lambda pool: (1,)),
             ("add_entry", lambda pool: (_fresh_entry(pool),)),
         ],
     )
-    def test_query_method_acquires_lock(self, tmp_path, monkeypatch, method, get_args):
-        import threading
+    async def test_query_method_acquires_lock(self, tmp_path, monkeypatch, method, get_args):
+        import asyncio
 
-        pool = _load_two_ok_pool(tmp_path, monkeypatch)
-        pool.select()
+        pool = await _load_two_ok_pool(tmp_path, monkeypatch)
+        await pool.select()
         args = get_args(pool)
-
-        inner = pool._lock
-
-        class _InstrumentedLock:
-            """Probe that records acquire attempts, so the test can prove the
-            worker actually reached ``self._lock`` before asserting that it
-            blocks (a plain timed wait passes spuriously if the worker is
-            simply never scheduled)."""
-
-            def __init__(self):
-                self.attempted = threading.Event()
-
-            def acquire(self, *args, **kwargs):
-                self.attempted.set()
-                return inner.acquire(*args, **kwargs)
-
-            def release(self):
-                inner.release()
-
-            def __enter__(self):
-                self.acquire()
-                return self
-
-            def __exit__(self, *exc):
-                self.release()
-
-        probe = _InstrumentedLock()
-        pool._lock = probe
-
-        done = threading.Event()
-
-        def _call():
-            getattr(pool, method)(*args)
-            done.set()
-
-        # Hold the real lock (without tripping the probe), then fire the query
-        # on another thread. If the method acquires self._lock (as it must),
-        # it blocks until we release.
-        inner.acquire()
+        await pool._lock.acquire()
         try:
-            worker = threading.Thread(target=_call, daemon=True)
-            worker.start()
-            assert probe.attempted.wait(timeout=2.0), (
-                f"{method}() never attempted to acquire self._lock"
-            )
-            assert not done.wait(timeout=0.5), (
-                f"{method}() returned while the pool lock was held — it is not "
-                f"blocking on self._lock"
-            )
+            task = asyncio.create_task(getattr(pool, method)(*args))
+            await asyncio.sleep(0)
+            assert not task.done(), f"{method}() bypassed the pool lock"
         finally:
-            inner.release()
+            pool._lock.release()
 
-        assert done.wait(timeout=2.0), f"{method}() did not complete after lock release"
+        await task

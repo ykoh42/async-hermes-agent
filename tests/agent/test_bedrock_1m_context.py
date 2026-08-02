@@ -44,12 +44,12 @@ class TestBedrockContext1MBeta:
         import agent.anthropic_adapter as adapter
 
         fake_sdk = MagicMock()
-        fake_sdk.AnthropicBedrock = MagicMock()
+        fake_sdk.AsyncAnthropicBedrock = MagicMock()
 
         with patch.object(adapter, "_anthropic_sdk", fake_sdk):
             adapter.build_anthropic_bedrock_client(region="us-west-2")
 
-        call_kwargs = fake_sdk.AnthropicBedrock.call_args.kwargs
+        call_kwargs = fake_sdk.AsyncAnthropicBedrock.call_args.kwargs
         assert call_kwargs["aws_region"] == "us-west-2"
 
         default_headers = call_kwargs.get("default_headers") or {}

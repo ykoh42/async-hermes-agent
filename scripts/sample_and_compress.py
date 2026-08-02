@@ -17,6 +17,7 @@ Usage:
 
 import json
 import random
+import asyncio
 from pathlib import Path
 from typing import List, Dict, Any, Tuple
 import fire
@@ -281,7 +282,7 @@ def run_compression(input_dir: Path, output_dir: Path, config_path: str):
     compressor = TrajectoryCompressor(config)
     
     # Run compression
-    compressor.process_directory(input_dir, output_dir)
+    asyncio.run(compressor.process_directory(input_dir, output_dir))
 
 
 def merge_output_to_single_jsonl(input_dir: Path, output_file: Path):

@@ -275,7 +275,7 @@ def _resolve_mcp_server_config(config: dict) -> dict:
     return _interpolate_env_vars(config)
 
 
-def _probe_single_server(
+async def _probe_single_server(
     name: str, config: dict, connect_timeout: Optional[float] = None, *, details: Optional[dict] = None
 ) -> List[Tuple[str, str]]:
     """Temporarily connect to one MCP server, list its tools, disconnect.
@@ -292,10 +292,7 @@ def _probe_single_server(
         raise ValueError("; ".join(issues))
 
     from tools.mcp_tool import (
-        _ensure_mcp_loop,
-        _run_on_mcp_loop,
         _connect_server,
-        _stop_mcp_loop_if_idle,
         _parse_boolish,
     )
 
@@ -307,7 +304,6 @@ def _probe_single_server(
         except (TypeError, ValueError):
             connect_timeout = 30.0
 
-    _ensure_mcp_loop()
     tools_found: List[Tuple[str, str]] = []
 
     async def _probe():
@@ -369,11 +365,9 @@ def _probe_single_server(
             await server.shutdown()
 
     try:
-        _run_on_mcp_loop(_probe(), timeout=connect_timeout + 10)
+        await asyncio.wait_for(_probe(), timeout=connect_timeout + 10)
     except BaseException as exc:
         raise _unwrap_exception_group(exc) from None
-    finally:
-        _stop_mcp_loop_if_idle()
 
     return tools_found
 
@@ -540,7 +534,7 @@ def cmd_mcp_add(args):
     print(color(f"  Connecting to '{name}'...", Colors.CYAN))
 
     try:
-        tools = _probe_single_server(name, server_config)
+        tools = asyncio.run(_probe_single_server(name, server_config))
     except Exception as exc:
         _error(f"Failed to connect: {exc}")
         if _confirm("Save config anyway (you can test later)?", default=False):
@@ -748,7 +742,7 @@ def cmd_mcp_test(args):
     # Attempt connection
     start = time.monotonic()
     try:
-        tools = _probe_single_server(name, cfg)
+        tools = asyncio.run(_probe_single_server(name, cfg))
         elapsed_ms = (time.monotonic() - start) * 1000
     except Exception as exc:
         elapsed_ms = (time.monotonic() - start) * 1000
@@ -817,9 +811,9 @@ def _reauth_oauth_server(name: str, server_config: dict) -> bool:
             _login_connect_timeout = 0.0
         _login_connect_timeout = max(_login_connect_timeout, 315.0)
         with force_interactive_oauth():
-            tools = _probe_single_server(
+            tools = asyncio.run(_probe_single_server(
                 name, server_config, connect_timeout=_login_connect_timeout
-            )
+            ))
         # A clean probe is NOT proof of authentication. Some MCP servers
         # (notably Google's official Drive server) serve initialize +
         # tools/list WITHOUT auth, so the probe lists tools even when the

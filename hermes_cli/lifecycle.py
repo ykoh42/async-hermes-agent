@@ -22,6 +22,18 @@ def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
     return plugins.invoke_hook(hook_name, **kwargs)
 
 
+async def invoke_hook_async(hook_name: str, **kwargs: Any) -> List[Any]:
+    """Invoke only native-async plugin hooks from the async agent runtime.
+
+    First-party observability and the legacy plugin dispatcher are synchronous
+    extension surfaces. They intentionally stay outside the library's native
+    turn path rather than being hidden in a worker thread.
+    """
+    from hermes_cli import plugins
+
+    return await plugins.invoke_hook_async(hook_name, **kwargs)
+
+
 def has_hook(hook_name: str) -> bool:
     """Return whether a first-party observer or plugin consumes a hook."""
     try:

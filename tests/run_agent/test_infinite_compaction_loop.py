@@ -37,7 +37,7 @@ def _make_compressor(**kwargs) -> ContextCompressor:
     # NOTE: 96K < 512K, so the small-context floor raises the effective
     # threshold_percent to 0.75 → threshold_tokens = 72_000. Tests use
     # 73_000 as the "over threshold" probe value.
-    with patch("agent.context_compressor.get_model_context_length", return_value=96000):
+    with patch("agent.context_compressor.get_static_context_length", return_value=96000):
         return ContextCompressor(**defaults)
 
 

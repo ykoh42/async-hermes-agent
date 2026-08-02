@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from unittest.mock import patch
 
+import pytest
+
 from run_agent import AIAgent
 
 
@@ -42,7 +44,8 @@ def _mock_client(base_url="https://chatgpt.com/backend-api/codex", api_key="fb-k
 
 
 class TestNousFallbackLocalAvailability:
-    def test_missing_nous_token_is_skipped_once(self):
+    @pytest.mark.asyncio
+    async def test_missing_nous_token_is_skipped_once(self):
         """Nous fallback is skipped when no access/refresh token is stored."""
         agent = _make_agent(
             fallback_model=[
@@ -57,11 +60,12 @@ class TestNousFallbackLocalAvailability:
             "agent.auxiliary_client.resolve_provider_client",
             return_value=(_mock_client(api_key="fb"), "gpt-5.5"),
         ):
-            activated = agent._try_activate_fallback(None)
+            activated = await agent._try_activate_fallback(None)
         assert activated is True
         assert agent.model == "gpt-5.5"
 
-    def test_nous_unavailable_not_retried_in_same_session(self):
+    @pytest.mark.asyncio
+    async def test_nous_unavailable_not_retried_in_same_session(self):
         """After Nous is skipped once, subsequent activations continue further."""
         agent = _make_agent(
             fallback_model=[
@@ -73,7 +77,7 @@ class TestNousFallbackLocalAvailability:
             "hermes_cli.auth.get_provider_auth_state",
             return_value={},
         ):
-            agent._try_activate_fallback(None)
+            await agent._try_activate_fallback(None)
         key = (
             "nous",
             "anthropic/claude-sonnet-4.6",
@@ -81,7 +85,8 @@ class TestNousFallbackLocalAvailability:
         )
         assert key in getattr(agent, "_unavailable_fallback_keys", set())
 
-    def test_present_nous_token_allows_activation(self):
+    @pytest.mark.asyncio
+    async def test_present_nous_token_allows_activation(self):
         """Nous is considered when token material exists."""
         agent = _make_agent(
             fallback_model=[
@@ -95,7 +100,10 @@ class TestNousFallbackLocalAvailability:
         ), patch(
             "agent.auxiliary_client.resolve_provider_client",
             return_value=(_mock_client(api_key="fb"), "anthropic/claude-sonnet-4.6"),
+        ), patch(
+            "agent.anthropic_adapter.build_anthropic_client",
+            return_value=object(),
         ):
-            activated = agent._try_activate_fallback(None)
+            activated = await agent._try_activate_fallback(None)
         assert activated is True
         assert agent.provider == "nous"

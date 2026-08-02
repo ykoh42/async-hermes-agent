@@ -36,6 +36,7 @@ streams"), generalized to cover Hermes's three streaming error-body sites
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import threading
 from typing import List, Optional
@@ -122,6 +123,55 @@ def read_streaming_error_body(
             sum(len(c) for c in chunks),
             max_bytes,
         )
+    return b"".join(chunks).decode("utf-8", errors="replace")
+
+
+async def read_streaming_error_body_async(
+    response: httpx.Response,
+    *,
+    max_bytes: int = DEFAULT_ERROR_BODY_MAX_BYTES,
+    timeout_s: float = DEFAULT_ERROR_BODY_TIMEOUT_S,
+) -> str:
+    """Native-async bounded error-body read for async HTTP responses.
+
+    The active agent transport must not hand an ``httpx.AsyncByteStream`` to
+    the synchronous worker-thread helper above.  Cancellation of the async
+    iterator is sufficient to release the response stream; the provider's
+    own read timeout remains the lower-level socket guard.
+    """
+    chunks: List[bytes] = []
+    total = 0
+
+    async def _drain() -> None:
+        nonlocal total
+        async for chunk in response.aiter_bytes():
+            if not chunk:
+                continue
+            remaining = max_bytes - total
+            if remaining <= 0:
+                break
+            chunks.append(chunk[:remaining])
+            total += min(len(chunk), remaining)
+            if len(chunk) > remaining:
+                break
+
+    try:
+        await asyncio.wait_for(_drain(), timeout=timeout_s)
+    except (asyncio.TimeoutError, asyncio.CancelledError):
+        if isinstance(asyncio.current_task(), asyncio.Task) and asyncio.current_task().cancelling():
+            raise
+        logger.debug(
+            "bounded async error-body read: hard timeout after %.1fs (%d bytes so far)",
+            timeout_s,
+            total,
+        )
+    except Exception as exc:  # noqa: BLE001 - error path must not mask HTTP failure
+        logger.debug("bounded async error-body read failed: %s", exc)
+    finally:
+        try:
+            await response.aclose()
+        except Exception:
+            pass
     return b"".join(chunks).decode("utf-8", errors="replace")
 
 

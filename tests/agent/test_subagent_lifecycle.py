@@ -140,18 +140,19 @@ def test_public_lifecycle_runs_host_aggregation(monkeypatch):
 
 
 
-def test_agent_turn_binds_and_clears_lifecycle_parent(monkeypatch):
+@pytest.mark.asyncio
+async def test_agent_turn_binds_and_clears_lifecycle_parent(monkeypatch):
     from run_agent import AIAgent
 
     agent = AIAgent.__new__(AIAgent)
     observed = []
 
-    def run_conversation(parent, *_args, **_kwargs):
+    async def run_conversation(parent, *_args, **_kwargs):
         observed.append(get_active_subagent_parent())
         return {"final_response": "ok"}
 
     monkeypatch.setattr("agent.conversation_loop.run_conversation", run_conversation)
 
-    assert agent.run_conversation("hello") == {"final_response": "ok"}
+    assert await agent.run_conversation("hello") == {"final_response": "ok"}
     assert observed == [agent]
     assert get_active_subagent_parent() is None

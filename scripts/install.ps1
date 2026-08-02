@@ -2233,45 +2233,6 @@ print(','.join(scripts))
         }
     }
 
-    # Verify the dashboard deps specifically -- they're the most common thing
-    # users hit and lazy-import errors from `hermes dashboard` are confusing.
-    # If tier 1 failed (the common case), [web] was still picked up by tiers
-    # 2-3; only tier 4 leaves you without it.
-    $pythonExe = if (-not $NoVenv) { "$InstallDir\venv\Scripts\python.exe" } else { (& $UvCmd python find $PythonVersion) }
-    if (Test-Path $pythonExe) {
-        $webOk = $false
-        $webServerSyntaxOk = $false
-        # Relax EAP=Stop while running the import probe; see the matching
-        # comment on the baseline-imports check above.  Python writes
-        # deprecation warnings to stderr and we don't want those wrapped
-        # as ErrorRecords that silently force the "not importable" path
-        # even when fastapi/uvicorn are actually installed.
-        $prevEAP = $ErrorActionPreference
-        $ErrorActionPreference = "Continue"
-        try {
-            & $pythonExe -c "import fastapi, uvicorn" 2>&1 | Out-Null
-            if ($LASTEXITCODE -eq 0) { $webOk = $true }
-        } catch { }
-        try {
-            & $pythonExe -m py_compile "$InstallDir\hermes_cli\web_server.py" 2>&1 | Out-Null
-            if ($LASTEXITCODE -eq 0) { $webServerSyntaxOk = $true }
-        } catch { }
-        $ErrorActionPreference = $prevEAP
-        if (-not $webOk) {
-            Write-Warn "fastapi/uvicorn not importable -- `hermes dashboard` will not work."
-            Write-Info "Attempting targeted install of [web] extra as last resort..."
-            & $UvCmd pip install -e ".[web]"
-            if ($LASTEXITCODE -eq 0) {
-                Write-Success "[web] extra installed; `hermes dashboard` should now work."
-            } else {
-                Write-Warn "Could not install [web] extra. Run manually: uv pip install --python `"$pythonExe`" `"fastapi>=0.104,<1`" `"uvicorn[standard]>=0.24,<1`""
-            }
-        }
-        if (-not $webServerSyntaxOk) {
-            throw "dashboard backend source failed syntax check: hermes_cli/web_server.py"
-        }
-    }
-    
     Pop-Location
     
     Write-Success "All dependencies installed"

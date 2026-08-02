@@ -4,6 +4,7 @@ Pure utility functions with no AIAgent dependency. Used by ContextCompressor
 and run_agent.py for pre-flight context checks.
 """
 
+import asyncio
 import base64
 import hashlib
 import ipaddress
@@ -662,6 +663,82 @@ def _endpoint_scoped_context_length(model: str, base_url: str) -> Optional[int]:
     return None
 
 
+def get_static_context_length(
+    model: str,
+    base_url: str = "",
+    config_context_length: int | None = None,
+    provider: str = "",
+    custom_providers: list | None = None,
+) -> int:
+    """Resolve a context window without I/O.
+
+    This is the core-safe half of context resolution: explicit configuration,
+    endpoint-specific facts, and the bundled model catalogue only.  It never
+    reads the persistent metadata cache or contacts a provider, so it is safe
+    on an async conversation's critical path.  The existing
+    :func:`get_model_context_length` remains the management/legacy resolver
+    for paths that intentionally perform live metadata discovery.
+    """
+    if (
+        config_context_length is not None
+        and isinstance(config_context_length, int)
+        and config_context_length > 0
+    ):
+        return config_context_length
+
+    # ``custom_providers`` is already loaded agent configuration.  Supplying
+    # it avoids a config-file read while retaining the per-model override.
+    if custom_providers and base_url and model:
+        try:
+            from hermes_cli.config import get_custom_provider_context_length
+
+            custom_context = get_custom_provider_context_length(
+                model=model,
+                base_url=base_url,
+                custom_providers=custom_providers,
+            )
+        except Exception:
+            custom_context = None
+        if custom_context:
+            return custom_context
+
+    model = _strip_provider_prefix(model)
+    endpoint_context = _endpoint_scoped_context_length(model, base_url)
+    if endpoint_context is not None:
+        return endpoint_context
+
+    is_bedrock_context = provider == "bedrock" or (
+        base_url
+        and base_url_hostname(base_url).startswith("bedrock-runtime.")
+        and base_url_host_matches(base_url, "amazonaws.com")
+    )
+    if is_bedrock_context:
+        try:
+            from agent.bedrock_adapter import get_bedrock_context_length
+
+            return get_bedrock_context_length(model, probe=False)
+        except ImportError:
+            pass
+
+    if provider == "openai-codex":
+        model_lower = model.lower()
+        for slug, context_length in sorted(
+            _CODEX_OAUTH_CONTEXT_FALLBACK.items(),
+            key=lambda item: len(item[0]),
+            reverse=True,
+        ):
+            if slug in model_lower:
+                return context_length
+
+    model_lower = model.lower()
+    for default_model, context_length in sorted(
+        DEFAULT_CONTEXT_LENGTHS.items(), key=lambda item: len(item[0]), reverse=True
+    ):
+        if default_model in model_lower:
+            return context_length
+    return DEFAULT_FALLBACK_CONTEXT
+
+
 def _skip_persistent_context_cache(base_url: str, provider: str) -> bool:
     """Return True when the on-disk context cache must not short-circuit probing.
 
@@ -1061,6 +1138,57 @@ def fetch_model_metadata(force_refresh: bool = False) -> Dict[str, Dict[str, Any
         return {}
 
 
+async def fetch_model_metadata_async(
+    force_refresh: bool = False,
+) -> Dict[str, Dict[str, Any]]:
+    """Fetch OpenRouter model metadata over a native async HTTP transport."""
+    global _model_metadata_cache, _model_metadata_cache_time
+
+    if (
+        not force_refresh
+        and _model_metadata_cache
+        and (time.time() - _model_metadata_cache_time) < _MODEL_CACHE_TTL
+    ):
+        return _model_metadata_cache
+
+    import httpx
+
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=5.0)) as client:
+            response = await client.get(OPENROUTER_MODELS_URL)
+            response.raise_for_status()
+            payload = response.json()
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.debug("Async OpenRouter metadata fetch failed: %s", exc)
+        return _model_metadata_cache
+
+    cache: Dict[str, Dict[str, Any]] = {}
+    for model in payload.get("data", []) if isinstance(payload, dict) else []:
+        if not isinstance(model, dict):
+            continue
+        model_id = model.get("id", "")
+        if not model_id:
+            continue
+        entry = {
+            "context_length": model.get("context_length", 128000),
+            "max_completion_tokens": model.get("top_provider", {}).get(
+                "max_completion_tokens", 4096
+            ),
+            "name": model.get("name", model_id),
+            "pricing": model.get("pricing", {}),
+        }
+        _add_model_aliases(cache, model_id, entry)
+        canonical = model.get("canonical_slug", "")
+        if canonical and canonical != model_id:
+            _add_model_aliases(cache, canonical, entry)
+
+    _model_metadata_cache = cache
+    _model_metadata_cache_time = time.time()
+    return cache
+
+
 def fetch_endpoint_model_metadata(
     base_url: str,
     api_key: str = "",
@@ -1204,6 +1332,72 @@ def fetch_endpoint_model_metadata(
     _endpoint_model_metadata_cache[normalized] = {}
     _endpoint_model_metadata_cache_time[normalized] = time.time()
     return {}
+
+
+async def fetch_endpoint_model_metadata_async(
+    base_url: str,
+    api_key: str = "",
+    force_refresh: bool = False,
+) -> Dict[str, Dict[str, Any]]:
+    """Fetch an OpenAI-compatible ``/models`` catalog without blocking."""
+    normalized = _normalize_base_url(base_url)
+    if not normalized or _is_openrouter_base_url(normalized):
+        return {}
+    if not force_refresh:
+        cached = _endpoint_model_metadata_cache.get(normalized)
+        cached_at = _endpoint_model_metadata_cache_time.get(normalized, 0)
+        if cached is not None and (time.time() - cached_at) < _ENDPOINT_MODEL_CACHE_TTL:
+            return cached
+
+    import httpx
+
+    candidates = [normalized]
+    alternate = normalized[:-3].rstrip("/") if normalized.endswith("/v1") else normalized + "/v1"
+    if alternate not in candidates:
+        candidates.append(alternate)
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+    payload = None
+    async_client = httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=5.0), headers=headers)
+    try:
+        async with async_client as client:
+            for candidate in candidates:
+                try:
+                    response = await client.get(candidate.rstrip("/") + "/models")
+                    response.raise_for_status()
+                    payload = response.json()
+                    if isinstance(payload, dict):
+                        break
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    continue
+    finally:
+        # The async context manager owns closure; this explicit branch keeps
+        # cancellation and unusual client implementations deterministic.
+        pass
+
+    cache: Dict[str, Dict[str, Any]] = {}
+    for model in (payload or {}).get("data", []) if isinstance(payload, dict) else []:
+        if not isinstance(model, dict):
+            continue
+        model_id = model.get("id")
+        if not model_id:
+            continue
+        entry: Dict[str, Any] = {"name": model.get("name", model_id)}
+        context_length = _extract_context_length(model)
+        if context_length is not None:
+            entry["context_length"] = context_length
+        max_completion_tokens = _extract_max_completion_tokens(model)
+        if max_completion_tokens is not None:
+            entry["max_completion_tokens"] = max_completion_tokens
+        pricing = _extract_pricing(model)
+        if pricing:
+            entry["pricing"] = pricing
+        _add_model_aliases(cache, model_id, entry)
+
+    _endpoint_model_metadata_cache[normalized] = cache
+    _endpoint_model_metadata_cache_time[normalized] = time.time()
+    return cache
 
 
 def _resolve_endpoint_context_length(
@@ -1658,6 +1852,64 @@ def query_ollama_num_ctx(model: str, base_url: str, api_key: str = "") -> Option
     return None
 
 
+async def query_ollama_num_ctx_async(
+    model: str, base_url: str, api_key: str = ""
+) -> Optional[int]:
+    """Query Ollama's ``/api/show`` endpoint without blocking the event loop.
+
+    This is the runtime counterpart to :func:`query_ollama_num_ctx`.  The
+    synchronous helper remains available to the legacy metadata/CLI surfaces,
+    but an active async turn must use this coroutine.  The optional disk probe
+    cache is intentionally not consulted here: its synchronous file access
+    would defeat the native async boundary, and the request is a best-effort
+    hint rather than required agent state.
+    """
+    import httpx
+
+    bare_model = _strip_provider_prefix(model)
+    server_url = _localhost_to_ipv4(str(base_url or "").rstrip("/"))
+    if server_url.endswith("/v1"):
+        server_url = server_url[:-3]
+    if not server_url or not bare_model:
+        return None
+
+    headers = _auth_headers(api_key)
+    try:
+        async with httpx.AsyncClient(timeout=3.0, headers=headers) as client:
+            response = await client.post(
+                f"{server_url}/api/show", json={"name": bare_model}
+            )
+            if response.status_code != 200:
+                return None
+            data = response.json()
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        return None
+
+    parameters = data.get("parameters", "")
+    if isinstance(parameters, str) and "num_ctx" in parameters:
+        for line in parameters.splitlines():
+            if "num_ctx" not in line:
+                continue
+            parts = line.strip().split()
+            if len(parts) >= 2:
+                try:
+                    value = int(parts[-1])
+                except (TypeError, ValueError):
+                    continue
+                if value > 0:
+                    return value
+
+    model_info = data.get("model_info", {})
+    if isinstance(model_info, dict):
+        for key, value in model_info.items():
+            if "context_length" in str(key) and isinstance(value, (int, float)):
+                value = int(value)
+                return value if value > 0 else None
+    return None
+
+
 def query_ollama_supports_vision(model: str, base_url: str, api_key: str = "") -> Optional[bool]:
     """Return True/False when Ollama ``/api/show`` reports vision support.
 
@@ -1705,6 +1957,51 @@ def query_ollama_supports_vision(model: str, base_url: str, api_key: str = "") -
             if "vision.block_count" in str(key).lower():
                 return True
 
+    return None
+
+
+async def query_ollama_supports_vision_async(
+    model: str,
+    base_url: str,
+    api_key: str = "",
+) -> Optional[bool]:
+    """Query Ollama vision capabilities without a blocking HTTP client."""
+    import httpx
+
+    bare_model = _strip_provider_prefix(model)
+    if not bare_model or not base_url:
+        return None
+
+    server_url = _localhost_to_ipv4(base_url.rstrip("/"))
+    if server_url.endswith("/v1"):
+        server_url = server_url[:-3]
+    headers = _auth_headers(api_key)
+
+    try:
+        async with httpx.AsyncClient(timeout=3.0, headers=headers) as client:
+            response = await client.post(
+                f"{server_url}/api/show", json={"name": bare_model}
+            )
+            if response.status_code != 200:
+                return None
+            data = response.json()
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        return None
+
+    capabilities = data.get("capabilities")
+    if isinstance(capabilities, list):
+        if any(str(cap).lower() == "vision" for cap in capabilities):
+            return True
+        if capabilities:
+            return False
+
+    model_info = data.get("model_info")
+    if isinstance(model_info, dict):
+        for key in model_info:
+            if "vision.block_count" in str(key).lower():
+                return True
     return None
 
 
@@ -2313,8 +2610,6 @@ def get_model_context_length(
                 load_config,
             )
             from hermes_cli.moa_config import resolve_moa_preset
-            from hermes_cli.runtime_provider import resolve_runtime_provider
-
             config = load_config()
             effective_custom_providers = custom_providers
             if effective_custom_providers is None:
@@ -2324,12 +2619,15 @@ def get_model_context_length(
             agg_provider = str(agg.get("provider") or "").strip()
             agg_model = str(agg.get("model") or "").strip()
             if agg_model and agg_provider and agg_provider.lower() != "moa":
-                rt = resolve_runtime_provider(requested=agg_provider, target_model=agg_model)
                 return get_model_context_length(
                     agg_model,
-                    base_url=rt.get("base_url", "") or "",
-                    api_key=rt.get("api_key", "") or "",
-                    provider=rt.get("provider") or agg_provider,
+                    # This metadata helper is synchronous by contract.  Use
+                    # the configured provider identity and let the async
+                    # runtime perform credential/pool resolution at turn
+                    # startup; no network or pool I/O belongs in metadata.
+                    base_url="",
+                    api_key="",
+                    provider=agg_provider,
                     custom_providers=effective_custom_providers,
                 )
         except Exception:
@@ -2756,35 +3054,6 @@ def get_model_context_length(
 
     # 9. Default fallback — 256K
     return DEFAULT_FALLBACK_CONTEXT
-
-
-async def get_model_context_length_async(
-    model: str,
-    base_url: str = "",
-    api_key: str = "",
-    config_context_length: int | None = None,
-    provider: str = "",
-    custom_providers: list | None = None,
-) -> int:
-    """Async variant of get_model_context_length.
-
-    Offloads the entire synchronous resolution chain (which contains
-    blocking HTTP calls via ``requests``) to a background thread so it
-    does not freeze the asyncio event loop and cause Discord heartbeat
-    timeouts.
-
-    Shares all logic with the sync version — no code duplication.
-    """
-    import asyncio
-    return await asyncio.to_thread(
-        get_model_context_length,
-        model,
-        base_url=base_url,
-        api_key=api_key,
-        config_context_length=config_context_length,
-        provider=provider,
-        custom_providers=custom_providers,
-    )
 
 
 def _is_cjk_token_dense_char(ch: str) -> bool:

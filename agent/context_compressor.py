@@ -19,7 +19,6 @@ Improvements over v2:
 import hashlib
 import json
 import logging
-import sqlite3
 import re
 import time
 import uuid
@@ -30,7 +29,7 @@ from agent.context_engine import ContextEngine, sanitize_memory_context
 from agent.error_classifier import FailoverReason, classify_api_error
 from agent.model_metadata import (
     MINIMUM_CONTEXT_LENGTH,
-    get_model_context_length,
+    get_static_context_length,
     estimate_messages_tokens_rough,
     estimate_tokens_rough,
 )
@@ -1403,9 +1402,7 @@ class ContextCompressor(ContextEngine):
         """Emit the informative startup line once, on first resolution.
 
         Deferred out of ``__init__`` (#32221): the line reports resolved token
-        budgets, so emitting it there would force the synchronous
-        ``get_model_context_length()`` probe during construction. Reads via
-        the properties below are safe here because
+        budgets. Reads via the properties below are safe here because
         ``_resolved_context_length`` is already set.
         """
         if not getattr(self, "_log_init_summary", False):
@@ -1422,12 +1419,11 @@ class ContextCompressor(ContextEngine):
         )
 
     def _resolve_context_length(self) -> int:
-        """Resolve and cache the model's context length on first access."""
+        """Resolve and cache the model's static context length on first access."""
         if self._resolved_context_length is None:
-            self._resolved_context_length = get_model_context_length(
+            self._resolved_context_length = get_static_context_length(
                 self.model,
                 base_url=self.base_url,
-                api_key=self.api_key,
                 config_context_length=self._config_context_length,
                 provider=self.provider,
             )
@@ -1565,7 +1561,14 @@ class ContextCompressor(ContextEngine):
         self._compression_telemetry_seed = None
 
     def bind_session_state(self, session_db: Any = None, session_id: str = "") -> None:
-        """Bind the current session row so durable cooldowns can round-trip."""
+        """Bind the current session identity without performing I/O.
+
+        The native async host hydrates durable guard state at the turn
+        prologue and persists it at the compression boundary.  This lifecycle
+        hook is intentionally synchronous because the context-engine ABC is
+        also used during object construction; it must therefore never call a
+        synchronous SessionDB method from an active async turn.
+        """
         self._session_db = session_db
         self._session_id = session_id or ""
         self._summary_failure_cooldown_until = 0.0
@@ -1575,49 +1578,16 @@ class ContextCompressor(ContextEngine):
         self._fallback_compression_streak = 0
         self._ineffective_compression_count = 0
         self._anti_thrash_recovery_deadline = 0.0
-        self.get_active_compression_failure_cooldown()
-        self._load_fallback_compression_streak()
-        self._load_ineffective_compression_count()
+        # Durable state is loaded by ``_hydrate_persisted_compression_guards``
+        # through AsyncSessionDB at the async turn boundary.
 
     def on_session_start(self, session_id: str, **kwargs) -> None:
         """Bind session-scoped compression state for a new or resumed session."""
         super().on_session_start(session_id, **kwargs)
         boundary_reason = kwargs.get("boundary_reason")
-        old_session_id = kwargs.get("old_session_id")
         session_db = kwargs.get("session_db", getattr(self, "_session_db", None))
         previous_fallback_streak = self._fallback_compression_streak
         previous_ineffective_count = self._ineffective_compression_count
-        if boundary_reason == "compression" and old_session_id:
-            getter = getattr(session_db, "get_compression_fallback_streak", None)
-            if callable(getter):
-                try:
-                    stored_streak = getter(old_session_id)
-                    if isinstance(stored_streak, (int, float, str)):
-                        previous_fallback_streak = max(0, int(stored_streak))
-                except (TypeError, ValueError, sqlite3.Error) as exc:
-                    logger.debug("compression parent fallback streak lookup failed: %s", exc)
-                except Exception as exc:
-                    logger.debug(
-                        "compression parent fallback streak lookup failed (non-sqlite): %s",
-                        exc,
-                    )
-            count_getter = getattr(
-                session_db, "get_compression_ineffective_count", None,
-            )
-            if callable(count_getter):
-                try:
-                    stored_count = count_getter(old_session_id)
-                    if isinstance(stored_count, (int, float, str)):
-                        previous_ineffective_count = max(0, int(stored_count))
-                except (TypeError, ValueError, sqlite3.Error) as exc:
-                    logger.debug(
-                        "compression parent ineffective count lookup failed: %s", exc,
-                    )
-                except Exception as exc:
-                    logger.debug(
-                        "compression parent ineffective count lookup failed (non-sqlite): %s",
-                        exc,
-                    )
         self.bind_session_state(session_db, session_id)
         if boundary_reason == "compression":
             # Rotation creates a fresh child row before this callback. Preserve
@@ -1634,36 +1604,12 @@ class ContextCompressor(ContextEngine):
                 self._persist_ineffective_compression_count()
 
     def _load_fallback_compression_streak(self) -> None:
-        session_db = getattr(self, "_session_db", None)
-        session_id = getattr(self, "_session_id", "")
-        getter = getattr(session_db, "get_compression_fallback_streak", None)
-        if not session_id or not callable(getter):
-            return
-        try:
-            stored_streak = getter(session_id)
-            self._fallback_compression_streak = max(
-                0,
-                int(stored_streak)
-                if isinstance(stored_streak, (int, float, str))
-                else 0,
-            )
-        except (TypeError, ValueError, sqlite3.Error) as exc:
-            logger.debug("compression fallback streak lookup failed: %s", exc)
-        except Exception as exc:
-            logger.debug("compression fallback streak lookup failed (non-sqlite): %s", exc)
+        """Compatibility no-op; async turn prologue owns DB hydration."""
+        return
 
     def _persist_fallback_compression_streak(self) -> None:
-        session_db = getattr(self, "_session_db", None)
-        session_id = getattr(self, "_session_id", "")
-        setter = getattr(session_db, "set_compression_fallback_streak", None)
-        if not session_id or not callable(setter):
-            return
-        try:
-            setter(session_id, self._fallback_compression_streak)
-        except sqlite3.Error as exc:
-            logger.debug("compression fallback streak persist failed: %s", exc)
-        except Exception as exc:
-            logger.debug("compression fallback streak persist failed (non-sqlite): %s", exc)
+        """Compatibility no-op; the async compression boundary persists it."""
+        return
 
     def _load_ineffective_compression_count(self) -> None:
         """Load the durable anti-thrash strike count for the bound session.
@@ -1676,36 +1622,12 @@ class ContextCompressor(ContextEngine):
         (#54923). The counter now round-trips through the session row like
         the failure cooldown and the fallback streak.
         """
-        session_db = getattr(self, "_session_db", None)
-        session_id = getattr(self, "_session_id", "")
-        getter = getattr(session_db, "get_compression_ineffective_count", None)
-        if not session_id or not callable(getter):
-            return
-        try:
-            stored_count = getter(session_id)
-            self._ineffective_compression_count = max(
-                0,
-                int(stored_count)
-                if isinstance(stored_count, (int, float, str))
-                else 0,
-            )
-        except (TypeError, ValueError, sqlite3.Error) as exc:
-            logger.debug("compression ineffective count lookup failed: %s", exc)
-        except Exception as exc:
-            logger.debug("compression ineffective count lookup failed (non-sqlite): %s", exc)
+        # The async turn prologue fills this value from AsyncSessionDB.
+        return
 
     def _persist_ineffective_compression_count(self) -> None:
-        session_db = getattr(self, "_session_db", None)
-        session_id = getattr(self, "_session_id", "")
-        setter = getattr(session_db, "set_compression_ineffective_count", None)
-        if not session_id or not callable(setter):
-            return
-        try:
-            setter(session_id, self._ineffective_compression_count)
-        except sqlite3.Error as exc:
-            logger.debug("compression ineffective count persist failed: %s", exc)
-        except Exception as exc:
-            logger.debug("compression ineffective count persist failed (non-sqlite): %s", exc)
+        """Compatibility no-op; the async compression boundary persists it."""
+        return
 
     def _record_ineffective_compression_verdict(self, count: int) -> None:
         """Set the anti-thrash strike counter, keeping the durable copy in sync.
@@ -1752,52 +1674,10 @@ class ContextCompressor(ContextEngine):
             if not refresh:
                 return local_state
 
-        session_db = getattr(self, "_session_db", None)
-        session_id = getattr(self, "_session_id", "")
-        if not session_db or not session_id:
-            return local_state
-
-        getter = getattr(session_db, "get_compression_failure_cooldown", None)
-        if getter is None:
-            return local_state
-        try:
-            state = getter(session_id)
-        except sqlite3.Error as exc:
-            logger.debug("compression failure cooldown lookup failed: %s", exc)
-            return local_state
-        except Exception:
-            return local_state
-        if not state:
-            if refresh:
-                if local_state is not None and self._cooldown_persist_failed:
-                    # The live local cooldown never made it to the DB (persist
-                    # failed), so the empty row is not evidence that another
-                    # agent cleared it. Honouring the DB here would re-enable
-                    # auto-compress mid-cooldown and reopen the #11529 thrash
-                    # window. Keep the local timer authoritative until it
-                    # expires or a successful DB read supersedes it.
-                    return local_state
-                self._summary_failure_cooldown_until = 0.0
-                self._last_summary_error = None
-            return None
-
-        remaining_seconds = float(state.get("remaining_seconds") or 0.0)
-        if remaining_seconds <= 0:
-            if refresh:
-                if local_state is not None and self._cooldown_persist_failed:
-                    return local_state
-                self._summary_failure_cooldown_until = 0.0
-                self._last_summary_error = None
-            return None
-
-        self._summary_failure_cooldown_until = now_mono + remaining_seconds
-        self._last_summary_error = state.get("error")
-        self._cooldown_persist_failed = False
-        return {
-            "cooldown_until": float(state.get("cooldown_until") or 0.0),
-            "remaining_seconds": remaining_seconds,
-            "error": self._last_summary_error,
-        }
+        # Durable state is hydrated asynchronously before this method is
+        # reached.  Keeping this accessor memory-only makes all synchronous
+        # decision helpers safe to call from the event loop.
+        return local_state
 
     def _record_compression_failure_cooldown(
         self,
@@ -1808,24 +1688,9 @@ class ContextCompressor(ContextEngine):
         self._summary_failure_cooldown_until = time.monotonic() + cooldown_seconds
         self._last_summary_error = error
 
-        session_db = getattr(self, "_session_db", None)
-        session_id = getattr(self, "_session_id", "")
-        if not session_db or not session_id:
-            return
-
-        recorder = getattr(session_db, "record_compression_failure_cooldown", None)
-        if recorder is None:
-            self._cooldown_persist_failed = True
-            return
-        try:
-            recorder(session_id, cooldown_until, error)
-            self._cooldown_persist_failed = False
-        except sqlite3.Error as exc:
-            self._cooldown_persist_failed = True
-            logger.debug("compression failure cooldown persist failed: %s", exc)
-        except Exception as exc:
-            self._cooldown_persist_failed = True
-            logger.debug("compression failure cooldown persist failed (non-sqlite): %s", exc)
+        # The async compression wrapper persists the complete guard snapshot in
+        # its ``finally`` block.  Never call a synchronous SessionDB method
+        # from this state transition.
 
     def _clear_compression_failure_cooldown(self) -> None:
         self._summary_failure_cooldown_until = 0.0
@@ -1833,20 +1698,7 @@ class ContextCompressor(ContextEngine):
         self._consecutive_timeout_failures = 0
         self._cooldown_persist_failed = False
 
-        session_db = getattr(self, "_session_db", None)
-        session_id = getattr(self, "_session_id", "")
-        if not session_db or not session_id:
-            return
-
-        clearer = getattr(session_db, "clear_compression_failure_cooldown", None)
-        if clearer is None:
-            return
-        try:
-            clearer(session_id)
-        except sqlite3.Error as exc:
-            logger.debug("compression failure cooldown clear failed: %s", exc)
-        except Exception as exc:
-            logger.debug("compression failure cooldown clear failed (non-sqlite): %s", exc)
+        # Durable clearing is performed by the async compression boundary.
 
     def update_model(
         self,
@@ -2171,9 +2023,9 @@ class ContextCompressor(ContextEngine):
         self._micro_compact_every_n_turns: int = 1
         self._micro_compact_turns_since_pass: int = 0
 
-        # Defer context-length resolution to first access (#32221):
-        # get_model_context_length() can issue a synchronous /models HTTP
-        # probe, which must not block AIAgent construction. The small-context
+        # Defer context-length resolution to first access (#32221). The
+        # static resolver below performs no I/O, so it is also safe on the
+        # async conversation critical path. The small-context
         # threshold floor and the absolute threshold cap both need the
         # resolved window, so they are applied on first resolution (see
         # _resolve_context_length / the threshold_tokens property) instead
@@ -2189,11 +2041,9 @@ class ContextCompressor(ContextEngine):
         self._max_summary_tokens: int | None = None
         self.compression_count = 0
 
-        # The "initialized" log reports resolved token budgets, which would
-        # force the deferred get_model_context_length() probe to run inside
-        # __init__ and re-introduce the exact synchronous blocking this change
-        # removes (#32221). Emit it on first context-length resolution instead
-        # so construction stays non-blocking on every path (not just quiet).
+        # The "initialized" log reports resolved token budgets. Emit it on
+        # first context-length resolution so construction stays lightweight on
+        # every path (not just quiet).
         self._log_init_summary = not quiet_mode
         self._context_probed = False  # True after a step-down from context error
 
@@ -2467,18 +2317,10 @@ class ContextCompressor(ContextEngine):
         counter has a timer — without a re-read the stale in-memory
         snapshot blocks forever.
         """
-        try:
-            self.get_active_compression_failure_cooldown(refresh=True)
-        except Exception as exc:
-            logger.debug("compression cooldown refresh failed: %s", exc)
-        try:
-            self._load_fallback_compression_streak()
-        except Exception as exc:
-            logger.debug("compression fallback-streak refresh failed: %s", exc)
-        try:
-            self._load_ineffective_compression_count()
-        except Exception as exc:
-            logger.debug("compression ineffective-count refresh failed: %s", exc)
+        # Refreshing durable state is an async operation owned by the host.
+        # This method remains as a compatibility hook but deliberately does no
+        # synchronous database work.
+        return
 
     def _automatic_compression_blocked(self) -> bool:
         """Return whether automatic compaction is in cooldown or tripped."""
@@ -3316,7 +3158,7 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         self.summary_model = ""  # empty = use main model
         self._clear_compression_failure_cooldown()  # no cooldown — retry immediately
 
-    def _generate_summary(
+    async def _generate_summary(
         self,
         turns_to_summarize: List[Dict[str, Any]],
         focus_topic: Optional[str] = None,
@@ -3660,7 +3502,7 @@ This compaction should PRIORITISE preserving all information related to the focu
             _aux_call_start = time.monotonic()
             try:
                 with aux_interrupt_protection():
-                    response = call_llm(**call_kwargs)
+                    response = await call_llm(**call_kwargs)
             finally:
                 self._record_aux_compression_call(
                     prompt_messages=call_kwargs["messages"],
@@ -3827,7 +3669,7 @@ This compaction should PRIORITISE preserving all information related to the focu
                 else:
                     _reason = "timed out"
                 self._fallback_to_main_for_compression(e, _reason)
-                return self._generate_summary(
+                return await self._generate_summary(
                     turns_to_summarize,
                     focus_topic=focus_topic,
                     memory_context=memory_context,
@@ -3848,7 +3690,7 @@ This compaction should PRIORITISE preserving all information related to the focu
                 and not getattr(self, "_summary_model_fallen_back", False)
             ):
                 self._fallback_to_main_for_compression(e, "failed")
-                return self._generate_summary(
+                return await self._generate_summary(
                     turns_to_summarize,
                     focus_topic=focus_topic,
                     memory_context=memory_context,
@@ -5208,7 +5050,7 @@ This compaction should PRIORITISE preserving all information related to the focu
             {"role": "user", "content": user_prompt},
         ]
 
-    def _micro_summarize_one(
+    async def _micro_summarize_one(
         self,
         exchange_text: str,
     ) -> Optional[str]:
@@ -5244,7 +5086,7 @@ This compaction should PRIORITISE preserving all information related to the focu
 
         try:
             with aux_interrupt_protection():
-                response = call_llm(**call_kwargs)
+                response = await call_llm(**call_kwargs)
         except Exception as exc:
             logger.info("micro-summarization call failed: %s", exc)
             return None
@@ -5270,7 +5112,7 @@ This compaction should PRIORITISE preserving all information related to the focu
         content_tokens = estimate_tokens_rough(self._micro_compact_rolling_summary)
         return content_tokens >= self._micro_compact_defrag_threshold_tokens
 
-    def _defrag_rolling_summary(
+    async def _defrag_rolling_summary(
         self,
         messages: List[Dict[str, Any]],
     ) -> bool:
@@ -5298,7 +5140,7 @@ This compaction should PRIORITISE preserving all information related to the focu
         # "merge these decisions into (no previous summary)" is exactly a
         # rewrite-compactly instruction for the accumulated text.
         self._micro_compact_rolling_summary = ""
-        fresh_summary = self._micro_summarize_one(old_summary)
+        fresh_summary = await self._micro_summarize_one(old_summary)
         if not fresh_summary:
             self._micro_compact_rolling_summary = old_summary
             return False
@@ -5325,9 +5167,11 @@ This compaction should PRIORITISE preserving all information related to the focu
         )
         return True
 
-    def _micro_compact(
+    async def _micro_compact(
         self,
         messages: List[Dict[str, Any]],
+        *,
+        session_db: Any = None,
     ) -> List[Dict[str, Any]]:
         """Run one round of micro-compaction on the conversation.
 
@@ -5340,9 +5184,9 @@ This compaction should PRIORITISE preserving all information related to the focu
         NOTE: the in-memory splice alone is not persisted — the subsequent
         ``_persist_session`` flush is append-only, so old DB rows stay
         ``active=1`` and a session resume double-loads both the summary and
-        the original exchanges.  This method therefore also calls
-        ``archive_and_compact`` on the session DB to soft-archive old rows
-        and insert the compacted set atomically.
+        the original exchanges. A caller can therefore supply its native
+        async session store, which atomically archives old rows and inserts
+        the compacted set.
         """
         if not self._micro_compact_enabled:
             return messages
@@ -5396,9 +5240,9 @@ This compaction should PRIORITISE preserving all information related to the focu
         # the transcript shape is unchanged and this pass does not also
         # absorb an exchange (one aux call per turn either way).
         if self._needs_defrag():
-            defragged = self._defrag_rolling_summary(messages)
+            defragged = await self._defrag_rolling_summary(messages)
             if defragged:
-                self._sync_micro_compact_to_db(messages)
+                await self._persist_micro_compaction(session_db, messages)
                 self._micro_compact_consecutive_failures = 0
                 self._micro_compact_last_failure_cursor = -1
             self._emit_micro_compaction_telemetry(
@@ -5418,7 +5262,7 @@ This compaction should PRIORITISE preserving all information related to the focu
         # Micro-summarize one exchange
         exchange_text = self._serialize_one_exchange(messages, exchange_start, exchange_end)
         _exchange_tokens = estimate_tokens_rough(exchange_text)
-        updated_summary = self._micro_summarize_one(exchange_text)
+        updated_summary = await self._micro_summarize_one(exchange_text)
         if updated_summary is None:
             # Track consecutive failures on the same cursor position so we
             # don't busy-loop on an unsummarizable exchange every turn.
@@ -5464,7 +5308,7 @@ This compaction should PRIORITISE preserving all information related to the focu
             messages, exchange_start, exchange_end, supersede=_cumulative,
         )
         self._micro_compact_cursor = self._cursor_after_splice(result, exchange_start + 1)
-        self._sync_micro_compact_to_db(result)
+        await self._persist_micro_compaction(session_db, result)
         self._emit_micro_compaction_telemetry(
             outcome="absorbed",
             messages_before=_messages_before,
@@ -5590,35 +5434,37 @@ This compaction should PRIORITISE preserving all information related to the focu
         except Exception as exc:
             logger.debug("failed to emit micro-compaction telemetry: %s", exc)
 
-    def _sync_micro_compact_to_db(
+    async def _persist_micro_compaction(
         self,
+        session_db: Any,
         compacted_messages: List[Dict[str, Any]],
     ) -> None:
         """Persist the micro-compacted message set to the session DB.
 
         Soft-archives every currently-active message row (``active = 0``)
         and inserts *compacted_messages* as fresh active rows — atomically,
-        via ``archive_and_compact``.  Then stamps ``_DB_PERSISTED_MARKER`` on
+        via the supplied native async ``archive_and_compact``. Then stamps
+        ``_DB_PERSISTED_MARKER`` on
         every dict so the upcoming append-only flush (``_persist_session`` →
         ``_flush_messages_to_session_db_unlocked``) skips them: they are
         already correctly stored.
 
         Without this, the in-memory-only splice leaves old exchange rows at
         ``active=1``, and a session resume double-loads both the summary and
-        the original messages — blowing past the model's context limit.
+        the original messages — blowing past the model's context limit. No
+        synchronous session-store fallback is used.
         """
-        session_db = getattr(self, "_session_db", None)
         session_id = getattr(self, "_session_id", "")
         if not session_db or not session_id:
             return
         try:
-            session_db.archive_and_compact(session_id, compacted_messages)
+            await session_db.archive_and_compact(session_id, compacted_messages)
             for msg in compacted_messages:
                 if isinstance(msg, dict):
                     msg[_DB_PERSISTED_MARKER] = True
         except Exception:
             logger.info(
-                "Micro-compaction DB sync failed — resume will double-load "
+                "Micro-compaction async DB persistence failed — resume will double-load "
                 "compacted messages until the next batch compression"
             )
 
@@ -5709,7 +5555,7 @@ This compaction should PRIORITISE preserving all information related to the focu
         # are accurate. Stripping them meant an archive_and_compact failure
         # left every previously-persisted message unstamped, and the next
         # append-only flush re-inserted them as duplicate active rows on top
-        # of the still-active originals. _sync_micro_compact_to_db re-stamps
+        # of the still-active originals. _persist_micro_compaction re-stamps
         # everything after a SUCCESSFUL archive; on failure the old stamps
         # keep the flush idempotent (only the new marker row is appended).
         return result
@@ -5766,7 +5612,7 @@ This compaction should PRIORITISE preserving all information related to the focu
             merged.append(msg)
         return merged
 
-    def compress(
+    async def compress(
         self,
         messages: List[Dict[str, Any]],
         current_tokens: Optional[int] = None,
@@ -6091,7 +5937,7 @@ This compaction should PRIORITISE preserving all information related to the focu
 
         # Phase 3: Generate structured summary
         summary_focus_topic = focus_topic or self._derive_auto_focus_topic(messages)
-        summary = self._generate_summary(
+        summary = await self._generate_summary(
             turns_to_summarize,
             focus_topic=summary_focus_topic,
             memory_context=memory_context,

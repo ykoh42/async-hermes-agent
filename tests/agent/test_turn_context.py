@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import threading
 import types
+import asyncio
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -91,6 +92,7 @@ class _FakeAgent:
         self._session_messages = []
         self._pending_cli_user_message = None
         self._session_persist_lock = threading.RLock()
+        self._async_session_persist_lock = asyncio.Lock()
         # Records _cached_system_prompt at the moment _ensure_db_session()
         # is called (regression guard for #45499 turn-setup ordering).
         self._ensure_db_prompt_at_call = "<unset>"
@@ -111,10 +113,13 @@ class _FakeAgent:
         self._last_ctx_overflow_warn = None
 
     # --- methods the prologue calls ---
-    def _ensure_db_session(self):
+    async def _ensure_db_session(self):
         self._ensure_db_prompt_at_call = self._cached_system_prompt
 
-    def _restore_primary_runtime(self):
+    def _get_async_session_persist_lock(self):
+        return self._async_session_persist_lock
+
+    async def _restore_primary_runtime(self):
         pass
 
     def _cleanup_dead_connections(self):
@@ -132,7 +137,7 @@ class _FakeAgent:
     def _safe_print(self, *_a, **_k):
         pass
 
-    def _persist_session(self, *_a, **_k):
+    async def _persist_session(self, *_a, **_k):
         self._persist_calls += 1
 
 
@@ -149,7 +154,7 @@ def _make_agent_with_cooldown(db_path, session_id, *, cooldown_until=None):
     if cooldown_until is not None:
         db.record_compression_failure_cooldown(session_id, cooldown_until, "timeout")
 
-    with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+    with patch("agent.context_compressor.get_static_context_length", return_value=100000):
         compressor = ContextCompressor(
             model="test/model",
             threshold_percent=0.85,
@@ -176,7 +181,11 @@ def _stub_runtime_main():
         yield
 
 
-def _build(agent, **overrides):
+async def _noop_async(*_args, **_kwargs):
+    return None
+
+
+async def _build(agent, **overrides):
     kwargs = dict(
         agent=agent,
         user_message="hello",
@@ -185,7 +194,7 @@ def _build(agent, **overrides):
         task_id=None,
         stream_callback=None,
         persist_user_message=None,
-        restore_or_build_system_prompt=lambda *a, **k: None,
+        restore_or_build_system_prompt=_noop_async,
         install_safe_stdio=lambda: None,
         sanitize_surrogates=lambda s: s,
         summarize_user_message_for_log=lambda s: s,
@@ -194,12 +203,13 @@ def _build(agent, **overrides):
         ra=lambda: types.SimpleNamespace(_set_interrupt=lambda *a, **k: None),
     )
     kwargs.update(overrides)
-    return build_turn_context(**kwargs)
+    return await build_turn_context(**kwargs)
 
 
-def test_returns_turn_context_with_user_message_appended():
+@pytest.mark.asyncio
+async def test_returns_turn_context_with_user_message_appended():
     agent = _FakeAgent()
-    ctx = _build(agent)
+    ctx = await _build(agent)
     assert isinstance(ctx, TurnContext)
     assert ctx.user_message == "hello"
     # The user turn was appended and indexed.
@@ -208,7 +218,8 @@ def test_returns_turn_context_with_user_message_appended():
     assert ctx.active_system_prompt == "SYSTEM"
 
 
-def test_turn_start_replaces_stale_parent_history_with_compression_child():
+@pytest.mark.asyncio
+async def test_turn_start_replaces_stale_parent_history_with_compression_child():
     agent = _FakeAgent()
     stale_history = [{"role": "user", "content": "stale parent"}]
     compacted_history = [
@@ -225,7 +236,7 @@ def test_turn_start_replaces_stale_parent_history_with_compression_child():
         "agent.turn_context.recover_rotated_compression_session",
         side_effect=_recover,
     ):
-        ctx = _build(
+        ctx = await _build(
             agent,
             conversation_history=stale_history,
             set_session_context=log_context,
@@ -239,9 +250,10 @@ def test_turn_start_replaces_stale_parent_history_with_compression_child():
     assert all(message.get("content") != "stale parent" for message in ctx.messages)
 
 
-def test_applies_agent_side_effects():
+@pytest.mark.asyncio
+async def test_applies_agent_side_effects():
     agent = _FakeAgent()
-    _build(agent)
+    await _build(agent)
     # Retry counters reset, guardrails reset, vision re-armed, turn counted.
     assert agent._invalid_tool_retries == 0
     assert agent._tool_guardrails.reset_called is True
@@ -262,13 +274,14 @@ def test_applies_agent_side_effects():
 
 
 
-def test_pending_cli_message_uses_clean_override_for_api_local_note():
+@pytest.mark.asyncio
+async def test_pending_cli_message_uses_clean_override_for_api_local_note():
     """A noted API message reuses the clean staged dict and its DB marker."""
     agent = _FakeAgent()
     staged = {"role": "user", "content": "clean prompt", "_db_persisted": True}
     agent._pending_cli_user_message = staged
 
-    ctx = _build(
+    ctx = await _build(
         agent,
         user_message="[MODEL NOTE]\n\nclean prompt",
         persist_user_message="clean prompt",
@@ -286,7 +299,8 @@ def test_pending_cli_message_uses_clean_override_for_api_local_note():
 
 
 
-def test_ensure_db_session_runs_after_system_prompt_restore():
+@pytest.mark.asyncio
+async def test_ensure_db_session_runs_after_system_prompt_restore():
     """Regression for #45499.
 
     On a fresh API/gateway agent (``_cached_system_prompt is None``) the DB
@@ -299,10 +313,10 @@ def test_ensure_db_session_runs_after_system_prompt_restore():
     agent = _FakeAgent()
     agent._cached_system_prompt = None  # fresh agent, no cached prompt yet
 
-    def _restore(_agent, _system_message, _history):
+    async def _restore(_agent, _system_message, _history):
         _agent._cached_system_prompt = "REBUILT-SYSTEM"
 
-    _build(agent, restore_or_build_system_prompt=_restore)
+    await _build(agent, restore_or_build_system_prompt=_restore)
 
     # The prompt was populated before the DB row was created.
     assert agent._ensure_db_prompt_at_call == "REBUILT-SYSTEM"
@@ -318,7 +332,8 @@ def test_ensure_db_session_runs_after_system_prompt_restore():
 # not timing permutations.
 
 
-def test_between_turns_refresh_adds_late_tool_when_servers_registered():
+@pytest.mark.asyncio
+async def test_between_turns_refresh_adds_late_tool_when_servers_registered():
     """R1: a tool that registered since build lands in this turn's snapshot."""
     agent = _FakeAgent()
 
@@ -327,13 +342,10 @@ def test_between_turns_refresh_adds_late_tool_when_servers_registered():
     import model_tools
     with patch("tools.mcp_tool.has_registered_mcp_tools", return_value=True), \
          patch.object(model_tools, "get_tool_definitions", return_value=[new_def]):
-        _build(agent)
+        await _build(agent)
 
     assert "mcp_x_tool" in agent.valid_tool_names
     assert any(t["function"]["name"] == "mcp_x_tool" for t in agent.tools)
-
-
-
 
 
 

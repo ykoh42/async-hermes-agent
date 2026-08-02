@@ -4,7 +4,7 @@ import logging
 import sys
 import types
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import yaml
@@ -20,7 +20,6 @@ from hermes_cli.plugins import (
     get_pre_tool_call_block_message,
     get_pre_verify_continue_message,
     has_middleware,
-    resolve_plugin_command_result,
 )
 from hermes_cli.middleware import (
     VALID_MIDDLEWARE,
@@ -122,15 +121,16 @@ class TestPluginDiscovery:
         assert mgr.has_middleware("llm_request") is True
 
 
-    def test_middleware_helpers_skip_no_listener_work(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_middleware_helpers_skip_no_listener_work(self, monkeypatch):
         manager = types.SimpleNamespace(_middleware={})
         monkeypatch.setattr("hermes_cli.plugins.get_plugin_manager", lambda: manager)
 
         request = {"messages": []}
         args = {"path": "README.md"}
 
-        llm_result = apply_llm_request_middleware(request)
-        tool_result = apply_tool_request_middleware("read_file", args)
+        llm_result = await apply_llm_request_middleware(request)
+        tool_result = await apply_tool_request_middleware("read_file", args)
 
         assert llm_result.payload is request
         assert llm_result.original_payload is request
@@ -140,7 +140,10 @@ class TestPluginDiscovery:
         assert tool_result.original_payload is args
         assert tool_result.changed is False
         assert tool_result.trace == []
-        assert run_tool_execution_middleware("terminal", args, lambda payload: payload) is args
+        async def terminal(payload):
+            return payload
+
+        assert await run_tool_execution_middleware("terminal", args, terminal) is args
         assert has_middleware("tool_request") is False
 
 
@@ -953,61 +956,32 @@ class TestPluginCommands:
 
 
 
-class TestPluginCommandResultResolution:
-
-
-    def test_awaits_async_result_with_running_loop(self, monkeypatch):
-        class _Loop:
-            pass
-
-        async def _handler():
-            return "threaded-ok"
-
-        monkeypatch.setattr("hermes_cli.plugins.asyncio.get_running_loop", lambda: _Loop())
-        assert resolve_plugin_command_result(_handler()) == "threaded-ok"
-
-    def test_running_loop_timeout_does_not_hang_forever(self, monkeypatch):
-        """Threaded path must abort a hung async handler instead of blocking the caller."""
-        import asyncio as _asyncio
-
-        class _Loop:
-            pass
-
-        async def _slow_handler():
-            await _asyncio.sleep(10)
-            return "should-not-reach"
-
-        monkeypatch.setattr("hermes_cli.plugins.asyncio.get_running_loop", lambda: _Loop())
-        monkeypatch.setattr("hermes_cli.plugins._PLUGIN_COMMAND_AWAIT_TIMEOUT_SECS", 0.1)
-
-        with pytest.raises(TimeoutError):
-            resolve_plugin_command_result(_slow_handler())
-
-
 # ── TestPluginDispatchTool ────────────────────────────────────────────────
 
 
 class TestPluginDispatchTool:
     """Tests for PluginContext.dispatch_tool() — tool dispatch with agent context."""
 
-    def test_dispatch_tool_calls_registry(self):
+    @pytest.mark.asyncio
+    async def test_dispatch_tool_calls_registry(self):
         """dispatch_tool() delegates to registry.dispatch()."""
         mgr = PluginManager()
         manifest = PluginManifest(name="test-plugin", source="user")
         ctx = PluginContext(manifest, mgr)
 
         mock_registry = MagicMock()
-        mock_registry.dispatch.return_value = '{"result": "ok"}'
+        mock_registry.dispatch = AsyncMock(return_value='{"result": "ok"}')
 
         with patch("hermes_cli.plugins.PluginContext.dispatch_tool.__module__", "hermes_cli.plugins"):
             with patch.dict("sys.modules", {}):
                 with patch("tools.registry.registry", mock_registry):
-                    result = ctx.dispatch_tool("web_search", {"query": "test"})
+                    result = await ctx.dispatch_tool("web_search", {"query": "test"})
 
         assert result == '{"result": "ok"}'
 
 
-    def test_dispatch_tool_respects_explicit_parent_agent(self):
+    @pytest.mark.asyncio
+    async def test_dispatch_tool_respects_explicit_parent_agent(self):
         """Explicit parent_agent kwarg is not overwritten by _cli_ref.agent."""
         mgr = PluginManager()
         manifest = PluginManifest(name="test-plugin", source="user")
@@ -1021,10 +995,10 @@ class TestPluginDispatchTool:
         explicit_agent = MagicMock(name="explicit_agent")
 
         mock_registry = MagicMock()
-        mock_registry.dispatch.return_value = '{"ok": true}'
+        mock_registry.dispatch = AsyncMock(return_value='{"ok": true}')
 
         with patch("tools.registry.registry", mock_registry):
-            ctx.dispatch_tool("delegate_task", {"goal": "test"}, parent_agent=explicit_agent)
+            await ctx.dispatch_tool("delegate_task", {"goal": "test"}, parent_agent=explicit_agent)
 
         call_kwargs = mock_registry.dispatch.call_args
         assert call_kwargs[1]["parent_agent"] is explicit_agent
@@ -1088,7 +1062,8 @@ class TestDispatchToolWithoutCliRef:
     kanban-spawned worker session, where _cli_ref is None.
     """
 
-    def test_dispatch_tool_invokes_handler_without_cli_ref(self):
+    @pytest.mark.asyncio
+    async def test_dispatch_tool_invokes_handler_without_cli_ref(self):
         from tools.registry import registry
 
         mgr = PluginManager()
@@ -1096,15 +1071,20 @@ class TestDispatchToolWithoutCliRef:
         ctx = PluginContext(PluginManifest(name="test-plugin", source="user"), mgr)
 
         calls = []
+
+        async def handler(args, **kwargs):
+            calls.append((args, kwargs))
+            return '{"ok": true}'
+
         registry.register(
             name="_test_dispatch_probe",
             toolset="debugging",
             schema={"name": "_test_dispatch_probe", "description": "probe",
                     "parameters": {"type": "object", "properties": {}}},
-            handler=lambda args, **kw: calls.append((args, kw)) or '{"ok": true}',
+            handler=handler,
         )
         try:
-            result = ctx.dispatch_tool("_test_dispatch_probe", {"x": 1})
+            result = await ctx.dispatch_tool("_test_dispatch_probe", {"x": 1})
             assert result == '{"ok": true}'
             assert calls and calls[0][0] == {"x": 1}
             # parent_agent is not forced when there's no CLI agent to resolve.

@@ -357,14 +357,15 @@ class TestDurability:
         gc.collect()
         assert ref() is None
 
-    def test_persist_session_drains_queue(self, tmp_path, monkeypatch):
-        """Turn finalize (_persist_session) flushes the accounting queue —
-        the crash window is at most the in-flight call's delta."""
+    @pytest.mark.asyncio
+    async def test_persist_session_preserves_native_token_counts(self, tmp_path, monkeypatch):
+        """Turn persistence keeps native async accounting durable."""
         import os
         monkeypatch.setitem(os.environ, "OPENROUTER_API_KEY", "test-key")
         from run_agent import AIAgent
 
         db = SessionDB(db_path=tmp_path / "finalize.db")
+        agent = None
         try:
             agent = AIAgent(
                 api_key="test-key",
@@ -376,20 +377,22 @@ class TestDurability:
                 skip_context_files=True,
                 skip_memory=True,
             )
-            agent._ensure_db_session()
+            await agent._ensure_db_session()
 
-            db.queue_token_counts(
+            await agent._get_async_session_db().update_token_counts(
                 "s-fin", input_tokens=11, output_tokens=2, api_call_count=1
             )
-            agent._persist_session(
+            await agent._persist_session(
                 [{"role": "user", "content": "q"}],
                 [],
             )
-            # Raw read: the flush happened inside _persist_session itself.
+            # Raw read: the native write is durable across turn persistence.
             totals = _totals(db, "s-fin")
             assert totals["input_tokens"] == 11
             assert totals["api_call_count"] == 1
         finally:
+            if agent is not None:
+                await agent.close()
             db.close()
 
 

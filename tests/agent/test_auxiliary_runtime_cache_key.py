@@ -5,23 +5,18 @@
 #56889, which isolates callers that pass different explicit ``model=`` values.
 """
 
-import asyncio
-from concurrent.futures import ThreadPoolExecutor
-from threading import Barrier
-from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
-
 import pytest
+import pytest_asyncio
 
 import agent.auxiliary_client as aux
 
 
-@pytest.fixture(autouse=True)
-def _clean_aux_state():
-    aux.shutdown_cached_clients()
+@pytest_asyncio.fixture(autouse=True)
+async def _clean_aux_state():
+    await aux.shutdown_cached_clients()
     aux.clear_runtime_main()
     yield
-    aux.shutdown_cached_clients()
+    await aux.shutdown_cached_clients()
     aux.clear_runtime_main()
 
 
@@ -38,7 +33,8 @@ def _runtime(model: str, *, provider: str = "custom:llama-swap") -> dict:
 
 
 
-def test_implicit_runtime_cache_key_covers_full_connection_and_auth_surface():
+@pytest.mark.asyncio
+async def test_implicit_runtime_cache_key_covers_full_connection_and_auth_surface():
     """Provider/endpoint/credential/wire/auth changes all isolate auto clients."""
     base = _runtime("same-model")
     variants = [
@@ -50,11 +46,11 @@ def test_implicit_runtime_cache_key_covers_full_connection_and_auth_surface():
     ]
 
     aux.set_runtime_main(**base)
-    baseline = aux._client_cache_key("auto", async_mode=False)
+    baseline = await aux._client_cache_key("auto")
     keys = []
     for variant in variants:
         aux.set_runtime_main(**variant)
-        keys.append(aux._client_cache_key("auto", async_mode=False))
+        keys.append(await aux._client_cache_key("auto"))
 
     assert all(key != baseline for key in keys)
     assert len(set(keys)) == len(keys)
@@ -80,13 +76,14 @@ def test_runtime_context_token_restores_previous_value_after_turn():
 
 
 
-def test_explicit_model_cache_isolation_remains_independent_of_runtime_key():
+@pytest.mark.asyncio
+async def test_explicit_model_cache_isolation_remains_independent_of_runtime_key():
     """#56889 remains covered: explicit model values isolate non-auto clients."""
-    first = aux._client_cache_key(
-        "openrouter", async_mode=False, model="anthropic/claude-opus-4.8"
+    first = await aux._client_cache_key(
+        "openrouter", model="anthropic/claude-opus-4.8"
     )
-    second = aux._client_cache_key(
-        "openrouter", async_mode=False, model="openai/gpt-5.5"
+    second = await aux._client_cache_key(
+        "openrouter", model="openai/gpt-5.5"
     )
 
     assert first != second
@@ -100,7 +97,8 @@ def test_explicit_model_cache_isolation_remains_independent_of_runtime_key():
 
 
 
-def test_unhashable_callable_runtime_api_keys_are_safe_secret_free_discriminators():
+@pytest.mark.asyncio
+async def test_unhashable_callable_runtime_api_keys_are_safe_secret_free_discriminators():
     """Callable token providers remain cacheable without leaking returned tokens."""
 
     class TokenProvider(list):
@@ -114,11 +112,11 @@ def test_unhashable_callable_runtime_api_keys_are_safe_secret_free_discriminator
     first_provider = TokenProvider("first-super-secret-token")
     second_provider = TokenProvider("second-super-secret-token")
 
-    first = aux._client_cache_key(
-        "auto", async_mode=False, main_runtime={**_runtime("same"), "api_key": first_provider}
+    first = await aux._client_cache_key(
+        "auto", main_runtime={**_runtime("same"), "api_key": first_provider}
     )
-    second = aux._client_cache_key(
-        "auto", async_mode=False, main_runtime={**_runtime("same"), "api_key": second_provider}
+    second = await aux._client_cache_key(
+        "auto", main_runtime={**_runtime("same"), "api_key": second_provider}
     )
 
     hash(first)
@@ -129,19 +127,18 @@ def test_unhashable_callable_runtime_api_keys_are_safe_secret_free_discriminator
     assert "second-super-secret-token" not in rendered
 
 
-def test_string_api_keys_are_not_retained_in_cache_key_repr():
+@pytest.mark.asyncio
+async def test_string_api_keys_are_not_retained_in_cache_key_repr():
     """String credentials discriminate clients without living in cache-key memory."""
     first_secret = "first-literal-super-secret"
     second_secret = "second-literal-super-secret"
-    first = aux._client_cache_key(
+    first = await aux._client_cache_key(
         "auto",
-        async_mode=False,
         api_key=first_secret,
         main_runtime={**_runtime("same"), "api_key": first_secret},
     )
-    second = aux._client_cache_key(
+    second = await aux._client_cache_key(
         "auto",
-        async_mode=False,
         api_key=second_secret,
         main_runtime={**_runtime("same"), "api_key": second_secret},
     )
@@ -150,5 +147,4 @@ def test_string_api_keys_are_not_retained_in_cache_key_repr():
     rendered = repr((first, second))
     assert first_secret not in rendered
     assert second_secret not in rendered
-
 

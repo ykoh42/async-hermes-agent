@@ -1,7 +1,9 @@
 import json
 import logging
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
+
+import pytest
 
 from agent.conversation_compression import compress_context
 from agent.context_compressor import ContextCompressor
@@ -33,7 +35,7 @@ class _Agent:
     def _emit_warning(self, _message):
         pass
 
-    def _invalidate_system_prompt(self):
+    async def _invalidate_system_prompt(self):
         self._cached_system_prompt = None
 
     def _build_system_prompt(self, system_message):
@@ -61,8 +63,9 @@ def _extract_telemetry(caplog):
     return json.loads(records[0].split("context compression attempt telemetry: ", 1)[1])
 
 
-def test_compression_attempt_telemetry_is_metadata_only(caplog):
-    with patch("agent.context_compressor.get_model_context_length", return_value=100_000):
+@pytest.mark.asyncio
+async def test_compression_attempt_telemetry_is_metadata_only(caplog):
+    with patch("agent.context_compressor.get_static_context_length", return_value=100_000):
         compressor = ContextCompressor(
             model="test/main-model",
             provider="test-provider",
@@ -73,9 +76,14 @@ def test_compression_attempt_telemetry_is_metadata_only(caplog):
     compressor.tail_token_budget = 10
     agent = _Agent(compressor)
 
-    with patch.object(compressor, "_generate_summary", return_value="SANITIZED SUMMARY"):
+    with patch.object(
+        compressor,
+        "_generate_summary",
+        new_callable=AsyncMock,
+        return_value="SANITIZED SUMMARY",
+    ):
         with caplog.at_level(logging.INFO, logger="agent.conversation_compression"):
-            compressed, system_prompt = compress_context(
+            compressed, system_prompt = await compress_context(
                 agent,
                 _messages(),
                 "system prompt",
@@ -112,8 +120,9 @@ def test_compression_attempt_telemetry_is_metadata_only(caplog):
     assert "assistant reply" not in raw_log
 
 
-def test_aux_call_telemetry_records_durations_without_content(caplog):
-    with patch("agent.context_compressor.get_model_context_length", return_value=100_000):
+@pytest.mark.asyncio
+async def test_aux_call_telemetry_records_durations_without_content(caplog):
+    with patch("agent.context_compressor.get_static_context_length", return_value=100_000):
         compressor = ContextCompressor(
             model="test/main-model",
             provider="test-provider",
@@ -127,9 +136,13 @@ def test_aux_call_telemetry_records_durations_without_content(caplog):
         choices=[SimpleNamespace(message=SimpleNamespace(content="SANITIZED SUMMARY"))]
     )
 
-    with patch("agent.context_compressor.call_llm", return_value=response):
+    with patch(
+        "agent.context_compressor.call_llm",
+        new_callable=AsyncMock,
+        return_value=response,
+    ):
         with caplog.at_level(logging.INFO, logger="agent.conversation_compression"):
-            compress_context(
+            await compress_context(
                 agent,
                 _messages(),
                 "system prompt",

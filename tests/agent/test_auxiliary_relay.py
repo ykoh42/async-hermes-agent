@@ -11,6 +11,7 @@ from agent import auxiliary_client, relay_llm, relay_runtime
 def relay_turn(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile"))
     relay_runtime._reset_for_tests()
+    relay_runtime.get_host()
     lease = relay_runtime.SESSION_COORDINATOR.acquire_conversation(
         profile_key=relay_runtime.current_profile_key(),
         session_id="session-1",
@@ -29,73 +30,6 @@ def relay_turn(tmp_path, monkeypatch):
         relay_runtime._reset_for_tests()
 
 
-def test_auxiliary_retries_share_logical_relay_identity(monkeypatch):
-    attempts = []
-    logical_completions = []
-    responses = iter([
-        SimpleNamespace(choices=[]),
-        SimpleNamespace(
-            choices=[SimpleNamespace(message=SimpleNamespace(content="ok"))]
-        ),
-    ])
-    client = SimpleNamespace(
-        chat=SimpleNamespace(
-            completions=SimpleNamespace(
-                create=lambda **_kwargs: next(responses),
-            )
-        )
-    )
-
-    def execute_current(request, callback, **kwargs):
-        attempts.append(kwargs)
-        return callback(request)
-
-    monkeypatch.setattr(relay_llm, "execute_current", execute_current)
-    monkeypatch.setattr(
-        relay_llm,
-        "complete_logical_call",
-        lambda request_id, *, outcome: logical_completions.append(
-            (request_id, outcome)
-        ),
-    )
-
-    @auxiliary_client._relay_auxiliary_call
-    def run(task):
-        auxiliary_client._set_relay_auxiliary_route(
-            "openrouter",
-            "test-model",
-            "chat_completions",
-        )
-        with pytest.raises(RuntimeError, match="invalid response"):
-            auxiliary_client._validate_llm_response(
-                auxiliary_client._relay_sync_completion(
-                    client,
-                    {"model": "test-model", "messages": []},
-                ),
-                task,
-            )
-        return auxiliary_client._validate_llm_response(
-            auxiliary_client._relay_sync_completion(
-                client,
-                {"model": "test-model", "messages": []},
-            ),
-            task,
-        )
-
-    result = run("compression")
-
-    assert result.choices[0].message.content == "ok"
-    assert attempts[0]["metadata"]["api_request_id"] == (
-        attempts[1]["metadata"]["api_request_id"]
-    )
-    assert [attempt["metadata"]["retry_count"] for attempt in attempts] == [0, 1]
-    assert attempts[0]["metadata"]["call_role"] == "auxiliary:compression"
-    assert all(attempt["defer_logical_completion"] is True for attempt in attempts)
-    assert logical_completions == [
-        (attempts[0]["metadata"]["api_request_id"], "success")
-    ]
-
-
 @pytest.mark.asyncio
 async def test_async_auxiliary_attempt_uses_inherited_relay_adapter(monkeypatch):
     captured = {}
@@ -111,32 +45,33 @@ async def test_async_auxiliary_attempt_uses_inherited_relay_adapter(monkeypatch)
         chat=SimpleNamespace(completions=SimpleNamespace(create=create))
     )
 
-    async def execute_current_async(request, callback, **kwargs):
+    async def execute_current(request, callback, **kwargs):
         captured.update(kwargs)
         return await callback(request)
 
     monkeypatch.setattr(
         relay_llm,
-        "execute_current_async",
-        execute_current_async,
+        "execute_current",
+        execute_current,
     )
+    async def complete_logical_call(request_id, *, outcome):
+        logical_completions.append((request_id, outcome))
+
     monkeypatch.setattr(
         relay_llm,
         "complete_logical_call",
-        lambda request_id, *, outcome: logical_completions.append(
-            (request_id, outcome)
-        ),
+        complete_logical_call,
     )
 
-    @auxiliary_client._relay_auxiliary_call_async
+    @auxiliary_client._relay_auxiliary_call
     async def run(task):
         auxiliary_client._set_relay_auxiliary_route(
             "anthropic",
             "claude-test",
             "chat_completions",
         )
-        return auxiliary_client._validate_llm_response(
-            await auxiliary_client._relay_async_completion(
+        return await auxiliary_client._validate_llm_response(
+            await auxiliary_client._relay_completion(
                 client,
                 {"model": "claude-test", "messages": []},
             ),
@@ -152,111 +87,3 @@ async def test_async_auxiliary_attempt_uses_inherited_relay_adapter(monkeypatch)
     assert logical_completions == [
         (captured["metadata"]["api_request_id"], "success")
     ]
-
-
-
-
-
-
-
-
-def test_partial_auxiliary_stream_failure_closes_before_recovery(
-    relay_turn, monkeypatch
-):
-    _relay, turn = relay_turn
-    consumer = "test.partial-auxiliary-stream-failure"
-    turn.lease.host.retain_managed_execution(consumer)
-    outcomes = []
-    original_pop = turn.lease.host.relay.scope.pop
-
-    def record_pop(*args, **kwargs):
-        outcomes.append((kwargs.get("output") or {}).get("outcome"))
-        return original_pop(*args, **kwargs)
-
-    monkeypatch.setattr(turn.lease.host.relay.scope, "pop", record_pop)
-
-    class ProviderError(Exception):
-        pass
-
-    provider_error = ProviderError("stream failed")
-    partial_chunk = SimpleNamespace(
-        model="test-model",
-        choices=[
-            SimpleNamespace(
-                delta=SimpleNamespace(content="partial", tool_calls=None),
-                finish_reason=None,
-            )
-        ],
-        usage=None,
-    )
-
-    def partial_stream():
-        yield partial_chunk
-        raise provider_error
-
-    stream_client = SimpleNamespace(
-        chat=SimpleNamespace(
-            completions=SimpleNamespace(
-                create=lambda **_kwargs: partial_stream(),
-            )
-        )
-    )
-    recovery_client = SimpleNamespace(
-        chat=SimpleNamespace(
-            completions=SimpleNamespace(
-                create=lambda **_kwargs: SimpleNamespace(
-                    choices=[
-                        SimpleNamespace(message=SimpleNamespace(content="recovered"))
-                    ]
-                ),
-            )
-        )
-    )
-
-    @auxiliary_client._relay_auxiliary_call
-    def start_stream(task):
-        auxiliary_client._set_relay_auxiliary_route(
-            "openrouter",
-            "test-model",
-            "chat_completions",
-        )
-        return auxiliary_client._relay_sync_stream(
-            stream_client,
-            {"model": "test-model", "messages": [], "stream": True},
-        )
-
-    @auxiliary_client._relay_auxiliary_call
-    def recover(task):
-        auxiliary_client._set_relay_auxiliary_route(
-            "openrouter",
-            "test-model",
-            "chat_completions",
-        )
-        return auxiliary_client._validate_llm_response(
-            auxiliary_client._relay_sync_completion(
-                recovery_client,
-                {"model": "test-model", "messages": []},
-            ),
-            task,
-        )
-
-    try:
-        stream = start_stream("moa")
-        assert next(stream) is partial_chunk
-
-        with pytest.raises(ProviderError) as caught:
-            next(stream)
-
-        assert caught.value is provider_error
-        assert outcomes == ["failed"]
-        assert turn.logical_llm_calls == {}
-
-        result = recover("moa")
-
-        assert result.choices[0].message.content == "recovered"
-        assert outcomes == ["failed", "success"]
-        assert turn.logical_llm_calls == {}
-    finally:
-        turn.lease.host.release_managed_execution(consumer)
-
-

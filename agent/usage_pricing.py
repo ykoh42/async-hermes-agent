@@ -6,7 +6,12 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, Dict, Literal, Optional
 
-from agent.model_metadata import fetch_endpoint_model_metadata, fetch_model_metadata
+from agent.model_metadata import (
+    fetch_endpoint_model_metadata,
+    fetch_endpoint_model_metadata_async,
+    fetch_model_metadata,
+    fetch_model_metadata_async,
+)
 from utils import base_url_host_matches
 
 DEFAULT_PRICING = {"input": 0.0, "output": 0.0}
@@ -1373,6 +1378,101 @@ def estimate_usage_cost(
         fetched_at=entry.fetched_at,
         pricing_version=entry.pricing_version,
         notes=tuple(notes),
+    )
+
+
+async def estimate_usage_cost_async(
+    model_name: str,
+    usage: CanonicalUsage,
+    *,
+    provider: Optional[str] = None,
+    base_url: Optional[str] = None,
+    api_key: Optional[str] = None,
+) -> CostResult:
+    """Estimate usage cost without synchronous provider metadata I/O.
+
+    The synchronous estimator remains for offline CLI/reporting callers. The
+    conversation loop uses this coroutine so an OpenRouter or custom
+    ``/models`` lookup cannot stall unrelated turns.
+    """
+    route = resolve_billing_route(model_name, provider=provider, base_url=base_url)
+    if route.billing_mode == "subscription_included":
+        return CostResult(
+            amount_usd=_ZERO,
+            status="included",
+            source="none",
+            label="included",
+            pricing_version="included-route",
+        )
+
+    entry: Optional[PricingEntry] = None
+    if route.provider == "openrouter":
+        entry = _pricing_entry_from_metadata(
+            await fetch_model_metadata_async(),
+            route.model,
+            source_url="https://openrouter.ai/docs/api/api-reference/models/get-models",
+            pricing_version="openrouter-models-api",
+        )
+    elif route.base_url:
+        entry = _pricing_entry_from_metadata(
+            await fetch_endpoint_model_metadata_async(
+                route.base_url, api_key=api_key or ""
+            ),
+            route.model,
+            source_url=f"{route.base_url.rstrip('/')}/models",
+            pricing_version="openai-compatible-models-api",
+        )
+    if entry is None:
+        entry = _lookup_official_docs_pricing(route)
+    if not entry:
+        return CostResult(amount_usd=None, status="unknown", source="none", label="n/a")
+
+    if usage.input_tokens and entry.input_cost_per_million is None:
+        return CostResult(amount_usd=None, status="unknown", source=entry.source, label="n/a")
+    if usage.output_tokens and entry.output_cost_per_million is None:
+        return CostResult(amount_usd=None, status="unknown", source=entry.source, label="n/a")
+    if usage.cache_read_tokens and entry.cache_read_cost_per_million is None:
+        return CostResult(
+            amount_usd=None,
+            status="unknown",
+            source=entry.source,
+            label="n/a",
+            notes=("cache-read pricing unavailable for route",),
+        )
+    if usage.cache_write_tokens and entry.cache_write_cost_per_million is None:
+        return CostResult(
+            amount_usd=None,
+            status="unknown",
+            source=entry.source,
+            label="n/a",
+            notes=("cache-write pricing unavailable for route",),
+        )
+
+    amount = _ZERO
+    if entry.input_cost_per_million is not None:
+        amount += Decimal(usage.input_tokens) * entry.input_cost_per_million / _ONE_MILLION
+    if entry.output_cost_per_million is not None:
+        amount += Decimal(usage.output_tokens) * entry.output_cost_per_million / _ONE_MILLION
+    if entry.cache_read_cost_per_million is not None:
+        amount += Decimal(usage.cache_read_tokens) * entry.cache_read_cost_per_million / _ONE_MILLION
+    if entry.cache_write_cost_per_million is not None:
+        amount += Decimal(usage.cache_write_tokens) * entry.cache_write_cost_per_million / _ONE_MILLION
+    if entry.request_cost is not None and usage.request_count:
+        amount += Decimal(usage.request_count) * entry.request_cost
+
+    notes = (
+        ("OpenRouter cost is estimated from the models API until reconciled.",)
+        if route.provider == "openrouter"
+        else ()
+    )
+    return CostResult(
+        amount_usd=amount,
+        status="estimated",
+        source=entry.source,
+        label=f"~${amount:.2f}",
+        fetched_at=entry.fetched_at,
+        pricing_version=entry.pricing_version,
+        notes=notes,
     )
 
 

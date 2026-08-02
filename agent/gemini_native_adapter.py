@@ -16,18 +16,17 @@ OpenAI-compat layer entirely.
 
 from __future__ import annotations
 
-import asyncio
 import base64
 import json
 import logging
 import time
 import uuid
 from types import SimpleNamespace
-from typing import Any, Dict, Iterator, List, Optional
+from typing import Any, AsyncIterator, Dict, Iterator, List, Optional
 
 import httpx
 
-from agent.bounded_response import read_streaming_error_body
+from agent.bounded_response import read_streaming_error_body_async
 from agent.gemini_schema import sanitize_gemini_tool_parameters
 
 logger = logging.getLogger(__name__)
@@ -715,6 +714,43 @@ def _iter_sse_events(response: httpx.Response) -> Iterator[Dict[str, Any]]:
                 yield payload
 
 
+async def _iter_sse_events_async(
+    response: httpx.Response,
+) -> AsyncIterator[Dict[str, Any]]:
+    """Yield Gemini SSE payloads from an ``httpx.AsyncClient`` stream."""
+    buffer = ""
+    async for chunk in response.aiter_text():
+        if not chunk:
+            continue
+        buffer += chunk
+        while "\n" in buffer:
+            line, buffer = buffer.split("\n", 1)
+            line = line.rstrip("\r")
+            if not line or not line.startswith("data: "):
+                continue
+            data = line[6:]
+            if data == "[DONE]":
+                return
+            try:
+                payload = json.loads(data)
+            except json.JSONDecodeError:
+                logger.debug("Non-JSON Gemini SSE line: %s", data[:200])
+                continue
+            if isinstance(payload, dict):
+                yield payload
+
+    # A final unterminated SSE line is legal on a closed stream.  Parse it so
+    # the last model/tool delta is not silently dropped.
+    line = buffer.rstrip("\r")
+    if line.startswith("data: ") and line[6:] != "[DONE]":
+        try:
+            payload = json.loads(line[6:])
+        except json.JSONDecodeError:
+            return
+        if isinstance(payload, dict):
+            yield payload
+
+
 def translate_stream_event(event: Dict[str, Any], model: str, tool_call_indices: Dict[str, Dict[str, Any]]) -> List[_GeminiStreamChunk]:
     candidates = event.get("candidates") or []
     if not candidates:
@@ -889,14 +925,6 @@ class _GeminiChatCompletions:
     def __init__(self, client: "GeminiNativeClient"):
         self._client = client
 
-    def create(self, **kwargs: Any) -> Any:
-        return self._client._create_chat_completion(**kwargs)
-
-
-class _AsyncGeminiChatCompletions:
-    def __init__(self, client: "AsyncGeminiNativeClient"):
-        self._client = client
-
     async def create(self, **kwargs: Any) -> Any:
         return await self._client._create_chat_completion(**kwargs)
 
@@ -904,11 +932,6 @@ class _AsyncGeminiChatCompletions:
 class _GeminiChatNamespace:
     def __init__(self, client: "GeminiNativeClient"):
         self.completions = _GeminiChatCompletions(client)
-
-
-class _AsyncGeminiChatNamespace:
-    def __init__(self, client: "AsyncGeminiNativeClient"):
-        self.completions = _AsyncGeminiChatCompletions(client)
 
 
 class GeminiNativeClient:
@@ -921,7 +944,7 @@ class GeminiNativeClient:
         base_url: Optional[str] = None,
         default_headers: Optional[Dict[str, str]] = None,
         timeout: Any = None,
-        http_client: Optional[httpx.Client] = None,
+        http_client: Optional[httpx.AsyncClient] = None,
         **_: Any,
     ) -> None:
         if not (api_key or "").strip():
@@ -939,22 +962,16 @@ class GeminiNativeClient:
         self._default_headers = dict(default_headers or {})
         self.chat = _GeminiChatNamespace(self)
         self.is_closed = False
-        self._http = http_client or httpx.Client(
+        self._http = http_client or httpx.AsyncClient(
             timeout=timeout or httpx.Timeout(connect=15.0, read=600.0, write=30.0, pool=30.0)
         )
 
-    def close(self) -> None:
+    async def aclose(self) -> None:
         self.is_closed = True
         try:
-            self._http.close()
+            await self._http.aclose()
         except Exception:
             pass
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self.close()
 
     def _headers(self) -> Dict[str, str]:
         headers = {
@@ -977,7 +994,7 @@ class GeminiNativeClient:
         except StopIteration:
             return True, None
 
-    def _create_chat_completion(
+    async def _create_chat_completion(
         self,
         *,
         model: str = "gemini-3.6-flash",
@@ -1013,7 +1030,7 @@ class GeminiNativeClient:
             return self._stream_completion(model=model, request=request, timeout=timeout)
 
         url = f"{self.base_url}/models/{model}:generateContent"
-        response = self._http.post(url, json=request, headers=self._headers(), timeout=timeout)
+        response = await self._http.post(url, json=request, headers=self._headers(), timeout=timeout)
         if response.status_code != 200:
             raise gemini_http_error(response)
         try:
@@ -1027,59 +1044,30 @@ class GeminiNativeClient:
             ) from exc
         return translate_gemini_response(payload, model=model)
 
-    def _stream_completion(self, *, model: str, request: Dict[str, Any], timeout: Any = None) -> Iterator[_GeminiStreamChunk]:
+    async def _stream_completion(
+        self,
+        *,
+        model: str,
+        request: Dict[str, Any],
+        timeout: Any = None,
+    ) -> AsyncIterator[_GeminiStreamChunk]:
         url = f"{self.base_url}/models/{model}:streamGenerateContent?alt=sse"
         stream_headers = dict(self._headers())
         stream_headers["Accept"] = "text/event-stream"
 
-        def _generator() -> Iterator[_GeminiStreamChunk]:
-            try:
-                with self._http.stream("POST", url, json=request, headers=stream_headers, timeout=timeout) as response:
-                    if response.status_code != 200:
-                        body_text = read_streaming_error_body(response)
-                        raise gemini_http_error(response, body_text=body_text)
-                    tool_call_indices: Dict[str, Dict[str, Any]] = {}
-                    for event in _iter_sse_events(response):
-                        for chunk in translate_stream_event(event, model, tool_call_indices):
-                            yield chunk
-            except httpx.HTTPError as exc:
-                raise GeminiAPIError(
-                    f"Gemini streaming request failed: {exc}",
-                    code="gemini_stream_error",
-                ) from exc
-
-        return _generator()
-
-
-class AsyncGeminiNativeClient:
-    """Async wrapper used by auxiliary_client for native Gemini calls."""
-
-    def __init__(self, sync_client: GeminiNativeClient):
-        self._sync = sync_client
-        self.api_key = sync_client.api_key
-        self.base_url = sync_client.base_url
-        self.chat = _AsyncGeminiChatNamespace(self)
-        # Expose the underlying sync client as _real_client so the auxiliary
-        # cache's eviction-by-leaf-client helper (#23482) can find and drop
-        # this async entry when the sync GeminiNativeClient is poisoned.
-        # GeminiNativeClient is itself the leaf (no OpenAI client beneath
-        # it), so we point at the sync_client directly.
-        self._real_client = sync_client
-
-    async def _create_chat_completion(self, **kwargs: Any) -> Any:
-        stream = bool(kwargs.get("stream"))
-        result = await asyncio.to_thread(self._sync.chat.completions.create, **kwargs)
-        if not stream:
-            return result
-
-        async def _async_stream() -> Any:
-            while True:
-                done, chunk = await asyncio.to_thread(self._sync._advance_stream_iterator, result)
-                if done:
-                    break
-                yield chunk
-
-        return _async_stream()
-
-    async def close(self) -> None:
-        await asyncio.to_thread(self._sync.close)
+        try:
+            async with self._http.stream(
+                "POST", url, json=request, headers=stream_headers, timeout=timeout
+            ) as response:
+                if response.status_code != 200:
+                    body_text = await read_streaming_error_body_async(response)
+                    raise gemini_http_error(response, body_text=body_text)
+                tool_call_indices: Dict[str, Dict[str, Any]] = {}
+                async for event in _iter_sse_events_async(response):
+                    for chunk in translate_stream_event(event, model, tool_call_indices):
+                        yield chunk
+        except httpx.HTTPError as exc:
+            raise GeminiAPIError(
+                f"Gemini streaming request failed: {exc}",
+                code="gemini_stream_error",
+            ) from exc

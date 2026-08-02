@@ -30,7 +30,6 @@ class _Server:
     def mark_tool_call(self):
         pass
 
-
 @pytest.mark.asyncio
 async def test_mcp_tool_uses_async_cross_loop_bridge(monkeypatch):
     server = _Server()
@@ -42,8 +41,8 @@ async def test_mcp_tool_uses_async_cross_loop_bridge(monkeypatch):
         result = coro_or_factory() if callable(coro_or_factory) else coro_or_factory
         return await result
 
-    monkeypatch.setattr(mcp_tool, "_run_on_mcp_loop_async", run_inline)
-    handler = mcp_tool._make_async_tool_handler("srv", "echo", 5)
+    monkeypatch.setattr(mcp_tool, "_await_mcp_operation", run_inline)
+    handler = mcp_tool._make_tool_handler("srv", "echo", 5)
 
     assert inspect.iscoroutinefunction(handler)
     result = await handler({"value": "hello"})

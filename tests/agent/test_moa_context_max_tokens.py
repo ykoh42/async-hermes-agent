@@ -36,7 +36,8 @@ def hermes_home(tmp_path, monkeypatch):
     return home
 
 
-def test_aggregator_call_never_receives_reference_max_tokens(hermes_home, monkeypatch):
+@pytest.mark.asyncio
+async def test_aggregator_call_never_receives_reference_max_tokens(hermes_home, monkeypatch):
     """reference_max_tokens must cap only the reference fan-out — the
     aggregator's own call_llm invocation must not receive max_tokens at all
     (call_llm omits it entirely when None; see its own docstring)."""
@@ -44,13 +45,13 @@ def test_aggregator_call_never_receives_reference_max_tokens(hermes_home, monkey
 
     calls: list[dict] = []
 
-    def fake_call_llm(**kwargs):
+    async def fake_call_llm(**kwargs):
         calls.append(kwargs)
         return _response("advice" if kwargs.get("task") == "moa_reference" else "synthesis")
 
     monkeypatch.setattr("agent.moa_loop.call_llm", fake_call_llm)
 
-    aggregate_moa_context(
+    await aggregate_moa_context(
         user_prompt="clean the db",
         api_messages=[{"role": "user", "content": "clean the db"}],
         reference_models=[{"provider": "openrouter", "model": "openai/gpt-5.5"}],
@@ -70,7 +71,8 @@ def test_aggregator_call_never_receives_reference_max_tokens(hermes_home, monkey
     assert "max_tokens" not in aggregator_calls[0]
 
 
-def test_aggregator_call_uncapped_when_reference_max_tokens_unset(hermes_home, monkeypatch):
+@pytest.mark.asyncio
+async def test_aggregator_call_uncapped_when_reference_max_tokens_unset(hermes_home, monkeypatch):
     """Sanity check: with no reference_max_tokens configured, the reference
     call still explicitly passes max_tokens=None (call_llm itself decides
     whether to omit it on the wire), while the aggregator call structurally
@@ -80,13 +82,13 @@ def test_aggregator_call_uncapped_when_reference_max_tokens_unset(hermes_home, m
 
     calls: list[dict] = []
 
-    def fake_call_llm(**kwargs):
+    async def fake_call_llm(**kwargs):
         calls.append(kwargs)
         return _response("advice" if kwargs.get("task") == "moa_reference" else "synthesis")
 
     monkeypatch.setattr("agent.moa_loop.call_llm", fake_call_llm)
 
-    aggregate_moa_context(
+    await aggregate_moa_context(
         user_prompt="clean the db",
         api_messages=[{"role": "user", "content": "clean the db"}],
         reference_models=[{"provider": "openrouter", "model": "openai/gpt-5.5"}],
