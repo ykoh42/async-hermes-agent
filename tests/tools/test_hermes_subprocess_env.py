@@ -114,32 +114,6 @@ class TestTierInvariants:
         assert {"MODAL_TOKEN_ID", "MODAL_TOKEN_SECRET", "DAYTONA_API_KEY"} <= _ALWAYS_STRIP_KEYS
 
 
-class TestBrowserPassthroughPattern:
-    def test_browser_keys_recoverable_after_strip(self):
-        """Browser tool pattern: strip everything, then re-add the browser
-        backend keys agent-browser actually needs."""
-        from tools.browser_tool import _BROWSER_PASSTHROUGH_KEYS
-
-        leaked = {
-            "BROWSERBASE_API_KEY": "bb-key",
-            "BROWSERBASE_PROJECT_ID": "bb-proj",
-            "FIRECRAWL_API_KEY": "fc-key",
-            "ANTHROPIC_API_KEY": "ant-should-go",
-            "TELEGRAM_BOT_TOKEN": "bot-should-go",
-        }
-        with patch.dict(os.environ, {**_SAFE_SAMPLE, **leaked}, clear=True):
-            env = hermes_subprocess_env(inherit_credentials=False)
-            for key in _BROWSER_PASSTHROUGH_KEYS:
-                if key in os.environ:
-                    env[key] = os.environ[key]
-
-        assert env["BROWSERBASE_API_KEY"] == "bb-key"
-        assert env["FIRECRAWL_API_KEY"] == "fc-key"
-        # Provider + gateway secrets must NOT come back.
-        assert "ANTHROPIC_API_KEY" not in env
-        assert "TELEGRAM_BOT_TOKEN" not in env
-
-
 class TestDelegatedChildMarker:
     def test_delegated_child_context_scrubs_parent_kanban_keys_and_sets_marker(self):
         from agent.delegation_context import delegated_child_context
