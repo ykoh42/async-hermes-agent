@@ -14,6 +14,9 @@ import socket
 import uuid
 from pathlib import Path
 
+import aiofiles
+import aiofiles.os
+
 from hermes_constants import get_hermes_home
 
 
@@ -40,9 +43,9 @@ def is_network_accessible(host: str) -> bool:
         return True
 
 
-def _cache_dir(kind: str) -> Path:
+async def _cache_dir(kind: str) -> Path:
     path = get_hermes_home() / "cache" / kind
-    path.mkdir(parents=True, exist_ok=True)
+    await aiofiles.os.makedirs(path, exist_ok=True)
     return path
 
 
@@ -68,66 +71,72 @@ def _looks_like_image(data: bytes) -> bool:
     )
 
 
-def _write_cached(kind: str, prefix: str, data: bytes, extension: str) -> str:
-    path = _cache_dir(kind) / f"{prefix}_{uuid.uuid4().hex[:12]}{extension}"
-    path.write_bytes(data)
+async def _write_cached(
+    kind: str, prefix: str, data: bytes, extension: str
+) -> str:
+    cache_dir = await _cache_dir(kind)
+    path = cache_dir / f"{prefix}_{uuid.uuid4().hex[:12]}{extension}"
+    async with aiofiles.open(path, "wb") as handle:
+        await handle.write(data)
     return str(path)
 
 
-def cache_image_from_bytes(data: bytes, ext: str = ".jpg") -> str:
+async def cache_image_from_bytes(data: bytes, ext: str = ".jpg") -> str:
     """Persist validated image bytes for MCP/image-tool consumption."""
     _validate_size(data, "image")
     if not _looks_like_image(data):
         raise ValueError("Refusing to cache non-image bytes as an image")
-    return _write_cached("images", "img", data, _safe_extension(ext, ".jpg"))
+    return await _write_cached("images", "img", data, _safe_extension(ext, ".jpg"))
 
 
-def cache_audio_from_bytes(data: bytes, ext: str = ".ogg") -> str:
+async def cache_audio_from_bytes(data: bytes, ext: str = ".ogg") -> str:
     """Persist audio bytes for MCP/tool consumption."""
     _validate_size(data, "audio")
-    return _write_cached("audio", "audio", data, _safe_extension(ext, ".ogg"))
+    return await _write_cached("audio", "audio", data, _safe_extension(ext, ".ogg"))
 
 
-def cache_document_from_bytes(data: bytes, filename: str) -> str:
+async def cache_document_from_bytes(data: bytes, filename: str) -> str:
     """Persist an MCP resource without allowing path traversal."""
     _validate_size(data, "document")
     name = Path(str(filename or "document")).name.replace("\x00", "").strip()
     if not name or name in {".", ".."}:
         name = "document"
-    target_dir = _cache_dir("documents")
+    target_dir = await _cache_dir("documents")
     path = target_dir / f"doc_{uuid.uuid4().hex[:12]}_{name}"
     if target_dir.resolve() not in path.resolve().parents:
         raise ValueError(f"Path traversal rejected: {filename!r}")
-    path.write_bytes(data)
+    async with aiofiles.open(path, "wb") as handle:
+        await handle.write(data)
     return str(path)
 
 
-def _cleanup_cache(kind: str, max_age_hours: int = 24) -> int:
+async def _cleanup_cache(kind: str, max_age_hours: int = 24) -> int:
     """Delete stale local cache entries; used only by explicit maintenance."""
     import time
 
     cutoff = time.time() - max(0, int(max_age_hours)) * 3600
     removed = 0
-    for path in _cache_dir(kind).iterdir():
+    cache_dir = await _cache_dir(kind)
+    for entry in await aiofiles.os.scandir(cache_dir):
         try:
-            if path.is_file() and path.stat().st_mtime < cutoff:
-                path.unlink()
+            if entry.is_file() and (await aiofiles.os.stat(entry.path)).st_mtime < cutoff:
+                await aiofiles.os.remove(entry.path)
                 removed += 1
         except OSError:
             continue
     return removed
 
 
-def cleanup_image_cache(max_age_hours: int = 24) -> int:
-    return _cleanup_cache("images", max_age_hours)
+async def cleanup_image_cache(max_age_hours: int = 24) -> int:
+    return await _cleanup_cache("images", max_age_hours)
 
 
-def cleanup_audio_cache(max_age_hours: int = 24) -> int:
-    return _cleanup_cache("audio", max_age_hours)
+async def cleanup_audio_cache(max_age_hours: int = 24) -> int:
+    return await _cleanup_cache("audio", max_age_hours)
 
 
-def cleanup_document_cache(max_age_hours: int = 24) -> int:
-    return _cleanup_cache("documents", max_age_hours)
+async def cleanup_document_cache(max_age_hours: int = 24) -> int:
+    return await _cleanup_cache("documents", max_age_hours)
 
 
 def resolve_proxy_url(*_args, **_kwargs) -> str | None:

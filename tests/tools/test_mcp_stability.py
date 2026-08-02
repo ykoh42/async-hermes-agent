@@ -26,9 +26,10 @@ class TestMCPLoopExceptionHandler:
 class TestStdioPidTracking:
     """_snapshot_child_pids and _stdio_pids track subprocess PIDs."""
 
-    def test_snapshot_returns_set(self):
+    @pytest.mark.asyncio
+    async def test_snapshot_returns_set(self):
         from tools.mcp_tool import _snapshot_child_pids
-        result = _snapshot_child_pids()
+        result = await _snapshot_child_pids()
         assert isinstance(result, set)
         # All elements should be ints
         for pid in result:
@@ -84,7 +85,8 @@ class TestMCPInitialConnectionRetry:
         assert _MAX_INITIAL_CONNECT_RETRIES >= 1
 
 
-    def test_initial_connect_retry_respects_shutdown(self):
+    @pytest.mark.asyncio
+    async def test_initial_connect_retry_respects_shutdown(self):
         """Shutdown during initial retry backoff aborts cleanly."""
         from tools.mcp_tool import MCPServerTask
 
@@ -114,7 +116,7 @@ class TestMCPInitialConnectionRetry:
                 assert server._error is not None
                 await task
 
-        asyncio.get_event_loop().run_until_complete(_run())
+        await _run()
 
 
 # ---------------------------------------------------------------------------

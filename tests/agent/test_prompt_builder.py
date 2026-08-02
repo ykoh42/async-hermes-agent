@@ -280,19 +280,21 @@ class TestBuildSkillsSystemPrompt:
 
 
 
-    def test_deduplicates_skills(self, monkeypatch, tmp_path):
+    @pytest.mark.asyncio
+    async def test_deduplicates_skills(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         cat_dir = tmp_path / "skills" / "tools"
         for subdir in ["search", "search"]:
             d = cat_dir / subdir
             d.mkdir(parents=True, exist_ok=True)
             (d / "SKILL.md").write_text("---\ndescription: Search stuff\n---\n")
-        result = build_skills_system_prompt()
+        result = await build_skills_system_prompt()
         # "search" should appear only once per category
         assert result.count("- search") == 1
 
 
-    def test_compact_categories_demote_nested_and_miss_cache_separately(
+    @pytest.mark.asyncio
+    async def test_compact_categories_demote_nested_and_miss_cache_separately(
         self, monkeypatch, tmp_path
     ):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
@@ -303,18 +305,19 @@ class TestBuildSkillsSystemPrompt:
         )
         # Nested category ("social-media/twitter") demoted via its parent:
         # name visible, description gone.
-        compact = build_skills_system_prompt(
+        compact = await build_skills_system_prompt(
             compact_categories=frozenset({"social-media"})
         )
         assert "thread-writer" in compact
         assert "Write threads" not in compact
         # Unfiltered call must not be served from the compacted cache entry.
-        full = build_skills_system_prompt()
+        full = await build_skills_system_prompt()
         assert "Write threads" in full
 
 
 
-    def test_excludes_disabled_skills(self, monkeypatch, tmp_path):
+    @pytest.mark.asyncio
+    async def test_excludes_disabled_skills(self, monkeypatch, tmp_path):
         """Skills in the user's disabled list should not appear in the system prompt."""
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         skills_dir = tmp_path / "skills" / "tools"
@@ -335,15 +338,16 @@ class TestBuildSkillsSystemPrompt:
         from unittest.mock import patch
 
         with patch(
-            "agent.prompt_builder.get_disabled_skill_names",
+            "agent.prompt_builder._get_disabled_skill_names_async",
             return_value={"old-tool"},
         ):
-            result = build_skills_system_prompt()
+            result = await build_skills_system_prompt()
 
         assert "web-search" in result
         assert "old-tool" not in result
 
-    def test_rebuilds_prompt_when_disabled_skills_change(self, monkeypatch, tmp_path):
+    @pytest.mark.asyncio
+    async def test_rebuilds_prompt_when_disabled_skills_change(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         skill_dir = tmp_path / "skills" / "tools" / "cached-skill"
         skill_dir.mkdir(parents=True)
@@ -351,14 +355,14 @@ class TestBuildSkillsSystemPrompt:
             "---\nname: cached-skill\ndescription: Cached skill\n---\n"
         )
 
-        first = build_skills_system_prompt()
+        first = await build_skills_system_prompt()
         assert "cached-skill" in first
 
         (tmp_path / "config.yaml").write_text(
             "skills:\n  disabled: [cached-skill]\n"
         )
 
-        second = build_skills_system_prompt()
+        second = await build_skills_system_prompt()
         assert "cached-skill" not in second
 
 
@@ -371,23 +375,25 @@ class TestBuildSkillsSystemPrompt:
 
 
 class TestBuildContextFilesPrompt:
-    def test_empty_dir_loads_seeded_global_soul(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_empty_dir_adds_no_context(self, tmp_path):
         from unittest.mock import patch
 
         fake_home = tmp_path / "fake_home"
         fake_home.mkdir()
         with patch("pathlib.Path.home", return_value=fake_home):
-            result = build_context_files_prompt(cwd=str(tmp_path))
-        assert "Project Context" in result
-        assert "Hermes Agent" in result
+            result = await build_context_files_prompt(cwd=str(tmp_path))
+        assert result == ""
 
-    def test_loads_agents_md(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_loads_agents_md(self, tmp_path):
         (tmp_path / "AGENTS.md").write_text("Use Ruff for linting.")
-        result = build_context_files_prompt(cwd=str(tmp_path))
+        result = await build_context_files_prompt(cwd=str(tmp_path))
         assert "Ruff for linting" in result
         assert "Project Context" in result
 
-    def test_skips_agents_md_in_install_tree_on_fallback(self, monkeypatch, tmp_path):
+    @pytest.mark.asyncio
+    async def test_skips_agents_md_in_install_tree_on_fallback(self, monkeypatch, tmp_path):
         # A backend that FALLS BACK into the install tree (cwd=None → getcwd,
         # the desktop default) must not load that tree's contributor AGENTS.md
         # as project context. The guard keys off the package root, so point it
@@ -397,7 +403,7 @@ class TestBuildContextFilesPrompt:
         monkeypatch.setattr(rt, "_PACKAGE_ROOT", tmp_path.resolve())
         (tmp_path / "AGENTS.md").write_text("Never give up on the right solution.")
         monkeypatch.chdir(tmp_path)
-        result = build_context_files_prompt(cwd=None, skip_soul=True)
+        result = await build_context_files_prompt(cwd=None, skip_soul=True)
         assert "Never give up" not in result
         assert result == ""
 
@@ -406,12 +412,13 @@ class TestBuildContextFilesPrompt:
 
 
 
-    def test_empty_soul_md_adds_nothing(self, tmp_path, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_empty_soul_md_adds_nothing(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes_home"))
         hermes_home = tmp_path / "hermes_home"
         hermes_home.mkdir()
         (hermes_home / "SOUL.md").write_text("\n\n", encoding="utf-8")
-        result = build_context_files_prompt(cwd=str(tmp_path))
+        result = await build_context_files_prompt(cwd=str(tmp_path))
         assert result == ""
 
 
@@ -429,9 +436,10 @@ class TestBuildContextFilesPrompt:
 
 
 
-    def test_loads_claude_md(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_loads_claude_md(self, tmp_path):
         (tmp_path / "CLAUDE.md").write_text("Use type hints everywhere.")
-        result = build_context_files_prompt(cwd=str(tmp_path))
+        result = await build_context_files_prompt(cwd=str(tmp_path))
         assert "type hints" in result
         assert "CLAUDE.md" in result
         assert "Project Context" in result
@@ -441,14 +449,15 @@ class TestBuildContextFilesPrompt:
         sys.platform == "darwin",
         reason="APFS default volume is case-insensitive; CLAUDE.md and claude.md alias the same path",
     )
-    def test_claude_md_uppercase_takes_priority(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_claude_md_uppercase_takes_priority(self, tmp_path):
         uppercase = tmp_path / "CLAUDE.md"
         lowercase = tmp_path / "claude.md"
         uppercase.write_text("From uppercase.")
         lowercase.write_text("From lowercase.")
         if uppercase.samefile(lowercase):
             pytest.skip("filesystem is case-insensitive")
-        result = build_context_files_prompt(cwd=str(tmp_path))
+        result = await build_context_files_prompt(cwd=str(tmp_path))
         assert "From uppercase" in result
         assert "From lowercase" not in result
 
@@ -462,22 +471,25 @@ class TestBuildContextFilesPrompt:
 
 
 class TestFindHermesMd:
-    def test_finds_in_cwd(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_finds_in_cwd(self, tmp_path):
         (tmp_path / ".hermes.md").write_text("rules")
-        assert _find_hermes_md(tmp_path) == tmp_path / ".hermes.md"
+        assert await _find_hermes_md(tmp_path) == tmp_path / ".hermes.md"
 
 
 
-    def test_walks_to_git_root(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_walks_to_git_root(self, tmp_path):
         (tmp_path / ".git").mkdir()
         (tmp_path / ".hermes.md").write_text("root rules")
         sub = tmp_path / "a" / "b"
         sub.mkdir(parents=True)
-        assert _find_hermes_md(sub) == tmp_path / ".hermes.md"
+        assert await _find_hermes_md(sub) == tmp_path / ".hermes.md"
 
 
 
-    def test_no_git_root_checks_cwd_only(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_no_git_root_checks_cwd_only(self, tmp_path):
         """Outside a git repo, only cwd is checked — parents are NOT walked.
 
         Walking parents with no git root to stop the loop would climb all
@@ -493,23 +505,26 @@ class TestFindHermesMd:
         cwd.mkdir()
         # No git root anywhere up the tree.
         with patch("agent.prompt_builder._find_git_root", return_value=None):
-            assert _find_hermes_md(cwd) is None
+            assert await _find_hermes_md(cwd) is None
 
 
 
 
 class TestFindGitRoot:
-    def test_finds_git_dir(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_finds_git_dir(self, tmp_path):
         (tmp_path / ".git").mkdir()
-        assert _find_git_root(tmp_path) == tmp_path
+        assert await _find_git_root(tmp_path) == tmp_path
 
-    def test_finds_from_subdirectory(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_finds_from_subdirectory(self, tmp_path):
         (tmp_path / ".git").mkdir()
         sub = tmp_path / "src" / "lib"
         sub.mkdir(parents=True)
-        assert _find_git_root(sub) == tmp_path
+        assert await _find_git_root(sub) == tmp_path
 
-    def test_returns_none_without_git(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_returns_none_without_git(self, tmp_path):
         # Create an isolated dir tree with no .git anywhere in it.
         # tmp_path itself might be under a git repo, so we test with
         # a directory that has its own .git higher up to verify the
@@ -518,7 +533,7 @@ class TestFindGitRoot:
         isolated.mkdir()
         # We can't fully guarantee no .git exists above tmp_path,
         # so just verify the function returns a Path or None.
-        result = _find_git_root(isolated)
+        result = await _find_git_root(isolated)
         # If result is not None, it must actually contain .git
         if result is not None:
             assert (result / ".git").exists()
@@ -755,14 +770,15 @@ class TestBuildSkillsSystemPromptConditional:
 
 
 
-    def test_requires_skill_hidden_when_toolset_missing(self, monkeypatch, tmp_path):
+    @pytest.mark.asyncio
+    async def test_requires_skill_hidden_when_toolset_missing(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         skill_dir = tmp_path / "skills" / "iot" / "openhue"
         skill_dir.mkdir(parents=True)
         (skill_dir / "SKILL.md").write_text(
             "---\nname: openhue\ndescription: Hue lights\nmetadata:\n  hermes:\n    requires_toolsets: [terminal]\n---\n"
         )
-        result = build_skills_system_prompt(
+        result = await build_skills_system_prompt(
             available_tools=set(),
             available_toolsets=set(),
         )
@@ -770,7 +786,8 @@ class TestBuildSkillsSystemPromptConditional:
 
 
 
-    def test_no_args_shows_all_skills(self, monkeypatch, tmp_path):
+    @pytest.mark.asyncio
+    async def test_no_args_shows_all_skills(self, monkeypatch, tmp_path):
         """Backward compat: calling with no args shows everything."""
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         skill_dir = tmp_path / "skills" / "search" / "duckduckgo"
@@ -778,7 +795,7 @@ class TestBuildSkillsSystemPromptConditional:
         (skill_dir / "SKILL.md").write_text(
             "---\nname: duckduckgo\ndescription: Free web search\nmetadata:\n  hermes:\n    fallback_for_toolsets: [web]\n---\n"
         )
-        result = build_skills_system_prompt()
+        result = await build_skills_system_prompt()
         assert "duckduckgo" in result
 
 

@@ -47,27 +47,29 @@ def _make_metadata(token_endpoint: str = "https://auth.example.com/oauth/token")
 
 
 class TestMetadataStorage:
-    def test_save_and_load_roundtrip(self, tmp_path, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_save_and_load_roundtrip(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         storage = HermesTokenStorage("example-server")
 
         meta = _make_metadata()
-        storage.save_oauth_metadata(meta)
+        await storage.save_oauth_metadata(meta)
 
         meta_path = tmp_path / "mcp-tokens" / "example-server.meta.json"
         assert meta_path.exists()
 
-        loaded = storage.load_oauth_metadata()
+        loaded = await storage.load_oauth_metadata()
         assert loaded is not None
         assert str(loaded.token_endpoint) == "https://auth.example.com/oauth/token"
         assert str(loaded.issuer).rstrip("/") == "https://auth.example.com"
 
 
-    def test_remove_deletes_meta_file(self, tmp_path, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_remove_deletes_meta_file(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         storage = HermesTokenStorage("cleanup-server")
 
-        storage.save_oauth_metadata(_make_metadata())
+        await storage.save_oauth_metadata(_make_metadata())
         assert storage._meta_path().exists()
 
         storage.remove()
@@ -100,24 +102,26 @@ def _manager_provider_with_context(storage: HermesTokenStorage, **context_attrs)
 
 
 class TestManagerOAuthProviderMetadata:
-    def test_initialize_restores_metadata_from_disk(self, tmp_path, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_initialize_restores_metadata_from_disk(self, tmp_path, monkeypatch):
         """Cold-load: if we have no in-memory metadata but disk has some, restore it."""
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         storage = HermesTokenStorage("mgr-srv")
-        storage.save_oauth_metadata(_make_metadata("https://mgr.example.com/token"))
+        await storage.save_oauth_metadata(_make_metadata("https://mgr.example.com/token"))
         provider = _manager_provider_with_context(storage, oauth_metadata=None)
 
         with patch.object(
             _HERMES_PROVIDER_CLS.__bases__[0], "_initialize", new=AsyncMock()
         ):
-            asyncio.run(provider._initialize())
+            await provider._initialize()
 
         assert provider.context.oauth_metadata is not None
         assert str(provider.context.oauth_metadata.token_endpoint) == \
             "https://mgr.example.com/token"
 
 
-    def test_async_auth_flow_persists_on_completion(self, tmp_path, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_async_auth_flow_persists_on_completion(self, tmp_path, monkeypatch):
         """End-to-end: running the wrapped auth_flow persists discovered metadata."""
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         storage = HermesTokenStorage("flow-srv")
@@ -140,13 +144,9 @@ class TestManagerOAuthProviderMetadata:
             "async_auth_flow",
             new=fake_parent_flow,
         ), patch("tools.mcp_oauth_manager.get_manager", return_value=manager):
-            async def drive():
-                gen = provider.async_auth_flow(MagicMock())
-                async for _ in gen:
-                    pass
+            async for _ in provider.async_auth_flow(MagicMock()):
+                pass
 
-            asyncio.run(drive())
-
-        loaded = storage.load_oauth_metadata()
+        loaded = await storage.load_oauth_metadata()
         assert loaded is not None
         assert str(loaded.token_endpoint) == "https://flow.example.com/token"

@@ -747,7 +747,7 @@ def _mcp_image_extension_for_mime_type(mime_type: str) -> str:
     return mimetypes.guess_extension(normalized) or ".png"
 
 
-def _cache_mcp_image_block(block) -> str:
+async def _cache_mcp_image_block(block) -> str:
     """Cache an MCP ``ImageContent`` block to the shared image cache and
     return a ``MEDIA:<path>`` tag that Hermes gateways know how to render.
 
@@ -774,7 +774,7 @@ def _cache_mcp_image_block(block) -> str:
     try:
         from gateway.platforms.base import cache_image_from_bytes
 
-        image_path = cache_image_from_bytes(
+        image_path = await cache_image_from_bytes(
             raw_bytes,
             ext=_mcp_image_extension_for_mime_type(normalized_mime),
         )
@@ -839,7 +839,7 @@ def _mcp_resource_filename(uri: str, mime_type: str) -> str:
     return name
 
 
-def _cache_mcp_audio_block(block) -> str:
+async def _cache_mcp_audio_block(block) -> str:
     """Cache an MCP ``AudioContent`` block and return a ``MEDIA:`` tag.
 
     Returns an empty string when *block* is not audio or on any failure —
@@ -869,7 +869,7 @@ def _cache_mcp_audio_block(block) -> str:
             or mimetypes.guess_extension(mime_type)
             or ".ogg"
         )
-        audio_path = cache_audio_from_bytes(raw_bytes, ext=ext)
+        audio_path = await cache_audio_from_bytes(raw_bytes, ext=ext)
     except ImportError:
         logger.debug("MCP audio caching skipped — gateway.platforms.base unavailable")
         return ""
@@ -879,7 +879,7 @@ def _cache_mcp_audio_block(block) -> str:
     return f"MEDIA:{audio_path}"
 
 
-def _render_mcp_resource_block(block, server_name: str = "") -> str:
+async def _render_mcp_resource_block(block, server_name: str = "") -> str:
     """Render an MCP ``ResourceLink`` or ``EmbeddedResource`` block as text.
 
     - ``EmbeddedResource`` with text contents → the text itself.
@@ -943,7 +943,9 @@ def _render_mcp_resource_block(block, server_name: str = "") -> str:
     try:
         from gateway.platforms.base import cache_document_from_bytes
 
-        path = cache_document_from_bytes(raw_bytes, _mcp_resource_filename(uri, mime))
+        path = await cache_document_from_bytes(
+            raw_bytes, _mcp_resource_filename(uri, mime)
+        )
     except ImportError:
         logger.debug("MCP resource caching skipped — gateway.platforms.base unavailable")
         return f"[MCP embedded resource received ({len(raw_bytes)} bytes, {mime or 'unknown type'}) but document cache unavailable in this process]"
@@ -4406,15 +4408,15 @@ async def _call_mcp_tool(
         if hasattr(block, "text") and block.text:
             parts.append(block.text)
             continue
-        image_tag = _cache_mcp_image_block(block)
+        image_tag = await _cache_mcp_image_block(block)
         if image_tag:
             parts.append(image_tag)
             continue
-        audio_tag = _cache_mcp_audio_block(block)
+        audio_tag = await _cache_mcp_audio_block(block)
         if audio_tag:
             parts.append(audio_tag)
             continue
-        resource_text = _render_mcp_resource_block(block, server_name)
+        resource_text = await _render_mcp_resource_block(block, server_name)
         if resource_text:
             parts.append(resource_text)
             continue
@@ -4617,7 +4619,7 @@ def _make_read_resource_handler(server_name: str, tool_timeout: float):
                     # Materialize binary resource contents into the document
                     # cache instead of discarding them (same contract as
                     # EmbeddedResource blocks in tool results).
-                    rendered = _render_mcp_resource_block(
+                    rendered = await _render_mcp_resource_block(
                         SimpleNamespace(type="resource", resource=block),
                         server_name,
                     )
