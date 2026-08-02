@@ -44,7 +44,7 @@ async def _captured_context_cwd(agent):
 
     with (
         patch("run_agent.load_soul_md", return_value=""),
-        patch("run_agent.build_environment_hints_async", return_value=""),
+        patch("run_agent.build_environment_hints", return_value=""),
         patch("run_agent.build_context_files_prompt", side_effect=fake_context_files),
     ):
         await build_system_prompt_parts(agent)
@@ -68,7 +68,7 @@ class TestContextFileCwd:
 async def _stable_prompt(agent):
     with (
         patch("run_agent.load_soul_md", return_value=""),
-        patch("run_agent.build_environment_hints_async", return_value=""),
+        patch("run_agent.build_environment_hints", return_value=""),
         patch("run_agent.build_context_files_prompt", return_value=""),
     ):
         return (await build_system_prompt_parts(agent))["stable"]
@@ -77,7 +77,7 @@ async def _stable_prompt(agent):
 async def _prompt_parts(agent):
     with (
         patch("run_agent.load_soul_md", return_value=""),
-        patch("run_agent.build_environment_hints_async", return_value=""),
+        patch("run_agent.build_environment_hints", return_value=""),
         patch("run_agent.build_context_files_prompt", return_value=""),
     ):
         return await build_system_prompt_parts(agent)
@@ -125,7 +125,7 @@ async def test_build_system_prompt_records_stable_prefix():
     agent = _make_agent()
     with (
         patch("run_agent.load_soul_md", return_value=""),
-        patch("run_agent.build_environment_hints_async", return_value=""),
+        patch("run_agent.build_environment_hints", return_value=""),
         patch("run_agent.build_context_files_prompt", return_value="context"),
     ):
         prompt = await build_system_prompt(agent)
@@ -170,10 +170,10 @@ async def test_coding_prompt_preserves_legacy_workspace_order(monkeypatch):
 
     with (
         patch("run_agent.load_soul_md", return_value=""),
-        patch("run_agent.build_environment_hints_async", return_value=""),
+        patch("run_agent.build_environment_hints", return_value=""),
         patch("run_agent.build_context_files_prompt", return_value="CONTEXT_FILES"),
         patch(
-            "agent.coding_context.coding_system_prompt_parts_async",
+            "agent.coding_context.coding_system_prompt_parts",
             return_value=(
                 ["CODING_STABLE"],
                 ["WORKSPACE"],

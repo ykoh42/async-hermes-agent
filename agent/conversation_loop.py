@@ -463,7 +463,7 @@ async def _restore_or_build_system_prompt(agent, system_message, conversation_hi
                 agent.session_id, exc,
             )
 
-    if stored_prompt and _stored_prompt_matches_runtime(agent, stored_prompt):
+    if stored_prompt and await _stored_prompt_matches_runtime(agent, stored_prompt):
         # Continuing session — reuse the exact system prompt from the
         # previous turn so the Anthropic cache prefix matches.
         agent._cached_system_prompt = stored_prompt
@@ -557,7 +557,7 @@ async def _restore_or_build_system_prompt(agent, system_message, conversation_hi
             )
 
 
-def _stored_prompt_matches_runtime(agent, prompt: str) -> bool:
+async def _stored_prompt_matches_runtime(agent, prompt: str) -> bool:
     """Return False when the persisted runtime-identity lines are stale."""
 
     def line_value(label: str) -> str:
@@ -619,7 +619,7 @@ def _stored_prompt_matches_runtime(agent, prompt: str) -> bool:
     # rejected (they would always differ from the launch dir's os.getcwd()).
     stored_cwd = host_info_value("Current working directory")
     if stored_cwd:
-        if stored_cwd != str(resolve_agent_cwd()):
+        if stored_cwd != str(await resolve_agent_cwd()):
             return False
 
     # Detect runtime-surface drift: the stored prompt records which platform it

@@ -20,7 +20,7 @@ from pathlib import Path
 from hermes_constants import get_hermes_home, get_skills_dir, is_wsl
 from typing import Optional
 
-from agent.runtime_cwd import resolve_agent_cwd, resolve_agent_cwd_async
+from agent.runtime_cwd import resolve_agent_cwd
 from agent.skill_utils import (
     EXCLUDED_SKILL_DIRS,
     ORG_ACTIVE_MARKER,
@@ -1002,139 +1002,12 @@ _WINDOWS_BASH_SHELL_HINT = (
 )
 
 
-def _probe_remote_backend(env_type: str) -> str | None:
-    """Run a tiny introspection command inside the active terminal backend.
-
-    Returns a pre-formatted multi-line string describing the backend's OS,
-    $HOME, cwd, and user — or None if the probe failed. Result is cached
-    per process. Used only for non-local backends where the agent's tools
-    operate on a different machine than the host Hermes runs on.
-    """
-    cwd_hint = os.getenv("TERMINAL_CWD", "")
-    cache_key = (env_type, cwd_hint)
-    cached = _BACKEND_PROBE_CACHE.get(cache_key)
-    if cached is not None:
-        return cached or None
-
-    try:
-        # Import locally: tools/ imports are heavy and only relevant when a
-        # non-local backend is actually configured.
-        from tools.terminal_tool import _create_environment, _get_env_config  # type: ignore
-    except Exception as e:
-        logger.debug("Backend probe unavailable (import failed): %s", e)
-        _BACKEND_PROBE_CACHE[cache_key] = ""
-        return None
-
-    try:
-        config = _get_env_config()
-        # Build the environment the same way tools/terminal_tool.py does for a
-        # live command: select the backend image, then assemble ssh/container
-        # config from the env-derived dict. (There is no `get_environment`
-        # factory — the real entry point is `_create_environment`.)
-        if env_type == "docker":
-            image = config.get("docker_image", "")
-        elif env_type == "singularity":
-            image = config.get("singularity_image", "")
-        elif env_type == "modal":
-            image = config.get("modal_image", "")
-        elif env_type == "daytona":
-            image = config.get("daytona_image", "")
-        else:
-            image = ""
-
-        ssh_config = None
-        if env_type == "ssh":
-            ssh_config = {
-                "host": config.get("ssh_host", ""),
-                "user": config.get("ssh_user", ""),
-                "port": config.get("ssh_port", 22),
-                "key": config.get("ssh_key", ""),
-                "persistent": config.get("ssh_persistent", False),
-            }
-
-        container_config = None
-        if env_type in {"docker", "singularity", "modal", "daytona", "vercel_sandbox"}:
-            container_config = {
-                "container_cpu": config.get("container_cpu", 1),
-                "container_memory": config.get("container_memory", 5120),
-                "container_disk": config.get("container_disk", 51200),
-                "container_persistent": config.get("container_persistent", True),
-                "modal_mode": config.get("modal_mode", "auto"),
-                "docker_volumes": config.get("docker_volumes", []),
-                "docker_mount_cwd_to_workspace": config.get("docker_mount_cwd_to_workspace", False),
-                "docker_forward_env": config.get("docker_forward_env", []),
-                "docker_env": config.get("docker_env", {}),
-                "docker_run_as_host_user": config.get("docker_run_as_host_user", False),
-                "docker_extra_args": config.get("docker_extra_args", []),
-                "docker_persist_across_processes": config.get("docker_persist_across_processes", True),
-                "docker_orphan_reaper": config.get("docker_orphan_reaper", True),
-            }
-
-        env = _create_environment(
-            env_type=env_type,
-            image=image,
-            cwd=config.get("cwd", ""),
-            timeout=config.get("timeout", 180),
-            ssh_config=ssh_config,
-            container_config=container_config,
-            task_id="prompt-backend-probe",
-            host_cwd=config.get("host_cwd"),
-        )
-        # Single-line POSIX probe — works on any Unixy backend. Wrapped in
-        # `2>/dev/null` so a missing binary doesn't pollute the output.
-        probe_cmd = (
-            "printf 'os=%s\\nkernel=%s\\nhome=%s\\ncwd=%s\\nuser=%s\\n' "
-            "\"$(uname -s 2>/dev/null || echo unknown)\" "
-            "\"$(uname -r 2>/dev/null || echo unknown)\" "
-            "\"$HOME\" \"$(pwd)\" \"$(whoami 2>/dev/null || id -un 2>/dev/null || echo unknown)\""
-        )
-        result = env.execute(probe_cmd, timeout=4)
-        if result.get("returncode") != 0:
-            logger.debug("Backend probe returned non-zero: %r", result)
-            _BACKEND_PROBE_CACHE[cache_key] = ""
-            return None
-        output = (result.get("output") or "").strip()
-        if not output:
-            _BACKEND_PROBE_CACHE[cache_key] = ""
-            return None
-    except Exception as e:
-        logger.debug("Backend probe failed: %s", e)
-        _BACKEND_PROBE_CACHE[cache_key] = ""
-        return None
-
-    # Parse key=value lines back into a tidy summary.
-    parsed: dict[str, str] = {}
-    for line in output.splitlines():
-        if "=" in line:
-            k, _, v = line.partition("=")
-            parsed[k.strip()] = v.strip()
-
-    pieces = []
-    os_bits = " ".join(x for x in (parsed.get("os"), parsed.get("kernel")) if x and x != "unknown")
-    if os_bits:
-        pieces.append(f"OS: {os_bits}")
-    if parsed.get("user") and parsed["user"] != "unknown":
-        pieces.append(f"User: {parsed['user']}")
-    if parsed.get("home"):
-        pieces.append(f"Home: {parsed['home']}")
-    if parsed.get("cwd"):
-        pieces.append(f"Working directory: {parsed['cwd']}")
-
-    if not pieces:
-        _BACKEND_PROBE_CACHE[cache_key] = ""
-        return None
-
-    formatted = "\n".join(f"  {p}" for p in pieces)
-    _BACKEND_PROBE_CACHE[cache_key] = formatted
-    return formatted
-
-
 def _clear_backend_probe_cache() -> None:
     """Test helper — drop the backend probe cache so monkeypatched backends take effect."""
     _BACKEND_PROBE_CACHE.clear()
 
 
-async def _probe_remote_backend_async(env_type: str) -> str | None:
+async def _probe_remote_backend(env_type: str) -> str | None:
     """Probe a non-local terminal backend through its async execution API."""
     cwd_hint = os.getenv("TERMINAL_CWD", "")
     cache_key = (env_type, cwd_hint)
@@ -1240,116 +1113,7 @@ async def _probe_remote_backend_async(env_type: str) -> str | None:
     return formatted
 
 
-def build_environment_hints() -> str:
-    """Return environment-specific guidance for the system prompt.
-
-    Always emits a factual block describing the execution environment:
-    - For **local** terminal backends: the host OS, user home, current
-      working directory (plus a Windows-only note about hostname != user
-      and a Windows-only note that `terminal` shells out to bash, not
-      PowerShell).
-    - For **remote / sandbox** terminal backends (docker, singularity,
-      modal, daytona, ssh, vercel_sandbox): host info is **suppressed**
-      because the agent's tools can't touch the host — only the backend
-      matters. A live probe inside the backend reports its OS, user, $HOME,
-      and cwd. Falls back to a static summary if the probe fails.
-
-    The WSL environment hint is appended unchanged when running under WSL.
-    """
-    import platform
-    import sys
-
-    hints: list[str] = []
-
-    backend = (os.getenv("TERMINAL_ENV") or "local").strip().lower()
-    is_remote_backend = backend in _REMOTE_TERMINAL_BACKENDS
-
-    if not is_remote_backend:
-        # --- Host info block (local backend: host == where tools run) ---
-        host_lines: list[str] = []
-        if is_wsl():
-            host_lines.append("Host: WSL (Windows Subsystem for Linux)")
-        elif sys.platform == "win32":
-            host_lines.append(f"Host: Windows ({platform.release()})")
-        elif sys.platform == "darwin":
-            mac_ver = platform.mac_ver()[0]
-            host_lines.append(f"Host: macOS ({mac_ver or platform.release()})")
-        else:
-            host_lines.append(f"Host: {platform.system()} ({platform.release()})")
-
-        host_lines.append(f"User home directory: {os.path.expanduser('~')}")
-        try:
-            host_lines.append(f"Current working directory: {resolve_agent_cwd()}")
-        except OSError:
-            pass
-
-        if sys.platform == "win32" and not is_wsl():
-            host_lines.append(
-                "Note: on Windows, the machine hostname (e.g. from `hostname` "
-                "or uname) is NOT the username. Use the 'User home directory' "
-                "above to construct paths under C:\\Users\\<user>\\, never the "
-                "hostname."
-            )
-        hints.append("\n".join(host_lines))
-
-        # Windows-local terminal runs bash, not PowerShell — the model must
-        # know this or it will issue PowerShell syntax and fail.
-        if sys.platform == "win32" and not is_wsl():
-            hints.append(_WINDOWS_BASH_SHELL_HINT)
-    else:
-        # --- Remote backend block (host info suppressed) ---
-        probe = _probe_remote_backend(backend)
-        if probe:
-            hints.append(
-                f"Terminal backend: {backend}. Your `terminal`, `read_file`, "
-                f"`write_file`, `patch`, and `search_files` tools all operate "
-                f"inside this {backend} environment — NOT on the machine "
-                f"where Hermes itself is running. The host OS, home, and cwd "
-                f"of the Hermes process are irrelevant; only the following "
-                f"backend state matters:\n{probe}"
-            )
-        else:
-            description = _BACKEND_FALLBACK_DESCRIPTIONS.get(
-                backend, f"a {backend} environment (likely Linux)"
-            )
-            hints.append(
-                f"Terminal backend: {backend}. Your `terminal`, `read_file`, "
-                f"`write_file`, `patch`, and `search_files` tools all operate "
-                f"inside {description} — NOT on the machine where Hermes "
-                f"itself runs. The backend probe didn't respond at "
-                f"prompt-build time, so the sandbox's current user, $HOME, "
-                f"and working directory are unknown from here. If you need "
-                f"them, probe directly with a terminal call like "
-                f"`uname -a && whoami && pwd`."
-            )
-
-    if is_wsl():
-        hints.append(WSL_ENVIRONMENT_HINT)
-
-    # Embedder-supplied environment description. Lets a host that wraps Hermes
-    # (e.g. a sandbox runner / managed platform) explain the environment the
-    # agent is running in — proxy, credential handling, mount layout — without
-    # forking the identity slot (SOUL.md). Read once at prompt-build time, so
-    # it's part of the stable, cache-safe system prompt. The env var is the
-    # build-time/embedder mechanism (set in a container ENV); config.yaml
-    # ``agent.environment_hint`` is the user-facing surface. Env var wins.
-    extra = (os.getenv("HERMES_ENVIRONMENT_HINT") or "").strip()
-    if not extra:
-        try:
-            from hermes_cli.config import load_config_readonly
-
-            extra = str(
-                (load_config_readonly().get("agent", {}) or {}).get("environment_hint", "")
-            ).strip()
-        except Exception as e:
-            logger.debug("Could not read agent.environment_hint from config: %s", e)
-    if extra:
-        hints.append(extra)
-
-    return "\n\n".join(hints)
-
-
-async def build_environment_hints_async() -> str:
+async def build_environment_hints() -> str:
     """Build environment guidance without sync config or backend execution."""
     import platform
     import sys
@@ -1370,7 +1134,7 @@ async def build_environment_hints_async() -> str:
             host_lines.append(f"Host: {platform.system()} ({platform.release()})")
         host_lines.append(f"User home directory: {os.path.expanduser('~')}")
         try:
-            host_lines.append(f"Current working directory: {await resolve_agent_cwd_async()}")
+            host_lines.append(f"Current working directory: {await resolve_agent_cwd()}")
         except OSError:
             pass
         if sys.platform == "win32" and not is_wsl():
@@ -1384,7 +1148,7 @@ async def build_environment_hints_async() -> str:
         if sys.platform == "win32" and not is_wsl():
             hints.append(_WINDOWS_BASH_SHELL_HINT)
     else:
-        probe = await _probe_remote_backend_async(backend)
+        probe = await _probe_remote_backend(backend)
         if probe:
             hints.append(
                 f"Terminal backend: {backend}. Your `terminal`, `read_file`, "
@@ -1457,28 +1221,9 @@ def _dynamic_context_file_max_chars(context_length: Optional[int]) -> int:
     return max(CONTEXT_FILE_MAX_CHARS, min(budget, _CONTEXT_FILE_DYNAMIC_CEILING))
 
 
-def _get_context_file_max_chars(context_length: Optional[int] = None) -> int:
-    """Return the context-file truncation limit.
-
-    Resolution order:
-      1. Explicit ``context_file_max_chars`` in config.yaml — user knows best,
-         always wins (including over the dynamic cap).
-      2. Dynamic cap derived from the model's ``context_length`` when provided
-         (scales the budget to the window; floor 20K, ceiling 500K).
-      3. ``CONTEXT_FILE_MAX_CHARS`` (20K) as the upstream-compatible fallback.
-    """
-    try:
-        from hermes_cli.config import load_config_readonly
-
-        val = load_config_readonly().get("context_file_max_chars")
-        if isinstance(val, (int, float)) and val > 0:
-            return int(val)
-    except Exception as e:
-        logger.debug("Could not read context_file_max_chars from config: %s", e)
-    return _dynamic_context_file_max_chars(context_length)
 
 
-async def _get_context_file_max_chars_async(
+async def _get_context_file_max_chars(
     context_length: Optional[int] = None,
 ) -> int:
     """Resolve the context-file cap without synchronous config I/O."""
@@ -1500,7 +1245,7 @@ async def _get_context_file_max_chars_async(
     return _dynamic_context_file_max_chars(context_length)
 
 
-async def _get_disabled_skill_names_async(platform: str | None = None) -> set[str]:
+async def _get_disabled_skill_names(platform: str | None = None) -> set[str]:
     """Read skill disable rules without the synchronous skill-utils loader."""
     try:
         from hermes_cli.config import get_config_path
@@ -1597,144 +1342,15 @@ def clear_skills_system_prompt_cache(*, clear_snapshot: bool = False) -> None:
             logger.debug("Could not remove skills prompt snapshot: %s", e)
 
 
-def _build_skills_manifest(skills_dir: Path) -> dict[str, list[int]]:
-    """Build an mtime/size manifest of all SKILL.md and DESCRIPTION.md files.
-
-    Org mirrors (M2): only the ACTIVE org's mirror participates, and the
-    ``.active_org`` marker itself is included — so switching/leaving an org
-    invalidates the snapshot even when no SKILL.md changed.
-    """
-    manifest: dict[str, list[int]] = {}
-    skills_dir_str = str(skills_dir)
-    base = os.path.join(skills_dir_str, "")
-    prefix_len = len(base)
-    active_org = read_active_org_id(skills_dir)
-    org_root = os.path.join(skills_dir_str, ORG_MIRROR_DIR_NAME)
-    marker_path = os.path.join(org_root, ORG_ACTIVE_MARKER)
-    try:
-        st = os.stat(marker_path)
-        manifest[ORG_MIRROR_DIR_NAME + "/" + ORG_ACTIVE_MARKER] = [
-            int(st.st_mtime), int(st.st_size),
-        ]
-    except OSError:
-        pass
-    for root, dirs, files in os.walk(skills_dir_str, followlinks=True):
-        has_skill_md = "SKILL.md" in files
-        if root == skills_dir_str and ORG_MIRROR_DIR_NAME in dirs and active_org is None:
-            dirs.remove(ORG_MIRROR_DIR_NAME)
-        elif root == org_root:
-            dirs[:] = [d for d in dirs if d == active_org]
-        dirs[:] = [
-            d
-            for d in dirs
-            if d not in EXCLUDED_SKILL_DIRS
-            and not (has_skill_md and d in SKILL_SUPPORT_DIRS)
-        ]
-        for filename in ("SKILL.md", "DESCRIPTION.md"):
-            if filename not in files:
-                continue
-            path = os.path.join(root, filename)
-            try:
-                st = os.stat(path)
-            except OSError:
-                continue
-            manifest[path[prefix_len:]] = [st.st_mtime_ns, st.st_size]
-    return manifest
 
 
-def _load_skills_snapshot(skills_dir: Path) -> Optional[dict]:
-    """Load the disk snapshot if it exists and its manifest still matches."""
-    snapshot_path = _skills_prompt_snapshot_path()
-    if not snapshot_path.exists():
-        return None
-    try:
-        snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
-    except Exception:
-        return None
-    if not isinstance(snapshot, dict):
-        return None
-    if snapshot.get("version") != _SKILLS_SNAPSHOT_VERSION:
-        return None
-    if snapshot.get("manifest") != _build_skills_manifest(skills_dir):
-        return None
-    return snapshot
 
 
-def _write_skills_snapshot(
-    skills_dir: Path,
-    manifest: dict[str, list[int]],
-    skill_entries: list[dict],
-    category_descriptions: dict[str, str],
-) -> None:
-    """Persist skill metadata to disk for fast cold-start reuse."""
-    payload = {
-        "version": _SKILLS_SNAPSHOT_VERSION,
-        "manifest": manifest,
-        "skills": skill_entries,
-        "category_descriptions": category_descriptions,
-    }
-    try:
-        atomic_json_write(_skills_prompt_snapshot_path(), payload)
-    except Exception as e:
-        logger.debug("Could not write skills prompt snapshot: %s", e)
 
 
-def _build_snapshot_entry(
-    skill_file: Path,
-    skills_dir: Path,
-    frontmatter: dict,
-    description: str,
-) -> dict:
-    """Build a serialisable metadata dict for one skill."""
-    rel_path = skill_file.relative_to(skills_dir)
-    parts = rel_path.parts
-
-    # M2 org mirror: strip the `_org/<org_id>/` prefix so category/name derive
-    # from the path WITHIN the mirror (same shape the org tree was built
-    # from), and record provenance for labeling + fail-loud collisions.
-    org_id: str | None = None
-    if len(parts) >= 3 and parts[0] == ORG_MIRROR_DIR_NAME:
-        org_id = parts[1]
-        parts = parts[2:]
-
-    if len(parts) >= 2:
-        skill_name = parts[-2]
-        category = "/".join(parts[:-2]) if len(parts) > 2 else parts[0]
-    else:
-        category = "general"
-        skill_name = skill_file.parent.name
-
-    platforms = frontmatter.get("platforms") or []
-    if isinstance(platforms, str):
-        platforms = [platforms]
-
-    entry = {
-        "skill_name": skill_name,
-        "category": category,
-        "frontmatter_name": str(frontmatter.get("name", skill_name)),
-        "description": description,
-        "platforms": [str(p).strip() for p in platforms if str(p).strip()],
-        "conditions": extract_skill_conditions(frontmatter),
-    }
-    if org_id:
-        entry["org_id"] = org_id
-        # Author from the pull-time provenance sidecar (token-verified at
-        # push by the plane's author_mismatch guard). Best-effort.
-        try:
-            import json as _json
-
-            prov_path = (
-                skills_dir / ORG_MIRROR_DIR_NAME / org_id / ORG_PROVENANCE_FILE
-            )
-            prov = _json.loads(prov_path.read_text(encoding="utf-8"))
-            device = str(prov.get("author_device") or "")
-            entry["org_author"] = device or str(prov.get("author_user_id") or "")
-        except Exception:
-            entry["org_author"] = ""
-    return entry
 
 
-async def _iter_skill_index_files_async(skills_dir: Path, filename: str):
+async def _iter_skill_index_files(skills_dir: Path, filename: str):
     """Yield skill index files without blocking the conversation loop."""
     # Keep one directory-walking policy for both the model-facing skill tool
     # and prompt discovery.  The import is lazy to avoid making prompt
@@ -1745,11 +1361,11 @@ async def _iter_skill_index_files_async(skills_dir: Path, filename: str):
         yield path
 
 
-async def _build_skills_manifest_async(skills_dir: Path) -> dict[str, list[int]]:
+async def _build_skills_manifest(skills_dir: Path) -> dict[str, list[int]]:
     """Build the prompt snapshot manifest with async stat/scandir calls."""
     manifest: dict[str, list[int]] = {}
     for filename in ("SKILL.md", "DESCRIPTION.md"):
-        async for path in _iter_skill_index_files_async(skills_dir, filename):
+        async for path in _iter_skill_index_files(skills_dir, filename):
             try:
                 stat_result = await aiofiles.os.stat(path)
             except OSError:
@@ -1768,7 +1384,7 @@ async def _build_skills_manifest_async(skills_dir: Path) -> dict[str, list[int]]
     return manifest
 
 
-async def _load_skills_snapshot_async(skills_dir: Path) -> Optional[dict]:
+async def _load_skills_snapshot(skills_dir: Path) -> Optional[dict]:
     """Load a valid skills snapshot without synchronous file I/O."""
     snapshot_path = _skills_prompt_snapshot_path()
     try:
@@ -1780,12 +1396,12 @@ async def _load_skills_snapshot_async(skills_dir: Path) -> Optional[dict]:
         return None
     if snapshot.get("version") != _SKILLS_SNAPSHOT_VERSION:
         return None
-    if snapshot.get("manifest") != await _build_skills_manifest_async(skills_dir):
+    if snapshot.get("manifest") != await _build_skills_manifest(skills_dir):
         return None
     return snapshot
 
 
-async def _write_skills_snapshot_async(
+async def _write_skills_snapshot(
     skills_dir: Path,
     manifest: dict[str, list[int]],
     skill_entries: list[dict],
@@ -1815,7 +1431,7 @@ async def _write_skills_snapshot_async(
             pass
 
 
-async def _parse_skill_file_async(skill_file: Path) -> tuple[bool, dict, str]:
+async def _parse_skill_file(skill_file: Path) -> tuple[bool, dict, str]:
     """Read and parse one skill file without blocking the event loop."""
     try:
         async with aiofiles.open(skill_file, encoding="utf-8") as handle:
@@ -1833,7 +1449,7 @@ async def _parse_skill_file_async(skill_file: Path) -> tuple[bool, dict, str]:
         return True, {}, ""
 
 
-async def _build_snapshot_entry_async(
+async def _build_snapshot_entry(
     skill_file: Path,
     skills_dir: Path,
     frontmatter: dict,
@@ -1880,30 +1496,6 @@ async def _build_snapshot_entry_async(
 # Skills index
 # =========================================================================
 
-def _parse_skill_file(skill_file: Path) -> tuple[bool, dict, str]:
-    """Read a SKILL.md once and return platform compatibility, frontmatter, and description.
-
-    Returns (is_compatible, frontmatter, description). On any error, returns
-    (True, {}, "") to err on the side of showing the skill.
-    """
-    try:
-        raw = skill_file.read_text(encoding="utf-8")
-        frontmatter, _ = parse_frontmatter(raw)
-
-        if not skill_matches_platform(frontmatter):
-            return False, frontmatter, ""
-
-        # Environment relevance gate (offer-time only): hide skills tagged for
-        # a runtime environment that isn't active (e.g. kanban-only skills for
-        # non-kanban users, s6-only skills outside the container). Explicit
-        # loads (skill_view / --skills) bypass this — see skill_matches_environment.
-        if not skill_matches_environment(frontmatter):
-            return False, frontmatter, ""
-
-        return True, frontmatter, extract_skill_description(frontmatter)
-    except Exception as e:
-        logger.warning("Failed to parse skill file %s: %s", skill_file, e)
-        return True, {}, ""
 
 
 def _skill_should_show(
@@ -1993,7 +1585,7 @@ async def build_skills_system_prompt(
     # Include the resolved platform so per-platform disabled-skill lists
     # produce distinct cache entries (gateway serves multiple platforms).
     _platform_hint = _current_session_platform_hint()
-    disabled = await _get_disabled_skill_names_async(_platform_hint or None)
+    disabled = await _get_disabled_skill_names(_platform_hint or None)
     cache_key = (
         str(skills_dir),
         tuple(str(d) for d in external_dirs),
@@ -2010,7 +1602,7 @@ async def build_skills_system_prompt(
             return cached
 
     # ── Layer 2: disk snapshot ────────────────────────────────────────
-    snapshot = await _load_skills_snapshot_async(skills_dir)
+    snapshot = await _load_skills_snapshot(skills_dir)
 
     skills_by_category: dict[str, list[tuple[str, str]]] = {}
     category_descriptions: dict[str, str] = {}
@@ -2044,9 +1636,9 @@ async def build_skills_system_prompt(
         }
     else:
         # Cold path: full filesystem scan + write snapshot for next time
-        async for skill_file in _iter_skill_index_files_async(skills_dir, "SKILL.md"):
-            is_compatible, frontmatter, desc = await _parse_skill_file_async(skill_file)
-            entry = await _build_snapshot_entry_async(skill_file, skills_dir, frontmatter, desc)
+        async for skill_file in _iter_skill_index_files(skills_dir, "SKILL.md"):
+            is_compatible, frontmatter, desc = await _parse_skill_file(skill_file)
+            entry = await _build_snapshot_entry(skill_file, skills_dir, frontmatter, desc)
             skill_entries.append(entry)
             if not is_compatible:
                 continue
@@ -2092,7 +1684,7 @@ async def build_skills_system_prompt(
     if snapshot is None:
         # (continuation of the cold path below: category descriptions + write)
         # Read category-level DESCRIPTION.md files
-        async for desc_file in _iter_skill_index_files_async(skills_dir, "DESCRIPTION.md"):
+        async for desc_file in _iter_skill_index_files(skills_dir, "DESCRIPTION.md"):
             try:
                 async with aiofiles.open(desc_file, encoding="utf-8") as handle:
                     content = await handle.read()
@@ -2106,9 +1698,9 @@ async def build_skills_system_prompt(
             except Exception as e:
                 logger.debug("Could not read skill description %s: %s", desc_file, e)
 
-        await _write_skills_snapshot_async(
+        await _write_skills_snapshot(
             skills_dir,
-            await _build_skills_manifest_async(skills_dir),
+            await _build_skills_manifest(skills_dir),
             skill_entries,
             category_descriptions,
         )
@@ -2125,12 +1717,12 @@ async def build_skills_system_prompt(
     for ext_dir in external_dirs:
         if not await aiofiles.os.path.isdir(ext_dir):
             continue
-        async for skill_file in _iter_skill_index_files_async(ext_dir, "SKILL.md"):
+        async for skill_file in _iter_skill_index_files(ext_dir, "SKILL.md"):
             try:
-                is_compatible, frontmatter, desc = await _parse_skill_file_async(skill_file)
+                is_compatible, frontmatter, desc = await _parse_skill_file(skill_file)
                 if not is_compatible:
                     continue
-                entry = await _build_snapshot_entry_async(skill_file, ext_dir, frontmatter, desc)
+                entry = await _build_snapshot_entry(skill_file, ext_dir, frontmatter, desc)
                 skill_name = entry["skill_name"]
                 frontmatter_name = entry["frontmatter_name"]
                 if frontmatter_name in seen_skill_names:
@@ -2151,7 +1743,7 @@ async def build_skills_system_prompt(
                 logger.debug("Error reading external skill %s: %s", skill_file, e)
 
         # External category descriptions
-        async for desc_file in _iter_skill_index_files_async(ext_dir, "DESCRIPTION.md"):
+        async for desc_file in _iter_skill_index_files(ext_dir, "DESCRIPTION.md"):
             try:
                 async with aiofiles.open(desc_file, encoding="utf-8") as handle:
                     content = await handle.read()
@@ -2271,7 +1863,7 @@ def _truncate_content(
     cap scale to the model's window when no explicit config override is set.
     """
     if max_chars is None:
-        max_chars = _get_context_file_max_chars(context_length)
+        max_chars = _dynamic_context_file_max_chars(context_length)
     if len(content) <= max_chars:
         return content
     target = read_path or filename
@@ -2311,7 +1903,7 @@ async def load_soul_md(context_length: Optional[int] = None) -> Optional[str]:
             content = (await handle.read()).strip()
         if not content:
             return None
-        max_chars = await _get_context_file_max_chars_async(context_length)
+        max_chars = await _get_context_file_max_chars(context_length)
         content = _scan_context_content(content, "SOUL.md")
         content = _truncate_content(
             content, "SOUL.md", max_chars=max_chars, context_length=context_length,
@@ -2484,7 +2076,7 @@ async def build_context_files_prompt(
 
     cwd_path = Path(cwd).absolute()
     sections = []
-    max_chars = await _get_context_file_max_chars_async(context_length)
+    max_chars = await _get_context_file_max_chars(context_length)
 
     # Never let a FALLBACK-picked directory inside the Hermes install/source
     # tree gain system-prompt authority. A backend that self-spawns into that

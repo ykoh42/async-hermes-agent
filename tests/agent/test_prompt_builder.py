@@ -117,7 +117,7 @@ class TestTruncateContent:
         monkeypatch.setattr("hermes_cli.config.load_config", fake_load_config)
         monkeypatch.setattr("hermes_cli.config.load_config_readonly", fake_load_config)
 
-        _truncate_content("x" * 180, "warning.md")
+        _truncate_content("x" * 180, "warning.md", max_chars=120)
 
         warnings = drain_truncation_warnings()
         assert len(warnings) == 1
@@ -138,7 +138,7 @@ class TestTruncateContent:
         # Generate a warning in a fresh child context, then assert it did NOT
         # leak into the parent context's accumulator.
         def _child():
-            _truncate_content("x" * 180, "child.md")
+            _truncate_content("x" * 180, "child.md", max_chars=120)
             # Inside the child context, the warning is visible & drainable.
             assert any("child.md" in w for w in drain_truncation_warnings())
 
@@ -148,7 +148,7 @@ class TestTruncateContent:
         assert drain_truncation_warnings() == []
 
         # And a warning raised in the parent stays in the parent.
-        _truncate_content("y" * 180, "parent.md")
+        _truncate_content("y" * 180, "parent.md", max_chars=120)
         parent_warnings = drain_truncation_warnings()
         assert len(parent_warnings) == 1
         assert "parent.md" in parent_warnings[0]
@@ -175,17 +175,12 @@ class TestDynamicContextFileCap:
 
 
 
-    def test_explicit_config_beats_dynamic(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_explicit_config_beats_dynamic(self, monkeypatch, tmp_path):
         # An explicit value always wins, even when a big window is available.
-        monkeypatch.setattr(
-            "hermes_cli.config.load_config",
-            lambda: {"context_file_max_chars": 1_000},
-        )
-        monkeypatch.setattr(
-            "hermes_cli.config.load_config_readonly",
-            lambda: {"context_file_max_chars": 1_000},
-        )
-        assert _get_context_file_max_chars(200_000) == 1_000
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        (tmp_path / "config.yaml").write_text("context_file_max_chars: 1000\n")
+        assert await _get_context_file_max_chars(200_000) == 1_000
 
     def test_large_window_avoids_truncation_of_midsize_doc(self):
         # A 30K-char AGENTS.md is truncated at the flat default but survives
@@ -205,36 +200,39 @@ class TestDynamicContextFileCap:
 
 
 class TestParseSkillFile:
-    def test_reads_frontmatter_description(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_reads_frontmatter_description(self, tmp_path):
         skill_file = tmp_path / "SKILL.md"
         skill_file.write_text(
             "---\nname: test-skill\ndescription: A useful test skill\n---\n\nBody here"
         )
-        is_compat, frontmatter, desc = _parse_skill_file(skill_file)
+        is_compat, frontmatter, desc = await _parse_skill_file(skill_file)
         assert is_compat is True
         assert frontmatter.get("name") == "test-skill"
         assert desc == "A useful test skill"
 
 
-    def test_long_description_truncated(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_long_description_truncated(self, tmp_path):
         skill_file = tmp_path / "SKILL.md"
         long_desc = "A" * 100
         skill_file.write_text(f"---\ndescription: {long_desc}\n---\n")
-        _, _, desc = _parse_skill_file(skill_file)
+        _, _, desc = await _parse_skill_file(skill_file)
         assert len(desc) <= 60
         assert desc.endswith("...")
 
 
-    def test_logs_parse_failures_and_returns_defaults(self, tmp_path, monkeypatch, caplog):
+    @pytest.mark.asyncio
+    async def test_logs_parse_failures_and_returns_defaults(self, tmp_path, monkeypatch, caplog):
         skill_file = tmp_path / "SKILL.md"
         skill_file.write_text("---\nname: broken\n---\n")
 
         def boom(*args, **kwargs):
             raise OSError("read exploded")
 
-        monkeypatch.setattr(type(skill_file), "read_text", boom)
+        monkeypatch.setattr("aiofiles.open", boom)
         with caplog.at_level(logging.DEBUG, logger="agent.prompt_builder"):
-            is_compat, frontmatter, desc = _parse_skill_file(skill_file)
+            is_compat, frontmatter, desc = await _parse_skill_file(skill_file)
 
         assert is_compat is True
         assert frontmatter == {}
@@ -338,7 +336,7 @@ class TestBuildSkillsSystemPrompt:
         from unittest.mock import patch
 
         with patch(
-            "agent.prompt_builder._get_disabled_skill_names_async",
+            "agent.prompt_builder._get_disabled_skill_names",
             return_value={"old-tool"},
         ):
             result = await build_skills_system_prompt()
@@ -623,7 +621,8 @@ class TestEnvironmentHints:
 
 
 
-    def test_build_environment_hints_suppresses_host_on_docker_backend(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_build_environment_hints_suppresses_host_on_docker_backend(self, monkeypatch):
         """Docker/remote backends must hide host info — the agent can only touch the backend."""
         import agent.prompt_builder as _pb
         import sys
@@ -632,9 +631,12 @@ class TestEnvironmentHints:
         monkeypatch.setenv("TERMINAL_ENV", "docker")
         # Force the probe to fail so we exercise the static fallback path
         # deterministically (the live probe would try to spin up docker).
-        monkeypatch.setattr(_pb, "_probe_remote_backend", lambda _t: None)
+        async def no_probe(_backend):
+            return None
+
+        monkeypatch.setattr(_pb, "_probe_remote_backend", no_probe)
         _pb._clear_backend_probe_cache()
-        result = _pb.build_environment_hints()
+        result = await _pb.build_environment_hints()
         # Host suppression: none of the local-backend lines should appear.
         assert "Host: Windows" not in result
         assert "User home directory:" not in result
@@ -643,7 +645,8 @@ class TestEnvironmentHints:
         assert "Terminal backend: docker" in result
         assert "inside" in result.lower()
 
-    def test_build_environment_hints_uses_terminal_cwd_over_launch_dir(self, monkeypatch, tmp_path):
+    @pytest.mark.asyncio
+    async def test_build_environment_hints_uses_terminal_cwd_over_launch_dir(self, monkeypatch, tmp_path):
         """THE BUG: gateway/cron set TERMINAL_CWD but the prompt emitted os.getcwd()
         (the daemon launch dir). Regression for #24882/#24969/#27383/#29265."""
         import agent.prompt_builder as _pb
@@ -654,9 +657,10 @@ class TestEnvironmentHints:
         monkeypatch.setenv("TERMINAL_CWD", str(configured))
         monkeypatch.chdir(tmp_path)
         _pb._clear_backend_probe_cache()
-        assert f"Current working directory: {configured}" in _pb.build_environment_hints()
+        assert f"Current working directory: {configured}" in await _pb.build_environment_hints()
 
-    def test_build_environment_hints_falls_back_to_launch_dir(self, monkeypatch, tmp_path):
+    @pytest.mark.asyncio
+    async def test_build_environment_hints_falls_back_to_launch_dir(self, monkeypatch, tmp_path):
         """The #19242 local-CLI contract: no TERMINAL_CWD → the launch dir."""
         import agent.prompt_builder as _pb
         monkeypatch.setattr(_pb, "is_wsl", lambda: False)
@@ -664,10 +668,11 @@ class TestEnvironmentHints:
         monkeypatch.delenv("TERMINAL_CWD", raising=False)
         monkeypatch.chdir(tmp_path)
         _pb._clear_backend_probe_cache()
-        assert f"Current working directory: {tmp_path}" in _pb.build_environment_hints()
+        assert f"Current working directory: {tmp_path}" in await _pb.build_environment_hints()
 
 
-    def test_probe_remote_backend_imports_real_factory(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_probe_remote_backend_imports_real_factory(self, monkeypatch):
         """Regression for #53667: the probe imported a nonexistent
         ``get_environment`` from ``tools.environments`` and always died with
         ``ImportError: cannot import name 'get_environment'`` (cosmetic — it
@@ -681,7 +686,7 @@ class TestEnvironmentHints:
         _pb._clear_backend_probe_cache()
 
         class _FakeEnv:
-            def execute(self, cmd, timeout=None):
+            async def aexecute(self, cmd, timeout=None):
                 return {
                     "returncode": 0,
                     "output": (
@@ -701,21 +706,22 @@ class TestEnvironmentHints:
         import tools.terminal_tool as _tt
         monkeypatch.setattr(_tt, "_create_environment", _fake_create_environment)
 
-        line = _pb._probe_remote_backend("docker")
+        line = await _pb._probe_remote_backend("docker")
         assert created.get("env_type") == "docker"
         assert line is not None
         assert "Linux 6.8.0" in line
         assert "root" in line
 
 
-    def test_environment_hint_from_env_var_is_appended(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_environment_hint_from_env_var_is_appended(self, monkeypatch):
         """HERMES_ENVIRONMENT_HINT lets an embedder describe the runtime env."""
         import agent.prompt_builder as _pb
         monkeypatch.setattr(_pb, "is_wsl", lambda: False)
         monkeypatch.delenv("TERMINAL_ENV", raising=False)
         monkeypatch.setenv("HERMES_ENVIRONMENT_HINT", "Running inside an OpenShell sandbox.")
         _pb._clear_backend_probe_cache()
-        result = _pb.build_environment_hints()
+        result = await _pb.build_environment_hints()
         assert "Running inside an OpenShell sandbox." in result
         # The factual host block must still come first.
         assert result.index("Host:") < result.index("OpenShell")

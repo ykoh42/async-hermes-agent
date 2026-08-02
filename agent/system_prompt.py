@@ -49,7 +49,7 @@ from agent.prompt_builder import (
     TOOL_USE_ENFORCEMENT_MODELS,
     drain_truncation_warnings,
 )
-from agent.runtime_cwd import resolve_context_cwd_async
+from agent.runtime_cwd import resolve_context_cwd
 from hermes_constants import get_hermes_home
 from utils import is_truthy_value
 
@@ -172,7 +172,7 @@ async def build_system_prompt_parts(agent: Any, system_message: Optional[str] = 
     # patch ``run_agent.get_toolset_for_tool`` and similar helpers, so
     # we resolve through ``_ra()`` to honor those patches.
     _r = _ra()
-    _context_cwd = await resolve_context_cwd_async()
+    _context_cwd = await resolve_context_cwd()
     _coding_config: Optional[dict] = None
 
     # Resolve the model's context window once so context-file caps can scale
@@ -311,13 +311,13 @@ async def build_system_prompt_parts(agent: Any, system_message: Optional[str] = 
         # default coding posture leaves the index untouched.
         _compact_cats = frozenset()
         try:
-            from agent.coding_context import coding_compact_skill_categories_async
+            from agent.coding_context import coding_compact_skill_categories
 
             if _coding_config is None:
                 from hermes_cli.config import load_config_readonly_async
 
                 _coding_config = await load_config_readonly_async()
-            _compact_cats = await coding_compact_skill_categories_async(
+            _compact_cats = await coding_compact_skill_categories(
                 platform=agent.platform, cwd=_context_cwd, config=_coding_config
             )
         except Exception:
@@ -349,7 +349,7 @@ async def build_system_prompt_parts(agent: Any, system_message: Optional[str] = 
     # Environment hints (WSL, Termux, etc.) — tell the agent about the
     # execution environment so it can translate paths and adapt behavior.
     # Stable for the lifetime of the process.
-    _env_hints = await _r.build_environment_hints_async()
+    _env_hints = await _r.build_environment_hints()
     if _env_hints:
         stable_parts.append(_env_hints)
 
@@ -362,13 +362,13 @@ async def build_system_prompt_parts(agent: Any, system_message: Optional[str] = 
     coding_trailing_parts: List[str] = []
     if agent.valid_tool_names:
         try:
-            from agent.coding_context import coding_system_prompt_parts_async
+            from agent.coding_context import coding_system_prompt_parts
 
             if _coding_config is None:
                 from hermes_cli.config import load_config_readonly_async
 
                 _coding_config = await load_config_readonly_async()
-            coding_prefix_parts, coding_workspace_parts, coding_trailing_parts = await coding_system_prompt_parts_async(
+            coding_prefix_parts, coding_workspace_parts, coding_trailing_parts = await coding_system_prompt_parts(
                 platform=agent.platform,
                 cwd=_context_cwd,
                 config=_coding_config,
