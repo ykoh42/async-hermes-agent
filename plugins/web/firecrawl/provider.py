@@ -166,44 +166,26 @@ def _has_direct_firecrawl_config() -> bool:
 
 
 def check_firecrawl_api_key() -> bool:
-    """Return True when Firecrawl backend (direct or gateway) is usable.
+    """Return True when a direct or self-hosted Firecrawl backend is usable.
 
     Re-exported by :mod:`tools.web_tools` for backward compatibility with
     existing tests and the ``hermes tools`` setup flow.
     """
-    return _has_direct_firecrawl_config() or _is_tool_gateway_ready()
+    return _has_direct_firecrawl_config()
 
 
 def _firecrawl_backend_help_suffix() -> str:
-    """Return optional managed-gateway guidance for Firecrawl help text."""
-    import tools.web_tools as _wt
-
-    if not _wt.managed_nous_tools_enabled():
-        return ""
-    return (
-        ", or use the Nous Tool Gateway via your subscription "
-        "(FIRECRAWL_GATEWAY_URL or TOOL_GATEWAY_DOMAIN)"
-    )
+    """Return no suffix; managed Firecrawl gateways are not shipped."""
+    return ""
 
 
 def _raise_web_backend_configuration_error() -> None:
     """Raise a clear error for unsupported web backend configuration."""
-    import tools.web_tools as _wt
-
     message = (
         "Web tools are not configured. "
         "Set FIRECRAWL_API_KEY for cloud Firecrawl or set FIRECRAWL_API_URL "
         "for a self-hosted Firecrawl instance."
     )
-    if _wt.managed_nous_tools_enabled():
-        message += (
-            " With your Nous subscription you can also use the Tool Gateway. "
-            "run `hermes tools` and select Nous Subscription as the web provider."
-        )
-    else:
-        message += " " + _wt.nous_tool_gateway_unavailable_message(
-            "managed Firecrawl web tools",
-        )
     raise ValueError(message)
 
 
@@ -228,7 +210,7 @@ def _get_firecrawl_client() -> Any:
     import tools.web_tools as _wt
 
     direct_config = _get_direct_firecrawl_config()
-    if direct_config is not None and not _wt.prefers_gateway("web"):
+    if direct_config is not None:
         kwargs, client_config = direct_config
     else:
         managed_gateway = _wt.resolve_managed_tool_gateway(
@@ -374,7 +356,7 @@ class FirecrawlWebSearchProvider(WebSearchProvider):
         import tools.web_tools as _wt
 
         direct_config = _get_direct_firecrawl_config()
-        if direct_config is not None and not _wt.prefers_gateway("web"):
+        if direct_config is not None:
             kwargs, _ = direct_config
             return (
                 (kwargs.get("api_url") or "https://api.firecrawl.dev/v1").rstrip("/"),

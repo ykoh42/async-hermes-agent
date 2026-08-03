@@ -9,7 +9,6 @@ Coverage:
 
 import json
 import os
-import asyncio
 import pytest
 from unittest.mock import patch, MagicMock
 
@@ -21,33 +20,37 @@ from tests.tools.conftest import register_all_web_providers
 class TestTavilyRequest:
     """Test suite for the _tavily_request helper."""
 
-    def test_raises_without_api_key(self):
+    @pytest.mark.asyncio
+    async def test_raises_without_api_key(self):
         """No TAVILY_API_KEY → ValueError with guidance."""
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("TAVILY_API_KEY", None)
             from tools.web_tools import _tavily_request
             with pytest.raises(ValueError, match="TAVILY_API_KEY"):
-                _tavily_request("search", {"query": "test"})
+                await _tavily_request("search", {"query": "test"})
 
-    def test_posts_with_api_key_in_body(self):
+    @pytest.mark.asyncio
+    async def test_posts_with_api_key_in_body(self):
         """api_key is injected into the JSON payload."""
         mock_response = MagicMock()
         mock_response.json.return_value = {"results": []}
         mock_response.raise_for_status = MagicMock()
 
         with patch.dict(os.environ, {"TAVILY_API_KEY": "tvly-test-key"}):
-            with patch("tools.web_tools.httpx.post", return_value=mock_response) as mock_post:
+            client = AsyncClientStub(mock_response)
+            with patch("httpx.AsyncClient", return_value=client):
                 from tools.web_tools import _tavily_request
-                result = _tavily_request("search", {"query": "hello"})
+                result = await _tavily_request("search", {"query": "hello"})
 
-                mock_post.assert_called_once()
-                call_kwargs = mock_post.call_args
-                payload = call_kwargs.kwargs.get("json") or call_kwargs[1].get("json")
+                assert len(client.calls) == 1
+                call_args, call_kwargs = client.calls[0]
+                payload = call_kwargs["json"]
                 assert payload["api_key"] == "tvly-test-key"
                 assert payload["query"] == "hello"
-                assert "api.tavily.com/search" in call_kwargs.args[0]
+                assert "api.tavily.com/search" in call_args[0]
 
-    def test_raises_on_http_error(self):
+    @pytest.mark.asyncio
+    async def test_raises_on_http_error(self):
         """Non-2xx responses propagate as httpx.HTTPStatusError."""
         import httpx as _httpx
         mock_response = MagicMock()
@@ -56,10 +59,10 @@ class TestTavilyRequest:
         )
 
         with patch.dict(os.environ, {"TAVILY_API_KEY": "tvly-bad-key"}):
-            with patch("tools.web_tools.httpx.post", return_value=mock_response):
+            with patch("httpx.AsyncClient", return_value=AsyncClientStub(mock_response)):
                 from tools.web_tools import _tavily_request
                 with pytest.raises(_httpx.HTTPStatusError):
-                    _tavily_request("search", {"query": "test"})
+                    await _tavily_request("search", {"query": "test"})
 
 
 # ─── _normalize_tavily_search_results ─────────────────────────────────────────
@@ -139,7 +142,8 @@ class TestWebSearchTavily:
         from agent.web_search_registry import _reset_for_tests
         _reset_for_tests()
 
-    def test_search_dispatches_to_tavily(self):
+    @pytest.mark.asyncio
+    async def test_search_dispatches_to_tavily(self):
         mock_response = MagicMock()
         mock_response.json.return_value = {
             "results": [{"title": "Result", "url": "https://r.com", "content": "desc", "score": 0.9}]
@@ -148,10 +152,10 @@ class TestWebSearchTavily:
 
         with patch("tools.web_tools._get_backend", return_value="tavily"), \
              patch.dict(os.environ, {"TAVILY_API_KEY": "tvly-test"}), \
-             patch("tools.web_tools.httpx.post", return_value=mock_response), \
+             patch("httpx.AsyncClient", return_value=AsyncClientStub(mock_response)), \
              patch("tools.interrupt.is_interrupted", return_value=False):
             from tools.web_tools import web_search_tool
-            result = json.loads(web_search_tool("test query", limit=3))
+            result = json.loads(await web_search_tool("test query", limit=3))
             assert result["success"] is True
             assert len(result["data"]["web"]) == 1
             assert result["data"]["web"][0]["title"] == "Result"
@@ -171,7 +175,8 @@ class TestWebExtractTavily:
         from agent.web_search_registry import _reset_for_tests
         _reset_for_tests()
 
-    def test_extract_dispatches_to_tavily(self):
+    @pytest.mark.asyncio
+    async def test_extract_dispatches_to_tavily(self):
         mock_response = MagicMock()
         mock_response.json.return_value = {
             "results": [{"url": "https://example.com", "raw_content": "Extracted content", "title": "Page"}]
@@ -180,13 +185,26 @@ class TestWebExtractTavily:
 
         with patch("tools.web_tools._get_backend", return_value="tavily"), \
              patch.dict(os.environ, {"TAVILY_API_KEY": "tvly-test"}), \
-             patch("tools.web_tools.httpx.post", return_value=mock_response):
+             patch("httpx.AsyncClient", return_value=AsyncClientStub(mock_response)):
             from tools.web_tools import web_extract_tool
-            result = json.loads(asyncio.get_event_loop().run_until_complete(
-                web_extract_tool(["https://example.com"])
-            ))
+            result = json.loads(await web_extract_tool(["https://example.com"]))
             assert "results" in result
             assert len(result["results"]) == 1
             assert result["results"][0]["url"] == "https://example.com"
             assert "Extracted content" in result["results"][0]["content"]
 
+
+class AsyncClientStub:
+    def __init__(self, response):
+        self.response = response
+        self.calls = []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_exc):
+        return False
+
+    async def post(self, *args, **kwargs):
+        self.calls.append((args, kwargs))
+        return self.response

@@ -6,7 +6,7 @@ capabilities advertised:
 - ``supports_search()``  -> True (Tavily ``/search``)
 - ``supports_extract()`` -> True (Tavily ``/extract``)
 
-Both are sync — the underlying call is ``httpx.post(...)``.
+Both use the native async ``httpx.AsyncClient`` transport.
 
 Config keys this provider responds to::
 
@@ -179,7 +179,7 @@ class TavilyWebSearchProvider(WebSearchProvider):
     async def extract(self, urls: List[str], **kwargs: Any) -> List[Dict[str, Any]]:
         """Extract content from one or more URLs via Tavily.
 
-        Sync — the underlying call is httpx.post(...). Returns the legacy
+        Uses native async HTTP and returns the legacy
         list-of-results shape; per-URL failures become items with ``error``.
         """
         try:

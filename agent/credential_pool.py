@@ -1024,12 +1024,70 @@ class CredentialPool:
                 await self._persist()
             return None
 
-        if self.provider != "anthropic":
+        if self.provider not in {"anthropic", "xai-oauth"}:
             raise AsyncCapabilityError(
                 f"Credential pool OAuth refresh for {self.provider} is not native async yet."
             )
 
         try:
+            if self.provider == "xai-oauth":
+                import httpx
+
+                async with httpx.AsyncClient(timeout=20) as client:
+                    discovery_response = await client.get(
+                        auth_mod.XAI_OAUTH_DISCOVERY_URL,
+                        headers={"Accept": "application/json"},
+                    )
+                    discovery_response.raise_for_status()
+                    discovery = discovery_response.json()
+                    token_endpoint = str(
+                        discovery.get("token_endpoint", "")
+                        if isinstance(discovery, dict)
+                        else ""
+                    ).strip()
+                    auth_mod._xai_validate_oauth_endpoint(
+                        token_endpoint,
+                        field="token_endpoint",
+                    )
+                    response = await client.post(
+                        token_endpoint,
+                        headers={
+                            "Accept": "application/json",
+                            "Content-Type": "application/x-www-form-urlencoded",
+                        },
+                        data={
+                            "grant_type": "refresh_token",
+                            "client_id": auth_mod.XAI_OAUTH_CLIENT_ID,
+                            "refresh_token": entry.refresh_token,
+                        },
+                    )
+                    response.raise_for_status()
+                    payload = response.json()
+                access_token = str(
+                    payload.get("access_token", "")
+                    if isinstance(payload, dict)
+                    else ""
+                ).strip()
+                if not access_token:
+                    raise ValueError("xAI OAuth refresh response omitted access_token")
+                updated = replace(
+                    entry,
+                    access_token=access_token,
+                    refresh_token=str(
+                        payload.get("refresh_token") or entry.refresh_token
+                    ).strip(),
+                    last_refresh=datetime.now(timezone.utc).isoformat(),
+                    last_status=STATUS_OK,
+                    last_status_at=None,
+                    last_error_code=None,
+                    last_error_reason=None,
+                    last_error_message=None,
+                    last_error_reset_at=None,
+                )
+                self._replace_entry(entry, updated)
+                await self._persist()
+                return updated
+
             from agent.anthropic_adapter import (
                 _write_claude_code_credentials,
                 refresh_anthropic_oauth_pure,

@@ -92,11 +92,6 @@ from tools.managed_tool_gateway import (  # noqa: F401 — backward-compat names
     read_nous_access_token as _read_nous_access_token,
     resolve_managed_tool_gateway,
 )
-from tools.tool_backend_helpers import (  # noqa: F401
-    managed_nous_tools_enabled,
-    nous_tool_gateway_unavailable_message,
-    prefers_gateway,
-)
 from tools.url_safety import is_safe_url, normalize_url_for_request, sensitive_query_param_name
 import sys
 
@@ -341,7 +336,7 @@ def _is_backend_available(backend: str) -> bool:
         return _ddgs_package_importable()
     if backend == "xai":
         # Cheap probe — env var OR auth.json has OAuth tokens. Must not
-        # call resolve_xai_http_credentials() here because the OAuth path
+        # await resolve_xai_http_credentials() here because the OAuth path
         # can trigger a network token refresh, and _is_backend_available
         # runs on every web_search dispatch + every `hermes tools` repaint.
         try:

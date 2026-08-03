@@ -24,7 +24,7 @@ Optional knobs (under ``web.xai`` in ``config.yaml``)::
         excluded_domains: ["bad.com"] # max 5 — mutually exclusive with allowed_domains
         timeout: 90                   # seconds (default 90)
 
-Auth: reuses :func:`tools.xai_http.resolve_xai_http_credentials_async`, which
+Auth: reuses :func:`tools.xai_http.resolve_xai_http_credentials`, which
 prefers Hermes-managed xAI Grok OAuth (via ``hermes auth``) and falls back
 to ``XAI_API_KEY`` (resolved through ``~/.hermes/.env``, then
 ``os.environ``).
@@ -41,7 +41,7 @@ from agent.web_search_provider import WebSearchProvider
 from tools.xai_http import (
     has_xai_credentials,
     hermes_xai_user_agent,
-    resolve_xai_http_credentials_async,
+    resolve_xai_http_credentials,
 )
 
 logger = logging.getLogger(__name__)
@@ -129,7 +129,7 @@ class XAIWebSearchProvider(WebSearchProvider):
         """Cheap availability probe — env var OR auth-store has OAuth tokens.
 
         Delegates to :func:`tools.xai_http.has_xai_credentials`, which is
-        deliberately *not* the same as :func:`resolve_xai_http_credentials`:
+        deliberately does not await :func:`resolve_xai_http_credentials`:
         it never triggers OAuth token refresh or acquires the auth-store
         lock. The ABC contract requires this method to be safe to call on
         every ``hermes tools`` repaint and at tool-registration time.
@@ -159,7 +159,7 @@ class XAIWebSearchProvider(WebSearchProvider):
         except Exception:  # noqa: BLE001 — interrupt module is best-effort
             pass
 
-        creds = await resolve_xai_http_credentials_async()
+        creds = await resolve_xai_http_credentials()
         api_key = str(creds.get("api_key") or "").strip()
         base_url = str(creds.get("base_url") or "https://api.x.ai/v1").strip().rstrip("/")
         if not api_key:
@@ -270,7 +270,7 @@ class XAIWebSearchProvider(WebSearchProvider):
                             "refresh and retrying once.",
                         )
                         try:
-                            refreshed = await resolve_xai_http_credentials_async(
+                            refreshed = await resolve_xai_http_credentials(
                                 force_refresh=True,
                                 api_key_hint=api_key,
                             )

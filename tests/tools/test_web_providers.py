@@ -130,7 +130,8 @@ class TestDefaultConfig:
 class TestWebSearchUsesSearchBackend:
     """web_search_tool dispatches through _get_search_backend not _get_backend."""
 
-    def test_search_tool_calls_search_backend(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_search_tool_calls_search_backend(self, monkeypatch):
         from tools import web_tools
 
         called_with = []
@@ -148,7 +149,7 @@ class TestWebSearchUsesSearchBackend:
         # The function will fail at Firecrawl client level but we just
         # need to verify _get_search_backend was called
         try:
-            web_tools.web_search_tool("test", 1)
+            await web_tools.web_search_tool("test", 1)
         except Exception:
             pass
 
@@ -190,7 +191,8 @@ class TestUnconfiguredErrorEnvelopeParity:
         ):
             monkeypatch.delenv(k, raising=False)
 
-    def test_unconfigured_search_emits_top_level_error(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_unconfigured_search_emits_top_level_error(self, monkeypatch):
         """``web_search_tool`` with no creds returns ``{"error": "Error searching web: ..."}``
         — matching main's ``tool_error()`` envelope, not a per-result shape.
         """
@@ -203,10 +205,11 @@ class TestUnconfiguredErrorEnvelopeParity:
         monkeypatch.setattr(web_tools, "_ddgs_package_importable", lambda: False)
         monkeypatch.setattr(web_tools, "_load_web_config", lambda: {})
 
-        result = json.loads(web_tools.web_search_tool("hello world", limit=3))
+        result = json.loads(
+            await web_tools.web_search_tool("hello world", limit=3)
+        )
         assert "error" in result, f"expected top-level 'error' key, got {result}"
-        # ``Error searching web:`` prefix comes from web_tools' top-level except handler
-        assert "Error searching web:" in result["error"]
+        assert "Web tools are not configured" in result["error"]
         assert "FIRECRAWL_API_KEY" in result["error"]
         # No per-result burying
         assert "results" not in result
@@ -246,7 +249,8 @@ class TestDispatchersTriggerPluginDiscovery:
 
         return _restore
 
-    def test_web_extract_tool_runs_discovery_before_registry_lookup(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_web_extract_tool_runs_discovery_before_registry_lookup(self, monkeypatch):
         """``web_extract_tool`` must invoke ``_ensure_web_plugins_loaded()``
         before looking up the configured backend so the registry is
         populated even from cold-start subprocess contexts.
@@ -257,7 +261,6 @@ class TestDispatchersTriggerPluginDiscovery:
         ``web.extract_backend: firecrawl`` and ``FIRECRAWL_API_KEY`` set
         (issue #27580).
         """
-        import asyncio
         import json
         from unittest.mock import MagicMock
         from agent.web_search_provider import WebSearchProvider
@@ -314,11 +317,9 @@ class TestDispatchersTriggerPluginDiscovery:
             # Sanity: registry IS empty before the tool call.
             assert web_search_registry.get_provider("firecrawl") is None
 
-            result = json.loads(asyncio.run(
-                web_tools.web_extract_tool(
-                    ["https://example.com"],
-                )
-            ))
+            result = json.loads(
+                await web_tools.web_extract_tool(["https://example.com"])
+            )
 
             # The hook must have been called BEFORE the registry lookup —
             # that is the invariant under regression test. Without the
@@ -333,7 +334,8 @@ class TestDispatchersTriggerPluginDiscovery:
         finally:
             restore()
 
-    def test_web_search_tool_runs_discovery_before_registry_lookup(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_web_search_tool_runs_discovery_before_registry_lookup(self, monkeypatch):
         """``web_search_tool`` must invoke ``_ensure_web_plugins_loaded()``
         before the registry lookup for the same reason as the extract
         path (issue #27580 root cause applies to all dispatchers).
@@ -361,7 +363,7 @@ class TestDispatchersTriggerPluginDiscovery:
                 def supports_search(self) -> bool:
                     return True
 
-                def search(self, query, limit=5):
+                async def search(self, query, limit=5):
                     return {"success": True, "data": {"web": [
                         {"title": "ok", "url": "https://x", "description": "",
                          "position": 0}
@@ -381,7 +383,7 @@ class TestDispatchersTriggerPluginDiscovery:
             )
             assert web_search_registry.get_provider("brave-free") is None
 
-            result = json.loads(web_tools.web_search_tool("hello", limit=1))
+            result = json.loads(await web_tools.web_search_tool("hello", limit=1))
             assert mock_hook.called, (
                 "web_search_tool must call _ensure_web_plugins_loaded() "
                 "before resolving the registry"
@@ -444,7 +446,8 @@ class TestDisabledPluginDiagnostic:
         assert _disabled_web_plugin_for("nope") is None
 
 
-    def test_search_tool_reports_disabled_plugin(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_search_tool_reports_disabled_plugin(self, monkeypatch):
         from tools import web_tools
 
         restore = self._clear_registry()
@@ -462,11 +465,10 @@ class TestDisabledPluginDiagnostic:
             self._patch_manager(monkeypatch, {
                 "web/firecrawl": self._FakeLoaded(False, "disabled via config"),
             })
-            result = json.loads(web_tools.web_search_tool("hello", limit=1))
+            result = json.loads(await web_tools.web_search_tool("hello", limit=1))
             err = result["error"]
             assert "disabled" in err
             assert "web/firecrawl" in err
             assert "No web search provider configured" not in err
         finally:
             restore()
-

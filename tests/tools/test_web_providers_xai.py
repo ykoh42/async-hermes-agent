@@ -13,7 +13,9 @@ Covers:
 from __future__ import annotations
 
 import json
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
 
 
 def _creds(api_key: str = "xai-test-key", base_url: str = "https://api.x.ai/v1") -> dict:
@@ -26,6 +28,28 @@ def _mock_resp(json_data, status_code: int = 200):
     m.json.return_value = json_data
     m.raise_for_status = MagicMock()
     return m
+
+
+class _AsyncClient:
+    def __init__(self, response_or_call):
+        self.response_or_call = response_or_call
+        self.calls = []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_exc):
+        return False
+
+    async def post(self, url, **kwargs):
+        self.calls.append((url, kwargs))
+        if callable(self.response_or_call) and not hasattr(
+            self.response_or_call, "json"
+        ):
+            return self.response_or_call(url, **kwargs)
+        if isinstance(self.response_or_call, Exception):
+            raise self.response_or_call
+        return self.response_or_call
 
 
 def _responses_payload(text: str, annotations=None, citations=None) -> dict:
@@ -111,13 +135,19 @@ class TestXAIProviderSearchJSONPath:
         ]
     })
 
-    def test_happy_path_normalizes_results(self):
+    @pytest.mark.asyncio
+    async def test_happy_path_normalizes_results(self):
         from plugins.web.xai import provider as xai_provider
 
-        with patch.object(xai_provider, "resolve_xai_http_credentials", return_value=_creds()), \
-             patch.object(xai_provider, "_load_xai_web_config", return_value={}), \
-             patch("httpx.post", return_value=_mock_resp(_responses_payload(self._GROK_JSON))):
-            result = xai_provider.XAIWebSearchProvider().search("what is xai", limit=5)
+        with patch.object(
+            xai_provider, "resolve_xai_http_credentials", new=AsyncMock(return_value=_creds())
+        ), patch.object(
+            xai_provider, "_load_xai_web_config", new=AsyncMock(return_value={})
+        ), patch(
+            "httpx.AsyncClient",
+            return_value=_AsyncClient(_mock_resp(_responses_payload(self._GROK_JSON))),
+        ):
+            result = await xai_provider.XAIWebSearchProvider().search("what is xai", limit=5)
 
         assert result["success"] is True
         web = result["data"]["web"]
@@ -131,20 +161,27 @@ class TestXAIProviderSearchJSONPath:
         assert web[2]["position"] == 3
 
 
-    def test_parses_json_with_leading_prose(self):
+    @pytest.mark.asyncio
+    async def test_parses_json_with_leading_prose(self):
         """Reasoning models sometimes narrate before the JSON block; we tolerate it."""
         from plugins.web.xai import provider as xai_provider
 
         text = "Here are the results:\n" + self._GROK_JSON
-        with patch.object(xai_provider, "resolve_xai_http_credentials", return_value=_creds()), \
-             patch.object(xai_provider, "_load_xai_web_config", return_value={}), \
-             patch("httpx.post", return_value=_mock_resp(_responses_payload(text))):
-            result = xai_provider.XAIWebSearchProvider().search("q", limit=5)
+        with patch.object(
+            xai_provider, "resolve_xai_http_credentials", new=AsyncMock(return_value=_creds())
+        ), patch.object(
+            xai_provider, "_load_xai_web_config", new=AsyncMock(return_value={})
+        ), patch(
+            "httpx.AsyncClient",
+            return_value=_AsyncClient(_mock_resp(_responses_payload(text))),
+        ):
+            result = await xai_provider.XAIWebSearchProvider().search("q", limit=5)
 
         assert result["success"] is True
         assert len(result["data"]["web"]) == 3
 
-    def test_drops_rows_without_url(self):
+    @pytest.mark.asyncio
+    async def test_drops_rows_without_url(self):
         from plugins.web.xai import provider as xai_provider
 
         bad_json = json.dumps({
@@ -153,10 +190,15 @@ class TestXAIProviderSearchJSONPath:
                 {"title": "good", "url": "https://ok.com", "description": "keep"},
             ]
         })
-        with patch.object(xai_provider, "resolve_xai_http_credentials", return_value=_creds()), \
-             patch.object(xai_provider, "_load_xai_web_config", return_value={}), \
-             patch("httpx.post", return_value=_mock_resp(_responses_payload(bad_json))):
-            result = xai_provider.XAIWebSearchProvider().search("q", limit=5)
+        with patch.object(
+            xai_provider, "resolve_xai_http_credentials", new=AsyncMock(return_value=_creds())
+        ), patch.object(
+            xai_provider, "_load_xai_web_config", new=AsyncMock(return_value={})
+        ), patch(
+            "httpx.AsyncClient",
+            return_value=_AsyncClient(_mock_resp(_responses_payload(bad_json))),
+        ):
+            result = await xai_provider.XAIWebSearchProvider().search("q", limit=5)
 
         assert result["success"] is True
         web = result["data"]["web"]
@@ -166,7 +208,8 @@ class TestXAIProviderSearchJSONPath:
 
 
 class TestXAIProviderSearchFallbacks:
-    def test_falls_back_to_annotations_when_json_missing(self):
+    @pytest.mark.asyncio
+    async def test_falls_back_to_annotations_when_json_missing(self):
         """If Grok ignores the JSON instruction, derive results from url_citation annotations."""
         from plugins.web.xai import provider as xai_provider
 
@@ -187,10 +230,17 @@ class TestXAIProviderSearchFallbacks:
                 "end_index": 52,
             },
         ]
-        with patch.object(xai_provider, "resolve_xai_http_credentials", return_value=_creds()), \
-             patch.object(xai_provider, "_load_xai_web_config", return_value={}), \
-             patch("httpx.post", return_value=_mock_resp(_responses_payload(body, annotations=annotations))):
-            result = xai_provider.XAIWebSearchProvider().search("xai", limit=5)
+        with patch.object(
+            xai_provider, "resolve_xai_http_credentials", new=AsyncMock(return_value=_creds())
+        ), patch.object(
+            xai_provider, "_load_xai_web_config", new=AsyncMock(return_value={})
+        ), patch(
+            "httpx.AsyncClient",
+            return_value=_AsyncClient(
+                _mock_resp(_responses_payload(body, annotations=annotations))
+            ),
+        ):
+            result = await xai_provider.XAIWebSearchProvider().search("xai", limit=5)
 
         assert result["success"] is True
         urls = [r["url"] for r in result["data"]["web"]]
@@ -199,14 +249,19 @@ class TestXAIProviderSearchFallbacks:
         assert result["data"]["web"][1]["position"] == 2
 
 
-    def test_empty_response_returns_empty_success(self):
+    @pytest.mark.asyncio
+    async def test_empty_response_returns_empty_success(self):
         from plugins.web.xai import provider as xai_provider
 
         payload = _responses_payload("", citations=[])
-        with patch.object(xai_provider, "resolve_xai_http_credentials", return_value=_creds()), \
-             patch.object(xai_provider, "_load_xai_web_config", return_value={}), \
-             patch("httpx.post", return_value=_mock_resp(payload)):
-            result = xai_provider.XAIWebSearchProvider().search("q", limit=5)
+        with patch.object(
+            xai_provider, "resolve_xai_http_credentials", new=AsyncMock(return_value=_creds())
+        ), patch.object(
+            xai_provider, "_load_xai_web_config", new=AsyncMock(return_value={})
+        ), patch(
+            "httpx.AsyncClient", return_value=_AsyncClient(_mock_resp(payload))
+        ):
+            result = await xai_provider.XAIWebSearchProvider().search("q", limit=5)
 
         assert result["success"] is True
         assert result["data"]["web"] == []
@@ -218,7 +273,8 @@ class TestXAIProviderSearchFallbacks:
 
 
 class TestXAIProviderRequestShape:
-    def test_posts_to_responses_endpoint_with_bearer_token(self):
+    @pytest.mark.asyncio
+    async def test_posts_to_responses_endpoint_with_bearer_token(self):
         from plugins.web.xai import provider as xai_provider
 
         captured: dict = {}
@@ -229,10 +285,16 @@ class TestXAIProviderRequestShape:
             captured["json"] = kwargs.get("json", {})
             return _mock_resp(_responses_payload(json.dumps({"results": []})))
 
-        with patch.object(xai_provider, "resolve_xai_http_credentials", return_value=_creds("secret-key")), \
-             patch.object(xai_provider, "_load_xai_web_config", return_value={}), \
-             patch("httpx.post", side_effect=fake_post):
-            xai_provider.XAIWebSearchProvider().search("q", limit=5)
+        with patch.object(
+            xai_provider,
+            "resolve_xai_http_credentials",
+            new=AsyncMock(return_value=_creds("secret-key")),
+        ), patch.object(
+            xai_provider, "_load_xai_web_config", new=AsyncMock(return_value={})
+        ), patch(
+            "httpx.AsyncClient", return_value=_AsyncClient(fake_post)
+        ):
+            await xai_provider.XAIWebSearchProvider().search("q", limit=5)
 
         assert captured["url"] == "https://api.x.ai/v1/responses"
         assert captured["headers"].get("Authorization") == "Bearer secret-key"
@@ -247,7 +309,8 @@ class TestXAIProviderRequestShape:
         assert "no_inline_citations" in body.get("include", [])
 
 
-    def test_allowed_domains_capped_at_five(self):
+    @pytest.mark.asyncio
+    async def test_allowed_domains_capped_at_five(self):
         """xAI caps domain filters at 5; we trim silently to avoid 400s."""
         from plugins.web.xai import provider as xai_provider
 
@@ -258,10 +321,14 @@ class TestXAIProviderRequestShape:
             return _mock_resp(_responses_payload(json.dumps({"results": []})))
 
         cfg = {"allowed_domains": [f"d{i}.com" for i in range(10)]}
-        with patch.object(xai_provider, "resolve_xai_http_credentials", return_value=_creds()), \
-             patch.object(xai_provider, "_load_xai_web_config", return_value=cfg), \
-             patch("httpx.post", side_effect=fake_post):
-            xai_provider.XAIWebSearchProvider().search("q", limit=5)
+        with patch.object(
+            xai_provider, "resolve_xai_http_credentials", new=AsyncMock(return_value=_creds())
+        ), patch.object(
+            xai_provider, "_load_xai_web_config", new=AsyncMock(return_value=cfg)
+        ), patch(
+            "httpx.AsyncClient", return_value=_AsyncClient(fake_post)
+        ):
+            await xai_provider.XAIWebSearchProvider().search("q", limit=5)
 
         domains = captured["json"]["tools"][0]["filters"]["allowed_domains"]
         assert len(domains) == 5
@@ -273,35 +340,45 @@ class TestXAIProviderRequestShape:
 
 
 class TestXAIProviderSearchErrors:
-    def test_missing_creds_returns_failure(self):
+    @pytest.mark.asyncio
+    async def test_missing_creds_returns_failure(self):
         from plugins.web.xai import provider as xai_provider
 
-        with patch.object(xai_provider, "resolve_xai_http_credentials", return_value=_creds("")):
-            result = xai_provider.XAIWebSearchProvider().search("q", limit=5)
+        with patch.object(
+            xai_provider,
+            "resolve_xai_http_credentials",
+            new=AsyncMock(return_value=_creds("")),
+        ):
+            result = await xai_provider.XAIWebSearchProvider().search("q", limit=5)
 
         assert result["success"] is False
         assert "xAI" in result["error"]
 
-    def test_mutually_exclusive_domain_filters_rejected_locally(self):
+    @pytest.mark.asyncio
+    async def test_mutually_exclusive_domain_filters_rejected_locally(self):
         from plugins.web.xai import provider as xai_provider
 
         cfg = {"allowed_domains": ["a.com"], "excluded_domains": ["b.com"]}
-        with patch.object(xai_provider, "resolve_xai_http_credentials", return_value=_creds()), \
-             patch.object(xai_provider, "_load_xai_web_config", return_value=cfg), \
-             patch("httpx.post") as posted:
-            result = xai_provider.XAIWebSearchProvider().search("q", limit=5)
+        client = _AsyncClient(_mock_resp({}))
+        with patch.object(
+            xai_provider, "resolve_xai_http_credentials", new=AsyncMock(return_value=_creds())
+        ), patch.object(
+            xai_provider, "_load_xai_web_config", new=AsyncMock(return_value=cfg)
+        ), patch("httpx.AsyncClient", return_value=client):
+            result = await xai_provider.XAIWebSearchProvider().search("q", limit=5)
 
         assert result["success"] is False
         assert "cannot both be set" in result["error"]
-        posted.assert_not_called()
+        assert client.calls == []
 
 
-    def test_401_on_oauth_path_triggers_force_refresh_and_retry(self):
+    @pytest.mark.asyncio
+    async def test_401_on_oauth_path_triggers_force_refresh_and_retry(self):
         """OAuth credentials → 401 must force-refresh and retry once.
 
         Closes the two-gap scenario the resolver's JWT-exp shortcut doesn't
         cover: opaque (non-JWT) tokens and mid-window revocation. We expect
-        ``httpx.post`` to be called twice with two different Bearer tokens.
+        The async client must post twice with two different Bearer tokens.
         """
         import httpx
         from plugins.web.xai import provider as xai_provider
@@ -334,16 +411,23 @@ class TestXAIProviderSearchErrors:
                 "base_url": "https://api.x.ai/v1",
             }
 
-        with patch.object(xai_provider, "resolve_xai_http_credentials", side_effect=fake_resolve), \
-             patch.object(xai_provider, "_load_xai_web_config", return_value={}), \
-             patch("httpx.post", side_effect=fake_post):
-            result = xai_provider.XAIWebSearchProvider().search("q", limit=5)
+        with patch.object(
+            xai_provider,
+            "resolve_xai_http_credentials",
+            new=AsyncMock(side_effect=fake_resolve),
+        ), patch.object(
+            xai_provider, "_load_xai_web_config", new=AsyncMock(return_value={})
+        ), patch(
+            "httpx.AsyncClient", return_value=_AsyncClient(fake_post)
+        ):
+            result = await xai_provider.XAIWebSearchProvider().search("q", limit=5)
 
         assert result["success"] is True
         assert calls["refresh_count"] == 1
         assert calls["posts"] == ["Bearer stale-token", "Bearer fresh-after-refresh"]
 
-    def test_401_on_env_var_path_does_not_retry(self):
+    @pytest.mark.asyncio
+    async def test_401_on_env_var_path_does_not_retry(self):
         """Env-var (XAI_API_KEY) creds can't be refreshed — must not retry."""
         import httpx
         from plugins.web.xai import provider as xai_provider
@@ -365,10 +449,16 @@ class TestXAIProviderSearchErrors:
             # provider=="xai" signals env-var path; retry must be skipped.
             return {"provider": "xai", "api_key": "«redacted:sk-…»", "base_url": "https://api.x.ai/v1"}
 
-        with patch.object(xai_provider, "resolve_xai_http_credentials", side_effect=fake_resolve), \
-             patch.object(xai_provider, "_load_xai_web_config", return_value={}), \
-             patch("httpx.post", side_effect=fake_post):
-            result = xai_provider.XAIWebSearchProvider().search("q", limit=5)
+        with patch.object(
+            xai_provider,
+            "resolve_xai_http_credentials",
+            new=AsyncMock(side_effect=fake_resolve),
+        ), patch.object(
+            xai_provider, "_load_xai_web_config", new=AsyncMock(return_value={})
+        ), patch(
+            "httpx.AsyncClient", return_value=_AsyncClient(fake_post)
+        ):
+            result = await xai_provider.XAIWebSearchProvider().search("q", limit=5)
 
         assert result["success"] is False
         assert "401" in result["error"]
@@ -376,7 +466,8 @@ class TestXAIProviderSearchErrors:
         assert calls["refreshed"] is False
 
 
-    def test_http_200_with_error_envelope_surfaces_failure(self):
+    @pytest.mark.asyncio
+    async def test_http_200_with_error_envelope_surfaces_failure(self):
         """xAI sometimes returns 200 with ``{"error": {...}}`` (model
         overloaded, refusal, etc.). Must be surfaced as a failure rather
         than silently masked as success-with-empty-results.
@@ -384,10 +475,14 @@ class TestXAIProviderSearchErrors:
         from plugins.web.xai import provider as xai_provider
 
         payload = {"error": {"message": "model overloaded", "type": "server_error"}}
-        with patch.object(xai_provider, "resolve_xai_http_credentials", return_value=_creds()), \
-             patch.object(xai_provider, "_load_xai_web_config", return_value={}), \
-             patch("httpx.post", return_value=_mock_resp(payload)):
-            result = xai_provider.XAIWebSearchProvider().search("q", limit=5)
+        with patch.object(
+            xai_provider, "resolve_xai_http_credentials", new=AsyncMock(return_value=_creds())
+        ), patch.object(
+            xai_provider, "_load_xai_web_config", new=AsyncMock(return_value={})
+        ), patch(
+            "httpx.AsyncClient", return_value=_AsyncClient(_mock_resp(payload))
+        ):
+            result = await xai_provider.XAIWebSearchProvider().search("q", limit=5)
 
         assert result["success"] is False
         assert "model overloaded" in result["error"]
@@ -463,7 +558,8 @@ class TestXAIProviderOAuthPath:
     against a temporary auth store.
     """
 
-    def test_search_uses_oauth_bearer_token_and_base_url(self, monkeypatch, tmp_path):
+    @pytest.mark.asyncio
+    async def test_search_uses_oauth_bearer_token_and_base_url(self, monkeypatch, tmp_path):
         from plugins.web.xai import provider as xai_provider
 
         # Force the env-var fallback to fail so resolution must go via OAuth.
@@ -490,15 +586,19 @@ class TestXAIProviderOAuthPath:
             captured["headers"] = kwargs.get("headers", {})
             return _mock_resp(_responses_payload(json.dumps({"results": []})))
 
-        with patch.object(xai_provider, "_load_xai_web_config", return_value={}), \
-             patch("httpx.post", side_effect=fake_post):
-            result = xai_provider.XAIWebSearchProvider().search("q", limit=3)
+        with patch.object(
+            xai_provider, "_load_xai_web_config", new=AsyncMock(return_value={})
+        ), patch(
+            "httpx.AsyncClient", return_value=_AsyncClient(fake_post)
+        ):
+            result = await xai_provider.XAIWebSearchProvider().search("q", limit=3)
 
         assert result["success"] is True
         assert captured["url"] == "https://proxy.x.ai/v1/responses"
         assert captured["headers"].get("Authorization") == "Bearer ya29.fake-oauth-access-token"
 
-    def test_pool_only_direct_refresh_updates_main_runtime(self, monkeypatch, tmp_path):
+    @pytest.mark.asyncio
+    async def test_pool_only_direct_refresh_updates_main_runtime(self, monkeypatch, tmp_path):
         """A direct 401 refresh must rotate the exact manual pool row.
 
         xAI refresh tokens are one-time credentials. Persisting the refreshed
@@ -544,28 +644,45 @@ class TestXAIProviderOAuthPath:
 
         refresh_calls = []
 
-        def fake_refresh(access_token, refresh_token, **_kwargs):
-            refresh_calls.append((access_token, refresh_token))
-            return {
-                "access_token": "fresh-access",
-                "refresh_token": "rotated-refresh",
-                "last_refresh": "2026-07-12T12:00:00Z",
-            }
+        class OAuthClient:
+            def __init__(self, **_kwargs):
+                pass
 
-        monkeypatch.setattr(
-            "hermes_cli.auth.refresh_xai_oauth_pure",
-            fake_refresh,
-        )
+            async def __aenter__(self):
+                return self
 
-        initial = resolve_xai_http_credentials()
+            async def __aexit__(self, *_exc):
+                return False
+
+            async def get(self, url, **_kwargs):
+                assert url.endswith("/.well-known/openid-configuration")
+                return _mock_resp(
+                    {"token_endpoint": "https://auth.x.ai/oauth2/token"}
+                )
+
+            async def post(self, url, **kwargs):
+                refresh_calls.append(
+                    (url, kwargs["data"]["refresh_token"])
+                )
+                return _mock_resp(
+                    {
+                        "access_token": "fresh-access",
+                        "refresh_token": "rotated-refresh",
+                    }
+                )
+
+        initial = await resolve_xai_http_credentials()
         assert initial["api_key"] == "rejected-access"
 
-        refreshed = resolve_xai_http_credentials(
-            force_refresh=True,
-            api_key_hint=initial["api_key"],
-        )
+        with patch("httpx.AsyncClient", OAuthClient):
+            refreshed = await resolve_xai_http_credentials(
+                force_refresh=True,
+                api_key_hint=initial["api_key"],
+            )
         assert refreshed["api_key"] == "fresh-access"
-        assert refresh_calls == [("rejected-access", "one-time-refresh")]
+        assert refresh_calls == [
+            ("https://auth.x.ai/oauth2/token", "one-time-refresh")
+        ]
 
         stored = json.loads(auth_path.read_text())
         entries = {
@@ -579,6 +696,8 @@ class TestXAIProviderOAuthPath:
         assert entries["backup-xai"]["refresh_token"] == "backup-refresh"
         assert "xai-oauth" not in stored.get("providers", {})
 
-        runtime = resolve_runtime_provider(requested="xai-oauth")
+        runtime = await resolve_runtime_provider(requested="xai-oauth")
         assert runtime["api_key"] == "backup-access"
-        assert refresh_calls == [("rejected-access", "one-time-refresh")]
+        assert refresh_calls == [
+            ("https://auth.x.ai/oauth2/token", "one-time-refresh")
+        ]
