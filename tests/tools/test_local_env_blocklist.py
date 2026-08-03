@@ -99,7 +99,7 @@ class TestProviderEnvBlocklist:
         (analogous to OPENAI_API_KEY) and must not leak into subprocesses.
 
         Regression for #32314: AWS_BEARER_TOKEN_BEDROCK leaked into terminal /
-        execute_code children because the ``bedrock`` ProviderConfig declares
+        terminal children because the ``bedrock`` ProviderConfig declares
         ``api_key_env_vars=()`` (auth_type="aws_sdk") and the blocklist builder
         only consulted that field. The reporter caught it when ``opencode
         models`` run inside a Hermes terminal enumerated the entire Bedrock

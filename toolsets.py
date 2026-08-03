@@ -53,8 +53,8 @@ _HERMES_CORE_TOOLS = [
     "session_search",
     # Clarifying questions
     "clarify",
-    # Code execution + delegation
-    "execute_code", "delegate_task",
+    # Delegation
+    "delegate_task",
 ]
 
 # Webhook events may originate from untrusted third-party content (for example,
@@ -229,12 +229,6 @@ TOOLSETS = {
         "includes": []
     },
     
-    "code_execution": {
-        "description": "Run Python scripts that call tools programmatically (reduces LLM round trips)",
-        "tools": ["execute_code"],
-        "includes": []
-    },
-    
     "delegation": {
         "description": "Spawn subagents with isolated context for complex subtasks",
         "tools": ["delegate_task"],
@@ -312,7 +306,7 @@ TOOLSETS = {
             "browser_vision", "browser_console", "browser_cdp", "browser_dialog",
             "todo", "memory",
             "session_search", "clarify",
-            "execute_code", "delegate_task",
+            "delegate_task",
         ],
         "includes": [],
         # Posture toolset: selected per-session by agent/coding_context.py,
@@ -344,7 +338,7 @@ TOOLSETS = {
             "browser_vision", "browser_console", "browser_cdp", "browser_dialog",
             "todo", "memory",
             "session_search",
-            "execute_code", "delegate_task",
+            "delegate_task",
         ],
         "includes": []
     },
@@ -376,7 +370,7 @@ TOOLSETS = {
             # Session history search
             "session_search",
             # Code execution + delegation
-            "execute_code", "delegate_task",
+            "delegate_task",
             # Home Assistant smart home control (gated on HASS_TOKEN via check_fn)
             "ha_list_entities", "ha_get_state", "ha_list_services", "ha_call_service",
 

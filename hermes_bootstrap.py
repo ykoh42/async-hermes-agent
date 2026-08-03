@@ -8,7 +8,7 @@ Python on Windows has two long-standing text-encoding footguns:
 
 2. Child processes spawned via ``subprocess`` don't know to use UTF-8
    unless ``PYTHONUTF8`` and/or ``PYTHONIOENCODING`` are set in their
-   environment — so any Python subprocess (the execute_code sandbox,
+   environment — so any Python subprocess (terminal scripts,
    delegation children, linter subprocesses, etc.) inherits the same
    cp1252 defaults and hits the same UnicodeEncodeError.
 

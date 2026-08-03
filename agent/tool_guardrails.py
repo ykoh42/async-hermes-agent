@@ -41,7 +41,6 @@ IDEMPOTENT_TOOL_NAMES = frozenset(
 MUTATING_TOOL_NAMES = frozenset(
     {
         "terminal",
-        "execute_code",
         "write_file",
         "patch",
         "todo",

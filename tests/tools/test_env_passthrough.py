@@ -62,8 +62,8 @@ class TestConfigPassthrough:
         assert "SKILL_KEY" in all_pt
 
 
-class TestExecuteCodeIntegration:
-    """Verify that the passthrough is checked in execute_code's env filtering."""
+class TestSandboxIntegration:
+    """Verify that passthrough is checked in sandbox environment filtering."""
 
     def test_secret_substring_blocked_by_default(self):
         """TENOR_API_KEY should be blocked without passthrough."""
@@ -132,7 +132,7 @@ class TestTerminalIntegration:
         """GHSA-rhgp-j443-p4rf: register_env_passthrough must NOT accept
         Hermes provider credentials — that was the bypass where a skill
         could declare ANTHROPIC_TOKEN / OPENAI_API_KEY as passthrough and
-        defeat the execute_code sandbox scrubbing."""
+        defeat the terminal sandbox scrubbing."""
         from tools.environments.local import (
             _sanitize_subprocess_env,
             _HERMES_PROVIDER_ENV_BLOCKLIST,
@@ -222,18 +222,18 @@ class TestTerminalIntegration:
     def test_provider_blocklist_import_failure_fails_closed(self, monkeypatch):
         """If the dynamic provider blocklist can't be imported, provider
         credentials must be treated as protected and refused passthrough —
-        otherwise a skill could tunnel a Hermes credential into the
-        execute_code child (regression for #37950 / GHSA-rhgp-j443-p4rf).
+        otherwise a skill could tunnel a Hermes credential into a terminal
+        child (regression for #37950 / GHSA-rhgp-j443-p4rf).
 
         Verifies the full path: _is_hermes_provider_credential returns True,
-        register_env_passthrough refuses the var, and _scrub_child_env keeps
+        register_env_passthrough refuses the var, and the terminal sanitizer keeps
         it out of the child env. A non-Hermes key is also rejected here (the
         fallback is conservative: when we can't tell, we fail closed), which
         is the safe direction.
         """
         import builtins
 
-        from tools.code_execution_tool import _scrub_child_env
+        from tools.environments.local import _sanitize_subprocess_env
 
         real_import = builtins.__import__
 
@@ -254,15 +254,13 @@ class TestTerminalIntegration:
         assert not is_env_passthrough("OPENAI_API_KEY")
         assert not is_env_passthrough("ANTHROPIC_API_KEY")
 
-        # And the credential never reaches the execute_code child.
-        child_env = _scrub_child_env(
+        # And the credential never reaches the terminal child.
+        child_env = _sanitize_subprocess_env(
             {
                 "OPENAI_API_KEY": "synthetic-secret",
                 "ANTHROPIC_API_KEY": "synthetic-secret",
                 "PATH": "/usr/bin",
-            },
-            is_passthrough=is_env_passthrough,
-            is_windows=False,
+            }
         )
         assert "OPENAI_API_KEY" not in child_env
         assert "ANTHROPIC_API_KEY" not in child_env

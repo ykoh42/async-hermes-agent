@@ -36,21 +36,6 @@ class TestSessionIdForwarding:
         assert captured.get("session_id") == "sess-abc"
 
     @pytest.mark.asyncio
-    async def test_execute_code_path_forwards_session_id(self):
-        """registry.dispatch receives session_id on the execute_code path."""
-        captured = {}
-        with patch("model_tools.registry", _make_registry(captured)):
-            from model_tools import handle_function_call
-            await handle_function_call(
-                "execute_code",
-                {"code": "print(1)"},
-                task_id="t1",
-                session_id="sess-xyz",
-                skip_pre_tool_call_hook=True,
-            )
-        assert captured.get("session_id") == "sess-xyz"
-
-    @pytest.mark.asyncio
     async def test_session_id_default_is_none(self):
         """When session_id is omitted, dispatch receives None."""
         captured = {}

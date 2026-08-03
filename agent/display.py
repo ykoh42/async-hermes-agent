@@ -390,7 +390,7 @@ def build_tool_preview(tool_name: str, args: dict, max_len: int | None = None) -
         "image_generate": "prompt", "text_to_speech": "text",
         "vision_analyze": "question",
         "skill_view": "name", "skills_list": "category",
-        "execute_code": "code", "delegate_task": "goal",
+        "delegate_task": "goal",
         "clarify": "question", "skill_manage": "name",
     }
 
@@ -435,9 +435,8 @@ def build_tool_preview(tool_name: str, args: dict, max_len: int | None = None) -
         else:
             return f"planning {len(todos_arg)} task(s)"
 
-    if tool_name in {"terminal", "execute_code"}:
-        key = "code" if tool_name == "execute_code" else "command"
-        command = args.get(key)
+    if tool_name == "terminal":
+        command = args.get("command")
         if command is None:
             return None
         preview = summarize_shell_command(str(command))
@@ -532,7 +531,6 @@ _TOOL_VERBS: dict[str, str] = {
     "patch": "Editing",
     "search_files": "Searching files",
     "terminal": "Running",
-    "execute_code": "Running code",
     "image_generate": "Generating image",
     "video_generate": "Generating video",
     "text_to_speech": "Generating speech",
@@ -1390,10 +1388,6 @@ def _get_cute_tool_message(
         return _wrap(f"┊ 👁️  vision    {_trunc(args.get('question', ''), 30)}  {dur}")
     if tool_name == "send_message":
         return _wrap(f"┊ 📨 send      {args.get('target', '?')}: \"{_trunc(args.get('message', ''), 25)}\"  {dur}")
-    if tool_name == "execute_code":
-        code = args.get("code", "")
-        first_line = code.strip().split("\n")[0] if code.strip() else ""
-        return _wrap(f"┊ 🐍 exec      {_trunc(first_line, 35)}  {dur}")
     if tool_name == "delegate_task":
         tasks = args.get("tasks")
         if tasks and isinstance(tasks, list):

@@ -13,7 +13,6 @@ import pytest
 import tools.approval as approval_module
 from tools.approval import (
     check_all_command_guards,
-    check_execute_code_guard,
     set_current_session_key,
     clear_session,
 )
@@ -170,8 +169,6 @@ class TestSmartModeFiresHooks:
         [
             (check_all_command_guards, "rm -rf /tmp/smart-hook", "approve", True, "smart_approve", None),
             (check_all_command_guards, "rm -rf /tmp/smart-hook", "deny", False, "smart_deny", None),
-            (check_execute_code_guard, "print('smart hook')", "approve", True, "smart_approve", "execute_code"),
-            (check_execute_code_guard, "print('smart hook')", "deny", False, "smart_deny", "execute_code"),
         ],
     )
     def test_smart_verdict_fires_redacted_pre_and_post_hooks(
@@ -209,7 +206,6 @@ class TestSmartModeFiresHooks:
 
     @pytest.mark.parametrize("guard,value", [
         (check_all_command_guards, "rm -rf /tmp/smart-order"),
-        (check_execute_code_guard, "print('smart order')"),
     ])
     def test_pre_hook_fires_before_aux_llm_decision(
         self, isolated_session, monkeypatch, guard, value
@@ -237,7 +233,6 @@ class TestSmartModeFiresHooks:
 
     @pytest.mark.parametrize("guard,value", [
         (check_all_command_guards, "rm -rf /tmp/smart-force-redaction"),
-        (check_execute_code_guard, "print('smart force redaction')"),
     ])
     def test_smart_observer_redaction_is_forced_when_config_disables_redaction(
         self, isolated_session, monkeypatch, guard, value
@@ -260,7 +255,6 @@ class TestSmartModeFiresHooks:
 
     @pytest.mark.parametrize("guard,value", [
         (check_all_command_guards, "rm -rf /tmp/smart-hook-crash"),
-        (check_execute_code_guard, "print('smart hook crash')"),
     ])
     @pytest.mark.parametrize("verdict,approved", [("approve", True), ("deny", False)])
     def test_observer_exception_never_changes_smart_verdict(
@@ -276,7 +270,6 @@ class TestSmartModeFiresHooks:
 
     @pytest.mark.parametrize("guard,value", [
         (check_all_command_guards, "rm -rf /tmp/smart-redactor-crash"),
-        (check_execute_code_guard, "print('smart redactor crash')"),
     ])
     @pytest.mark.parametrize("verdict,approved", [("approve", True), ("deny", False)])
     def test_redactor_exception_never_changes_smart_verdict_or_leaks_payload(
@@ -307,11 +300,6 @@ class TestSmartModeFiresHooks:
             "rm -rf /tmp/first-smart-command",
             "rm -rf /tmp/second-smart-command",
         ),
-        (
-            check_execute_code_guard,
-            "print('first smart script')",
-            "print('second smart script')",
-        ),
     ])
     def test_smart_approval_is_per_command(
         self, isolated_session, monkeypatch, guard, first_value, second_value
@@ -341,5 +329,4 @@ class TestSmartModeFiresHooks:
             "smart_approve",
             "smart_deny",
         ]
-
 

@@ -2146,10 +2146,9 @@ def _denial_breaker_addendum(session_key: str) -> str:
 # =========================================================================
 # Blocking gateway approval (mirrors CLI's synchronous input() flow)
 # =========================================================================
-# Per-session QUEUE of pending approvals.  Multiple threads (parallel
-# subagents, execute_code RPC handlers) can block concurrently — each gets
-# its own threading.Event.  /approve resolves the oldest, /approve all
-# resolves every pending approval in the session.
+# Per-session QUEUE of pending approvals. Multiple callers can block
+# concurrently — each gets its own threading.Event. /approve resolves the
+# oldest, and /approve all resolves every pending approval in the session.
 
 
 class _ApprovalEntry:
@@ -3070,8 +3069,7 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
     thread until the request is resolved or the gateway approval timeout
     elapses — firing pre/post approval hooks and cleaning up the queue entry.
 
-    Shared by the terminal command guard (``check_all_command_guards``) and
-    the execute_code guard (``check_execute_code_guard``) so the fiddly
+    Used by the terminal command guard (``check_all_command_guards``) so its
     heartbeat-polling wait loop lives in one place.
 
     Returns ``{"resolved": bool, "choice": str|None}`` on completion, or
@@ -3455,8 +3453,7 @@ def check_all_command_guards(command: str, env_type: str,
         if notify_cb is not None:
             # --- Blocking gateway approval (queue-based) ---
             # Block the agent thread until the user responds; the notify +
-            # heartbeat wait loop is shared with check_execute_code_guard via
-            # _await_gateway_decision().
+            # heartbeat wait loop lives in _await_gateway_decision().
             #
             # Redact secrets in the notified payload: the gateway renders this
             # dict directly to Discord/Slack/etc. and those messages are
@@ -3649,243 +3646,6 @@ def check_all_command_guards(command: str, env_type: str,
     _reset_denials(session_key)
     return {"approved": True, "message": None,
             "user_approved": True, "description": combined_desc}
-
-
-def check_execute_code_guard(code: str, env_type: str,
-                             has_host_access: bool = False) -> dict:
-    """Approve an execute_code script before its child process is spawned.
-
-    execute_code runs arbitrary local Python — the script can call
-    ``subprocess``, ``os.system``, ``ctypes``, or other process/file APIs
-    directly, none of which pass through ``terminal()`` /
-    ``DANGEROUS_PATTERNS``. In gateway/ask contexts we fail closed by approving
-    the script as a whole before it runs (#30882). Returns the same dict
-    contract as ``check_all_command_guards``.
-
-    Scope (documented limitation, #30882): in a purely local non-interactive
-    non-gateway session (no TTY, not gateway, not cron-deny) this returns
-    approved — matching the existing terminal auto-approve contract. The
-    hardline floor still blocks catastrophic ``terminal()`` commands the script
-    issues; running arbitrary code headlessly without any approval surface is
-    trusted-by-config (set a gateway/ask surface or ``approvals.cron_mode`` to
-    require approval).
-    """
-    pattern_key = "execute_code"
-    description = (
-        "execute_code script execution. The script can spawn subprocesses or "
-        "mutate files without passing through terminal command approval; "
-        "approval is one-shot for this run."
-    )
-
-    # Isolated backends already sandbox the child — matches the container skip
-    # in check_all_command_guards / check_dangerous_command. Docker stops
-    # skipping once host paths are bind-mounted into the sandbox; vercel_sandbox
-    # has no host-bind concept so it stays always-skipped.
-    if env_type == "vercel_sandbox":
-        return {"approved": True, "message": None}
-    if _should_skip_container_guards(env_type, has_host_access=has_host_access):
-        return {"approved": True, "message": None}
-
-    # --yolo or approvals.mode=off: bypass (session- or process-scoped).
-    approval_mode = _get_approval_mode()
-    if _YOLO_MODE_FROZEN or is_current_session_yolo_enabled() or approval_mode == "off":
-        return {"approved": True, "message": None}
-
-    is_gateway = _is_gateway_approval_context()
-    is_ask = env_var_enabled("HERMES_EXEC_ASK")
-
-    # Cron: no user is present to approve arbitrary code.
-    if env_var_enabled("HERMES_CRON_SESSION"):
-        if _get_cron_approval_mode() == "deny":
-            return {
-                "approved": False,
-                "message": (
-                    "BLOCKED: execute_code runs arbitrary local Python "
-                    "(including subprocess calls that bypass shell-string "
-                    "approval checks). Cron jobs run without a user present "
-                    "to approve it. Use normal tools instead, or set "
-                    "approvals.cron_mode: approve only if this cron profile "
-                    "is intentionally trusted."
-                ),
-                "pattern_key": pattern_key,
-                "description": description,
-                "outcome": "blocked",
-                "user_consent": False,
-            }
-        return {"approved": True, "message": None}
-
-    # Only gateway/ask contexts get the one-shot whole-script approval.
-    #   * CLI interactive: the script's terminal() calls are guarded per-call
-    #     (context now propagates into the RPC thread, #33057); a whole-script
-    #     prompt would fire on every execute_code call.
-    #   * Local non-interactive non-gateway: documented limitation above.
-    if not is_gateway and not is_ask:
-        return {"approved": True, "message": None}
-
-    session_key = get_current_session_key()
-    # Built only now (past the early-return gates) so the common non-approval
-    # paths don't pay to copy a potentially-large script into this string.
-    command = f"execute_code <<'PY'\n{code}\nPY"
-
-    # Check session/permanent approval — same gate as check_all_command_guards.
-    # Without this, "Approve session" / "Always" choices are stored but never
-    # consulted, so every execute_code call re-prompts the user (#39275).
-    if is_approved(session_key, pattern_key):
-        return {"approved": True, "message": None}
-
-    # Smart mode: ask the aux LLM about the whole script. An APPROVE here only
-    # suppresses the redundant whole-script prompt; the per-call terminal()
-    # guards (restored by context propagation) still run independently.
-    smart_denied_for_owner = False
-    if approval_mode == "smart":
-        observer_payload = _prepare_smart_approval_observer(
-            command=command,
-            description=description,
-            pattern_key=pattern_key,
-            pattern_keys=[pattern_key],
-            session_key=session_key,
-        )
-        verdict = _smart_approve(command, description)
-        _observe_smart_approval_verdict(observer_payload, verdict)
-        if verdict == "approve":
-            _reset_denials(session_key)
-            logger.debug("Smart approval: auto-approved execute_code for session %s",
-                         session_key)
-            return {"approved": True, "message": None,
-                    "smart_approved": True, "description": description}
-        if verdict == "deny" and not (is_gateway or is_ask):
-            _record_denial(session_key)
-            breaker_addendum = _denial_breaker_addendum(session_key)
-            return {
-                "approved": False,
-                "message": ("BLOCKED by smart approval: execute_code script "
-                            "execution was assessed as genuinely dangerous. "
-                            f"Do NOT retry.{breaker_addendum}"),
-                "smart_denied": True,
-                "pattern_key": pattern_key,
-                "description": description,
-                "outcome": "denied",
-                "user_consent": False,
-            }
-        if verdict == "deny":
-            # Guardian DENY that falls through to a one-operation human
-            # override still counts toward the consecutive-denial breaker;
-            # a subsequent human approval resets the tally below.
-            _record_denial(session_key)
-            smart_denied_for_owner = True
-        # Interactive DENY falls through to one-operation human approval;
-        # ESCALATE retains the normal manual approval behavior.
-
-    # Redacted copies for user-visible rendering only. An execute_code script
-    # can embed credentials (e.g. api_key = "sk-..."), and the gateway renders
-    # this payload directly to Discord/Slack — those messages are
-    # screenshottable. The raw `command`/`code` are still what get assessed by
-    # smart approval and executed; redaction is display-only. Approval
-    # persistence keys off pattern_key, so the allowlist is unaffected.
-    from agent.redact import redact_sensitive_text
-    display_command = redact_sensitive_text(command)
-    display_code = redact_sensitive_text(code)
-    display_description = redact_sensitive_text(description)
-
-    notify_cb = None
-    with _lock:
-        notify_cb = _gateway_notify_cbs.get(session_key)
-
-    if notify_cb is None:
-        # No gateway callback registered (e.g. ask-mode without a notifier):
-        # surface a pending approval for backward compatibility.
-        pending_data = {
-            "command": display_command,
-            "pattern_key": pattern_key,
-            "pattern_keys": [pattern_key],
-            "description": display_description,
-        }
-        if smart_denied_for_owner:
-            pending_data.update(smart_denied=True, allow_permanent=False)
-        submit_pending(session_key, pending_data)
-        result = {
-            "approved": False,
-            "pattern_key": pattern_key,
-            "status": "pending_approval",
-            "approval_pending": True,
-            "command": display_command,
-            "description": display_description,
-            "message": (
-                f"⚠️ {display_description}. Asking the user for approval.\n\n"
-                f"**Code:**\n```python\n{display_code}\n```"
-            ),
-        }
-        if smart_denied_for_owner:
-            result.update(smart_denied=True, allow_permanent=False)
-        return result
-
-    approval_data = {
-        "command": display_command,
-        "pattern_key": pattern_key,
-        "pattern_keys": [pattern_key],
-        "description": display_description,
-        "allow_permanent": not smart_denied_for_owner,
-        "allow_session": not smart_denied_for_owner,
-    }
-    if smart_denied_for_owner:
-        approval_data["smart_denied"] = True
-    decision = _await_gateway_decision(
-        session_key, notify_cb, approval_data, surface="gateway"
-    )
-    if decision.get("notify_failed"):
-        return {
-            "approved": False,
-            "message": ("BLOCKED: Failed to send execute_code approval request "
-                        "to user. Do NOT retry."),
-            "pattern_key": pattern_key,
-            "description": description,
-            "outcome": "notify_failed",
-            "user_consent": False,
-        }
-
-    resolved = decision["resolved"]
-    choice = decision["choice"]
-    deny_reason = decision.get("reason")
-
-    if not resolved or choice is None or choice == "deny":
-        reason = "timed out without user response" if not resolved else "denied by user"
-        addendum = " Silence is not consent." if not resolved else ""
-        reason_addendum = ""
-        if resolved and choice == "deny" and deny_reason:
-            reason_addendum = f' Reason given by the user: "{deny_reason}".'
-        breaker_addendum = _denial_breaker_addendum(session_key)
-        return {
-            "approved": False,
-            "message": (
-                f"BLOCKED: execute_code script {reason}.{reason_addendum} The "
-                f"user has NOT consented to running this code. Do NOT retry, "
-                f"do NOT rephrase the script, and do NOT attempt the same "
-                f"outcome via a different tool.{addendum}{breaker_addendum}"
-            ),
-            "pattern_key": pattern_key,
-            "description": description,
-            "outcome": "timeout" if not resolved else "denied",
-            "user_consent": False,
-            "deny_reason": deny_reason,
-        }
-
-    # Never persist a smart-DENY override under the coarse execute_code key;
-    # doing so would approve unrelated future scripts. Manual and ESCALATE
-    # decisions preserve their existing session/permanent behavior.
-    if not smart_denied_for_owner:
-        if choice == "session":
-            approve_session(session_key, pattern_key)
-        elif choice == "always":
-            approve_session(session_key, pattern_key)
-            approve_permanent(pattern_key)
-            save_permanent_allowlist(_permanent_approved)
-    # choice == "once": no persistence — approval lasts this single call only.
-
-    # A human approval resets the consecutive-denial tally.
-    _reset_denials(session_key)
-    return {"approved": True, "message": None,
-            "user_approved": True, "description": description}
-
 
 # =========================================================================
 # MCP elicitation entry point

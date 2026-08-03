@@ -188,16 +188,6 @@ class TestTerminalSchema:
 
 
 # =========================================================================
-# Code execution blocked params
-# =========================================================================
-
-class TestCodeExecutionBlocked:
-    def test_notify_on_complete_blocked_in_sandbox(self):
-        from tools.code_execution_tool import _TERMINAL_BLOCKED_PARAMS
-        assert "notify_on_complete" in _TERMINAL_BLOCKED_PARAMS
-
-
-# =========================================================================
 # Completion consumed suppression
 # =========================================================================
 

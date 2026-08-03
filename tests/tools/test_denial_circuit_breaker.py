@@ -5,10 +5,8 @@ verdicts in one session, the deny message returned to the model escalates
 from "Do NOT retry" to a hard-stop CIRCUIT BREAKER instruction. Any
 approval resets the tally. State is per-session and capped in size.
 
-Follows the existing smart-approval mocking patterns from
-tests/tools/test_execute_code_approval_cluster.py: monkeypatch
-``_smart_approve`` / ``_get_approval_mode`` on the module and drive the
-public guard entry points.
+Tests monkeypatch ``_smart_approve`` / ``_get_approval_mode`` on the module
+and drive the public terminal guard entry point.
 """
 
 from __future__ import annotations
@@ -51,9 +49,7 @@ def breaker_session(monkeypatch):
     A._reset_denials(session_key)
     with A._lock:
         A._permanent_approved.discard("breaker-test-danger")
-        A._permanent_approved.discard("execute_code")
         A._session_approved.get(session_key, set()).discard("breaker-test-danger")
-        A._session_approved.get(session_key, set()).discard("execute_code")
         A._gateway_queues.pop(session_key, None)
         A._gateway_notify_cbs.pop(session_key, None)
     try:
@@ -80,10 +76,6 @@ def _register_resolver(session_key: str, result):
 
 def _denied_terminal(command="dangerous thing"):
     return A.check_all_command_guards(command, "local")
-
-
-def _denied_execute_code(code="print('x')"):
-    return A.check_execute_code_guard(code, "local")
 
 
 # ---------------------------------------------------------------------------
@@ -151,11 +143,6 @@ def test_human_approval_resets_tally(breaker_session):
 
 # ---------------------------------------------------------------------------
 # (d) Tally is per-session — two session keys are independent
-# ---------------------------------------------------------------------------
-
-
-# ---------------------------------------------------------------------------
-# (e) BOTH call paths increment: terminal guard and execute_code guard
 # ---------------------------------------------------------------------------
 
 

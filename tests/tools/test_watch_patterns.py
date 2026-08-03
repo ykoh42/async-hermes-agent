@@ -205,16 +205,6 @@ class TestTerminalToolSchema:
 
 
 # =========================================================================
-# Code execution tool blocked params
-# =========================================================================
-
-class TestCodeExecutionBlocked:
-    def test_watch_patterns_blocked(self):
-        from tools.code_execution_tool import _TERMINAL_BLOCKED_PARAMS
-        assert "watch_patterns" in _TERMINAL_BLOCKED_PARAMS
-
-
-# =========================================================================
 # Suppress-after-exit (anti-spam fix)
 # =========================================================================
 

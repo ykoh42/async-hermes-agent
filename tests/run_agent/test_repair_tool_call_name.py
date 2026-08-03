@@ -25,7 +25,6 @@ VALID = {
     "read_file",
     "write_file",
     "terminal",
-    "execute_code",
     "session_search",
 }
 
@@ -87,7 +86,7 @@ class TestVolcEngineXmlPollution:
     Observed in production with the ``anthropic_messages`` API mode:
 
         terminal" parameter="command" string="true
-        execute_code" parameter="code" string="true
+        read_file" parameter="path" string="true
         session_search" parameter="session_id" string="true
 
     The fix trims at the first ``"``/``'``/``<``/``>`` so the rest of
@@ -110,7 +109,7 @@ class TestVolcEngineXmlPollution:
 
     def test_clean_tool_name_unaffected_by_sanitizer(self, repair):
         # Pure passthrough — no XML/quote chars, no change.
-        assert repair("execute_code") == "execute_code"
+        assert repair("read_file") == "read_file"
         assert repair("session_search") == "session_search"
 
     def test_space_separated_name_still_normalizes(self, repair):

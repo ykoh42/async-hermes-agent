@@ -219,20 +219,6 @@ class TestResolveToolsetIncludeRegistry:
     """include_registry flag exposes the static (pre-registry-merge) view used
     by platform reverse-mapping. Regression harness for issue #49622."""
 
-    def test_include_registry_false_excludes_registry_tools(self):
-        from tools.registry import discover_builtin_tools
-        discover_builtin_tools()  # registers read_terminal into 'terminal'
-
-        merged = set(resolve_toolset("terminal"))
-        static = set(resolve_toolset("terminal", include_registry=False))
-
-        assert static == {"terminal", "process"}, static
-        # read_terminal is registered into 'terminal' but is desktop-only and
-        # not part of the static definition — it must only appear in the merged view.
-        assert "read_terminal" in merged
-        assert "read_terminal" not in static
-
-
     def test_static_view_threads_through_includes(self):
         # 'debugging' has direct tools [terminal, process] and includes [web, file]
         static = set(resolve_toolset("debugging", include_registry=False))

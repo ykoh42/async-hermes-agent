@@ -2217,7 +2217,7 @@ def repair_tool_call(agent, tool_name: str) -> str | None:
     # protocol-translation layer occasionally leaks raw XML attribute
     # fragments into tool_use.name, e.g.
     #   `terminal" parameter="command" string="true`
-    #   `execute_code" parameter="code" string="true`
+    #   `read_file" parameter="path" string="true`
     #   `session_search" parameter="session_id" string="true`
     # We trim at the first unambiguous XML/quote character so the rest
     # of the repair pipeline (lowercase / snake_case / fuzzy match)

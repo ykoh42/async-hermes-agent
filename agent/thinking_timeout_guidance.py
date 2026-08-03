@@ -18,7 +18,7 @@ distinct guidance for this case:
 
 The existing `_is_stream_drop` guidance at
 ``agent/conversation_loop.py:3464-3486`` fires for large-file-write
-stream drops ("try execute_code with Python's open() for large files")
+stream drops ("use terminal with a small script for large files")
 which is the WRONG advice for the thinking-timeout case.  This module
 provides the detection and the message as standalone helpers so the
 detection logic is unit-testable without driving the full retry loop,

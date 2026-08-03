@@ -10,7 +10,7 @@ returned exit 130 + "[Command interrupted]" while still carrying the
 "...approved by the user." note (the 3-part signature).
 
 Fix: clear the current thread's interrupt bit once before the approved command
-spawns its child (terminal foreground; execute_code local + remote), and enrich
+spawns its terminal child, and enrich
 the note on a genuine post-start interrupt instead of implying success.
 
 Invariant preserved: a genuine interrupt arriving AFTER execution starts (or
@@ -188,49 +188,3 @@ def test_retry_backoff_does_not_clear_genuine_interrupt(monkeypatch):
     assert calls["n"] == 2, calls
     assert calls["interrupted_at_retry"] is True, "retry must NOT re-clear a genuine interrupt"
     assert result["exit_code"] == 130, result
-
-
-# ---------------------------------------------------------------------------
-# execute_code (same root cause, its own approval-wait + spawn/poll loop)
-# ---------------------------------------------------------------------------
-
-def test_execute_code_approved_clears_stale_interrupt_bit(monkeypatch):
-    """An approved execute_code script (local path) runs from a clean slate."""
-    from tools.code_execution_tool import execute_code
-
-    monkeypatch.setattr(
-        "tools.approval.check_execute_code_guard",
-        lambda *a, **k: {"approved": True, "user_approved": True},
-    )
-    set_interrupt(True)
-    assert is_interrupted()
-
-    result = json.loads(execute_code(
-        code='import time; time.sleep(0.5); print("CODE_DONE")',
-        task_id="test-clean-slate",
-    ))
-
-    assert result["status"] == "success", result
-    assert "CODE_DONE" in result["output"]
-    assert "execution interrupted" not in result["output"]
-
-
-def test_execute_code_non_approved_still_interrupts_on_stale_bit(monkeypatch):
-    """Non-user-approved execute_code keeps current interrupt behavior."""
-    from tools.code_execution_tool import execute_code
-
-    monkeypatch.setattr(
-        "tools.approval.check_execute_code_guard",
-        lambda *a, **k: {"approved": True},  # approved, but NOT user_approved
-    )
-    set_interrupt(True)
-
-    result = json.loads(execute_code(
-        code='import time; time.sleep(0.5); print("CODE_DONE")',
-        task_id="test-clean-slate-2",
-    ))
-
-    # Killed on the first poll before the script can print.
-    assert "CODE_DONE" not in result["output"], result
-
-

@@ -14,8 +14,8 @@ Tool dispatch inside such a thread therefore silently loses:
     (GHSA-qg5c-hvr5-hjgr, #15216).
 
 This helper factors out that capture/install/clear lifecycle so the several
-places that fan tool dispatch onto worker threads (``agent.tool_executor`` and
-the ``execute_code`` RPC threads) share one audited implementation instead of
+places that fan tool dispatch onto worker threads share one audited
+implementation instead of
 divergent copies.
 
 Usage — call :func:`propagate_context_to_thread` **on the parent thread**

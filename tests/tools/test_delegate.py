@@ -90,8 +90,8 @@ class TestChildSystemPrompt(unittest.TestCase):
 
 class TestStripBlockedTools(unittest.TestCase):
     def test_removes_blocked_toolsets(self):
-        result = _strip_blocked_tools(["terminal", "file", "delegation", "clarify", "memory", "code_execution"])
-        self.assertEqual(sorted(result), ["code_execution", "file", "terminal"])
+        result = _strip_blocked_tools(["terminal", "file", "delegation", "clarify", "memory", "custom"])
+        self.assertEqual(sorted(result), ["custom", "file", "terminal"])
 
     def test_strips_cronjob_toolset(self):
         """Regression for issue #43466: child subagents must not inherit
@@ -145,10 +145,6 @@ class TestStripBlockedTools(unittest.TestCase):
             "memory",
         ):
             self.assertIn(toolset_name, disabled)
-        # code_execution is deliberately NOT denied — children keep
-        # execute_code for programmatic tool calling (Teknium, Jul 2026).
-        self.assertNotIn("code_execution", disabled)
-
         definitions = model_tools.get_tool_definitions(
             enabled_toolsets=kwargs["enabled_toolsets"],
             disabled_toolsets=disabled,
@@ -286,57 +282,6 @@ class TestDelegateTask(unittest.TestCase):
 
             _, kwargs = MockAgent.call_args
             self.assertEqual(kwargs["api_mode"], "anthropic_messages")
-
-class TestToolNamePreservation(unittest.TestCase):
-    """Verify _last_resolved_tool_names is restored after subagent runs."""
-
-    def test_global_tool_names_restored_after_delegation(self):
-        """The process-global _last_resolved_tool_names must be restored
-        after a subagent completes so the parent's execute_code sandbox
-        generates correct imports."""
-        import model_tools
-
-        parent = _make_mock_parent(depth=0)
-        original_tools = ["terminal", "read_file", "web_search", "execute_code", "delegate_task"]
-        model_tools._last_resolved_tool_names = list(original_tools)
-
-        with patch("run_agent.AIAgent") as MockAgent:
-            mock_child = MagicMock()
-            mock_child.run_conversation.return_value = {
-                "final_response": "done", "completed": True, "api_calls": 1,
-            }
-            MockAgent.return_value = mock_child
-
-            delegate_task(goal="Test tool preservation", parent_agent=parent)
-
-        self.assertEqual(model_tools._last_resolved_tool_names, original_tools)
-
-
-    def test_saved_tool_names_set_on_child_before_run(self):
-        """_run_single_child must set _delegate_saved_tool_names on the child
-        from model_tools._last_resolved_tool_names before run_conversation."""
-        import model_tools
-
-        parent = _make_mock_parent(depth=0)
-        expected_tools = ["read_file", "web_search", "execute_code"]
-        model_tools._last_resolved_tool_names = list(expected_tools)
-
-        captured = {}
-
-        with patch("run_agent.AIAgent") as MockAgent:
-            mock_child = MagicMock()
-
-            def capture_and_return(user_message, task_id=None, stream_callback=None):
-                captured["saved"] = list(mock_child._delegate_saved_tool_names)
-                return {"final_response": "ok", "completed": True, "api_calls": 1}
-
-            mock_child.run_conversation.side_effect = capture_and_return
-            MockAgent.return_value = mock_child
-
-            delegate_task(goal="capture test", parent_agent=parent)
-
-        self.assertEqual(captured["saved"], expected_tools)
-
 
 class TestDelegateObservability(unittest.TestCase):
     """Tests for enriched metadata returned by _run_single_child."""
@@ -583,14 +528,6 @@ class TestSubagentCostRollup(unittest.TestCase):
         for entry in result["results"]:
             self.assertNotIn("_child_cost_usd", entry)
             self.assertNotIn("_child_role", entry)
-
-class TestBlockedTools(unittest.TestCase):
-
-    def test_execute_code_not_blocked(self):
-        """Children retain execute_code (programmatic tool calling) so they
-        can batch mechanical work instead of burning reasoning iterations
-        (Teknium, Jul 2026)."""
-        self.assertNotIn("execute_code", DELEGATE_BLOCKED_TOOLS)
 
 class TestDelegationCredentialResolution(unittest.TestCase):
     """Tests for provider:model credential resolution in delegation config."""

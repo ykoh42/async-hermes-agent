@@ -1253,29 +1253,3 @@ class TestApprovalPromptRedaction:
         prompt_dangerous_approval("rm -rf /var/data", "recursive delete",
                                   approval_callback=cb)
         assert seen["command"] == "rm -rf /var/data"
-
-    def test_execute_code_pending_fallback_redacts_script(self):
-        """check_execute_code_guard's no-notifier fallback masks an embedded
-        secret in both the pending record and the returned approval message."""
-        from unittest.mock import patch as _patch
-
-        from tools.approval import check_execute_code_guard
-
-        code = (
-            "import os\n"
-            'api_key = "sk-proj-abc123xyz4567890abcdef"\n'
-            "print(api_key)"
-        )
-        cfg = {"approvals": {"mode": "manual"}}
-        with _patch("hermes_cli.config.load_config", return_value=cfg):
-            with _patch("tools.approval._is_gateway_approval_context",
-                        return_value=True):
-                with _patch("tools.approval._get_approval_mode",
-                            return_value="manual"):
-                    # No gateway notify callback registered -> pending fallback.
-                    result = check_execute_code_guard(code, "local")
-
-        assert result.get("status") == "pending_approval"
-        # The script's credential must not appear in the user-facing message.
-        assert "sk-proj-abc123xyz4567890abcdef" not in result["message"]
-        assert "sk-proj-abc123xyz4567890abcdef" not in result["command"]

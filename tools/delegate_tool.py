@@ -893,7 +893,7 @@ def _strip_blocked_tools(toolsets: List[str]) -> List[str]:
     """Remove toolsets that contain only blocked tools.
 
     The strip set is derived from DELEGATE_BLOCKED_TOOLS plus the explicit
-    composite/scenario toolsets (delegation, code_execution) that have no
+    composite/scenario toolsets (delegation) that have no
     one-to-one tool. This keeps the blocklist and the strip set in lockstep
     so new blocked tools can't silently leak through as toolset names.
     """
@@ -1976,14 +1976,6 @@ def _run_single_child(
     # Get the progress callback from the child agent
     child_progress_cb = getattr(child, "tool_progress_callback", None)
 
-    # Restore parent tool names using the value saved before child construction
-    # mutated the global. This is the correct parent toolset, not the child's.
-    import model_tools
-
-    _saved_tool_names = getattr(
-        child, "_delegate_saved_tool_names", list(model_tools._last_resolved_tool_names)
-    )
-
     child_pool = getattr(child, "_credential_pool", None)
     leased_cred_id = None
     leased_entry = None
@@ -2563,14 +2555,6 @@ def _run_single_child(
             except Exception as exc:
                 logger.debug("Failed to release credential lease: %s", exc)
 
-        # Restore the parent's tool names so the process-global is correct
-        # for any subsequent execute_code calls or other consumers.
-        import model_tools
-
-        saved_tool_names = getattr(child, "_delegate_saved_tool_names", None)
-        if isinstance(saved_tool_names, list):
-            model_tools._last_resolved_tool_names = list(saved_tool_names)
-
         # Remove child from active tracking
 
         # Unregister child from interrupt propagation
@@ -2618,17 +2602,9 @@ _CHILD_CONSTRUCTION_LOCK = threading.RLock()
 
 
 def _build_child_preserving_parent_tools(**kwargs):
-    """Build a child without leaking its resolved toolset into the parent."""
-    import model_tools
-
+    """Build a child while serializing process-global construction state."""
     with _CHILD_CONSTRUCTION_LOCK:
-        parent_tool_names = list(model_tools._last_resolved_tool_names)
-        try:
-            child = _build_child_agent(**kwargs)
-        finally:
-            model_tools._last_resolved_tool_names = parent_tool_names
-    child._delegate_saved_tool_names = parent_tool_names
-    return child
+        return _build_child_agent(**kwargs)
 
 
 def _parent_finalization_lock(parent_agent) -> threading.RLock:
@@ -3714,7 +3690,7 @@ def _build_top_level_description() -> str:
         "- Tasks that would flood your context with intermediate data\n"
         "- Parallel independent workstreams (research A and B simultaneously)\n\n"
         "WHEN NOT TO USE (use these instead):\n"
-        "- Mechanical multi-step work with no reasoning needed -> use execute_code\n"
+        "- Mechanical multi-step work with no reasoning needed -> use terminal\n"
         "- Single tool call -> just call the tool directly\n"
         "- Tasks needing user interaction -> subagents cannot use clarify\n"
         "- Durable long-running work that must outlive the current turn -> "

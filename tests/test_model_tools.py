@@ -336,7 +336,7 @@ class TestDisabledToolsetsPostureToolset:
 
         # web_search is check_fn-gated (needs an API key); probe only the core
         # tools actually present in baseline so gating cannot mask the fix.
-        core_probe = {"terminal", "read_file", "write_file", "web_search", "execute_code"}
+        core_probe = {"terminal", "read_file", "write_file", "web_search"}
 
         baseline = {
             t["function"]["name"]

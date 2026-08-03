@@ -5131,7 +5131,7 @@ async def run_conversation(
                         )
                         agent._vprint(
                             f"{agent.log_prefix}      Try asking the model "
-                            f"to use execute_code with Python's open() for "
+                            f"to use terminal with a small Python script for "
                             f"large files, or to write the file in smaller "
                             f"sections.",
                             force=True,
@@ -5237,7 +5237,7 @@ async def run_conversation(
                             "dropping — this often happens when generating "
                             "very large tool call responses (e.g. write_file "
                             "with long content). Try asking me to use "
-                            "execute_code with Python's open() for large "
+                            "terminal with a small Python script for large "
                             "files, or to write in smaller sections."
                         )
                     return {
@@ -6128,13 +6128,6 @@ async def run_conversation(
                 # arrives.
                 agent._stream_needs_break = True
 
-                # Refund the iteration if the ONLY tool(s) called were
-                # execute_code (programmatic tool calling).  These are
-                # cheap RPC-style calls that shouldn't eat the budget.
-                _tc_names = {tc.function.name for tc in assistant_message.tool_calls}
-                if _tc_names == {"execute_code"}:
-                    agent.iteration_budget.refund()
-                
                 # Use real token counts from the API response to decide
                 # compression.  prompt_tokens + completion_tokens is the
                 # actual context size the provider reported plus the

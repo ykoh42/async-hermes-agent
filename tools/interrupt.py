@@ -88,7 +88,7 @@ def clear_current_thread_interrupt() -> None:
 # ---------------------------------------------------------------------------
 # Backward-compatible _interrupt_event proxy
 # ---------------------------------------------------------------------------
-# Some legacy call sites (code_execution_tool, process_registry, tests)
+# Some legacy call sites (process_registry, tests)
 # import _interrupt_event directly and call .is_set() / .set() / .clear().
 # This shim maps those calls to the per-thread functions above so existing
 # code keeps working while the underlying mechanism is thread-scoped.

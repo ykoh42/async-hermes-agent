@@ -25,8 +25,8 @@ class IterationBudget:
     Users control the per-subagent limit via ``delegation.max_iterations``
     in config.yaml.
 
-    ``execute_code`` (programmatic tool calling) iterations are refunded via
-    :meth:`refund` so they don't eat into the budget.
+    Internal retry and recovery calls can be refunded via :meth:`refund` so
+    they do not consume user budget.
     """
 
     def __init__(self, max_total: int):
@@ -43,7 +43,7 @@ class IterationBudget:
             return True
 
     def refund(self) -> None:
-        """Give back one iteration (e.g. for execute_code turns)."""
+        """Give back one iteration for an internal retry or recovery call."""
         with self._lock:
             if self._used > 0:
                 self._used -= 1

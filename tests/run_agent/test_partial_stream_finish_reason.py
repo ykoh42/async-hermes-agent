@@ -118,7 +118,7 @@ class TestCleanStreamEndMidToolCall:
             # finish_reason chunk, no [DONE].
             yield _make_stream_chunk(content="\n")
             yield _make_stream_chunk(tool_calls=[
-                _make_tool_call_delta(index=0, tc_id="call_x", name="execute_code"),
+                _make_tool_call_delta(index=0, tc_id="call_x", name="terminal"),
             ])
             yield _make_stream_chunk(tool_calls=[
                 _make_tool_call_delta(index=0, arguments="{"),
@@ -146,7 +146,7 @@ class TestCleanStreamEndMidToolCall:
         assert response.choices[0].message.tool_calls is None, (
             "Incomplete tool args must never auto-execute."
         )
-        assert getattr(response, "_dropped_tool_names", None) == ["execute_code"]
+        assert getattr(response, "_dropped_tool_names", None) == ["terminal"]
 
 
 
