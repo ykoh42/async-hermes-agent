@@ -30,6 +30,11 @@ jobs:
       - name: Install Python
         run: uv python install 3.11
 
+      - name: Install ripgrep
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes ripgrep
+
       - name: Verify lockfile
         run: uv lock --check
 
@@ -40,7 +45,7 @@ jobs:
         run: uv run ruff check .
 
       - name: Test
-        run: uv run pytest -q
+        run: uv run pytest -q -W error::pytest.PytestUnhandledThreadExceptionWarning
         env:
           OPENROUTER_API_KEY: ""
           OPENAI_API_KEY: ""

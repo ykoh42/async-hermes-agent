@@ -102,6 +102,7 @@ class TestFlushAfterCompression:
                 f"Expected 5 compressed messages in new session, got {len(new_rows)}. "
                 f"Compression persistence bug: messages not written to SQLite."
             )
+            await db.close()
 
     @pytest.mark.asyncio
     async def test_flush_with_stale_history_loses_messages(self):
@@ -132,6 +133,7 @@ class TestFlushAfterCompression:
             rows = await db.get_messages("new-session")
             assert len(rows) == 2
             assert [row["content"] for row in rows] == ["summary", "continuing..."]
+            await db.close()
 
     @pytest.mark.asyncio
     async def test_in_place_compression_rebaseline_prevents_duplicate_compacted_rows(self):
@@ -195,6 +197,7 @@ class TestFlushAfterCompression:
                 "tool result",
                 "final answer",
             ]
+            await db.close()
 
     @pytest.mark.asyncio
     async def test_abort_after_in_place_compaction_preserves_flush_baseline(self):
