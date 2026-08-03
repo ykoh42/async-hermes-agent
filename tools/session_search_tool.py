@@ -304,7 +304,7 @@ async def _resolve_profile_db(profile: str):
     return AsyncSessionDB(profile_dir / "state.db")
 
 
-def _session_link(session_id: str, profile: str = None) -> str:
+async def _session_link(session_id: str, profile: str = None) -> str:
     """The reference the agent writes to point the user at a session.
 
     Same value the desktop composer emits when a session is dragged into a
@@ -315,28 +315,12 @@ def _session_link(session_id: str, profile: str = None) -> str:
     name = (profile or "").strip()
     if not name:
         try:
-            from hermes_cli.profiles import get_active_profile_name
-
-            resolved = get_active_profile_name()
-            name = "" if resolved == "custom" else resolved
-        except Exception:
-            logging.debug("get_active_profile_name failed for session link", exc_info=True)
-            name = ""
-
-    return f"@session:{name}/{session_id}" if name else f"@session:{session_id}"
-
-
-async def _session_link_async(session_id: str, profile: str = None) -> str:
-    """Build a session reference without synchronous profile-path probing."""
-    name = (profile or "").strip()
-    if not name:
-        try:
             from hermes_cli.profiles import get_active_profile_name_async
 
             resolved = await get_active_profile_name_async()
             name = "" if resolved == "custom" else resolved
         except Exception:
-            logging.debug("get_active_profile_name_async failed for session link", exc_info=True)
+            logging.debug("get_active_profile_name failed for session link", exc_info=True)
             name = ""
     return f"@session:{name}/{session_id}" if name else f"@session:{session_id}"
 
@@ -429,7 +413,7 @@ async def _read_session(db, session_id: str, head: int = 20, tail: int = 10, lin
         "success": True,
         "mode": "read",
         "session_id": session_id,
-        "link": await _session_link_async(session_id, link_profile),
+        "link": await _session_link(session_id, link_profile),
         "session_meta": {
             "when": _format_timestamp(meta.get("started_at")),
             "source": meta.get("source"),
@@ -473,7 +457,7 @@ async def _list_recent_sessions(db, limit: int, current_session_id: str = None, 
                 continue
             results.append({
                 "session_id": sid,
-                "link": await _session_link_async(sid, link_profile),
+                "link": await _session_link(sid, link_profile),
                 "title": s.get("title") or None,
                 "source": s.get("source", ""),
                 "started_at": s.get("started_at", ""),
@@ -854,7 +838,7 @@ async def _discover(
         results.append(entry)
 
     for entry in results:
-        entry["link"] = await _session_link_async(entry["session_id"], link_profile)
+        entry["link"] = await _session_link(entry["session_id"], link_profile)
 
     _final_payload = {
         "success": True,
