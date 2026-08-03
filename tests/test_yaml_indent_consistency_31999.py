@@ -99,10 +99,10 @@ class TestAtomicYamlWriteUsesIndentDumper:
 
 
 class TestRoundtripConsistency:
-    """Output of atomic_yaml_write should round-trip through ruamel.yaml."""
+    """Output of atomic_yaml_write should round-trip through the runtime parser."""
 
-    def test_pyyaml_output_loads_in_ruamel(self, tmp_path):
-        """File written by atomic_yaml_write should load in ruamel.yaml without errors."""
+    def test_pyyaml_output_round_trips(self, tmp_path):
+        """The retained PyYAML runtime must recover the complete structure."""
         data = {
             "custom_providers": [
                 {"name": "Provider A", "base_url": "https://a.example.com"},
@@ -113,8 +113,6 @@ class TestRoundtripConsistency:
         path = tmp_path / "config.yaml"
         atomic_yaml_write(path, data)
 
-        from ruamel.yaml import YAML
-        yaml_rt = YAML(typ="rt")
-        loaded = yaml_rt.load(path.read_text(encoding="utf-8"))
+        loaded = yaml.safe_load(path.read_text(encoding="utf-8"))
         assert loaded["custom_providers"][0]["name"] == "Provider A"
         assert loaded["fallback_providers"] == ["backup1", "backup2"]
