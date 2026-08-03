@@ -908,6 +908,17 @@ async def skill_view(
                 "content": f"[Binary file: {target.name}, size: {size} bytes]",
                 "is_binary": True,
             }, ensure_ascii=False)
+
+        try:
+            from tools.skill_manager_tool import mark_background_review_skill_read
+
+            mark_background_review_skill_read(target)
+        except Exception:
+            logger.debug(
+                "Could not record background-review skill read for %s",
+                target,
+                exc_info=True,
+            )
         if file_path:
             return json.dumps({
                 "success": True,

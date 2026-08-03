@@ -38,10 +38,10 @@ class _Agent:
     async def _invalidate_system_prompt(self):
         self._cached_system_prompt = None
 
-    def _build_system_prompt(self, system_message):
+    async def _build_system_prompt(self, system_message):
         return system_message
 
-    def commit_memory_session(self, _messages):
+    async def commit_memory_session(self, _messages):
         pass
 
 

@@ -6,6 +6,7 @@ import base64
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
 
 from agent.image_routing import (
     _coerce_capability_bool,
@@ -59,11 +60,13 @@ class TestDecideImageInputMode:
 
 
 
-    def test_auto_with_unknown_model(self):
+    @pytest.mark.asyncio
+    async def test_auto_with_unknown_model(self):
         with patch("agent.image_routing._lookup_supports_vision", return_value=None):
-            assert decide_image_input_mode("openrouter", "brand-new-slug", {}) == "text"
+            assert await decide_image_input_mode("openrouter", "brand-new-slug", {}) == "text"
 
-    def test_auto_prefers_native_for_vision_capable_main_model_even_with_aux_configured(self):
+    @pytest.mark.asyncio
+    async def test_auto_prefers_native_for_vision_capable_main_model_even_with_aux_configured(self):
         """Regression #29135: vision-capable main model wins over aux fallback.
 
         Auxiliary.vision is a fallback for text-only main models; it must
@@ -71,12 +74,13 @@ class TestDecideImageInputMode:
         """
         cfg = {"auxiliary": {"vision": {"provider": "openrouter", "model": "google/gemini-2.5-flash"}}}
         with patch("agent.image_routing._lookup_supports_vision", return_value=True):
-            assert decide_image_input_mode("anthropic", "claude-sonnet-4", cfg) == "native"
+            assert await decide_image_input_mode("anthropic", "claude-sonnet-4", cfg) == "native"
 
 
-    def test_none_config_is_auto(self):
+    @pytest.mark.asyncio
+    async def test_none_config_is_auto(self):
         with patch("agent.image_routing._lookup_supports_vision", return_value=True):
-            assert decide_image_input_mode("anthropic", "claude-sonnet-4", None) == "native"
+            assert await decide_image_input_mode("anthropic", "claude-sonnet-4", None) == "native"
 
 
 
@@ -137,25 +141,24 @@ class TestSupportsVisionOverride:
 
 class TestLookupSupportsVisionOverride:
 
-
-    def test_no_override_falls_back_to_models_dev(self):
+    @pytest.mark.asyncio
+    async def test_no_override_falls_back_to_models_dev(self):
         fake_caps = type("Caps", (), {"supports_vision": True})()
-        with patch("agent.models_dev.get_model_capabilities", return_value=fake_caps):
-            assert _lookup_supports_vision("anthropic", "claude-sonnet-4", {}) is True
+        with patch("agent.models_dev.get_model_capabilities_async", return_value=fake_caps):
+            assert await _lookup_supports_vision("anthropic", "claude-sonnet-4", {}) is True
 
-
-    def test_ollama_probe_when_models_dev_missing(self):
+    @pytest.mark.asyncio
+    async def test_ollama_probe_when_models_dev_missing(self):
         cfg = {"model": {"base_url": "http://localhost:11434/v1"}}
-        with patch("agent.models_dev.get_model_capabilities", return_value=None), \
-             patch("agent.image_routing._should_probe_ollama_vision", return_value=True), \
-             patch("agent.model_metadata.query_ollama_supports_vision", return_value=True):
-            assert _lookup_supports_vision("ollama", "gemma4:e2b", cfg) is True
+        with patch("agent.models_dev.get_model_capabilities_async", return_value=None), \
+             patch("agent.model_metadata.query_ollama_supports_vision_async", return_value=True):
+            assert await _lookup_supports_vision("ollama", "gemma4:e2b", cfg) is True
 
-
-    def test_cfg_none_falls_back_to_models_dev(self):
+    @pytest.mark.asyncio
+    async def test_cfg_none_falls_back_to_models_dev(self):
         # Caller didn't pass cfg at all — old call sites must still work.
-        with patch("agent.models_dev.get_model_capabilities", return_value=None):
-            assert _lookup_supports_vision("openrouter", "x", None) is None
+        with patch("agent.models_dev.get_model_capabilities_async", return_value=None):
+            assert await _lookup_supports_vision("openrouter", "x", None) is None
 
 
 # ─── decide_image_input_mode with auto + override ────────────────────────────
@@ -164,15 +167,17 @@ class TestLookupSupportsVisionOverride:
 class TestAutoModeRespectsOverride:
 
 
-    def test_auto_text_for_custom_with_supports_vision_false(self):
+    @pytest.mark.asyncio
+    async def test_auto_text_for_custom_with_supports_vision_false(self):
         cfg = {"model": {"supports_vision": False}}
         with patch("agent.models_dev.get_model_capabilities", return_value=None):
-            assert decide_image_input_mode("custom", "some-text-only", cfg) == "text"
+            assert await decide_image_input_mode("custom", "some-text-only", cfg) == "text"
 
-    def test_auto_text_for_custom_with_no_override(self):
+    @pytest.mark.asyncio
+    async def test_auto_text_for_custom_with_no_override(self):
         # Unchanged baseline: unknown custom model → text.
         with patch("agent.models_dev.get_model_capabilities", return_value=None):
-            assert decide_image_input_mode("custom", "unknown", {}) == "text"
+            assert await decide_image_input_mode("custom", "unknown", {}) == "text"
 
 
 
@@ -478,7 +483,8 @@ class TestCustomProviderVisionAlias:
         assert _supports_vision_override(cfg, "my-vllm", "llama-3") is False
 
 
-    def test_named_custom_provider_bare_custom_runtime_vision_alias(self):
+    @pytest.mark.asyncio
+    async def test_named_custom_provider_bare_custom_runtime_vision_alias(self):
         """Teknium's requested regression case.
 
         A named custom provider (``model.provider: my-vllm``) is rewritten to
@@ -495,7 +501,7 @@ class TestCustomProviderVisionAlias:
         }
         # Runtime provider is the bare normalized value "custom".
         assert _supports_vision_override(cfg, "custom", "llava-v1.6") is True
-        assert decide_image_input_mode("custom", "llava-v1.6", cfg) == "native"
+        assert await decide_image_input_mode("custom", "llava-v1.6", cfg) == "native"
 
 
 

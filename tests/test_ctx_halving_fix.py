@@ -23,8 +23,9 @@ These are different and the old code conflated them; the fix keeps them
 separate.
 """
 
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
+import pytest
 
 
 
@@ -182,27 +183,29 @@ class TestEphemeralMaxOutputTokens:
         agent.context_compressor = compressor
 
         # Stub out the internal message-preparation helper
-        agent._prepare_anthropic_messages_for_api = MagicMock(
+        agent._prepare_anthropic_messages_for_api = AsyncMock(
             return_value=[{"role": "user", "content": "hi"}]
         )
         agent._anthropic_preserve_dots = MagicMock(return_value=False)
         agent.request_overrides = {}
         return agent
 
-    def test_ephemeral_override_is_used_on_first_call(self):
+    @pytest.mark.asyncio
+    async def test_ephemeral_override_is_used_on_first_call(self):
         """When _ephemeral_max_output_tokens is set, it overrides self.max_tokens."""
         agent = self._make_agent()
         agent._ephemeral_max_output_tokens = 5_000
 
-        kwargs = agent._build_api_kwargs([{"role": "user", "content": "hi"}])
+        kwargs = await agent._build_api_kwargs([{"role": "user", "content": "hi"}])
         assert kwargs["max_tokens"] == 5_000
 
-    def test_ephemeral_override_is_consumed_after_one_call(self):
+    @pytest.mark.asyncio
+    async def test_ephemeral_override_is_consumed_after_one_call(self):
         """After one call the ephemeral override is cleared to None."""
         agent = self._make_agent()
         agent._ephemeral_max_output_tokens = 5_000
 
-        agent._build_api_kwargs([{"role": "user", "content": "hi"}])
+        await agent._build_api_kwargs([{"role": "user", "content": "hi"}])
         assert agent._ephemeral_max_output_tokens is None
 
 
@@ -283,4 +286,3 @@ class TestContextNotHalvedOnOutputCapError:
         available_out = parse_available_output_tokens_from_error(error_msg)
         safe_out = max(1, available_out - 64)
         assert safe_out == 9_936
-

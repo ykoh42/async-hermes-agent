@@ -650,9 +650,13 @@ class AIAgent:
             )
 
     async def _persist_pending_billing_route(self) -> None:
-        """Persist a synchronous model switch at the next async turn boundary."""
+        """Persist the active model route after an async model switch."""
         pending = getattr(self, "_pending_billing_route", None)
-        if not pending or not self._session_db or getattr(self, "_persist_disabled", False):
+        if (
+            not pending
+            or not getattr(self, "_session_db", None)
+            or getattr(self, "_persist_disabled", False)
+        ):
             return
         try:
             session_db = self._session_db

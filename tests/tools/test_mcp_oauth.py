@@ -762,7 +762,8 @@ class TestWaitForCallbackSkipIntegration:
 # ---------------------------------------------------------------------------
 
 class TestPoisonClientRegistration:
-    def test_poison_backs_up_and_removes_client_and_meta(self, tmp_path, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_poison_backs_up_and_removes_client_and_meta(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         storage = HermesTokenStorage("srv")
         d = tmp_path / "mcp-tokens"
@@ -771,7 +772,7 @@ class TestPoisonClientRegistration:
         (d / "srv.client.json").write_text('{"client_id": "dead"}')
         (d / "srv.meta.json").write_text('{"token_endpoint": "https://idp/token"}')
 
-        removed = storage.poison_client_registration()
+        removed = await storage.poison_client_registration()
 
         assert removed is True
         # Client + metadata gone, forcing re-registration on the next flow.

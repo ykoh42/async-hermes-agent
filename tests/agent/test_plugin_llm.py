@@ -430,7 +430,8 @@ class TestAsyncSurface:
 
 
 class TestConfigDrivenPolicy:
-    def test_policy_loaded_from_yaml(self, tmp_path, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_policy_loaded_from_yaml(self, tmp_path, monkeypatch):
         from agent.plugin_llm import _resolve_trust_policy
 
         hermes_home = tmp_path / ".hermes"
@@ -455,7 +456,7 @@ plugins:
         from hermes_cli import config as _config_mod
         _config_mod._config_cache = None  # type: ignore[attr-defined]
 
-        policy = _resolve_trust_policy("my-plugin")
+        policy = await _resolve_trust_policy("my-plugin")
         assert policy.allow_provider_override is True
         assert policy.allow_model_override is True
         assert policy.allow_profile_override is False
@@ -464,7 +465,8 @@ plugins:
             "openai/gpt-4o-mini", "anthropic/claude-3-5-haiku",
         })
 
-    def test_missing_plugin_entry_yields_default_deny(self, tmp_path, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_missing_plugin_entry_yields_default_deny(self, tmp_path, monkeypatch):
         from agent.plugin_llm import _resolve_trust_policy
 
         hermes_home = tmp_path / ".hermes"
@@ -474,7 +476,7 @@ plugins:
         from hermes_cli import config as _config_mod
         _config_mod._config_cache = None  # type: ignore[attr-defined]
 
-        policy = _resolve_trust_policy("never-configured")
+        policy = await _resolve_trust_policy("never-configured")
         assert policy.allow_provider_override is False
         assert policy.allow_model_override is False
         assert policy.allow_profile_override is False
@@ -521,14 +523,15 @@ class TestAttribution:
     fallbacks ('auto', 'default') from earlier drafts."""
 
 
-    def test_response_model_wins_over_model_override(self):
+    @pytest.mark.asyncio
+    async def test_response_model_wins_over_model_override(self):
         """Providers often canonicalise the model name (e.g. ``gpt-4o``
         → ``gpt-4o-2024-08-06``). Whatever they actually returned wins
         for the recorded model so the audit log reflects reality."""
         from agent.plugin_llm import _resolve_attribution
 
         response = SimpleNamespace(model="gpt-4o-2024-08-06", choices=[])
-        provider, model = _resolve_attribution(
+        provider, model = await _resolve_attribution(
             provider_override="openrouter",
             model_override="openai/gpt-4o",
             response=response,
@@ -538,17 +541,24 @@ class TestAttribution:
         assert provider == "openrouter"
 
 
-    def test_response_model_used_even_when_no_overrides(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_response_model_used_even_when_no_overrides(self, monkeypatch):
         """The provider's canonical model name should still flow through
         when no overrides are set."""
         from agent import plugin_llm
         import agent.auxiliary_client as ac
 
-        monkeypatch.setattr(ac, "_read_main_provider", lambda: "openrouter")
-        monkeypatch.setattr(ac, "_read_main_model", lambda: "openai/gpt-4o")
+        async def _main_provider():
+            return "openrouter"
+
+        async def _main_model():
+            return "openai/gpt-4o"
+
+        monkeypatch.setattr(ac, "_read_main_provider_async", _main_provider)
+        monkeypatch.setattr(ac, "_read_main_model_async", _main_model)
 
         response = SimpleNamespace(model="openai/gpt-4o-2024-08-06", choices=[])
-        provider, model = plugin_llm._resolve_attribution(
+        provider, model = await plugin_llm._resolve_attribution(
             provider_override=None,
             model_override=None,
             response=response,

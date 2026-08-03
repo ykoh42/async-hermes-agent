@@ -842,7 +842,8 @@ class TestCuratorConsolidationDeleteGuard:
         assert (skills_root / "active-skill").exists()
 
 
-    def test_background_review_support_file_overwrite_requires_that_file_read(self, tmp_path, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_background_review_support_file_overwrite_requires_that_file_read(self, tmp_path, monkeypatch):
         from tools.skills_tool import skill_view
         from tools.skill_manager_tool import _reset_background_review_read_marks
 
@@ -854,7 +855,7 @@ class TestCuratorConsolidationDeleteGuard:
             (ref / "workflow.md").write_text("old workflow\n", encoding="utf-8")
 
             # Reading SKILL.md does not authorize overwriting a linked file.
-            assert json.loads(skill_view("reviewed"))["success"] is True
+            assert json.loads(await skill_view("reviewed"))["success"] is True
             blocked = json.loads(skill_manage(
                 action="write_file",
                 name="reviewed",
@@ -864,7 +865,9 @@ class TestCuratorConsolidationDeleteGuard:
             assert blocked["success"] is False
             assert blocked.get("_read_before_write_required") is True
 
-            assert json.loads(skill_view("reviewed", "references/workflow.md"))["success"] is True
+            assert json.loads(
+                await skill_view("reviewed", "references/workflow.md")
+            )["success"] is True
             allowed = json.loads(skill_manage(
                 action="write_file",
                 name="reviewed",

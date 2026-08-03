@@ -2023,6 +2023,26 @@ async def switch_model(agent, new_model, new_provider, api_key='', base_url='', 
     ).strip().lower()
     effective_base_url = str(base_url or getattr(agent, "base_url", "") or "").strip()
     effective_key = api_key or getattr(agent, "api_key", "")
+
+    # Resolve destination-only context configuration before mutating the live
+    # runtime.  A model switch must never inherit the previous model's explicit
+    # window.  Configuration I/O stays async; the metadata lookup below is the
+    # pure, no-network resolver used on the conversation path.
+    from hermes_cli.config import (
+        get_compatible_custom_providers,
+        get_custom_provider_context_length,
+        load_config_readonly_async,
+    )
+
+    switch_config = await load_config_readonly_async()
+    custom_providers = get_compatible_custom_providers(switch_config)
+    destination_context = get_custom_provider_context_length(
+        model=new_model,
+        base_url=effective_base_url,
+        custom_providers=custom_providers,
+    )
+    previous_context_length = getattr(agent, "_config_context_length", None)
+    agent._config_context_length = destination_context
     if not api_mode:
         api_mode = determine_api_mode(new_provider, effective_base_url, model=new_model)
     if (
@@ -2045,15 +2065,25 @@ async def switch_model(agent, new_model, new_provider, api_key='', base_url='', 
     }
     try:
         await agent._ensure_provider_runtime()
-    except Exception:
+    except BaseException:
         agent._deferred_provider_runtime = previous_deferred
+        agent._config_context_length = previous_context_length
         raise
 
     compressor = getattr(agent, "context_compressor", None)
     if compressor is not None:
+        from agent.model_metadata import get_static_context_length
+
+        context_length = get_static_context_length(
+            agent.model,
+            base_url=agent.base_url,
+            provider=agent.provider,
+            config_context_length=destination_context,
+            custom_providers=custom_providers,
+        )
         compressor.update_model(
             model=agent.model,
-            context_length=compressor.context_length,
+            context_length=context_length,
             base_url=agent.base_url,
             api_key=agent.api_key,
             provider=agent.provider,
