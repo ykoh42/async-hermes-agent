@@ -3,12 +3,12 @@
 Covers convert_base64_images_to_links, _truncate_with_footer, _store_full_text,
 _get_extract_char_limit, and the end-to-end web_extract_tool truncation behavior.
 """
-import asyncio
 import json
 import os
 from unittest.mock import patch
 
 import pytest
+import aiofiles
 
 import tools.web_tools as wt
 
@@ -33,23 +33,30 @@ class TestImageConversion:
 
 
 class TestTruncation:
-    def test_short_content_returned_whole(self):
+    @pytest.mark.asyncio
+    async def test_short_content_returned_whole(self):
         content = "# Title\n\nshort body\n"
-        out, truncated = wt._truncate_with_footer(content, "https://e.com", 15000)
+        out, truncated = await wt._truncate_with_footer(
+            content, "https://e.com", 15000
+        )
         assert out == content
         assert truncated is False
 
 
-    def test_truncation_stores_full_text_readable(self, tmp_path, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_truncation_stores_full_text_readable(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
         body = "UNIQUE_MIDDLE_MARKER\n" + ("\n".join(f"row {i}" for i in range(5000)))
-        out, truncated = wt._truncate_with_footer(body, "https://example.com/doc", 3000)
+        out, truncated = await wt._truncate_with_footer(
+            body, "https://example.com/doc", 3000
+        )
         assert truncated is True
         # Extract the stored path from the footer and confirm full text is there.
         path_line = next(ln for ln in out.splitlines() if "Full text saved to:" in ln)
         stored_path = path_line.split("Full text saved to:", 1)[1].strip()
         assert os.path.exists(stored_path)
-        full = open(stored_path).read()
+        async with aiofiles.open(stored_path, encoding="utf-8") as handle:
+            full = await handle.read()
         assert "UNIQUE_MIDDLE_MARKER" in full
         assert "row 2500" in full  # the omitted-middle row is in the stored file
 
@@ -66,7 +73,8 @@ class TestCharLimitConfig:
 
 
 class TestEndToEnd:
-    def test_web_extract_truncates_large_page_no_llm(self, tmp_path, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_web_extract_truncates_large_page_no_llm(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
         big = "\n".join(f"para {i} " + "y" * 80 for i in range(3000))
 
@@ -85,9 +93,11 @@ class TestEndToEnd:
              patch("tools.web_tools._get_extract_backend", return_value="fake"), \
              patch("tools.web_tools.is_safe_url", new=_AsyncTrue()), \
              patch("agent.web_search_registry.get_provider", return_value=FakeProvider()):
-            result = json.loads(asyncio.new_event_loop().run_until_complete(
-                wt.web_extract_tool(["https://example.com/big"], char_limit=5000)
-            ))
+            result = json.loads(
+                await wt.web_extract_tool(
+                    ["https://example.com/big"], char_limit=5000
+                )
+            )
 
         assert "results" in result
         content = result["results"][0]["content"]
@@ -96,12 +106,6 @@ class TestEndToEnd:
         # No LLM was involved: para 0 (head) and the last para (tail) are verbatim.
         assert "para 0 " in content
         assert "para 2999 " in content
-
-
-def _make_awaitable(value):
-    async def _coro(*a, **k):
-        return value
-    return _coro()
 
 
 class _AsyncTrue:

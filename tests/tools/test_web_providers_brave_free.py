@@ -57,12 +57,35 @@ class TestBraveFreeProviderSearch:
         m.raise_for_status = MagicMock()
         return m
 
-    def test_happy_path_normalizes_results(self, monkeypatch):
+    @staticmethod
+    def _client(response, capture=None):
+        class Client:
+            def __init__(self, **_kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_exc):
+                return False
+
+            async def get(self, url, **kwargs):
+                if capture is not None:
+                    capture.update({"url": url, **kwargs})
+                return response
+
+        return Client
+
+    @pytest.mark.asyncio
+    async def test_happy_path_normalizes_results(self, monkeypatch):
         monkeypatch.setenv("BRAVE_SEARCH_API_KEY", "BSAkey123")
         from plugins.web.brave_free.provider import BraveFreeWebSearchProvider
 
-        with patch("httpx.get", return_value=self._mock_resp(self._SAMPLE_RESPONSE)):
-            result = BraveFreeWebSearchProvider().search("test query", limit=5)
+        with patch(
+            "httpx.AsyncClient",
+            self._client(self._mock_resp(self._SAMPLE_RESPONSE)),
+        ):
+            result = await BraveFreeWebSearchProvider().search("test query", limit=5)
 
         assert result["success"] is True
         web = result["data"]["web"]
@@ -70,21 +93,19 @@ class TestBraveFreeProviderSearch:
         assert web[0] == {"title": "A", "url": "https://a.example.com", "description": "desc A", "position": 1}
         assert web[2]["position"] == 3
 
-    def test_sends_subscription_token_header_and_count(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_sends_subscription_token_header_and_count(self, monkeypatch):
         """Brave uses X-Subscription-Token; count maps from limit."""
         monkeypatch.setenv("BRAVE_SEARCH_API_KEY", "BSAkey123")
         from plugins.web.brave_free.provider import BraveFreeWebSearchProvider
 
         captured = {}
 
-        def fake_get(url, **kwargs):
-            captured["url"] = url
-            captured["headers"] = kwargs.get("headers", {})
-            captured["params"] = kwargs.get("params", {})
-            return self._mock_resp({"web": {"results": []}})
-
-        with patch("httpx.get", side_effect=fake_get):
-            BraveFreeWebSearchProvider().search("q", limit=5)
+        with patch(
+            "httpx.AsyncClient",
+            self._client(self._mock_resp({"web": {"results": []}}), captured),
+        ):
+            await BraveFreeWebSearchProvider().search("q", limit=5)
 
         assert captured["url"] == "https://api.search.brave.com/res/v1/web/search"
         assert captured["headers"].get("X-Subscription-Token") == "BSAkey123"
@@ -92,23 +113,25 @@ class TestBraveFreeProviderSearch:
         assert captured["params"].get("count") == 5
 
 
-    def test_missing_web_key_returns_empty(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_missing_web_key_returns_empty(self, monkeypatch):
         """Responses without a ``web`` block should produce an empty result set, not crash."""
         monkeypatch.setenv("BRAVE_SEARCH_API_KEY", "BSAkey123")
         from plugins.web.brave_free.provider import BraveFreeWebSearchProvider
 
-        with patch("httpx.get", return_value=self._mock_resp({})):
-            result = BraveFreeWebSearchProvider().search("q", limit=5)
+        with patch("httpx.AsyncClient", self._client(self._mock_resp({}))):
+            result = await BraveFreeWebSearchProvider().search("q", limit=5)
 
         assert result["success"] is True
         assert result["data"]["web"] == []
 
 
-    def test_missing_key_returns_failure(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_missing_key_returns_failure(self, monkeypatch):
         monkeypatch.delenv("BRAVE_SEARCH_API_KEY", raising=False)
         from plugins.web.brave_free.provider import BraveFreeWebSearchProvider
 
-        result = BraveFreeWebSearchProvider().search("q", limit=5)
+        result = await BraveFreeWebSearchProvider().search("q", limit=5)
         assert result["success"] is False
         assert "BRAVE_SEARCH_API_KEY" in result["error"]
 
@@ -158,8 +181,8 @@ class TestBraveFreeSearchOnlyErrors:
         from agent.web_search_registry import _reset_for_tests
         _reset_for_tests()
 
-    def test_web_extract_returns_search_only_error(self, monkeypatch):
-        import asyncio
+    @pytest.mark.asyncio
+    async def test_web_extract_returns_search_only_error(self, monkeypatch):
         from tools import web_tools
 
         monkeypatch.setattr(web_tools, "_load_web_config", lambda: {"backend": "brave-free"})
@@ -171,9 +194,7 @@ class TestBraveFreeSearchOnlyErrors:
         monkeypatch.setattr(web_tools, "is_safe_url", _allow_ssrf)
         monkeypatch.setattr("tools.interrupt.is_interrupted", lambda: False, raising=False)
 
-        result_str = asyncio.get_event_loop().run_until_complete(
-            web_tools.web_extract_tool(["https://example.com"])
-        )
+        result_str = await web_tools.web_extract_tool(["https://example.com"])
         result = json.loads(result_str)
         assert result["success"] is False
         assert "search-only" in result["error"].lower()

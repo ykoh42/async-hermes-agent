@@ -75,13 +75,15 @@ async def test_web_extract_dispatches_urls_from_search_result_objects(extract_pr
     assert [entry["url"] for entry in result["results"]] == extract_provider.received_urls
 
 
-def test_web_extract_registry_dispatch_accepts_search_result_objects(
+@pytest.mark.asyncio
+async def test_web_extract_registry_dispatch_accepts_search_result_objects(
     extract_provider,
 ):
     """The model-facing registry path preserves object URLs through dispatch."""
-    raw = web_tools.registry.dispatch("web_extract", {
-        "urls": [{"url": "https://example.net/from-registry", "title": "R"}],
-    })
+    raw = await web_tools.registry.dispatch(
+        "web_extract",
+        {"urls": [{"url": "https://example.net/from-registry", "title": "R"}]},
+    )
     assert isinstance(raw, str)
     result = json.loads(raw)
 

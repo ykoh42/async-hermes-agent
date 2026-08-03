@@ -55,13 +55,33 @@ class TestSearXNGSearchProviderSearch:
         mock_resp.raise_for_status = MagicMock()
         return mock_resp
 
-    def test_happy_path_returns_normalized_results(self, monkeypatch):
+    @staticmethod
+    def _client(response, calls=None):
+        class Client:
+            def __init__(self, **_kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_exc):
+                return False
+
+            async def get(self, url, **_kwargs):
+                if calls is not None:
+                    calls.append(url)
+                return response
+
+        return Client
+
+    @pytest.mark.asyncio
+    async def test_happy_path_returns_normalized_results(self, monkeypatch):
         monkeypatch.setenv("SEARXNG_URL", "http://localhost:8080")
         from plugins.web.searxng.provider import SearXNGWebSearchProvider
         mock_resp = self._make_mock_response(self._SAMPLE_RESPONSE)
 
-        with patch("httpx.get", return_value=mock_resp):
-            result = SearXNGWebSearchProvider().search("test query", limit=5)
+        with patch("httpx.AsyncClient", self._client(mock_resp)):
+            result = await SearXNGWebSearchProvider().search("test query", limit=5)
 
         assert result["success"] is True
         web = result["data"]["web"]
@@ -71,7 +91,8 @@ class TestSearXNGSearchProviderSearch:
         assert web[0]["description"] == "Desc A"
         assert web[0]["position"] == 1
 
-    def test_results_sorted_by_score_descending(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_results_sorted_by_score_descending(self, monkeypatch):
         """Results should be sorted by score before limit is applied."""
         monkeypatch.setenv("SEARXNG_URL", "http://localhost:8080")
         from plugins.web.searxng.provider import SearXNGWebSearchProvider
@@ -84,8 +105,8 @@ class TestSearXNGSearchProviderSearch:
         }
         mock_resp = self._make_mock_response(unordered)
 
-        with patch("httpx.get", return_value=mock_resp):
-            result = SearXNGWebSearchProvider().search("query", limit=5)
+        with patch("httpx.AsyncClient", self._client(mock_resp)):
+            result = await SearXNGWebSearchProvider().search("query", limit=5)
 
         assert result["success"] is True
         assert result["data"]["web"][0]["title"] == "High"
@@ -93,19 +114,16 @@ class TestSearXNGSearchProviderSearch:
         assert result["data"]["web"][2]["title"] == "Low"
 
 
-    def test_trailing_slash_stripped_from_url(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_trailing_slash_stripped_from_url(self, monkeypatch):
         """Base URL trailing slash should not produce double-slash in endpoint."""
         monkeypatch.setenv("SEARXNG_URL", "http://localhost:8080/")
         from plugins.web.searxng.provider import SearXNGWebSearchProvider
         mock_resp = self._make_mock_response({"results": []})
 
         calls = []
-        def capture_get(url, **kwargs):
-            calls.append(url)
-            return mock_resp
-
-        with patch("httpx.get", side_effect=capture_get):
-            SearXNGWebSearchProvider().search("query", limit=5)
+        with patch("httpx.AsyncClient", self._client(mock_resp, calls)):
+            await SearXNGWebSearchProvider().search("query", limit=5)
 
         assert calls[0] == "http://localhost:8080/search", f"Got: {calls[0]}"
 
@@ -230,8 +248,8 @@ class TestSearXNGOnlyExtractCrawlErrors:
         from agent.web_search_registry import _reset_for_tests
         _reset_for_tests()
 
-    def test_web_extract_searxng_returns_clear_error(self, monkeypatch):
-        import asyncio
+    @pytest.mark.asyncio
+    async def test_web_extract_searxng_returns_clear_error(self, monkeypatch):
         from tools import web_tools
 
         monkeypatch.setattr(web_tools, "_load_web_config", lambda: {"backend": "searxng"})
@@ -243,9 +261,7 @@ class TestSearXNGOnlyExtractCrawlErrors:
         monkeypatch.setattr(web_tools, "is_safe_url", _allow_ssrf)
         monkeypatch.setattr("tools.interrupt.is_interrupted", lambda: False, raising=False)
 
-        result_str = asyncio.get_event_loop().run_until_complete(
-            web_tools.web_extract_tool(["https://example.com"])
-        )
+        result_str = await web_tools.web_extract_tool(["https://example.com"])
         result = json.loads(result_str)
         assert result["success"] is False
         assert "search-only" in result["error"].lower() or "SearXNG" in result["error"]

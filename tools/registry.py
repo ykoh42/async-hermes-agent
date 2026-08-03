@@ -45,6 +45,7 @@ _TRAINING_RUNTIME_TOOL_MODULES = frozenset({
     "session_search_tool",
     "terminal_tool",
     "todo_tool",
+    "web_tools",
 })
 
 # A few legacy modules are imported for helpers (for example compression resets
@@ -63,6 +64,7 @@ _ASYNC_RUNTIME_HANDLER_MODULES = frozenset({
     "tools.session_search_tool",
     "tools.terminal_tool",
     "tools.todo_tool",
+    "tools.web_tools",
 })
 
 

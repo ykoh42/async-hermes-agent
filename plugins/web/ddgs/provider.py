@@ -104,40 +104,6 @@ def _plugins_path_entry() -> str:
     )
 
 
-def _terminate_and_reap(
-    proc: Optional[subprocess.Popen],
-    *,
-    grace: float = _TERMINATE_GRACE_SECS,
-) -> None:
-    """Terminate a worker, escalate to kill, and wait so no orphan remains.
-
-    Does not close the parent's pipe ends — the caller must finish any
-    ``communicate()``/reader first. Closing stdout while another thread is
-    blocked in ``read()`` deadlocks on some platforms.
-    """
-    if proc is None:
-        return
-
-    def _wait_until_dead(seconds: float) -> bool:
-        deadline = time.monotonic() + seconds
-        while time.monotonic() < deadline:
-            if proc.poll() is not None:
-                return True
-            time.sleep(0.05)
-        return proc.poll() is not None
-
-    try:
-        if proc.poll() is None:
-            proc.terminate()
-            _wait_until_dead(grace)
-        if proc.poll() is None:
-            proc.kill()
-            if not _wait_until_dead(grace):
-                logger.warning("DDGS worker pid=%s did not exit after kill", proc.pid)
-    except Exception as exc:  # noqa: BLE001 — best-effort cleanup
-        logger.debug("DDGS worker reap error: %s", exc)
-
-
 async def _run_ddgs_search_bounded(query: str, safe_limit: int) -> list[dict[str, Any]]:
     """Run ``_run_ddgs_search`` in a disposable process with a hard deadline.
 
