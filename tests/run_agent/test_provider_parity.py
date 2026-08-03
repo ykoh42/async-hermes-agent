@@ -4,12 +4,11 @@ and handles responses properly for all supported providers.
 Ensures changes to one provider path don't silently break another.
 """
 
-import base64
 import json
 import sys
 import types
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from agent.codex_responses_adapter import _chat_content_to_responses_parts, _chat_messages_to_responses_input, _normalize_codex_response, _preflight_codex_input_items
@@ -35,17 +34,6 @@ def _tool_defs(*names):
         }
         for n in names
     ]
-
-
-def _fake_invoke_jwt() -> str:
-    def _part(payload):
-        raw = json.dumps(payload, separators=(",", ":")).encode("utf-8")
-        return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
-
-    return (
-        f"{_part({'alg': 'none', 'typ': 'JWT'})}."
-        f"{_part({'scope': 'inference:invoke', 'exp': 4102444800})}.sig"
-    )
 
 
 class _FakeOpenAI:
@@ -83,42 +71,45 @@ def _make_agent(monkeypatch, provider, api_mode="chat_completions", base_url="ht
         kwargs["model"] = model
     elif provider == "nous":
         kwargs["model"] = "gpt-5"
-    base_url="https://openrouter.ai/api/v1",
-    api_key="test-key",
-    base_url="https://openrouter.ai/api/v1",
     return AIAgent(**kwargs)
 
 
 # ── _build_api_kwargs tests ─────────────────────────────────────────────────
 
 class TestBuildApiKwargsOpenRouter:
-    def test_uses_chat_completions_format(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_uses_chat_completions_format(self, monkeypatch):
         agent = _make_agent(monkeypatch, "openrouter")
         messages = [{"role": "user", "content": "hi"}]
-        kwargs = agent._build_api_kwargs(messages)
+        kwargs = await agent._build_api_kwargs(messages)
         assert "messages" in kwargs
         assert "model" in kwargs
         assert kwargs["messages"][-1]["content"] == "hi"
 
-    def test_includes_reasoning_in_extra_body(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_includes_reasoning_in_extra_body(self, monkeypatch):
         agent = _make_agent(monkeypatch, "openrouter")
         agent.model = "anthropic/claude-sonnet-4-20250514"
         messages = [{"role": "user", "content": "hi"}]
-        kwargs = agent._build_api_kwargs(messages)
+        kwargs = await agent._build_api_kwargs(messages)
         extra = kwargs.get("extra_body", {})
         assert "reasoning" in extra
         assert extra["reasoning"]["enabled"] is True
 
 
-    def test_no_responses_api_fields(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_no_responses_api_fields(self, monkeypatch):
         agent = _make_agent(monkeypatch, "openrouter")
         messages = [{"role": "user", "content": "hi"}]
-        kwargs = agent._build_api_kwargs(messages)
+        kwargs = await agent._build_api_kwargs(messages)
         assert "input" not in kwargs
         assert "instructions" not in kwargs
         assert "store" not in kwargs
 
-    def test_strips_codex_only_tool_call_fields_from_chat_messages(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_strips_codex_only_tool_call_fields_from_chat_messages(
+        self, monkeypatch
+    ):
         agent = _make_agent(monkeypatch, "openrouter")
         messages = [
             {"role": "user", "content": "hi"},
@@ -142,7 +133,7 @@ class TestBuildApiKwargsOpenRouter:
             {"role": "tool", "tool_call_id": "call_123", "content": "/tmp"},
         ]
 
-        kwargs = agent._build_api_kwargs(messages)
+        kwargs = await agent._build_api_kwargs(messages)
 
         assistant_msg = kwargs["messages"][1]
         tool_call = assistant_msg["tool_calls"][0]
@@ -164,7 +155,8 @@ class TestBuildApiKwargsOpenRouter:
         assert "codex_reasoning_items" in messages[1]
         assert messages[1]["tool_calls"][0]["extra_content"] == {"thought_signature": "opaque"}
 
-    def test_keeps_extra_content_for_gemini_target(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_keeps_extra_content_for_gemini_target(self, monkeypatch):
         """Gemini-family targets must keep extra_content (thought_signature) —
         Gemini 3 thinking models 400 without it replayed on the next turn.
         """
@@ -188,7 +180,7 @@ class TestBuildApiKwargsOpenRouter:
             {"role": "tool", "tool_call_id": "call_123", "content": "/tmp"},
         ]
 
-        kwargs = agent._build_api_kwargs(messages)
+        kwargs = await agent._build_api_kwargs(messages)
         tool_call = kwargs["messages"][1]["tool_calls"][0]
         assert tool_call["extra_content"] == {"google": {"thought_signature": "opaque"}}
         # call_id/response_item_id still stripped regardless of model
@@ -202,7 +194,10 @@ class TestBuildApiKwargsOpenRouter:
             "google": {"thought_signature": "opaque"}
         }
 
-    def test_gemini_native_passes_base_url_for_top_level_thinking_config(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_gemini_native_passes_base_url_for_top_level_thinking_config(
+        self, monkeypatch
+    ):
         agent = _make_agent(
             monkeypatch,
             "gemini",
@@ -210,7 +205,9 @@ class TestBuildApiKwargsOpenRouter:
             model="gemini-3-flash-preview",
         )
         agent.reasoning_config = {"enabled": True, "effort": "high"}
-        kwargs = agent._build_api_kwargs([{"role": "user", "content": "hi"}])
+        kwargs = await agent._build_api_kwargs(
+            [{"role": "user", "content": "hi"}]
+        )
         assert kwargs["extra_body"]["thinking_config"] == {
             "includeThoughts": True,
             "thinkingLevel": "high",
@@ -271,14 +268,15 @@ class TestDeveloperRoleSwap:
         "codex-mini-latest",
         "openai/codex-pro",
     ])
-    def test_gpt5_codex_get_developer_role(self, monkeypatch, model):
+    @pytest.mark.asyncio
+    async def test_gpt5_codex_get_developer_role(self, monkeypatch, model):
         agent = _make_agent(monkeypatch, "openrouter")
         agent.model = model
         messages = [
             {"role": "system", "content": "You are helpful."},
             {"role": "user", "content": "hi"},
         ]
-        kwargs = agent._build_api_kwargs(messages)
+        kwargs = await agent._build_api_kwargs(messages)
         assert kwargs["messages"][0]["role"] == "developer"
         assert kwargs["messages"][0]["content"] == "You are helpful."
         assert kwargs["messages"][1]["role"] == "user"
@@ -291,19 +289,21 @@ class TestDeveloperRoleSwap:
 class TestBuildApiKwargsChatCompletionsServiceTier:
     """service_tier via request_overrides works on the chat_completions path."""
 
-    def test_includes_service_tier_via_request_overrides(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_includes_service_tier_via_request_overrides(self, monkeypatch):
         agent = _make_agent(monkeypatch, "openrouter")
         agent.model = "gpt-4.1"
         agent.request_overrides = {"service_tier": "priority"}
         messages = [{"role": "user", "content": "hi"}]
-        kwargs = agent._build_api_kwargs(messages)
+        kwargs = await agent._build_api_kwargs(messages)
         assert kwargs["service_tier"] == "priority"
 
 
 
 
 class TestBuildApiKwargsKimiNoTemperatureOverride:
-    def test_kimi_for_coding_omits_temperature(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_kimi_for_coding_omits_temperature(self, monkeypatch):
         """Temperature should NOT be set client-side for Kimi models.
 
         The Kimi gateway selects the correct temperature server-side.
@@ -315,46 +315,51 @@ class TestBuildApiKwargsKimiNoTemperatureOverride:
             model="kimi-for-coding",
         )
         messages = [{"role": "user", "content": "hi"}]
-        kwargs = agent._build_api_kwargs(messages)
+        kwargs = await agent._build_api_kwargs(messages)
         assert "temperature" not in kwargs
 
 
 class TestBuildApiKwargsAIGateway:
-    def test_uses_chat_completions_format(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_uses_chat_completions_format(self, monkeypatch):
         agent = _make_agent(monkeypatch, "ai-gateway", base_url="https://ai-gateway.vercel.sh/v1", model="gpt-4o")
         messages = [{"role": "user", "content": "hi"}]
-        kwargs = agent._build_api_kwargs(messages)
+        kwargs = await agent._build_api_kwargs(messages)
         assert "messages" in kwargs
         assert "model" in kwargs
         assert kwargs["messages"][-1]["content"] == "hi"
 
-    def test_no_responses_api_fields(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_no_responses_api_fields(self, monkeypatch):
         agent = _make_agent(monkeypatch, "ai-gateway", base_url="https://ai-gateway.vercel.sh/v1", model="gpt-4o")
         messages = [{"role": "user", "content": "hi"}]
-        kwargs = agent._build_api_kwargs(messages)
+        kwargs = await agent._build_api_kwargs(messages)
         assert "input" not in kwargs
         assert "instructions" not in kwargs
         assert "store" not in kwargs
 
-    def test_includes_reasoning_in_extra_body(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_includes_reasoning_in_extra_body(self, monkeypatch):
         agent = _make_agent(monkeypatch, "ai-gateway", base_url="https://ai-gateway.vercel.sh/v1", model="gpt-4o")
         messages = [{"role": "user", "content": "hi"}]
-        kwargs = agent._build_api_kwargs(messages)
+        kwargs = await agent._build_api_kwargs(messages)
         extra = kwargs.get("extra_body", {})
         assert "reasoning" in extra
         assert extra["reasoning"]["enabled"] is True
 
-    def test_includes_tools(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_includes_tools(self, monkeypatch):
         agent = _make_agent(monkeypatch, "ai-gateway", base_url="https://ai-gateway.vercel.sh/v1", model="gpt-4o")
         messages = [{"role": "user", "content": "hi"}]
-        kwargs = agent._build_api_kwargs(messages)
+        kwargs = await agent._build_api_kwargs(messages)
         assert "tools" in kwargs
         tool_names = [t["function"]["name"] for t in kwargs["tools"]]
         assert "web_search" in tool_names
 
 
 class TestBuildApiKwargsNousPortal:
-    def test_includes_nous_product_tags(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_includes_nous_product_tags(self, monkeypatch):
         from agent.portal_tags import nous_portal_tags
         agent = _make_agent(
             monkeypatch,
@@ -363,11 +368,12 @@ class TestBuildApiKwargsNousPortal:
             model="gpt-5",
         )
         messages = [{"role": "user", "content": "hi"}]
-        kwargs = agent._build_api_kwargs(messages)
+        kwargs = await agent._build_api_kwargs(messages)
         extra = kwargs.get("extra_body", {})
         assert extra.get("tags") == nous_portal_tags(session_id=agent.session_id)
 
-    def test_uses_chat_completions_format(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_uses_chat_completions_format(self, monkeypatch):
         agent = _make_agent(
             monkeypatch,
             "nous",
@@ -375,21 +381,25 @@ class TestBuildApiKwargsNousPortal:
             model="gpt-5",
         )
         messages = [{"role": "user", "content": "hi"}]
-        kwargs = agent._build_api_kwargs(messages)
+        kwargs = await agent._build_api_kwargs(messages)
         assert "messages" in kwargs
         assert "input" not in kwargs
 
 
 class TestBuildApiKwargsCustomEndpoint:
-    def test_uses_chat_completions_format(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_uses_chat_completions_format(self, monkeypatch):
         agent = _make_agent(monkeypatch, "custom", base_url="http://localhost:1234/v1")
         messages = [{"role": "user", "content": "hi"}]
-        kwargs = agent._build_api_kwargs(messages)
+        kwargs = await agent._build_api_kwargs(messages)
         assert "messages" in kwargs
         assert "input" not in kwargs
 
 
-    def test_fireworks_tool_call_payload_strips_codex_only_fields(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_fireworks_tool_call_payload_strips_codex_only_fields(
+        self, monkeypatch
+    ):
         agent = _make_agent(
             monkeypatch,
             "custom",
@@ -419,7 +429,7 @@ class TestBuildApiKwargsCustomEndpoint:
             {"role": "tool", "tool_call_id": "call_fw_123", "content": "/tmp"},
         ]
 
-        kwargs = agent._build_api_kwargs(messages)
+        kwargs = await agent._build_api_kwargs(messages)
 
         assert kwargs["tools"][0]["function"]["name"] == "web_search"
         assert "input" not in kwargs
@@ -437,34 +447,37 @@ class TestBuildApiKwargsCustomEndpoint:
 
 
 class TestBuildApiKwargsCodex:
-    def test_uses_responses_api_format(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_uses_responses_api_format(self, monkeypatch):
         agent = _make_agent(monkeypatch, "openai-codex", api_mode="codex_responses",
                             base_url="https://chatgpt.com/backend-api/codex")
         messages = [{"role": "user", "content": "hi"}]
-        kwargs = agent._build_api_kwargs(messages)
+        kwargs = await agent._build_api_kwargs(messages)
         assert "input" in kwargs
         assert "instructions" in kwargs
         assert "messages" not in kwargs
         assert kwargs["store"] is False
 
 
-    def test_includes_service_tier_via_request_overrides(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_includes_service_tier_via_request_overrides(self, monkeypatch):
         agent = _make_agent(monkeypatch, "openai-codex", api_mode="codex_responses",
                             base_url="https://chatgpt.com/backend-api/codex")
         agent.model = "gpt-5.4"
         agent.service_tier = "priority"
         agent.request_overrides = {"service_tier": "priority"}
         messages = [{"role": "user", "content": "hi"}]
-        kwargs = agent._build_api_kwargs(messages)
+        kwargs = await agent._build_api_kwargs(messages)
         assert kwargs["service_tier"] == "priority"
 
 
 
-    def test_tools_converted_to_responses_format(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_tools_converted_to_responses_format(self, monkeypatch):
         agent = _make_agent(monkeypatch, "openai-codex", api_mode="codex_responses",
                             base_url="https://chatgpt.com/backend-api/codex")
         messages = [{"role": "user", "content": "hi"}]
-        kwargs = agent._build_api_kwargs(messages)
+        kwargs = await agent._build_api_kwargs(messages)
         tools = kwargs.get("tools", [])
         assert len(tools) > 0
         # Responses format has "name" at top level, not nested under "function"
@@ -760,28 +773,34 @@ class TestBuildAssistantMessage:
 class TestAuxiliaryClientProviderPriority:
     """Verify auxiliary client resolution doesn't break for any provider."""
 
-    def test_openrouter_always_wins(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_openrouter_always_wins(self, monkeypatch):
         monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
         from agent.auxiliary_client import _OPENROUTER_MODEL, get_text_auxiliary_client
-        with patch("agent.auxiliary_client.OpenAI") as mock:
-            client, model = get_text_auxiliary_client()
+        with patch(
+            "agent.auxiliary_client._create_openai_client",
+            return_value=MagicMock(),
+        ) as mock:
+            client, model = await get_text_auxiliary_client()
         assert model == _OPENROUTER_MODEL
         assert "openrouter" in str(mock.call_args.kwargs["base_url"]).lower()
 
-    def test_nous_when_no_openrouter(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_nous_when_no_openrouter(self, monkeypatch):
         monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
         from agent.auxiliary_client import _NOUS_MODEL, get_text_auxiliary_client
-        nous_auth = {
-            "access_token": _fake_invoke_jwt(),
-            "scope": "inference:invoke",
-        }
-        with patch("agent.auxiliary_client._read_nous_auth", return_value=nous_auth), \
-             patch("agent.auxiliary_client.OpenAI") as mock, \
-             patch("hermes_cli.models.get_nous_recommended_aux_model", return_value=None):
-            client, model = get_text_auxiliary_client()
+        expected_client = MagicMock()
+        with patch(
+            "agent.auxiliary_client._try_nous",
+            new_callable=AsyncMock,
+            return_value=(expected_client, _NOUS_MODEL),
+        ):
+            client, model = await get_text_auxiliary_client()
+        assert client is expected_client
         assert model == _NOUS_MODEL
 
-    def test_custom_endpoint_when_no_nous(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_custom_endpoint_when_no_nous(self, monkeypatch):
         """Custom endpoint is used when no OpenRouter/Nous keys are available.
 
         Since the March 2026 config refactor, OPENAI_BASE_URL env var is no
@@ -791,14 +810,17 @@ class TestAuxiliaryClientProviderPriority:
         monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
         monkeypatch.setenv("OPENAI_API_KEY", "local-key")
         from agent.auxiliary_client import get_text_auxiliary_client
-        with patch("agent.auxiliary_client._read_nous_auth", return_value=None), \
+        with patch("agent.auxiliary_client._try_nous", new_callable=AsyncMock,
+                   return_value=(None, None)), \
              patch("agent.auxiliary_client._resolve_custom_runtime",
-                   return_value=("http://localhost:1234/v1", "local-key")), \
-             patch("agent.auxiliary_client.OpenAI") as mock:
-            client, model = get_text_auxiliary_client()
+                   return_value=("http://localhost:1234/v1", "local-key", None)), \
+             patch("agent.auxiliary_client._create_openai_client",
+                   return_value=MagicMock()) as mock:
+            client, model = await get_text_auxiliary_client()
         assert mock.call_args.kwargs["base_url"] == "http://localhost:1234/v1"
 
-    def test_codex_not_in_auto_fallback(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_codex_not_in_auto_fallback(self, monkeypatch):
         """Codex is deliberately NOT part of the auto fallback chain.
 
         ChatGPT-account Codex gates which models it accepts via an
@@ -811,12 +833,18 @@ class TestAuxiliaryClientProviderPriority:
         monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
         monkeypatch.delenv("OPENAI_API_KEY", raising=False)
         from agent.auxiliary_client import get_text_auxiliary_client
-        with patch("agent.auxiliary_client._read_nous_auth", return_value=None), \
-             patch("agent.auxiliary_client._read_codex_access_token", return_value="codex-tok"), \
-             patch("agent.auxiliary_client.OpenAI"):
-            client, model = get_text_auxiliary_client()
+        with patch("agent.auxiliary_client._try_nous", new_callable=AsyncMock,
+                   return_value=(None, None)), \
+             patch("agent.auxiliary_client._try_custom_endpoint", new_callable=AsyncMock,
+                   return_value=(None, None)), \
+             patch("agent.auxiliary_client._resolve_api_key_provider", new_callable=AsyncMock,
+                   return_value=(None, None)), \
+             patch("agent.auxiliary_client._read_codex_access_token",
+                   new_callable=AsyncMock, return_value="codex-tok") as mock_codex:
+            client, model = await get_text_auxiliary_client()
         assert client is None
         assert model is None
+        mock_codex.assert_not_awaited()
 
 
 # ── Provider routing tests ───────────────────────────────────────────────────
@@ -824,10 +852,13 @@ class TestAuxiliaryClientProviderPriority:
 class TestProviderRouting:
     """Verify provider_routing config flows into extra_body.provider."""
 
-    def test_sort_throughput(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_sort_throughput(self, monkeypatch):
         agent = _make_agent(monkeypatch, "openrouter")
         agent.provider_sort = "throughput"
-        kwargs = agent._build_api_kwargs([{"role": "user", "content": "hi"}])
+        kwargs = await agent._build_api_kwargs(
+            [{"role": "user", "content": "hi"}]
+        )
         assert kwargs["extra_body"]["provider"]["sort"] == "throughput"
 
 
@@ -835,9 +866,12 @@ class TestProviderRouting:
 
 
 
-    def test_no_routing_when_unset(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_no_routing_when_unset(self, monkeypatch):
         agent = _make_agent(monkeypatch, "openrouter")
-        kwargs = agent._build_api_kwargs([{"role": "user", "content": "hi"}])
+        kwargs = await agent._build_api_kwargs(
+            [{"role": "user", "content": "hi"}]
+        )
         assert "provider" not in kwargs.get("extra_body", {}).get("provider", {}) or \
                kwargs.get("extra_body", {}).get("provider") is None or \
                "only" not in kwargs.get("extra_body", {}).get("provider", {})
@@ -907,18 +941,21 @@ class TestCodexReasoningPreflight:
 class TestReasoningEffortDefaults:
     """Verify reasoning effort defaults to medium across all provider paths."""
 
-    def test_openrouter_default_medium(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_openrouter_default_medium(self, monkeypatch):
         agent = _make_agent(monkeypatch, "openrouter")
         agent.model = "anthropic/claude-sonnet-4-20250514"
-        kwargs = agent._build_api_kwargs([{"role": "user", "content": "hi"}])
+        kwargs = await agent._build_api_kwargs(
+            [{"role": "user", "content": "hi"}]
+        )
         reasoning = kwargs["extra_body"]["reasoning"]
         assert reasoning["effort"] == "medium"
 
-    def test_codex_default_medium(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_codex_default_medium(self, monkeypatch):
         agent = _make_agent(monkeypatch, "openai-codex", api_mode="codex_responses",
                             base_url="https://chatgpt.com/backend-api/codex")
-        kwargs = agent._build_api_kwargs([{"role": "user", "content": "hi"}])
+        kwargs = await agent._build_api_kwargs(
+            [{"role": "user", "content": "hi"}]
+        )
         assert kwargs["reasoning"]["effort"] == "medium"
-
-
-
