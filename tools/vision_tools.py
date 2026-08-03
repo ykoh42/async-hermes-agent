@@ -65,7 +65,7 @@ def _load_auxiliary_client() -> None:
 
 from hermes_constants import get_hermes_dir
 from tools.debug_helpers import DebugSession
-from tools.website_policy import async_check_website_access
+from tools.website_policy import check_website_access
 import sys
 
 logger = logging.getLogger(__name__)
@@ -230,8 +230,8 @@ async def _validate_image_url(url: str) -> bool:
     """Validate remote image URL without blocking the event loop on DNS."""
     if not _image_url_shape_ok(url):
         return False
-    from tools.url_safety import async_is_safe_url
-    return await async_is_safe_url(url)
+    from tools.url_safety import is_safe_url
+    return await is_safe_url(url)
 
 
 def _detect_image_mime_type_from_bytes(data: bytes) -> Optional[str]:
@@ -423,9 +423,9 @@ async def _download_image(image_url: str, destination: Path, max_retries: int = 
 
         Must be async because httpx.AsyncClient awaits event hooks.
         """
-        from tools.url_safety import async_is_safe_url, redirect_target_from_response
+        from tools.url_safety import is_safe_url, redirect_target_from_response
         redirect_url = redirect_target_from_response(response)
-        if redirect_url and not await async_is_safe_url(redirect_url):
+        if redirect_url and not await is_safe_url(redirect_url):
             raise ValueError(
                 f"Blocked redirect to private/internal address: {redirect_url}"
             )
@@ -433,17 +433,17 @@ async def _download_image(image_url: str, destination: Path, max_retries: int = 
     last_error = None
     for attempt in range(max_retries):
         try:
-            blocked = await async_check_website_access(image_url)
+            blocked = await check_website_access(image_url)
             if blocked:
                 raise PermissionError(blocked["message"])
 
-            from tools.url_safety import create_ssrf_safe_async_client
+            from tools.url_safety import create_ssrf_safe_client
 
             # Download the image with appropriate headers using async httpx
             # Enable follow_redirects to handle image CDNs that redirect (e.g., Imgur, Picsum)
             # SSRF: the client validates DNS at TCP connect time; event_hooks
             # validate each redirect target against private IP ranges.
-            async with create_ssrf_safe_async_client(
+            async with create_ssrf_safe_client(
                 timeout=_VISION_DOWNLOAD_TIMEOUT,
                 follow_redirects=True,
                 event_hooks={"response": [_ssrf_redirect_guard]},
@@ -465,7 +465,7 @@ async def _download_image(image_url: str, destination: Path, max_retries: int = 
                     )
 
                 final_url = str(response.url)
-                blocked = await async_check_website_access(final_url)
+                blocked = await check_website_access(final_url)
                 if blocked:
                     raise PermissionError(blocked["message"])
                 
@@ -1598,9 +1598,9 @@ async def _download_video(video_url: str, destination: Path, max_retries: int = 
     await aiofiles.os.makedirs(destination.parent, exist_ok=True)
 
     async def _ssrf_redirect_guard(response):
-        from tools.url_safety import async_is_safe_url, redirect_target_from_response
+        from tools.url_safety import is_safe_url, redirect_target_from_response
         redirect_url = redirect_target_from_response(response)
-        if redirect_url and not await async_is_safe_url(redirect_url):
+        if redirect_url and not await is_safe_url(redirect_url):
             raise ValueError(
                 f"Blocked redirect to private/internal address: {redirect_url}"
             )
@@ -1608,13 +1608,13 @@ async def _download_video(video_url: str, destination: Path, max_retries: int = 
     last_error = None
     for attempt in range(max_retries):
         try:
-            blocked = await async_check_website_access(video_url)
+            blocked = await check_website_access(video_url)
             if blocked:
                 raise PermissionError(blocked["message"])
 
-            from tools.url_safety import create_ssrf_safe_async_client
+            from tools.url_safety import create_ssrf_safe_client
 
-            async with create_ssrf_safe_async_client(
+            async with create_ssrf_safe_client(
                 timeout=60.0,
                 follow_redirects=True,
                 event_hooks={"response": [_ssrf_redirect_guard]},
@@ -1635,7 +1635,7 @@ async def _download_video(video_url: str, destination: Path, max_retries: int = 
                     )
 
                 final_url = str(response.url)
-                blocked = await async_check_website_access(final_url)
+                blocked = await check_website_access(final_url)
                 if blocked:
                     raise PermissionError(blocked["message"])
 
@@ -1712,7 +1712,7 @@ async def video_analyze_tool(
             temp_video_path = local_path
             should_cleanup = False
         elif await _validate_image_url(video_url):
-            blocked = await async_check_website_access(video_url)
+            blocked = await check_website_access(video_url)
             if blocked:
                 raise PermissionError(blocked["message"])
             temp_dir = get_hermes_dir("cache/video", "temp_video_files")

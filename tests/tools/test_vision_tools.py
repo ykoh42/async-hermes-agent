@@ -353,11 +353,11 @@ class TestVisionSafetyGuards:
 
         with (
             patch(
-                "tools.website_policy.async_check_website_access",
+                "tools.website_policy.check_website_access",
                 new=AsyncMock(return_value=blocked),
             ),
             patch(
-                "tools.url_safety.async_is_safe_url",
+                "tools.url_safety.is_safe_url",
                 new=AsyncMock(return_value=True),
             ),
             patch("tools.vision_tools._download_image", new_callable=AsyncMock) as mock_download,
@@ -398,11 +398,11 @@ class TestVisionSafetyGuards:
         mock_client.get = AsyncMock(return_value=FakeResponse())
         with (
             patch(
-                "tools.vision_tools.async_check_website_access",
+                "tools.vision_tools.check_website_access",
                 new=AsyncMock(side_effect=fake_check),
             ),
             patch(
-                "tools.url_safety.create_ssrf_safe_async_client",
+                "tools.url_safety.create_ssrf_safe_client",
                 return_value=mock_client,
             ),
             pytest.raises(PermissionError, match="Blocked by website policy"),
@@ -755,11 +755,11 @@ class TestDownloadRetryClassification:
         mock_client = self._make_client_raising_status(503)
         with (
             patch(
-                "tools.url_safety.create_ssrf_safe_async_client",
+                "tools.url_safety.create_ssrf_safe_client",
                 return_value=mock_client,
             ),
             patch(
-                "tools.vision_tools.async_check_website_access",
+                "tools.vision_tools.check_website_access",
                 new=AsyncMock(return_value=None),
             ),
             patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep,

@@ -252,7 +252,7 @@ class TestManagedMediaUploader:
 
         with patch.object(managed_tool_gateway, "managed_nous_tools_enabled", return_value=True), \
                 patch.object(httpx, "AsyncClient", _PresignClient), \
-                patch.object(url_safety, "create_ssrf_safe_async_client", lambda **_kw: _PutClient()):
+                patch.object(url_safety, "create_ssrf_safe_client", lambda **_kw: _PutClient()):
             calls["result"] = asyncio.run(uploader(data, mime))
         return calls
 

@@ -188,12 +188,12 @@ async def _http_block_reason(url: str) -> Optional[str]:
     blocked URL; the inner one covers redirects and non-resolver callers.
     Preserves the specific website-policy message so the agent sees *why*.
     """
-    from tools.url_safety import async_is_safe_url
-    from tools.website_policy import async_check_website_access
+    from tools.url_safety import is_safe_url
+    from tools.website_policy import check_website_access
 
-    if not await async_is_safe_url(url):
+    if not await is_safe_url(url):
         return "blocked: unsafe or private URL"
-    blocked = await async_check_website_access(url)
+    blocked = await check_website_access(url)
     if blocked:
         return blocked.get("message") or "blocked by website policy"
     return None

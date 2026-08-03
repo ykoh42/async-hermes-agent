@@ -240,7 +240,7 @@ class TestSearXNGOnlyExtractCrawlErrors:
         async def _allow_ssrf(_url: str) -> bool:
             return True
 
-        monkeypatch.setattr(web_tools, "async_is_safe_url", _allow_ssrf)
+        monkeypatch.setattr(web_tools, "is_safe_url", _allow_ssrf)
         monkeypatch.setattr("tools.interrupt.is_interrupted", lambda: False, raising=False)
 
         result_str = asyncio.get_event_loop().run_until_complete(

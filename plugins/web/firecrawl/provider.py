@@ -499,7 +499,7 @@ class FirecrawlWebSearchProvider(WebSearchProvider):
                 continue
 
             # Pre-scrape website policy gate
-            blocked = check_website_access(url)
+            blocked = await check_website_access(url)
             if blocked:
                 logger.info(
                     "Blocked web_extract for %s by rule %s",
@@ -564,7 +564,7 @@ class FirecrawlWebSearchProvider(WebSearchProvider):
                 final_url = metadata.get("sourceURL", url)
 
                 # Re-check SSRF safety after any redirect reported by Firecrawl.
-                if not is_safe_url(final_url):
+                if not await is_safe_url(final_url):
                     logger.info(
                         "Blocked redirected web_extract for unsafe final URL: %s",
                         final_url,
@@ -584,7 +584,7 @@ class FirecrawlWebSearchProvider(WebSearchProvider):
                     continue
 
                 # Re-check website-access policy after any redirect
-                final_blocked = check_website_access(final_url)
+                final_blocked = await check_website_access(final_url)
                 if final_blocked:
                     logger.info(
                         "Blocked redirected web_extract for %s by rule %s",
