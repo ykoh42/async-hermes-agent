@@ -701,9 +701,16 @@ async def test_run_reference_captures_usage_and_cost(monkeypatch):
         return {"provider": "openrouter", "model": slot.get("model")}
 
     monkeypatch.setattr("agent.moa_loop._slot_runtime", fake_slot_runtime)
+    async def fake_estimate_usage_cost(*_args, **_kwargs):
+        return SimpleNamespace(
+            amount_usd=0.0123,
+            status="estimated",
+            source="table",
+        )
+
     monkeypatch.setattr(
         "agent.usage_pricing.estimate_usage_cost",
-        lambda *a, **k: SimpleNamespace(amount_usd=0.0123, status="estimated", source="table"),
+        fake_estimate_usage_cost,
     )
 
     label, text, acct = await _run_reference(
@@ -828,7 +835,10 @@ async def test_prepared_aggregator_preserves_reasoning_config(monkeypatch):
         return _response("aggregator acted")
 
     monkeypatch.setattr(moa_loop, "call_llm", fake_call_llm)
-    monkeypatch.setattr(moa_loop, "_aggregator_reasoning_config", lambda _slot: expected_reasoning)
+    async def reasoning_config(_slot):
+        return expected_reasoning
+
+    monkeypatch.setattr(moa_loop, "_aggregator_reasoning_config", reasoning_config)
     monkeypatch.setattr(
         moa_loop,
         "_slot_runtime",
@@ -1097,7 +1107,7 @@ def _trim(messages, *, window=1000, reserve=None, cache=None, counting=None,
     from agent import model_metadata, moa_loop
 
     stub = counting or _CountingCtxLen(window)
-    monkeypatch.setattr(model_metadata, "get_model_context_length", stub)
+    monkeypatch.setattr(model_metadata, "get_static_context_length", stub)
     return moa_loop._trim_messages_for_reference(
         messages,
         {"provider": "openrouter", "model": "small-window"},
@@ -1127,24 +1137,26 @@ def _advisory_view(n_pairs, chunk="x" * 400):
 
 
 
-def test_reference_trim_context_length_cache_hits_once(monkeypatch):
+@pytest.mark.asyncio
+async def test_reference_trim_context_length_cache_hits_once(monkeypatch):
     """A shared per-turn cache resolves each (provider, model) window once."""
     cache = {}
     stub = _CountingCtxLen(10_000_000)
     msgs = _advisory_view(2)
     for _ in range(4):
-        _trim(list(msgs), cache=cache, counting=stub, monkeypatch=monkeypatch)
+        await _trim(list(msgs), cache=cache, counting=stub, monkeypatch=monkeypatch)
     assert stub.calls == 1
     assert cache == {("openrouter", "small-window"): 10_000_000}
 
 
-def test_reference_trim_caches_resolution_failures(monkeypatch):
+@pytest.mark.asyncio
+async def test_reference_trim_caches_resolution_failures(monkeypatch):
     """A failing metadata source is probed once, not per reference call."""
     cache = {}
     stub = _CountingCtxLen(RuntimeError("metadata down"))
     msgs = _advisory_view(2)
     for _ in range(3):
-        out = _trim(list(msgs), cache=cache, counting=stub, monkeypatch=monkeypatch)
+        out = await _trim(list(msgs), cache=cache, counting=stub, monkeypatch=monkeypatch)
         assert out == msgs
     assert stub.calls == 1
     assert cache == {("openrouter", "small-window"): None}
