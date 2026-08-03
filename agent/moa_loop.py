@@ -1648,6 +1648,7 @@ class MoAChatCompletions:
                 raise TypeError("_moa_prepared_request must be a dict")
             return await self._call_prepared_aggregator(prepared_request, api_kwargs)
 
+        from hermes_cli.config import load_config_readonly_async
         from hermes_cli.moa_config import resolve_moa_preset
 
         _moa_raw = (await load_config_readonly_async()).get("moa") or {}

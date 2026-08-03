@@ -2147,7 +2147,7 @@ async def resolve_runtime_provider(
         requested_provider=requested_provider,
         explicit_api_key=explicit_api_key,
         explicit_base_url=explicit_base_url,
-        config=config,
+        config=config_snapshot,
     )
     runtime["requested_provider"] = requested_provider
     return runtime

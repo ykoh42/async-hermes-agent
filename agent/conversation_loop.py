@@ -3691,13 +3691,13 @@ async def run_conversation(
                         FailoverReason.auth,
                     }
                 ):
-                    recovered, _retry.has_retried_429 = await agent._recover_with_credential_pool(
+                    recovered_with_pool, _retry.has_retried_429 = await agent._recover_with_credential_pool(
                         status_code=classified.status_code,
                         has_retried_429=_retry.has_retried_429,
                         classified_reason=classified.reason,
                         error_context=classified.error_context,
                     )
-                    if recovered:
+                    if recovered_with_pool:
                         retry_count = 0
                         continue
 
