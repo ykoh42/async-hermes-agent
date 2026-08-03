@@ -84,7 +84,6 @@ from agent.retry_utils import (
 from agent.trajectory import has_incomplete_scratchpad
 from agent.usage_pricing import (
     estimate_usage_cost,
-    estimate_usage_cost_async,
     normalize_usage,
 )
 from hermes_constants import PARTIAL_STREAM_STUB_ID
@@ -3176,7 +3175,7 @@ async def run_conversation(
                         _agg_cost_model = _agg_slot["model"]
                         _agg_cost_provider = _agg_slot.get("provider") or agent.provider
                         _agg_cost_base_url = _agg_slot.get("base_url") or agent.base_url
-                    cost_result = await estimate_usage_cost_async(
+                    cost_result = await estimate_usage_cost(
                         _agg_cost_model,
                         aggregator_usage,
                         provider=_agg_cost_provider,

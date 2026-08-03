@@ -1302,86 +1302,7 @@ def normalize_usage(
     )
 
 
-def estimate_usage_cost(
-    model_name: str,
-    usage: CanonicalUsage,
-    *,
-    provider: Optional[str] = None,
-    base_url: Optional[str] = None,
-    api_key: Optional[str] = None,
-) -> CostResult:
-    route = resolve_billing_route(model_name, provider=provider, base_url=base_url)
-    if route.billing_mode == "subscription_included":
-        return CostResult(
-            amount_usd=_ZERO,
-            status="included",
-            source="none",
-            label="included",
-            pricing_version="included-route",
-        )
-
-    entry = get_pricing_entry(model_name, provider=provider, base_url=base_url, api_key=api_key)
-    if not entry:
-        return CostResult(amount_usd=None, status="unknown", source="none", label="n/a")
-
-    notes: list[str] = []
-    amount = _ZERO
-
-    if usage.input_tokens and entry.input_cost_per_million is None:
-        return CostResult(amount_usd=None, status="unknown", source=entry.source, label="n/a")
-    if usage.output_tokens and entry.output_cost_per_million is None:
-        return CostResult(amount_usd=None, status="unknown", source=entry.source, label="n/a")
-    if usage.cache_read_tokens:
-        if entry.cache_read_cost_per_million is None:
-            return CostResult(
-                amount_usd=None,
-                status="unknown",
-                source=entry.source,
-                label="n/a",
-                notes=("cache-read pricing unavailable for route",),
-            )
-    if usage.cache_write_tokens:
-        if entry.cache_write_cost_per_million is None:
-            return CostResult(
-                amount_usd=None,
-                status="unknown",
-                source=entry.source,
-                label="n/a",
-                notes=("cache-write pricing unavailable for route",),
-            )
-
-    if entry.input_cost_per_million is not None:
-        amount += Decimal(usage.input_tokens) * entry.input_cost_per_million / _ONE_MILLION
-    if entry.output_cost_per_million is not None:
-        amount += Decimal(usage.output_tokens) * entry.output_cost_per_million / _ONE_MILLION
-    if entry.cache_read_cost_per_million is not None:
-        amount += Decimal(usage.cache_read_tokens) * entry.cache_read_cost_per_million / _ONE_MILLION
-    if entry.cache_write_cost_per_million is not None:
-        amount += Decimal(usage.cache_write_tokens) * entry.cache_write_cost_per_million / _ONE_MILLION
-    if entry.request_cost is not None and usage.request_count:
-        amount += Decimal(usage.request_count) * entry.request_cost
-
-    status: CostStatus = "estimated"
-    label = f"~${amount:.2f}"
-    if entry.source == "none" and amount == _ZERO:
-        status = "included"
-        label = "included"
-
-    if route.provider == "openrouter":
-        notes.append("OpenRouter cost is estimated from the models API until reconciled.")
-
-    return CostResult(
-        amount_usd=amount,
-        status=status,
-        source=entry.source,
-        label=label,
-        fetched_at=entry.fetched_at,
-        pricing_version=entry.pricing_version,
-        notes=tuple(notes),
-    )
-
-
-async def estimate_usage_cost_async(
+async def estimate_usage_cost(
     model_name: str,
     usage: CanonicalUsage,
     *,
@@ -1391,8 +1312,7 @@ async def estimate_usage_cost_async(
 ) -> CostResult:
     """Estimate usage cost without synchronous provider metadata I/O.
 
-    The synchronous estimator remains for offline CLI/reporting callers. The
-    conversation loop uses this coroutine so an OpenRouter or custom
+    The conversation loop uses this coroutine so an OpenRouter or custom
     ``/models`` lookup cannot stall unrelated turns.
     """
     route = resolve_billing_route(model_name, provider=provider, base_url=base_url)

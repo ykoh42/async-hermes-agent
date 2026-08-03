@@ -462,7 +462,7 @@ async def _run_reference(
     """
     from agent.usage_pricing import (
         CanonicalUsage,
-        estimate_usage_cost_async,
+        estimate_usage_cost,
         normalize_usage,
     )
 
@@ -554,7 +554,7 @@ async def _run_reference(
         cost_status = None
         cost_source = None
         try:
-            cost = await estimate_usage_cost_async(
+            cost = await estimate_usage_cost(
                 slot.get("model") or "",
                 usage,
                 provider=runtime.get("provider"),

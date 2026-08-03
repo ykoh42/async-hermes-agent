@@ -100,7 +100,7 @@ async def record_aux_usage(
         if raw_usage is None:
             return
 
-        from agent.usage_pricing import estimate_usage_cost_async, normalize_usage
+        from agent.usage_pricing import estimate_usage_cost, normalize_usage
 
         usage = normalize_usage(raw_usage, provider=provider)
         if not (
@@ -113,7 +113,7 @@ async def record_aux_usage(
         model = str(getattr(response, "model", "") or "") or "unknown"
         estimated_cost = None
         try:
-            cost = await estimate_usage_cost_async(
+            cost = await estimate_usage_cost(
                 model, usage, provider=provider, base_url=base_url
             )
             if cost.amount_usd is not None:

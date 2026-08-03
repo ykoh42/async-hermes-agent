@@ -1,5 +1,7 @@
 from types import SimpleNamespace
 
+import pytest
+
 from agent.usage_pricing import (
     CanonicalUsage,
     estimate_usage_cost,
@@ -214,7 +216,8 @@ def test_bedrock_versioned_inference_profile_resolves_to_bare_pricing():
 
 
 
-def test_bedrock_claude_cached_session_estimates_cost_not_unknown():
+@pytest.mark.asyncio
+async def test_bedrock_claude_cached_session_estimates_cost_not_unknown():
     """A Bedrock Claude session with cache hits must produce a dollar estimate,
     not ``unknown`` — the user-visible symptom in #50295.
     """
@@ -229,7 +232,7 @@ def test_bedrock_claude_cached_session_estimates_cost_not_unknown():
     assert canonical.cache_read_tokens == 1369379
     assert canonical.cache_write_tokens == 42135
 
-    result = estimate_usage_cost(
+    result = await estimate_usage_cost(
         "us.anthropic.claude-opus-4-6",
         canonical,
         provider="bedrock",
@@ -291,19 +294,22 @@ def test_google_and_vertex_routes_share_official_pricing_snapshot():
     assert all(route.billing_mode == "official_docs_snapshot" for route in routes)
 
 
-def test_vertex_default_model_estimates_cached_usage(monkeypatch):
+@pytest.mark.asyncio
+async def test_vertex_default_model_estimates_cached_usage(monkeypatch):
     """The bundled Vertex profile's default auxiliary model must fall back to
     Google snapshot pricing when the OpenAI-compatible endpoint has no model
     metadata, including for cache-read accounting.
     """
     from providers import get_provider_profile
 
+    async def _empty_metadata(*_args, **_kwargs):
+        return {}
+
     monkeypatch.setattr(
-        "agent.usage_pricing.fetch_endpoint_model_metadata",
-        lambda *_args, **_kwargs: {},
+        "agent.usage_pricing.fetch_endpoint_model_metadata_async", _empty_metadata
     )
     vertex = get_provider_profile("vertex")
-    result = estimate_usage_cost(
+    result = await estimate_usage_cost(
         vertex.default_aux_model,
         CanonicalUsage(input_tokens=100, output_tokens=100, cache_read_tokens=100),
         provider=vertex.name,
