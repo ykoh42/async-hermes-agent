@@ -8,16 +8,13 @@ confirm the prologue produces the right ``TurnContext`` and applies the
 
 from __future__ import annotations
 
-import threading
 import types
 import asyncio
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-from agent.context_compressor import ContextCompressor
 from agent.turn_context import TurnContext, build_turn_context
-from hermes_state import SessionDB
 
 
 class _FakeTodoStore:
@@ -91,8 +88,7 @@ class _FakeAgent:
         self._persist_calls = 0
         self._session_messages = []
         self._pending_cli_user_message = None
-        self._session_persist_lock = threading.RLock()
-        self._async_session_persist_lock = asyncio.Lock()
+        self._session_persist_lock = asyncio.Lock()
         # Records _cached_system_prompt at the moment _ensure_db_session()
         # is called (regression guard for #45499 turn-setup ordering).
         self._ensure_db_prompt_at_call = "<unset>"
@@ -116,8 +112,8 @@ class _FakeAgent:
     async def _ensure_db_session(self):
         self._ensure_db_prompt_at_call = self._cached_system_prompt
 
-    def _get_async_session_persist_lock(self):
-        return self._async_session_persist_lock
+    def _get_session_persist_lock(self):
+        return self._session_persist_lock
 
     async def _restore_primary_runtime(self):
         pass
@@ -139,33 +135,6 @@ class _FakeAgent:
 
     async def _persist_session(self, *_a, **_k):
         self._persist_calls += 1
-
-
-def _make_agent_with_cooldown(db_path, session_id, *, cooldown_until=None):
-    agent = _FakeAgent()
-    agent.compression_enabled = True
-    agent._emit_status = MagicMock()
-    agent._compress_context = MagicMock(
-        side_effect=lambda messages, *_a, **_k: (messages, "SYSTEM")
-    )
-
-    db = SessionDB(db_path=db_path)
-    db.create_session(session_id, source="cli")
-    if cooldown_until is not None:
-        db.record_compression_failure_cooldown(session_id, cooldown_until, "timeout")
-
-    with patch("agent.context_compressor.get_static_context_length", return_value=100000):
-        compressor = ContextCompressor(
-            model="test/model",
-            threshold_percent=0.85,
-            protect_first_n=2,
-            protect_last_n=2,
-            quiet_mode=True,
-        )
-    compressor.bind_session_state(db, session_id)
-    agent.context_compressor = compressor
-    agent._session_db = db
-    return agent
 
 
 @pytest.fixture(autouse=True)
@@ -346,7 +315,6 @@ async def test_between_turns_refresh_adds_late_tool_when_servers_registered():
 
     assert "mcp_x_tool" in agent.valid_tool_names
     assert any(t["function"]["name"] == "mcp_x_tool" for t in agent.tools)
-
 
 
 

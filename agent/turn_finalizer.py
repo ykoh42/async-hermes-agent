@@ -356,7 +356,7 @@ async def finalize_turn(
                 ):
                     _before = len(messages)
                     _session_db = (
-                        agent._get_async_session_db()
+                        agent._session_db
                         if getattr(agent, "_session_db", None) is not None
                         else None
                     )

@@ -8555,11 +8555,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 class AsyncSessionDB:
     """Native-async session store used by the agent turn path.
 
-    The constructor accepts either the historical ``SessionDB`` object or a
-    database path so existing callers keep working.  Only the path is read
-    from a supplied object; no synchronous connection or method is used by
-    this class.  The SQLite connection and schema are created lazily on the
-    first awaited operation, keeping ``AIAgent.__init__`` state-only.
+    The constructor accepts a database path. The SQLite connection and schema
+    are created lazily on the first awaited operation, keeping
+    ``AIAgent.__init__`` state-only.
 
     Deliberately do not provide a generic ``__getattr__`` bridge: an unknown
     synchronous database method must fail loudly instead of silently moving
@@ -8584,8 +8582,8 @@ class AsyncSessionDB:
     _rows_to_conversation = SessionDB._rows_to_conversation
     _sanitize_fts5_query = staticmethod(SessionDB._sanitize_fts5_query)
 
-    def __init__(self, db: "SessionDB | os.PathLike[str] | str") -> None:
-        self._db_path = Path(getattr(db, "db_path", db))
+    def __init__(self, db_path: "os.PathLike[str] | str") -> None:
+        self._db_path = Path(db_path)
         self._connection = None
         self._connect_lock = None
         self._write_lock = None
@@ -8795,6 +8793,37 @@ class AsyncSessionDB:
 
         await self._write(_create)
         return session_id
+
+    async def update_session_cwd(
+        self,
+        session_id: str,
+        cwd: str,
+        git_branch: str = None,
+        git_repo_root: str = None,
+    ) -> None:
+        """Persist workspace identity without blocking the event loop."""
+        if not session_id or not cwd:
+            return
+
+        assignments = ["cwd = ?"]
+        parameters: list[Any] = [cwd]
+        branch = (git_branch or "").strip()
+        repo_root = (git_repo_root or "").strip()
+        if branch:
+            assignments.append("git_branch = ?")
+            parameters.append(branch)
+        if repo_root:
+            assignments.append("git_repo_root = ?")
+            parameters.append(repo_root)
+        parameters.append(session_id)
+
+        async def _update(connection):
+            await connection.execute(
+                f"UPDATE sessions SET {', '.join(assignments)} WHERE id = ?",
+                parameters,
+            )
+
+        await self._write(_update)
 
     async def append_message(
         self,

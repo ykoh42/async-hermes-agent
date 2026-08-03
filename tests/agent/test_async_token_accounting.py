@@ -17,7 +17,7 @@ import time
 
 import pytest
 
-from hermes_state import SessionDB
+from hermes_state import AsyncSessionDB, SessionDB
 
 
 @pytest.fixture()
@@ -364,7 +364,7 @@ class TestDurability:
         monkeypatch.setitem(os.environ, "OPENROUTER_API_KEY", "test-key")
         from run_agent import AIAgent
 
-        db = SessionDB(db_path=tmp_path / "finalize.db")
+        db = AsyncSessionDB(tmp_path / "finalize.db")
         agent = None
         try:
             agent = AIAgent(
@@ -379,7 +379,7 @@ class TestDurability:
             )
             await agent._ensure_db_session()
 
-            await agent._get_async_session_db().update_token_counts(
+            await agent._session_db.update_token_counts(
                 "s-fin", input_tokens=11, output_tokens=2, api_call_count=1
             )
             await agent._persist_session(
@@ -387,13 +387,13 @@ class TestDurability:
                 [],
             )
             # Raw read: the native write is durable across turn persistence.
-            totals = _totals(db, "s-fin")
+            totals = await db.get_session("s-fin")
             assert totals["input_tokens"] == 11
             assert totals["api_call_count"] == 1
         finally:
             if agent is not None:
                 await agent.close()
-            db.close()
+            await db.close()
 
 
 # =========================================================================

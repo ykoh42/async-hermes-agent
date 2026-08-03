@@ -439,7 +439,7 @@ async def _restore_or_build_system_prompt(agent, system_message, conversation_hi
     stored_state = "missing"
     if conversation_history and agent._session_db:
         try:
-            session_db = agent._get_async_session_db()
+            session_db = agent._session_db
             session_row = (
                 await session_db.get_session(agent.session_id)
                 if session_db is not None
@@ -541,7 +541,7 @@ async def _restore_or_build_system_prompt(agent, system_message, conversation_hi
     # subsequent turn).
     if agent._session_db:
         try:
-            session_db = agent._get_async_session_db()
+            session_db = agent._session_db
             if session_db is not None:
                 await session_db.update_system_prompt(
                     agent.session_id,
@@ -3223,7 +3223,7 @@ async def run_conversation(
                                     _cost_delta = (_cost_delta or 0.0) + float(_moa_ref_cost)
                                 except (TypeError, ValueError):  # pragma: no cover
                                     pass
-                            session_db = agent._get_async_session_db()
+                            session_db = agent._session_db
                             if session_db is None:
                                 raise RuntimeError("Async session DB is unavailable")
                             await session_db.update_token_counts(

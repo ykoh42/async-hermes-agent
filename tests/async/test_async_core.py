@@ -19,7 +19,7 @@ from agent.turn_context import build_turn_context
 from agent.turn_finalizer import finalize_turn
 from agent import tool_executor
 from agent.tool_executor import execute_tool_calls_segmented
-from hermes_state import AsyncSessionDB, SessionDB
+from hermes_state import AsyncSessionDB
 from run_agent import AIAgent
 from model_tools import handle_function_call
 from tools.registry import registry
@@ -129,8 +129,8 @@ def test_conversation_and_chat_are_coroutines():
 @pytest.mark.asyncio
 async def test_async_session_billing_route_update_uses_native_connection(tmp_path):
     """A model switch must not fall back to the synchronous SessionDB writer."""
-    database = SessionDB(db_path=tmp_path / "state.db")
-    async_database = AsyncSessionDB(database)
+    database = AsyncSessionDB(tmp_path / "state.db")
+    async_database = database
     try:
         await async_database.create_session("route", "test", model="initial")
         await async_database.update_session_billing_route(
@@ -145,7 +145,6 @@ async def test_async_session_billing_route_update_uses_native_connection(tmp_pat
         assert session["billing_mode"] == "chat_completions"
     finally:
         await async_database.close()
-        database.close()
 
 
 @pytest.mark.asyncio
@@ -230,11 +229,10 @@ async def test_native_file_read_deduplicates_and_write_invalidates(tmp_path, mon
 @pytest.mark.asyncio
 async def test_model_switch_route_is_deferred_to_the_async_turn_boundary(tmp_path):
     """The sync state switch never writes SQLite directly."""
-    database = SessionDB(db_path=tmp_path / "state.db")
-    async_database = AsyncSessionDB(database)
+    database = AsyncSessionDB(tmp_path / "state.db")
+    async_database = database
     agent = AIAgent.__new__(AIAgent)
     agent._session_db = database
-    agent._async_session_db = async_database
     agent._persist_disabled = False
     agent.session_id = "route"
     agent._pending_billing_route = {
@@ -250,7 +248,6 @@ async def test_model_switch_route_is_deferred_to_the_async_turn_boundary(tmp_pat
         assert agent._pending_billing_route is None
     finally:
         await async_database.close()
-        database.close()
 
 
 @pytest.mark.asyncio
@@ -710,7 +707,7 @@ async def test_turn_retries_with_rotated_api_key_pool_entry(monkeypatch, tmp_pat
     )
     pool = CredentialPool("openrouter", [first, second])
     pool._current_id = first.id
-    database = SessionDB(tmp_path / "state.db")
+    database = AsyncSessionDB(tmp_path / "state.db")
     with (
         patch("run_agent.get_tool_definitions", return_value=[]),
         patch("run_agent.check_toolset_requirements", return_value={}),
@@ -728,7 +725,6 @@ async def test_turn_retries_with_rotated_api_key_pool_entry(monkeypatch, tmp_pat
             save_trajectories=False,
         )
     agent._session_db = database
-    agent._async_session_db = AsyncSessionDB(database)
     agent._session_db_created = False
     agent.compression_enabled = False
     attempts = 0
@@ -770,7 +766,7 @@ async def test_turn_retries_with_rotated_api_key_pool_entry(monkeypatch, tmp_pat
         assert agent.api_key == "second-key"
     finally:
         await agent.close()
-        database.close()
+        await database.close()
 
 
 @pytest.mark.asyncio
@@ -922,7 +918,7 @@ async def test_turn_retries_after_native_anthropic_oauth_refresh(monkeypatch, tm
     )
     pool = CredentialPool("anthropic", [entry])
     pool._current_id = entry.id
-    database = SessionDB(tmp_path / "state.db")
+    database = AsyncSessionDB(tmp_path / "state.db")
     with (
         patch("run_agent.get_tool_definitions", return_value=[]),
         patch("run_agent.check_toolset_requirements", return_value={}),
@@ -941,7 +937,6 @@ async def test_turn_retries_after_native_anthropic_oauth_refresh(monkeypatch, tm
             save_trajectories=False,
         )
     agent._session_db = database
-    agent._async_session_db = AsyncSessionDB(database)
     agent._session_db_created = False
     agent.compression_enabled = False
     agent._is_entitlement_failure = lambda *_args, **_kwargs: False
@@ -1002,7 +997,7 @@ async def test_turn_retries_after_native_anthropic_oauth_refresh(monkeypatch, tm
         assert agent.api_key == "fresh-access"
     finally:
         await agent.close()
-        database.close()
+        await database.close()
 
 
 def test_native_file_tool_imports_expand_the_async_model_surface():
@@ -1244,7 +1239,7 @@ async def test_agent_turn_lock_serializes_one_instance():
 
     async def enter_turn():
         nonlocal running, maximum
-        async with agent._get_async_turn_lock():
+        async with agent._get_turn_lock():
             running += 1
             maximum = max(maximum, running)
             await asyncio.sleep(0)
@@ -1263,7 +1258,7 @@ async def test_distinct_agents_can_run_turns_in_parallel():
 
     async def enter_turn(agent):
         nonlocal running, maximum
-        async with agent._get_async_turn_lock():
+        async with agent._get_turn_lock():
             running += 1
             maximum = max(maximum, running)
             await asyncio.sleep(0)
@@ -1276,7 +1271,7 @@ async def test_distinct_agents_can_run_turns_in_parallel():
 @pytest.mark.asyncio
 async def test_run_conversation_serializes_turns_for_one_agent(monkeypatch, tmp_path):
     """The public turn API, not only its raw lock, serializes one agent."""
-    database = SessionDB(tmp_path / "state.db")
+    database = AsyncSessionDB(tmp_path / "state.db")
     with (
         patch("run_agent.get_tool_definitions", return_value=[]),
         patch("run_agent.check_toolset_requirements", return_value={}),
@@ -1292,7 +1287,6 @@ async def test_run_conversation_serializes_turns_for_one_agent(monkeypatch, tmp_
             save_trajectories=False,
         )
     agent._session_db = database
-    agent._async_session_db = AsyncSessionDB(database)
     agent._session_db_created = False
     agent.compression_enabled = False
     agent._skip_mcp_refresh = True
@@ -1361,13 +1355,13 @@ async def test_run_conversation_serializes_turns_for_one_agent(monkeypatch, tmp_
         if pending:
             await asyncio.gather(*pending, return_exceptions=True)
         await agent.close()
-        database.close()
+        await database.close()
 
 
 @pytest.mark.asyncio
 async def test_default_compression_prologue_uses_static_context_metadata(monkeypatch, tmp_path):
     """The default compression path must not synchronously discover models."""
-    database = SessionDB(tmp_path / "state.db")
+    database = AsyncSessionDB(tmp_path / "state.db")
     with (
         patch("run_agent.get_tool_definitions", return_value=[]),
         patch("run_agent.check_toolset_requirements", return_value={}),
@@ -1383,7 +1377,6 @@ async def test_default_compression_prologue_uses_static_context_metadata(monkeyp
             save_trajectories=False,
         )
     agent._session_db = database
-    agent._async_session_db = AsyncSessionDB(database)
     agent._session_db_created = False
     agent._skip_mcp_refresh = True
 
@@ -1416,13 +1409,13 @@ async def test_default_compression_prologue_uses_static_context_metadata(monkeyp
         assert result["final_response"] == "answer"
     finally:
         await agent.close()
-        database.close()
+        await database.close()
 
 
 @pytest.mark.asyncio
 async def test_run_conversation_allows_distinct_agents_to_overlap(monkeypatch, tmp_path):
     """Separate agent instances keep their model I/O concurrent."""
-    databases = [SessionDB(tmp_path / f"state-{index}.db") for index in range(2)]
+    databases = [AsyncSessionDB(tmp_path / f"state-{index}.db") for index in range(2)]
     with (
         patch("run_agent.get_tool_definitions", return_value=[]),
         patch("run_agent.check_toolset_requirements", return_value={}),
@@ -1442,7 +1435,6 @@ async def test_run_conversation_allows_distinct_agents_to_overlap(monkeypatch, t
         ]
     for agent, database in zip(agents, databases):
         agent._session_db = database
-        agent._async_session_db = AsyncSessionDB(database)
         agent._session_db_created = False
         agent.compression_enabled = False
 
@@ -1511,7 +1503,7 @@ async def test_run_conversation_allows_distinct_agents_to_overlap(monkeypatch, t
         for agent in agents:
             await agent.close()
         for database in databases:
-            database.close()
+            await database.close()
 
 
 @pytest.mark.asyncio
@@ -1583,8 +1575,8 @@ async def test_trajectory_writer_is_awaitable(tmp_path):
 
 @pytest.mark.asyncio
 async def test_async_session_db_writes_without_to_thread(tmp_path, monkeypatch):
-    database = SessionDB(tmp_path / "state.db")
-    session_db = AsyncSessionDB(database)
+    database = AsyncSessionDB(tmp_path / "state.db")
+    session_db = database
 
     def fail_if_called(*args, **kwargs):
         raise AssertionError("core async persistence must not call asyncio.to_thread")
@@ -1595,45 +1587,40 @@ async def test_async_session_db_writes_without_to_thread(tmp_path, monkeypatch):
         await session_db.append_message("async-session", "user", "hello")
         await session_db.end_session("async-session", "test_complete")
 
-        stored = database.get_session("async-session")
+        stored = await database.get_session("async-session")
         assert stored["model"] == "test-model"
-        assert [message["content"] for message in database.get_messages("async-session")] == ["hello"]
+        assert [
+            message["content"]
+            for message in await database.get_messages("async-session")
+        ] == ["hello"]
         assert stored["end_reason"] == "test_complete"
     finally:
         await session_db.close()
-        database.close()
+        await database.close()
 
 
 @pytest.mark.asyncio
 async def test_conversation_root_uses_async_session_db(tmp_path, monkeypatch):
-    database = SessionDB(tmp_path / "state.db")
-    database.create_session("root", "test")
-    database.create_session("child", "test", parent_session_id="root")
+    database = AsyncSessionDB(tmp_path / "state.db")
+    await database.create_session("root", "test")
+    await database.create_session("child", "test", parent_session_id="root")
     agent = AIAgent.__new__(AIAgent)
     agent.session_id = "child"
     agent._parent_session_id = None
     agent._session_db = database
-    session_db = AsyncSessionDB(database)
-    agent._async_session_db = session_db
+    session_db = database
 
-    monkeypatch.setattr(
-        database,
-        "get_conversation_root",
-        lambda *_args: (_ for _ in ()).throw(
-            AssertionError("async turn must not read through SessionDB")
-        ),
-    )
     try:
         assert await agent._conversation_root_id() == "root"
     finally:
         await session_db.close()
-        database.close()
+        await database.close()
 
 
 @pytest.mark.asyncio
 async def test_async_session_db_loads_compression_snapshot(tmp_path, monkeypatch):
-    database = SessionDB(tmp_path / "state.db")
-    session_db = AsyncSessionDB(database)
+    database = AsyncSessionDB(tmp_path / "state.db")
+    session_db = database
     monkeypatch.setattr(
         asyncio,
         "to_thread",
@@ -1660,13 +1647,13 @@ async def test_async_session_db_loads_compression_snapshot(tmp_path, monkeypatch
         ] == ["parent message", "child message"]
     finally:
         await session_db.close()
-        database.close()
+        await database.close()
 
 
 @pytest.mark.asyncio
 async def test_async_session_db_persists_compression_guards(tmp_path, monkeypatch):
-    database = SessionDB(tmp_path / "state.db")
-    session_db = AsyncSessionDB(database)
+    database = AsyncSessionDB(tmp_path / "state.db")
+    session_db = database
     monkeypatch.setattr(
         asyncio,
         "to_thread",
@@ -1689,7 +1676,7 @@ async def test_async_session_db_persists_compression_guards(tmp_path, monkeypatc
         assert await session_db.get_compression_ineffective_count("guarded") == 1
     finally:
         await session_db.close()
-        database.close()
+        await database.close()
 
 
 @pytest.mark.asyncio
@@ -1700,8 +1687,8 @@ async def test_micro_compaction_persists_through_async_session_db(tmp_path, monk
         ContextCompressor,
     )
 
-    database = SessionDB(tmp_path / "state.db")
-    session_db = AsyncSessionDB(database)
+    database = AsyncSessionDB(tmp_path / "state.db")
+    session_db = database
     messages = [{"role": "system", "content": "system"}]
     for index in range(6):
         messages.extend(
@@ -1736,13 +1723,6 @@ async def test_micro_compaction_persists_through_async_session_db(tmp_path, monk
             AssertionError("micro-compaction must not call asyncio.to_thread")
         ),
     )
-    monkeypatch.setattr(
-        database,
-        "archive_and_compact",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            AssertionError("micro-compaction must not call SessionDB")
-        ),
-    )
     try:
         await session_db.create_session("micro-session", "test")
         for message in messages:
@@ -1761,7 +1741,7 @@ async def test_micro_compaction_persists_through_async_session_db(tmp_path, monk
         )
     finally:
         await session_db.close()
-        database.close()
+        await database.close()
 
 
 @pytest.mark.asyncio
@@ -1770,8 +1750,8 @@ async def test_async_auxiliary_accounting_writes_without_to_thread(tmp_path, mon
     from agent.aux_accounting import reset_accounting_context, set_accounting_context
     from agent.auxiliary_client import _validate_llm_response
 
-    database = SessionDB(tmp_path / "state.db")
-    session_db = AsyncSessionDB(database)
+    database = AsyncSessionDB(tmp_path / "state.db")
+    session_db = database
     monkeypatch.setattr(
         asyncio,
         "to_thread",
@@ -1797,15 +1777,15 @@ async def test_async_auxiliary_accounting_writes_without_to_thread(tmp_path, mon
     finally:
         reset_accounting_context(token)
         await session_db.close()
-        database.close()
+        await database.close()
 
 
 @pytest.mark.asyncio
 async def test_async_session_db_backfills_api_sidecar_without_to_thread(
     tmp_path, monkeypatch
 ):
-    database = SessionDB(tmp_path / "state.db")
-    session_db = AsyncSessionDB(database)
+    database = AsyncSessionDB(tmp_path / "state.db")
+    session_db = database
 
     monkeypatch.setattr(
         asyncio,
@@ -1821,11 +1801,11 @@ async def test_async_session_db_backfills_api_sidecar_without_to_thread(
         assert await session_db.set_latest_user_api_content(
             "sidecar-session", "clean prompt", "clean prompt\n\n<context/>"
         ) == 1
-        messages = database.get_messages_as_conversation("sidecar-session")
+        messages = await database.get_messages_as_conversation("sidecar-session")
         assert messages[0]["api_content"] == "clean prompt\n\n<context/>"
     finally:
         await session_db.close()
-        database.close()
+        await database.close()
 
 
 @pytest.mark.asyncio
@@ -1833,8 +1813,8 @@ async def test_async_session_db_compacts_and_releases_lease_without_to_thread(
     tmp_path, monkeypatch
 ):
     """The async compaction primitives preserve active/archived transcript rows."""
-    database = SessionDB(tmp_path / "state.db")
-    session_db = AsyncSessionDB(database)
+    database = AsyncSessionDB(tmp_path / "state.db")
+    session_db = database
 
     monkeypatch.setattr(
         asyncio,
@@ -1860,25 +1840,29 @@ async def test_async_session_db_compacts_and_releases_lease_without_to_thread(
         await session_db.update_system_prompt("compact-session", "stable system prompt")
         await session_db.release_compression_lock("compact-session", "test-holder")
 
-        active = database.get_messages("compact-session")
-        archived = database.get_messages("compact-session", include_inactive=True)
+        active = await database.get_messages("compact-session")
+        archived = await database.get_messages(
+            "compact-session", include_inactive=True
+        )
         assert [message["content"] for message in active] == [
             "original question",
             "compressed answer",
         ]
         assert len(archived) == 3
-        assert database.get_session("compact-session")["system_prompt"] == "stable system prompt"
+        assert (await database.get_session("compact-session"))["system_prompt"] == (
+            "stable system prompt"
+        )
         assert await session_db.get_compression_lock_holder("compact-session") is None
     finally:
         await session_db.close()
-        database.close()
+        await database.close()
 
 
 @pytest.mark.asyncio
 async def test_in_place_compression_uses_native_async_sqlite_path(tmp_path, monkeypatch):
     """A complete in-place compaction never re-enters the sync SessionDB API."""
-    database = SessionDB(tmp_path / "state.db")
-    session_db = AsyncSessionDB(database)
+    database = AsyncSessionDB(tmp_path / "state.db")
+    session_db = database
 
     class Compressor:
         compression_count = 1
@@ -1904,8 +1888,7 @@ async def test_in_place_compression_uses_native_async_sqlite_path(tmp_path, monk
 
     agent = SimpleNamespace(
         _session_db=database,
-        _get_async_session_db=lambda: session_db,
-        session_id="compression-session",
+                session_id="compression-session",
         context_compressor=compressor,
         api_mode=None,
         compression_in_place=True,
@@ -1954,20 +1937,23 @@ async def test_in_place_compression_uses_native_async_sqlite_path(tmp_path, monk
         ]
         assert prompt == "stable system prompt"
         assert agent._last_compaction_in_place is True
-        assert [message["content"] for message in database.get_messages(agent.session_id)] == [
+        assert [
+            message["content"]
+            for message in await database.get_messages(agent.session_id)
+        ] == [
             "question",
             "compressed answer",
         ]
     finally:
         await session_db.close()
-        database.close()
+        await database.close()
 
 
 @pytest.mark.asyncio
 async def test_rotating_compression_publishes_child_with_native_async_sqlite(tmp_path):
     """The optional rotation mode retains its atomic parent/child handoff."""
-    database = SessionDB(tmp_path / "state.db")
-    session_db = AsyncSessionDB(database)
+    database = AsyncSessionDB(tmp_path / "state.db")
+    session_db = database
 
     class Compressor:
         compression_count = 1
@@ -1995,8 +1981,7 @@ async def test_rotating_compression_publishes_child_with_native_async_sqlite(tmp
 
     agent = SimpleNamespace(
         _session_db=database,
-        _get_async_session_db=lambda: session_db,
-        session_id="rotation-parent",
+                session_id="rotation-parent",
         context_compressor=Compressor(),
         api_mode=None,
         compression_in_place=False,
@@ -2034,23 +2019,25 @@ async def test_rotating_compression_publishes_child_with_native_async_sqlite(tmp
             force=True,
         )
         assert agent.session_id != "rotation-parent"
-        assert database.get_session("rotation-parent")["end_reason"] == "compression"
-        assert [message["content"] for message in database.get_messages(agent.session_id)] == [
+        assert (await database.get_session("rotation-parent"))["end_reason"] == "compression"
+        assert [
+            message["content"]
+            for message in await database.get_messages(agent.session_id)
+        ] == [
             message["content"] for message in compressed
         ]
     finally:
         await session_db.close()
-        database.close()
+        await database.close()
 
 
 @pytest.mark.asyncio
 async def test_agent_session_lifecycle_uses_native_async_store(tmp_path, monkeypatch):
-    database = SessionDB(tmp_path / "state.db")
+    database = AsyncSessionDB(tmp_path / "state.db")
     agent = AIAgent.__new__(AIAgent)
     agent._persist_disabled = False
     agent._session_db = database
-    agent._async_session_db = AsyncSessionDB(database)
-    agent._async_session_persist_lock = None
+    agent._session_persist_lock = None
     agent._session_db_created = False
     agent.session_id = "agent-async-session"
     agent.platform = "cli"
@@ -2077,21 +2064,23 @@ async def test_agent_session_lifecycle_uses_native_async_store(tmp_path, monkeyp
         assert await agent._flush_messages_to_session_db([
             {"role": "user", "content": "hello"}
         ]) is True
-        assert [message["content"] for message in database.get_messages(agent.session_id)] == ["hello"]
+        assert [
+            message["content"]
+            for message in await database.get_messages(agent.session_id)
+        ] == ["hello"]
     finally:
-        await agent._async_session_db.close()
-        database.close()
+        await agent._session_db.close()
+        await database.close()
 
 
 @pytest.mark.asyncio
 async def test_persist_session_does_not_reenter_its_async_lock(tmp_path, monkeypatch):
     """The persist funnel owns one lock and calls its unlocked DB writer."""
-    database = SessionDB(tmp_path / "state.db")
+    database = AsyncSessionDB(tmp_path / "state.db")
     agent = AIAgent.__new__(AIAgent)
     agent._persist_disabled = False
     agent._session_db = database
-    agent._async_session_db = AsyncSessionDB(database)
-    agent._async_session_persist_lock = None
+    agent._session_persist_lock = None
     agent._session_db_created = False
     agent.session_id = "persist-session"
     agent.platform = "cli"
@@ -2127,12 +2116,15 @@ async def test_persist_session_does_not_reenter_its_async_lock(tmp_path, monkeyp
             agent._persist_session([{"role": "user", "content": "hello"}]),
             timeout=0.5,
         )
-        assert [message["content"] for message in database.get_messages(agent.session_id)] == [
+        assert [
+            message["content"]
+            for message in await database.get_messages(agent.session_id)
+        ] == [
             "hello"
         ]
     finally:
-        await agent._async_session_db.close()
-        database.close()
+        await agent._session_db.close()
+        await database.close()
 
 
 @pytest.mark.asyncio
@@ -2159,7 +2151,7 @@ async def test_synthetic_turn_records_trajectory_without_to_thread(monkeypatch, 
     """Exercise the public turn path with an async model and real session DB."""
     from run_agent import AIAgent
 
-    database = SessionDB(tmp_path / "state.db")
+    database = AsyncSessionDB(tmp_path / "state.db")
     with (
         patch("run_agent.get_tool_definitions", return_value=[]),
         patch("run_agent.check_toolset_requirements", return_value={}),
@@ -2175,7 +2167,6 @@ async def test_synthetic_turn_records_trajectory_without_to_thread(monkeypatch, 
             save_trajectories=False,
         )
     agent._session_db = database
-    agent._async_session_db = AsyncSessionDB(database)
     agent._session_db_created = False
     agent.compression_enabled = False
 
@@ -2211,13 +2202,16 @@ async def test_synthetic_turn_records_trajectory_without_to_thread(monkeypatch, 
             "user",
             "assistant",
         ]
-        assert [message["content"] for message in database.get_messages(agent.session_id)] == [
+        assert [
+            message["content"]
+            for message in await database.get_messages(agent.session_id)
+        ] == [
             "hello async",
             "async answer",
         ]
     finally:
         await agent.close()
-        database.close()
+        await database.close()
 
 
 @pytest.mark.asyncio
@@ -2228,7 +2222,7 @@ async def test_oauth_renewal_fails_fast_without_sync_refresh(monkeypatch, tmp_pa
     class UnauthorizedError(Exception):
         status_code = 401
 
-    database = SessionDB(tmp_path / "state.db")
+    database = AsyncSessionDB(tmp_path / "state.db")
     with (
         patch("run_agent.get_tool_definitions", return_value=[]),
         patch("run_agent.check_toolset_requirements", return_value={}),
@@ -2246,7 +2240,6 @@ async def test_oauth_renewal_fails_fast_without_sync_refresh(monkeypatch, tmp_pa
             save_trajectories=False,
         )
     agent._session_db = database
-    agent._async_session_db = AsyncSessionDB(database)
     agent._session_db_created = False
     agent.compression_enabled = False
 
@@ -2262,7 +2255,7 @@ async def test_oauth_renewal_fails_fast_without_sync_refresh(monkeypatch, tmp_pa
             await agent.run_conversation("hello async")
     finally:
         await agent.close()
-        database.close()
+        await database.close()
 
 
 @pytest.mark.asyncio
@@ -2293,7 +2286,7 @@ async def test_codex_responses_main_path_uses_native_async_client(monkeypatch):
 @pytest.mark.asyncio
 async def test_synthetic_model_tool_observation_turn_preserves_order(monkeypatch, tmp_path):
     """The model → tool → observation → model training shape stays ordered."""
-    database = SessionDB(tmp_path / "state.db")
+    database = AsyncSessionDB(tmp_path / "state.db")
     with (
         patch("run_agent.get_tool_definitions", return_value=[]),
         patch("run_agent.check_toolset_requirements", return_value={}),
@@ -2309,7 +2302,6 @@ async def test_synthetic_model_tool_observation_turn_preserves_order(monkeypatch
             save_trajectories=False,
         )
     agent._session_db = database
-    agent._async_session_db = AsyncSessionDB(database)
     agent._session_db_created = False
     agent.compression_enabled = False
     agent.valid_tool_names = {"terminal"}
@@ -2388,7 +2380,10 @@ async def test_synthetic_model_tool_observation_turn_preserves_order(monkeypatch
             "error": None,
         }
         assert result["final_response"] == "tool observation incorporated"
-        assert [message["role"] for message in database.get_messages(agent.session_id)] == [
+        assert [
+            message["role"]
+            for message in await database.get_messages(agent.session_id)
+        ] == [
             "user",
             "assistant",
             "tool",
@@ -2396,13 +2391,13 @@ async def test_synthetic_model_tool_observation_turn_preserves_order(monkeypatch
         ]
     finally:
         await agent.close()
-        database.close()
+        await database.close()
 
 
 @pytest.mark.asyncio
 async def test_cancelled_turn_persists_partial_session_and_reraises(monkeypatch, tmp_path):
     """Cancellation keeps the crash-safe user row, then propagates cancellation."""
-    database = SessionDB(tmp_path / "state.db")
+    database = AsyncSessionDB(tmp_path / "state.db")
     with (
         patch("run_agent.get_tool_definitions", return_value=[]),
         patch("run_agent.check_toolset_requirements", return_value={}),
@@ -2418,7 +2413,6 @@ async def test_cancelled_turn_persists_partial_session_and_reraises(monkeypatch,
             save_trajectories=False,
         )
     agent._session_db = database
-    agent._async_session_db = AsyncSessionDB(database)
     agent._session_db_created = False
     agent.compression_enabled = False
     model_started = asyncio.Event()
@@ -2439,7 +2433,10 @@ async def test_cancelled_turn_persists_partial_session_and_reraises(monkeypatch,
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
-        assert [message["content"] for message in database.get_messages(agent.session_id)] == [
+        assert [
+            message["content"]
+            for message in await database.get_messages(agent.session_id)
+        ] == [
             "persist this before cancel"
         ]
     finally:
@@ -2447,7 +2444,7 @@ async def test_cancelled_turn_persists_partial_session_and_reraises(monkeypatch,
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
         await agent.close()
-        database.close()
+        await database.close()
 
 
 @pytest.mark.asyncio
@@ -2459,7 +2456,7 @@ async def test_cancelled_tool_batch_persists_ordered_cancelled_observation(
 
     active_registry = importlib.import_module("tools.registry").registry
     active_model_tools = importlib.import_module("model_tools")
-    database = SessionDB(tmp_path / "state.db")
+    database = AsyncSessionDB(tmp_path / "state.db")
     tool_name = "__async_core_slow_tool__"
     tool_started = asyncio.Event()
 
@@ -2497,7 +2494,6 @@ async def test_cancelled_tool_batch_persists_ordered_cancelled_observation(
             save_trajectories=False,
         )
     agent._session_db = database
-    agent._async_session_db = AsyncSessionDB(database)
     agent._session_db_created = False
     agent.compression_enabled = False
     agent.valid_tool_names = {tool_name}
@@ -2538,7 +2534,7 @@ async def test_cancelled_tool_batch_persists_ordered_cancelled_observation(
         with pytest.raises(asyncio.CancelledError):
             await task
 
-        stored = database.get_messages(agent.session_id)
+        stored = await database.get_messages(agent.session_id)
         assert [message["role"] for message in stored] == [
             "user",
             "assistant",
@@ -2552,7 +2548,7 @@ async def test_cancelled_tool_batch_persists_ordered_cancelled_observation(
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
         await agent.close()
-        database.close()
+        await database.close()
 
 
 @pytest.mark.asyncio

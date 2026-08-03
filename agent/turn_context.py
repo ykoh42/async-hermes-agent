@@ -631,7 +631,7 @@ async def build_turn_context(
     # LATER (after memory prefetch / pre_llm_call), so the row is written
     # once with its final api_content — both steps take the same per-agent
     # persist lock as CLI close persistence.
-    persist_lock = agent._get_async_session_persist_lock()
+    persist_lock = agent._get_session_persist_lock()
     try:
         async with persist_lock:
             await agent._ensure_db_session()
@@ -639,7 +639,7 @@ async def build_turn_context(
             if getattr(agent, "_session_db", None) is not None:
                 await _hydrate_persisted_compression_guards(
                     agent.context_compressor,
-                    agent._get_async_session_db(),
+                    agent._session_db,
                     agent.session_id,
                 )
     except Exception:
@@ -1192,7 +1192,7 @@ async def build_turn_context(
             ):
                 if getattr(agent, "_session_db", None) is not None:
                     try:
-                        await agent._get_async_session_db().set_latest_user_api_content(
+                        await agent._session_db.set_latest_user_api_content(
                             agent.session_id,
                             _turn_user_msg.get("content"),
                             _api_content,

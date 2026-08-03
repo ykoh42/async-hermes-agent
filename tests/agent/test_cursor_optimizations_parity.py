@@ -143,13 +143,13 @@ def test_parity_token_memo():
 async def test_parity_persist_bounded_scan(tmp_path):
     print("=== parity: _flush_messages_to_session_db bounded scan ===")
     import run_agent as ra
-    from hermes_state import SessionDB
+    from hermes_state import AsyncSessionDB
 
-    def make_agent(bounded, label):
+    async def make_agent(bounded, label):
         a = ra.AIAgent.__new__(ra.AIAgent)
         a.session_id = "s1"
-        a._session_db = SessionDB(db_path=tmp_path / f"{label}.db")
-        a._session_db.create_session("s1", source="test")
+        a._session_db = AsyncSessionDB(tmp_path / f"{label}.db")
+        await a._session_db.create_session("s1", source="test")
         a._session_db_created = True
         a._last_flushed_db_idx = 0
         a._flushed_db_message_ids = set()
@@ -160,23 +160,26 @@ async def test_parity_persist_bounded_scan(tmp_path):
             a._db_flush_scan_prefix = None
         return a
 
-    def persisted_messages(agent):
+    async def persisted_messages(agent):
         return [
             {key: value for key, value in message.items() if key != "timestamp"}
-            for message in agent._session_db.get_messages_as_conversation("s1")
+            for message in await agent._session_db.get_messages_as_conversation("s1")
         ]
 
     for n in (50, 200, 500):
         base = build_history(n)
         la, lb = copy.deepcopy(base), copy.deepcopy(base)
-        A, B = make_agent(False, f"baseline-{n}"), make_agent(True, f"bounded-{n}")
+        A, B = (
+            await make_agent(False, f"baseline-{n}"),
+            await make_agent(True, f"bounded-{n}"),
+        )
         for iteration in range(3):
             A._db_flush_scan_prefix = None  # baseline: always full scan
             ra_ok = await A._flush_messages_to_session_db_unlocked(la, None)
             rb_ok = await B._flush_messages_to_session_db_unlocked(lb, None)
             assert ra_ok is True and rb_ok is True
             assert (
-                persisted_messages(A) == persisted_messages(B)
+                await persisted_messages(A) == await persisted_messages(B)
             ), f"rows diverge n={n} it={iteration}"
             assert la == lb
             for lst in (la, lb):
@@ -197,13 +200,11 @@ async def test_parity_persist_bounded_scan(tmp_path):
         await A._flush_messages_to_session_db_unlocked(la, None)
         await B._flush_messages_to_session_db_unlocked(lb, None)
         assert (
-            persisted_messages(A) == persisted_messages(B)
+            await persisted_messages(A) == await persisted_messages(B)
             and la == lb
         )
-        await A._get_async_session_db().close()
-        await B._get_async_session_db().close()
-        A._session_db.close()
-        B._session_db.close()
+        await A._session_db.close()
+        await B._session_db.close()
         print(f"  n={n}: OK (identical DB rows + marker stamps across 3 flushes + compression rewrite)")
 
 

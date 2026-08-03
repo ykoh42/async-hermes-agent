@@ -579,59 +579,29 @@ class AIAgent:
             pass_session_id=pass_session_id,
         )
 
-    def _get_async_turn_lock(self) -> asyncio.Lock:
+    def _get_turn_lock(self) -> asyncio.Lock:
         """Return the lazily-created lock that serializes one agent's turns."""
-        lock = getattr(self, "_async_turn_lock", None)
+        lock = getattr(self, "_turn_lock", None)
         if lock is None:
             lock = asyncio.Lock()
-            self._async_turn_lock = lock
+            self._turn_lock = lock
         return lock
 
-    def _get_async_close_lock(self) -> asyncio.Lock:
+    def _get_close_lock(self) -> asyncio.Lock:
         """Return the lazily-created lock that makes ``close()`` idempotent."""
-        lock = getattr(self, "_async_close_lock", None)
+        lock = getattr(self, "_close_lock", None)
         if lock is None:
             lock = asyncio.Lock()
-            self._async_close_lock = lock
+            self._close_lock = lock
         return lock
 
-    def _get_async_session_persist_lock(self) -> asyncio.Lock:
+    def _get_session_persist_lock(self) -> asyncio.Lock:
         """Return the per-agent async lock for transcript mutations."""
-        lock = getattr(self, "_async_session_persist_lock", None)
+        lock = getattr(self, "_session_persist_lock", None)
         if lock is None:
             lock = asyncio.Lock()
-            self._async_session_persist_lock = lock
+            self._session_persist_lock = lock
         return lock
-
-    def _get_async_session_db(self):
-        """Return the native-async store for this agent's transcript writes.
-
-        A supplied historical ``SessionDB`` contributes only its path for
-        constructor compatibility. ``AsyncSessionDB`` owns the connection,
-        schema bootstrap, and every active-turn query lazily, so no
-        synchronous DB method runs in a conversation turn. Unknown adapters
-        are rejected rather than quietly executed in a worker thread.
-        """
-        session_db = getattr(self, "_session_db", None)
-        if session_db is None:
-            return None
-        async_session_db = getattr(self, "_async_session_db", None)
-        if async_session_db is not None:
-            return async_session_db
-
-        from hermes_state import AsyncSessionDB, SessionDB
-
-        if isinstance(session_db, AsyncSessionDB):
-            self._async_session_db = session_db
-        elif isinstance(session_db, SessionDB):
-            self._async_session_db = AsyncSessionDB(session_db)
-        else:
-            raise RuntimeError(
-                "Async AIAgent requires hermes_state.SessionDB or "
-                "hermes_state.AsyncSessionDB for session persistence; "
-                f"got {type(session_db).__name__}."
-            )
-        return self._async_session_db
 
     async def __aenter__(self):
         """Support ``async with AIAgent(...)`` without a separate start API."""
@@ -657,7 +627,7 @@ class AIAgent:
                     _profile_for_session = None
             except Exception:
                 _profile_for_session = None
-            session_db = self._get_async_session_db()
+            session_db = self._session_db
             if session_db is None:
                 return
             await session_db.create_session(
@@ -685,7 +655,7 @@ class AIAgent:
         if not pending or not self._session_db or getattr(self, "_persist_disabled", False):
             return
         try:
-            session_db = self._get_async_session_db()
+            session_db = self._session_db
             if session_db is None:
                 return
             await session_db.update_session_billing_route(
@@ -1840,7 +1810,7 @@ class AIAgent:
         # observe the same unmarked dict and write duplicate durable rows.
         from agent.agent_runtime_helpers import note_turn_persisted
 
-        async with self._get_async_session_persist_lock():
+        async with self._get_session_persist_lock():
             self._drop_trailing_empty_response_scaffolding(messages)
             self._session_messages = messages
             await self._save_session_log(messages)
@@ -1861,7 +1831,7 @@ class AIAgent:
                 # SessionDB implements this drain, while an adapter that only
                 # supports message writes should not make an otherwise
                 # durable turn fail on exit.
-                session_db = self._get_async_session_db()
+                session_db = self._session_db
                 flush_token_counts = getattr(session_db, "flush_token_counts", None)
                 if callable(flush_token_counts):
                     await flush_token_counts()
@@ -1931,7 +1901,7 @@ class AIAgent:
         conversation_history: Optional[List[Dict]] = None,
     ):
         """Serialize direct and turn-boundary session flushes per agent."""
-        async with self._get_async_session_persist_lock():
+        async with self._get_session_persist_lock():
             return await self._flush_messages_to_session_db_unlocked(
                 messages, conversation_history
             )
@@ -2158,7 +2128,7 @@ class AIAgent:
                     ]
                 elif isinstance(msg.get("tool_calls"), list):
                     tool_calls_data = msg["tool_calls"]
-                session_db = self._get_async_session_db()
+                session_db = self._session_db
                 if session_db is None:
                     return None
                 await session_db.append_message(
@@ -3856,7 +3826,7 @@ class AIAgent:
         guarantees cancellation can never strand an agent in a permanently
         locked closing state.
         """
-        close_lock = self._get_async_close_lock()
+        close_lock = self._get_close_lock()
         await close_lock.acquire()
         try:
             await self._close_unlocked()
@@ -3989,17 +3959,17 @@ class AIAgent:
         # 'cron_complete' / 'cli_close' reason set by an earlier terminal path.
         try:
             if getattr(self, "_end_session_on_close", True):
-                session_db = self._get_async_session_db()
+                session_db = self._session_db
                 session_id = getattr(self, "session_id", None)
                 if session_db and session_id:
                     await session_db.end_session(session_id, "agent_close")
         except Exception:
             pass
         try:
-            session_db = getattr(self, "_async_session_db", None)
+            session_db = getattr(self, "_session_db", None)
             if session_db is not None:
                 await session_db.close()
-                self._async_session_db = None
+                self._session_db = None
         except Exception:
             logger.debug("Async session DB close failed", exc_info=True)
 
@@ -6137,7 +6107,7 @@ class AIAgent:
         start = getattr(self, "_parent_session_id", None) or sid
         if getattr(self, "_session_db", None) is not None:
             try:
-                db = self._get_async_session_db()
+                db = self._session_db
                 root = await db.get_conversation_root(start) if db is not None else None
                 if root:
                     return root
@@ -6170,7 +6140,7 @@ class AIAgent:
             set_conversation_context,
         )
         from agent.subagent_lifecycle import bind_subagent_parent
-        turn_lock = self._get_async_turn_lock()
+        turn_lock = self._get_turn_lock()
         await turn_lock.acquire()
         self._active_turn_task = asyncio.current_task()
         effective_task_id = task_id or str(uuid.uuid4())
@@ -6227,7 +6197,7 @@ class AIAgent:
             # dimension) — the fix for aux spend being invisible in analytics
             # (issue #23270).
             acct_token = set_accounting_context(
-                self._get_async_session_db()
+                self._session_db
                 if getattr(self, "_session_db", None) is not None
                 else None,
                 getattr(self, "session_id", None),

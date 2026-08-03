@@ -105,8 +105,7 @@ async def test_flush_persist_override_replaces_api_local_multimodal_note(agent):
         {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
     ]
     db = SimpleNamespace(append_message=AsyncMock())
-    agent._session_db = object()
-    agent._get_async_session_db = MagicMock(return_value=db)
+    agent._session_db = db
     agent._session_db_created = True
     agent.session_id = "session-123"
     agent._last_flushed_db_idx = 0
@@ -142,8 +141,7 @@ async def test_direct_session_db_flushes_share_marker_claim(agent):
             self.rows.append(kwargs["content"])
 
     db = _BarrierDB()
-    agent._session_db = object()
-    agent._get_async_session_db = MagicMock(return_value=db)
+    agent._session_db = db
     agent._session_db_created = True
     agent.session_id = "session-123"
     agent._last_flushed_db_idx = 0
@@ -153,7 +151,7 @@ async def test_direct_session_db_flushes_share_marker_claim(agent):
     agent._persist_user_message_override = None
     agent._persist_user_message_timestamp = None
     agent._persist_disabled = False
-    agent._async_session_persist_lock = None
+    agent._session_persist_lock = None
     agent._session_json_enabled = False
 
     message = {"role": "user", "content": "exactly once"}
@@ -803,11 +801,13 @@ class TestHydrateTodoStore:
 
 
 class TestBuildSystemPrompt:
-    def test_always_has_identity(self, agent):
-        prompt = agent._build_system_prompt()
+    @pytest.mark.asyncio
+    async def test_always_has_identity(self, agent):
+        prompt = await agent._build_system_prompt()
         assert DEFAULT_AGENT_IDENTITY in prompt
 
-    def test_can_use_soul_identity_even_when_context_files_are_skipped(self):
+    @pytest.mark.asyncio
+    async def test_can_use_soul_identity_even_when_context_files_are_skipped(self):
         with (
             patch("run_agent.get_tool_definitions", return_value=_make_tool_defs("terminal")),
             patch("run_agent.check_toolset_requirements", return_value={}),
@@ -822,26 +822,28 @@ class TestBuildSystemPrompt:
                 load_soul_identity=True,
                 skip_memory=True,
             )
-            prompt = agent._build_system_prompt()
+            prompt = await agent._build_system_prompt()
 
         assert "SOUL IDENTITY" in prompt
         assert DEFAULT_AGENT_IDENTITY not in prompt
 
 
-    def test_memory_guidance_when_memory_tool_loaded(self, agent_with_memory_tool):
+    @pytest.mark.asyncio
+    async def test_memory_guidance_when_memory_tool_loaded(self, agent_with_memory_tool):
         from agent.prompt_builder import MEMORY_GUIDANCE
 
-        prompt = agent_with_memory_tool._build_system_prompt()
+        prompt = await agent_with_memory_tool._build_system_prompt()
         assert MEMORY_GUIDANCE in prompt
 
 
 
-    def test_datetime_is_date_only_not_minute_precision(self, agent):
+    @pytest.mark.asyncio
+    async def test_datetime_is_date_only_not_minute_precision(self, agent):
         """Timestamp must be date-only (no HH:MM) so the system prompt
         stays byte-stable for the full day. Minute precision invalidates
         prefix-cache KV on every rebuild path (compression, fresh-agent
         gateway turns, session resume without a stored prompt)."""
-        prompt = agent._build_system_prompt()
+        prompt = await agent._build_system_prompt()
         # Find the line and strip it for inspection
         for line in prompt.splitlines():
             if line.startswith("Conversation started:"):
@@ -858,7 +860,8 @@ class TestBuildSystemPrompt:
         else:
             assert False, "Expected a 'Conversation started:' line in the system prompt"
 
-    def test_skills_prompt_derives_available_toolsets_from_loaded_tools(self):
+    @pytest.mark.asyncio
+    async def test_skills_prompt_derives_available_toolsets_from_loaded_tools(self):
         tools = _make_tool_defs("web_search", "skills_list", "skill_view", "skill_manage")
         toolset_map = {
             "web_search": "web",
@@ -885,7 +888,7 @@ class TestBuildSystemPrompt:
                 skip_memory=True,
             )
 
-            prompt = agent._build_system_prompt()
+            prompt = await agent._build_system_prompt()
 
         assert "SKILLS_PROMPT" in prompt
         assert mock_skills.call_args.kwargs["available_tools"] == set(toolset_map)
@@ -923,10 +926,11 @@ class TestToolUseEnforcementConfig:
             a.client = MagicMock()
             return a
 
-    def test_auto_injects_for_gpt(self):
+    @pytest.mark.asyncio
+    async def test_auto_injects_for_gpt(self):
         from agent.prompt_builder import TOOL_USE_ENFORCEMENT_GUIDANCE
         agent = self._make_agent(model="openai/gpt-4.1", tool_use_enforcement="auto")
-        prompt = agent._build_system_prompt()
+        prompt = await agent._build_system_prompt()
         assert TOOL_USE_ENFORCEMENT_GUIDANCE in prompt
 
 
@@ -945,7 +949,8 @@ class TestToolUseEnforcementConfig:
 
 
 
-    def test_no_tools_never_injects(self):
+    @pytest.mark.asyncio
+    async def test_no_tools_never_injects(self):
         """Even with enforcement=true, no injection when agent has no tools."""
         from agent.prompt_builder import TOOL_USE_ENFORCEMENT_GUIDANCE
         with (
@@ -969,7 +974,7 @@ class TestToolUseEnforcementConfig:
                 enabled_toolsets=[],
             )
             a.client = MagicMock()
-            prompt = a._build_system_prompt()
+            prompt = await a._build_system_prompt()
             assert TOOL_USE_ENFORCEMENT_GUIDANCE not in prompt
 
 
@@ -1011,18 +1016,20 @@ class TestTaskCompletionGuidance:
             a.client = MagicMock()
             return a
 
-    def test_default_injects_for_claude(self):
+    @pytest.mark.asyncio
+    async def test_default_injects_for_claude(self):
         """The block must reach Claude by default — that's the
         primary motivating model family."""
         from agent.prompt_builder import TASK_COMPLETION_GUIDANCE
         agent = self._make_agent(model="anthropic/claude-opus-4.8")
-        prompt = agent._build_system_prompt()
+        prompt = await agent._build_system_prompt()
         assert TASK_COMPLETION_GUIDANCE in prompt
 
 
 
 
-    def test_no_tools_no_injection(self):
+    @pytest.mark.asyncio
+    async def test_no_tools_no_injection(self):
         """Same gate as tool_use_enforcement — no tools means no guidance.
         The guidance refers to ``tool calls`` and ``tool output``; without
         tools it would be advice for a capability the agent doesn't have."""
@@ -1048,7 +1055,7 @@ class TestTaskCompletionGuidance:
                 enabled_toolsets=[],
             )
             a.client = MagicMock()
-            assert TASK_COMPLETION_GUIDANCE not in a._build_system_prompt()
+            assert TASK_COMPLETION_GUIDANCE not in await a._build_system_prompt()
 
 
 class TestEnvironmentProbeIntegration:
@@ -1085,7 +1092,8 @@ class TestEnvironmentProbeIntegration:
             a.client = MagicMock()
             return a
 
-    def test_probe_appears_when_problem_detected(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_probe_appears_when_problem_detected(self, monkeypatch):
         """When the probe finds something off, the line lands in the prompt."""
         from tools import env_probe
         env_probe._reset_cache_for_tests()
@@ -1101,11 +1109,12 @@ class TestEnvironmentProbeIntegration:
         # path; explicit callers may still prime this optional diagnostic.
         env_probe.get_environment_probe_line()
         agent = self._make_agent(environment_probe=True)
-        prompt = agent._build_system_prompt()
+        prompt = await agent._build_system_prompt()
         assert "Python toolchain:" in prompt
         assert "3.11.15" in prompt
 
-    def test_probe_silent_on_clean_env(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_probe_silent_on_clean_env(self, monkeypatch):
         """Clean environment → probe emits nothing → no line in prompt."""
         from tools import env_probe
         env_probe._reset_cache_for_tests()
@@ -1117,10 +1126,11 @@ class TestEnvironmentProbeIntegration:
         monkeypatch.setattr(env_probe.shutil, "which", lambda name: None)
 
         agent = self._make_agent(environment_probe=True)
-        prompt = agent._build_system_prompt()
+        prompt = await agent._build_system_prompt()
         assert "Python toolchain:" not in prompt
 
-    def test_probe_disabled_by_config(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_probe_disabled_by_config(self, monkeypatch):
         """Even with detectable problems, the probe stays out when disabled."""
         from tools import env_probe
         env_probe._reset_cache_for_tests()
@@ -1132,7 +1142,7 @@ class TestEnvironmentProbeIntegration:
         monkeypatch.setattr(env_probe.shutil, "which", lambda name: None)
 
         agent = self._make_agent(environment_probe=False)
-        prompt = agent._build_system_prompt()
+        prompt = await agent._build_system_prompt()
         assert "Python toolchain:" not in prompt
 
 
@@ -1153,14 +1163,16 @@ class TestInvalidateSystemPrompt:
 
 
 class TestBuildApiKwargs:
-    def test_basic_kwargs(self, agent):
+    @pytest.mark.asyncio
+    async def test_basic_kwargs(self, agent):
         messages = [{"role": "user", "content": "hi"}]
-        kwargs = agent._build_api_kwargs(messages)
+        kwargs = await agent._build_api_kwargs(messages)
         assert kwargs["model"] == agent.model
         assert kwargs["messages"] is messages
         assert kwargs["timeout"] == 1800.0
 
-    def test_public_moonshot_kimi_k2_5_omits_temperature(self, agent):
+    @pytest.mark.asyncio
+    async def test_public_moonshot_kimi_k2_5_omits_temperature(self, agent):
         """Kimi models should NOT have client-side temperature overrides.
 
         The Kimi gateway selects the correct temperature server-side.
@@ -1170,7 +1182,7 @@ class TestBuildApiKwargs:
         agent.model = "kimi-k2.5"
         messages = [{"role": "user", "content": "hi"}]
 
-        kwargs = agent._build_api_kwargs(messages)
+        kwargs = await agent._build_api_kwargs(messages)
 
         assert "temperature" not in kwargs
 
@@ -1179,7 +1191,8 @@ class TestBuildApiKwargs:
 
 
 
-    def test_kimi_coding_endpoint_disables_thinking(self, agent):
+    @pytest.mark.asyncio
+    async def test_kimi_coding_endpoint_disables_thinking(self, agent):
         """When reasoning_config.enabled=False, thinking should be disabled
         and reasoning_effort should be omitted entirely — mirroring Kimi
         CLI's with_thinking("off") which maps to reasoning_effort=None."""
@@ -1190,39 +1203,42 @@ class TestBuildApiKwargs:
         agent.reasoning_config = {"enabled": False}
         messages = [{"role": "user", "content": "hi"}]
 
-        kwargs = agent._build_api_kwargs(messages)
+        kwargs = await agent._build_api_kwargs(messages)
 
         assert kwargs["extra_body"]["thinking"] == {"type": "disabled"}
         assert "reasoning_effort" not in kwargs
 
 
 
-    def test_provider_preferences_injected(self, agent):
+    @pytest.mark.asyncio
+    async def test_provider_preferences_injected(self, agent):
         agent.provider = "openrouter"
         agent.base_url = "https://openrouter.ai/api/v1"
         agent.providers_allowed = ["Anthropic"]
         messages = [{"role": "user", "content": "hi"}]
-        kwargs = agent._build_api_kwargs(messages)
+        kwargs = await agent._build_api_kwargs(messages)
         assert kwargs["extra_body"]["provider"]["only"] == ["Anthropic"]
 
 
-    def test_reasoning_config_default_openrouter(self, agent):
+    @pytest.mark.asyncio
+    async def test_reasoning_config_default_openrouter(self, agent):
         """Default reasoning config for OpenRouter should be medium."""
         agent.provider = "openrouter"
         agent.base_url = "https://openrouter.ai/api/v1"
         agent.model = "anthropic/claude-sonnet-4-20250514"
         messages = [{"role": "user", "content": "hi"}]
-        kwargs = agent._build_api_kwargs(messages)
+        kwargs = await agent._build_api_kwargs(messages)
         reasoning = kwargs["extra_body"]["reasoning"]
         assert reasoning["enabled"] is True
         assert reasoning["effort"] == "medium"
 
 
-    def test_reasoning_not_sent_for_unsupported_openrouter_model(self, agent):
+    @pytest.mark.asyncio
+    async def test_reasoning_not_sent_for_unsupported_openrouter_model(self, agent):
         agent.base_url = "https://openrouter.ai/api/v1"
         agent.model = "minimax/minimax-m2.5"
         messages = [{"role": "user", "content": "hi"}]
-        kwargs = agent._build_api_kwargs(messages)
+        kwargs = await agent._build_api_kwargs(messages)
         assert "reasoning" not in kwargs.get("extra_body", {})
 
 
@@ -1259,7 +1275,8 @@ class TestBuildApiKwargs:
 
 
 
-    def test_qwen_portal_formats_messages_and_metadata(self, agent):
+    @pytest.mark.asyncio
+    async def test_qwen_portal_formats_messages_and_metadata(self, agent):
         agent.provider = "qwen-oauth"
         agent.base_url = "https://portal.qwen.ai/v1"
         agent._base_url_lower = agent.base_url.lower()
@@ -1269,14 +1286,15 @@ class TestBuildApiKwargs:
             {"role": "assistant", "content": "Got it"},
             {"role": "user", "content": "hi"},
         ]
-        kwargs = agent._build_api_kwargs(messages)
+        kwargs = await agent._build_api_kwargs(messages)
         assert kwargs["metadata"]["sessionId"] == "sess-123"
         assert kwargs["extra_body"]["vl_high_resolution_images"] is True
         assert isinstance(kwargs["messages"][0]["content"], list)
         assert kwargs["messages"][0]["content"][0]["cache_control"] == {"type": "ephemeral"}
         assert kwargs["messages"][2]["content"][0]["text"] == "hi"
 
-    def test_qwen_portal_normalizes_bare_string_content_parts(self, agent):
+    @pytest.mark.asyncio
+    async def test_qwen_portal_normalizes_bare_string_content_parts(self, agent):
         agent.provider = "qwen-oauth"
         agent.base_url = "https://portal.qwen.ai/v1"
         agent._base_url_lower = agent.base_url.lower()
@@ -1284,7 +1302,7 @@ class TestBuildApiKwargs:
             {"role": "system", "content": [{"type": "text", "text": "system"}]},
             {"role": "user", "content": ["hello", {"type": "text", "text": "world"}]},
         ]
-        kwargs = agent._build_api_kwargs(messages)
+        kwargs = await agent._build_api_kwargs(messages)
         user_content = kwargs["messages"][1]["content"]
         assert user_content[0] == {"type": "text", "text": "hello"}
         assert user_content[1] == {"type": "text", "text": "world"}
@@ -1295,13 +1313,14 @@ class TestBuildApiKwargs:
 
 
 
-    def test_non_custom_provider_unaffected(self, agent):
+    @pytest.mark.asyncio
+    async def test_non_custom_provider_unaffected(self, agent):
         """OpenRouter provider with effort=none should NOT inject think=false."""
         agent.provider = "openrouter"
         agent.model = "qwen/qwen3.5-plus-02-15"
         agent.reasoning_config = {"effort": "none"}
         messages = [{"role": "user", "content": "hi"}]
-        kwargs = agent._build_api_kwargs(messages)
+        kwargs = await agent._build_api_kwargs(messages)
         assert kwargs.get("extra_body", {}).get("think") is None
 
 
@@ -1460,11 +1479,11 @@ class TestExecuteToolCalls:
         agent._current_turn_id = "turn-1"
         agent._current_api_request_id = "api-1"
 
-        def _capture_hook(hook_name, **kwargs):
+        async def _capture_hook(hook_name, **kwargs):
             hook_calls.append((hook_name, kwargs))
             return []
 
-        monkeypatch.setattr("hermes_cli.lifecycle.invoke_hook", _capture_hook)
+        monkeypatch.setattr("hermes_cli.lifecycle.invoke_hook_async", _capture_hook)
         monkeypatch.setattr("hermes_cli.lifecycle.has_hook", lambda name: True)
 
         with (
@@ -2471,17 +2490,16 @@ class TestRunConversation:
         agent.save_trajectories = False
 
     @pytest.mark.asyncio
-    async def test_task_start_failure_closes_relay_turn_and_lease(self, agent):
+    async def test_relay_turn_start_failure_releases_lease(self, agent):
         relay_lease = SimpleNamespace(
             parent_session_id="",
             profile_key="/profile",
             session_id=agent.session_id or "",
         )
-        relay_turn = object()
         coordinator = MagicMock()
         coordinator.acquire_conversation.return_value = relay_lease
-        coordinator.begin_turn.return_value = relay_turn
-        start_error = RuntimeError("task metrics start failed")
+        start_error = RuntimeError("relay turn start failed")
+        coordinator.begin_turn.side_effect = start_error
 
         with (
             patch("agent.relay_runtime.SESSION_COORDINATOR", coordinator),
@@ -2489,13 +2507,6 @@ class TestRunConversation:
                 "agent.relay_runtime.current_profile_key",
                 return_value="/profile",
             ),
-            patch(
-                "hermes_cli.observability.relay_shared_metrics.start_task_run",
-                side_effect=start_error,
-            ),
-            patch(
-                "hermes_cli.observability.relay_shared_metrics.finish_task_run"
-            ) as finish_task_run,
             patch("agent.conversation_loop.run_conversation", new_callable=AsyncMock) as run_conversation,
         ):
             with pytest.raises(RuntimeError) as caught:
@@ -2503,15 +2514,8 @@ class TestRunConversation:
 
         assert caught.value is start_error
         run_conversation.assert_not_called()
-        finish_task_run.assert_not_called()
-        coordinator.finish_logical_calls.assert_called_once_with(
-            relay_turn,
-            outcome="failed",
-        )
-        coordinator.end_turn.assert_called_once_with(
-            relay_turn,
-            outcome="failed",
-        )
+        coordinator.finish_logical_calls.assert_not_called()
+        coordinator.end_turn.assert_not_called()
         coordinator.release_conversation.assert_called_once_with(relay_lease)
         assert agent._relay_pending_turn_id is None
 
@@ -2751,7 +2755,7 @@ class TestRunConversation:
         assert all("assistant_message" in c["response"] for c in post_request_calls)
 
     @pytest.mark.asyncio
-    async def test_terminal_task_closes_logical_calls_before_metrics_scope(self, agent):
+    async def test_terminal_task_closes_logical_calls(self, agent):
         from agent import relay_runtime
 
         order = []
@@ -2769,13 +2773,6 @@ class TestRunConversation:
                 new_callable=AsyncMock,
                 return_value=failed_result,
             ),
-            patch(
-                "hermes_cli.observability.relay_shared_metrics.start_task_run",
-            ),
-            patch(
-                "hermes_cli.observability.relay_shared_metrics.finish_task_run",
-                side_effect=lambda **_kwargs: order.append("metrics"),
-            ),
             patch.object(
                 relay_runtime.SESSION_COORDINATOR,
                 "finish_logical_calls",
@@ -2785,7 +2782,7 @@ class TestRunConversation:
             result = await agent.run_conversation("private prompt")
 
         assert result is failed_result
-        assert order == ["logical", "metrics"]
+        assert order == ["logical"]
 
     @pytest.mark.asyncio
     async def test_api_request_error_hook_skips_payload_work_without_listener(self, agent, monkeypatch):
@@ -4365,12 +4362,15 @@ class TestGpt5ApiModeRouting:
 class TestSystemPromptStability:
     """Verify that the system prompt stays stable across turns for cache hits."""
 
-    def test_stored_prompt_reused_for_continuing_session(self, agent):
+    @pytest.mark.asyncio
+    async def test_stored_prompt_reused_for_continuing_session(self, agent):
         """When conversation_history is non-empty and session DB has a stored
         prompt, it should be reused instead of rebuilding from disk."""
         stored = "You are helpful. [stored from turn 1]"
-        mock_db = MagicMock()
-        mock_db.get_session.return_value = {"system_prompt": stored}
+        mock_db = SimpleNamespace(
+            get_session=AsyncMock(return_value={"system_prompt": stored}),
+            update_system_prompt=AsyncMock(),
+        )
         agent._session_db = mock_db
 
         # Simulate a continuing session with history
@@ -4379,54 +4379,35 @@ class TestSystemPromptStability:
             {"role": "assistant", "content": "hi"},
         ]
 
-        # First call — _cached_system_prompt is None, history is non-empty
         agent._cached_system_prompt = None
+        from agent.conversation_loop import _restore_or_build_system_prompt
 
-        # Patch run_conversation internals to just test the system prompt logic.
-        # We'll call the prompt caching block directly by simulating what
-        # run_conversation does.
-        conversation_history = history
-
-        # The block under test (from run_conversation):
-        if agent._cached_system_prompt is None:
-            stored_prompt = None
-            if conversation_history and agent._session_db:
-                try:
-                    session_row = agent._session_db.get_session(agent.session_id)
-                    if session_row:
-                        stored_prompt = session_row.get("system_prompt") or None
-                except Exception:
-                    pass
-
-            if stored_prompt:
-                agent._cached_system_prompt = stored_prompt
+        with patch(
+            "agent.conversation_loop._stored_prompt_matches_runtime",
+            new_callable=AsyncMock,
+            return_value=True,
+        ):
+            await _restore_or_build_system_prompt(agent, None, history)
 
         assert agent._cached_system_prompt == stored
-        mock_db.get_session.assert_called_once_with(agent.session_id)
+        mock_db.get_session.assert_awaited_once_with(agent.session_id)
 
-    def test_fresh_build_when_no_history(self, agent):
+    @pytest.mark.asyncio
+    async def test_fresh_build_when_no_history(self, agent):
         """On the first turn (no history), system prompt should be built fresh."""
-        mock_db = MagicMock()
+        mock_db = SimpleNamespace(
+            get_session=AsyncMock(),
+            update_system_prompt=AsyncMock(),
+        )
         agent._session_db = mock_db
 
         agent._cached_system_prompt = None
-        conversation_history = []
+        from agent.conversation_loop import _restore_or_build_system_prompt
 
-        # The block under test:
-        if agent._cached_system_prompt is None:
-            stored_prompt = None
-            if conversation_history and agent._session_db:
-                session_row = agent._session_db.get_session(agent.session_id)
-                if session_row:
-                    stored_prompt = session_row.get("system_prompt") or None
-
-            if stored_prompt:
-                agent._cached_system_prompt = stored_prompt
-            else:
-                agent._cached_system_prompt = agent._build_system_prompt()
+        await _restore_or_build_system_prompt(agent, None, [])
 
         # Should have built fresh, not queried the DB
-        mock_db.get_session.assert_not_called()
+        mock_db.get_session.assert_not_awaited()
         assert agent._cached_system_prompt is not None
         assert "Hermes Agent" in agent._cached_system_prompt
 
@@ -4493,14 +4474,15 @@ class TestSafeWriter:
 class TestBuildApiKwargsAnthropicMaxTokens:
     """Bug fix: max_tokens was always None for Anthropic mode, ignoring user config."""
 
-    def test_max_tokens_passed_to_anthropic(self, agent):
+    @pytest.mark.asyncio
+    async def test_max_tokens_passed_to_anthropic(self, agent):
         agent.api_mode = "anthropic_messages"
         agent.max_tokens = 4096
         agent.reasoning_config = None
 
         with patch("agent.anthropic_adapter.build_anthropic_kwargs") as mock_build:
             mock_build.return_value = {"model": "claude-sonnet-4-20250514", "messages": [], "max_tokens": 4096}
-            agent._build_api_kwargs([{"role": "user", "content": "test"}])
+            await agent._build_api_kwargs([{"role": "user", "content": "test"}])
             _, kwargs = mock_build.call_args
             if not kwargs:
                 kwargs = dict(zip(

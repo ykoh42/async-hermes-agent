@@ -23,12 +23,19 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+import pytest_asyncio
 
+from agent.conversation_compression import (
+    _hydrate_persisted_compression_guards,
+    _persist_compression_guards,
+)
 from agent.context_compressor import ContextCompressor
-from hermes_state import AsyncSessionDB, SessionDB
+from hermes_state import AsyncSessionDB
 
 
-def _build_agent_with_db(db: SessionDB, session_id: str, platform: str = "telegram"):
+def _build_agent_with_db(
+    db: AsyncSessionDB, session_id: str, platform: str = "telegram"
+):
     with patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}):
         from run_agent import AIAgent
 
@@ -68,7 +75,9 @@ def _msgs(n=20):
     return [{"role": "user", "content": f"m{i}"} for i in range(n)]
 
 
-def _bound_context_compressor(db: SessionDB, session_id: str) -> ContextCompressor:
+def _bound_context_compressor(
+    db: AsyncSessionDB, session_id: str
+) -> ContextCompressor:
     with patch(
         "agent.context_compressor.get_static_context_length",
         return_value=100_000,
@@ -84,21 +93,21 @@ def _bound_context_compressor(db: SessionDB, session_id: str) -> ContextCompress
     return compressor
 
 
-@pytest.fixture
-def refresh_state_db(tmp_path: Path):
-    db = SessionDB(db_path=tmp_path / "state.db")
+@pytest_asyncio.fixture
+async def refresh_state_db(tmp_path: Path):
+    db = AsyncSessionDB(tmp_path / "state.db")
     try:
         yield db
     finally:
-        db.close()
+        await db.close()
 
 
 class TestGoalMigratesOnRotation:
     @pytest.mark.asyncio
     async def test_goal_follows_compression_rotation(self, tmp_path: Path):
-        db = SessionDB(db_path=tmp_path / "state.db")
+        db = AsyncSessionDB(tmp_path / "state.db")
         parent = "PARENT_GOAL_ROT"
-        db.create_session(parent, source="cli")
+        await db.create_session(parent, source="cli")
         agent = _build_agent_with_db(db, parent)
 
         # Set a persistent goal on the parent via the real persistence path.
@@ -110,7 +119,7 @@ class TestGoalMigratesOnRotation:
                 goals,
                 "_get_session_db",
                 new_callable=AsyncMock,
-                side_effect=lambda: AsyncSessionDB(db),
+                side_effect=lambda: AsyncSessionDB(tmp_path / "state.db"),
             ):
                 await goals.save_goal(parent, goals.GoalState(goal="finish the migration"))
 
@@ -124,15 +133,15 @@ class TestGoalMigratesOnRotation:
                 assert migrated is not None
                 assert migrated.goal == "finish the migration"
         await agent.close()
-        db.close()
+        await db.close()
 
 
 class TestOrphanRollbackOnCreateFailure:
     @pytest.mark.asyncio
     async def test_rolls_back_to_parent_when_child_create_fails(self, tmp_path: Path):
-        db = SessionDB(db_path=tmp_path / "state.db")
+        db = AsyncSessionDB(tmp_path / "state.db")
         parent = "PARENT_ORPHAN_ROT"
-        db.create_session(parent, source="cli")
+        await db.create_session(parent, source="cli")
         agent = _build_agent_with_db(db, parent)
 
         # Atomic publication failure must leave the live parent and caller's
@@ -147,7 +156,7 @@ class TestOrphanRollbackOnCreateFailure:
 
         agent.context_compressor.compress.side_effect = _mutating_compress
 
-        def _boom(*a, **k):
+        async def _boom(*a, **k):
             raise RuntimeError("simulated atomic publication failure")
 
         with patch(
@@ -163,12 +172,12 @@ class TestOrphanRollbackOnCreateFailure:
             (m["role"], m["content"]) for m in _msgs()
         ]
         assert returned is original
-        parent_row = db.get_session(parent)
+        parent_row = await db.get_session(parent)
         assert parent_row is not None
         assert parent_row["ended_at"] is None
-        assert db.find_live_compression_child(parent) is None
+        assert await db.find_live_compression_child(parent) is None
         await agent.close()
-        db.close()
+        await db.close()
 
 
 class TestWorkspaceMetadataFollowsRotation:
@@ -178,9 +187,9 @@ class TestWorkspaceMetadataFollowsRotation:
         and assert the child session row carries the parent's workspace and
         gateway-origin metadata, so the project sidebar entry and the peer
         routing mapping both survive the compaction boundary."""
-        db = SessionDB(db_path=tmp_path / "state.db")
+        db = AsyncSessionDB(tmp_path / "state.db")
         parent = "PARENT_CWD_ROT"
-        db.create_session(
+        await db.create_session(
             parent,
             source="telegram",
             user_id="u1",
@@ -188,7 +197,7 @@ class TestWorkspaceMetadataFollowsRotation:
             chat_id="c1",
             chat_type="private",
         )
-        db.update_session_cwd(
+        await db.update_session_cwd(
             parent, "/work/repo", git_branch="main", git_repo_root="/work/repo"
         )
         agent = _build_agent_with_db(db, parent, platform="telegram")
@@ -197,7 +206,7 @@ class TestWorkspaceMetadataFollowsRotation:
         child = agent.session_id
         assert child != parent  # rotation happened
 
-        row = db.get_session(child)
+        row = await db.get_session(child)
         assert row is not None
         assert row["parent_session_id"] == parent
         # Workspace metadata (#64709): sidebar grouping keys must survive.
@@ -211,15 +220,15 @@ class TestWorkspaceMetadataFollowsRotation:
         assert row["chat_type"] == "private"
         assert row["user_id"] == "u1"
         await agent.close()
-        db.close()
+        await db.close()
 
 
 class TestPlatformForwardedAtBoundary:
     @pytest.mark.asyncio
     async def test_on_session_start_receives_platform(self, tmp_path: Path):
-        db = SessionDB(db_path=tmp_path / "state.db")
+        db = AsyncSessionDB(tmp_path / "state.db")
         parent = "PARENT_PLATFORM_ROT"
-        db.create_session(parent, source="telegram")
+        await db.create_session(parent, source="telegram")
         agent = _build_agent_with_db(db, parent, platform="telegram")
 
         await agent._compress_context(_msgs(), "sys", approx_tokens=120_000)
@@ -232,14 +241,15 @@ class TestPlatformForwardedAtBoundary:
         assert kwargs.get("platform") == "telegram"
         assert kwargs.get("boundary_reason") == "compression"
         await agent.close()
-        db.close()
+        await db.close()
 
 
 class TestFallbackStreakFollowsRotation:
-    def test_fallback_boundary_persists_on_child_session(self, tmp_path: Path):
-        db = SessionDB(db_path=tmp_path / "state.db")
+    @pytest.mark.asyncio
+    async def test_fallback_boundary_persists_on_child_session(self, tmp_path: Path):
+        db = AsyncSessionDB(tmp_path / "state.db")
         parent = "PARENT_FALLBACK_ROT"
-        db.create_session(parent, source="telegram")
+        await db.create_session(parent, source="telegram")
         with patch(
             "agent.context_compressor.get_static_context_length",
             return_value=100_000,
@@ -256,8 +266,9 @@ class TestFallbackStreakFollowsRotation:
         # A fallback streak must survive the session-id rotation itself. The
         # boundary then records the just-completed fallback on the child row.
         compressor.record_completed_compaction(used_fallback=True)
-        assert db.get_compression_fallback_streak(parent) == 1
-        db.create_session(
+        await _persist_compression_guards(compressor, db, parent)
+        assert await db.get_compression_fallback_streak(parent) == 1
+        await db.create_session(
             "CHILD_FALLBACK_ROT",
             source="telegram",
             parent_session_id=parent,
@@ -271,8 +282,9 @@ class TestFallbackStreakFollowsRotation:
         assert compressor._fallback_compression_streak == 1
 
         compressor.record_completed_compaction(used_fallback=True)
+        await _persist_compression_guards(compressor, db, "CHILD_FALLBACK_ROT")
         assert compressor._fallback_compression_streak == 2
-        assert db.get_compression_fallback_streak("CHILD_FALLBACK_ROT") == 2
+        assert await db.get_compression_fallback_streak("CHILD_FALLBACK_ROT") == 2
 
         resumed = ContextCompressor(
             model="test/model",
@@ -282,13 +294,17 @@ class TestFallbackStreakFollowsRotation:
             quiet_mode=True,
         )
         resumed.bind_session_state(db, "CHILD_FALLBACK_ROT")
+        await _hydrate_persisted_compression_guards(
+            resumed, db, "CHILD_FALLBACK_ROT"
+        )
         assert resumed._fallback_compression_streak == 2
+        await db.close()
 
     @pytest.mark.asyncio
     async def test_real_rotation_records_fallback_after_lifecycle_rebind(self, tmp_path: Path):
-        db = SessionDB(db_path=tmp_path / "state.db")
+        db = AsyncSessionDB(tmp_path / "state.db")
         parent = "PARENT_REAL_FALLBACK_ROT"
-        db.create_session(parent, source="telegram")
+        await db.create_session(parent, source="telegram")
         agent = _build_agent_with_db(db, parent, platform="telegram")
 
         with patch(
@@ -326,32 +342,32 @@ class TestFallbackStreakFollowsRotation:
 
         assert child != parent
         assert compressor._fallback_compression_streak == 1
-        assert db.get_compression_fallback_streak(child) == 1
+        assert await db.get_compression_fallback_streak(child) == 1
         await agent.close()
-        db.close()
+        await db.close()
 
 
 class TestAutomaticCompressionStateRefreshAfterLock:
     @pytest.mark.asyncio
     async def test_prebound_agent_rejects_parent_rotated_before_lock_acquisition(
         self,
-        refresh_state_db: SessionDB,
+        refresh_state_db: AsyncSessionDB,
     ):
         db = refresh_state_db
         parent_id = "STALE_ROTATED_PARENT"
         child_id = "CANONICAL_COMPRESSION_CHILD"
-        db.create_session(parent_id, source="telegram")
+        await db.create_session(parent_id, source="telegram")
         agent = _build_agent_with_db(db, parent_id, platform="telegram")
         compressor = _bound_context_compressor(db, parent_id)
 
         # A competing path completes rotation after this call's initial checks
         # but before it acquires the parent lock.
-        async_db = agent._get_async_session_db()
+        async_db = agent._session_db
         real_acquire = async_db.try_acquire_compression_lock
 
         async def _acquire_after_rotation(*args, **kwargs):
-            db.end_session(parent_id, "compression")
-            db.create_session(
+            await db.end_session(parent_id, "compression")
+            await db.create_session(
                 child_id,
                 source="telegram",
                 parent_session_id=parent_id,
@@ -376,15 +392,13 @@ class TestAutomaticCompressionStateRefreshAfterLock:
                 force=True,
             )
 
-        children = db._conn.execute(
-            "SELECT id FROM sessions WHERE parent_session_id = ?",
-            (parent_id,),
-        ).fetchall()
         assert returned is messages
         assert agent.session_id == parent_id
-        assert [row["id"] for row in children] == [child_id]
+        child = await db.find_live_compression_child(parent_id)
+        assert child is not None
+        assert child["id"] == child_id
         compress.assert_not_called()
-        assert db.get_compression_lock_holder(parent_id) is None
+        assert await db.get_compression_lock_holder(parent_id) is None
         await agent.close()
 
 
@@ -393,23 +407,24 @@ class TestAutomaticCompressionStateRefreshAfterLock:
     @pytest.mark.asyncio
     async def test_prebound_agent_drops_stale_cooldown_before_initial_gate(
         self,
-        refresh_state_db: SessionDB,
+        refresh_state_db: AsyncSessionDB,
     ):
         db = refresh_state_db
         session_id = "CLEARED_COMPRESSION_COOLDOWN"
-        db.create_session(session_id, source="telegram")
-        db.record_compression_failure_cooldown(
+        await db.create_session(session_id, source="telegram")
+        await db.record_compression_failure_cooldown(
             session_id,
             time.time() + 60,
             "rate limited",
         )
         agent = _build_agent_with_db(db, session_id, platform="telegram")
         compressor = _bound_context_compressor(db, session_id)
+        await _hydrate_persisted_compression_guards(compressor, db, session_id)
         assert compressor.get_active_compression_failure_cooldown() is not None
 
         # A successful forced retry on another agent clears the durable row.
         # This prebound compressor must not keep honoring its stale local timer.
-        db.clear_compression_failure_cooldown(session_id)
+        await db.clear_compression_failure_cooldown(session_id)
         agent.context_compressor = compressor
         agent.compression_in_place = True
         agent._compression_feasibility_checked = True
@@ -430,7 +445,7 @@ class TestAutomaticCompressionStateRefreshAfterLock:
         assert returned is messages
         assert compressor.get_active_compression_failure_cooldown() is None
         compress.assert_called_once()
-        assert db.get_compression_lock_holder(session_id) is None
+        assert await db.get_compression_lock_holder(session_id) is None
         await agent.close()
 
 
@@ -445,30 +460,34 @@ class TestGateLevelGuardRefresh:
     blocked forever.
     """
 
-    def test_should_compress_unblocks_after_another_agent_clears_streak(
+    @pytest.mark.asyncio
+    async def test_turn_hydration_unblocks_after_another_agent_clears_streak(
         self,
-        refresh_state_db: SessionDB,
+        refresh_state_db: AsyncSessionDB,
     ):
         db = refresh_state_db
         session_id = "GATE_LEVEL_STREAK_CLEAR"
-        db.create_session(session_id, source="telegram")
-        db.set_compression_fallback_streak(session_id, 2)
+        await db.create_session(session_id, source="telegram")
+        await db.set_compression_fallback_streak(session_id, 2)
         compressor = _bound_context_compressor(db, session_id)
+        await _hydrate_persisted_compression_guards(compressor, db, session_id)
         assert compressor._fallback_compression_streak == 2
 
         # Another agent's healthy boundary clears the durable breaker.
-        db.set_compression_fallback_streak(session_id, 0)
+        await db.set_compression_fallback_streak(session_id, 0)
+        await _hydrate_persisted_compression_guards(compressor, db, session_id)
 
         assert compressor.should_compress(10**9) is True
         assert compressor._fallback_compression_streak == 0
 
-    def test_unblocked_gate_does_not_touch_the_db(
+    @pytest.mark.asyncio
+    async def test_unblocked_gate_does_not_touch_the_db(
         self,
-        refresh_state_db: SessionDB,
+        refresh_state_db: AsyncSessionDB,
     ):
         db = refresh_state_db
         session_id = "GATE_LEVEL_HOT_PATH"
-        db.create_session(session_id, source="telegram")
+        await db.create_session(session_id, source="telegram")
         compressor = _bound_context_compressor(db, session_id)
 
         with patch.object(
@@ -480,9 +499,10 @@ class TestGateLevelGuardRefresh:
 
 
 class TestCooldownPersistFailureIsNotAClearedRow:
-    def test_refresh_keeps_local_cooldown_when_persist_failed(
+    @pytest.mark.asyncio
+    async def test_persist_failure_keeps_local_cooldown(
         self,
-        refresh_state_db: SessionDB,
+        refresh_state_db: AsyncSessionDB,
     ):
         """An empty durable row is not evidence of a clear when OUR write failed.
 
@@ -494,48 +514,53 @@ class TestCooldownPersistFailureIsNotAClearedRow:
         """
         db = refresh_state_db
         session_id = "PERSIST_FAILED_COOLDOWN"
-        db.create_session(session_id, source="telegram")
+        await db.create_session(session_id, source="telegram")
         compressor = _bound_context_compressor(db, session_id)
 
         with patch.object(
-            db,
+            type(db),
             "record_compression_failure_cooldown",
-            side_effect=Exception("disk full"),
+            new_callable=AsyncMock,
+            side_effect=OSError("disk full"),
         ):
             compressor._record_compression_failure_cooldown(60, "rate limited")
-        assert compressor._cooldown_persist_failed is True
+            await _persist_compression_guards(compressor, db, session_id)
 
-        state = compressor.get_active_compression_failure_cooldown(refresh=True)
+        state = compressor.get_active_compression_failure_cooldown()
         assert state is not None
         assert compressor._summary_failure_cooldown_until > 0
         assert compressor._automatic_compression_blocked() is True
 
         # Once a durable round-trip succeeds, the DB is authoritative again.
         compressor._record_compression_failure_cooldown(30, "retry later")
-        assert compressor._cooldown_persist_failed is False
-        db.clear_compression_failure_cooldown(session_id)
-        assert compressor.get_active_compression_failure_cooldown(refresh=True) is None
+        await _persist_compression_guards(compressor, db, session_id)
+        await db.clear_compression_failure_cooldown(session_id)
+        await _hydrate_persisted_compression_guards(compressor, db, session_id)
+        assert compressor.get_active_compression_failure_cooldown() is None
         assert compressor._summary_failure_cooldown_until == 0.0
 
-    def test_ineffective_count_block_honors_durable_clear_by_another_agent(
+    @pytest.mark.asyncio
+    async def test_ineffective_count_block_honors_turn_hydration(
         self,
-        refresh_state_db: SessionDB,
+        refresh_state_db: AsyncSessionDB,
     ):
         """The ineffective-strike counter is durable (#54923): a block owed to
         it must re-read the DB so another agent's clear (a real usage reading
         that dipped below the threshold) unblocks this compressor too."""
         db = refresh_state_db
         session_id = "INEFFECTIVE_DURABLE_BLOCK"
-        db.create_session(session_id, source="telegram")
-        db.set_compression_ineffective_count(session_id, 2)
+        await db.create_session(session_id, source="telegram")
+        await db.set_compression_ineffective_count(session_id, 2)
         compressor = _bound_context_compressor(db, session_id)
+        await _hydrate_persisted_compression_guards(compressor, db, session_id)
         assert compressor._ineffective_compression_count == 2
 
         assert compressor._automatic_compression_blocked() is True
 
         # Another agent's real prompt reading dipped below the threshold and
         # zeroed the durable counter.
-        db.set_compression_ineffective_count(session_id, 0)
+        await db.set_compression_ineffective_count(session_id, 0)
+        await _hydrate_persisted_compression_guards(compressor, db, session_id)
 
         assert compressor._automatic_compression_blocked() is False
         assert compressor._ineffective_compression_count == 0
@@ -546,9 +571,9 @@ class TestTodoSnapshotMergedNotDuplicated:
 
     @pytest.mark.asyncio
     async def test_snapshot_merges_into_trailing_user(self, tmp_path: Path):
-        db = SessionDB(db_path=tmp_path / "state.db")
+        db = AsyncSessionDB(tmp_path / "state.db")
         parent = "PARENT_TODO_MERGE"
-        db.create_session(parent, source="cli")
+        await db.create_session(parent, source="cli")
         agent = _build_agent_with_db(db, parent, platform="cli")
 
         agent.context_compressor.compress.return_value = [
@@ -577,16 +602,16 @@ class TestTodoSnapshotMergedNotDuplicated:
             for previous, current in zip(compressed, compressed[1:])
         )
         await agent.close()
-        db.close()
+        await db.close()
 
 
 
 
     @pytest.mark.asyncio
     async def test_multimodal_snapshot_merge_is_persisted_in_place(self, tmp_path: Path):
-        db = SessionDB(db_path=tmp_path / "state.db")
+        db = AsyncSessionDB(tmp_path / "state.db")
         parent = "PARENT_TODO_MULTIMODAL_INPLACE"
-        db.create_session(parent, source="cli")
+        await db.create_session(parent, source="cli")
         agent = _build_agent_with_db(db, parent, platform="cli")
         agent.compression_in_place = True
 
@@ -627,7 +652,7 @@ class TestTodoSnapshotMergedNotDuplicated:
             for previous, current in zip(compressed, compressed[1:])
         )
 
-        db_msgs = db.get_messages(agent.session_id)
+        db_msgs = await db.get_messages(agent.session_id)
         persisted_tail = db_msgs[-1]
         assert persisted_tail["role"] == "user"
         assert persisted_tail["content"][: len(original_parts)] == original_parts
@@ -640,15 +665,17 @@ class TestTodoSnapshotMergedNotDuplicated:
             for previous, current in zip(db_msgs, db_msgs[1:])
         )
         await agent.close()
-        db.close()
+        await db.close()
 
 
 class TestTodoSnapshotScaffoldingTails:
     """Scaffolding tails must never absorb the todo snapshot (#69292)."""
 
     @staticmethod
-    def _agent_with_todo(db: SessionDB, session_id: str, tail: dict):
-        db.create_session(session_id, source="cli")
+    async def _agent_with_todo(
+        db: AsyncSessionDB, session_id: str, tail: dict
+    ):
+        await db.create_session(session_id, source="cli")
         agent = _build_agent_with_db(db, session_id, platform="cli")
         agent.context_compressor.compress.return_value = [
             {"role": "user", "content": "[CONTEXT COMPACTION] summary"},
@@ -673,8 +700,8 @@ class TestTodoSnapshotScaffoldingTails:
             "please fix the login bug\n\n"
             f"{TODO_INJECTION_HEADER}\n- [ ] t0. old finished task (pending)"
         )
-        db = SessionDB(db_path=tmp_path / "state.db")
-        agent = self._agent_with_todo(
+        db = AsyncSessionDB(tmp_path / "state.db")
+        agent = await self._agent_with_todo(
             db,
             "PARENT_TODO_RESTRIP",
             {"role": "user", "content": previously_merged},
@@ -695,15 +722,15 @@ class TestTodoSnapshotScaffoldingTails:
             for previous, current in zip(compressed, compressed[1:])
         )
         await agent.close()
-        db.close()
+        await db.close()
 
     @pytest.mark.asyncio
     async def test_empty_todo_store_injects_nothing(self, tmp_path: Path):
         from tools.todo_tool import TODO_INJECTION_HEADER
 
-        db = SessionDB(db_path=tmp_path / "state.db")
+        db = AsyncSessionDB(tmp_path / "state.db")
         session_id = "PARENT_TODO_EMPTY"
-        db.create_session(session_id, source="cli")
+        await db.create_session(session_id, source="cli")
         agent = _build_agent_with_db(db, session_id, platform="cli")
         expected = [
             {"role": "user", "content": "[CONTEXT COMPACTION] summary"},
@@ -727,4 +754,4 @@ class TestTodoSnapshotScaffoldingTails:
             for message in compressed
         )
         await agent.close()
-        db.close()
+        await db.close()

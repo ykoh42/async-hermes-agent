@@ -864,8 +864,8 @@ def init_agent(
     agent._active_children_lock = threading.Lock()
     # Async-first runtime ownership. The lock binds to the event loop on first
     # use, keeping construction itself synchronous and side-effect free.
-    agent._async_turn_lock = None
-    agent._async_close_lock = None
+    agent._turn_lock = None
+    agent._close_lock = None
     agent._active_turn_task = None
     # Every turn gets an isolated terminal task id.  Keep the ids until hard
     # close so persistent terminal environments and background commands from
@@ -1531,19 +1531,25 @@ def init_agent(
     # from the persisted string and is used only to place an early cache marker.
     agent._cached_system_prompt_static: Optional[str] = None
     
-    # SQLite session store (optional -- provided by CLI or gateway)
+    # SQLite session store (optional -- provided by the embedding runtime).
+    # Only the native async implementation is accepted: silently wrapping a
+    # synchronous store would reintroduce blocking I/O into the turn path.
+    if session_db is not None:
+        from hermes_state import AsyncSessionDB
+
+        if not isinstance(session_db, AsyncSessionDB):
+            raise TypeError(
+                "AIAgent session_db must be hermes_state.AsyncSessionDB; "
+                f"got {type(session_db).__name__}"
+            )
     agent._session_db = session_db
     # ``switch_model()`` remains a synchronous state mutation; its billing
     # route is durably recorded by the next native async turn boundary.
     agent._pending_billing_route = None
-    # The async turn path owns its aiosqlite connection lazily.  A historical
-    # SessionDB object, when supplied by an embedding caller, is retained only
-    # as the public injection value; active turns never invoke its sync methods.
-    agent._async_session_db = None
     agent._parent_session_id = parent_session_id
     # Transcript mutations are serialized by a lazily-created asyncio.Lock.
     # Construction remains synchronous and does not bind the lock to a loop.
-    agent._async_session_persist_lock = None
+    agent._session_persist_lock = None
     # CLI retains its just-accepted user dict until turn setup can reuse it.
     # This preserves the message-local durable marker if close persistence wins
     # the race before the agent's normal early turn flush.

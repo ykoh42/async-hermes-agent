@@ -46,9 +46,7 @@ def test_verification_flags_registered_as_ephemeral(tmp_path, monkeypatch):
 
 
 def _make_agent(ra, session_id, tmp_path):
-    # Use the real SQLite schema owner. AIAgent opens its own native-async
-    # connection from this instance, matching the production persistence path.
-    from hermes_state import SessionDB
+    from hermes_state import AsyncSessionDB
 
     agent = ra.AIAgent(
         session_id=session_id,
@@ -60,7 +58,7 @@ def _make_agent(ra, session_id, tmp_path):
         skip_context_files=True,
         skip_memory=True,
     )
-    agent._session_db = SessionDB(tmp_path / "state.db")
+    agent._session_db = AsyncSessionDB(tmp_path / "state.db")
     agent._session_db_created = False
     agent._session_json_enabled = True
     agent.logs_dir = tmp_path / "logs"
@@ -87,7 +85,7 @@ async def test_db_flush_drops_only_nudge_keeps_candidate(tmp_path, monkeypatch):
 
     try:
         await agent._flush_messages_to_session_db(messages, conversation_history=[])
-        persisted = await agent._get_async_session_db().get_messages_as_conversation(
+        persisted = await agent._session_db.get_messages_as_conversation(
             agent.session_id
         )
     finally:

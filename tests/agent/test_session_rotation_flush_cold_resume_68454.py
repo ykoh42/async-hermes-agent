@@ -19,11 +19,11 @@ from types import SimpleNamespace
 
 import pytest
 
-from hermes_state import AsyncSessionDB, SessionDB
+from hermes_state import AsyncSessionDB
 from run_agent import AIAgent
 
 
-def _make_flush_agent(db: SessionDB, session_id: str):
+def _make_flush_agent(db: AsyncSessionDB, session_id: str):
     """Minimal agent shell that owns the real flush implementation."""
     agent = SimpleNamespace(
         _session_db=db,
@@ -39,11 +39,9 @@ def _make_flush_agent(db: SessionDB, session_id: str):
         _persist_user_message_timestamp=None,
         _pending_cli_user_message=None,
     )
-    agent._async_session_persist_lock = asyncio.Lock()
-    agent._async_session_db = AsyncSessionDB(db)
+    agent._session_persist_lock = asyncio.Lock()
     agent._ensure_db_session = lambda: None
-    agent._get_async_session_persist_lock = lambda: agent._async_session_persist_lock
-    agent._get_async_session_db = lambda: agent._async_session_db
+    agent._get_session_persist_lock = lambda: agent._session_persist_lock
     agent._flush_messages_to_session_db = (
         AIAgent._flush_messages_to_session_db.__get__(agent, AIAgent)
     )
@@ -60,34 +58,33 @@ def _contents(rows):
 @pytest.mark.asyncio
 async def test_rotation_flush_without_history_boundary_duplicates(tmp_path: Path) -> None:
     """Control: bare flush of unstamped cold-resume rows double-writes (#68454)."""
-    db = SessionDB(db_path=tmp_path / "state.db")
+    db = AsyncSessionDB(tmp_path / "state.db")
     sid = "COLD_ROTATE_DUP"
-    db.create_session(sid, source="cli")
-    db.append_message(sid, "user", "persisted question")
-    db.append_message(sid, "assistant", "persisted answer")
+    await db.create_session(sid, source="cli")
+    await db.append_message(sid, "user", "persisted question")
+    await db.append_message(sid, "assistant", "persisted answer")
 
-    loaded = db.get_messages_as_conversation(sid)
+    loaded = await db.get_messages_as_conversation(sid)
     agent = _make_flush_agent(db, sid)
     try:
         await agent._flush_messages_to_session_db(loaded)  # missing conversation_history=
 
-        rows = db.get_messages_as_conversation(sid, include_inactive=True)
+        rows = await db.get_messages_as_conversation(sid, include_inactive=True)
         assert _contents(rows).count("persisted question") == 2
     finally:
-        await agent._async_session_db.close()
-        db.close()
+        await db.close()
 
 
 @pytest.mark.asyncio
 async def test_rotation_flush_with_history_boundary_is_noop(tmp_path: Path) -> None:
     """Fix shape used by /new, /resume, /branch: pass conversation_history=self list."""
-    db = SessionDB(db_path=tmp_path / "state.db")
+    db = AsyncSessionDB(tmp_path / "state.db")
     sid = "COLD_ROTATE_OK"
-    db.create_session(sid, source="cli")
-    db.append_message(sid, "user", "persisted question")
-    db.append_message(sid, "assistant", "persisted answer")
+    await db.create_session(sid, source="cli")
+    await db.append_message(sid, "user", "persisted question")
+    await db.append_message(sid, "assistant", "persisted answer")
 
-    loaded = db.get_messages_as_conversation(sid)
+    loaded = await db.get_messages_as_conversation(sid)
     agent = _make_flush_agent(db, sid)
     try:
         await agent._flush_messages_to_session_db(
@@ -95,23 +92,22 @@ async def test_rotation_flush_with_history_boundary_is_noop(tmp_path: Path) -> N
             conversation_history=loaded,
         )
 
-        rows = db.get_messages_as_conversation(sid, include_inactive=True)
+        rows = await db.get_messages_as_conversation(sid, include_inactive=True)
         assert _contents(rows) == ["persisted question", "persisted answer"]
     finally:
-        await agent._async_session_db.close()
-        db.close()
+        await db.close()
 
 
 @pytest.mark.asyncio
 async def test_rotation_flush_writes_only_new_tail(tmp_path: Path) -> None:
     """If a turn added messages after cold resume, only the tail is written."""
-    db = SessionDB(db_path=tmp_path / "state.db")
+    db = AsyncSessionDB(tmp_path / "state.db")
     sid = "COLD_ROTATE_TAIL"
-    db.create_session(sid, source="cli")
-    db.append_message(sid, "user", "persisted question")
-    db.append_message(sid, "assistant", "persisted answer")
+    await db.create_session(sid, source="cli")
+    await db.append_message(sid, "user", "persisted question")
+    await db.append_message(sid, "assistant", "persisted answer")
 
-    loaded = db.get_messages_as_conversation(sid)
+    loaded = await db.get_messages_as_conversation(sid)
     live = [*loaded, {"role": "user", "content": "new unpersisted turn"}]
     agent = _make_flush_agent(db, sid)
     try:
@@ -120,12 +116,11 @@ async def test_rotation_flush_writes_only_new_tail(tmp_path: Path) -> None:
             conversation_history=loaded,
         )
 
-        rows = db.get_messages_as_conversation(sid, include_inactive=True)
+        rows = await db.get_messages_as_conversation(sid, include_inactive=True)
         assert _contents(rows) == [
             "persisted question",
             "persisted answer",
             "new unpersisted turn",
         ]
     finally:
-        await agent._async_session_db.close()
-        db.close()
+        await db.close()

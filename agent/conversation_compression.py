@@ -498,7 +498,7 @@ async def recover_rotated_compression_session(
             "boundary API and are disabled in async-hermes-agent."
         )
     session_db = (
-        agent._get_async_session_db()
+        agent._session_db
         if getattr(agent, "_session_db", None) is not None
         else None
     )
@@ -1300,16 +1300,23 @@ async def compress_context(
             if _codex_fence_entered:
                 commit_fence.finish_commit()
 
-    # Every automatic entrypoint must honor compressor-owned cooldown and
-    # breaker state. Gateway hygiene constructs a fresh AIAgent, so the
-    # persisted fallback streak is loaded by bind_session_state() before this.
+    # Every automatic entrypoint must honor the latest durable cooldown and
+    # breaker state. Another agent may have cleared a guard since this
+    # compressor was hydrated at turn start, so refresh it before the first
+    # synchronous decision gate.
     if not force:
+        compressor = agent.context_compressor
+        await _hydrate_persisted_compression_guards(
+            compressor,
+            getattr(agent, "_session_db", None),
+            getattr(agent, "session_id", None) or "",
+        )
         blocked = getattr(
-            type(agent.context_compressor),
+            type(compressor),
             "_automatic_compression_blocked",
             None,
         )
-        if callable(blocked) and blocked(agent.context_compressor):
+        if callable(blocked) and blocked(compressor):
             existing_prompt = getattr(agent, "_cached_system_prompt", None)
             if not existing_prompt:
                 existing_prompt = await agent._build_system_prompt(system_message)
@@ -1402,7 +1409,7 @@ async def compress_context(
     # and stops retrying for this cycle. The session is NOT corrupted —
     # we just sit out this round and let the winner finish.
     _lock_db = (
-        agent._get_async_session_db()
+        agent._session_db
         if getattr(agent, "_session_db", None) is not None
         else None
     )

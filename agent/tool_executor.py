@@ -573,13 +573,7 @@ async def execute_tool_calls_segmented(
                 elif name == "todo":
                     dispatch_kwargs["store"] = getattr(agent, "_todo_store", None)
                 elif name == "session_search":
-                    session_db = getattr(agent, "_get_async_session_db", None)
-                    dispatch_kwargs["db"] = (
-                        session_db()
-                        if callable(session_db)
-                        and getattr(agent, "_session_db", None) is not None
-                        else None
-                    )
+                    dispatch_kwargs["db"] = getattr(agent, "_session_db", None)
                     dispatch_kwargs["current_session_id"] = getattr(
                         agent, "session_id", None
                     )

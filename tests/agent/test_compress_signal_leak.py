@@ -17,7 +17,7 @@ async def test_signal_cleared_on_entry_between_calls(monkeypatch):
     agent.tools = None
     agent._memory_manager = None
     agent.session_id = "s1"
-    agent._build_system_prompt = MagicMock(return_value="sys prompt")
+    agent._build_system_prompt = AsyncMock(return_value="sys prompt")
     agent._emit_warning = MagicMock()
 
     msgs = [
@@ -35,7 +35,6 @@ async def test_signal_cleared_on_entry_between_calls(monkeypatch):
     db1.try_acquire_compression_lock = AsyncMock(return_value=False)
     db1.get_compression_lock_holder = AsyncMock(return_value="pid=holder1")
     agent._session_db = db1
-    agent._get_async_session_db.return_value = db1
 
     await compress_context(agent, msgs, "", approx_tokens=100, force=True)
 
@@ -47,7 +46,6 @@ async def test_signal_cleared_on_entry_between_calls(monkeypatch):
     db2.try_acquire_compression_lock = AsyncMock(return_value=True)
     db2.release_compression_lock = AsyncMock(return_value=None)
     agent._session_db = db2
-    agent._get_async_session_db.return_value = db2
     agent.context_compressor = MagicMock()
     compressed = [
         {"role": "user", "content": "[summary]"},
