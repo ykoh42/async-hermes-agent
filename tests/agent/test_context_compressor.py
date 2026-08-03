@@ -13,7 +13,8 @@ from agent.context_compressor import (
     _summarize_tool_result,
     _is_summary_access_or_quota_error,
 )
-from hermes_state import SessionDB
+from agent.conversation_compression import _persist_compression_guards
+from hermes_state import AsyncSessionDB
 
 
 class StubProviderError(Exception):
@@ -1094,20 +1095,27 @@ class TestAbortOnSummaryFailure:
 
 
 
-    def test_aux_fallback_clears_persisted_session_cooldown_before_retry(self, tmp_path):
-        db = SessionDB(db_path=tmp_path / "state.db")
-        db.create_session("s1", "cli")
-        db.record_compression_failure_cooldown("s1", time.time() + 999.0, "timeout")
+    @pytest.mark.asyncio
+    async def test_aux_fallback_clears_persisted_session_cooldown_before_retry(
+        self, tmp_path
+    ):
+        db = AsyncSessionDB(tmp_path / "state.db")
+        await db.create_session("s1", "cli")
+        await db.record_compression_failure_cooldown(
+            "s1", time.time() + 999.0, "timeout"
+        )
 
         c = self._make_compressor()
         c.bind_session_state(db, "s1")
         c.summary_model = "aux/model"
 
         c._fallback_to_main_for_compression(Exception("provider down"), "failed")
+        await _persist_compression_guards(c, db, "s1")
 
         assert c.summary_model == ""
         assert c._summary_failure_cooldown_until == 0.0
-        assert db.get_compression_failure_cooldown("s1") is None
+        assert await db.get_compression_failure_cooldown("s1") is None
+        await db.close()
 
     @pytest.mark.asyncio
     async def test_success_clears_persisted_session_cooldown(self, tmp_path):
@@ -1115,9 +1123,11 @@ class TestAbortOnSummaryFailure:
         mock_response.choices = [MagicMock()]
         mock_response.choices[0].message.content = "summary text"
 
-        db = SessionDB(db_path=tmp_path / "state.db")
-        db.create_session("s1", "cli")
-        db.record_compression_failure_cooldown("s1", time.time() + 999.0, "timeout")
+        db = AsyncSessionDB(tmp_path / "state.db")
+        await db.create_session("s1", "cli")
+        await db.record_compression_failure_cooldown(
+            "s1", time.time() + 999.0, "timeout"
+        )
 
         c = self._make_compressor()
         c.bind_session_state(db, "s1")
@@ -1126,11 +1136,13 @@ class TestAbortOnSummaryFailure:
 
         with patch("agent.context_compressor.call_llm", new=AsyncMock(return_value=mock_response)) as mock_llm:
             result = await c.compress(msgs, current_tokens=999999)
+        await _persist_compression_guards(c, db, "s1")
 
         mock_llm.assert_called()
         assert c._last_compress_aborted is False
         assert len(result) < len(msgs)
-        assert db.get_compression_failure_cooldown("s1") is None
+        assert await db.get_compression_failure_cooldown("s1") is None
+        await db.close()
 
 
 
