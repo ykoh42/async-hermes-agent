@@ -1215,11 +1215,29 @@ WEB_EXTRACT_SCHEMA = {
 }
 
 
+async def _handle_web_search(args: dict, **_kwargs) -> str:
+    """Adapt the registry argument object to the public search function."""
+    return await web_search_tool(
+        args.get("query", ""),
+        limit=args.get("limit", 5),
+    )
+
+
+async def _handle_web_extract(args: dict, **_kwargs) -> str:
+    """Adapt the registry argument object to the public extract function."""
+    urls = args.get("urls")
+    return await web_extract_tool(
+        urls[:5] if isinstance(urls, list) else [],
+        "markdown",
+        char_limit=args.get("char_limit"),
+    )
+
+
 registry.register(
     name="web_search",
     toolset="web",
     schema=WEB_SEARCH_SCHEMA,
-    handler=lambda args, **kw: web_search_tool(args.get("query", ""), limit=args.get("limit", 5)),
+    handler=_handle_web_search,
     check_fn=check_web_api_key,
     requires_env=_web_requires_env(),
     emoji="🔍",
@@ -1229,11 +1247,7 @@ registry.register(
     name="web_extract",
     toolset="web",
     schema=WEB_EXTRACT_SCHEMA,
-    handler=lambda args, **_kw: web_extract_tool(
-        (args.get("urls") or [])[:5] if isinstance(args.get("urls"), list) else [],
-        "markdown",
-        char_limit=args.get("char_limit"),
-    ),
+    handler=_handle_web_extract,
     check_fn=check_web_api_key,
     requires_env=_web_requires_env(),
     emoji="📄",

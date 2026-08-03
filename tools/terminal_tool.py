@@ -24,14 +24,13 @@ from typing import Any, Callable, Optional
 import aiofiles.os
 
 from tools.environments.local import build_subprocess_env
-from tools.registry import registry, tool_error
+from tools.registry import registry
 
 _active_environments: dict[str, "LocalEnvironment"] = {}
 _env_lock = threading.RLock()
 _last_activity: dict[str, float] = {}
-_creation_locks: dict[str, threading.Lock] = {}
 _creation_locks_lock = threading.Lock()
-_async_creation_locks: weakref.WeakKeyDictionary[
+_creation_locks: weakref.WeakKeyDictionary[
     asyncio.AbstractEventLoop, dict[str, asyncio.Lock]
 ] = weakref.WeakKeyDictionary()
 _task_env_overrides: dict[str, dict[str, Any]] = {}
@@ -41,8 +40,8 @@ _CONTAINER_BACKENDS = frozenset()
 # not the legacy ProcessRegistry (which is backed by blocking Popen readers).
 # Keeping their handles here lets ``AIAgent.close()`` terminate and reap them
 # without leaking child processes when a service request/session ends.
-_async_background_processes: dict[str, set[asyncio.subprocess.Process]] = {}
-_async_background_reapers: dict[asyncio.subprocess.Process, asyncio.Task] = {}
+_background_processes: dict[str, set[asyncio.subprocess.Process]] = {}
+_background_reapers: dict[asyncio.subprocess.Process, asyncio.Task] = {}
 
 _approval_callback: Callable[..., Any] | None = None
 _sudo_password_callback: Callable[..., Any] | None = None
@@ -83,36 +82,8 @@ def _parse_env_var(
         raise ValueError(f"{name} must be valid {type_label}") from exc
 
 
-def _get_env_config() -> dict[str, Any]:
-    """Return the local-only terminal configuration."""
-    raw_cwd = os.getenv("TERMINAL_CWD", "").strip()
-    cwd = raw_cwd if raw_cwd and os.path.isabs(os.path.expanduser(raw_cwd)) else os.getcwd()
-    cwd = os.path.abspath(os.path.expanduser(cwd))
-    if not os.path.isdir(cwd):
-        cwd = os.getcwd()
-    return {
-        "env_type": "local",
-        "cwd": cwd,
-        "timeout": _parse_env_var("TERMINAL_TIMEOUT", "120"),
-        "docker_forward_env": _parse_env_var(
-            "TERMINAL_DOCKER_FORWARD_ENV", "[]", json.loads, "valid JSON"
-        ),
-        "docker_image": "",
-        "singularity_image": "",
-        "modal_image": "",
-        "daytona_image": "",
-        "local_persistent": True,
-    }
-
-
-async def _get_env_config_async() -> dict[str, Any]:
-    """Read local terminal configuration without synchronous filesystem I/O.
-
-    The synchronous configuration helper remains for legacy code-execution
-    callers.  The registered terminal tool uses this coroutine so a first
-    tool call cannot perform ``os.path.isdir`` while the event loop is serving
-    another agent.
-    """
+async def _get_env_config() -> dict[str, Any]:
+    """Read local terminal configuration without synchronous filesystem I/O."""
     raw_cwd = os.getenv("TERMINAL_CWD", "").strip()
     expanded_cwd = os.path.expanduser(raw_cwd) if raw_cwd else ""
     if expanded_cwd and os.path.isabs(expanded_cwd):
@@ -198,16 +169,11 @@ def register_task_env_overrides(task_id: str, overrides: dict[str, Any]) -> None
 
 
 def get_session_cwd(task_id: str | None = None) -> str:
-    key = str(task_id or "default")
-    with _env_lock:
-        env = _active_environments.get(key)
-        if env is not None and env.cwd:
-            return env.cwd
-        return _session_cwds.get(key, _get_env_config()["cwd"])
+    """Return the in-memory cwd anchor for a session.
 
-
-async def get_session_cwd_async(task_id: str | None = None) -> str:
-    """Return a session cwd using the async terminal configuration path."""
+    This lookup performs no filesystem I/O, so it remains a synchronous state
+    accessor even though environment creation and command execution are async.
+    """
     key = str(task_id or "default")
     with _env_lock:
         env = _active_environments.get(key)
@@ -216,7 +182,12 @@ async def get_session_cwd_async(task_id: str | None = None) -> str:
         recorded = _session_cwds.get(key)
     if recorded:
         return recorded
-    return (await _get_env_config_async())["cwd"]
+    configured = os.getenv("TERMINAL_CWD", "").strip()
+    if configured:
+        configured = os.path.expanduser(configured)
+        if os.path.isabs(configured):
+            return os.path.abspath(configured)
+    return os.getcwd()
 
 
 def record_session_cwd(task_id: str | None, cwd: str) -> None:
@@ -337,9 +308,14 @@ class LocalEnvironment:
         return {"output": output, "returncode": process.returncode}
 
 
-def _create_environment(*, cwd: str | None = None, timeout: int | None = None, **_kwargs: Any) -> LocalEnvironment:
-    config = _get_env_config()
-    return LocalEnvironment(cwd or config["cwd"], int(timeout or config["timeout"]))
+def _create_environment(
+    *, cwd: str | None = None, timeout: int | None = None, **_kwargs: Any
+) -> LocalEnvironment:
+    """Construct the local environment without performing external I/O."""
+    return LocalEnvironment(
+        cwd or os.getcwd(),
+        int(timeout or _parse_env_var("TERMINAL_TIMEOUT", "120")),
+    )
 
 
 def get_active_env(task_id: str | None = None) -> LocalEnvironment | None:
@@ -352,37 +328,20 @@ def is_persistent_env(_task_id: str | None = None) -> bool:
     return True
 
 
-def _get_or_create_environment(task_id: str | None = None) -> LocalEnvironment:
-    raw_key = _resolve_container_task_id(task_id)
-    with _env_lock:
-        env = _active_environments.get(raw_key)
-        if env is not None:
-            _last_activity[raw_key] = time.time()
-            return env
-    overrides = resolve_task_overrides(raw_key)
-    cwd = overrides.get("cwd") or get_session_cwd(raw_key)
-    env = _create_environment(cwd=cwd, timeout=_get_env_config()["timeout"], task_id=raw_key)
-    with _env_lock:
-        _active_environments[raw_key] = env
-        _last_activity[raw_key] = time.time()
-    record_session_cwd(raw_key, env.cwd)
-    return env
-
-
-def _get_async_creation_lock(task_id: str) -> asyncio.Lock:
+def _get_creation_lock(task_id: str) -> asyncio.Lock:
     """Get the per-task async environment creation lock."""
     loop = asyncio.get_running_loop()
     with _creation_locks_lock:
-        per_loop = _async_creation_locks.setdefault(loop, {})
+        per_loop = _creation_locks.setdefault(loop, {})
         return per_loop.setdefault(task_id, asyncio.Lock())
 
 
-async def _get_or_create_environment_async(
+async def _get_or_create_environment(
     task_id: str | None = None,
 ) -> LocalEnvironment:
     """Get or create a local environment without blocking filesystem calls."""
     raw_key = _resolve_container_task_id(task_id)
-    creation_lock = _get_async_creation_lock(raw_key)
+    creation_lock = _get_creation_lock(raw_key)
     async with creation_lock:
         with _env_lock:
             env = _active_environments.get(raw_key)
@@ -390,13 +349,12 @@ async def _get_or_create_environment_async(
                 _last_activity[raw_key] = time.time()
                 return env
         overrides = resolve_task_overrides(raw_key)
-        config = await _get_env_config_async()
-        cwd = overrides.get("cwd") or await get_session_cwd_async(raw_key)
+        config = await _get_env_config()
+        cwd = overrides.get("cwd") or get_session_cwd(raw_key)
         env = LocalEnvironment(cwd or config["cwd"], int(config["timeout"]))
         with _env_lock:
-            # A legacy synchronous caller may have created the environment
-            # while the async config was being read. Reuse that object rather
-            # than replacing its cwd/state.
+            # Another turn may have created the environment while async config
+            # was being read. Reuse it rather than replacing its cwd/state.
             existing = _active_environments.get(raw_key)
             if existing is not None:
                 env = existing
@@ -414,9 +372,9 @@ async def cleanup_vm(task_id: str | None = None) -> None:
     closed agent or remain as zombies after their parent request is cancelled.
     """
     key = _resolve_container_task_id(task_id)
-    processes = list(_async_background_processes.pop(key, set()))
+    processes = list(_background_processes.pop(key, set()))
     reapers = [
-        _async_background_reapers.pop(process, None)
+        _background_reapers.pop(process, None)
         for process in processes
     ]
     if processes:
@@ -441,26 +399,26 @@ async def cleanup_vm(task_id: str | None = None) -> None:
         _last_activity.pop(key, None)
 
 
-def _track_async_background_process(
+def _track_background_process(
     task_id: str | None,
     process: asyncio.subprocess.Process,
 ) -> None:
     """Register a native child and remove it once its awaited reaper exits."""
     key = _resolve_container_task_id(task_id)
-    _async_background_processes.setdefault(key, set()).add(process)
+    _background_processes.setdefault(key, set()).add(process)
 
     async def _reap() -> None:
         try:
             await process.wait()
         finally:
-            processes = _async_background_processes.get(key)
+            processes = _background_processes.get(key)
             if processes is not None:
                 processes.discard(process)
                 if not processes:
-                    _async_background_processes.pop(key, None)
-            _async_background_reapers.pop(process, None)
+                    _background_processes.pop(key, None)
+            _background_reapers.pop(process, None)
 
-    _async_background_reapers[process] = asyncio.create_task(_reap())
+    _background_reapers[process] = asyncio.create_task(_reap())
 
 
 def cleanup_all_environments() -> None:
@@ -480,12 +438,31 @@ async def terminal_tool(
     task_id: str | None = None,
     **_kwargs: Any,
 ) -> str:
-    """Native-async terminal handler used by the async conversation loop."""
-    if not isinstance(command, str) or not command.strip():
-        return tool_error("terminal requires a non-empty command")
-    env = await _get_or_create_environment_async(task_id)
-    if background:
-        try:
+    """Run a local command asynchronously and preserve Hermes' JSON result contract."""
+    if not isinstance(command, str):
+        return json.dumps(
+            {
+                "output": "",
+                "exit_code": -1,
+                "error": f"Invalid command: expected string, got {type(command).__name__}",
+                "status": "error",
+            },
+            ensure_ascii=False,
+        )
+    if not command.strip():
+        return json.dumps(
+            {
+                "output": "",
+                "exit_code": -1,
+                "error": "Invalid command: expected a non-empty string",
+                "status": "error",
+            },
+            ensure_ascii=False,
+        )
+
+    try:
+        env = await _get_or_create_environment(task_id)
+        if background:
             process = await asyncio.create_subprocess_shell(
                 command,
                 executable=os.environ.get("SHELL") or "/bin/sh",
@@ -494,14 +471,41 @@ async def terminal_tool(
                 stderr=asyncio.subprocess.DEVNULL,
                 start_new_session=True,
             )
-            _track_async_background_process(task_id, process)
-            return f"Background process started (pid={process.pid})"
-        except OSError as exc:
-            return tool_error(f"Failed to start background command: {exc}")
-    result = await env.execute(command, timeout=timeout)
-    return str(result.get("output", "")) if result.get("returncode", 0) == 0 else tool_error(
-        f"Command exited with code {result.get('returncode')}:\n{result.get('output', '')}"
-    )
+            _track_background_process(task_id, process)
+            return json.dumps(
+                {
+                    "output": "Background process started",
+                    "session_id": str(process.pid),
+                    "pid": process.pid,
+                    "exit_code": 0,
+                    "error": None,
+                },
+                ensure_ascii=False,
+            )
+
+        result = await env.execute(command, timeout=timeout)
+        exit_code = int(result.get("returncode", 0))
+        payload: dict[str, Any] = {
+            "output": str(result.get("output", "")),
+            "exit_code": exit_code,
+            "error": None,
+        }
+        exit_note = _interpret_exit_code(command, exit_code)
+        if exit_note:
+            payload["exit_code_meaning"] = exit_note
+        return json.dumps(payload, ensure_ascii=False)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        return json.dumps(
+            {
+                "output": "",
+                "exit_code": -1,
+                "error": f"Failed to execute command: {exc}",
+                "status": "error",
+            },
+            ensure_ascii=False,
+        )
 
 
 def _interpret_exit_code(command: str, exit_code: int) -> str | None:

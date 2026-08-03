@@ -616,35 +616,6 @@ class TestPromptBuilderConstants:
 # =========================================================================
 
 class TestEnvironmentHints:
-
-
-
-
-
-    @pytest.mark.asyncio
-    async def test_build_environment_hints_suppresses_host_on_docker_backend(self, monkeypatch):
-        """Docker/remote backends must hide host info — the agent can only touch the backend."""
-        import agent.prompt_builder as _pb
-        import sys
-        monkeypatch.setattr(_pb, "is_wsl", lambda: False)
-        monkeypatch.setattr(sys, "platform", "win32")
-        monkeypatch.setenv("TERMINAL_ENV", "docker")
-        # Force the probe to fail so we exercise the static fallback path
-        # deterministically (the live probe would try to spin up docker).
-        async def no_probe(_backend):
-            return None
-
-        monkeypatch.setattr(_pb, "_probe_remote_backend", no_probe)
-        _pb._clear_backend_probe_cache()
-        result = await _pb.build_environment_hints()
-        # Host suppression: none of the local-backend lines should appear.
-        assert "Host: Windows" not in result
-        assert "User home directory:" not in result
-        assert "PowerShell" not in result
-        # Backend info must appear instead.
-        assert "Terminal backend: docker" in result
-        assert "inside" in result.lower()
-
     @pytest.mark.asyncio
     async def test_build_environment_hints_uses_terminal_cwd_over_launch_dir(self, monkeypatch, tmp_path):
         """THE BUG: gateway/cron set TERMINAL_CWD but the prompt emitted os.getcwd()
@@ -656,7 +627,6 @@ class TestEnvironmentHints:
         configured.mkdir()
         monkeypatch.setenv("TERMINAL_CWD", str(configured))
         monkeypatch.chdir(tmp_path)
-        _pb._clear_backend_probe_cache()
         assert f"Current working directory: {configured}" in await _pb.build_environment_hints()
 
     @pytest.mark.asyncio
@@ -667,50 +637,7 @@ class TestEnvironmentHints:
         monkeypatch.delenv("TERMINAL_ENV", raising=False)
         monkeypatch.delenv("TERMINAL_CWD", raising=False)
         monkeypatch.chdir(tmp_path)
-        _pb._clear_backend_probe_cache()
         assert f"Current working directory: {tmp_path}" in await _pb.build_environment_hints()
-
-
-    @pytest.mark.asyncio
-    async def test_probe_remote_backend_imports_real_factory(self, monkeypatch):
-        """Regression for #53667: the probe imported a nonexistent
-        ``get_environment`` from ``tools.environments`` and always died with
-        ``ImportError: cannot import name 'get_environment'`` (cosmetic — it
-        only dropped the live backend description to a static fallback). The
-        real factory is ``_create_environment`` in ``tools.terminal_tool``;
-        the probe must import and call THAT, returning a parsed line instead
-        of None."""
-        import agent.prompt_builder as _pb
-
-        monkeypatch.setenv("TERMINAL_ENV", "docker")
-        _pb._clear_backend_probe_cache()
-
-        class _FakeEnv:
-            async def aexecute(self, cmd, timeout=None):
-                return {
-                    "returncode": 0,
-                    "output": (
-                        "os=Linux\nkernel=6.8.0\nhome=/root\n"
-                        "cwd=/workspace\nuser=root\n"
-                    ),
-                }
-
-        created = {}
-
-        def _fake_create_environment(*, env_type, **kwargs):
-            created["env_type"] = env_type
-            return _FakeEnv()
-
-        # Patch the REAL factory in tools.terminal_tool — the probe imports it
-        # locally, so the import itself must succeed (the bug was here).
-        import tools.terminal_tool as _tt
-        monkeypatch.setattr(_tt, "_create_environment", _fake_create_environment)
-
-        line = await _pb._probe_remote_backend("docker")
-        assert created.get("env_type") == "docker"
-        assert line is not None
-        assert "Linux 6.8.0" in line
-        assert "root" in line
 
 
     @pytest.mark.asyncio
@@ -720,24 +647,10 @@ class TestEnvironmentHints:
         monkeypatch.setattr(_pb, "is_wsl", lambda: False)
         monkeypatch.delenv("TERMINAL_ENV", raising=False)
         monkeypatch.setenv("HERMES_ENVIRONMENT_HINT", "Running inside an OpenShell sandbox.")
-        _pb._clear_backend_probe_cache()
         result = await _pb.build_environment_hints()
         assert "Running inside an OpenShell sandbox." in result
         # The factual host block must still come first.
         assert result.index("Host:") < result.index("OpenShell")
-
-
-
-    def test_remote_backend_list_covers_known_sandboxes(self):
-        """Regression guard: if someone adds a remote backend, they must list it here."""
-        import agent.prompt_builder as _pb
-        for backend in ("docker", "singularity", "modal", "daytona", "ssh", "vercel_sandbox"):
-            assert backend in _pb._REMOTE_TERMINAL_BACKENDS, (
-                f"{backend!r} must be in _REMOTE_TERMINAL_BACKENDS so its host "
-                f"info is suppressed in the system prompt"
-            )
-
-
 # =========================================================================
 # Conditional skill activation
 # =========================================================================

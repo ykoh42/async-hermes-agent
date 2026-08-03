@@ -2143,7 +2143,15 @@ async def test_native_async_terminal_does_not_use_to_thread(monkeypatch, tmp_pat
     monkeypatch.setattr(asyncio, "to_thread", fail_if_called)
     monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
 
-    assert await terminal_tool("printf async-terminal", task_id="async-test") == "async-terminal"
+    result = json.loads(
+        await terminal_tool("printf async-terminal", task_id="async-test")
+    )
+
+    assert result == {
+        "output": "async-terminal",
+        "exit_code": 0,
+        "error": None,
+    }
 
 
 @pytest.mark.asyncio
@@ -2374,7 +2382,11 @@ async def test_synthetic_model_tool_observation_turn_preserves_order(monkeypatch
         ]
         assert messages[1]["tool_calls"][0]["id"] == "call-1"
         assert messages[2]["tool_call_id"] == "call-1"
-        assert messages[2]["content"] == "tool-observation"
+        assert json.loads(messages[2]["content"]) == {
+            "output": "tool-observation",
+            "exit_code": 0,
+            "error": None,
+        }
         assert result["final_response"] == "tool observation incorporated"
         assert [message["role"] for message in database.get_messages(agent.session_id)] == [
             "user",
@@ -2620,11 +2632,11 @@ async def test_native_background_terminal_process_is_reaped_at_cleanup():
         command, background=True, task_id=task_id
     )
     assert "Background process started" in started
-    processes = list(terminal_module._async_background_processes[task_id])
+    processes = list(terminal_module._background_processes[task_id])
 
     await terminal_module.cleanup_vm(task_id)
 
-    assert task_id not in terminal_module._async_background_processes
+    assert task_id not in terminal_module._background_processes
     assert all(process.returncode is not None for process in processes)
 
 

@@ -235,39 +235,8 @@ _CONTAINER_PATH_BACKENDS_FALLBACK = frozenset({"docker", "singularity", "modal",
 
 
 def _terminal_env_type_for_task(task_id: str = "default") -> str:
-    """Best-effort terminal backend type for path-resolution decisions."""
-    try:
-        from tools.terminal_tool import (
-            _active_environments,
-            _env_lock,
-            _get_env_config,
-            _resolve_container_task_id,
-        )
-
-        try:
-            container_key = _resolve_container_task_id(task_id)
-        except Exception:
-            container_key = task_id
-        with _env_lock:
-            env = _active_environments.get(container_key) or _active_environments.get(task_id)
-        if env is not None:
-            name = env.__class__.__name__.lower()
-            if "local" in name:
-                return "local"
-            if "ssh" in name:
-                return "ssh"
-            if "docker" in name:
-                return "docker"
-            if "singularity" in name:
-                return "singularity"
-            if "modal" in name:
-                return "modal"
-            if "daytona" in name:
-                return "daytona"
-        cfg = _get_env_config()
-        return str(cfg.get("env_type") or os.getenv("TERMINAL_ENV") or "local").lower()
-    except Exception:
-        return str(os.getenv("TERMINAL_ENV") or "local").lower()
+    """Return the only terminal backend retained by this training runtime."""
+    return "local"
 
 
 def _uses_container_paths(task_id: str = "default") -> bool:
@@ -655,36 +624,7 @@ def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None
 
 
 def _get_container_mirror_prefix_for_task(task_id: str = "default") -> str | None:
-    """Return the container-side Hermes mirror prefix for Docker file tools."""
-    try:
-        from tools.terminal_tool import (
-            _active_environments,
-            _env_lock,
-            _get_env_config,
-            _resolve_container_task_id,
-        )
-
-        container_key = _resolve_container_task_id(task_id)
-    except Exception:
-        return None
-
-    try:
-        with _env_lock:
-            env = _active_environments.get(container_key) or _active_environments.get(task_id)
-
-        if env is not None:
-            if env.__class__.__name__ == "DockerEnvironment" and bool(
-                getattr(env, "_persistent", False)
-            ):
-                return "/root/.hermes"
-            return None
-
-        config = _get_env_config()
-    except Exception:
-        return None
-
-    if config.get("env_type") == "docker" and config.get("container_persistent", True):
-        return "/root/.hermes"
+    """Container mirrors do not exist in the local-only training runtime."""
     return None
 
 
