@@ -37,16 +37,16 @@ _OPENAI_CLS_CACHE = None
 
 
 def _load_openai_cls() -> type:
-    """Import and cache ``openai.OpenAI``."""
+    """Import and cache ``openai.AsyncOpenAI``."""
     global _OPENAI_CLS_CACHE
     if _OPENAI_CLS_CACHE is None:
-        from openai import OpenAI as _cls
+        from openai import AsyncOpenAI as _cls
         _OPENAI_CLS_CACHE = _cls
     return _OPENAI_CLS_CACHE
 
 
 class _OpenAIProxy:
-    """Module-level proxy that looks like ``openai.OpenAI`` but imports lazily."""
+    """Lazy factory retaining Hermes' stable ``OpenAI`` import name."""
 
     __slots__ = ()
 
@@ -57,7 +57,7 @@ class _OpenAIProxy:
         return isinstance(obj, _load_openai_cls())
 
     def __repr__(self):
-        return "<lazy openai.OpenAI proxy>"
+        return "<lazy openai.AsyncOpenAI proxy>"
 
 
 class _SafeWriter:
@@ -210,7 +210,8 @@ def _install_safe_stdio() -> None:
             setattr(sys, stream_name, _SafeWriter(stream))
 
 
-# Module-level proxy instance — drops in for ``openai.OpenAI``.  Imported as
+# Module-level proxy instance — creates ``openai.AsyncOpenAI`` while preserving
+# Hermes' long-standing import/patch location. Imported as
 # ``from agent.process_bootstrap import OpenAI`` (or re-exported via
 # ``run_agent`` for legacy tests).
 OpenAI = _OpenAIProxy()

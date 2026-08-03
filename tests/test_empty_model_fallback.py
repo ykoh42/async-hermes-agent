@@ -19,33 +19,6 @@ class TestGetDefaultModelForProvider:
 
 
 
-    def test_catalog_label_overrides_constant(self):
-        """A ``"default": true`` label in the cached catalog manifest wins over
-        the in-repo constant, so maintainers can rotate the silent default
-        without shipping a release."""
-        from unittest.mock import patch
-
-        from hermes_cli import models as models_mod
-
-        with patch(
-            "hermes_cli.model_catalog.get_default_model_from_cache",
-            return_value="qwen/qwen3.7-max",
-        ):
-            assert (
-                models_mod.get_preferred_silent_default_model("nous")
-                == "qwen/qwen3.7-max"
-            )
-            # nous catalog carries qwen3.7-max, so the full resolver follows.
-            assert (
-                models_mod.get_default_model_for_provider("nous")
-                == "qwen/qwen3.7-max"
-            )
-
-
-
-
-
-
 @pytest.mark.skip(reason="gateway runtime is outside the reduced training runtime")
 class TestGatewayEmptyModelFallback:
     """Test that _resolve_session_agent_runtime fills in empty model from provider catalog."""

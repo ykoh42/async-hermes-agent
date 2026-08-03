@@ -6,7 +6,7 @@ during error recovery.
 """
 
 import pytest
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 
 class TestFallbackReasoningOverride:
@@ -52,7 +52,8 @@ class TestFallbackReasoningOverride:
         assert result is None  # caller falls back to global
 
 
-    def test_fallback_recovery_restores_primary_reasoning(self):
+    @pytest.mark.asyncio
+    async def test_fallback_recovery_restores_primary_reasoning(self):
         """After fallback + restore_primary_runtime, reasoning_config returns to primary's value.
 
         This tests the integration of Task 6 (_primary_runtime snapshot) with
@@ -99,9 +100,11 @@ class TestFallbackReasoningOverride:
         agent.base_url = ""
         agent._anthropic_prompt_cache_policy = MagicMock(return_value=(False, False))
         agent._create_openai_client = MagicMock(return_value=MagicMock())
-        agent._ensure_lmstudio_runtime_loaded = MagicMock()
+        agent._ensure_lmstudio_runtime_loaded = AsyncMock()
+        agent._ensure_provider_runtime = AsyncMock(return_value=True)
+        agent._credential_pool = None
 
-        result = restore_primary_runtime(agent)
+        result = await restore_primary_runtime(agent)
         assert result is True
         # reasoning_config should be restored to primary's value (medium)
         assert agent.reasoning_config == {"enabled": True, "effort": "medium"}

@@ -291,7 +291,7 @@ async def _resolve_profile_db(profile: str):
         return None
 
     from hermes_cli import profiles as profiles_mod
-    from hermes_state import AsyncSessionDB
+    from hermes_state import SessionDB
 
     canon = profiles_mod.normalize_profile_name(profile)
     profiles_mod.validate_profile_name(canon)
@@ -301,7 +301,7 @@ async def _resolve_profile_db(profile: str):
         profile_dir = profiles_mod.get_profile_dir(canon)
         if not await aiofiles.os.path.isdir(profile_dir):
             raise ValueError(f"profile '{canon}' does not exist")
-    return AsyncSessionDB(profile_dir / "state.db")
+    return SessionDB(profile_dir / "state.db")
 
 
 async def _session_link(session_id: str, profile: str = None) -> str:
@@ -338,7 +338,7 @@ async def _locate_session_db(session_id: str):
 
     try:
         from hermes_cli import profiles as profiles_mod
-        from hermes_state import AsyncSessionDB
+        from hermes_state import SessionDB
     except Exception:
         return None, None
 
@@ -369,7 +369,7 @@ async def _locate_session_db(session_id: str):
             continue
         seen.add(key)
         try:
-            pdb = AsyncSessionDB(db_path)
+            pdb = SessionDB(db_path)
         except Exception:
             continue
         try:
@@ -880,12 +880,11 @@ async def session_search(
     """
     if db is None:
         try:
-            from hermes_state import AsyncSessionDB, _default_db_path
-            db = AsyncSessionDB(_default_db_path())
-        except Exception:
-            logging.debug("SessionDB unavailable for session_search", exc_info=True)
-            from hermes_state import format_session_db_unavailable
-            return tool_error(format_session_db_unavailable(), success=False)
+            from hermes_state import SessionDB, _default_db_path
+            db = SessionDB(_default_db_path())
+        except Exception as exc:
+            logging.debug("SessionDB construction failed for session_search", exc_info=True)
+            return tool_error(f"Session database not available: {exc}", success=False)
 
     # Normalise a raw `@session:<profile>/<id>` link value passed as session_id.
     # Session ids never contain "/", so a slash unambiguously means profile/id —

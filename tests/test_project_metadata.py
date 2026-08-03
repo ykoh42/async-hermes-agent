@@ -10,84 +10,6 @@ def _load_optional_dependencies():
     return project["optional-dependencies"]
 
 
-def _load_package_data():
-    pyproject_path = Path(__file__).resolve().parents[1] / "pyproject.toml"
-    with pyproject_path.open("rb") as handle:
-        tool = tomllib.load(handle)["tool"]
-    return tool["setuptools"]["package-data"]
-
-
-def test_matrix_extra_not_in_all():
-    """The [matrix] extra pulls `mautrix[encryption]` -> `python-olm`,
-    which has Linux-only wheels and no native build path on Windows or
-    modern macOS (archived libolm, C++ errors with Clang 21+).
-
-    With matrix in [all], `uv sync --locked` on Windows tried to build
-    python-olm from sdist and failed on `make`. As of 2026-05-12 the
-    [matrix] extra is excluded from [all] entirely and routed through
-    `tools/lazy_deps.py` (LAZY_DEPS["platform.matrix"]) — installs at
-    first use, where the user is expected to have a toolchain.
-    """
-    optional_dependencies = _load_optional_dependencies()
-
-    assert "matrix" in optional_dependencies, "[matrix] extra must still exist for `uv sync --extra matrix`"
-    # Must NOT appear in [all] in any form — neither unconditional nor
-    # platform-gated. Lazy-install handles it.
-    matrix_in_all = [
-        dep for dep in optional_dependencies["all"]
-        if "matrix" in dep
-    ]
-    assert not matrix_in_all, (
-        "matrix must not appear in [all] — it's lazy-installed via "
-        "tools/lazy_deps.py LAZY_DEPS['platform.matrix']. Found: "
-        f"{matrix_in_all}"
-    )
-
-
-def test_lazy_installable_extras_excluded_from_all():
-    """Policy (2026-05-12): every extra that has a `LAZY_DEPS` entry
-    in `tools/lazy_deps.py` must be excluded from [all].
-
-    The lazy-install system exists so one quarantined PyPI release
-    (e.g. mistralai 2.4.6) can't break every fresh install. Putting a
-    backend in BOTH [all] and LAZY_DEPS defeats that — fresh installs
-    eager-install it and inherit whatever's broken upstream.
-
-    If you're tempted to add an opt-in backend to [all] for "convenience,"
-    add it to `LAZY_DEPS` instead so it installs at first use.
-    """
-    optional_dependencies = _load_optional_dependencies()
-
-    # Hard-coded mirror of the extras that are in LAZY_DEPS as of
-    # 2026-05-12. This list intentionally duplicates rather than
-    # imports tools/lazy_deps.py so the test stays a contract — if
-    # someone adds a new lazy-install backend, they have to update
-    # this list AND verify [all] doesn't contain it.
-    lazy_covered_extras = {
-        "anthropic", "bedrock",
-        "exa", "firecrawl", "parallel-web",
-        "fal",
-        "edge-tts", "tts-premium",
-        "voice",  # faster-whisper / sounddevice / numpy
-        "modal", "daytona", "vercel",
-        "messaging", "slack", "matrix", "feishu",
-        "honcho", "hindsight",
-        "supermemory", "mem0",
-        "mistral",  # mistralai — Voxtral STT/TTS, lazy-installed (stt.mistral / tts.mistral)
-    }
-    all_extra_specs = optional_dependencies["all"]
-    for extra in lazy_covered_extras:
-        offending = [
-            spec for spec in all_extra_specs
-            if f"hermes-agent[{extra}]" in spec
-        ]
-        assert not offending, (
-            f"[{extra}] is in [all] but also in LAZY_DEPS. "
-            f"Remove it from [all] in pyproject.toml — it lazy-installs "
-            f"at first use. Found in [all]: {offending}"
-        )
-
-
 def _exact_pins(specs):
     pins = {}
     for spec in specs:
@@ -98,6 +20,7 @@ def _exact_pins(specs):
         package = package.split("[", 1)[0].lower().replace("_", "-")
         pins[package] = version
     return pins
+
 
 
 
@@ -222,57 +145,4 @@ def test_every_lazy_deps_exact_pin_matches_uv_lock():
         "consumers (#60783, #31817). Bump the pin AND run "
         "`uv lock --upgrade-package <name>` in the same commit. Drift: "
         f"{drift}"
-    )
-
-
-def test_huggingface_hub_lazy_pin_matches_uv_lock():
-    """The whole tree must converge on ONE huggingface-hub version (#60783).
-
-    huggingface-hub is a shared dependency: the core lock resolves it (via
-    faster-whisper/tokenizers, and transformers/sentence-transformers when
-    local Hindsight embeddings are installed), and LAZY_DEPS
-    ['tool.trace_upload'] exact-pins it. Because active_features() activates
-    a feature from mere package presence, the `hermes update` lazy-refresh
-    pass re-asserts the LAZY_DEPS pin on every install where hub is present.
-    If that pin drifts from the lock's resolved version, every update churns
-    the shared package — and a pin below transformers' floor (>=1.5.0)
-    force-downgrades it and breaks the Hindsight local daemon on startup.
-    """
-    from tools.lazy_deps import LAZY_DEPS
-
-    lazy_pin = _exact_pins(LAZY_DEPS["tool.trace_upload"]).get("huggingface-hub")
-    assert lazy_pin, "tool.trace_upload must exact-pin huggingface-hub"
-
-    locked = _uv_lock_version("huggingface-hub")
-    assert lazy_pin == locked, (
-        "LAZY_DEPS['tool.trace_upload'] pins huggingface-hub=="
-        f"{lazy_pin} but uv.lock resolves {locked}. These must move in "
-        "lockstep (bump the pin AND run `uv lock --upgrade-package "
-        "huggingface-hub`), or `hermes update` will churn/downgrade the "
-        "shared package and break Hindsight local embeddings (#60783)."
-    )
-
-
-def test_huggingface_hub_lazy_pin_inside_transformers_window():
-    """The hub pin must stay in transformers' accepted range (#60783).
-
-    transformers (pulled by sentence-transformers for Hindsight
-    local/local_embedded embeddings) requires huggingface-hub>=1.5.0,<2.
-    An exact pin outside that window makes the lazy-refresh downgrade the
-    shared package below what the embedding stack imports, and the
-    Hindsight daemon fails on startup. Contract, not a snapshot: any
-    future exact pin is fine as long as it stays inside the window.
-    """
-    from packaging.specifiers import SpecifierSet
-    from packaging.version import Version
-
-    from tools.lazy_deps import LAZY_DEPS
-
-    pin = _exact_pins(LAZY_DEPS["tool.trace_upload"]).get("huggingface-hub")
-    assert pin, "tool.trace_upload must exact-pin huggingface-hub"
-    transformers_window = SpecifierSet(">=1.5.0,<2")
-    assert Version(pin) in transformers_window, (
-        f"huggingface-hub=={pin} falls outside transformers' accepted "
-        "range (>=1.5.0,<2). The lazy refresh would downgrade the shared "
-        "package and break Hindsight local embeddings (#60783)."
     )

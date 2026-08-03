@@ -1000,27 +1000,6 @@ def _fallback_entry_key(fb: dict) -> tuple[str, str, str]:
     )
 
 
-def _fallback_entry_unavailable_without_network(agent, fb: dict) -> Optional[str]:
-    """Return a skip reason for fallback entries known to be unusable locally."""
-    fb_provider = (fb.get("provider") or "").strip().lower()
-    if fb_provider != "nous":
-        return None
-    try:
-        from hermes_cli.auth import get_provider_auth_state
-
-        state = get_provider_auth_state("nous") or {}
-    except Exception as exc:
-        return f"nous_auth_unreadable:{type(exc).__name__}"
-    access_value = state.get("access_token")
-    refresh_value = state.get("refresh_token")
-    has_access = isinstance(access_value, str) and bool(access_value.strip())
-    has_refresh = isinstance(refresh_value, str) and bool(refresh_value.strip())
-    if not (has_access or has_refresh):
-        return "nous_token_missing"
-    return None
-
-
-
 async def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool:
     """Switch to the next fallback model/provider in the chain.
 
@@ -1073,17 +1052,6 @@ async def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -
     fb_model = (fb.get("model") or "").strip()
     if not fb_provider or not fb_model:
         return await agent._try_activate_fallback(reason)  # skip invalid, try next
-
-    local_skip_reason = _fallback_entry_unavailable_without_network(agent, fb)
-    if local_skip_reason:
-        unavailable.add(fb_key)
-        logger.warning(
-            "Fallback skip: %s/%s is not locally usable (%s); suppressing for this session",
-            fb_provider,
-            fb_model,
-            local_skip_reason,
-        )
-        return await agent._try_activate_fallback(reason)
 
     # Skip entries that resolve to the same backend that just failed —
     # falling back to it loops the failure. Identity semantics (which axes
@@ -1357,8 +1325,6 @@ async def handle_max_iterations(agent, messages: list, api_call_count: int) -> s
     """Request a summary when max iterations are reached. Returns the final response text."""
     print(f"⚠️  Reached maximum iterations ({agent.max_iterations}). Requesting summary...")
 
-    summary_api_request_id = f"iteration-summary:{uuid.uuid4()}"
-    summary_call_outcome = "failed"
 
     summary_request = (
         "You've reached the maximum number of tool-calling iterations allowed. "
@@ -1574,7 +1540,6 @@ async def handle_max_iterations(agent, messages: list, api_call_count: int) -> s
             if "<think>" in final_response:
                 final_response = re.sub(r'<think>.*?</think>\s*', '', final_response, flags=re.DOTALL).strip()
             if final_response:
-                summary_call_outcome = "success"
                 messages.append({"role": "assistant", "content": final_response})
             else:
                 final_response = "I reached the iteration limit and couldn't generate a summary."
@@ -1631,7 +1596,6 @@ async def handle_max_iterations(agent, messages: list, api_call_count: int) -> s
                 if "<think>" in final_response:
                     final_response = re.sub(r'<think>.*?</think>\s*', '', final_response, flags=re.DOTALL).strip()
                 if final_response:
-                    summary_call_outcome = "success"
                     messages.append({"role": "assistant", "content": final_response})
                 else:
                     final_response = "I reached the iteration limit and couldn't generate a summary."
@@ -1641,14 +1605,6 @@ async def handle_max_iterations(agent, messages: list, api_call_count: int) -> s
     except Exception as e:
         logger.warning(f"Failed to get summary response: {e}")
         final_response = f"I reached the maximum iterations ({agent.max_iterations}) but couldn't summarize. Error: {str(e)}"
-    finally:
-        from agent import relay_llm
-
-        await relay_llm.complete_logical_call(
-            summary_api_request_id,
-            outcome=summary_call_outcome,
-        )
-
     return final_response
 
 

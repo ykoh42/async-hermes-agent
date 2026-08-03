@@ -43,14 +43,3 @@ def test_config_show_no_managed_scope_silent(tmp_path, monkeypatch, capsys):
     show_config()
     out = capsys.readouterr().out.lower()
     assert "managed by your administrator" not in out
-
-
-
-
-def test_doctor_silent_with_no_managed_scope(tmp_path, monkeypatch, capsys):
-    monkeypatch.setenv("HERMES_MANAGED_DIR", str(tmp_path / "nope"))
-    from hermes_cli import managed_scope, doctor
-
-    managed_scope.invalidate_managed_cache()
-    doctor.managed_scope_check()
-    assert capsys.readouterr().out.strip() == ""

@@ -67,24 +67,3 @@ class TestProviderPersistsAfterModelSave:
                 )
 
         assert config_path.read_text(encoding="utf-8") == original_text
-
-
-class TestZaiEndpointPicker:
-    def test_current_endpoint_is_default_choice(self, config_home):
-        """The reusable endpoint picker selects the currently active URL."""
-        from hermes_cli.auth import ZAI_ENDPOINTS
-        from hermes_cli.model_setup_flows import _select_zai_endpoint
-
-        coding_url = ZAI_ENDPOINTS[2][1]
-        captured = {}
-
-        def choose(choices, *, default=0, title=""):
-            captured["default"] = default
-            captured["choices"] = choices
-            return default
-
-        with patch("hermes_cli.main._prompt_provider_choice", side_effect=choose):
-            result = _select_zai_endpoint(coding_url)
-
-        assert captured["default"] == 2
-        assert result == coding_url

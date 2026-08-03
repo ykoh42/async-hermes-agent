@@ -693,138 +693,6 @@ def partition_nous_models_by_tier(
     return (selectable, unavailable)
 
 
-def union_with_portal_free_recommendations(
-    curated_ids: list[str],
-    pricing: dict[str, dict[str, str]],
-    portal_base_url: str = "",
-    *,
-    force_refresh: bool = False,
-) -> tuple[list[str], dict[str, dict[str, str]]]:
-    """Augment curated list + pricing with the Portal's ``freeRecommendedModels``.
-
-    The Portal's ``/api/nous/recommended-models`` endpoint advertises which
-    models are free *right now* — independent of what the in-repo
-    ``_PROVIDER_MODELS["nous"]`` list happens to contain or whether the
-    docs-hosted catalog manifest has been rebuilt since the last release.
-
-    For free-tier users this is the source of truth: any model the Portal
-    flags as free should be selectable, even if the user is running an
-    older Hermes that doesn't ship that model in its hardcoded curated
-    list.  This function returns an augmented ``(model_ids, pricing)``
-    pair where:
-
-    * Portal free recommendations missing from ``curated_ids`` are
-      appended after the curated list (so the in-repo curated models
-      show first and Portal-only picks follow).
-    * ``pricing`` gets a synthetic ``{"prompt": "0", "completion": "0"}``
-      entry for any free recommendation missing from the live pricing
-      map, so :func:`partition_nous_models_by_tier` keeps it.
-
-    Failures (network, parse, missing field) are silent and degrade to
-    returning the inputs unchanged.
-    """
-    try:
-        payload = fetch_nous_recommended_models(
-            portal_base_url, force_refresh=force_refresh
-        )
-    except Exception:
-        return (list(curated_ids), dict(pricing))
-
-    free_block = payload.get("freeRecommendedModels") if isinstance(payload, dict) else None
-    if not isinstance(free_block, list) or not free_block:
-        return (list(curated_ids), dict(pricing))
-
-    portal_free_ids: list[str] = []
-    for entry in free_block:
-        name = _extract_model_name(entry)
-        if name:
-            portal_free_ids.append(name)
-    if not portal_free_ids:
-        return (list(curated_ids), dict(pricing))
-
-    augmented_pricing = dict(pricing)
-    free_synthetic = {"prompt": "0", "completion": "0"}
-    for mid in portal_free_ids:
-        if mid not in augmented_pricing:
-            augmented_pricing[mid] = dict(free_synthetic)
-
-    augmented_ids = list(curated_ids)
-    seen = set(augmented_ids)
-    # Append Portal free recommendations that aren't already curated, so the
-    # in-repo curated ("HA") models show first and Portal-only picks follow.
-    new_ones = [mid for mid in portal_free_ids if mid not in seen]
-    if new_ones:
-        augmented_ids = augmented_ids + new_ones
-
-    return (augmented_ids, augmented_pricing)
-
-
-def union_with_portal_paid_recommendations(
-    curated_ids: list[str],
-    pricing: dict[str, dict[str, str]],
-    portal_base_url: str = "",
-    *,
-    force_refresh: bool = False,
-) -> tuple[list[str], dict[str, dict[str, str]]]:
-    """Augment curated list with the Portal's ``paidRecommendedModels``.
-
-    Mirror of :func:`union_with_portal_free_recommendations` for paid-tier
-    users. The Portal's ``/api/nous/recommended-models`` endpoint advertises
-    which paid models are blessed *right now* — independent of what the
-    in-repo ``_PROVIDER_MODELS["nous"]`` list happens to contain or whether
-    the docs-hosted catalog manifest has been rebuilt since the last release.
-
-    For paid-tier users this lets newly-launched paid models surface in the
-    picker even if the user is running an older Hermes that doesn't ship
-    them in its hardcoded curated list. This function returns an augmented
-    ``(model_ids, pricing)`` pair where:
-
-    * Portal paid recommendations missing from ``curated_ids`` are
-      appended after the curated list (so the in-repo curated models
-      show first and Portal-only picks follow).
-    * ``pricing`` is left untouched — we deliberately do NOT synthesize
-      pricing entries for paid models. Live pricing is fetched separately
-      via :func:`get_pricing_for_provider`; if the live endpoint hasn't
-      published pricing yet, the picker shows a blank price column rather
-      than fabricating numbers. (The free helper synthesizes ``$0`` so
-      :func:`partition_nous_models_by_tier` keeps free models selectable;
-      no equivalent gating applies on the paid side, so synthesis would
-      only mislead the user.)
-
-    Failures (network, parse, missing field) are silent and degrade to
-    returning the inputs unchanged — never block the picker on a
-    Portal-side hiccup.
-    """
-    try:
-        payload = fetch_nous_recommended_models(
-            portal_base_url, force_refresh=force_refresh
-        )
-    except Exception:
-        return (list(curated_ids), dict(pricing))
-
-    paid_block = payload.get("paidRecommendedModels") if isinstance(payload, dict) else None
-    if not isinstance(paid_block, list) or not paid_block:
-        return (list(curated_ids), dict(pricing))
-
-    portal_paid_ids: list[str] = []
-    for entry in paid_block:
-        name = _extract_model_name(entry)
-        if name:
-            portal_paid_ids.append(name)
-    if not portal_paid_ids:
-        return (list(curated_ids), dict(pricing))
-
-    augmented_ids = list(curated_ids)
-    seen = set(augmented_ids)
-    # Append Portal paid recommendations that aren't already curated, so the
-    # in-repo curated ("HA") models show first and Portal-only picks follow.
-    new_ones = [mid for mid in portal_paid_ids if mid not in seen]
-    if new_ones:
-        augmented_ids = augmented_ids + new_ones
-
-    return (augmented_ids, dict(pricing))
-
-
 # ---------------------------------------------------------------------------
 # TTL cache for free-tier detection — avoids repeated API calls within a
 # session while still picking up upgrades quickly.
@@ -833,42 +701,8 @@ _FREE_TIER_CACHE_TTL: int = 180  # seconds (3 minutes)
 _free_tier_cache: tuple[bool, float] | None = None  # (result, timestamp)
 
 
-def check_nous_free_tier(*, force_fresh: bool = False) -> bool:
-    """Check if the current Nous Portal user is on a free (unpaid) tier.
-
-    Results are cached for ``_FREE_TIER_CACHE_TTL`` seconds to avoid
-    hitting the Portal API on every call.  The cache is short-lived so
-    that an account upgrade is reflected within a few minutes.
-
-    Returns True only when entitlement is known to be free.  Unknown/error
-    states return False so this compatibility wrapper does not block users.
-    """
-    global _free_tier_cache
-    now = time.monotonic()
-    if not force_fresh and _free_tier_cache is not None:
-        cached_result, cached_at = _free_tier_cache
-        if now - cached_at < _FREE_TIER_CACHE_TTL:
-            return cached_result
-
-    try:
-        from hermes_cli.nous_account import get_nous_portal_account_info
-
-        account_info = get_nous_portal_account_info(force_fresh=force_fresh)
-        result = account_info.is_free_tier
-        _free_tier_cache = (result, now)
-        return result
-    except Exception:
-        _free_tier_cache = (False, now)
-        return False  # default to paid on error — don't block users
-
-
-async def check_nous_free_tier_async(*, force_fresh: bool = False) -> bool:
-    """Resolve Nous entitlement without entering the synchronous model picker.
-
-    ``check_nous_free_tier`` remains the synchronous CLI/admin helper.  The
-    agent and auxiliary paths use this coroutine so account discovery stays on
-    the same event loop as the provider request.
-    """
+async def check_nous_free_tier(*, force_fresh: bool = False) -> bool:
+    """Resolve Nous entitlement on the active event loop."""
     global _free_tier_cache
     now = time.monotonic()
     if not force_fresh and _free_tier_cache is not None:
@@ -921,132 +755,13 @@ def _nous_recommended_disk_path() -> "Path":
     return get_hermes_home() / "cache" / "nous_recommended_cache.json"
 
 
-def _read_nous_recommended_disk(base: str) -> dict[str, Any] | None:
-    """Return the last-known-good payload for ``base`` from disk, or None.
-
-    The disk file is a JSON object keyed by portal base URL so staging and
-    prod don't collide:
-    ``{"<base>": {"data": {...}, "ts": <epoch_seconds>}}``.
-    """
-    try:
-        with open(_nous_recommended_disk_path(), encoding="utf-8") as fh:
-            blob = json.load(fh)
-    except (OSError, json.JSONDecodeError):
-        return None
-    if not isinstance(blob, dict):
-        return None
-    entry = blob.get(base)
-    if not isinstance(entry, dict):
-        return None
-    data = entry.get("data")
-    return data if isinstance(data, dict) and data else None
-
-
-def _write_nous_recommended_disk(base: str, data: dict[str, Any]) -> None:
-    """Persist ``data`` as the last-known-good payload for ``base``.
-
-    Merges into any existing per-base map, then writes atomically. Failures
-    are non-fatal (logged at debug) — the in-process cache still works.
-    """
-    if not data:
-        return
-    path = _nous_recommended_disk_path()
-    try:
-        try:
-            with open(path, encoding="utf-8") as fh:
-                blob = json.load(fh)
-            if not isinstance(blob, dict):
-                blob = {}
-        except (OSError, json.JSONDecodeError):
-            blob = {}
-        blob[base] = {"data": data, "ts": time.time()}
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(path.suffix + ".tmp")
-        with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump(blob, fh, indent=2)
-            fh.write("\n")
-        os.replace(tmp, path)
-    except OSError as exc:
-        import logging
-        logging.getLogger(__name__).debug(
-            "nous recommended-models disk cache write failed: %s", exc
-        )
-
-
-def fetch_nous_recommended_models(
+async def fetch_nous_recommended_models(
     portal_base_url: str = "",
     timeout: float = 5.0,
     *,
     force_refresh: bool = False,
 ) -> dict[str, Any]:
-    """Fetch the Nous Portal's curated recommended-models payload.
-
-    Hits ``<portal>/api/nous/recommended-models``. The endpoint is public —
-    no auth is required. Results are cached per portal URL for
-    ``_NOUS_RECOMMENDED_CACHE_TTL`` seconds in process; pass
-    ``force_refresh=True`` to bypass the in-process cache.
-
-    A successful live fetch is also persisted to a per-base disk cache
-    (``$HERMES_HOME/cache/nous_recommended_cache.json``) as last-known-good.
-    When the live fetch fails (network, parse, non-2xx) and the in-process
-    cache is empty, the disk copy is returned instead of ``{}`` — so a
-    transient Portal hiccup no longer silently drops the free/paid model
-    recommendations from the picker. Self-heals on the next successful fetch.
-
-    Returns the parsed JSON dict, or ``{}`` only when neither the network nor
-    any cache layer can supply data. Callers must treat missing/null fields
-    as "no recommendation" and fall back to their own default.
-    """
-    base = (portal_base_url or "https://portal.nousresearch.com").rstrip("/")
-    now = time.monotonic()
-    cached = _nous_recommended_cache.get(base)
-    if not force_refresh and cached is not None:
-        payload, cached_at = cached
-        if now - cached_at < _NOUS_RECOMMENDED_CACHE_TTL:
-            return payload
-
-    url = f"{base}{NOUS_RECOMMENDED_MODELS_PATH}"
-    try:
-        req = urllib.request.Request(
-            url,
-            headers={"Accept": "application/json"},
-        )
-        with _urlopen_model_catalog_request(req, timeout=timeout) as resp:
-            data = json.loads(resp.read().decode())
-        if not isinstance(data, dict):
-            data = {}
-    except Exception:
-        data = {}
-
-    if data:
-        # Live fetch succeeded — refresh both cache layers.
-        _nous_recommended_cache[base] = (data, now)
-        _write_nous_recommended_disk(base, data)
-        return data
-
-    # Live fetch failed. Fall back to the last-known-good disk copy so a
-    # transient Portal hiccup doesn't drop the recommendations entirely.
-    disk = _read_nous_recommended_disk(base)
-    if disk:
-        _nous_recommended_cache[base] = (disk, now)
-        return disk
-
-    _nous_recommended_cache[base] = (data, now)
-    return data
-
-
-async def fetch_nous_recommended_models_async(
-    portal_base_url: str = "",
-    timeout: float = 5.0,
-    *,
-    force_refresh: bool = False,
-) -> dict[str, Any]:
-    """Fetch Portal recommendations with native async HTTP and file I/O.
-
-    The synchronous function above is retained for model-picker/admin callers.
-    Runtime auxiliary calls must use this path; it deliberately does not call
-    the synchronous urllib or disk-cache helpers.
-    """
+    """Fetch Portal recommendations with native async HTTP and file I/O."""
     base = (portal_base_url or "https://portal.nousresearch.com").rstrip("/")
     now = time.monotonic()
     cached = _nous_recommended_cache.get(base)
@@ -1138,64 +853,7 @@ def _extract_model_name(entry: Any) -> Optional[str]:
     return None
 
 
-def get_nous_recommended_aux_model(
-    *,
-    vision: bool = False,
-    free_tier: Optional[bool] = None,
-    portal_base_url: str = "",
-    force_refresh: bool = False,
-) -> Optional[str]:
-    """Return the Portal's recommended model name for an auxiliary task.
-
-    Picks the best field from the Portal's recommended-models payload:
-
-    * ``vision=True``  → ``paidRecommendedVisionModel``  (paid tier) or
-                         ``freeRecommendedVisionModel``  (free tier)
-    * ``vision=False`` → ``paidRecommendedCompactionModel`` or
-                         ``freeRecommendedCompactionModel``
-
-    When ``free_tier`` is ``None`` (default) the user's tier is auto-detected
-    via :func:`check_nous_free_tier`. Pass an explicit bool to bypass the
-    detection — useful for tests or when the caller already knows the tier.
-
-    For paid-tier users we prefer the paid recommendation but gracefully fall
-    back to the free recommendation if the Portal returned ``null`` for the
-    paid field (common during the staged rollout of new paid models).
-
-    Returns ``None`` when every candidate is missing, null, or the fetch
-    fails — callers should fall back to their own default (currently
-    ``google/gemini-3-flash-preview``).
-    """
-    base = portal_base_url or _resolve_nous_portal_url()
-    payload = fetch_nous_recommended_models(base, force_refresh=force_refresh)
-    if not payload:
-        return None
-
-    if free_tier is None:
-        try:
-            free_tier = check_nous_free_tier()
-        except Exception:
-            # On any detection error, assume paid — paid users see both fields
-            # anyway so this is a safe default that maximises model quality.
-            free_tier = False
-
-    if vision:
-        paid_key, free_key = "paidRecommendedVisionModel", "freeRecommendedVisionModel"
-    else:
-        paid_key, free_key = "paidRecommendedCompactionModel", "freeRecommendedCompactionModel"
-
-    # Preference order:
-    #   free tier  → free only
-    #   paid tier  → paid, then free (if paid field is null)
-    candidates = [free_key] if free_tier else [paid_key, free_key]
-    for key in candidates:
-        name = _extract_model_name(payload.get(key))
-        if name:
-            return name
-    return None
-
-
-async def get_nous_recommended_aux_model_async(
+async def get_nous_recommended_aux_model(
     *,
     vision: bool = False,
     free_tier: Optional[bool] = None,
@@ -1204,13 +862,13 @@ async def get_nous_recommended_aux_model_async(
 ) -> Optional[str]:
     """Return the Portal recommendation for an async auxiliary call."""
     base = portal_base_url or _resolve_nous_portal_url()
-    payload = await fetch_nous_recommended_models_async(
+    payload = await fetch_nous_recommended_models(
         base, force_refresh=force_refresh
     )
     if not payload:
         return None
     if free_tier is None:
-        free_tier = await check_nous_free_tier_async()
+        free_tier = await check_nous_free_tier()
     if vision:
         paid_key, free_key = "paidRecommendedVisionModel", "freeRecommendedVisionModel"
     else:
@@ -1510,20 +1168,7 @@ PREFERRED_SILENT_DEFAULT_MODEL = "z-ai/glm-5.2"
 
 
 def get_preferred_silent_default_model(provider: str = "openrouter") -> str:
-    """Return the silent-default model id — catalog label first, constant second.
-
-    Reads the ``"default": true`` label from the cached remote catalog
-    (never hits the network — safe on hot resolution paths), falling back to
-    :data:`PREFERRED_SILENT_DEFAULT_MODEL` when no cached manifest exists or
-    the provider block carries no label.
-    """
-    try:
-        from hermes_cli.model_catalog import get_default_model_from_cache
-        labeled = get_default_model_from_cache(provider)
-        if labeled:
-            return labeled
-    except Exception:
-        pass
+    """Return the stable in-package silent-default model id."""
     return PREFERRED_SILENT_DEFAULT_MODEL
 
 
@@ -1628,74 +1273,9 @@ def fetch_openrouter_models(
     *,
     force_refresh: bool = False,
 ) -> list[tuple[str, str]]:
-    """Return the curated OpenRouter picker list, refreshed from the live catalog when possible."""
-    global _openrouter_catalog_cache
-
-    if _openrouter_catalog_cache is not None and not force_refresh:
-        return list(_openrouter_catalog_cache)
-
-    # Prefer the remotely-hosted catalog manifest; fall back to the in-repo
-    # snapshot when the manifest is unreachable. Both are curated lists that
-    # drive the picker; the OpenRouter live /v1/models filter (tool support,
-    # free pricing) is applied on top either way.
-    try:
-        from hermes_cli.model_catalog import get_curated_openrouter_models
-        remote = get_curated_openrouter_models()
-    except Exception:
-        remote = None
-    fallback = list(remote) if remote else list(OPENROUTER_MODELS)
-    preferred_ids = [mid for mid, _ in fallback]
-
-    try:
-        req = urllib.request.Request(
-            "https://openrouter.ai/api/v1/models",
-            headers={"Accept": "application/json"},
-        )
-        with _urlopen_model_catalog_request(req, timeout=timeout) as resp:
-            payload = json.loads(resp.read().decode())
-    except Exception:
-        return list(_openrouter_catalog_cache or fallback)
-
-    live_items = payload.get("data", [])
-    if not isinstance(live_items, list):
-        return list(_openrouter_catalog_cache or fallback)
-
-    live_by_id: dict[str, dict[str, Any]] = {}
-    for item in live_items:
-        if not isinstance(item, dict):
-            continue
-        mid = str(item.get("id") or "").strip()
-        if not mid:
-            continue
-        live_by_id[mid] = item
-
-    curated: list[tuple[str, str]] = []
-    silent_default = get_preferred_silent_default_model("openrouter")
-    for preferred_id in preferred_ids:
-        live_item = live_by_id.get(preferred_id)
-        if live_item is None:
-            continue
-        # Hide models that don't advertise tool-calling support — hermes-agent
-        # requires it and surfacing them leads to immediate runtime failures
-        # when the user selects them. Ported from Kilo-Org/kilocode#9068.
-        if not _openrouter_model_supports_tools(live_item):
-            continue
-        if preferred_id == silent_default:
-            # Keep the silent-default badge through the live refresh so the
-            # picker shows which model Hermes lands on when none is selected.
-            desc = "default"
-        else:
-            desc = "free" if _openrouter_model_is_free(live_item.get("pricing")) else ""
-        curated.append((preferred_id, desc))
-
-    if not curated:
-        return list(_openrouter_catalog_cache or fallback)
-
-    first_id, first_desc = curated[0]
-    if not first_desc:
-        curated[0] = (first_id, "recommended")
-    _openrouter_catalog_cache = curated
-    return list(curated)
+    """Return the stable in-package OpenRouter catalog without network I/O."""
+    del timeout, force_refresh
+    return list(OPENROUTER_MODELS)
 
 
 def model_ids(*, force_refresh: bool = False) -> list[str]:
@@ -1704,20 +1284,7 @@ def model_ids(*, force_refresh: bool = False) -> list[str]:
 
 
 def get_curated_nous_model_ids() -> list[str]:
-    """Return the curated Nous Portal model-id list.
-
-    Prefers the remotely-hosted catalog manifest (published under
-    ``website/static/api/model-catalog.json``); falls back to the in-repo
-    snapshot in ``_PROVIDER_MODELS["nous"]`` when the manifest is
-    unreachable. Always returns a list (never None).
-    """
-    try:
-        from hermes_cli.model_catalog import get_curated_nous_models
-        remote = get_curated_nous_models()
-    except Exception:
-        remote = None
-    if remote:
-        return list(remote)
+    """Return the curated in-package Nous Portal model-id list."""
     return list(_PROVIDER_MODELS.get("nous", []))
 
 
@@ -2755,64 +2322,6 @@ def resolve_fast_mode_overrides(model_id: Optional[str]) -> dict[str, Any] | Non
     return {"service_tier": "priority"}
 
 
-def _resolve_copilot_catalog_api_key() -> str:
-    """Best-effort GitHub token for fetching the Copilot model catalog.
-
-    Resolution order:
-      1. ``resolve_api_key_provider_credentials("copilot")`` — env vars
-         (``COPILOT_GITHUB_TOKEN`` / ``GH_TOKEN`` / ``GITHUB_TOKEN``) plus
-         the ``gh auth token`` CLI fallback.
-      2. ``read_credential_pool("copilot")`` — a token (typically a
-         ``gho_*`` from device-code login, or a fine-grained PAT) stored in
-         ``auth.json`` under ``credential_pool.copilot[]``. The pool is
-         populated by ``hermes auth add copilot`` and by ``_seed_from_env``
-         when the env var is set in ``~/.hermes/.env``.
-
-    Without (2), users whose only Copilot credential is in the pool see
-    the ``/model`` picker fall back to a stale hardcoded list because the
-    live catalog fetch silently 401s. To avoid wedging on a malformed pool
-    entry, each candidate is exchanged via ``exchange_copilot_token`` —
-    only entries that actually exchange successfully are returned, so a
-    later valid entry is reachable when an earlier one is unsupported.
-    """
-    try:
-        from hermes_cli.auth import resolve_api_key_provider_credentials
-
-        creds = resolve_api_key_provider_credentials("copilot")
-        api_key = str(creds.get("api_key") or "").strip()
-        if api_key:
-            return api_key
-    except Exception:
-        pass
-
-    try:
-        from hermes_cli.auth import read_credential_pool
-        from hermes_cli.copilot_auth import (
-            exchange_copilot_token,
-            validate_copilot_token,
-        )
-
-        for entry in read_credential_pool("copilot"):
-            if not isinstance(entry, dict):
-                continue
-            raw = str(entry.get("access_token") or "").strip()
-            if not raw:
-                continue
-            valid, _ = validate_copilot_token(raw)
-            if not valid:
-                continue
-            try:
-                api_token, _expires_at = exchange_copilot_token(raw)
-            except Exception:
-                continue
-            if api_token:
-                return api_token
-    except Exception:
-        pass
-
-    return ""
-
-
 # Providers where models.dev is treated as authoritative: curated static
 # lists are kept only as an offline fallback and to capture custom additions
 # the registry doesn't publish yet. Adding a provider here causes its
@@ -2932,14 +2441,7 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
     if normalized == "xai-oauth":
         return list(_PROVIDER_MODELS.get("xai-oauth", _PROVIDER_MODELS.get("xai", [])))
     if normalized in {"copilot", "copilot-acp"}:
-        try:
-            live = _fetch_github_models(_resolve_copilot_catalog_api_key())
-            if live:
-                return live
-        except Exception:
-            pass
-        if normalized == "copilot-acp":
-            return list(_PROVIDER_MODELS.get("copilot", []))
+        return list(_PROVIDER_MODELS.get("copilot", []))
     if normalized == "nous":
         # Try live Nous Portal /models endpoint
         try:

@@ -1047,10 +1047,9 @@ class TestApprovalTimeoutIsNotConsent:
             lambda: {"mode": "manual", "timeout": seconds},
         )
 
-    def test_timeout_blocks_with_no_consent_and_timeout_hook(self, monkeypatch):
+    def test_timeout_blocks_with_no_consent(self, monkeypatch):
         """The reported #24912 scenario — user never responds, agent must see
-        BLOCKED, and the post hook must distinguish timeout from deny so audit
-        plugins can alert on 'agent asked, user never replied'."""
+        a fail-closed result that distinguishes timeout from an explicit deny."""
         from tools import approval as mod
 
         self._force_short_timeout(monkeypatch)
@@ -1058,15 +1057,6 @@ class TestApprovalTimeoutIsNotConsent:
         # Slack-shaped: notify_cb registered, but user doesn't respond.
         notified = []
         mod.register_gateway_notify(self.SESSION_KEY, lambda data: notified.append(data))
-
-        hook_calls = []
-        original_fire = mod._fire_approval_hook
-
-        def _capture(event_name, **kwargs):
-            hook_calls.append((event_name, kwargs))
-            return original_fire(event_name, **kwargs)
-
-        monkeypatch.setattr(mod, "_fire_approval_hook", _capture)
 
         result = mod.check_all_command_guards("rm -rf .git", "local")
 
@@ -1086,12 +1076,6 @@ class TestApprovalTimeoutIsNotConsent:
         assert "retry" in msg.lower()
         assert "rephrase" in msg.lower()
         assert "different command" in msg.lower()
-
-        posts = [c for c in hook_calls if c[0] == "post_approval_response"]
-        assert posts, "post_approval_response hook did not fire"
-        assert posts[-1][1].get("choice") == "timeout", (
-            f"hook choice should be 'timeout' on no-response, got {posts[-1][1].get('choice')!r}"
-        )
 
     def test_explicit_deny_carries_same_no_consent_shape(self, monkeypatch):
         """An explicit /deny must produce the same shape as timeout —

@@ -1,7 +1,7 @@
 """Tests for hermes_cli.copilot_auth — Copilot token validation and resolution."""
 
 import pytest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 
 class TestTokenValidation:
@@ -19,26 +19,31 @@ class TestResolveToken:
     """Token resolution with env var priority."""
 
 
-    def test_gh_token_second_priority(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_gh_token_second_priority(self, monkeypatch):
         from hermes_cli.copilot_auth import resolve_copilot_token
         monkeypatch.delenv("COPILOT_GITHUB_TOKEN", raising=False)
         monkeypatch.setenv("GH_TOKEN", "gho_gh_second")
         monkeypatch.setenv("GITHUB_TOKEN", "gho_github_third")
-        token, source = resolve_copilot_token()
+        token, source = await resolve_copilot_token()
         assert token == "gho_gh_second"
         assert source == "GH_TOKEN"
 
 
 
 
-    def test_gh_cli_classic_pat_raises(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_gh_cli_classic_pat_raises(self, monkeypatch):
         from hermes_cli.copilot_auth import resolve_copilot_token
         monkeypatch.delenv("COPILOT_GITHUB_TOKEN", raising=False)
         monkeypatch.delenv("GH_TOKEN", raising=False)
         monkeypatch.delenv("GITHUB_TOKEN", raising=False)
-        with patch("hermes_cli.copilot_auth._try_gh_cli_token", return_value="ghp_classic"):
+        with patch(
+            "hermes_cli.copilot_auth._try_gh_cli_token",
+            new=AsyncMock(return_value="ghp_classic"),
+        ):
             with pytest.raises(ValueError, match="classic PAT"):
-                resolve_copilot_token()
+                await resolve_copilot_token()
 
 
 class TestRequestHeaders:
@@ -105,4 +110,3 @@ class TestEnvVarOrder:
         assert "COPILOT_GITHUB_TOKEN" in copilot.api_key_env_vars
         # COPILOT_GITHUB_TOKEN should be first
         assert copilot.api_key_env_vars[0] == "COPILOT_GITHUB_TOKEN"
-

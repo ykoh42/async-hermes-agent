@@ -39,7 +39,6 @@ import inspect
 import logging
 import os
 import sys
-import threading
 import types
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -170,22 +169,6 @@ VALID_HOOKS: Set[str] = {
     #   {"action": "allow"}  /  None             -> normal dispatch
     # Kwargs: event: MessageEvent, gateway: GatewayRunner, session_store.
     "pre_gateway_dispatch",
-    # Approval lifecycle hooks. Fired by tools/approval.py when a dangerous
-    # command needs an approval decision -- fires for CLI-interactive prompts,
-    # gateway/ACP approvals, and smart-mode auxiliary-LLM decisions.
-    # Observers only: return values are ignored. Plugins cannot veto or
-    # pre-answer an approval from these hooks (use pre_tool_call to block
-    # a tool before it reaches approval).
-    #
-    # Kwargs for pre_approval_request:
-    #   command: str, description: str, pattern_key: str, pattern_keys: list[str],
-    #   session_key: str, surface: "cli" | "gateway" | "smart"
-    # Kwargs for post_approval_response: same as above plus
-    #   choice: "once" | "session" | "always" | "deny" | "timeout"
-    #           | "smart_approve" | "smart_deny"
-    #   decided_by: "aux_llm"  -- only on surface="smart"
-    "pre_approval_request",
-    "post_approval_response",
     # Kanban task lifecycle hooks. Fired by hermes_cli.kanban_db when a task
     # transitions state, AFTER the change is committed to the board DB (so the
     # hook always sees durable state and a slow plugin can never hold the
@@ -517,31 +500,6 @@ class PluginContext:
             cli._pending_input.put(msg)
         return True
 
-    # -- CLI command registration --------------------------------------------
-
-    def register_cli_command(
-        self,
-        name: str,
-        help: str,
-        setup_fn: Callable,
-        handler_fn: Callable | None = None,
-        description: str = "",
-    ) -> None:
-        """Register a CLI subcommand (e.g. ``hermes honcho ...``).
-
-        The *setup_fn* receives an argparse subparser and should add any
-        arguments/sub-subparsers.  If *handler_fn* is provided it is set
-        as the default dispatch function via ``set_defaults(func=...)``."""
-        self._manager._cli_commands[name] = {
-            "name": name,
-            "help": help,
-            "description": description,
-            "setup_fn": setup_fn,
-            "handler_fn": handler_fn,
-            "plugin": self.manifest.name,
-        }
-        logger.debug("Plugin %s registered CLI command: %s", self.manifest.name, name)
-
     # -- slash command registration -------------------------------------------
 
     def register_command(
@@ -555,10 +513,6 @@ class PluginContext:
 
         The handler signature is ``fn(raw_args: str) -> str | None``.
         It may also be an async callable — the gateway dispatch handles both.
-
-        Unlike ``register_cli_command()`` (which creates ``hermes <subcommand>``
-        terminal commands), this registers in-session slash commands that users
-        invoke during a conversation.
 
         ``args_hint`` is an optional short string (e.g. ``"<file>"`` or
         ``"dias:7 formato:json"``) used by gateway adapters to surface the
@@ -1232,7 +1186,6 @@ class PluginManager:
         self._middleware: Dict[str, List[Callable]] = {}
         self._plugin_tool_names: Set[str] = set()
         self._plugin_platform_names: Set[str] = set()
-        self._cli_commands: Dict[str, dict] = {}
         self._context_engine = None  # Set by a plugin via register_context_engine()
         self._plugin_commands: Dict[str, dict] = {}  # Slash commands registered by plugins
         self._discovered: bool = False
@@ -1273,7 +1226,6 @@ class PluginManager:
             self._middleware.clear()
             self._plugin_tool_names.clear()
             self._plugin_platform_names.clear()
-            self._cli_commands.clear()
             self._plugin_commands.clear()
             self._plugin_skills.clear()
             self._aux_tasks.clear()
@@ -1788,15 +1740,11 @@ class PluginManager:
                 ]
                 loaded.enabled = True
                 logger.debug(
-                    "  registered: %d tool(s), %d hook(s), %d middleware, %d slash command(s), %d CLI command(s)",
+                    "  registered: %d tool(s), %d hook(s), %d middleware, %d slash command(s)",
                     len(loaded.tools_registered),
                     len(loaded.hooks_registered),
                     len(loaded.middleware_registered),
                     len(loaded.commands_registered),
-                    sum(
-                        1 for c in self._cli_commands
-                        if self._cli_commands[c].get("plugin") == manifest.name
-                    ),
                 )
 
         except Exception as exc:
@@ -1867,44 +1815,7 @@ class PluginManager:
     # Hook invocation
     # -----------------------------------------------------------------------
 
-    def invoke_hook(self, hook_name: str, **kwargs: Any) -> List[Any]:
-        """Call all registered callbacks for *hook_name*.
-
-        Each callback is wrapped in its own try/except so a misbehaving
-        plugin cannot break the core agent loop.
-
-        Returns a list of non-``None`` return values from callbacks.
-
-        For ``pre_llm_call``, callbacks may return a dict describing
-        context to inject into the current turn's user message::
-
-            {"context": "recalled text..."}
-            "recalled text..."          # plain string, equivalent
-
-        Context is ALWAYS injected into the user message, never the
-        system prompt.  This preserves the prompt cache prefix — the
-        system prompt stays identical across turns so cached tokens
-        are reused.  All injected context is ephemeral — never
-        persisted to session DB.
-        """
-        kwargs.setdefault("telemetry_schema_version", OBSERVER_SCHEMA_VERSION)
-        callbacks = self._hooks.get(hook_name, [])
-        results: List[Any] = []
-        for cb in callbacks:
-            try:
-                ret = cb(**kwargs)
-                if ret is not None:
-                    results.append(ret)
-            except Exception as exc:
-                logger.warning(
-                    "Hook '%s' callback %s raised: %s",
-                    hook_name,
-                    getattr(cb, "__name__", repr(cb)),
-                    exc,
-                )
-        return results
-
-    async def invoke_hook_async(self, hook_name: str, **kwargs: Any) -> List[Any]:
+    async def invoke_hook(self, hook_name: str, **kwargs: Any) -> List[Any]:
         """Invoke lifecycle hooks through the native async plugin contract.
 
         An async agent cannot safely guess whether a third-party synchronous
@@ -2056,21 +1967,13 @@ def discover_plugins(force: bool = False) -> None:
     get_plugin_manager().discover_and_load(force=force)
 
 
-def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
-    """Invoke a lifecycle hook on loaded plugins.
-
-    Returns a list of non-``None`` return values from plugin callbacks.
-    """
-    return get_plugin_manager().invoke_hook(hook_name, **kwargs)
-
-
 class AsyncPluginCapabilityError(RuntimeError):
     """Raised when an unconverted plugin reaches the native async runtime."""
 
 
-async def invoke_hook_async(hook_name: str, **kwargs: Any) -> List[Any]:
+async def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
     """Await native lifecycle hooks without a sync compatibility bridge."""
-    return await get_plugin_manager().invoke_hook_async(hook_name, **kwargs)
+    return await get_plugin_manager().invoke_hook(hook_name, **kwargs)
 
 
 def invoke_middleware(kind: str, **kwargs: Any) -> List[Any]:
@@ -2095,85 +1998,11 @@ def has_hook(hook_name: str) -> bool:
     return get_plugin_manager().has_hook(hook_name)
 
 
-_thread_tool_whitelist = threading.local()
-
-
 @dataclass(frozen=True)
 class _PreToolCallDirective:
     action: Optional[str] = None
     message: Optional[str] = None
     rule_key: Optional[str] = None
-
-
-def set_thread_tool_whitelist(
-    allowed: Optional[Set[str]],
-    deny_msg_fmt: str = "Tool '{tool_name}' denied: not in this thread's tool whitelist",
-) -> None:
-    _thread_tool_whitelist.allowed = allowed
-    _thread_tool_whitelist.fmt = deny_msg_fmt
-
-
-def clear_thread_tool_whitelist() -> None:
-    _thread_tool_whitelist.allowed = None
-
-
-def _get_pre_tool_call_directive_details(
-    tool_name: str,
-    args: Optional[Dict[str, Any]],
-    task_id: str = "",
-    session_id: str = "",
-    tool_call_id: str = "",
-    turn_id: str = "",
-    api_request_id: str = "",
-    middleware_trace: Optional[List[Dict[str, Any]]] = None,
-) -> _PreToolCallDirective:
-    """Check ``pre_tool_call`` hooks for a blocking or approval directive.
-
-    Plugins that need to enforce policy (rate limiting, security
-    restrictions, approval workflows) can return one of::
-
-        {"action": "block",   "message": "Reason the tool was blocked"}
-        {"action": "approve", "message": "Why this needs human confirmation"}
-        {"action": "approve", "message": "...", "rule_key": "write_file:ssh"}
-
-    from their ``pre_tool_call`` callback.
-
-    - ``block`` vetoes the tool call outright (the message becomes the tool
-      result the model sees).
-    - ``approve`` ESCALATES to the existing human-approval gate
-      (``prompt_dangerous_approval`` on CLI, the approval callback on the
-      gateway) — the same mechanism Tier-2 dangerous shell patterns use.
-      This lets a plugin require a human ``[o]nce/[s]ession/[a]lways/[d]eny``
-      decision on ANY tool, not just terminal command strings. The caller is
-      responsible for invoking the gate (see
-      :func:`tools.approval.request_tool_approval`).
-    - ``rule_key`` is optional and only honored for ``approve`` directives. It
-      lets plugins choose the allowlist grain for `[a]lways` approvals.
-
-    The first valid directive wins. Invalid or irrelevant hook return values
-    are silently ignored so existing observer-only hooks are unaffected.
-    """
-    allowed = getattr(_thread_tool_whitelist, "allowed", None)
-    if allowed is not None and tool_name not in allowed:
-        fmt = getattr(_thread_tool_whitelist, "fmt", "Tool '{tool_name}' denied")
-        return _PreToolCallDirective(
-            action="block",
-            message=fmt.format(tool_name=tool_name),
-        )
-
-    hook_results = invoke_hook(
-        "pre_tool_call",
-        tool_name=tool_name,
-        args=args if isinstance(args, dict) else {},
-        task_id=task_id,
-        session_id=session_id,
-        tool_call_id=tool_call_id,
-        turn_id=turn_id,
-        api_request_id=api_request_id,
-        middleware_trace=list(middleware_trace or []),
-    )
-
-    return _first_pre_tool_call_directive(hook_results)
 
 
 def _first_pre_tool_call_directive(hook_results: List[Any]) -> _PreToolCallDirective:
@@ -2199,7 +2028,7 @@ def _first_pre_tool_call_directive(hook_results: List[Any]) -> _PreToolCallDirec
     return _PreToolCallDirective()
 
 
-async def _get_pre_tool_call_directive_details_async(
+async def _get_pre_tool_call_directive_details(
     tool_name: str,
     args: Optional[Dict[str, Any]],
     task_id: str = "",
@@ -2209,16 +2038,8 @@ async def _get_pre_tool_call_directive_details_async(
     api_request_id: str = "",
     middleware_trace: Optional[List[Dict[str, Any]]] = None,
 ) -> _PreToolCallDirective:
-    """Async equivalent of the policy hook lookup used by tool dispatch."""
-    allowed = getattr(_thread_tool_whitelist, "allowed", None)
-    if allowed is not None and tool_name not in allowed:
-        fmt = getattr(_thread_tool_whitelist, "fmt", "Tool '{tool_name}' denied")
-        return _PreToolCallDirective(
-            action="block",
-            message=fmt.format(tool_name=tool_name),
-        )
-
-    hook_results = await invoke_hook_async(
+    """Check async ``pre_tool_call`` hooks for a policy directive."""
+    hook_results = await invoke_hook(
         "pre_tool_call",
         tool_name=tool_name,
         args=args if isinstance(args, dict) else {},
@@ -2232,7 +2053,7 @@ async def _get_pre_tool_call_directive_details_async(
     return _first_pre_tool_call_directive(hook_results)
 
 
-def get_pre_tool_call_directive(
+async def get_pre_tool_call_directive(
     tool_name: str,
     args: Optional[Dict[str, Any]],
     task_id: str = "",
@@ -2249,7 +2070,7 @@ def get_pre_tool_call_directive(
     that need approve-specific metadata use
     :func:`_get_pre_tool_call_directive_details`.
     """
-    details = _get_pre_tool_call_directive_details(
+    details = await _get_pre_tool_call_directive_details(
         tool_name, args, task_id=task_id, session_id=session_id,
         tool_call_id=tool_call_id, turn_id=turn_id,
         api_request_id=api_request_id, middleware_trace=middleware_trace,
@@ -2257,7 +2078,7 @@ def get_pre_tool_call_directive(
     return (details.action, details.message)
 
 
-def get_pre_tool_call_block_message(
+async def get_pre_tool_call_block_message(
     tool_name: str,
     args: Optional[Dict[str, Any]],
     task_id: str = "",
@@ -2267,22 +2088,21 @@ def get_pre_tool_call_block_message(
     api_request_id: str = "",
     middleware_trace: Optional[List[Dict[str, Any]]] = None,
 ) -> Optional[str]:
-    """Back-compat shim: return only a ``block`` message (or ``None``).
-
-    Deprecated in favor of :func:`get_pre_tool_call_directive`, which also
-    surfaces the ``approve`` escalation directive. Kept so any external caller
-    importing the old name keeps working; ``approve`` directives are invisible
-    to this shim (it only reports blocks).
-    """
-    directive, message = get_pre_tool_call_directive(
-        tool_name, args, task_id=task_id, session_id=session_id,
-        tool_call_id=tool_call_id, turn_id=turn_id,
-        api_request_id=api_request_id, middleware_trace=middleware_trace,
+    """Return a plugin's async ``pre_tool_call`` block message, if any."""
+    directive, message = await get_pre_tool_call_directive(
+        tool_name,
+        args,
+        task_id=task_id,
+        session_id=session_id,
+        tool_call_id=tool_call_id,
+        turn_id=turn_id,
+        api_request_id=api_request_id,
+        middleware_trace=middleware_trace,
     )
     return message if directive == "block" else None
 
 
-def resolve_pre_tool_block(
+async def resolve_pre_tool_block(
     tool_name: str,
     args: Optional[Dict[str, Any]],
     task_id: str = "",
@@ -2292,64 +2112,8 @@ def resolve_pre_tool_block(
     api_request_id: str = "",
     middleware_trace: Optional[List[Dict[str, Any]]] = None,
 ) -> Optional[str]:
-    """Resolve the pre_tool_call directive to a final block message (or None).
-
-    Single entry point for every tool-dispatch site: fetches the plugin
-    directive and, for an ``approve`` escalation, invokes the human-approval
-    gate (:func:`tools.approval.request_tool_approval`). Returns the message
-    the tool result should carry when the call is blocked, or ``None`` when
-    the call may proceed.
-
-    Centralizing this keeps the security-critical fail-closed logic in ONE
-    place instead of copy-pasted across the concurrent/sequential/helper
-    dispatch paths: an ``approve`` directive whose gate errors, denies, or
-    times out is fail-closed to a block; ``block`` blocks with its message;
-    anything else proceeds.
-    """
-    details = _get_pre_tool_call_directive_details(
-        tool_name, args, task_id=task_id, session_id=session_id,
-        tool_call_id=tool_call_id, turn_id=turn_id,
-        api_request_id=api_request_id, middleware_trace=middleware_trace,
-    )
-    if details.action == "block":
-        return details.message
-    if details.action == "approve":
-        try:
-            from tools.approval import request_tool_approval
-            result = request_tool_approval(
-                tool_name,
-                details.message or "",
-                rule_key=details.rule_key or tool_name,
-            )
-        except Exception:
-            # Fail-closed: if the gate itself errors, block rather than
-            # silently execute an action a plugin flagged for approval.
-            return f"BLOCKED: plugin approval gate failed for {tool_name}"
-        if not result.get("approved"):
-            return str(
-                result.get("message")
-                or f"BLOCKED: plugin approval required for {tool_name}"
-            )
-    return None
-
-
-async def resolve_pre_tool_block_async(
-    tool_name: str,
-    args: Optional[Dict[str, Any]],
-    task_id: str = "",
-    session_id: str = "",
-    tool_call_id: str = "",
-    turn_id: str = "",
-    api_request_id: str = "",
-    middleware_trace: Optional[List[Dict[str, Any]]] = None,
-) -> Optional[str]:
-    """Resolve a native pre-tool policy directive without blocking the loop.
-
-    Approval escalation stays fail-closed until the approval callback itself
-    has been migrated.  A synchronous prompt must never freeze all other
-    conversations on the shared event loop.
-    """
-    details = await _get_pre_tool_call_directive_details_async(
+    """Resolve a pre-tool policy directive through the async approval callback."""
+    details = await _get_pre_tool_call_directive_details(
         tool_name,
         args,
         task_id=task_id,
@@ -2362,14 +2126,47 @@ async def resolve_pre_tool_block_async(
     if details.action == "block":
         return details.message
     if details.action == "approve":
-        return (
-            f"BLOCKED: plugin approval for {tool_name} requires an async "
-            "approval callback"
-        )
+        from tools.terminal_tool import _get_approval_callback
+
+        callback = _get_approval_callback()
+        if callback is None:
+            return f"BLOCKED: plugin approval required for {tool_name}"
+        try:
+            decision = callback(
+                tool_name=tool_name,
+                reason=details.message or "",
+                rule_key=details.rule_key or tool_name,
+                args=args if isinstance(args, dict) else {},
+                task_id=task_id,
+                session_id=session_id,
+            )
+            if not inspect.isawaitable(decision):
+                raise AsyncPluginCapabilityError(
+                    "Async Hermes requires a coroutine approval callback"
+                )
+            decision = await decision
+        except AsyncPluginCapabilityError:
+            raise
+        except Exception:
+            logger.exception("Plugin approval callback failed for %s", tool_name)
+            return f"BLOCKED: plugin approval callback failed for {tool_name}"
+
+        approved = decision is True or str(decision).strip().lower() in {
+            "approve",
+            "approved",
+            "allow",
+            "yes",
+        }
+        if not approved:
+            return str(
+                decision.get("message")
+                if isinstance(decision, dict) and decision.get("message")
+                else f"BLOCKED: plugin approval denied for {tool_name}"
+            )
     return None
 
 
-def get_pre_verify_continue_message(
+async def get_pre_verify_continue_message(
     *,
     session_id: str = "",
     platform: str = "",
@@ -2396,7 +2193,7 @@ def get_pre_verify_continue_message(
     self-throttle (``if attempt`` …), the same way a ``pre_tool_call`` hook
     scopes on ``tool_name``.
     """
-    hook_results = invoke_hook(
+    hook_results = await invoke_hook(
         "pre_verify",
         session_id=session_id,
         platform=platform,

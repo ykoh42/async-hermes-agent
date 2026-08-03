@@ -7,7 +7,7 @@ continuation prompt back into the same session and keeps working until the
 goal is done, turn budget is exhausted, the user pauses/clears it, or the
 user sends a new message (which takes priority and pauses the goal loop).
 
-State is persisted in ``AsyncSessionDB``'s ``state_meta`` table keyed by
+State is persisted in ``SessionDB``'s ``state_meta`` table keyed by
 ``goal:<session_id>`` so ``/resume`` picks it up.
 
 Design notes / invariants:
@@ -492,7 +492,7 @@ class GoalState:
 
 
 # ──────────────────────────────────────────────────────────────────────
-# Persistence (AsyncSessionDB state_meta)
+# Persistence (SessionDB state_meta)
 # ──────────────────────────────────────────────────────────────────────
 
 
@@ -503,21 +503,21 @@ def _meta_key(session_id: str) -> str:
 async def _get_session_db() -> Optional[Any]:
     """Return the native async session store for the current HERMES_HOME.
 
-    ``AsyncSessionDB`` opens its aiosqlite connection lazily, so constructing
+    ``SessionDB`` opens its aiosqlite connection lazily, so constructing
     the instance here does not perform blocking I/O. Callers own the returned
     store and must close it after the operation so an aiosqlite worker cannot
     outlive the agent or command that used it.
     """
     try:
-        from hermes_state import AsyncSessionDB, _default_db_path
+        from hermes_state import SessionDB, _default_db_path
     except Exception as exc:  # pragma: no cover
-        logger.debug("GoalManager: AsyncSessionDB bootstrap failed (%s)", exc)
+        logger.debug("GoalManager: SessionDB bootstrap failed (%s)", exc)
         return None
 
     try:
-        return AsyncSessionDB(_default_db_path())
+        return SessionDB(_default_db_path())
     except Exception as exc:  # pragma: no cover
-        logger.debug("GoalManager: AsyncSessionDB construction failed (%s)", exc)
+        logger.debug("GoalManager: SessionDB construction failed (%s)", exc)
         return None
 
 

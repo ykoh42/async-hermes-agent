@@ -30,11 +30,11 @@ from agent.conversation_compression import (
     _persist_compression_guards,
 )
 from agent.context_compressor import ContextCompressor
-from hermes_state import AsyncSessionDB
+from hermes_state import SessionDB
 
 
 def _build_agent_with_db(
-    db: AsyncSessionDB, session_id: str, platform: str = "telegram"
+    db: SessionDB, session_id: str, platform: str = "telegram"
 ):
     with patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}):
         from run_agent import AIAgent
@@ -76,7 +76,7 @@ def _msgs(n=20):
 
 
 def _bound_context_compressor(
-    db: AsyncSessionDB, session_id: str
+    db: SessionDB, session_id: str
 ) -> ContextCompressor:
     with patch(
         "agent.context_compressor.get_static_context_length",
@@ -95,7 +95,7 @@ def _bound_context_compressor(
 
 @pytest_asyncio.fixture
 async def refresh_state_db(tmp_path: Path):
-    db = AsyncSessionDB(tmp_path / "state.db")
+    db = SessionDB(tmp_path / "state.db")
     try:
         yield db
     finally:
@@ -105,7 +105,7 @@ async def refresh_state_db(tmp_path: Path):
 class TestGoalMigratesOnRotation:
     @pytest.mark.asyncio
     async def test_goal_follows_compression_rotation(self, tmp_path: Path):
-        db = AsyncSessionDB(tmp_path / "state.db")
+        db = SessionDB(tmp_path / "state.db")
         parent = "PARENT_GOAL_ROT"
         await db.create_session(parent, source="cli")
         agent = _build_agent_with_db(db, parent)
@@ -119,7 +119,7 @@ class TestGoalMigratesOnRotation:
                 goals,
                 "_get_session_db",
                 new_callable=AsyncMock,
-                side_effect=lambda: AsyncSessionDB(tmp_path / "state.db"),
+                side_effect=lambda: SessionDB(tmp_path / "state.db"),
             ):
                 await goals.save_goal(parent, goals.GoalState(goal="finish the migration"))
 
@@ -139,7 +139,7 @@ class TestGoalMigratesOnRotation:
 class TestOrphanRollbackOnCreateFailure:
     @pytest.mark.asyncio
     async def test_rolls_back_to_parent_when_child_create_fails(self, tmp_path: Path):
-        db = AsyncSessionDB(tmp_path / "state.db")
+        db = SessionDB(tmp_path / "state.db")
         parent = "PARENT_ORPHAN_ROT"
         await db.create_session(parent, source="cli")
         agent = _build_agent_with_db(db, parent)
@@ -160,7 +160,7 @@ class TestOrphanRollbackOnCreateFailure:
             raise RuntimeError("simulated atomic publication failure")
 
         with patch(
-            "hermes_state.AsyncSessionDB.publish_compression_child",
+            "hermes_state.SessionDB.publish_compression_child",
             side_effect=_boom,
         ):
             returned, _system_prompt = await agent._compress_context(
@@ -187,7 +187,7 @@ class TestWorkspaceMetadataFollowsRotation:
         and assert the child session row carries the parent's workspace and
         gateway-origin metadata, so the project sidebar entry and the peer
         routing mapping both survive the compaction boundary."""
-        db = AsyncSessionDB(tmp_path / "state.db")
+        db = SessionDB(tmp_path / "state.db")
         parent = "PARENT_CWD_ROT"
         await db.create_session(
             parent,
@@ -226,7 +226,7 @@ class TestWorkspaceMetadataFollowsRotation:
 class TestPlatformForwardedAtBoundary:
     @pytest.mark.asyncio
     async def test_on_session_start_receives_platform(self, tmp_path: Path):
-        db = AsyncSessionDB(tmp_path / "state.db")
+        db = SessionDB(tmp_path / "state.db")
         parent = "PARENT_PLATFORM_ROT"
         await db.create_session(parent, source="telegram")
         agent = _build_agent_with_db(db, parent, platform="telegram")
@@ -247,7 +247,7 @@ class TestPlatformForwardedAtBoundary:
 class TestFallbackStreakFollowsRotation:
     @pytest.mark.asyncio
     async def test_fallback_boundary_persists_on_child_session(self, tmp_path: Path):
-        db = AsyncSessionDB(tmp_path / "state.db")
+        db = SessionDB(tmp_path / "state.db")
         parent = "PARENT_FALLBACK_ROT"
         await db.create_session(parent, source="telegram")
         with patch(
@@ -302,7 +302,7 @@ class TestFallbackStreakFollowsRotation:
 
     @pytest.mark.asyncio
     async def test_real_rotation_records_fallback_after_lifecycle_rebind(self, tmp_path: Path):
-        db = AsyncSessionDB(tmp_path / "state.db")
+        db = SessionDB(tmp_path / "state.db")
         parent = "PARENT_REAL_FALLBACK_ROT"
         await db.create_session(parent, source="telegram")
         agent = _build_agent_with_db(db, parent, platform="telegram")
@@ -351,7 +351,7 @@ class TestAutomaticCompressionStateRefreshAfterLock:
     @pytest.mark.asyncio
     async def test_prebound_agent_rejects_parent_rotated_before_lock_acquisition(
         self,
-        refresh_state_db: AsyncSessionDB,
+        refresh_state_db: SessionDB,
     ):
         db = refresh_state_db
         parent_id = "STALE_ROTATED_PARENT"
@@ -407,7 +407,7 @@ class TestAutomaticCompressionStateRefreshAfterLock:
     @pytest.mark.asyncio
     async def test_prebound_agent_drops_stale_cooldown_before_initial_gate(
         self,
-        refresh_state_db: AsyncSessionDB,
+        refresh_state_db: SessionDB,
     ):
         db = refresh_state_db
         session_id = "CLEARED_COMPRESSION_COOLDOWN"
@@ -463,7 +463,7 @@ class TestGateLevelGuardRefresh:
     @pytest.mark.asyncio
     async def test_turn_hydration_unblocks_after_another_agent_clears_streak(
         self,
-        refresh_state_db: AsyncSessionDB,
+        refresh_state_db: SessionDB,
     ):
         db = refresh_state_db
         session_id = "GATE_LEVEL_STREAK_CLEAR"
@@ -483,7 +483,7 @@ class TestGateLevelGuardRefresh:
     @pytest.mark.asyncio
     async def test_unblocked_gate_does_not_touch_the_db(
         self,
-        refresh_state_db: AsyncSessionDB,
+        refresh_state_db: SessionDB,
     ):
         db = refresh_state_db
         session_id = "GATE_LEVEL_HOT_PATH"
@@ -502,7 +502,7 @@ class TestCooldownPersistFailureIsNotAClearedRow:
     @pytest.mark.asyncio
     async def test_persist_failure_keeps_local_cooldown(
         self,
-        refresh_state_db: AsyncSessionDB,
+        refresh_state_db: SessionDB,
     ):
         """An empty durable row is not evidence of a clear when OUR write failed.
 
@@ -542,7 +542,7 @@ class TestCooldownPersistFailureIsNotAClearedRow:
     @pytest.mark.asyncio
     async def test_ineffective_count_block_honors_turn_hydration(
         self,
-        refresh_state_db: AsyncSessionDB,
+        refresh_state_db: SessionDB,
     ):
         """The ineffective-strike counter is durable (#54923): a block owed to
         it must re-read the DB so another agent's clear (a real usage reading
@@ -571,7 +571,7 @@ class TestTodoSnapshotMergedNotDuplicated:
 
     @pytest.mark.asyncio
     async def test_snapshot_merges_into_trailing_user(self, tmp_path: Path):
-        db = AsyncSessionDB(tmp_path / "state.db")
+        db = SessionDB(tmp_path / "state.db")
         parent = "PARENT_TODO_MERGE"
         await db.create_session(parent, source="cli")
         agent = _build_agent_with_db(db, parent, platform="cli")
@@ -609,7 +609,7 @@ class TestTodoSnapshotMergedNotDuplicated:
 
     @pytest.mark.asyncio
     async def test_multimodal_snapshot_merge_is_persisted_in_place(self, tmp_path: Path):
-        db = AsyncSessionDB(tmp_path / "state.db")
+        db = SessionDB(tmp_path / "state.db")
         parent = "PARENT_TODO_MULTIMODAL_INPLACE"
         await db.create_session(parent, source="cli")
         agent = _build_agent_with_db(db, parent, platform="cli")
@@ -673,7 +673,7 @@ class TestTodoSnapshotScaffoldingTails:
 
     @staticmethod
     async def _agent_with_todo(
-        db: AsyncSessionDB, session_id: str, tail: dict
+        db: SessionDB, session_id: str, tail: dict
     ):
         await db.create_session(session_id, source="cli")
         agent = _build_agent_with_db(db, session_id, platform="cli")
@@ -700,7 +700,7 @@ class TestTodoSnapshotScaffoldingTails:
             "please fix the login bug\n\n"
             f"{TODO_INJECTION_HEADER}\n- [ ] t0. old finished task (pending)"
         )
-        db = AsyncSessionDB(tmp_path / "state.db")
+        db = SessionDB(tmp_path / "state.db")
         agent = await self._agent_with_todo(
             db,
             "PARENT_TODO_RESTRIP",
@@ -728,7 +728,7 @@ class TestTodoSnapshotScaffoldingTails:
     async def test_empty_todo_store_injects_nothing(self, tmp_path: Path):
         from tools.todo_tool import TODO_INJECTION_HEADER
 
-        db = AsyncSessionDB(tmp_path / "state.db")
+        db = SessionDB(tmp_path / "state.db")
         session_id = "PARENT_TODO_EMPTY"
         await db.create_session(session_id, source="cli")
         agent = _build_agent_with_db(db, session_id, platform="cli")

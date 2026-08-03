@@ -42,14 +42,6 @@ _approval_session_key: contextvars.ContextVar[str] = contextvars.ContextVar(
     "approval_session_key",
     default="",
 )
-_approval_turn_id: contextvars.ContextVar[str] = contextvars.ContextVar(
-    "approval_turn_id",
-    default="",
-)
-_approval_tool_call_id: contextvars.ContextVar[str] = contextvars.ContextVar(
-    "approval_tool_call_id",
-    default="",
-)
 
 # Interactive-CLI flag. Concurrent ACP sessions run on a shared
 # ThreadPoolExecutor (acp_adapter/server.py), so mutating the process-global
@@ -93,80 +85,6 @@ def _is_interactive_cli() -> bool:
     return env_var_enabled("HERMES_INTERACTIVE")
 
 
-def _fire_approval_hook(hook_name: str, **kwargs) -> None:
-    """Invoke a plugin lifecycle hook for the approval system.
-
-    Lazy-imports the plugin manager to avoid circular imports (approval.py is
-    imported very early, long before plugins are discovered). Never raises --
-    plugin errors are logged and swallowed.
-
-    Only fires for the two approval-specific hooks in VALID_HOOKS:
-    pre_approval_request, post_approval_response.
-    """
-    try:
-        from hermes_cli.lifecycle import invoke_hook
-    except Exception:
-        # Plugin system not available in this execution context
-        # (e.g. bare tool-only imports, minimal test environments).
-        return
-    try:
-        kwargs.setdefault("turn_id", _approval_turn_id.get())
-        kwargs.setdefault("tool_call_id", _approval_tool_call_id.get())
-        invoke_hook(hook_name, **kwargs)
-    except Exception as exc:
-        # invoke_hook() already swallows per-callback errors, so reaching here
-        # means the dispatch layer itself failed. Log and move on -- approval
-        # flow is safety-critical, plugin observability is not.
-        logger.debug("Approval hook %s dispatch failed: %s", hook_name, exc)
-
-
-def _prepare_smart_approval_observer(
-    *,
-    command: str,
-    description: str,
-    pattern_key: str,
-    pattern_keys: list[str],
-    session_key: str,
-) -> dict | None:
-    """Redact and emit the pre-decision smart approval observer hook.
-
-    Redaction is part of observer payload preparation, not approval policy. If
-    it fails, skip all observability rather than leaking raw data or preventing
-    the auxiliary LLM from making its decision.
-    """
-    try:
-        from agent.redact import redact_sensitive_text
-
-        hook_command = redact_sensitive_text(command, force=True)
-        hook_description = redact_sensitive_text(description, force=True)
-    except Exception as exc:
-        logger.debug("Smart approval hook redaction failed: %s", exc)
-        return
-
-    payload = {
-        "command": hook_command,
-        "description": hook_description,
-        "pattern_key": pattern_key,
-        "pattern_keys": list(pattern_keys),
-        "session_key": session_key,
-        "surface": "smart",
-    }
-    _fire_approval_hook("pre_approval_request", **payload)
-    return payload
-
-
-def _observe_smart_approval_verdict(payload: dict | None, verdict: str) -> None:
-    """Emit a smart verdict after the auxiliary LLM decision, if safe."""
-    if payload is None or verdict not in {"approve", "deny"}:
-        return
-    _fire_approval_hook(
-        "post_approval_response",
-        **payload,
-        choice=f"smart_{verdict}",
-        decided_by="aux_llm",
-    )
-
-
 
 def set_current_session_key(session_key: str) -> contextvars.Token[str]:
     """Bind the active approval session key to the current context."""
@@ -176,27 +94,6 @@ def set_current_session_key(session_key: str) -> contextvars.Token[str]:
 def reset_current_session_key(token: contextvars.Token[str]) -> None:
     """Restore the prior approval session key context."""
     _approval_session_key.reset(token)
-
-
-def set_current_observability_context(
-    *,
-    turn_id: str = "",
-    tool_call_id: str = "",
-) -> tuple[contextvars.Token[str], contextvars.Token[str]]:
-    """Bind active tool correlation IDs to approval hooks."""
-    return (
-        _approval_turn_id.set(turn_id or ""),
-        _approval_tool_call_id.set(tool_call_id or ""),
-    )
-
-
-def reset_current_observability_context(
-    tokens: tuple[contextvars.Token[str], contextvars.Token[str]],
-) -> None:
-    """Restore prior approval hook correlation IDs."""
-    turn_token, tool_token = tokens
-    _approval_tool_call_id.reset(tool_token)
-    _approval_turn_id.reset(turn_token)
 
 
 def get_current_session_key(default: str = "default") -> str:
@@ -3094,18 +2991,6 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
             if not queue:
                 _gateway_queues.pop(session_key, None)
 
-    # Notify plugins that an approval is being requested. Fires before the
-    # gateway notify callback so observers get the event in real time.
-    _fire_approval_hook(
-        "pre_approval_request",
-        command=command,
-        description=description,
-        pattern_key=primary_key,
-        pattern_keys=list(all_keys),
-        session_key=session_key,
-        surface=surface,
-    )
-
     # Notify the user (bridges sync agent thread → async gateway)
     try:
         notify_cb(approval_data)
@@ -3160,20 +3045,6 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
     _drop_entry()
 
     choice = entry.result
-    # Normalize outcome for the post hook. Unresolved (timeout) and None both
-    # mean the user never responded; report that explicitly so plugins can
-    # distinguish timeout from explicit deny.
-    _outcome = "timeout" if not resolved else (choice if choice else "timeout")
-    _fire_approval_hook(
-        "post_approval_response",
-        command=command,
-        description=description,
-        pattern_key=primary_key,
-        pattern_keys=list(all_keys),
-        session_key=session_key,
-        surface=surface,
-        choice=_outcome,
-    )
     return {"resolved": resolved, "choice": choice, "reason": entry.reason}
 
 
@@ -3387,15 +3258,7 @@ def check_all_command_guards(command: str, env_type: str,
     smart_denied_for_owner = False
     if approval_mode == "smart":
         combined_desc_for_llm = "; ".join(desc for _, desc, _ in warnings)
-        observer_payload = _prepare_smart_approval_observer(
-            command=command,
-            description=combined_desc_for_llm,
-            pattern_key=warnings[0][0],
-            pattern_keys=[key for key, _, _ in warnings],
-            session_key=session_key,
-        )
         verdict = _smart_approve(command, combined_desc_for_llm)
-        _observe_smart_approval_verdict(observer_payload, verdict)
         if verdict == "approve":
             # Approve this command only. Pattern-level persistence would let one
             # benign command suppress review of later commands that happen to
@@ -3584,15 +3447,6 @@ def check_all_command_guards(command: str, env_type: str,
 
     # CLI interactive: single combined prompt
     # Hide [a]lways when no persistable (non-tirith) warning is present
-    _fire_approval_hook(
-        "pre_approval_request",
-        command=command,
-        description=combined_desc,
-        pattern_key=primary_key,
-        pattern_keys=list(all_keys),
-        session_key=session_key,
-        surface="cli",
-    )
     choice = prompt_dangerous_approval(
         command,
         combined_desc,
@@ -3600,17 +3454,6 @@ def check_all_command_guards(command: str, env_type: str,
         smart_denied=smart_denied_for_owner,
         approval_callback=approval_callback,
     )
-    _fire_approval_hook(
-        "post_approval_response",
-        command=command,
-        description=combined_desc,
-        pattern_key=primary_key,
-        pattern_keys=list(all_keys),
-        session_key=session_key,
-        surface="cli",
-        choice=choice,
-    )
-
     if choice == "deny":
         breaker_addendum = _denial_breaker_addendum(session_key)
         return {

@@ -73,23 +73,17 @@ def test_subdirectory_named_auth_json_not_blocked(fake_home):
 
 
 
-def test_search_tool_blocks_direct_auth_json_path(fake_home, monkeypatch):
+@pytest.mark.asyncio
+async def test_search_tool_blocks_direct_auth_json_path(fake_home):
     """Searching a credential file directly must not invoke the search backend."""
     import json
 
     import tools.file_tools as ft
-    import tools.terminal_tool as terminal_tool
-
     auth = _create(fake_home, "auth.json")
     auth.write_text("SEARCH_DIRECT_AUTH_SECRET", encoding="utf-8")
 
-    def fail_if_called(task_id="default"):
-        raise AssertionError("search backend should not run for blocked path")
-
-    monkeypatch.setattr(ft, "_get_file_ops", fail_if_called)
-
     out = json.loads(
-        ft.search_tool(
+        await ft.search_tool(
             pattern="SEARCH_DIRECT_AUTH_SECRET",
             path=str(auth),
             task_id="search-direct-auth-json",
@@ -101,70 +95,37 @@ def test_search_tool_blocks_direct_auth_json_path(fake_home, monkeypatch):
     assert "SEARCH_DIRECT_AUTH_SECRET" not in raw
 
 
-def test_search_tool_filters_credential_results(fake_home, tmp_path, monkeypatch):
+@pytest.mark.asyncio
+async def test_search_tool_filters_credential_results(fake_home):
     """Directory searches omit credential and MCP-token result entries."""
     import json
 
-    from tools.file_operations import SearchMatch, SearchResult
     import tools.file_tools as ft
-    import tools.terminal_tool as terminal_tool
 
     auth = _create(fake_home, "auth.json")
     token = _create(fake_home, Path("mcp-tokens") / "provider.json")
     safe = _create(fake_home, "notes.txt")
+    auth.write_text("SEARCH_AUTH_SECRET", encoding="utf-8")
+    token.write_text("SEARCH_MCP_SECRET", encoding="utf-8")
+    safe.write_text("public note", encoding="utf-8")
 
-    class FakeFileOps:
-        def search(self, **kwargs):
-            return SearchResult(
-                matches=[
-                    SearchMatch(
-                        path=str(auth),
-                        line_number=1,
-                        content="SEARCH_AUTH_SECRET",
-                    ),
-                    SearchMatch(
-                        path=str(token),
-                        line_number=1,
-                        content="SEARCH_MCP_SECRET",
-                    ),
-                    SearchMatch(
-                        path=str(safe),
-                        line_number=1,
-                        content="public note",
-                    ),
-                ],
-                files=[str(auth), str(token), str(safe)],
-                total_count=5,
-                truncated=True,
-            )
-
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(ft, "_get_file_ops", lambda task_id="default": FakeFileOps())
-    monkeypatch.setattr(
-        terminal_tool, "_session_cwds", {}
-    )
-
-    search_response = ft.search_tool(
-        pattern="SEARCH",
+    search_response = await ft.search_tool(
+        pattern="SEARCH|public",
         path=str(fake_home),
         task_id="search-filter-credentials",
     )
-    out = json.loads(search_response.split("\n\n[Hint:", 1)[0])
+    out = json.loads(search_response)
     raw = json.dumps(out)
-    returned_paths = {
-        match["path"] for match in out.get("matches", [])
-    } | set(out.get("files", []))
 
     assert "SEARCH_AUTH_SECRET" not in raw
     assert "SEARCH_MCP_SECRET" not in raw
-    assert str(auth) not in returned_paths
-    assert str(token) not in returned_paths
+    assert str(auth) not in raw
+    assert str(token) not in raw
     assert "public note" in raw
-    assert str(safe) in returned_paths
-    assert out["_omitted"].startswith("4 result(s) omitted")
-    assert out["total_count"] == 5
-    assert out["truncated"] is True
-    assert "[Hint: Results truncated." in search_response
+    assert str(safe) in raw
+    assert out["omitted_sensitive_results"] == 2
+    assert out["total_count"] == 1
+    assert out["truncated"] is False
 
 
 # ---------------------------------------------------------------------------

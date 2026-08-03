@@ -226,33 +226,6 @@ def test_probe_and_connect_do_not_race(tmp_path, clean_registry, monkeypatch):
 
 
 
-def test_session_db_read_only_is_tracked(tmp_path, clean_registry, monkeypatch):
-    """End-to-end: a real read-only SessionDB blocks byte-probes."""
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    from hermes_state import SessionDB
-
-    db_path = tmp_path / "state.db"
-    seed = SessionDB(db_path=db_path)
-    seed.create_session("s1", source="cli")
-    seed.close()
-
-    ro = SessionDB(db_path=db_path, read_only=True)
-    try:
-        assert has_live_connection(db_path)
-        assert read_header_bytes_preopen(db_path, length=16) is None
-    finally:
-        ro.close()
-
-    assert not has_live_connection(db_path)
-    assert read_header_bytes_preopen(db_path, length=16) is not None
-
-
-
-
-
-
-
-
 def test_page_count_bytes_matches_on_disk_size(tmp_path):
     """The PRAGMA route reports the same size the header field encodes."""
     db = tmp_path / "state.db"

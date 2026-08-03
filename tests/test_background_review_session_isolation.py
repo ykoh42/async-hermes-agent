@@ -12,6 +12,8 @@ removes any such stray harness message (and the assistant reply that followed
 it) so a polluted session resumes clean.
 """
 
+import pytest
+
 from hermes_state import (
     _is_background_review_harness_message,
     _strip_background_review_harness,
@@ -64,7 +66,8 @@ class TestGetMessagesAsConversationStripsHarness:
     _strip_background_review_harness, so a session polluted with stray harness
     rows resumes clean end-to-end (not just the pure helper in isolation)."""
 
-    def test_polluted_session_resumes_without_harness(self):
+    @pytest.mark.asyncio
+    async def test_polluted_session_resumes_without_harness(self):
         import tempfile
         from pathlib import Path
         from hermes_state import SessionDB
@@ -72,18 +75,18 @@ class TestGetMessagesAsConversationStripsHarness:
         with tempfile.TemporaryDirectory() as tmp:
             db = SessionDB(db_path=Path(tmp) / "t.db")
             try:
-                db.create_session(session_id="s1", source="cli")
-                db.append_message("s1", role="user", content="What's the weather?")
-                db.append_message("s1", role="assistant", content="It's sunny.")
+                await db.create_session(session_id="s1", source="cli")
+                await db.append_message("s1", role="user", content="What's the weather?")
+                await db.append_message("s1", role="assistant", content="It's sunny.")
                 # Stray background-review pollution written by an older build.
-                db.append_message(
+                await db.append_message(
                     "s1", role="user",
                     content="Review the conversation above and update the skill library with anything useful.",
                 )
-                db.append_message("s1", role="assistant", content="I'll act as the curator now.")
-                db.append_message("s1", role="user", content="Thanks, now book a flight.")
+                await db.append_message("s1", role="assistant", content="I'll act as the curator now.")
+                await db.append_message("s1", role="user", content="Thanks, now book a flight.")
 
-                conv = db.get_messages_as_conversation("s1")
+                conv = await db.get_messages_as_conversation("s1")
                 contents = [m["content"] for m in conv]
 
                 # Harness user turn AND its curator-mode assistant reply are gone.
@@ -95,14 +98,15 @@ class TestGetMessagesAsConversationStripsHarness:
                 # Genuine turns survive in order.
                 assert contents == ["What's the weather?", "It's sunny.", "Thanks, now book a flight."]
             finally:
-                db.close()
+                await db.close()
 
 
 class TestPersistDisabledHardStop:
     """The isolation wiring: a _persist_disabled agent must never write to the
     session store via _flush_messages_to_session_db, even with a live db set."""
 
-    def test_flush_is_a_noop_when_persist_disabled(self):
+    @pytest.mark.asyncio
+    async def test_flush_is_a_noop_when_persist_disabled(self):
         import os
         import tempfile
         from pathlib import Path
@@ -110,7 +114,7 @@ class TestPersistDisabledHardStop:
         from hermes_state import SessionDB
 
         with tempfile.TemporaryDirectory() as tmp:
-            db = SessionDB(db_path=Path(tmp) / "t.db")
+            db = SessionDB(Path(tmp) / "t.db")
             try:
                 with patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}):
                     from run_agent import AIAgent
@@ -124,16 +128,16 @@ class TestPersistDisabledHardStop:
                         skip_context_files=True,
                         skip_memory=True,
                     )
-                agent._ensure_db_session()
+                await agent._ensure_db_session()
                 agent._persist_disabled = True
 
-                agent._flush_messages_to_session_db(
+                await agent._flush_messages_to_session_db(
                     [{"role": "user", "content": "Review the conversation above and update the skill library."},
                      {"role": "assistant", "content": "curator reply"}],
                     [],
                 )
 
                 # Nothing written: the hard-stop fired before any append.
-                assert db.get_messages("s-review") == []
+                assert await db.get_messages("s-review") == []
             finally:
-                db.close()
+                await db.close()

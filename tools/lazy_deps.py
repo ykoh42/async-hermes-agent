@@ -116,75 +116,6 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     "search.firecrawl": ("firecrawl-py==4.17.0",),
     "search.parallel": ("parallel-web==0.4.2",),
 
-    # ─── Monitoring ─────────────────────────────────────────────────────────
-    # OTLP gateway monitoring export. Lazily installed on first use of
-    # monitoring.gateway_health_export / monitoring.export.otlp. Tracks the
-    # `otlp` extra in pyproject.toml — bump both together.
-    "export.otlp": (
-        "opentelemetry-sdk==1.39.1",
-        "opentelemetry-exporter-otlp-proto-http==1.39.1",
-    ),
-
-    # ─── TTS providers ─────────────────────────────────────────────────────
-    # Pinned to exact versions to match pyproject.toml's no-ranges policy
-    # (see comment at top of [project.dependencies]). When bumping, update
-    # both this map AND the corresponding extra in pyproject.toml.
-    #
-    # mistralai pin tracks the `mistral` extra in pyproject.toml. PyPI
-    # quarantined the project 2026-05-12 (malicious 2.4.6, Mini Shai-Hulud);
-    # 2.4.6 was removed and clean releases resumed (2.4.7, 2.4.8). Voxtral
-    # STT + TTS share the same SDK.
-    "tts.mistral": ("mistralai==2.4.8",),
-    "tts.edge": ("edge-tts==7.2.7",),
-    "tts.elevenlabs": ("elevenlabs==1.59.0",),
-
-    # ─── Speech-to-text providers ──────────────────────────────────────────
-    "stt.mistral": ("mistralai==2.4.8",),
-    "stt.faster_whisper": (
-        "faster-whisper==1.2.1",
-        "sounddevice==0.5.5",
-        "numpy==2.4.3",
-    ),
-    # SILK voice-note decoding (WeChat/QQ .silk voice messages). pilk is a
-    # small silk-v3 codec binding; installed on first .silk transcription.
-    "stt.silk": ("pilk==0.2.4",),
-
-    # ─── Wake word ("Hey Hermes") engines ──────────────────────────────────
-    # Keep in sync with the `wake` extra in pyproject.toml. openWakeWord is the
-    # free, local default (ONNX runtime); Porcupine is the premium engine.
-    # openWakeWord's ONNX embedding model returns near-zero scores on macOS
-    # ARM64 (dscripka/openWakeWord#336), so the wake word runs on the tflite
-    # backend there. Upstream declares tflite-runtime for Linux only;
-    # ai-edge-litert is the macOS equivalent, bridged in tools/wake_word.py.
-    # It lives in its own feature because lazy-dep specs cannot carry PEP 508
-    # environment markers (_spec_is_safe rejects ";"), so the platform gate is
-    # applied by the caller instead.
-    "wake.openwakeword.tflite": (
-        "ai-edge-litert==2.1.6",
-    ),
-    "wake.openwakeword": (
-        "openwakeword==0.6.0",
-        "onnxruntime==1.27.0",
-        "sounddevice==0.5.5",
-        "numpy==2.4.3",
-    ),
-    # Open-vocabulary keyword spotting: any typed phrase, zero training.
-    # sentencepiece is required by sherpa_onnx.text2token (runtime phrase
-    # tokenization) even though sherpa-onnx doesn't declare it.
-    "wake.sherpa": (
-        "sherpa-onnx==1.13.4",
-        "sentencepiece==0.2.2",
-        "sounddevice==0.5.5",
-        "numpy==2.4.3",
-    ),
-    "wake.porcupine": (
-        "pvporcupine==4.0.3",
-        "sounddevice==0.5.5",
-        "numpy==2.4.3",
-    ),
-
-    # ─── Image generation backends ─────────────────────────────────────────
-    "image.fal": ("fal-client==0.13.1",),
 
     # ─── Memory providers ──────────────────────────────────────────────────
     "memory.honcho": ("honcho-ai==2.2.0",),
@@ -199,97 +130,6 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     "memory.supermemory": ("supermemory==3.50.0",),
     "memory.mem0": ("mem0ai==2.0.10",),
 
-    # ─── Messaging platforms (lazy-installable on demand) ──────────────────
-    "platform.telegram": ("python-telegram-bot[webhooks]==22.6",),
-    # brotlicffi gives aiohttp a working 2-arg Decompressor.process() for
-    # Discord CDN's Brotli-encoded attachments. Without it, aiohttp falls
-    # back to google's `Brotli` package (1-arg API), and any .txt/.md/.doc
-    # uploaded to the Discord gateway fails to decode at att.read() with
-    # "Can not decode content-encoding: br" — see #12511 / #15744.
-    "platform.discord": (
-        "discord.py[voice]==2.7.1",
-        "brotlicffi==1.2.0.1",
-        # discord.py pulls aiohttp transitively (>=3.7.4,<4) as its HTTP
-        # backbone. Pin the patched floor here too so the lazy Discord path
-        # can't keep an already-installed vulnerable aiohttp satisfying that
-        # range — mirrors the messaging extra and platform.slack.
-        "aiohttp==3.14.1",  # CVE-2026-34513/34518/34519/34520/34525 + 34993(RCE)/47265
-    ),
-    "platform.slack": (
-        "slack-bolt==1.29.0",
-        "slack-sdk==3.43.0",
-        "aiohttp==3.14.1",  # CVE-2026-34513/34518/34519/34520/34525 + 34993(RCE)/47265
-    ),
-    "platform.matrix": (
-        "mautrix[encryption]==0.21.0",
-        "aiosqlite==0.22.1",
-        "asyncpg==0.31.0",
-        "aiohttp-socks==0.11.0",
-        # mautrix (aiohttp>=3,<4) and aiohttp-socks (aiohttp>=3.10.0) only cap
-        # aiohttp transitively, so a vulnerable already-installed aiohttp still
-        # satisfies both — pin the patched floor here too, like platform.discord.
-        "aiohttp==3.14.1",  # CVE-2026-34513/34518/34519/34520/34525 + 34993(RCE)/47265
-    ),
-    "platform.feishu": (
-        "lark-oapi==1.6.8",
-        "qrcode==7.4.2",
-    ),
-    # WeCom callback-mode adapter — parses untrusted XML POST bodies. Pulls
-    # defusedxml only; aiohttp/httpx are core dependencies of every messaging
-    # adapter and ship via `platform.discord` / `platform.slack` / etc.
-    "platform.wecom_callback": ("defusedxml==0.7.1",),
-    # Microsoft Teams adapter — microsoft-teams-apps pulls a heavy tree
-    # (microsoft-teams-api/cards/common, dependency-injector, msal). Lazy-
-    # installed on demand like every other messaging platform; also exposed
-    # as the `teams` extra in pyproject for packagers / explicit installs.
-    "platform.teams": ("microsoft-teams-apps==2.0.13.4", "aiohttp==3.14.1"),  # aiohttp 3.14.1: CVE-2026-34993(RCE)/47265 + 34513/34518/34519/34520/34525
-
-    # ─── Terminal backends ─────────────────────────────────────────────────
-    "terminal.modal": ("modal==1.3.4",),
-    "terminal.daytona": ("daytona==0.155.0",),
-    "terminal.vercel": ("vercel==0.7.2",),
-
-    # ─── Skills ────────────────────────────────────────────────────────────
-    "skill.google_workspace": (
-        "google-api-python-client==2.194.0",
-        "google-auth-oauthlib==1.3.1",
-        "google-auth-httplib2==0.3.1",
-    ),
-    "skill.youtube": ("youtube-transcript-api==1.2.4",),
-
-    # ─── Tools ─────────────────────────────────────────────────────────────
-    # ACP adapter (VS Code / Zed / JetBrains integration)
-    "tool.acp": ("agent-client-protocol==0.9.0",),
-    # Vision image-resize recovery (Pillow). Pillow is now a CORE dependency
-    # (pyproject `dependencies`), so this entry is a belt-and-suspenders fallback
-    # for stripped/source-build installs that somehow dropped it. The vision
-    # call site uses prompt=False so it can never raise a blocking input()
-    # prompt mid-session (#40490).
-    "tool.vision": ("Pillow==12.2.0",),
-    # Computer Use (cua-driver) — the MCP client SDK used to spawn and talk
-    # to the cua-driver process over stdio. Matches the `mcp` / `computer-use`
-    # extras in pyproject.toml. The one-liner installer pulls this in via
-    # `[all]`; lazy-installing here covers lean / partial / broken-extra
-    # installs so computer_use never dead-ends on `No module named 'mcp'`.
-    "tool.computer_use": (
-        "mcp==1.26.0",
-        "starlette==1.3.1",  # CVE-2026-48710 — keep in sync with pyproject [computer-use]
-    ),
-    # HF Agent Trace Viewer upload (hermes trace upload / /upload-trace).
-    #
-    # huggingface-hub is a SHARED dependency: transformers (pulled by
-    # sentence-transformers for local Hindsight embeddings) requires
-    # >=1.5.0,<2, and faster-whisper/tokenizers depend on it transitively.
-    # Because active_features() marks a feature active from mere package
-    # presence, the `hermes update` lazy-refresh pass re-asserts THIS pin on
-    # every install where hub is present — so an exact pin below 1.5.0
-    # force-downgrades the shared package and breaks Hindsight startup
-    # (#60783). Policy: keep the exact pin (no ranges — security posture),
-    # but it MUST stay inside transformers' accepted window and MUST match
-    # uv.lock so the whole tree converges on ONE hub version
-    # (tests/test_project_metadata.py enforces both). When bumping: update
-    # here AND `uv lock --upgrade-package huggingface-hub` in lockstep.
-    "tool.trace_upload": ("huggingface-hub==1.24.0",),
 }
 
 
@@ -503,22 +343,6 @@ def _allow_lazy_installs() -> bool:
         return _lazy_install_target() is not None
 
     return True
-
-
-def _unsupported_feature_reason(feature: str) -> Optional[str]:
-    """Return why a lazy feature cannot work on this host, or ``None``.
-
-    This is a platform capability gate, not a security policy gate. It keeps
-    known-impossible installs out of both first-use lazy installation and the
-    ``hermes update`` lazy-refresh pass.
-    """
-    if sys.platform == "win32" and feature == "platform.matrix":
-        return (
-            "unsupported on Windows: Matrix E2EE depends on python-olm, "
-            "which has no Windows wheel and requires make + libolm to build "
-            "from sdist. Run Hermes under WSL to use Matrix on Windows."
-        )
-    return None
 
 
 def _spec_is_safe(spec: str) -> bool:
@@ -811,10 +635,6 @@ def ensure(feature: str, *, prompt: bool = True) -> None:
     if not missing:
         return
 
-    unsupported = _unsupported_feature_reason(feature)
-    if unsupported:
-        raise FeatureUnavailable(feature, missing, unsupported)
-
     # Validate every spec against the allowlist + safety regex. Belt and
     # braces — the keys-in-LAZY_DEPS check above already constrains this.
     for spec in missing:
@@ -997,11 +817,7 @@ def active_features() -> list[str]:
 
     A feature counts as "active" if its anchor package (the first declared
     spec) is currently installed in the venv (presence check, ignoring
-    version). We intentionally do NOT treat shared helper packages as proof
-    that a backend was enabled: for example ``platform.matrix`` depends on
-    generic packages like ``asyncpg``/``aiosqlite`` that can be installed for
-    unrelated reasons, while the actual Matrix adapter anchor is ``mautrix``.
-    Features the user has never enabled stay quiet.
+    version). Features the user has never enabled stay quiet.
 
     Used by ``hermes update`` to figure out which lazy backends need a
     refresh pass when pins move in :data:`LAZY_DEPS`.
@@ -1031,11 +847,6 @@ def refresh_active_features(*, prompt: bool = False) -> dict[str, str]:
         missing = feature_missing(feature)
         if not missing:
             results[feature] = "current"
-            continue
-
-        unsupported = _unsupported_feature_reason(feature)
-        if unsupported:
-            results[feature] = f"skipped: {unsupported}"
             continue
 
         try:
@@ -1078,24 +889,17 @@ def ensure_and_bind(
 
     Returns True on success, False if deps couldn't be installed or imported.
 
-    Example usage in a platform adapter::
+    Example usage in a provider adapter::
 
-        def check_slack_requirements() -> bool:
-            if SLACK_AVAILABLE:
+        def check_provider_requirements() -> bool:
+            if PROVIDER_AVAILABLE:
                 return True
             def _import():
-                from slack_bolt.async_app import AsyncApp
-                from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
-                from slack_sdk.web.async_client import AsyncWebClient
-                import aiohttp
-                return {
-                    "AsyncApp": AsyncApp,
-                    "AsyncSocketModeHandler": AsyncSocketModeHandler,
-                    "AsyncWebClient": AsyncWebClient,
-                    "aiohttp": aiohttp,
-                    "SLACK_AVAILABLE": True,
-                }
-            return ensure_and_bind("platform.slack", _import, globals(), prompt=False)
+                import anthropic
+                return {"anthropic": anthropic, "PROVIDER_AVAILABLE": True}
+            return ensure_and_bind(
+                "provider.anthropic", _import, globals(), prompt=False
+            )
     """
     try:
         ensure(feature, prompt=prompt)

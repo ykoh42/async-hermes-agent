@@ -512,7 +512,7 @@ async def _restore_or_build_system_prompt(agent, system_message, conversation_hi
     # session is created (not on continuation).  Plugins can use this
     # to initialise session-scoped state (e.g. warm a memory cache).
     try:
-        from hermes_cli.lifecycle import invoke_hook_async as _invoke_hook
+        from hermes_cli.lifecycle import invoke_hook as _invoke_hook
         await _invoke_hook(
             "on_session_start",
             session_id=agent.session_id,
@@ -2124,7 +2124,7 @@ async def run_conversation(
                 try:
                     from hermes_cli.lifecycle import (
                         has_hook,
-                        invoke_hook_async as _invoke_hook,
+                        invoke_hook as _invoke_hook,
                     )
                     if has_hook("pre_api_request"):
                         request_messages = api_kwargs.get("messages")
@@ -3292,12 +3292,6 @@ async def run_conversation(
                         clear_nous_rate_limit()
                     except Exception:
                         pass
-                from agent import relay_llm
-
-                await relay_llm.complete_logical_call(
-                    api_request_id,
-                    outcome="success",
-                )
                 agent._touch_activity(f"API call #{api_call_count} completed")
                 break  # Success, exit retry loop
 
@@ -5453,7 +5447,7 @@ async def run_conversation(
             try:
                 from hermes_cli.lifecycle import (
                     has_hook,
-                    invoke_hook_async as _invoke_hook,
+                    invoke_hook as _invoke_hook,
                 )
                 if has_hook("post_api_request"):
                     _assistant_tool_calls = (

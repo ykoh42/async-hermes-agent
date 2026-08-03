@@ -2,6 +2,7 @@
 
 import logging
 import sys
+import textwrap
 import types
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -55,7 +56,7 @@ def _make_plugin_dir(base: Path, name: str, *, register_body: str = "pass",
 
     (plugin_dir / "plugin.yaml").write_text(yaml.dump(manifest))
     (plugin_dir / "__init__.py").write_text(
-        f"def register(ctx):\n    {register_body}\n"
+        "def register(ctx):\n" + textwrap.indent(register_body, "    ") + "\n"
     )
 
     if auto_enable:
@@ -100,7 +101,7 @@ class TestPluginDiscovery:
             register_body=(
                 "ctx.register_middleware('llm_request', "
                 "lambda **kw: {'request': {**kw['request'], 'mw': True}})\n"
-                "    ctx.register_middleware('tool_request', "
+                "ctx.register_middleware('tool_request', "
                 "lambda **kw: {'args': {**kw['args'], 'mw': True}})"
             ),
         )
@@ -211,7 +212,6 @@ class TestPluginDiscovery:
         mgr._middleware["llm_request"] = [lambda **_: None]
         mgr._plugin_tool_names.add("some_tool")
         mgr._plugin_platform_names.add("irc")
-        mgr._cli_commands["c"] = {"plugin": "p"}
         mgr._plugin_commands["cmd"] = {"plugin": "p"}
         mgr._plugin_skills["p:skill"] = {}
         mgr._aux_tasks["task"] = {"plugin": "p"}
@@ -228,7 +228,6 @@ class TestPluginDiscovery:
         assert mgr._plugin_platform_names == set(), (
             "_plugin_platform_names was not cleared on force-rediscover"
         )
-        assert mgr._cli_commands == {}
         assert mgr._plugin_commands == {}
         assert mgr._plugin_skills == {}
         assert mgr._aux_tasks == {}
@@ -311,14 +310,16 @@ class TestPluginHooks:
 
 
 
-    def test_pre_gateway_dispatch_collects_action_dicts(self, tmp_path, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_pre_gateway_dispatch_collects_action_dicts(self, tmp_path, monkeypatch):
         """pre_gateway_dispatch callbacks return action dicts (skip/rewrite/allow)."""
         plugins_dir = tmp_path / "hermes_test" / "plugins"
         _make_plugin_dir(
             plugins_dir, "predispatch_plugin",
             register_body=(
-                'ctx.register_hook("pre_gateway_dispatch", '
-                'lambda **kw: {"action": "skip", "reason": "test"})'
+                'async def callback(**kw):\n'
+                '    return {"action": "skip", "reason": "test"}\n'
+                'ctx.register_hook("pre_gateway_dispatch", callback)'
             ),
         )
         monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes_test"))
@@ -326,7 +327,7 @@ class TestPluginHooks:
         mgr = PluginManager()
         mgr.discover_and_load()
 
-        results = mgr.invoke_hook(
+        results = await mgr.invoke_hook(
             "pre_gateway_dispatch",
             event=object(),
             gateway=object(),
@@ -339,14 +340,16 @@ class TestPluginHooks:
 
 
 
-    def test_request_hooks_are_invokeable(self, tmp_path, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_request_hooks_are_invokeable(self, tmp_path, monkeypatch):
         plugins_dir = tmp_path / "hermes_test" / "plugins"
         _make_plugin_dir(
             plugins_dir, "request_hook",
             register_body=(
-                'ctx.register_hook("pre_api_request", '
-                'lambda **kw: {"seen": kw.get("api_call_count"), '
-                '"mc": kw.get("message_count"), "tc": kw.get("tool_count")})'
+                'async def callback(**kw):\n'
+                '    return {"seen": kw.get("api_call_count"), '
+                '"mc": kw.get("message_count"), "tc": kw.get("tool_count")}\n'
+                'ctx.register_hook("pre_api_request", callback)'
             ),
         )
         monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes_test"))
@@ -356,7 +359,7 @@ class TestPluginHooks:
 
         assert mgr.has_hook("pre_api_request") is True
         assert mgr.has_hook("post_api_request") is False
-        results = mgr.invoke_hook(
+        results = await mgr.invoke_hook(
             "pre_api_request",
             session_id="s1",
             task_id="t1",
@@ -375,26 +378,34 @@ class TestPluginHooks:
 class TestPreToolCallBlocking:
     """Tests for the pre_tool_call block directive helper."""
 
-    def test_block_message_returned_for_valid_directive(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_block_message_returned_for_valid_directive(self, monkeypatch):
+        async def invoke_hook(hook_name, **kwargs):
+            return [{"action": "block", "message": "blocked by plugin"}]
+
         monkeypatch.setattr(
             "hermes_cli.plugins.invoke_hook",
-            lambda hook_name, **kwargs: [{"action": "block", "message": "blocked by plugin"}],
+            invoke_hook,
         )
-        assert get_pre_tool_call_block_message("todo", {}, task_id="t1") == "blocked by plugin"
+        assert await get_pre_tool_call_block_message("todo", {}, task_id="t1") == "blocked by plugin"
 
 
 class TestPreToolCallDirective:
     """Tests for the extended (block | approve) directive helper."""
 
 
-    def test_approve_without_message_is_valid(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_approve_without_message_is_valid(self, monkeypatch):
         """approve may omit a message (block may not)."""
         from hermes_cli.plugins import get_pre_tool_call_directive
+        async def invoke_hook(hook_name, **kwargs):
+            return [{"action": "approve"}]
+
         monkeypatch.setattr(
             "hermes_cli.plugins.invoke_hook",
-            lambda hook_name, **kwargs: [{"action": "approve"}],
+            invoke_hook,
         )
-        assert get_pre_tool_call_directive("write_file", {}) == ("approve", None)
+        assert await get_pre_tool_call_directive("write_file", {}) == ("approve", None)
 
 
 class TestResolvePreToolBlock:
@@ -402,31 +413,38 @@ class TestResolvePreToolBlock:
     directive (incl. the approve→gate escalation) to a block message."""
 
 
-    def test_approve_passes_plugin_rule_key_to_gate(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_approve_passes_plugin_rule_key_to_gate(self, monkeypatch):
         from hermes_cli.plugins import resolve_pre_tool_block
+        from tools.terminal_tool import set_approval_callback
 
         seen = {}
 
-        monkeypatch.setattr(
-            "hermes_cli.plugins.invoke_hook",
-            lambda hook_name, **kwargs: [
+        async def invoke_hook(hook_name, **kwargs):
+            return [
                 {
                     "action": "approve",
                     "message": "why",
                     "rule_key": "write_file:ssh",
                 }
-            ],
+            ]
+
+        monkeypatch.setattr(
+            "hermes_cli.plugins.invoke_hook",
+            invoke_hook,
         )
 
-        def _approve(tool_name, reason, **kwargs):
+        async def _approve(tool_name, reason, **kwargs):
             seen["tool_name"] = tool_name
             seen["reason"] = reason
             seen["rule_key"] = kwargs.get("rule_key")
-            return {"approved": True, "message": None}
+            return True
 
-        monkeypatch.setattr("tools.approval.request_tool_approval", _approve)
-
-        assert resolve_pre_tool_block("write_file", {}) is None
+        set_approval_callback(_approve)
+        try:
+            assert await resolve_pre_tool_block("write_file", {}) is None
+        finally:
+            set_approval_callback(None)
         assert seen == {
             "tool_name": "write_file",
             "reason": "why",
@@ -434,110 +452,55 @@ class TestResolvePreToolBlock:
         }
 
 
-    def test_approve_gate_exception_fails_closed(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_approve_gate_exception_fails_closed(self, monkeypatch):
         from hermes_cli.plugins import resolve_pre_tool_block
+        from tools.terminal_tool import set_approval_callback
+
+        async def invoke_hook(hook_name, **kwargs):
+            return [{"action": "approve", "message": "why"}]
+
         monkeypatch.setattr(
             "hermes_cli.plugins.invoke_hook",
-            lambda hook_name, **kwargs: [{"action": "approve", "message": "why"}],
+            invoke_hook,
         )
-        def _boom(*a, **k):
+
+        async def _boom(*a, **k):
             raise RuntimeError("gate crashed")
-        monkeypatch.setattr("tools.approval.request_tool_approval", _boom)
-        msg = resolve_pre_tool_block("terminal", {})
-        assert msg is not None and "gate failed" in msg  # fail-closed
+
+        set_approval_callback(_boom)
+        try:
+            msg = await resolve_pre_tool_block("terminal", {})
+        finally:
+            set_approval_callback(None)
+        assert msg is not None and "callback failed" in msg
 
 
 class TestGetPreVerifyContinueMessage:
     """`pre_verify` directive aggregation — mirrors the pre_tool_call block path."""
 
 
-    def test_none_when_no_hooks(self, monkeypatch):
-        monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda hook_name, **kwargs: [])
-        assert get_pre_verify_continue_message() is None
+    @pytest.mark.asyncio
+    async def test_none_when_no_hooks(self, monkeypatch):
+        async def invoke_hook(hook_name, **kwargs):
+            return []
 
-    def test_forwards_scope_signals_to_hooks(self, monkeypatch):
+        monkeypatch.setattr("hermes_cli.plugins.invoke_hook", invoke_hook)
+        assert await get_pre_verify_continue_message() is None
+
+    @pytest.mark.asyncio
+    async def test_forwards_scope_signals_to_hooks(self, monkeypatch):
         seen = {}
 
-        def capture(hook_name, **kwargs):
+        async def capture(hook_name, **kwargs):
             seen.update(kwargs)
             return []
 
         monkeypatch.setattr("hermes_cli.plugins.invoke_hook", capture)
-        get_pre_verify_continue_message(coding=True, attempt=2, changed_paths=["a.py"])
+        await get_pre_verify_continue_message(coding=True, attempt=2, changed_paths=["a.py"])
         assert seen["coding"] is True
         assert seen["attempt"] == 2
         assert seen["changed_paths"] == ["a.py"]
-
-
-class TestThreadToolWhitelist:
-    """Tests for the thread-local tool whitelist used by background review forks."""
-
-    def test_allowed_tool_passes_through_to_hooks(self, monkeypatch):
-        from hermes_cli.plugins import (
-            set_thread_tool_whitelist,
-            clear_thread_tool_whitelist,
-        )
-
-        monkeypatch.setattr(
-            "hermes_cli.plugins.invoke_hook",
-            lambda hook_name, **kwargs: [],
-        )
-        set_thread_tool_whitelist({"memory", "skill_manage"})
-        try:
-            assert get_pre_tool_call_block_message("memory", {}) is None
-        finally:
-            clear_thread_tool_whitelist()
-
-
-    def test_clear_restores_unrestricted_behavior(self, monkeypatch):
-        from hermes_cli.plugins import (
-            set_thread_tool_whitelist,
-            clear_thread_tool_whitelist,
-        )
-
-        monkeypatch.setattr(
-            "hermes_cli.plugins.invoke_hook",
-            lambda hook_name, **kwargs: [],
-        )
-        set_thread_tool_whitelist({"memory"})
-        clear_thread_tool_whitelist()
-        # After clearing, any tool should pass through to plugin hooks (which
-        # return [] here, so result is None).
-        assert get_pre_tool_call_block_message("terminal", {}) is None
-
-    def test_whitelist_is_thread_local(self, monkeypatch):
-        """Setting a whitelist in one thread must NOT leak into another."""
-        import threading
-
-        from hermes_cli.plugins import (
-            set_thread_tool_whitelist,
-            clear_thread_tool_whitelist,
-        )
-
-        monkeypatch.setattr(
-            "hermes_cli.plugins.invoke_hook",
-            lambda hook_name, **kwargs: [],
-        )
-
-        # Main thread: install a restrictive whitelist.
-        set_thread_tool_whitelist({"memory"})
-        try:
-            assert get_pre_tool_call_block_message("terminal", {}) is not None
-
-            # Worker thread: should NOT inherit main thread's whitelist.
-            result = {}
-
-            def worker():
-                result["msg"] = get_pre_tool_call_block_message("terminal", {})
-
-            t = threading.Thread(target=worker)
-            t.start()
-            t.join()
-            assert result["msg"] is None, (
-                "thread-local whitelist leaked across threads"
-            )
-        finally:
-            clear_thread_tool_whitelist()
 
 
 # ── TestPluginContext ──────────────────────────────────────────────────────
@@ -788,11 +751,19 @@ class TestPluginManagerList:
         plugins_dir = tmp_path / "hermes_test" / "plugins"
         _make_plugin_dir(
             plugins_dir, "first_hooker",
-            register_body='ctx.register_hook("post_tool_call", lambda **kw: None)',
+            register_body=(
+                "async def callback(**kw):\n"
+                "    return None\n"
+                'ctx.register_hook("post_tool_call", callback)'
+            ),
         )
         _make_plugin_dir(
             plugins_dir, "second_hooker",
-            register_body='ctx.register_hook("post_tool_call", lambda **kw: None)',
+            register_body=(
+                "async def callback(**kw):\n"
+                "    return None\n"
+                'ctx.register_hook("post_tool_call", callback)'
+            ),
         )
         monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes_test"))
 
@@ -819,11 +790,14 @@ class TestPreLlmCallTargetRouting:
         _make_plugin_dir(
             plugins_dir, name,
             register_body=(
-                f'ctx.register_hook("pre_llm_call", lambda **kw: {return_expr})'
+                "async def callback(**kw):\n"
+                f"    return {return_expr}\n"
+                'ctx.register_hook("pre_llm_call", callback)'
             ),
         )
 
-    def test_context_dict_returned(self, tmp_path, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_context_dict_returned(self, tmp_path, monkeypatch):
         """Plugin returning a context dict is collected by invoke_hook."""
         plugins_dir = tmp_path / "hermes_test" / "plugins"
         self._make_pre_llm_plugin(
@@ -835,7 +809,7 @@ class TestPreLlmCallTargetRouting:
         mgr = PluginManager()
         mgr.discover_and_load()
 
-        results = mgr.invoke_hook(
+        results = await mgr.invoke_hook(
             "pre_llm_call", session_id="s1", user_message="hi",
             conversation_history=[], is_first_turn=True, model="test",
         )
@@ -844,7 +818,8 @@ class TestPreLlmCallTargetRouting:
         assert "target" not in results[0]
 
 
-    def test_routing_logic_all_to_user_message(self, tmp_path, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_routing_logic_all_to_user_message(self, tmp_path, monkeypatch):
         """Simulate the routing logic from run_agent.py.
 
         All plugin context — dicts and plain strings — ends up in a single
@@ -868,7 +843,7 @@ class TestPreLlmCallTargetRouting:
         mgr = PluginManager()
         mgr.discover_and_load()
 
-        results = mgr.invoke_hook(
+        results = await mgr.invoke_hook(
             "pre_llm_call", session_id="s1", user_message="hi",
             conversation_history=[], is_first_turn=True, model="test",
         )

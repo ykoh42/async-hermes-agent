@@ -118,7 +118,7 @@ async def test_public_lifecycle_runs_host_aggregation(monkeypatch):
         "tools.delegate_tool._run_single_child",
         run_child,
     )
-    monkeypatch.setattr("hermes_cli.plugins.invoke_hook_async", hook)
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", hook)
 
     service = SubagentLifecycleService(lambda: parent)
     handle = await service.launch(SubagentLaunchRequest(goal="aggregate me"))

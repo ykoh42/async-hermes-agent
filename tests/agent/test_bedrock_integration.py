@@ -116,7 +116,7 @@ class TestRuntimeProvider:
         """When bedrock is auto-detected (not explicitly requested) and no
         credentials are found, runtime resolution should raise AuthError."""
         from hermes_cli.runtime_provider import resolve_runtime_provider
-        from hermes_cli.auth import AuthError
+        from agent.agent_runtime_helpers import AsyncCapabilityError
 
         # Clear all AWS env vars
         for var in ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_PROFILE",
@@ -133,13 +133,13 @@ class TestRuntimeProvider:
              patch.dict("sys.modules", {"botocore": MagicMock(), "botocore.session": MagicMock()}):
             import botocore.session as _bs
             _bs.get_session = MagicMock(return_value=mock_session)
-            with pytest.raises(AuthError, match="No AWS credentials"):
+            with pytest.raises(AsyncCapabilityError, match="AWS Bedrock"):
                 await resolve_runtime_provider(requested="auto")
 
     @pytest.mark.asyncio
     async def test_bedrock_runtime_explicit_skips_credential_check(self, monkeypatch):
-        """When user explicitly requests bedrock, trust boto3's credential chain
-        even if env-var detection finds nothing (covers IMDS, SSO, etc.)."""
+        """Explicit Bedrock requests fail before a blocking boto3 transport is built."""
+        from agent.agent_runtime_helpers import AsyncCapabilityError
         from hermes_cli.runtime_provider import resolve_runtime_provider
 
         # No AWS env vars set — but explicit bedrock request should not raise
@@ -149,9 +149,8 @@ class TestRuntimeProvider:
 
         with patch("hermes_cli.runtime_provider.resolve_provider", return_value="bedrock"), \
              patch("hermes_cli.runtime_provider._get_model_config", return_value={"provider": "bedrock"}):
-            result = await resolve_runtime_provider(requested="bedrock")
-        assert result["provider"] == "bedrock"
-        assert result["api_mode"] == "bedrock_converse"
+            with pytest.raises(AsyncCapabilityError, match="AWS Bedrock"):
+                await resolve_runtime_provider(requested="bedrock")
 
 
 # ---------------------------------------------------------------------------
@@ -212,9 +211,13 @@ class TestPackaging:
         assert "bedrock" in extras
         assert any(dep.startswith("boto3==") for dep in extras["bedrock"])
 
-    def test_bedrock_is_not_eager_installed_by_all_extra(self):
-        extras = self._optional_dependencies()
-        assert "hermes-agent[bedrock]" not in extras["all"]
+    def test_bedrock_is_not_eager_installed(self):
+        import tomllib
+        from pathlib import Path
+
+        content = (Path(__file__).parent.parent.parent / "pyproject.toml").read_text()
+        dependencies = tomllib.loads(content)["project"]["dependencies"]
+        assert not any(dep.startswith("boto3") for dep in dependencies)
 
 
 # ---------------------------------------------------------------------------
@@ -372,7 +375,8 @@ class TestAuxiliaryClientBedrockResolution:
 
     @pytest.mark.asyncio
     async def test_bedrock_returns_client_with_credentials(self, monkeypatch):
-        """With valid AWS credentials, Bedrock should return a usable client."""
+        """Auxiliary Bedrock fails fast instead of constructing a blocking client."""
+        from agent.agent_runtime_helpers import AsyncCapabilityError
         monkeypatch.setenv("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE")
         monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY")
         monkeypatch.setenv("AWS_REGION", "us-west-2")
@@ -380,65 +384,53 @@ class TestAuxiliaryClientBedrockResolution:
         mock_anthropic_bedrock = MagicMock()
         with patch("agent.anthropic_adapter.build_anthropic_bedrock_client",
                    return_value=mock_anthropic_bedrock):
-            from agent.auxiliary_client import resolve_provider_client, AnthropicAuxiliaryClient
-            client, model = await resolve_provider_client("bedrock", None)
-
-        assert client is not None, (
-            "resolve_provider_client('bedrock') returned None — "
-            "aws_sdk auth type is not handled"
-        )
-        assert isinstance(client, AnthropicAuxiliaryClient)
-        assert model is not None
-        assert client.api_key == "aws-sdk"
-        assert "us-west-2" in client.base_url
+            from agent.auxiliary_client import resolve_provider_client
+            with pytest.raises(AsyncCapabilityError, match="AWS Bedrock"):
+                await resolve_provider_client("bedrock", None)
 
     @pytest.mark.asyncio
     async def test_bedrock_returns_none_without_credentials(self, monkeypatch):
-        """Without AWS credentials, Bedrock should return (None, None) gracefully."""
+        """The unsupported transport is reported consistently without credentials."""
+        from agent.agent_runtime_helpers import AsyncCapabilityError
         with patch("agent.bedrock_adapter.has_aws_credentials", return_value=False):
             from agent.auxiliary_client import resolve_provider_client
-            client, model = await resolve_provider_client("bedrock", None)
-
-        assert client is None
-        assert model is None
+            with pytest.raises(AsyncCapabilityError, match="AWS Bedrock"):
+                await resolve_provider_client("bedrock", None)
 
 
 
 
     @pytest.mark.asyncio
     async def test_bedrock_default_model_is_haiku(self, monkeypatch):
-        """Default auxiliary model for Bedrock should be Haiku (fast, cheap)."""
+        """Model selection never hides the unsupported blocking transport."""
+        from agent.agent_runtime_helpers import AsyncCapabilityError
         monkeypatch.setenv("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE")
         monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY")
 
         with patch("agent.anthropic_adapter.build_anthropic_bedrock_client",
                    return_value=MagicMock()):
             from agent.auxiliary_client import resolve_provider_client
-            _, model = await resolve_provider_client("bedrock", None)
-
-        assert "haiku" in model.lower()
-
+            with pytest.raises(AsyncCapabilityError, match="AWS Bedrock"):
+                await resolve_provider_client("bedrock", None)
 
 
 
 
-    def test_bedrock_converse_shim_stream_returns_complete_response(self, monkeypatch):
-        """stream=True is not supported by the shim — a complete response comes
-        back and call_llm's streaming consumer downgrades gracefully."""
+
+    @pytest.mark.asyncio
+    async def test_bedrock_converse_shim_fails_fast(self, monkeypatch):
+        """The compatibility shim must never call blocking boto3 from the loop."""
         monkeypatch.setenv("AWS_ACCESS_KEY_ID", "AKIAIO...MPLE")
         monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY")
 
         from agent.auxiliary_client import BedrockAuxiliaryClient
 
         client = BedrockAuxiliaryClient("us-east-1", "openai.gpt-oss-20b-1:0")
-        sentinel = object()
-        with patch("agent.bedrock_adapter.call_converse", return_value=sentinel) as mock_converse:
-            resp = client.chat.completions.create(
-                model="openai.gpt-oss-20b-1:0",
-                messages=[{"role": "user", "content": "hi"}],
-                stream=True,
-            )
-        # Non-streaming call_converse is still used; the caller's
-        # got-final-object downgrade path handles the rest.
-        assert resp is sentinel
-        assert mock_converse.call_count == 1
+        with patch("agent.bedrock_adapter.call_converse") as mock_converse:
+            with pytest.raises(RuntimeError, match="native async transport"):
+                await client.chat.completions.create(
+                    model="openai.gpt-oss-20b-1:0",
+                    messages=[{"role": "user", "content": "hi"}],
+                    stream=True,
+                )
+        mock_converse.assert_not_called()

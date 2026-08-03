@@ -29,11 +29,11 @@ from agent.conversation_compression import (
     _hydrate_persisted_compression_guards,
     _persist_compression_guards,
 )
-from hermes_state import AsyncSessionDB
+from hermes_state import SessionDB
 
 
 async def _compressor(
-    db: AsyncSessionDB | None = None, session_id: str = ""
+    db: SessionDB | None = None, session_id: str = ""
 ) -> ContextCompressor:
     with patch(
         "agent.context_compressor.get_static_context_length",
@@ -52,8 +52,8 @@ async def _compressor(
     return cc
 
 
-def _db(tmp_path: Path) -> AsyncSessionDB:
-    return AsyncSessionDB(tmp_path / "state.db")
+def _db(tmp_path: Path) -> SessionDB:
+    return SessionDB(tmp_path / "state.db")
 
 
 class TestCounterRoundTripsBindSessionState:

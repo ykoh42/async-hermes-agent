@@ -1387,7 +1387,8 @@ class TestProviderEnabledRuntimeGate:
     full runtime resolution has its own fixture-heavy tests; here we
     only assert the early-exit raises a typed error."""
 
-    def test_disabled_custom_provider_raises_valueerror(self, tmp_path, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_disabled_custom_provider_raises_valueerror(self, tmp_path, monkeypatch):
         cfg = {
             "model": {"default": "claude-sonnet-4-6", "provider": "claude-agent-sdk"},
             "providers": {
@@ -1408,7 +1409,7 @@ class TestProviderEnabledRuntimeGate:
 
         from hermes_cli.runtime_provider import resolve_runtime_provider
         with pytest.raises(ValueError, match="disabled"):
-            resolve_runtime_provider(requested="my-fork")
+            await resolve_runtime_provider(requested="my-fork")
 
 
 # ---------------------------------------------------------------------------

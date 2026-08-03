@@ -7,6 +7,8 @@ show "Unknown") and, worse, functional headers like Kimi's User-Agent
 sentinel (403 without it).
 """
 
+import pytest
+
 from unittest.mock import MagicMock, patch
 
 from run_agent import AIAgent
@@ -42,14 +44,15 @@ def _make_agent(provider="copilot", base_url="https://api.githubcopilot.com") ->
     return agent
 
 
+@pytest.mark.asyncio
 @patch("agent.model_metadata.get_model_context_length", return_value=131_072)
-def test_switch_to_openrouter_reapplies_attribution_headers(mock_ctx_len):
+async def test_switch_to_openrouter_reapplies_attribution_headers(mock_ctx_len):
     """Switching to an openrouter.ai base_url must attach the OpenRouter
     attribution headers (HTTP-Referer / X-Title) to the rebuilt client
     kwargs — not ship a bare api_key+base_url client (#61099)."""
     agent = _make_agent(provider="copilot", base_url="https://api.githubcopilot.com")
 
-    agent.switch_model(
+    await agent.switch_model(
         "deepseek/deepseek-chat",
         "openrouter",
         api_key="sk-or-new",
@@ -63,8 +66,9 @@ def test_switch_to_openrouter_reapplies_attribution_headers(mock_ctx_len):
 
 
 
+@pytest.mark.asyncio
 @patch("agent.model_metadata.get_model_context_length", return_value=131_072)
-def test_switch_away_from_headered_provider_clears_stale_headers(mock_ctx_len):
+async def test_switch_away_from_headered_provider_clears_stale_headers(mock_ctx_len):
     """Switching FROM a headered provider TO one with no URL-specific headers
     must not carry the old provider's headers along."""
     agent = _make_agent(provider="openrouter", base_url="https://openrouter.ai/api/v1")
@@ -73,7 +77,7 @@ def test_switch_away_from_headered_provider_clears_stale_headers(mock_ctx_len):
         "X-Title": "Hermes Agent",
     }
 
-    agent.switch_model(
+    await agent.switch_model(
         "MiniMax-M3",
         "custom:minimax",
         api_key="sk-minimax",

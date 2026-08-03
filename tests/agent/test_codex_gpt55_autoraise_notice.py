@@ -23,7 +23,7 @@ from pathlib import Path
 import pytest
 
 from hermes_constants import get_hermes_home
-from hermes_state import AsyncSessionDB
+from hermes_state import SessionDB
 from run_agent import AIAgent
 
 from agent.agent_init import (
@@ -61,7 +61,7 @@ def _make_codex_agent(monkeypatch, tmp_path: Path, *, show_notice: bool):
     monkeypatch.setattr(config_mod, "load_config", lambda: _config(show_notice=show_notice))
 
     monkeypatch.setattr(config_mod, "load_config_readonly", lambda: _config(show_notice=show_notice))
-    db = AsyncSessionDB(tmp_path / "state.db")
+    db = SessionDB(tmp_path / "state.db")
     stdout = io.StringIO()
 
     with contextlib.redirect_stdout(stdout):

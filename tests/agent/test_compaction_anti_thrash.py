@@ -178,11 +178,12 @@ class TestFutilityGuard:
 
 
 
-    def test_model_switch_resets_and_persists_fallback_streak(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_model_switch_resets_fallback_streak(self, tmp_path):
         from hermes_state import SessionDB
 
         db = SessionDB(db_path=tmp_path / "state.db")
-        db.create_session("s1", source="cli")
+        await db.create_session("s1", source="cli")
         cc = _compressor(threshold_tokens=24_576)
         cc.bind_session_state(db, "s1")
         cc.record_completed_compaction(used_fallback=True)
@@ -190,7 +191,8 @@ class TestFutilityGuard:
         cc.update_model("next-model", 100_000)
 
         assert cc._fallback_compression_streak == 0
-        assert db.get_compression_fallback_streak("s1") == 0
+        assert await db.get_compression_fallback_streak("s1") == 0
+        await db.close()
 
 
 

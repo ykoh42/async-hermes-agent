@@ -26,8 +26,7 @@ async def test_credential_rotation_rebuilds_natively_without_sync_settings_io():
     with (
         patch("run_agent.get_tool_definitions", return_value=[]),
         patch("run_agent.check_toolset_requirements", return_value={}),
-        patch("run_agent.OpenAI", return_value=MagicMock()),
-        patch("openai.AsyncOpenAI", return_value=native_client) as async_openai,
+        patch("run_agent.OpenAI", return_value=native_client) as async_openai,
         patch(
             "hermes_cli.config.load_config_readonly",
             side_effect=AssertionError("credential rotation must not read settings"),
@@ -67,8 +66,7 @@ async def test_credential_rotation_drops_previous_route_headers():
     with (
         patch("run_agent.get_tool_definitions", return_value=[]),
         patch("run_agent.check_toolset_requirements", return_value={}),
-        patch("run_agent.OpenAI", return_value=MagicMock()),
-        patch("openai.AsyncOpenAI", return_value=native_client),
+        patch("run_agent.OpenAI", return_value=native_client),
     ):
         agent = AIAgent(
             provider="custom",

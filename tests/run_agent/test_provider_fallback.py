@@ -172,10 +172,6 @@ class TestFallbackChainAdvancement:
 
         with (
             patch(
-                "agent.chat_completion_helpers._fallback_entry_unavailable_without_network",
-                return_value=None,
-            ),
-            patch(
                 "hermes_cli.model_normalize.normalize_model_for_provider",
                 side_effect=lambda m, p: m,
             ),
@@ -206,10 +202,6 @@ class TestFallbackChainAdvancement:
         }]
         agent = _make_agent(fallback_model=fbs)
         with (
-            patch(
-                "agent.chat_completion_helpers._fallback_entry_unavailable_without_network",
-                return_value=None,
-            ),
             patch(
                 "hermes_cli.model_normalize.normalize_model_for_provider",
                 side_effect=lambda m, p: m,

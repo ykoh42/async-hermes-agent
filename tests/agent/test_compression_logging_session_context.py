@@ -19,10 +19,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import hermes_logging
 import pytest
-from hermes_state import AsyncSessionDB
+from hermes_state import SessionDB
 
 
-def _build_agent_with_db(db: AsyncSessionDB, session_id: str):
+def _build_agent_with_db(db: SessionDB, session_id: str):
     """Mirror tests/agent/test_compression_concurrent_fork.py's harness."""
     with patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}):
         from run_agent import AIAgent
@@ -60,7 +60,7 @@ def _build_agent_with_db(db: AsyncSessionDB, session_id: str):
 
 @pytest.mark.asyncio
 async def test_logging_session_context_follows_compression_rotation(tmp_path: Path) -> None:
-    db = AsyncSessionDB(tmp_path / "state.db")
+    db = SessionDB(tmp_path / "state.db")
     parent_sid = "PARENT_LOGCTX_SESSION"
     await db.create_session(parent_sid, source="cli")
 

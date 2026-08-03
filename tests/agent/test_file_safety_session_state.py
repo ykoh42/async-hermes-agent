@@ -49,7 +49,8 @@ def test_session_state_paths_are_write_denied(fake_homes, relative):
 
 
 
-def test_write_file_tool_preserves_existing_session_snapshot(fake_homes):
+@pytest.mark.asyncio
+async def test_write_file_tool_preserves_existing_session_snapshot(fake_homes):
     import tools.file_tools as ft
 
     _root, profile = fake_homes
@@ -57,7 +58,7 @@ def test_write_file_tool_preserves_existing_session_snapshot(fake_homes):
     target.parent.mkdir(parents=True)
     target.write_text("original transcript", encoding="utf-8")
 
-    result = json.loads(ft.write_file_tool(str(target), "tampered"))
+    result = json.loads(await ft.write_file_tool(str(target), "tampered"))
 
     assert "error" in result
     assert target.read_text(encoding="utf-8") == "original transcript"

@@ -62,7 +62,7 @@ def _native_tool_entry():
 
 def _native_policy_path():
     return patch(
-        "hermes_cli.plugins.resolve_pre_tool_block_async",
+        "hermes_cli.plugins.resolve_pre_tool_block",
         new_callable=AsyncMock,
         return_value=None,
     )

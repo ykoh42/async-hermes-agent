@@ -29,10 +29,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from hermes_state import AsyncSessionDB
+from hermes_state import SessionDB
 
 
-def _build_agent_with_db(db: AsyncSessionDB, session_id: str):
+def _build_agent_with_db(db: SessionDB, session_id: str):
     """Build an AIAgent wired to ``db`` and pinned to ``session_id``.
 
     Mirrors the helper in ``test_compression_concurrent_fork.py``: stub the
@@ -84,7 +84,7 @@ def _contents(rows):
 async def test_rotation_flush_does_not_duplicate_persisted_prefix(tmp_path: Path) -> None:
     """Cold-resume + rotating preflight compression keeps the parent transcript
     at (persisted prefix + one new turn) — no second copy of the durable rows."""
-    db = AsyncSessionDB(tmp_path / "state.db")
+    db = SessionDB(tmp_path / "state.db")
 
     parent_sid = "COLD_RESUME_PARENT"
     await db.create_session(parent_sid, source="desktop")

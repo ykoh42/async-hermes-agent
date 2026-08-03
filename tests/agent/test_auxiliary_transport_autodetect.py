@@ -75,9 +75,10 @@ def test_endpoint_speaks_anthropic_messages(url, expected, label):
 
 
 @pytest.mark.asyncio
-async def test_maybe_wrap_anthropic_sdk_missing_falls_back():
-    """ImportError on anthropic SDK returns plain client with warning."""
-    from agent.auxiliary_client import _maybe_wrap_anthropic, AnthropicAuxiliaryClient
+async def test_maybe_wrap_anthropic_sdk_missing_fails_fast():
+    """A missing required transport must not silently use the wrong wire protocol."""
+    from agent.agent_runtime_helpers import AsyncCapabilityError
+    from agent.auxiliary_client import _maybe_wrap_anthropic
 
     plain_client = MagicMock(name="plain_openai")
 
@@ -96,18 +97,17 @@ async def test_maybe_wrap_anthropic_sdk_missing_falls_back():
         saved = _sys.modules.get("agent.anthropic_adapter")
         _sys.modules["agent.anthropic_adapter"] = None  # force ImportError
         try:
-            result = await _maybe_wrap_anthropic(
-                plain_client, "kimi-for-coding", "sk-kimi-test",
-                "https://api.kimi.com/coding", api_mode=None,
-            )
+            with pytest.raises(AsyncCapabilityError, match="Anthropic async transport"):
+                await _maybe_wrap_anthropic(
+                    plain_client, "kimi-for-coding", "sk-kimi-test",
+                    "https://api.kimi.com/coding", api_mode=None,
+                )
         finally:
             if saved is not None:
                 _sys.modules["agent.anthropic_adapter"] = saved
             else:
                 _sys.modules.pop("agent.anthropic_adapter", None)
 
-    assert result is plain_client
-    assert not isinstance(result, AnthropicAuxiliaryClient)
 
 
 # ---------------------------------------------------------------------------

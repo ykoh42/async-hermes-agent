@@ -28,7 +28,7 @@ import pytest
 import pytest_asyncio
 
 from agent.turn_context import build_turn_context
-from hermes_state import AsyncSessionDB
+from hermes_state import SessionDB
 from run_agent import AIAgent
 
 NOTE = "[System note: Your previous turn was interrupted mid-run …]\n\nkeep going"
@@ -37,7 +37,7 @@ NOTE = "[System note: Your previous turn was interrupted mid-run …]\n\nkeep go
 @pytest_asyncio.fixture()
 async def agent_db():
     tmp = tempfile.mkdtemp(prefix="synthetic_display_kind_")
-    db = AsyncSessionDB(Path(tmp) / "state.db")
+    db = SessionDB(Path(tmp) / "state.db")
     sid = "sess-synthetic"
     await db.create_session(session_id=sid, source="desktop", model="test-model")
     agent = AIAgent(

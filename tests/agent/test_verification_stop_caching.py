@@ -46,7 +46,7 @@ def test_verification_flags_registered_as_ephemeral(tmp_path, monkeypatch):
 
 
 def _make_agent(ra, session_id, tmp_path):
-    from hermes_state import AsyncSessionDB
+    from hermes_state import SessionDB
 
     agent = ra.AIAgent(
         session_id=session_id,
@@ -58,7 +58,7 @@ def _make_agent(ra, session_id, tmp_path):
         skip_context_files=True,
         skip_memory=True,
     )
-    agent._session_db = AsyncSessionDB(tmp_path / "state.db")
+    agent._session_db = SessionDB(tmp_path / "state.db")
     agent._session_db_created = False
     agent._session_json_enabled = True
     agent.logs_dir = tmp_path / "logs"

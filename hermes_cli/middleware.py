@@ -97,7 +97,7 @@ async def apply_llm_request_middleware(
     current_request = _safe_copy(original_request)
     trace: List[Dict[str, Any]] = []
 
-    for result in await _invoke_middleware_async(
+    for result in await _invoke_middleware(
         LLM_REQUEST_MIDDLEWARE,
         request=current_request,
         original_request=original_request,
@@ -137,20 +137,6 @@ async def apply_tool_request_middleware(
     current_args = _safe_copy(original_args)
     trace: List[Dict[str, Any]] = []
 
-    session_id = str(context.get("session_id") or "")
-    skip_relay = bool(context.pop("skip_relay", False))
-    if session_id and not skip_relay:
-        from agent import relay_runtime
-
-        relay_args = relay_runtime.apply_tool_request_intercepts(
-            session_id=session_id,
-            tool_name=tool_name,
-            args=current_args,
-        )
-        if relay_args != current_args:
-            current_args = _safe_copy(relay_args)
-            trace.append({"source": "nemo_relay"})
-
     if not _has_middleware(TOOL_REQUEST_MIDDLEWARE):
         return RequestMiddlewareResult(
             payload=args if not trace else current_args,
@@ -159,7 +145,7 @@ async def apply_tool_request_middleware(
             trace=trace,
         )
 
-    for result in await _invoke_middleware_async(
+    for result in await _invoke_middleware(
         TOOL_REQUEST_MIDDLEWARE,
         tool_name=tool_name,
         args=current_args,
@@ -194,7 +180,7 @@ async def run_llm_execution_middleware(
     callbacks = _get_middleware_callbacks(LLM_EXECUTION_MIDDLEWARE)
     if not callbacks:
         return await next_call(request)
-    return await _run_execution_chain_async(
+    return await _run_execution_chain(
         LLM_EXECUTION_MIDDLEWARE,
         callbacks,
         next_call,
@@ -223,7 +209,7 @@ async def run_tool_execution_middleware(
     callbacks = _get_middleware_callbacks(TOOL_EXECUTION_MIDDLEWARE)
     if not callbacks:
         return await next_call(args)
-    return await _run_execution_chain_async(
+    return await _run_execution_chain(
         TOOL_EXECUTION_MIDDLEWARE,
         callbacks,
         next_call,
@@ -238,7 +224,7 @@ class AsyncMiddlewareCapabilityError(RuntimeError):
     """Raised when a synchronous plugin callback reaches the async agent."""
 
 
-async def _invoke_middleware_async(kind: str, **kwargs: Any) -> List[Any]:
+async def _invoke_middleware(kind: str, **kwargs: Any) -> List[Any]:
     """Invoke middleware callbacks without a sync fallback or worker bridge."""
     callbacks = _get_middleware_callbacks(kind)
     results: List[Any] = []
@@ -278,78 +264,13 @@ def _get_middleware_callbacks(kind: str) -> List[Callable]:
     return list(get_plugin_manager()._middleware.get(kind, []))
 
 
-def _run_execution_chain(
+async def _run_execution_chain(
     kind: str,
     callbacks: List[Callable],
     terminal_call: Callable[[Any], Any],
     **kwargs: Any,
 ) -> Any:
-    payload_key = "request" if "request" in kwargs else "args"
-
-    class _DownstreamExecutionError(Exception):
-        def __init__(self, original: BaseException) -> None:
-            super().__init__(str(original))
-            self.original = original
-
-    def call_at(index: int, payload: Any) -> Any:
-        if index >= len(callbacks):
-            return terminal_call(payload)
-
-        callback = callbacks[index]
-        next_called = False
-        next_succeeded = False
-        next_result: Any = None
-
-        def next_call(next_payload: Any = None) -> Any:
-            nonlocal next_called, next_succeeded, next_result
-            # ``next_call`` is single-use per middleware frame. Calling it more
-            # than once would re-run the downstream provider/tool, so a second
-            # invocation is a contract violation rather than a retry. Surface it
-            # instead of silently executing the terminal call twice.
-            if next_called:
-                raise RuntimeError(
-                    f"Middleware '{kind}' callback "
-                    f"{getattr(callback, '__name__', repr(callback))} called "
-                    "next_call() more than once; downstream execution is single-use"
-                )
-            next_called = True
-            try:
-                next_result = call_at(index + 1, payload if next_payload is None else next_payload)
-                next_succeeded = True
-                return next_result
-            except Exception as exc:
-                raise _DownstreamExecutionError(exc) from exc
-
-        call_kwargs = middleware_payload(**kwargs)
-        call_kwargs[payload_key] = payload
-        call_kwargs["next_call"] = next_call
-        try:
-            return callback(**call_kwargs)
-        except _DownstreamExecutionError as exc:
-            raise exc.original
-        except Exception as exc:
-            logger.warning(
-                "Middleware '%s' callback %s raised: %s",
-                kind,
-                getattr(callback, "__name__", repr(callback)),
-                exc,
-            )
-            if next_succeeded:
-                return next_result
-            if next_called:
-                raise
-            return call_at(index + 1, payload)
-
-    return call_at(0, kwargs[payload_key])
-
-
-async def _run_execution_chain_async(
-    kind: str,
-    callbacks: List[Callable],
-    terminal_call: Callable[[Any], Any],
-    **kwargs: Any,
-) -> Any:
-    """Coroutine-native equivalent of :func:`_run_execution_chain`."""
+    """Run coroutine middleware while preserving single-use ``next_call``."""
     payload_key = "request" if "request" in kwargs else "args"
 
     class _DownstreamExecutionError(Exception):

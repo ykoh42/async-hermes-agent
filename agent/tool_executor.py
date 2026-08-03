@@ -226,9 +226,9 @@ async def _run_agent_tool_execution_middleware(
         block_error_type = "tool_scope_block"
         if block_message is None:
             block_error_type = "plugin_block"
-            from hermes_cli.plugins import resolve_pre_tool_block_async
+            from hermes_cli.plugins import resolve_pre_tool_block
 
-            block_message = await resolve_pre_tool_block_async(
+            block_message = await resolve_pre_tool_block(
                 function_name,
                 next_args,
                 task_id=effective_task_id or "",

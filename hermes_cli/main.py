@@ -7,7 +7,7 @@ or tool-installation command surface.  Agent execution lives in
 upstream path solely to configure external MCP servers.
 """
 
-from __future__ import annotations
+import hermes_bootstrap  # noqa: F401
 
 import argparse
 import os
@@ -88,9 +88,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.version:
         try:
-            print(version("hermes-agent"))
+            print(version("async-hermes-agent"))
         except PackageNotFoundError:
-            print("hermes-agent (source checkout)")
+            print("async-hermes-agent (source checkout)")
         return 0
     if not hasattr(args, "func"):
         parser.print_help()

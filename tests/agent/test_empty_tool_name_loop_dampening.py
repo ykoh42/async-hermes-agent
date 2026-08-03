@@ -45,7 +45,9 @@ class _MockHandler(BaseHTTPRequestHandler):
         req = json.loads(self.rfile.read(length).decode())
         type(self).captured_requests.append(req)
         is_stream = req.get("stream") is True
-        if type(self).response_queue:
+        if "messages" not in req:
+            resp = _text_resp("probe")
+        elif type(self).response_queue:
             resp = type(self).response_queue.pop(0)
         else:
             resp = _text_resp("DONE")

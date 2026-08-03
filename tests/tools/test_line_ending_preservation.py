@@ -55,7 +55,8 @@ def _bare_lf_count(b: bytes) -> int:
 
 
 class TestPatchCRLFPreservation:
-    def test_patch_on_crlf_file_stays_pure_crlf(self, hermes_home, tmp_path):
+    @pytest.mark.asyncio
+    async def test_patch_on_crlf_file_stays_pure_crlf(self, hermes_home, tmp_path):
         """LLM sends LF old/new; file has CRLF.  Result must be all CRLF,
         no mixed endings."""
         from tools.file_tools import _handle_patch
@@ -63,7 +64,7 @@ class TestPatchCRLFPreservation:
         target = tmp_path / "config.ini"
         target.write_bytes(b"[a]\r\nkey=1\r\n\r\n[b]\r\nkey=2\r\n")
 
-        result = _handle_patch(
+        result = await _handle_patch(
             {
                 "mode": "replace",
                 "path": str(target),
@@ -84,7 +85,8 @@ class TestPatchCRLFPreservation:
         assert b"key=99\r\n" in raw
 
 
-    def test_patch_multiline_replacement_on_crlf(self, hermes_home, tmp_path):
+    @pytest.mark.asyncio
+    async def test_patch_multiline_replacement_on_crlf(self, hermes_home, tmp_path):
         """Multi-line new_string with bare LFs should be CRLF-converted
         before write."""
         from tools.file_tools import _handle_patch
@@ -92,7 +94,7 @@ class TestPatchCRLFPreservation:
         target = tmp_path / "f.py"
         target.write_bytes(b"def foo():\r\n    return 1\r\n")
 
-        result = _handle_patch(
+        result = await _handle_patch(
             {
                 "mode": "replace",
                 "path": str(target),
@@ -112,7 +114,8 @@ class TestPatchCRLFPreservation:
 
 
 class TestWriteFileCRLFPreservation:
-    def test_overwrite_crlf_file_with_lf_content_preserves_crlf(
+    @pytest.mark.asyncio
+    async def test_overwrite_crlf_file_with_lf_content_preserves_crlf(
         self, hermes_home, tmp_path
     ):
         """The agent typically sends bare-LF content; if the file existed
@@ -123,7 +126,7 @@ class TestWriteFileCRLFPreservation:
         target = tmp_path / "config.bat"
         target.write_bytes(b"@echo off\r\nset X=1\r\n")
 
-        result = _handle_write_file(
+        result = await _handle_write_file(
             {
                 "path": str(target),
                 "content": "@echo off\nset X=99\nset Y=42\n",
@@ -140,14 +143,15 @@ class TestWriteFileCRLFPreservation:
         assert _crlf_count(raw) == 3
 
 
-    def test_overwrite_lf_file_stays_lf(self, hermes_home, tmp_path):
+    @pytest.mark.asyncio
+    async def test_overwrite_lf_file_stays_lf(self, hermes_home, tmp_path):
         """Pre-existing LF file should not get spurious CRLFs."""
         from tools.file_tools import _handle_write_file
 
         target = tmp_path / "lf.txt"
         target.write_bytes(b"line1\nline2\n")
 
-        result = _handle_write_file(
+        result = await _handle_write_file(
             {"path": str(target), "content": "X\nY\nZ\n"},
             task_id="crlf_write_3",
         )

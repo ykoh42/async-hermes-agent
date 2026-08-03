@@ -100,10 +100,10 @@ class TestAbortPathsResetPerAttemptState:
             compress_context,
             conversation_history_after_compression,
         )
-        from hermes_state import AsyncSessionDB
+        from hermes_state import SessionDB
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            db = AsyncSessionDB(Path(tmpdir) / "test.db")
+            db = SessionDB(Path(tmpdir) / "test.db")
             agent = _make_agent(db)
             agent.compression_in_place = True
             original = [

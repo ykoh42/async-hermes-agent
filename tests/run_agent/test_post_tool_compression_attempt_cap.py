@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import json
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -108,6 +108,9 @@ def agent():
             max_iterations=10,
         )
     a.client = MagicMock()
+    a.client.chat.completions.create = AsyncMock()
+    a._deferred_provider_runtime = None
+    a.provider = a.requested_provider = "openrouter"
     a._cached_system_prompt = "You are helpful."
     a._use_prompt_caching = False
     a._disable_streaming = True
@@ -118,7 +121,7 @@ def agent():
     return a
 
 
-def _run_tool_loop(agent, n_tool_iterations: int):
+async def _run_tool_loop(agent, n_tool_iterations: int):
     """Drive one turn: ``n_tool_iterations`` tool calls, then a stop."""
     responses = [_tool_response(i) for i in range(n_tool_iterations)]
     responses.append(_stop_response())
@@ -126,7 +129,7 @@ def _run_tool_loop(agent, n_tool_iterations: int):
 
     compress_calls = []
 
-    def _fake_compress(messages, system_message, **_kwargs):
+    async def _fake_compress(messages, system_message, **_kwargs):
         compress_calls.append(len(messages))
         return messages, "compressed prompt"
 
@@ -136,11 +139,12 @@ def _run_tool_loop(agent, n_tool_iterations: int):
         patch.object(agent, "_save_trajectory"),
         patch.object(agent, "_cleanup_task_resources"),
         patch(
-            "run_agent.handle_function_call",
-            lambda name, args, task_id=None, **kwargs: json.dumps({"ok": True}),
+            "model_tools.handle_function_call",
+            new_callable=AsyncMock,
+            return_value=json.dumps({"ok": True}),
         ),
     ):
-        result = agent.run_conversation("do a lot of tool work")
+        result = await agent.run_conversation("do a lot of tool work")
 
     return result, compress_calls
 
@@ -151,7 +155,8 @@ def _run_tool_loop(agent, n_tool_iterations: int):
 
 
 class TestPostToolCompressionAttemptCap:
-    def test_post_tool_compression_capped_at_default_three(self, agent):
+    @pytest.mark.asyncio
+    async def test_post_tool_compression_capped_at_default_three(self, agent):
         """7 tool iterations under constant pressure → exactly 3 compactions.
 
         Before the fix the post-tool gate re-fired after every tool response
@@ -159,7 +164,7 @@ class TestPostToolCompressionAttemptCap:
         resolved default of 3.
         """
         assert agent.max_compression_attempts == 3  # config default
-        result, compress_calls = _run_tool_loop(agent, n_tool_iterations=7)
+        result, compress_calls = await _run_tool_loop(agent, n_tool_iterations=7)
 
         assert result["completed"] is True
         assert len(compress_calls) == 3, (
@@ -168,7 +173,8 @@ class TestPostToolCompressionAttemptCap:
         )
 
 
-    def test_post_tool_compression_shares_counter_with_pre_api_gate(self, agent):
+    @pytest.mark.asyncio
+    async def test_post_tool_compression_shares_counter_with_pre_api_gate(self, agent):
         """Pre-API compactions consume the same per-turn budget.
 
         Let the pre-API pressure gate fire once (defer disabled for the first
@@ -181,7 +187,7 @@ class TestPostToolCompressionAttemptCap:
         agent.context_compressor.should_defer_preflight_to_real_usage.side_effect = (
             lambda _t: next(defers, True)
         )
-        result, compress_calls = _run_tool_loop(agent, n_tool_iterations=7)
+        result, compress_calls = await _run_tool_loop(agent, n_tool_iterations=7)
 
         assert result["completed"] is True
         assert len(compress_calls) == 3, (
@@ -189,11 +195,12 @@ class TestPostToolCompressionAttemptCap:
             f"attempt budget, got {len(compress_calls)} total compactions"
         )
 
-    def test_cap_is_per_turn_not_per_session(self, agent):
+    @pytest.mark.asyncio
+    async def test_cap_is_per_turn_not_per_session(self, agent):
         """A fresh turn gets a fresh attempt budget."""
-        _result, first = _run_tool_loop(agent, n_tool_iterations=5)
+        _result, first = await _run_tool_loop(agent, n_tool_iterations=5)
         agent.client.chat.completions.create.side_effect = None
-        _result, second = _run_tool_loop(agent, n_tool_iterations=5)
+        _result, second = await _run_tool_loop(agent, n_tool_iterations=5)
 
         assert len(first) == 3
         assert len(second) == 3

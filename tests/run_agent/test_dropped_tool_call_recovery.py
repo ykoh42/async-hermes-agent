@@ -18,7 +18,7 @@ genuine ``finish_reason="stop"`` text turn is unaffected.
 from __future__ import annotations
 
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -42,6 +42,9 @@ def loop_agent():
             skip_memory=True,
         )
         agent.client = MagicMock()
+        agent.client.chat.completions.create = AsyncMock()
+        agent._deferred_provider_runtime = None
+        agent.provider = agent.requested_provider = "openrouter"
         agent._cached_system_prompt = "You are helpful."
         agent._use_prompt_caching = False
         agent.tool_delay = 0
@@ -67,7 +70,8 @@ def _dropped_tool_call_response(content: str):
 
 
 class TestDroppedToolCallRecovery:
-    def test_dropped_tool_call_reprompts_instead_of_exiting(self, loop_agent):
+    @pytest.mark.asyncio
+    async def test_dropped_tool_call_reprompts_instead_of_exiting(self, loop_agent):
         """finish_reason=tool_calls with an empty tool_calls array must
         re-prompt the model to emit the call rather than exiting the loop
         with the narration as the final answer."""
@@ -83,7 +87,7 @@ class TestDroppedToolCallRecovery:
             patch.object(loop_agent, "_save_trajectory"),
             patch.object(loop_agent, "_cleanup_task_resources"),
         ):
-            result = loop_agent.run_conversation("review the PR")
+            result = await loop_agent.run_conversation("review the PR")
 
         assert loop_agent.client.chat.completions.create.call_count == 2, (
             "A dropped tool call must trigger a re-prompt (second API call), "
@@ -104,7 +108,8 @@ class TestDroppedToolCallRecovery:
         assert "All checks pass" in result["final_response"]
 
 
-    def test_clean_stop_text_turn_is_unaffected(self, loop_agent):
+    @pytest.mark.asyncio
+    async def test_clean_stop_text_turn_is_unaffected(self, loop_agent):
         """A genuine finish_reason=stop text response must exit normally — the
         recovery path must not fire on ordinary final answers."""
         from tests.run_agent.test_run_agent import _mock_response
@@ -118,14 +123,15 @@ class TestDroppedToolCallRecovery:
             patch.object(loop_agent, "_save_trajectory"),
             patch.object(loop_agent, "_cleanup_task_resources"),
         ):
-            result = loop_agent.run_conversation("hello")
+            result = await loop_agent.run_conversation("hello")
 
         assert loop_agent.client.chat.completions.create.call_count == 1, (
             "A clean finish_reason=stop turn must not trigger a re-prompt."
         )
         assert "Here is your answer." in result["final_response"]
 
-    def test_persistent_dropped_tool_calls_are_bounded(self, loop_agent):
+    @pytest.mark.asyncio
+    async def test_persistent_dropped_tool_calls_are_bounded(self, loop_agent):
         """If the model never emits a call, the recovery must give up after a
         bounded number of consecutive stalls instead of looping forever."""
         from tests.run_agent.test_run_agent import _mock_response
@@ -142,7 +148,7 @@ class TestDroppedToolCallRecovery:
             patch.object(loop_agent, "_save_trajectory"),
             patch.object(loop_agent, "_cleanup_task_resources"),
         ):
-            result = loop_agent.run_conversation("review the PR")
+            result = await loop_agent.run_conversation("review the PR")
 
         # 1 initial call + at most 3 bounded re-prompts = 4 total before the
         # guard stops firing. It must NOT consume all 9 staged stalls.
@@ -151,7 +157,8 @@ class TestDroppedToolCallRecovery:
         )
         assert result is not None
 
-    def test_nudge_pair_is_ephemeral_scaffolding(self, loop_agent):
+    @pytest.mark.asyncio
+    async def test_nudge_pair_is_ephemeral_scaffolding(self, loop_agent):
         """The re-prompt pair (interim assistant turn + synthetic user nudge)
         must be flagged as ephemeral scaffolding so persistence never writes
         it to the durable transcript — a resumed session must not replay the
@@ -170,7 +177,7 @@ class TestDroppedToolCallRecovery:
             patch.object(loop_agent, "_save_trajectory"),
             patch.object(loop_agent, "_cleanup_task_resources"),
         ):
-            result = loop_agent.run_conversation("review the PR")
+            result = await loop_agent.run_conversation("review the PR")
 
         assert result["completed"] is True
         # The finalization pop strips the answered pair from the live list —
@@ -191,4 +198,3 @@ class TestDroppedToolCallRecovery:
             "_dropped_toolcall_nudge messages must be classified as "
             "ephemeral scaffolding so they are never persisted."
         )
-

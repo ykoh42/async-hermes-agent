@@ -78,7 +78,7 @@ def test_op_env_autoloads_bootstrap_token_in_cron_context(tmp_path, monkeypatch)
 # ---------------------------------------------------------------------------
 
 
-def _seed_openrouter_token(monkeypatch, dotenv_value, environ_value):
+async def _seed_openrouter_token(monkeypatch, dotenv_value, environ_value):
     """Drive _seed_from_env('openrouter') and return the seeded access_token.
 
     _get_env_prefer_dotenv is a closure inside _seed_from_env, so we exercise
@@ -86,11 +86,21 @@ def _seed_openrouter_token(monkeypatch, dotenv_value, environ_value):
     _get_env_prefer_dotenv('OPENROUTER_API_KEY') and stores the result as the
     pooled credential's access_token.
     """
+    async def _get_env_value(key):
+        assert key == "OPENROUTER_API_KEY"
+        if isinstance(dotenv_value, str) and not dotenv_value.startswith("op://"):
+            return dotenv_value
+        return environ_value if environ_value is not None else dotenv_value
+
+    async def _load_auth_store():
+        return {}
+
     monkeypatch.setattr(
         credential_pool,
-        "load_env",
-        lambda: {"OPENROUTER_API_KEY": dotenv_value},
+        "get_env_value_prefer_dotenv_async",
+        _get_env_value,
     )
+    monkeypatch.setattr(credential_pool, "_load_auth_store_async", _load_auth_store)
     if environ_value is None:
         monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
     else:
@@ -101,14 +111,15 @@ def _seed_openrouter_token(monkeypatch, dotenv_value, environ_value):
     )
 
     entries: list = []
-    changed, sources = credential_pool._seed_from_env("openrouter", entries)
+    changed, sources = await credential_pool._seed_from_env("openrouter", entries)
     assert changed and entries, "expected a seeded openrouter credential"
     return entries[0].access_token
 
 
-def test_credential_pool_prefers_resolved_env_over_raw_op_ref(monkeypatch):
+@pytest.mark.asyncio
+async def test_credential_pool_prefers_resolved_env_over_raw_op_ref(monkeypatch):
     """A raw op:// reference in .env must lose to the resolved os.environ value."""
-    token = _seed_openrouter_token(
+    token = await _seed_openrouter_token(
         monkeypatch,
         dotenv_value="op://Vault/Item/field",
         environ_value="resolved-value",
@@ -116,9 +127,10 @@ def test_credential_pool_prefers_resolved_env_over_raw_op_ref(monkeypatch):
     assert token == "resolved-value"
 
 
-def test_credential_pool_still_prefers_dotenv_for_non_op_values(monkeypatch):
+@pytest.mark.asyncio
+async def test_credential_pool_still_prefers_dotenv_for_non_op_values(monkeypatch):
     """Regression guard: .env still beats os.environ for ordinary values."""
-    token = _seed_openrouter_token(
+    token = await _seed_openrouter_token(
         monkeypatch,
         dotenv_value="dotenv-value",
         environ_value="shell-value",
@@ -126,14 +138,15 @@ def test_credential_pool_still_prefers_dotenv_for_non_op_values(monkeypatch):
     assert token == "dotenv-value"
 
 
-def test_credential_pool_falls_back_to_env_when_dotenv_is_only_op_ref(monkeypatch):
+@pytest.mark.asyncio
+async def test_credential_pool_falls_back_to_env_when_dotenv_is_only_op_ref(monkeypatch):
     """An unresolved op:// in .env with no resolved env value yields the raw ref.
 
     This is the pre-resolution / misconfigured edge: there is nothing better
     to return, so behaviour is unchanged (the raw reference is surfaced rather
     than silently dropping the credential).
     """
-    token = _seed_openrouter_token(
+    token = await _seed_openrouter_token(
         monkeypatch,
         dotenv_value="op://Vault/Item/field",
         environ_value=None,

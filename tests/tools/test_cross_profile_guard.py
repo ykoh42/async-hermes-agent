@@ -57,23 +57,25 @@ def fake_hermes(tmp_path, monkeypatch):
 
 
 class TestWriteFileCrossProfileGuard:
-    def test_in_profile_write_allowed(self, fake_hermes):
+    @pytest.mark.asyncio
+    async def test_in_profile_write_allowed(self, fake_hermes):
         from tools.file_tools import write_file_tool
         target = fake_hermes["sec_home"] / "skills" / "new-skill" / "SKILL.md"
         target.parent.mkdir(parents=True)
-        result_json = write_file_tool(str(target), "in-profile content")
+        result_json = await write_file_tool(str(target), "in-profile content")
         result = json.loads(result_json)
         assert not result.get("error"), f"In-profile write should succeed: {result}"
         assert target.exists()
         assert target.read_text() == "in-profile content"
 
-    def test_cross_profile_write_blocked_by_default(self, fake_hermes):
+    @pytest.mark.asyncio
+    async def test_cross_profile_write_blocked_by_default(self, fake_hermes):
         """The May 2026 incident — security-profile session edits default
         profile's skill. Must be blocked."""
         from tools.file_tools import write_file_tool
         target = fake_hermes["root"] / "skills" / "shared-skill" / "SKILL.md"
         original = target.read_text()
-        result_json = write_file_tool(str(target), "OVERWRITTEN")
+        result_json = await write_file_tool(str(target), "OVERWRITTEN")
         result = json.loads(result_json)
         assert result.get("error"), "Cross-profile write should be refused"
         assert "cross-profile" in result["error"].lower()
@@ -83,11 +85,12 @@ class TestWriteFileCrossProfileGuard:
         assert target.read_text() == original
 
 
-    def test_non_hermes_path_unaffected(self, fake_hermes, tmp_path):
+    @pytest.mark.asyncio
+    async def test_non_hermes_path_unaffected(self, fake_hermes, tmp_path):
         from tools.file_tools import write_file_tool
         target = tmp_path / "outside" / "main.py"
         target.parent.mkdir()
-        result_json = write_file_tool(str(target), "print('hello')")
+        result_json = await write_file_tool(str(target), "print('hello')")
         result = json.loads(result_json)
         assert not result.get("error")
         assert target.exists()
@@ -99,11 +102,12 @@ class TestWriteFileCrossProfileGuard:
 
 
 class TestPatchCrossProfileGuard:
-    def test_cross_profile_patch_blocked(self, fake_hermes):
+    @pytest.mark.asyncio
+    async def test_cross_profile_patch_blocked(self, fake_hermes):
         from tools.file_tools import patch_tool
         target = fake_hermes["root"] / "skills" / "shared-skill" / "SKILL.md"
         original = target.read_text()
-        result_json = patch_tool(
+        result_json = await patch_tool(
             mode="replace",
             path=str(target),
             old_string="default copy.",
@@ -114,10 +118,11 @@ class TestPatchCrossProfileGuard:
         assert "cross-profile" in result["error"].lower()
         assert target.read_text() == original
 
-    def test_cross_profile_patch_bypass(self, fake_hermes):
+    @pytest.mark.asyncio
+    async def test_cross_profile_patch_bypass(self, fake_hermes):
         from tools.file_tools import patch_tool
         target = fake_hermes["root"] / "skills" / "shared-skill" / "SKILL.md"
-        result_json = patch_tool(
+        result_json = await patch_tool(
             mode="replace",
             path=str(target),
             old_string="default copy.",
@@ -128,7 +133,8 @@ class TestPatchCrossProfileGuard:
         assert not result.get("error"), f"cross_profile=True bypass: {result}"
         assert "user-directed update." in target.read_text()
 
-    def test_v4a_patch_extracts_path_for_guard(self, fake_hermes):
+    @pytest.mark.asyncio
+    async def test_v4a_patch_extracts_path_for_guard(self, fake_hermes):
         """V4A patches embed the target paths in the patch body, not in
         a ``path`` kwarg. The guard must still apply."""
         from tools.file_tools import patch_tool
@@ -142,7 +148,7 @@ class TestPatchCrossProfileGuard:
             "+HIJACKED.\n"
             "*** End Patch"
         )
-        result_json = patch_tool(mode="patch", patch=v4a)
+        result_json = await patch_tool(mode="patch", patch=v4a)
         result = json.loads(result_json)
         assert result.get("error"), f"V4A cross-profile must block: {result}"
         assert "cross-profile" in result["error"].lower()

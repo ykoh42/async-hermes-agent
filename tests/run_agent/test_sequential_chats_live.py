@@ -107,7 +107,8 @@ def _assert_healthy_reply(reply, turn_label: str) -> None:
     )
 
 
-def test_three_sequential_chats_across_client_rebuild():
+@pytest.mark.asyncio
+async def test_three_sequential_chats_across_client_rebuild():
     """Reproduces AlexKucera's exact failure shape end-to-end.
 
     Turn 1 always worked under #10933. Turn 2 was the one that failed
@@ -122,10 +123,10 @@ def test_three_sequential_chats_across_client_rebuild():
     """
     agent = _make_live_agent()
 
-    r1 = agent.chat("Respond with only the word: ONE")
+    r1 = await agent.chat("Respond with only the word: ONE")
     _assert_healthy_reply(r1, "turn 1")
 
-    r2 = agent.chat("Respond with only the word: TWO")
+    r2 = await agent.chat("Respond with only the word: TWO")
     _assert_healthy_reply(r2, "turn 2")
 
     # Force a client rebuild through the real path — mimics 401 refresh /
@@ -133,5 +134,5 @@ def test_three_sequential_chats_across_client_rebuild():
     rebuilt = agent._replace_primary_openai_client(reason="regression_test_rebuild")
     assert rebuilt, "rebuild via _replace_primary_openai_client returned False"
 
-    r3 = agent.chat("Respond with only the word: THREE")
+    r3 = await agent.chat("Respond with only the word: THREE")
     _assert_healthy_reply(r3, "turn 3 (post-rebuild)")

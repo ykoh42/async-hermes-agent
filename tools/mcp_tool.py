@@ -4472,11 +4472,10 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
         # A recycled stdio server is woken without waiting synchronously on
         # the caller's event loop.  The normal connected path never enters
         # this branch.
-        if server.session is None and server._is_recycled_stdio():
-            server._ready.clear()
-            server._reconnect_event.set()
-
         if server.session is None:
+            if server._is_recycled_stdio():
+                server._ready.clear()
+            _signal_reconnect(server)
             deadline = time.monotonic() + min(5.0, float(tool_timeout or 5.0))
             while server.session is None and time.monotonic() < deadline:
                 await asyncio.sleep(0.05)
@@ -4556,11 +4555,11 @@ def _make_list_resources_handler(server_name: str, tool_timeout: float):
         if not server or not server.session:
             return tool_error(f"MCP server '{server_name}' is not connected")
 
-        async def _call():
-            _mark_server_call_started(server)
-            async with server._rpc_lock:
+        async def _call(active_server):
+            _mark_server_call_started(active_server)
+            async with active_server._rpc_lock:
                 all_resources = await _paginate_full_list(
-                    server.session.list_resources, "resources", server_name
+                    active_server.session.list_resources, "resources", server_name
                 )
             resources = []
             for r in all_resources:
@@ -4577,12 +4576,27 @@ def _make_list_resources_handler(server_name: str, tool_timeout: float):
             return json.dumps({"resources": resources}, ensure_ascii=False)
 
         try:
-            return await _await_mcp_operation(_call, timeout=tool_timeout)
+            return await _await_mcp_operation(
+                lambda: _call(server), timeout=tool_timeout
+            )
         except InterruptedError:
             return _interrupted_call_result()
         except asyncio.CancelledError:
             raise
         except Exception as exc:
+            async def _retry_call() -> str:
+                retry_server = await _get_connected_server_for_call(server_name)
+                if retry_server is None or retry_server.session is None:
+                    raise RuntimeError(f"MCP server '{server_name}' did not reconnect")
+                return await _await_mcp_operation(
+                    lambda: _call(retry_server), timeout=tool_timeout
+                )
+
+            recovered = await _handle_session_expired_and_retry(
+                server_name, exc, _retry_call, "resources/list"
+            )
+            if recovered is not None:
+                return recovered
             logger.error(
                 "MCP %s/list_resources failed: %s", server_name, exc,
             )
@@ -4605,10 +4619,10 @@ def _make_read_resource_handler(server_name: str, tool_timeout: float):
         if not uri:
             return tool_error("Missing required parameter 'uri'")
 
-        async def _call():
-            _mark_server_call_started(server)
-            async with server._rpc_lock:
-                result = await server.session.read_resource(uri)
+        async def _call(active_server):
+            _mark_server_call_started(active_server)
+            async with active_server._rpc_lock:
+                result = await active_server.session.read_resource(uri)
             # read_resource returns ReadResourceResult with .contents list
             parts: List[str] = []
             contents = result.contents if hasattr(result, "contents") else []
@@ -4627,12 +4641,27 @@ def _make_read_resource_handler(server_name: str, tool_timeout: float):
             return json.dumps({"result": "\n".join(parts) if parts else ""}, ensure_ascii=False)
 
         try:
-            return await _await_mcp_operation(_call, timeout=tool_timeout)
+            return await _await_mcp_operation(
+                lambda: _call(server), timeout=tool_timeout
+            )
         except InterruptedError:
             return _interrupted_call_result()
         except asyncio.CancelledError:
             raise
         except Exception as exc:
+            async def _retry_call() -> str:
+                retry_server = await _get_connected_server_for_call(server_name)
+                if retry_server is None or retry_server.session is None:
+                    raise RuntimeError(f"MCP server '{server_name}' did not reconnect")
+                return await _await_mcp_operation(
+                    lambda: _call(retry_server), timeout=tool_timeout
+                )
+
+            recovered = await _handle_session_expired_and_retry(
+                server_name, exc, _retry_call, "resources/read"
+            )
+            if recovered is not None:
+                return recovered
             logger.error(
                 "MCP %s/read_resource failed: %s", server_name, exc,
             )
@@ -4651,11 +4680,11 @@ def _make_list_prompts_handler(server_name: str, tool_timeout: float):
         if not server or not server.session:
             return tool_error(f"MCP server '{server_name}' is not connected")
 
-        async def _call():
-            _mark_server_call_started(server)
-            async with server._rpc_lock:
+        async def _call(active_server):
+            _mark_server_call_started(active_server)
+            async with active_server._rpc_lock:
                 all_prompts = await _paginate_full_list(
-                    server.session.list_prompts, "prompts", server_name
+                    active_server.session.list_prompts, "prompts", server_name
                 )
             prompts = []
             for p in all_prompts:
@@ -4677,12 +4706,27 @@ def _make_list_prompts_handler(server_name: str, tool_timeout: float):
             return json.dumps({"prompts": prompts}, ensure_ascii=False)
 
         try:
-            return await _await_mcp_operation(_call, timeout=tool_timeout)
+            return await _await_mcp_operation(
+                lambda: _call(server), timeout=tool_timeout
+            )
         except InterruptedError:
             return _interrupted_call_result()
         except asyncio.CancelledError:
             raise
         except Exception as exc:
+            async def _retry_call() -> str:
+                retry_server = await _get_connected_server_for_call(server_name)
+                if retry_server is None or retry_server.session is None:
+                    raise RuntimeError(f"MCP server '{server_name}' did not reconnect")
+                return await _await_mcp_operation(
+                    lambda: _call(retry_server), timeout=tool_timeout
+                )
+
+            recovered = await _handle_session_expired_and_retry(
+                server_name, exc, _retry_call, "prompts/list"
+            )
+            if recovered is not None:
+                return recovered
             logger.error(
                 "MCP %s/list_prompts failed: %s", server_name, exc,
             )
@@ -4706,10 +4750,12 @@ def _make_get_prompt_handler(server_name: str, tool_timeout: float):
             return tool_error("Missing required parameter 'name'")
         arguments = args.get("arguments", {})
 
-        async def _call():
-            _mark_server_call_started(server)
-            async with server._rpc_lock:
-                result = await server.session.get_prompt(name, arguments=arguments)
+        async def _call(active_server):
+            _mark_server_call_started(active_server)
+            async with active_server._rpc_lock:
+                result = await active_server.session.get_prompt(
+                    name, arguments=arguments
+                )
             # GetPromptResult has .messages list
             messages = []
             for msg in (result.messages if hasattr(result, "messages") else []):
@@ -4731,12 +4777,27 @@ def _make_get_prompt_handler(server_name: str, tool_timeout: float):
             return json.dumps(resp, ensure_ascii=False)
 
         try:
-            return await _await_mcp_operation(_call, timeout=tool_timeout)
+            return await _await_mcp_operation(
+                lambda: _call(server), timeout=tool_timeout
+            )
         except InterruptedError:
             return _interrupted_call_result()
         except asyncio.CancelledError:
             raise
         except Exception as exc:
+            async def _retry_call() -> str:
+                retry_server = await _get_connected_server_for_call(server_name)
+                if retry_server is None or retry_server.session is None:
+                    raise RuntimeError(f"MCP server '{server_name}' did not reconnect")
+                return await _await_mcp_operation(
+                    lambda: _call(retry_server), timeout=tool_timeout
+                )
+
+            recovered = await _handle_session_expired_and_retry(
+                server_name, exc, _retry_call, "prompts/get"
+            )
+            if recovered is not None:
+                return recovered
             logger.error(
                 "MCP %s/get_prompt failed: %s", server_name, exc,
             )

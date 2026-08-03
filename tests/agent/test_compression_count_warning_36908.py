@@ -17,11 +17,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from hermes_state import AsyncSessionDB
+from hermes_state import SessionDB
 
 
 def _build_agent_with_db(
-    db: AsyncSessionDB, session_id: str, compression_count: int
+    db: SessionDB, session_id: str, compression_count: int
 ):
     with patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}):
         from run_agent import AIAgent
@@ -55,7 +55,7 @@ def _build_agent_with_db(
 
 @pytest.mark.asyncio
 async def test_repeated_compression_warning_routed_through_emit_status(tmp_path: Path) -> None:
-    db = AsyncSessionDB(tmp_path / "state.db")
+    db = SessionDB(tmp_path / "state.db")
     sid = "PARENT_36908"
     await db.create_session(sid, source="cli")
 
@@ -80,7 +80,7 @@ async def test_repeated_compression_warning_routed_through_emit_status(tmp_path:
 
 @pytest.mark.asyncio
 async def test_no_warning_below_threshold(tmp_path: Path) -> None:
-    db = AsyncSessionDB(tmp_path / "state.db")
+    db = SessionDB(tmp_path / "state.db")
     sid = "PARENT_36908_ONCE"
     await db.create_session(sid, source="cli")
 

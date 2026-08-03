@@ -1195,7 +1195,7 @@ class TestAuxiliaryPoolAwareness:
             patch("agent.auxiliary_client.load_pool", new=AsyncMock(return_value=pool)),
             patch("agent.auxiliary_client._create_openai_client") as mock_create,
             patch(
-                "hermes_cli.models.get_nous_recommended_aux_model_async",
+                "hermes_cli.models.get_nous_recommended_aux_model",
                 new_callable=AsyncMock,
                 return_value=None,
             ),
@@ -1413,7 +1413,7 @@ class TestRefreshNousRecommendedModel:
         async def _boom(**kw):
             raise RuntimeError("portal down")
         monkeypatch.setattr(
-            "hermes_cli.models.get_nous_recommended_aux_model_async", _boom)
+            "hermes_cli.models.get_nous_recommended_aux_model", _boom)
         out = await _refresh_nous_recommended_model(
             vision=False, stale_model="some/dead-model")
         assert out == _NOUS_MODEL
@@ -1423,7 +1423,7 @@ class TestRefreshNousRecommendedModel:
         """When the failed model IS the default and the Portal has nothing
         else, there's no usable alternative."""
         monkeypatch.setattr(
-            "hermes_cli.models.get_nous_recommended_aux_model_async",
+            "hermes_cli.models.get_nous_recommended_aux_model",
             AsyncMock(return_value=_NOUS_MODEL),
         )
         out = await _refresh_nous_recommended_model(

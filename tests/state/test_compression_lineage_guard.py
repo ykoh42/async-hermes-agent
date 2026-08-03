@@ -1,164 +1,125 @@
-"""Regression tests for stale writes after a compression session split."""
+"""Native-async compression handoff and lineage guards."""
 
-from __future__ import annotations
+import sqlite3
 
 import pytest
+import pytest_asyncio
 
 from hermes_state import SessionDB
 
 
-@pytest.fixture()
-def db(tmp_path):
-    session_db = SessionDB(db_path=tmp_path / "state.db")
-    try:
-        yield session_db
-    finally:
-        session_db.close()
+@pytest_asyncio.fixture
+async def db(tmp_path):
+    database = SessionDB(tmp_path / "state.db")
+    yield database
+    await database.close()
 
 
-def _compression_parent(db: SessionDB, session_id: str = "parent") -> None:
-    db.create_session(session_id, source="webui")
-    db.append_message(session_id, "user", "before split")
-    db.end_session(session_id, "compression")
+async def _closed_parent(db, session_id="parent"):
+    await db.create_session(session_id, source="library")
+    await db.append_message(session_id, "user", "before split")
+    await db.end_session(session_id, "compression")
 
 
-def test_find_live_compression_child_returns_unique_direct_child(db: SessionDB) -> None:
-    _compression_parent(db)
-    db.create_session("child", source="webui", parent_session_id="parent")
+@pytest.mark.asyncio
+async def test_find_live_compression_child_requires_one_canonical_child(db):
+    await _closed_parent(db)
+    await db.create_session("child", source="library", parent_session_id="parent")
+    child = await db.find_live_compression_child("parent")
+    assert child is not None and child["id"] == "child"
 
-    child = db.find_live_compression_child("parent")
-
-    assert child is not None
-    assert child["id"] == "child"
-    assert child["parent_session_id"] == "parent"
-    assert child["ended_at"] is None
-
-
-def test_find_live_compression_child_fails_closed_when_ambiguous(db: SessionDB) -> None:
-    _compression_parent(db)
-    db.create_session("child-a", source="webui", parent_session_id="parent")
-    db.create_session("child-b", source="webui", parent_session_id="parent")
-
-    assert db.find_live_compression_child("parent") is None
+    await db.create_session("ambiguous", source="library", parent_session_id="parent")
+    assert await db.find_live_compression_child("parent") is None
 
 
-
-
-def test_find_live_compression_child_ignores_non_continuation_children(
-    db: SessionDB,
-) -> None:
-    _compression_parent(db)
-    db.create_session("canonical", source="webui", parent_session_id="parent")
-    db.create_session(
+@pytest.mark.asyncio
+async def test_non_continuation_children_do_not_make_lineage_ambiguous(db):
+    await _closed_parent(db)
+    await db.create_session("canonical", source="library", parent_session_id="parent")
+    await db.create_session(
         "branch",
-        source="webui",
+        source="library",
         parent_session_id="parent",
         model_config={"_branched_from": "parent"},
     )
-    db.create_session(
+    await db.create_session(
         "delegate",
-        source="webui",
+        source="library",
         parent_session_id="parent",
         model_config={"_delegate_from": "parent"},
     )
-    db.create_session("tool-child", source="tool", parent_session_id="parent")
-
-    child = db.find_live_compression_child("parent")
-
-    assert child is not None
-    assert child["id"] == "canonical"
+    await db.create_session("tool-child", source="tool", parent_session_id="parent")
+    child = await db.find_live_compression_child("parent")
+    assert child is not None and child["id"] == "canonical"
 
 
+@pytest.mark.asyncio
+async def test_publish_compression_child_is_atomic_on_insert_failure(db):
+    await db.create_session("parent", source="library")
+    await db.append_message("parent", "user", "original")
+    await db.create_session("child", source="library")
+    assert await db.try_acquire_compression_lock("parent", "winner", ttl_seconds=60)
 
-
-
-
-
-
-def test_publish_compression_child_is_atomic_on_handoff_failure(
-    db: SessionDB, monkeypatch
-) -> None:
-    db.create_session("atomic-parent", source="webui")
-    db.append_message("atomic-parent", "user", "original")
-    assert db.try_acquire_compression_lock("atomic-parent", "winner", ttl_seconds=60)
-
-    def _boom(*_args, **_kwargs):
-        raise RuntimeError("handoff insert failed")
-
-    monkeypatch.setattr(db, "_insert_message_rows", _boom)
-    with pytest.raises(RuntimeError, match="handoff insert failed"):
-        db.publish_compression_child(
-            parent_session_id="atomic-parent",
-            child_session_id="atomic-child",
-            source="webui",
+    with pytest.raises(sqlite3.IntegrityError):
+        await db.publish_compression_child(
+            parent_session_id="parent",
+            child_session_id="child",
+            source="library",
             messages=[{"role": "user", "content": "summary"}],
             compression_lock_holder="winner",
         )
 
-    parent = db.get_session("atomic-parent")
-    assert parent is not None
-    assert parent["ended_at"] is None
-    assert db.get_session("atomic-child") is None
+    assert (await db.get_session("parent"))["ended_at"] is None
+    assert [m["content"] for m in await db.get_messages("parent")] == ["original"]
 
 
-def test_publish_compression_child_exposes_complete_child(db: SessionDB) -> None:
-    db.create_session("atomic-parent", source="webui")
-    db.append_message("atomic-parent", "user", "original")
-    assert db.try_acquire_compression_lock("atomic-parent", "winner", ttl_seconds=60)
-
-    db.publish_compression_child(
-        parent_session_id="atomic-parent",
-        child_session_id="atomic-child",
-        source="webui",
+@pytest.mark.asyncio
+async def test_publish_exposes_only_complete_child(db):
+    await db.create_session("parent", source="library")
+    await db.append_message("parent", "user", "original")
+    assert await db.try_acquire_compression_lock("parent", "winner", ttl_seconds=60)
+    await db.publish_compression_child(
+        parent_session_id="parent",
+        child_session_id="child",
+        source="library",
         system_prompt="compressed system",
         messages=[{"role": "user", "content": "summary"}],
         compression_lock_holder="winner",
     )
 
-    assert db.get_session("atomic-parent")["end_reason"] == "compression"
-    child = db.find_live_compression_child("atomic-parent")
-    assert child is not None
-    assert child["id"] == "atomic-child"
-    assert child["system_prompt"] == "compressed system"
-    assert [m["content"] for m in db.get_messages("atomic-child")] == ["summary"]
+    assert (await db.get_session("parent"))["end_reason"] == "compression"
+    child = await db.find_live_compression_child("parent")
+    assert child is not None and child["system_prompt"] == "compressed system"
+    assert [m["content"] for m in await db.get_messages("child")] == ["summary"]
 
 
-def test_publish_compression_child_rejects_lost_or_expired_lease(db: SessionDB) -> None:
-    db.create_session("lease-parent", source="webui")
-    db.append_message("lease-parent", "user", "new durable turn")
-    assert db.try_acquire_compression_lock("lease-parent", "new-winner", ttl_seconds=60)
-
+@pytest.mark.asyncio
+async def test_publish_rejects_lost_lease_without_mutation(db):
+    await db.create_session("parent", source="library")
+    await db.append_message("parent", "user", "durable")
+    assert await db.try_acquire_compression_lock("parent", "winner", ttl_seconds=60)
     with pytest.raises(RuntimeError, match="lease lost"):
-        db.publish_compression_child(
-            parent_session_id="lease-parent",
-            child_session_id="stale-child",
-            source="webui",
-            messages=[{"role": "user", "content": "stale summary"}],
-            compression_lock_holder="old-loser",
+        await db.publish_compression_child(
+            parent_session_id="parent",
+            child_session_id="stale",
+            source="library",
+            messages=[{"role": "user", "content": "stale"}],
+            compression_lock_holder="loser",
         )
-
-    parent = db.get_session("lease-parent")
-    assert parent is not None
-    assert parent["ended_at"] is None
-    assert db.get_session("stale-child") is None
-    assert [m["content"] for m in db.get_messages("lease-parent")] == [
-        "new durable turn"
-    ]
+    assert (await db.get_session("parent"))["ended_at"] is None
+    assert await db.get_session("stale") is None
 
 
-def test_compression_lease_blocks_non_owner_but_allows_owner_flush(
-    db: SessionDB,
-) -> None:
-    db.create_session("leased", source="webui")
-    assert db.try_acquire_compression_lock("leased", "winner", ttl_seconds=60)
-
+@pytest.mark.asyncio
+async def test_lease_blocks_non_owner_but_allows_owner_flush(db):
+    await db.create_session("leased", source="library")
+    assert await db.try_acquire_compression_lock("leased", "winner", ttl_seconds=60)
     with pytest.raises(RuntimeError, match="being compressed"):
-        db.append_message("leased", "user", "late stale turn")
-
-    db.append_message(
+        await db.append_message("leased", "user", "stale")
+    await db.append_message(
         "leased",
         "assistant",
         "winner flush",
         compression_lock_holder="winner",
     )
-    assert [m["content"] for m in db.get_messages("leased")] == ["winner flush"]
+    assert [m["content"] for m in await db.get_messages("leased")] == ["winner flush"]

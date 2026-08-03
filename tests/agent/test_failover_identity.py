@@ -10,6 +10,8 @@ gpt-5.4-mini after a Codex usage-limit 429.
 
 from types import SimpleNamespace
 
+import pytest
+
 from agent.chat_completion_helpers import rewrite_prompt_model_identity
 from agent.conversation_loop import (
     _redecorate_prompt_cache_for_provider,
@@ -189,7 +191,8 @@ class TestRedecoratePromptCacheOnPolicyChange:
 
     _STATIC = "You are a helpful assistant.\n\nStable brief.\n"
 
-    def test_cache_off_to_cache_on_adds_breakpoints(self):
+    @pytest.mark.asyncio
+    async def test_cache_off_to_cache_on_adds_breakpoints(self):
         prompt = self._STATIC + "Model: gpt-5.4-mini\nProvider: openai"
         # Primary never decorated (cache-off).
         undecorated = [
@@ -207,7 +210,7 @@ class TestRedecoratePromptCacheOnPolicyChange:
             static=self._STATIC,
             provider="anthropic",
         )
-        decorated, _ = _redecorate_prompt_cache_for_provider(agent, undecorated)
+        decorated, _ = await _redecorate_prompt_cache_for_provider(agent, undecorated)
         assert _count_cache_markers(decorated) >= 2
         assert isinstance(decorated[0]["content"], list)
         assert decorated[0]["content"][0]["text"] == self._STATIC
@@ -215,7 +218,8 @@ class TestRedecoratePromptCacheOnPolicyChange:
 
 
 
-    def test_moa_guidance_stays_outside_last_breakpoint(self):
+    @pytest.mark.asyncio
+    async def test_moa_guidance_stays_outside_last_breakpoint(self):
         prompt = "sys"
         guidance = (
             "[Mixture of Agents context — use this as private guidance for the "
@@ -240,7 +244,7 @@ class TestRedecoratePromptCacheOnPolicyChange:
         agent = _cache_agent(use_caching=True, native=True, prompt=prompt, provider="moa")
         agent.client = SimpleNamespace(chat=SimpleNamespace(completions=_Completions()))
         prepared = {"guidance": guidance, "messages": decorated}
-        out, new_prepared = _redecorate_prompt_cache_for_provider(
+        out, new_prepared = await _redecorate_prompt_cache_for_provider(
             agent, decorated, moa_prepared=prepared
         )
         assert new_prepared is not None

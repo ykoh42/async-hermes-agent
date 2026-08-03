@@ -17,7 +17,7 @@ from unittest.mock import patch
 import pytest
 import pytest_asyncio
 
-from hermes_state import AsyncSessionDB
+from hermes_state import SessionDB
 
 
 _ASYNC_DBS = []
@@ -31,8 +31,8 @@ async def _close_async_dbs():
     _ASYNC_DBS.clear()
 
 
-def _async_db(path: Path) -> AsyncSessionDB:
-    db = AsyncSessionDB(path)
+def _async_db(path: Path) -> SessionDB:
+    db = SessionDB(path)
     _ASYNC_DBS.append(db)
     return db
 
@@ -130,7 +130,7 @@ class TestInPlaceCompaction:
             archived = [m for m in all_rows if not m.get("active", 1)]
             assert len(archived) == 8
             # The originals remain searchable through the public contract;
-            # AsyncSessionDB may use FTS5 or its native LIKE fallback.
+            # SessionDB may use FTS5 or its native LIKE fallback.
             hits = await db.search_messages(
                 "msg", role_filter=["user", "assistant"]
             )
@@ -285,13 +285,14 @@ class TestCompactedTurnsStaySearchable:
     rewind/undo rows (active=0, compacted=0) must stay hidden. The two share
     the active flag but are distinguished by the compacted flag."""
 
-    def test_compacted_turns_found_by_default_search(self):
+    @pytest.mark.asyncio
+    async def test_compacted_turns_found_by_default_search(self):
         from hermes_state import SessionDB
 
         with tempfile.TemporaryDirectory() as tmp:
             db = SessionDB(db_path=Path(tmp) / "t.db")
             sid = "20260619_search"
-            db.create_session(sid, "cli", model="test/model")
+            await db.create_session(sid, "cli", model="test/model")
             for r, c in [
                 ("user", "configure the HMAC secret"),
                 ("assistant", "set it in config.yaml"),
@@ -300,12 +301,12 @@ class TestCompactedTurnsStaySearchable:
                 ("user", "works now"),
                 ("assistant", "great"),
             ]:
-                db.append_message(session_id=sid, role=r, content=c)
+                await db.append_message(session_id=sid, role=r, content=c)
 
-            before = db.search_messages("HMAC", role_filter=["user", "assistant"])
+            before = await db.search_messages("HMAC", role_filter=["user", "assistant"])
             assert len(before) == 2
 
-            db.archive_and_compact(
+            await db.archive_and_compact(
                 sid,
                 [
                     {"role": "user", "content": "[SUMMARY] earlier setup"},
@@ -315,12 +316,13 @@ class TestCompactedTurnsStaySearchable:
 
             # The archived originals (active=0, compacted=1) are still found by
             # the DEFAULT search — this is the durability requirement.
-            after = db.search_messages("HMAC", role_filter=["user", "assistant"])
+            after = await db.search_messages("HMAC", role_filter=["user", "assistant"])
             assert {m["id"] for m in after} == {1, 4}
             # Live context still excludes them.
-            assert len(db.get_messages_as_conversation(sid)) == 2
+            assert len(await db.get_messages_as_conversation(sid)) == 2
 
-    def test_rewound_turns_stay_hidden(self):
+    @pytest.mark.asyncio
+    async def test_rewound_turns_stay_hidden(self):
         """Rewind/undo (active=0, compacted=0) must NOT leak into default
         search — the distinction the compacted flag preserves."""
         from hermes_state import SessionDB
@@ -328,13 +330,14 @@ class TestCompactedTurnsStaySearchable:
         with tempfile.TemporaryDirectory() as tmp:
             db = SessionDB(db_path=Path(tmp) / "t.db")
             sid = "20260619_undo"
-            db.create_session(sid, "cli", model="test/model")
-            db.append_message(session_id=sid, role="user", content="ZEBRAWORD remember this")
-            db.append_message(session_id=sid, role="assistant", content="noted")
-            db.rewind_to_message(sid, db.get_messages(sid)[0]["id"])
+            await db.create_session(sid, "cli", model="test/model")
+            await db.append_message(session_id=sid, role="user", content="ZEBRAWORD remember this")
+            await db.append_message(session_id=sid, role="assistant", content="noted")
+            rows = await db.get_messages(sid)
+            await db.rewind_to_message(sid, rows[0]["id"])
 
-            assert db.search_messages("ZEBRAWORD", role_filter=["user", "assistant"]) == []
-            recovered = db.search_messages(
+            assert await db.search_messages("ZEBRAWORD", role_filter=["user", "assistant"]) == []
+            recovered = await db.search_messages(
                 "ZEBRAWORD", role_filter=["user", "assistant"], include_inactive=True
             )
             assert len(recovered) == 1

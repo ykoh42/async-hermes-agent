@@ -36,10 +36,10 @@ class TestIdentityFlush:
     @pytest.mark.asyncio
     async def test_repair_shrunk_messages_below_history_length_still_persists_assistant(self):
         """When repair shortens messages below conversation_history, don't slice empty."""
-        from hermes_state import AsyncSessionDB
+        from hermes_state import SessionDB
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            db = AsyncSessionDB(Path(tmpdir) / "t.db")
+            db = SessionDB(Path(tmpdir) / "t.db")
             try:
                 agent = await _make_agent(db)
 
@@ -77,10 +77,10 @@ class TestIdentityFlush:
     @pytest.mark.asyncio
     async def test_repeated_flush_same_turn_writes_once(self):
         """Identity tracking preserves #860 same-turn dedup behavior."""
-        from hermes_state import AsyncSessionDB
+        from hermes_state import SessionDB
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            db = AsyncSessionDB(Path(tmpdir) / "t.db")
+            db = SessionDB(Path(tmpdir) / "t.db")
             try:
                 agent = await _make_agent(db)
                 messages = [{"role": "user", "content": "q"}]
@@ -98,10 +98,10 @@ class TestIdentityFlush:
     @pytest.mark.asyncio
     async def test_cursor_reset_starts_new_turn_identity_window(self):
         """Gateway resets _last_flushed_db_idx=0 before a cached-agent turn."""
-        from hermes_state import AsyncSessionDB
+        from hermes_state import SessionDB
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            db = AsyncSessionDB(Path(tmpdir) / "t.db")
+            db = SessionDB(Path(tmpdir) / "t.db")
             try:
                 agent = await _make_agent(db)
                 first_turn = [
@@ -136,10 +136,10 @@ class TestIdentityFlush:
         written to state.db. Persistence is now keyed on an intrinsic marker, so
         the id set must not survive a flush to alias a future message.
         """
-        from hermes_state import AsyncSessionDB
+        from hermes_state import SessionDB
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            db = AsyncSessionDB(Path(tmpdir) / "t.db")
+            db = SessionDB(Path(tmpdir) / "t.db")
             try:
                 agent = await _make_agent(db)
                 turn = [
@@ -171,10 +171,10 @@ class TestIdentityFlush:
         the seed is a one-shot that is cleared after every flush and the message
         is written because it carries no _db_persisted marker.
         """
-        from hermes_state import AsyncSessionDB
+        from hermes_state import SessionDB
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            db = AsyncSessionDB(Path(tmpdir) / "t.db")
+            db = SessionDB(Path(tmpdir) / "t.db")
             try:
                 agent = await _make_agent(db)
                 # Turn 1 establishes a same-session continuation so the seed is

@@ -26,6 +26,8 @@ single branch cannot silently revert #32243.
 
 from __future__ import annotations
 
+import pytest
+
 from hermes_cli import runtime_provider as rp
 
 
@@ -39,8 +41,9 @@ class TestExplicitRuntimeForAnthropic:
     resolver.
     """
 
-    def test_explicit_args_route_to_messages_api(self):
-        result = rp._resolve_explicit_runtime(
+    @pytest.mark.asyncio
+    async def test_explicit_args_route_to_messages_api(self):
+        result = await rp._resolve_explicit_runtime(
             provider="anthropic",
             requested_provider="anthropic",
             model_cfg={},
@@ -53,13 +56,14 @@ class TestExplicitRuntimeForAnthropic:
         assert result["base_url"] == "https://api.anthropic.com"
 
 
-    def test_no_explicit_args_returns_none(self):
+    @pytest.mark.asyncio
+    async def test_no_explicit_args_returns_none(self):
         # Guard the gating contract — _resolve_explicit_runtime only
         # fires when an explicit override is present; without one it
         # must return None so the caller falls through to the pool /
         # top-level anthropic branch.
         assert (
-            rp._resolve_explicit_runtime(
+            await rp._resolve_explicit_runtime(
                 provider="anthropic",
                 requested_provider="anthropic",
                 model_cfg={"provider": "anthropic"},
@@ -133,7 +137,8 @@ class TestCustomProviderUrlFallback:
     config routes to ``/v1/messages`` where Pro/Max OAuth is billed.
     """
 
-    def test_url_fallback_picks_messages_api(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_url_fallback_picks_messages_api(self, monkeypatch):
         class _Entry:
             access_token = "sk-ant-oat01-custom-pool"
             runtime_api_key = "sk-ant-oat01-custom-pool"
@@ -143,17 +148,19 @@ class TestCustomProviderUrlFallback:
             def has_credentials(self):
                 return True
 
-            def select(self):
+            async def select(self):
                 return _Entry()
 
         monkeypatch.setattr(rp, "get_custom_provider_pool_key", lambda *a, **k: "custom:my-claude")
-        monkeypatch.setattr(rp, "load_pool", lambda key: _Pool())
+        async def _load_pool(key):
+            return _Pool()
 
-        resolved = rp._try_resolve_from_custom_pool(
+        monkeypatch.setattr(rp, "load_pool", _load_pool)
+
+        resolved = await rp._try_resolve_from_custom_pool(
             "https://api.anthropic.com",
             "custom",
         )
 
         assert resolved is not None
         assert resolved["api_mode"] == "anthropic_messages"
-

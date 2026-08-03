@@ -42,11 +42,11 @@ class TestFlushDeduplication:
     @pytest.mark.asyncio
     async def test_flush_writes_only_new_messages(self):
         """First flush writes all new messages, second flush writes none."""
-        from hermes_state import AsyncSessionDB
+        from hermes_state import SessionDB
 
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = Path(tmpdir) / "test.db"
-            db = AsyncSessionDB(db_path)
+            db = SessionDB(db_path)
             try:
                 agent = await self._make_agent(db)
 
@@ -78,11 +78,11 @@ class TestFlushDeduplication:
     @pytest.mark.asyncio
     async def test_flush_reset_after_compression(self):
         """After compression creates a new session, flush index resets."""
-        from hermes_state import AsyncSessionDB
+        from hermes_state import SessionDB
 
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = Path(tmpdir) / "test.db"
-            db = AsyncSessionDB(db_path)
+            db = SessionDB(db_path)
             try:
                 agent = await self._make_agent(db)
 

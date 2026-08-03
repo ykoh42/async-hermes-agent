@@ -618,7 +618,7 @@ class TestHookMode:
         ctx.register_hook("post_tool_call", rewrite_error_hook)
 
         # Fire the hook the same way the agent core does it.
-        await manager.invoke_hook_async(
+        await manager.invoke_hook(
             "post_tool_call",
             tool_name="terminal",
             args={"command": "boom"},
@@ -659,5 +659,5 @@ class TestHookMode:
             called.append(r.text)
 
         ctx.register_hook("post_tool_call", hook)
-        await manager.invoke_hook_async("post_tool_call", tool_name="x", args={}, result="y")
+        await manager.invoke_hook("post_tool_call", tool_name="x", args={}, result="y")
         assert called == ["ok"]

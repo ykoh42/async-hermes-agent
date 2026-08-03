@@ -134,6 +134,43 @@ class _StubHTTPClient:
         return self._response
 
 
+def _patch_native_xai_refresh(monkeypatch, payload, *, before_error=None):
+    class _Response:
+        def __init__(self, body):
+            self._body = body
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self._body
+
+    class _Client:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def get(self, *args, **kwargs):
+            return _Response({"token_endpoint": "https://auth.x.ai/oauth/token"})
+
+        async def post(self, *args, **kwargs):
+            if before_error is not None:
+                before_error()
+                raise AuthError(
+                    "refresh_token_reused",
+                    provider="xai-oauth",
+                    code="xai_refresh_failed",
+                    relogin_required=True,
+                )
+            return _Response(payload)
+
+    monkeypatch.setattr("httpx.AsyncClient", _Client)
+
 def _patch_httpx_client(monkeypatch, response):
     holder = {"client": None}
 
@@ -562,7 +599,8 @@ def test_xai_oauth_discovery_validates_endpoints(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_credential_pool_seeds_xai_oauth_from_singleton(tmp_path, monkeypatch):
+@pytest.mark.asyncio
+async def test_credential_pool_seeds_xai_oauth_from_singleton(tmp_path, monkeypatch):
     """After `hermes model` -> xai-oauth, the singleton holds tokens.  load_pool
     must surface that as a pool entry so `hermes auth list` reflects truth and
     refreshes route through the pool consistently with codex.
@@ -576,7 +614,7 @@ def test_credential_pool_seeds_xai_oauth_from_singleton(tmp_path, monkeypatch):
     _setup_hermes_auth(hermes_home, access_token=fresh, refresh_token="rt-1")
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
 
-    pool = load_pool("xai-oauth")
+    pool = await load_pool("xai-oauth")
     assert pool.has_credentials()
     entries = pool.entries()
     assert len(entries) == 1
@@ -587,7 +625,8 @@ def test_credential_pool_seeds_xai_oauth_from_singleton(tmp_path, monkeypatch):
     assert entry.base_url == DEFAULT_XAI_OAUTH_BASE_URL
 
 
-def test_credential_pool_device_code_seed_respects_suppression(tmp_path, monkeypatch):
+@pytest.mark.asyncio
+async def test_credential_pool_device_code_seed_respects_suppression(tmp_path, monkeypatch):
     from agent.credential_pool import load_pool
     from hermes_cli.auth import suppress_credential_source
 
@@ -602,11 +641,12 @@ def test_credential_pool_device_code_seed_respects_suppression(tmp_path, monkeyp
 
     suppress_credential_source("xai-oauth", "device_code")
 
-    pool = load_pool("xai-oauth")
+    pool = await load_pool("xai-oauth")
     assert not pool.has_credentials()
 
 
-def test_login_xai_oauth_relogin_clears_suppression_and_reseeds(tmp_path, monkeypatch):
+@pytest.mark.asyncio
+async def test_login_xai_oauth_relogin_clears_suppression_and_reseeds(tmp_path, monkeypatch):
     """remove -> ``hermes model`` re-login (``_login_xai_oauth``) must clear the
     ``device_code`` suppression marker so the singleton seed re-creates the
     pool entry.
@@ -638,7 +678,7 @@ def test_login_xai_oauth_relogin_clears_suppression_and_reseeds(tmp_path, monkey
     # seed is gated off and the pool is empty.
     suppress_credential_source("xai-oauth", "device_code")
     assert is_source_suppressed("xai-oauth", "device_code") is True
-    assert not load_pool("xai-oauth").has_credentials()
+    assert not (await load_pool("xai-oauth")).has_credentials()
 
     new_access = _jwt_with_exp(int(time.time()) + 2 * 60 * 60)
     monkeypatch.setattr(
@@ -671,7 +711,7 @@ def test_login_xai_oauth_relogin_clears_suppression_and_reseeds(tmp_path, monkey
     # The explicit interactive login cleared the suppression marker...
     assert is_source_suppressed("xai-oauth", "device_code") is False
     # ...so the singleton seed re-creates the canonical pool entry.
-    pool = load_pool("xai-oauth")
+    pool = await load_pool("xai-oauth")
     assert pool.has_credentials()
     entry = next(e for e in pool.entries() if e.source == "device_code")
     assert entry.access_token == new_access
@@ -682,7 +722,8 @@ def test_login_xai_oauth_relogin_clears_suppression_and_reseeds(tmp_path, monkey
 # ---------------------------------------------------------------------------
 
 
-def test_pool_sync_back_writes_to_singleton(tmp_path, monkeypatch):
+@pytest.mark.asyncio
+async def test_pool_sync_back_writes_to_singleton(tmp_path, monkeypatch):
     """When the pool refreshes a singleton-seeded xAI entry, the new tokens
     must be written back to providers["xai-oauth"] so that
     resolve_xai_oauth_runtime_credentials() (which reads the singleton)
@@ -696,21 +737,13 @@ def test_pool_sync_back_writes_to_singleton(tmp_path, monkeypatch):
 
     new_access = _jwt_with_exp(int(time.time()) + 2 * 60 * 60)
 
-    def _fake_refresh(access_token, refresh_token, **kwargs):
-        assert refresh_token == "rt-old"
-        return {
-            "access_token": new_access,
-            "refresh_token": "rt-new",
-            "id_token": "",
-            "expires_in": 3600,
-            "token_type": "Bearer",
-            "last_refresh": "2026-05-15T01:00:00Z",
-        }
+    _patch_native_xai_refresh(
+        monkeypatch,
+        {"access_token": new_access, "refresh_token": "rt-new"},
+    )
 
-    monkeypatch.setattr("hermes_cli.auth.refresh_xai_oauth_pure", _fake_refresh)
-
-    pool = load_pool("xai-oauth")
-    selected = pool.select()
+    pool = await load_pool("xai-oauth")
+    selected = await pool.select()
     assert selected is not None
     assert selected.access_token == new_access
     assert selected.refresh_token == "rt-new"
@@ -722,7 +755,7 @@ def test_pool_sync_back_writes_to_singleton(tmp_path, monkeypatch):
     state = raw["providers"]["xai-oauth"]
     assert state["tokens"]["access_token"] == new_access
     assert state["tokens"]["refresh_token"] == "rt-new"
-    assert state["last_refresh"] == "2026-05-15T01:00:00Z"
+    assert state["last_refresh"]
 
 
 # ---------------------------------------------------------------------------
@@ -730,7 +763,8 @@ def test_pool_sync_back_writes_to_singleton(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_runtime_provider_uses_pool_entry_for_xai_oauth(tmp_path, monkeypatch):
+@pytest.mark.asyncio
+async def test_runtime_provider_uses_pool_entry_for_xai_oauth(tmp_path, monkeypatch):
     from hermes_cli.runtime_provider import resolve_runtime_provider
 
     hermes_home = tmp_path / "hermes"
@@ -740,7 +774,7 @@ def test_runtime_provider_uses_pool_entry_for_xai_oauth(tmp_path, monkeypatch):
     monkeypatch.delenv("HERMES_XAI_BASE_URL", raising=False)
     monkeypatch.delenv("XAI_BASE_URL", raising=False)
 
-    runtime = resolve_runtime_provider(requested="xai-oauth")
+    runtime = await resolve_runtime_provider(requested="xai-oauth")
     assert runtime["provider"] == "xai-oauth"
     assert runtime["api_mode"] == "codex_responses"
     assert runtime["api_key"] == fresh
@@ -754,7 +788,8 @@ def test_runtime_provider_uses_pool_entry_for_xai_oauth(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_pool_refresh_recovers_when_other_process_already_refreshed(tmp_path, monkeypatch):
+@pytest.mark.asyncio
+async def test_pool_refresh_recovers_when_other_process_already_refreshed(tmp_path, monkeypatch):
     """Variant of the multi-process race where the other process refreshes
     BETWEEN our proactive sync and the HTTP POST.  Our refresh fails with a
     consumed-token error; we must re-check auth.json, find the fresh pair
@@ -767,11 +802,11 @@ def test_pool_refresh_recovers_when_other_process_already_refreshed(tmp_path, mo
     _setup_hermes_auth(hermes_home, access_token=in_memory_at, refresh_token="rt-shared")
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
 
-    pool = load_pool("xai-oauth")
+    pool = await load_pool("xai-oauth")
 
     other_process_at = _jwt_with_exp(int(time.time()) + 2 * 60 * 60)
 
-    def _fake_refresh(access_token, refresh_token, **kwargs):
+    def _other_process_refresh():
         # Simulate the racing process winning at the auth server right
         # before our POST: by the time we reach this call, auth.json
         # already holds the fresher pair, but we POSTed with rt-shared.
@@ -784,16 +819,13 @@ def test_pool_refresh_recovers_when_other_process_already_refreshed(tmp_path, mo
             "token_type": "Bearer",
         }
         (hermes_home / "auth.json").write_text(json.dumps(raw))
-        raise AuthError(
-            "refresh_token_reused",
-            provider="xai-oauth",
-            code="xai_refresh_failed",
-            relogin_required=True,
-        )
+    _patch_native_xai_refresh(
+        monkeypatch,
+        {},
+        before_error=_other_process_refresh,
+    )
 
-    monkeypatch.setattr("hermes_cli.auth.refresh_xai_oauth_pure", _fake_refresh)
-
-    selected = pool.select()
+    selected = await pool.select()
     # Even though refresh_xai_oauth_pure raised, the post-failure
     # recovery path should adopt the fresher singleton tokens.
     assert selected is not None
@@ -801,7 +833,8 @@ def test_pool_refresh_recovers_when_other_process_already_refreshed(tmp_path, mo
     assert selected.refresh_token == "rt-rotated"
 
 
-def test_pool_manual_entry_does_not_sync_back_to_singleton(tmp_path, monkeypatch):
+@pytest.mark.asyncio
+async def test_pool_manual_entry_does_not_sync_back_to_singleton(tmp_path, monkeypatch):
     """`hermes auth add xai-oauth` entries (source='manual:xai_pkce') are
     independent credentials and must NOT write to the singleton.  Sync-back
     is restricted to entries seeded from the singleton.  Otherwise adding a
@@ -818,21 +851,13 @@ def test_pool_manual_entry_does_not_sync_back_to_singleton(tmp_path, monkeypatch
     manual_at_old = _jwt_with_exp(int(time.time()) + 30)
     manual_at_new = _jwt_with_exp(int(time.time()) + 7200)
 
-    def _fake_refresh(access_token, refresh_token, **kwargs):
-        assert refresh_token == "rt-manual"
-        return {
-            "access_token": manual_at_new,
-            "refresh_token": "rt-manual-new",
-            "id_token": "",
-            "expires_in": 3600,
-            "token_type": "Bearer",
-            "last_refresh": "2026-05-15T04:00:00Z",
-        }
+    _patch_native_xai_refresh(
+        monkeypatch,
+        {"access_token": manual_at_new, "refresh_token": "rt-manual-new"},
+    )
 
-    monkeypatch.setattr("hermes_cli.auth.refresh_xai_oauth_pure", _fake_refresh)
-
-    pool = load_pool("xai-oauth")
-    pool.add_entry(
+    pool = await load_pool("xai-oauth")
+    await pool.add_entry(
         PooledCredential(
             provider="xai-oauth",
             id=uuid.uuid4().hex[:6],
@@ -848,7 +873,9 @@ def test_pool_manual_entry_does_not_sync_back_to_singleton(tmp_path, monkeypatch
     # Refresh the manual entry — singleton must be left alone.
     manual_entries = [e for e in pool.entries() if e.source == "manual:xai_pkce"]
     assert len(manual_entries) == 1
-    pool._refresh_entry(manual_entries[0], force=True)
+    refreshed = await pool._refresh_entry(manual_entries[0], force=True)
+    assert refreshed is not None
+    assert refreshed.access_token == manual_at_new
 
     raw = json.loads((hermes_home / "auth.json").read_text())
     tokens = raw["providers"]["xai-oauth"]["tokens"]
@@ -862,7 +889,8 @@ def test_pool_manual_entry_does_not_sync_back_to_singleton(tmp_path, monkeypatch
 # ---------------------------------------------------------------------------
 
 
-def test_auxiliary_client_routes_xai_oauth_through_responses_api(tmp_path, monkeypatch):
+@pytest.mark.asyncio
+async def test_auxiliary_client_routes_xai_oauth_through_responses_api(tmp_path, monkeypatch):
     """Without explicit xai-oauth handling in ``resolve_provider_client``, an
     xai-oauth main provider falls through to the generic ``oauth_external``
     arm and returns ``(None, None)`` — silently re-routing every auxiliary
@@ -886,7 +914,7 @@ def test_auxiliary_client_routes_xai_oauth_through_responses_api(tmp_path, monke
     monkeypatch.delenv("HERMES_XAI_BASE_URL", raising=False)
     monkeypatch.delenv("XAI_BASE_URL", raising=False)
 
-    client, model = resolve_provider_client("xai-oauth", model="grok-4")
+    client, model = await resolve_provider_client("xai-oauth", model="grok-4")
     assert client is not None, (
         "xai-oauth must route to a Responses-API client; falling through to "
         "the generic oauth_external branch silently swaps providers for "
@@ -900,7 +928,8 @@ def test_auxiliary_client_routes_xai_oauth_through_responses_api(tmp_path, monke
     assert client.api_key == fresh
 
 
-def test_auxiliary_client_xai_oauth_requires_explicit_model(tmp_path, monkeypatch):
+@pytest.mark.asyncio
+async def test_auxiliary_client_xai_oauth_requires_explicit_model(tmp_path, monkeypatch):
     """xAI's Responses API has no safe "cheap aux model" default —
     pinning one would silently rot the same way Codex's did.  Callers
     must pass an explicit model (auxiliary.<task>.model in config.yaml)."""
@@ -911,7 +940,7 @@ def test_auxiliary_client_xai_oauth_requires_explicit_model(tmp_path, monkeypatc
     _setup_hermes_auth(hermes_home, access_token=fresh)
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
 
-    client, model = resolve_provider_client("xai-oauth", model=None)
+    client, model = await resolve_provider_client("xai-oauth", model=None)
     assert client is None
     assert model is None
 
@@ -921,7 +950,8 @@ def test_auxiliary_client_xai_oauth_requires_explicit_model(tmp_path, monkeypatc
 # ---------------------------------------------------------------------------
 
 
-def test_pool_sync_back_preserves_active_provider(tmp_path, monkeypatch):
+@pytest.mark.asyncio
+async def test_pool_sync_back_preserves_active_provider(tmp_path, monkeypatch):
     """A token-rotation sync-back is a side effect of refresh, not the user
     picking a provider.  ``_save_provider_state`` flips ``active_provider``;
     using it on the sync-back path means every xAI/Codex/Nous refresh in a
@@ -945,20 +975,13 @@ def test_pool_sync_back_preserves_active_provider(tmp_path, monkeypatch):
 
     new_access = _jwt_with_exp(int(time.time()) + 2 * 60 * 60)
 
-    def _fake_refresh(access_token, refresh_token, **kwargs):
-        return {
-            "access_token": new_access,
-            "refresh_token": "rt-rotated",
-            "id_token": "",
-            "expires_in": 3600,
-            "token_type": "Bearer",
-            "last_refresh": "2026-05-15T10:00:00Z",
-        }
+    _patch_native_xai_refresh(
+        monkeypatch,
+        {"access_token": new_access, "refresh_token": "rt-rotated"},
+    )
 
-    monkeypatch.setattr("hermes_cli.auth.refresh_xai_oauth_pure", _fake_refresh)
-
-    pool = load_pool("xai-oauth")
-    selected = pool.select()
+    pool = await load_pool("xai-oauth")
+    selected = await pool.select()
     assert selected is not None
     assert selected.access_token == new_access
 

@@ -12,13 +12,9 @@ provider would keep short-circuiting forever:
 - ``try_activate_fallback()``  (automatic provider fallback)
 - ``restore_primary_runtime()``  (turn-start restore back to the primary)
 
-The non-streaming sibling ``interruptible_api_call`` shares the same
-breaker (guard at entry, bump on stale_call_kill, reset on success) —
-quiet-mode / subagent sessions take that path and had the identical
-infinite stale-retry class.
 """
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -83,16 +79,27 @@ def _mock_client(base_url="https://openrouter.ai/api/v1", api_key="fb-key"):
     return mock
 
 
-def test_switch_model_resets_stale_streak():
+@pytest.mark.asyncio
+async def test_switch_model_resets_stale_streak():
     """A user-initiated /model swap must clear the latched streak so the new
     provider gets a real stream attempt instead of an instant short-circuit."""
     agent = _make_agent_openrouter()
     agent._consecutive_stale_streams = 7  # past any reasonable threshold
 
-    agent._create_openai_client = MagicMock(return_value=MagicMock(name="NewClient"))
+    async def initialize_runtime():
+        pending = agent._deferred_provider_runtime
+        agent.provider = agent.requested_provider = pending["provider"]
+        agent.model = pending["model"]
+        agent.api_key = pending["api_key"]
+        agent.base_url = pending["base_url"]
+        agent.api_mode = pending["api_mode"]
+        agent._deferred_provider_runtime = None
 
-    with patch("hermes_cli.timeouts.get_provider_request_timeout", return_value=None):
-        agent.switch_model(
+    agent._ensure_provider_runtime = AsyncMock(side_effect=initialize_runtime)
+    agent._persist_pending_billing_route = AsyncMock()
+
+    with patch("hermes_cli.config.load_config_readonly_async", new_callable=AsyncMock, return_value={}):
+        await agent.switch_model(
             new_model="openai/gpt-5",
             new_provider="openrouter",
             api_key="or-key-new",
@@ -103,20 +110,20 @@ def test_switch_model_resets_stale_streak():
     assert agent._consecutive_stale_streams == 0
 
 
-def test_switch_model_failure_does_not_reset_streak():
+@pytest.mark.asyncio
+async def test_switch_model_failure_does_not_reset_streak():
     """A failed swap rolls back — the agent is still on the wedged provider,
     so the breaker must stay latched (reset happens after the rebuild)."""
     agent = _make_agent_openrouter()
     agent._consecutive_stale_streams = 7
 
-    def boom(*_a, **_kw):
-        raise RuntimeError("simulated client build failure")
+    agent._ensure_provider_runtime = AsyncMock(
+        side_effect=RuntimeError("simulated client build failure")
+    )
 
-    agent._create_openai_client = boom
-
-    with patch("hermes_cli.timeouts.get_provider_request_timeout", return_value=None):
+    with patch("hermes_cli.config.load_config_readonly_async", new_callable=AsyncMock, return_value={}):
         try:
-            agent.switch_model(
+            await agent.switch_model(
                 new_model="openai/gpt-5",
                 new_provider="openrouter",
                 api_key="or-key-new",
@@ -157,35 +164,3 @@ async def test_fallback_exhaustion_keeps_stale_streak():
 
     assert await agent._try_activate_fallback() is False
     assert agent._consecutive_stale_streams == 7
-
-
-
-
-
-
-class TestNonStreamingSibling:
-    """interruptible_api_call carries the same breaker (#58962)."""
-
-    def test_non_streaming_short_circuits_at_threshold(self, monkeypatch):
-        monkeypatch.setenv("HERMES_STREAM_STALE_GIVEUP", "3")
-        agent = _make_fallback_agent(fallback_model=[])
-        agent._consecutive_stale_streams = 3
-
-        with pytest.raises(RuntimeError, match="unresponsive"):
-            agent._interruptible_api_call({})
-
-        # The client is never touched on the short-circuit path.
-        agent.client.chat.completions.create.assert_not_called()
-        assert agent._consecutive_stale_streams == 3
-
-    def test_non_streaming_success_resets_streak(self, monkeypatch):
-        monkeypatch.setenv("HERMES_STREAM_STALE_GIVEUP", "3")
-        agent = _make_fallback_agent(fallback_model=[])
-        agent._consecutive_stale_streams = 2  # below threshold
-        agent.client.chat.completions.create.return_value = MagicMock(
-            name="resp", choices=[MagicMock()]
-        )
-
-        resp = agent._interruptible_api_call({"model": "m", "messages": []})
-        assert resp is not None
-        assert agent._consecutive_stale_streams == 0

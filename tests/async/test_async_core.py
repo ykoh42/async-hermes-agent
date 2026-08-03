@@ -19,7 +19,7 @@ from agent.turn_context import build_turn_context
 from agent.turn_finalizer import finalize_turn
 from agent import tool_executor
 from agent.tool_executor import execute_tool_calls_segmented
-from hermes_state import AsyncSessionDB
+from hermes_state import SessionDB
 from run_agent import AIAgent
 from model_tools import handle_function_call
 from tools.registry import registry
@@ -43,7 +43,6 @@ def test_conversation_and_chat_are_coroutines():
         _create_with_progress,
         _create_with_stream,
     )
-    from agent import relay_llm, relay_tools
     from tools.file_tools import (
         patch_tool,
         read_file_tool,
@@ -96,10 +95,6 @@ def test_conversation_and_chat_are_coroutines():
     assert inspect.iscoroutinefunction(_aggregate_chat_stream)
     assert inspect.iscoroutinefunction(_create_with_progress)
     assert inspect.iscoroutinefunction(_create_with_stream)
-    assert inspect.iscoroutinefunction(relay_llm.execute)
-    assert inspect.iscoroutinefunction(relay_llm.execute_current)
-    assert inspect.iscoroutinefunction(relay_llm.complete_logical_call)
-    assert inspect.iscoroutinefunction(relay_tools.execute)
     assert inspect.iscoroutinefunction(run_llm_execution_middleware)
     assert inspect.iscoroutinefunction(_get_session_db)
     assert inspect.iscoroutinefunction(load_goal)
@@ -129,7 +124,7 @@ def test_conversation_and_chat_are_coroutines():
 @pytest.mark.asyncio
 async def test_async_session_billing_route_update_uses_native_connection(tmp_path):
     """A model switch must not fall back to the synchronous SessionDB writer."""
-    database = AsyncSessionDB(tmp_path / "state.db")
+    database = SessionDB(tmp_path / "state.db")
     async_database = database
     try:
         await async_database.create_session("route", "test", model="initial")
@@ -150,7 +145,7 @@ async def test_async_session_billing_route_update_uses_native_connection(tmp_pat
 @pytest.mark.asyncio
 async def test_async_session_db_can_bootstrap_from_a_path(tmp_path):
     """The active path does not need a synchronously opened SessionDB."""
-    database = AsyncSessionDB(tmp_path / "state.db")
+    database = SessionDB(tmp_path / "state.db")
     try:
         await database.create_session("native", "test", model="test-model")
         await database.append_message("native", "user", "hello")
@@ -167,7 +162,7 @@ async def test_async_session_db_can_bootstrap_from_a_path(tmp_path):
 @pytest.mark.asyncio
 async def test_async_session_db_meta_and_gateway_listing_match_native_shape(tmp_path):
     """Management readers can migrate without reopening the sync database."""
-    database = AsyncSessionDB(tmp_path / "state.db")
+    database = SessionDB(tmp_path / "state.db")
     try:
         await database.set_meta("goal:session", '{"status":"active"}')
         assert await database.get_meta("goal:session") == '{"status":"active"}'
@@ -229,7 +224,7 @@ async def test_native_file_read_deduplicates_and_write_invalidates(tmp_path, mon
 @pytest.mark.asyncio
 async def test_model_switch_route_is_deferred_to_the_async_turn_boundary(tmp_path):
     """The sync state switch never writes SQLite directly."""
-    database = AsyncSessionDB(tmp_path / "state.db")
+    database = SessionDB(tmp_path / "state.db")
     async_database = database
     agent = AIAgent.__new__(AIAgent)
     agent._session_db = database
@@ -329,13 +324,13 @@ async def test_async_plugin_lifecycle_requires_coroutine_callbacks():
     manager = PluginManager()
     manager._hooks["turn"] = [lambda **_kwargs: None]
     with pytest.raises(AsyncPluginCapabilityError, match="coroutine lifecycle hooks"):
-        await manager.invoke_hook_async("turn")
+        await manager.invoke_hook("turn")
 
     async def callback(**_kwargs):
         return "native"
 
     manager._hooks["turn"] = [callback]
-    assert await manager.invoke_hook_async("turn") == ["native"]
+    assert await manager.invoke_hook("turn") == ["native"]
 
 
 @pytest.mark.asyncio
@@ -584,11 +579,7 @@ async def test_explicit_credentials_defer_sdk_construction_until_await(monkeypat
     with (
         patch("run_agent.get_tool_definitions", return_value=[]),
         patch("run_agent.check_toolset_requirements", return_value={}),
-        patch(
-            "run_agent.OpenAI",
-            side_effect=AssertionError("__init__ must not create a sync client"),
-        ),
-        patch("openai.AsyncOpenAI", return_value=native_client) as async_openai,
+        patch("run_agent.OpenAI", return_value=native_client) as async_openai,
     ):
         agent = AIAgent(
             provider="custom",
@@ -634,10 +625,7 @@ async def test_custom_env_key_preserves_constructor_route_and_tls_snapshot(
     with (
         patch("run_agent.get_tool_definitions", return_value=[]),
         patch("run_agent.check_toolset_requirements", return_value={}),
-        patch(
-            "run_agent.OpenAI",
-            side_effect=AssertionError("__init__ must not create a sync client"),
-        ),
+        patch("run_agent.OpenAI", return_value=native_client) as async_openai,
         patch("hermes_cli.config.load_config", return_value={
             "custom_providers": [{
                 "name": "Local endpoint",
@@ -650,7 +638,6 @@ async def test_custom_env_key_preserves_constructor_route_and_tls_snapshot(
             "agent.process_bootstrap.build_keepalive_http_client",
             return_value=transport,
         ) as build_http_client,
-        patch("openai.AsyncOpenAI", return_value=native_client),
     ):
         agent = AIAgent(
             provider="custom",
@@ -660,6 +647,7 @@ async def test_custom_env_key_preserves_constructor_route_and_tls_snapshot(
             skip_context_files=True,
             skip_memory=True,
         )
+        async_openai.assert_not_called()
         monkeypatch.setattr(
             asyncio,
             "to_thread",
@@ -707,7 +695,7 @@ async def test_turn_retries_with_rotated_api_key_pool_entry(monkeypatch, tmp_pat
     )
     pool = CredentialPool("openrouter", [first, second])
     pool._current_id = first.id
-    database = AsyncSessionDB(tmp_path / "state.db")
+    database = SessionDB(tmp_path / "state.db")
     with (
         patch("run_agent.get_tool_definitions", return_value=[]),
         patch("run_agent.check_toolset_requirements", return_value={}),
@@ -918,7 +906,7 @@ async def test_turn_retries_after_native_anthropic_oauth_refresh(monkeypatch, tm
     )
     pool = CredentialPool("anthropic", [entry])
     pool._current_id = entry.id
-    database = AsyncSessionDB(tmp_path / "state.db")
+    database = SessionDB(tmp_path / "state.db")
     with (
         patch("run_agent.get_tool_definitions", return_value=[]),
         patch("run_agent.check_toolset_requirements", return_value={}),
@@ -1218,7 +1206,7 @@ async def test_fallback_swaps_to_a_native_async_client(monkeypatch):
 
     monkeypatch.setattr(asyncio, "to_thread", fail_if_threaded)
     try:
-        with patch("openai.AsyncOpenAI", return_value=native_client) as async_openai:
+        with patch("run_agent.OpenAI", return_value=native_client) as async_openai:
             assert await agent._try_activate_fallback()
             response = await agent._execute_model_request(
                 {"model": agent.model, "messages": []}
@@ -1271,7 +1259,7 @@ async def test_distinct_agents_can_run_turns_in_parallel():
 @pytest.mark.asyncio
 async def test_run_conversation_serializes_turns_for_one_agent(monkeypatch, tmp_path):
     """The public turn API, not only its raw lock, serializes one agent."""
-    database = AsyncSessionDB(tmp_path / "state.db")
+    database = SessionDB(tmp_path / "state.db")
     with (
         patch("run_agent.get_tool_definitions", return_value=[]),
         patch("run_agent.check_toolset_requirements", return_value={}),
@@ -1361,7 +1349,7 @@ async def test_run_conversation_serializes_turns_for_one_agent(monkeypatch, tmp_
 @pytest.mark.asyncio
 async def test_default_compression_prologue_uses_static_context_metadata(monkeypatch, tmp_path):
     """The default compression path must not synchronously discover models."""
-    database = AsyncSessionDB(tmp_path / "state.db")
+    database = SessionDB(tmp_path / "state.db")
     with (
         patch("run_agent.get_tool_definitions", return_value=[]),
         patch("run_agent.check_toolset_requirements", return_value={}),
@@ -1415,7 +1403,7 @@ async def test_default_compression_prologue_uses_static_context_metadata(monkeyp
 @pytest.mark.asyncio
 async def test_run_conversation_allows_distinct_agents_to_overlap(monkeypatch, tmp_path):
     """Separate agent instances keep their model I/O concurrent."""
-    databases = [AsyncSessionDB(tmp_path / f"state-{index}.db") for index in range(2)]
+    databases = [SessionDB(tmp_path / f"state-{index}.db") for index in range(2)]
     with (
         patch("run_agent.get_tool_definitions", return_value=[]),
         patch("run_agent.check_toolset_requirements", return_value={}),
@@ -1575,7 +1563,7 @@ async def test_trajectory_writer_is_awaitable(tmp_path):
 
 @pytest.mark.asyncio
 async def test_async_session_db_writes_without_to_thread(tmp_path, monkeypatch):
-    database = AsyncSessionDB(tmp_path / "state.db")
+    database = SessionDB(tmp_path / "state.db")
     session_db = database
 
     def fail_if_called(*args, **kwargs):
@@ -1601,7 +1589,7 @@ async def test_async_session_db_writes_without_to_thread(tmp_path, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_conversation_root_uses_async_session_db(tmp_path, monkeypatch):
-    database = AsyncSessionDB(tmp_path / "state.db")
+    database = SessionDB(tmp_path / "state.db")
     await database.create_session("root", "test")
     await database.create_session("child", "test", parent_session_id="root")
     agent = AIAgent.__new__(AIAgent)
@@ -1619,7 +1607,7 @@ async def test_conversation_root_uses_async_session_db(tmp_path, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_async_session_db_loads_compression_snapshot(tmp_path, monkeypatch):
-    database = AsyncSessionDB(tmp_path / "state.db")
+    database = SessionDB(tmp_path / "state.db")
     session_db = database
     monkeypatch.setattr(
         asyncio,
@@ -1652,7 +1640,7 @@ async def test_async_session_db_loads_compression_snapshot(tmp_path, monkeypatch
 
 @pytest.mark.asyncio
 async def test_async_session_db_persists_compression_guards(tmp_path, monkeypatch):
-    database = AsyncSessionDB(tmp_path / "state.db")
+    database = SessionDB(tmp_path / "state.db")
     session_db = database
     monkeypatch.setattr(
         asyncio,
@@ -1687,7 +1675,7 @@ async def test_micro_compaction_persists_through_async_session_db(tmp_path, monk
         ContextCompressor,
     )
 
-    database = AsyncSessionDB(tmp_path / "state.db")
+    database = SessionDB(tmp_path / "state.db")
     session_db = database
     messages = [{"role": "system", "content": "system"}]
     for index in range(6):
@@ -1746,11 +1734,11 @@ async def test_micro_compaction_persists_through_async_session_db(tmp_path, monk
 
 @pytest.mark.asyncio
 async def test_async_auxiliary_accounting_writes_without_to_thread(tmp_path, monkeypatch):
-    """An auxiliary model response persists usage through AsyncSessionDB only."""
+    """An auxiliary model response persists usage through SessionDB only."""
     from agent.aux_accounting import reset_accounting_context, set_accounting_context
     from agent.auxiliary_client import _validate_llm_response
 
-    database = AsyncSessionDB(tmp_path / "state.db")
+    database = SessionDB(tmp_path / "state.db")
     session_db = database
     monkeypatch.setattr(
         asyncio,
@@ -1784,7 +1772,7 @@ async def test_async_auxiliary_accounting_writes_without_to_thread(tmp_path, mon
 async def test_async_session_db_backfills_api_sidecar_without_to_thread(
     tmp_path, monkeypatch
 ):
-    database = AsyncSessionDB(tmp_path / "state.db")
+    database = SessionDB(tmp_path / "state.db")
     session_db = database
 
     monkeypatch.setattr(
@@ -1813,7 +1801,7 @@ async def test_async_session_db_compacts_and_releases_lease_without_to_thread(
     tmp_path, monkeypatch
 ):
     """The async compaction primitives preserve active/archived transcript rows."""
-    database = AsyncSessionDB(tmp_path / "state.db")
+    database = SessionDB(tmp_path / "state.db")
     session_db = database
 
     monkeypatch.setattr(
@@ -1861,7 +1849,7 @@ async def test_async_session_db_compacts_and_releases_lease_without_to_thread(
 @pytest.mark.asyncio
 async def test_in_place_compression_uses_native_async_sqlite_path(tmp_path, monkeypatch):
     """A complete in-place compaction never re-enters the sync SessionDB API."""
-    database = AsyncSessionDB(tmp_path / "state.db")
+    database = SessionDB(tmp_path / "state.db")
     session_db = database
 
     class Compressor:
@@ -1952,7 +1940,7 @@ async def test_in_place_compression_uses_native_async_sqlite_path(tmp_path, monk
 @pytest.mark.asyncio
 async def test_rotating_compression_publishes_child_with_native_async_sqlite(tmp_path):
     """The optional rotation mode retains its atomic parent/child handoff."""
-    database = AsyncSessionDB(tmp_path / "state.db")
+    database = SessionDB(tmp_path / "state.db")
     session_db = database
 
     class Compressor:
@@ -2033,7 +2021,7 @@ async def test_rotating_compression_publishes_child_with_native_async_sqlite(tmp
 
 @pytest.mark.asyncio
 async def test_agent_session_lifecycle_uses_native_async_store(tmp_path, monkeypatch):
-    database = AsyncSessionDB(tmp_path / "state.db")
+    database = SessionDB(tmp_path / "state.db")
     agent = AIAgent.__new__(AIAgent)
     agent._persist_disabled = False
     agent._session_db = database
@@ -2076,7 +2064,7 @@ async def test_agent_session_lifecycle_uses_native_async_store(tmp_path, monkeyp
 @pytest.mark.asyncio
 async def test_persist_session_does_not_reenter_its_async_lock(tmp_path, monkeypatch):
     """The persist funnel owns one lock and calls its unlocked DB writer."""
-    database = AsyncSessionDB(tmp_path / "state.db")
+    database = SessionDB(tmp_path / "state.db")
     agent = AIAgent.__new__(AIAgent)
     agent._persist_disabled = False
     agent._session_db = database
@@ -2151,7 +2139,7 @@ async def test_synthetic_turn_records_trajectory_without_to_thread(monkeypatch, 
     """Exercise the public turn path with an async model and real session DB."""
     from run_agent import AIAgent
 
-    database = AsyncSessionDB(tmp_path / "state.db")
+    database = SessionDB(tmp_path / "state.db")
     with (
         patch("run_agent.get_tool_definitions", return_value=[]),
         patch("run_agent.check_toolset_requirements", return_value={}),
@@ -2222,7 +2210,7 @@ async def test_oauth_renewal_fails_fast_without_sync_refresh(monkeypatch, tmp_pa
     class UnauthorizedError(Exception):
         status_code = 401
 
-    database = AsyncSessionDB(tmp_path / "state.db")
+    database = SessionDB(tmp_path / "state.db")
     with (
         patch("run_agent.get_tool_definitions", return_value=[]),
         patch("run_agent.check_toolset_requirements", return_value={}),
@@ -2286,7 +2274,7 @@ async def test_codex_responses_main_path_uses_native_async_client(monkeypatch):
 @pytest.mark.asyncio
 async def test_synthetic_model_tool_observation_turn_preserves_order(monkeypatch, tmp_path):
     """The model → tool → observation → model training shape stays ordered."""
-    database = AsyncSessionDB(tmp_path / "state.db")
+    database = SessionDB(tmp_path / "state.db")
     with (
         patch("run_agent.get_tool_definitions", return_value=[]),
         patch("run_agent.check_toolset_requirements", return_value={}),
@@ -2397,7 +2385,7 @@ async def test_synthetic_model_tool_observation_turn_preserves_order(monkeypatch
 @pytest.mark.asyncio
 async def test_cancelled_turn_persists_partial_session_and_reraises(monkeypatch, tmp_path):
     """Cancellation keeps the crash-safe user row, then propagates cancellation."""
-    database = AsyncSessionDB(tmp_path / "state.db")
+    database = SessionDB(tmp_path / "state.db")
     with (
         patch("run_agent.get_tool_definitions", return_value=[]),
         patch("run_agent.check_toolset_requirements", return_value={}),
@@ -2456,7 +2444,7 @@ async def test_cancelled_tool_batch_persists_ordered_cancelled_observation(
 
     active_registry = importlib.import_module("tools.registry").registry
     active_model_tools = importlib.import_module("model_tools")
-    database = AsyncSessionDB(tmp_path / "state.db")
+    database = SessionDB(tmp_path / "state.db")
     tool_name = "__async_core_slow_tool__"
     tool_started = asyncio.Event()
 

@@ -17,10 +17,12 @@ suite (we patch ``run_agent.OpenAI`` and drive ``agent.client``), so they
 pass identically in CI and locally.
 """
 
+import pytest
+
 import os
 import uuid
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from run_agent import AIAgent
 
@@ -50,6 +52,7 @@ def _make_agent(max_iterations: int = 10, config: dict | None = None) -> AIAgent
             skip_memory=True,
         )
     agent.client = MagicMock()
+    agent._deferred_provider_runtime = None
     agent._cached_system_prompt = "You are helpful."
     agent._use_prompt_caching = False
     agent.compression_enabled = False
@@ -96,20 +99,22 @@ def test_explanation_for_max_iterations_reached_prefix_match():
 # --------------------------------------------------------------------------
 # 2. Enable/disable seam
 # --------------------------------------------------------------------------
-def test_explainer_enabled_by_default():
+@pytest.mark.asyncio
+async def test_explainer_enabled_by_default():
     agent = _make_agent()
     with patch.dict(os.environ, {}, clear=False):
         os.environ.pop("HERMES_TURN_COMPLETION_EXPLAINER", None)
         with patch("hermes_cli.config.load_config", return_value={}):
-            assert agent._turn_completion_explainer_enabled() is True
+            assert await agent._turn_completion_explainer_enabled() is True
 
 
-def test_explainer_disabled_via_env():
+@pytest.mark.asyncio
+async def test_explainer_disabled_via_env():
     agent = _make_agent()
     with patch.dict(
         os.environ, {"HERMES_TURN_COMPLETION_EXPLAINER": "0"}, clear=False
     ):
-        assert agent._turn_completion_explainer_enabled() is False
+        assert await agent._turn_completion_explainer_enabled() is False
 
 
 
@@ -117,21 +122,22 @@ def test_explainer_disabled_via_env():
 # --------------------------------------------------------------------------
 # 3. End-to-end: empty-response exhaustion surfaces the explanation
 # --------------------------------------------------------------------------
-def test_run_conversation_empty_exhausted_surfaces_explanation():
+@pytest.mark.asyncio
+async def test_run_conversation_empty_exhausted_surfaces_explanation():
     """Four empty responses in a row should exhaust retries and the final
     response should be the actionable explanation, not a bare '(empty)'."""
     agent = _make_agent(max_iterations=10)
     # 4 empty responses: retries 1..3 then the terminal on the 4th.
-    agent.client.chat.completions.create.side_effect = [
-        _mock_response(content="", finish_reason="stop") for _ in range(8)
-    ]
+    agent._execute_model_request = AsyncMock(
+        side_effect=[_mock_response(content="", finish_reason="stop") for _ in range(8)]
+    )
 
     with (
         patch.object(agent, "_persist_session"),
         patch.object(agent, "_save_trajectory"),
         patch.object(agent, "_cleanup_task_resources"),
     ):
-        result = agent.run_conversation("do something")
+        result = await agent.run_conversation("do something")
 
     assert result["turn_exit_reason"] == "empty_response_exhausted"
     # The user must NOT be left with a bare sentinel; the explanation wins.
@@ -140,7 +146,8 @@ def test_run_conversation_empty_exhausted_surfaces_explanation():
     assert "No reply:" in result["final_response"]
 
 
-def test_run_conversation_partial_stream_recovery_surfaces_explanation():
+@pytest.mark.asyncio
+async def test_run_conversation_partial_stream_recovery_surfaces_explanation():
     """A long recovered partial stream still needs the visible footer.
 
     Without this, the gateway marks the turn as previewed and suppresses
@@ -153,21 +160,20 @@ def test_run_conversation_partial_stream_recovery_surfaces_explanation():
         "stopped after the provider stream timed out."
     )
 
-    def _fake_api_call(_api_kwargs):
+    async def _fake_api_call(_api_kwargs, **_kwargs):
         agent._current_streamed_assistant_text = recovered
         return empty_stub
 
     with (
-        patch.object(agent, "_interruptible_api_call", side_effect=_fake_api_call),
+        patch.object(agent, "_execute_model_request", side_effect=_fake_api_call),
         patch.object(agent, "_persist_session"),
         patch.object(agent, "_save_trajectory"),
         patch.object(agent, "_cleanup_task_resources"),
     ):
-        result = agent.run_conversation("do something")
+        result = await agent.run_conversation("do something")
 
     assert result["turn_exit_reason"] == "partial_stream_recovery"
     assert result["final_response"].startswith(recovered)
     assert "No reply:" in result["final_response"]
     assert result["response_previewed"] is False
-
 

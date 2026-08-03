@@ -4,6 +4,7 @@ import json
 import os
 
 import pytest
+from unittest.mock import AsyncMock
 
 from hermes_cli.auth import (
     PROVIDER_REGISTRY,
@@ -340,7 +341,8 @@ class TestResolveApiKeyProviderCredentials:
 
 
 
-    def test_try_gh_cli_token_uses_homebrew_path_when_not_on_path(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_try_gh_cli_token_uses_homebrew_path_when_not_on_path(self, monkeypatch):
         monkeypatch.setattr("hermes_cli.copilot_auth.shutil.which", lambda command: None)
         monkeypatch.setattr(
             "hermes_cli.copilot_auth.os.path.isfile",
@@ -353,17 +355,22 @@ class TestResolveApiKeyProviderCredentials:
 
         calls = []
 
-        class _Result:
+        class _Process:
             returncode = 0
-            stdout = "gh-cli-secret\n"
 
-        def _fake_run(cmd, **kwargs):
-            calls.append(cmd)
-            return _Result()
+            async def communicate(self):
+                return b"gh-cli-secret\n", b""
 
-        monkeypatch.setattr("hermes_cli.copilot_auth.subprocess.run", _fake_run)
+        async def _create_process(*cmd, **kwargs):
+            calls.append(list(cmd))
+            return _Process()
 
-        assert _try_gh_cli_token() == "gh-cli-secret"
+        monkeypatch.setattr(
+            "hermes_cli.copilot_auth.asyncio.create_subprocess_exec",
+            _create_process,
+        )
+
+        assert await _try_gh_cli_token() == "gh-cli-secret"
         assert calls == [["/opt/homebrew/bin/gh", "auth", "token"]]
 
 
@@ -402,10 +409,11 @@ class TestResolveApiKeyProviderCredentials:
 
 class TestRuntimeProviderResolution:
 
-    def test_runtime_zai(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_runtime_zai(self, monkeypatch):
         monkeypatch.setenv("GLM_API_KEY", "glm-key")
         from hermes_cli.runtime_provider import resolve_runtime_provider
-        result = resolve_runtime_provider(requested="zai")
+        result = await resolve_runtime_provider(requested="zai")
         assert result["provider"] == "zai"
         assert result["api_mode"] == "chat_completions"
         assert result["api_key"] == "glm-key"
@@ -413,61 +421,74 @@ class TestRuntimeProviderResolution:
 
 
 
-    def test_runtime_minimax(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_runtime_minimax(self, monkeypatch):
         monkeypatch.setenv("MINIMAX_API_KEY", "mm-key")
         from hermes_cli.runtime_provider import resolve_runtime_provider
-        result = resolve_runtime_provider(requested="minimax")
+        result = await resolve_runtime_provider(requested="minimax")
         assert result["provider"] == "minimax"
         assert result["api_key"] == "mm-key"
 
-    def test_runtime_ai_gateway(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_runtime_ai_gateway(self, monkeypatch):
         monkeypatch.setenv("AI_GATEWAY_API_KEY", "gw-key")
         from hermes_cli.runtime_provider import resolve_runtime_provider
-        result = resolve_runtime_provider(requested="ai-gateway")
+        result = await resolve_runtime_provider(requested="ai-gateway")
         assert result["provider"] == "ai-gateway"
         assert result["api_mode"] == "chat_completions"
         assert result["api_key"] == "gw-key"
         assert "ai-gateway.vercel.sh" in result["base_url"]
 
-    def test_runtime_kilocode(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_runtime_kilocode(self, monkeypatch):
         monkeypatch.setenv("KILOCODE_API_KEY", "kilo-key")
         from hermes_cli.runtime_provider import resolve_runtime_provider
-        result = resolve_runtime_provider(requested="kilocode")
+        result = await resolve_runtime_provider(requested="kilocode")
         assert result["provider"] == "kilocode"
         assert result["api_mode"] == "chat_completions"
         assert result["api_key"] == "kilo-key"
         assert "kilo.ai" in result["base_url"]
 
-    def test_runtime_gmi(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_runtime_gmi(self, monkeypatch):
         monkeypatch.setenv("GMI_API_KEY", "gmi-key")
         from hermes_cli.runtime_provider import resolve_runtime_provider
-        result = resolve_runtime_provider(requested="gmi")
+        result = await resolve_runtime_provider(requested="gmi")
         assert result["provider"] == "gmi"
         assert result["api_mode"] == "chat_completions"
         assert result["api_key"] == "gmi-key"
         assert result["base_url"] == "https://api.gmi-serving.com/v1"
 
-    def test_runtime_auto_detects_api_key_provider(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_runtime_auto_detects_api_key_provider(self, monkeypatch):
         monkeypatch.setenv("KIMI_API_KEY", "auto-kimi-key")
         from hermes_cli.runtime_provider import resolve_runtime_provider
-        result = resolve_runtime_provider(requested="auto")
+        result = await resolve_runtime_provider(requested="auto")
         assert result["provider"] == "kimi-coding"
         assert result["api_key"] == "auto-kimi-key"
 
-    def test_runtime_copilot_uses_gh_cli_token(self, monkeypatch):
-        monkeypatch.setattr("hermes_cli.copilot_auth._try_gh_cli_token", lambda: "gho_cli_secret")
+    @pytest.mark.asyncio
+    async def test_runtime_copilot_uses_gh_cli_token(self, monkeypatch):
+        monkeypatch.setattr(
+            "hermes_cli.copilot_auth._try_gh_cli_token",
+            AsyncMock(return_value="gho_cli_secret"),
+        )
         from hermes_cli.runtime_provider import resolve_runtime_provider
-        result = resolve_runtime_provider(requested="copilot")
+        result = await resolve_runtime_provider(requested="copilot")
         assert result["provider"] == "copilot"
         assert result["api_mode"] == "chat_completions"
         assert result["api_key"] == "gho_cli_secret"
         assert result["base_url"] == "https://api.githubcopilot.com"
 
-    def test_runtime_copilot_uses_responses_for_gpt_5_4(self, monkeypatch):
-        monkeypatch.setattr("hermes_cli.copilot_auth._try_gh_cli_token", lambda: "gho_cli_secret")
+    @pytest.mark.asyncio
+    async def test_runtime_copilot_uses_responses_for_gpt_5_4(self, monkeypatch):
+        monkeypatch.setattr(
+            "hermes_cli.copilot_auth._try_gh_cli_token",
+            AsyncMock(return_value="gho_cli_secret"),
+        )
         monkeypatch.setattr(
             "hermes_cli.runtime_provider._get_model_config",
-            lambda: {"provider": "copilot", "default": "gpt-5.4"},
+            lambda *args, **kwargs: {"provider": "copilot", "default": "gpt-5.4"},
         )
         monkeypatch.setattr(
             "hermes_cli.models.fetch_github_model_catalog",
@@ -481,25 +502,22 @@ class TestRuntimeProviderResolution:
         )
         from hermes_cli.runtime_provider import resolve_runtime_provider
 
-        result = resolve_runtime_provider(requested="copilot")
+        result = await resolve_runtime_provider(requested="copilot")
 
         assert result["provider"] == "copilot"
         assert result["api_mode"] == "codex_responses"
 
-    def test_runtime_copilot_acp_uses_process_runtime(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_runtime_copilot_acp_uses_process_runtime(self, monkeypatch):
         monkeypatch.setattr("hermes_cli.auth.shutil.which", lambda command: f"/usr/local/bin/{command}")
         monkeypatch.setenv("HERMES_COPILOT_ACP_ARGS", "--acp --stdio --debug")
 
         from hermes_cli.runtime_provider import resolve_runtime_provider
 
-        result = resolve_runtime_provider(requested="copilot-acp")
+        from agent.agent_runtime_helpers import AsyncCapabilityError
 
-        assert result["provider"] == "copilot-acp"
-        assert result["api_mode"] == "chat_completions"
-        assert result["api_key"] == "copilot-acp"
-        assert result["base_url"] == "acp://copilot"
-        assert result["command"] == "/usr/local/bin/copilot"
-        assert result["args"] == ["--acp", "--stdio", "--debug"]
+        with pytest.raises(AsyncCapabilityError, match="blocking subprocess"):
+            await resolve_runtime_provider(requested="copilot-acp")
 
 
 # =============================================================================

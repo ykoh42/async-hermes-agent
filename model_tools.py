@@ -768,12 +768,12 @@ async def _emit_post_tool_call_hook(
     listener will actually consume it).
     """
     try:
-        from hermes_cli.lifecycle import has_hook, invoke_hook_async
+        from hermes_cli.lifecycle import has_hook, invoke_hook
         if not has_hook("post_tool_call"):
             return
         if status is None:
             status, error_type, error_message = _tool_result_observer_fields(result)
-        await invoke_hook_async(
+        await invoke_hook(
             "post_tool_call",
             tool_name=function_name,
             args=function_args,
@@ -847,9 +847,9 @@ async def handle_function_call(
         return tool_error(f"{function_name} must be handled by the agent loop")
 
     if not skip_pre_tool_call_hook:
-        from hermes_cli.plugins import resolve_pre_tool_block_async
+        from hermes_cli.plugins import resolve_pre_tool_block
 
-        block_message = await resolve_pre_tool_block_async(
+        block_message = await resolve_pre_tool_block(
             function_name,
             function_args,
             task_id=task_id or "",
@@ -931,11 +931,11 @@ async def handle_function_call(
         middleware_trace=middleware_trace,
     )
 
-    from hermes_cli.lifecycle import has_hook, invoke_hook_async
+    from hermes_cli.lifecycle import has_hook, invoke_hook
 
     if has_hook("transform_tool_result"):
         status, error_type, error_message = _tool_result_observer_fields(result)
-        hook_results = await invoke_hook_async(
+        hook_results = await invoke_hook(
             "transform_tool_result",
             tool_name=function_name,
             args=function_args,

@@ -7,7 +7,7 @@ to the next provider.
 
 from __future__ import annotations
 
-from unittest.mock import patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -33,16 +33,6 @@ def _make_agent(fallback_model=None):
         return agent
 
 
-def _mock_client(base_url="https://chatgpt.com/backend-api/codex", api_key="fb-key"):
-    mock = type("Client", (), {})()
-    mock.base_url = base_url
-    mock.api_key = api_key
-    mock.chat = type("Chat", (), {})()
-    mock.chat.completions = type("Completions", (), {})()
-    mock.chat.completions.create = lambda *args, **kwargs: None
-    return mock
-
-
 class TestNousFallbackLocalAvailability:
     @pytest.mark.asyncio
     async def test_missing_nous_token_is_skipped_once(self):
@@ -50,16 +40,15 @@ class TestNousFallbackLocalAvailability:
         agent = _make_agent(
             fallback_model=[
                 {"provider": "nous", "model": "anthropic/claude-sonnet-4.6"},
-                {"provider": "openai-codex", "model": "gpt-5.5"},
+                {
+                    "provider": "custom",
+                    "model": "gpt-5.5",
+                    "base_url": "https://fallback.example/v1",
+                    "api_key": "fb-key",
+                },
             ]
         )
-        with patch(
-            "hermes_cli.auth.get_provider_auth_state",
-            return_value={},
-        ), patch(
-            "agent.auxiliary_client.resolve_provider_client",
-            return_value=(_mock_client(api_key="fb"), "gpt-5.5"),
-        ):
+        with patch("run_agent.OpenAI", return_value=MagicMock()):
             activated = await agent._try_activate_fallback(None)
         assert activated is True
         assert agent.model == "gpt-5.5"
@@ -73,11 +62,7 @@ class TestNousFallbackLocalAvailability:
                 {"provider": "openai-codex", "model": "gpt-5.5"},
             ]
         )
-        with patch(
-            "hermes_cli.auth.get_provider_auth_state",
-            return_value={},
-        ):
-            await agent._try_activate_fallback(None)
+        await agent._try_activate_fallback(None)
         key = (
             "nous",
             "anthropic/claude-sonnet-4.6",
@@ -90,17 +75,16 @@ class TestNousFallbackLocalAvailability:
         """Nous is considered when token material exists."""
         agent = _make_agent(
             fallback_model=[
-                {"provider": "nous", "model": "anthropic/claude-sonnet-4.6"},
+                {
+                    "provider": "nous",
+                    "model": "anthropic/claude-sonnet-4.6",
+                    "base_url": "https://inference-api.nousresearch.com/v1",
+                    "api_key": "portal-jwt",
+                },
                 {"provider": "openai-codex", "model": "gpt-5.5"},
             ]
         )
         with patch(
-            "hermes_cli.auth.get_provider_auth_state",
-            return_value={"access_token": "abc", "refresh_token": "xyz"},
-        ), patch(
-            "agent.auxiliary_client.resolve_provider_client",
-            return_value=(_mock_client(api_key="fb"), "anthropic/claude-sonnet-4.6"),
-        ), patch(
             "agent.anthropic_adapter.build_anthropic_client",
             return_value=object(),
         ):

@@ -249,7 +249,8 @@ def test_resolver_recovers_when_probe_confirms_reset(tmp_path, monkeypatch):
 
 
 
-def test_pool_probe_not_fired_for_non_quota_exhaustion(tmp_path, monkeypatch):
+@pytest.mark.asyncio
+async def test_pool_probe_not_fired_for_non_quota_exhaustion(tmp_path, monkeypatch):
     """Entries frozen by auth-shaped failures must not trigger the probe."""
     now = time.time()
     store = _pool_only_rate_limited_store(now)
@@ -262,7 +263,7 @@ def test_pool_probe_not_fired_for_non_quota_exhaustion(tmp_path, monkeypatch):
 
     from agent.credential_pool import load_pool
 
-    pool = load_pool("openai-codex")
+    pool = await load_pool("openai-codex")
     probes = []
 
     def _spy(token, **kw):
@@ -270,7 +271,7 @@ def test_pool_probe_not_fired_for_non_quota_exhaustion(tmp_path, monkeypatch):
         return True
 
     monkeypatch.setattr(auth_mod, "_probe_codex_quota_restored", _spy)
-    pool._available_entries(clear_expired=True, refresh=False)
+    await pool._available_entries(clear_expired=True)
     assert probes == []
 
 
@@ -279,5 +280,3 @@ def test_pool_probe_not_fired_for_non_quota_exhaustion(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 # /usage reset redemption clears persisted pool cooldowns
 # ---------------------------------------------------------------------------
-
-

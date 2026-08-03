@@ -16,17 +16,17 @@ import pytest
 
 
 
-def test_resolve_runtime_provider_raises_autherror_when_unresolved(monkeypatch):
+@pytest.mark.asyncio
+async def test_resolve_runtime_provider_raises_autherror_when_unresolved(monkeypatch):
     import agent.vertex_adapter as va
     from hermes_cli import runtime_provider as rp
-    from hermes_cli.auth import AuthError
+    from agent.agent_runtime_helpers import AsyncCapabilityError
 
     monkeypatch.setattr(va, "get_vertex_config", lambda: (None, None))
-    with pytest.raises(AuthError) as exc:
-        rp.resolve_runtime_provider(requested="vertex")
+    with pytest.raises(AsyncCapabilityError) as exc:
+        await rp.resolve_runtime_provider(requested="vertex")
     msg = str(exc.value)
-    assert "OAuth2" in msg
-    assert "not a static API key" in msg
+    assert "synchronous google-auth transport" in msg
 
 
 def test_vertex_registered_in_provider_registry():

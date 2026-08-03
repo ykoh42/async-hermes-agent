@@ -83,8 +83,6 @@ def test_codex_stream_wire_error_event_surfaces_stream_error_event(provider_mess
     provider's real message in the body."""
     from run_agent import _StreamErrorEvent
 
-    agent = _make_codex_agent()
-
     class _ErrorCreateStream:
         def __iter__(self_inner):
             yield SimpleNamespace(type="error", message=provider_message, code="forbidden")
@@ -92,11 +90,10 @@ def test_codex_stream_wire_error_event_surfaces_stream_error_event(provider_mess
         def close(self_inner):
             pass
 
-    mock_client = MagicMock()
-    mock_client.responses.create.return_value = _ErrorCreateStream()
+    from agent.codex_runtime import _consume_codex_event_stream
 
     with pytest.raises(_StreamErrorEvent) as excinfo:
-        agent._run_codex_stream({}, client=mock_client)
+        _consume_codex_event_stream(_ErrorCreateStream(), model="grok-4.3")
 
     assert provider_message in str(excinfo.value)
     assert excinfo.value.body["error"]["message"] == provider_message
@@ -121,8 +118,6 @@ def test_codex_stream_wire_error_event_nested_envelope_attr_style():
     """Details nested under ``error`` (SDK attr-object shape) are surfaced."""
     from run_agent import _StreamErrorEvent
 
-    agent = _make_codex_agent()
-
     class _ErrorCreateStream:
         def __iter__(self_inner):
             yield SimpleNamespace(
@@ -141,11 +136,10 @@ def test_codex_stream_wire_error_event_nested_envelope_attr_style():
         def close(self_inner):
             pass
 
-    mock_client = MagicMock()
-    mock_client.responses.create.return_value = _ErrorCreateStream()
+    from agent.codex_runtime import _consume_codex_event_stream
 
     with pytest.raises(_StreamErrorEvent) as excinfo:
-        agent._run_codex_stream({}, client=mock_client)
+        _consume_codex_event_stream(_ErrorCreateStream(), model="grok-4.3")
 
     assert "Slow down" in str(excinfo.value)
     assert excinfo.value.code == "rate_limit_exceeded"

@@ -19,15 +19,15 @@ Credential search order (matching Copilot CLI behaviour):
 from __future__ import annotations
 
 import json
+import asyncio
 import logging
 import os
 import shutil
-import subprocess
 import time
 from pathlib import Path
 from typing import Optional
 
-from hermes_cli._subprocess_compat import IS_WINDOWS, windows_hide_flags
+import httpx
 
 logger = logging.getLogger(__name__)
 
@@ -72,7 +72,7 @@ def validate_copilot_token(token: str) -> tuple[bool, str]:
     return True, "OK"
 
 
-def resolve_copilot_token() -> tuple[str, str]:
+async def resolve_copilot_token() -> tuple[str, str]:
     """Resolve a GitHub token suitable for Copilot API use.
 
     Returns (token, source) where source describes where the token came from.
@@ -91,7 +91,7 @@ def resolve_copilot_token() -> tuple[str, str]:
             return val, env_var
 
     # 2. Fall back to gh auth token
-    token = _try_gh_cli_token()
+    token = await _try_gh_cli_token()
     if token:
         valid, msg = validate_copilot_token(token)
         if not valid:
@@ -124,7 +124,7 @@ def _gh_cli_candidates() -> list[str]:
     return candidates
 
 
-def _try_gh_cli_token() -> Optional[str]:
+async def _try_gh_cli_token() -> Optional[str]:
     """Return a token from ``gh auth token`` when the GitHub CLI is available.
 
     When COPILOT_GH_HOST is set, passes ``--hostname`` so gh returns the
@@ -138,25 +138,29 @@ def _try_gh_cli_token() -> Optional[str]:
     clean_env = {k: v for k, v in os.environ.items()
                  if k not in {"GITHUB_TOKEN", "GH_TOKEN"}}
 
-    _popen_kwargs = {"creationflags": windows_hide_flags()} if IS_WINDOWS else {}
     for gh_path in _gh_cli_candidates():
         cmd = [gh_path, "auth", "token"]
         if hostname:
             cmd += ["--hostname", hostname]
         try:
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True, encoding='utf-8', errors='replace',
-                timeout=5,
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
                 env=clean_env,
-                **_popen_kwargs,
             )
-        except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+            stdout, _ = await asyncio.wait_for(process.communicate(), timeout=5)
+        except asyncio.TimeoutError:
+            process.kill()
+            await process.wait()
+            logger.debug("gh CLI token lookup timed out (%s)", gh_path)
+            continue
+        except FileNotFoundError as exc:
             logger.debug("gh CLI token lookup failed (%s): %s", gh_path, exc)
             continue
-        if result.returncode == 0 and result.stdout.strip():
-            return result.stdout.strip()
+        token = stdout.decode("utf-8", errors="replace").strip()
+        if process.returncode == 0 and token:
+            return token
     return None
 
 
@@ -304,7 +308,11 @@ def _token_fingerprint(raw_token: str) -> str:
     return hashlib.sha256(raw_token.encode()).hexdigest()[:16]
 
 
-def exchange_copilot_token(raw_token: str, *, timeout: float = 10.0) -> tuple[str, float, Optional[str]]:
+async def exchange_copilot_token(
+    raw_token: str,
+    *,
+    timeout: float = 10.0,
+) -> tuple[str, float, Optional[str]]:
     """Exchange a raw GitHub token for a short-lived Copilot API token.
 
     Calls ``GET https://api.github.com/copilot_internal/v2/token`` with
@@ -320,8 +328,6 @@ def exchange_copilot_token(raw_token: str, *, timeout: float = 10.0) -> tuple[st
     Results are cached in-process and reused until close to expiry.
     Raises ``ValueError`` on failure.
     """
-    import urllib.request
-
     fp = _token_fingerprint(raw_token)
 
     # Check cache first
@@ -331,20 +337,19 @@ def exchange_copilot_token(raw_token: str, *, timeout: float = 10.0) -> tuple[st
         if time.time() < expires_at - _JWT_REFRESH_MARGIN_SECONDS:
             return api_token, expires_at, base_url
 
-    req = urllib.request.Request(
-        _TOKEN_EXCHANGE_URL,
-        method="GET",
-        headers={
-            "Authorization": f"token {raw_token}",
-            "User-Agent": _EXCHANGE_USER_AGENT,
-            "Accept": "application/json",
-            "Editor-Version": _EDITOR_VERSION,
-        },
-    )
-
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            data = json.loads(resp.read().decode())
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            response = await client.get(
+                _TOKEN_EXCHANGE_URL,
+                headers={
+                    "Authorization": f"token {raw_token}",
+                    "User-Agent": _EXCHANGE_USER_AGENT,
+                    "Accept": "application/json",
+                    "Editor-Version": _EDITOR_VERSION,
+                },
+            )
+            response.raise_for_status()
+            data = response.json()
     except Exception as exc:
         raise ValueError(f"Copilot token exchange failed: {exc}") from exc
 
@@ -412,7 +417,7 @@ def _derive_base_url_from_proxy_ep(token: str) -> Optional[str]:
     return f"https://{api_host}"
 
 
-def get_copilot_api_token(raw_token: str) -> tuple[str, Optional[str]]:
+async def get_copilot_api_token(raw_token: str) -> tuple[str, Optional[str]]:
     """Exchange a raw GitHub token for a Copilot API token, with fallback.
 
     Convenience wrapper: returns ``(api_token, base_url)`` on success, or
@@ -427,7 +432,7 @@ def get_copilot_api_token(raw_token: str) -> tuple[str, Optional[str]]:
     if not raw_token:
         return raw_token, None
     try:
-        api_token, _, base_url = exchange_copilot_token(raw_token)
+        api_token, _, base_url = await exchange_copilot_token(raw_token)
         return api_token, base_url
     except Exception as exc:
         logger.debug("Copilot token exchange failed, using raw token: %s", exc)

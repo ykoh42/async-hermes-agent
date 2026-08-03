@@ -174,6 +174,7 @@ class TestAuxiliaryClientIntegration:
     @pytest.mark.asyncio
     async def test_try_nous_works_when_not_rate_limited(self, rate_guard_env, monkeypatch):
         import agent.auxiliary_client as aux
+        from agent.agent_runtime_helpers import AsyncCapabilityError
 
         # No rate limit recorded — _try_nous should proceed normally
         # (will return None because no real creds, but won't be blocked
@@ -182,8 +183,8 @@ class TestAuxiliaryClientIntegration:
             return None
 
         monkeypatch.setattr(aux, "_read_nous_auth", read_nous_auth)
-        result = await aux._try_nous()
-        assert result == (None, None)
+        with pytest.raises(AsyncCapabilityError, match="Nous Portal OAuth refresh"):
+            await aux._try_nous()
 
 
 class TestIsGenuineNousRateLimit:

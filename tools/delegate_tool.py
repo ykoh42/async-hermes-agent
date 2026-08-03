@@ -1556,7 +1556,7 @@ async def _build_child_agent(
             logger.debug("spawn_requested relay failed: %s", exc)
 
     try:
-        from hermes_cli.lifecycle import invoke_hook_async as _invoke_hook
+        from hermes_cli.lifecycle import invoke_hook as _invoke_hook
         await _invoke_hook(
             "subagent_start",
             parent_session_id=getattr(parent_agent, "session_id", None),
@@ -2313,24 +2313,6 @@ async def _run_single_child(
         except Exception:
             logger.debug("Failed to close child agent after delegation")
 
-        # The AIAgent turn boundary normally closes the child scope itself. This
-        # fallback covers failures before that boundary starts, but must not pop
-        # a scope while a timed-out child worker is still unwinding.
-        try:
-            from agent import relay_runtime
-
-            runtime = relay_runtime.get_runtime(create=False)
-            child_session_id = str(getattr(child, "session_id", "") or "")
-            child_turn_is_active = relay_runtime.SESSION_COORDINATOR.has_active_turn(
-                profile_key=relay_runtime.current_profile_key(),
-                session_id=child_session_id,
-            )
-            if runtime is not None and child_session_id and not child_turn_is_active:
-                runtime.unregister_subagent({"child_session_id": child_session_id})
-        except Exception:
-            logger.debug("Failed to close child Relay session after delegation")
-
-
 async def _finalize_child_results(
     results: List[Dict[str, Any]],
     task_list: List[Dict[str, Any]],
@@ -2362,9 +2344,9 @@ async def _finalize_child_results(
                 logger.debug("Delegation memory hook failed", exc_info=True)
 
     try:
-        from hermes_cli.plugins import invoke_hook_async
+        from hermes_cli.plugins import invoke_hook
     except Exception:
-        invoke_hook_async = None
+        invoke_hook = None
 
     parent_session_id = getattr(parent_agent, "session_id", None)
     children_cost_total = 0.0
@@ -2377,12 +2359,12 @@ async def _finalize_child_results(
         except (TypeError, ValueError):
             pass
 
-        if invoke_hook_async is None:
+        if invoke_hook is None:
             continue
         try:
             child_index = entry.get("task_index", -1)
             child = child_by_index.get(child_index)
-            await invoke_hook_async(
+            await invoke_hook(
                 "subagent_stop",
                 parent_session_id=parent_session_id,
                 parent_turn_id=getattr(parent_agent, "_current_turn_id", "") or "",

@@ -1572,7 +1572,7 @@ class ContextCompressor(ContextEngine):
         self._ineffective_compression_count = 0
         self._anti_thrash_recovery_deadline = 0.0
         # Durable state is loaded by ``_hydrate_persisted_compression_guards``
-        # through AsyncSessionDB at the async turn boundary.
+        # through SessionDB at the async turn boundary.
 
     def on_session_start(self, session_id: str, **kwargs) -> None:
         """Bind session-scoped compression state for a new or resumed session."""
@@ -1615,7 +1615,7 @@ class ContextCompressor(ContextEngine):
         (#54923). The counter now round-trips through the session row like
         the failure cooldown and the fallback streak.
         """
-        # The async turn prologue fills this value from AsyncSessionDB.
+        # The async turn prologue fills this value from SessionDB.
         return
 
     def _persist_ineffective_compression_count(self) -> None:

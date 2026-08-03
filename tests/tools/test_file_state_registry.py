@@ -140,7 +140,7 @@ class FileStateRegistryUnitTests(unittest.TestCase):
             del os.environ["HERMES_DISABLE_FILE_STATE_GUARD"]
 
 
-class FileToolsIntegrationTests(unittest.TestCase):
+class FileToolsIntegrationTests(unittest.IsolatedAsyncioTestCase):
     """Integration through the real file_tools handlers.
 
     These exercise the wiring: read_file_tool → registry.record_read,
@@ -162,15 +162,15 @@ class FileToolsIntegrationTests(unittest.TestCase):
             f.write(content)
         return p
 
-    def test_sibling_agent_write_surfaces_warning_through_handler(self):
+    async def test_sibling_agent_write_surfaces_warning_through_handler(self):
         p = self._write_seed("shared.txt")
-        r = json.loads(read_file_tool(path=p, task_id="agentA"))
+        r = json.loads(await read_file_tool(path=p, task_id="agentA"))
         self.assertNotIn("error", r)
 
-        w_b = json.loads(write_file_tool(path=p, content="B wrote\n", task_id="agentB"))
+        w_b = json.loads(await write_file_tool(path=p, content="B wrote\n", task_id="agentB"))
         self.assertNotIn("error", w_b)
 
-        w_a = json.loads(write_file_tool(path=p, content="A stale\n", task_id="agentA"))
+        w_a = json.loads(await write_file_tool(path=p, content="A stale\n", task_id="agentA"))
         warn = w_a.get("_warning", "")
         self.assertTrue(warn, f"expected warning, got: {w_a}")
         # The cross-agent message names the sibling task_id.
@@ -178,10 +178,10 @@ class FileToolsIntegrationTests(unittest.TestCase):
         self.assertIn("sibling", warn.lower())
 
 
-    def test_net_new_file_no_warning(self):
+    async def test_net_new_file_no_warning(self):
         p = os.path.join(self._tmpdir, "brand_new.txt")
         # Nobody has read or written this before.
-        w = json.loads(write_file_tool(path=p, content="hi\n", task_id="agentX"))
+        w = json.loads(await write_file_tool(path=p, content="hi\n", task_id="agentX"))
         self.assertFalse(w.get("_warning"))
         self.assertNotIn("error", w)
 

@@ -13,7 +13,7 @@ import time
 import pytest
 import pytest_asyncio
 
-from hermes_state import AsyncSessionDB
+from hermes_state import SessionDB
 from tools.session_search_tool import (
     SESSION_SEARCH_SCHEMA,
     _format_timestamp,
@@ -27,7 +27,7 @@ from tools.session_search_tool import (
 
 @pytest_asyncio.fixture
 async def db(tmp_path):
-    store = AsyncSessionDB(tmp_path / "state.db")
+    store = SessionDB(tmp_path / "state.db")
     yield store
     await store.close()
 
@@ -402,7 +402,7 @@ class TestCrossProfileRead:
         profiles_root = tmp_path / "profiles"
         other_home = profiles_root / "asdf"
         other_home.mkdir(parents=True)
-        other = AsyncSessionDB(other_home / "state.db")
+        other = SessionDB(other_home / "state.db")
         await other.create_session("s_far", source="cli")
         await other.append_message("s_far", role="user", content="hi")
         await other.close()
@@ -428,7 +428,7 @@ class TestCrossProfileRead:
         # no separate profile — the tool should recover both.
         other_home = tmp_path / "other_home"
         other_home.mkdir()
-        other = AsyncSessionDB(other_home / "state.db")
+        other = SessionDB(other_home / "state.db")
         await other.create_session("s_other", source="cli")
         await other.append_message("s_other", role="user", content="hi")
         await other.close()

@@ -1,5 +1,7 @@
 """Test validation error prevention for strict APIs (Fireworks, etc.)"""
 
+import pytest
+
 import sys
 import types
 
@@ -55,7 +57,8 @@ def _make_agent(monkeypatch, provider, api_mode="chat_completions", base_url="ht
 class TestStrictApiValidation:
     """Verify tool_call field sanitization prevents 400 errors on strict APIs."""
 
-    def test_fireworks_compatible_messages_after_sanitization(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_fireworks_compatible_messages_after_sanitization(self, monkeypatch):
         """Messages should be Fireworks-compatible after sanitization."""
         agent = _make_agent(monkeypatch, "openrouter")
         agent.api_mode = "chat_completions"  # Fireworks uses chat completions
@@ -79,7 +82,7 @@ class TestStrictApiValidation:
         ]
 
         # After _build_api_kwargs, Codex fields should be stripped
-        kwargs = agent._build_api_kwargs(messages)
+        kwargs = await agent._build_api_kwargs(messages)
 
         assistant_msg = kwargs["messages"][1]
         tool_call = assistant_msg["tool_calls"][0]

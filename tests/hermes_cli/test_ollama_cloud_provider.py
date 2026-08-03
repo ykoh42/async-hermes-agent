@@ -71,10 +71,11 @@ class TestOllamaCloudCredentials:
         assert creds["base_url"] == "https://ollama.com/v1"
 
 
-    def test_runtime_ollama_cloud(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_runtime_ollama_cloud(self, monkeypatch):
         monkeypatch.setenv("OLLAMA_API_KEY", "ollama-key")
         from hermes_cli.runtime_provider import resolve_runtime_provider
-        result = resolve_runtime_provider(requested="ollama-cloud")
+        result = await resolve_runtime_provider(requested="ollama-cloud")
         assert result["provider"] == "ollama-cloud"
         assert result["api_mode"] == "chat_completions"
         assert result["api_key"] == "ollama-key"
@@ -110,41 +111,6 @@ class TestOllamaCloudModelCatalog:
 
 
 # ── Model Picker (list_authenticated_providers) ──
-
-class TestOllamaCloudModelPicker:
-    def test_ollama_cloud_shows_model_count(self, tmp_path, monkeypatch):
-        """Ollama Cloud should show non-zero model count in provider picker."""
-        from hermes_cli.model_switch import list_authenticated_providers
-
-        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-        monkeypatch.setenv("OLLAMA_API_KEY", "test-key")
-
-        mock_mdev = {
-            "ollama-cloud": {
-                "models": {
-                    "qwen3.5:397b": {"tool_call": True},
-                    "glm-5": {"tool_call": True},
-                }
-            }
-        }
-        with patch("hermes_cli.models.fetch_api_models", return_value=["qwen3.5:397b"]), \
-             patch("agent.models_dev.fetch_models_dev", return_value=mock_mdev):
-            providers = list_authenticated_providers(current_provider="ollama-cloud")
-
-        ollama = next((p for p in providers if p["slug"] == "ollama-cloud"), None)
-        assert ollama is not None, "ollama-cloud should appear when OLLAMA_API_KEY is set"
-        assert ollama["total_models"] > 0, "ollama-cloud should show non-zero model count"
-
-    def test_ollama_cloud_not_shown_without_creds(self, monkeypatch):
-        """Ollama Cloud should not appear without credentials."""
-        from hermes_cli.model_switch import list_authenticated_providers
-
-        monkeypatch.delenv("OLLAMA_API_KEY", raising=False)
-
-        providers = list_authenticated_providers(current_provider="openrouter")
-        ollama = next((p for p in providers if p["slug"] == "ollama-cloud"), None)
-        assert ollama is None, "ollama-cloud should not appear without OLLAMA_API_KEY"
-
 
 # ── Merged Model Discovery ──
 

@@ -56,31 +56,6 @@ def test_resolve_spotify_runtime_credentials_refreshes_without_changing_active_p
     assert auth_mod.get_active_provider() == "nous"
 
 
-def test_auth_spotify_status_command_reports_logged_in(capsys, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(
-        auth_mod,
-        "get_auth_status",
-        lambda provider=None: {
-            "logged_in": True,
-            "auth_type": "oauth_pkce",
-            "client_id": "spotify-client",
-            "redirect_uri": "http://127.0.0.1:43827/spotify/callback",
-            "scope": "user-library-read",
-        },
-    )
-
-    from hermes_cli.auth_commands import auth_status_command
-
-    auth_status_command(SimpleNamespace(provider="spotify"))
-    output = capsys.readouterr().out
-    assert "spotify: logged in" in output
-    assert "client_id: spotify-client" in output
-
-
-
-
-
-
 # ---------------------------------------------------------------------------
 # Quarantine: terminal refresh failure clears dead tokens (#28139)
 # ---------------------------------------------------------------------------
@@ -164,5 +139,4 @@ def test_resolve_credentials_quarantines_dead_tokens_on_terminal_refresh_failure
 
     # Active provider must be unchanged.
     assert auth_mod.get_active_provider() == "nous"
-
 

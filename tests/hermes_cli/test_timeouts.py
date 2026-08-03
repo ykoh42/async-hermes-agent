@@ -70,9 +70,20 @@ def test_resolved_api_call_timeout_priority(monkeypatch, tmp_path):
     # Per-model override wins
     assert agent._resolved_api_call_timeout() == 42.0
 
-    # Provider-level (different model, no per-model override)
-    agent.model = "some/other-model"
-    assert agent._resolved_api_call_timeout() == 77.0
+    # Provider-level (different model, no per-model override). Runtime timeout
+    # policy is resolved when the route is constructed; direct attribute
+    # mutation intentionally does not rebuild provider state.
+    provider_agent = AIAgent(
+        model="some/other-model",
+        provider="openrouter",
+        api_key="sk-dummy",
+        base_url="https://openrouter.ai/api/v1",
+        quiet_mode=True,
+        skip_context_files=True,
+        skip_memory=True,
+        platform="cli",
+    )
+    assert provider_agent._resolved_api_call_timeout() == 77.0
 
     # Case B: no config → env wins
     _write_config(tmp_path, "")
@@ -100,7 +111,6 @@ def test_resolved_api_call_timeout_priority(monkeypatch, tmp_path):
     # Case C: no config, no env → 1800.0 default
     monkeypatch.delenv("HERMES_API_TIMEOUT", raising=False)
     assert agent2._resolved_api_call_timeout() == 1800.0
-
 
 
 

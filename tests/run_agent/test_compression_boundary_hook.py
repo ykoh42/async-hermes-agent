@@ -22,7 +22,7 @@ import pytest_asyncio
 from agent.conversation_compression import (
     finalize_context_engine_compression_notification,
 )
-from hermes_state import AsyncSessionDB
+from hermes_state import SessionDB
 
 
 _ASYNC_DBS = []
@@ -36,8 +36,8 @@ async def _close_async_dbs():
     _ASYNC_DBS.clear()
 
 
-def _async_db(path: Path) -> AsyncSessionDB:
-    db = AsyncSessionDB(path)
+def _async_db(path: Path) -> SessionDB:
+    db = SessionDB(path)
     _ASYNC_DBS.append(db)
     return db
 

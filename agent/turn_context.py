@@ -452,12 +452,9 @@ async def build_turn_context(
         task_ids = set()
         agent._async_task_ids = task_ids
     task_ids.add(effective_task_id)
-    turn_id = str(getattr(agent, "_relay_pending_turn_id", "") or "")
-    if not turn_id:
-        turn_id = (
-            f"{agent.session_id or 'session'}:{effective_task_id}:{uuid.uuid4().hex[:8]}"
-        )
-    agent._relay_pending_turn_id = None
+    turn_id = (
+        f"{agent.session_id or 'session'}:{effective_task_id}:{uuid.uuid4().hex[:8]}"
+    )
     agent._current_turn_id = turn_id
     agent._current_api_request_id = ""
     # Tripwire: warn (with both turn ids) when this turn starts before the
@@ -1065,10 +1062,10 @@ async def build_turn_context(
     # running them in a worker. Do not hide that capability error here; users
     # must either migrate the plugin hook or disable it.
     try:
-        from hermes_cli.lifecycle import invoke_hook_async
+        from hermes_cli.lifecycle import invoke_hook
         from hermes_cli.plugins import AsyncPluginCapabilityError
 
-        pre_llm_results = await invoke_hook_async(
+        pre_llm_results = await invoke_hook(
             "pre_llm_call",
             session_id=agent.session_id,
             user_message=original_user_message,

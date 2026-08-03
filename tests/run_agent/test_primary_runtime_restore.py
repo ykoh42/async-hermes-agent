@@ -494,7 +494,7 @@ class TestTryRecoverPrimaryTransport:
         agent = _make_agent(provider="custom")
         error = _make_transport_error("ReadTimeout")
 
-        with patch("openai.AsyncOpenAI", side_effect=Exception("socket error")), \
+        with patch("run_agent.OpenAI", side_effect=Exception("socket error")), \
              patch("agent.agent_runtime_helpers.asyncio.sleep", new_callable=AsyncMock):
             result = await agent._try_recover_primary_transport(
                 error, retry_count=3, max_retries=3,

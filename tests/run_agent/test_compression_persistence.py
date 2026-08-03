@@ -16,6 +16,8 @@ Bug scenario (pre-fix):
   8. Fallback wrote only user/assistant pair — summary lost
 """
 
+import pytest
+
 import os
 import tempfile
 from pathlib import Path
@@ -47,7 +49,8 @@ class TestFlushAfterCompression:
             )
         return agent
 
-    def test_flush_after_compression_with_long_history(self):
+    @pytest.mark.asyncio
+    async def test_flush_after_compression_with_long_history(self):
         """The actual bug: conversation_history longer than compressed messages.
 
         Before the fix, flush_from = max(len(conversation_history), 0) = 200,
@@ -71,13 +74,13 @@ class TestFlushAfterCompression:
             ]
 
             # First, flush original messages to the original session
-            agent._flush_messages_to_session_db(original_history, [])
-            original_rows = db.get_messages("original-session")
+            await agent._flush_messages_to_session_db(original_history, [])
+            original_rows = await db.get_messages("original-session")
             assert len(original_rows) == 200
 
             # Now simulate compression: new session, reset idx, shorter messages
             agent.session_id = "compressed-session"
-            db.create_session(session_id="compressed-session", source="test")
+            await db.create_session(session_id="compressed-session", source="test")
             agent._last_flushed_db_idx = 0
 
             # The compressed messages (summary + tail + new turn)
@@ -92,15 +95,16 @@ class TestFlushAfterCompression:
             # THE BUG: passing the original history as conversation_history
             # causes flush_from = max(200, 0) = 200, skipping everything.
             # After the fix, conversation_history should be None.
-            agent._flush_messages_to_session_db(compressed_messages, None)
+            await agent._flush_messages_to_session_db(compressed_messages, None)
 
-            new_rows = db.get_messages("compressed-session")
+            new_rows = await db.get_messages("compressed-session")
             assert len(new_rows) == 5, (
                 f"Expected 5 compressed messages in new session, got {len(new_rows)}. "
                 f"Compression persistence bug: messages not written to SQLite."
             )
 
-    def test_flush_with_stale_history_loses_messages(self):
+    @pytest.mark.asyncio
+    async def test_flush_with_stale_history_loses_messages(self):
         """Stale conversation_history no longer causes data loss."""
         from hermes_state import SessionDB
 
@@ -112,7 +116,7 @@ class TestFlushAfterCompression:
 
             # Simulate compression reset
             agent.session_id = "new-session"
-            db.create_session(session_id="new-session", source="test")
+            await db.create_session(session_id="new-session", source="test")
             agent._last_flushed_db_idx = 0
 
             compressed = [
@@ -123,13 +127,14 @@ class TestFlushAfterCompression:
             # Stale history longer than messages: the old positional flush
             # sliced past the end and dropped both messages (#46053).
             stale_history = [{"role": "user", "content": f"msg{i}"} for i in range(100)]
-            agent._flush_messages_to_session_db(compressed, stale_history)
+            await agent._flush_messages_to_session_db(compressed, stale_history)
 
-            rows = db.get_messages("new-session")
+            rows = await db.get_messages("new-session")
             assert len(rows) == 2
             assert [row["content"] for row in rows] == ["summary", "continuing..."]
 
-    def test_in_place_compression_rebaseline_prevents_duplicate_compacted_rows(self):
+    @pytest.mark.asyncio
+    async def test_in_place_compression_rebaseline_prevents_duplicate_compacted_rows(self):
         """In-place compaction already persisted the compacted transcript.
 
         Regression for the 2026-06-26 SRE compression loop: archive_and_compact()
@@ -145,14 +150,14 @@ class TestFlushAfterCompression:
             db = SessionDB(db_path=db_path)
 
             agent = self._make_agent(db)
-            agent._ensure_db_session()
+            await agent._ensure_db_session()
 
             original_history = [
                 {"role": "user", "content": "old question"},
                 {"role": "assistant", "content": "old answer"},
             ]
-            agent._flush_messages_to_session_db(original_history, [])
-            assert [row["content"] for row in db.get_messages("original-session")] == [
+            await agent._flush_messages_to_session_db(original_history, [])
+            assert [row["content"] for row in await db.get_messages("original-session")] == [
                 "old question",
                 "old answer",
             ]
@@ -162,7 +167,7 @@ class TestFlushAfterCompression:
                 {"role": "user", "content": "recent question"},
                 {"role": "assistant", "content": "recent answer"},
             ]
-            db.archive_and_compact("original-session", compacted)
+            await db.archive_and_compact("original-session", compacted)
             setattr(agent, "_last_compaction_in_place", True)
             agent._last_flushed_db_idx = 0
 
@@ -180,9 +185,9 @@ class TestFlushAfterCompression:
                 {"role": "tool", "content": "tool result"},
                 {"role": "assistant", "content": "final answer"},
             ]
-            agent._flush_messages_to_session_db(messages, post_compaction_history)
+            await agent._flush_messages_to_session_db(messages, post_compaction_history)
 
-            rows = db.get_messages("original-session")
+            rows = await db.get_messages("original-session")
             assert [row["content"] for row in rows] == [
                 "[CONTEXT COMPACTION] summary",
                 "recent question",
@@ -191,7 +196,8 @@ class TestFlushAfterCompression:
                 "final answer",
             ]
 
-    def test_abort_after_in_place_compaction_preserves_flush_baseline(self):
+    @pytest.mark.asyncio
+    async def test_abort_after_in_place_compaction_preserves_flush_baseline(self):
         """An aborted retry must survive flush, restart, and resume."""
         from agent.conversation_compression import (
             compress_context,
@@ -210,7 +216,7 @@ class TestFlushAfterCompression:
             last_completion_tokens = 0
             awaiting_real_usage_after_compression = False
 
-            def compress(self, _messages, **_kwargs):
+            async def compress(self, _messages, **_kwargs):
                 return [
                     {"role": "user", "content": "[summary] earlier state"},
                     {"role": "assistant", "content": "retained tail"},
@@ -227,7 +233,7 @@ class TestFlushAfterCompression:
             last_completion_tokens = 0
             awaiting_real_usage_after_compression = False
 
-            def compress(self, messages, **_kwargs):
+            async def compress(self, messages, **_kwargs):
                 self._last_compress_aborted = True
                 return messages
 
@@ -240,10 +246,10 @@ class TestFlushAfterCompression:
                 {"role": "user", "content": "old question"},
                 {"role": "assistant", "content": "old answer"},
             ]
-            agent._flush_messages_to_session_db(original, [])
+            await agent._flush_messages_to_session_db(original, [])
 
             agent.context_compressor = SuccessCompressor()
-            compacted, _ = compress_context(
+            compacted, _ = await compress_context(
                 agent, original, "system", approx_tokens=100_000
             )
             history = conversation_history_after_compression(
@@ -255,17 +261,17 @@ class TestFlushAfterCompression:
                 {"role": "assistant", "content": "new answer"},
             ]
             agent.context_compressor = AbortCompressor()
-            returned, _ = compress_context(
+            returned, _ = await compress_context(
                 agent, messages, "system", approx_tokens=100_000
             )
             history = conversation_history_after_compression(
                 agent, returned, history
             )
-            agent._flush_messages_to_session_db(returned, history)
+            await agent._flush_messages_to_session_db(returned, history)
 
-            db.close()
+            await db.close()
             resumed_db = SessionDB(db_path=db_path)
-            assert [message["content"] for message in resumed_db.get_messages_as_conversation(
+            assert [message["content"] for message in await resumed_db.get_messages_as_conversation(
                 agent.session_id
             )] == [
                 "[summary] earlier state",
@@ -273,9 +279,10 @@ class TestFlushAfterCompression:
                 "new request",
                 "new answer",
             ]
-            resumed_db.close()
+            await resumed_db.close()
 
-    def test_rotation_child_session_flushes_full_compressed_transcript_with_markers(self):
+    @pytest.mark.asyncio
+    async def test_rotation_child_session_flushes_full_compressed_transcript_with_markers(self):
         """Regression for #57491: live cached-agent markers must not block child flush."""
         from agent.conversation_compression import compress_context
         from hermes_state import SessionDB
@@ -284,12 +291,12 @@ class TestFlushAfterCompression:
             db_path = Path(tmpdir) / "test.db"
             db = SessionDB(db_path=db_path)
             parent_sid = "20260701_152840_parent"
-            db.create_session(parent_sid, "gateway", model="test/model")
+            await db.create_session(parent_sid, "gateway", model="test/model")
 
             agent = self._make_agent(db)
             agent.session_id = parent_sid
             agent.compression_in_place = False
-            agent._ensure_db_session()
+            await agent._ensure_db_session()
 
             # Plain marked messages only: the exact-equality assertion below
             # relies on `compressed` containing no message that _flush filters
@@ -306,21 +313,21 @@ class TestFlushAfterCompression:
             ]
 
             with patch("agent.context_compressor.call_llm", side_effect=RuntimeError("no provider")):
-                compressed, _ = compress_context(
+                compressed, _ = await compress_context(
                     agent, messages, approx_tokens=100_000, system_message="sys"
                 )
 
             assert agent.session_id != parent_sid
             child_sid = agent.session_id
 
-            agent._flush_messages_to_session_db(compressed, None)
+            await agent._flush_messages_to_session_db(compressed, None)
 
-            child_rows = db.get_messages(child_sid)
+            child_rows = await db.get_messages(child_sid)
             assert len(child_rows) == len(compressed), (
                 f"Expected {len(compressed)} rows in child session, got {len(child_rows)}. "
                 f"_db_persisted marker propagation bug (#57491)."
             )
-            db.close()
+            await db.close()
 
 
 
@@ -398,7 +405,8 @@ class TestStoredPromptCwdDrift:
             f"Current working directory: {cwd}\n"
         )
 
-    def test_stored_prompt_stale_when_cwd_differs(self):
+    @pytest.mark.asyncio
+    async def test_stored_prompt_stale_when_cwd_differs(self):
         """Different cwd should force a prompt rebuild."""
         from unittest.mock import patch
         from agent.conversation_loop import _stored_prompt_matches_runtime
@@ -411,11 +419,12 @@ class TestStoredPromptCwdDrift:
         )
 
         with patch("os.getcwd", return_value="/project/new"):
-            assert _stored_prompt_matches_runtime(agent, stored_prompt) is False, (
+            assert await _stored_prompt_matches_runtime(agent, stored_prompt) is False, (
                 "Expected False when stored cwd differs from current cwd"
             )
 
-    def test_stored_prompt_fresh_when_cwd_matches(self):
+    @pytest.mark.asyncio
+    async def test_stored_prompt_fresh_when_cwd_matches(self):
         """Matching cwd should allow prompt reuse."""
         from unittest.mock import patch
         from agent.conversation_loop import _stored_prompt_matches_runtime
@@ -429,11 +438,12 @@ class TestStoredPromptCwdDrift:
         )
 
         with patch("os.getcwd", return_value=current_cwd):
-            assert _stored_prompt_matches_runtime(agent, stored_prompt) is True, (
+            assert await _stored_prompt_matches_runtime(agent, stored_prompt) is True, (
                 "Expected True when stored cwd matches current cwd"
             )
 
-    def test_project_context_cannot_force_a_rebuild(self):
+    @pytest.mark.asyncio
+    async def test_project_context_cannot_force_a_rebuild(self):
         """🔴 CACHE INVARIANT: user project text must never invalidate the prompt.
 
         The prompt embeds AGENTS.md / CLAUDE.md / .cursorrules in the context
@@ -461,13 +471,14 @@ class TestStoredPromptCwdDrift:
         )
 
         with patch("os.getcwd", return_value=current_cwd):
-            assert _stored_prompt_matches_runtime(agent, stored_prompt) is True, (
+            assert await _stored_prompt_matches_runtime(agent, stored_prompt) is True, (
                 "A project file that merely MENTIONS 'Current working "
                 "directory:' must not invalidate the prompt — that would "
                 "rebuild every turn and break the prefix cache"
             )
 
-    def test_project_context_cannot_mask_real_drift(self):
+    @pytest.mark.asyncio
+    async def test_project_context_cannot_mask_real_drift(self):
         """The inverse: project text must not fake a match either.
 
         A stored prompt built in /project/old whose embedded AGENTS.md happens
@@ -487,7 +498,7 @@ class TestStoredPromptCwdDrift:
         )
 
         with patch("os.getcwd", return_value="/project/new"):
-            assert _stored_prompt_matches_runtime(agent, stored_prompt) is False, (
+            assert await _stored_prompt_matches_runtime(agent, stored_prompt) is False, (
                 "Embedded project text naming the new cwd must not mask real "
                 "drift in the host-info block"
             )
@@ -496,7 +507,8 @@ class TestStoredPromptCwdDrift:
 
 
 
-    def test_built_prompt_contains_platform_line(self):
+    @pytest.mark.asyncio
+    async def test_built_prompt_contains_platform_line(self):
         """The built system prompt must carry a Platform: line so drift detection works."""
         import tempfile
         from pathlib import Path
@@ -520,7 +532,8 @@ class TestStoredPromptCwdDrift:
                     skip_memory=True,
                 )
             agent.platform = "cli"
-            parts = build_system_prompt_parts(agent)
+            parts = await build_system_prompt_parts(agent)
             assert "Platform: cli" in parts["volatile"], (
                 "Built prompt missing 'Platform: cli' — drift detection cannot read it"
             )
+            await db.close()

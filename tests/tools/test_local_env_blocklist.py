@@ -9,36 +9,19 @@ See: https://github.com/NousResearch/hermes-agent/issues/1264
 """
 
 import os
-import threading
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
 from tools.environments.local import (
-    LocalEnvironment,
     _HERMES_PROVIDER_ENV_BLOCKLIST,
     _HERMES_PROVIDER_ENV_FORCE_PREFIX,
+    build_subprocess_env,
 )
 
 
-def _make_fake_popen(captured: dict):
-    """Return a fake Popen constructor that records the env kwarg."""
-    def fake_popen(cmd, **kwargs):
-        captured["env"] = kwargs.get("env", {})
-        proc = MagicMock()
-        proc.poll.return_value = 0
-        proc.returncode = 0
-        proc.stdout = MagicMock(__iter__=lambda s: iter([]), __next__=lambda s: (_ for _ in ()).throw(StopIteration))
-        proc.stdin = MagicMock()
-        return proc
-    return fake_popen
-
-
 def _run_with_env(extra_os_env=None, self_env=None):
-    """Execute a command via LocalEnvironment with mocked Popen
-    and return the env dict passed to the subprocess."""
-    captured = {}
-    fake_interrupt = threading.Event()
+    """Build the exact sanitized environment used by the async terminal."""
     test_environ = {
         "PATH": "/usr/bin:/bin",
         "HOME": "/home/user",
@@ -47,15 +30,8 @@ def _run_with_env(extra_os_env=None, self_env=None):
     if extra_os_env:
         test_environ.update(extra_os_env)
 
-    env = LocalEnvironment(cwd="/tmp", timeout=10, env=self_env)
-
-    with patch("tools.environments.local._find_bash", return_value="/bin/bash"), \
-         patch("subprocess.Popen", side_effect=_make_fake_popen(captured)), \
-         patch("tools.terminal_tool._interrupt_event", fake_interrupt), \
-         patch.dict(os.environ, test_environ, clear=True):
-        env.execute("echo hello")
-
-    return captured.get("env", {})
+    with patch.dict(os.environ, test_environ, clear=True):
+        return build_subprocess_env(extra=self_env)
 
 
 class TestProviderEnvBlocklist:

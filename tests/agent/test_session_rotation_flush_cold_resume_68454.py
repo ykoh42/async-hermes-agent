@@ -19,11 +19,11 @@ from types import SimpleNamespace
 
 import pytest
 
-from hermes_state import AsyncSessionDB
+from hermes_state import SessionDB
 from run_agent import AIAgent
 
 
-def _make_flush_agent(db: AsyncSessionDB, session_id: str):
+def _make_flush_agent(db: SessionDB, session_id: str):
     """Minimal agent shell that owns the real flush implementation."""
     agent = SimpleNamespace(
         _session_db=db,
@@ -58,7 +58,7 @@ def _contents(rows):
 @pytest.mark.asyncio
 async def test_rotation_flush_without_history_boundary_duplicates(tmp_path: Path) -> None:
     """Control: bare flush of unstamped cold-resume rows double-writes (#68454)."""
-    db = AsyncSessionDB(tmp_path / "state.db")
+    db = SessionDB(tmp_path / "state.db")
     sid = "COLD_ROTATE_DUP"
     await db.create_session(sid, source="cli")
     await db.append_message(sid, "user", "persisted question")
@@ -78,7 +78,7 @@ async def test_rotation_flush_without_history_boundary_duplicates(tmp_path: Path
 @pytest.mark.asyncio
 async def test_rotation_flush_with_history_boundary_is_noop(tmp_path: Path) -> None:
     """Fix shape used by /new, /resume, /branch: pass conversation_history=self list."""
-    db = AsyncSessionDB(tmp_path / "state.db")
+    db = SessionDB(tmp_path / "state.db")
     sid = "COLD_ROTATE_OK"
     await db.create_session(sid, source="cli")
     await db.append_message(sid, "user", "persisted question")
@@ -101,7 +101,7 @@ async def test_rotation_flush_with_history_boundary_is_noop(tmp_path: Path) -> N
 @pytest.mark.asyncio
 async def test_rotation_flush_writes_only_new_tail(tmp_path: Path) -> None:
     """If a turn added messages after cold resume, only the tail is written."""
-    db = AsyncSessionDB(tmp_path / "state.db")
+    db = SessionDB(tmp_path / "state.db")
     sid = "COLD_ROTATE_TAIL"
     await db.create_session(sid, source="cli")
     await db.append_message(sid, "user", "persisted question")

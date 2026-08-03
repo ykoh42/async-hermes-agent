@@ -25,6 +25,9 @@ See: https://github.com/NousResearch/hermes-agent/issues/27344
 
 from __future__ import annotations
 
+import pytest
+from unittest.mock import AsyncMock
+
 
 from agent.error_classifier import FailoverReason, classify_api_error
 
@@ -136,14 +139,15 @@ class TestToolResultContentShortCircuit:
                      "png_bytes": 1024},
         }
 
-    def test_returns_text_summary_for_xiaomi_proactively(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_returns_text_summary_for_xiaomi_proactively(self, monkeypatch):
         """Xiaomi MiMo rejects list-type tool content, so even with an
         empty cache, _tool_result_content_for_active_model should
         proactively downgrade to a text summary."""
         agent = _make_agent(provider="xiaomi", model="mimo-v2.5")
         agent._no_list_tool_content_models = set()  # explicit empty
-        monkeypatch.setattr(agent, "_model_supports_vision", lambda: True)
-        out = agent._tool_result_content_for_active_model(
+        monkeypatch.setattr(agent, "_model_supports_vision", AsyncMock(return_value=True))
+        out = await agent._tool_result_content_for_active_model(
             "computer_use", self._multimodal_result()
         )
         # Proactive downgrade: text summary instead of list with images.
@@ -153,14 +157,15 @@ class TestToolResultContentShortCircuit:
 
 
 
-    def test_missing_cache_attribute_falls_through(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_missing_cache_attribute_falls_through(self, monkeypatch):
         """Agents built via ``object.__new__`` without calling ``__init__``
         must not crash — the cache attribute may be absent. Xiaomi still
         gets a text summary because the provider profile says so."""
         agent = _make_agent(provider="xiaomi", model="mimo-v2.5")
         # Deliberately do not assign _no_list_tool_content_models.
-        monkeypatch.setattr(agent, "_model_supports_vision", lambda: True)
-        out = agent._tool_result_content_for_active_model(
+        monkeypatch.setattr(agent, "_model_supports_vision", AsyncMock(return_value=True))
+        out = await agent._tool_result_content_for_active_model(
             "computer_use", self._multimodal_result()
         )
         # Xiaomi proactively downgrades regardless of cache state.

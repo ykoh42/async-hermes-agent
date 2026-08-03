@@ -22,7 +22,7 @@ Salvaged from PR #49874 (@helix4u), rebuilt on the landed #69870 signal.
 from __future__ import annotations
 
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -103,6 +103,9 @@ def agent():
             skip_memory=True,
         )
         a.client = MagicMock()
+        a.client.chat.completions.create = AsyncMock()
+        a._deferred_provider_runtime = None
+        a.provider = a.requested_provider = "openrouter"
         a._cached_system_prompt = "You are helpful."
         a._use_prompt_caching = False
         a.tool_delay = 0
@@ -124,7 +127,7 @@ def _lock_skipping_compress(agent, *, holder=LOCK_HOLDER):
     INPUT list object unchanged and sets the #69870 lock-skip signal.
     """
 
-    def _compress(messages, _system_message, **_kwargs):
+    async def _compress(messages, _system_message, **_kwargs):
         agent._compression_skipped_due_to_lock = holder
         return messages, "You are helpful."
 
@@ -134,7 +137,7 @@ def _lock_skipping_compress(agent, *, holder=LOCK_HOLDER):
 def _plain_noop_compress(agent):
     """A compress double that no-ops WITHOUT lock contention (real no-progress)."""
 
-    def _compress(messages, _system_message, **_kwargs):
+    async def _compress(messages, _system_message, **_kwargs):
         agent._compression_skipped_due_to_lock = None
         return messages, "You are helpful."
 
@@ -177,7 +180,8 @@ class TestLockSkipSignalTypePin:
 
 
 class TestLockContended413Defer:
-    def test_lock_contended_413_returns_compression_deferred(self, agent):
+    @pytest.mark.asyncio
+    async def test_lock_contended_413_returns_compression_deferred(self, agent):
         """A 413 whose compression pass lost the lock must end the turn as a
         soft ``compression_deferred`` — never ``compression_exhausted``."""
         agent.client.chat.completions.create.side_effect = _make_413_error()
@@ -191,7 +195,7 @@ class TestLockContended413Defer:
             patch.object(agent, "_save_trajectory"),
             patch.object(agent, "_cleanup_task_resources"),
         ):
-            result = agent.run_conversation("hello", conversation_history=list(_PREFILL))
+            result = await agent.run_conversation("hello", conversation_history=list(_PREFILL))
 
         mock_compress.assert_called_once()
         assert result.get("compression_deferred") is True
@@ -203,7 +207,8 @@ class TestLockContended413Defer:
         assert result.get("partial") is True
 
 
-    def test_unconfirmed_lock_skip_true_also_defers(self, agent):
+    @pytest.mark.asyncio
+    async def test_unconfirmed_lock_skip_true_also_defers(self, agent):
         """``_compression_skipped_due_to_lock = True`` (holder unconfirmed —
         ``try_acquire`` swallowed a sqlite error) is still a lock skip."""
         agent.client.chat.completions.create.side_effect = _make_413_error()
@@ -217,7 +222,7 @@ class TestLockContended413Defer:
             patch.object(agent, "_save_trajectory"),
             patch.object(agent, "_cleanup_task_resources"),
         ):
-            result = agent.run_conversation("hello", conversation_history=list(_PREFILL))
+            result = await agent.run_conversation("hello", conversation_history=list(_PREFILL))
 
         assert result.get("compression_deferred") is True
         assert not result.get("compression_exhausted")
@@ -231,7 +236,8 @@ class TestLockContended413Defer:
 
 
 class TestPreApiLockDeferDoesNotBurnBudget:
-    def test_lock_loser_turn_recovers_after_lock_release(self, agent):
+    @pytest.mark.asyncio
+    async def test_lock_loser_turn_recovers_after_lock_release(self, agent):
         """End-to-end shape of the live bug at cap=1:
 
         1. Pre-API pressure gate fires; the compression pass loses the lock
@@ -298,7 +304,7 @@ class TestPreApiLockDeferDoesNotBurnBudget:
             patch.object(agent, "_save_trajectory"),
             patch.object(agent, "_cleanup_task_resources"),
         ):
-            result = agent.run_conversation("hello", conversation_history=list(_PREFILL))
+            result = await agent.run_conversation("hello", conversation_history=list(_PREFILL))
 
         # Pass 1: pre-API (lock defer, refunded). Pass 2: 413 handler
         # (succeeds within the cap because the defer did not count).

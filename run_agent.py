@@ -50,12 +50,12 @@ import threading
 import uuid
 import warnings
 from typing import List, Dict, Any, Optional, Callable
-# NOTE: `from openai import OpenAI` is deliberately NOT at module top — the
+# NOTE: `from openai import AsyncOpenAI` is deliberately NOT at module top — the
 # SDK pulls ~240 ms of imports. We expose `OpenAI` as a thin proxy object
 # that imports the SDK on first call/isinstance check. This preserves:
-#   (a) the single in-module `OpenAI(**client_kwargs)` call site at
-#       _create_openai_client, and
-#   (b) `patch("run_agent.OpenAI", ...)` test patterns used by ~28 test files.
+#   (a) the stable `OpenAI(**client_kwargs)` factory name while constructing a
+#       native async client, and
+#   (b) `patch("run_agent.OpenAI", ...)` integration seams.
 #
 # NOTE: `fire` is ONLY used in the `__main__` block below (for running
 # run_agent.py directly as a CLI) — it is NOT needed for library usage.
@@ -2745,7 +2745,7 @@ class AIAgent:
             if not _lifecycle.has_hook("api_request_error"):
                 return
             ended_at = time.time()
-            await _lifecycle.invoke_hook_async(
+            await _lifecycle.invoke_hook(
                 "api_request_error",
                 task_id=task_id,
                 turn_id=turn_id,
@@ -4399,7 +4399,11 @@ class AIAgent:
             except Exception:
                 logger.debug("custom-provider extra_headers skipped", exc_info=True)
 
-    def _apply_user_default_headers(self) -> None:
+    def _apply_user_default_headers(
+        self,
+        *,
+        config: Optional[Dict[str, Any]] = None,
+    ) -> None:
         """Merge user-configured request headers onto the OpenAI client.
 
         Reads ``model.default_headers`` from config.yaml and merges it onto
@@ -4425,7 +4429,10 @@ class AIAgent:
         from agent.auxiliary_client import (
             _apply_user_default_headers as _merge_user_headers,
         )
-        merged = _merge_user_headers(self._client_kwargs.get("default_headers"))
+        merged = _merge_user_headers(
+            self._client_kwargs.get("default_headers"),
+            config=config,
+        )
         if merged:
             self._client_kwargs["default_headers"] = merged
 
@@ -4589,7 +4596,13 @@ class AIAgent:
             self._async_client = client
             self._async_client_source = self.client
 
-        if getattr(client, "_sync", None) is not None:
+        # Keep the OpenAI SDK lazy at module import time, but reject its real
+        # blocking client before invoking it.  Attribute probing is unsafe
+        # here because mocks and user clients may synthesize arbitrary
+        # attributes (for example ``_sync``) on access.
+        from openai._base_client import SyncAPIClient
+
+        if isinstance(client, SyncAPIClient):
             raise RuntimeError(
                 f"provider={self.provider!r} resolves to a synchronous adapter. "
                 "The async-first core does not run providers in a thread; add "
@@ -5079,7 +5092,24 @@ class AIAgent:
             except Exception:
                 self._credits_notices_enabled_cache = True
         from agent.agent_init import initialize_deferred_runtime
-        return await initialize_deferred_runtime(self)
+        from agent.agent_runtime_helpers import AsyncCapabilityError
+
+        initialization_error: AsyncCapabilityError | None = None
+        allow_startup_fallback = False
+        try:
+            return await initialize_deferred_runtime(self)
+        except AsyncCapabilityError as exc:
+            initialization_error = exc
+            pending = getattr(self, "_deferred_provider_runtime", None) or {}
+            allow_startup_fallback = bool(pending.get("update_primary", True))
+
+        # Release initialize_deferred_runtime's provider lock before entering
+        # the fallback lifecycle: fallback resolution calls this method again
+        # with update_primary=False for the selected candidate.
+        if allow_startup_fallback and self._has_pending_fallback():
+            if await self._try_activate_fallback():
+                return True
+        raise initialization_error
 
     async def _restore_primary_runtime(self) -> bool:
         """Forwarder — see ``agent.agent_runtime_helpers.restore_primary_runtime``."""
@@ -6104,7 +6134,6 @@ class AIAgent:
             reset_accounting_context,
             set_accounting_context,
         )
-        from agent import relay_runtime
         from agent.conversation_loop import run_conversation
         from agent.portal_tags import (
             reset_conversation_context,
@@ -6116,47 +6145,9 @@ class AIAgent:
         self._active_turn_task = asyncio.current_task()
         effective_task_id = task_id or str(uuid.uuid4())
         session_id = str(getattr(self, "session_id", None) or "")
-        task_context = {
-            "session_id": session_id,
-            "task_id": effective_task_id,
-            "platform": getattr(self, "platform", None) or "",
-        }
-        relay_turn_id = (
-            f"{session_id or 'session'}:{effective_task_id}:{uuid.uuid4().hex[:8]}"
-        )
-        self._relay_pending_turn_id = relay_turn_id
-        relay_parent_session_id = (
-            str(getattr(self, "_parent_session_id", None) or "")
-            if task_context["platform"] == "subagent"
-            else ""
-        )
-        relay_lease = None
-        relay_turn = None
         token = None
         acct_token = None
-        relay_outcome = "failed"
         try:
-            existing_relay_host = relay_runtime.get_host(create=False)
-            if (
-                isinstance(existing_relay_host, relay_runtime.RelayRuntime)
-                and existing_relay_host.managed_execution_enabled()
-            ):
-                raise RuntimeError(
-                    "NeMo Relay managed execution is unavailable in the native "
-                    "async agent runtime; disable synchronous Relay instrumentation"
-                )
-            relay_lease = relay_runtime.SESSION_COORDINATOR.acquire_conversation(
-                profile_key=relay_runtime.current_profile_key(),
-                session_id=task_context["session_id"],
-                platform=task_context["platform"],
-                parent_session_id=relay_parent_session_id,
-                model=str(getattr(self, "model", None) or ""),
-            )
-            relay_turn = relay_runtime.SESSION_COORDINATOR.begin_turn(
-                relay_lease,
-                turn_id=relay_turn_id,
-                task_id=effective_task_id,
-            )
             # Publish the conversation id for ambient Nous Portal tagging. Every
             # LLM call made inside this turn — main loop, compression, vision,
             # web_extract, session_search, MoA slots, background-review forks
@@ -6180,7 +6171,7 @@ class AIAgent:
             # Keep the scope local instead of storing ContextVar tokens on the agent,
             # which may be observed from another thread.
             with bind_subagent_parent(self), scoped_runtime_main({}):
-                result = await run_conversation(
+                return await run_conversation(
                     self,
                     user_message,
                     system_message,
@@ -6193,54 +6184,14 @@ class AIAgent:
                     persist_user_display_metadata=persist_user_display_metadata,
                     moa_config=moa_config,
                 )
-            terminal = result if isinstance(result, dict) else {}
-            if terminal.get("interrupted") is True:
-                relay_outcome = "cancelled"
-            elif terminal.get("failed") is True:
-                relay_outcome = "failed"
-            else:
-                relay_outcome = "success"
-            relay_runtime.SESSION_COORDINATOR.finish_logical_calls(
-                relay_turn,
-                outcome=relay_outcome,
-            )
-            return result
-        except BaseException as exc:
-            if isinstance(exc, (KeyboardInterrupt, InterruptedError)) or (
-                type(exc).__name__ == "CancelledError"
-            ):
-                relay_outcome = "cancelled"
-            elif isinstance(exc, TimeoutError):
-                relay_outcome = "timed_out"
-            if relay_turn is not None:
-                relay_runtime.SESSION_COORDINATOR.finish_logical_calls(
-                    relay_turn,
-                    outcome=relay_outcome,
-                )
-            raise
         finally:
-            try:
-                if relay_turn is not None:
-                    relay_runtime.SESSION_COORDINATOR.end_turn(
-                        relay_turn,
-                        outcome=relay_outcome,
-                    )
-            finally:
-                try:
-                    if relay_lease is not None:
-                        relay_runtime.SESSION_COORDINATOR.release_conversation(
-                            relay_lease
-                        )
-                finally:
-                    if getattr(self, "_relay_pending_turn_id", None) == relay_turn_id:
-                        self._relay_pending_turn_id = None
-                    if acct_token is not None:
-                        reset_accounting_context(acct_token)
-                    if token is not None:
-                        reset_conversation_context(token)
-                    if getattr(self, "_active_turn_task", None) is asyncio.current_task():
-                        self._active_turn_task = None
-                    turn_lock.release()
+            if acct_token is not None:
+                reset_accounting_context(acct_token)
+            if token is not None:
+                reset_conversation_context(token)
+            if getattr(self, "_active_turn_task", None) is asyncio.current_task():
+                self._active_turn_task = None
+            turn_lock.release()
 
     async def chat(self, message: str, stream_callback: Optional[callable] = None) -> str:
         """

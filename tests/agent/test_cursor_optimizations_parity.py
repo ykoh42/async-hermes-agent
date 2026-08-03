@@ -143,12 +143,12 @@ def test_parity_token_memo():
 async def test_parity_persist_bounded_scan(tmp_path):
     print("=== parity: _flush_messages_to_session_db bounded scan ===")
     import run_agent as ra
-    from hermes_state import AsyncSessionDB
+    from hermes_state import SessionDB
 
     async def make_agent(bounded, label):
         a = ra.AIAgent.__new__(ra.AIAgent)
         a.session_id = "s1"
-        a._session_db = AsyncSessionDB(tmp_path / f"{label}.db")
+        a._session_db = SessionDB(tmp_path / f"{label}.db")
         await a._session_db.create_session("s1", source="test")
         a._session_db_created = True
         a._last_flushed_db_idx = 0

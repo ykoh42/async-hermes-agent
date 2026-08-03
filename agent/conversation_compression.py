@@ -30,7 +30,6 @@ from __future__ import annotations
 
 import asyncio
 import copy
-import functools
 import inspect
 import json
 import logging
@@ -2730,21 +2729,14 @@ async def try_shrink_image_parts_in_messages(
     *,
     max_dimension: int = 8000,
 ) -> bool:
-    """Shrink rejected image parts without blocking the conversation loop.
+    """Shrink rejected image parts in the async conversation path.
 
-    Pillow and the base64 re-encode are synchronous CPU/file work.  Keep that
-    implementation isolated from the async turn and await its completion on
-    the executor; model, tool, persistence, and cancellation paths remain
-    coroutine-native.
+    The resize itself is CPU-only and intentionally stays synchronous; there
+    is no hidden thread fallback in the native-async runtime.
     """
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(
-        None,
-        functools.partial(
-            _try_shrink_image_parts_in_messages_sync,
-            api_messages,
-            max_dimension=max_dimension,
-        ),
+    return _try_shrink_image_parts_in_messages_sync(
+        api_messages,
+        max_dimension=max_dimension,
     )
 
 

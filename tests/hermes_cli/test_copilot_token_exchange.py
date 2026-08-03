@@ -1,136 +1,112 @@
-"""Tests for Copilot token exchange (raw GitHub token → Copilot API token)."""
+"""Native-async Copilot token exchange tests."""
 
 from __future__ import annotations
 
-import json
 import time
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
+import httpx
 import pytest
 
 
 @pytest.fixture(autouse=True)
 def _clear_jwt_cache():
-    """Reset the module-level JWT cache before each test."""
-    import hermes_cli.copilot_auth as mod
-    mod._jwt_cache.clear()
+    import hermes_cli.copilot_auth as module
+
+    module._jwt_cache.clear()
     yield
-    mod._jwt_cache.clear()
+    module._jwt_cache.clear()
 
 
-class TestExchangeCopilotToken:
-    """Tests for exchange_copilot_token()."""
+class _Client:
+    payload: dict = {}
+    request_headers: dict[str, str] = {}
 
-    def _mock_urlopen(self, token="tid=abc;exp=123;sku=copilot_individual", expires_at=None):
-        """Create a mock urlopen context manager returning a token response."""
-        if expires_at is None:
-            expires_at = time.time() + 1800
-        resp_data = json.dumps({"token": token, "expires_at": expires_at}).encode()
-        mock_resp = MagicMock()
-        mock_resp.read.return_value = resp_data
-        mock_resp.__enter__ = MagicMock(return_value=mock_resp)
-        mock_resp.__exit__ = MagicMock(return_value=False)
-        return mock_resp
+    def __init__(self, **_kwargs):
+        pass
 
-    @patch("urllib.request.urlopen")
-    def test_exchanges_token_successfully(self, mock_urlopen):
-        from hermes_cli.copilot_auth import exchange_copilot_token
+    async def __aenter__(self):
+        return self
 
-        mock_urlopen.return_value = self._mock_urlopen(token="tid=abc;exp=999")
-        api_token, expires_at, base_url = exchange_copilot_token("gho_test123")
+    async def __aexit__(self, *_args):
+        return False
 
-        assert api_token == "tid=abc;exp=999"
-        assert isinstance(expires_at, float)
-        assert base_url is None  # no proxy-ep in this token
-
-        # Verify request was made with correct headers
-        call_args = mock_urlopen.call_args
-        req = call_args[0][0]
-        assert req.get_header("Authorization") == "token gho_test123"
-        assert "GitHubCopilotChat" in req.get_header("User-agent")
+    async def get(self, url: str, *, headers: dict[str, str]):
+        type(self).request_headers = headers
+        request = httpx.Request("GET", url)
+        return httpx.Response(200, request=request, json=type(self).payload)
 
 
+@pytest.mark.asyncio
+async def test_exchanges_token_successfully(monkeypatch):
+    from hermes_cli import copilot_auth
 
-    @patch("urllib.request.urlopen")
-    def test_raises_on_empty_token(self, mock_urlopen):
-        from hermes_cli.copilot_auth import exchange_copilot_token
+    _Client.payload = {
+        "token": "tid=abc;exp=999",
+        "expires_at": time.time() + 1800,
+    }
+    monkeypatch.setattr(copilot_auth.httpx, "AsyncClient", _Client)
 
-        resp_data = json.dumps({"token": "", "expires_at": 0}).encode()
-        mock_resp = MagicMock()
-        mock_resp.read.return_value = resp_data
-        mock_resp.__enter__ = MagicMock(return_value=mock_resp)
-        mock_resp.__exit__ = MagicMock(return_value=False)
-        mock_urlopen.return_value = mock_resp
+    api_token, expires_at, base_url = await copilot_auth.exchange_copilot_token(
+        "gho_test123"
+    )
 
-        with pytest.raises(ValueError, match="empty token"):
-            exchange_copilot_token("gho_test123")
-
-
-class TestGetCopilotApiToken:
-    """Tests for get_copilot_api_token() — the fallback wrapper."""
-
-    @patch("hermes_cli.copilot_auth.exchange_copilot_token")
-    def test_returns_exchanged_token(self, mock_exchange):
-        from hermes_cli.copilot_auth import get_copilot_api_token
-
-        mock_exchange.return_value = ("exchanged_jwt", time.time() + 1800, None)
-        api_token, base_url = get_copilot_api_token("gho_raw")
-        assert api_token == "exchanged_jwt"
-        assert base_url is None
+    assert api_token == "tid=abc;exp=999"
+    assert isinstance(expires_at, float)
+    assert base_url is None
+    assert _Client.request_headers["Authorization"] == "token gho_test123"
+    assert "GitHubCopilotChat" in _Client.request_headers["User-Agent"]
 
 
-class TestTokenFingerprint:
-    """Tests for _token_fingerprint()."""
+@pytest.mark.asyncio
+async def test_exchange_rejects_empty_token(monkeypatch):
+    from hermes_cli import copilot_auth
 
-    def test_consistent(self):
-        from hermes_cli.copilot_auth import _token_fingerprint
+    _Client.payload = {"token": "", "expires_at": 0}
+    monkeypatch.setattr(copilot_auth.httpx, "AsyncClient", _Client)
 
-        fp1 = _token_fingerprint("gho_abc123")
-        fp2 = _token_fingerprint("gho_abc123")
-        assert fp1 == fp2
-
-
-class TestCallerIntegration:
-    """Test that callers correctly use token exchange."""
-
-    @patch("hermes_cli.copilot_auth.resolve_copilot_token", return_value=("gho_raw", "GH_TOKEN"))
-    @patch("hermes_cli.copilot_auth.get_copilot_api_token", return_value=("exchanged_jwt", None))
-    def test_auth_resolve_uses_exchange(self, mock_exchange, mock_resolve):
-        from hermes_cli.auth import _resolve_api_key_provider_secret
-
-        # Create a minimal pconfig mock
-        pconfig = MagicMock()
-        token, source = _resolve_api_key_provider_secret("copilot", pconfig)
-        assert token == "exchanged_jwt"
-        assert source == "GH_TOKEN"
-        mock_exchange.assert_called_once_with("gho_raw")
+    with pytest.raises(ValueError, match="empty token"):
+        await copilot_auth.exchange_copilot_token("gho_test123")
 
 
-class TestDeriveBaseUrlFromProxyEp:
-    """Tests for _derive_base_url_from_proxy_ep()."""
+@pytest.mark.asyncio
+async def test_get_copilot_api_token_returns_exchange():
+    from hermes_cli.copilot_auth import get_copilot_api_token
 
-    def test_extracts_enterprise_url(self):
-        from hermes_cli.copilot_auth import _derive_base_url_from_proxy_ep
-
-        token = "tid=abc;exp=999;proxy-ep=proxy.enterprise.githubcopilot.com;sku=copilot_enterprise"
-        assert _derive_base_url_from_proxy_ep(token) == "https://api.enterprise.githubcopilot.com"
-
-
+    with patch(
+        "hermes_cli.copilot_auth.exchange_copilot_token",
+        new=AsyncMock(return_value=("exchanged", time.time() + 1800, None)),
+    ):
+        assert await get_copilot_api_token("gho_raw") == ("exchanged", None)
 
 
-    @patch("urllib.request.urlopen")
-    def test_exchange_returns_none_base_url_for_individual(self, mock_urlopen, _clear_jwt_cache):
-        """exchange_copilot_token returns None base_url for individual accounts."""
-        from hermes_cli.copilot_auth import exchange_copilot_token
+@pytest.mark.asyncio
+async def test_runtime_credentials_use_exchange(monkeypatch):
+    from hermes_cli import auth
 
-        token_no_ep = "tid=abc;exp=999;sku=copilot_individual"
-        expires_at = time.time() + 1800
-        resp_data = json.dumps({"token": token_no_ep, "expires_at": expires_at}).encode()
-        mock_resp = MagicMock()
-        mock_resp.read.return_value = resp_data
-        mock_resp.__enter__ = MagicMock(return_value=mock_resp)
-        mock_resp.__exit__ = MagicMock(return_value=False)
-        mock_urlopen.return_value = mock_resp
+    monkeypatch.setattr(
+        "hermes_cli.copilot_auth.resolve_copilot_token",
+        AsyncMock(return_value=("gho_raw", "GH_TOKEN")),
+    )
+    exchange = AsyncMock(return_value=("exchanged", "https://enterprise.example/v1"))
+    monkeypatch.setattr("hermes_cli.copilot_auth.get_copilot_api_token", exchange)
 
-        api_token, _, base_url = exchange_copilot_token("gho_test")
-        assert base_url is None
+    credentials = await auth.resolve_api_key_provider_credentials_async("copilot")
+
+    assert credentials["api_key"] == "exchanged"
+    assert credentials["base_url"] == "https://enterprise.example/v1"
+    assert credentials["source"] == "GH_TOKEN"
+    exchange.assert_awaited_once_with("gho_raw")
+
+
+def test_token_fingerprint_is_stable():
+    from hermes_cli.copilot_auth import _token_fingerprint
+
+    assert _token_fingerprint("gho_abc") == _token_fingerprint("gho_abc")
+
+
+def test_derive_enterprise_base_url():
+    from hermes_cli.copilot_auth import _derive_base_url_from_proxy_ep
+
+    token = "tid=abc;proxy-ep=proxy.enterprise.githubcopilot.com;sku=enterprise"
+    assert _derive_base_url_from_proxy_ep(token) == "https://api.enterprise.githubcopilot.com"

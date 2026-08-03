@@ -59,6 +59,9 @@ def _install_stub_server(mcp_tool_module, name: str, call_tool_impl):
         def set(self):
             self.set_calls += 1
             old_session = server.session
+            if old_session is None and call_tool_impl is None:
+                ready_flag.set()
+                return
             new_session = MagicMock()
             if old_session is not None:
                 new_session.call_tool = old_session.call_tool
@@ -105,7 +108,8 @@ def _cleanup(mcp_tool_module, name: str) -> None:
 
 
 
-def test_half_open_probe_on_dead_session_requests_reconnect(monkeypatch, tmp_path):
+@pytest.mark.asyncio
+async def test_half_open_probe_on_dead_session_requests_reconnect(monkeypatch, tmp_path):
     """A half-open probe against a server with no live session must request
     a transport reconnect and return a clean error — NOT write into a dead
     pipe or permanently re-arm the breaker.
@@ -123,25 +127,15 @@ def test_half_open_probe_on_dead_session_requests_reconnect(monkeypatch, tmp_pat
     server = _install_stub_server(mcp_tool, "srv", None)
     # Simulate a dead/parked transport: no live session.
     server.session = None
-    # Drive _signal_reconnect down its direct .set() path (no live loop).
-    monkeypatch.setattr(mcp_tool, "_mcp_loop", None)
-
     try:
         mcp_tool._server_error_counts["srv"] = mcp_tool._CIRCUIT_BREAKER_THRESHOLD
-        fake_now = [1000.0]
-
-        def _fake_monotonic():
-            return fake_now[0]
-
-        monkeypatch.setattr(mcp_tool.time, "monotonic", _fake_monotonic)
-        mcp_tool._server_breaker_opened_at["srv"] = fake_now[0]
         cooldown = getattr(mcp_tool, "_CIRCUIT_BREAKER_COOLDOWN_SEC", 60.0)
+        mcp_tool._server_breaker_opened_at["srv"] = (
+            mcp_tool.time.monotonic() - cooldown - 1.0
+        )
 
-        # Advance past cooldown → next call is a half-open probe.
-        fake_now[0] += cooldown + 1.0
-
-        handler = _make_tool_handler("srv", "tool1", 10.0)
-        result = handler({})
+        handler = _make_tool_handler("srv", "tool1", 0.01)
+        result = await handler({})
         parsed = json.loads(result)
 
         # Clean "reconnecting" error, and a reconnect was actually signalled.

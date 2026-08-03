@@ -61,14 +61,15 @@ class TestAggregatorGlobalFallback:
 
 
 
-    def test_global_yaml_false_disables(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_global_yaml_false_disables(self, monkeypatch):
         from agent import moa_loop
 
-        monkeypatch.setattr(
-            "hermes_cli.config.load_config",
-            lambda: {"agent": {"reasoning_effort": False}},
-        )
-        cfg = moa_loop._aggregator_reasoning_config({})
+        async def load_config():
+            return {"agent": {"reasoning_effort": False}}
+
+        monkeypatch.setattr("hermes_cli.config.load_config_readonly_async", load_config)
+        cfg = await moa_loop._aggregator_reasoning_config({})
         assert cfg == {"enabled": False}
 
 

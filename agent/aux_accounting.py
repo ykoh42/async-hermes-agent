@@ -124,7 +124,7 @@ async def record_aux_usage(
         record_usage = getattr(session_db, "record_auxiliary_usage", None)
         if not callable(record_usage):
             raise RuntimeError(
-                "Async auxiliary accounting requires AsyncSessionDB."
+                "Async auxiliary accounting requires SessionDB."
             )
         await record_usage(
             session_id,

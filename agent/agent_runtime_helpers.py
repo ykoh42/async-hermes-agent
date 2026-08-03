@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import copy
 import asyncio
+import inspect
 import json
 import logging
 import re
@@ -2021,7 +2022,18 @@ async def switch_model(agent, new_model, new_provider, api_key='', base_url='', 
         or getattr(agent, "provider", "")
         or ""
     ).strip().lower()
-    effective_base_url = str(base_url or getattr(agent, "base_url", "") or "").strip()
+    # A provider change must not inherit the previous provider's endpoint.
+    # An omitted URL is resolved by the destination provider during deferred
+    # initialization; only same-provider model changes may reuse the live URL.
+    effective_base_url = str(
+        base_url
+        or (
+            getattr(agent, "base_url", "")
+            if new_provider == previous_provider
+            else ""
+        )
+        or ""
+    ).strip()
     effective_key = api_key or getattr(agent, "api_key", "")
 
     # Resolve destination-only context configuration before mutating the live
@@ -2036,6 +2048,19 @@ async def switch_model(agent, new_model, new_provider, api_key='', base_url='', 
 
     switch_config = await load_config_readonly_async()
     custom_providers = get_compatible_custom_providers(switch_config)
+    if not effective_base_url and new_provider.startswith("custom:"):
+        from hermes_cli.providers import resolve_custom_provider
+
+        custom_provider = resolve_custom_provider(new_provider, custom_providers)
+        if custom_provider is None:
+            raise ValueError(
+                f"Provider changed to {new_provider!r}, but no base_url resolved"
+            )
+        effective_base_url = str(custom_provider.get("base_url") or "").strip()
+        if not effective_base_url:
+            raise ValueError(
+                f"Provider changed to {new_provider!r}, but no base_url resolved"
+            )
     destination_context = get_custom_provider_context_length(
         model=new_model,
         base_url=effective_base_url,
@@ -2052,7 +2077,36 @@ async def switch_model(agent, new_model, new_provider, api_key='', base_url='', 
     ):
         effective_base_url = re.sub(r"/v1/?$", "", effective_base_url)
 
-    previous_deferred = getattr(agent, "_deferred_provider_runtime", None)
+    rollback_attributes = (
+        "model",
+        "provider",
+        "requested_provider",
+        "base_url",
+        "api_mode",
+        "api_key",
+        "client",
+        "_client_kwargs",
+        "_deferred_provider_runtime",
+        "_config_context_length",
+        "_anthropic_api_key",
+        "_anthropic_base_url",
+        "_anthropic_client",
+        "_is_anthropic_oauth",
+        "_async_client",
+        "_async_client_source",
+        "_async_anthropic_client",
+        "_async_anthropic_source",
+        "_credential_pool",
+        "_credential_pool_entry_id",
+        "_use_prompt_caching",
+        "_use_native_cache_layout",
+    )
+    missing = object()
+    rollback_state = {
+        name: getattr(agent, name, missing)
+        for name in rollback_attributes
+    }
+    rollback_state["_config_context_length"] = previous_context_length
     agent._deferred_provider_runtime = {
         "provider": new_provider,
         "model": new_model,
@@ -2066,9 +2120,65 @@ async def switch_model(agent, new_model, new_provider, api_key='', base_url='', 
     try:
         await agent._ensure_provider_runtime()
     except BaseException:
-        agent._deferred_provider_runtime = previous_deferred
-        agent._config_context_length = previous_context_length
+        current_clients = {
+            id(client): client
+            for client in (
+                getattr(agent, "client", None),
+                getattr(agent, "_anthropic_client", None),
+            )
+            if client is not None
+        }
+        previous_client_ids = {
+            id(client)
+            for client in (
+                rollback_state.get("client"),
+                rollback_state.get("_anthropic_client"),
+            )
+            if client is not None and client is not missing
+        }
+        for client_id, client in current_clients.items():
+            if client_id in previous_client_ids:
+                continue
+            close = getattr(client, "aclose", None) or getattr(client, "close", None)
+            if close is not None and inspect.iscoroutinefunction(close):
+                try:
+                    await close()
+                except Exception:
+                    logger.debug("Failed to close rejected model-switch client", exc_info=True)
+        for name, value in rollback_state.items():
+            if value is missing:
+                try:
+                    delattr(agent, name)
+                except AttributeError:
+                    pass
+            else:
+                setattr(agent, name, value)
         raise
+
+    # Explicit credentials bypass pool selection during runtime creation. If
+    # the provider changed, replace the old provider's pool so later 401/429
+    # recovery cannot mutate unrelated credentials (#52727).
+    active_pool = getattr(agent, "_credential_pool", None)
+    active_pool_provider = str(
+        getattr(active_pool, "provider", "") or ""
+    ).strip().lower()
+    current_provider = str(getattr(agent, "provider", "") or "").strip().lower()
+    if active_pool is None or (
+        active_pool_provider and active_pool_provider != current_provider
+    ):
+        if active_pool_provider and active_pool_provider != current_provider:
+            agent._credential_pool = None
+            agent._credential_pool_entry_id = None
+        try:
+            from agent.credential_pool import load_pool
+
+            agent._credential_pool = await load_pool(current_provider)
+        except Exception as exc:
+            logger.warning(
+                "Model switch could not load credential pool for %s: %s",
+                current_provider,
+                exc,
+            )
 
     compressor = getattr(agent, "context_compressor", None)
     if compressor is not None:

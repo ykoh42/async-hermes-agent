@@ -689,32 +689,7 @@ def _make_stream_chunk(
     )
 
 
-def _iter_sse_events(response: httpx.Response) -> Iterator[Dict[str, Any]]:
-    buffer = ""
-    for chunk in response.iter_text():
-        if not chunk:
-            continue
-        buffer += chunk
-        while "\n" in buffer:
-            line, buffer = buffer.split("\n", 1)
-            line = line.rstrip("\r")
-            if not line:
-                continue
-            if not line.startswith("data: "):
-                continue
-            data = line[6:]
-            if data == "[DONE]":
-                return
-            try:
-                payload = json.loads(data)
-            except json.JSONDecodeError:
-                logger.debug("Non-JSON Gemini SSE line: %s", data[:200])
-                continue
-            if isinstance(payload, dict):
-                yield payload
-
-
-async def _iter_sse_events_async(
+async def _iter_sse_events(
     response: httpx.Response,
 ) -> AsyncIterator[Dict[str, Any]]:
     """Yield Gemini SSE payloads from an ``httpx.AsyncClient`` stream."""
@@ -1063,7 +1038,7 @@ class GeminiNativeClient:
                     body_text = await read_streaming_error_body(response)
                     raise gemini_http_error(response, body_text=body_text)
                 tool_call_indices: Dict[str, Dict[str, Any]] = {}
-                async for event in _iter_sse_events_async(response):
+                async for event in _iter_sse_events(response):
                     for chunk in translate_stream_event(event, model, tool_call_indices):
                         yield chunk
         except httpx.HTTPError as exc:

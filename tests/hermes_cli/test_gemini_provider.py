@@ -87,10 +87,11 @@ class TestGeminiCredentials:
         assert creds["api_key"] == "gemini-secret"
 
 
-    def test_runtime_gemini(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_runtime_gemini(self, monkeypatch):
         monkeypatch.setenv("GOOGLE_API_KEY", "google-key")
         from hermes_cli.runtime_provider import resolve_runtime_provider
-        result = resolve_runtime_provider(requested="gemini")
+        result = await resolve_runtime_provider(requested="gemini")
         assert result["provider"] == "gemini"
         assert result["api_mode"] == "chat_completions"
         assert result["api_key"] == "google-key"
@@ -155,14 +156,15 @@ class TestGeminiAgentInit:
 
 
 
-    def test_gemini_resolve_provider_client_uses_native_client(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_gemini_resolve_provider_client_uses_native_client(self, monkeypatch):
         """resolve_provider_client('gemini') should build GeminiNativeClient."""
         monkeypatch.setenv("GEMINI_API_KEY", "AIzaSy_TEST_KEY")
         with patch("agent.gemini_native_adapter.GeminiNativeClient") as mock_client, \
              patch("agent.auxiliary_client.OpenAI") as mock_openai:
             mock_client.return_value = MagicMock()
             from agent.auxiliary_client import resolve_provider_client
-            resolve_provider_client("gemini")
+            await resolve_provider_client("gemini")
         assert mock_client.called
         mock_openai.assert_not_called()
 
@@ -201,4 +203,3 @@ class TestGeminiModelsDev:
         assert "gemini-2.5-flash-preview-tts" not in result  # no tool_call
         assert "gemini-live-2.5-flash" not in result     # noise: live-
         assert "gemini-2.5-flash-preview-04-17" not in result  # noise: dated preview
-

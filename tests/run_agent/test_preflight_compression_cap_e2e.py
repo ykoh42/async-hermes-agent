@@ -25,7 +25,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from hermes_state import AsyncSessionDB
+from hermes_state import SessionDB
 from run_agent import AIAgent
 
 
@@ -67,7 +67,7 @@ def _make_agent(monkeypatch, tmp_path: Path, *, max_attempts):
         config_mod, "load_config_readonly", lambda: _config(max_attempts)
 
     )
-    db = AsyncSessionDB(tmp_path / "state.db")
+    db = SessionDB(tmp_path / "state.db")
     with (
         contextlib.redirect_stdout(io.StringIO()),
         patch("run_agent.get_tool_definitions", return_value=[]),

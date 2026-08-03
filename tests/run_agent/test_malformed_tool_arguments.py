@@ -2,7 +2,7 @@
 
 import json
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -34,7 +34,7 @@ def _make_agent() -> AIAgent:
             skip_memory=True,
         )
     agent.client = MagicMock()
-    agent._flush_messages_to_session_db = MagicMock()
+    agent._flush_messages_to_session_db = AsyncMock()
     return agent
 
 
@@ -57,7 +57,8 @@ def _tool_call(call_id: str, arguments: str):
         pytest.param('{"query": "cut off', id="truncated"),
     ],
 )
-def test_malformed_arguments_are_rejected_without_blocking_valid_sibling(
+@pytest.mark.asyncio
+async def test_malformed_arguments_are_rejected_without_blocking_valid_sibling(
     dispatch_mode: str,
     bad_arguments: str,
 ):
@@ -72,21 +73,32 @@ def test_malformed_arguments_are_rejected_without_blocking_valid_sibling(
     messages = []
     executed = []
 
-    def fake_dispatch(name, args, task_id, *positional, **kwargs):
+    async def fake_dispatch(name, args, task_id, *positional, **kwargs):
         call_id = kwargs.get("tool_call_id") or (positional[0] if positional else None)
         executed.append((name, args, call_id))
         return json.dumps({"ok": args["query"]})
 
     with (
-        patch("run_agent.handle_function_call", side_effect=fake_dispatch),
-        patch.object(agent, "_invoke_tool", side_effect=fake_dispatch),
+        patch("model_tools.handle_function_call", new=AsyncMock(side_effect=fake_dispatch)),
+        patch(
+            "tools.registry.registry.get_entry",
+            return_value=SimpleNamespace(is_async=True, max_result_size_chars=None),
+        ),
         patch(
             "agent.tool_executor.maybe_persist_tool_result",
-            side_effect=lambda **kwargs: kwargs["content"],
+            new=AsyncMock(side_effect=lambda **kwargs: kwargs["content"]),
         ),
     ):
-        execute = getattr(agent, f"_execute_tool_calls_{dispatch_mode}")
-        execute(assistant_message, messages, "task-1")
+        from agent.tool_executor import execute_tool_calls_segmented
+
+        segment_kind = "sequential" if dispatch_mode == "sequential" else "parallel"
+        await execute_tool_calls_segmented(
+            agent,
+            assistant_message,
+            messages,
+            "task-1",
+            segments=[(segment_kind, assistant_message.tool_calls)],
+        )
 
     assert executed == [("web_search", {"query": "valid"}, "call-good")]
     assert [message["tool_call_id"] for message in messages] == ["call-bad", "call-good"]

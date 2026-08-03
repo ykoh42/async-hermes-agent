@@ -7,6 +7,7 @@ explicit choice — e.g. a user OAuth-logged-into Anthropic but with
 OPENAI_API_KEY exported (or model.provider set) got routed to Anthropic.
 """
 import pytest
+from types import SimpleNamespace
 
 from hermes_cli.auth import resolve_provider, AuthError
 
@@ -76,7 +77,8 @@ class TestProviderPrecedence:
         assert any("no `provider` key" in r.message for r in caplog.records)
 
 
-    def test_openrouter_pool_beats_stale_oauth(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_openrouter_pool_beats_stale_oauth(self, monkeypatch):
         """An OpenRouter credential-pool entry (no env var) wins over a logged-in
         OAuth provider — the pool rung sits above OAuth (#42130 + #29285)."""
         _clear_provider_env(monkeypatch)
@@ -88,5 +90,26 @@ class TestProviderPrecedence:
             def has_credentials(self):
                 return True
 
-        monkeypatch.setattr("agent.credential_pool.load_pool", lambda name: _Pool())
-        assert resolve_provider("auto") == "openrouter"
+            async def select(self):
+                return SimpleNamespace(
+                    runtime_api_key="pool-token",
+                    access_token="pool-token",
+                    runtime_base_url="https://openrouter.ai/api/v1",
+                    base_url="https://openrouter.ai/api/v1",
+                    source="pool",
+                )
+
+        async def _load_pool(name):
+            assert name == "openrouter"
+            return _Pool()
+
+        from hermes_cli import runtime_provider
+
+        monkeypatch.setattr(runtime_provider, "load_pool", _load_pool)
+        monkeypatch.setattr(
+            runtime_provider,
+            "resolve_requested_provider",
+            lambda requested, config: "auto",
+        )
+        runtime = await runtime_provider.resolve_runtime_provider(requested="auto")
+        assert runtime["provider"] == "openrouter"

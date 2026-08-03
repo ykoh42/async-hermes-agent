@@ -12,8 +12,6 @@ from __future__ import annotations
 import inspect
 from unittest.mock import patch
 
-import pytest
-
 from agent.credits_tracker import AgentNotice
 from run_agent import AIAgent
 
@@ -62,78 +60,3 @@ class TestSignatureThreading:
     def test_agent_init_exposes_notice_callback(self):
         sig = inspect.signature(AIAgent.__init__)
         assert "notice_callback" in sig.parameters
-
-
-
-
-
-# ── C. TUI _agent_cbs binding ────────────────────────────────────────────────
-
-
-class TestAgentCbsNoticeBinding:
-    """Mirror test_status_callback_emits_kind_and_text from test_tui_gateway_server.py."""
-
-    def test_notice_callback_emits_notification_show(self):
-        from tui_gateway import server
-
-        with patch("tui_gateway.server._emit") as mock_emit:
-            cbs = server._agent_cbs("sid123")
-            notice = AgentNotice(
-                text="credits 90% used",
-                level="warn",
-                kind="sticky",
-                ttl_ms=None,
-                key="credits.warn90",
-                id="n1",
-            )
-            cbs["notice_callback"](notice)
-
-        mock_emit.assert_called_once_with(
-            "notification.show",
-            "sid123",
-            {
-                "text": "credits 90% used",
-                "level": "warn",
-                "kind": "sticky",
-                "ttl_ms": None,
-                "key": "credits.warn90",
-                "id": "n1",
-            },
-        )
-
-    def test_notice_callback_payload_is_full_snake_case_dict(self):
-        """All six snake_case fields must be present in the payload — no extras,
-        no camelCase variants."""
-        from tui_gateway import server
-
-        captured = []
-        with patch("tui_gateway.server._emit", side_effect=lambda *a: captured.append(a)):
-            cbs = server._agent_cbs("sid123")
-            cbs["notice_callback"](
-                AgentNotice(
-                    text="credits 90% used",
-                    level="warn",
-                    kind="sticky",
-                    ttl_ms=None,
-                    key="credits.warn90",
-                    id="n1",
-                )
-            )
-
-        assert len(captured) == 1
-        _event_type, _sid, payload = captured[0]
-        assert set(payload.keys()) == {"text", "level", "kind", "ttl_ms", "key", "id"}
-
-
-
-    def test_notice_clear_callback_event_type_is_notification_clear(self):
-        from tui_gateway import server
-
-        captured = []
-        with patch("tui_gateway.server._emit", side_effect=lambda *a: captured.append(a)):
-            cbs = server._agent_cbs("sid123")
-            cbs["notice_clear_callback"]("some.key")
-
-        assert captured[0][0] == "notification.clear"
-        assert captured[0][1] == "sid123"
-        assert captured[0][2] == {"key": "some.key"}

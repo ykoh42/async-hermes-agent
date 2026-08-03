@@ -1682,7 +1682,7 @@ async def _make_anthropic_claude_code_pool(tmp_path, monkeypatch, *, access_toke
     monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
     _write_auth_store(tmp_path, {"version": 1, "credential_pool": {}})
     monkeypatch.setattr(
-        "agent.credential_pool._is_provider_explicitly_configured_async",
+        "agent.credential_pool._is_provider_explicitly_configured",
         AsyncMock(return_value=True),
     )
     monkeypatch.setattr(

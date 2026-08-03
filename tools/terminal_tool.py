@@ -15,6 +15,8 @@ import re
 import shlex
 import asyncio
 import contextvars
+import inspect
+import logging
 import signal
 import threading
 import time
@@ -26,6 +28,8 @@ import aiofiles.os
 
 from tools.environments.local import build_subprocess_env
 from tools.registry import registry
+
+logger = logging.getLogger(__name__)
 
 _active_environments: dict[str, "LocalEnvironment"] = {}
 _env_lock = threading.RLock()
@@ -307,6 +311,13 @@ def register_task_env_overrides(task_id: str, overrides: dict[str, Any]) -> None
         record_session_cwd(key, cwd)
 
 
+def clear_task_env_overrides(task_id: str) -> None:
+    """Remove one task's local environment overrides and cwd anchor."""
+    key = str(task_id or "default")
+    _task_env_overrides.pop(key, None)
+    clear_session_cwd(key)
+
+
 def get_session_cwd(task_id: str | None = None) -> str:
     """Return the in-memory cwd anchor for a session.
 
@@ -393,7 +404,20 @@ class LocalEnvironment:
         """Run a local shell command without blocking the agent event loop."""
         workdir = os.path.abspath(os.path.expanduser(cwd or self.cwd))
         if not await aiofiles.os.path.isdir(workdir):
-            return {"output": f"Working directory does not exist: {workdir}", "returncode": 1}
+            recovered = await _nearest_existing_directory(workdir)
+            if recovered is None:
+                return {
+                    "output": f"Working directory does not exist: {workdir}",
+                    "returncode": 1,
+                }
+            logger.warning(
+                "Terminal working directory %s is missing on disk; recovered to %s",
+                workdir,
+                recovered,
+            )
+            workdir = recovered
+            async with self._lock:
+                self.cwd = recovered
         limit = float(timeout or self.timeout)
         shell = os.environ.get("SHELL") or "/bin/sh"
         marker = "__HERMES_LOCAL_CWD_7F3A__"
@@ -411,8 +435,7 @@ class LocalEnvironment:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 env=build_subprocess_env(
-                    scrub_secrets=False,
-                    inherit_profile_home=False,
+                    scrub_secrets=True,
                 ),
             )
             input_bytes = stdin_data.encode() if stdin_data is not None else None
@@ -445,6 +468,15 @@ class LocalEnvironment:
                 async with self._lock:
                     self.cwd = new_cwd
         return {"output": output, "returncode": process.returncode}
+
+
+async def _nearest_existing_directory(path: str) -> str | None:
+    """Return the closest existing directory at or above *path*."""
+    candidate = Path(os.path.abspath(os.path.expanduser(path)))
+    for current in (candidate, *candidate.parents):
+        if await aiofiles.os.path.isdir(current):
+            return str(current)
+    return None
 
 
 def _create_environment(
@@ -572,9 +604,15 @@ def cleanup_all_environments() -> None:
 
 async def terminal_tool(
     command: str,
-    timeout: int | None = None,
     background: bool = False,
+    timeout: int | None = None,
     task_id: str | None = None,
+    session_id: str | None = None,
+    force: bool = False,
+    workdir: str | None = None,
+    pty: bool = False,
+    notify_on_complete: bool = False,
+    watch_patterns: list[str] | None = None,
     **_kwargs: Any,
 ) -> str:
     """Run a local command asynchronously and preserve Hermes' JSON result contract."""
@@ -599,16 +637,128 @@ async def terminal_tool(
             ensure_ascii=False,
         )
 
+    if timeout is not None and not background and timeout > FOREGROUND_MAX_TIMEOUT:
+        return json.dumps(
+            {
+                "output": "",
+                "exit_code": -1,
+                "error": (
+                    f"Foreground timeout {timeout}s exceeds the {FOREGROUND_MAX_TIMEOUT}s "
+                    "maximum; use background=true for longer commands."
+                ),
+                "status": "error",
+            },
+            ensure_ascii=False,
+        )
+    if pty:
+        return json.dumps(
+            {
+                "output": "",
+                "exit_code": -1,
+                "error": "PTY execution is not supported by the native async local terminal.",
+                "status": "error",
+            },
+            ensure_ascii=False,
+        )
+    if notify_on_complete or watch_patterns:
+        return json.dumps(
+            {
+                "output": "",
+                "exit_code": -1,
+                "error": (
+                    "Background notification flags require the removed messaging gateway "
+                    "and are not supported by the async library runtime."
+                ),
+                "status": "error",
+            },
+            ensure_ascii=False,
+        )
+
+    callback = _get_approval_callback()
+    if callback is not None and not force:
+        decision = callback(
+            command=command,
+            task_id=task_id,
+            session_id=session_id,
+            background=background,
+        )
+        if not inspect.isawaitable(decision):
+            raise RuntimeError(
+                "Async Hermes requires a coroutine terminal approval callback"
+            )
+        decision = await decision
+        approved = decision is True or str(decision).strip().lower() in {
+            "approve",
+            "approved",
+            "allow",
+            "yes",
+        }
+        if not approved:
+            return json.dumps(
+                {
+                    "output": "",
+                    "exit_code": -1,
+                    "error": "Terminal command denied by the approval callback.",
+                    "status": "denied",
+                },
+                ensure_ascii=False,
+            )
+
     try:
         env = await _get_or_create_environment(task_id)
+        cwd = workdir or env.cwd
+        cwd = os.path.abspath(os.path.expanduser(str(cwd)))
+        if workdir and not os.path.isabs(os.path.expanduser(workdir)):
+            return json.dumps(
+                {
+                    "output": "",
+                    "exit_code": -1,
+                    "error": "workdir must be an absolute path.",
+                    "status": "error",
+                },
+                ensure_ascii=False,
+            )
+        if not await aiofiles.os.path.isdir(cwd):
+            if workdir:
+                return json.dumps(
+                    {
+                        "output": "",
+                        "exit_code": -1,
+                        "error": f"Working directory does not exist: {cwd}",
+                        "status": "error",
+                    },
+                    ensure_ascii=False,
+                )
+            recovered = await _nearest_existing_directory(cwd)
+            if recovered is None:
+                return json.dumps(
+                    {
+                        "output": "",
+                        "exit_code": -1,
+                        "error": f"Working directory does not exist: {cwd}",
+                        "status": "error",
+                    },
+                    ensure_ascii=False,
+                )
+            logger.warning(
+                "Terminal working directory %s is missing on disk; recovered to %s",
+                cwd,
+                recovered,
+            )
+            cwd = recovered
+            env.cwd = recovered
+            record_session_cwd(task_id, recovered)
         if background:
             process = await asyncio.create_subprocess_shell(
                 command,
                 executable=os.environ.get("SHELL") or "/bin/sh",
-                cwd=env.cwd,
+                cwd=cwd,
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.DEVNULL,
-                start_new_session=True,
+                env=build_subprocess_env(
+                    scrub_secrets=True,
+                ),
+                **({"start_new_session": True} if os.name == "posix" else {}),
             )
             _track_background_process(task_id, process)
             return json.dumps(
@@ -622,7 +772,8 @@ async def terminal_tool(
                 ensure_ascii=False,
             )
 
-        result = await env.execute(command, timeout=timeout)
+        result = await env.execute(command, cwd=cwd, timeout=timeout)
+        record_session_cwd(task_id, env.cwd)
         exit_code = int(result.get("returncode", 0))
         payload: dict[str, Any] = {
             "output": str(result.get("output", "")),
@@ -687,8 +838,20 @@ TERMINAL_SCHEMA = {
         "type": "object",
         "properties": {
             "command": {"type": "string", "description": "Shell command to execute."},
-            "timeout": {"type": "integer", "minimum": 1, "description": "Timeout in seconds."},
+            "timeout": {
+                "type": "integer",
+                "minimum": 1,
+                "description": (
+                    f"Timeout in seconds. Foreground maximum is {FOREGROUND_MAX_TIMEOUT}; "
+                    "use background=true for longer commands."
+                ),
+            },
             "background": {"type": "boolean", "description": "Start without waiting for completion."},
+            "workdir": {
+                "type": "string",
+                "description": "Absolute working directory for this command.",
+            },
+            "pty": {"type": "boolean", "description": "Unsupported in the async local runtime."},
         },
         "required": ["command"],
     },
@@ -702,6 +865,9 @@ async def _handle_terminal(args: dict, **kwargs) -> str:
         timeout=args.get("timeout"),
         background=bool(args.get("background", False)),
         task_id=kwargs.get("task_id"),
+        session_id=kwargs.get("session_id"),
+        workdir=args.get("workdir"),
+        pty=bool(args.get("pty", False)),
     )
 
 

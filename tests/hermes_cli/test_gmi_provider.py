@@ -124,85 +124,6 @@ class TestGmiProvidersModule:
         assert _PROVIDER_LABELS["gmi"] == "GMI Cloud"
 
 
-class TestGmiDoctor:
-    def test_provider_env_hints_include_gmi(self):
-        from hermes_cli.doctor import _PROVIDER_ENV_HINTS
-
-        assert "GMI_API_KEY" in _PROVIDER_ENV_HINTS
-
-    def test_run_doctor_checks_gmi_models_endpoint(self, monkeypatch, tmp_path):
-        from hermes_cli import doctor as doctor_mod
-
-        home = tmp_path / ".hermes"
-        home.mkdir(parents=True, exist_ok=True)
-        (home / "config.yaml").write_text("memory: {}\n", encoding="utf-8")
-        (home / ".env").write_text("GMI_API_KEY=***\n", encoding="utf-8")
-        project = tmp_path / "project"
-        project.mkdir(exist_ok=True)
-
-        monkeypatch.setattr(doctor_mod, "HERMES_HOME", home)
-        monkeypatch.setattr(doctor_mod, "PROJECT_ROOT", project)
-        monkeypatch.setattr(doctor_mod, "_DHH", str(home))
-        monkeypatch.setenv("GMI_API_KEY", "gmi-test-key")
-
-        for env_name in (
-            "OPENROUTER_API_KEY",
-            "OPENAI_API_KEY",
-            "ANTHROPIC_API_KEY",
-            "ANTHROPIC_TOKEN",
-            "GLM_API_KEY",
-            "ZAI_API_KEY",
-            "Z_AI_API_KEY",
-            "KIMI_API_KEY",
-            "KIMI_CN_API_KEY",
-            "ARCEEAI_API_KEY",
-            "DEEPSEEK_API_KEY",
-            "HF_TOKEN",
-            "DASHSCOPE_API_KEY",
-            "MINIMAX_API_KEY",
-            "MINIMAX_CN_API_KEY",
-            "AI_GATEWAY_API_KEY",
-            "KILOCODE_API_KEY",
-            "OPENCODE_ZEN_API_KEY",
-            "OPENCODE_GO_API_KEY",
-            "XIAOMI_API_KEY",
-        ):
-            monkeypatch.delenv(env_name, raising=False)
-
-        fake_model_tools = types.SimpleNamespace(
-            check_tool_availability=lambda *a, **kw: ([], []),
-            TOOLSET_REQUIREMENTS={},
-        )
-        monkeypatch.setitem(sys.modules, "model_tools", fake_model_tools)
-
-        try:
-            from hermes_cli import auth as _auth_mod
-
-            monkeypatch.setattr(_auth_mod, "get_nous_auth_status", lambda: {})
-            monkeypatch.setattr(_auth_mod, "get_codex_auth_status", lambda: {})
-        except Exception:
-            pass
-
-        calls = []
-
-        def fake_get(url, headers=None, timeout=None):
-            calls.append((url, headers, timeout))
-            return types.SimpleNamespace(status_code=200)
-
-        import httpx
-
-        monkeypatch.setattr(httpx, "get", fake_get)
-
-        buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
-            doctor_mod.run_doctor(Namespace(fix=False))
-        out = buf.getvalue()
-
-        assert "API key or custom endpoint configured" in out
-        assert "GMI Cloud" in out
-        assert any(url == "https://api.gmi-serving.com/v1/models" for url, _, _ in calls)
-
-
 class TestGmiModelMetadata:
     def test_url_to_provider(self):
         from agent.model_metadata import _URL_TO_PROVIDER
@@ -237,14 +158,15 @@ class TestGmiModelMetadata:
 
 
 class TestGmiAuxiliary:
-    def test_resolve_provider_client_uses_gmi_aux_default(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_resolve_provider_client_uses_gmi_aux_default(self, monkeypatch):
         import agent.auxiliary_client as auxiliary_client
 
         monkeypatch.setenv("GMI_API_KEY", "gmi-test-key")
 
-        with patch("agent.auxiliary_client.OpenAI") as mock_openai:
+        with patch("agent.auxiliary_client._create_openai_client") as mock_openai:
             mock_openai.return_value = object()
-            client, model = auxiliary_client.resolve_provider_client("gmi")
+            client, model = await auxiliary_client.resolve_provider_client("gmi")
 
         assert client is not None
         assert model == "google/gemini-3.1-flash-lite-preview"

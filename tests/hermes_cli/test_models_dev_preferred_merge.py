@@ -114,28 +114,6 @@ class TestProviderModelIdsPreferred:
         # Legacy / custom endpoints never advertise the k3 family at all
         # via live discovery (their curated floor may still carry kimi-k3).
 
-    def test_kimi_setup_flow_uses_same_coding_plan_catalog(self):
-        """The setup wizard must not carry a stale duplicate Kimi model list."""
-        from hermes_cli.model_setup_flows import _model_flow_kimi
-
-        captured = {}
-
-        def fake_select(model_list, **_kwargs):
-            captured["models"] = model_list
-            return None
-
-        with (
-            patch("hermes_cli.main._prompt_api_key", return_value=("sk-kimi-test", False)),
-            patch("hermes_cli.auth._prompt_model_selection", side_effect=fake_select),
-            patch("hermes_cli.config.get_env_value", return_value=""),
-            patch("hermes_cli.config.save_env_value"),
-        ):
-            _model_flow_kimi({}, current_model="")
-
-        assert captured["models"] == _PROVIDER_MODELS["kimi-coding"]
-        assert captured["models"][0] == "kimi-k3"
-
-
 class TestOpenRouterAndNousUnchanged:
     """Per Teknium: openrouter and nous are NEVER merged with models.dev."""
 

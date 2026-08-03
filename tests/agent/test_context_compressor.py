@@ -14,7 +14,7 @@ from agent.context_compressor import (
     _is_summary_access_or_quota_error,
 )
 from agent.conversation_compression import _persist_compression_guards
-from hermes_state import AsyncSessionDB
+from hermes_state import SessionDB
 
 
 class StubProviderError(Exception):
@@ -1099,7 +1099,7 @@ class TestAbortOnSummaryFailure:
     async def test_aux_fallback_clears_persisted_session_cooldown_before_retry(
         self, tmp_path
     ):
-        db = AsyncSessionDB(tmp_path / "state.db")
+        db = SessionDB(tmp_path / "state.db")
         await db.create_session("s1", "cli")
         await db.record_compression_failure_cooldown(
             "s1", time.time() + 999.0, "timeout"
@@ -1123,7 +1123,7 @@ class TestAbortOnSummaryFailure:
         mock_response.choices = [MagicMock()]
         mock_response.choices[0].message.content = "summary text"
 
-        db = AsyncSessionDB(tmp_path / "state.db")
+        db = SessionDB(tmp_path / "state.db")
         await db.create_session("s1", "cli")
         await db.record_compression_failure_cooldown(
             "s1", time.time() + 999.0, "timeout"

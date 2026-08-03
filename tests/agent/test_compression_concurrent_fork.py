@@ -37,7 +37,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 import pytest_asyncio
 
-from hermes_state import AsyncSessionDB
+from hermes_state import SessionDB
 
 
 _BUILT_AGENTS = []
@@ -51,7 +51,7 @@ async def _close_async_agents():
     _BUILT_AGENTS.clear()
 
 
-def _build_agent_with_db(db: AsyncSessionDB, session_id: str):
+def _build_agent_with_db(db: SessionDB, session_id: str):
     """Build an AIAgent that's wired to ``db`` and pinned to ``session_id``."""
     with patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}):
         from run_agent import AIAgent
@@ -97,7 +97,7 @@ def _build_agent_with_db(db: AsyncSessionDB, session_id: str):
     return agent
 
 
-async def _count_children(db: AsyncSessionDB, parent_sid: str) -> int:
+async def _count_children(db: SessionDB, parent_sid: str) -> int:
     """Count rows in state.db whose parent_session_id == parent_sid."""
     connection = await db._get_connection()
     rows = await (
@@ -109,7 +109,7 @@ async def _count_children(db: AsyncSessionDB, parent_sid: str) -> int:
     return len(rows)
 
 
-async def _live_child_id(db: AsyncSessionDB, parent_sid: str) -> str | None:
+async def _live_child_id(db: SessionDB, parent_sid: str) -> str | None:
     """The single child id of ``parent_sid``, or None when there is none.
 
     Fails loudly on more than one child: callers use this to prove the agents
@@ -149,7 +149,7 @@ async def test_concurrent_compression_does_not_fork_session(tmp_path: Path) -> N
     retries — 0, because _compress_context safely rolls back to the parent
     instead of orphaning a child. The forbidden outcome is 2+ (the fork).
     """
-    db = AsyncSessionDB(tmp_path / "state.db")
+    db = SessionDB(tmp_path / "state.db")
 
     parent_sid = "PARENT_TEST_SESSION"
     await db.create_session(parent_sid, source="discord")
@@ -234,7 +234,7 @@ async def test_durable_message_committed_before_lease_is_adopted(
     acquisition", and never called the compressor. Adopting the durable
     transcript keeps the late-committed turn and lets compression proceed.
     """
-    db = AsyncSessionDB(tmp_path / "state.db")
+    db = SessionDB(tmp_path / "state.db")
     parent_sid = "PRE_LEASE_DURABLE_RACE"
     await db.create_session(parent_sid, source="webui")
     await db.append_message(parent_sid, "user", "old durable")
@@ -281,7 +281,7 @@ async def test_fence_cancelled_compression_leaves_lock_reacquirable(tmp_path: Pa
     """
     from agent.conversation_compression import CompressionCommitFence
 
-    db = AsyncSessionDB(tmp_path / "state.db")
+    db = SessionDB(tmp_path / "state.db")
     session_id = "HYGIENE_LOCK_REACQUIRE"
     await db.create_session(session_id, source="telegram")
 
@@ -369,7 +369,7 @@ def test_commit_fence_waits_for_an_active_commit() -> None:
 @pytest.mark.asyncio
 async def test_delayed_contender_adopts_unique_rotated_child(tmp_path: Path) -> None:
     """A stale agent must continue on the winner's compacted child transcript."""
-    db = AsyncSessionDB(tmp_path / "state.db")
+    db = SessionDB(tmp_path / "state.db")
     parent_sid = "STALE_PARENT"
     child_sid = "CANONICAL_CHILD"
     await db.create_session(parent_sid, source="webui")
@@ -408,7 +408,7 @@ async def test_delayed_contender_adopts_unique_rotated_child(tmp_path: Path) -> 
     assert lifecycle_args == (child_sid,)
     assert lifecycle_kwargs["boundary_reason"] == "compression"
     assert lifecycle_kwargs["old_session_id"] == parent_sid
-    # The async turn owns persistence separately through AsyncSessionDB; a
+    # The async turn owns persistence separately through SessionDB; a
     # synchronous context-engine lifecycle hook receives no raw SessionDB.
     assert lifecycle_kwargs["session_db"] is None
 
@@ -476,7 +476,7 @@ def test_restored_anchor_never_creates_consecutive_user_roles() -> None:
 
 @pytest.mark.asyncio
 async def test_compression_persists_child_handoff_immediately(tmp_path: Path) -> None:
-    db = AsyncSessionDB(tmp_path / "state.db")
+    db = SessionDB(tmp_path / "state.db")
     parent_sid = "HEADLESS_PREFLIGHT_PARENT"
     await db.create_session(parent_sid, source="cli")
 
@@ -504,7 +504,7 @@ async def test_equal_copy_compression_result_does_not_rewrite_session(
     tmp_path: Path,
     in_place: bool,
 ) -> None:
-    db = AsyncSessionDB(tmp_path / "state.db")
+    db = SessionDB(tmp_path / "state.db")
     parent_sid = f"EQUAL_COPY_NOOP_{in_place}"
     await db.create_session(parent_sid, source="cli")
 
@@ -540,14 +540,14 @@ async def test_equal_copy_compression_result_does_not_rewrite_session(
 @pytest.mark.asyncio
 async def test_post_compress_exception_stops_lock_refresher(tmp_path: Path, monkeypatch) -> None:
     """A warning-path exception after compress() returns must still release the lock."""
-    real_try_acquire = AsyncSessionDB.try_acquire_compression_lock
+    real_try_acquire = SessionDB.try_acquire_compression_lock
 
     async def _short_ttl(self, session_id: str, holder: str, ttl_seconds: float = 300.0) -> bool:
         return await real_try_acquire(self, session_id, holder, ttl_seconds=0.15)
 
-    monkeypatch.setattr(AsyncSessionDB, "try_acquire_compression_lock", _short_ttl)
+    monkeypatch.setattr(SessionDB, "try_acquire_compression_lock", _short_ttl)
 
-    db = AsyncSessionDB(tmp_path / "state.db")
+    db = SessionDB(tmp_path / "state.db")
     parent_sid = "REFRESH_EXCEPTION_TEST"
     await db.create_session(parent_sid, source="discord")
 
@@ -577,7 +577,7 @@ async def test_signature_introspection_exception_releases_lock_and_refresher(
     tmp_path: Path, monkeypatch
 ) -> None:
     """Capability inspection failures must not leak the acquired lock lease."""
-    db = AsyncSessionDB(tmp_path / "state.db")
+    db = SessionDB(tmp_path / "state.db")
     parent_sid = "SIGNATURE_EXCEPTION_TEST"
     await db.create_session(parent_sid, source="discord")
 
@@ -631,14 +631,14 @@ async def test_real_lock_api_internal_errors_fail_closed_skips_compression(
     proving that an internal AttributeError or TypeError cannot take the
     structural-absence compatibility path.
     """
-    db = AsyncSessionDB(tmp_path / "state.db")
+    db = SessionDB(tmp_path / "state.db")
     parent_sid = "ERRORING_LOCK_TEST"
     await db.create_session(parent_sid, source="discord")
 
     async def _fail_lock_write(_self, _fn):
         raise error
 
-    monkeypatch.setattr(AsyncSessionDB, "_write", _fail_lock_write)
+    monkeypatch.setattr(SessionDB, "_write", _fail_lock_write)
     agent = _build_agent_with_db(db, parent_sid)
     messages = [{"role": "user", "content": f"m{i}"} for i in range(20)]
 

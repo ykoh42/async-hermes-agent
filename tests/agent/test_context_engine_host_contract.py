@@ -28,6 +28,8 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
+import pytest
+
 from agent.context_compressor import ContextCompressor
 from hermes_state import SessionDB
 from run_agent import AIAgent
@@ -83,7 +85,8 @@ def test_transition_skips_optional_hooks_when_engine_lacks_them():
 
 
 
-def test_reset_session_state_rebinds_builtin_compressor_after_session_switch(tmp_path, monkeypatch):
+@pytest.mark.asyncio
+async def test_reset_session_state_rebinds_builtin_compressor_after_session_switch(tmp_path, monkeypatch):
     """Reset-only session switches must rebind local compression state.
 
     Native turn persistence goes through ``conversation_compression`` and the
@@ -92,10 +95,10 @@ def test_reset_session_state_rebinds_builtin_compressor_after_session_switch(tmp
     synchronous SQLite write.
     """
     db = SessionDB(db_path=tmp_path / "state.db")
-    db.create_session("old-sid", source="cli")
-    db.create_session("new-sid", source="cli")
-    db.record_compression_failure_cooldown("old-sid", 4_000_000_000.0, "old-timeout")
-    db.set_compression_fallback_streak("old-sid", 2)
+    await db.create_session("old-sid", source="cli")
+    await db.create_session("new-sid", source="cli")
+    await db.record_compression_failure_cooldown("old-sid", 4_000_000_000.0, "old-timeout")
+    await db.set_compression_fallback_streak("old-sid", 2)
 
     monkeypatch.setattr(
         "agent.context_compressor.get_static_context_length",
@@ -120,14 +123,15 @@ def test_reset_session_state_rebinds_builtin_compressor_after_session_switch(tmp
     assert compressor._session_id == "new-sid"
     assert compressor.get_active_compression_failure_cooldown() is None
     assert compressor._fallback_compression_streak == 0
-    assert db.get_compression_failure_cooldown("old-sid") is not None
-    assert db.get_compression_fallback_streak("old-sid") == 2
+    assert await db.get_compression_failure_cooldown("old-sid") is not None
+    assert await db.get_compression_fallback_streak("old-sid") == 2
 
     compressor._record_compression_failure_cooldown(30.0, "new-timeout")
 
     assert compressor.get_active_compression_failure_cooldown() is not None
-    assert db.get_compression_failure_cooldown("new-sid") is None
-    assert db.get_compression_failure_cooldown("old-sid")["error"] == "old-timeout"
+    assert await db.get_compression_failure_cooldown("new-sid") is None
+    assert (await db.get_compression_failure_cooldown("old-sid"))["error"] == "old-timeout"
+    await db.close()
 
 
 def test_update_from_response_forwards_canonical_cache_buckets():

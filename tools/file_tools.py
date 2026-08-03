@@ -16,7 +16,7 @@ from pathlib import Path, PurePosixPath
 import aiofiles
 import aiofiles.os
 
-from agent.file_safety import get_read_block_error
+from agent.file_safety import get_read_block_error, get_write_denied_error
 from tools.binary_extensions import has_binary_extension
 from tools.file_operations import (
     MAX_LINE_LENGTH,
@@ -128,7 +128,7 @@ _DEFAULT_MAX_READ_CHARS = 100_000
 _max_read_chars_cached: int | None = None
 
 
-def _get_max_read_chars() -> int:
+async def _get_max_read_chars() -> int:
     """Return the configured max characters per file read.
 
     Reads ``file_read_max_chars`` from config.yaml on first call, caches
@@ -139,8 +139,9 @@ def _get_max_read_chars() -> int:
     if _max_read_chars_cached is not None:
         return _max_read_chars_cached
     try:
-        from hermes_cli.config import load_config
-        cfg = load_config()
+        from hermes_cli.config import load_config_readonly_async
+
+        cfg = await load_config_readonly_async()
         val = cfg.get("file_read_max_chars")
         if isinstance(val, (int, float)) and val > 0:
             _max_read_chars_cached = int(val)
@@ -1165,7 +1166,7 @@ async def _handle_read_file(args, **kw):
         for line_number, line in enumerate(page, start=offset)
     )
     numbered, lines_kept, char_truncated = _truncate_to_char_budget(
-        numbered, _DEFAULT_MAX_READ_CHARS
+        numbered, await _get_max_read_chars()
     )
     next_offset = offset + lines_kept
     truncated = len(lines) >= next_offset or char_truncated
@@ -1254,11 +1255,32 @@ async def _handle_write_file(args, **kw):
     resolved = _native_file_path(path, task_id)
     if isinstance(resolved, str):
         return resolved
+    denied_error = get_write_denied_error(str(resolved))
+    if denied_error:
+        return tool_error(denied_error)
+    if not args.get("cross_profile", False):
+        profile_error = _check_cross_profile_path(str(resolved), task_id)
+        if profile_error:
+            return tool_error(profile_error)
     cross_warning = file_state.check_stale(task_id, str(resolved))
     stale_warning = await _check_file_staleness(path, task_id)
     lock = await _async_file_lock(resolved)
     try:
         async with lock:
+            try:
+                existing = await _read_native_patch_content(resolved)
+            except FileNotFoundError:
+                existing = None
+            if existing is not None:
+                from tools.file_operations import (
+                    _detect_line_ending,
+                    _normalize_line_endings,
+                )
+
+                content = _normalize_line_endings(
+                    content,
+                    _detect_line_ending(existing),
+                )
             await _write_native_file(resolved, content)
     except OSError as exc:
         return tool_error(f"Failed to write {path}: {exc}")
@@ -1403,6 +1425,9 @@ async def _handle_v4a_patch(args: dict, task_id: str) -> str:
         resolved = _native_file_path(raw_path, task_id)
         if isinstance(resolved, str):
             return resolved
+        denied_error = get_write_denied_error(str(resolved))
+        if denied_error:
+            return tool_error(denied_error)
         resolved_by_raw[raw_path] = resolved
 
     paths = sorted(set(resolved_by_raw.values()), key=str)
@@ -1522,6 +1547,13 @@ async def _handle_patch(args, **kw):
     resolved = _native_file_path(path, task_id)
     if isinstance(resolved, str):
         return resolved
+    denied_error = get_write_denied_error(str(resolved))
+    if denied_error:
+        return tool_error(denied_error)
+    if not args.get("cross_profile", False):
+        profile_error = _check_cross_profile_path(str(resolved), task_id)
+        if profile_error:
+            return tool_error(profile_error)
     cross_warning = file_state.check_stale(task_id, str(resolved))
     stale_warning = await _check_file_staleness(path, task_id)
     lock = await _async_file_lock(resolved)
@@ -1529,6 +1561,14 @@ async def _handle_patch(args, **kw):
         async with lock:
             async with aiofiles.open(resolved, "r", encoding="utf-8", errors="replace", newline="") as handle:
                 content = await handle.read()
+            from tools.file_operations import (
+                _detect_line_ending,
+                _normalize_line_endings,
+            )
+
+            line_ending = _detect_line_ending(content)
+            old_string = _normalize_line_endings(old_string, line_ending)
+            new_string = _normalize_line_endings(new_string, line_ending)
             occurrences = content.count(old_string)
             if occurrences == 0:
                 return tool_error(

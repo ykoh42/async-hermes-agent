@@ -12,8 +12,7 @@ affected MCP server failed until the gateway was manually restarted.
 """
 import asyncio
 import json
-import threading
-import time
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -69,6 +68,16 @@ def test_is_session_expired_traversal_is_budget_bounded():
 # ---------------------------------------------------------------------------
 
 
+def _install_stub_server(mcp_tool, name):
+    server = MagicMock()
+    server.name = name
+    server._rpc_lock = asyncio.Lock()
+    server._is_recycled_stdio.return_value = False
+    server.session = SimpleNamespace()
+    mcp_tool._servers[name] = server
+    mcp_tool._server_error_counts.pop(name, None)
+    return server
+
 
 
 # ---------------------------------------------------------------------------
@@ -86,7 +95,8 @@ def test_is_session_expired_traversal_is_budget_bounded():
         ("_make_get_prompt_handler", {"tool_timeout": 10.0}, "get_prompt", "get_prompt"),
     ],
 )
-def test_non_tool_handlers_also_reconnect_on_session_expired(
+@pytest.mark.asyncio
+async def test_non_tool_handlers_also_reconnect_on_session_expired(
     monkeypatch, tmp_path, handler_factory, handler_kwargs, session_method, op_label
 ):
     """All four non-``tools/call`` MCP handlers share the recovery
@@ -95,9 +105,8 @@ def test_non_tool_handlers_also_reconnect_on_session_expired(
 
     from tools import mcp_tool
 
-    server, reconnect_flag = _install_stub_server(f"srv-{op_label}")
-    mcp_tool._servers[f"srv-{op_label}"] = server
-    mcp_tool._server_error_counts.pop(f"srv-{op_label}", None)
+    server_name = f"srv-{op_label}"
+    server = _install_stub_server(mcp_tool, server_name)
 
     call_count = {"n": 0}
 
@@ -109,37 +118,39 @@ def test_non_tool_handlers_also_reconnect_on_session_expired(
         # Explicitly set primitive attrs — MagicMock's default auto-attr
         # behaviour surfaces ``MagicMock`` values for optional fields
         # like ``description``, which break ``json.dumps`` downstream.
-        result = MagicMock()
-        result.resources = []
-        result.prompts = []
-        result.contents = []
-        result.messages = []  # get_prompt
-        result.description = None  # get_prompt optional field
-        return result
+        return SimpleNamespace(
+            resources=[],
+            prompts=[],
+            contents=[],
+            messages=[],
+            description=None,
+            nextCursor=None,
+        )
 
     setattr(server.session, session_method, _sequence)
 
+    async def reconnect(*_args, **_kwargs):
+        return True
+
+    monkeypatch.setattr(mcp_tool, "_await_native_mcp_reconnect", reconnect)
     factory = getattr(mcp_tool, handler_factory)
     # list_resources / list_prompts take (server_name, timeout).
     # read_resource / get_prompt take the same signature.
     try:
-        handler = factory(f"srv-{op_label}", **handler_kwargs)
+        handler = factory(server_name, **handler_kwargs)
         if op_label == "read_resource":
-            out = handler({"uri": "file://foo"})
+            out = await handler({"uri": "file://foo"})
         elif op_label == "get_prompt":
-            out = handler({"name": "p1"})
+            out = await handler({"name": "p1"})
         else:
-            out = handler({})
+            out = await handler({})
         parsed = json.loads(out)
         assert "error" not in parsed, (
             f"{op_label}: expected retry success, got {parsed}"
-        )
-        assert reconnect_flag.is_set(), (
-            f"{op_label}: reconnect should fire for session-expired"
         )
         assert call_count["n"] == 2, (
             f"{op_label}: expected 1 original + 1 retry"
         )
     finally:
-        mcp_tool._servers.pop(f"srv-{op_label}", None)
-        mcp_tool._server_error_counts.pop(f"srv-{op_label}", None)
+        mcp_tool._servers.pop(server_name, None)
+        mcp_tool._server_error_counts.pop(server_name, None)

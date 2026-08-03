@@ -1181,7 +1181,7 @@ async def _iter_skill_index_files(skills_dir: Path, filename: str):
     # Keep one directory-walking policy for both the model-facing skill tool
     # and prompt discovery.  The import is lazy to avoid making prompt
     # construction import the registry during module startup.
-    from tools.skills_tool import _iter_skill_index_files_async as _iter
+    from tools.skills_tool import _iter_skill_index_files as _iter
 
     async for path in _iter(skills_dir, filename):
         yield path
@@ -1398,9 +1398,9 @@ async def build_skills_system_prompt(
     """
     skills_dir = get_skills_dir()
     try:
-        from tools.skills_tool import _external_skills_dirs_async
+        from tools.skills_tool import _external_skills_dirs
 
-        external_dirs = await _external_skills_dirs_async()
+        external_dirs = await _external_skills_dirs()
     except Exception:
         external_dirs = []
 

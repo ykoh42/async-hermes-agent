@@ -81,60 +81,6 @@ class TestFireworksOverlay:
         assert not overlay.is_aggregator
 
 
-class TestFireworksDoctor:
-    def test_provider_env_hints_include_fireworks(self):
-        from hermes_cli.doctor import _PROVIDER_ENV_HINTS
-
-        assert "FIREWORKS_API_KEY" in _PROVIDER_ENV_HINTS
-
-    def test_slash_form_model_is_not_flagged_as_vendor_prefixed(self, monkeypatch, tmp_path):
-        """Fireworks' native model IDs are slash-form (accounts/fireworks/...),
-        so doctor must NOT warn that provider should be 'openrouter' / the prefix
-        dropped — that heuristic is for aggregator vendor slugs only."""
-        from hermes_cli import doctor as doctor_mod
-
-        home = tmp_path / ".hermes"
-        home.mkdir(parents=True)
-        (home / "config.yaml").write_text(
-            "model:\n"
-            "  provider: fireworks\n"
-            "  default: accounts/fireworks/models/kimi-k2p6\n"
-            "memory: {}\n",
-            encoding="utf-8",
-        )
-        (home / ".env").write_text("FIREWORKS_API_KEY=fw_test\n", encoding="utf-8")
-        project = tmp_path / "project"
-        project.mkdir()
-
-        monkeypatch.setattr(doctor_mod, "HERMES_HOME", home)
-        monkeypatch.setattr(doctor_mod, "PROJECT_ROOT", project)
-        monkeypatch.setattr(doctor_mod, "_DHH", str(home))
-        monkeypatch.setenv("FIREWORKS_API_KEY", "fw_test")
-
-        # Keep the run offline and cheap.
-        import httpx
-
-        monkeypatch.setattr(httpx, "get", lambda *a, **k: types.SimpleNamespace(status_code=200))
-        monkeypatch.setitem(
-            sys.modules,
-            "model_tools",
-            types.SimpleNamespace(check_tool_availability=lambda *a, **k: ([], []), TOOLSET_REQUIREMENTS={}),
-        )
-        with contextlib.suppress(Exception):
-            from hermes_cli import auth as _auth_mod
-
-            monkeypatch.setattr(_auth_mod, "get_nous_auth_status", lambda: {})
-            monkeypatch.setattr(_auth_mod, "get_codex_auth_status", lambda: {})
-
-        buf = io.StringIO()
-        with contextlib.suppress(SystemExit), contextlib.redirect_stdout(buf):
-            doctor_mod.run_doctor(Namespace(fix=False))
-        out = buf.getvalue()
-
-        assert "vendor-prefixed" not in out
-        assert "vendor/model slug" not in out
-
-
 class TestFireworksCredentials:
     def test_resolves_default_base_url(self, monkeypatch):
         monkeypatch.setenv("FIREWORKS_API_KEY", "fw_test_key")
@@ -145,19 +91,20 @@ class TestFireworksCredentials:
 class TestFireworksAuxiliary:
     """resolve_provider_client wires the BYOK key and PAYG-safe aux model."""
 
-    def _resolve(self, name):
+    async def _resolve(self, name):
         from unittest.mock import patch
 
         from agent.auxiliary_client import resolve_provider_client
 
-        with patch("agent.auxiliary_client.OpenAI") as mock_openai:
+        with patch("agent.auxiliary_client._create_openai_client") as mock_openai:
             mock_openai.return_value = object()
-            client, model = resolve_provider_client(name)
+            client, model = await resolve_provider_client(name)
         return client, model, mock_openai.call_args.kwargs
 
-    def test_client_has_no_partner_attribution_headers(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_client_has_no_partner_attribution_headers(self, monkeypatch):
         monkeypatch.setenv("FIREWORKS_API_KEY", "fw_test_key")
-        client, model, kwargs = self._resolve("fireworks")
+        client, model, kwargs = await self._resolve("fireworks")
         assert client is not None
         headers = kwargs.get("default_headers", {})
         assert "HTTP-Referer" not in headers

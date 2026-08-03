@@ -16,7 +16,7 @@ Core invariant these tests pin:
 """
 
 import os
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 
 import pytest
 
@@ -37,7 +37,7 @@ def _isolated_cwd(tmp_path, monkeypatch):
     # the worktree.
     monkeypatch.chdir(decoy)
     # No session cwd recorded yet (fresh-session condition).
-    monkeypatch.setattr(terminal_tool, "_session_cwd", {})
+    monkeypatch.setattr(terminal_tool, "_session_cwds", {})
     return workspace, decoy
 
 
@@ -89,56 +89,6 @@ def test_absolute_terminal_cwd_used_verbatim(_isolated_cwd, monkeypatch):
     assert resolved == (workspace / "target.py")
 
 
-def test_container_absolute_input_path_does_not_follow_host_symlink(tmp_path, monkeypatch):
-    """Docker paths are sandbox-local and must not be host-dereferenced.
-
-    A user may have a host symlink at a container-looking path such as
-    ``/workspace/projects``. For Docker file ops, resolving that symlink on the
-    host rewrites the path before Docker sees it, making file tools and terminal
-    disagree about where the file lives.
-    """
-    host_project = tmp_path / "host-project"
-    host_project.mkdir()
-    container_mount = tmp_path / "workspace-projects"
-    container_mount.symlink_to(host_project, target_is_directory=True)
-    monkeypatch.setattr(terminal_tool, "_get_env_config", lambda: {"env_type": "docker"})
-    monkeypatch.setattr(terminal_tool, "_active_environments", {})
-
-    container_path = container_mount / "oilsands-sim" / "README.md"
-    resolved = ft._resolve_path_for_task(str(container_path), task_id="default")
-
-    assert resolved == container_path
-    assert resolved != (host_project / "oilsands-sim" / "README.md")
-
-
-def test_container_path_normalization_uses_posix_path_syntax():
-    resolved = ft._normalize_without_host_deref("/workspace/projects/foo/../bar")
-
-    assert resolved == PurePosixPath("/workspace/projects/bar")
-    assert str(resolved) == "/workspace/projects/bar"
-
-
-def test_container_relative_path_keeps_container_cwd_symlink(tmp_path, monkeypatch):
-    """Relative Docker paths should stay under the container cwd textually."""
-    host_project = tmp_path / "host-project"
-    host_project.mkdir()
-    container_mount = tmp_path / "workspace-projects"
-    container_mount.symlink_to(host_project, target_is_directory=True)
-    monkeypatch.setattr(terminal_tool, "_get_env_config", lambda: {"env_type": "docker"})
-    monkeypatch.setattr(terminal_tool, "_active_environments", {})
-    terminal_tool.record_session_cwd("default", str(container_mount))
-
-    resolved = ft._resolve_path_for_task("oilsands-sim/README.md", task_id="default")
-
-    assert resolved == container_mount / "oilsands-sim" / "README.md"
-    assert resolved != host_project / "oilsands-sim" / "README.md"
-
-
-class _DummyDockerEnvironment:
-    cwd = "/workspace"
-    cwd_owner = "default"
-
-
 def test_resolution_base_always_absolute_no_terminal_cwd(_isolated_cwd, monkeypatch):
     """With TERMINAL_CWD unset, the base falls back to an ABSOLUTE process cwd."""
     workspace, decoy = _isolated_cwd
@@ -188,7 +138,7 @@ def test_warning_fires_from_terminal_cwd_when_registry_empty(_isolated_cwd, monk
     worktree is flagged on the very first write.
     """
     workspace, decoy = _isolated_cwd
-    monkeypatch.setattr(terminal_tool, "_session_cwd", {})
+    monkeypatch.setattr(terminal_tool, "_session_cwds", {})
     monkeypatch.setenv("TERMINAL_CWD", str(workspace))
 
     # Relative path that escapes the worktree into the decoy/main checkout.
@@ -224,8 +174,7 @@ def _two_worktree_sessions(tmp_path, monkeypatch):
     monkeypatch.chdir(main)
     monkeypatch.delenv("TERMINAL_CWD", raising=False)
     monkeypatch.setattr(terminal_tool, "_task_env_overrides", {})
-    monkeypatch.setattr(terminal_tool, "_session_cwd", {})
-    monkeypatch.setattr(ft, "_file_ops_cache", {})
+    monkeypatch.setattr(terminal_tool, "_session_cwds", {})
     # Both sessions register their worktree cwd (TUI/desktop registration path;
     # registration seeds each session's record).
     terminal_tool.register_task_env_overrides("sess-a", {"cwd": str(wt_a)})

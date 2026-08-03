@@ -322,7 +322,7 @@ async def test_request_middleware_rewrite_precedes_policy_and_dispatch():
     with (
         patch("hermes_cli.middleware.apply_tool_request_middleware", side_effect=rewrite_request),
         patch(
-            "hermes_cli.plugins.resolve_pre_tool_block_async",
+            "hermes_cli.plugins.resolve_pre_tool_block",
             side_effect=observe_plugin,
         ),
         patch.object(agent._tool_guardrails, "before_call", side_effect=observe_guardrail),
@@ -393,7 +393,7 @@ async def test_plugin_pre_tool_block_wins_without_counting_as_toolguard_block():
 
     with (
         patch(
-            "hermes_cli.plugins.resolve_pre_tool_block_async",
+            "hermes_cli.plugins.resolve_pre_tool_block",
             new_callable=AsyncMock,
             return_value="plugin policy",
         ),

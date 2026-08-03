@@ -30,7 +30,7 @@ def _clean_inference_env(monkeypatch):
         monkeypatch.delenv(key, raising=False)
 
 
-def _seed_openrouter_pool(token: str = "sk-or-FAKEKEY123") -> None:
+async def _seed_openrouter_pool(token: str = "sk-or-FAKEKEY123") -> None:
     """Mimic `hermes auth add openrouter <token>` — a manual pool entry."""
     from agent.credential_pool import (
         AUTH_TYPE_API_KEY,
@@ -39,8 +39,8 @@ def _seed_openrouter_pool(token: str = "sk-or-FAKEKEY123") -> None:
         load_pool,
     )
 
-    pool = load_pool("openrouter")
-    pool.add_entry(
+    pool = await load_pool("openrouter")
+    await pool.add_entry(
         PooledCredential(
             provider="openrouter",
             id=uuid.uuid4().hex[:6],
@@ -54,14 +54,16 @@ def _seed_openrouter_pool(token: str = "sk-or-FAKEKEY123") -> None:
     )
 
 
-def test_auto_detects_openrouter_from_pool(tmp_path, monkeypatch):
+@pytest.mark.asyncio
+async def test_auto_detects_openrouter_from_pool(tmp_path, monkeypatch):
     """With only a pool credential (no env var), auto-detection finds it."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
     (tmp_path / "hermes").mkdir(parents=True, exist_ok=True)
-    _seed_openrouter_pool()
+    await _seed_openrouter_pool()
 
-    from hermes_cli.auth import resolve_provider
+    from hermes_cli.runtime_provider import resolve_runtime_provider
 
-    assert resolve_provider("auto") == "openrouter"
-
+    runtime = await resolve_runtime_provider(requested="auto")
+    assert runtime["provider"] == "openrouter"
+    assert runtime["api_key"] == "sk-or-FAKEKEY123"
 

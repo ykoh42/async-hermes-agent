@@ -169,7 +169,7 @@ class TestMinimaxBetaHeaders:
         from agent.anthropic_adapter import build_anthropic_client
         with patch("agent.anthropic_adapter._anthropic_sdk") as mock_sdk:
             build_anthropic_client(api_key, base_url=base_url)
-            kwargs = mock_sdk.Anthropic.call_args[1]
+            kwargs = mock_sdk.AsyncAnthropic.call_args[1]
             headers = kwargs.get("default_headers", {})
             return headers.get("anthropic-beta", "")
 

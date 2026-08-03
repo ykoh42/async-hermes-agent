@@ -9,11 +9,13 @@ instance.
 
 from __future__ import annotations
 
+import pytest
+
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 
-def _make_minimal_agent(memory_manager, context_compressor, session_id="abc"):
+def _make_minimal_agent(context_compressor, session_id="abc"):
     """Build an object with just enough surface for commit_memory_session to run.
 
     AIAgent.__init__ is too heavy for a focused unit test — bind the method
@@ -23,7 +25,7 @@ def _make_minimal_agent(memory_manager, context_compressor, session_id="abc"):
     from run_agent import AIAgent
 
     obj = SimpleNamespace(
-        _memory_manager=memory_manager,
+        _memory_manager=None,
         context_compressor=context_compressor,
         session_id=session_id,
     )
@@ -31,18 +33,16 @@ def _make_minimal_agent(memory_manager, context_compressor, session_id="abc"):
     return obj
 
 
-def test_commit_memory_session_notifies_context_engine():
-    """Both the memory manager AND the context engine receive on_session_end."""
-    mm = MagicMock()
+@pytest.mark.asyncio
+async def test_commit_memory_session_notifies_context_engine():
+    """The active built-in context engine receives the session boundary."""
     ctx = MagicMock()
-    agent = _make_minimal_agent(mm, ctx, session_id="sess-42")
+    agent = _make_minimal_agent(ctx, session_id="sess-42")
 
     msgs = [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "yo"}]
-    agent.commit_memory_session(msgs)
+    await agent.commit_memory_session(msgs)
 
-    mm.on_session_end.assert_called_once_with(msgs)
     ctx.on_session_end.assert_called_once_with("sess-42", msgs)
-
 
 
 

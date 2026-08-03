@@ -20,6 +20,7 @@ preserved.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import os
 import re
@@ -1270,14 +1271,6 @@ def init_agent(
                     headers["x-anthropic-beta"] = _FINE_GRAINED
                 client_kwargs["default_headers"] = headers
 
-        # User-configured request headers (model.default_headers in
-        # config.yaml) override provider/SDK defaults. Lets custom
-        # OpenAI-compatible endpoints behind a gateway/WAF that rejects the
-        # OpenAI SDK's identifying headers swap in a plain User-Agent. (#40033)
-        # client_kwargs is the same dict object as agent._client_kwargs, so
-        # this mutation is reflected in the client built just below.
-        agent._apply_user_default_headers()
-
         try:
             from hermes_cli.config import (
                 apply_custom_provider_extra_headers_to_client_kwargs,
@@ -1288,6 +1281,18 @@ def init_agent(
             )
 
             _cp_config = load_config()
+            # Header policy is part of the construction-time route snapshot.
+            # The deferred async runtime receives the resolved values through
+            # client_kwargs and never rereads config.yaml during a turn.
+            if base_url_host_matches(_cp_base_url := str(
+                base_url or client_kwargs.get("base_url") or agent.base_url or ""
+            ), "openrouter.ai"):
+                from agent.auxiliary_client import build_or_headers
+
+                client_kwargs["default_headers"] = build_or_headers(
+                    _cp_config.get("openrouter") or {}
+                )
+            agent._apply_user_default_headers(config=_cp_config)
             _configured_providers = _cp_config.get("providers", {})
             if isinstance(_configured_providers, dict):
                 # Keep a state-only policy snapshot for provider switches and
@@ -1295,7 +1300,6 @@ def init_agent(
                 # never config.yaml.
                 agent._async_provider_timeout_settings = dict(_configured_providers)
             _cp_entries = get_compatible_custom_providers(_cp_config)
-            _cp_base_url = str(base_url or client_kwargs.get("base_url") or agent.base_url or "")
             apply_custom_provider_tls_to_client_kwargs(
                 client_kwargs,
                 _cp_base_url,
@@ -1535,11 +1539,11 @@ def init_agent(
     # Only the native async implementation is accepted: silently wrapping a
     # synchronous store would reintroduce blocking I/O into the turn path.
     if session_db is not None:
-        from hermes_state import AsyncSessionDB
+        from hermes_state import SessionDB
 
-        if not isinstance(session_db, AsyncSessionDB):
+        if not isinstance(session_db, SessionDB):
             raise TypeError(
-                "AIAgent session_db must be hermes_state.AsyncSessionDB; "
+                "AIAgent session_db must be hermes_state.SessionDB; "
                 f"got {type(session_db).__name__}"
             )
     agent._session_db = session_db
@@ -3017,7 +3021,6 @@ async def initialize_deferred_runtime(agent: Any) -> bool:
             agent._async_client_source = agent.client
             agent._anthropic_client = None
         else:
-            from openai import AsyncOpenAI
             from agent.auxiliary_client import (
                 _AI_GATEWAY_HEADERS,
                 build_nvidia_nim_headers,
@@ -3064,7 +3067,7 @@ async def initialize_deferred_runtime(agent: Any) -> bool:
             )
             if http_client is not None:
                 client_kwargs["http_client"] = http_client
-            agent.client = AsyncOpenAI(**client_kwargs)
+            agent.client = _ra().OpenAI(**client_kwargs)
             # OpenAI>=2 lazily resolves the platform on the first request.
             # The value only controls an SDK telemetry
             # header, so use a stable conservative value and keep the agent
@@ -3080,26 +3083,6 @@ async def initialize_deferred_runtime(agent: Any) -> bool:
             # A fallback can leave an Anthropic client attached while the
             # next selected credential uses the OpenAI wire format.
             agent._anthropic_client = None
-
-        active_clients = {id(candidate) for candidate in (
-            getattr(agent, "client", None),
-            getattr(agent, "_anthropic_client", None),
-        ) if candidate is not None}
-        closed_client_ids: set[int] = set()
-        for stale_client in (previous_client, previous_anthropic_client):
-            if stale_client is None or id(stale_client) in active_clients:
-                continue
-            if id(stale_client) in closed_client_ids:
-                continue
-            closed_client_ids.add(id(stale_client))
-            aclose = getattr(stale_client, "aclose", None)
-            if aclose is None:
-                # The only expected synchronous client is the constructor's
-                # no-request placeholder. Calling its blocking ``close`` from
-                # a turn would violate the async boundary; let normal object
-                # finalization release it instead.
-                continue
-            await aclose()
 
         agent._use_prompt_caching, agent._use_native_cache_layout = (
             agent._anthropic_prompt_cache_policy()
@@ -3136,6 +3119,25 @@ async def initialize_deferred_runtime(agent: Any) -> bool:
                     "anthropic_base_url": agent._anthropic_base_url,
                     "is_anthropic_oauth": agent._is_anthropic_oauth,
                 })
+
+        # Retire the previous transport only after every fallible policy and
+        # compressor update above succeeds. This keeps switch_model rollback
+        # able to restore a still-live client if native initialization fails.
+        active_clients = {id(candidate) for candidate in (
+            getattr(agent, "client", None),
+            getattr(agent, "_anthropic_client", None),
+        ) if candidate is not None}
+        closed_client_ids: set[int] = set()
+        for stale_client in (previous_client, previous_anthropic_client):
+            if stale_client is None or id(stale_client) in active_clients:
+                continue
+            if id(stale_client) in closed_client_ids:
+                continue
+            closed_client_ids.add(id(stale_client))
+            aclose = getattr(stale_client, "aclose", None)
+            if aclose is None or not inspect.iscoroutinefunction(aclose):
+                continue
+            await aclose()
 
         agent._deferred_provider_runtime = None
         logger.info("Initialized native async runtime for %s", provider)

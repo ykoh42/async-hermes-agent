@@ -209,24 +209,6 @@ class TestIsSatisfiedVersionAware:
         self._fake_version(monkeypatch, {"mautrix": "0.20.0"})
         assert ld._is_satisfied("mautrix[encryption]==0.21.0") is False
 
-    def test_trace_upload_hub_at_core_locked_version_is_current(self, monkeypatch):
-        """#60783 regression: refresh must not churn the shared hub install.
-
-        huggingface-hub arrives in the venv via the core lock (transformers /
-        sentence-transformers for local Hindsight, faster-whisper, tokenizers).
-        With the LAZY_DEPS pin held in lockstep with uv.lock, the version the
-        core installs satisfies the trace-upload spec, so the `hermes update`
-        lazy-refresh pass reports "current" instead of reinstalling — the
-        downgrade that used to break the Hindsight daemon can't happen.
-        """
-        spec = ld.LAZY_DEPS["tool.trace_upload"][0]
-        pinned = ld._specifier_from_spec(spec).lstrip("=")
-        self._fake_version(monkeypatch, {"huggingface-hub": pinned})
-        assert ld._is_satisfied(spec) is True
-        assert ld.feature_missing("tool.trace_upload") == ()
-
-
-# ---------------------------------------------------------------------------
 # active_features + refresh_active_features (Piece A — hermes update wiring)
 # ---------------------------------------------------------------------------
 
@@ -237,39 +219,12 @@ class TestActiveFeatures:
         assert ld.active_features() == []
 
 
-    def test_shared_dependency_does_not_activate_feature(self, monkeypatch):
-        # asyncpg is a generic dependency that may be installed for unrelated
-        # reasons. It must not make hermes update try to refresh Matrix unless
-        # the Matrix anchor package (mautrix) is present.
-        monkeypatch.setattr(
-            ld, "_is_present",
-            lambda spec: ld._pkg_name_from_spec(spec) == "asyncpg",
-        )
-        assert "platform.matrix" not in ld.active_features()
 
 
 class TestRefreshActiveFeatures:
     def test_no_active_features_returns_empty(self, monkeypatch):
         monkeypatch.setattr(ld, "active_features", lambda: [])
         assert ld.refresh_active_features() == {}
-
-    def test_windows_matrix_refresh_is_skipped_before_pip(self, monkeypatch):
-        # Matrix E2EE pulls python-olm, which has no native Windows wheel/build
-        # path. `hermes update` must not retry that doomed install every run.
-        monkeypatch.setattr(ld.sys, "platform", "win32")
-        monkeypatch.setattr(ld, "active_features", lambda: ["platform.matrix"])
-        monkeypatch.setattr(ld, "_is_satisfied", lambda spec: False)
-        monkeypatch.setattr(ld, "_allow_lazy_installs", lambda: True)
-        monkeypatch.setattr(
-            ld,
-            "_venv_pip_install",
-            lambda *a, **kw: pytest.fail("pip should not be called for unsupported Matrix on Windows"),
-        )
-
-        result = ld.refresh_active_features()
-
-        assert result["platform.matrix"].startswith("skipped:")
-        assert "unsupported on Windows" in result["platform.matrix"]
 
 
     def test_mixed_results_returns_per_feature_status(self, monkeypatch):

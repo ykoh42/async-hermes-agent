@@ -34,7 +34,7 @@ from agent.conversation_compression import (
     _persist_compression_guards,
 )
 from agent.context_compressor import ContextCompressor
-from hermes_state import AsyncSessionDB
+from hermes_state import SessionDB
 
 
 def _compressor(threshold_tokens: int = 10_000) -> ContextCompressor:
@@ -95,7 +95,7 @@ class TestRestartSemantics:
     @pytest.mark.asyncio
     async def test_restart_with_durable_tripped_counter_waits_a_full_window(self, tmp_path):
         """#69872 x #14694: a restart must not disarm OR shorten the guard."""
-        db = AsyncSessionDB(db_path=tmp_path / "state.db")
+        db = SessionDB(db_path=tmp_path / "state.db")
         await db.create_session(session_id="sess-1", source="cli")
         await db.set_compression_ineffective_count("sess-1", 2)
 

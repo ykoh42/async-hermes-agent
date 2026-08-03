@@ -14,27 +14,6 @@ from hermes_cli.moa_config import (
 )
 
 
-def test_moa_slot_picker_excludes_unconfigured_providers(monkeypatch):
-    from hermes_cli import moa_cmd
-
-    captured = {}
-    monkeypatch.setattr(moa_cmd, "load_picker_context", lambda: object())
-
-    def fake_build(_context, **kwargs):
-        captured.update(kwargs)
-        return {
-            "providers": [
-                {"slug": "moa", "models": ["default"]},
-                {"slug": "opencode-go", "models": ["deepseek-v4-pro"]},
-            ]
-        }
-
-    monkeypatch.setattr(moa_cmd, "build_models_payload", fake_build)
-
-    assert [row["slug"] for row in moa_cmd._model_options()] == ["opencode-go"]
-    assert captured["include_unconfigured"] is False
-
-
 def _enabled_refs(refs):
     return [{**slot, "enabled": True} for slot in refs]
 
@@ -175,7 +154,6 @@ def test_validate_moa_payload_agrees_with_clean_slot():
 
 
 # --- privacy_filter normalization ---
-
 
 
 

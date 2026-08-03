@@ -46,7 +46,7 @@ class TestHandleFunctionCall:
             patch("model_tools.registry.dispatch", return_value='{"ok":true}'),
             patch("hermes_cli.plugins.has_hook", return_value=True),
             patch(
-                "hermes_cli.plugins.invoke_hook_async",
+                "hermes_cli.plugins.invoke_hook",
                 new_callable=AsyncMock,
                 return_value=[],
             ) as mock_invoke_hook,
@@ -98,7 +98,7 @@ class TestHandleFunctionCall:
         async def invoke_hook(hook_name, **kwargs):
             hook_calls.append((hook_name, kwargs))
             return []
-        monkeypatch.setattr("hermes_cli.plugins.invoke_hook_async", invoke_hook)
+        monkeypatch.setattr("hermes_cli.plugins.invoke_hook", invoke_hook)
         monkeypatch.setattr("hermes_cli.plugins.has_hook", lambda name: True)
         monkeypatch.setattr("model_tools.registry.dispatch", fake_dispatch)
 
@@ -163,7 +163,7 @@ class TestPreToolCallBlocking:
             dispatch_called = True
             raise AssertionError("dispatch should not run when blocked")
 
-        monkeypatch.setattr("hermes_cli.plugins.invoke_hook_async", fake_invoke_hook)
+        monkeypatch.setattr("hermes_cli.plugins.invoke_hook", fake_invoke_hook)
         monkeypatch.setattr("hermes_cli.plugins.has_hook", lambda name: True)
         monkeypatch.setattr("model_tools.registry.dispatch", fake_dispatch)
 
@@ -187,7 +187,7 @@ class TestPreToolCallBlocking:
                 return [{"action": "block", "message": "Blocked"}]
             return []
 
-        monkeypatch.setattr("hermes_cli.plugins.invoke_hook_async", fake_invoke_hook)
+        monkeypatch.setattr("hermes_cli.plugins.invoke_hook", fake_invoke_hook)
         monkeypatch.setattr("model_tools.registry.dispatch",
                             lambda *a, **kw: (_ for _ in ()).throw(AssertionError("should not run")))
         monkeypatch.setattr("tools.file_tools.notify_other_tool_call",
@@ -211,7 +211,7 @@ class TestPreToolCallBlocking:
                 ]
             return []
 
-        monkeypatch.setattr("hermes_cli.plugins.invoke_hook_async", fake_invoke_hook)
+        monkeypatch.setattr("hermes_cli.plugins.invoke_hook", fake_invoke_hook)
         async def dispatch(*_args, **_kwargs):
             return json.dumps({"ok": True})
 
@@ -221,43 +221,6 @@ class TestPreToolCallBlocking:
             await handle_function_call("read_file", {"path": "test.txt"}, task_id="t1")
         )
         assert result == {"ok": True}
-
-
-    @pytest.mark.asyncio
-    async def test_relay_rewrite_is_visible_to_pre_tool_authorization(self, monkeypatch):
-        observed = {}
-
-        def rewrite(**kwargs):
-            assert kwargs["tool_name"] == "read_file"
-            return {**kwargs["args"], "path": "approved.txt"}
-
-        async def fake_invoke_hook(hook_name, **kwargs):
-            if hook_name == "pre_tool_call":
-                observed["pre_tool_args"] = kwargs["args"]
-            return []
-
-        async def dispatch(_name, args, **_kwargs):
-            observed["dispatch_args"] = args
-            return json.dumps({"ok": True})
-
-        monkeypatch.setattr(
-            "hermes_cli.observability.relay_runtime.apply_tool_request_intercepts",
-            rewrite,
-        )
-        monkeypatch.setattr("hermes_cli.plugins.invoke_hook_async", fake_invoke_hook)
-        monkeypatch.setattr("hermes_cli.plugins.has_hook", lambda name: True)
-        monkeypatch.setattr("model_tools.registry.dispatch", dispatch)
-
-        await handle_function_call(
-            "read_file",
-            {"path": "original.txt"},
-            task_id="t1",
-            session_id="s1",
-        )
-
-        assert observed["pre_tool_args"]["path"] == "approved.txt"
-        assert observed["dispatch_args"]["path"] == "approved.txt"
-
 
 
 # =========================================================================

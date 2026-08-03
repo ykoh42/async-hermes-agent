@@ -164,7 +164,7 @@ def _skills_dir() -> Path:
     return get_hermes_home() / "skills"
 
 
-async def _external_skills_dirs_async() -> List[Path]:
+async def _external_skills_dirs() -> List[Path]:
     """Resolve configured external skill roots without synchronous file I/O."""
     from hermes_cli.config import get_config_path
 
@@ -220,7 +220,7 @@ async def _external_skills_dirs_async() -> List[Path]:
     return roots
 
 
-async def _active_org_id_async(skills_dir: Path) -> str | None:
+async def _active_org_id(skills_dir: Path) -> str | None:
     marker = skills_dir / "_org" / ".active_org"
     try:
         if not await aiofiles.os.path.isfile(marker):
@@ -232,11 +232,11 @@ async def _active_org_id_async(skills_dir: Path) -> str | None:
         return None
 
 
-async def _iter_skill_index_files_async(skills_dir: Path, filename: str):
+async def _iter_skill_index_files(skills_dir: Path, filename: str):
     """Yield skill index files using native async directory operations."""
     from agent.skill_utils import SKILL_SUPPORT_DIRS
 
-    active_org = await _active_org_id_async(skills_dir)
+    active_org = await _active_org_id(skills_dir)
     org_root = skills_dir / "_org"
 
     async def walk(directory: Path):
@@ -283,7 +283,7 @@ async def _iter_skill_index_files_async(skills_dir: Path, filename: str):
         yield result
 
 
-async def _iter_files_async(directory: Path):
+async def _iter_files(directory: Path):
     """Yield regular files below *directory* without blocking the loop."""
     try:
         iterator = await aiofiles.os.scandir(directory)
@@ -303,7 +303,7 @@ async def _iter_files_async(directory: Path):
     finally:
         iterator.close()
     for child in sorted(directories, key=lambda path: path.name):
-        async for result in _iter_files_async(child):
+        async for result in _iter_files(child):
             yield result
 
 
@@ -743,7 +743,7 @@ async def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any
     active = _skills_dir()
     if await aiofiles.os.path.isdir(active):
         roots.append(active)
-    roots.extend(await _external_skills_dirs_async())
+    roots.extend(await _external_skills_dirs())
     signature = await _skills_scan_signature(roots, disabled)
     now = time.monotonic()
     cached = _SKILLS_CACHE.get(cache_key)
@@ -753,7 +753,7 @@ async def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any
     skills: List[Dict[str, Any]] = []
     seen_names: set[str] = set()
     for root in roots:
-        async for skill_md in _iter_skill_index_files_async(root, "SKILL.md"):
+        async for skill_md in _iter_skill_index_files(root, "SKILL.md"):
             if any(part in _EXCLUDED_SKILL_DIRS for part in skill_md.parts):
                 continue
             try:
@@ -976,7 +976,7 @@ async def skill_view(
                 )
         active = _skills_dir()
         roots = [active] if await aiofiles.os.path.isdir(active) else []
-        roots.extend(await _external_skills_dirs_async())
+        roots.extend(await _external_skills_dirs())
         candidates: list[tuple[Path | None, Path, Path]] = []
         seen: set[Path] = set()
         for root in roots:
@@ -989,7 +989,7 @@ async def skill_view(
             if await aiofiles.os.path.isfile(legacy_md):
                 candidates.append((None, legacy_md, root))
                 seen.add(legacy_md.resolve())
-            async for candidate in _iter_skill_index_files_async(root, "SKILL.md"):
+            async for candidate in _iter_skill_index_files(root, "SKILL.md"):
                 if candidate.resolve() in seen:
                     continue
                 if candidate.parent.name == name:
@@ -1086,7 +1086,7 @@ async def skill_view(
                 if await aiofiles.os.path.isdir(folder):
                     files = [
                         str(path.relative_to(skill_dir))
-                        async for path in _iter_files_async(folder)
+                        async for path in _iter_files(folder)
                     ]
                     if files:
                         linked_files[folder_name] = files

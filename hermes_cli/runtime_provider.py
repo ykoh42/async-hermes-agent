@@ -1834,6 +1834,32 @@ async def resolve_runtime_provider(
                 runtime["requested_provider"] = requested_provider
                 return runtime
 
+    # Pool-only OpenRouter credentials must participate in auto resolution
+    # before a stale OAuth login or a lower-priority provider key wins.  The
+    # synchronous provider classifier cannot inspect the native-async pool, so
+    # keep that I/O at this async runtime boundary.
+    if requested_provider == "auto" and not explicit_api_key and not explicit_base_url:
+        try:
+            openrouter_pool = await load_pool("openrouter")
+        except Exception:
+            openrouter_pool = None
+        if openrouter_pool and openrouter_pool.has_credentials():
+            entry = await openrouter_pool.select()
+            if entry is not None:
+                pool_api_key = (
+                    getattr(entry, "runtime_api_key", None)
+                    or getattr(entry, "access_token", "")
+                )
+                if pool_api_key:
+                    return _resolve_runtime_from_pool_entry(
+                        provider="openrouter",
+                        entry=entry,
+                        requested_provider=requested_provider,
+                        model_cfg=model_config_snapshot,
+                        pool=openrouter_pool,
+                        target_model=target_model,
+                    )
+
     provider = resolve_provider(
         requested_provider,
         explicit_api_key=explicit_api_key,

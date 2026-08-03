@@ -1,7 +1,7 @@
 """Credential pools must never cross provider or custom-endpoint boundaries."""
 
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -52,17 +52,17 @@ async def test_runtime_ignores_pool_loaded_for_different_provider(monkeypatch):
     monkeypatch.setattr(
         rp,
         "_get_model_config",
-        lambda: {"provider": "deepseek", "default": "deepseek-chat"},
+        lambda *_args, **_kwargs: {"provider": "deepseek", "default": "deepseek-chat"},
     )
     monkeypatch.setattr(
-        rp,
-        "resolve_api_key_provider_credentials",
-        lambda _provider: {
+        rp.auth_mod,
+        "resolve_api_key_provider_credentials_async",
+        AsyncMock(return_value={
             "provider": "deepseek",
             "api_key": "deepseek-key",
             "base_url": "https://api.deepseek.com/v1",
             "source": "env",
-        },
+        }),
     )
 
     resolved = await rp.resolve_runtime_provider(requested="deepseek")

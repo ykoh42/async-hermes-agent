@@ -41,7 +41,7 @@ def _facade(monkeypatch, tmp_path, on_call=None):
     monkeypatch.setenv("HERMES_HOME", str(home))
     calls = []
 
-    def fake_call_llm(**kwargs):
+    async def fake_call_llm(**kwargs):
         calls.append(kwargs)
         if on_call is not None:
             r = on_call(kwargs)
@@ -61,7 +61,8 @@ def _facade(monkeypatch, tmp_path, on_call=None):
 # Facade-level: create() stream branch
 # --------------------------------------------------------------------------
 
-def test_create_streams_aggregator_when_requested(monkeypatch, tmp_path):
+@pytest.mark.asyncio
+async def test_create_streams_aggregator_when_requested(monkeypatch, tmp_path):
     """stream=True: references still run, aggregator is called with stream=True
     and stream_options, and create() returns the aggregator call's result
     (the raw stream) verbatim."""
@@ -73,7 +74,7 @@ def test_create_streams_aggregator_when_requested(monkeypatch, tmp_path):
         return None
 
     facade, calls = _facade(monkeypatch, tmp_path, on_call=on_call)
-    out = facade.create(
+    out = await facade.create(
         messages=[{"role": "user", "content": "q"}],
         tools=[{"type": "function"}],
         stream=True,
@@ -90,11 +91,12 @@ def test_create_streams_aggregator_when_requested(monkeypatch, tmp_path):
     assert agg["tools"] is not None
 
 
-def test_create_non_stream_path_unchanged(monkeypatch, tmp_path):
+@pytest.mark.asyncio
+async def test_create_non_stream_path_unchanged(monkeypatch, tmp_path):
     """Default (no stream): the aggregator call carries NO stream/stream_options
     keys, so the non-streaming path is byte-identical to before."""
     facade, calls = _facade(monkeypatch, tmp_path)
-    facade.create(messages=[{"role": "user", "content": "q"}], tools=[])
+    await facade.create(messages=[{"role": "user", "content": "q"}], tools=[])
 
     agg = next(c for c in calls if c["task"] == "moa_aggregator")
     assert "stream" not in agg
@@ -102,12 +104,13 @@ def test_create_non_stream_path_unchanged(monkeypatch, tmp_path):
     assert "timeout" not in agg
 
 
-def test_create_forwards_stream_read_timeout(monkeypatch, tmp_path):
+@pytest.mark.asyncio
+async def test_create_forwards_stream_read_timeout(monkeypatch, tmp_path):
     """The consumer's per-request (stream read) timeout is forwarded to the
     aggregator so it actually governs the stream."""
     timeout_sentinel = object()
     facade, calls = _facade(monkeypatch, tmp_path)
-    facade.create(
+    await facade.create(
         messages=[{"role": "user", "content": "q"}],
         tools=[],
         stream=True,
@@ -125,7 +128,8 @@ def test_create_forwards_stream_read_timeout(monkeypatch, tmp_path):
 # call_llm-level: stream branch returns the raw SDK stream
 # --------------------------------------------------------------------------
 
-def test_call_llm_stream_returns_raw_stream_and_skips_validation(monkeypatch):
+@pytest.mark.asyncio
+async def test_call_llm_stream_returns_raw_stream_and_skips_validation(monkeypatch):
     """call_llm(stream=True) returns the client's raw stream object directly,
     attaches stream/stream_options to the request, and does NOT run response
     validation (which assumes a complete response)."""
@@ -134,7 +138,7 @@ def test_call_llm_stream_returns_raw_stream_and_skips_validation(monkeypatch):
     captured = {}
 
     class _Completions:
-        def create(self, **kwargs):
+        async def create(self, **kwargs):
             captured.update(kwargs)
             return "RAW_STREAM"
 
@@ -147,14 +151,17 @@ def test_call_llm_stream_returns_raw_stream_and_skips_validation(monkeypatch):
         ac, "_resolve_task_provider_model",
         lambda *a, **k: ("custom", "m", "http://localhost:8001/v1", "key", "chat_completions"),
     )
-    monkeypatch.setattr(ac, "_get_cached_client", lambda *a, **k: (fake_client, "m"))
+    async def _cached_client(*args, **kwargs):
+        return fake_client, "m"
+
+    monkeypatch.setattr(ac, "_get_cached_client", _cached_client)
 
     def _no_validate(*a, **k):
         raise AssertionError("streaming must not go through _validate_llm_response")
 
     monkeypatch.setattr(ac, "_validate_llm_response", _no_validate)
 
-    out = ac.call_llm(
+    out = await ac.call_llm(
         provider="custom",
         model="m",
         messages=[{"role": "user", "content": "hi"}],
@@ -165,5 +172,3 @@ def test_call_llm_stream_returns_raw_stream_and_skips_validation(monkeypatch):
     assert out == "RAW_STREAM"
     assert captured.get("stream") is True
     assert captured.get("stream_options") == {"include_usage": True}
-
-

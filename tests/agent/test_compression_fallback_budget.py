@@ -7,7 +7,7 @@ Two failure amplifiers when the auxiliary compression route times out:
    A fallback tuned differently (or simply slower-but-healthy) died on the
    same clock the primary just burned, guaranteeing chain exhaustion.
    Fix: ``auxiliary.<task>.fallback_chain`` entries may declare their own
-   ``timeout``; ``_call_fallback_candidate_sync/async`` resolve it via
+   ``timeout``; ``_call_fallback_candidate`` resolves it via
    ``_fallback_entry_timeout``.
 
 2. A session whose transcript structurally cannot be summarised within the
@@ -47,20 +47,18 @@ async def test_fallback_candidate_call_uses_entry_timeout():
     timeout, not the task-level one the primary just burned."""
     seen = {}
 
-    fb_client = SimpleNamespace(
-        base_url="https://example.invalid/v1",
-    )
-    chain = [{"provider": "custom", "timeout": 240}]
-    async def _fake_completion(_client, kwargs, **_options):
-        seen.update(kwargs)
-        return SimpleNamespace(
+    create = AsyncMock(
+        return_value=SimpleNamespace(
             choices=[SimpleNamespace(message=SimpleNamespace(content="ok"))]
         )
+    )
+    fb_client = SimpleNamespace(
+        base_url="https://example.invalid/v1",
+        chat=SimpleNamespace(completions=SimpleNamespace(create=create)),
+    )
+    chain = [{"provider": "custom", "timeout": 240}]
 
-    with _patch_task_config(chain), patch(
-        "agent.auxiliary_client._relay_completion",
-        side_effect=_fake_completion,
-    ):
+    with _patch_task_config(chain):
         resp = await _call_fallback_candidate(
             fb_client, "deepseek-v4-flash", "fallback_chain[0](custom)",
             task="compression", messages=[{"role": "user", "content": "hi"}],
@@ -69,6 +67,7 @@ async def test_fallback_candidate_call_uses_entry_timeout():
             effective_extra_body={}, reasoning_config=None,
         )
     assert resp is not None
+    seen.update(create.await_args.kwargs)
     assert seen.get("timeout") == 240.0
 
 

@@ -52,14 +52,17 @@ def fresh_tracker():
 
 
 class TestPatchFailureEscalation:
-    def test_first_two_failures_use_normal_hint(self, hermes_home, tmp_path, fresh_tracker):
+    @pytest.mark.asyncio
+    async def test_first_two_failures_use_normal_hint(
+        self, hermes_home, tmp_path, fresh_tracker
+    ):
         from tools.file_tools import _handle_patch
 
         target = tmp_path / "f.py"
         target.write_text("def foo():\n    return 1\n")
 
         for _i in range(2):
-            result = _handle_patch(
+            result = await _handle_patch(
                 {
                     "mode": "replace",
                     "path": str(target),
@@ -75,7 +78,8 @@ class TestPatchFailureEscalation:
             )
 
 
-    def test_different_tasks_have_independent_counters(
+    @pytest.mark.asyncio
+    async def test_different_tasks_have_independent_counters(
         self, hermes_home, tmp_path, fresh_tracker
     ):
         from tools.file_tools import _handle_patch
@@ -85,7 +89,7 @@ class TestPatchFailureEscalation:
 
         # Three failures under task A.
         for _i in range(3):
-            _handle_patch(
+            await _handle_patch(
                 {
                     "mode": "replace",
                     "path": str(target),
@@ -96,7 +100,7 @@ class TestPatchFailureEscalation:
             )
 
         # First failure under task B — should NOT see escalation.
-        result = _handle_patch(
+        result = await _handle_patch(
             {
                 "mode": "replace",
                 "path": str(target),

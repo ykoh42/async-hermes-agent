@@ -149,34 +149,6 @@ def test_bounded_git_probe_spawn_failure_returns_empty(monkeypatch):
 
 
 
-def test_shell_hooks_hide_hook_command_windows(monkeypatch):
-    from agent import shell_hooks
-
-    captured = []
-
-    def fake_run(cmd, **kwargs):
-        captured.append((cmd, kwargs))
-        return SimpleNamespace(returncode=0, stdout="{}", stderr="")
-
-    monkeypatch.setattr(shell_hooks, "IS_WINDOWS", True)
-    monkeypatch.setattr(shell_hooks, "windows_hide_flags", lambda: _CREATE_NO_WINDOW)
-    monkeypatch.setattr(shell_hooks.subprocess, "run", fake_run)
-
-    result = shell_hooks._spawn(
-        shell_hooks.ShellHookSpec(event="post_tool_call", command="hook-bin --flag"),
-        "{}",
-    )
-
-    assert result["returncode"] == 0
-    assert captured[0][1]["creationflags"] == _CREATE_NO_WINDOW
-
-
-
-
-
-
-
-
 
 
 

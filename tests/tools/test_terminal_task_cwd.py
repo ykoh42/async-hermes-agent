@@ -1,143 +1,58 @@
-"""Regression tests for task/session cwd propagation in terminal_tool."""
+"""Task-scoped working directories remain isolated in the async terminal."""
 
+import asyncio
 import json
-from types import SimpleNamespace
 
-import tools.terminal_tool as terminal_tool
+import pytest
 
-
-def _minimal_terminal_config(cwd="/default"):
-    return {
-        "env_type": "local",
-        "cwd": cwd,
-        "timeout": 60,
-        "lifetime_seconds": 3600,
-    }
+import tools.terminal_tool as terminal
 
 
-def test_foreground_command_uses_registered_task_cwd_for_existing_environment(monkeypatch):
-    """ACP can update task cwd after the local env exists; foreground must honor it."""
-    calls = []
-
-    class FakeEnv:
-        env = {}
-
-        def execute(self, command, **kwargs):
-            calls.append((command, kwargs))
-            return {"output": "ok", "returncode": 0}
-
-    task_id = "acp-session-1"
-    monkeypatch.setattr(terminal_tool, "_active_environments", {task_id: FakeEnv()})
-    monkeypatch.setattr(terminal_tool, "_last_activity", {})
-    monkeypatch.setattr(terminal_tool, "_task_env_overrides", {task_id: {"cwd": "/workspace/acp"}})
-    monkeypatch.setattr(terminal_tool, "_get_env_config", lambda: _minimal_terminal_config())
-    monkeypatch.setattr(
-        terminal_tool,
-        "_check_all_guards",
-        lambda command, env_type, **kwargs: {"approved": True},
-    )
-
-    result = json.loads(terminal_tool.terminal_tool(command="pwd", task_id=task_id))
-
-    assert result["exit_code"] == 0
-    assert calls == [("pwd", {"timeout": 60, "cwd": "/workspace/acp", "bounded_capture": True})]
+@pytest.mark.asyncio
+async def test_registered_task_cwd_is_used(tmp_path):
+    task_id = "cwd-task"
+    terminal.register_task_env_overrides(task_id, {"cwd": str(tmp_path)})
+    try:
+        result = json.loads(await terminal.terminal_tool("pwd", task_id=task_id))
+        assert result["output"] == str(tmp_path)
+    finally:
+        await terminal.cleanup_vm(task_id)
+        terminal.clear_session_cwd(task_id)
 
 
-def test_explicit_workdir_still_wins_over_registered_task_cwd(monkeypatch):
-    calls = []
-
-    class FakeEnv:
-        env = {}
-
-        def execute(self, command, **kwargs):
-            calls.append(kwargs)
-            return {"output": "ok", "returncode": 0}
-
-    task_id = "acp-session-1"
-    monkeypatch.setattr(terminal_tool, "_active_environments", {task_id: FakeEnv()})
-    monkeypatch.setattr(terminal_tool, "_last_activity", {})
-    monkeypatch.setattr(terminal_tool, "_task_env_overrides", {task_id: {"cwd": "/workspace/acp"}})
-    monkeypatch.setattr(terminal_tool, "_get_env_config", lambda: _minimal_terminal_config())
-    monkeypatch.setattr(
-        terminal_tool,
-        "_check_all_guards",
-        lambda command, env_type, **kwargs: {"approved": True},
-    )
-
-    result = json.loads(
-        terminal_tool.terminal_tool(
-            command="pwd",
-            task_id=task_id,
-            workdir="/explicit/workdir",
+@pytest.mark.asyncio
+async def test_explicit_workdir_wins_over_task_cwd(tmp_path):
+    configured = tmp_path / "configured"
+    explicit = tmp_path / "explicit"
+    configured.mkdir()
+    explicit.mkdir()
+    task_id = "cwd-override"
+    terminal.register_task_env_overrides(task_id, {"cwd": str(configured)})
+    try:
+        result = json.loads(
+            await terminal.terminal_tool("pwd", task_id=task_id, workdir=str(explicit))
         )
-    )
+        assert result["output"] == str(explicit)
+    finally:
+        await terminal.cleanup_vm(task_id)
+        terminal.clear_session_cwd(task_id)
 
-    assert result["exit_code"] == 0
-    assert calls == [{"timeout": 60, "cwd": "/explicit/workdir", "bounded_capture": True}]
 
-
-def test_background_command_prefers_recorded_session_cwd_over_init_time_cwd(monkeypatch):
-    """Background process launches must also use the recorded session cwd."""
-
-    class FakeEnv:
-        env = {}
-        cwd = "/workspace/live"
-
-    class FakeRegistry:
-        def __init__(self):
-            self.calls = []
-            self.pending_watchers = []
-
-        def spawn_local(self, **kwargs):
-            self.calls.append(kwargs)
-            return SimpleNamespace(id="proc_test", pid=1234)
-
-    import tools.process_registry as process_registry_mod
-
-    registry = FakeRegistry()
-    task_id = "session-live-cwd-bg"
-    monkeypatch.setattr(terminal_tool, "_active_environments", {task_id: FakeEnv()})
-    monkeypatch.setattr(terminal_tool, "_last_activity", {})
-    monkeypatch.setattr(terminal_tool, "_session_cwd", {})
-    monkeypatch.setattr(terminal_tool, "_task_env_overrides", {task_id: {"cwd": "/workspace/init"}})
-    monkeypatch.setattr(terminal_tool, "_get_env_config", lambda: _minimal_terminal_config(cwd="/workspace/init"))
-    monkeypatch.setattr(terminal_tool, "_start_cleanup_thread", lambda: None)
-    monkeypatch.setattr(terminal_tool, "_resolve_container_task_id", lambda value: value or "default")
-    monkeypatch.setattr(
-        terminal_tool,
-        "_check_all_guards",
-        lambda command, env_type, **kwargs: {"approved": True},
-    )
-    monkeypatch.setattr(process_registry_mod, "process_registry", registry)
-    terminal_tool.record_session_cwd(task_id, "/workspace/live")
-
-    result = json.loads(
-        terminal_tool.terminal_tool(
-            command="sleep 1",
-            task_id=task_id,
-            background=True,
+@pytest.mark.asyncio
+async def test_different_tasks_keep_independent_cwds(tmp_path):
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    terminal.register_task_env_overrides("one", {"cwd": str(first)})
+    terminal.register_task_env_overrides("two", {"cwd": str(second)})
+    try:
+        one, two = await asyncio.gather(
+            terminal.terminal_tool("pwd", task_id="one"),
+            terminal.terminal_tool("pwd", task_id="two"),
         )
-    )
-
-    assert result["exit_code"] == 0
-    # session_key falls back to the raw task_id when no gateway contextvar is set
-    # (it doesn't propagate to tool-worker threads), so process.kill / stop can
-    # still find and terminate this background process.
-    assert registry.calls == [{
-        "command": "sleep 1",
-        "cwd": "/workspace/live",
-        "task_id": task_id,
-        "session_key": task_id,
-        "env_vars": {},
-        "use_pty": False,
-    }]
-
-
-def test_safe_getcwd_falls_back_to_home_when_no_terminal_cwd(monkeypatch):
-    def _boom():
-        raise FileNotFoundError()
-
-    monkeypatch.setattr(terminal_tool.os, "getcwd", _boom)
-    monkeypatch.delenv("TERMINAL_CWD", raising=False)
-    monkeypatch.setattr(terminal_tool.os.path, "expanduser", lambda p: "/home/me")
-    assert terminal_tool._safe_getcwd() == "/home/me"
+        assert json.loads(one)["output"] == str(first)
+        assert json.loads(two)["output"] == str(second)
+    finally:
+        await terminal.cleanup_vm("one")
+        await terminal.cleanup_vm("two")

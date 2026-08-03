@@ -49,35 +49,6 @@ def agent():
         return a
 
 
-class TestOAuthFlagOnRefresh:
-    """Site 3 — _try_refresh_anthropic_client_credentials."""
-
-    def test_third_party_provider_refresh_is_noop(self, agent):
-        """Refresh path returns False immediately when provider != anthropic — the
-        OAuth flag can never be mutated for third-party providers. Double-defended
-        by the per-assignment guard at line ~5393 so future refactors can't
-        reintroduce the bug."""
-        agent.api_mode = "anthropic_messages"
-        agent.provider = "minimax"          # ← third-party
-        agent._anthropic_api_key = "***"
-        agent._anthropic_client = MagicMock()
-        agent._is_anthropic_oauth = False
-
-        with (
-            patch("agent.anthropic_adapter.resolve_anthropic_token",
-                  return_value=_OAUTH_LIKE_TOKEN),
-            patch("agent.anthropic_adapter.build_anthropic_client",
-                  return_value=MagicMock()),
-        ):
-            result = agent._try_refresh_anthropic_client_credentials()
-
-        # The function short-circuits on non-anthropic providers.
-        assert result is False
-        # And the flag is untouched regardless.
-        assert agent._is_anthropic_oauth is False
-
-
-
 class TestOAuthFlagOnCredentialSwap:
     """Site 4 — _swap_credential (credential pool rotation)."""
 

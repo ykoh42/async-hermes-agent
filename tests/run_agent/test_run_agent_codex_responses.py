@@ -1054,7 +1054,7 @@ async def test_mid_turn_compaction_does_not_double_persist_in_place_rows(monkeyp
     context and retriggering compression. This guards that regression with a
     REAL SessionDB and the REAL archive_and_compact path (no persist stubs).
     """
-    from hermes_state import AsyncSessionDB
+    from hermes_state import SessionDB
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     agent = _build_agent(monkeypatch)
@@ -1066,7 +1066,7 @@ async def test_mid_turn_compaction_does_not_double_persist_in_place_rows(monkeyp
     agent.context_compressor.context_length = 20_000
     agent.context_compressor.threshold_tokens = 20_000
 
-    agent._session_db = AsyncSessionDB(tmp_path / "state.db")
+    agent._session_db = SessionDB(tmp_path / "state.db")
     await agent._ensure_db_session()
 
     responses = [

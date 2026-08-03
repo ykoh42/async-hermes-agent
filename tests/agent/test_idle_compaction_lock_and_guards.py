@@ -98,7 +98,7 @@ async def test_idle_compaction_status_emitted_by_default(tmp_path: Path) -> None
     """Control: the default engine keeps the 💤 idle-resume status line."""
     db = SessionDB(db_path=tmp_path / "state.db")
     sid = "IDLE_LOUD"
-    db.create_session(sid, source="cli")
+    await db.create_session(sid, source="cli")
     agent = _prep_idle_agent(db, sid)
     # MagicMock would auto-create the hook attributes as truthy mocks; pin
     # the default-engine surface explicitly.
@@ -130,8 +130,8 @@ async def test_idle_compaction_defers_to_held_compression_lock(tmp_path: Path) -
     """
     db = SessionDB(db_path=tmp_path / "state.db")
     sid = "IDLE_LOCKED"
-    db.create_session(sid, source="cli")
-    assert db.try_acquire_compression_lock(sid, "external_holder") is True
+    await db.create_session(sid, source="cli")
+    assert await db.try_acquire_compression_lock(sid, "external_holder") is True
 
     agent = _prep_idle_agent(db, sid)
     history = _history()
@@ -144,7 +144,7 @@ async def test_idle_compaction_defers_to_held_compression_lock(tmp_path: Path) -
         assert agent.session_id == sid
         # The external holder still owns the lock (we must not have stolen or
         # released someone else's lease).
-        assert db.get_compression_lock_holder(sid) == "external_holder"
+        assert await db.get_compression_lock_holder(sid) == "external_holder"
         # Turn state untouched: full history + this turn's user message, anchor on
         # the just-appended message, flush baseline not re-baselined to None-then-
         # doubled semantics.
@@ -168,7 +168,7 @@ async def test_idle_compaction_respects_anti_thrash_breaker(tmp_path: Path) -> N
 
     db = SessionDB(db_path=tmp_path / "state.db")
     sid = "IDLE_THRASH"
-    db.create_session(sid, source="cli")
+    await db.create_session(sid, source="cli")
     agent = _prep_idle_agent(db, sid)
 
     with patch(
@@ -183,8 +183,8 @@ async def test_idle_compaction_respects_anti_thrash_breaker(tmp_path: Path) -> N
         )
     # Trip the breaker durably. The native runtime does not bind the
     # synchronous SessionDB to the compressor; it hydrates this state through
-    # the agent-owned AsyncSessionDB immediately before the guarded call.
-    db.set_compression_ineffective_count(sid, 2)
+    # the agent-owned SessionDB immediately before the guarded call.
+    await db.set_compression_ineffective_count(sid, 2)
     compressor.compress = AsyncMock()
     agent.context_compressor = compressor
 
@@ -196,5 +196,4 @@ async def test_idle_compaction_respects_anti_thrash_breaker(tmp_path: Path) -> N
         assert len(ctx.messages) == len(_history()) + 1
     finally:
         await agent.close()
-
 

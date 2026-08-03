@@ -80,7 +80,7 @@ class _FakeAgent:
     async def _persist_pending_billing_route(self):
         pass
 
-    def _get_async_session_persist_lock(self):
+    def _get_session_persist_lock(self):
         return self._persist_lock
 
     def _emit_status(self, _msg):
@@ -157,7 +157,7 @@ class TestStringContentSidecarDelivery:
         bytes (replay keeps them byte-stable in history)."""
         agent = _FakeAgent()
         agent._gateway_turn_context_notes = RESET_NOTE
-        with patch("hermes_cli.lifecycle.invoke_hook_async", new=AsyncMock(return_value=[])):
+        with patch("hermes_cli.lifecycle.invoke_hook", new=AsyncMock(return_value=[])):
             ctx = await _build(agent)
         msg = ctx.messages[ctx.current_turn_user_idx]
         assert msg["content"] == "hello"
@@ -174,7 +174,7 @@ class TestStringContentSidecarDelivery:
         agent = _FakeAgent()
         agent._gateway_turn_context_notes = VC_NOTE
         with patch(
-            "hermes_cli.lifecycle.invoke_hook_async",
+            "hermes_cli.lifecycle.invoke_hook",
             new=AsyncMock(return_value=[{"context": "PLUGIN-CTX"}]),
         ):
             ctx = await _build(agent)
@@ -184,7 +184,7 @@ class TestStringContentSidecarDelivery:
     @pytest.mark.asyncio
     async def test_no_notes_means_no_stamp(self):
         agent = _FakeAgent()
-        with patch("hermes_cli.lifecycle.invoke_hook_async", new=AsyncMock(return_value=[])):
+        with patch("hermes_cli.lifecycle.invoke_hook", new=AsyncMock(return_value=[])):
             ctx = await _build(agent)
         assert "api_content" not in ctx.messages[ctx.current_turn_user_idx]
 
@@ -201,7 +201,7 @@ class TestMultimodalFallback:
             {"type": "text", "text": "look at this"},
             {"type": "image_url", "image_url": {"url": "https://x/img.png"}},
         ]
-        with patch("hermes_cli.lifecycle.invoke_hook_async", new=AsyncMock(return_value=[])):
+        with patch("hermes_cli.lifecycle.invoke_hook", new=AsyncMock(return_value=[])):
             ctx = await _build(agent, user_message=content)
         msg = ctx.messages[ctx.current_turn_user_idx]
         assert msg["content"][-1] == {"type": "text", "text": RESET_NOTE}

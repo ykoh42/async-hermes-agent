@@ -1,88 +1,68 @@
-"""Regression tests for sudo detection and sudo password handling."""
+"""Native-async local terminal behavior contracts."""
+from __future__ import annotations
 
-import tools.terminal_tool as terminal_tool
+import json
 
+import pytest
 
-def setup_function():
-    terminal_tool._reset_cached_sudo_passwords()
-
-
-def teardown_function():
-    terminal_tool._reset_cached_sudo_passwords()
+import tools.terminal_tool as terminal
 
 
-def test_searching_for_sudo_does_not_trigger_rewrite(monkeypatch):
-    monkeypatch.delenv("SUDO_PASSWORD", raising=False)
-    monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
-
-    command = "rg --line-number --no-heading --with-filename 'sudo' . | head -n 20"
-    transformed, sudo_stdin = terminal_tool._transform_sudo_command(command)
-
-    assert transformed == command
-    assert sudo_stdin is None
+@pytest.mark.asyncio
+async def test_executes_local_command_and_reports_exit_code(tmp_path):
+    result = json.loads(
+        await terminal.terminal_tool("printf hello", workdir=str(tmp_path), task_id="exec")
+    )
+    assert result["exit_code"] == 0
+    assert result["output"] == "hello"
 
 
-def test_terminal_schema_advertises_persistent_env_state():
-    description = terminal_tool.TERMINAL_TOOL_DESCRIPTION
-
-    assert "exported environment variables persist between calls" in description
-    assert "activate a virtualenv" in description
-    assert "do not re-source the same environment before every command" in description
-
-
-def test_printf_literal_sudo_does_not_trigger_rewrite(monkeypatch):
-    monkeypatch.delenv("SUDO_PASSWORD", raising=False)
-    monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
-
-    command = "printf '%s\\n' sudo"
-    transformed, sudo_stdin = terminal_tool._transform_sudo_command(command)
-
-    assert transformed == command
-    assert sudo_stdin is None
+@pytest.mark.asyncio
+@pytest.mark.parametrize("command", [None, "", "   "])
+async def test_rejects_invalid_commands(command):
+    result = json.loads(await terminal.terminal_tool(command))
+    assert result["status"] == "error"
 
 
-def test_non_command_argument_named_sudo_does_not_trigger_rewrite(monkeypatch):
-    monkeypatch.delenv("SUDO_PASSWORD", raising=False)
-    monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
+@pytest.mark.asyncio
+async def test_async_approval_callback_can_allow_and_deny(tmp_path):
+    decisions: list[str] = []
 
-    command = "grep -n sudo README.md"
-    transformed, sudo_stdin = terminal_tool._transform_sudo_command(command)
+    async def callback(**kwargs):
+        decisions.append(kwargs["command"])
+        return kwargs["command"] == "printf allowed"
 
-    assert transformed == command
-    assert sudo_stdin is None
+    terminal.set_approval_callback(callback)
+    try:
+        allowed = json.loads(
+            await terminal.terminal_tool("printf allowed", workdir=str(tmp_path))
+        )
+        denied = json.loads(
+            await terminal.terminal_tool("printf denied", workdir=str(tmp_path))
+        )
+    finally:
+        terminal.set_approval_callback(None)
 
-
-def test_actual_sudo_command_uses_configured_password(monkeypatch):
-    monkeypatch.setenv("SUDO_PASSWORD", "testpass")
-    monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
-
-    transformed, sudo_stdin = terminal_tool._transform_sudo_command("sudo apt install -y ripgrep")
-
-    assert transformed == "sudo -S -p '' apt install -y ripgrep"
-    assert sudo_stdin == "testpass\n"
-
-
-def test_explicit_empty_sudo_password_tries_empty_without_prompt(monkeypatch):
-    monkeypatch.setenv("SUDO_PASSWORD", "")
-    monkeypatch.setenv("HERMES_INTERACTIVE", "1")
-
-    def _fail_prompt(*_args, **_kwargs):
-        raise AssertionError("interactive sudo prompt should not run for explicit empty password")
-
-    monkeypatch.setattr(terminal_tool, "_prompt_for_sudo_password", _fail_prompt)
-
-    transformed, sudo_stdin = terminal_tool._transform_sudo_command("sudo true")
-
-    assert transformed == "sudo -S -p '' true"
-    assert sudo_stdin == "\n"
+    assert allowed["exit_code"] == 0
+    assert denied["status"] == "denied"
+    assert decisions == ["printf allowed", "printf denied"]
 
 
-def test_validate_workdir_blocks_shell_metacharacters_in_windows_paths():
-    assert terminal_tool._validate_workdir(r"C:\Users\Alice\project; rm -rf /")
-    assert terminal_tool._validate_workdir(r"C:\Users\Alice\project$(whoami)")
-    assert terminal_tool._validate_workdir("C:\\Users\\Alice\\project\nwhoami")
+@pytest.mark.asyncio
+async def test_force_bypasses_registered_approval_callback(tmp_path):
+    async def deny(**_kwargs):
+        return False
+
+    terminal.set_approval_callback(deny)
+    try:
+        result = json.loads(
+            await terminal.terminal_tool("printf forced", force=True, workdir=str(tmp_path))
+        )
+    finally:
+        terminal.set_approval_callback(None)
+    assert result["output"] == "forced"
 
 
-def test_count_real_sudo_invocations_ignores_mentions(monkeypatch):
-    assert terminal_tool._count_real_sudo_invocations("grep sudo README.md") == 0
-    assert terminal_tool._count_real_sudo_invocations("sudo a; sudo b") == 2
+def test_schema_preserves_stable_local_arguments():
+    properties = terminal.TERMINAL_SCHEMA["parameters"]["properties"]
+    assert {"command", "background", "timeout", "workdir", "pty"} <= properties.keys()

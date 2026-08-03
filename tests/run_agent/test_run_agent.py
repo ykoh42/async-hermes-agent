@@ -76,6 +76,9 @@ def agent():
             skip_memory=True,
         )
         a.client = MagicMock()
+        a.client.chat.completions.create = AsyncMock()
+        a._deferred_provider_runtime = None
+        a.provider = a.requested_provider = "openrouter"
         return a
 
 
@@ -186,6 +189,9 @@ def agent_with_memory_tool():
             skip_memory=True,
         )
         a.client = MagicMock()
+        a.client.chat.completions.create = AsyncMock()
+        a._deferred_provider_runtime = None
+        a.provider = a.requested_provider = "openrouter"
         return a
 
 
@@ -1483,7 +1489,7 @@ class TestExecuteToolCalls:
             hook_calls.append((hook_name, kwargs))
             return []
 
-        monkeypatch.setattr("hermes_cli.lifecycle.invoke_hook_async", _capture_hook)
+        monkeypatch.setattr("hermes_cli.lifecycle.invoke_hook", _capture_hook)
         monkeypatch.setattr("hermes_cli.lifecycle.has_hook", lambda name: True)
 
         with (
@@ -1937,7 +1943,7 @@ class TestConcurrentToolExecution:
             run_execution_middleware,
         )
         monkeypatch.setattr(
-            "hermes_cli.plugins.resolve_pre_tool_block_async",
+            "hermes_cli.plugins.resolve_pre_tool_block",
             resolve_pre_tool_block,
         )
         monkeypatch.setattr(
@@ -1993,7 +1999,7 @@ class TestConcurrentToolExecution:
         async def blocked(*_args, **_kwargs):
             return "Blocked by policy"
 
-        monkeypatch.setattr("hermes_cli.plugins.resolve_pre_tool_block_async", blocked)
+        monkeypatch.setattr("hermes_cli.plugins.resolve_pre_tool_block", blocked)
         starts = []
         agent.tool_start_callback = lambda *a: starts.append(a)
 
@@ -2067,7 +2073,7 @@ class TestConcurrentToolExecution:
 
         monkeypatch.setattr("hermes_cli.middleware.apply_tool_request_middleware", apply_request_middleware)
         monkeypatch.setattr("hermes_cli.middleware.run_tool_execution_middleware", invoke_twice)
-        monkeypatch.setattr("hermes_cli.plugins.resolve_pre_tool_block_async", no_block)
+        monkeypatch.setattr("hermes_cli.plugins.resolve_pre_tool_block", no_block)
         monkeypatch.setattr(tool_executor, "_begin_tool_execution", lambda *_a, **_k: None)
 
         async def execute(args, trace):
@@ -2121,7 +2127,7 @@ class TestConcurrentToolExecution:
 
         monkeypatch.setattr("hermes_cli.middleware.apply_tool_request_middleware", apply_request_middleware)
         monkeypatch.setattr("hermes_cli.middleware.run_tool_execution_middleware", invoke_concurrently)
-        monkeypatch.setattr("hermes_cli.plugins.resolve_pre_tool_block_async", no_block)
+        monkeypatch.setattr("hermes_cli.plugins.resolve_pre_tool_block", no_block)
         monkeypatch.setattr(tool_executor, "_begin_tool_execution", lambda *_a, **_k: None)
 
         async def execute(args, trace):
@@ -2261,27 +2267,22 @@ class TestHandleMaxIterations:
         ])
         agent._cached_system_prompt = "You are helpful."
 
-        with patch("agent.relay_llm.complete_logical_call") as complete_logical:
-            result = await agent._handle_max_iterations(
-                [{"role": "user", "content": "do stuff"}], 60
-            )
+        result = await agent._handle_max_iterations(
+            [{"role": "user", "content": "do stuff"}], 60
+        )
 
         assert result == "Summary"
         assert agent._execute_model_request.await_count == 2
-        complete_logical.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_api_failure_returns_error(self, agent):
         agent._execute_model_request = AsyncMock(side_effect=Exception("API down"))
         agent._cached_system_prompt = "You are helpful."
         messages = [{"role": "user", "content": "do stuff"}]
-        with patch("agent.relay_llm.complete_logical_call") as complete_logical:
-            result = await agent._handle_max_iterations(messages, 60)
+        result = await agent._handle_max_iterations(messages, 60)
         assert isinstance(result, str)
         assert "error" in result.lower()
         assert "API down" in result
-        complete_logical.assert_called_once()
-        assert complete_logical.call_args.kwargs == {"outcome": "failed"}
 
     @pytest.mark.asyncio
     async def test_summary_skips_reasoning_for_unsupported_openrouter_model(self, agent):
@@ -2493,36 +2494,6 @@ class TestRunConversation:
         agent.save_trajectories = False
 
     @pytest.mark.asyncio
-    async def test_relay_turn_start_failure_releases_lease(self, agent):
-        relay_lease = SimpleNamespace(
-            parent_session_id="",
-            profile_key="/profile",
-            session_id=agent.session_id or "",
-        )
-        coordinator = MagicMock()
-        coordinator.acquire_conversation.return_value = relay_lease
-        start_error = RuntimeError("relay turn start failed")
-        coordinator.begin_turn.side_effect = start_error
-
-        with (
-            patch("agent.relay_runtime.SESSION_COORDINATOR", coordinator),
-            patch(
-                "agent.relay_runtime.current_profile_key",
-                return_value="/profile",
-            ),
-            patch("agent.conversation_loop.run_conversation", new_callable=AsyncMock) as run_conversation,
-        ):
-            with pytest.raises(RuntimeError) as caught:
-                await agent.run_conversation("hello", task_id="task-1")
-
-        assert caught.value is start_error
-        run_conversation.assert_not_called()
-        coordinator.finish_logical_calls.assert_not_called()
-        coordinator.end_turn.assert_not_called()
-        coordinator.release_conversation.assert_called_once_with(relay_lease)
-        assert agent._relay_pending_turn_id is None
-
-    @pytest.mark.asyncio
     async def test_stop_finish_reason_returns_response(self, agent):
         self._setup_agent(agent)
         resp = _mock_response(content="Final answer", finish_reason="stop")
@@ -2608,7 +2579,6 @@ class TestRunConversation:
             usage=None,
         )
         hook_events = []
-        logical_completions = []
 
         async def _fake_activate(reason=None):
             agent._fallback_index = len(agent._fallback_chain)
@@ -2626,12 +2596,6 @@ class TestRunConversation:
                 new=AsyncMock(side_effect=_fake_activate),
             ) as mock_try_activate_fallback,
             patch.object(agent, "_invoke_api_request_error_hook", side_effect=lambda **kw: hook_events.append(kw)),
-            patch(
-                "agent.relay_llm.complete_logical_call",
-                side_effect=lambda request_id, *, outcome: logical_completions.append(
-                    (request_id, outcome)
-                ),
-            ),
             patch.object(agent, "_persist_session"),
             patch.object(agent, "_save_trajectory"),
             patch.object(agent, "_cleanup_task_resources"),
@@ -2645,9 +2609,6 @@ class TestRunConversation:
         assert hook_events[0]["error_type"] == "ContentPolicyBlocked"
         assert hook_events[0]["retryable"] is False
         assert hook_events[0]["reason"] == FailoverReason.content_policy_blocked.value
-        assert logical_completions == [
-            (hook_events[0]["api_request_id"], "success")
-        ]
 
     @pytest.mark.asyncio
     async def test_ollama_small_runtime_context_fails_before_api_call(self, agent, caplog):
@@ -2731,7 +2692,7 @@ class TestRunConversation:
                 "hermes_cli.lifecycle.has_hook",
                 side_effect=lambda name: name in {"pre_api_request", "post_api_request"},
             ),
-            patch("hermes_cli.lifecycle.invoke_hook_async", side_effect=_record_hook),
+            patch("hermes_cli.lifecycle.invoke_hook", side_effect=_record_hook),
             patch.object(agent, "_persist_session", new_callable=AsyncMock),
             patch.object(agent, "_save_trajectory", new_callable=AsyncMock),
             patch.object(agent, "_cleanup_task_resources", new_callable=AsyncMock),
@@ -2756,36 +2717,6 @@ class TestRunConversation:
         assert any(msg.get("role") == "user" and msg.get("content") == "search something" for msg in pre_request_calls[0]["request_messages"])
         assert all("usage" in c and "response" in c for c in post_request_calls)
         assert all("assistant_message" in c["response"] for c in post_request_calls)
-
-    @pytest.mark.asyncio
-    async def test_terminal_task_closes_logical_calls(self, agent):
-        from agent import relay_runtime
-
-        order = []
-        failed_result = {
-            "final_response": "provider failed",
-            "messages": [],
-            "completed": False,
-            "failed": True,
-            "interrupted": False,
-        }
-
-        with (
-            patch(
-                "agent.conversation_loop.run_conversation",
-                new_callable=AsyncMock,
-                return_value=failed_result,
-            ),
-            patch.object(
-                relay_runtime.SESSION_COORDINATOR,
-                "finish_logical_calls",
-                side_effect=lambda *_args, **_kwargs: order.append("logical"),
-            ),
-        ):
-            result = await agent.run_conversation("private prompt")
-
-        assert result is failed_result
-        assert order == ["logical"]
 
     @pytest.mark.asyncio
     async def test_api_request_error_hook_skips_payload_work_without_listener(self, agent, monkeypatch):
@@ -2848,7 +2779,7 @@ class TestRunConversation:
         monkeypatch.setattr(agent, "_api_response_payload_for_hook", _response_payload)
 
         with (
-            patch("hermes_cli.lifecycle.invoke_hook_async", new_callable=AsyncMock, return_value=[]),
+            patch("hermes_cli.lifecycle.invoke_hook", new_callable=AsyncMock, return_value=[]),
             patch.object(agent, "_persist_session", new_callable=AsyncMock),
             patch.object(agent, "_save_trajectory", new_callable=AsyncMock),
             patch.object(agent, "_cleanup_task_resources", new_callable=AsyncMock),

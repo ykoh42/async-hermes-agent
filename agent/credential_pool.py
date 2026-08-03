@@ -533,7 +533,7 @@ def credential_pool_matches_provider(
 DEFAULT_MAX_CONCURRENT_PER_CREDENTIAL = 1
 
 
-def _write_through_provider_state_to_global_root(
+async def _write_through_provider_state_to_global_root(
     provider_id: str, state: Dict[str, Any]
 ) -> None:
     """Persist a rotated OAuth ``state`` into the global-root auth.json.
@@ -574,12 +574,15 @@ def _write_through_provider_state_to_global_root(
             except Exception:
                 return
     try:
-        auth_mod._persist_provider_state_to_store(
-            provider_id,
-            state,
-            global_path,
-            set_active=False,
-        )
+        async with auth_mod._async_auth_store_transaction(global_path):
+            auth_store = await auth_mod._load_auth_store_async(global_path)
+            auth_mod._store_provider_state(
+                auth_store,
+                provider_id,
+                state,
+                set_active=False,
+            )
+            await auth_mod._save_auth_store_async(auth_store, global_path)
     except Exception as exc:  # pragma: no cover - best effort
         logger.debug(
             "%s pool refresh: write-through to global root failed: %s",
@@ -777,6 +780,104 @@ class CredentialPool:
             [entry.to_dict() for entry in self._entries],
             removed_ids=removed_ids,
         )
+
+    async def _sync_xai_oauth_entry_from_auth_store(
+        self, entry: PooledCredential,
+    ) -> PooledCredential:
+        """Adopt a newer singleton xAI token pair without blocking the loop."""
+        if entry.source != "device_code":
+            return entry
+        try:
+            auth_store = await auth_mod._load_auth_store_async()
+            state = auth_mod._load_provider_state(auth_store, "xai-oauth")
+            tokens = state.get("tokens") if isinstance(state, dict) else None
+            if not isinstance(tokens, dict):
+                return entry
+            access_token = str(tokens.get("access_token") or "").strip()
+            refresh_token = str(tokens.get("refresh_token") or "").strip()
+            if not access_token or (
+                access_token == entry.access_token
+                and refresh_token == str(entry.refresh_token or "")
+            ):
+                return entry
+            updated = replace(
+                entry,
+                access_token=access_token,
+                refresh_token=refresh_token or entry.refresh_token,
+                last_refresh=state.get("last_refresh") or entry.last_refresh,
+                last_status=STATUS_OK,
+                last_status_at=None,
+                last_error_code=None,
+                last_error_reason=None,
+                last_error_message=None,
+                last_error_reset_at=None,
+            )
+            self._replace_entry(entry, updated)
+            return updated
+        except Exception as exc:
+            logger.debug("Failed to sync xAI OAuth entry from auth store: %s", exc)
+            return entry
+
+    async def _sync_device_code_entry_to_auth_store(
+        self, entry: PooledCredential,
+    ) -> None:
+        """Write a rotated singleton-seeded OAuth token pair back to auth.json."""
+        if entry.source != "device_code" or self.provider not in {
+            "nous", "openai-codex", "xai-oauth",
+        }:
+            return
+        state: Optional[Dict[str, Any]] = None
+        write_through_to_root = False
+        try:
+            async with auth_mod._async_auth_store_transaction():
+                auth_store = await auth_mod._load_auth_store_async()
+                providers = auth_store.get("providers")
+                write_through_to_root = not (
+                    isinstance(providers, dict)
+                    and isinstance(providers.get(self.provider), dict)
+                )
+                state = auth_mod._load_provider_state(auth_store, self.provider)
+                if not isinstance(state, dict):
+                    return
+                if self.provider == "nous":
+                    state["access_token"] = entry.access_token
+                    if entry.refresh_token:
+                        state["refresh_token"] = entry.refresh_token
+                    if entry.expires_at:
+                        state["expires_at"] = entry.expires_at
+                    if entry.agent_key:
+                        state["agent_key"] = entry.agent_key
+                    if entry.agent_key_expires_at:
+                        state["agent_key_expires_at"] = entry.agent_key_expires_at
+                    if entry.inference_base_url:
+                        state["inference_base_url"] = entry.inference_base_url
+                else:
+                    tokens = state.get("tokens")
+                    if not isinstance(tokens, dict):
+                        return
+                    tokens["access_token"] = entry.access_token
+                    if entry.refresh_token:
+                        tokens["refresh_token"] = entry.refresh_token
+                    if entry.last_refresh:
+                        state["last_refresh"] = entry.last_refresh
+                auth_mod._store_provider_state(
+                    auth_store,
+                    self.provider,
+                    state,
+                    set_active=False,
+                )
+                await auth_mod._save_auth_store_async(auth_store)
+            if write_through_to_root and state is not None:
+                await _write_through_provider_state_to_global_root(
+                    self.provider,
+                    state,
+                )
+        except Exception as exc:
+            logger.debug(
+                "Failed to sync %s pool entry back to auth store: %s",
+                self.provider,
+                exc,
+            )
 
     async def _available_entries(
         self, *, clear_expired: bool = False,
@@ -1031,6 +1132,11 @@ class CredentialPool:
 
         try:
             if self.provider == "xai-oauth":
+                synced = await self._sync_xai_oauth_entry_from_auth_store(entry)
+                if synced is not entry:
+                    entry = synced
+                    if not force and not self._entry_needs_refresh(entry):
+                        return entry
                 import httpx
 
                 async with httpx.AsyncClient(timeout=20) as client:
@@ -1086,6 +1192,7 @@ class CredentialPool:
                 )
                 self._replace_entry(entry, updated)
                 await self._persist()
+                await self._sync_device_code_entry_to_auth_store(updated)
                 return updated
 
             from agent.anthropic_adapter import (
@@ -1126,6 +1233,11 @@ class CredentialPool:
             # capability failure instead of a misleading quota error.
             raise
         except Exception as exc:
+            if self.provider == "xai-oauth":
+                synced = await self._sync_xai_oauth_entry_from_auth_store(entry)
+                if synced is not entry:
+                    await self._persist()
+                    return synced
             logger.debug(
                 "Async credential refresh failed for %s/%s: %s",
                 self.provider,
@@ -1337,7 +1449,7 @@ def _normalize_pool_priorities(provider: str, entries: List[PooledCredential]) -
     return changed
 
 
-async def _is_provider_explicitly_configured_async(
+async def _is_provider_explicitly_configured(
     provider_id: str,
     *,
     auth_store: Optional[Dict[str, Any]] = None,
@@ -1439,7 +1551,7 @@ async def _seed_from_singletons(
         # Without this gate, auxiliary client fallback chains silently read
         # ~/.claude/.credentials.json without user consent.  See PR #4210.
         try:
-            if not await _is_provider_explicitly_configured_async(
+            if not await _is_provider_explicitly_configured(
                 "anthropic", auth_store=auth_store
             ):
                 return changed, active_sources
@@ -1762,7 +1874,11 @@ async def _seed_from_env(
         if provider == "kimi-coding":
             base_url = _resolve_kimi_base_url(token, pconfig.inference_base_url, env_url)
         elif provider == "zai":
-            base_url = _resolve_zai_base_url(token, pconfig.inference_base_url, env_url)
+            base_url = await _resolve_zai_base_url(
+                token,
+                pconfig.inference_base_url,
+                env_url,
+            )
         changed |= _upsert_entry(
             entries,
             provider,

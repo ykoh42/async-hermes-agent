@@ -8,41 +8,6 @@ return ``None`` instead of the default — calling ``.lower()`` on that raises
 from unittest.mock import patch
 
 
-# ── TTS tool ──────────────────────────────────────────────────────────────
-
-class TestTTSProviderNullGuard:
-    """tools/tts_tool.py — _get_provider()"""
-
-    def test_explicit_null_provider_returns_default(self):
-        """YAML ``tts: {provider: null}`` should fall back to default."""
-        from tools.tts_tool import _get_provider, DEFAULT_PROVIDER
-
-        result = _get_provider({"provider": None})
-        assert result == DEFAULT_PROVIDER.lower().strip()
-
-
-    def test_missing_provider_keeps_free_default_with_cloud_credentials(self):
-        """A chat-provider key must not silently opt the user into paid TTS."""
-        from tools.tts_tool import _get_provider, DEFAULT_PROVIDER
-
-        assert _get_provider({}) == DEFAULT_PROVIDER
-        assert _get_provider({"provider": None}) == DEFAULT_PROVIDER
-
-    def test_active_provider_without_credentials_keeps_edge(self):
-        """A TTS-capable active provider that can't authenticate must NOT
-        silently displace the free Edge default (no surprise billing / hard
-        errors for a credential-less deployment)."""
-        from tools.tts_tool import _get_provider, DEFAULT_PROVIDER
-
-        assert _get_provider({}) == DEFAULT_PROVIDER.lower().strip()
-
-    def test_explicit_provider_wins_over_active(self):
-        """An explicit tts.provider always overrides the active-provider fallback."""
-        from tools.tts_tool import _get_provider
-
-        assert _get_provider({"provider": "edge"}) == "edge"
-
-
 # ── Web tools ─────────────────────────────────────────────────────────────
 
 class TestWebBackendNullGuard:

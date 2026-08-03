@@ -1,19 +1,4 @@
-"""
-Regression tests for the shared-container task_id mapping.
-
-The top-level agent and all delegate_task subagents share a single
-terminal sandbox keyed by ``"default"``.  ``_resolve_container_task_id``
-is the sole gatekeeper for which tool-call task_ids go to the shared
-container vs. get their own isolated sandbox.  RL / benchmark
-environments opt in to isolation by calling
-``register_task_env_overrides(task_id, {...})`` before the agent loop;
-every other task_id collapses back to ``"default"``.
-
-If you change the collapse logic, update both the helper and these
-tests -- see `hermes-agent-dev` skill, "Why do subagents get their own
-containers?" section, and the Container lifecycle paragraph under
-Docker Backend in ``website/docs/user-guide/configuration.md``.
-"""
+"""Task identity is preserved by the local-only async terminal runtime."""
 
 import pytest
 
@@ -38,32 +23,23 @@ def test_empty_task_id_maps_to_default():
     assert terminal_tool._resolve_container_task_id("") == "default"
 
 
-def test_cwd_only_override_collapses_to_default():
-    """CWD-only overrides (ACP adapter workspace tracking) must NOT trigger
-    container isolation — they should collapse to the shared 'default'
-    container so all surfaces (TUI, gateway, dashboard) share one sandbox.
-    Regression for #37361."""
+def test_cwd_override_keeps_own_session_id(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
     terminal_tool.register_task_env_overrides(
-        "acp-session-abc", {"cwd": "/home/user/project"}
+        "session-abc", {"cwd": str(workspace)}
     )
     try:
-        assert (
-            terminal_tool._resolve_container_task_id("acp-session-abc")
-            == "default"
-        )
+        assert terminal_tool._resolve_container_task_id("session-abc") == "session-abc"
     finally:
-        terminal_tool.clear_task_env_overrides("acp-session-abc")
+        terminal_tool.clear_task_env_overrides("session-abc")
 
 
-def test_env_type_override_keeps_own_id():
-    """env_type is an isolation key — must trigger per-task container."""
-    terminal_tool.register_task_env_overrides(
-        "bench-env", {"env_type": "sandbox", "cwd": "/work"}
-    )
-    try:
-        assert (
-            terminal_tool._resolve_container_task_id("bench-env")
-            == "bench-env"
-        )
-    finally:
-        terminal_tool.clear_task_env_overrides("bench-env")
+def test_clear_override_removes_cwd_anchor(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    terminal_tool.register_task_env_overrides("session", {"cwd": str(workspace)})
+    terminal_tool.clear_task_env_overrides("session")
+
+    assert terminal_tool.resolve_task_overrides("session") == {}
+    assert terminal_tool.get_session_cwd("session") != str(workspace)

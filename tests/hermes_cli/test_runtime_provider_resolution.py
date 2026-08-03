@@ -101,10 +101,9 @@ async def test_resolve_runtime_provider_uses_credential_pool(monkeypatch):
 async def test_qwen_oauth_fails_fast_without_native_async_lifecycle(monkeypatch):
     monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "qwen-oauth")
     monkeypatch.setattr(rp, "_get_model_config", lambda *_args, **_kwargs: {})
-    monkeypatch.setenv("OPENROUTER_API_KEY", "test-or-key")
 
     with pytest.raises(AsyncCapabilityError, match="Qwen OAuth credential refresh"):
-        await rp.resolve_runtime_provider(requested="auto")
+        await rp.resolve_runtime_provider(requested="qwen-oauth")
 
 
 async def test_resolve_runtime_provider_ai_gateway(monkeypatch):
