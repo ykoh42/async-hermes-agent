@@ -3,7 +3,9 @@
 Mirrors the OpenRouter pattern for the Vercel AI Gateway so that
 referrerUrl / appName / User-Agent flow into gateway analytics.
 """
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
 
 from run_agent import AIAgent
 
@@ -89,12 +91,16 @@ def test_nvidia_cloud_base_url_applies_billing_origin_header(mock_openai):
 
 
 @patch("run_agent.OpenAI")
-def test_openrouter_headers_include_response_cache_when_enabled(mock_openai):
+@pytest.mark.asyncio
+async def test_openrouter_headers_include_response_cache_when_enabled(mock_openai):
     """When openrouter.response_cache is True, the cache header is injected."""
     mock_openai.return_value = MagicMock()
-    with patch("hermes_cli.config.load_config", return_value={
-        "openrouter": {"response_cache": True, "response_cache_ttl": 600},
-    }):
+    with patch(
+        "hermes_cli.config.load_config_readonly",
+        new=AsyncMock(return_value={
+            "openrouter": {"response_cache": True, "response_cache_ttl": 600},
+        }),
+    ):
         agent = AIAgent(
             api_key="test-key",
             base_url="https://openrouter.ai/api/v1",
@@ -103,6 +109,7 @@ def test_openrouter_headers_include_response_cache_when_enabled(mock_openai):
             skip_context_files=True,
             skip_memory=True,
         )
+        await agent._ensure_provider_runtime()
 
     headers = agent._client_kwargs["default_headers"]
     assert headers["HTTP-Referer"] == "https://hermes-agent.nousresearch.com"
@@ -116,13 +123,17 @@ def test_openrouter_headers_include_response_cache_when_enabled(mock_openai):
 
 
 @patch("run_agent.OpenAI")
-def test_user_default_headers_override_sdk_user_agent(mock_openai):
+@pytest.mark.asyncio
+async def test_user_default_headers_override_sdk_user_agent(mock_openai):
     """``model.default_headers`` lets a custom endpoint swap the OpenAI SDK
     User-Agent that some gateways/WAFs reject (the #40033 reproduction)."""
     mock_openai.return_value = MagicMock()
-    with patch("hermes_cli.config.load_config", return_value={
-        "model": {"default_headers": {"User-Agent": "curl/8.7.1", "X-Extra": "1"}},
-    }):
+    with patch(
+        "hermes_cli.config.load_config_readonly",
+        new=AsyncMock(return_value={
+            "model": {"default_headers": {"User-Agent": "curl/8.7.1", "X-Extra": "1"}},
+        }),
+    ):
         agent = AIAgent(
             api_key="test-key",
             base_url="http://localhost:8080/v1",
@@ -132,6 +143,7 @@ def test_user_default_headers_override_sdk_user_agent(mock_openai):
             skip_context_files=True,
             skip_memory=True,
         )
+        await agent._ensure_provider_runtime()
 
     headers = agent._client_kwargs["default_headers"]
     assert headers["User-Agent"] == "curl/8.7.1"
@@ -168,4 +180,3 @@ def test_openrouter_headers_no_cache_when_disabled(mock_openai):
     assert headers["HTTP-Referer"] == "https://hermes-agent.nousresearch.com"
     assert "X-OpenRouter-Cache" not in headers
     assert "X-OpenRouter-Cache-TTL" not in headers
-

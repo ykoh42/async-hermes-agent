@@ -33,8 +33,7 @@ from hermes_cli.auth import (
 )
 from hermes_cli.config import (
     get_compatible_custom_providers,
-    get_env_value_prefer_dotenv_async,
-    load_config,
+    get_env_value_prefer_dotenv,
     normalize_extra_headers,
 )
 from hermes_cli.providers import custom_provider_aliases, custom_provider_slug
@@ -83,9 +82,9 @@ def _config_base_url_trustworthy_for_bare_custom(cfg_base_url: str, cfg_provider
     # is, otherwise a legit LAN/WireGuard ollama endpoint silently falls
     # through to OpenRouter.
     try:
-        from hermes_cli.auth import resolve_provider as _resolve_provider
+        from hermes_cli.models import normalize_provider
 
-        if _resolve_provider(cfg_provider_norm) == "custom":
+        if normalize_provider(cfg_provider_norm) == "custom":
             return True
     except Exception:
         pass
@@ -251,30 +250,7 @@ def _anthropic_base_url_override_ok(base_url: str) -> bool:
     return False
 
 
-def _auto_detect_local_model(base_url: str) -> str:
-    """Query a local server for its model name when only one model is loaded."""
-    if not base_url:
-        return ""
-    try:
-        import requests
-        url = base_url.rstrip("/")
-        if not url.endswith("/v1"):
-            url += "/v1"
-        resp = requests.get(url + "/models", timeout=(2, 3))
-        if resp.ok:
-            models = resp.json().get("data", [])
-            if len(models) == 1:
-                model_id = models[0].get("id", "")
-                if model_id:
-                    return model_id
-    except Exception as exc:
-        # Log instead of silently swallowing — aids debugging when
-        # local model auto-detection fails unexpectedly.
-        logger.debug("Auto-detect model from %s failed: %s", base_url, exc)
-    return ""
-
-
-async def _auto_detect_local_model_async(base_url: str) -> str:
+async def _auto_detect_local_model(base_url: str) -> str:
     """Discover a single local model without blocking the event loop."""
     if not base_url:
         return ""
@@ -299,30 +275,20 @@ async def _auto_detect_local_model_async(base_url: str) -> str:
 
 def _get_model_config(
     config: Optional[Dict[str, Any]] = None,
-    *,
-    detect_local_model: bool = True,
 ) -> Dict[str, Any]:
-    """Normalize model settings from a supplied config snapshot or disk.
+    """Normalize model settings from an already-loaded config snapshot.
 
-    Native async callers pass their already-loaded snapshot.  Keeping the
-    synchronous fallback preserves the CLI/status readers without allowing
-    the async runtime to reopen ``config.yaml`` on its event-loop path.
+    This helper only transforms dictionaries. File loading belongs to the
+    awaited runtime boundary, and local-model discovery belongs to
+    :func:`_auto_detect_local_model`.
     """
-    config = load_config() if config is None else config
+    config = config or {}
     model_cfg = config.get("model")
     if isinstance(model_cfg, dict):
         cfg = dict(model_cfg)
         # Accept "model" as alias for "default" (users intuitively write model.model)
         if not cfg.get("default") and cfg.get("model"):
             cfg["default"] = cfg["model"]
-        default = (cfg.get("default") or "").strip()
-        base_url = (cfg.get("base_url") or "").strip()
-        is_local = "localhost" in base_url or "127.0.0.1" in base_url
-        is_fallback = not default
-        if detect_local_model and is_local and is_fallback and base_url:
-            detected = _auto_detect_local_model(base_url)
-            if detected:
-                cfg["default"] = detected
         return cfg
     if isinstance(model_cfg, str) and model_cfg.strip():
         return {"default": model_cfg.strip()}
@@ -444,7 +410,7 @@ def _resolve_runtime_from_pool_entry(
     pool: Optional[CredentialPool] = None,
     target_model: Optional[str] = None,
 ) -> Dict[str, Any]:
-    model_cfg = model_cfg or _get_model_config()
+    model_cfg = model_cfg or {}
     # When the caller is resolving for a specific target model (e.g. a /model
     # mid-session switch), prefer that over the persisted model.default. This
     # prevents api_mode being computed from a stale config default that no
@@ -592,7 +558,7 @@ def resolve_requested_provider(
     if requested and requested.strip():
         return requested.strip().lower()
 
-    model_cfg = _get_model_config(config, detect_local_model=False)
+    model_cfg = _get_model_config(config)
     cfg_provider = model_cfg.get("provider")
     if isinstance(cfg_provider, str) and cfg_provider.strip():
         return cfg_provider.strip().lower()
@@ -613,7 +579,10 @@ async def _try_resolve_from_custom_pool(
     provider_name: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """Check if a credential pool exists for a custom endpoint and return a runtime dict if so."""
-    pool_key = get_custom_provider_pool_key(base_url, provider_name=provider_name)
+    pool_key = await get_custom_provider_pool_key(
+        base_url,
+        provider_name=provider_name,
+    )
     if not pool_key:
         return None
     try:
@@ -691,7 +660,9 @@ def _get_named_custom_provider(
         return None
     if requested_norm != "custom" and not requested_norm.startswith("custom:"):
         try:
-            canonical = auth_mod.resolve_provider(requested_norm)
+            from hermes_cli.models import normalize_provider
+
+            canonical = normalize_provider(requested_norm)
         except AuthError:
             pass
         else:
@@ -703,10 +674,13 @@ def _get_named_custom_provider(
             # accidentally shadowing a canonical provider still resolves to
             # the built-in. See tests/hermes_cli/test_runtime_provider_resolution.py
             # ``test_named_custom_provider_does_not_shadow_builtin_provider``.
-            if (canonical or "").strip().lower() == requested_norm:
+            if (
+                (canonical or "").strip().lower() == requested_norm
+                and canonical in {*PROVIDER_REGISTRY, "openrouter", "custom"}
+            ):
                 return None
 
-    config = load_config() if config is None else config
+    config = config or {}
     
     # First check providers: dict (new-style user-defined providers)
     providers = config.get("providers")
@@ -809,7 +783,10 @@ def _get_named_custom_provider(
     return None
 
 
-def has_named_custom_provider(requested_provider: str) -> bool:
+def has_named_custom_provider(
+    requested_provider: str,
+    config: Optional[Dict[str, Any]] = None,
+) -> bool:
     """Return True when config defines a custom provider matching the request.
 
     Thin public wrapper around :func:`_get_named_custom_provider` so other
@@ -818,12 +795,15 @@ def has_named_custom_provider(requested_provider: str) -> bool:
     entry — without reaching into a private helper or duplicating the scan.
     """
     try:
-        return _get_named_custom_provider(requested_provider) is not None
+        return _get_named_custom_provider(requested_provider, config=config) is not None
     except Exception:
         return False
 
 
-def find_custom_provider_identity(base_url: str) -> Optional[str]:
+def find_custom_provider_identity(
+    base_url: str,
+    config: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
     """Map an endpoint URL back to its canonical ``custom:<name>`` menu key.
 
     Returns the ``custom:<normalized-name>`` slug of the first ``providers:``
@@ -842,10 +822,7 @@ def find_custom_provider_identity(base_url: str) -> Optional[str]:
     target = _normalize_base_url_for_match(base_url)
     if not target:
         return None
-    try:
-        config = load_config()
-    except Exception:
-        return None
+    config = config or {}
 
     providers = config.get("providers")
     if isinstance(providers, dict):
@@ -877,7 +854,10 @@ def find_custom_provider_identity(base_url: str) -> Optional[str]:
     return None
 
 
-def find_custom_provider_identity_by_model(model: str) -> Optional[str]:
+def find_custom_provider_identity_by_model(
+    model: str,
+    config: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
     """Map a model id back to the ``custom:<name>`` entry that serves it.
 
     Returns the ``custom:<normalized-name>`` slug of the first ``providers:``
@@ -895,10 +875,7 @@ def find_custom_provider_identity_by_model(model: str) -> Optional[str]:
     target = str(model or "").strip().lower()
     if not target:
         return None
-    try:
-        config = load_config()
-    except Exception:
-        return None
+    config = config or {}
 
     def _entry_serves_model(entry: Dict[str, Any]) -> bool:
         for key in ("model", "default_model"):
@@ -952,6 +929,7 @@ def canonical_custom_identity(
     base_url: Optional[str] = None,
     config_provider: Optional[str] = None,
     model: Optional[str] = None,
+    config: Optional[Dict[str, Any]] = None,
 ) -> Optional[str]:
     """Recover a routable ``custom:<name>`` identity for a bare custom provider.
 
@@ -988,13 +966,13 @@ def canonical_custom_identity(
     """
     # 1. Reverse-lookup by endpoint URL.
     if base_url:
-        identity = find_custom_provider_identity(base_url)
+        identity = find_custom_provider_identity(base_url, config=config)
         if identity:
             return identity
 
     # 2. Reverse-lookup by the session's model name.
     if model:
-        identity = find_custom_provider_identity_by_model(model)
+        identity = find_custom_provider_identity_by_model(model, config=config)
         if identity:
             return identity
 
@@ -1002,7 +980,7 @@ def canonical_custom_identity(
     candidate = str(config_provider or "").strip()
     if not candidate:
         try:
-            candidate = str(_get_model_config().get("provider") or "").strip()
+            candidate = str(_get_model_config(config).get("provider") or "").strip()
         except Exception:
             candidate = ""
     if not candidate:
@@ -1015,7 +993,7 @@ def canonical_custom_identity(
     # Only return it when it actually resolves to a configured custom entry,
     # so we never invent a `custom:<x>` that resolution can't honor.
     try:
-        if _get_named_custom_provider(candidate) is not None:
+        if _get_named_custom_provider(candidate, config=config) is not None:
             if candidate_norm.startswith("custom:"):
                 return candidate_norm
             return f"custom:{candidate_norm}"
@@ -1053,9 +1031,9 @@ async def _resolve_named_custom_runtime(
     requested_norm = (requested_provider or "").strip().lower()
     if requested_norm and requested_norm != "custom":
         try:
-            from hermes_cli.auth import resolve_provider as _resolve_provider
+            from hermes_cli.models import normalize_provider
 
-            if _resolve_provider(requested_norm) == "custom":
+            if normalize_provider(requested_norm) == "custom":
                 requested_norm = "custom"
         except Exception:
             pass
@@ -1180,7 +1158,7 @@ async def _resolve_openrouter_runtime(
     explicit_base_url: Optional[str] = None,
     config: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    model_cfg = _get_model_config(config, detect_local_model=False)
+    model_cfg = _get_model_config(config)
     cfg_base_url = model_cfg.get("base_url") if isinstance(model_cfg.get("base_url"), str) else ""
     cfg_provider = model_cfg.get("provider") if isinstance(model_cfg.get("provider"), str) else ""
     cfg_api_key = ""
@@ -1198,9 +1176,9 @@ async def _resolve_openrouter_runtime(
     # gate up the stack — alias-aware without duplicating the alias map.
     if requested_norm and requested_norm != "custom":
         try:
-            from hermes_cli.auth import resolve_provider as _resolve_provider
+            from hermes_cli.models import normalize_provider
 
-            if _resolve_provider(requested_norm) == "custom":
+            if normalize_provider(requested_norm) == "custom":
                 requested_norm = "custom"
         except Exception:
             pass
@@ -1602,14 +1580,14 @@ async def _resolve_explicit_runtime(
         base_url = explicit_base_url
         if not base_url:
             if provider in {"kimi-coding", "kimi-coding-cn"}:
-                creds = await auth_mod.resolve_api_key_provider_credentials_async(provider)
+                creds = await auth_mod.resolve_api_key_provider_credentials(provider)
                 base_url = creds.get("base_url", "").rstrip("/")
             else:
                 base_url = env_url or pconfig.inference_base_url
 
         api_key = explicit_api_key
         if not api_key:
-            creds = await auth_mod.resolve_api_key_provider_credentials_async(provider)
+            creds = await auth_mod.resolve_api_key_provider_credentials(provider)
             api_key = creds.get("api_key", "")
             if not base_url:
                 base_url = creds.get("base_url", "").rstrip("/")
@@ -1663,20 +1641,17 @@ async def resolve_runtime_provider(
     persisted default. Other callers can leave it None to preserve existing
     behavior (api_mode derived from config).
     """
-    from hermes_cli.config import is_provider_enabled, load_config_readonly_async
+    from hermes_cli.config import is_provider_enabled, load_config_readonly
 
-    config_snapshot = await load_config_readonly_async()
+    config_snapshot = await load_config_readonly()
     requested_provider = resolve_requested_provider(requested, config_snapshot)
-    model_config_snapshot = _get_model_config(
-        config_snapshot,
-        detect_local_model=False,
-    )
+    model_config_snapshot = _get_model_config(config_snapshot)
     if not model_config_snapshot.get("default"):
         local_base_url = str(model_config_snapshot.get("base_url") or "").strip()
         if local_base_url and (
             "localhost" in local_base_url or "127.0.0.1" in local_base_url
         ):
-            detected_model = await _auto_detect_local_model_async(local_base_url)
+            detected_model = await _auto_detect_local_model(local_base_url)
             if detected_model:
                 model_config_snapshot["default"] = detected_model
 
@@ -1756,7 +1731,7 @@ async def resolve_runtime_provider(
                 or model_config_snapshot.get("api_key_env")
                 or "AZURE_FOUNDRY_API_KEY"
             ).strip()
-            azure_api_key = (await get_env_value_prefer_dotenv_async(key_env) or "").strip()
+            azure_api_key = (await get_env_value_prefer_dotenv(key_env) or "").strip()
         azure_runtime = _resolve_azure_foundry_runtime(
             requested_provider=requested_provider,
             model_cfg=model_config_snapshot,
@@ -1860,7 +1835,7 @@ async def resolve_runtime_provider(
                         target_model=target_model,
                     )
 
-    provider = resolve_provider(
+    provider = await resolve_provider(
         requested_provider,
         explicit_api_key=explicit_api_key,
         explicit_base_url=explicit_base_url,
@@ -1877,6 +1852,14 @@ async def resolve_runtime_provider(
     )
     if explicit_runtime:
         return explicit_runtime
+
+    if provider in {"nous", "openai-codex", "qwen-oauth", "minimax-oauth"}:
+        from agent.agent_runtime_helpers import AsyncCapabilityError
+
+        raise AsyncCapabilityError(
+            f"{provider} requires an OAuth lifecycle that is not native async; "
+            "use explicit credentials or an API-key provider."
+        )
 
     should_use_pool = provider != "openrouter"
     if provider == "openrouter":
@@ -1965,46 +1948,6 @@ async def resolve_runtime_provider(
                 pool=pool,
                 target_model=target_model,
             )
-
-    if provider == "nous":
-        from agent.agent_runtime_helpers import AsyncCapabilityError
-
-        raise AsyncCapabilityError(
-            "Nous Portal OAuth refresh has no native async credential lifecycle "
-            "yet; select an API-key provider for async runtime execution."
-        )
-
-    if provider == "openai-codex":
-        from agent.agent_runtime_helpers import AsyncCapabilityError
-
-        raise AsyncCapabilityError(
-            "Codex OAuth credential refresh has no native async lifecycle yet; "
-            "pass explicit credentials or use an API-key provider."
-        )
-
-    if provider == "xai-oauth":
-        from agent.agent_runtime_helpers import AsyncCapabilityError
-
-        raise AsyncCapabilityError(
-            "xAI OAuth credential refresh has no native async lifecycle yet; "
-            "pass explicit credentials or use an API-key provider."
-        )
-
-    if provider == "qwen-oauth":
-        from agent.agent_runtime_helpers import AsyncCapabilityError
-
-        raise AsyncCapabilityError(
-            "Qwen OAuth credential refresh has no native async lifecycle yet; "
-            "pass explicit credentials or use an API-key provider."
-        )
-
-    if provider == "minimax-oauth":
-        from agent.agent_runtime_helpers import AsyncCapabilityError
-
-        raise AsyncCapabilityError(
-            "MiniMax OAuth credential refresh has no native async lifecycle yet; "
-            "use a static API key provider."
-        )
 
     if provider == "copilot-acp":
         from agent.agent_runtime_helpers import AsyncCapabilityError
@@ -2096,7 +2039,7 @@ async def resolve_runtime_provider(
     # API-key providers (z.ai/GLM, Kimi, MiniMax, MiniMax-CN)
     pconfig = PROVIDER_REGISTRY.get(provider)
     if pconfig and pconfig.auth_type == "api_key":
-        creds = await auth_mod.resolve_api_key_provider_credentials_async(provider)
+        creds = await auth_mod.resolve_api_key_provider_credentials(provider)
         # An explicitly selected API-key provider is authoritative. Returning
         # a runtime with an empty key defers failure until the first request and
         # can make a later fallback look like a silent provider switch. Fail at

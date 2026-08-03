@@ -10,16 +10,9 @@ from __future__ import annotations
 
 import contextlib
 import io
-import sys
-import types
 from argparse import Namespace
 
 import pytest
-
-if "dotenv" not in sys.modules:
-    fake_dotenv = types.ModuleType("dotenv")
-    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
-    sys.modules["dotenv"] = fake_dotenv
 
 from hermes_cli.auth import resolve_api_key_provider_credentials
 from hermes_cli.models import CANONICAL_PROVIDERS, _PROVIDER_LABELS, normalize_provider
@@ -82,9 +75,10 @@ class TestFireworksOverlay:
 
 
 class TestFireworksCredentials:
-    def test_resolves_default_base_url(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_resolves_default_base_url(self, monkeypatch):
         monkeypatch.setenv("FIREWORKS_API_KEY", "fw_test_key")
-        creds = resolve_api_key_provider_credentials("fireworks")
+        creds = await resolve_api_key_provider_credentials("fireworks")
         assert creds["api_key"] == "fw_test_key"
         assert creds["base_url"] == "https://api.fireworks.ai/inference/v1"
 

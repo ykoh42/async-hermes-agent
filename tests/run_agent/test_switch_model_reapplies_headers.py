@@ -40,6 +40,7 @@ def _make_agent(provider="copilot", base_url="https://api.githubcopilot.com") ->
     )
     agent.context_compressor = compressor
     agent._primary_runtime = {}
+    agent._runtime_config_loaded = True
 
     return agent
 

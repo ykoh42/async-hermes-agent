@@ -348,10 +348,8 @@ class TestBuildTokenProvider:
 
 
 class TestRequireAzureIdentityMissing:
-    def test_clear_error_when_lazy_install_disabled(self, monkeypatch):
-        """When azure-identity isn't importable AND lazy installs are
-        off, the adapter must raise ImportError with an actionable
-        message, not propagate FeatureUnavailable."""
+    def test_clear_error_when_package_is_missing(self, monkeypatch):
+        """A missing optional SDK fails fast with an installation hint."""
         from agent import azure_identity_adapter as _adapter
 
         # Force the import path to fail.
@@ -362,20 +360,6 @@ class TestRequireAzureIdentityMissing:
             return original_import(name, *args, **kwargs)
 
         monkeypatch.setattr("builtins.__import__", _fake_import)
-
-        # Simulate lazy installs disabled.
-        from tools.lazy_deps import FeatureUnavailable
-
-        def _fake_ensure(*args, **kwargs):
-            raise FeatureUnavailable(
-                "provider.azure_identity",
-                ("azure-identity==1.25.3",),
-                "lazy installs disabled (test simulation)",
-            )
-
-        # The adapter calls ``ensure`` from ``tools.lazy_deps``; intercept
-        # it by patching the actual symbol path.
-        monkeypatch.setattr("tools.lazy_deps.ensure", _fake_ensure)
 
         with pytest.raises(ImportError) as exc_info:
             _adapter._require_azure_identity()
@@ -467,9 +451,8 @@ class TestHasAzureIdentityCredentials:
 
 class TestDescribeActiveCredential:
 
-    def test_reports_install_failure(self, monkeypatch):
-        """When lazy install is allowed but fails (e.g. lazy installs
-        disabled), the diagnostic surfaces the failure as the error."""
+    def test_reports_missing_package(self, monkeypatch):
+        """The diagnostic surfaces a missing optional package clearly."""
         from agent import azure_identity_adapter as _adapter
         monkeypatch.setattr(_adapter, "has_azure_identity_installed", lambda: False)
 
@@ -482,7 +465,7 @@ class TestDescribeActiveCredential:
         )
         assert info["ok"] is False
         assert "lazy installs disabled" in info["error"]
-        assert "lazy" in info["hint"].lower()
+        assert "pip install azure-identity" in info["hint"].lower()
 
     def test_reports_env_sources_for_managed_identity(self, fake_azure_identity, monkeypatch):
         from agent.azure_identity_adapter import describe_active_credential
@@ -491,6 +474,4 @@ class TestDescribeActiveCredential:
         assert info["ok"] is True
         sources = info.get("env_sources") or []
         assert any("ManagedIdentity" in s for s in sources)
-
-
 

@@ -5,7 +5,7 @@ import os
 import stat
 import sys
 from io import BytesIO
-from unittest.mock import patch, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -57,14 +57,13 @@ def _hit_callback_when_ready(url: str, timeout: float = 15.0) -> None:
 # ---------------------------------------------------------------------------
 
 class TestHermesTokenStorage:
-    def test_roundtrip_tokens(self, tmp_path, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_roundtrip_tokens(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         storage = HermesTokenStorage("test-server")
 
-        import asyncio
-
         # Initially empty
-        assert asyncio.run(storage.get_tokens()) is None
+        assert await storage.get_tokens() is None
 
         # Save and retrieve
         mock_token = MagicMock()
@@ -73,7 +72,7 @@ class TestHermesTokenStorage:
             "token_type": "Bearer",
             "refresh_token": "ref456",
         }
-        asyncio.run(storage.set_tokens(mock_token))
+        await storage.set_tokens(mock_token)
 
         # File exists with correct permissions
         token_path = tmp_path / "mcp-tokens" / "test-server.json"
@@ -82,7 +81,8 @@ class TestHermesTokenStorage:
         assert data["access_token"] == "abc123"
 
     @pytest.mark.skipif(sys.platform.startswith("win"), reason="POSIX mode bits not enforced on Windows")
-    def test_token_file_created_with_0o600(self, tmp_path, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_token_file_created_with_0o600(self, tmp_path, monkeypatch):
         """Tokens must land on disk at 0o600 with no umask-default exposure window.
 
         Regression for the TOCTOU race where ``write_text`` + post-write
@@ -93,14 +93,13 @@ class TestHermesTokenStorage:
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         storage = HermesTokenStorage("perm-test-server")
 
-        import asyncio
         mock_token = MagicMock()
         mock_token.model_dump.return_value = {
             "access_token": "secret-abc",
             "token_type": "Bearer",
             "refresh_token": "secret-ref",
         }
-        asyncio.run(storage.set_tokens(mock_token))
+        await storage.set_tokens(mock_token)
 
         token_path = tmp_path / "mcp-tokens" / "perm-test-server.json"
         assert token_path.exists()
@@ -113,7 +112,8 @@ class TestHermesTokenStorage:
         )
 
 
-    def test_corrupt_tokens_returns_none(self, tmp_path, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_corrupt_tokens_returns_none(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         storage = HermesTokenStorage("bad-server")
 
@@ -121,8 +121,7 @@ class TestHermesTokenStorage:
         d.mkdir(parents=True)
         (d / "bad-server.json").write_text("NOT VALID JSON{{{")
 
-        import asyncio
-        assert asyncio.run(storage.get_tokens()) is None
+        assert await storage.get_tokens() is None
 
 
 # ---------------------------------------------------------------------------
@@ -130,19 +129,21 @@ class TestHermesTokenStorage:
 # ---------------------------------------------------------------------------
 
 class TestBuildOAuthAuth:
-    def test_returns_none_without_sdk(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_returns_none_without_sdk(self, monkeypatch):
         import tools.mcp_oauth as mod
         monkeypatch.setattr(mod, "_OAUTH_AVAILABLE", False)
-        result = build_oauth_auth("test", "https://example.com")
+        result = await build_oauth_auth("test", "https://example.com")
         assert result is None
 
 
-    def test_scope_passed_through(self, tmp_path, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_scope_passed_through(self, tmp_path, monkeypatch):
         pytest.importorskip("mcp.client.auth")
 
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         _set_interactive_stdin(monkeypatch)
-        provider = build_oauth_auth("scoped", "https://example.com/mcp", {
+        provider = await build_oauth_auth("scoped", "https://example.com/mcp", {
             "scope": "read write admin",
         })
         assert provider is not None
@@ -302,16 +303,18 @@ class TestCallbackPortReservation:
             if reserved is not None:
                 reserved.close()
 
-    def test_pinned_port_is_not_reserved(self):
+    @pytest.mark.asyncio
+    async def test_pinned_port_is_not_reserved(self):
         import tools.mcp_oauth as mod
 
         cfg: dict = {"redirect_port": 49399}
-        port = mod._configure_callback_port(cfg)
+        port = await mod._configure_callback_port(cfg)
         assert port == 49399
         assert cfg["_resolved_port"] == 49399
         assert 49399 not in mod._reserved_sockets
 
-    def test_wait_for_callback_adopts_reserved_socket(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_wait_for_callback_adopts_reserved_socket(self, monkeypatch):
         """E2E: reserve → _wait_for_callback binds the SAME socket and the
         callback round-trips through it."""
         import asyncio
@@ -319,7 +322,7 @@ class TestCallbackPortReservation:
         import tools.mcp_oauth as mod
 
         cfg: dict = {}
-        port = mod._configure_callback_port(cfg)
+        port = await mod._configure_callback_port(cfg)
         monkeypatch.setattr(mod, "_is_interactive", lambda: False)
         # Bypass the non-interactive guard — this test drives the flow directly.
         monkeypatch.setattr(mod, "_raise_if_non_interactive", lambda lead: None)
@@ -333,13 +336,14 @@ class TestCallbackPortReservation:
             ).start()
             return await asyncio.wait_for(task, timeout=20)
 
-        code, state = asyncio.run(drive())
+        code, state = await drive()
         assert code == "abc123"
         assert state == "xyz"
         # Reservation was consumed by adoption.
         assert port not in mod._reserved_sockets
 
-    def test_concurrent_flows_keep_their_own_callback_ports(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_concurrent_flows_keep_their_own_callback_ports(self, monkeypatch):
         """#34260: flow A's waiter listens on A's port even after flow B
         overwrites the legacy module-level global.
 
@@ -355,11 +359,11 @@ class TestCallbackPortReservation:
         monkeypatch.setattr(mod, "_raise_if_non_interactive", lambda lead: None)
 
         cfg_a: dict = {}
-        port_a = mod._configure_callback_port(cfg_a)
+        port_a = await mod._configure_callback_port(cfg_a)
         waiter_a = mod._make_callback_waiter(port_a)
         # Flow B configures afterwards — overwrites mod._oauth_port.
         cfg_b: dict = {}
-        port_b = mod._configure_callback_port(cfg_b)
+        port_b = await mod._configure_callback_port(cfg_b)
         assert mod._oauth_port == port_b != port_a
 
         async def drive():
@@ -374,7 +378,7 @@ class TestCallbackPortReservation:
             return await asyncio.wait_for(task, timeout=20)
 
         try:
-            code, state = asyncio.run(drive())
+            code, state = await drive()
         finally:
             leftover = mod._reserved_sockets.pop(port_b, None)
             if leftover is not None:
@@ -388,14 +392,15 @@ class TestCallbackPortReservation:
 # ---------------------------------------------------------------------------
 
 class TestRemoveOAuthTokens:
-    def test_removes_files(self, tmp_path, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_removes_files(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         d = tmp_path / "mcp-tokens"
         d.mkdir()
         (d / "myserver.json").write_text("{}")
         (d / "myserver.client.json").write_text("{}")
 
-        remove_oauth_tokens("myserver")
+        await remove_oauth_tokens("myserver")
 
         assert not (d / "myserver.json").exists()
         assert not (d / "myserver.client.json").exists()
@@ -495,7 +500,8 @@ class TestWaitForCallbackNoBlocking:
 class TestBuildOAuthAuthNonInteractive:
     """build_oauth_auth() in non-interactive mode."""
 
-    def test_noninteractive_without_cached_tokens_fails_fast(self, tmp_path, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_noninteractive_without_cached_tokens_fails_fast(self, tmp_path, monkeypatch):
         """Without cached tokens, non-interactive mode skips browser auth."""
         pytest.importorskip("mcp.client.auth")
 
@@ -505,7 +511,7 @@ class TestBuildOAuthAuthNonInteractive:
         monkeypatch.setattr("tools.mcp_oauth.sys.stdin", mock_stdin)
 
         with pytest.raises(OAuthNonInteractiveError, match="non-interactive"):
-            build_oauth_auth("atlassian", "https://mcp.atlassian.com/v1/mcp")
+            await build_oauth_auth("atlassian", "https://mcp.atlassian.com/v1/mcp")
 
 
 class TestNonInteractiveFailFastAtCallbackBoundary:
@@ -591,11 +597,12 @@ _PROXY_REDIRECT = "https://oauth.example.ts.net/callback"
     ({}, "none"),                                    # public client
     ({"client_secret": "shh"}, "client_secret_post"),  # confidential client
 ])
-def test_build_client_metadata_token_endpoint_auth(cfg, expected_auth):
+@pytest.mark.asyncio
+async def test_build_client_metadata_token_endpoint_auth(cfg, expected_auth):
     pytest.importorskip("mcp")
     from tools.mcp_oauth import _build_client_metadata, _configure_callback_port
 
-    _configure_callback_port(cfg)
+    await _configure_callback_port(cfg)
     md = _build_client_metadata(cfg)
     assert md.token_endpoint_auth_method == expected_auth
     assert "authorization_code" in md.grant_types
@@ -614,7 +621,8 @@ def test_resolve_redirect_uri(cfg, expected):
     assert _resolve_redirect_uri(cfg, 1234) == expected
 
 
-def test_build_oauth_auth_preserves_server_url_path():
+@pytest.mark.asyncio
+async def test_build_oauth_auth_preserves_server_url_path():
     """server_url with path is forwarded to OAuthClientProvider unmodified.
 
     Regression for #16015: previously ``_parse_base_url`` stripped the path,
@@ -635,10 +643,10 @@ def test_build_oauth_auth_preserves_server_url_path():
     with patch.object(mcp_oauth, "_OAUTH_AVAILABLE", True), \
          patch.object(mcp_oauth, "OAuthClientProvider", _FakeProvider), \
          patch.object(mcp_oauth, "_is_interactive", return_value=True), \
-         patch.object(mcp_oauth, "_maybe_preregister_client"), \
+         patch.object(mcp_oauth, "_maybe_preregister_client", new_callable=AsyncMock), \
          patch.object(mcp_oauth, "HermesTokenStorage") as mock_storage_cls:
-        mock_storage_cls.return_value = MagicMock(has_cached_tokens=lambda: True)
-        build_oauth_auth(
+        mock_storage_cls.return_value.has_cached_tokens = AsyncMock(return_value=True)
+        await build_oauth_auth(
             server_name="notion",
             server_url="https://mcp.notion.com/mcp",
             oauth_config={},

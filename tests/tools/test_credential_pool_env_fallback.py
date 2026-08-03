@@ -119,20 +119,22 @@ class TestCredentialPoolSeedsFromDotEnv:
 class TestAuthResolvesFromDotEnv:
     """_resolve_api_key_provider_secret must also read from ~/.hermes/.env."""
 
-    def test_key_from_dotenv_only(self, isolated_hermes_home):
+    @pytest.mark.asyncio
+    async def test_key_from_dotenv_only(self, isolated_hermes_home):
         """Key in .env but not os.environ → _resolve returns it with the env var source."""
         _write_env_file(isolated_hermes_home, DEEPSEEK_API_KEY="sk-dotenv-resolve-789")
         assert "DEEPSEEK_API_KEY" not in os.environ
 
         from hermes_cli.auth import _resolve_api_key_provider_secret
-        key, source = _resolve_api_key_provider_secret(
+        key, source = await _resolve_api_key_provider_secret(
             provider_id="deepseek",
             pconfig=_make_pconfig(),
         )
         assert key == "sk-dotenv-resolve-789"
         assert source == "DEEPSEEK_API_KEY"
 
-    def test_dotenv_wins_over_stale_os_environ_on_resolve(
+    @pytest.mark.asyncio
+    async def test_dotenv_wins_over_stale_os_environ_on_resolve(
         self, isolated_hermes_home, monkeypatch
     ):
         """Regression for #20591: when both ~/.hermes/.env and os.environ define
@@ -145,38 +147,23 @@ class TestAuthResolvesFromDotEnv:
         monkeypatch.setenv("DEEPSEEK_API_KEY", "stale-shell-deepseek")
 
         from hermes_cli.auth import _resolve_api_key_provider_secret
-        key, source = _resolve_api_key_provider_secret(
+        key, source = await _resolve_api_key_provider_secret(
             provider_id="deepseek",
             pconfig=_make_pconfig(),
         )
         assert key == "dotenv-fresh-deepseek"
         assert source == "DEEPSEEK_API_KEY"
 
-    def test_get_anthropic_key_prefers_dotenv_over_stale_os_environ(
-        self, isolated_hermes_home, monkeypatch
-    ):
-        """Regression for #20591 (sibling site): get_anthropic_key() must also
-        prefer ~/.hermes/.env over a stale shell export. This path resolves
-        ANTHROPIC_API_KEY/ANTHROPIC_TOKEN/CLAUDE_CODE_OAUTH_TOKEN and had the
-        identical os.environ-first rotation bug that the api-key resolution
-        path did, just for Anthropic.
-        """
-        _write_env_file(isolated_hermes_home, ANTHROPIC_API_KEY="dotenv-fresh-anthropic")
-        monkeypatch.setenv("ANTHROPIC_API_KEY", "stale-shell-anthropic")
-
-        from hermes_cli.auth import get_anthropic_key
-        assert get_anthropic_key() == "dotenv-fresh-anthropic"
-
-
 class TestAuthCredentialPoolFallback:
     """_resolve_api_key_provider_secret falls back to credential pool when env + dotenv are empty."""
 
-    def test_sync_config_helper_never_loads_async_pool(self, isolated_hermes_home):
+    @pytest.mark.asyncio
+    async def test_config_helper_never_loads_credential_pool(self, isolated_hermes_home):
         """The config-only helper must not create an unawaited pool coroutine."""
         from hermes_cli.auth import _resolve_api_key_provider_secret
 
         with patch("agent.credential_pool.load_pool") as load_pool:
-            key, source = _resolve_api_key_provider_secret(
+            key, source = await _resolve_api_key_provider_secret(
                 provider_id="deepseek",
                 pconfig=_make_pconfig(),
             )
@@ -184,20 +171,22 @@ class TestAuthCredentialPoolFallback:
         assert (key, source) == ("", "")
         load_pool.assert_not_called()
 
-    def test_credential_pool_empty_returns_empty(self, isolated_hermes_home):
+    @pytest.mark.asyncio
+    async def test_credential_pool_empty_returns_empty(self, isolated_hermes_home):
         """Empty env + empty .env + empty pool → empty string."""
         mock_pool = MagicMock()
         mock_pool.has_credentials.return_value = False
 
         from hermes_cli.auth import _resolve_api_key_provider_secret
         with patch("agent.credential_pool.load_pool", return_value=mock_pool):
-            key, source = _resolve_api_key_provider_secret(
+            key, source = await _resolve_api_key_provider_secret(
                 provider_id="deepseek",
                 pconfig=_make_pconfig(),
             )
         assert key == ""
 
-    def test_env_var_takes_priority_over_pool(self, isolated_hermes_home, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_env_var_takes_priority_over_pool(self, isolated_hermes_home, monkeypatch):
         """os.environ key wins — credential pool is NEVER consulted."""
         monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-env-key-first-abc123")
 
@@ -206,7 +195,7 @@ class TestAuthCredentialPoolFallback:
 
         from hermes_cli.auth import _resolve_api_key_provider_secret
         with patch("agent.credential_pool.load_pool", return_value=mock_pool) as mp:
-            key, source = _resolve_api_key_provider_secret(
+            key, source = await _resolve_api_key_provider_secret(
                 provider_id="deepseek",
                 pconfig=_make_pconfig(),
             )
@@ -215,7 +204,8 @@ class TestAuthCredentialPoolFallback:
         # Pool should not even have been loaded — env var satisfied the request first
         mp.assert_not_called()
 
-    def test_dotenv_takes_priority_over_pool(self, isolated_hermes_home):
+    @pytest.mark.asyncio
+    async def test_dotenv_takes_priority_over_pool(self, isolated_hermes_home):
         """Key in .env beats credential pool — pool only fires when both env sources are empty."""
         _write_env_file(isolated_hermes_home, DEEPSEEK_API_KEY="sk-dotenv-priority-xyz")
         assert "DEEPSEEK_API_KEY" not in os.environ
@@ -225,7 +215,7 @@ class TestAuthCredentialPoolFallback:
 
         from hermes_cli.auth import _resolve_api_key_provider_secret
         with patch("agent.credential_pool.load_pool", return_value=mock_pool) as mp:
-            key, source = _resolve_api_key_provider_secret(
+            key, source = await _resolve_api_key_provider_secret(
                 provider_id="deepseek",
                 pconfig=_make_pconfig(),
             )

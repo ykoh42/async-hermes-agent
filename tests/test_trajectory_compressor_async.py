@@ -11,7 +11,7 @@ each asyncio.run() gets a client bound to the current loop.
 """
 
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -53,9 +53,8 @@ class TestAsyncClientLazyCreation:
         )
         assert comp.async_client is not None
 
-    def test_get_async_client_creates_fresh_each_call(self):
-        """Each call to _get_async_client() creates a NEW client instance,
-        so it binds to the current event loop."""
+    def test_get_async_client_reuses_owned_client(self):
+        """One compressor lifecycle reuses one event-loop-bound client."""
         from trajectory_compressor import TrajectoryCompressor
 
         comp = TrajectoryCompressor.__new__(TrajectoryCompressor)
@@ -78,9 +77,21 @@ class TestAsyncClientLazyCreation:
             client1 = comp._get_async_client()
             client2 = comp._get_async_client()
 
-        # Should have created two separate instances
-        assert call_count == 2
-        assert instances[0] is not instances[1]
+        assert call_count == 1
+        assert client1 is client2 is instances[0]
+
+    @pytest.mark.asyncio
+    async def test_close_releases_owned_client(self):
+        from trajectory_compressor import TrajectoryCompressor
+
+        comp = TrajectoryCompressor.__new__(TrajectoryCompressor)
+        client = MagicMock(close=AsyncMock())
+        comp.async_client = client
+
+        await comp.close()
+
+        client.close.assert_awaited_once_with()
+        assert comp.async_client is None
 
 
 class TestSourceLineVerification:

@@ -342,26 +342,6 @@ def get_profile(name: str) -> ContextProfile:
 # ── Helpers ─────────────────────────────────────────────────────────────────
 
 
-def _coding_mode(config: Optional[dict[str, Any]]) -> str:
-    """Return the normalized ``agent.coding_context`` mode (auto/focus/on/off)."""
-    if config is None:
-        try:
-            from hermes_cli.config import load_config_readonly
-
-            config = load_config_readonly()
-        except Exception:
-            config = {}
-    raw = ((config or {}).get("agent", {}) or {}).get("coding_context", "auto")
-    mode = str(raw).strip().lower()
-    if mode in {"focus", "strict", "lean"}:
-        return "focus"
-    if mode in {"on", "true", "yes", "1", "always"}:
-        return "on"
-    if mode in {"off", "false", "no", "0", "never"}:
-        return "off"
-    return "auto"
-
-
 def _coding_instructions(config: Optional[dict[str, Any]]) -> str:
     """Standing operator instructions for the coding posture (config).
 
@@ -372,13 +352,6 @@ def _coding_instructions(config: Optional[dict[str, Any]]) -> str:
     Cache-safe: resolved once per session into the stable system-prompt tier,
     like the rest of the posture.
     """
-    if config is None:
-        try:
-            from hermes_cli.config import load_config
-
-            config = load_config()
-        except Exception:
-            config = {}
     raw = ((config or {}).get("agent", {}) or {}).get("coding_instructions", "")
     if isinstance(raw, (list, tuple)):
         return "\n".join(str(item).strip() for item in raw if str(item).strip())
@@ -389,9 +362,9 @@ async def _load_coding_config(config: Optional[dict[str, Any]]) -> dict[str, Any
     if config is not None:
         return config
     try:
-        from hermes_cli.config import load_config_readonly_async
+        from hermes_cli.config import load_config_readonly
 
-        loaded = await load_config_readonly_async()
+        loaded = await load_config_readonly()
         return loaded if isinstance(loaded, dict) else {}
     except Exception:
         return {}

@@ -616,6 +616,10 @@ async def terminal_tool(
     **_kwargs: Any,
 ) -> str:
     """Run a local command asynchronously and preserve Hermes' JSON result contract."""
+    from tools.tool_output_limits import refresh_tool_output_limits
+
+    await refresh_tool_output_limits()
+
     if not isinstance(command, str):
         return json.dumps(
             {
@@ -670,6 +674,20 @@ async def terminal_tool(
                     "and are not supported by the async library runtime."
                 ),
                 "status": "error",
+            },
+            ensure_ascii=False,
+        )
+
+    from tools.approval import validate_terminal_command
+
+    guard = await validate_terminal_command(command)
+    if not guard.get("approved", False):
+        return json.dumps(
+            {
+                "output": "",
+                "exit_code": -1,
+                "error": guard.get("message") or "Terminal command blocked by policy.",
+                "status": "denied",
             },
             ensure_ascii=False,
         )

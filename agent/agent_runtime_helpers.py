@@ -896,7 +896,7 @@ def strip_think_blocks(agent, content: str) -> str:
 
 
 
-def sync_credential_pool_entry_id(agent) -> None:
+def bind_credential_pool_entry_id(agent) -> None:
     """Rebind ``agent._credential_pool_entry_id`` from the current pool + key.
 
     OAuth refreshes can replace the runtime token before a failed request is
@@ -974,7 +974,7 @@ async def recover_with_credential_pool(
                 from agent.credential_pool import get_custom_provider_pool_key
                 _agent_base = (getattr(agent, "base_url", "") or "").strip()
                 _custom_match = bool(_agent_base) and (
-                    (get_custom_provider_pool_key(_agent_base) or "").strip().lower()
+                    (await get_custom_provider_pool_key(_agent_base) or "").strip().lower()
                     == pool_provider
                 )
             except Exception:
@@ -1545,7 +1545,7 @@ async def restore_primary_runtime(agent) -> bool:
                 from agent.credential_pool import get_custom_provider_pool_key
 
                 primary_key = (
-                    get_custom_provider_pool_key(str(rt.get("base_url") or "")) or ""
+                    await get_custom_provider_pool_key(str(rt.get("base_url") or "")) or ""
                 ).strip().lower()
                 pool_matches_primary = bool(primary_key) and primary_key == pool_provider
             except Exception:
@@ -1597,7 +1597,7 @@ async def restore_primary_runtime(agent) -> bool:
                         from agent.credential_pool import get_custom_provider_pool_key
                         primary_base_url = str(rt.get("base_url") or "").strip()
                         primary_key = (
-                            get_custom_provider_pool_key(primary_base_url) or ""
+                            await get_custom_provider_pool_key(primary_base_url) or ""
                         ).strip().lower()
                         entry_matches_primary = bool(primary_key) and primary_key == entry_provider
                     except Exception:
@@ -2043,10 +2043,10 @@ async def switch_model(agent, new_model, new_provider, api_key='', base_url='', 
     from hermes_cli.config import (
         get_compatible_custom_providers,
         get_custom_provider_context_length,
-        load_config_readonly_async,
+        load_config_readonly,
     )
 
-    switch_config = await load_config_readonly_async()
+    switch_config = await load_config_readonly()
     custom_providers = get_compatible_custom_providers(switch_config)
     if not effective_base_url and new_provider.startswith("custom:"):
         from hermes_cli.providers import resolve_custom_provider

@@ -1947,9 +1947,9 @@ class SlashCommandCompleter(Completer):
     def _personality_completions(sub_text: str, sub_lower: str):
         """Yield completions for /personality from configured personalities."""
         try:
-            from hermes_cli.config import load_config_readonly
+            from hermes_cli.config import load_config
 
-            personalities = (load_config_readonly().get("agent") or {}).get("personalities", {}) or {}
+            personalities = (load_config().get("agent") or {}).get("personalities", {}) or {}
             if "none".startswith(sub_lower) and "none" != sub_lower:
                 yield Completion(
                     "none",

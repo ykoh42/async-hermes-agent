@@ -277,11 +277,11 @@ async def resolve_xai_http_credentials(
             or getattr(entry, "base_url", "")
             or auth_mod.DEFAULT_XAI_OAUTH_BASE_URL
         ).strip().rstrip("/")
-        from hermes_cli.config import get_env_value_prefer_dotenv_async
+        from hermes_cli.config import get_env_value_prefer_dotenv
 
         override_base_url = str(
-            await get_env_value_prefer_dotenv_async("HERMES_XAI_BASE_URL")
-            or await get_env_value_prefer_dotenv_async("XAI_BASE_URL")
+            await get_env_value_prefer_dotenv("HERMES_XAI_BASE_URL")
+            or await get_env_value_prefer_dotenv("XAI_BASE_URL")
             or ""
         ).strip().rstrip("/")
         base_url = auth_mod._xai_validate_inference_base_url(
@@ -299,13 +299,13 @@ async def resolve_xai_http_credentials(
         # pool falls through to the explicit API-key resolver.
         pass
 
-    from hermes_cli.config import get_env_value_prefer_dotenv_async
+    from hermes_cli.config import get_env_value_prefer_dotenv
 
     api_key = str(
-        await get_env_value_prefer_dotenv_async("XAI_API_KEY") or ""
+        await get_env_value_prefer_dotenv("XAI_API_KEY") or ""
     ).strip()
     base_url = str(
-        await get_env_value_prefer_dotenv_async("XAI_BASE_URL")
+        await get_env_value_prefer_dotenv("XAI_BASE_URL")
         or "https://api.x.ai/v1"
     ).strip().rstrip("/")
     return {

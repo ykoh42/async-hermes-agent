@@ -1039,10 +1039,10 @@ class PluginContext:
                 f"must contain only alphanumeric characters and underscores"
             )
 
-        # Lazy import to avoid circular: hermes_cli.main imports plugins indirectly
-        from hermes_cli.main import _AUX_TASKS as _BUILTIN_AUX_TASKS
-
-        builtin_keys = {k for k, _name, _desc in _BUILTIN_AUX_TASKS}
+        # This library build has no CLI-owned auxiliary-task catalog. Core
+        # tasks are registered by their runtime owners; plugin keys only need
+        # collision checks against other plugin registrations here.
+        builtin_keys: set[str] = set()
         if key in builtin_keys:
             raise ValueError(
                 f"Plugin '{self.manifest.name}' cannot register auxiliary task "

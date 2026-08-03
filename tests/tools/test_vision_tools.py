@@ -151,7 +151,7 @@ class TestHandleVisionAnalyze:
                 st.enter_context(patch.dict(os.environ, {}, clear=False))
                 if config is not None:
                     st.enter_context(patch(
-                        "hermes_cli.config.load_config_readonly_async",
+                        "hermes_cli.config.load_config_readonly",
                         new=AsyncMock(return_value=config),
                     ))
                 if env_model is None:
@@ -265,7 +265,7 @@ class TestVisionConfig:
 
             with (
                 patch(
-                    "hermes_cli.config.load_config_readonly_async",
+                    "hermes_cli.config.load_config_readonly",
                     new=AsyncMock(return_value=config),
                 ),
                 patch(

@@ -23,9 +23,7 @@ from hermes_cli.config import (
     remove_env_value,
     save_config,
     save_env_value,
-    save_env_value_secure,
     sanitize_env_file,
-    set_config_value,
     write_platform_config_field,
     _sanitize_env_lines,
 )
@@ -243,20 +241,6 @@ class TestSaveAndLoadRoundtrip:
 
 
 
-
-
-
-class TestSaveEnvValueSecure:
-
-    def test_secure_save_returns_metadata_only(self, tmp_path):
-        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
-            result = save_env_value_secure("GITHUB_TOKEN", "ghp_test_secret")
-            assert result == {
-                "success": True,
-                "stored_as": "GITHUB_TOKEN",
-                "validated": False,
-            }
-            assert "secret" not in str(result).lower()
 
 
 
@@ -1077,14 +1061,6 @@ class TestEnvWriteDenylist:
         save_env_value(allowed_key, "test-value-123")
         env = load_env()
         assert env[allowed_key] == "test-value-123"
-
-
-
-    def test_save_env_value_secure_inherits_denylist(self):
-        """The ``_secure`` variant goes through ``save_env_value`` so
-        it inherits the gate — verify, don't assume."""
-        with pytest.raises(ValueError, match="denylist"):
-            save_env_value_secure("LD_PRELOAD", "/tmp/evil.so")
 
 
 

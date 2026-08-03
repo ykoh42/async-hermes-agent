@@ -1004,9 +1004,9 @@ async def build_environment_hints() -> str:
     extra = (os.getenv("HERMES_ENVIRONMENT_HINT") or "").strip()
     if not extra:
         try:
-            from hermes_cli.config import load_config_readonly_async
+            from hermes_cli.config import load_config_readonly
 
-            config = await load_config_readonly_async()
+            config = await load_config_readonly()
             extra = str((config.get("agent", {}) or {}).get("environment_hint", "")).strip()
         except asyncio.CancelledError:
             raise

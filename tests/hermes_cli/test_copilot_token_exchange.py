@@ -91,7 +91,7 @@ async def test_runtime_credentials_use_exchange(monkeypatch):
     exchange = AsyncMock(return_value=("exchanged", "https://enterprise.example/v1"))
     monkeypatch.setattr("hermes_cli.copilot_auth.get_copilot_api_token", exchange)
 
-    credentials = await auth.resolve_api_key_provider_credentials_async("copilot")
+    credentials = await auth.resolve_api_key_provider_credentials("copilot")
 
     assert credentials["api_key"] == "exchanged"
     assert credentials["base_url"] == "https://enterprise.example/v1"

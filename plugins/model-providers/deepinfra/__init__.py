@@ -22,29 +22,7 @@ class _DeepInfraProfile(ProviderProfile):
     """
 
     def default_vision_model(self):  # type: ignore[override]
-        """First vision-capable *chat* model from the live catalog, or None.
-
-        Key-gated so a box without ``DEEPINFRA_API_KEY`` never pays the
-        catalog round-trip. Requires the ``chat`` surface tag (not just the
-        ``vision`` capability) so an image-gen/edit model that merely carries
-        a ``vision`` tag can't be picked as a chat-completions vision backend.
-        """
-        import os
-
-        if not (os.environ.get("DEEPINFRA_API_KEY") or "").strip():
-            return None
-        try:
-            from hermes_cli.models import _fetch_deepinfra_models_by_tag
-            items = _fetch_deepinfra_models_by_tag("chat")
-        except Exception:
-            return None
-        for item in items or []:
-            metadata = item.get("metadata") or {}
-            tags = metadata.get("tags") if isinstance(metadata, dict) else None
-            if isinstance(tags, list) and "vision" in tags:
-                model_id = item.get("id")
-                if model_id:
-                    return model_id
+        """No implicit network discovery from the synchronous profile hook."""
         return None
 
 

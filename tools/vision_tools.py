@@ -73,7 +73,7 @@ _debug = DebugSession("vision_tools", env_var="VISION_TOOLS_DEBUG")
 # Configurable HTTP download timeout for _download_image().
 # Separate from auxiliary.vision.timeout which governs the LLM API call.
 # Resolution: config.yaml auxiliary.vision.download_timeout → env var → 30s default.
-def _resolve_download_timeout() -> float:
+async def _resolve_download_timeout() -> float:
     env_val = os.getenv("HERMES_VISION_DOWNLOAD_TIMEOUT", "").strip()
     if env_val:
         try:
@@ -81,16 +81,14 @@ def _resolve_download_timeout() -> float:
         except ValueError:
             pass
     try:
-        from hermes_cli.config import cfg_get, load_config
-        cfg = load_config()
+        from hermes_cli.config import cfg_get, load_config_readonly
+        cfg = await load_config_readonly()
         val = cfg_get(cfg, "auxiliary", "vision", "download_timeout")
         if val is not None:
             return float(val)
     except Exception:
         pass
     return 30.0
-
-_VISION_DOWNLOAD_TIMEOUT = _resolve_download_timeout()
 
 # Hard cap on downloaded image file size (50 MB). Prevents OOM from
 # attacker-hosted multi-gigabyte files or decompression bombs.
@@ -316,6 +314,7 @@ async def _download_image(image_url: str, destination: Path, max_retries: int = 
                 f"Blocked redirect to private/internal address: {redirect_url}"
             )
 
+    download_timeout = await _resolve_download_timeout()
     last_error = None
     for attempt in range(max_retries):
         try:
@@ -330,7 +329,7 @@ async def _download_image(image_url: str, destination: Path, max_retries: int = 
             # SSRF: the client validates DNS at TCP connect time; event_hooks
             # validate each redirect target against private IP ranges.
             async with create_ssrf_safe_client(
-                timeout=_VISION_DOWNLOAD_TIMEOUT,
+                timeout=download_timeout,
                 follow_redirects=True,
                 event_hooks={"response": [_ssrf_redirect_guard]},
             ) as client:
@@ -548,24 +547,10 @@ def _resize_image_for_vision(image_path: Path, mime_type: Optional[str] = None,
         from PIL import Image
         import io as _io
     except ImportError:
-        # Pillow is a lazy-installable soft dependency. Try a best-effort
-        # install (respects security.allow_lazy_installs; no-op if disabled or
-        # offline), then re-import. If it still isn't importable, fall back to
-        # the raw bytes and let the caller raise the size error.
-        try:
-            from tools.lazy_deps import ensure as _ensure_dep
-            # prompt=False: never raise a blocking input() prompt mid-session.
-            # Under the interactive CLI prompt_toolkit owns stdin, so a bare
-            # input() deadlocks the terminal (#40490). The install is already
-            # gated by security.allow_lazy_installs, so reaching here is opt-in.
-            _ensure_dep("tool.vision", prompt=False)
-            from PIL import Image
-            import io as _io
-        except Exception:
-            logger.info("Pillow not installed — cannot auto-resize oversized image")
-            if data_url is None:
-                data_url = _image_to_base64_data_url(image_path, mime_type=mime_type)
-            return data_url  # caller will raise the size error
+        logger.info("Pillow not installed — cannot auto-resize oversized image")
+        if data_url is None:
+            data_url = _image_to_base64_data_url(image_path, mime_type=mime_type)
+        return data_url  # caller will raise the size error
 
     logger.info("Image file is %.1f MB (estimated base64 %.1f MB, limit %.1f MB, max_dimension=%s), auto-resizing...",
                 file_size / (1024 * 1024), estimated_b64 / (1024 * 1024),
@@ -1124,8 +1109,8 @@ async def vision_analyze_tool(
         vision_timeout = 120.0
         vision_temperature = 0.1
         try:
-            from hermes_cli.config import cfg_get, load_config_readonly_async
-            _cfg = await load_config_readonly_async()
+            from hermes_cli.config import cfg_get, load_config_readonly
+            _cfg = await load_config_readonly()
             _vision_cfg = cfg_get(_cfg, "auxiliary", "vision", default={})
             _vt = _vision_cfg.get("timeout")
             if _vt is not None:
@@ -1284,60 +1269,6 @@ async def check_vision_requirements() -> bool:
 
 
 
-if __name__ == "__main__":
-    """
-    Simple test/demo when run directly
-    """
-    print("👁️ Vision Tools Module")
-    print("=" * 40)
-    
-    # Check if vision model is available
-    import asyncio
-
-    api_available = asyncio.run(check_vision_requirements())
-    
-    if not api_available:
-        print("❌ No auxiliary vision model available")
-        print("Configure a supported multimodal backend (OpenRouter, Nous, Codex, Anthropic, or a custom OpenAI-compatible endpoint).")
-        sys.exit(1)
-    else:
-        print("✅ Vision model available")
-    
-    print("🛠️ Vision tools ready for use!")
-    
-    # Show debug mode status
-    if _debug.active:
-        print(f"🐛 Debug mode ENABLED - Session ID: {_debug.session_id}")
-        print(f"   Debug logs will be saved to: ./logs/vision_tools_debug_{_debug.session_id}.json")
-    else:
-        print("🐛 Debug mode disabled (set VISION_TOOLS_DEBUG=true to enable)")
-    
-    print("\nBasic usage:")
-    print("  from vision_tools import vision_analyze_tool")
-    print("  import asyncio")
-    print("")
-    print("  async def main():")
-    print("      result = await vision_analyze_tool(")
-    print("          image_url='https://example.com/image.jpg',")
-    print("          user_prompt='What do you see in this image?'")
-    print("      )")
-    print("      print(result)")
-    print("  asyncio.run(main())")
-    
-    print("\nExample prompts:")
-    print("  - 'What architectural style is this building?'")
-    print("  - 'Describe the emotions and mood in this image'")
-    print("  - 'What text can you read in this image?'")
-    print("  - 'Identify any safety hazards visible'")
-    print("  - 'What products or brands are shown?'")
-    
-    print("\nDebug mode:")
-    print("  # Enable debug logging")
-    print("  export VISION_TOOLS_DEBUG=true")
-    print("  # Debug logs capture all vision analysis calls and results")
-    print("  # Logs saved to: ./logs/vision_tools_debug_UUID.json")
-
-
 # ---------------------------------------------------------------------------
 # Registry
 # ---------------------------------------------------------------------------
@@ -1396,8 +1327,8 @@ async def _handle_vision_analyze(args: Dict[str, Any], **kw: Any) -> str:
     # Prefer config.yaml auxiliary.vision.model; env var is a legacy override.
     model = None
     try:
-        from hermes_cli.config import cfg_get, load_config_readonly_async
-        _cfg = await load_config_readonly_async()
+        from hermes_cli.config import cfg_get, load_config_readonly
+        _cfg = await load_config_readonly()
         _vmodel = cfg_get(_cfg, "auxiliary", "vision", "model")
         if _vmodel:
             model = str(_vmodel).strip() or None
@@ -1413,7 +1344,6 @@ registry.register(
     toolset="vision",
     schema=VISION_ANALYZE_SCHEMA,
     handler=_handle_vision_analyze,
-    check_fn=check_vision_requirements,
     emoji="👁️",
 )
 
@@ -1636,8 +1566,8 @@ async def video_analyze_tool(
         vision_timeout = 180.0
         vision_temperature = 0.1
         try:
-            from hermes_cli.config import cfg_get, load_config_readonly_async
-            _cfg = await load_config_readonly_async()
+            from hermes_cli.config import cfg_get, load_config_readonly
+            _cfg = await load_config_readonly()
             _vision_cfg = cfg_get(_cfg, "auxiliary", "vision", default={})
             _vt = _vision_cfg.get("timeout")
             if _vt is not None:
@@ -1772,7 +1702,7 @@ VIDEO_ANALYZE_SCHEMA = {
 }
 
 
-def _handle_video_analyze(args: Dict[str, Any], **kw: Any) -> Awaitable[str]:
+async def _handle_video_analyze(args: Dict[str, Any], **kw: Any) -> str:
     video_url = args.get("video_url", "")
     question = args.get("question", "")
     full_prompt = (
@@ -1784,8 +1714,8 @@ def _handle_video_analyze(args: Dict[str, Any], **kw: Any) -> Awaitable[str]:
     # env vars are a legacy override.
     model = None
     try:
-        from hermes_cli.config import cfg_get, load_config
-        _cfg = load_config()
+        from hermes_cli.config import cfg_get, load_config_readonly
+        _cfg = await load_config_readonly()
         _vmodel = cfg_get(_cfg, "auxiliary", "video", "model") or cfg_get(_cfg, "auxiliary", "vision", "model")
         if _vmodel:
             model = str(_vmodel).strip() or None
@@ -1793,7 +1723,7 @@ def _handle_video_analyze(args: Dict[str, Any], **kw: Any) -> Awaitable[str]:
         pass
     if not model:
         model = os.getenv("AUXILIARY_VIDEO_MODEL", "").strip() or os.getenv("AUXILIARY_VISION_MODEL", "").strip() or None
-    return video_analyze_tool(video_url, full_prompt, model)
+    return await video_analyze_tool(video_url, full_prompt, model)
 
 
 registry.register(
@@ -1801,6 +1731,5 @@ registry.register(
     toolset="video",
     schema=VIDEO_ANALYZE_SCHEMA,
     handler=_handle_video_analyze,
-    check_fn=check_vision_requirements,
     emoji="🎬",
 )

@@ -31,6 +31,7 @@ from tools.terminal_tool import terminal_tool
 
 
 def test_conversation_and_chat_are_coroutines():
+    from run_agent import main as agent_main
     from agent.agent_runtime_helpers import (
         invoke_tool,
         recover_with_credential_pool,
@@ -49,7 +50,12 @@ def test_conversation_and_chat_are_coroutines():
         search_tool,
         write_file_tool,
     )
-    from batch_runner import BatchRunner
+    from batch_runner import BatchRunner, main as batch_main
+    from trajectory_compressor import (
+        CompressionConfig,
+        TrajectoryCompressor,
+        main as trajectory_main,
+    )
     from hermes_cli.middleware import run_llm_execution_middleware
     from hermes_cli.goals import (
         GoalManager,
@@ -64,6 +70,7 @@ def test_conversation_and_chat_are_coroutines():
     assert inspect.iscoroutinefunction(AIAgent.run_conversation)
     assert inspect.iscoroutinefunction(AIAgent.chat)
     assert inspect.iscoroutinefunction(AIAgent.close)
+    assert inspect.iscoroutinefunction(agent_main)
     assert inspect.iscoroutinefunction(AIAgent.switch_model)
     assert inspect.iscoroutinefunction(AIAgent._ensure_db_session)
     assert inspect.iscoroutinefunction(AIAgent._persist_session)
@@ -81,6 +88,11 @@ def test_conversation_and_chat_are_coroutines():
     assert inspect.iscoroutinefunction(compress_context)
     assert inspect.iscoroutinefunction(execute_tool_calls_segmented)
     assert inspect.iscoroutinefunction(BatchRunner.run)
+    assert inspect.iscoroutinefunction(batch_main)
+    assert inspect.iscoroutinefunction(CompressionConfig.from_yaml)
+    assert inspect.iscoroutinefunction(TrajectoryCompressor.close)
+    assert inspect.iscoroutinefunction(trajectory_main)
+    assert inspect.iscoroutinefunction(SessionDB._parse_schema_columns)
     assert inspect.iscoroutinefunction(terminal_tool)
     assert inspect.iscoroutinefunction(read_file_tool)
     assert inspect.iscoroutinefunction(write_file_tool)
@@ -119,6 +131,31 @@ def test_conversation_and_chat_are_coroutines():
     assert active_entries
     assert all(entry.is_async for entry in active_entries)
     assert all(inspect.iscoroutinefunction(entry.handler) for entry in active_entries)
+
+
+def test_constructor_does_not_read_runtime_config_or_create_logs():
+    """AIAgent construction is state-only; I/O starts at the first await."""
+    with (
+        patch("run_agent.get_tool_definitions", return_value=[]),
+        patch(
+            "hermes_cli.config.load_config",
+            side_effect=AssertionError("constructor read config.yaml"),
+        ),
+        patch(
+            "hermes_logging.setup_logging",
+            side_effect=AssertionError("constructor initialized file logging"),
+        ),
+    ):
+        agent = AIAgent(
+            api_key="test-key",
+            base_url="https://example.invalid/v1",
+            model="test-model",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+
+    assert agent._deferred_provider_runtime is not None
 
 
 @pytest.mark.asyncio
@@ -200,21 +237,23 @@ async def test_async_session_db_meta_and_gateway_listing_match_native_shape(tmp_
 @pytest.mark.asyncio
 async def test_native_file_read_deduplicates_and_write_invalidates(tmp_path, monkeypatch):
     """File-loop guards survive the sync-backend removal on native I/O."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setattr("tools.file_tools._check_sensitive_path", lambda *_args: None)
     path = tmp_path / "sample.txt"
+    task_id = f"native-file-{tmp_path.name}"
     path.write_text("first\nsecond\n", encoding="utf-8")
 
-    first = json.loads(await read_file_tool(str(path), task_id="native-file"))
-    second = json.loads(await read_file_tool(str(path), task_id="native-file"))
+    first = json.loads(await read_file_tool(str(path), task_id=task_id))
+    second = json.loads(await read_file_tool(str(path), task_id=task_id))
 
     assert "content" in first
     assert second["dedup"] is True
     assert second["status"] == "unchanged"
 
     written = json.loads(
-        await write_file_tool(str(path), "updated\n", task_id="native-file")
+        await write_file_tool(str(path), "updated\n", task_id=task_id)
     )
-    refreshed = json.loads(await read_file_tool(str(path), task_id="native-file"))
+    refreshed = json.loads(await read_file_tool(str(path), task_id=task_id))
 
     assert written["files_modified"] == [str(path)]
     assert "updated" in refreshed["content"]
@@ -1390,7 +1429,6 @@ async def test_default_compression_prologue_uses_static_context_metadata(monkeyp
         raise AssertionError("async compression prologue attempted blocking I/O")
 
     agent._execute_model_request = model_response
-    monkeypatch.setattr("agent.model_metadata._ensure_requests", fail_if_called)
     monkeypatch.setattr(asyncio, "to_thread", fail_if_called)
     try:
         result = await agent.run_conversation("hello")

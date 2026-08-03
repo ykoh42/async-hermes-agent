@@ -98,7 +98,7 @@ async def test_switch_model_resets_stale_streak():
     agent._ensure_provider_runtime = AsyncMock(side_effect=initialize_runtime)
     agent._persist_pending_billing_route = AsyncMock()
 
-    with patch("hermes_cli.config.load_config_readonly_async", new_callable=AsyncMock, return_value={}):
+    with patch("hermes_cli.config.load_config_readonly", new_callable=AsyncMock, return_value={}):
         await agent.switch_model(
             new_model="openai/gpt-5",
             new_provider="openrouter",
@@ -121,7 +121,7 @@ async def test_switch_model_failure_does_not_reset_streak():
         side_effect=RuntimeError("simulated client build failure")
     )
 
-    with patch("hermes_cli.config.load_config_readonly_async", new_callable=AsyncMock, return_value={}):
+    with patch("hermes_cli.config.load_config_readonly", new_callable=AsyncMock, return_value={}):
         try:
             await agent.switch_model(
                 new_model="openai/gpt-5",

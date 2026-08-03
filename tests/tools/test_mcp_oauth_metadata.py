@@ -72,7 +72,7 @@ class TestMetadataStorage:
         await storage.save_oauth_metadata(_make_metadata())
         assert storage._meta_path().exists()
 
-        storage.remove()
+        await storage.remove()
         assert not storage._meta_path().exists()
 
 

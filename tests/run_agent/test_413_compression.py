@@ -94,6 +94,8 @@ def agent():
         a.client = MagicMock()
         a.client.chat.completions.create = AsyncMock()
         a._deferred_provider_runtime = None
+        a._runtime_config_loaded = True
+        a._runtime_config_snapshot = {}
         a.provider = a.requested_provider = "openrouter"
         a._cached_system_prompt = "You are helpful."
         a._use_prompt_caching = False

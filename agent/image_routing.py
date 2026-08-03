@@ -332,21 +332,6 @@ def _resolve_inference_base_url(
     return ""
 
 
-def _should_probe_ollama_vision(provider: str, base_url: str) -> bool:
-    """True when the active provider likely fronts a local Ollama server."""
-    p = (provider or "").strip().lower()
-    if p == "ollama":
-        return True
-    if not base_url:
-        return False
-    try:
-        from agent.model_metadata import detect_local_server_type
-
-        return detect_local_server_type(base_url) == "ollama"
-    except Exception:
-        return False
-
-
 def _coerce_mode(raw: Any) -> str:
     """Normalize a config value into one of the valid modes."""
     if not isinstance(raw, str):
@@ -431,8 +416,8 @@ async def _lookup_supports_vision(
         return None
     caps = None
     try:
-        from agent.models_dev import get_model_capabilities_async
-        caps = await get_model_capabilities_async(provider, model)
+        from agent.models_dev import get_model_capabilities
+        caps = await get_model_capabilities(provider, model)
     except Exception as exc:  # pragma: no cover - defensive
         logger.debug("image_routing: caps lookup failed for %s:%s — %s", provider, model, exc)
     if caps is not None:
@@ -450,9 +435,9 @@ async def _lookup_supports_vision(
     )
     if looks_like_ollama:
         try:
-            from agent.model_metadata import query_ollama_supports_vision_async
+            from agent.model_metadata import query_ollama_supports_vision
 
-            ollama_vision = await query_ollama_supports_vision_async(model, base_url)
+            ollama_vision = await query_ollama_supports_vision(model, base_url)
             if ollama_vision is not None:
                 return ollama_vision
         except Exception as exc:  # pragma: no cover - defensive

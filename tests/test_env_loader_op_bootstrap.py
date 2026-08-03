@@ -36,6 +36,8 @@ if str(ROOT) not in sys.path:
 from hermes_cli import env_loader  # noqa: E402
 import agent.credential_pool as credential_pool  # noqa: E402
 
+pytestmark = pytest.mark.asyncio
+
 
 @pytest.fixture(autouse=True)
 def _isolate_op_token(monkeypatch):
@@ -51,7 +53,7 @@ def _isolate_op_token(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_op_env_autoloads_bootstrap_token_in_cron_context(tmp_path, monkeypatch):
+async def test_op_env_autoloads_bootstrap_token_in_cron_context(tmp_path, monkeypatch):
     """A fresh interpreter (no inherited shell state) picks up the token."""
     home = tmp_path / ".hermes"
     home.mkdir()
@@ -64,7 +66,7 @@ def test_op_env_autoloads_bootstrap_token_in_cron_context(tmp_path, monkeypatch)
 
     assert os.environ.get("OP_SERVICE_ACCOUNT_TOKEN") is None
 
-    env_loader.load_hermes_dotenv(hermes_home=home)
+    await env_loader.load_hermes_dotenv(hermes_home=home)
 
     assert os.environ["OP_SERVICE_ACCOUNT_TOKEN"] == "test-token"
 
@@ -97,19 +99,14 @@ async def _seed_openrouter_token(monkeypatch, dotenv_value, environ_value):
 
     monkeypatch.setattr(
         credential_pool,
-        "get_env_value_prefer_dotenv_async",
+        "get_env_value_prefer_dotenv",
         _get_env_value,
     )
-    monkeypatch.setattr(credential_pool, "_load_auth_store_async", _load_auth_store)
+    monkeypatch.setattr(credential_pool, "_load_auth_store", _load_auth_store)
     if environ_value is None:
         monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
     else:
         monkeypatch.setenv("OPENROUTER_API_KEY", environ_value)
-    # Never treat the synthetic source as suppressed.
-    monkeypatch.setattr(
-        "hermes_cli.auth.is_source_suppressed", lambda _p, _s: False
-    )
-
     entries: list = []
     changed, sources = await credential_pool._seed_from_env("openrouter", entries)
     assert changed and entries, "expected a seeded openrouter credential"

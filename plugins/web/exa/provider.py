@@ -1,9 +1,8 @@
 """Exa web search + content extraction — plugin form.
 
-Subclasses :class:`agent.web_search_provider.WebSearchProvider`. Uses the
-official Exa SDK (``exa-py``) which is lazy-loaded via
-:func:`tools.lazy_deps.ensure` so that cold-start CLI users don't pay the
-SDK import cost when Exa isn't configured.
+Subclasses :class:`agent.web_search_provider.WebSearchProvider`. The active
+provider uses Exa's native async HTTP API; the optional SDK is imported only
+by the legacy client-inspection helper.
 
 Config keys this provider responds to::
 
@@ -61,15 +60,11 @@ def _get_exa_client() -> Any:
         )
 
     try:
-        from tools.lazy_deps import ensure as _lazy_ensure
-
-        _lazy_ensure("search.exa", prompt=False)
-    except ImportError:
-        pass
-    except Exception as exc:  # noqa: BLE001 — lazy_deps surfaces install hints
-        raise ImportError(str(exc))
-
-    from exa_py import Exa  # noqa: WPS433 — deliberately lazy
+        from exa_py import Exa  # noqa: WPS433 — deliberately lazy
+    except ImportError as exc:
+        raise ImportError(
+            "The optional Exa SDK is not installed. Install async-hermes-agent[exa]."
+        ) from exc
 
     client = Exa(api_key=api_key)
     client.headers["x-exa-integration"] = "hermes-agent"

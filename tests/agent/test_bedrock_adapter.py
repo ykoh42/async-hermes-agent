@@ -1143,7 +1143,6 @@ class TestBearerTokenRoutesToConverse:
                 "provider": "bedrock",
             },
         )
-        monkeypatch.setattr(rp, "load_config", lambda: {"bedrock": {}})
         return await rp.resolve_runtime_provider(requested="bedrock")
 
     @pytest.mark.asyncio

@@ -64,9 +64,9 @@ _JSON_BLOCK_RE = re.compile(r"\{[\s\S]*\}", re.MULTILINE)
 async def _load_xai_web_config() -> Dict[str, Any]:
     """Read ``web.xai`` from config.yaml without blocking the event loop."""
     try:
-        from hermes_cli.config import load_config_readonly_async
+        from hermes_cli.config import load_config_readonly
 
-        cfg = await load_config_readonly_async()
+        cfg = await load_config_readonly()
         web_section = cfg.get("web") if isinstance(cfg, dict) else None
         xai_section = web_section.get("xai") if isinstance(web_section, dict) else None
         return xai_section if isinstance(xai_section, dict) else {}

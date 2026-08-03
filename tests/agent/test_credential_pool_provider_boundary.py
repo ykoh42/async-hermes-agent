@@ -1,11 +1,15 @@
 """Credential pools must never cross provider or custom-endpoint boundaries."""
 
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock
 
 import pytest
 
-from agent.credential_pool import credential_pool_matches_provider
+from agent.credential_pool import (
+    CredentialPool,
+    PooledCredential,
+    credential_pool_matches_provider,
+)
 from hermes_cli import runtime_provider as rp
 
 
@@ -16,16 +20,27 @@ def test_provider_match_requires_exact_non_custom_identity():
 
 
 def test_custom_pool_match_is_scoped_by_endpoint():
-    with patch(
-        "agent.credential_pool.get_custom_provider_pool_key",
-        return_value="custom:lab",
-    ):
-        assert credential_pool_matches_provider(
-            "custom:lab", "custom", base_url="https://lab.example/v1"
-        )
-        assert not credential_pool_matches_provider(
-            "custom:other", "custom", base_url="https://lab.example/v1"
-        )
+    pool = CredentialPool(
+        "custom:lab",
+        [
+            PooledCredential(
+                provider="custom:lab",
+                id="lab",
+                label="lab",
+                auth_type="api_key",
+                priority=0,
+                source="manual",
+                access_token="secret",
+                base_url="https://lab.example/v1",
+            )
+        ],
+    )
+    assert credential_pool_matches_provider(
+        pool, "custom", base_url="https://lab.example/v1"
+    )
+    assert not credential_pool_matches_provider(
+        pool, "custom", base_url="https://other.example/v1"
+    )
 
 
 @pytest.mark.asyncio
@@ -48,7 +63,7 @@ async def test_runtime_ignores_pool_loaded_for_different_provider(monkeypatch):
         )
 
     monkeypatch.setattr(rp, "load_pool", load_pool)
-    monkeypatch.setattr(rp, "resolve_provider", lambda *_a, **_kw: "deepseek")
+    monkeypatch.setattr(rp, "resolve_provider", AsyncMock(return_value="deepseek"))
     monkeypatch.setattr(
         rp,
         "_get_model_config",
@@ -56,7 +71,7 @@ async def test_runtime_ignores_pool_loaded_for_different_provider(monkeypatch):
     )
     monkeypatch.setattr(
         rp.auth_mod,
-        "resolve_api_key_provider_credentials_async",
+        "resolve_api_key_provider_credentials",
         AsyncMock(return_value={
             "provider": "deepseek",
             "api_key": "deepseek-key",

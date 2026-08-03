@@ -314,9 +314,9 @@ async def build_system_prompt_parts(agent: Any, system_message: Optional[str] = 
             from agent.coding_context import coding_compact_skill_categories
 
             if _coding_config is None:
-                from hermes_cli.config import load_config_readonly_async
+                from hermes_cli.config import load_config_readonly
 
-                _coding_config = await load_config_readonly_async()
+                _coding_config = await load_config_readonly()
             _compact_cats = await coding_compact_skill_categories(
                 platform=agent.platform, cwd=_context_cwd, config=_coding_config
             )
@@ -365,9 +365,9 @@ async def build_system_prompt_parts(agent: Any, system_message: Optional[str] = 
             from agent.coding_context import coding_system_prompt_parts
 
             if _coding_config is None:
-                from hermes_cli.config import load_config_readonly_async
+                from hermes_cli.config import load_config_readonly
 
-                _coding_config = await load_config_readonly_async()
+                _coding_config = await load_config_readonly()
             coding_prefix_parts, coding_workspace_parts, coding_trailing_parts = await coding_system_prompt_parts(
                 platform=agent.platform,
                 cwd=_context_cwd,
@@ -459,8 +459,8 @@ async def build_system_prompt_parts(agent: Any, system_message: Optional[str] = 
     # 10.1 guidance (tables, task lists, math, collapsible details, etc.).
     if platform_key == "telegram" and _default_hint:
         try:
-            from hermes_cli.config import load_config_readonly_async
-            _cfg = await load_config_readonly_async()
+            from hermes_cli.config import load_config_readonly
+            _cfg = await load_config_readonly()
             _tg_extra = ((_cfg.get("platforms") or {}).get("telegram") or {}).get("extra") or {}
             if _tg_extra.get("rich_messages"):
                 _default_hint = _default_hint.rstrip() + " " + TELEGRAM_RICH_MESSAGES_HINT

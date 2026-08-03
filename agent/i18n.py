@@ -189,21 +189,7 @@ def _flatten_into(node: Any, prefix: str, out: dict[str, str]) -> None:
 
 @lru_cache(maxsize=1)
 def _config_language_cached() -> str | None:
-    """Read ``display.language`` from config.yaml once per process.
-
-    Cached because ``t()`` is called in hot paths (every approval prompt,
-    every gateway reply) and re-reading YAML each call would be wasteful.
-    ``reset_language_cache()`` clears this when config changes at runtime
-    (e.g. after the setup wizard).
-    """
-    try:
-        from hermes_cli.config import load_config_readonly
-        cfg = load_config_readonly()
-        lang = (cfg.get("display") or {}).get("language")
-        if lang:
-            return _normalize_lang(lang)
-    except Exception as exc:
-        logger.debug("Could not read display.language from config: %s", exc)
+    """Return no implicit config language on the library runtime."""
     return None
 
 

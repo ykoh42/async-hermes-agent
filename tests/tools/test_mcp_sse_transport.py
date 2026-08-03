@@ -150,7 +150,7 @@ class TestSSEOAuthForwarding:
         server = _build_server_with_sse(oauth=True)
         fake_oauth_provider = MagicMock(name="fake_oauth_provider")
         fake_manager = MagicMock()
-        fake_manager.get_or_build_provider_async = AsyncMock(
+        fake_manager.get_or_build_provider = AsyncMock(
             return_value=fake_oauth_provider
         )
 

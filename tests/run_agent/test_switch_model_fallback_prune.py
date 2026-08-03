@@ -35,6 +35,7 @@ def _make_agent(chain):
     agent._fallback_index = 0
     agent._fallback_chain = list(chain)
     agent._fallback_model = chain[0] if chain else None
+    agent._runtime_config_loaded = True
 
     return agent
 
@@ -51,7 +52,7 @@ async def _switch_to_anthropic(agent):
 
     agent._ensure_provider_runtime = AsyncMock(side_effect=initialize_runtime)
     agent._persist_pending_billing_route = AsyncMock()
-    with patch("hermes_cli.config.load_config_readonly_async", new_callable=AsyncMock, return_value={}):
+    with patch("hermes_cli.config.load_config_readonly", new_callable=AsyncMock, return_value={}):
         await agent.switch_model(
             new_model="claude-sonnet-4-5",
             new_provider="anthropic",

@@ -79,7 +79,7 @@ def patch_load_config(monkeypatch):
             lambda: {"model": model_cfg},
         )
         monkeypatch.setattr(
-            "hermes_cli.config.load_config_readonly_async",
+            "hermes_cli.config.load_config_readonly",
             AsyncMock(return_value={"model": model_cfg}),
         )
     return _apply

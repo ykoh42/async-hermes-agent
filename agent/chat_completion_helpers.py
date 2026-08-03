@@ -664,7 +664,7 @@ async def build_api_kwargs(agent, api_messages: list) -> dict:
             provider_preferences=_prefs or None,
             openrouter_min_coding_score=agent.openrouter_min_coding_score,
             anthropic_max_output=_ant_max,
-            supports_reasoning=agent._supports_reasoning_extra_body(),
+            supports_reasoning=await agent._supports_reasoning_extra_body(),
             qwen_session_metadata=_qwen_meta,
         )
 
@@ -708,9 +708,13 @@ async def build_api_kwargs(agent, api_messages: list) -> dict:
         qwen_session_metadata=_qwen_meta,
         fixed_temperature=_fixed_temp,
         omit_temperature=_omit_temp,
-        supports_reasoning=agent._supports_reasoning_extra_body(),
+        supports_reasoning=await agent._supports_reasoning_extra_body(),
         github_reasoning_extra=agent._github_models_reasoning_extra_body() if _is_gh else None,
-        lmstudio_reasoning_options=agent._lmstudio_reasoning_options_cached() if _is_lmstudio else None,
+        lmstudio_reasoning_options=(
+            await agent._lmstudio_reasoning_options_cached()
+            if _is_lmstudio
+            else None
+        ),
         anthropic_max_output=_ant_max,
         provider_name=agent.provider,
     )
@@ -1421,13 +1425,13 @@ async def handle_max_iterations(agent, messages: list, api_call_count: int) -> s
         # through the transport — sends the same shape the transport does.
         _is_lmstudio_summary = (
             (agent.provider or "").strip().lower() == "lmstudio"
-            and agent._supports_reasoning_extra_body()
+            and await agent._supports_reasoning_extra_body()
         )
         _lm_reasoning_effort: str | None = (
-            agent._resolve_lmstudio_summary_reasoning_effort()
+            await agent._resolve_lmstudio_summary_reasoning_effort()
             if _is_lmstudio_summary else None
         )
-        if not _is_lmstudio_summary and agent._supports_reasoning_extra_body():
+        if not _is_lmstudio_summary and await agent._supports_reasoning_extra_body():
             if agent.reasoning_config is not None:
                 summary_extra_body["reasoning"] = agent.reasoning_config
             else:

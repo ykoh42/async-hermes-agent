@@ -962,6 +962,7 @@ class TestSessionRowExistsBeforePreflightCompaction:
         agent._cached_system_prompt = "SYSTEM"
         agent.compression_enabled = True
         agent.compression_in_place = in_place
+        agent._runtime_config_loaded = True
         agent._compression_feasibility_checked = True
 
         calls = {"n": 0}

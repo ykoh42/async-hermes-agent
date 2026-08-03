@@ -68,7 +68,7 @@ class TestAggregatorGlobalFallback:
         async def load_config():
             return {"agent": {"reasoning_effort": False}}
 
-        monkeypatch.setattr("hermes_cli.config.load_config_readonly_async", load_config)
+        monkeypatch.setattr("hermes_cli.config.load_config_readonly", load_config)
         cfg = await moa_loop._aggregator_reasoning_config({})
         assert cfg == {"enabled": False}
 

@@ -16,20 +16,6 @@ from trajectory_compressor import (
 )
 
 
-def test_import_loads_env_from_hermes_home(tmp_path, monkeypatch):
-    home = tmp_path / ".hermes"
-    home.mkdir()
-    (home / ".env").write_text("OPENROUTER_API_KEY=from-hermes-home\n", encoding="utf-8")
-
-    monkeypatch.setenv("HERMES_HOME", str(home))
-    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
-
-    sys.modules.pop("trajectory_compressor", None)
-    importlib.import_module("trajectory_compressor")
-
-    assert os.getenv("OPENROUTER_API_KEY") == "from-hermes-home"
-
-
 @pytest.mark.asyncio
 async def test_generate_summary_kimi_omits_temperature():
     """Kimi models should have temperature omitted — server manages it."""
@@ -73,7 +59,8 @@ class TestCompressionConfig:
         assert config.protect_last_n_turns == 4
         assert config.skip_under_target is True
 
-    def test_from_yaml(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_from_yaml(self, tmp_path):
         yaml_content = """\
 tokenizer:
   name: custom-tokenizer
@@ -104,7 +91,7 @@ metrics:
 """
         yaml_file = tmp_path / "config.yaml"
         yaml_file.write_text(yaml_content)
-        config = CompressionConfig.from_yaml(str(yaml_file))
+        config = await CompressionConfig.from_yaml(str(yaml_file))
         assert config.tokenizer_name == "custom-tokenizer"
         assert config.trust_remote_code is False
         assert config.target_max_tokens == 10000
@@ -195,8 +182,7 @@ def _make_compressor(config=None):
     """Create a TrajectoryCompressor with mocked tokenizer and summarizer."""
     if config is None:
         config = CompressionConfig()
-    with patch.object(TrajectoryCompressor, '_init_tokenizer'), \
-         patch.object(TrajectoryCompressor, '_init_summarizer'):
+    with patch.object(TrajectoryCompressor, '_init_summarizer'):
         compressor = TrajectoryCompressor(config)
     # Provide a simple token counter for tests (1 token per 4 chars)
     compressor.tokenizer = MagicMock()

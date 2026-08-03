@@ -29,6 +29,8 @@ from utils import env_var_enabled, is_truthy_value
 
 logger = logging.getLogger(__name__)
 
+_approval_config_snapshot: dict = {}
+
 # Freeze YOLO mode at module import time. Reading os.environ on every call
 # would allow any skill running inside the process to set this variable and
 # instantly bypass all approval checks — a prompt-injection escalation path.
@@ -2287,27 +2289,15 @@ def load_permanent_allowlist() -> set:
     Also syncs them into the approval module so is_approved() works for
     patterns added via 'always' in a previous session.
     """
-    try:
-        from hermes_cli.config import load_config
-        config = load_config()
-        patterns = set(config.get("command_allowlist", []) or [])
-        if patterns:
-            load_permanent(patterns)
-        return patterns
-    except Exception as e:
-        logger.warning("Failed to load permanent allowlist: %s", e)
-        return set()
+    patterns = set(_approval_config_snapshot.get("command_allowlist", []) or [])
+    if patterns:
+        load_permanent(patterns)
+    return patterns
 
 
 def save_permanent_allowlist(patterns: set):
-    """Save permanently allowed command patterns to config."""
-    try:
-        from hermes_cli.config import load_config, save_config
-        config = load_config()
-        config["command_allowlist"] = list(patterns)
-        save_config(config)
-    except Exception as e:
-        logger.warning("Could not save allowlist: %s", e)
+    """Update the in-process snapshot; library callers own persistence."""
+    _approval_config_snapshot["command_allowlist"] = list(patterns)
 
 
 # =========================================================================
@@ -2390,14 +2380,37 @@ def _normalize_approval_mode(mode) -> str:
 
 
 def _get_approval_config() -> dict:
-    """Read the approvals config block. Returns a dict with 'mode', 'timeout', etc."""
+    """Return the immutable snapshot loaded at an async command boundary."""
+    return _approval_config_snapshot
+
+
+async def validate_terminal_command(command: str) -> dict:
+    """Apply non-bypassable command policy without blocking the event loop."""
+    global _approval_config_snapshot
+
     try:
-        from hermes_cli.config import load_config
-        config = load_config()
-        return config.get("approvals", {}) or {}
-    except Exception as e:
-        logger.warning("Failed to load approval config: %s", e)
-        return {}
+        from hermes_cli.config import load_config_readonly
+
+        config = await load_config_readonly()
+        approvals = config.get("approvals", {}) if isinstance(config, dict) else {}
+        _approval_config_snapshot = approvals if isinstance(approvals, dict) else {}
+    except Exception:
+        logger.warning("Failed to load approval config", exc_info=True)
+        _approval_config_snapshot = {}
+
+    is_hardline, description = detect_hardline_command(command)
+    if is_hardline:
+        return _hardline_block_result(description)
+
+    is_sudo_guess, description = _check_sudo_stdin_guard(command)
+    if is_sudo_guess:
+        return _sudo_stdin_block_result(description)
+
+    deny_pattern = _match_user_deny_rule(command)
+    if deny_pattern is not None:
+        return _user_deny_block_result(deny_pattern)
+
+    return {"approved": True, "message": None}
 
 
 def _get_approval_mode() -> str:
@@ -2450,15 +2463,8 @@ def _get_approval_timeout() -> int:
 
 def _get_cron_approval_mode() -> str:
     """Read the cron approval mode from config. Returns 'deny' or 'approve'."""
-    try:
-        from hermes_cli.config import load_config
-        config = load_config()
-        mode = str(cfg_get(config, "approvals", "cron_mode", default="deny")).lower().strip()
-        if mode in {"approve", "off", "allow", "yes"}:
-            return "approve"
-        return "deny"
-    except Exception:
-        return "deny"
+    mode = str(_approval_config_snapshot.get("cron_mode", "deny")).lower().strip()
+    return "approve" if mode in {"approve", "off", "allow", "yes"} else "deny"
 
 
 def _strip_shell_comments(command: str) -> str:
@@ -3575,7 +3581,3 @@ def request_elicitation_consent(
     if choice in ("once", "session", "always"):
         return "accept"
     return "decline"
-
-
-# Load permanent allowlist from config on module import
-load_permanent_allowlist()

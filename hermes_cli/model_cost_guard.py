@@ -72,32 +72,6 @@ def expensive_model_warning(
         return None
 
     input_cost, output_cost, source = _pricing_from_model_info(model_info)
-    if input_cost is None and output_cost is None and provider:
-        try:
-            from agent.models_dev import get_model_info
-
-            input_cost, output_cost, source = _pricing_from_model_info(
-                get_model_info(provider, model)
-            )
-        except Exception:
-            pass
-    if input_cost is None and output_cost is None:
-        try:
-            from agent.usage_pricing import get_pricing_entry
-
-            entry = get_pricing_entry(
-                model,
-                provider=provider,
-                base_url=base_url,
-                api_key=api_key,
-            )
-        except Exception:
-            entry = None
-        if entry is not None:
-            input_cost = entry.input_cost_per_million
-            output_cost = entry.output_cost_per_million
-            source = entry.source
-
     over_input = (
         input_cost is not None and input_cost > INPUT_COST_WARNING_THRESHOLD
     )

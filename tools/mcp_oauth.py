@@ -245,7 +245,7 @@ def _reserve_callback_port() -> int:
     return port
 
 
-def _cached_redirect_port(storage: "HermesTokenStorage | None") -> int | None:
+async def _cached_redirect_port(storage: "HermesTokenStorage | None") -> int | None:
     """Return the loopback callback port from cached client registration.
 
     OAuth providers bind a dynamically-registered ``client_id`` to the exact
@@ -259,7 +259,7 @@ def _cached_redirect_port(storage: "HermesTokenStorage | None") -> int | None:
         return None
 
     try:
-        data = _read_json(storage._client_info_path())
+        data = await _read_json(storage._client_info_path())
     except (AttributeError, TypeError, ValueError):
         return None
     if not data:
@@ -280,12 +280,12 @@ def _cached_redirect_port(storage: "HermesTokenStorage | None") -> int | None:
     return None
 
 
-def _cached_redirect_uri(storage: "HermesTokenStorage | None") -> str | None:
+async def _cached_redirect_uri(storage: "HermesTokenStorage | None") -> str | None:
     """Return a cached non-loopback redirect URI, if one was registered."""
     if storage is None:
         return None
     try:
-        data = _read_json(storage._client_info_path())
+        data = await _read_json(storage._client_info_path())
     except (AttributeError, TypeError, ValueError):
         return None
     for uri in (data or {}).get("redirect_uris") or []:
@@ -376,18 +376,7 @@ def _can_open_browser() -> bool:
     return False
 
 
-def _read_json(path: Path) -> dict | None:
-    """Read a JSON file, returning None if it doesn't exist or is invalid."""
-    if not path.exists():
-        return None
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError) as exc:
-        logger.warning("Failed to read %s: %s", path, exc)
-        return None
-
-
-async def _read_json_async(path: Path) -> dict | None:
+async def _read_json(path: Path) -> dict | None:
     """Read a JSON credential file without blocking the MCP event loop."""
     try:
         if not await aiofiles.os.path.isfile(path):
@@ -399,44 +388,7 @@ async def _read_json_async(path: Path) -> dict | None:
         return None
 
 
-def _write_json(path: Path, data: dict) -> None:
-    """Write a dict as JSON with restricted permissions (0o600).
-
-    Uses ``os.open`` with ``O_EXCL`` and an explicit mode so the file is
-    created atomically at 0o600. The previous ``write_text`` + post-write
-    ``chmod`` opened a TOCTOU window where the temp file briefly inherited
-    the process umask (commonly 0o644 = world-readable), exposing OAuth
-    tokens to other local users between create and chmod. Mirrors the fix
-    in ``agent/google_oauth.py`` (#19673).
-    """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    # Tighten parent dir to 0o700 so siblings can't traverse to the creds.
-    # No-op on Windows (POSIX mode bits aren't enforced); ignore failures.
-    # secure_parent_dir refuses to chmod / or top-level dirs (#25821).
-    secure_parent_dir(path)
-    # Per-process random suffix avoids collisions between concurrent
-    # writers and stale leftovers from a prior crashed write.
-    tmp = path.with_suffix(f".tmp.{os.getpid()}.{secrets.token_hex(4)}")
-    try:
-        fd = os.open(
-            str(tmp),
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-            stat.S_IRUSR | stat.S_IWUSR,
-        )
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            json.dump(data, fh, indent=2, default=str)
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.replace(tmp, path)
-    except OSError:
-        try:
-            tmp.unlink(missing_ok=True)
-        except OSError:
-            pass
-        raise
-
-
-async def _write_json_async(path: Path, data: dict) -> None:
+async def _write_json(path: Path, data: dict) -> None:
     """Atomically write OAuth state through the native async file boundary."""
     await aiofiles.os.makedirs(path.parent, exist_ok=True)
     secure_parent_dir(path)
@@ -451,7 +403,7 @@ async def _write_json_async(path: Path, data: dict) -> None:
         async with aiofiles.open(tmp, "w", encoding="utf-8") as handle:
             await handle.write(json.dumps(data, indent=2, default=str))
             await handle.flush()
-        os.replace(tmp, path)
+        await aiofiles.os.replace(tmp, path)
     except OSError:
         try:
             await aiofiles.os.remove(tmp)
@@ -491,7 +443,7 @@ class HermesTokenStorage:
     # -- tokens ------------------------------------------------------------
 
     async def get_tokens(self) -> "OAuthToken | None":
-        data = await _read_json_async(self._tokens_path())
+        data = await _read_json(self._tokens_path())
         if data is None:
             return None
         if OAuthToken is None and not _ensure_sdk_loaded():
@@ -550,13 +502,13 @@ class HermesTokenStorage:
                 # Mock tokens or unusual shapes: skip the expires_at write
                 # rather than fail persistence.
                 pass
-        await _write_json_async(self._tokens_path(), payload)
+        await _write_json(self._tokens_path(), payload)
         logger.debug("OAuth tokens saved for %s", self._server_name)
 
     # -- client info -------------------------------------------------------
 
     async def get_client_info(self) -> "OAuthClientInformationFull | None":
-        data = await _read_json_async(self._client_info_path())
+        data = await _read_json(self._client_info_path())
         if data is None:
             return None
         if OAuthClientInformationFull is None and not _ensure_sdk_loaded():
@@ -568,7 +520,7 @@ class HermesTokenStorage:
             return None
 
     async def set_client_info(self, client_info: "OAuthClientInformationFull") -> None:
-        await _write_json_async(
+        await _write_json(
             self._client_info_path(),
             client_info.model_dump(mode="json", exclude_none=True),
         )
@@ -583,13 +535,13 @@ class HermesTokenStorage:
     # forces a full browser re-authorization.
 
     async def save_oauth_metadata(self, metadata: "OAuthMetadata") -> None:
-        await _write_json_async(
+        await _write_json(
             self._meta_path(), metadata.model_dump(exclude_none=True, mode="json")
         )
         logger.debug("OAuth metadata saved for %s", self._server_name)
 
     async def load_oauth_metadata(self) -> "OAuthMetadata | None":
-        data = await _read_json_async(self._meta_path())
+        data = await _read_json(self._meta_path())
         if data is None:
             return None
         if OAuthMetadata is None and not _ensure_sdk_loaded():
@@ -602,12 +554,15 @@ class HermesTokenStorage:
 
     # -- cleanup -----------------------------------------------------------
 
-    def remove(self) -> None:
+    async def remove(self) -> None:
         """Delete all stored OAuth state for this server."""
-        for p in (self._tokens_path(), self._client_info_path(), self._meta_path()):
-            p.unlink(missing_ok=True)
+        for path in (self._tokens_path(), self._client_info_path(), self._meta_path()):
+            try:
+                await aiofiles.os.remove(path)
+            except FileNotFoundError:
+                pass
 
-    def snapshot(self) -> dict[str, bytes]:
+    async def snapshot(self) -> dict[str, bytes]:
         """Capture on-disk OAuth state so a failed re-auth can restore it.
 
         Maps filename -> bytes for whichever of the three state files exist.
@@ -615,39 +570,44 @@ class HermesTokenStorage:
         re-authentication attempt fails, so a still-valid token isn't destroyed.
         """
         snap: dict[str, bytes] = {}
-        for p in (self._tokens_path(), self._client_info_path(), self._meta_path()):
+        for path in (self._tokens_path(), self._client_info_path(), self._meta_path()):
             try:
-                snap[p.name] = p.read_bytes()
+                async with aiofiles.open(path, "rb") as handle:
+                    snap[path.name] = await handle.read()
             except OSError:
                 pass
         return snap
 
-    def restore(self, snapshot: dict[str, bytes], *, only_if_absent: bool = False) -> None:
+    async def restore(
+        self,
+        snapshot: dict[str, bytes],
+        *,
+        only_if_absent: bool = False,
+    ) -> None:
         """Revert to a snapshot without overwriting a concurrent successful write."""
-        if only_if_absent and any(
-            path.exists()
-            for path in (self._tokens_path(), self._client_info_path(), self._meta_path())
-        ):
-            logger.info(
-                "Skipping OAuth rollback for %s because newer state exists",
-                self._server_name,
-            )
-            return
-        self.remove()
+        if only_if_absent:
+            for path in (
+                self._tokens_path(),
+                self._client_info_path(),
+                self._meta_path(),
+            ):
+                if await aiofiles.os.path.exists(path):
+                    logger.info(
+                        "Skipping OAuth rollback for %s because newer state exists",
+                        self._server_name,
+                    )
+                    return
+        await self.remove()
         if not snapshot:
             return
         token_dir = _get_token_dir(self._hermes_home)
-        token_dir.mkdir(parents=True, exist_ok=True)
+        await aiofiles.os.makedirs(token_dir, exist_ok=True)
         for fname, data in snapshot.items():
             path = token_dir / fname
             try:
-                fd = os.open(
-                    str(path),
-                    os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
-                    stat.S_IRUSR | stat.S_IWUSR,
-                )
-                with os.fdopen(fd, "wb") as fh:
-                    fh.write(data)
+                async with aiofiles.open(path, "wb") as handle:
+                    await handle.write(data)
+                await aiofiles.os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)
             except OSError as exc:
                 logger.warning("Failed to restore OAuth state %s: %s", fname, exc)
 
@@ -692,11 +652,7 @@ class HermesTokenStorage:
         )
         return True
 
-    def has_cached_tokens(self) -> bool:
-        """Return True if we have tokens on disk (may be expired)."""
-        return self._tokens_path().exists()
-
-    async def has_cached_tokens_async(self) -> bool:
+    async def has_cached_tokens(self) -> bool:
         """Return cached-token presence without a synchronous stat call."""
         return await aiofiles.os.path.isfile(self._tokens_path())
 
@@ -1085,14 +1041,14 @@ def _paste_callback_reader(result: dict) -> None:
 # ---------------------------------------------------------------------------
 
 
-def remove_oauth_tokens(
+async def remove_oauth_tokens(
     server_name: str,
     *,
     hermes_home: str | Path | None = None,
 ) -> None:
     """Delete stored OAuth tokens and client info for a server."""
     storage = HermesTokenStorage(server_name, hermes_home=hermes_home)
-    storage.remove()
+    await storage.remove()
     logger.info("OAuth tokens removed for '%s'", server_name)
 
 
@@ -1105,7 +1061,7 @@ def remove_oauth_tokens(
 # ---------------------------------------------------------------------------
 
 
-def _configure_callback_port(
+async def _configure_callback_port(
     cfg: dict,
     storage: "HermesTokenStorage | None" = None,
 ) -> int:
@@ -1134,7 +1090,7 @@ def _configure_callback_port(
         cfg["_resolved_port"] = 0
         cfg["redirect_uri"] = cfg.get("redirect_uri") or dashboard_flow.redirect_uri
         return 0
-    cached_redirect_uri = _cached_redirect_uri(storage)
+    cached_redirect_uri = await _cached_redirect_uri(storage)
     if not cfg.get("redirect_uri") and cached_redirect_uri:
         cfg["redirect_uri"] = cached_redirect_uri
         cfg["_resolved_port"] = 0
@@ -1148,7 +1104,7 @@ def _configure_callback_port(
     # _wait_for_callback adopts it — closing the select→bind TOCTOU race
     # (#22161). Explicit and cached ports are fixed, known values and bind
     # via the reuse_address path instead.
-    port = requested or _cached_redirect_port(storage) or _reserve_callback_port()
+    port = requested or await _cached_redirect_port(storage) or _reserve_callback_port()
     cfg["_resolved_port"] = port
     _oauth_port = port  # legacy consumer: _wait_for_callback reads this
     return port
@@ -1276,40 +1232,7 @@ def _build_client_metadata(cfg: dict) -> "OAuthClientMetadata":
     return OAuthClientMetadata.model_validate(metadata_kwargs)
 
 
-def _maybe_preregister_client(
-    storage: "HermesTokenStorage",
-    cfg: dict,
-    client_metadata: "OAuthClientMetadata",
-) -> None:
-    """If cfg has a pre-registered client_id, persist it to storage."""
-    client_id = cfg.get("client_id")
-    if not client_id:
-        return
-    if OAuthClientInformationFull is None:
-        _ensure_sdk_loaded()
-    port = cfg["_resolved_port"]
-    redirect_uri = _resolve_redirect_uri(cfg, port)
-
-    info_dict: dict[str, Any] = {
-        "client_id": client_id,
-        "redirect_uris": [redirect_uri],
-        "grant_types": client_metadata.grant_types,
-        "response_types": client_metadata.response_types,
-        "token_endpoint_auth_method": client_metadata.token_endpoint_auth_method,
-    }
-    if cfg.get("client_secret"):
-        info_dict["client_secret"] = cfg["client_secret"]
-    if cfg.get("client_name"):
-        info_dict["client_name"] = cfg["client_name"]
-    if cfg.get("scope"):
-        info_dict["scope"] = cfg["scope"]
-
-    client_info = OAuthClientInformationFull.model_validate(info_dict)
-    _write_json(storage._client_info_path(), client_info.model_dump(mode="json", exclude_none=True))
-    logger.debug("Pre-registered client_id=%s for '%s'", client_id, storage._server_name)
-
-
-async def _maybe_preregister_client_async(
+async def _maybe_preregister_client(
     storage: "HermesTokenStorage",
     cfg: dict,
     client_metadata: "OAuthClientMetadata",
@@ -1389,7 +1312,7 @@ def humanize_oauth_registration_error(
     )
 
 
-def build_oauth_auth(
+async def build_oauth_auth(
     server_name: str,
     server_url: str,
     oauth_config: dict | None = None,
@@ -1425,7 +1348,7 @@ def build_oauth_auth(
     )
     storage = HermesTokenStorage(server_name)
 
-    if not _is_interactive() and not storage.has_cached_tokens():
+    if not _is_interactive() and not await storage.has_cached_tokens():
         raise OAuthNonInteractiveError(
             "MCP OAuth for "
             f"'{server_name}': non-interactive environment and no cached tokens "
@@ -1434,9 +1357,9 @@ def build_oauth_auth(
             "initial authorization, then cached tokens will be reused."
         )
 
-    _configure_callback_port(cfg, storage)
+    await _configure_callback_port(cfg, storage)
     client_metadata = _build_client_metadata(cfg)
-    _maybe_preregister_client(storage, cfg, client_metadata)
+    await _maybe_preregister_client(storage, cfg, client_metadata)
 
     # Use closure factories to avoid global state pollution (#44588, #34260).
     resolved_port = cfg.get("_resolved_port", _oauth_port)

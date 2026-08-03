@@ -112,7 +112,7 @@ OpenAI = _OpenAIProxy()  # module-level name, resolves lazily on call/isinstance
 from agent.credential_pool import load_pool
 from agent.model_metadata import (
     MINIMUM_CONTEXT_LENGTH,
-    fetch_endpoint_model_metadata_async,
+    fetch_endpoint_model_metadata,
     get_static_context_length,
 )
 from hermes_cli.config import get_hermes_home
@@ -1641,9 +1641,9 @@ async def _read_nous_auth() -> Optional[dict]:
         }
 
     try:
-        from hermes_cli.auth import _load_auth_store_async
+        from hermes_cli.auth import _load_auth_store
 
-        data = await _load_auth_store_async()
+        data = await _load_auth_store()
         if data.get("active_provider") != "nous":
             return None
         provider = data.get("providers", {}).get("nous", {})
@@ -1818,9 +1818,9 @@ async def _read_codex_access_token() -> Optional[str]:
             return token
 
     try:
-        from hermes_cli.auth import _load_auth_store_async
+        from hermes_cli.auth import _load_auth_store
 
-        state = await _load_auth_store_async()
+        state = await _load_auth_store()
         provider = state.get("providers", {}).get("openai-codex", {})
         tokens = provider.get("tokens", {}) if isinstance(provider, dict) else {}
         access_token = tokens.get("access_token")
@@ -1857,9 +1857,9 @@ async def _resolve_api_key_provider(
     credentials, or (None, None) if none are configured.
     """
     if config is None:
-        from hermes_cli.config import load_config_readonly_async
+        from hermes_cli.config import load_config_readonly
 
-        config = await load_config_readonly_async()
+        config = await load_config_readonly()
     try:
         from hermes_cli.auth import PROVIDER_REGISTRY
     except ImportError:
@@ -1991,9 +1991,9 @@ async def _try_openrouter(
     config: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Optional[OpenAI], Optional[str]]:
     if config is None:
-        from hermes_cli.config import load_config_readonly_async
+        from hermes_cli.config import load_config_readonly
 
-        config = await load_config_readonly_async()
+        config = await load_config_readonly()
     openrouter_config = config.get("openrouter", {}) if isinstance(config, dict) else {}
     if not isinstance(openrouter_config, dict):
         openrouter_config = {}
@@ -2190,9 +2190,9 @@ async def _read_main_model(config: Optional[Dict[str, Any]] = None) -> str:
         return override.strip()
     try:
         if config is None:
-            from hermes_cli.config import load_config_readonly_async
+            from hermes_cli.config import load_config_readonly
 
-            config = await load_config_readonly_async()
+            config = await load_config_readonly()
         cfg = config
         model_cfg = cfg.get("model", {})
         if isinstance(model_cfg, str) and model_cfg.strip():
@@ -2213,9 +2213,9 @@ async def _read_main_provider(config: Optional[Dict[str, Any]] = None) -> str:
         return override.strip().lower()
     try:
         if config is None:
-            from hermes_cli.config import load_config_readonly_async
+            from hermes_cli.config import load_config_readonly
 
-            config = await load_config_readonly_async()
+            config = await load_config_readonly()
         cfg = config
         model_cfg = cfg.get("model", {})
         if isinstance(model_cfg, dict):
@@ -2278,9 +2278,9 @@ async def _read_main_model_for_aux(
         model = runtime_model.strip()
     else:
         if config is None:
-            from hermes_cli.config import load_config_readonly_async
+            from hermes_cli.config import load_config_readonly
 
-            config = await load_config_readonly_async()
+            config = await load_config_readonly()
         model_cfg = config.get("model", {}) if isinstance(config, dict) else {}
         if isinstance(model_cfg, str):
             model = model_cfg.strip()
@@ -2317,9 +2317,9 @@ async def _read_main_api_key_if_same_host(
     main_key = str(_runtime_main_value("api_key") or "").strip()
     if not main_base or not main_key:
         if config is None:
-            from hermes_cli.config import load_config_readonly_async
+            from hermes_cli.config import load_config_readonly
 
-            config = await load_config_readonly_async()
+            config = await load_config_readonly()
         model_cfg = config.get("model", {}) if isinstance(config, dict) else {}
         if isinstance(model_cfg, dict):
             main_base = main_base or str(model_cfg.get("base_url") or "").strip()
@@ -2574,9 +2574,9 @@ async def _try_custom_endpoint(
     config: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Optional[Any], Optional[str]]:
     if config is None:
-        from hermes_cli.config import load_config_readonly_async
+        from hermes_cli.config import load_config_readonly
 
-        config = await load_config_readonly_async()
+        config = await load_config_readonly()
     runtime = _normalize_main_runtime(None)
     custom_base = str(runtime.get("base_url") or os.getenv("OPENAI_BASE_URL") or "").strip()
     custom_key = runtime.get("api_key") or os.getenv("OPENAI_API_KEY", "").strip()
@@ -2763,9 +2763,9 @@ async def _try_azure_foundry(
 
     try:
         if config is None:
-            from hermes_cli.config import load_config_readonly_async
+            from hermes_cli.config import load_config_readonly
 
-            config = await load_config_readonly_async()
+            config = await load_config_readonly()
         model_cfg = config.get("model") if isinstance(config, dict) else {}
         if not isinstance(model_cfg, dict):
             model_cfg = {}
@@ -2785,10 +2785,10 @@ async def _try_azure_foundry(
             or model_cfg.get("api_key_env")
             or "AZURE_FOUNDRY_API_KEY"
         ).strip()
-        from hermes_cli.config import get_env_value_prefer_dotenv_async
+        from hermes_cli.config import get_env_value_prefer_dotenv
 
         resolved_api_key = (
-            await get_env_value_prefer_dotenv_async(key_env) or ""
+            await get_env_value_prefer_dotenv(key_env) or ""
         ).strip()
 
     try:
@@ -3130,15 +3130,8 @@ def _is_payment_error(exc: Exception) -> bool:
 
 
 async def _nous_portal_account_has_fresh_paid_access() -> bool:
-    """Return True only when the fresh Nous account API says paid access is allowed."""
-    try:
-        from hermes_cli.nous_account import get_nous_portal_account_info
-
-        account_info = await get_nous_portal_account_info(force_fresh=True)
-        return account_info.paid_service_access is True
-    except Exception as exc:
-        logger.debug("Auxiliary Nous paid-entitlement refresh check failed: %s", exc)
-        return False
+    """Nous Portal OAuth is unavailable in the native-async runtime."""
+    return False
 
 
 def _is_rate_limit_error(exc: Exception) -> bool:
@@ -3928,9 +3921,9 @@ async def _try_main_agent_model_fallback(
         (client, model, provider_label) or (None, None, "") if no fallback.
     """
     if config is None:
-        from hermes_cli.config import load_config_readonly_async
+        from hermes_cli.config import load_config_readonly
 
-        config = await load_config_readonly_async()
+        config = await load_config_readonly()
     main_provider = (await _read_main_provider(config) or "").strip()
     main_model = (await _read_main_model(config) or "").strip()
     if main_provider.lower() == "moa":
@@ -4049,7 +4042,7 @@ async def _candidate_context_window(
     try:
         ctx = None
         if base_url:
-            metadata = await fetch_endpoint_model_metadata_async(
+            metadata = await fetch_endpoint_model_metadata(
                 base_url, api_key=api_key
             )
             entry = metadata.get(model)
@@ -4121,9 +4114,9 @@ async def _try_configured_fallback_chain(
     if not task:
         return None, None, ""
     if config is None:
-        from hermes_cli.config import load_config_readonly_async
+        from hermes_cli.config import load_config_readonly
 
-        config = await load_config_readonly_async()
+        config = await load_config_readonly()
 
     task_config = _get_auxiliary_task_config(task, config=config)
     chain = task_config.get("fallback_chain")
@@ -4287,9 +4280,9 @@ async def _try_main_fallback_chain(
         from hermes_cli.fallback_config import get_fallback_chain
 
         if config is None:
-            from hermes_cli.config import load_config_readonly_async
+            from hermes_cli.config import load_config_readonly
 
-            config = await load_config_readonly_async()
+            config = await load_config_readonly()
         chain = get_fallback_chain(config)
     except Exception as exc:
         logger.debug("Auxiliary %s: could not load main fallback chain: %s", task or "call", exc)
@@ -4398,9 +4391,9 @@ async def _resolve_auto(
     global auxiliary_is_nous, _stale_base_url_warned
     auxiliary_is_nous = False  # Reset — _try_nous() will set True if it wins
     if config is None:
-        from hermes_cli.config import load_config_readonly_async
+        from hermes_cli.config import load_config_readonly
 
-        config = await load_config_readonly_async()
+        config = await load_config_readonly()
     config_snapshot = config
     runtime = _normalize_main_runtime(main_runtime)
     runtime_provider = runtime.get("provider", "")
@@ -4662,9 +4655,9 @@ async def resolve_provider_client(
         (client, resolved_model) or (None, None) if auth is unavailable.
     """
     if config is None:
-        from hermes_cli.config import load_config_readonly_async
+        from hermes_cli.config import load_config_readonly
 
-        config = await load_config_readonly_async()
+        config = await load_config_readonly()
     _validate_proxy_env_urls()
     # Preserve the original provider name before alias normalization so a
     # user-declared ``custom_providers`` entry whose name coincidentally
@@ -5174,7 +5167,7 @@ async def resolve_provider_client(
     try:
         from hermes_cli.auth import (
             PROVIDER_REGISTRY,
-            resolve_api_key_provider_credentials_async,
+            resolve_api_key_provider_credentials,
         )
     except ImportError:
         logger.debug("hermes_cli.auth not available for provider %s", provider)
@@ -5190,7 +5183,7 @@ async def resolve_provider_client(
         return None, None
 
     if pconfig.auth_type == "api_key":
-        creds = await resolve_api_key_provider_credentials_async(provider)
+        creds = await resolve_api_key_provider_credentials(provider)
         api_key = str(creds.get("api_key", "")).strip()
         # Honour an explicit api_key override (e.g. from a fallback_model entry
         # or a custom_providers entry) so callers that pass an explicit
@@ -5361,11 +5354,11 @@ async def get_text_auxiliary_client(
     Callers may override the returned model via config.yaml
     (e.g. auxiliary.compression.model, auxiliary.web_extract.model).
     """
-    from hermes_cli.config import load_config_readonly_async
+    from hermes_cli.config import load_config_readonly
 
     provider, model, base_url, api_key, api_mode = _resolve_task_provider_model(
         task or None,
-        config=await load_config_readonly_async(),
+        config=await load_config_readonly(),
     )
     return await resolve_provider_client(
         provider,
@@ -5524,9 +5517,9 @@ async def resolve_vision_provider_client(
     """
     runtime = _normalize_main_runtime(main_runtime)
     if config is None:
-        from hermes_cli.config import load_config_readonly_async
+        from hermes_cli.config import load_config_readonly
 
-        config = await load_config_readonly_async()
+        config = await load_config_readonly()
     requested, resolved_model, resolved_base_url, resolved_api_key, resolved_api_mode = _resolve_task_provider_model(
         "vision",
         provider,
@@ -7415,9 +7408,9 @@ async def call_llm(
     # Keep every async phase on the same runtime identity, even if another
     # session switches models while this task is awaiting network I/O.
     main_runtime = _normalize_main_runtime(main_runtime)
-    from hermes_cli.config import load_config_readonly_async
+    from hermes_cli.config import load_config_readonly
 
-    config_snapshot = await load_config_readonly_async()
+    config_snapshot = await load_config_readonly()
     resolved_provider, resolved_model, resolved_base_url, resolved_api_key, resolved_api_mode = _resolve_task_provider_model(
         task, provider, model, base_url, api_key, config=config_snapshot)
     if api_mode:

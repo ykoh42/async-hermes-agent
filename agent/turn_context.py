@@ -428,8 +428,12 @@ async def build_turn_context(
             if not getattr(agent, "_mcp_discovery_started", False):
                 agent._mcp_discovery_started = True
                 await discover_mcp_tools()
-            if has_registered_mcp_tools():
+            if (
+                not getattr(agent, "_tool_snapshot_initialized", False)
+                or has_registered_mcp_tools()
+            ):
                 await refresh_agent_mcp_tools(agent, quiet_mode=True)
+                agent._tool_snapshot_initialized = True
     except Exception:
         logger.debug("between-turns MCP tool refresh skipped", exc_info=True)
 

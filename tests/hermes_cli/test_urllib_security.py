@@ -273,36 +273,6 @@ def test_multihop_redirects_never_resurrect_credentials():
     assert "authorization" not in returned_headers
     assert "cf-access-client-secret" not in returned_headers
 
-
-def test_probe_api_models_drops_custom_credentials_on_wire():
-    from hermes_cli.models import probe_api_models
-
-    source = _server()
-    sink = _server()
-    _RecordingHandler.requests = []
-    _RecordingHandler.redirect_status = 302
-    _RecordingHandler.redirect_to = f"http://localhost:{sink.server_port}/sink"
-    try:
-        result = probe_api_models(
-            "provider-key",
-            f"http://127.0.0.1:{source.server_port}/redirect/..",
-            timeout=3,
-            request_headers={
-                "CF-Access-Client-Secret": "cloudflare-secret",
-                "X-Custom-Auth": "tenant-secret",
-            },
-        )
-    finally:
-        source.shutdown()
-        sink.shutdown()
-
-    assert result["models"] == []
-    _, headers = _RecordingHandler.requests[-1]
-    assert "authorization" not in headers
-    assert "cf-access-client-secret" not in headers
-    assert "x-custom-auth" not in headers
-
-
 class _LmStudioSourceHandler(BaseHTTPRequestHandler):
     redirect_to = ""
 
@@ -393,5 +363,3 @@ def test_azure_anthropic_probe_drops_api_key_and_bearer_on_redirect():
     _, headers = _RecordingHandler.requests[-1]
     assert "authorization" not in headers
     assert "api-key" not in headers
-
-

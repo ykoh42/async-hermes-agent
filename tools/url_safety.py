@@ -259,9 +259,9 @@ async def _resolve_allow_private_urls() -> bool:
 
     # 2. Config file
     try:
-        from hermes_cli.config import load_config_readonly_async
+        from hermes_cli.config import load_config_readonly
 
-        cfg = await load_config_readonly_async()
+        cfg = await load_config_readonly()
         # security.allow_private_urls (preferred)
         sec = cfg.get("security", {})
         if isinstance(sec, dict) and is_truthy_value(

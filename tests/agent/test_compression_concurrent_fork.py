@@ -93,6 +93,7 @@ def _build_agent_with_db(db: SessionDB, session_id: str):
     # lock contention) — pin in_place=False so they keep exercising it
     # regardless of the global default (which flipped to True in #38763).
     agent.compression_in_place = False
+    agent._runtime_config_loaded = True
     _BUILT_AGENTS.append(agent)
     return agent
 

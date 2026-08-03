@@ -176,30 +176,13 @@ def _discovery_cache_path() -> Optional[Path]:
 
 
 def _load_discovery_cache() -> Dict[str, list]:
-    """Read the discovery cache; any error → empty dict (full scan)."""
-    path = _discovery_cache_path()
-    if path is None:
-        return {}
-    try:
-        with open(path, "r", encoding="utf-8") as fh:
-            data = json.load(fh)
-        return data if isinstance(data, dict) else {}
-    except (OSError, ValueError):
-        return {}
+    """The async distribution performs a deterministic in-memory scan."""
+    return {}
 
 
 def _save_discovery_cache(cache: Dict[str, list]) -> None:
-    """Best-effort atomic write of the discovery cache. Never raises."""
-    path = _discovery_cache_path()
-    if path is None:
-        return
-    try:
-        from utils import atomic_json_write  # stdlib+yaml only; no cycle
-
-        path.parent.mkdir(parents=True, exist_ok=True)
-        atomic_json_write(path, cache, indent=0)
-    except Exception as e:
-        logger.debug("Could not write tool discovery cache %s: %s", path, e)
+    """The async distribution does not persist discovery state."""
+    return None
 
 
 class ToolEntry:
@@ -270,14 +253,7 @@ _check_fn_cache_lock = threading.Lock()
 
 
 def _check_fn_cached(fn: Callable) -> bool:
-    """Return bool(fn()), TTL-cached across calls.
-
-    Exceptions are swallowed as False. A transient False/exception within
-    ``_CHECK_FN_FAILURE_GRACE_SECONDS`` of the last True is suppressed (the
-    last-good True is returned and the failure is NOT cached, so the next call
-    re-probes) to keep flaky external checks (Docker daemon busy, socket
-    contention, probe timeout) from silently stripping tools mid-session.
-    """
+    """Return bool(fn()), TTL-cached across calls."""
     now = time.monotonic()
     with _check_fn_cache_lock:
         cached = _check_fn_cache.get(fn)
@@ -298,12 +274,8 @@ def _check_fn_cached(fn: Callable) -> bool:
             _check_fn_last_good[fn] = now
             _check_fn_cache[fn] = (now, True)
             return True
-
         last_good = _check_fn_last_good.get(fn)
         if last_good is not None and now - last_good < _CHECK_FN_FAILURE_GRACE_SECONDS:
-            # Recent success → treat this failure as a flake. Serve last-good
-            # True and do NOT cache the failure, so the next call re-probes
-            # rather than pinning a stale verdict for the full TTL.
             logger.warning(
                 "check_fn %s failed (%s) within %.0fs of last success; "
                 "treating as transient and keeping tool(s) available",
@@ -312,9 +284,6 @@ def _check_fn_cached(fn: Callable) -> bool:
                 _CHECK_FN_FAILURE_GRACE_SECONDS,
             )
             return True
-
-        # No recent success (or grace expired) — honor the failure. Log it so
-        # silent tool loss in quiet mode (subagents) is diagnosable.
         logger.warning(
             "check_fn %s %s; dependent tools will be unavailable this turn",
             getattr(fn, "__qualname__", fn),
@@ -646,7 +615,13 @@ class ToolRegistry:
     # Schema retrieval
     # ------------------------------------------------------------------
 
-    def get_definitions(self, tool_names: Set[str], quiet: bool = False) -> List[dict]:
+    def get_definitions(
+        self,
+        tool_names: Set[str],
+        quiet: bool = False,
+        *,
+        probe_availability: bool = True,
+    ) -> List[dict]:
         """Return OpenAI-format tool schemas for the requested tool names.
 
         Only tools whose ``check_fn()`` returns True (or have no check_fn)
@@ -667,7 +642,7 @@ class ToolRegistry:
             entry = entries_by_name.get(name)
             if not entry:
                 continue
-            if entry.check_fn:
+            if entry.check_fn and probe_availability:
                 if entry.check_fn not in check_results:
                     check_results[entry.check_fn] = _check_fn_cached(entry.check_fn)
                 if not check_results[entry.check_fn]:

@@ -8,7 +8,7 @@ Two-phase design:
      status_callback (gateway platforms)
 """
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -231,7 +231,12 @@ async def test_init_feasibility_check_uses_aux_context_override_from_config():
     mock_client.api_key = "sk-custom"
 
     with (
-        patch("hermes_cli.config.load_config", return_value=cfg), patch("hermes_cli.config.load_config_readonly", return_value=cfg),
+        patch("hermes_cli.config.load_config", return_value=cfg),
+        patch(
+            "hermes_cli.config.load_config_readonly",
+            new_callable=AsyncMock,
+            return_value=cfg,
+        ),
         patch("run_agent.get_tool_definitions", return_value=[]),
         patch("run_agent.check_toolset_requirements", return_value={}),
         patch("run_agent.OpenAI"),
@@ -247,9 +252,10 @@ async def test_init_feasibility_check_uses_aux_context_override_from_config():
             skip_memory=True,
         )
 
-        # Config override is captured eagerly in __init__ (still needed
-        # because the threshold-derivation logic at construction time
-        # consults it).
+        await agent._ensure_provider_runtime()
+
+        # File-backed configuration is captured at the first async runtime
+        # boundary, before any model or compression request.
         assert agent._aux_compression_context_length_config == 1_000_000
 
         # The expensive feasibility probe is deferred. Drive it manually
@@ -260,7 +266,7 @@ async def test_init_feasibility_check_uses_aux_context_override_from_config():
         "custom/big-model",
         base_url="http://custom-endpoint:8080/v1",
         config_context_length=1_000_000,
-        provider="",
+        provider="openrouter",
         custom_providers=[],
     )
 
@@ -404,5 +410,3 @@ async def test_threshold_suggestion_kept_for_large_context_main(mock_get_client,
 
     assert len(messages) == 1
     assert "threshold: 0.30" in messages[0]
-
-

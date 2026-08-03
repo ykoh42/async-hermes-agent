@@ -173,13 +173,13 @@ class TestModelSupportsVision:
         fake_caps = MagicMock()
         fake_caps.supports_vision = True
         with patch(
-            "agent.models_dev.get_model_capabilities_async",
+            "agent.models_dev.get_model_capabilities",
             new=AsyncMock(return_value=fake_caps),
         ):
             assert await agent._model_supports_vision() is True
         fake_caps.supports_vision = False
         with patch(
-            "agent.models_dev.get_model_capabilities_async",
+            "agent.models_dev.get_model_capabilities",
             new=AsyncMock(return_value=fake_caps),
         ):
             assert await agent._model_supports_vision() is False
@@ -188,7 +188,7 @@ class TestModelSupportsVision:
     async def test_none_caps_returns_false(self):
         agent = _make_agent()
         with patch(
-            "agent.models_dev.get_model_capabilities_async",
+            "agent.models_dev.get_model_capabilities",
             new=AsyncMock(return_value=None),
         ):
             assert await agent._model_supports_vision() is False

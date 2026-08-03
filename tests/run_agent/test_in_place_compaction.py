@@ -287,10 +287,8 @@ class TestCompactedTurnsStaySearchable:
 
     @pytest.mark.asyncio
     async def test_compacted_turns_found_by_default_search(self):
-        from hermes_state import SessionDB
-
         with tempfile.TemporaryDirectory() as tmp:
-            db = SessionDB(db_path=Path(tmp) / "t.db")
+            db = _async_db(Path(tmp) / "t.db")
             sid = "20260619_search"
             await db.create_session(sid, "cli", model="test/model")
             for r, c in [
@@ -325,10 +323,8 @@ class TestCompactedTurnsStaySearchable:
     async def test_rewound_turns_stay_hidden(self):
         """Rewind/undo (active=0, compacted=0) must NOT leak into default
         search — the distinction the compacted flag preserves."""
-        from hermes_state import SessionDB
-
         with tempfile.TemporaryDirectory() as tmp:
-            db = SessionDB(db_path=Path(tmp) / "t.db")
+            db = _async_db(Path(tmp) / "t.db")
             sid = "20260619_undo"
             await db.create_session(sid, "cli", model="test/model")
             await db.append_message(session_id=sid, role="user", content="ZEBRAWORD remember this")

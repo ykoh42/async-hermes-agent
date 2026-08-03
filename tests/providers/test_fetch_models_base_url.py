@@ -148,26 +148,3 @@ class TestFetchModelsRedirectCredentialStripping:
         assert result == ["redirected-model"]
         assert headers.get("authorization") == "Bearer bearer-secret"
         assert headers.get("x-api-key") == "default-header-secret"
-
-
-class TestModelPickerBaseUrlIntegration:
-    """The /model picker path should pass model.base_url to fetch_models."""
-
-    def test_picker_passes_base_url(self):
-        """Verify models.py caller passes base_url to fetch_models."""
-        mock_profile = MagicMock()
-        mock_profile.auth_type = "api_key"
-        mock_profile.base_url = "https://default.api.com"
-        mock_profile.fetch_models.return_value = ["model-a"]
-
-        with (
-            patch("providers.get_provider_profile", return_value=mock_profile),
-            patch("hermes_cli.auth.resolve_api_key_provider_credentials",
-                  return_value={"api_key": "sk-test", "base_url": "https://custom.proxy.com"}),
-        ):
-            from hermes_cli.models import provider_model_ids
-            result = provider_model_ids("test-provider")
-            # Verify fetch_models was called with base_url
-            mock_profile.fetch_models.assert_called_once()
-            call_kwargs = mock_profile.fetch_models.call_args
-            assert call_kwargs.kwargs.get("base_url") == "https://custom.proxy.com"

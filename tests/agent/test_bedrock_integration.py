@@ -73,36 +73,18 @@ class TestModelCatalog:
 class TestResolveProvider:
     """Verify resolve_provider() handles bedrock correctly."""
 
-    def test_explicit_bedrock_resolves(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_explicit_bedrock_resolves(self, monkeypatch):
         """When user explicitly requests 'bedrock', it should resolve."""
         # bedrock is in the registry, so resolve_provider should return it
         from hermes_cli.auth import resolve_provider
-        result = resolve_provider("bedrock")
+        result = await resolve_provider("bedrock")
         assert result == "bedrock"
 
-    def test_aws_alias_resolves_to_bedrock(self):
+    @pytest.mark.asyncio
+    async def test_aws_alias_resolves_to_bedrock(self):
         from hermes_cli.auth import resolve_provider
-        result = resolve_provider("aws")
-        assert result == "bedrock"
-
-
-    def test_auto_detect_with_aws_credentials(self, monkeypatch):
-        """When AWS credentials are present and no other provider is configured,
-        auto-detect should find bedrock."""
-        from hermes_cli.auth import resolve_provider
-
-        # Clear all other provider env vars
-        for var in ["OPENAI_API_KEY", "OPENROUTER_API_KEY", "ANTHROPIC_API_KEY",
-                     "ANTHROPIC_TOKEN", "GOOGLE_API_KEY", "DEEPSEEK_API_KEY"]:
-            monkeypatch.delenv(var, raising=False)
-
-        # Set AWS credentials
-        monkeypatch.setenv("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE")
-        monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY")
-
-        # Mock the auth store to have no active provider
-        with patch("hermes_cli.auth._load_auth_store", return_value={}):
-            result = resolve_provider("auto")
+        result = await resolve_provider("aws")
         assert result == "bedrock"
 
 

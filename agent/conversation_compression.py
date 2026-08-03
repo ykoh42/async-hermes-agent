@@ -675,9 +675,9 @@ async def check_compression_model_feasibility(agent: Any) -> None:
         # to the client's base_url hostname so the user can still tell
         # where the compression model is actually being called.
         try:
-            from hermes_cli.config import load_config_readonly_async
+            from hermes_cli.config import load_config_readonly
 
-            config_snapshot = await load_config_readonly_async()
+            config_snapshot = await load_config_readonly()
             _aux_cfg_provider, _, _, _, _ = _resolve_task_provider_model(
                 "compression",
                 config=config_snapshot,
@@ -2040,9 +2040,9 @@ async def compress_context(
                     # from the parent row, covering app-global remote sessions
                     # whose thread lacks the HERMES_HOME context.
                     try:
-                        from hermes_cli.profiles import get_active_profile_name_async
+                        from hermes_cli.profiles import get_active_profile_name
 
-                        _profile_for_child = await get_active_profile_name_async()
+                        _profile_for_child = get_active_profile_name()
                         if _profile_for_child == "default":
                             _profile_for_child = None
                     except Exception:
@@ -2437,7 +2437,7 @@ async def _compress_context_via_codex_app_server(
     return messages, existing_prompt
 
 
-def _try_shrink_image_parts_in_messages_sync(
+async def try_shrink_image_parts_in_messages(
     api_messages: list,
     *,
     max_dimension: int = 8000,
@@ -2722,22 +2722,6 @@ def _try_shrink_image_parts_in_messages_sync(
         )
         return False
     return changed_count > 0
-
-
-async def try_shrink_image_parts_in_messages(
-    api_messages: list,
-    *,
-    max_dimension: int = 8000,
-) -> bool:
-    """Shrink rejected image parts in the async conversation path.
-
-    The resize itself is CPU-only and intentionally stays synchronous; there
-    is no hidden thread fallback in the native-async runtime.
-    """
-    return _try_shrink_image_parts_in_messages_sync(
-        api_messages,
-        max_dimension=max_dimension,
-    )
 
 
 __all__ = [

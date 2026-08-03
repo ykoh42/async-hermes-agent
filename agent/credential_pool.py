@@ -16,8 +16,8 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 from hermes_constants import OPENROUTER_BASE_URL
 from hermes_cli.config import (
-    get_env_value_prefer_dotenv_async,
-    load_config_readonly_async,
+    get_env_value_prefer_dotenv,
+    load_config_readonly,
 )
 from agent.credential_persistence import (
     is_borrowed_credential_source,
@@ -27,39 +27,18 @@ import hermes_cli.auth as auth_mod
 from hermes_cli.auth import (
     CODEX_ACCESS_TOKEN_REFRESH_SKEW_SECONDS,
     PROVIDER_REGISTRY,
-    _auth_store_lock,
     _codex_access_token_is_expiring,
     _decode_jwt_claims,
-    _load_auth_store_async,
+    _load_auth_store,
     _load_provider_state,
     _resolve_kimi_base_url,
     _resolve_zai_base_url,
-    _save_auth_store,
-    _save_provider_state,
     _store_provider_state,
-    read_credential_pool_async,
-    write_credential_pool_async,
+    read_credential_pool,
+    write_credential_pool,
 )
 
 logger = logging.getLogger(__name__)
-
-
-def _load_config_safe() -> Optional[dict]:
-    """Load config.yaml read-only, returning None on any error.
-
-    Uses ``load_config_readonly()``: every consumer in this module only reads
-    (``get_pool_strategy``, ``_iter_custom_providers``, the model-config seed),
-    and the deepcopy that ``load_config()`` pays per call is what made
-    credential-pool checks the dominant cost of ``model.options`` — the picker
-    calls ``load_pool()`` once per provider row, each of which loaded (and
-    deep-copied) the full config again.
-    """
-    try:
-        from hermes_cli.config import load_config_readonly
-
-        return load_config_readonly()
-    except Exception:
-        return None
 
 
 # --- Status and type constants ---
@@ -394,8 +373,6 @@ def _normalize_custom_pool_name(name: str) -> str:
 def _iter_custom_providers(config: Optional[dict] = None):
     """Yield (normalized_name, entry_dict) for each valid custom_providers entry."""
     if config is None:
-        config = _load_config_safe()
-    if config is None:
         return
     custom_providers = config.get("custom_providers")
     if not isinstance(custom_providers, list):
@@ -417,7 +394,7 @@ def _iter_custom_providers(config: Optional[dict] = None):
         yield _normalize_custom_pool_name(name), entry
 
 
-def get_custom_provider_pool_key(
+async def get_custom_provider_pool_key(
     base_url: Optional[str],
     provider_name: Optional[str] = None,
     *,
@@ -433,6 +410,8 @@ def get_custom_provider_pool_key(
     """
     if not base_url:
         return None
+    if config is None:
+        config = await load_config_readonly()
     normalized_url = base_url.strip().rstrip("/")
 
     # When a provider name is given, try to match by name first.
@@ -454,7 +433,7 @@ def get_custom_provider_pool_key(
 
 async def list_custom_pool_providers() -> List[str]:
     """Return all 'custom:*' pool keys that have entries in auth.json."""
-    pool_data = await read_credential_pool_async(None)
+    pool_data = await read_credential_pool(None)
     return sorted(
         key for key in pool_data
         if key.startswith(CUSTOM_POOL_PREFIX)
@@ -476,9 +455,9 @@ def _get_custom_provider_config(
     return None
 
 
-def get_pool_strategy(provider: str) -> str:
+async def get_pool_strategy(provider: str) -> str:
     """Return the configured selection strategy for a provider."""
-    config = _load_config_safe()
+    config = await load_config_readonly()
     if config is None:
         return STRATEGY_FILL_FIRST
 
@@ -523,11 +502,16 @@ def credential_pool_matches_provider(
         return True
     if provider_norm != "custom" or not pool_provider.startswith(CUSTOM_POOL_PREFIX):
         return False
-    try:
-        matched_pool = get_custom_provider_pool_key(base_url or "")
-    except Exception:
+    target_url = str(base_url or "").strip().rstrip("/")
+    if not target_url:
         return False
-    return str(matched_pool or "").strip().lower() == pool_provider
+    entries = getattr(pool_or_provider, "entries", None)
+    if not callable(entries):
+        return False
+    return any(
+        str(getattr(entry, "base_url", "") or "").strip().rstrip("/") == target_url
+        for entry in entries()
+    )
 
 
 DEFAULT_MAX_CONCURRENT_PER_CREDENTIAL = 1
@@ -575,14 +559,14 @@ async def _write_through_provider_state_to_global_root(
                 return
     try:
         async with auth_mod._async_auth_store_transaction(global_path):
-            auth_store = await auth_mod._load_auth_store_async(global_path)
+            auth_store = await auth_mod._load_auth_store(global_path)
             auth_mod._store_provider_state(
                 auth_store,
                 provider_id,
                 state,
                 set_active=False,
             )
-            await auth_mod._save_auth_store_async(auth_store, global_path)
+            await auth_mod._save_auth_store(auth_store, global_path)
     except Exception as exc:  # pragma: no cover - best effort
         logger.debug(
             "%s pool refresh: write-through to global root failed: %s",
@@ -592,11 +576,17 @@ async def _write_through_provider_state_to_global_root(
 
 
 class CredentialPool:
-    def __init__(self, provider: str, entries: List[PooledCredential]):
+    def __init__(
+        self,
+        provider: str,
+        entries: List[PooledCredential],
+        *,
+        strategy: str = STRATEGY_FILL_FIRST,
+    ):
         self.provider = provider
         self._entries = sorted(entries, key=lambda entry: entry.priority)
         self._current_id: Optional[str] = None
-        self._strategy = get_pool_strategy(provider)
+        self._strategy = strategy
         self._lock = asyncio.Lock()
         self._active_leases: Dict[str, int] = {}
         self._max_concurrent = DEFAULT_MAX_CONCURRENT_PER_CREDENTIAL
@@ -775,7 +765,7 @@ class CredentialPool:
 
     async def _persist(self, *, removed_ids: Optional[List[str]] = None) -> None:
         """Persist the current snapshot without blocking an agent turn."""
-        await write_credential_pool_async(
+        await write_credential_pool(
             self.provider,
             [entry.to_dict() for entry in self._entries],
             removed_ids=removed_ids,
@@ -788,7 +778,7 @@ class CredentialPool:
         if entry.source != "device_code":
             return entry
         try:
-            auth_store = await auth_mod._load_auth_store_async()
+            auth_store = await auth_mod._load_auth_store()
             state = auth_mod._load_provider_state(auth_store, "xai-oauth")
             tokens = state.get("tokens") if isinstance(state, dict) else None
             if not isinstance(tokens, dict):
@@ -830,7 +820,7 @@ class CredentialPool:
         write_through_to_root = False
         try:
             async with auth_mod._async_auth_store_transaction():
-                auth_store = await auth_mod._load_auth_store_async()
+                auth_store = await auth_mod._load_auth_store()
                 providers = auth_store.get("providers")
                 write_through_to_root = not (
                     isinstance(providers, dict)
@@ -866,7 +856,7 @@ class CredentialPool:
                     state,
                     set_active=False,
                 )
-                await auth_mod._save_auth_store_async(auth_store)
+                await auth_mod._save_auth_store(auth_store)
             if write_through_to_root and state is not None:
                 await _write_through_provider_state_to_global_root(
                     self.provider,
@@ -1464,13 +1454,13 @@ async def _is_provider_explicitly_configured(
     if not normalized:
         return False
 
-    store = auth_store if isinstance(auth_store, dict) else await _load_auth_store_async()
+    store = auth_store if isinstance(auth_store, dict) else await _load_auth_store()
     active = str(store.get("active_provider") or "").strip().lower()
     if active == normalized:
         return True
 
     try:
-        config = await load_config_readonly_async()
+        config = await load_config_readonly()
     except Exception:
         config = {}
     model_cfg = config.get("model") if isinstance(config, dict) else None
@@ -1506,12 +1496,12 @@ async def _is_provider_explicitly_configured(
         for env_var in pconfig.api_key_env_vars:
             if env_var == "CLAUDE_CODE_OAUTH_TOKEN":
                 continue
-            value = await get_env_value_prefer_dotenv_async(env_var)
+            value = await get_env_value_prefer_dotenv(env_var)
             if value and len(value.strip()) >= 4:
                 return True
 
     try:
-        persisted = await read_credential_pool_async(normalized)
+        persisted = await read_credential_pool(normalized)
     except Exception:
         persisted = []
     for entry in persisted:
@@ -1524,7 +1514,7 @@ async def _is_provider_explicitly_configured(
             return True
         if source.startswith("env:"):
             env_var = source.split(":", 1)[1].strip()
-            if env_var and await get_env_value_prefer_dotenv_async(env_var):
+            if env_var and await get_env_value_prefer_dotenv(env_var):
                 return True
     return False
 
@@ -1534,7 +1524,7 @@ async def _seed_from_singletons(
 ) -> Tuple[bool, Set[str]]:
     changed = False
     active_sources: Set[str] = set()
-    auth_store = await _load_auth_store_async()
+    auth_store = await _load_auth_store()
     suppressed_sources = auth_store.get("suppressed_sources", {})
 
     def _is_suppressed(source: str) -> bool:
@@ -1575,12 +1565,12 @@ async def _seed_from_singletons(
         # same reason `_seed_from_env` does — that's the authoritative file
         # that `hermes setup` writes.
         anthropic_api_key = (
-            await get_env_value_prefer_dotenv_async("ANTHROPIC_API_KEY") or ""
+            await get_env_value_prefer_dotenv("ANTHROPIC_API_KEY") or ""
         ).strip()
         anthropic_oauth_env = (
-            await get_env_value_prefer_dotenv_async("ANTHROPIC_TOKEN") or ""
+            await get_env_value_prefer_dotenv("ANTHROPIC_TOKEN") or ""
         ).strip() or (
-            await get_env_value_prefer_dotenv_async("CLAUDE_CODE_OAUTH_TOKEN") or ""
+            await get_env_value_prefer_dotenv("CLAUDE_CODE_OAUTH_TOKEN") or ""
         )
         anthropic_oauth_env = anthropic_oauth_env.strip()
         api_key_path_explicit = bool(anthropic_api_key and not anthropic_oauth_env)
@@ -1773,7 +1763,7 @@ async def _seed_from_env(
 ) -> Tuple[bool, Set[str]]:
     changed = False
     active_sources: Set[str] = set()
-    auth_store = await _load_auth_store_async()
+    auth_store = await _load_auth_store()
     suppressed_sources = auth_store.get("suppressed_sources", {})
 
     # Prefer ~/.hermes/.env over os.environ — the user's config file is the
@@ -1781,7 +1771,7 @@ async def _seed_from_env(
     # processes (Codex CLI, test scripts, etc.) should not override deliberate
     # changes to the .env file.
     async def _get_env_prefer_dotenv(key: str) -> str:
-        return (await get_env_value_prefer_dotenv_async(key) or "").strip()
+        return (await get_env_value_prefer_dotenv(key) or "").strip()
 
     # Honour user suppression — `hermes auth remove <provider> <N>` for an
     # env-seeded credential marks the env:<VAR> source as suppressed so it
@@ -1934,9 +1924,9 @@ async def _seed_custom_pool(
     """Seed a custom endpoint pool from custom_providers config and model config."""
     changed = False
     active_sources: Set[str] = set()
-    auth_store = await _load_auth_store_async()
+    auth_store = await _load_auth_store()
     suppressed_sources = auth_store.get("suppressed_sources", {})
-    config = await load_config_readonly_async()
+    config = await load_config_readonly()
 
     # Shared suppression gate — same pattern as _seed_from_env/_seed_from_singletons.
     def _is_suppressed(source: str) -> bool:
@@ -1984,7 +1974,7 @@ async def _seed_custom_pool(
                     break
             if model_provider == "custom" and model_base_url and model_api_key:
                 # Check if this model's base_url matches our custom provider
-                matched_key = get_custom_provider_pool_key(
+                matched_key = await get_custom_provider_pool_key(
                     model_base_url, config=config
                 )
                 if matched_key == pool_key:
@@ -2011,7 +2001,7 @@ async def _seed_custom_pool(
 
 async def load_pool(provider: str) -> CredentialPool:
     provider = (provider or "").strip().lower()
-    raw_entries = await read_credential_pool_async(provider)
+    raw_entries = await read_credential_pool(provider)
     disk_ids = {
         entry.get("id")
         for entry in raw_entries
@@ -2036,7 +2026,7 @@ async def load_pool(provider: str) -> CredentialPool:
         # A profile may be reading this provider from the global-root fallback.
         # Keep that fallback read-only: only the store that owns these rows may
         # rewrite them. Loading the default/root profile will heal global rows.
-        active_pool = (await _load_auth_store_async()).get("credential_pool")
+        active_pool = (await _load_auth_store()).get("credential_pool")
         active_entries = active_pool.get(provider) if isinstance(active_pool, dict) else None
         raw_needs_auth_normalization = bool(active_entries)
 
@@ -2067,9 +2057,13 @@ async def load_pool(provider: str) -> CredentialPool:
 
     if changed:
         new_ids = {entry.id for entry in entries}
-        await write_credential_pool_async(
+        await write_credential_pool(
             provider,
             [entry.to_dict() for entry in sorted(entries, key=lambda item: item.priority)],
             removed_ids=disk_ids - new_ids,
         )
-    return CredentialPool(provider, entries)
+    return CredentialPool(
+        provider,
+        entries,
+        strategy=await get_pool_strategy(provider),
+    )

@@ -22,6 +22,11 @@ class _StubStartupCompressor:
     def on_session_start(self, *args, **kwargs):
         return None
 
+    def update_model(self, *, model, context_length=None, **_kwargs):
+        self.model = model
+        if context_length is not None:
+            self.context_length = context_length
+
 
 def test_route_url_normalization_preserves_path_slash_before_query():
     """A path slash before a query changes OpenAI SDK URL joining."""
@@ -42,17 +47,22 @@ def test_route_url_normalization_preserves_path_slash_before_query():
 
 
 
-def _make_direct_start_agent(
+async def _make_direct_start_agent(
     cfg: dict, *, model: str, provider: str, base_url: str
 ) -> AIAgent:
     with (
-        patch("hermes_cli.config.load_config", return_value=cfg), patch("hermes_cli.config.load_config_readonly", return_value=cfg),
+        patch("hermes_cli.config.load_config", return_value=cfg),
+        patch(
+            "hermes_cli.config.load_config_readonly",
+            new_callable=AsyncMock,
+            return_value=cfg,
+        ),
         patch("run_agent.get_tool_definitions", return_value=[]),
         patch("run_agent.check_toolset_requirements", return_value={}),
         patch("run_agent.OpenAI"),
         patch("agent.agent_init.ContextCompressor", new=_StubStartupCompressor),
     ):
-        return AIAgent(
+        agent = AIAgent(
             model=model,
             provider=provider,
             api_key="fake-test-token",
@@ -61,6 +71,8 @@ def _make_direct_start_agent(
             skip_context_files=True,
             skip_memory=True,
         )
+        await agent._ensure_provider_runtime()
+        return agent
 
 
 def _make_agent_with_compressor(config_context_length=None) -> AIAgent:
@@ -93,6 +105,7 @@ def _make_agent_with_compressor(config_context_length=None) -> AIAgent:
 
     # For switch_model
     agent._primary_runtime = {}
+    agent._runtime_config_loaded = True
 
     return agent
 
@@ -134,7 +147,8 @@ async def test_switch_model_without_config_context_length():
         assert call_kwargs.get("config_context_length") is None
 
 
-def test_direct_start_model_override_does_not_inherit_profile_context_length():
+@pytest.mark.asyncio
+async def test_direct_start_model_override_does_not_inherit_profile_context_length():
     """A CLI ``--model`` startup override must not inherit another model's window."""
     cfg = {
         "model": {
@@ -151,7 +165,7 @@ def test_direct_start_model_override_does_not_inherit_profile_context_length():
             }
         ],
     }
-    agent = _make_direct_start_agent(
+    agent = await _make_direct_start_agent(
         cfg,
         model="gpt-5.6-sol",
         provider="openai-codex",
@@ -162,7 +176,8 @@ def test_direct_start_model_override_does_not_inherit_profile_context_length():
     assert agent.context_compressor.context_length == 272_000
 
 
-def test_direct_start_preserves_context_for_normalized_default_model_alias():
+@pytest.mark.asyncio
+async def test_direct_start_preserves_context_for_normalized_default_model_alias():
     """Equivalent vendor-prefixed defaults still own their explicit window."""
     cfg = {
         "model": {
@@ -173,7 +188,7 @@ def test_direct_start_preserves_context_for_normalized_default_model_alias():
         }
     }
 
-    agent = _make_direct_start_agent(
+    agent = await _make_direct_start_agent(
         cfg,
         model="gpt-5.6-sol",
         provider="openai-codex",

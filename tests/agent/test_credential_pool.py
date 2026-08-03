@@ -45,11 +45,6 @@ def _jwt_with_claims(claims: dict) -> str:
 
 async def test_explicit_reset_timestamp_overrides_default_429_ttl(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
-    # Prevent auto-seeding from Codex CLI tokens on the host
-    monkeypatch.setattr(
-        "hermes_cli.auth._import_codex_cli_tokens",
-        lambda: None,
-    )
     _write_auth_store(
         tmp_path,
         {
@@ -791,7 +786,7 @@ async def test_write_credential_pool_sanitizes_borrowed_payload_at_disk_boundary
 
     from hermes_cli.auth import write_credential_pool
 
-    write_credential_pool("openrouter", [
+    await write_credential_pool("openrouter", [
         {
             "id": "borrowed-1",
             "label": "systemd-ref",
@@ -834,7 +829,7 @@ async def test_write_credential_pool_treats_unowned_oauth_source_as_borrowed(tmp
 
     from hermes_cli.auth import write_credential_pool
 
-    write_credential_pool("openrouter", [
+    await write_credential_pool("openrouter", [
         {
             "id": "unowned-oauth",
             "label": "unowned-oauth",
@@ -862,7 +857,7 @@ async def test_write_credential_pool_preserves_known_provider_owned_oauth_state(
 
     from hermes_cli.auth import write_credential_pool
 
-    write_credential_pool("nous", [
+    await write_credential_pool("nous", [
         {
             "id": "nous-device",
             "label": "device-code",
@@ -1044,7 +1039,10 @@ async def test_load_pool_api_key_path_skips_oauth_autodiscovery(tmp_path, monkey
     monkeypatch.delenv("ANTHROPIC_TOKEN", raising=False)
     monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
     _write_auth_store(tmp_path, {"version": 1, "providers": {}})
-    monkeypatch.setattr("hermes_cli.auth.is_provider_explicitly_configured", lambda pid: True)
+    monkeypatch.setattr(
+        "agent.credential_pool._is_provider_explicitly_configured",
+        AsyncMock(return_value=True),
+    )
 
     pkce_called = {"n": 0}
     cc_called = {"n": 0}
@@ -1118,7 +1116,10 @@ async def test_load_pool_api_key_path_prunes_stale_oauth_entries(tmp_path, monke
             },
         },
     )
-    monkeypatch.setattr("hermes_cli.auth.is_provider_explicitly_configured", lambda pid: True)
+    monkeypatch.setattr(
+        "agent.credential_pool._is_provider_explicitly_configured",
+        AsyncMock(return_value=True),
+    )
     monkeypatch.setattr(
         "agent.anthropic_adapter.read_hermes_oauth_credentials",
         AsyncMock(return_value=None),
@@ -1151,7 +1152,10 @@ async def test_load_pool_oauth_path_still_autodiscovers(tmp_path, monkeypatch):
     monkeypatch.setenv("ANTHROPIC_TOKEN", "sk-ant-oat01-explicit-oauth-token")
     monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
     _write_auth_store(tmp_path, {"version": 1, "providers": {}})
-    monkeypatch.setattr("hermes_cli.auth.is_provider_explicitly_configured", lambda pid: True)
+    monkeypatch.setattr(
+        "agent.credential_pool._is_provider_explicitly_configured",
+        AsyncMock(return_value=True),
+    )
 
     monkeypatch.setattr(
         "agent.anthropic_adapter.read_hermes_oauth_credentials",
@@ -1181,7 +1185,7 @@ async def test_least_used_strategy_selects_lowest_count(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
     monkeypatch.setattr(
         "agent.credential_pool.get_pool_strategy",
-        lambda _provider: "least_used",
+        AsyncMock(return_value="least_used"),
     )
     monkeypatch.setattr(
         "agent.credential_pool._seed_from_singletons",
@@ -1333,8 +1337,8 @@ async def test_load_pool_does_not_seed_claude_code_when_anthropic_not_configured
     )
     # User configured kimi-coding, NOT anthropic
     monkeypatch.setattr(
-        "hermes_cli.auth.is_provider_explicitly_configured",
-        lambda pid: pid == "kimi-coding",
+        "agent.credential_pool._is_provider_explicitly_configured",
+        AsyncMock(side_effect=lambda pid, **_: pid == "kimi-coding"),
     )
 
     from agent.credential_pool import load_pool
@@ -1367,18 +1371,6 @@ async def test_load_pool_does_not_read_qwen_cli_tokens(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
     _write_auth_store(tmp_path, {"version": 1, "credential_pool": {}})
 
-    monkeypatch.setattr(
-        "hermes_cli.auth.resolve_qwen_runtime_credentials",
-        lambda **kw: {
-            "provider": "qwen-oauth",
-            "base_url": "https://portal.qwen.ai/v1",
-            "api_key": "qwen_fake_token_xyz",
-            "source": "qwen-cli",
-            "expires_at_ms": 1900000000000,
-            "auth_file": str(tmp_path / ".qwen" / "oauth_creds.json"),
-        },
-    )
-
     from agent.credential_pool import load_pool
     pool = await load_pool("qwen-oauth")
 
@@ -1389,15 +1381,6 @@ async def test_load_pool_does_not_seed_qwen_oauth_when_no_token(tmp_path, monkey
     """Qwen OAuth pool should be empty when no CLI credentials exist."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
     _write_auth_store(tmp_path, {"version": 1, "credential_pool": {}})
-
-    from hermes_cli.auth import AuthError
-
-    monkeypatch.setattr(
-        "hermes_cli.auth.resolve_qwen_runtime_credentials",
-        lambda **kw: (_ for _ in ()).throw(
-            AuthError("Qwen CLI credentials not found.", provider="qwen-oauth", code="qwen_auth_missing")
-        ),
-    )
 
     from agent.credential_pool import load_pool
     pool = await load_pool("qwen-oauth")
@@ -1479,7 +1462,6 @@ class TestLeastUsedStrategy:
 
     async def test_request_count_increments(self):
         """Each select() call should increment the chosen entry's request_count."""
-        from unittest.mock import patch as _patch
         from agent.credential_pool import CredentialPool, PooledCredential, STRATEGY_LEAST_USED
 
         entries = [
@@ -1488,8 +1470,7 @@ class TestLeastUsedStrategy:
             PooledCredential(provider="test", id="b", label="b", auth_type="api_key",
                              source="b", access_token="tok-b", priority=1, request_count=0),
         ]
-        with _patch("agent.credential_pool.get_pool_strategy", return_value=STRATEGY_LEAST_USED):
-            pool = CredentialPool("test", entries)
+        pool = CredentialPool("test", entries, strategy=STRATEGY_LEAST_USED)
 
         # First select should pick entry with lowest count (both 0 → first)
         e1 = await pool.select()
@@ -1642,7 +1623,7 @@ async def test_persist_preserves_concurrent_disk_only_entry(tmp_path, monkeypatc
     pool = await load_pool("anthropic")
     assert {entry.id for entry in pool.entries()} == {"cred-A", "cred-B"}
 
-    disk_snapshot = read_credential_pool("anthropic")
+    disk_snapshot = await read_credential_pool("anthropic")
     disk_snapshot.append(
         {
             "id": "cred-C",
@@ -1653,7 +1634,7 @@ async def test_persist_preserves_concurrent_disk_only_entry(tmp_path, monkeypatc
             "access_token": "sk-C",
         }
     )
-    write_credential_pool("anthropic", disk_snapshot)
+    await write_credential_pool("anthropic", disk_snapshot)
 
     await pool.mark_exhausted_and_rotate(status_code=429)
 

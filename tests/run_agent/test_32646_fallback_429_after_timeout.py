@@ -63,6 +63,7 @@ def _make_agent_with_fallback(fb_chain):
             fallback_model=fb_chain,
         )
         agent.client = MagicMock()
+        agent._runtime_config_loaded = True
         return agent
 
 

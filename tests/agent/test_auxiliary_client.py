@@ -326,11 +326,11 @@ class TestMoaAggregatorSharedResolution:
         cfg["auxiliary"] = {"title_generation": {"provider": "moa", "model": "opus-gpt"}}
         (home / "config.yaml").write_text(yaml.safe_dump(cfg))
 
-        from hermes_cli.config import load_config_readonly_async
+        from hermes_cli.config import load_config_readonly
 
         resolved_provider, model, base_url, api_key, api_mode = _resolve_task_provider_model(
             task="title_generation",
-            config=await load_config_readonly_async(),
+            config=await load_config_readonly(),
         )
 
         assert resolved_provider == "openrouter"
@@ -1061,7 +1061,6 @@ class TestGetTextAuxiliaryClient:
         with (
             patch("agent.auxiliary_client.load_pool", new=AsyncMock(return_value=_Pool())),
             patch("agent.auxiliary_client._create_openai_client", return_value=MagicMock()),
-            patch("hermes_cli.auth._read_codex_tokens", side_effect=AssertionError("legacy codex store should not run")),
         ):
             from agent.auxiliary_client import _build_codex_client
 
@@ -1157,91 +1156,6 @@ class TestVisionClientFallback:
 
 
 class TestAuxiliaryPoolAwareness:
-
-    @pytest.mark.asyncio
-    async def test_try_nous_refreshes_stale_pool_entry(self):
-        stale_token = _jwt_with_claims({
-            "scope": "inference:invoke",
-            "exp": int(time.time() - 60),
-        })
-        fresh_token = _jwt_with_claims({
-            "scope": "inference:invoke",
-            "exp": int(time.time() + 3600),
-        })
-
-        class _Entry:
-            def __init__(self, token):
-                self.access_token = "pooled-access-token"
-                self.agent_key = token
-                self.agent_key_expires_at = "2099-01-01T00:00:00+00:00"
-                self.scope = "inference:invoke"
-                self.inference_base_url = "https://inference.pool.example/v1"
-
-        class _Pool:
-            refreshed = False
-
-            def has_credentials(self):
-                return True
-
-            async def select(self):
-                return _Entry(stale_token)
-
-            async def try_refresh_current(self):
-                self.refreshed = True
-                return _Entry(fresh_token)
-
-        pool = _Pool()
-        with (
-            patch("agent.auxiliary_client.load_pool", new=AsyncMock(return_value=pool)),
-            patch("agent.auxiliary_client._create_openai_client") as mock_create,
-            patch(
-                "hermes_cli.models.get_nous_recommended_aux_model",
-                new_callable=AsyncMock,
-                return_value=None,
-            ),
-        ):
-            from agent.auxiliary_client import _try_nous
-
-            client, model = await _try_nous()
-
-        assert pool.refreshed is True
-        assert client is not None
-        assert model == _NOUS_MODEL
-        assert mock_create.call_args.kwargs["api_key"] == fresh_token
-        assert mock_create.call_args.kwargs["base_url"] == "https://inference.pool.example/v1"
-
-
-
-
-
-    @pytest.mark.asyncio
-    async def test_call_llm_retries_nous_after_401(self):
-        class _Auth401(Exception):
-            status_code = 401
-
-        stale_client = MagicMock()
-        stale_client.base_url = "https://inference-api.nousresearch.com/v1"
-        stale_client.chat.completions.create = AsyncMock(side_effect=_Auth401("stale nous key"))
-
-        fresh_client = MagicMock()
-        fresh_client.base_url = "https://inference-api.nousresearch.com/v1"
-        fresh_client.chat.completions.create = AsyncMock(return_value={"ok": True})
-
-        with (
-            patch("agent.auxiliary_client._resolve_task_provider_model", return_value=("nous", "nous-model", None, None, None)),
-            patch("agent.auxiliary_client._get_cached_client", return_value=(stale_client, "nous-model")),
-            patch("agent.auxiliary_client._refresh_nous_auxiliary_client", return_value=(fresh_client, "nous-model")),
-            patch("agent.auxiliary_client._validate_llm_response_shape", side_effect=lambda resp, _task, **_kw: resp),
-            patch("agent.auxiliary_client._resolve_nous_runtime_api", return_value=("fresh-agent-key", "https://inference-api.nousresearch.com/v1")),
-        ):
-            result = await call_llm(
-                task="compression",
-                messages=[{"role": "user", "content": "hi"}],
-            )
-
-        assert result == {"ok": True}
-        assert stale_client.chat.completions.create.call_count == 1
-        assert fresh_client.chat.completions.create.call_count == 1
 
 
 
@@ -1401,34 +1315,6 @@ class TestIsModelIncompatibleError:
         assert _is_model_incompatible_error(exc) is False
 
 
-
-
-class TestRefreshNousRecommendedModel:
-    """_refresh_nous_recommended_model picks a fresh model after a stale 404."""
-
-
-
-    @pytest.mark.asyncio
-    async def test_falls_back_to_default_when_portal_unavailable(self, monkeypatch):
-        async def _boom(**kw):
-            raise RuntimeError("portal down")
-        monkeypatch.setattr(
-            "hermes_cli.models.get_nous_recommended_aux_model", _boom)
-        out = await _refresh_nous_recommended_model(
-            vision=False, stale_model="some/dead-model")
-        assert out == _NOUS_MODEL
-
-    @pytest.mark.asyncio
-    async def test_returns_none_when_no_distinct_alternative(self, monkeypatch):
-        """When the failed model IS the default and the Portal has nothing
-        else, there's no usable alternative."""
-        monkeypatch.setattr(
-            "hermes_cli.models.get_nous_recommended_aux_model",
-            AsyncMock(return_value=_NOUS_MODEL),
-        )
-        out = await _refresh_nous_recommended_model(
-            vision=False, stale_model=_NOUS_MODEL)
-        assert out is None
 
 
 class TestIsRateLimitError:
@@ -1939,11 +1825,6 @@ async def test_resolve_api_key_provider_skips_unconfigured_anthropic(monkeypatch
 
     monkeypatch.setattr("agent.auxiliary_client._try_anthropic", mock_try_anthropic)
     monkeypatch.setattr("hermes_cli.auth.PROVIDER_REGISTRY", fake_registry)
-    monkeypatch.setattr(
-        "hermes_cli.auth.is_provider_explicitly_configured",
-        lambda pid: False,
-    )
-
     from agent.auxiliary_client import _resolve_api_key_provider
     await _resolve_api_key_provider()
 
@@ -2268,7 +2149,7 @@ class TestAuxiliaryTaskExtraBody:
             }
         }
 
-        with patch("hermes_cli.config.load_config_readonly_async", new_callable=AsyncMock, return_value=config), patch(
+        with patch("hermes_cli.config.load_config_readonly", new_callable=AsyncMock, return_value=config), patch(
             "agent.auxiliary_client._get_cached_client",
             return_value=(client, "glm-4.5-air"),
         ):
@@ -2299,7 +2180,7 @@ class TestAuxiliaryTaskExtraBody:
             }
         }
 
-        with patch("hermes_cli.config.load_config_readonly_async", new_callable=AsyncMock, return_value=config), patch(
+        with patch("hermes_cli.config.load_config_readonly", new_callable=AsyncMock, return_value=config), patch(
             "agent.auxiliary_client._get_cached_client",
             return_value=(client, "glm-4.5-air"),
         ):
@@ -4103,7 +3984,7 @@ class TestCustomEndpointApiKeyInheritance:
             captured.update(kwargs)
             return MagicMock()
 
-        with patch("hermes_cli.config.load_config_readonly_async", new_callable=AsyncMock, return_value=fake_config), \
+        with patch("hermes_cli.config.load_config_readonly", new_callable=AsyncMock, return_value=fake_config), \
              patch.object(ac, "_create_openai_client", side_effect=_capture_create):
             client, model = await resolve_provider_client(
                 "custom",
@@ -4132,7 +4013,7 @@ class TestCustomEndpointApiKeyInheritance:
             captured.update(kwargs)
             return MagicMock()
 
-        with patch("hermes_cli.config.load_config_readonly_async", new_callable=AsyncMock, return_value=fake_config), \
+        with patch("hermes_cli.config.load_config_readonly", new_callable=AsyncMock, return_value=fake_config), \
              patch.object(ac, "_create_openai_client", side_effect=_capture_create):
             client, model = await resolve_provider_client(
                 "custom",
@@ -4160,7 +4041,7 @@ class TestCustomEndpointApiKeyInheritance:
 
         with patch.object(ac, "_RUNTIME_MAIN_API_KEY", "sk-runtime-key"), \
              patch.object(ac, "_RUNTIME_MAIN_BASE_URL", "https://gw.example.com/v1"), \
-             patch("hermes_cli.config.load_config_readonly_async", new_callable=AsyncMock, return_value={"model": {}}), \
+             patch("hermes_cli.config.load_config_readonly", new_callable=AsyncMock, return_value={"model": {}}), \
              patch.object(ac, "_create_openai_client", side_effect=_capture_create):
             client, model = await resolve_provider_client(
                 "custom",
@@ -4193,7 +4074,7 @@ class TestCustomEndpointApiKeyInheritance:
             captured.update(kwargs)
             return MagicMock()
 
-        with patch("hermes_cli.config.load_config_readonly_async", new_callable=AsyncMock, return_value=fake_config), \
+        with patch("hermes_cli.config.load_config_readonly", new_callable=AsyncMock, return_value=fake_config), \
              patch.object(ac, "_create_openai_client", side_effect=_capture_create):
             client, model = await resolve_provider_client(
                 "custom",

@@ -44,18 +44,28 @@ from dataclasses import dataclass, field
 from datetime import datetime
 
 from utils import base_url_host_matches, base_url_hostname
-import fire
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn, TimeElapsedColumn, TimeRemainingColumn
 from rich.console import Console
 from hermes_constants import OPENROUTER_BASE_URL, get_hermes_home
 from agent.retry_utils import jittered_backoff
 
-# Load .env from HERMES_HOME first, then project root as a dev fallback.
-from hermes_cli.env_loader import load_hermes_dotenv
 
-_hermes_home = get_hermes_home()
-_project_env = Path(__file__).parent / ".env"
-load_hermes_dotenv(hermes_home=_hermes_home, project_env=_project_env)
+async def _list_jsonl_files(directory: Path) -> List[Path]:
+    """Return JSONL files without blocking the event loop on directory I/O."""
+    try:
+        iterator = await aiofiles.os.scandir(directory)
+    except OSError:
+        return []
+    paths: list[Path] = []
+    try:
+        for entry in iterator:
+            if entry.name.endswith(".jsonl") and await aiofiles.os.path.isfile(
+                entry.path
+            ):
+                paths.append(Path(entry.path))
+    finally:
+        iterator.close()
+    return sorted(paths)
 
 
 def _effective_temperature_for_model(
@@ -125,10 +135,10 @@ class CompressionConfig:
     metrics_output_file: str = "compression_metrics.json"
     
     @classmethod
-    def from_yaml(cls, yaml_path: str) -> "CompressionConfig":
+    async def from_yaml(cls, yaml_path: str) -> "CompressionConfig":
         """Load configuration from YAML file."""
-        with open(yaml_path, 'r', encoding="utf-8") as f:
-            data = yaml.safe_load(f) or {}
+        async with aiofiles.open(yaml_path, "r", encoding="utf-8") as source:
+            data = yaml.safe_load(await source.read()) or {}
 
         config = cls()
 
@@ -347,26 +357,16 @@ class TrajectoryCompressor:
         """Initialize the compressor."""
         self.config = config
         self.aggregate_metrics = AggregateMetrics()
-        
-        # Initialize tokenizer
-        self._init_tokenizer()
+        # Token counting defaults to the existing deterministic character
+        # estimate. Callers may inject a CPU-only tokenizer object with an
+        # ``encode`` method; construction never performs model downloads or
+        # synchronous disk I/O.
+        self.tokenizer = None
         
         # Initialize OpenRouter client
         self._init_summarizer()
         
         self.logger = logging.getLogger(__name__)
-    
-    def _init_tokenizer(self):
-        """Initialize HuggingFace tokenizer for token counting."""
-        try:
-            from transformers import AutoTokenizer
-            self.tokenizer = AutoTokenizer.from_pretrained(
-                self.config.tokenizer_name,
-                trust_remote_code=self.config.trust_remote_code
-            )
-            print(f"✅ Loaded tokenizer: {self.config.tokenizer_name}")
-        except Exception as e:
-            raise RuntimeError(f"Failed to load tokenizer '{self.config.tokenizer_name}': {e}")
     
     def _init_summarizer(self):
         """Initialize async-only LLM routing metadata for summarization.
@@ -406,18 +406,25 @@ class TrajectoryCompressor:
     def _get_async_client(self):
         """Return an AsyncOpenAI client bound to the current event loop.
 
-        Created lazily so that each ``asyncio.run()`` call in
-        ``process_directory()`` gets a client tied to its own loop,
-        avoiding "Event loop is closed" errors on repeated calls.
+        Created lazily and reused for this compressor lifecycle.
         """
+        if self.async_client is not None:
+            return self.async_client
         from openai import AsyncOpenAI
         from agent.auxiliary_client import _to_openai_base_url
-        # Always create a fresh client so it binds to the running loop.
+
         self.async_client = AsyncOpenAI(
             api_key=self._async_client_api_key,
             base_url=_to_openai_base_url(self.config.base_url),
         )
         return self.async_client
+
+    async def close(self) -> None:
+        """Close the owned summarization transport, if one was created."""
+        client = self.async_client
+        self.async_client = None
+        if client is not None:
+            await client.close()
 
     def _detect_provider(self) -> str:
         """Detect the provider name from the configured base_url."""
@@ -449,14 +456,16 @@ class TrajectoryCompressor:
         return ""
     
     def count_tokens(self, text: str) -> int:
-        """Count tokens in text using the configured tokenizer."""
+        """Count tokens with an injected tokenizer or deterministic estimate."""
         if not text:
             return 0
-        try:
-            return len(self.tokenizer.encode(text))
-        except Exception:
-            # Fallback to character estimate
-            return len(text) // 4
+        tokenizer = self.tokenizer
+        if tokenizer is not None:
+            try:
+                return len(tokenizer.encode(text))
+            except Exception:
+                pass
+        return len(text) // 4
     
     def count_trajectory_tokens(self, trajectory: List[Dict[str, str]]) -> int:
         """Count total tokens in a trajectory."""
@@ -821,7 +830,7 @@ Write only the summary, starting with "[CONTEXT SUMMARY]:" prefix."""
         start_time = time.time()
         
         # Find all JSONL files
-        jsonl_files = sorted(input_dir.glob("*.jsonl"))
+        jsonl_files = await _list_jsonl_files(input_dir)
         
         if not jsonl_files:
             self.logger.warning(f"No JSONL files found in {input_dir}")
@@ -1121,7 +1130,7 @@ Write only the summary, starting with "[CONTEXT SUMMARY]:" prefix."""
             print(f"   Tokens saved:       min={min(tokens_saved_list):,}, max={max(tokens_saved_list):,}, median={sorted(tokens_saved_list)[len(tokens_saved_list)//2]:,}")
 
 
-def main(
+async def main(
     input: str,
     output: str = None,
     config: str = "configs/trajectory_compression.yaml",
@@ -1163,16 +1172,15 @@ def main(
     """
     import random
     import tempfile
-    import shutil
     
     print("🗜️  Trajectory Compressor")
     print("=" * 60)
     
     # Load configuration
     config_path = Path(config)
-    if config_path.exists():
+    if await aiofiles.os.path.exists(config_path):
         print(f"📋 Loading config from {config}")
-        compression_config = CompressionConfig.from_yaml(config)
+        compression_config = await CompressionConfig.from_yaml(config)
     else:
         print(f"⚠️  Config not found at {config}, using defaults")
         compression_config = CompressionConfig()
@@ -1192,11 +1200,11 @@ def main(
     
     # Setup paths and determine input type
     input_path = Path(input)
-    if not input_path.exists():
+    if not await aiofiles.os.path.exists(input_path):
         print(f"❌ Input not found: {input}")
         return
     
-    is_file_input = input_path.is_file()
+    is_file_input = await aiofiles.os.path.isfile(input_path)
     
     if is_file_input:
         print("📄 Input mode: Single JSONL file")
@@ -1209,8 +1217,10 @@ def main(
         
         # Load entries from the single file
         entries = []
-        with open(input_path, 'r', encoding='utf-8') as f:
-            for line_num, line in enumerate(f, 1):
+        async with aiofiles.open(input_path, "r", encoding="utf-8") as source:
+            line_num = 0
+            async for line in source:
+                line_num += 1
                 line = line.strip()
                 if line:
                     try:
@@ -1238,31 +1248,45 @@ def main(
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_input_dir = Path(temp_dir) / "input"
             temp_output_dir = Path(temp_dir) / "output"
-            temp_input_dir.mkdir()
+            await aiofiles.os.makedirs(temp_input_dir)
             
             # Write entries to temp file
             temp_input_file = temp_input_dir / "trajectories.jsonl"
-            with open(temp_input_file, 'w', encoding='utf-8') as f:
+            async with aiofiles.open(
+                temp_input_file, "w", encoding="utf-8"
+            ) as temporary_input:
                 for entry in entries:
-                    f.write(json.dumps(entry, ensure_ascii=False) + '\n')
+                    await temporary_input.write(
+                        json.dumps(entry, ensure_ascii=False) + "\n"
+                    )
             
             # Initialize compressor and process
             compressor = TrajectoryCompressor(compression_config)
-            asyncio.run(compressor.process_directory(temp_input_dir, temp_output_dir))
+            try:
+                await compressor.process_directory(temp_input_dir, temp_output_dir)
+            finally:
+                await compressor.close()
             
             # Copy result to output path (merge all files in temp_output_dir)
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(output_path, 'w', encoding='utf-8') as out_f:
-                for jsonl_file in sorted(temp_output_dir.glob("*.jsonl")):
-                    with open(jsonl_file, 'r', encoding='utf-8') as in_f:
-                        for line in in_f:
-                            out_f.write(line)
+            await aiofiles.os.makedirs(output_path.parent, exist_ok=True)
+            async with aiofiles.open(
+                output_path, "w", encoding="utf-8"
+            ) as output_file:
+                for jsonl_file in await _list_jsonl_files(temp_output_dir):
+                    async with aiofiles.open(
+                        jsonl_file, "r", encoding="utf-8"
+                    ) as input_file:
+                        async for line in input_file:
+                            await output_file.write(line)
             
             # Copy metrics file if it exists
             metrics_file = temp_output_dir / compression_config.metrics_output_file
-            if metrics_file.exists():
+            if await aiofiles.os.path.exists(metrics_file):
                 metrics_output = output_path.parent / (output_path.stem + "_metrics.json")
-                shutil.copy(metrics_file, metrics_output)
+                async with aiofiles.open(metrics_file, "rb") as metrics_source:
+                    metrics_payload = await metrics_source.read()
+                async with aiofiles.open(metrics_output, "wb") as metrics_target:
+                    await metrics_target.write(metrics_payload)
                 print(f"💾 Metrics saved to {metrics_output}")
         
         print("\n✅ Compression complete!")
@@ -1284,17 +1308,19 @@ def main(
             # Create a temp directory with sampled files
             with tempfile.TemporaryDirectory() as temp_dir:
                 temp_input_dir = Path(temp_dir) / "input"
-                temp_input_dir.mkdir()
+                await aiofiles.os.makedirs(temp_input_dir)
                 
                 random.seed(seed)
                 total_original = 0
                 total_sampled = 0
                 
                 # Sample from each JSONL file
-                for jsonl_file in sorted(input_path.glob("*.jsonl")):
+                for jsonl_file in await _list_jsonl_files(input_path):
                     entries = []
-                    with open(jsonl_file, 'r', encoding='utf-8') as f:
-                        for line in f:
+                    async with aiofiles.open(
+                        jsonl_file, "r", encoding="utf-8"
+                    ) as source:
+                        async for line in source:
                             line = line.strip()
                             if line:
                                 try:
@@ -1309,9 +1335,13 @@ def main(
                     
                     # Write sampled entries
                     temp_file = temp_input_dir / jsonl_file.name
-                    with open(temp_file, 'w', encoding='utf-8') as f:
+                    async with aiofiles.open(
+                        temp_file, "w", encoding="utf-8"
+                    ) as sampled_file:
                         for entry in sampled_entries:
-                            f.write(json.dumps(entry, ensure_ascii=False) + '\n')
+                            await sampled_file.write(
+                                json.dumps(entry, ensure_ascii=False) + "\n"
+                            )
                 
                 print(f"   Sampled {total_sampled:,} from {total_original:,} total trajectories")
                 
@@ -1323,7 +1353,10 @@ def main(
                 
                 # Initialize compressor and process the sampled data
                 compressor = TrajectoryCompressor(compression_config)
-                asyncio.run(compressor.process_directory(temp_input_dir, output_path))
+                try:
+                    await compressor.process_directory(temp_input_dir, output_path)
+                finally:
+                    await compressor.close()
         else:
             if dry_run:
                 print("\n🔍 DRY RUN MODE - analyzing without writing")
@@ -1333,10 +1366,9 @@ def main(
             
             # Initialize compressor and process directly
             compressor = TrajectoryCompressor(compression_config)
-            asyncio.run(compressor.process_directory(input_path, output_path))
+            try:
+                await compressor.process_directory(input_path, output_path)
+            finally:
+                await compressor.close()
         
         print("\n✅ Compression complete!")
-
-
-if __name__ == "__main__":
-    fire.Fire(main)

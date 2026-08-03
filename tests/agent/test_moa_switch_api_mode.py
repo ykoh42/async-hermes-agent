@@ -20,6 +20,7 @@ def _make_fake_agent():
     agent._config_context_length = 123456
     agent._transport_cache = {}
     agent.quiet_mode = True
+    agent._runtime_config_loaded = True
     agent._anthropic_prompt_cache_policy = lambda: (False, False)
 
     async def persist_pending_billing_route():

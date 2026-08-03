@@ -3476,12 +3476,12 @@ This compaction should PRIORITISE preserving all information related to the focu
             _aux_context = None
             try:
                 from agent.auxiliary_client import _resolve_task_provider_model
-                from hermes_cli.config import load_config_readonly_async
+                from hermes_cli.config import load_config_readonly
 
                 _resolved_provider, _resolved_model, _, _, _ = _resolve_task_provider_model(
                     "compression",
                     model=(self.summary_model or ""),
-                    config=await load_config_readonly_async(),
+                    config=await load_config_readonly(),
                 )
                 _aux_provider = _resolved_provider or ""
                 _aux_model = _resolved_model or _aux_model or self.model or ""

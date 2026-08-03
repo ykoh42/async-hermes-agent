@@ -139,9 +139,9 @@ async def _get_max_read_chars() -> int:
     if _max_read_chars_cached is not None:
         return _max_read_chars_cached
     try:
-        from hermes_cli.config import load_config_readonly_async
+        from hermes_cli.config import load_config_readonly
 
-        cfg = await load_config_readonly_async()
+        cfg = await load_config_readonly()
         val = cfg.get("file_read_max_chars")
         if isinstance(val, (int, float)) and val > 0:
             _max_read_chars_cached = int(val)
@@ -560,7 +560,7 @@ def _is_blocked_device(filepath: str, base_dir: str | Path | None = None) -> boo
 # terminal tool's approval system.  These match prefixes after os.path.realpath.
 _SENSITIVE_PATH_PREFIXES = (
     "/etc/", "/boot/", "/usr/lib/systemd/",
-    "/private/etc/", "/private/var/",
+    "/private/etc/", "/private/var/db/", "/private/var/root/",
 )
 _SENSITIVE_EXACT_PATHS = {"/var/run/docker.sock", "/run/docker.sock"}
 
@@ -1087,6 +1087,9 @@ def _record_read_metadata(
 
 async def _handle_read_file(args, **kw):
     """Read a local text file with native async I/O and stable line gutters."""
+    from tools.tool_output_limits import refresh_tool_output_limits
+
+    await refresh_tool_output_limits()
     task_id = kw.get("task_id") or "default"
     path = args.get("path", "")
     if not isinstance(path, str) or not path:
@@ -1606,6 +1609,9 @@ async def _handle_patch(args, **kw):
 
 async def _handle_search_files(args, **kw):
     """Search files using a native subprocess and preserve async cancellation."""
+    from tools.tool_output_limits import refresh_tool_output_limits
+
+    await refresh_tool_output_limits()
     task_id = kw.get("task_id") or "default"
     pattern = args.get("pattern", "")
     if not isinstance(pattern, str) or not pattern:

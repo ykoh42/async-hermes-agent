@@ -282,7 +282,7 @@ class TestGlobalAllowPrivateUrls:
         """Toggle defaults to False when no env var or config is set."""
         monkeypatch.delenv("HERMES_ALLOW_PRIVATE_URLS", raising=False)
         with patch(
-            "hermes_cli.config.load_config_readonly_async",
+            "hermes_cli.config.load_config_readonly",
             new=AsyncMock(side_effect=Exception("no config")),
         ):
             assert await _global_allow_private_urls() is False
@@ -293,7 +293,7 @@ class TestGlobalAllowPrivateUrls:
         monkeypatch.delenv("HERMES_ALLOW_PRIVATE_URLS", raising=False)
         cfg = {"security": {"allow_private_urls": "false"}}
         with patch(
-            "hermes_cli.config.load_config_readonly_async",
+            "hermes_cli.config.load_config_readonly",
             new=AsyncMock(return_value=cfg),
         ):
             assert await _global_allow_private_urls() is False

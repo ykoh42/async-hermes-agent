@@ -10,9 +10,13 @@ Contract:
 
 import json
 import time
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
 
 import agent.model_metadata as MM
+
+pytestmark = pytest.mark.asyncio
 
 
 def _clear_in_proc():
@@ -26,36 +30,36 @@ def _cache_file():
 
 class TestDiskHelpers:
 
-    def test_expired_entry_is_miss(self):
-        MM._local_probe_disk_put("server_type", "http://127.0.0.1:11434", "ollama")
+    async def test_expired_entry_is_miss(self):
+        await MM._local_probe_disk_put("server_type", "http://127.0.0.1:11434", "ollama")
         path = _cache_file()
         data = json.loads(path.read_text(encoding="utf-8"))
         for entry in data.values():
             entry["ts"] = time.time() - MM._LOCAL_PROBE_DISK_TTL_SECONDS - 1
         path.write_text(json.dumps(data), encoding="utf-8")
-        assert MM._local_probe_disk_get("server_type", "http://127.0.0.1:11434") is None
+        assert await MM._local_probe_disk_get("server_type", "http://127.0.0.1:11434") is None
 
-    def test_corrupted_file_is_miss(self):
+    async def test_corrupted_file_is_miss(self):
         path = _cache_file()
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("not json{{{", encoding="utf-8")
-        assert MM._local_probe_disk_get("server_type", "anything") is None
+        assert await MM._local_probe_disk_get("server_type", "anything") is None
         # And put() recovers by rewriting cleanly
-        MM._local_probe_disk_put("server_type", "k", "vllm")
-        assert MM._local_probe_disk_get("server_type", "k") == "vllm"
+        await MM._local_probe_disk_put("server_type", "k", "vllm")
+        assert await MM._local_probe_disk_get("server_type", "k") == "vllm"
 
 
 
 class TestDetectLocalServerTypeDiskL2:
-    def test_disk_hit_skips_http_entirely(self):
+    async def test_disk_hit_skips_http_entirely(self):
         _clear_in_proc()
-        MM._local_probe_disk_put("server_type", "http://127.0.0.1:9999", "ollama")
-        with patch("httpx.Client") as mock_client:
-            result = MM.detect_local_server_type("http://127.0.0.1:9999/v1")
+        await MM._local_probe_disk_put("server_type", "http://127.0.0.1:9999", "ollama")
+        with patch("httpx.AsyncClient") as mock_client:
+            result = await MM.detect_local_server_type("http://127.0.0.1:9999/v1")
         assert result == "ollama"
         mock_client.assert_not_called()
 
-    def test_successful_probe_persists_to_disk(self):
+    async def test_successful_probe_persists_to_disk(self):
         _clear_in_proc()
         ok = MagicMock(status_code=200)
         ok.json.return_value = {"models": []}
@@ -65,54 +69,58 @@ class TestDetectLocalServerTypeDiskL2:
             return ok if url.endswith("/api/tags") else notfound
 
         client = MagicMock()
-        client.get.side_effect = route
-        client.__enter__ = lambda s: client
-        client.__exit__ = lambda s, *a: False
-        with patch("httpx.Client", return_value=client):
-            result = MM.detect_local_server_type("http://127.0.0.1:8888/v1")
+        client.get = AsyncMock(side_effect=route)
+        client.__aenter__ = AsyncMock(return_value=client)
+        client.__aexit__ = AsyncMock(return_value=False)
+        with patch("httpx.AsyncClient", return_value=client):
+            result = await MM.detect_local_server_type("http://127.0.0.1:8888/v1")
         assert result == "ollama"
-        assert MM._local_probe_disk_get("server_type", "http://127.0.0.1:8888") == "ollama"
+        assert await MM._local_probe_disk_get("server_type", "http://127.0.0.1:8888") == "ollama"
 
-    def test_failed_probe_not_persisted(self):
+    async def test_failed_probe_not_persisted(self):
         _clear_in_proc()
         client = MagicMock()
-        client.get.side_effect = Exception("connection refused")
-        client.__enter__ = lambda s: client
-        client.__exit__ = lambda s, *a: False
-        with patch("httpx.Client", return_value=client):
-            result = MM.detect_local_server_type("http://127.0.0.1:7777/v1")
+        client.get = AsyncMock(side_effect=Exception("connection refused"))
+        client.__aenter__ = AsyncMock(return_value=client)
+        client.__aexit__ = AsyncMock(return_value=False)
+        with patch("httpx.AsyncClient", return_value=client):
+            result = await MM.detect_local_server_type("http://127.0.0.1:7777/v1")
         assert result is None
-        assert MM._local_probe_disk_get("server_type", "http://127.0.0.1:7777") is None
+        assert await MM._local_probe_disk_get("server_type", "http://127.0.0.1:7777") is None
 
 
 class TestOllamaNumCtxDiskL2:
-    def test_disk_hit_skips_api_show(self):
+    async def test_disk_hit_skips_api_show(self):
         _clear_in_proc()
-        MM._local_probe_disk_put("server_type", "http://127.0.0.1:11434", "ollama")
-        MM._local_probe_disk_put(
+        await MM._local_probe_disk_put("server_type", "http://127.0.0.1:11434", "ollama")
+        await MM._local_probe_disk_put(
             "ollama_num_ctx", "http://127.0.0.1:11434|llama3", 131072
         )
-        with patch("httpx.Client") as mock_client:
-            ctx = MM.query_ollama_num_ctx("llama3", "http://127.0.0.1:11434/v1")
+        with patch("httpx.AsyncClient") as mock_client:
+            ctx = await MM.query_ollama_num_ctx(
+                "llama3", "http://127.0.0.1:11434/v1"
+            )
         assert ctx == 131072
         mock_client.assert_not_called()
 
-    def test_successful_show_persists(self):
+    async def test_successful_show_persists(self):
         _clear_in_proc()
-        MM._local_probe_disk_put("server_type", "http://127.0.0.1:11434", "ollama")
+        await MM._local_probe_disk_put("server_type", "http://127.0.0.1:11434", "ollama")
         resp = MagicMock(status_code=200)
         resp.json.return_value = {
             "parameters": "",
             "model_info": {"llama.context_length": 8192},
         }
         client = MagicMock()
-        client.post.return_value = resp
-        client.__enter__ = lambda s: client
-        client.__exit__ = lambda s, *a: False
-        with patch("httpx.Client", return_value=client):
-            ctx = MM.query_ollama_num_ctx("llama3", "http://127.0.0.1:11434/v1")
+        client.post = AsyncMock(return_value=resp)
+        client.__aenter__ = AsyncMock(return_value=client)
+        client.__aexit__ = AsyncMock(return_value=False)
+        with patch("httpx.AsyncClient", return_value=client):
+            ctx = await MM.query_ollama_num_ctx(
+                "llama3", "http://127.0.0.1:11434/v1"
+            )
         assert ctx == 8192
         assert (
-            MM._local_probe_disk_get("ollama_num_ctx", "http://127.0.0.1:11434|llama3")
+            await MM._local_probe_disk_get("ollama_num_ctx", "http://127.0.0.1:11434|llama3")
             == 8192
         )

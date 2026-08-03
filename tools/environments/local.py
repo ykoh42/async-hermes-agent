@@ -1271,23 +1271,8 @@ def _make_run_env(env: dict) -> dict:
 
 
 def _read_terminal_shell_init_config() -> tuple[list[str], bool]:
-    """Return (shell_init_files, auto_source_bashrc) from config.yaml.
-
-    Best-effort — returns sensible defaults on any failure so terminal
-    execution never breaks because the config file is unreadable.
-    """
-    try:
-        from hermes_cli.config import load_config
-
-        cfg = load_config() or {}
-        terminal_cfg = cfg.get("terminal") or {}
-        files = terminal_cfg.get("shell_init_files") or []
-        if not isinstance(files, list):
-            files = []
-        auto_bashrc = bool(terminal_cfg.get("auto_source_bashrc", True))
-        return [str(f) for f in files if f], auto_bashrc
-    except Exception:
-        return [], True
+    """Return the native library's deterministic shell initialization policy."""
+    return [], False
 
 
 def _resolve_shell_init_files() -> list[str]:

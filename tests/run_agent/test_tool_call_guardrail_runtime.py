@@ -59,6 +59,11 @@ def _make_agent(*tool_names: str, max_iterations: int = 10, config: dict | None 
     agent._use_prompt_caching = False
     agent.compression_enabled = False
     agent.save_trajectories = False
+    if config:
+        from agent.agent_init import _apply_runtime_config
+
+        _apply_runtime_config(agent, config)
+    agent._runtime_config_loaded = True
     return agent
 
 

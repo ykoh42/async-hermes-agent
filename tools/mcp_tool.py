@@ -2712,7 +2712,7 @@ class MCPServerTask:
         if self._auth_type == "oauth":
             try:
                 from tools.mcp_oauth_manager import get_manager
-                _oauth_auth = await get_manager().get_or_build_provider_async(
+                _oauth_auth = await get_manager().get_or_build_provider(
                     self.name, url, config.get("oauth"),
                 )
             except Exception as exc:
@@ -5962,6 +5962,7 @@ async def refresh_agent_mcp_tools(
             enabled_toolsets=enabled,
             disabled_toolsets=disabled,
             quiet_mode=quiet_mode,
+            probe_availability=False,
         )
         or []
     )

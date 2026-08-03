@@ -57,28 +57,30 @@ def _coerce_positive_int(value: Any, default: int) -> int:
 
 
 def get_tool_output_limits() -> Dict[str, int]:
-    """Return resolved tool-output limits, reading ``tool_output`` from config.
-
-    Keys: ``max_bytes``, ``max_lines``, ``max_line_length``. Missing or
-    invalid entries fall through to the ``DEFAULT_*`` constants. This
-    function NEVER raises.
-
-    Result is cached for the process lifetime to avoid repeated disk I/O
-    on every tool call. Call ``_reset_tool_output_limits_cache()`` in
-    tests that need a fresh read after config changes.
-    """
+    """Return deterministic limits without synchronous configuration I/O."""
     global _cached_limits
     if _cached_limits is not None:
         return _cached_limits
+    _cached_limits = {
+        "max_bytes": DEFAULT_MAX_BYTES,
+        "max_lines": DEFAULT_MAX_LINES,
+        "max_line_length": DEFAULT_MAX_LINE_LENGTH,
+    }
+    return _cached_limits
+
+
+async def refresh_tool_output_limits() -> Dict[str, int]:
+    """Refresh the process snapshot through the native async config loader."""
+    global _cached_limits
     try:
-        from hermes_cli.config import load_config
-        cfg = load_config() or {}
-        section = cfg.get("tool_output") if isinstance(cfg, dict) else None
+        from hermes_cli.config import load_config_readonly
+
+        config = await load_config_readonly()
+        section = config.get("tool_output") if isinstance(config, dict) else None
         if not isinstance(section, dict):
             section = {}
     except Exception:
         section = {}
-
     _cached_limits = {
         "max_bytes": _coerce_positive_int(section.get("max_bytes"), DEFAULT_MAX_BYTES),
         "max_lines": _coerce_positive_int(section.get("max_lines"), DEFAULT_MAX_LINES),

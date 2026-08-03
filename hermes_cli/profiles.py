@@ -32,8 +32,6 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import List, Optional, Tuple
 
-import aiofiles.os
-
 from agent.skill_utils import is_excluded_skill_path
 
 _PROFILE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
@@ -1841,13 +1839,17 @@ def get_active_profile_name() -> str:
     """
     from hermes_constants import get_hermes_home
     hermes_home = get_hermes_home()
-    resolved = hermes_home.resolve()
+    # ``abspath`` is lexical path normalization; unlike ``Path.resolve()`` it
+    # does not touch the filesystem.  Profile detection is therefore a small
+    # CPU-only helper and should remain synchronous rather than being routed
+    # through aiofiles' thread-backed ``os.path`` wrappers.
+    resolved = Path(os.path.abspath(hermes_home))
 
-    default_resolved = _get_default_hermes_home().resolve()
+    default_resolved = Path(os.path.abspath(_get_default_hermes_home()))
     if resolved == default_resolved:
         return "default"
 
-    profiles_root = _get_profiles_root().resolve()
+    profiles_root = Path(os.path.abspath(_get_profiles_root()))
     try:
         rel = resolved.relative_to(profiles_root)
         parts = rel.parts
@@ -1856,29 +1858,6 @@ def get_active_profile_name() -> str:
     except ValueError:
         pass
 
-    return "custom"
-
-
-async def get_active_profile_name_async() -> str:
-    """Resolve the active profile name without synchronous path canonicalization."""
-    from hermes_constants import get_hermes_home
-
-    async def _absolute(path: Path) -> Path:
-        return Path(await aiofiles.os.path.abspath(str(path)))
-
-    resolved = await _absolute(get_hermes_home())
-    default_resolved = await _absolute(_get_default_hermes_home())
-    if resolved == default_resolved:
-        return "default"
-
-    profiles_root = await _absolute(_get_profiles_root())
-    try:
-        rel = resolved.relative_to(profiles_root)
-        parts = rel.parts
-        if len(parts) == 1 and _PROFILE_ID_RE.match(parts[0]):
-            return parts[0]
-    except ValueError:
-        pass
     return "custom"
 
 

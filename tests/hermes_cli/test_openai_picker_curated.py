@@ -18,12 +18,6 @@ Bug 2 — OpenRouter appeared authenticated whenever OPENAI_API_KEY was set
     in runtime_provider.py, independent of the overlay).
 """
 
-import os
-from unittest.mock import patch
-
-import pytest
-
-from hermes_cli import models as M
 from hermes_cli.providers import HERMES_OVERLAYS
 
 
@@ -32,41 +26,3 @@ from hermes_cli.providers import HERMES_OVERLAYS
 def test_openrouter_overlay_does_not_list_openai_api_key():
     overlay = HERMES_OVERLAYS["openrouter"]
     assert "OPENAI_API_KEY" not in overlay.extra_env_vars
-
-
-# --- Bug 1: default OpenAI endpoint filters to curated agentic models -------
-
-def test_default_openai_endpoint_filters_to_curated(monkeypatch):
-    """The 126-model /v1/models dump is intersected with the curated list."""
-    monkeypatch.setenv("OPENAI_API_KEY", "sk-fake")
-    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
-
-    curated = M._PROVIDER_MODELS["openai-api"]
-    # Live catalog: every curated model PLUS a pile of non-agentic junk.
-    live = list(curated) + [
-        "text-embedding-3-large", "whisper-1", "tts-1", "dall-e-3",
-        "gpt-3.5-turbo", "davinci-002", "omni-moderation-latest",
-    ]
-    with patch.object(M, "fetch_api_models", return_value=live):
-        result = M.provider_model_ids("openai-api", force_refresh=True)
-
-    # Only curated models survive, in curated order, no junk.
-    assert result == list(curated)
-    for m in result:
-        assert m in curated
-
-
-def test_default_openai_endpoint_intersects_account_access(monkeypatch):
-    """Curated models the account can't access are dropped (intersection)."""
-    monkeypatch.setenv("OPENAI_API_KEY", "sk-fake")
-    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
-
-    curated = M._PROVIDER_MODELS["openai-api"]
-    # Account only serves the first two curated models.
-    live = list(curated[:2]) + ["text-embedding-3-large", "whisper-1"]
-    with patch.object(M, "fetch_api_models", return_value=live):
-        result = M.provider_model_ids("openai-api", force_refresh=True)
-
-    assert result == list(curated[:2])
-
-

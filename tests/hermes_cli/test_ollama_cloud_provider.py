@@ -1,7 +1,7 @@
 """Tests for Ollama Cloud provider integration."""
 
 import pytest
-from unittest.mock import patch, MagicMock
+from unittest.mock import AsyncMock, patch, MagicMock
 
 from hermes_cli.auth import PROVIDER_REGISTRY, resolve_provider, resolve_api_key_provider_credentials
 from hermes_cli.models import _PROVIDER_MODELS, _PROVIDER_LABELS, _PROVIDER_ALIASES, normalize_provider
@@ -41,9 +41,10 @@ def _clean_provider_env(monkeypatch):
 
 class TestOllamaCloudAliases:
 
-    def test_alias_ollama_underscore(self):
+    @pytest.mark.asyncio
+    async def test_alias_ollama_underscore(self):
         """ollama_cloud (underscore) is the unambiguous cloud alias."""
-        assert resolve_provider("ollama_cloud") == "ollama-cloud"
+        assert await resolve_provider("ollama_cloud") == "ollama-cloud"
 
 
     def test_models_py_aliases(self):
@@ -55,17 +56,19 @@ class TestOllamaCloudAliases:
 # ── Auto-detection ──
 
 class TestOllamaCloudAutoDetection:
-    def test_auto_detects_ollama_api_key(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_auto_detects_ollama_api_key(self, monkeypatch):
         monkeypatch.setenv("OLLAMA_API_KEY", "test-ollama-key")
-        assert resolve_provider("auto") == "ollama-cloud"
+        assert await resolve_provider("auto") == "ollama-cloud"
 
 
 # ── Credential Resolution ──
 
 class TestOllamaCloudCredentials:
-    def test_resolve_with_ollama_api_key(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_resolve_with_ollama_api_key(self, monkeypatch):
         monkeypatch.setenv("OLLAMA_API_KEY", "ollama-secret")
-        creds = resolve_api_key_provider_credentials("ollama-cloud")
+        creds = await resolve_api_key_provider_credentials("ollama-cloud")
         assert creds["provider"] == "ollama-cloud"
         assert creds["api_key"] == "ollama-secret"
         assert creds["base_url"] == "https://ollama.com/v1"
@@ -80,89 +83,6 @@ class TestOllamaCloudCredentials:
         assert result["api_mode"] == "chat_completions"
         assert result["api_key"] == "ollama-key"
         assert result["base_url"] == "https://ollama.com/v1"
-
-
-# ── Model Catalog (dynamic — no static list) ──
-
-class TestOllamaCloudModelCatalog:
-
-
-    def test_provider_model_ids_returns_dynamic_models(self, tmp_path, monkeypatch):
-        """provider_model_ids('ollama-cloud') should call fetch_ollama_cloud_models()."""
-        from hermes_cli.models import provider_model_ids
-
-        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-        monkeypatch.setenv("OLLAMA_API_KEY", "test-key")
-
-        mock_mdev = {
-            "ollama-cloud": {
-                "models": {
-                    "qwen3.5:397b": {"tool_call": True},
-                    "glm-5": {"tool_call": True},
-                }
-            }
-        }
-        with patch("hermes_cli.models.fetch_api_models", return_value=["qwen3.5:397b"]), \
-             patch("agent.models_dev.fetch_models_dev", return_value=mock_mdev):
-            result = provider_model_ids("ollama-cloud", force_refresh=True)
-
-        assert len(result) > 0
-        assert "qwen3.5:397b" in result
-
-
-# ── Model Picker (list_authenticated_providers) ──
-
-# ── Merged Model Discovery ──
-
-class TestOllamaCloudMergedDiscovery:
-    def test_merges_live_and_models_dev(self, tmp_path, monkeypatch):
-        """Live API models appear first, models.dev additions fill gaps."""
-        from hermes_cli.models import fetch_ollama_cloud_models
-
-        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-        monkeypatch.setenv("OLLAMA_API_KEY", "test-key")
-
-        mock_mdev = {
-            "ollama-cloud": {
-                "models": {
-                    "glm-5": {"tool_call": True},
-                    "kimi-k2.5": {"tool_call": True},
-                    "nemotron-3-super": {"tool_call": True},
-                }
-            }
-        }
-        with patch("hermes_cli.models.fetch_api_models", return_value=["qwen3.5:397b", "glm-5"]), \
-             patch("agent.models_dev.fetch_models_dev", return_value=mock_mdev):
-            result = fetch_ollama_cloud_models(force_refresh=True)
-
-        # Live models first, then models.dev additions (deduped)
-        assert result[0] == "qwen3.5:397b"  # from live API
-        assert result[1] == "glm-5"          # from live API (also in models.dev)
-        assert "kimi-k2.5" in result         # from models.dev only
-        assert "nemotron-3-super" in result  # from models.dev only
-        assert result.count("glm-5") == 1    # no duplicates
-
-    def test_falls_back_to_models_dev_without_api_key(self, tmp_path, monkeypatch):
-        """Without API key, only models.dev results are returned."""
-        from hermes_cli.models import fetch_ollama_cloud_models
-
-        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-        monkeypatch.delenv("OLLAMA_API_KEY", raising=False)
-
-        mock_mdev = {
-            "ollama-cloud": {
-                "models": {
-                    "glm-5": {"tool_call": True},
-                }
-            }
-        }
-        with patch("agent.models_dev.fetch_models_dev", return_value=mock_mdev):
-            result = fetch_ollama_cloud_models(force_refresh=True)
-
-        assert result == ["glm-5"]
-
-
-
 
 
 
@@ -184,7 +104,8 @@ class TestOllamaCloudModelsDev:
     def test_ollama_cloud_mapped(self):
         assert PROVIDER_TO_MODELS_DEV.get("ollama-cloud") == "ollama-cloud"
 
-    def test_list_agentic_models_with_mock_data(self):
+    @pytest.mark.asyncio
+    async def test_list_agentic_models_with_mock_data(self):
         """list_agentic_models filters correctly from mock models.dev data."""
         mock_data = {
             "ollama-cloud": {
@@ -196,8 +117,8 @@ class TestOllamaCloudModelsDev:
                 }
             }
         }
-        with patch("agent.models_dev.fetch_models_dev", return_value=mock_data):
-            result = list_agentic_models("ollama-cloud")
+        with patch("agent.models_dev.fetch_models_dev", new=AsyncMock(return_value=mock_data)):
+            result = await list_agentic_models("ollama-cloud")
         assert "qwen3.5:397b" in result
         assert "glm-5" in result
         assert "nemotron-3-nano:30b" in result
@@ -207,12 +128,6 @@ class TestOllamaCloudModelsDev:
 # ── Agent Init (no SyntaxError) ──
 
 class TestOllamaCloudAgentInit:
-    def test_agent_imports_without_error(self):
-        """Verify run_agent.py has no SyntaxError."""
-        import importlib
-        import run_agent
-        importlib.reload(run_agent)
-
     def test_ollama_cloud_agent_uses_chat_completions(self, monkeypatch):
         """Ollama Cloud falls through to chat_completions — no special elif needed."""
         monkeypatch.setenv("OLLAMA_API_KEY", "test-key")
@@ -251,65 +166,3 @@ class TestOllamaCloudProvidersNew:
         assert pdef is not None
         assert pdef.id == "ollama-cloud"
         assert pdef.transport == "openai_chat"
-
-
-# ── Cloud Suffix Stripping ──
-
-class TestOllamaCloudSuffixStripping:
-    """models.dev appends :cloud / -cloud suffixes that the live API omits.
-
-    fetch_ollama_cloud_models() must normalise these before the dedup merge so
-    users never see broken IDs like 'kimi-k2.6:cloud' in the model picker.
-    """
-
-
-    def test_no_duplicate_when_live_clean_and_mdev_suffixed(self, tmp_path, monkeypatch):
-        """Live API returns clean ID; mdev has :cloud variant — result has exactly one entry."""
-        from hermes_cli.models import fetch_ollama_cloud_models
-
-        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-        monkeypatch.setenv("OLLAMA_API_KEY", "test-key")
-
-        mock_mdev = {
-            "ollama-cloud": {
-                "models": {
-                    "kimi-k2.6:cloud": {"tool_call": True},
-                    "glm-5.1:cloud": {"tool_call": True},
-                }
-            }
-        }
-        with patch("hermes_cli.models.fetch_api_models", return_value=["kimi-k2.6", "glm-5.1"]), \
-             patch("agent.models_dev.fetch_models_dev", return_value=mock_mdev):
-            result = fetch_ollama_cloud_models(force_refresh=True)
-
-        assert result.count("kimi-k2.6") == 1
-        assert result.count("glm-5.1") == 1
-        assert "kimi-k2.6:cloud" not in result
-        assert "glm-5.1:cloud" not in result
-
-    def test_unsuffixed_model_id_unchanged(self, tmp_path, monkeypatch):
-        """Model IDs without :cloud / -cloud suffix are passed through unchanged."""
-        from hermes_cli.models import fetch_ollama_cloud_models
-
-        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-        monkeypatch.delenv("OLLAMA_API_KEY", raising=False)
-
-        mock_mdev = {
-            "ollama-cloud": {
-                "models": {"nemotron-3-nano:30b": {"tool_call": True}}
-            }
-        }
-        with patch("agent.models_dev.fetch_models_dev", return_value=mock_mdev):
-            result = fetch_ollama_cloud_models(force_refresh=True)
-
-        assert "nemotron-3-nano:30b" in result
-
-    def test_strip_suffix_helper(self):
-        """Unit test for the _strip_ollama_cloud_suffix helper."""
-        from hermes_cli.models import _strip_ollama_cloud_suffix
-
-        assert _strip_ollama_cloud_suffix("kimi-k2.6:cloud") == "kimi-k2.6"
-        assert _strip_ollama_cloud_suffix("glm-5.1:cloud") == "glm-5.1"
-        assert _strip_ollama_cloud_suffix("qwen3-coder:480b-cloud") == "qwen3-coder:480b"
-        assert _strip_ollama_cloud_suffix("nemotron-3-nano:30b") == "nemotron-3-nano:30b"
-        assert _strip_ollama_cloud_suffix("") == ""

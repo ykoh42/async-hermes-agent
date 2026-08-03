@@ -282,20 +282,7 @@ def _ra():
 
 
 async def _nous_entitlement_message(capability: str) -> str:
-    try:
-        from hermes_cli.nous_account import (
-            format_nous_portal_entitlement_message,
-            get_nous_portal_account_info,
-        )
-
-        account_info = await get_nous_portal_account_info(force_fresh=True)
-        message = format_nous_portal_entitlement_message(
-            account_info,
-            capability=capability,
-        )
-        return message or ""
-    except Exception:
-        return ""
+    return ""
 
 
 async def _print_nous_entitlement_guidance(agent, capability: str) -> bool:
@@ -3082,7 +3069,7 @@ async def run_conversation(
                             _agg_streamed_text = (
                                 getattr(agent, "_current_streamed_assistant_text", "") or ""
                             )
-                            _moa_client.consume_and_save_trace(
+                            await _moa_client.consume_and_save_trace(
                                 agent.session_id,
                                 aggregator_output_fallback=_agg_streamed_text or None,
                             )
@@ -3133,7 +3120,9 @@ async def run_conversation(
                     if getattr(agent.context_compressor, "_context_probed", False):
                         ctx = agent.context_compressor.context_length
                         if getattr(agent.context_compressor, "_context_probe_persistable", False):
-                            save_context_length(agent.model, agent.base_url, ctx)
+                            await save_context_length(
+                                agent.model, agent.base_url, ctx
+                            )
                             agent._safe_print(f"{agent.log_prefix}💾 Cached context length: {ctx:,} tokens for {agent.model}")
                         agent.context_compressor._context_probed = False
                         agent.context_compressor._context_probe_persistable = False

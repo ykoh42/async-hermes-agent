@@ -504,7 +504,7 @@ class SessionDB:
 
 
     @staticmethod
-    def _parse_schema_columns(schema_sql: str) -> Dict[str, Dict[str, str]]:
+    async def _parse_schema_columns(schema_sql: str) -> Dict[str, Dict[str, str]]:
         """Extract expected columns per table from SCHEMA_SQL.
 
         Uses an in-memory SQLite database to parse the SQL — SQLite itself
@@ -516,18 +516,22 @@ class SessionDB:
         Adding a column to SCHEMA_SQL is all that's needed; the
         reconciliation loop picks it up automatically.
         """
-        ref = sqlite3.connect(":memory:")
+        import aiosqlite
+
+        ref = await aiosqlite.connect(":memory:")
         try:
-            ref.executescript(schema_sql)
+            await ref.executescript(schema_sql)
             table_columns: Dict[str, Dict[str, str]] = {}
-            for (tbl,) in ref.execute(
+            cursor = await ref.execute(
                 "SELECT name FROM sqlite_master "
                 "WHERE type='table' AND name NOT LIKE 'sqlite_%'"
-            ).fetchall():
+            )
+            for (tbl,) in await cursor.fetchall():
                 cols: Dict[str, str] = {}
-                for row in ref.execute(
+                column_cursor = await ref.execute(
                     f'PRAGMA table_info("{tbl}")'
-                ).fetchall():
+                )
+                for row in await column_cursor.fetchall():
                     # row: (cid, name, type, notnull, dflt_value, pk)
                     col_name = row[1]
                     col_type = row[2] or ""
@@ -544,7 +548,7 @@ class SessionDB:
                 table_columns[tbl] = cols
             return table_columns
         finally:
-            ref.close()
+            await ref.close()
 
     def __init__(
         self,
@@ -628,7 +632,7 @@ class SessionDB:
         if self._schema_ready:
             return
         await connection.executescript(SCHEMA_SQL)
-        expected = self._parse_schema_columns(SCHEMA_SQL)
+        expected = await self._parse_schema_columns(SCHEMA_SQL)
         for table_name, declared_columns in expected.items():
             cursor = await connection.execute(
                 f'PRAGMA table_info("{table_name}")'

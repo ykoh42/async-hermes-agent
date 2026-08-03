@@ -6,7 +6,9 @@ declare an ``extra_headers`` dict that must land on the OpenAI client's
 credential swaps / rebuilds. Values may carry credentials — the plumbing must
 never log them.
 """
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
 
 from run_agent import AIAgent
 
@@ -27,9 +29,13 @@ _PROXY_CONFIG = {
 
 
 @patch("run_agent.OpenAI")
-def test_custom_provider_extra_headers_applied_at_construction(mock_openai):
+@pytest.mark.asyncio
+async def test_custom_provider_extra_headers_applied_at_construction(mock_openai):
     mock_openai.return_value = MagicMock()
-    with patch("hermes_cli.config.load_config", return_value=_PROXY_CONFIG):
+    with patch(
+        "hermes_cli.config.load_config_readonly",
+        new=AsyncMock(return_value=_PROXY_CONFIG),
+    ):
         agent = AIAgent(
             api_key="proxy-key",
             base_url=_PROXY_URL,
@@ -39,11 +45,11 @@ def test_custom_provider_extra_headers_applied_at_construction(mock_openai):
             skip_context_files=True,
             skip_memory=True,
         )
+        await agent._ensure_provider_runtime()
 
     headers = agent._client_kwargs["default_headers"]
     assert headers["CF-Access-Client-Id"] == "xxxx.access"
     assert headers["X-Client-Name"] == "hermes-agent"
-
 
 
 

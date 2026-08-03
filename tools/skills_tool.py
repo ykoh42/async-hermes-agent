@@ -825,10 +825,10 @@ async def skills_list(category: str = None, task_id: str = None) -> str:
 
 async def _serve_plugin_skill(skill_md: Path, namespace: str, bare: str) -> str:
     """Read a registered plugin skill through the native async file boundary."""
-    from hermes_cli.config import load_config_readonly_async
+    from hermes_cli.config import load_config_readonly
     from hermes_cli.plugins import get_plugin_manager
 
-    config = await load_config_readonly_async()
+    config = await load_config_readonly()
     if namespace in set(cfg_get(config, "plugins", "disabled", default=[]) or []):
         return json.dumps(
             {

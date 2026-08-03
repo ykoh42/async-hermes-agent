@@ -46,8 +46,6 @@ from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeRe
 from rich.console import Console
 
 logger = logging.getLogger(__name__)
-import fire
-
 from run_agent import AIAgent
 from toolset_distributions import (
     list_distributions, 
@@ -157,10 +155,10 @@ async def _training_toolsets(selected_toolsets: List[str]) -> List[str]:
             result.append(required)
 
     try:
-        from hermes_cli.config import load_config_readonly_async
+        from hermes_cli.config import load_config_readonly
         from hermes_cli.tools_config import enabled_mcp_server_names
 
-        config = await load_config_readonly_async()
+        config = await load_config_readonly()
         for server_name in sorted(enabled_mcp_server_names(config)):
             if server_name not in result:
                 result.append(server_name)
@@ -1294,7 +1292,7 @@ class BatchRunner:
         print(f"   - Checkpoint: {self.checkpoint_file.name}")
 
 
-def main(
+async def main(
     dataset_file: str = None,
     batch_size: int = None,
     run_name: str = None,
@@ -1422,8 +1420,10 @@ def main(
     prefill_messages = None
     if prefill_messages_file:
         try:
-            with open(prefill_messages_file, 'r', encoding='utf-8') as f:
-                prefill_messages = json.load(f)
+            async with aiofiles.open(
+                prefill_messages_file, "r", encoding="utf-8"
+            ) as source:
+                prefill_messages = json.loads(await source.read())
             if not isinstance(prefill_messages, list):
                 print("❌ Error: prefill_messages_file must contain a JSON array of messages")
                 return
@@ -1457,14 +1457,10 @@ def main(
             max_samples=max_samples,
         )
 
-        asyncio.run(runner.run(resume=resume))
+        await runner.run(resume=resume)
     
     except Exception as e:
         print(f"\n❌ Fatal error: {e}")
         if verbose:
             traceback.print_exc()
         return 1
-
-
-if __name__ == "__main__":
-    fire.Fire(main)

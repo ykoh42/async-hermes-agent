@@ -8,7 +8,9 @@ import os
 import sys
 from pathlib import Path
 
-from dotenv import load_dotenv
+import aiofiles
+import aiofiles.os
+from dotenv import dotenv_values, load_dotenv
 from utils import atomic_replace, fast_safe_load
 
 
@@ -292,7 +294,32 @@ def _sanitize_env_file_if_needed(path: Path) -> None:
         pass  # best-effort — don't block gateway startup
 
 
-def load_hermes_dotenv(
+async def _load_dotenv_file(path: Path, *, override: bool) -> None:
+    """Read and apply one dotenv file without blocking the event loop."""
+    async with aiofiles.open(path, "rb") as handle:
+        raw = await handle.read()
+    rewrite_utf8 = False
+    if raw.startswith((codecs.BOM_UTF32_LE, codecs.BOM_UTF32_BE)):
+        return
+    if raw.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)):
+        text = raw.decode("utf-16")
+        rewrite_utf8 = True
+    else:
+        try:
+            text = raw.decode("utf-8-sig")
+        except UnicodeDecodeError:
+            text = raw.decode("latin-1")
+    text = text.replace("\x00", "")
+    if rewrite_utf8:
+        async with aiofiles.open(path, "w", encoding="utf-8") as handle:
+            await handle.write(text)
+    for key, value in dotenv_values(stream=io.StringIO(text)).items():
+        if value is not None and (override or key not in os.environ):
+            os.environ[key] = value
+    _sanitize_loaded_credentials()
+
+
+async def load_hermes_dotenv(
     *,
     hermes_home: str | os.PathLike | None = None,
     project_env: str | os.PathLike | None = None,
@@ -311,14 +338,13 @@ def load_hermes_dotenv(
     user_env = home_path / ".env"
     project_env_path = Path(project_env) if project_env else None
 
-    # Normalize safe formatting and remove invalid NUL bytes before parsing.
-    if user_env.exists():
-        _sanitize_env_file_if_needed(user_env)
-    if project_env_path and project_env_path.exists():
-        _sanitize_env_file_if_needed(project_env_path)
+    user_exists = await aiofiles.os.path.exists(user_env)
+    project_exists = bool(
+        project_env_path and await aiofiles.os.path.exists(project_env_path)
+    )
 
-    if user_env.exists():
-        _load_dotenv_with_fallback(user_env, override=True)
+    if user_exists:
+        await _load_dotenv_file(user_env, override=True)
         loaded.append(user_env)
 
     # Load .op.env AFTER .env so that .env values win, but the bootstrap
@@ -332,15 +358,23 @@ def load_hermes_dotenv(
     # in their gateway unit, which takes precedence (override=False below
     # ensures .op.env never clobbers a token already in the environment).
     op_env = home_path / ".op.env"
-    if op_env.exists() and not os.environ.get("OP_SERVICE_ACCOUNT_TOKEN"):
-        _load_dotenv_with_fallback(op_env, override=False)
+    if (
+        await aiofiles.os.path.exists(op_env)
+        and not os.environ.get("OP_SERVICE_ACCOUNT_TOKEN")
+    ):
+        await _load_dotenv_file(op_env, override=False)
 
-    if project_env_path and project_env_path.exists():
-        _load_dotenv_with_fallback(project_env_path, override=not loaded)
+    if project_env_path and project_exists:
+        await _load_dotenv_file(project_env_path, override=not loaded)
         loaded.append(project_env_path)
 
-    _apply_external_secret_sources(home_path)
-    _apply_managed_env()
+    managed_override = os.environ.get("HERMES_MANAGED_DIR", "").strip()
+    managed_dir = Path(managed_override) if managed_override else Path("/etc/hermes")
+    managed_env = managed_dir / ".env"
+    if await aiofiles.os.path.isdir(managed_dir) and await aiofiles.os.path.exists(
+        managed_env
+    ):
+        await _load_dotenv_file(managed_env, override=True)
 
     return loaded
 

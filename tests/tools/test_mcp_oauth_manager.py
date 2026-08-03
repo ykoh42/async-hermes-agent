@@ -12,7 +12,8 @@ from unittest.mock import MagicMock
 import pytest
 
 
-def test_manager_isolates_same_named_servers_by_profile_home(tmp_path, monkeypatch):
+@pytest.mark.asyncio
+async def test_manager_isolates_same_named_servers_by_profile_home(tmp_path, monkeypatch):
     from hermes_constants import reset_hermes_home_override, set_hermes_home_override
     from tools.mcp_oauth import HermesTokenStorage
     from tools.mcp_oauth_manager import MCPOAuthManager
@@ -36,8 +37,10 @@ def test_manager_isolates_same_named_servers_by_profile_home(tmp_path, monkeypat
     for home in (profile_a, profile_b):
         token = set_hermes_home_override(home)
         try:
-            provider = manager.get_or_build_provider("shared", "https://mcp.example/mcp", {})
-            asyncio.run(provider._initialize())
+            provider = await manager.get_or_build_provider(
+                "shared", "https://mcp.example/mcp", {}
+            )
+            await provider._initialize()
             providers.append(provider)
         finally:
             reset_hermes_home_override(token)
@@ -47,19 +50,22 @@ def test_manager_isolates_same_named_servers_by_profile_home(tmp_path, monkeypat
     assert providers[1].context.current_tokens.access_token == "TOKEN_B"
 
 
-def test_manager_restore_entry_preserves_newer_concurrent_entry(tmp_path, monkeypatch):
+@pytest.mark.asyncio
+async def test_manager_restore_entry_preserves_newer_concurrent_entry(tmp_path, monkeypatch):
     from tools.mcp_oauth_manager import MCPOAuthManager
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     _set_interactive_stdin(monkeypatch)
     manager = MCPOAuthManager()
-    old_provider = manager.get_or_build_provider("shared", "https://old.example", {})
-    old_entry = manager.remove("shared")
-    new_provider = manager.get_or_build_provider("shared", "https://new.example", {})
+    old_provider = await manager.get_or_build_provider("shared", "https://old.example", {})
+    old_entry = await manager.remove("shared")
+    new_provider = await manager.get_or_build_provider("shared", "https://new.example", {})
 
-    manager.restore_entry("shared", old_entry)
+    await manager.restore_entry("shared", old_entry)
 
-    assert manager.get_or_build_provider("shared", "https://new.example", {}) is new_provider
+    assert await manager.get_or_build_provider(
+        "shared", "https://new.example", {}
+    ) is new_provider
     assert new_provider is not old_provider
 
 pytest.importorskip(
@@ -105,7 +111,7 @@ async def test_disk_watch_invalidates_on_mtime_change(tmp_path, monkeypatch):
     }))
 
     mgr = MCPOAuthManager()
-    provider = mgr.get_or_build_provider("srv", "https://example.com/mcp", None)
+    provider = await mgr.get_or_build_provider("srv", "https://example.com/mcp", None)
     assert provider is not None
 
     # First call: records mtime (zero -> real) -> returns True
@@ -251,7 +257,7 @@ def _fake_response(status, url, body):
     return resp
 
 
-def _provider_with_token_endpoint(tmp_path, oauth_config, token_endpoint, monkeypatch):
+async def _provider_with_token_endpoint(tmp_path, oauth_config, token_endpoint, monkeypatch):
     from tools.mcp_oauth_manager import MCPOAuthManager, reset_manager_for_tests
     reset_manager_for_tests()
     # Provider construction fails fast in a non-interactive environment with no
@@ -259,27 +265,30 @@ def _provider_with_token_endpoint(tmp_path, oauth_config, token_endpoint, monkey
     # TTY, so present an interactive stdin to reach the code under test.
     _set_interactive_stdin(monkeypatch)
     mgr = MCPOAuthManager()
-    provider = mgr.get_or_build_provider("srv", "https://mcp.example.com", oauth_config)
+    provider = await mgr.get_or_build_provider(
+        "srv", "https://mcp.example.com", oauth_config
+    )
     provider.context.oauth_metadata = SimpleNamespace(token_endpoint=token_endpoint)
     provider._initialized = True
     return provider
 
 
-def test_invalid_client_at_token_endpoint_poisons(tmp_path, monkeypatch):
+@pytest.mark.asyncio
+async def test_invalid_client_at_token_endpoint_poisons(tmp_path, monkeypatch):
     """400 invalid_client on the token endpoint deletes the dead client.json."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     d = tmp_path / "mcp-tokens"
     d.mkdir(parents=True)
     (d / "srv.client.json").write_text('{"client_id": "dead"}')
     (d / "srv.meta.json").write_text("{}")
-    provider = _provider_with_token_endpoint(
+    provider = await _provider_with_token_endpoint(
         tmp_path, {}, "https://idp.example.com/oauth/token", monkeypatch
     )
     resp = _fake_response(
         400, "https://idp.example.com/oauth/token", b'{"error":"invalid_client"}'
     )
 
-    asyncio.run(provider._maybe_flag_poisoned_client(resp))
+    await provider._maybe_flag_poisoned_client(resp)
 
     assert not (d / "srv.client.json").exists()
     assert (d / "srv.client.json.bak").exists()
@@ -287,20 +296,21 @@ def test_invalid_client_at_token_endpoint_poisons(tmp_path, monkeypatch):
     assert provider.context.client_info is None
 
 
-def test_invalid_client_metadata_does_not_trip(tmp_path, monkeypatch):
+@pytest.mark.asyncio
+async def test_invalid_client_metadata_does_not_trip(tmp_path, monkeypatch):
     """RFC 7591 `invalid_client_metadata` must NOT be mistaken for invalid_client."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     d = tmp_path / "mcp-tokens"
     d.mkdir(parents=True)
     (d / "srv.client.json").write_text('{"client_id": "live"}')
-    provider = _provider_with_token_endpoint(
+    provider = await _provider_with_token_endpoint(
         tmp_path, {}, "https://idp.example.com/oauth/token", monkeypatch
     )
     resp = _fake_response(
         400, "https://idp.example.com/oauth/token", b'{"error":"invalid_client_metadata"}'
     )
 
-    asyncio.run(provider._maybe_flag_poisoned_client(resp))
+    await provider._maybe_flag_poisoned_client(resp)
 
     assert (d / "srv.client.json").exists()
     assert provider._initialized is True
@@ -316,7 +326,8 @@ class _FakeMeta:
         return {"token_endpoint": self.token_endpoint}
 
 
-def test_bridge_forwards_requests_and_poisons_on_token_endpoint_400(
+@pytest.mark.asyncio
+async def test_bridge_forwards_requests_and_poisons_on_token_endpoint_400(
     tmp_path, monkeypatch
 ):
     """Drive the REAL async_auth_flow bridge to prove the inserted detection
@@ -341,7 +352,7 @@ def test_bridge_forwards_requests_and_poisons_on_token_endpoint_400(
     from mcp.client.auth.oauth2 import OAuthClientProvider
     monkeypatch.setattr(OAuthClientProvider, "async_auth_flow", fake_base_flow)
 
-    provider = _provider_with_token_endpoint(tmp_path, {}, token_ep, monkeypatch)
+    provider = await _provider_with_token_endpoint(tmp_path, {}, token_ep, monkeypatch)
     provider.context.oauth_metadata = _FakeMeta(token_ep)
 
     sentinel_request = object()
@@ -356,7 +367,7 @@ def test_bridge_forwards_requests_and_poisons_on_token_endpoint_400(
         except StopAsyncIteration:
             pass
 
-    asyncio.run(drive())
+    await drive()
 
     # The poison response reached the inner generator (forwarding intact)...
     assert ("in", poison_resp) in forwarded

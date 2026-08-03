@@ -49,7 +49,7 @@ async def test_configured_character_budget_is_loaded_asynchronously(monkeypatch)
         return {"file_read_max_chars": 12345}
 
     monkeypatch.setattr(
-        "hermes_cli.config.load_config_readonly_async",
+        "hermes_cli.config.load_config_readonly",
         load_config,
     )
     assert await file_tools._get_max_read_chars() == 12345

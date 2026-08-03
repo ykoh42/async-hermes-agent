@@ -825,16 +825,7 @@ async def seed_credits_at_session_start(agent) -> bool:
             _hydrate_seed_state(agent, fixture)
             return True
 
-        from hermes_cli.nous_account import get_nous_portal_account_info
-
-        info = await get_nous_portal_account_info(force_fresh=True)
-        if getattr(agent, "_credits_state", None) is not None:
-            return False  # a live inference header beat the portal response
-        state = _credits_state_from_account(info)
-        if state is None:
-            return False
-        _hydrate_seed_state(agent, state)
-        return True
+        return False
     except Exception:
         # Fail-open: any auth/portal hiccup leaves _credits_state as-is, never blocks.
         # Innermost log across all four call sites (TUI build / CLI build / first

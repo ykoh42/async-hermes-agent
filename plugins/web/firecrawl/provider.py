@@ -77,14 +77,12 @@ def _load_firecrawl_cls() -> type:
     global _FIRECRAWL_CLS_CACHE
     if _FIRECRAWL_CLS_CACHE is None:
         try:
-            from tools.lazy_deps import ensure as _lazy_ensure
-
-            _lazy_ensure("search.firecrawl", prompt=False)
-        except ImportError:
-            pass
-        except Exception as exc:  # noqa: BLE001 — surface install hint
-            raise ImportError(str(exc))
-        from firecrawl import Firecrawl as _cls  # noqa: WPS433 — deliberately lazy
+            from firecrawl import Firecrawl as _cls  # noqa: WPS433
+        except ImportError as exc:
+            raise ImportError(
+                "The optional Firecrawl SDK is not installed. "
+                "Install async-hermes-agent[firecrawl]."
+            ) from exc
 
         _FIRECRAWL_CLS_CACHE = _cls
     return _FIRECRAWL_CLS_CACHE

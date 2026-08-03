@@ -78,7 +78,7 @@ class TestResolveProviderClientMainAlias:
         })
         with (
             patch(
-                "hermes_cli.auth.resolve_api_key_provider_credentials_async",
+                "hermes_cli.auth.resolve_api_key_provider_credentials",
                 new_callable=AsyncMock,
                 return_value={
                     "api_key": "ghu_test_token",
@@ -140,7 +140,7 @@ class TestResolveProviderClientModelNormalization:
         })
         with (
             patch(
-                "hermes_cli.auth.resolve_api_key_provider_credentials_async",
+                "hermes_cli.auth.resolve_api_key_provider_credentials",
                 new_callable=AsyncMock,
                 return_value={
                     "api_key": "glm-key",
@@ -188,7 +188,7 @@ class TestResolveVisionProviderClientModelNormalization:
                 return_value=None,
             ),
             patch(
-                "hermes_cli.auth.resolve_api_key_provider_credentials_async",
+                "hermes_cli.auth.resolve_api_key_provider_credentials",
                 new_callable=AsyncMock,
                 return_value={
                     "api_key": "glm-key",
@@ -240,7 +240,8 @@ class TestProvidersDictApiModeAnthropicMessages:
     ``resolve_provider_client``'s named-custom branch never read it.
     """
 
-    def test_providers_dict_propagates_api_mode(self, tmp_path, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_providers_dict_propagates_api_mode(self, tmp_path, monkeypatch):
         monkeypatch.setenv("MYRELAY_API_KEY", "sk-test")
         _write_config(tmp_path, {
             "providers": {
@@ -253,8 +254,11 @@ class TestProvidersDictApiModeAnthropicMessages:
                 },
             },
         })
+        from hermes_cli.config import load_config_readonly
         from hermes_cli.runtime_provider import _get_named_custom_provider
-        entry = _get_named_custom_provider("myrelay")
+        entry = _get_named_custom_provider(
+            "myrelay", config=await load_config_readonly()
+        )
         assert entry is not None
         assert entry.get("api_mode") == "anthropic_messages"
         assert entry.get("base_url") == "https://example-relay.test/anthropic"

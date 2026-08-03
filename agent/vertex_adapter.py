@@ -23,16 +23,6 @@ from typing import Optional, Tuple
 
 from agent.secret_scope import get_secret as _get_secret, is_multiplex_active
 
-# Ensure google-auth is installed before importing. The [vertex] extra is no
-# longer in [all] per the lazy-install policy added 2026-05-12 — lazy_deps
-# handles on-demand installation so the Vertex provider still works for users
-# who installed plain `hermes-agent` and only later selected a Gemini model.
-try:
-    from tools.lazy_deps import ensure as _lazy_ensure
-    _lazy_ensure("provider.vertex", prompt=False)
-except Exception:
-    pass  # lazy_deps unavailable or install failed — fall through to the real ImportError below
-
 try:
     import google.auth
     import google.auth.transport.requests

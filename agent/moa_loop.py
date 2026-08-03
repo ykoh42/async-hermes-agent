@@ -304,11 +304,11 @@ async def _aggregator_reasoning_config(
     if cfg is not None:
         return cfg
     try:
-        from hermes_cli.config import load_config_readonly_async
+        from hermes_cli.config import load_config_readonly
         from hermes_constants import resolve_reasoning_config
 
         if config is None:
-            config = await load_config_readonly_async()
+            config = await load_config_readonly()
         return resolve_reasoning_config(
             config or {}, str(aggregator.get("model") or "")
         )
@@ -649,7 +649,7 @@ async def _trim_messages_for_reference(
 
     from agent.model_metadata import (
         estimate_messages_tokens_rough,
-        fetch_endpoint_model_metadata_async,
+        fetch_endpoint_model_metadata,
         get_static_context_length,
     )
 
@@ -665,7 +665,7 @@ async def _trim_messages_for_reference(
     else:
         try:
             base_url = str(runtime.get("base_url") or "")
-            metadata = await fetch_endpoint_model_metadata_async(
+            metadata = await fetch_endpoint_model_metadata(
                 base_url, api_key=str(runtime.get("api_key") or "")
             ) if base_url else {}
             entry = metadata.get(model)
@@ -1169,9 +1169,9 @@ async def aggregate_moa_context(
     # runs on the successful outputs only (failed refs are already filtered
     # into the degraded notice).
     try:
-        from hermes_cli.config import load_config_readonly_async
+        from hermes_cli.config import load_config_readonly
 
-        if _moa_privacy_mode((await load_config_readonly_async()).get("moa")) == "full":
+        if _moa_privacy_mode((await load_config_readonly()).get("moa")) == "full":
             successful_outputs = _redact_reference_outputs(successful_outputs)
     except Exception:  # pragma: no cover - privacy filter must never break a turn
         logger.debug("MoA privacy filter check failed", exc_info=True)
@@ -1468,7 +1468,7 @@ class MoAChatCompletions:
             "MoA: recorded late accounting for interrupted reference %s", label
         )
 
-    def consume_and_save_trace(
+    async def consume_and_save_trace(
         self, session_id: Any = None, aggregator_output_fallback: Any = None
     ) -> None:
         """Flush the pending full-turn trace to disk, if one is pending.
@@ -1500,7 +1500,7 @@ class MoAChatCompletions:
             agg_output = pending.get("aggregator_output")
             if agg_output is None and aggregator_output_fallback:
                 agg_output = aggregator_output_fallback
-            save_moa_turn(
+            await save_moa_turn(
                 session_id=session_id,
                 preset_name=pending.get("preset", ""),
                 reference_outputs=pending.get("reference_outputs", []),
@@ -1648,10 +1648,10 @@ class MoAChatCompletions:
                 raise TypeError("_moa_prepared_request must be a dict")
             return await self._call_prepared_aggregator(prepared_request, api_kwargs)
 
-        from hermes_cli.config import load_config_readonly_async
+        from hermes_cli.config import load_config_readonly
         from hermes_cli.moa_config import resolve_moa_preset
 
-        _moa_raw = (await load_config_readonly_async()).get("moa") or {}
+        _moa_raw = (await load_config_readonly()).get("moa") or {}
         preset = resolve_moa_preset(_moa_raw, self.preset_name)
         # Privacy filter mode: '' (off, default) | 'display' | 'full'. See
         # coerce_privacy_filter / the pattern block at the top of this module.
@@ -2041,7 +2041,7 @@ class MoAClient:
         preset name."""
         return getattr(self.chat.completions, "last_aggregator_slot", None)
 
-    def consume_and_save_trace(
+    async def consume_and_save_trace(
         self, session_id: Any = None, aggregator_output_fallback: Any = None
     ) -> None:
         """Flush the pending full-turn MoA trace via the completions facade.
@@ -2050,7 +2050,7 @@ class MoAClient:
         ``aggregator_output_fallback`` supplies the resolved acting text so the
         streaming path's trace is self-contained (see the facade docstring).
         """
-        return self.chat.completions.consume_and_save_trace(
+        return await self.chat.completions.consume_and_save_trace(
             session_id, aggregator_output_fallback=aggregator_output_fallback
         )
 

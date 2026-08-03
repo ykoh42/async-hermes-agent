@@ -43,24 +43,6 @@ logger = logging.getLogger(__name__)
 # :func:`_get_sync_client` / :func:`_get_async_client`).
 
 
-def _ensure_parallel_sdk_installed() -> None:
-    """Trigger lazy install of the parallel SDK if it isn't present.
-
-    Mirrors the lazy-deps pattern used by the legacy implementation.
-    Swallows benign ImportError from the lazy_deps helper itself; if the
-    SDK is genuinely missing the subsequent ``from parallel import ...``
-    raises ImportError that the caller can handle.
-    """
-    try:
-        from tools.lazy_deps import ensure as _lazy_ensure
-
-        _lazy_ensure("search.parallel", prompt=False)
-    except ImportError:
-        pass
-    except Exception as exc:  # noqa: BLE001 — surface install hint as ImportError
-        raise ImportError(str(exc))
-
-
 def _get_sync_client() -> Any:
     """Lazy-load + cache the sync Parallel client.
 
@@ -82,8 +64,13 @@ def _get_sync_client() -> Any:
             "Get your API key at https://parallel.ai"
         )
 
-    _ensure_parallel_sdk_installed()
-    from parallel import Parallel  # noqa: WPS433 — deliberately lazy
+    try:
+        from parallel import Parallel  # noqa: WPS433 — deliberately lazy
+    except ImportError as exc:
+        raise ImportError(
+            "The optional Parallel SDK is not installed. "
+            "Install async-hermes-agent[parallel-web]."
+        ) from exc
 
     client = Parallel(api_key=api_key)
     _wt._parallel_client = client
@@ -110,8 +97,13 @@ def _get_async_client() -> Any:
             "Get your API key at https://parallel.ai"
         )
 
-    _ensure_parallel_sdk_installed()
-    from parallel import AsyncParallel  # noqa: WPS433 — deliberately lazy
+    try:
+        from parallel import AsyncParallel  # noqa: WPS433 — deliberately lazy
+    except ImportError as exc:
+        raise ImportError(
+            "The optional Parallel SDK is not installed. "
+            "Install async-hermes-agent[parallel-web]."
+        ) from exc
 
     client = AsyncParallel(api_key=api_key)
     _wt._async_parallel_client = client

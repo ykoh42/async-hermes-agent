@@ -170,54 +170,8 @@ def test_global_write_through_preserves_concurrent_root_update(
 
 @pytest.mark.asyncio
 async def test_unsupported_codex_pool_refresh_fails_fast(monkeypatch, tmp_path):
-    """The Codex OAuth pool refresh must POST under the cross-process auth lock.
-
-    Codex refresh tokens are single-use. If two Hermes processes both read the
-    same on-disk token and both POST it, the loser gets ``refresh_token_reused``.
-    Serializing the sync -> refresh POST -> write-back sequence through the
-    shared ``_auth_store_lock`` closes that window: a second process blocks on
-    the flock and, once inside, adopts the rotated token instead of re-POSTing.
-
-    This asserts the invariant directly — that ``refresh_codex_oauth_pure`` is
-    only ever called while the auth-store lock is held — rather than snapshotting
-    any token value.
-    """
+    """Codex refresh fails before crossing the removed synchronous boundary."""
     provider = "openai-codex"
-    profile_path = tmp_path / "auth.json"
-    monkeypatch.setattr(A, "_auth_file_path", lambda: profile_path)
-    monkeypatch.setattr(A, "_global_auth_file_path", lambda: None)
-    monkeypatch.setenv("HOME", str(tmp_path / "not-the-root"))
-
-    lock_held: dict = {"during_post": None}
-    real_lock = A._auth_store_lock
-
-    depth = {"n": 0}
-
-    import contextlib
-
-    @contextlib.contextmanager
-    def tracking_lock(*args, **kwargs):
-        depth["n"] += 1
-        try:
-            with real_lock(*args, **kwargs):
-                yield
-        finally:
-            depth["n"] -= 1
-
-    monkeypatch.setattr(A, "_auth_store_lock", tracking_lock)
-    # credential_pool imported _auth_store_lock by name; patch that binding too.
-    monkeypatch.setattr(CP, "_auth_store_lock", tracking_lock)
-
-    def fake_refresh(access_token, refresh_token, **kwargs):
-        # The POST to the token endpoint must happen with the lock held.
-        lock_held["during_post"] = depth["n"] > 0
-        return {
-            "access_token": "rotated-access",
-            "refresh_token": "rotated-refresh",
-            "last_refresh": "2020-01-02T00:00:00Z",
-        }
-
-    monkeypatch.setattr(A, "refresh_codex_oauth_pure", fake_refresh)
 
     entry = _entry(
         provider,
@@ -231,4 +185,3 @@ async def test_unsupported_codex_pool_refresh_fails_fast(monkeypatch, tmp_path):
 
     with pytest.raises(AsyncCapabilityError, match="not native async yet"):
         await pool._refresh_entry(entry, force=True)
-    assert lock_held["during_post"] is None

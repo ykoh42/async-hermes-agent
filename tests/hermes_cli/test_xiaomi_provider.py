@@ -38,12 +38,13 @@ class TestXiaomiAliases:
     @pytest.mark.parametrize("alias", [
         "xiaomi", "mimo", "xiaomi-mimo",
     ])
-    def test_alias_resolves(self, alias, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_alias_resolves(self, alias, monkeypatch):
         # Clear env to avoid auto-detection interfering
         for key in ("XIAOMI_API_KEY",):
             monkeypatch.delenv(key, raising=False)
         monkeypatch.setenv("XIAOMI_API_KEY", "sk-test-key-12345678")
-        assert resolve_provider(alias) == "xiaomi"
+        assert await resolve_provider(alias) == "xiaomi"
 
     def test_normalize_provider_models_py(self):
         from hermes_cli.models import normalize_provider
@@ -59,7 +60,8 @@ class TestXiaomiAliases:
 class TestXiaomiAutoDetection:
     """Setting XIAOMI_API_KEY should auto-detect the provider."""
 
-    def test_auto_detect(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_auto_detect(self, monkeypatch):
         # Clear all other provider env vars
         for var in ("OPENROUTER_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY",
                      "DEEPSEEK_API_KEY", "GOOGLE_API_KEY", "GEMINI_API_KEY",
@@ -70,7 +72,7 @@ class TestXiaomiAutoDetection:
                      "TOKENHUB_API_KEY", "ARCEEAI_API_KEY"):
             monkeypatch.delenv(var, raising=False)
         monkeypatch.setenv("XIAOMI_API_KEY", "sk-xiaomi-test-12345678")
-        provider = resolve_provider("auto")
+        provider = await resolve_provider("auto")
         assert provider == "xiaomi"
 
 
@@ -84,15 +86,17 @@ class TestXiaomiCredentials:
 
 
 
-    def test_resolve_credentials(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_resolve_credentials(self, monkeypatch):
         monkeypatch.setenv("XIAOMI_API_KEY", "sk-test-12345678")
         monkeypatch.delenv("XIAOMI_BASE_URL", raising=False)
-        creds = resolve_api_key_provider_credentials("xiaomi")
+        creds = await resolve_api_key_provider_credentials("xiaomi")
         assert creds["api_key"] == "sk-test-12345678"
         assert creds["base_url"] == "https://api.xiaomimimo.com/v1"
 
 
-    def test_resolve_credentials_reads_home_external_secret_scope(
+    @pytest.mark.asyncio
+    async def test_resolve_credentials_reads_home_external_secret_scope(
         self, tmp_path, monkeypatch
     ):
         """BWS-injected keys belong in the profile scope that loaded them."""
@@ -116,7 +120,7 @@ class TestXiaomiCredentials:
         ss.set_multiplex_active(True)
         token = ss.set_secret_scope(ss.build_profile_secret_scope(home))
         try:
-            creds = resolve_api_key_provider_credentials("xiaomi")
+            creds = await resolve_api_key_provider_credentials("xiaomi")
         finally:
             ss.reset_secret_scope(token)
             ss.set_multiplex_active(False)
@@ -150,7 +154,8 @@ class TestXiaomiModelCatalog:
         assert "xiaomi" in _PROVIDER_MODELS
         assert len(_PROVIDER_MODELS["xiaomi"]) >= 1
 
-    def test_list_agentic_models_mock(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_list_agentic_models_mock(self, monkeypatch):
         """When models.dev returns Xiaomi data, list_agentic_models should return models."""
         from agent import models_dev as md
 
@@ -175,9 +180,12 @@ class TestXiaomiModelCatalog:
                 },
             }
         }
-        monkeypatch.setattr(md, "fetch_models_dev", lambda: fake_data)
+        async def fetch_models_dev():
+            return fake_data
 
-        result = md.list_agentic_models("xiaomi")
+        monkeypatch.setattr(md, "fetch_models_dev", fetch_models_dev)
+
+        result = await md.list_agentic_models("xiaomi")
         assert "mimo-v2-pro" in result
         assert "mimo-v2-flash" in result
 

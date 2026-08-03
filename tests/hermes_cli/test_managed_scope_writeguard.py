@@ -23,18 +23,6 @@ def homes(tmp_path, monkeypatch):
     return home, managed
 
 
-def test_config_set_managed_key_rejected(homes, capsys):
-    from hermes_cli.config import set_config_value
-
-    with pytest.raises(SystemExit) as exc:
-        set_config_value("model.default", "user/override")
-    assert exc.value.code != 0
-    captured = capsys.readouterr()
-    assert "managed" in (captured.out + captured.err).lower()
-
-
-
-
 # ── env write guards ─────────────────────────────────────────────────────────
 
 
@@ -68,5 +56,4 @@ def test_save_env_value_managed_key_rejected(env_homes, capsys):
 
 
 # ── bulk save strips managed leaves ──────────────────────────────────────────
-
 

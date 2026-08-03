@@ -4686,7 +4686,8 @@ class TestSupportsReasoningExtraBody:
         agent.model = ""
         return agent
 
-    def test_xiaomi_models_are_treated_as_reasoning_capable(self):
+    @pytest.mark.asyncio
+    async def test_xiaomi_models_are_treated_as_reasoning_capable(self):
         agent = self._make_agent()
         for model in (
             "xiaomi/mimo-v2.5-pro",
@@ -4696,7 +4697,7 @@ class TestSupportsReasoningExtraBody:
             "xiaomi/mimo-v2-flash",
         ):
             agent.model = model
-            assert agent._supports_reasoning_extra_body() is True, model
+            assert await agent._supports_reasoning_extra_body() is True, model
 
 
 class TestMemoryContextSanitization:

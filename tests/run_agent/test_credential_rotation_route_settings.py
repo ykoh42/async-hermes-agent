@@ -41,6 +41,7 @@ async def test_credential_rotation_rebuilds_natively_without_sync_settings_io():
             skip_context_files=True,
             skip_memory=True,
         )
+        agent._runtime_config_loaded = True
         entry = SimpleNamespace(
             id="pool-entry-b",
             runtime_api_key="new-key",
@@ -77,6 +78,7 @@ async def test_credential_rotation_drops_previous_route_headers():
             skip_context_files=True,
             skip_memory=True,
         )
+        agent._runtime_config_loaded = True
         agent._client_kwargs["default_headers"] = {"Authorization": "old-secret"}
         entry = SimpleNamespace(
             id="pool-entry-b",

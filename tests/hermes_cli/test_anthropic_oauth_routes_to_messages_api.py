@@ -27,6 +27,7 @@ single branch cannot silently revert #32243.
 from __future__ import annotations
 
 import pytest
+from unittest.mock import AsyncMock
 
 from hermes_cli import runtime_provider as rp
 
@@ -151,7 +152,11 @@ class TestCustomProviderUrlFallback:
             async def select(self):
                 return _Entry()
 
-        monkeypatch.setattr(rp, "get_custom_provider_pool_key", lambda *a, **k: "custom:my-claude")
+        monkeypatch.setattr(
+            rp,
+            "get_custom_provider_pool_key",
+            AsyncMock(return_value="custom:my-claude"),
+        )
         async def _load_pool(key):
             return _Pool()
 

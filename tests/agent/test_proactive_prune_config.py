@@ -13,6 +13,7 @@ from __future__ import annotations
 import contextlib
 import io
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -37,12 +38,16 @@ def _config(**prune_keys) -> dict:
     }
 
 
-def _make_agent(monkeypatch, tmp_path: Path, **prune_keys):
+async def _make_agent(monkeypatch, tmp_path: Path, **prune_keys):
     from hermes_cli import config as config_mod
 
     monkeypatch.setattr(config_mod, "load_config", lambda: _config(**prune_keys))
 
-    monkeypatch.setattr(config_mod, "load_config_readonly", lambda: _config(**prune_keys))
+    monkeypatch.setattr(
+        config_mod,
+        "load_config_readonly",
+        AsyncMock(return_value=_config(**prune_keys)),
+    )
     db = SessionDB(tmp_path / "state.db")
     with contextlib.redirect_stdout(io.StringIO()):
         agent = AIAgent(
@@ -57,13 +62,14 @@ def _make_agent(monkeypatch, tmp_path: Path, **prune_keys):
             session_db=db,
             session_id="proactive-prune-config-test",
         )
+    await agent._ensure_provider_runtime()
     return agent, db
 
 
 class TestProactivePruneConfig:
     @pytest.mark.asyncio
     async def test_default_is_disabled_when_unset(self, monkeypatch, tmp_path):
-        agent, db = _make_agent(monkeypatch, tmp_path)
+        agent, db = await _make_agent(monkeypatch, tmp_path)
         cc = agent.context_compressor
         assert cc.proactive_prune_tokens == 0
         assert cc.proactive_prune_min_result_chars == 8000
@@ -73,7 +79,7 @@ class TestProactivePruneConfig:
 
     @pytest.mark.asyncio
     async def test_custom_values_are_honored(self, monkeypatch, tmp_path):
-        agent, db = _make_agent(
+        agent, db = await _make_agent(
             monkeypatch,
             tmp_path,
             proactive_prune_tokens=48_000,
@@ -91,10 +97,11 @@ class TestProactivePruneConfig:
     async def test_boolean_is_rejected_not_coerced(self, monkeypatch, tmp_path):
         # bool subclasses int: YAML `proactive_prune_tokens: true` must fall
         # back to disabled, never coerce to 1 token.
-        agent, db = _make_agent(monkeypatch, tmp_path, proactive_prune_tokens=True)
+        agent, db = await _make_agent(
+            monkeypatch, tmp_path, proactive_prune_tokens=True
+        )
         assert agent.context_compressor.proactive_prune_tokens == 0
         await agent.close()
         await db.close()
-
 
 

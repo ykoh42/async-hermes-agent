@@ -315,9 +315,9 @@ async def _session_link(session_id: str, profile: str = None) -> str:
     name = (profile or "").strip()
     if not name:
         try:
-            from hermes_cli.profiles import get_active_profile_name_async
+            from hermes_cli.profiles import get_active_profile_name
 
-            resolved = await get_active_profile_name_async()
+            resolved = get_active_profile_name()
             name = "" if resolved == "custom" else resolved
         except Exception:
             logging.debug("get_active_profile_name failed for session link", exc_info=True)

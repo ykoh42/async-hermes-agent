@@ -13,17 +13,13 @@ gets stripped from the durable transcript. This test file verifies:
 """
 
 import json
-import sys
-
 import pytest
 
 
 def _fresh_run_agent(hermes_home):
-    for mod in list(sys.modules):
-        if mod == "run_agent" or mod.startswith("agent.") or mod.startswith("tools.") or mod.startswith("hermes_"):
-            del sys.modules[mod]
-    import run_agent  # noqa: F401
-    return sys.modules["run_agent"]
+    import run_agent
+
+    return run_agent
 
 
 def test_verification_flags_registered_as_ephemeral(tmp_path, monkeypatch):

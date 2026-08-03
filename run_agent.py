@@ -15,11 +15,10 @@ Features:
 
 Usage:
     from run_agent import AIAgent
-    import asyncio
-    
+
     agent = AIAgent(base_url="http://localhost:30000/v1", model="claude-opus-4-20250514")
-    response = asyncio.run(
-        agent.run_conversation("Tell me about the latest Python updates")
+    response = await agent.run_conversation(
+        "Tell me about the latest Python updates"
     )
 """
 
@@ -35,7 +34,6 @@ except ModuleNotFoundError:
     pass
 
 import asyncio
-import base64
 import copy
 import hashlib
 import json
@@ -44,7 +42,6 @@ logger = logging.getLogger(__name__)
 import os
 import re
 import sys
-import tempfile
 import time
 import threading
 import uuid
@@ -57,11 +54,6 @@ from typing import List, Dict, Any, Optional, Callable
 #       native async client, and
 #   (b) `patch("run_agent.OpenAI", ...)` integration seams.
 #
-# NOTE: `fire` is ONLY used in the `__main__` block below (for running
-# run_agent.py directly as a CLI) — it is NOT needed for library usage.
-# It is imported there, not here, so that importing run_agent from a
-# daemon thread (e.g. curator's forked review agent) never fails with
-# ModuleNotFoundError on broken/partial installs where `fire` isn't present.
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -120,21 +112,13 @@ from agent.process_bootstrap import (
 from agent.iteration_budget import IterationBudget
 
 
-from hermes_cli.env_loader import load_hermes_dotenv
 from hermes_cli.timeouts import (
     get_provider_request_timeout,
     get_provider_stale_timeout,
 )
 
 _hermes_home = get_hermes_home()
-_project_env = Path(__file__).parent / '.env'
-_loaded_env_paths = load_hermes_dotenv(hermes_home=_hermes_home, project_env=_project_env)
-if _loaded_env_paths:
-    for _env_path in _loaded_env_paths:
-        logger.info("Loaded environment variables from %s", _env_path)
-else:
-    logger.info("No .env file found. Using system environment variables.")
-
+_project_env = Path(__file__).parent / ".env"
 
 # Import our tool system
 from model_tools import (
@@ -621,8 +605,8 @@ class AIAgent:
         source = _session_source_for_agent(self.platform)
         try:
             try:
-                from hermes_cli.profiles import get_active_profile_name_async
-                _profile_for_session = await get_active_profile_name_async()
+                from hermes_cli.profiles import get_active_profile_name
+                _profile_for_session = get_active_profile_name()
                 if _profile_for_session == "default":
                     _profile_for_session = None
             except Exception:
@@ -2862,6 +2846,7 @@ class AIAgent:
             return
 
         try:
+            await aiofiles.os.makedirs(self.logs_dir, exist_ok=True)
             cleaned = []
             for msg in messages:
                 # Mirror the SQLite flush: ephemeral recovery scaffolding is
@@ -3265,8 +3250,8 @@ class AIAgent:
             # Read from the persisted config.yaml so gateway and CLI share
             # the same setting.  Import lazily to avoid a startup-time cycle.
             try:
-                from hermes_cli.config import load_config_readonly_async
-                _cfg = await load_config_readonly_async()
+                from hermes_cli.config import load_config_readonly
+                _cfg = await load_config_readonly()
             except Exception:
                 _cfg = {}
             _display = _cfg.get("display") if isinstance(_cfg, dict) else None
@@ -3362,8 +3347,8 @@ class AIAgent:
             # Read from the persisted config.yaml so gateway and CLI share
             # the same setting.  Import lazily to avoid a startup-time cycle.
             try:
-                from hermes_cli.config import load_config_readonly_async
-                _cfg = await load_config_readonly_async()
+                from hermes_cli.config import load_config_readonly
+                _cfg = await load_config_readonly()
             except Exception:
                 _cfg = {}
             _display = _cfg.get("display") if isinstance(_cfg, dict) else None
@@ -3777,50 +3762,6 @@ class AIAgent:
                 )
             except Exception:
                 pass
-
-    def release_clients(self) -> None:
-        """Release LLM client resources WITHOUT tearing down session tool state.
-
-        Used by the gateway when evicting this agent from _agent_cache for
-        memory-management reasons (LRU cap or idle TTL) — the session may
-        resume at any time with a freshly-built AIAgent that reuses the
-        same task_id / session_id, so we must NOT kill:
-          - native background terminal commands for task_id
-          - terminal sandbox for task_id (cwd, env, shell state)
-          - browser daemon for task_id (open tabs, cookies)
-          - computer-use backend for task_id (native target and browser refs)
-          - memory provider (has its own lifecycle; keeps running)
-
-        We DO close:
-          - OpenAI/httpx client pool (big chunk of held memory + sockets;
-            the rebuilt agent gets a fresh client anyway)
-          - Active child subagents (per-turn artefacts; safe to drop)
-
-        Safe to call multiple times.  Distinct from close() — which is the
-        hard teardown for actual session boundaries (/new, /reset, session
-        expiry).
-        """
-        # Close active child agents (per-turn; no cross-turn persistence).
-        try:
-            with self._active_children_lock:
-                children = list(self._active_children)
-                self._active_children.clear()
-            for child in children:
-                try:
-                    child.release_clients()
-                except Exception:
-                    # Fall back to full close on children; they're per-turn.
-                    try:
-                        child.close()
-                    except Exception:
-                        pass
-        except Exception:
-            pass
-
-        # Native clients are owned and closed by ``await close()``.  Soft
-        # eviction only drops state; it never revives the old cross-thread
-        # synchronous request-client lifecycle.
-        self.client = None
 
     async def close(self) -> None:
         """Release all resources held by this agent instance.
@@ -5080,17 +5021,6 @@ class AIAgent:
 
     async def _ensure_provider_runtime(self) -> bool:
         """Resolve a deferred provider through the native async auth boundary."""
-        if getattr(self, "_credits_notices_enabled_cache", None) is None:
-            try:
-                from hermes_cli.config import load_config_readonly_async
-
-                display = (await load_config_readonly_async()).get("display") or {}
-                if isinstance(display, dict):
-                    self._credits_notices_enabled_cache = bool(
-                        display.get("credits_notices", True)
-                    )
-            except Exception:
-                self._credits_notices_enabled_cache = True
         from agent.agent_init import initialize_deferred_runtime
         from agent.agent_runtime_helpers import AsyncCapabilityError
 
@@ -5136,46 +5066,6 @@ class AIAgent:
             if isinstance(part, dict) and part.get("type") in {"image_url", "input_image"}:
                 return True
         return False
-
-    # 20 MB base64 ≈ 15 MB decoded image — generous but prevents OOM from an
-    # oversized data: URL (a 100 MB+ payload creates ~275 MB of memory pressure,
-    # and gateway users sharing the same process can trivially OOM it).
-    _MAX_DATA_URL_BASE64_BYTES = 20 * 1024 * 1024
-
-    @staticmethod
-    def _materialize_data_url_for_vision(image_url: str) -> tuple[str, Optional[Path]]:
-        header, _, data = str(image_url or "").partition(",")
-        if len(data) > AIAgent._MAX_DATA_URL_BASE64_BYTES:
-            logger.warning(
-                "data-URL payload too large (%d bytes), skipping", len(data)
-            )
-            return "", None
-        mime = "image/jpeg"
-        if header.startswith("data:"):
-            mime_part = header[len("data:"):].split(";", 1)[0].strip()
-            if mime_part.startswith("image/"):
-                mime = mime_part
-        suffix = {
-            "image/png": ".png",
-            "image/gif": ".gif",
-            "image/webp": ".webp",
-            "image/jpeg": ".jpg",
-            "image/jpg": ".jpg",
-        }.get(mime, ".jpg")
-        tmp = tempfile.NamedTemporaryFile(prefix="anthropic_image_", suffix=suffix, delete=False)
-        try:
-            with tmp:
-                tmp.write(base64.b64decode(data))
-        except Exception:
-            # delete=False means a corrupt/unsupported data URL would otherwise
-            # leak a zero-byte temp file on every failed materialization.
-            try:
-                os.unlink(tmp.name)
-            except OSError:
-                pass
-            raise
-        path = Path(tmp.name)
-        return str(path), path
 
     def _describe_image_for_anthropic_fallback(self, image_url: str, role: str) -> str:
         role_label = {
@@ -5632,7 +5522,7 @@ class AIAgent:
         from agent.chat_completion_helpers import build_api_kwargs
         return await build_api_kwargs(self, api_messages)
 
-    def _supports_reasoning_extra_body(self) -> bool:
+    async def _supports_reasoning_extra_body(self) -> bool:
         """Return True when reasoning extra_body is safe to send for this route/model.
 
         OpenRouter forwards unknown extra_body fields to upstream providers.
@@ -5654,7 +5544,7 @@ class AIAgent:
             except Exception:
                 return False
         if (self.provider or "").strip().lower() == "lmstudio":
-            opts = self._lmstudio_reasoning_options_cached()
+            opts = await self._lmstudio_reasoning_options_cached()
             # "off-only" (or absent) means no real reasoning capability.
             return any(opt and opt != "off" for opt in opts)
         # Ollama Cloud (and any Ollama-compatible server): the native
@@ -5662,7 +5552,7 @@ class AIAgent:
         # only for models that declare the "thinking" capability. deepseek-v4
         # has it; gemma3 / qwen3-coder don't. Cached per (model, base_url).
         if base_url_host_matches(self._base_url_lower, "ollama.com"):
-            return self._ollama_supports_thinking_cached()
+            return await self._ollama_supports_thinking_cached()
         if "openrouter" not in self._base_url_lower:
             return False
         if "api.mistral.ai" in self._base_url_lower:
@@ -5682,7 +5572,7 @@ class AIAgent:
         )
         return any(model.startswith(prefix) for prefix in reasoning_model_prefixes)
 
-    def _lmstudio_reasoning_options_cached(self) -> list[str]:
+    async def _lmstudio_reasoning_options_cached(self) -> list[str]:
         """Probe LM Studio's published reasoning ``allowed_options`` once per
         (model, base_url). The list (e.g. ``["off","on"]`` or
         ``["off","minimal","low"]``) is needed both for the supports-reasoning
@@ -5708,7 +5598,7 @@ class AIAgent:
                 return opts
         try:
             from hermes_cli.models import lmstudio_model_reasoning_options
-            opts = lmstudio_model_reasoning_options(
+            opts = await lmstudio_model_reasoning_options(
                 self.model, self.base_url, getattr(self, "api_key", ""),
             )
         except Exception:
@@ -5716,7 +5606,7 @@ class AIAgent:
         cache[key] = (opts, _time.monotonic())
         return opts
 
-    def _ollama_supports_thinking_cached(self) -> bool:
+    async def _ollama_supports_thinking_cached(self) -> bool:
         """Probe Ollama's ``/api/show`` capabilities once per (model, base_url).
 
         Returns True only when the model declares the ``thinking`` capability.
@@ -5739,7 +5629,7 @@ class AIAgent:
                 return bool(supported)
         try:
             from hermes_cli.models import ollama_model_supports_thinking
-            supported = ollama_model_supports_thinking(
+            supported = await ollama_model_supports_thinking(
                 self.model, self.base_url, getattr(self, "api_key", "")
             )
         except Exception:
@@ -5747,7 +5637,7 @@ class AIAgent:
         cache[key] = (supported, _time.monotonic())
         return bool(supported)
 
-    def _resolve_lmstudio_summary_reasoning_effort(self) -> Optional[str]:
+    async def _resolve_lmstudio_summary_reasoning_effort(self) -> Optional[str]:
         """Resolve a safe top-level ``reasoning_effort`` for LM Studio.
 
         The iteration-limit summary path calls ``chat.completions.create()``
@@ -5757,7 +5647,7 @@ class AIAgent:
         from agent.lmstudio_reasoning import resolve_lmstudio_effort
         return resolve_lmstudio_effort(
             self.reasoning_config,
-            self._lmstudio_reasoning_options_cached(),
+            await self._lmstudio_reasoning_options_cached(),
         )
 
     def _github_models_reasoning_extra_body(self) -> dict | None:
@@ -6208,7 +6098,7 @@ class AIAgent:
         return result["final_response"]
 
 
-def main(
+async def main(
     query: str = None,
     model: str = "",
     api_key: str = None,
@@ -6376,52 +6266,50 @@ def main(
     print(f"\n📝 User Query: {user_query}")
     print("\n" + "=" * 50)
     
-    # Run conversation
-    result = asyncio.run(agent.run_conversation(user_query))
-    
-    print("\n" + "=" * 50)
-    print("📋 CONVERSATION SUMMARY")
-    print("=" * 50)
-    print(f"✅ Completed: {result['completed']}")
-    print(f"📞 API Calls: {result['api_calls']}")
-    print(f"💬 Messages: {len(result['messages'])}")
-    
-    if result['final_response']:
-        print("\n🎯 FINAL RESPONSE:")
-        print("-" * 30)
-        print(result['final_response'])
-    
-    # Save sample trajectory to UUID-named file if requested
-    if save_sample:
-        sample_id = str(uuid.uuid4())[:8]
-        sample_filename = f"sample_{sample_id}.json"
-        
-        # Convert messages to trajectory format (same as batch_runner)
-        trajectory = agent._convert_to_trajectory_format(
-            result['messages'], 
-            user_query, 
-            result['completed']
-        )
-        
-        entry = {
-            "conversations": trajectory,
-            "timestamp": datetime.now().isoformat(),
-            "model": model,
-            "completed": result['completed'],
-            "query": user_query
-        }
-        
-        try:
-            with open(sample_filename, "w", encoding="utf-8") as f:
-                # Pretty-print JSON with indent for readability
-                f.write(json.dumps(entry, ensure_ascii=False, indent=2))
-            print(f"\n💾 Sample trajectory saved to: {sample_filename}")
-        except Exception as e:
-            print(f"\n⚠️ Failed to save sample: {e}")
-    
-    print("\n👋 Agent execution completed!")
+    try:
+        result = await agent.run_conversation(user_query)
 
+        print("\n" + "=" * 50)
+        print("📋 CONVERSATION SUMMARY")
+        print("=" * 50)
+        print(f"✅ Completed: {result['completed']}")
+        print(f"📞 API Calls: {result['api_calls']}")
+        print(f"💬 Messages: {len(result['messages'])}")
 
-if __name__ == "__main__":
-    import fire
-    fire.Fire(main)
+        if result['final_response']:
+            print("\n🎯 FINAL RESPONSE:")
+            print("-" * 30)
+            print(result['final_response'])
+
+        if save_sample:
+            sample_id = str(uuid.uuid4())[:8]
+            sample_filename = f"sample_{sample_id}.json"
+            trajectory = agent._convert_to_trajectory_format(
+                result['messages'],
+                user_query,
+                result['completed'],
+            )
+            entry = {
+                "conversations": trajectory,
+                "timestamp": datetime.now().isoformat(),
+                "model": model,
+                "completed": result['completed'],
+                "query": user_query,
+            }
+
+            try:
+                import aiofiles
+
+                async with aiofiles.open(
+                    sample_filename, "w", encoding="utf-8"
+                ) as output:
+                    await output.write(
+                        json.dumps(entry, ensure_ascii=False, indent=2)
+                    )
+                print(f"\n💾 Sample trajectory saved to: {sample_filename}")
+            except Exception as e:
+                print(f"\n⚠️ Failed to save sample: {e}")
+
+        print("\n👋 Agent execution completed!")
+    finally:
+        await agent.close()

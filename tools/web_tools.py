@@ -41,8 +41,13 @@ import logging
 import os
 import re
 import asyncio
+import contextvars
 from typing import List, Dict, Any, Optional, TYPE_CHECKING
 import httpx  # noqa: F401 — kept at module top so tests can patch tools.web_tools.httpx
+
+_web_config_snapshot: contextvars.ContextVar[dict] = contextvars.ContextVar(
+    "web_config_snapshot", default={}
+)
 # After the web-provider plugin migration (PR #25182), the Firecrawl SDK
 # proxy, client construction, and response-shape normalizers all live in
 # plugins.web.firecrawl.provider. We re-export the names that external
@@ -139,16 +144,22 @@ def _has_env(name: str) -> bool:
     return bool(_env_value(name))
 
 def _load_web_config() -> dict:
-    """Load the ``web:`` section from ~/.hermes/config.yaml."""
+    """Return settings captured at the current async tool boundary."""
+    return _web_config_snapshot.get()
+
+
+async def _refresh_web_config() -> dict:
     try:
-        from hermes_cli.config import load_config
-        # ``or {}``: a present-but-null ``web:`` section (YAML ``web:`` with no
-        # body) makes ``.get("web", {})`` return None, which would break every
-        # caller that does ``_load_web_config().get(...)``. Honor the ``-> dict``
-        # contract so callers never see None.
-        return load_config().get("web") or {}
-    except (ImportError, Exception):
-        return {}
+        from hermes_cli.config import load_config_readonly
+
+        config = await load_config_readonly()
+        web = config.get("web") or {} if isinstance(config, dict) else {}
+    except Exception:
+        web = {}
+    if not isinstance(web, dict):
+        web = {}
+    _web_config_snapshot.set(web)
+    return web
 
 
 # The built-in web backends whose availability is driven by hardcoded
@@ -647,6 +658,8 @@ async def web_search_tool(query: str, limit: int = 5) -> str:
     Raises:
         Exception: If search fails or API key is not set
     """
+    await _refresh_web_config()
+
     try:
         limit = int(limit)
     except (TypeError, ValueError):
@@ -779,6 +792,8 @@ async def web_extract_tool(
     Raises:
         Exception: If extraction fails or API key is not set
     """
+    await _refresh_web_config()
+
     # Block URLs containing embedded secrets (exfiltration prevention).
     # URL-decode first so percent-encoded secrets (%73k- = sk-) are caught.
     from agent.redact import _PREFIX_RE

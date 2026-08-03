@@ -18,10 +18,16 @@ never the child's intermediate tool calls or reasoning.
 
 import enum
 import asyncio
+import contextvars
 import json
 import logging
 
 logger = logging.getLogger(__name__)
+
+_delegation_config_snapshot: contextvars.ContextVar[dict] = contextvars.ContextVar(
+    "delegation_config_snapshot",
+    default={},
+)
 import os
 import threading
 import time
@@ -2471,6 +2477,8 @@ async def delegate_task(
     if parent_agent is None:
         return tool_error("delegate_task requires a parent agent context.")
 
+    await _refresh_config()
+
     # Operator-controlled kill switch — lets the TUI freeze new fan-out
     # when a runaway tree is detected, without interrupting already-running
     # children.  Cleared via the matching `delegation.pause` RPC.
@@ -2691,7 +2699,7 @@ async def _resolve_child_credential_pool(
         try:
             from agent.credential_pool import get_custom_provider_pool_key, load_pool
 
-            child_key = get_custom_provider_pool_key(effective_base_url)
+            child_key = await get_custom_provider_pool_key(effective_base_url)
             if child_key is None:
                 # Unregistered endpoint (raw delegation.base_url with no
                 # matching custom_providers entry) -> no shared pool exists.
@@ -2700,7 +2708,7 @@ async def _resolve_child_credential_pool(
                 return None
 
             # Reuse the parent's pool only when it is the same custom endpoint.
-            parent_key = get_custom_provider_pool_key(
+            parent_key = await get_custom_provider_pool_key(
                 getattr(parent_agent, "base_url", None)
             )
             if (
@@ -2872,32 +2880,26 @@ async def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
 
 
 def _load_config() -> dict:
-    """Load delegation config from the active Hermes config.
+    """Return the per-task snapshot loaded at the async delegate boundary."""
+    return _delegation_config_snapshot.get()
 
-    Prefer the shared persistent loader because it follows the active
-    HERMES_HOME/profile. ``cli.CLI_CONFIG`` is a legacy fallback for entry
-    points that cannot import the shared loader; importing it first can return
-    an old default ``delegation`` block and hide user-set keys such as
-    ``max_concurrent_children``.
 
-    Uses ``load_config_readonly()``: every consumer of this dict is read-only
-    (``.get()`` lookups), and this runs on each ``get_definitions()`` schema
-    rebuild via ``_get_max_concurrent_children``, so skipping the defensive
-    deepcopy matters. Do NOT mutate the returned dict.
-
-    ``HERMES_IGNORE_USER_CONFIG=1`` suppresses user configuration for the
-    runtime, so delegation defaults to an empty configuration in that mode.
-    """
+async def _refresh_config() -> dict:
+    """Load delegation settings without blocking the running event loop."""
     if os.environ.get("HERMES_IGNORE_USER_CONFIG") == "1":
-        return {}
-    try:
-        from hermes_cli.config import load_config_readonly
+        config = {}
+    else:
+        try:
+            from hermes_cli.config import load_config_readonly
 
-        full = load_config_readonly()
-        cfg = full.get("delegation") or {}
-        return cfg if isinstance(cfg, dict) else {}
-    except Exception:
-        return {}
+            full = await load_config_readonly()
+            config = full.get("delegation") or {} if isinstance(full, dict) else {}
+        except Exception:
+            config = {}
+    if not isinstance(config, dict):
+        config = {}
+    _delegation_config_snapshot.set(config)
+    return config
 
 
 # ---------------------------------------------------------------------------

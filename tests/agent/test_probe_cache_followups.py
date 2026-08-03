@@ -7,9 +7,11 @@ Covers:
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+
+pytestmark = pytest.mark.asyncio
 
 
 
@@ -36,42 +38,43 @@ def _mock_show_response(ctx=131072):
 
 def _client_mock(resp):
     client = MagicMock()
-    client.__enter__ = lambda s: client
-    client.__exit__ = MagicMock(return_value=False)
-    client.post.return_value = resp
+    client.__aenter__ = AsyncMock(return_value=client)
+    client.__aexit__ = AsyncMock(return_value=False)
+    client.post = AsyncMock(return_value=resp)
+    client.get = AsyncMock()
     return client
 
 
 class TestOllamaApiShowCaching:
 
-    def test_failure_never_memoized(self):
+    async def test_failure_never_memoized(self):
         """A down server must be re-probed on the next call (startup race)."""
         from agent.model_metadata import _query_ollama_api_show
 
         bad = MagicMock()
         bad.status_code = 404
         client = _client_mock(bad)
-        with patch("httpx.Client", return_value=client):
-            assert _query_ollama_api_show("llama3", "http://127.0.0.1:11434") is None
-            assert _query_ollama_api_show("llama3", "http://127.0.0.1:11434") is None
+        with patch("httpx.AsyncClient", return_value=client):
+            assert await _query_ollama_api_show("llama3", "http://127.0.0.1:11434") is None
+            assert await _query_ollama_api_show("llama3", "http://127.0.0.1:11434") is None
 
         assert client.post.call_count == 2  # None was NOT cached
 
-    def test_ttl_expiry_reprobes(self):
+    async def test_ttl_expiry_reprobes(self):
         """After the 30s TTL lapses, the next call must hit the network again."""
         from agent import model_metadata
         from agent.model_metadata import _query_ollama_api_show
         import time as _time
 
         client = _client_mock(_mock_show_response(131072))
-        with patch("httpx.Client", return_value=client):
-            _query_ollama_api_show("llama3", "http://127.0.0.1:11434")
+        with patch("httpx.AsyncClient", return_value=client):
+            await _query_ollama_api_show("llama3", "http://127.0.0.1:11434")
             # Age the entry past the TTL.
             ((key, (val, _ts)),) = list(model_metadata._LOCAL_CTX_PROBE_CACHE.items())
             model_metadata._LOCAL_CTX_PROBE_CACHE[key] = (
                 val, _time.monotonic() - model_metadata._LOCAL_CTX_PROBE_TTL_SECONDS - 1,
             )
-            _query_ollama_api_show("llama3", "http://127.0.0.1:11434")
+            await _query_ollama_api_show("llama3", "http://127.0.0.1:11434")
 
         assert client.post.call_count == 2  # expired entry re-probed
 
@@ -88,30 +91,30 @@ class TestDetectLocalServerTypeCache:
         miss.status_code = 404
 
         client = MagicMock()
-        client.__enter__ = lambda s: client
-        client.__exit__ = MagicMock(return_value=False)
+        client.__aenter__ = AsyncMock(return_value=client)
+        client.__aexit__ = AsyncMock(return_value=False)
 
         def _get(url, *a, **k):
             if url.endswith("/api/tags"):
                 return ollama_resp
             return miss
 
-        client.get.side_effect = _get
+        client.get = AsyncMock(side_effect=_get)
         return client
 
-    def test_second_call_served_from_cache(self):
+    async def test_second_call_served_from_cache(self):
         from agent.model_metadata import detect_local_server_type
 
         client = self._get_client()
-        with patch("httpx.Client", return_value=client):
-            first = detect_local_server_type("http://127.0.0.1:11434")
+        with patch("httpx.AsyncClient", return_value=client):
+            first = await detect_local_server_type("http://127.0.0.1:11434")
             calls_after_first = client.get.call_count
-            second = detect_local_server_type("http://127.0.0.1:11434")
+            second = await detect_local_server_type("http://127.0.0.1:11434")
 
         assert first == second == "ollama"
         assert client.get.call_count == calls_after_first  # no new HTTP traffic
 
-    def test_ttl_expiry_allows_server_swap_redetection(self):
+    async def test_ttl_expiry_allows_server_swap_redetection(self):
         """Stopping Ollama and starting LM Studio on the same port must be
         re-detected once the TTL lapses — the cache is bounded, not
         process-lifetime."""
@@ -120,8 +123,8 @@ class TestDetectLocalServerTypeCache:
         import time as _time
 
         client = self._get_client()
-        with patch("httpx.Client", return_value=client):
-            assert detect_local_server_type("http://127.0.0.1:11434") == "ollama"
+        with patch("httpx.AsyncClient", return_value=client):
+            assert await detect_local_server_type("http://127.0.0.1:11434") == "ollama"
 
         # Age the entry past the TTL, then swap the backend behind the URL.
         ((key, (val, _ts)),) = list(model_metadata._endpoint_probe_path_cache.items())
@@ -146,8 +149,8 @@ class TestDetectLocalServerTypeCache:
         lmstudio_resp.status_code = 200
         lmstudio_resp.json.return_value = {"data": []}
         swap_client = MagicMock()
-        swap_client.__enter__ = lambda s: swap_client
-        swap_client.__exit__ = MagicMock(return_value=False)
+        swap_client.__aenter__ = AsyncMock(return_value=swap_client)
+        swap_client.__aexit__ = AsyncMock(return_value=False)
 
         def _get(url, *a, **k):
             if url.endswith("/api/v1/models"):
@@ -155,9 +158,9 @@ class TestDetectLocalServerTypeCache:
             miss = MagicMock(); miss.status_code = 404
             return miss
 
-        swap_client.get.side_effect = _get
-        with patch("httpx.Client", return_value=swap_client):
-            assert detect_local_server_type("http://127.0.0.1:11434") == "lm-studio"
+        swap_client.get = AsyncMock(side_effect=_get)
+        with patch("httpx.AsyncClient", return_value=swap_client):
+            assert await detect_local_server_type("http://127.0.0.1:11434") == "lm-studio"
 
 
 class TestLocalhostIPv4SiblingSites:
@@ -165,7 +168,7 @@ class TestLocalhostIPv4SiblingSites:
     not just detect_local_server_type."""
 
 
-    def test_rewrite_is_host_only_not_substring(self):
+    async def test_rewrite_is_host_only_not_substring(self):
         """A URL that merely EMBEDS 'http://localhost' in its path/query must
         not be corrupted — only the URL's own host is rewritten."""
         from agent.model_metadata import _localhost_to_ipv4
@@ -177,19 +180,19 @@ class TestLocalhostIPv4SiblingSites:
             "http://localhost.example.com/v1"
         )
 
-    def test_ollama_api_show_probes_ipv4(self):
+    async def test_ollama_api_show_probes_ipv4(self):
         from agent.model_metadata import _query_ollama_api_show
 
         client = _client_mock(_mock_show_response(131072))
-        with patch("httpx.Client", return_value=client):
-            _query_ollama_api_show("llama3", "http://localhost:11434")
+        with patch("httpx.AsyncClient", return_value=client):
+            await _query_ollama_api_show("llama3", "http://localhost:11434")
 
         assert client.post.call_args[0][0].startswith("http://127.0.0.1:11434")
 
 
 
 class TestContextCacheKeyNormalization:
-    def test_trailing_slash_variants_share_one_entry(self, tmp_path, monkeypatch):
+    async def test_trailing_slash_variants_share_one_entry(self, tmp_path, monkeypatch):
         from agent import model_metadata
 
         monkeypatch.setattr(
@@ -197,17 +200,17 @@ class TestContextCacheKeyNormalization:
             lambda: tmp_path / "context_lengths.yaml",
         )
 
-        model_metadata.save_context_length("m1", "http://host/v1/", 200_000)
+        await model_metadata.save_context_length("m1", "http://host/v1/", 200_000)
         # Both slash variants resolve to the same row.
-        assert model_metadata.get_cached_context_length("m1", "http://host/v1") == 200_000
-        assert model_metadata.get_cached_context_length("m1", "http://host/v1/") == 200_000
+        assert await model_metadata.get_cached_context_length("m1", "http://host/v1") == 200_000
+        assert await model_metadata.get_cached_context_length("m1", "http://host/v1/") == 200_000
 
-        cache = model_metadata._load_context_cache()
+        cache = await model_metadata._load_context_cache()
         assert list(cache.keys()) == ["m1@http://host/v1"]
 
 
 
-    def test_invalidate_clears_both_key_shapes(self, tmp_path, monkeypatch):
+    async def test_invalidate_clears_both_key_shapes(self, tmp_path, monkeypatch):
         import yaml
         from agent import model_metadata
 
@@ -218,9 +221,8 @@ class TestContextCacheKeyNormalization:
             "m1@http://host/v1/": 64_000,
         }}))
 
-        model_metadata._invalidate_cached_context_length("m1", "http://host/v1/")
-        cache = model_metadata._load_context_cache()
+        await model_metadata._invalidate_cached_context_length("m1", "http://host/v1/")
+        cache = await model_metadata._load_context_cache()
         assert "m1@http://host/v1" not in cache
         assert "m1@http://host/v1/" not in cache
-
 

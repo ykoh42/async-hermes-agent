@@ -56,7 +56,7 @@ def _stop_response():
     return SimpleNamespace(choices=[choice], model="test/model", usage=None)
 
 
-def _make_agent(monkeypatch, tmp_path: Path, *, max_attempts):
+async def _make_agent(monkeypatch, tmp_path: Path, *, max_attempts):
     from hermes_cli import config as config_mod
 
     monkeypatch.setattr(
@@ -64,7 +64,9 @@ def _make_agent(monkeypatch, tmp_path: Path, *, max_attempts):
     )
 
     monkeypatch.setattr(
-        config_mod, "load_config_readonly", lambda: _config(max_attempts)
+        config_mod,
+        "load_config_readonly",
+        AsyncMock(return_value=_config(max_attempts)),
 
     )
     db = SessionDB(tmp_path / "state.db")
@@ -91,12 +93,13 @@ def _make_agent(monkeypatch, tmp_path: Path, *, max_attempts):
     agent._disable_streaming = True
     agent.tool_delay = 0
     agent.save_trajectories = False
+    await agent._ensure_provider_runtime()
     return agent, db
 
 
 @pytest.mark.asyncio
 async def test_preflight_runs_fourth_compaction_pass_at_cap_six(monkeypatch, tmp_path):
-    agent, db = _make_agent(monkeypatch, tmp_path, max_attempts=6)
+    agent, db = await _make_agent(monkeypatch, tmp_path, max_attempts=6)
     # Config-driven attach seam (agent_init) resolved the raised cap.
     assert agent.max_compression_attempts == 6
 
@@ -148,4 +151,3 @@ async def test_preflight_runs_fourth_compaction_pass_at_cap_six(monkeypatch, tmp
     assert len(compress_calls) == 6
     await agent.close()
     await db.close()
-

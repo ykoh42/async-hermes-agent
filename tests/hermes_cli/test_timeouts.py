@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import textwrap
 
+import pytest
+
 from hermes_cli.timeouts import (
     get_provider_request_timeout,
     get_provider_stale_timeout,
@@ -39,7 +41,8 @@ def test_anthropic_adapter_honors_timeout_kwarg():
     assert c_custom.timeout.connect == 10.0
 
 
-def test_resolved_api_call_timeout_priority(monkeypatch, tmp_path):
+@pytest.mark.asyncio
+async def test_resolved_api_call_timeout_priority(monkeypatch, tmp_path):
     """AIAgent._resolved_api_call_timeout() honors config > env > default priority."""
     # Isolate HERMES_HOME
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
@@ -67,6 +70,7 @@ def test_resolved_api_call_timeout_priority(monkeypatch, tmp_path):
         skip_memory=True,
         platform="cli",
     )
+    await agent._ensure_provider_runtime()
     # Per-model override wins
     assert agent._resolved_api_call_timeout() == 42.0
 
@@ -83,20 +87,12 @@ def test_resolved_api_call_timeout_priority(monkeypatch, tmp_path):
         skip_memory=True,
         platform="cli",
     )
+    await provider_agent._ensure_provider_runtime()
     assert provider_agent._resolved_api_call_timeout() == 77.0
 
     # Case B: no config → env wins
     _write_config(tmp_path, "")
-    # Clear the cached config load
-    import importlib
-    from hermes_cli import config as cfg_mod
-    importlib.reload(cfg_mod)
-    from hermes_cli import timeouts as to_mod
-    importlib.reload(to_mod)
-    import run_agent as ra_mod
-    importlib.reload(ra_mod)
-
-    agent2 = ra_mod.AIAgent(
+    agent2 = AIAgent(
         model="some/model",
         provider="openrouter",
         api_key="sk-dummy",
@@ -106,11 +102,11 @@ def test_resolved_api_call_timeout_priority(monkeypatch, tmp_path):
         skip_memory=True,
         platform="cli",
     )
+    await agent2._ensure_provider_runtime()
     assert agent2._resolved_api_call_timeout() == 999.0
 
     # Case C: no config, no env → 1800.0 default
     monkeypatch.delenv("HERMES_API_TIMEOUT", raising=False)
     assert agent2._resolved_api_call_timeout() == 1800.0
-
 
 

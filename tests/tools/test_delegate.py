@@ -24,6 +24,7 @@ from tools.delegate_tool import (
     DelegateEvent,
     _get_max_concurrent_children,
     _load_config,
+    _refresh_config,
     delegate_task,
     _build_child_agent,
     _build_child_progress_callback,
@@ -1099,7 +1100,7 @@ class TestDelegateEventEnum(unittest.IsolatedAsyncioTestCase):
 class TestConcurrencyDefaults(unittest.IsolatedAsyncioTestCase):
     """Tests for the concurrency default and no hard ceiling."""
 
-    def test_load_config_prefers_active_persistent_config_over_cli_defaults(self):
+    async def test_load_config_prefers_active_persistent_config_over_cli_defaults(self):
         stale_cli = types.ModuleType("cli")
         stale_cli.CLI_CONFIG = {
             "delegation": {
@@ -1120,8 +1121,10 @@ class TestConcurrencyDefaults(unittest.IsolatedAsyncioTestCase):
 
         with patch.dict("sys.modules", {"cli": stale_cli}):
             with patch(
-                "hermes_cli.config.load_config_readonly", return_value=active_config
+                "hermes_cli.config.load_config_readonly",
+                new=AsyncMock(return_value=active_config),
             ):
+                await _refresh_config()
                 self.assertEqual(_load_config()["max_concurrent_children"], 50)
                 self.assertEqual(_get_max_concurrent_children(), 50)
 

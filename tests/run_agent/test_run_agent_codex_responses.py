@@ -55,6 +55,8 @@ def _build_agent(monkeypatch):
     agent._cleanup_task_resources = AsyncMock()
     agent._persist_session = AsyncMock()
     agent._save_trajectory = AsyncMock()
+    agent._runtime_config_loaded = True
+    agent._runtime_config_snapshot = {}
     return agent
 
 
@@ -1687,7 +1689,6 @@ async def test_duplicate_detection_uses_commentary_when_hidden_reasoning_changes
     reasoning_items = interim_msgs[0].get("codex_reasoning_items")
     if reasoning_items:
         assert reasoning_items[0].get("id") == "rs_second"
-
 
 
 

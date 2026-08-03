@@ -12,7 +12,6 @@ from contextvars import ContextVar, Token
 from pathlib import Path
 
 
-_profile_fallback_warned: bool = False
 _UNSET = object()
 _HERMES_HOME_OVERRIDE: ContextVar[str | object] = ContextVar(
     "_HERMES_HOME_OVERRIDE", default=_UNSET
@@ -66,43 +65,6 @@ def _hermes_home_from_env() -> Path:
     return _get_platform_default_hermes_home()
 
 
-def _warn_profile_fallback_once() -> None:
-    """Warn once when falling back to the default home while a profile is active.
-
-    Guard: if a non-default profile is sticky-active but ``HERMES_HOME`` is
-    unset, the fallback to the default profile is almost certainly wrong.
-    """
-    global _profile_fallback_warned
-    if _profile_fallback_warned:
-        return
-    try:
-        fallback_home = _get_platform_default_hermes_home()
-        active_path = fallback_home / "active_profile"
-        active = active_path.read_text(encoding="utf-8").strip() if active_path.exists() else ""
-    except (UnicodeDecodeError, OSError):
-        active = ""
-    if active and active != "default":
-        _profile_fallback_warned = True
-        # Write directly to stderr.  We intentionally do NOT route this
-        # through ``logging`` because (a) this function is called at
-        # module-import time from 30+ sites, often before logging is
-        # configured, and (b) root-logger propagation would double-emit
-        # on consoles where a StreamHandler is already attached.
-        msg = (
-            f"[HERMES_HOME fallback] HERMES_HOME is unset but active "
-            f"profile is {active!r}. Falling back to {fallback_home}, which "
-            f"is the DEFAULT profile — not {active!r}. Any data this "
-            f"process writes will land in the wrong profile. The "
-            f"subprocess spawner should pass HERMES_HOME explicitly "
-            f"(see issue #18594)."
-        )
-        try:
-            sys.stderr.write(msg + "\n")
-            sys.stderr.flush()
-        except Exception:
-            pass
-
-
 def get_hermes_home() -> Path:
     """Return the Hermes home directory (default: platform-native path).
 
@@ -111,22 +73,13 @@ def get_hermes_home() -> Path:
     platform-native default.  This is the single source of truth — all other
     copies should import this.
 
-    When ``HERMES_HOME`` is unset but an ``active_profile`` file indicates
-    a non-default profile is active, logs a loud one-shot warning to
-    ``errors.log`` so cross-profile data corruption is diagnosable instead
-    of silent.  Behavior is unchanged otherwise — we still return
-    the platform-native default — because raising here would brick 30+ module-level
-    callers that import this at load time.  Subprocess spawners are
-    expected to propagate ``HERMES_HOME`` explicitly (see the systemd
-    template in ``hermes_cli/gateway.py`` and the kanban dispatcher in
-    ``hermes_cli/kanban_db.py``).  See https://github.com/NousResearch/hermes-agent/issues/18594.
+    Resolution is environment-only and never touches the filesystem, so this
+    helper remains safe at import time. A service selecting a named profile
+    must pass ``HERMES_HOME`` explicitly.
     """
     override = get_hermes_home_override()
     if override:
         return Path(override)
-
-    if not os.environ.get("HERMES_HOME", "").strip():
-        _warn_profile_fallback_once()
 
     return _hermes_home_from_env()
 

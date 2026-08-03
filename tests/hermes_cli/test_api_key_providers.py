@@ -1,6 +1,5 @@
 """Tests for API-key provider support (z.ai/GLM, Kimi, MiniMax, AI Gateway)."""
 
-import json
 import os
 
 import pytest
@@ -11,9 +10,6 @@ from hermes_cli.auth import (
     resolve_provider,
     get_api_key_provider_status,
     resolve_api_key_provider_credentials,
-    get_external_process_provider_status,
-    resolve_external_process_provider_credentials,
-    get_auth_status,
     AuthError,
     KIMI_CODE_BASE_URL,
     STEPFUN_STEP_PLAN_INTL_BASE_URL,
@@ -157,145 +153,182 @@ PROVIDER_ENV_VARS = tuple(
 def _clear_provider_env(monkeypatch):
     for key in PROVIDER_ENV_VARS:
         monkeypatch.delenv(key, raising=False)
-    monkeypatch.setattr("hermes_cli.auth._load_auth_store", lambda: {})
+    monkeypatch.setattr("hermes_cli.auth._load_auth_store", AsyncMock(return_value={}))
 
 
 class TestResolveProvider:
     """Test resolve_provider() with new providers."""
 
-    def test_explicit_zai(self):
-        assert resolve_provider("zai") == "zai"
+    @pytest.mark.asyncio
+    async def test_explicit_zai(self):
+        assert await resolve_provider("zai") == "zai"
 
 
 
 
 
-    def test_explicit_ai_gateway(self):
-        assert resolve_provider("ai-gateway") == "ai-gateway"
+    @pytest.mark.asyncio
+    async def test_explicit_ai_gateway(self):
+        assert await resolve_provider("ai-gateway") == "ai-gateway"
 
-    def test_explicit_gmi(self):
-        assert resolve_provider("gmi") == "gmi"
+    @pytest.mark.asyncio
+    async def test_explicit_gmi(self):
+        assert await resolve_provider("gmi") == "gmi"
 
 
 
-    def test_alias_zhipu(self):
-        assert resolve_provider("zhipu") == "zai"
+    @pytest.mark.asyncio
+    async def test_alias_zhipu(self):
+        assert await resolve_provider("zhipu") == "zai"
 
-    def test_alias_kimi(self):
-        assert resolve_provider("kimi") == "kimi-coding"
+    @pytest.mark.asyncio
+    async def test_alias_kimi(self):
+        assert await resolve_provider("kimi") == "kimi-coding"
 
-    def test_alias_moonshot(self):
-        assert resolve_provider("moonshot") == "kimi-coding"
+    @pytest.mark.asyncio
+    async def test_alias_moonshot(self):
+        assert await resolve_provider("moonshot") == "kimi-coding"
 
-    def test_alias_step(self):
-        assert resolve_provider("step") == "stepfun"
+    @pytest.mark.asyncio
+    async def test_alias_step(self):
+        assert await resolve_provider("step") == "stepfun"
 
-    def test_alias_minimax_underscore(self):
-        assert resolve_provider("minimax_cn") == "minimax-cn"
+    @pytest.mark.asyncio
+    async def test_alias_minimax_underscore(self):
+        assert await resolve_provider("minimax_cn") == "minimax-cn"
 
-    def test_alias_aigateway(self):
-        assert resolve_provider("aigateway") == "ai-gateway"
+    @pytest.mark.asyncio
+    async def test_alias_aigateway(self):
+        assert await resolve_provider("aigateway") == "ai-gateway"
 
-    def test_alias_vercel(self):
-        assert resolve_provider("vercel") == "ai-gateway"
+    @pytest.mark.asyncio
+    async def test_alias_vercel(self):
+        assert await resolve_provider("vercel") == "ai-gateway"
 
-    def test_alias_gmi_cloud(self):
-        assert resolve_provider("gmi-cloud") == "gmi"
+    @pytest.mark.asyncio
+    async def test_alias_gmi_cloud(self):
+        assert await resolve_provider("gmi-cloud") == "gmi"
 
-    def test_explicit_kilocode(self):
-        assert resolve_provider("kilocode") == "kilocode"
+    @pytest.mark.asyncio
+    async def test_explicit_kilocode(self):
+        assert await resolve_provider("kilocode") == "kilocode"
 
-    def test_alias_kilo(self):
-        assert resolve_provider("kilo") == "kilocode"
+    @pytest.mark.asyncio
+    async def test_alias_kilo(self):
+        assert await resolve_provider("kilo") == "kilocode"
 
-    def test_alias_kilo_code(self):
-        assert resolve_provider("kilo-code") == "kilocode"
+    @pytest.mark.asyncio
+    async def test_alias_kilo_code(self):
+        assert await resolve_provider("kilo-code") == "kilocode"
 
-    def test_alias_kilo_gateway(self):
-        assert resolve_provider("kilo-gateway") == "kilocode"
+    @pytest.mark.asyncio
+    async def test_alias_kilo_gateway(self):
+        assert await resolve_provider("kilo-gateway") == "kilocode"
 
-    def test_alias_case_insensitive(self):
-        assert resolve_provider("GLM") == "zai"
-        assert resolve_provider("Z-AI") == "zai"
-        assert resolve_provider("Kimi") == "kimi-coding"
+    @pytest.mark.asyncio
+    async def test_alias_case_insensitive(self):
+        assert await resolve_provider("GLM") == "zai"
+        assert await resolve_provider("Z-AI") == "zai"
+        assert await resolve_provider("Kimi") == "kimi-coding"
 
-    def test_alias_github_copilot(self):
-        assert resolve_provider("github-copilot") == "copilot"
+    @pytest.mark.asyncio
+    async def test_alias_github_copilot(self):
+        assert await resolve_provider("github-copilot") == "copilot"
 
-    def test_alias_github_models(self):
-        assert resolve_provider("github-models") == "copilot"
+    @pytest.mark.asyncio
+    async def test_alias_github_models(self):
+        assert await resolve_provider("github-models") == "copilot"
 
-    def test_alias_github_copilot_acp(self):
-        assert resolve_provider("github-copilot-acp") == "copilot-acp"
-        assert resolve_provider("copilot-acp-agent") == "copilot-acp"
+    @pytest.mark.asyncio
+    async def test_alias_github_copilot_acp(self):
+        assert await resolve_provider("github-copilot-acp") == "copilot-acp"
+        assert await resolve_provider("copilot-acp-agent") == "copilot-acp"
 
-    def test_explicit_huggingface(self):
-        assert resolve_provider("huggingface") == "huggingface"
+    @pytest.mark.asyncio
+    async def test_explicit_huggingface(self):
+        assert await resolve_provider("huggingface") == "huggingface"
 
-    def test_alias_hf(self):
-        assert resolve_provider("hf") == "huggingface"
+    @pytest.mark.asyncio
+    async def test_alias_hf(self):
+        assert await resolve_provider("hf") == "huggingface"
 
-    def test_alias_hugging_face(self):
-        assert resolve_provider("hugging-face") == "huggingface"
+    @pytest.mark.asyncio
+    async def test_alias_hugging_face(self):
+        assert await resolve_provider("hugging-face") == "huggingface"
 
-    def test_alias_huggingface_hub(self):
-        assert resolve_provider("huggingface-hub") == "huggingface"
+    @pytest.mark.asyncio
+    async def test_alias_huggingface_hub(self):
+        assert await resolve_provider("huggingface-hub") == "huggingface"
 
-    def test_unknown_provider_raises(self):
+    @pytest.mark.asyncio
+    async def test_unknown_provider_raises(self):
         with pytest.raises(AuthError):
-            resolve_provider("nonexistent-provider-xyz")
+            await resolve_provider("nonexistent-provider-xyz")
 
-    def test_auto_detects_glm_key(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_auto_detects_glm_key(self, monkeypatch):
         monkeypatch.setenv("GLM_API_KEY", "test-glm-key")
-        assert resolve_provider("auto") == "zai"
+        assert await resolve_provider("auto") == "zai"
 
-    def test_auto_detects_zai_key(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_auto_detects_zai_key(self, monkeypatch):
         monkeypatch.setenv("ZAI_API_KEY", "test-zai-key")
-        assert resolve_provider("auto") == "zai"
+        assert await resolve_provider("auto") == "zai"
 
-    def test_auto_detects_z_ai_key(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_auto_detects_z_ai_key(self, monkeypatch):
         monkeypatch.setenv("Z_AI_API_KEY", "test-z-ai-key")
-        assert resolve_provider("auto") == "zai"
+        assert await resolve_provider("auto") == "zai"
 
-    def test_auto_detects_kimi_key(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_auto_detects_kimi_key(self, monkeypatch):
         monkeypatch.setenv("KIMI_API_KEY", "test-kimi-key")
-        assert resolve_provider("auto") == "kimi-coding"
+        assert await resolve_provider("auto") == "kimi-coding"
 
-    def test_auto_detects_stepfun_key(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_auto_detects_stepfun_key(self, monkeypatch):
         monkeypatch.setenv("STEPFUN_API_KEY", "test-stepfun-key")
-        assert resolve_provider("auto") == "stepfun"
+        assert await resolve_provider("auto") == "stepfun"
 
-    def test_auto_detects_minimax_key(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_auto_detects_minimax_key(self, monkeypatch):
         monkeypatch.setenv("MINIMAX_API_KEY", "test-mm-key")
-        assert resolve_provider("auto") == "minimax"
+        assert await resolve_provider("auto") == "minimax"
 
-    def test_auto_detects_minimax_cn_key(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_auto_detects_minimax_cn_key(self, monkeypatch):
         monkeypatch.setenv("MINIMAX_CN_API_KEY", "test-mm-cn-key")
-        assert resolve_provider("auto") == "minimax-cn"
+        assert await resolve_provider("auto") == "minimax-cn"
 
-    def test_auto_detects_ai_gateway_key(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_auto_detects_ai_gateway_key(self, monkeypatch):
         monkeypatch.setenv("AI_GATEWAY_API_KEY", "test-gw-key")
-        assert resolve_provider("auto") == "ai-gateway"
+        assert await resolve_provider("auto") == "ai-gateway"
 
-    def test_auto_detects_gmi_key(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_auto_detects_gmi_key(self, monkeypatch):
         monkeypatch.setenv("GMI_API_KEY", "test-gmi-key")
-        assert resolve_provider("auto") == "gmi"
+        assert await resolve_provider("auto") == "gmi"
 
-    def test_auto_detects_kilocode_key(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_auto_detects_kilocode_key(self, monkeypatch):
         monkeypatch.setenv("KILOCODE_API_KEY", "test-kilo-key")
-        assert resolve_provider("auto") == "kilocode"
+        assert await resolve_provider("auto") == "kilocode"
 
-    def test_auto_detects_hf_token(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_auto_detects_hf_token(self, monkeypatch):
         monkeypatch.setenv("HF_TOKEN", "hf_test_token")
-        assert resolve_provider("auto") == "huggingface"
+        assert await resolve_provider("auto") == "huggingface"
 
-    def test_openrouter_takes_priority_over_glm(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_openrouter_takes_priority_over_glm(self, monkeypatch):
         """OpenRouter API key should win over GLM in auto-detection."""
         monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
         monkeypatch.setenv("GLM_API_KEY", "glm-key")
-        assert resolve_provider("auto") == "openrouter"
+        assert await resolve_provider("auto") == "openrouter"
 
-    def test_auto_does_not_select_copilot_from_github_token(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_auto_does_not_select_copilot_from_github_token(self, monkeypatch):
         # AWS Bedrock auto-detection (via boto3's credential chain) runs at
         # the tail of resolve_provider("auto") and will silently pick up
         # ~/.aws/credentials on developer machines that aren't blanked by
@@ -308,7 +341,7 @@ class TestResolveProvider:
         )
         monkeypatch.setenv("GITHUB_TOKEN", "gh-test-token")
         with pytest.raises(AuthError, match="No inference provider configured"):
-            resolve_provider("auto")
+            await resolve_provider("auto")
 
 
 # =============================================================================
@@ -317,14 +350,16 @@ class TestResolveProvider:
 
 class TestApiKeyProviderStatus:
 
-    def test_unconfigured_provider(self):
-        status = get_api_key_provider_status("zai")
+    @pytest.mark.asyncio
+    async def test_unconfigured_provider(self):
+        status = await get_api_key_provider_status("zai")
         assert status["configured"] is False
         assert status["logged_in"] is False
 
-    def test_configured_provider(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_configured_provider(self, monkeypatch):
         monkeypatch.setenv("GLM_API_KEY", "test-key-123")
-        status = get_api_key_provider_status("zai")
+        status = await get_api_key_provider_status("zai")
         assert status["configured"] is True
         assert status["logged_in"] is True
         assert status["key_source"] == "GLM_API_KEY"
@@ -375,9 +410,10 @@ class TestResolveApiKeyProviderCredentials:
 
 
 
-    def test_resolve_stepfun_with_key(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_resolve_stepfun_with_key(self, monkeypatch):
         monkeypatch.setenv("STEPFUN_API_KEY", "stepfun-secret-key")
-        creds = resolve_api_key_provider_credentials("stepfun")
+        creds = await resolve_api_key_provider_credentials("stepfun")
         assert creds["provider"] == "stepfun"
         assert creds["api_key"] == "stepfun-secret-key"
         assert creds["base_url"] == STEPFUN_STEP_PLAN_INTL_BASE_URL
@@ -385,16 +421,18 @@ class TestResolveApiKeyProviderCredentials:
 
 
 
-    def test_resolve_ai_gateway_with_key(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_resolve_ai_gateway_with_key(self, monkeypatch):
         monkeypatch.setenv("AI_GATEWAY_API_KEY", "gw-secret-key")
-        creds = resolve_api_key_provider_credentials("ai-gateway")
+        creds = await resolve_api_key_provider_credentials("ai-gateway")
         assert creds["provider"] == "ai-gateway"
         assert creds["api_key"] == "gw-secret-key"
         assert creds["base_url"] == "https://ai-gateway.vercel.sh/v1"
 
-    def test_resolve_kilocode_with_key(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_resolve_kilocode_with_key(self, monkeypatch):
         monkeypatch.setenv("KILOCODE_API_KEY", "kilo-secret-key")
-        creds = resolve_api_key_provider_credentials("kilocode")
+        creds = await resolve_api_key_provider_credentials("kilocode")
         assert creds["provider"] == "kilocode"
         assert creds["api_key"] == "kilo-secret-key"
         assert creds["base_url"] == "https://api.kilo.ai/api/gateway"
@@ -490,16 +528,6 @@ class TestRuntimeProviderResolution:
             "hermes_cli.runtime_provider._get_model_config",
             lambda *args, **kwargs: {"provider": "copilot", "default": "gpt-5.4"},
         )
-        monkeypatch.setattr(
-            "hermes_cli.models.fetch_github_model_catalog",
-            lambda api_key=None, timeout=5.0: [
-                {
-                    "id": "gpt-5.4",
-                    "supported_endpoints": ["/responses"],
-                    "capabilities": {"type": "chat"},
-                }
-            ],
-        )
         from hermes_cli.runtime_provider import resolve_runtime_provider
 
         result = await resolve_runtime_provider(requested="copilot")
@@ -545,10 +573,11 @@ class TestKimiCodeStatusAutoDetect:
     """Test that get_api_key_provider_status auto-detects sk-kimi- keys."""
 
 
-    def test_env_override_wins(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_env_override_wins(self, monkeypatch):
         monkeypatch.setenv("KIMI_API_KEY", "sk-kimi-test-key")
         monkeypatch.setenv("KIMI_BASE_URL", "https://override.example/v1")
-        status = get_api_key_provider_status("kimi-coding")
+        status = await get_api_key_provider_status("kimi-coding")
         assert status["base_url"] == "https://override.example/v1"
 
 
@@ -556,18 +585,23 @@ class TestKimiCodeCredentialAutoDetect:
     """Test that resolve_api_key_provider_credentials auto-detects sk-kimi- keys."""
 
 
-    def test_legacy_key_gets_moonshot_url(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_legacy_key_gets_moonshot_url(self, monkeypatch):
         monkeypatch.setenv("KIMI_API_KEY", "sk-legacy-secret-key")
-        creds = resolve_api_key_provider_credentials("kimi-coding")
+        creds = await resolve_api_key_provider_credentials("kimi-coding")
         assert creds["api_key"] == "sk-legacy-secret-key"
         assert creds["base_url"] == MOONSHOT_DEFAULT_URL
 
 
-    def test_non_kimi_providers_unaffected(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_non_kimi_providers_unaffected(self, monkeypatch):
         """Ensure the auto-detect logic doesn't leak to other providers."""
         monkeypatch.setenv("GLM_API_KEY", "sk-kim...isnt")
-        monkeypatch.setattr("hermes_cli.auth.detect_zai_endpoint", lambda *a, **kw: None)
-        creds = resolve_api_key_provider_credentials("zai")
+        async def _no_endpoint(*args, **kwargs):
+            return None
+
+        monkeypatch.setattr("hermes_cli.auth.detect_zai_endpoint", _no_endpoint)
+        creds = await resolve_api_key_provider_credentials("zai")
         assert creds["base_url"] == "https://api.z.ai/api/paas/v4"
 
 
@@ -575,7 +609,8 @@ class TestZaiEndpointAutoDetect:
     """Test that resolve_api_key_provider_credentials auto-detects Z.AI endpoints."""
 
 
-    def test_env_override_skips_probe(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_env_override_skips_probe(self, monkeypatch):
         """GLM_BASE_URL should always win without probing."""
         monkeypatch.setenv("GLM_API_KEY", "glm-key")
         monkeypatch.setenv("GLM_BASE_URL", "https://custom.example/v4")
@@ -587,14 +622,18 @@ class TestZaiEndpointAutoDetect:
             return None
 
         monkeypatch.setattr("hermes_cli.auth.detect_zai_endpoint", _never_called)
-        creds = resolve_api_key_provider_credentials("zai")
+        creds = await resolve_api_key_provider_credentials("zai")
         assert creds["base_url"] == "https://custom.example/v4"
         assert not probe_called
 
-    def test_no_key_skips_probe(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_no_key_skips_probe(self, monkeypatch):
         """Without an API key, no probe should occur."""
-        monkeypatch.setattr("hermes_cli.auth.detect_zai_endpoint", lambda *a, **kw: None)
-        creds = resolve_api_key_provider_credentials("zai")
+        async def _no_endpoint(*args, **kwargs):
+            return None
+
+        monkeypatch.setattr("hermes_cli.auth.detect_zai_endpoint", _no_endpoint)
+        creds = await resolve_api_key_provider_credentials("zai")
         assert creds["api_key"] == ""
 
 
@@ -636,58 +675,6 @@ class TestNovitaProvider:
 
 
 
-
-
-    def test_novita_pricing_cache(self, monkeypatch):
-        """_fetch_novita_pricing should cache results in _pricing_cache."""
-        from hermes_cli import models as models_mod
-        monkeypatch.setenv("NOVITA_API_KEY", "sk-test-key")
-        monkeypatch.setenv("NOVITA_BASE_URL", "https://api.novita.ai/openai/v1")
-        models_mod._pricing_cache.pop("https://api.novita.ai/openai/v1", None)
-
-        call_count = {"n": 0}
-        fake_payload = {
-            "data": [
-                {
-                    "id": "x/y",
-                    "input_token_price_per_m": 1000,
-                    "output_token_price_per_m": 2000,
-                }
-            ]
-        }
-
-        class _FakeResp:
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *args):
-                return False
-
-            def read(self):
-                import json as _json
-                return _json.dumps(fake_payload).encode()
-
-        def fake_urlopen(req, timeout=None):
-            call_count["n"] += 1
-            return _FakeResp()
-
-        monkeypatch.setattr(
-            models_mod, "_urlopen_model_catalog_request", fake_urlopen
-        )
-
-        # First call hits the network.
-        first = models_mod._fetch_novita_pricing()
-        assert "x/y" in first
-        assert call_count["n"] == 1
-
-        # Second call returns cached result without re-hitting the network.
-        second = models_mod._fetch_novita_pricing()
-        assert second == first
-        assert call_count["n"] == 1
-
-        # force_refresh bypasses the cache.
-        models_mod._fetch_novita_pricing(force_refresh=True)
-        assert call_count["n"] == 2
 
 
 # =============================================================================
@@ -733,204 +720,11 @@ class TestMinimaxOAuthProvider:
 # baseline provider wiring.
 
 
-@pytest.fixture
-def _deepinfra_cache_isolation(monkeypatch):
-    """Reset the module-level catalog cache around each DeepInfra test.
-
-    The cache is keyed by base URL and would otherwise leak fixture data
-    from one test into the next in the same session. The negative cache is
-    reset too, so a test that simulates an unreachable catalog can't suppress
-    a later test's fetch within the failure TTL.
-    """
-    import hermes_cli.models as _models_mod
-    monkeypatch.setattr(_models_mod, "_deepinfra_catalog_cache", {})
-    monkeypatch.setattr(_models_mod, "_deepinfra_catalog_neg_cache", {})
-    yield
-
-
-@pytest.mark.usefixtures("_deepinfra_cache_isolation")
-class TestFetchDeepInfraModels:
-    """Tests for _fetch_deepinfra_models() live model discovery."""
-
-    def test_returns_filtered_models_on_success(self, monkeypatch):
-        monkeypatch.setenv("DEEPINFRA_API_KEY", "test-key")
-
-        class _Resp:
-            def __enter__(self):
-                return self
-            def __exit__(self, *a):
-                return False
-            def read(self):
-                return json.dumps({"data": [
-                    {"id": "meta-llama/Llama-3-70B-Instruct", "metadata": {}},
-                    {"id": "mistralai/Mistral-Nemo-Instruct-2407", "metadata": {}},
-                    {"id": "BAAI/bge-large-en-v1.5-embed", "metadata": {}},
-                    {"id": "stabilityai/stable-diffusion-xl-base-1.0", "metadata": {}},
-                ]}).encode()
-
-        import hermes_cli.models as models
-        monkeypatch.setattr(
-            models, "_urlopen_model_catalog_request", lambda *a, **kw: _Resp()
-        )
-        from hermes_cli.models import _fetch_deepinfra_models
-        result = _fetch_deepinfra_models()
-
-        assert result is not None
-        assert "meta-llama/Llama-3-70B-Instruct" in result
-        assert "mistralai/Mistral-Nemo-Instruct-2407" in result
-        # Embedding and image models should be excluded
-        assert not any("embed" in m.lower() for m in result)
-        assert not any("stable-diffusion" in m.lower() for m in result)
-
-
-
-    def test_catalog_uses_credential_safe_opener(self, monkeypatch):
-        import hermes_cli.models as models
-
-        seen = {}
-
-        class _Resp:
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *args):
-                return False
-
-            def read(self):
-                return json.dumps({"data": []}).encode()
-
-        def _safe_open(request, *, timeout):
-            seen["authorization"] = request.get_header("Authorization")
-            seen["timeout"] = timeout
-            return _Resp()
-
-        monkeypatch.setenv("DEEPINFRA_API_KEY", "test-key")
-        monkeypatch.setattr(models, "_urlopen_model_catalog_request", _safe_open)
-
-        assert models._fetch_deepinfra_catalog(force_refresh=True) == []
-        assert seen == {"authorization": "Bearer test-key", "timeout": 5.0}
-
-
-
-
-def _make_urlopen_returning(payload):
-    """Helper: build a urlopen() shim returning a fixed JSON payload."""
-    import json as _json
-
-    class _Resp:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *a):
-            return False
-
-        def read(self):
-            return _json.dumps(payload).encode()
-
-    return lambda *a, **kw: _Resp()
-
-
-@pytest.mark.usefixtures("_deepinfra_cache_isolation")
-class TestDeepInfraTagFiltering:
-    """Contract tests for the shared _fetch_deepinfra_models_by_tag helper."""
-
-    def test_filters_by_surface_tag_and_handles_rollout_states(self, monkeypatch):
-        # One payload, several invariants in one test:
-        #  - explicit surface tags are honored (chat / image-gen / tts / stt / embed)
-        #  - capability-tags-only items fall through to the regex fallback
-        #    (used during the surface-tag rollout)
-        #  - the regex excludes id-name matches (whisper, embed, …)
-        #  - a surface tag takes priority over the regex
-        #  - ``metadata: None`` stubs are dropped
-        payload = {"data": [
-            {"id": "vendor/chat-tagged", "metadata": {"tags": ["chat"]}},
-            {"id": "vendor/image-tagged", "metadata": {"tags": ["image-gen"]}},
-            {"id": "vendor/tts-tagged", "metadata": {"tags": ["tts"]}},
-            {"id": "vendor/stt-tagged", "metadata": {"tags": ["stt"]}},
-            {"id": "vendor/embed-tagged", "metadata": {"tags": ["embed"]}},
-            # capability-only — rolls through regex fallback
-            {"id": "Qwen/Qwen3-30B", "metadata": {"tags": ["reasoning", "vision"]}},
-            {"id": "openai/whisper-large", "metadata": {"tags": ["reasoning"]}},
-            # surface tag overrides legacy regex exclusion
-            {"id": "some-org/whisper-finetune-chat", "metadata": {"tags": ["chat"]}},
-            # null metadata — stub model, must be skipped
-            {"id": "stub-model", "metadata": None},
-        ]}
-        from hermes_cli.models import _fetch_deepinfra_models_by_tag
-        import hermes_cli.models as _m
-
-        for surface in ("chat", "image-gen", "tts", "stt", "embed"):
-            monkeypatch.setattr(
-                _m,
-                "_urlopen_model_catalog_request",
-                _make_urlopen_returning(payload),
-            )
-            # Reset cache between iterations so each surface re-parses the payload.
-            _m._deepinfra_catalog_cache.clear()
-            got = _fetch_deepinfra_models_by_tag(surface)
-            assert got is not None
-            ids = {item["id"] for item in got}
-            assert "stub-model" not in ids  # null-metadata always skipped
-            if surface == "chat":
-                # explicit chat + capability-only (Qwen) + surface-tag-over-regex
-                assert "vendor/chat-tagged" in ids
-                assert "Qwen/Qwen3-30B" in ids
-                assert "some-org/whisper-finetune-chat" in ids
-                # regex still excludes capability-only items that match the excluder
-                assert "openai/whisper-large" not in ids
-            else:
-                # non-chat surfaces only see explicit surface-tagged items
-                for item in got:
-                    assert surface in item["metadata"]["tags"]
-
-
-@pytest.mark.usefixtures("_deepinfra_cache_isolation")
-class TestDeepInfraPricingFetcher:
-    """_fetch_deepinfra_pricing reshapes $/MTok values into per-token strings
-    and is wired into the get_pricing_for_provider dispatch."""
-
-    def test_pricing_shape_and_dispatch(self, monkeypatch):
-        payload = {"data": [
-            {
-                "id": "vendor/model-a",
-                "metadata": {
-                    "tags": ["chat", "prompt_cache"],
-                    "pricing": {
-                        "input_tokens": 0.1,
-                        "output_tokens": 0.3,
-                        "cache_read_tokens": 0.02,
-                    },
-                },
-            },
-            {
-                "id": "vendor/model-b",
-                "metadata": {"tags": ["chat"], "pricing": {"input_tokens": 1.0, "output_tokens": 5.0}},
-            },
-            # non-chat — must not appear
-            {"id": "vendor/model-image", "metadata": {"tags": ["image-gen"], "pricing": {"per_image_unit": 0.05}}},
-        ]}
-        import hermes_cli.models as models
-        monkeypatch.setattr(
-            models,
-            "_urlopen_model_catalog_request",
-            _make_urlopen_returning(payload),
-        )
-        from hermes_cli.models import get_pricing_for_provider
-
-        # get_pricing_for_provider → _fetch_deepinfra_pricing dispatch path
-        result = get_pricing_for_provider("deepinfra")
-        assert set(result) == {"vendor/model-a", "vendor/model-b"}
-        # Picker-shape: per-token strings under prompt/completion (+ cache_read when source had it)
-        assert float(result["vendor/model-a"]["prompt"]) == pytest.approx(0.1 / 1_000_000)
-        assert float(result["vendor/model-a"]["completion"]) == pytest.approx(0.3 / 1_000_000)
-        assert "input_cache_read" in result["vendor/model-a"]
-        assert "input_cache_read" not in result["vendor/model-b"]
-
-
 class TestDeepInfraProviderProfile:
     """plugins/model-providers/deepinfra registration + aux resolution."""
 
-    def test_profile_registered_with_alias_and_aux(self):
+    @pytest.mark.asyncio
+    async def test_profile_registered_with_alias_and_aux(self):
         from providers import get_provider_profile
         from agent.auxiliary_client import _get_aux_model_for_provider
         from hermes_cli.auth import PROVIDER_REGISTRY, resolve_provider
@@ -943,7 +737,7 @@ class TestDeepInfraProviderProfile:
         assert profile.auth_type == "api_key"
         # Alias resolves to the same profile.
         assert get_provider_profile("deep-infra") is profile
-        assert resolve_provider("deep-infra") == "deepinfra"
+        assert await resolve_provider("deep-infra") == "deepinfra"
         assert PROVIDER_REGISTRY["deepinfra"].inference_base_url == profile.base_url
         assert any(entry.slug == "deepinfra" for entry in CANONICAL_PROVIDERS)
         assert OPTIONAL_ENV_VARS["DEEPINFRA_API_KEY"]["password"] is True

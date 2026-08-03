@@ -36,7 +36,9 @@ class TestApprovalModeParsing:
 
 
     def test_config_bool_false_maps_to_off(self):
-        with mock_patch("hermes_cli.config.load_config", return_value={"approvals": {"mode": False}}):
+        with mock_patch.object(
+            approval_module, "_approval_config_snapshot", {"mode": False}
+        ):
             assert _get_approval_mode() == "off"
 
 

@@ -8,9 +8,7 @@ from typing import Any, Dict, Literal, Optional
 
 from agent.model_metadata import (
     fetch_endpoint_model_metadata,
-    fetch_endpoint_model_metadata_async,
     fetch_model_metadata,
-    fetch_model_metadata_async,
 )
 from utils import base_url_host_matches
 
@@ -1124,15 +1122,6 @@ def _lookup_official_docs_pricing(route: BillingRoute) -> Optional[PricingEntry]
     return None
 
 
-def _openrouter_pricing_entry(route: BillingRoute) -> Optional[PricingEntry]:
-    return _pricing_entry_from_metadata(
-        fetch_model_metadata(),
-        route.model,
-        source_url="https://openrouter.ai/docs/api/api-reference/models/get-models",
-        pricing_version="openrouter-models-api",
-    )
-
-
 def _pricing_entry_from_metadata(
     metadata: Dict[str, Dict[str, Any]],
     model_id: str,
@@ -1177,7 +1166,7 @@ def _pricing_entry_from_metadata(
     )
 
 
-def get_pricing_entry(
+async def get_pricing_entry(
     model_name: str,
     provider: Optional[str] = None,
     base_url: Optional[str] = None,
@@ -1194,10 +1183,17 @@ def get_pricing_entry(
             pricing_version="included-route",
         )
     if route.provider == "openrouter":
-        return _openrouter_pricing_entry(route)
+        return _pricing_entry_from_metadata(
+            await fetch_model_metadata(),
+            route.model,
+            source_url="https://openrouter.ai/docs/api/api-reference/models/get-models",
+            pricing_version="openrouter-models-api",
+        )
     if route.base_url:
         entry = _pricing_entry_from_metadata(
-            fetch_endpoint_model_metadata(route.base_url, api_key=api_key or ""),
+            await fetch_endpoint_model_metadata(
+                route.base_url, api_key=api_key or ""
+            ),
             route.model,
             source_url=f"{route.base_url.rstrip('/')}/models",
             pricing_version="openai-compatible-models-api",
@@ -1328,14 +1324,14 @@ async def estimate_usage_cost(
     entry: Optional[PricingEntry] = None
     if route.provider == "openrouter":
         entry = _pricing_entry_from_metadata(
-            await fetch_model_metadata_async(),
+            await fetch_model_metadata(),
             route.model,
             source_url="https://openrouter.ai/docs/api/api-reference/models/get-models",
             pricing_version="openrouter-models-api",
         )
     elif route.base_url:
         entry = _pricing_entry_from_metadata(
-            await fetch_endpoint_model_metadata_async(
+            await fetch_endpoint_model_metadata(
                 route.base_url, api_key=api_key or ""
             ),
             route.model,
@@ -1396,7 +1392,7 @@ async def estimate_usage_cost(
     )
 
 
-def has_known_pricing(
+async def has_known_pricing(
     model_name: str,
     provider: Optional[str] = None,
     base_url: Optional[str] = None,
@@ -1410,7 +1406,9 @@ def has_known_pricing(
     route = resolve_billing_route(model_name, provider=provider, base_url=base_url)
     if route.billing_mode == "subscription_included":
         return True
-    entry = get_pricing_entry(model_name, provider=provider, base_url=base_url, api_key=api_key)
+    entry = await get_pricing_entry(
+        model_name, provider=provider, base_url=base_url, api_key=api_key
+    )
     return entry is not None
 
 

@@ -10,62 +10,21 @@ import hashlib
 import ipaddress
 import json
 import logging
-import os
 import re
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
+import aiofiles
+import aiofiles.os
 import yaml
 
-if TYPE_CHECKING:  # pragma: no cover — runtime import is lazy (see below)
-    import requests
-
-from utils import atomic_json_write, base_url_host_matches, base_url_hostname
+from utils import base_url_host_matches, base_url_hostname
 
 from hermes_constants import OPENROUTER_MODELS_URL
 
 logger = logging.getLogger(__name__)
-
-# ``requests`` (with urllib3) is only used inside the fetch functions below,
-# so it is resolved lazily:
-# ``_ensure_requests()`` populates the module global on the runtime path, and
-# the PEP 562 ``__getattr__`` covers external attribute access — notably
-# ``patch("agent.model_metadata.requests.get")`` in tests, which resolves the
-# attribute at patch time.
-
-
-def _ensure_requests():
-    if "requests" not in globals():
-        import requests as _requests
-        globals()["requests"] = _requests
-    return globals()["requests"]
-
-
-def __getattr__(name: str):
-    if name == "requests":
-        return _ensure_requests()
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-
-
-def _resolve_requests_verify() -> bool | str:
-    """Resolve SSL verify setting for `requests` calls from env vars.
-
-    The `requests` library only honours REQUESTS_CA_BUNDLE / CURL_CA_BUNDLE
-    by default. Hermes also honours HERMES_CA_BUNDLE (its own convention)
-    and SSL_CERT_FILE (used by the stdlib `ssl` module and by httpx), so
-    that a single env var can cover both `requests` and `httpx` callsites
-    inside the same process.
-
-    Returns either a filesystem path to a CA bundle, or True to defer to
-    the requests default (certifi).
-    """
-    for env_var in ("HERMES_CA_BUNDLE", "REQUESTS_CA_BUNDLE", "SSL_CERT_FILE"):
-        val = os.getenv(env_var)
-        if val and os.path.isfile(val):
-            return val
-    return True
 
 # Provider names that can appear as a "provider:" prefix before a model ID.
 # Only these are stripped — Ollama-style "model:tag" colons (e.g. "qwen3.5:27b")
@@ -136,6 +95,8 @@ _MODEL_CACHE_TTL = 3600
 _endpoint_model_metadata_cache: Dict[str, Dict[str, Dict[str, Any]]] = {}
 _endpoint_model_metadata_cache_time: Dict[str, float] = {}
 _ENDPOINT_MODEL_CACHE_TTL = 300
+_context_cache_lock = asyncio.Lock()
+_local_probe_disk_lock = asyncio.Lock()
 # Bounded-lifetime cache: after the first successful probe we remember the
 # server type so subsequent refreshes skip the full waterfall (no more 404
 # spam every 5 minutes on non-matching endpoints like /api/v1/models on vllm).
@@ -164,18 +125,20 @@ def _local_probe_disk_cache_path() -> Path:
     return get_hermes_home() / "cache" / "local_endpoint_probes.json"
 
 
-def _load_local_probe_disk_cache() -> Dict[str, Any]:
+async def _load_local_probe_disk_cache() -> Dict[str, Any]:
     try:
-        with _local_probe_disk_cache_path().open("r", encoding="utf-8") as f:
-            data = json.load(f)
+        async with aiofiles.open(
+            _local_probe_disk_cache_path(), "r", encoding="utf-8"
+        ) as handle:
+            data = json.loads(await handle.read())
         return data if isinstance(data, dict) else {}
     except Exception:
         return {}
 
 
-def _local_probe_disk_get(kind: str, key: str) -> Optional[Any]:
+async def _local_probe_disk_get(kind: str, key: str) -> Optional[Any]:
     """Return a fresh cached value for ``kind:key``, else None."""
-    entry = _load_local_probe_disk_cache().get(f"{kind}:{key}")
+    entry = (await _load_local_probe_disk_cache()).get(f"{kind}:{key}")
     if not isinstance(entry, dict):
         return None
     try:
@@ -186,54 +149,51 @@ def _local_probe_disk_get(kind: str, key: str) -> Optional[Any]:
         return None
 
 
-def _local_probe_disk_put(kind: str, key: str, value: Any) -> None:
+async def _local_probe_disk_put(kind: str, key: str, value: Any) -> None:
     """Persist a successful probe result. Best-effort; prunes stale entries."""
     try:
-        now = time.time()
-        data = _load_local_probe_disk_cache()
-        data = {
-            k: v
-            for k, v in data.items()
-            if isinstance(v, dict)
-            and (now - float(v.get("ts", 0))) < _LOCAL_PROBE_DISK_TTL_SECONDS
-        }
-        data[f"{kind}:{key}"] = {"value": value, "ts": now}
-        atomic_json_write(
-            _local_probe_disk_cache_path(),
-            data,
-            indent=0,
-            separators=(",", ":"),
-        )
+        async with _local_probe_disk_lock:
+            now = time.time()
+            data = await _load_local_probe_disk_cache()
+            data = {
+                k: v
+                for k, v in data.items()
+                if isinstance(v, dict)
+                and (now - float(v.get("ts", 0)))
+                < _LOCAL_PROBE_DISK_TTL_SECONDS
+            }
+            data[f"{kind}:{key}"] = {"value": value, "ts": now}
+            path = _local_probe_disk_cache_path()
+            await aiofiles.os.makedirs(path.parent, exist_ok=True)
+            temporary = path.with_suffix(path.suffix + ".tmp")
+            async with aiofiles.open(temporary, "w", encoding="utf-8") as handle:
+                await handle.write(json.dumps(data, separators=(",", ":")))
+            await aiofiles.os.replace(temporary, path)
     except Exception as e:
         logger.debug("Failed to save local probe disk cache: %s", e)
 
 
 def _get_model_metadata_cache_path() -> Path:
-    """Return path to the OpenRouter model metadata disk cache."""
     from hermes_constants import get_hermes_home
+
     return get_hermes_home() / "cache" / "openrouter_model_metadata.json"
 
 
-def _model_metadata_disk_cache_age_seconds() -> Optional[float]:
-    """Return disk-cache age in seconds, or None if freshness is unknown."""
+async def _model_metadata_disk_cache_age_seconds() -> Optional[float]:
     try:
-        cache_path = _get_model_metadata_cache_path()
-        if not cache_path.exists():
-            return None
-        age = time.time() - cache_path.stat().st_mtime
-        if age < 0:
-            return None
-        return age
-    except Exception:
+        stat = await aiofiles.os.stat(_get_model_metadata_cache_path())
+        age = time.time() - stat.st_mtime
+        return age if age >= 0 else None
+    except (FileNotFoundError, OSError):
         return None
 
 
-def _load_model_metadata_disk_cache() -> Dict[str, Dict[str, Any]]:
-    """Load processed OpenRouter metadata cache from disk."""
+async def _load_model_metadata_disk_cache() -> Dict[str, Dict[str, Any]]:
     try:
-        cache_path = _get_model_metadata_cache_path()
-        with cache_path.open("r", encoding="utf-8") as f:
-            data = json.load(f)
+        async with aiofiles.open(
+            _get_model_metadata_cache_path(), "r", encoding="utf-8"
+        ) as handle:
+            data = json.loads(await handle.read())
         if not isinstance(data, dict):
             return {}
         return {
@@ -241,22 +201,24 @@ def _load_model_metadata_disk_cache() -> Dict[str, Dict[str, Any]]:
             for key, value in data.items()
             if isinstance(value, dict)
         }
-    except Exception as e:
-        logger.debug("Failed to load OpenRouter model metadata disk cache: %s", e)
+    except Exception as exc:
+        logger.debug("Failed to load OpenRouter model metadata disk cache: %s", exc)
         return {}
 
 
-def _save_model_metadata_disk_cache(data: Dict[str, Dict[str, Any]]) -> None:
-    """Save processed OpenRouter metadata cache to disk atomically."""
+async def _save_model_metadata_disk_cache(
+    data: Dict[str, Dict[str, Any]],
+) -> None:
     try:
-        atomic_json_write(
-            _get_model_metadata_cache_path(),
-            data,
-            indent=0,
-            separators=(",", ":"),
-        )
-    except Exception as e:
-        logger.debug("Failed to save OpenRouter model metadata disk cache: %s", e)
+        path = _get_model_metadata_cache_path()
+        await aiofiles.os.makedirs(path.parent, exist_ok=True)
+        temporary = path.with_suffix(path.suffix + ".tmp")
+        async with aiofiles.open(temporary, "w", encoding="utf-8") as handle:
+            await handle.write(json.dumps(data, separators=(",", ":")))
+        await aiofiles.os.replace(temporary, path)
+    except Exception as exc:
+        logger.debug("Failed to save OpenRouter model metadata disk cache: %s", exc)
+
 
 # Descending tiers for context length probing when the model is unknown.
 # We start at 256K (covers GPT-5.x, many current large-context models) and
@@ -753,7 +715,7 @@ def _skip_persistent_context_cache(base_url: str, provider: str) -> bool:
     return (provider or "").strip().lower() in {"lmstudio", "openai-codex"}
 
 
-def _maybe_cache_local_context_length(
+async def _maybe_cache_local_context_length(
     model: str,
     base_url: str,
     length: int,
@@ -766,10 +728,10 @@ def _maybe_cache_local_context_length(
     as if they were valid operating limits.
     """
     if length >= MINIMUM_CONTEXT_LENGTH:
-        save_context_length(model, base_url, length)
+        await save_context_length(model, base_url, length)
 
 
-def _reconcile_local_cached_context_length(
+async def _reconcile_local_cached_context_length(
     model: str,
     base_url: str,
     cached: int,
@@ -786,7 +748,7 @@ def _reconcile_local_cached_context_length(
     entries but are not persisted — startup should reject them, not bless a
     sub-64K window as config.
     """
-    live_ctx = _query_local_context_length(model, base_url, api_key=api_key)
+    live_ctx = await _query_local_context_length(model, base_url, api_key=api_key)
     if live_ctx and live_ctx > 0 and live_ctx != cached:
         if live_ctx < MINIMUM_CONTEXT_LENGTH:
             logger.info(
@@ -794,14 +756,14 @@ def _reconcile_local_cached_context_length(
                 "invalidating stale cache — agent init should reject",
                 model, base_url, f"{live_ctx:,}", f"{MINIMUM_CONTEXT_LENGTH:,}",
             )
-            _invalidate_cached_context_length(model, base_url)
+            await _invalidate_cached_context_length(model, base_url)
             return live_ctx
         logger.info(
             "Reconciling stale local cache entry %s@%s: %s -> %s (live probe)",
             model, base_url, f"{cached:,}", f"{live_ctx:,}",
         )
-        _invalidate_cached_context_length(model, base_url)
-        _maybe_cache_local_context_length(model, base_url, live_ctx)
+        await _invalidate_cached_context_length(model, base_url)
+        await _maybe_cache_local_context_length(model, base_url, live_ctx)
         return live_ctx
     return cached
 
@@ -885,7 +847,7 @@ def _localhost_to_ipv4(url: str) -> str:
     )
 
 
-def detect_local_server_type(base_url: str, api_key: str = "") -> Optional[str]:
+async def detect_local_server_type(base_url: str, api_key: str = "") -> Optional[str]:
     """Detect which local server is running at base_url by probing known endpoints.
 
     Returns one of: "ollama", "lm-studio", "vllm", "llamacpp", or None.
@@ -914,7 +876,7 @@ def detect_local_server_type(base_url: str, api_key: str = "") -> Optional[str]:
 
     # Disk L2: a fresh cross-process verdict skips the HTTP waterfall
     # entirely (back-to-back CLI invocations, cron ticks).
-    disk_hit = _local_probe_disk_get("server_type", server_url)
+    disk_hit = await _local_probe_disk_get("server_type", server_url)
     if isinstance(disk_hit, str):
         _endpoint_probe_path_cache[server_url] = (disk_hit, time.monotonic())
         return disk_hit
@@ -923,10 +885,10 @@ def detect_local_server_type(base_url: str, api_key: str = "") -> Optional[str]:
 
     result: Optional[str] = None
     try:
-        with httpx.Client(timeout=2.0, headers=headers) as client:
+        async with httpx.AsyncClient(timeout=2.0, headers=headers) as client:
             # LM Studio exposes /api/v1/models — check first (most specific)
             try:
-                r = client.get(f"{lmstudio_url}/api/v1/models")
+                r = await client.get(f"{lmstudio_url}/api/v1/models")
                 if r.status_code == 200:
                     result = "lm-studio"
             except Exception:
@@ -936,7 +898,7 @@ def detect_local_server_type(base_url: str, api_key: str = "") -> Optional[str]:
                 # LM Studio returns {"error": "Unexpected endpoint"} with status 200
                 # on this path, so we must verify the response contains "models".
                 try:
-                    r = client.get(f"{server_url}/api/tags")
+                    r = await client.get(f"{server_url}/api/tags")
                     if r.status_code == 200:
                         try:
                             data = r.json()
@@ -949,9 +911,9 @@ def detect_local_server_type(base_url: str, api_key: str = "") -> Optional[str]:
             if result is None:
                 # llama.cpp exposes /v1/props (older builds used /props without the /v1 prefix)
                 try:
-                    r = client.get(f"{server_url}/v1/props")
+                    r = await client.get(f"{server_url}/v1/props")
                     if r.status_code != 200:
-                        r = client.get(f"{server_url}/props")  # fallback for older builds
+                        r = await client.get(f"{server_url}/props")  # fallback for older builds
                     if r.status_code == 200 and "default_generation_settings" in r.text:
                         result = "llamacpp"
                 except Exception:
@@ -959,7 +921,7 @@ def detect_local_server_type(base_url: str, api_key: str = "") -> Optional[str]:
             if result is None:
                 # vLLM: /version
                 try:
-                    r = client.get(f"{server_url}/version")
+                    r = await client.get(f"{server_url}/version")
                     if r.status_code == 200:
                         data = r.json()
                         if "version" in data:
@@ -971,7 +933,7 @@ def detect_local_server_type(base_url: str, api_key: str = "") -> Optional[str]:
 
     if result is not None:
         _endpoint_probe_path_cache[server_url] = (result, time.monotonic())
-        _local_probe_disk_put("server_type", server_url, result)
+        await _local_probe_disk_put("server_type", server_url, result)
     return result
 
 
@@ -1077,68 +1039,7 @@ def _add_model_aliases(cache: Dict[str, Dict[str, Any]], model_id: str, entry: D
         cache.setdefault(bare_model, entry)
 
 
-def fetch_model_metadata(force_refresh: bool = False) -> Dict[str, Dict[str, Any]]:
-    """Fetch model metadata from OpenRouter (cached for 1 hour)."""
-    global _model_metadata_cache, _model_metadata_cache_time
-
-    if not force_refresh and _model_metadata_cache and (time.time() - _model_metadata_cache_time) < _MODEL_CACHE_TTL:
-        return _model_metadata_cache
-
-    if not force_refresh:
-        disk_age = _model_metadata_disk_cache_age_seconds()
-        if disk_age is not None and disk_age < _MODEL_CACHE_TTL:
-            disk_cache = _load_model_metadata_disk_cache()
-            if disk_cache:
-                _model_metadata_cache = disk_cache
-                _model_metadata_cache_time = time.time() - disk_age
-                return _model_metadata_cache
-
-    try:
-        _ensure_requests()
-        # Tuple (connect, read) — flat timeout=10 means urllib3 can block 10s per
-        # retry stage through proxies that 403 CONNECT, ballooning to minutes
-        # (#46620). 5s connect / 10s read fails fast on unreachable hosts.
-        response = requests.get(OPENROUTER_MODELS_URL, timeout=(5, 10), verify=_resolve_requests_verify())
-        response.raise_for_status()
-        data = response.json()
-
-        cache = {}
-        for model in data.get("data", []):
-            model_id = model.get("id", "")
-            entry = {
-                "context_length": model.get("context_length", 128000),
-                "max_completion_tokens": model.get("top_provider", {}).get("max_completion_tokens", 4096),
-                "name": model.get("name", model_id),
-                "pricing": model.get("pricing", {}),
-            }
-            _add_model_aliases(cache, model_id, entry)
-            canonical = model.get("canonical_slug", "")
-            if canonical and canonical != model_id:
-                _add_model_aliases(cache, canonical, entry)
-
-        _model_metadata_cache = cache
-        _model_metadata_cache_time = time.time()
-        _save_model_metadata_disk_cache(cache)
-        logger.debug("Fetched metadata for %s models from OpenRouter", len(cache))
-        return cache
-
-    except Exception as e:
-        logger.warning(f"Failed to fetch model metadata from OpenRouter: {e}")
-        if _model_metadata_cache:
-            return _model_metadata_cache
-        disk_cache = _load_model_metadata_disk_cache()
-        if disk_cache:
-            _model_metadata_cache = disk_cache
-            disk_age = _model_metadata_disk_cache_age_seconds()
-            if disk_age is not None:
-                _model_metadata_cache_time = time.time() - min(disk_age, _MODEL_CACHE_TTL)
-            else:
-                _model_metadata_cache_time = time.time() - _MODEL_CACHE_TTL + 1
-            return _model_metadata_cache
-        return {}
-
-
-async def fetch_model_metadata_async(
+async def fetch_model_metadata(
     force_refresh: bool = False,
 ) -> Dict[str, Dict[str, Any]]:
     """Fetch OpenRouter model metadata over a native async HTTP transport."""
@@ -1151,6 +1052,15 @@ async def fetch_model_metadata_async(
     ):
         return _model_metadata_cache
 
+    if not force_refresh:
+        disk_age = await _model_metadata_disk_cache_age_seconds()
+        if disk_age is not None and disk_age < _MODEL_CACHE_TTL:
+            disk_cache = await _load_model_metadata_disk_cache()
+            if disk_cache:
+                _model_metadata_cache = disk_cache
+                _model_metadata_cache_time = time.time() - disk_age
+                return _model_metadata_cache
+
     import httpx
 
     try:
@@ -1162,7 +1072,18 @@ async def fetch_model_metadata_async(
         raise
     except Exception as exc:
         logger.debug("Async OpenRouter metadata fetch failed: %s", exc)
-        return _model_metadata_cache
+        if _model_metadata_cache:
+            return _model_metadata_cache
+        disk_cache = await _load_model_metadata_disk_cache()
+        if disk_cache:
+            _model_metadata_cache = disk_cache
+            disk_age = await _model_metadata_disk_cache_age_seconds()
+            if disk_age is not None:
+                _model_metadata_cache_time = time.time() - min(
+                    disk_age, _MODEL_CACHE_TTL
+                )
+            return _model_metadata_cache
+        return {}
 
     cache: Dict[str, Dict[str, Any]] = {}
     for model in payload.get("data", []) if isinstance(payload, dict) else []:
@@ -1186,155 +1107,11 @@ async def fetch_model_metadata_async(
 
     _model_metadata_cache = cache
     _model_metadata_cache_time = time.time()
+    await _save_model_metadata_disk_cache(cache)
     return cache
 
 
-def fetch_endpoint_model_metadata(
-    base_url: str,
-    api_key: str = "",
-    force_refresh: bool = False,
-) -> Dict[str, Dict[str, Any]]:
-    """Fetch model metadata from an OpenAI-compatible ``/models`` endpoint.
-
-    This is used for explicit custom endpoints where hardcoded global model-name
-    defaults are unreliable. Results are cached in memory per base URL.
-    """
-    normalized = _normalize_base_url(base_url)
-    if not normalized or _is_openrouter_base_url(normalized):
-        return {}
-    _ensure_requests()
-
-    if not force_refresh:
-        cached = _endpoint_model_metadata_cache.get(normalized)
-        cached_at = _endpoint_model_metadata_cache_time.get(normalized, 0)
-        if cached is not None and (time.time() - cached_at) < _ENDPOINT_MODEL_CACHE_TTL:
-            return cached
-
-    candidates = [normalized]
-    if normalized.endswith("/v1"):
-        alternate = normalized[:-3].rstrip("/")
-    else:
-        alternate = normalized + "/v1"
-    if alternate and alternate not in candidates:
-        candidates.append(alternate)
-
-    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
-    last_error: Optional[Exception] = None
-
-    if is_local_endpoint(normalized):
-        try:
-            if detect_local_server_type(normalized, api_key=api_key) == "lm-studio":
-                server_url = _lmstudio_server_root(normalized)
-                response = requests.get(
-                    server_url.rstrip("/") + "/api/v1/models",
-                    headers=headers,
-                    timeout=(5, 10),
-                    verify=_resolve_requests_verify(),
-                )
-                response.raise_for_status()
-                payload = response.json()
-                cache: Dict[str, Dict[str, Any]] = {}
-                for model in payload.get("models", []):
-                    if not isinstance(model, dict):
-                        continue
-                    model_id = model.get("key") or model.get("id")
-                    if not model_id:
-                        continue
-                    entry: Dict[str, Any] = {"name": model.get("name", model_id)}
-
-                    context_length = None
-                    for inst in model.get("loaded_instances", []) or []:
-                        if not isinstance(inst, dict):
-                            continue
-                        cfg = inst.get("config", {})
-                        ctx = cfg.get("context_length") if isinstance(cfg, dict) else None
-                        if isinstance(ctx, int) and ctx > 0:
-                            context_length = ctx
-                            break
-                    if context_length is not None:
-                        entry["context_length"] = context_length
-
-                    max_completion_tokens = _extract_max_completion_tokens(model)
-                    if max_completion_tokens is not None:
-                        entry["max_completion_tokens"] = max_completion_tokens
-
-                    pricing = _extract_pricing(model)
-                    if pricing:
-                        entry["pricing"] = pricing
-
-                    _add_model_aliases(cache, model_id, entry)
-                    alt_id = model.get("id")
-                    if isinstance(alt_id, str) and alt_id and alt_id != model_id:
-                        _add_model_aliases(cache, alt_id, entry)
-
-                _endpoint_model_metadata_cache[normalized] = cache
-                _endpoint_model_metadata_cache_time[normalized] = time.time()
-                return cache
-        except Exception as exc:
-            last_error = exc
-
-    for candidate in candidates:
-        url = candidate.rstrip("/") + "/models"
-        try:
-            response = requests.get(url, headers=headers, timeout=(5, 10), verify=_resolve_requests_verify())
-            response.raise_for_status()
-            payload = response.json()
-            cache: Dict[str, Dict[str, Any]] = {}
-            for model in payload.get("data", []):
-                if not isinstance(model, dict):
-                    continue
-                model_id = model.get("id")
-                if not model_id:
-                    continue
-                entry: Dict[str, Any] = {"name": model.get("name", model_id)}
-                context_length = _extract_context_length(model)
-                if context_length is not None:
-                    entry["context_length"] = context_length
-                max_completion_tokens = _extract_max_completion_tokens(model)
-                if max_completion_tokens is not None:
-                    entry["max_completion_tokens"] = max_completion_tokens
-                pricing = _extract_pricing(model)
-                if pricing:
-                    entry["pricing"] = pricing
-                _add_model_aliases(cache, model_id, entry)
-
-            # If this is a llama.cpp server, query /props for actual allocated context
-            is_llamacpp = any(
-                m.get("owned_by") == "llamacpp"
-                for m in payload.get("data", []) if isinstance(m, dict)
-            )
-            if is_llamacpp:
-                try:
-                    # Try /v1/props first (current llama.cpp); fall back to /props for older builds
-                    base = candidate.rstrip("/").replace("/v1", "")
-                    _verify = _resolve_requests_verify()
-                    props_resp = requests.get(base + "/v1/props", headers=headers, timeout=5, verify=_verify)
-                    if not props_resp.ok:
-                        props_resp = requests.get(base + "/props", headers=headers, timeout=5, verify=_verify)
-                    if props_resp.ok:
-                        props = props_resp.json()
-                        gen_settings = props.get("default_generation_settings", {})
-                        n_ctx = gen_settings.get("n_ctx")
-                        model_alias = props.get("model_alias", "")
-                        if n_ctx and model_alias and model_alias in cache:
-                            cache[model_alias]["context_length"] = n_ctx
-                except Exception:
-                    pass
-
-            _endpoint_model_metadata_cache[normalized] = cache
-            _endpoint_model_metadata_cache_time[normalized] = time.time()
-            return cache
-        except Exception as exc:
-            last_error = exc
-
-    if last_error:
-        logger.debug("Failed to fetch model metadata from %s/models: %s", normalized, last_error)
-    _endpoint_model_metadata_cache[normalized] = {}
-    _endpoint_model_metadata_cache_time[normalized] = time.time()
-    return {}
-
-
-async def fetch_endpoint_model_metadata_async(
+async def fetch_endpoint_model_metadata(
     base_url: str,
     api_key: str = "",
     force_refresh: bool = False,
@@ -1357,24 +1134,74 @@ async def fetch_endpoint_model_metadata_async(
         candidates.append(alternate)
     headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
     payload = None
-    async_client = httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=5.0), headers=headers)
-    try:
-        async with async_client as client:
-            for candidate in candidates:
-                try:
-                    response = await client.get(candidate.rstrip("/") + "/models")
-                    response.raise_for_status()
-                    payload = response.json()
-                    if isinstance(payload, dict):
-                        break
-                except asyncio.CancelledError:
-                    raise
-                except Exception:
-                    continue
-    finally:
-        # The async context manager owns closure; this explicit branch keeps
-        # cancellation and unusual client implementations deterministic.
-        pass
+    async with httpx.AsyncClient(
+        timeout=httpx.Timeout(10.0, connect=5.0), headers=headers
+    ) as client:
+        if (
+            is_local_endpoint(normalized)
+            and await detect_local_server_type(normalized, api_key=api_key)
+            == "lm-studio"
+        ):
+            try:
+                response = await client.get(
+                    _lmstudio_server_root(normalized).rstrip("/")
+                    + "/api/v1/models"
+                )
+                response.raise_for_status()
+                native_payload = response.json()
+                cache: Dict[str, Dict[str, Any]] = {}
+                for model in native_payload.get("models", []):
+                    if not isinstance(model, dict):
+                        continue
+                    model_id = model.get("key") or model.get("id")
+                    if not model_id:
+                        continue
+                    entry: Dict[str, Any] = {
+                        "name": model.get("name", model_id)
+                    }
+                    for instance in model.get("loaded_instances", []) or []:
+                        config = (
+                            instance.get("config", {})
+                            if isinstance(instance, dict)
+                            else {}
+                        )
+                        context_length = config.get("context_length")
+                        if isinstance(context_length, int) and context_length > 0:
+                            entry["context_length"] = context_length
+                            break
+                    max_completion_tokens = _extract_max_completion_tokens(model)
+                    if max_completion_tokens is not None:
+                        entry["max_completion_tokens"] = max_completion_tokens
+                    pricing = _extract_pricing(model)
+                    if pricing:
+                        entry["pricing"] = pricing
+                    _add_model_aliases(cache, model_id, entry)
+                    alternate_id = model.get("id")
+                    if (
+                        isinstance(alternate_id, str)
+                        and alternate_id
+                        and alternate_id != model_id
+                    ):
+                        _add_model_aliases(cache, alternate_id, entry)
+                _endpoint_model_metadata_cache[normalized] = cache
+                _endpoint_model_metadata_cache_time[normalized] = time.time()
+                return cache
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                pass
+
+        for candidate in candidates:
+            try:
+                response = await client.get(candidate.rstrip("/") + "/models")
+                response.raise_for_status()
+                payload = response.json()
+                if isinstance(payload, dict):
+                    break
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                continue
 
     cache: Dict[str, Dict[str, Any]] = {}
     for model in (payload or {}).get("data", []) if isinstance(payload, dict) else []:
@@ -1395,18 +1222,43 @@ async def fetch_endpoint_model_metadata_async(
             entry["pricing"] = pricing
         _add_model_aliases(cache, model_id, entry)
 
+    if any(
+        isinstance(model, dict) and model.get("owned_by") == "llamacpp"
+        for model in (payload or {}).get("data", [])
+    ):
+        root = normalized.removesuffix("/v1")
+        async with httpx.AsyncClient(
+            timeout=5.0, headers=headers
+        ) as client:
+            try:
+                response = await client.get(root + "/v1/props")
+                if response.status_code != 200:
+                    response = await client.get(root + "/props")
+                if response.status_code == 200:
+                    props = response.json()
+                    context_length = props.get(
+                        "default_generation_settings", {}
+                    ).get("n_ctx")
+                    model_alias = props.get("model_alias", "")
+                    if context_length and model_alias in cache:
+                        cache[model_alias]["context_length"] = context_length
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                pass
+
     _endpoint_model_metadata_cache[normalized] = cache
     _endpoint_model_metadata_cache_time[normalized] = time.time()
     return cache
 
 
-def _resolve_endpoint_context_length(
+async def _resolve_endpoint_context_length(
     model: str,
     base_url: str,
     api_key: str = "",
 ) -> Optional[int]:
     """Resolve context length from an endpoint's live ``/models`` metadata."""
-    endpoint_metadata = fetch_endpoint_model_metadata(base_url, api_key=api_key)
+    endpoint_metadata = await fetch_endpoint_model_metadata(base_url, api_key=api_key)
     matched = endpoint_metadata.get(model)
     if not matched:
         if len(endpoint_metadata) == 1:
@@ -1429,15 +1281,15 @@ def _get_context_cache_path() -> Path:
     return get_hermes_home() / "context_length_cache.yaml"
 
 
-def _load_context_cache() -> Dict[str, int]:
+async def _load_context_cache() -> Dict[str, int]:
     """Load the model+provider -> context_length cache from disk."""
     path = _get_context_cache_path()
-    if not path.exists():
-        return {}
     try:
-        with open(path, encoding="utf-8") as f:
-            data = yaml.safe_load(f) or {}
+        async with aiofiles.open(path, "r", encoding="utf-8") as handle:
+            data = yaml.safe_load(await handle.read()) or {}
         return data.get("context_lengths") or {}
+    except FileNotFoundError:
+        return {}
     except Exception as e:
         logger.debug("Failed to load context length cache: %s", e)
         return {}
@@ -1453,31 +1305,37 @@ def _context_cache_key(model: str, base_url: str) -> str:
     return f"{model}@{(base_url or '').rstrip('/')}"
 
 
-def save_context_length(model: str, base_url: str, length: int) -> None:
+async def save_context_length(model: str, base_url: str, length: int) -> None:
     """Persist a discovered context length for a model+provider combo.
 
     Cache key is ``model@base_url`` so the same model name served from
     different providers can have different limits.
     """
     key = _context_cache_key(model, base_url)
-    cache = _load_context_cache()
-    if cache.get(key) == length:
-        return  # already stored
-    cache[key] = length
-    path = _get_context_cache_path()
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
-            yaml.dump({"context_lengths": cache}, f, default_flow_style=False)
-        logger.info("Cached context length %s -> %s tokens", key, f"{length:,}")
-    except Exception as e:
-        logger.debug("Failed to save context length cache: %s", e)
+    async with _context_cache_lock:
+        cache = await _load_context_cache()
+        if cache.get(key) == length:
+            return
+        cache[key] = length
+        path = _get_context_cache_path()
+        try:
+            await aiofiles.os.makedirs(path.parent, exist_ok=True)
+            serialized = yaml.safe_dump(
+                {"context_lengths": cache}, default_flow_style=False
+            )
+            temporary = path.with_suffix(path.suffix + ".tmp")
+            async with aiofiles.open(temporary, "w", encoding="utf-8") as handle:
+                await handle.write(serialized)
+            await aiofiles.os.replace(temporary, path)
+            logger.info("Cached context length %s -> %s tokens", key, f"{length:,}")
+        except Exception as e:
+            logger.debug("Failed to save context length cache: %s", e)
 
 
-def get_cached_context_length(model: str, base_url: str) -> Optional[int]:
+async def get_cached_context_length(model: str, base_url: str) -> Optional[int]:
     """Look up a previously discovered context length for model+provider."""
     key = _context_cache_key(model, base_url)
-    cache = _load_context_cache()
+    cache = await _load_context_cache()
     hit = cache.get(key)
     if hit is not None:
         return hit
@@ -1494,10 +1352,9 @@ def get_cached_context_length(model: str, base_url: str) -> Optional[int]:
     return None
 
 
-def _invalidate_cached_context_length(model: str, base_url: str) -> None:
+async def _invalidate_cached_context_length(model: str, base_url: str) -> None:
     """Drop a stale cache entry so it gets re-resolved on the next lookup."""
     key = _context_cache_key(model, base_url)
-    cache = _load_context_cache()
     # Invalidation must also drop the in-memory TTL probe entries for this
     # pair — otherwise the next resolution inside the TTL window reuses the
     # very value we just declared stale and re-persists it.
@@ -1509,17 +1366,26 @@ def _invalidate_cached_context_length(model: str, base_url: str) -> None:
     # form, and the slashed legacy form — same set get_cached_context_length
     # consults, so a lookup can never resurrect a row invalidation missed.
     stale_keys = {key, f"{model}@{base_url}", f"{key}/"}
-    if not any(k in cache for k in stale_keys):
-        return
-    for k in stale_keys:
-        cache.pop(k, None)
-    path = _get_context_cache_path()
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
-            yaml.dump({"context_lengths": cache}, f, default_flow_style=False)
-    except Exception as e:
-        logger.debug("Failed to invalidate context length cache entry %s: %s", key, e)
+    async with _context_cache_lock:
+        cache = await _load_context_cache()
+        if not any(k in cache for k in stale_keys):
+            return
+        for stale_key in stale_keys:
+            cache.pop(stale_key, None)
+        path = _get_context_cache_path()
+        try:
+            await aiofiles.os.makedirs(path.parent, exist_ok=True)
+            temporary = path.with_suffix(path.suffix + ".tmp")
+            serialized = yaml.safe_dump(
+                {"context_lengths": cache}, default_flow_style=False
+            )
+            async with aiofiles.open(temporary, "w", encoding="utf-8") as handle:
+                await handle.write(serialized)
+            await aiofiles.os.replace(temporary, path)
+        except Exception as e:
+            logger.debug(
+                "Failed to invalidate context length cache entry %s: %s", key, e
+            )
 
 
 def get_next_probe_tier(current_length: int) -> Optional[int]:
@@ -1786,83 +1652,13 @@ def _model_id_matches(candidate_id: str, lookup_model: str) -> bool:
     return False
 
 
-def query_ollama_num_ctx(model: str, base_url: str, api_key: str = "") -> Optional[int]:
-    """Query an Ollama server for the model's context length.
-
-    Returns the model's maximum context from GGUF metadata via ``/api/show``,
-    or the explicit ``num_ctx`` from the Modelfile if set.  Returns None if
-    the server is unreachable or not Ollama.
-
-    This is the value that should be passed as ``num_ctx`` in Ollama chat
-    requests to override the default 2048.
-    """
-    import httpx
-
-    bare_model = _strip_provider_prefix(model)
-    server_url = _localhost_to_ipv4(base_url.rstrip("/"))
-    if server_url.endswith("/v1"):
-        server_url = server_url[:-3]
-
-    try:
-        server_type = detect_local_server_type(base_url, api_key=api_key)
-    except Exception:
-        return None
-    if server_type != "ollama":
-        return None
-
-    # Disk L2: /api/show results are stable for a given (model, server) on
-    # human timescales — skip the HTTP roundtrip on fresh cross-process hits.
-    _disk_key = f"{server_url}|{bare_model}"
-    disk_hit = _local_probe_disk_get("ollama_num_ctx", _disk_key)
-    if isinstance(disk_hit, int) and disk_hit > 0:
-        return disk_hit
-
-    headers = _auth_headers(api_key)
-
-    try:
-        with httpx.Client(timeout=3.0, headers=headers) as client:
-            resp = client.post(f"{server_url}/api/show", json={"name": bare_model})
-            if resp.status_code != 200:
-                return None
-            data = resp.json()
-
-            # Prefer explicit num_ctx from Modelfile parameters (user override)
-            params = data.get("parameters", "")
-            if "num_ctx" in params:
-                for line in params.split("\n"):
-                    if "num_ctx" in line:
-                        parts = line.strip().split()
-                        if len(parts) >= 2:
-                            try:
-                                _ctx = int(parts[-1])
-                                _local_probe_disk_put("ollama_num_ctx", _disk_key, _ctx)
-                                return _ctx
-                            except ValueError:
-                                pass
-
-            # Fall back to GGUF model_info context_length (training max)
-            model_info = data.get("model_info", {})
-            for key, value in model_info.items():
-                if "context_length" in key and isinstance(value, (int, float)):
-                    _ctx = int(value)
-                    _local_probe_disk_put("ollama_num_ctx", _disk_key, _ctx)
-                    return _ctx
-    except Exception:
-        pass
-    return None
-
-
-async def query_ollama_num_ctx_async(
+async def query_ollama_num_ctx(
     model: str, base_url: str, api_key: str = ""
 ) -> Optional[int]:
     """Query Ollama's ``/api/show`` endpoint without blocking the event loop.
 
-    This is the runtime counterpart to :func:`query_ollama_num_ctx`.  The
-    synchronous helper remains available to the legacy metadata/CLI surfaces,
-    but an active async turn must use this coroutine.  The optional disk probe
-    cache is intentionally not consulted here: its synchronous file access
-    would defeat the native async boundary, and the request is a best-effort
-    hint rather than required agent state.
+    Successful values are cached through the same native-async disk cache as
+    local server detection so repeated processes do not re-probe the server.
     """
     import httpx
 
@@ -1872,6 +1668,11 @@ async def query_ollama_num_ctx_async(
         server_url = server_url[:-3]
     if not server_url or not bare_model:
         return None
+
+    cache_key = f"{server_url}|{bare_model}"
+    disk_hit = await _local_probe_disk_get("ollama_num_ctx", cache_key)
+    if isinstance(disk_hit, int) and disk_hit > 0:
+        return disk_hit
 
     headers = _auth_headers(api_key)
     try:
@@ -1899,6 +1700,9 @@ async def query_ollama_num_ctx_async(
                 except (TypeError, ValueError):
                     continue
                 if value > 0:
+                    await _local_probe_disk_put(
+                        "ollama_num_ctx", cache_key, value
+                    )
                     return value
 
     model_info = data.get("model_info", {})
@@ -1906,61 +1710,16 @@ async def query_ollama_num_ctx_async(
         for key, value in model_info.items():
             if "context_length" in str(key) and isinstance(value, (int, float)):
                 value = int(value)
-                return value if value > 0 else None
-    return None
-
-
-def query_ollama_supports_vision(model: str, base_url: str, api_key: str = "") -> Optional[bool]:
-    """Return True/False when Ollama ``/api/show`` reports vision support.
-
-    Uses the ``capabilities`` field on Ollama 0.6.0+ and falls back to
-    ``model_info.*.vision.block_count`` on older servers. Returns None when
-    the server is unreachable, not Ollama, or the model is unknown.
-    """
-    import httpx
-
-    bare_model = _strip_provider_prefix(model)
-    if not bare_model or not base_url:
-        return None
-
-    try:
-        if detect_local_server_type(base_url, api_key=api_key) != "ollama":
-            return None
-    except Exception:
-        return None
-
-    server_url = _localhost_to_ipv4(base_url.rstrip("/"))
-    if server_url.endswith("/v1"):
-        server_url = server_url[:-3]
-
-    headers = _auth_headers(api_key)
-
-    try:
-        with httpx.Client(timeout=3.0, headers=headers) as client:
-            resp = client.post(f"{server_url}/api/show", json={"name": bare_model})
-            if resp.status_code != 200:
+                if value > 0:
+                    await _local_probe_disk_put(
+                        "ollama_num_ctx", cache_key, value
+                    )
+                    return value
                 return None
-            data = resp.json()
-    except Exception:
-        return None
-
-    caps = data.get("capabilities")
-    if isinstance(caps, list):
-        if any(str(cap).lower() == "vision" for cap in caps):
-            return True
-        if caps:
-            return False
-
-    model_info = data.get("model_info")
-    if isinstance(model_info, dict):
-        for key in model_info:
-            if "vision.block_count" in str(key).lower():
-                return True
-
     return None
 
 
-async def query_ollama_supports_vision_async(
+async def query_ollama_supports_vision(
     model: str,
     base_url: str,
     api_key: str = "",
@@ -2005,7 +1764,9 @@ async def query_ollama_supports_vision_async(
     return None
 
 
-def _query_ollama_api_show(model: str, base_url: str, api_key: str = "") -> Optional[int]:
+async def _query_ollama_api_show(
+    model: str, base_url: str, api_key: str = ""
+) -> Optional[int]:
     """Query an Ollama server's native ``/api/show`` for context length.
 
     Provider-agnostic: works against ANY Ollama-compatible server regardless
@@ -2041,13 +1802,17 @@ def _query_ollama_api_show(model: str, base_url: str, api_key: str = "") -> Opti
     if cached is not None and (now - cached[1]) < _LOCAL_CTX_PROBE_TTL_SECONDS:
         return cached[0]
 
-    result = _query_ollama_api_show_uncached(model, base_url, api_key=api_key)
+    result = await _query_ollama_api_show_uncached(
+        model, base_url, api_key=api_key
+    )
     if result:  # positive-only — never memoize a failed probe
         _LOCAL_CTX_PROBE_CACHE[cache_key] = (result, now)
     return result
 
 
-def _query_ollama_api_show_uncached(model: str, base_url: str, api_key: str = "") -> Optional[int]:
+async def _query_ollama_api_show_uncached(
+    model: str, base_url: str, api_key: str = ""
+) -> Optional[int]:
     """Uncached body of ``_query_ollama_api_show`` — one POST to ``/api/show``."""
     import httpx
 
@@ -2058,8 +1823,10 @@ def _query_ollama_api_show_uncached(model: str, base_url: str, api_key: str = ""
     headers = _auth_headers(api_key)
 
     try:
-        with httpx.Client(timeout=5.0, headers=headers) as client:
-            resp = client.post(f"{server_url}/api/show", json={"name": model})
+        async with httpx.AsyncClient(timeout=5.0, headers=headers) as client:
+            resp = await client.post(
+                f"{server_url}/api/show", json={"name": model}
+            )
             if resp.status_code != 200:
                 return None
             data = resp.json()
@@ -2127,7 +1894,9 @@ def _model_name_suggests_grok_4_3(model: str) -> bool:
     return "grok-4.3" in model.lower()
 
 
-def _query_local_context_length(model: str, base_url: str, api_key: str = "") -> Optional[int]:
+async def _query_local_context_length(
+    model: str, base_url: str, api_key: str = ""
+) -> Optional[int]:
     """Query a local server for the model's context length (short-TTL cached).
 
     The live-probe paths added for local endpoints (reconcile-on-hit and the
@@ -2149,7 +1918,9 @@ def _query_local_context_length(model: str, base_url: str, api_key: str = "") ->
     if cached is not None and (now - cached[1]) < _LOCAL_CTX_PROBE_TTL_SECONDS:
         return cached[0]
 
-    result = _query_local_context_length_uncached(model, base_url, api_key=api_key)
+    result = await _query_local_context_length_uncached(
+        model, base_url, api_key=api_key
+    )
     # Cache only positive results. A None/failure (server not up yet,
     # connection refused, timeout) must NOT be memoized — otherwise a probe
     # that fails during a startup race would suppress a legit retry seconds
@@ -2161,7 +1932,9 @@ def _query_local_context_length(model: str, base_url: str, api_key: str = "") ->
     return result
 
 
-def _query_local_context_length_uncached(model: str, base_url: str, api_key: str = "") -> Optional[int]:
+async def _query_local_context_length_uncached(
+    model: str, base_url: str, api_key: str = ""
+) -> Optional[int]:
     """Query a local server for the model's context length."""
     import httpx
 
@@ -2178,15 +1951,17 @@ def _query_local_context_length_uncached(model: str, base_url: str, api_key: str
     headers = _auth_headers(api_key)
 
     try:
-        server_type = detect_local_server_type(base_url, api_key=api_key)
+        server_type = await detect_local_server_type(base_url, api_key=api_key)
     except Exception:
         server_type = None
 
     try:
-        with httpx.Client(timeout=3.0, headers=headers) as client:
+        async with httpx.AsyncClient(timeout=3.0, headers=headers) as client:
             # Ollama: /api/show returns model details with context info
             if server_type == "ollama":
-                resp = client.post(f"{server_url}/api/show", json={"name": model})
+                resp = await client.post(
+                    f"{server_url}/api/show", json={"name": model}
+                )
                 if resp.status_code == 200:
                     data = resp.json()
                     # Prefer explicit num_ctx from Modelfile parameters: this is
@@ -2217,7 +1992,7 @@ def _query_local_context_length_uncached(model: str, base_url: str, api_key: str
             # Use _model_id_matches for fuzzy matching: LM Studio stores models as
             # "publisher/slug" but users configure only "slug" after "local:" prefix.
             if server_type == "lm-studio":
-                resp = client.get(f"{lmstudio_url}/api/v1/models")
+                resp = await client.get(f"{lmstudio_url}/api/v1/models")
                 if resp.status_code == 200:
                     data = resp.json()
                     for m in data.get("models", []):
@@ -2231,7 +2006,7 @@ def _query_local_context_length_uncached(model: str, base_url: str, api_key: str
                             break
 
             # LM Studio / vLLM / llama.cpp: try /v1/models/{model}
-            resp = client.get(f"{server_url}/v1/models/{model}")
+            resp = await client.get(f"{server_url}/v1/models/{model}")
             if resp.status_code == 200:
                 data = resp.json()
                 # vLLM returns max_model_len
@@ -2241,7 +2016,7 @@ def _query_local_context_length_uncached(model: str, base_url: str, api_key: str
 
             # Try /v1/models and find the model in the list.
             # Use _model_id_matches to handle "publisher/slug" vs bare "slug".
-            resp = client.get(f"{server_url}/v1/models")
+            resp = await client.get(f"{server_url}/v1/models")
             if resp.status_code == 200:
                 data = resp.json()
                 models_list = data.get("data", [])
@@ -2266,7 +2041,9 @@ def _normalize_model_version(model: str) -> str:
     return model.replace(".", "-")
 
 
-def _query_anthropic_context_length(model: str, base_url: str, api_key: str) -> Optional[int]:
+async def _query_anthropic_context_length(
+    model: str, base_url: str, api_key: str
+) -> Optional[int]:
     """Query Anthropic's /v1/models endpoint for context length.
 
     Only works with regular ANTHROPIC_API_KEY (sk-ant-api*).
@@ -2283,8 +2060,12 @@ def _query_anthropic_context_length(model: str, base_url: str, api_key: str) -> 
             "x-api-key": api_key,
             "anthropic-version": "2023-06-01",
         }
-        _ensure_requests()
-        resp = requests.get(url, headers=headers, timeout=(5, 10), verify=_resolve_requests_verify())
+        import httpx
+
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(10.0, connect=5.0), headers=headers
+        ) as client:
+            resp = await client.get(url)
         if resp.status_code != 200:
             return None
         data = resp.json()
@@ -2365,7 +2146,7 @@ def _extract_chatgpt_account_id(access_token: str) -> Optional[str]:
         return None
 
 
-def _fetch_codex_oauth_context_lengths_with_source(
+async def _fetch_codex_oauth_context_lengths_with_source(
     access_token: str,
 ) -> Tuple[Dict[str, int], bool]:
     """Fetch Codex catalogue data and report whether it came from HTTP.
@@ -2391,13 +2172,14 @@ def _fetch_codex_oauth_context_lengths_with_source(
         headers["ChatGPT-Account-Id"] = acct_id
 
     try:
-        _ensure_requests()
-        resp = requests.get(
-            "https://chatgpt.com/backend-api/codex/models?client_version=1.0.0",
-            headers=headers,
-            timeout=(5, 10),
-            verify=_resolve_requests_verify(),
-        )
+        import httpx
+
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(10.0, connect=5.0), headers=headers
+        ) as client:
+            resp = await client.get(
+                "https://chatgpt.com/backend-api/codex/models?client_version=1.0.0"
+            )
         if resp.status_code != 200:
             logger.debug(
                 "Codex /models probe returned HTTP %s; falling back to hardcoded defaults",
@@ -2424,20 +2206,7 @@ def _fetch_codex_oauth_context_lengths_with_source(
     return result, True
 
 
-def _fetch_codex_oauth_context_lengths(access_token: str) -> Dict[str, int]:
-    """Probe the ChatGPT Codex /models endpoint for per-slug context windows.
-
-    Codex OAuth imposes its own context limits that differ from the direct
-    OpenAI API (e.g. gpt-5.5 is 1.05M on the API, 272K on Codex). The
-    `context_window` field in each model entry is the authoritative source.
-
-    Returns a ``{slug: context_window}`` dict. Empty on failure.
-    """
-    result, _fresh = _fetch_codex_oauth_context_lengths_with_source(access_token)
-    return result
-
-
-def _resolve_codex_oauth_context_length_with_source(
+async def _resolve_codex_oauth_context_length_with_source(
     model: str, access_token: str = ""
 ) -> Tuple[Optional[int], str]:
     """Resolve a Codex OAuth model's real context window.
@@ -2455,7 +2224,9 @@ def _resolve_codex_oauth_context_length_with_source(
         return None, ""
 
     if access_token:
-        live, fresh_probe = _fetch_codex_oauth_context_lengths_with_source(access_token)
+        live, fresh_probe = await _fetch_codex_oauth_context_lengths_with_source(
+            access_token
+        )
         live_source = "live" if fresh_probe else "memory"
         if model_bare in live:
             return live[model_bare], live_source
@@ -2476,17 +2247,7 @@ def _resolve_codex_oauth_context_length_with_source(
     return None, ""
 
 
-def _resolve_codex_oauth_context_length(
-    model: str, access_token: str = ""
-) -> Optional[int]:
-    """Resolve a Codex OAuth model's context length (compatibility wrapper)."""
-    context_length, _source = _resolve_codex_oauth_context_length_with_source(
-        model, access_token=access_token,
-    )
-    return context_length
-
-
-def _resolve_nous_context_length(
+async def _resolve_nous_context_length(
     model: str,
     base_url: str = "",
     api_key: str = "",
@@ -2513,11 +2274,13 @@ def _resolve_nous_context_length(
     # qwen3.6-plus; the portal correctly says 262144).  Fall back to the OR
     # catalog only if the portal doesn't list the model.
     if base_url:
-        portal_ctx = _resolve_endpoint_context_length(model, base_url, api_key=api_key)
+        portal_ctx = await _resolve_endpoint_context_length(
+            model, base_url, api_key=api_key
+        )
         if portal_ctx is not None:
             return portal_ctx, "portal"
 
-    metadata = fetch_model_metadata()
+    metadata = await fetch_model_metadata()
 
     def _safe_ctx(or_id: str, entry: dict) -> Optional[int]:
         ctx = entry.get("context_length")
@@ -2560,7 +2323,7 @@ def _resolve_nous_context_length(
     return None, ""
 
 
-def get_model_context_length(
+async def get_model_context_length(
     model: str,
     base_url: str = "",
     api_key: str = "",
@@ -2607,10 +2370,10 @@ def get_model_context_length(
         try:
             from hermes_cli.config import (
                 get_compatible_custom_providers,
-                load_config,
+                load_config_readonly,
             )
             from hermes_cli.moa_config import resolve_moa_preset
-            config = load_config()
+            config = await load_config_readonly()
             effective_custom_providers = custom_providers
             if effective_custom_providers is None:
                 effective_custom_providers = get_compatible_custom_providers(config)
@@ -2619,12 +2382,8 @@ def get_model_context_length(
             agg_provider = str(agg.get("provider") or "").strip()
             agg_model = str(agg.get("model") or "").strip()
             if agg_model and agg_provider and agg_provider.lower() != "moa":
-                return get_model_context_length(
+                return await get_model_context_length(
                     agg_model,
-                    # This metadata helper is synchronous by contract.  Use
-                    # the configured provider identity and let the async
-                    # runtime perform credential/pool resolution at turn
-                    # startup; no network or pool I/O belongs in metadata.
                     base_url="",
                     api_key="",
                     provider=agg_provider,
@@ -2687,7 +2446,7 @@ def get_model_context_length(
     # Codex OAuth is excluded because the authenticated /models catalogue is
     # account-specific and a fallback must never suppress later revalidation.
     if base_url and not _skip_persistent_context_cache(base_url, provider):
-        cached = get_cached_context_length(model, base_url)
+        cached = await get_cached_context_length(model, base_url)
         if cached is not None:
             # Invalidate stale 32k cache entries for Kimi-family models.
             if cached <= 32768 and _model_name_suggests_kimi(model):
@@ -2696,7 +2455,7 @@ def get_model_context_length(
                     "re-resolving via hardcoded defaults",
                     model, base_url, f"{cached:,}",
                 )
-                _invalidate_cached_context_length(model, base_url)
+                await _invalidate_cached_context_length(model, base_url)
             # Invalidate stale ≤204,800 cache entries for MiniMax-M3.  Pre-catalog
             # builds resolved M3 via the generic ``minimax`` catch-all (204,800)
             # and persisted it before the ``minimax-m3`` (1M) entry existed; that
@@ -2709,7 +2468,7 @@ def get_model_context_length(
                     "re-resolving via hardcoded defaults",
                     model, base_url, f"{cached:,}",
                 )
-                _invalidate_cached_context_length(model, base_url)
+                await _invalidate_cached_context_length(model, base_url)
             # Invalidate stale ≤256,000 cache entries for Grok-4.3.  The
             # ``grok-4.3`` (1M) entry was added to DEFAULT_CONTEXT_LENGTHS on
             # 2026-05-15; prior to that, grok-4.3 slugs resolved via the
@@ -2722,7 +2481,7 @@ def get_model_context_length(
                     "re-resolving via hardcoded defaults",
                     model, base_url, f"{cached:,}",
                 )
-                _invalidate_cached_context_length(model, base_url)
+                await _invalidate_cached_context_length(model, base_url)
             # Nous Portal: the portal /v1/models endpoint is authoritative.
             # Bypass the persistent cache so step 5b can always reconcile
             # against it — this corrects pre-fix entries seeded from the
@@ -2756,14 +2515,14 @@ def get_model_context_length(
                             f"{cached:,}",
                             f"{bedrock_ctx:,}",
                         )
-                        _invalidate_cached_context_length(model, base_url)
+                        await _invalidate_cached_context_length(model, base_url)
                         return bedrock_ctx
                 except ImportError:
                     pass
                 return cached
             else:
                 if is_local_endpoint(base_url):
-                    return _reconcile_local_cached_context_length(
+                    return await _reconcile_local_cached_context_length(
                         model, base_url, cached, api_key=api_key,
                     )
                 return cached
@@ -2793,7 +2552,7 @@ def get_model_context_length(
             # every turn — keyed by base_url when present, else a synthetic
             # bedrock:// key so display/offline paths share the entry.
             cache_key_url = base_url or "bedrock://"
-            cached = get_cached_context_length(model, cache_key_url)
+            cached = await get_cached_context_length(model, cache_key_url)
             if cached is not None:
                 return cached
             # Resolve region from the base_url host first, then the standard
@@ -2808,19 +2567,21 @@ def get_model_context_length(
                     region = resolve_bedrock_region()
                 except Exception:
                     region = ""
-            ctx = get_bedrock_context_length(model, region=region, probe=bool(region))
-            if ctx and region:
-                # Only persist probe-derived values (region present); a pure
-                # table fallback shouldn't poison the cache against a later
-                # successful probe.
-                save_context_length(model, cache_key_url, ctx)
+            # boto3's control plane is synchronous. Context resolution stays
+            # non-blocking by using the curated provider table; inference is
+            # handled by the provider's native async transport.
+            ctx = get_bedrock_context_length(model, region=region, probe=False)
             return ctx
 
     if provider == "novita" or (base_url and base_url_host_matches(base_url, "api.novita.ai")):
-        ctx = _resolve_endpoint_context_length(model, base_url or "https://api.novita.ai/openai/v1", api_key=api_key)
+        ctx = await _resolve_endpoint_context_length(
+            model,
+            base_url or "https://api.novita.ai/openai/v1",
+            api_key=api_key,
+        )
         if ctx is not None:
             if base_url:
-                save_context_length(model, base_url, ctx)
+                await save_context_length(model, base_url, ctx)
             return ctx
 
     # 2. Active endpoint metadata for truly custom/unknown endpoints.
@@ -2829,7 +2590,9 @@ def get_model_context_length(
     # returns 128k) instead of the model's full context (400k).  models.dev
     # has the correct per-provider values and is checked at step 5+.
     if _is_custom_endpoint(base_url) and not _is_known_provider_base_url(base_url):
-        context_length = _resolve_endpoint_context_length(model, base_url, api_key=api_key)
+        context_length = await _resolve_endpoint_context_length(
+            model, base_url, api_key=api_key
+        )
         if context_length is not None:
             return context_length
         if not _is_known_provider_base_url(base_url):
@@ -2840,18 +2603,22 @@ def get_model_context_length(
             # would create a false-safe window for compression (#63122).
             # Non-local endpoints preserve the existing GGUF-first behavior.
             if is_local_endpoint(base_url):
-                local_ctx = _query_local_context_length(model, base_url, api_key=api_key)
+                local_ctx = await _query_local_context_length(
+                    model, base_url, api_key=api_key
+                )
                 if local_ctx and local_ctx > 0:
                     if not _skip_persistent_context_cache(base_url, provider):
-                        _maybe_cache_local_context_length(model, base_url, local_ctx)
+                        await _maybe_cache_local_context_length(
+                            model, base_url, local_ctx
+                        )
                     return local_ctx
             # 2b. Ollama native /api/show — non-local endpoints preserve
             # the existing generic /api/show GGUF-first behavior.
             # Non-Ollama servers return 404/405 quickly.
-            ctx = _query_ollama_api_show(model, base_url, api_key=api_key)
+            ctx = await _query_ollama_api_show(model, base_url, api_key=api_key)
             if ctx is not None:
                 if not _skip_persistent_context_cache(base_url, provider):
-                    save_context_length(model, base_url, ctx)
+                    await save_context_length(model, base_url, ctx)
                 return ctx
             # 3. Probe-down fallback after endpoint-specific detection failed
             logger.info(
@@ -2886,7 +2653,9 @@ def get_model_context_length(
     if provider == "anthropic" or (
         base_url and base_url_hostname(base_url) == "api.anthropic.com"
     ):
-        ctx = _query_anthropic_context_length(model, base_url or "https://api.anthropic.com", api_key)
+        ctx = await _query_anthropic_context_length(
+            model, base_url or "https://api.anthropic.com", api_key
+        )
         if ctx:
             return ctx
 
@@ -2904,21 +2673,8 @@ def get_model_context_length(
             if inferred:
                 effective_provider = inferred
 
-    # 5a. Copilot live /models API — max_prompt_tokens from the user's account.
-    # This catches account-specific models (e.g. claude-opus-4.6-1m) that
-    # don't exist in models.dev. For models that ARE in models.dev, this
-    # returns the provider-enforced limit which is what users can actually use.
-    if effective_provider in {"copilot", "copilot-acp", "github-copilot"}:
-        try:
-            from hermes_cli.models import get_copilot_model_context
-            ctx = get_copilot_model_context(model, api_key=api_key)
-            if ctx:
-                return ctx
-        except Exception:
-            pass  # Fall through to models.dev
-
     if effective_provider == "nous":
-        ctx, source = _resolve_nous_context_length(
+        ctx, source = await _resolve_nous_context_length(
             model, base_url=base_url or "", api_key=api_key or ""
         )
         if ctx:
@@ -2929,13 +2685,13 @@ def get_model_context_length(
             # Kimi/Qwen DEFAULT_CONTEXT_LENGTHS overrides exist — we don't
             # want it leaking into the persistent cache for Nous URLs.
             if base_url and source == "portal":
-                save_context_length(model, base_url, ctx)
+                await save_context_length(model, base_url, ctx)
             return ctx
     if effective_provider == "openai-codex":
         # Codex OAuth enforces lower context limits than the direct OpenAI
         # API for the same slug (e.g. gpt-5.5 is 1.05M on the API but 272K
         # on Codex). Authoritative source is Codex's own /models endpoint.
-        codex_ctx, codex_source = _resolve_codex_oauth_context_length_with_source(
+        codex_ctx, codex_source = await _resolve_codex_oauth_context_length_with_source(
             model, access_token=api_key or "",
         )
         if codex_ctx:
@@ -2943,12 +2699,14 @@ def get_model_context_length(
             # persist. The static fallback is deliberately runtime-only so a
             # transient OAuth/network failure cannot poison future probes.
             if base_url and codex_source == "live":
-                save_context_length(model, base_url, codex_ctx)
+                await save_context_length(model, base_url, codex_ctx)
             return codex_ctx
     if effective_provider == "gmi" and base_url:
         # GMI exposes authoritative context_length via /models, but it is not
         # in models.dev yet. Preserve that higher-fidelity endpoint lookup.
-        ctx = _resolve_endpoint_context_length(model, base_url, api_key=api_key)
+        ctx = await _resolve_endpoint_context_length(
+            model, base_url, api_key=api_key
+        )
         if ctx is not None:
             return ctx
     # 5e. Ollama native /api/show probe — runs for providers whose base_url
@@ -2969,10 +2727,10 @@ def get_model_context_length(
             and "ollama" not in _inferred_for_probe
         )
         if not _skip_ollama_probe:
-            ctx = _query_ollama_api_show(model, base_url, api_key=api_key)
+            ctx = await _query_ollama_api_show(model, base_url, api_key=api_key)
             if ctx is not None:
                 if not _skip_persistent_context_cache(base_url, provider):
-                    save_context_length(model, base_url, ctx)
+                    await save_context_length(model, base_url, ctx)
                 return ctx
     # 5f. OpenRouter live /models metadata — authoritative for OpenRouter-routed
     # models. OpenRouter's catalog carries per-model context_length (e.g.
@@ -2985,7 +2743,7 @@ def get_model_context_length(
     # the generic "claude": 200K entry and under-reported a 1M window. Mirrors
     # the dedicated Nous/Copilot/GMI branches above.
     if effective_provider == "openrouter":
-        metadata = fetch_model_metadata()
+        metadata = await fetch_model_metadata()
         entry = metadata.get(model)
         if entry:
             or_ctx = entry.get("context_length")
@@ -2998,7 +2756,7 @@ def get_model_context_length(
 
     if effective_provider:
         from agent.models_dev import lookup_models_dev_context
-        ctx = lookup_models_dev_context(effective_provider, model)
+        ctx = await lookup_models_dev_context(effective_provider, model)
         if ctx:
             # MiniMax M3: models.dev reports 512K but actual context is 1M.
             # Prefer hardcoded catalog over stale probe value.
@@ -3018,7 +2776,7 @@ def get_model_context_length(
     # because OpenRouter data is community-maintained and can be incorrect
     # for models that belong to known providers with curated defaults.
     if not effective_provider:
-        metadata = fetch_model_metadata()
+        metadata = await fetch_model_metadata()
         if model in metadata:
             or_ctx = metadata[model].get("context_length", DEFAULT_FALLBACK_CONTEXT)
             # Guard against stale OpenRouter metadata for Kimi-family models.
@@ -3035,10 +2793,12 @@ def get_model_context_length(
     # ``Hermes-3-Llama-3.1-70B`` substring-match ``llama`` (131072) even when
     # vLLM is running at a lower ``--max-model-len`` (e.g. 32768 on limited VRAM).
     if base_url and is_local_endpoint(base_url):
-        local_ctx = _query_local_context_length(model, base_url, api_key=api_key)
+        local_ctx = await _query_local_context_length(
+            model, base_url, api_key=api_key
+        )
         if local_ctx and local_ctx > 0:
             if not _skip_persistent_context_cache(base_url, provider):
-                _maybe_cache_local_context_length(model, base_url, local_ctx)
+                await _maybe_cache_local_context_length(model, base_url, local_ctx)
             return local_ctx
 
     # 8. Hardcoded defaults (fuzzy match — longest key first for specificity)

@@ -17,6 +17,7 @@ from __future__ import annotations
 import contextlib
 import io
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -42,14 +43,16 @@ def _config(max_attempts=None) -> dict:
     }
 
 
-def _make_agent(monkeypatch, tmp_path: Path, *, max_attempts=None):
+async def _make_agent(monkeypatch, tmp_path: Path, *, max_attempts=None):
     from hermes_cli import config as config_mod
 
     monkeypatch.setattr(
         config_mod, "load_config", lambda: _config(max_attempts=max_attempts)
     )
     monkeypatch.setattr(
-        config_mod, "load_config_readonly", lambda: _config(max_attempts=max_attempts)
+        config_mod,
+        "load_config_readonly",
+        AsyncMock(return_value=_config(max_attempts=max_attempts)),
     )
     db = SessionDB(tmp_path / "state.db")
     with contextlib.redirect_stdout(io.StringIO()):
@@ -65,19 +68,20 @@ def _make_agent(monkeypatch, tmp_path: Path, *, max_attempts=None):
             session_db=db,
             session_id="max-attempts-test",
         )
+    await agent._ensure_provider_runtime()
     return agent
 
 
 class TestCompressionMaxAttemptsConfig:
     @pytest.mark.asyncio
     async def test_default_is_three_when_unset(self, monkeypatch, tmp_path):
-        agent = _make_agent(monkeypatch, tmp_path)
+        agent = await _make_agent(monkeypatch, tmp_path)
         assert agent.max_compression_attempts == 3
         await agent.close()
 
     @pytest.mark.asyncio
     async def test_custom_value_is_honored(self, monkeypatch, tmp_path):
-        agent = _make_agent(monkeypatch, tmp_path, max_attempts=6)
+        agent = await _make_agent(monkeypatch, tmp_path, max_attempts=6)
         assert agent.max_compression_attempts == 6
         await agent.close()
 
@@ -95,7 +99,7 @@ class TestCompressionMaxAttemptsConfig:
         # configured agent exposes its value, and an object without the
         # attribute (older pickle / minimal stub) degrades to the prior
         # hardcoded behavior.
-        agent = _make_agent(monkeypatch, tmp_path, max_attempts=7)
+        agent = await _make_agent(monkeypatch, tmp_path, max_attempts=7)
         assert getattr(agent, "max_compression_attempts", 3) == 7
         assert getattr(object(), "max_compression_attempts", 3) == 3
         await agent.close()

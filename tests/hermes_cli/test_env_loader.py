@@ -3,7 +3,10 @@ import importlib
 import os
 import sys
 
+import pytest
+
 from hermes_cli.env_loader import load_hermes_dotenv
+
 
 
 
@@ -38,7 +41,8 @@ def _assert_clean_utf8_env_on_disk(env_file, *, first_key: str) -> None:
 
 
 
-def test_utf16_le_bom_preserves_non_ascii_values(tmp_path, monkeypatch):
+@pytest.mark.asyncio
+async def test_utf16_le_bom_preserves_non_ascii_values(tmp_path, monkeypatch):
     """UTF-16-LE+BOM rewrite must preserve non-ASCII values (not just ASCII keys).
 
     Uses non-credential var names so _sanitize_loaded_credentials does not
@@ -53,7 +57,7 @@ def test_utf16_le_bom_preserves_non_ascii_values(tmp_path, monkeypatch):
     monkeypatch.delenv("GREETING", raising=False)
     monkeypatch.delenv("CJK_LABEL", raising=False)
 
-    loaded = load_hermes_dotenv(hermes_home=home)
+    loaded = await load_hermes_dotenv(hermes_home=home)
 
     assert loaded == [env_file]
     assert os.getenv("GREETING") == "café"
@@ -123,7 +127,8 @@ def test_utf32_warning_fires_once_per_path(tmp_path, caplog, monkeypatch):
 
 
 
-def test_plain_utf8_env_regression(tmp_path, monkeypatch):
+@pytest.mark.asyncio
+async def test_plain_utf8_env_regression(tmp_path, monkeypatch):
     """Plain UTF-8 .env must keep loading after the UTF-16 sanitize changes."""
     home = tmp_path / "hermes"
     home.mkdir()
@@ -134,7 +139,7 @@ def test_plain_utf8_env_regression(tmp_path, monkeypatch):
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.delenv("SECOND_KEY", raising=False)
 
-    loaded = load_hermes_dotenv(hermes_home=home)
+    loaded = await load_hermes_dotenv(hermes_home=home)
 
     assert loaded == [env_file]
     assert os.getenv("OPENAI_API_KEY") == "sk-plain"
@@ -143,7 +148,8 @@ def test_plain_utf8_env_regression(tmp_path, monkeypatch):
     assert env_file.read_bytes() == before
 
 
-def test_cp1252_env_regression_does_not_crash(tmp_path, monkeypatch):
+@pytest.mark.asyncio
+async def test_cp1252_env_regression_does_not_crash(tmp_path, monkeypatch):
     """cp1252/latin-1 body must not crash sanitize; ASCII keys still usable.
 
     0xE9 is 'é' in cp1252 and incomplete as UTF-8. First line does not begin
@@ -162,7 +168,7 @@ def test_cp1252_env_regression_does_not_crash(tmp_path, monkeypatch):
     monkeypatch.delenv("ASCII_KEY", raising=False)
     monkeypatch.delenv("LATIN1_VALUE", raising=False)
 
-    loaded = load_hermes_dotenv(hermes_home=home)
+    loaded = await load_hermes_dotenv(hermes_home=home)
 
     assert loaded == [env_file]
     assert os.getenv("ASCII_KEY") == "ok"

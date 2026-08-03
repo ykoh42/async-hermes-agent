@@ -70,35 +70,15 @@ def has_azure_identity_installed() -> bool:
 
 
 def _require_azure_identity():
-    """Import ``azure.identity``, lazy-installing it if allowed.
-
-    Raises ``ImportError`` with a clear actionable message when the
-    package is missing and lazy installs are disabled.
-    """
+    """Import ``azure.identity`` or fail with an actionable message."""
     try:
         import azure.identity as _ai
         return _ai
-    except ImportError:
-        try:
-            from tools.lazy_deps import ensure, FeatureUnavailable
-        except ImportError as exc:
-            raise ImportError(
-                "The 'azure-identity' package is required for Azure AI "
-                "Foundry Entra ID authentication. Install it with: "
-                "pip install azure-identity"
-            ) from exc
-
-        try:
-            ensure(_AZURE_IDENTITY_FEATURE, prompt=False)
-        except FeatureUnavailable as exc:
-            raise ImportError(
-                "The 'azure-identity' package is required for Azure AI "
-                "Foundry Entra ID authentication. " + str(exc)
-            ) from exc
-
-        # Retry import after lazy install.
-        import azure.identity as _ai  # noqa: WPS440
-        return _ai
+    except ImportError as exc:
+        raise ImportError(
+            "The 'azure-identity' package is required for Azure AI Foundry "
+            "Entra ID authentication. Install it with: pip install azure-identity"
+        ) from exc
 
 
 def reset_credential_cache() -> None:
@@ -271,11 +251,8 @@ def has_azure_identity_credentials(scope: Optional[str] = None,
     error — never raises. Use for ``hermes doctor`` /
     ``hermes auth status`` / wizard preflight.
 
-    ``allow_install``: when True (default) and ``azure-identity`` is not
-    importable, the adapter triggers the standard lazy-install path
-    (subject to ``security.allow_lazy_installs``) before probing. Set
-    False to make this strictly an "is installed?" check — used on hot
-    paths like CLI startup where we never want pip to run.
+    ``allow_install`` remains as a diagnostic-call compatibility argument;
+    packages are never installed at runtime.
 
     NOT used by ``is_provider_configured()`` — that path is structural
     only (no token mint), so CLI startup doesn't pay this latency.
@@ -286,7 +263,7 @@ def has_azure_identity_credentials(scope: Optional[str] = None,
         try:
             _require_azure_identity()
         except ImportError as exc:
-            logger.debug("azure-identity lazy install unavailable: %s", exc)
+            logger.debug("azure-identity unavailable: %s", exc)
             return False
     if config is None:
         effective_scope = (scope or "").strip() or SCOPE_AI_AZURE_DEFAULT
@@ -324,11 +301,8 @@ def describe_active_credential(config: Optional[EntraIdentityConfig] = None,
     Designed for ``hermes doctor`` and the wizard preflight — never
     raises, returns ``{"ok": False, "error": ...}`` on failure.
 
-    ``allow_install``: when True (default) and ``azure-identity`` is not
-    importable, the adapter triggers the standard lazy-install path
-    (subject to ``security.allow_lazy_installs``) before probing. The
-    install failure is surfaced as the diagnostic error when it fails.
-    Set False for hot CLI paths that should never trigger pip.
+    ``allow_install`` remains as a diagnostic-call compatibility argument;
+    packages are never installed at runtime.
 
     ``azure-identity`` doesn't expose the winning inner credential as
     a public field, so we report a coarse picture (env vars present,
@@ -341,8 +315,7 @@ def describe_active_credential(config: Optional[EntraIdentityConfig] = None,
         if not allow_install:
             info["error"] = "azure-identity not installed"
             info["hint"] = (
-                "pip install azure-identity (or rely on lazy install at "
-                "first use)"
+                "pip install azure-identity"
             )
             return info
         try:
@@ -350,9 +323,7 @@ def describe_active_credential(config: Optional[EntraIdentityConfig] = None,
         except ImportError as exc:
             info["error"] = str(exc) or "azure-identity not installed"
             info["hint"] = (
-                "pip install azure-identity manually, or enable lazy "
-                "installs (security.allow_lazy_installs: true in "
-                "config.yaml)."
+                "pip install azure-identity manually."
             )
             return info
 
