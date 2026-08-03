@@ -1,6 +1,6 @@
 """Tests that _try_activate_fallback updates the context compressor."""
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -44,10 +44,9 @@ def _make_agent_with_compressor() -> AIAgent:
     return agent
 
 
-@patch("agent.auxiliary_client.resolve_provider_client")
-@patch("agent.model_metadata.get_model_context_length", return_value=128_000)
+@patch("agent.model_metadata.get_static_context_length", return_value=128_000)
 @pytest.mark.asyncio
-async def test_compressor_updated_on_fallback(mock_ctx_len, mock_resolve):
+async def test_compressor_updated_on_fallback(mock_ctx_len):
     """After fallback activation, the compressor must reflect the fallback model."""
     agent = _make_agent_with_compressor()
 
@@ -56,12 +55,25 @@ async def test_compressor_updated_on_fallback(mock_ctx_len, mock_resolve):
     fb_client = MagicMock()
     fb_client.base_url = "https://api.openai.com/v1"
     fb_client.api_key = "sk-fallback"
-    mock_resolve.return_value = (fb_client, None)
+    async def initialize_fallback_runtime():
+        agent.client = fb_client
+        agent.base_url = str(fb_client.base_url)
+        agent.api_key = str(fb_client.api_key)
+        agent.api_mode = "chat_completions"
+        agent.provider = "openai"
+        agent.model = "gpt-4o"
+        return True
 
+    agent._ensure_provider_runtime = AsyncMock(side_effect=initialize_fallback_runtime)
     agent._is_direct_openai_url = lambda url: "api.openai.com" in url
+    agent._is_azure_openai_url = lambda _url: False
+    agent._provider_model_requires_responses_api = lambda *_args, **_kwargs: False
+    agent._anthropic_prompt_cache_policy = lambda **_kwargs: (False, False)
+    agent._buffer_status = lambda _msg: None
     agent._emit_status = lambda msg: None
 
-    result = await agent._try_activate_fallback()
+    with patch("agent.chat_completion_helpers.rewrite_prompt_model_identity"):
+        result = await agent._try_activate_fallback()
 
     assert result is True
     assert agent._fallback_activated is True
@@ -73,4 +85,3 @@ async def test_compressor_updated_on_fallback(mock_ctx_len, mock_resolve):
     assert c.provider == "openai"
     assert c.context_length == 128_000
     assert c.threshold_tokens == int(128_000 * c.threshold_percent)
-

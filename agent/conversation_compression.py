@@ -676,7 +676,13 @@ async def check_compression_model_feasibility(agent: Any) -> None:
         # to the client's base_url hostname so the user can still tell
         # where the compression model is actually being called.
         try:
-            _aux_cfg_provider, _, _, _, _ = _resolve_task_provider_model("compression")
+            from hermes_cli.config import load_config_readonly_async
+
+            config_snapshot = await load_config_readonly_async()
+            _aux_cfg_provider, _, _, _, _ = _resolve_task_provider_model(
+                "compression",
+                config=config_snapshot,
+            )
         except Exception:
             _aux_cfg_provider = ""
         client, aux_model = await get_text_auxiliary_client(

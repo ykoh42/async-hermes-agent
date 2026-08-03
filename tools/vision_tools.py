@@ -859,16 +859,16 @@ async def _should_use_native_vision_fast_path() -> bool:
     """
     try:
         from agent.auxiliary_client import (
-            _read_main_provider_async,
-            _read_main_model_async,
+            _read_main_provider,
+            _read_main_model,
         )
         from agent.image_routing import decide_image_input_mode, _lookup_supports_vision
         from hermes_cli.config import get_config_path
         import aiofiles
         from utils import fast_safe_load
 
-        provider = await _read_main_provider_async()
-        model = await _read_main_model_async()
+        provider = await _read_main_provider()
+        model = await _read_main_model()
         try:
             async with aiofiles.open(get_config_path(), encoding="utf-8") as fh:
                 cfg = fast_safe_load(await fh.read()) or {}

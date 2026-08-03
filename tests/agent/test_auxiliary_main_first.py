@@ -95,11 +95,13 @@ class TestResolveAutoMainFirst:
     async def test_main_unavailable_uses_task_fallback_chain_before_builtin_chain(self):
         """Auto aux resolution honors auxiliary.<task>.fallback_chain before built-ins."""
         task_client = MagicMock()
+        config = {
+            "model": {
+                "provider": "nvidia",
+                "default": "qwen/qwen3.5-122b-a10b",
+            }
+        }
         with patch(
-            "agent.auxiliary_client._read_main_provider", return_value="nvidia",
-        ), patch(
-            "agent.auxiliary_client._read_main_model", return_value="qwen/qwen3.5-122b-a10b",
-        ), patch(
             "agent.auxiliary_client.resolve_provider_client",
             new_callable=AsyncMock,
             return_value=(None, None),  # main provider has no client
@@ -116,12 +118,19 @@ class TestResolveAutoMainFirst:
         ) as mock_openrouter:
             from agent.auxiliary_client import _resolve_auto
 
-            client, model = await _resolve_auto(task="title_generation")
+            client, model = await _resolve_auto(
+                task="title_generation",
+                config=config,
+            )
 
         assert client is task_client
         assert model == "task-free-model"
         mock_task_chain.assert_called_once_with(
-            "title_generation", "nvidia", reason="main provider unavailable")
+            "title_generation",
+            "nvidia",
+            reason="main provider unavailable",
+            config=config,
+        )
         mock_main_chain.assert_not_called()
         mock_openrouter.assert_not_called()
 
@@ -134,6 +143,7 @@ class TestResolveAutoMainFirst:
         runtime_client = MagicMock()
         with patch(
             "agent.auxiliary_client._read_main_model",
+            new_callable=AsyncMock,
             return_value="claude-opus-4-8",
         ) as mock_read_main_model, patch(
             "agent.auxiliary_client._resolve_auto",
@@ -164,9 +174,11 @@ class TestResolveAutoMainFirst:
         token_plan_url = "https://token-plan-sgp.xiaomimimo.com/v1"
         with patch(
             "agent.auxiliary_client._read_main_provider",
+            new_callable=AsyncMock,
             return_value="openrouter",
         ), patch(
-            "agent.auxiliary_client._read_main_model", return_value="config-model",
+            "agent.auxiliary_client._read_main_model", new_callable=AsyncMock,
+            return_value="config-model",
         ), patch(
             "agent.auxiliary_client.resolve_provider_client",
             new_callable=AsyncMock,
@@ -202,9 +214,11 @@ class TestResolveVisionMainFirst:
         monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
 
         with patch(
-            "agent.auxiliary_client._read_main_provider", return_value="openrouter",
+            "agent.auxiliary_client._read_main_provider", new_callable=AsyncMock,
+            return_value="openrouter",
         ), patch(
             "agent.auxiliary_client._read_main_model",
+            new_callable=AsyncMock,
             return_value="anthropic/claude-sonnet-4.6",
         ), patch(
             "agent.auxiliary_client.resolve_provider_client",
@@ -246,9 +260,11 @@ class TestResolveVisionMainFirst:
             return {"Copilot-Vision-Request": "true"} if is_vision else {}
 
         with patch(
-            "agent.auxiliary_client._read_main_provider", return_value="copilot",
+            "agent.auxiliary_client._read_main_provider", new_callable=AsyncMock,
+            return_value="copilot",
         ), patch(
-            "agent.auxiliary_client._read_main_model", return_value="configured-copilot-model",
+            "agent.auxiliary_client._read_main_model", new_callable=AsyncMock,
+            return_value="configured-copilot-model",
         ), patch(
             "agent.auxiliary_client._resolve_task_provider_model",
             return_value=("auto", None, None, None, None),
@@ -344,9 +360,11 @@ class TestResolveVisionCustomProvider:
         monkeypatch.setattr(aux, "_RUNTIME_MAIN_API_MODE", "anthropic_messages")
 
         with patch(
-            "agent.auxiliary_client._read_main_provider", return_value="custom",
+            "agent.auxiliary_client._read_main_provider", new_callable=AsyncMock,
+            return_value="custom",
         ), patch(
-            "agent.auxiliary_client._read_main_model", return_value="claude-opus-4-8",
+            "agent.auxiliary_client._read_main_model", new_callable=AsyncMock,
+            return_value="claude-opus-4-8",
         ), patch(
             "agent.auxiliary_client._resolve_task_provider_model",
             return_value=("auto", None, None, None, None),
@@ -382,9 +400,11 @@ class TestResolveVisionCustomProvider:
 
         with patch(
             "agent.auxiliary_client._read_main_provider",
+            new_callable=AsyncMock,
             return_value="custom:copilot-gateway",
         ), patch(
-            "agent.auxiliary_client._read_main_model", return_value="claude-opus-4-8",
+            "agent.auxiliary_client._read_main_model", new_callable=AsyncMock,
+            return_value="claude-opus-4-8",
         ), patch(
             "agent.auxiliary_client._resolve_task_provider_model",
             return_value=("auto", None, None, None, None),
@@ -416,9 +436,11 @@ class TestResolveVisionCustomProvider:
         monkeypatch.setattr(aux, "_RUNTIME_MAIN_API_MODE", "")
 
         with patch(
-            "agent.auxiliary_client._read_main_provider", return_value="custom",
+            "agent.auxiliary_client._read_main_provider", new_callable=AsyncMock,
+            return_value="custom",
         ), patch(
-            "agent.auxiliary_client._read_main_model", return_value="claude-opus-4-8",
+            "agent.auxiliary_client._read_main_model", new_callable=AsyncMock,
+            return_value="claude-opus-4-8",
         ), patch(
             "agent.auxiliary_client._resolve_task_provider_model",
             return_value=("auto", None, None, None, None),

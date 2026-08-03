@@ -571,8 +571,8 @@ async def _resolve_attribution(
         provider = provider_override
     else:
         try:
-            from agent.auxiliary_client import _read_main_provider_async
-            provider = (await _read_main_provider_async() or "").strip() or "auto"
+            from agent.auxiliary_client import _read_main_provider
+            provider = (await _read_main_provider() or "").strip() or "auto"
         except Exception:  # pragma: no cover — defensive
             provider = "auto"
 
@@ -583,8 +583,8 @@ async def _resolve_attribution(
         model = model_override
     else:
         try:
-            from agent.auxiliary_client import _read_main_model_async
-            model = (await _read_main_model_async() or "").strip() or "default"
+            from agent.auxiliary_client import _read_main_model
+            model = (await _read_main_model() or "").strip() or "default"
         except Exception:  # pragma: no cover — defensive
             model = "default"
 

@@ -5,7 +5,7 @@ import json
 import logging
 import time
 from types import SimpleNamespace
-from unittest.mock import patch, MagicMock, AsyncMock
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -174,13 +174,10 @@ class TestResolveTaskProviderModel:
         preset = {
             "aggregator": {"provider": "openrouter", "model": "anthropic/claude-opus-4.8"},
         }
-        monkeypatch.setattr("agent.auxiliary_client._get_auxiliary_task_config", lambda task: {})
         monkeypatch.setattr(
             "hermes_cli.moa_config.resolve_moa_preset",
             lambda cfg, name: preset,
         )
-        monkeypatch.setattr("hermes_cli.config.load_config", lambda: {"moa": {}})
-        monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda: {"moa": {}})
 
         resolved_provider, model, base_url, api_key, api_mode = _resolve_task_provider_model(
             task="title_generation",
@@ -188,6 +185,7 @@ class TestResolveTaskProviderModel:
             model="opus-gpt",
             base_url="moa://local",
             api_key="moa-virtual-provider",
+            config={"moa": {}},
         )
 
         assert resolved_provider == "openrouter"
@@ -208,18 +206,21 @@ class TestResolveTaskProviderModel:
             "aggregator": {"provider": "anthropic", "model": "claude-opus-4.8"},
         }
         monkeypatch.setattr(
-            "agent.auxiliary_client._get_auxiliary_task_config",
-            lambda task: {"provider": "moa", "model": "opus-gpt"} if task == "title_generation" else {},
-        )
-        monkeypatch.setattr(
             "hermes_cli.moa_config.resolve_moa_preset",
             lambda cfg, name: preset,
         )
-        monkeypatch.setattr("hermes_cli.config.load_config", lambda: {"moa": {}})
-        monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda: {"moa": {}})
 
         resolved_provider, model, base_url, api_key, api_mode = _resolve_task_provider_model(
             task="title_generation",
+            config={
+                "moa": {},
+                "auxiliary": {
+                    "title_generation": {
+                        "provider": "moa",
+                        "model": "opus-gpt",
+                    }
+                },
+            },
         )
 
         assert resolved_provider == "anthropic"
@@ -232,18 +233,16 @@ class TestResolveTaskProviderModel:
         """If the MoA preset can't be resolved (e.g. renamed/deleted), the
         function must not raise — it degrades to the pre-fix behavior
         (literal "moa") rather than crash resolve_provider_client() harder."""
-        monkeypatch.setattr("agent.auxiliary_client._get_auxiliary_task_config", lambda task: {})
         monkeypatch.setattr(
             "hermes_cli.moa_config.resolve_moa_preset",
             lambda cfg, name: (_ for _ in ()).throw(KeyError("gone-preset")),
         )
-        monkeypatch.setattr("hermes_cli.config.load_config", lambda: {"moa": {}})
-        monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda: {"moa": {}})
 
         resolved_provider, model, base_url, api_key, api_mode = _resolve_task_provider_model(
             task="title_generation",
             provider="moa",
             model="gone-preset",
+            config={"moa": {}},
         )
 
         assert resolved_provider == "moa"
@@ -316,7 +315,8 @@ class TestMoaAggregatorSharedResolution:
         monkeypatch.setenv("HERMES_HOME", str(home))
         return home
 
-    def test_real_config_explicit_task_provider_moa(self, tmp_path, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_real_config_explicit_task_provider_moa(self, tmp_path, monkeypatch):
         """auxiliary.<task>.provider: moa in a REAL config.yaml resolves to the
         aggregator through the genuine load_config()/resolve_moa_preset() path."""
         import yaml
@@ -326,8 +326,11 @@ class TestMoaAggregatorSharedResolution:
         cfg["auxiliary"] = {"title_generation": {"provider": "moa", "model": "opus-gpt"}}
         (home / "config.yaml").write_text(yaml.safe_dump(cfg))
 
+        from hermes_cli.config import load_config_readonly_async
+
         resolved_provider, model, base_url, api_key, api_mode = _resolve_task_provider_model(
             task="title_generation",
+            config=await load_config_readonly_async(),
         )
 
         assert resolved_provider == "openrouter"
@@ -347,8 +350,8 @@ class TestMoaAggregatorSharedResolution:
         from agent.auxiliary_client import _try_main_agent_model_fallback
 
         self._write_moa_config(tmp_path, monkeypatch)
-        with patch("agent.auxiliary_client._read_main_provider", return_value="moa"), \
-             patch("agent.auxiliary_client._read_main_model", return_value="opus-gpt"), \
+        with patch("agent.auxiliary_client._read_main_provider", new_callable=AsyncMock, return_value="moa"), \
+             patch("agent.auxiliary_client._read_main_model", new_callable=AsyncMock, return_value="opus-gpt"), \
              patch("agent.auxiliary_client._is_provider_unhealthy", return_value=False), \
              patch("agent.auxiliary_client.resolve_provider_client", new_callable=AsyncMock) as mock_resolve:
             mock_client = MagicMock()
@@ -812,6 +815,31 @@ class TestResolveProviderClientUniversalModelFallback:
     against the wrong subscription.
     """
 
+    @pytest.mark.asyncio
+    async def test_main_alias_resolves_through_async_provider_reader(self):
+        client = MagicMock()
+        with (
+            patch(
+                "agent.auxiliary_client._read_main_provider",
+                new_callable=AsyncMock,
+                return_value="openrouter",
+            ) as read_provider,
+            patch(
+                "agent.auxiliary_client._try_openrouter",
+                new_callable=AsyncMock,
+                return_value=(client, "openai/gpt-5.4"),
+            ),
+        ):
+            resolved_client, resolved_model = await resolve_provider_client(
+                "main",
+                "openai/gpt-5.4",
+                config={},
+            )
+
+        assert resolved_client is client
+        assert resolved_model == "openai/gpt-5.4"
+        read_provider.assert_awaited_once()
+
 
     @pytest.mark.asyncio
     async def test_empty_model_for_codex_also_uses_main_model(self):
@@ -819,10 +847,6 @@ class TestResolveProviderClientUniversalModelFallback:
         from agent.auxiliary_client import resolve_provider_client
 
         with (
-            patch(
-                "agent.auxiliary_client._read_main_model",
-                return_value="gpt-5.4",
-            ),
             patch(
                 "agent.auxiliary_client._get_aux_model_for_provider",
                 return_value="",  # openai-codex has no catalog default either
@@ -838,7 +862,11 @@ class TestResolveProviderClientUniversalModelFallback:
                 return_value=(True, None),
             ),
         ):
-            client, model = await resolve_provider_client("openai-codex", "")
+            client, model = await resolve_provider_client(
+                "openai-codex",
+                "",
+                config={"model": {"default": "gpt-5.4"}},
+            )
 
         assert client is not None
         assert model == "gpt-5.4"
@@ -855,7 +883,7 @@ class TestResolveProviderClientUniversalModelFallback:
         from agent.auxiliary_client import resolve_provider_client
 
         with (
-            patch("agent.auxiliary_client._read_main_model") as mock_read_main,
+            patch("agent.auxiliary_client._read_main_model", new_callable=AsyncMock) as mock_read_main,
             patch(
                 "agent.auxiliary_client._get_aux_model_for_provider",
                 return_value="catalog-default-should-not-be-used",
@@ -1084,8 +1112,8 @@ class TestVisionClientFallback:
         monkeypatch.setenv("ANTHROPIC_API_KEY", "***")
         with (
             patch("agent.auxiliary_client._read_nous_auth", return_value=None),
-            patch("agent.auxiliary_client._read_main_provider", return_value="anthropic"),
-            patch("agent.auxiliary_client._read_main_model", return_value="claude-sonnet-4"),
+            patch("agent.auxiliary_client._read_main_provider", new_callable=AsyncMock, return_value="anthropic"),
+            patch("agent.auxiliary_client._read_main_model", new_callable=AsyncMock, return_value="claude-sonnet-4"),
             patch("agent.anthropic_adapter.build_anthropic_client", return_value=MagicMock()),
             patch("agent.anthropic_adapter.resolve_anthropic_token", return_value="***"),
         ):
@@ -1166,7 +1194,11 @@ class TestAuxiliaryPoolAwareness:
         with (
             patch("agent.auxiliary_client.load_pool", new=AsyncMock(return_value=pool)),
             patch("agent.auxiliary_client._create_openai_client") as mock_create,
-            patch("hermes_cli.models.get_nous_recommended_aux_model", return_value=None),
+            patch(
+                "hermes_cli.models.get_nous_recommended_aux_model_async",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
         ):
             from agent.auxiliary_client import _try_nous
 
@@ -1376,23 +1408,25 @@ class TestRefreshNousRecommendedModel:
 
 
 
-    def test_falls_back_to_default_when_portal_unavailable(self, monkeypatch):
-        def _boom(**kw):
+    @pytest.mark.asyncio
+    async def test_falls_back_to_default_when_portal_unavailable(self, monkeypatch):
+        async def _boom(**kw):
             raise RuntimeError("portal down")
         monkeypatch.setattr(
-            "hermes_cli.models.get_nous_recommended_aux_model", _boom)
-        out = _refresh_nous_recommended_model(
+            "hermes_cli.models.get_nous_recommended_aux_model_async", _boom)
+        out = await _refresh_nous_recommended_model(
             vision=False, stale_model="some/dead-model")
         assert out == _NOUS_MODEL
 
-    def test_returns_none_when_no_distinct_alternative(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_returns_none_when_no_distinct_alternative(self, monkeypatch):
         """When the failed model IS the default and the Portal has nothing
         else, there's no usable alternative."""
         monkeypatch.setattr(
-            "hermes_cli.models.get_nous_recommended_aux_model",
-            lambda **kw: _NOUS_MODEL,
+            "hermes_cli.models.get_nous_recommended_aux_model_async",
+            AsyncMock(return_value=_NOUS_MODEL),
         )
-        out = _refresh_nous_recommended_model(
+        out = await _refresh_nous_recommended_model(
             vision=False, stale_model=_NOUS_MODEL)
         assert out is None
 
@@ -1465,7 +1499,7 @@ class TestTryPaymentFallback:
         mock_client = MagicMock()
         with patch("agent.auxiliary_client._try_openrouter", new_callable=AsyncMock, return_value=(None, None)), \
              patch("agent.auxiliary_client._try_nous", new_callable=AsyncMock, return_value=(mock_client, "nous-model")), \
-             patch("agent.auxiliary_client._read_main_provider", return_value="openrouter"):
+             patch("agent.auxiliary_client._read_main_provider", new_callable=AsyncMock, return_value="openrouter"):
             client, model, label = await _try_payment_fallback("openrouter", task="compression")
         assert client is mock_client
         assert model == "nous-model"
@@ -1484,7 +1518,7 @@ class TestTryPaymentFallback:
              patch("agent.auxiliary_client._try_nous", new_callable=AsyncMock, return_value=(None, None)), \
              patch("agent.auxiliary_client._try_custom_endpoint", new_callable=AsyncMock, return_value=(None, None)), \
              patch("agent.auxiliary_client._resolve_api_key_provider", new_callable=AsyncMock, return_value=(None, None)), \
-             patch("agent.auxiliary_client._read_main_provider", return_value="openrouter"):
+             patch("agent.auxiliary_client._read_main_provider", new_callable=AsyncMock, return_value="openrouter"):
             client, model, label = await _try_payment_fallback("openrouter")
         assert client is None
         assert model is None
@@ -1808,6 +1842,7 @@ class TestAuxiliaryFallbackLayering:
             "compression",
             "ollama-cloud",
             reason="provider unavailable",
+            config=ANY,
         )
 
 
@@ -1848,8 +1883,8 @@ class TestTryMainAgentModelFallback:
     @pytest.mark.asyncio
     async def test_returns_none_when_main_provider_is_auto(self):
         from agent.auxiliary_client import _try_main_agent_model_fallback
-        with patch("agent.auxiliary_client._read_main_provider", return_value="auto"), \
-             patch("agent.auxiliary_client._read_main_model", return_value="some-model"):
+        with patch("agent.auxiliary_client._read_main_provider", new_callable=AsyncMock, return_value="auto"), \
+             patch("agent.auxiliary_client._read_main_model", new_callable=AsyncMock, return_value="some-model"):
             client, model, label = await _try_main_agent_model_fallback("glm", task="vision")
         assert client is None and model is None and label == ""
 
@@ -1858,8 +1893,8 @@ class TestTryMainAgentModelFallback:
     async def test_resolves_main_provider_client(self):
         from agent.auxiliary_client import _try_main_agent_model_fallback
         fake_client = MagicMock()
-        with patch("agent.auxiliary_client._read_main_provider", return_value="openrouter"), \
-             patch("agent.auxiliary_client._read_main_model", return_value="anthropic/claude-sonnet-4"), \
+        with patch("agent.auxiliary_client._read_main_provider", new_callable=AsyncMock, return_value="openrouter"), \
+             patch("agent.auxiliary_client._read_main_model", new_callable=AsyncMock, return_value="anthropic/claude-sonnet-4"), \
              patch("agent.auxiliary_client._is_provider_unhealthy", return_value=False), \
              patch("agent.auxiliary_client.resolve_provider_client",
                    new_callable=AsyncMock, return_value=(fake_client, "anthropic/claude-sonnet-4")):
@@ -2199,10 +2234,15 @@ class TestStaleBaseUrlWarning:
         monkeypatch.setenv("OPENAI_BASE_URL", "http://localhost:11434/v1")
         monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
 
-        with patch("agent.auxiliary_client._read_main_provider", return_value="openrouter"), \
-             patch("agent.auxiliary_client._read_main_model", return_value="google/gemini-flash"), \
-             caplog.at_level(logging.WARNING, logger="agent.auxiliary_client"):
-            await _resolve_auto()
+        with caplog.at_level(logging.WARNING, logger="agent.auxiliary_client"):
+            await _resolve_auto(
+                config={
+                    "model": {
+                        "provider": "openrouter",
+                        "default": "google/gemini-flash",
+                    }
+                }
+            )
 
         assert any("OPENAI_BASE_URL is set" in rec.message for rec in caplog.records), \
             "Expected a warning about stale OPENAI_BASE_URL"
@@ -2228,7 +2268,7 @@ class TestAuxiliaryTaskExtraBody:
             }
         }
 
-        with patch("hermes_cli.config.load_config", return_value=config), patch("hermes_cli.config.load_config_readonly", return_value=config), patch(
+        with patch("hermes_cli.config.load_config_readonly_async", new_callable=AsyncMock, return_value=config), patch(
             "agent.auxiliary_client._get_cached_client",
             return_value=(client, "glm-4.5-air"),
         ):
@@ -2259,7 +2299,7 @@ class TestAuxiliaryTaskExtraBody:
             }
         }
 
-        with patch("hermes_cli.config.load_config", return_value=config), patch("hermes_cli.config.load_config_readonly", return_value=config), patch(
+        with patch("hermes_cli.config.load_config_readonly_async", new_callable=AsyncMock, return_value=config), patch(
             "agent.auxiliary_client._get_cached_client",
             return_value=(client, "glm-4.5-air"),
         ):
@@ -2285,9 +2325,8 @@ class TestAuxiliaryTaskExtraBody:
         from agent.auxiliary_client import _get_task_extra_body
 
         config = {"auxiliary": {moa_task: {"reasoning_effort": "xhigh"}}}
-        with patch("hermes_cli.config.load_config", return_value=config), patch("hermes_cli.config.load_config_readonly", return_value=config), \
-             caplog.at_level(logging.WARNING, logger="agent.auxiliary_client"):
-            result = _get_task_extra_body(moa_task)
+        with caplog.at_level(logging.WARNING, logger="agent.auxiliary_client"):
+            result = _get_task_extra_body(moa_task, config=config)
 
         assert "reasoning" not in result
         assert any("per-slot" in rec.message for rec in caplog.records)
@@ -2370,12 +2409,19 @@ class TestAuxiliaryTaskExtraBody:
         monkeypatch.setenv("OPENAI_BASE_URL", "http://localhost:11434/v1")
         monkeypatch.setenv("OPENAI_API_KEY", "test-key")
 
-        with patch("agent.auxiliary_client._read_main_provider", return_value="custom"), \
-             patch("agent.auxiliary_client._read_main_model", return_value="llama3"), \
-             patch("agent.auxiliary_client._create_openai_client") as mock_create, \
+        with patch("agent.auxiliary_client._create_openai_client") as mock_create, \
              caplog.at_level(logging.WARNING, logger="agent.auxiliary_client"):
             mock_create.return_value = MagicMock()
-            await _resolve_auto()
+            await _resolve_auto(
+                config={
+                    "model": {
+                        "provider": "custom",
+                        "default": "llama3",
+                        "base_url": "http://localhost:11434/v1",
+                        "api_key": "test-key",
+                    }
+                }
+            )
 
         assert not any("OPENAI_BASE_URL is set" in rec.message for rec in caplog.records), \
             "Should NOT warn when provider is 'custom'"
@@ -2552,11 +2598,13 @@ class TestAuxiliaryAuthRefreshRetry:
 
     @pytest.mark.asyncio
     async def test_resolve_provider_client_vertex_none_when_no_credentials(self):
-        with patch("agent.vertex_adapter.has_vertex_credentials", return_value=False):
-            client, model = await resolve_provider_client("vertex", "google/gemini-3-flash-preview")
+        from agent.agent_runtime_helpers import AsyncCapabilityError
 
-        assert client is None
-        assert model is None
+        with pytest.raises(AsyncCapabilityError, match="Vertex AI credential minting"):
+            await resolve_provider_client(
+                "vertex",
+                "google/gemini-3-flash-preview",
+            )
 
 
 
@@ -3071,10 +3119,12 @@ class TestVisionAutoSkipsKimiCoding:
         fake_or_client = MagicMock(name="openrouter_client")
 
         monkeypatch.setattr(
-            "agent.auxiliary_client._read_main_provider", lambda: "kimi-coding",
+            "agent.auxiliary_client._read_main_provider",
+            AsyncMock(return_value="kimi-coding"),
         )
         monkeypatch.setattr(
-            "agent.auxiliary_client._read_main_model", lambda: "kimi-code",
+            "agent.auxiliary_client._read_main_model",
+            AsyncMock(return_value="kimi-code"),
         )
         # Guard: if the skip doesn't fire, _resolve_strict_vision_backend
         # and resolve_provider_client both would try kimi-coding — detect
@@ -3785,7 +3835,7 @@ class TestAuxUnhealthyCache:
         # Mark BOTH the failed provider (openrouter) and a sibling (custom)
         # unhealthy. The chain should still find nous.
         _mark_provider_unhealthy("local/custom")
-        with patch("agent.auxiliary_client._read_main_provider", return_value="openrouter"), \
+        with patch("agent.auxiliary_client._read_main_provider", new_callable=AsyncMock, return_value="openrouter"), \
              patch("agent.auxiliary_client._try_openrouter", new_callable=AsyncMock) as or_try, \
              patch("agent.auxiliary_client._try_nous", new=AsyncMock(return_value=(nous_client, "n-model"))), \
              patch("agent.auxiliary_client._try_custom_endpoint", new_callable=AsyncMock) as custom_try, \
@@ -3924,26 +3974,24 @@ class TestCompressionFallbackContextFilter:
             self._make_chain_entry("big-provider", "huge-1m"),
         ]
 
-        async def fake_resolve(entry):
+        async def fake_resolve(entry, **_kwargs):
             if entry is entries[0]:
                 return small_client, "tiny-8k"
             return large_client, "huge-1m"
 
         # tiny-8k resolves to 8K (below 64K floor); huge-1m resolves to 1M
-        def fake_ctx(model, base_url="", api_key="", **kwargs):
+        async def fake_ctx(provider, model, base_url="", api_key=""):
             return {"tiny-8k": 8192, "huge-1m": 1_048_576}.get(model, 256_000)
-
-        monkeypatch.setattr(
-            "agent.auxiliary_client._get_auxiliary_task_config",
-            lambda task: {"fallback_chain": entries} if task == "compression" else {},
-        )
 
         with patch("agent.auxiliary_client._resolve_fallback_entry",
                    side_effect=fake_resolve), \
-             patch("agent.auxiliary_client.get_model_context_length",
+             patch("agent.auxiliary_client._candidate_context_window",
                    side_effect=fake_ctx):
             client, model, label = await _try_configured_fallback_chain(
-                task="compression", failed_provider="auto")
+                task="compression",
+                failed_provider="auto",
+                config={"auxiliary": {"compression": {"fallback_chain": entries}}},
+            )
 
         assert client is large_client, (
             f"Expected large_client (1M context), got {client}. "
@@ -3971,17 +4019,13 @@ class TestCompressionFallbackContextFilter:
             self._make_chain_entry("nvidia", "deepseek-ai/deepseek-v4-pro"),
         ]
 
-        monkeypatch.setattr(
-            "agent.auxiliary_client._get_auxiliary_task_config",
-            lambda task: {"fallback_chain": entries} if task == "compression" else {},
-        )
-
         with patch("agent.auxiliary_client._resolve_fallback_entry",
                    side_effect=AssertionError("must not be resolved")):
             client, model, label = await _try_configured_fallback_chain(
                 task="compression",
                 failed_provider="nvidia",
                 failed_model="deepseek-ai/deepseek-v4-pro",
+                config={"auxiliary": {"compression": {"fallback_chain": entries}}},
             )
 
         assert client is None
@@ -4059,7 +4103,7 @@ class TestCustomEndpointApiKeyInheritance:
             captured.update(kwargs)
             return MagicMock()
 
-        with patch("hermes_cli.config.load_config", return_value=fake_config), patch("hermes_cli.config.load_config_readonly", return_value=fake_config), \
+        with patch("hermes_cli.config.load_config_readonly_async", new_callable=AsyncMock, return_value=fake_config), \
              patch.object(ac, "_create_openai_client", side_effect=_capture_create):
             client, model = await resolve_provider_client(
                 "custom",
@@ -4088,7 +4132,7 @@ class TestCustomEndpointApiKeyInheritance:
             captured.update(kwargs)
             return MagicMock()
 
-        with patch("hermes_cli.config.load_config", return_value=fake_config), patch("hermes_cli.config.load_config_readonly", return_value=fake_config), \
+        with patch("hermes_cli.config.load_config_readonly_async", new_callable=AsyncMock, return_value=fake_config), \
              patch.object(ac, "_create_openai_client", side_effect=_capture_create):
             client, model = await resolve_provider_client(
                 "custom",
@@ -4116,7 +4160,7 @@ class TestCustomEndpointApiKeyInheritance:
 
         with patch.object(ac, "_RUNTIME_MAIN_API_KEY", "sk-runtime-key"), \
              patch.object(ac, "_RUNTIME_MAIN_BASE_URL", "https://gw.example.com/v1"), \
-             patch("hermes_cli.config.load_config", return_value={"model": {}}), patch("hermes_cli.config.load_config_readonly", return_value={"model": {}}), \
+             patch("hermes_cli.config.load_config_readonly_async", new_callable=AsyncMock, return_value={"model": {}}), \
              patch.object(ac, "_create_openai_client", side_effect=_capture_create):
             client, model = await resolve_provider_client(
                 "custom",
@@ -4149,7 +4193,7 @@ class TestCustomEndpointApiKeyInheritance:
             captured.update(kwargs)
             return MagicMock()
 
-        with patch("hermes_cli.config.load_config", return_value=fake_config), patch("hermes_cli.config.load_config_readonly", return_value=fake_config), \
+        with patch("hermes_cli.config.load_config_readonly_async", new_callable=AsyncMock, return_value=fake_config), \
              patch.object(ac, "_create_openai_client", side_effect=_capture_create):
             client, model = await resolve_provider_client(
                 "custom",

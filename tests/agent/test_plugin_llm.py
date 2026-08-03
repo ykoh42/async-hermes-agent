@@ -554,8 +554,8 @@ class TestAttribution:
         async def _main_model():
             return "openai/gpt-4o"
 
-        monkeypatch.setattr(ac, "_read_main_provider_async", _main_provider)
-        monkeypatch.setattr(ac, "_read_main_model_async", _main_model)
+        monkeypatch.setattr(ac, "_read_main_provider", _main_provider)
+        monkeypatch.setattr(ac, "_read_main_model", _main_model)
 
         response = SimpleNamespace(model="openai/gpt-4o-2024-08-06", choices=[])
         provider, model = await plugin_llm._resolve_attribution(

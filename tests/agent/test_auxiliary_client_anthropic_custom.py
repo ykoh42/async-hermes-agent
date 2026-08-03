@@ -45,7 +45,7 @@ async def test_custom_endpoint_anthropic_messages_builds_anthropic_wrapper():
             "api_mode": "anthropic_messages",
         },
     ), patch(
-        "agent.auxiliary_client._read_main_model_for_aux_async",
+        "agent.auxiliary_client._read_main_model_for_aux",
         new=AsyncMock(return_value="claude-sonnet-4-6"),
     ):
         adapter_patch, fake_client = _install_anthropic_adapter_mocks()
@@ -78,7 +78,7 @@ async def test_custom_endpoint_anthropic_messages_falls_back_when_sdk_missing():
             "api_mode": "anthropic_messages",
         },
     ), patch(
-        "agent.auxiliary_client._read_main_model_for_aux_async",
+        "agent.auxiliary_client._read_main_model_for_aux",
         new=AsyncMock(return_value="claude-sonnet-4-6"),
     ), patch(
         "agent.anthropic_adapter.build_anthropic_client",
@@ -107,7 +107,7 @@ async def test_custom_endpoint_chat_completions_still_uses_openai_wire():
             "api_key": "key",
         },
     ), patch(
-        "agent.auxiliary_client._read_main_model_for_aux_async",
+        "agent.auxiliary_client._read_main_model_for_aux",
         new=AsyncMock(return_value="my-model"),
     ):
         client, model = await _try_custom_endpoint()

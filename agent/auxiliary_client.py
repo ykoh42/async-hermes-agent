@@ -58,6 +58,8 @@ from types import SimpleNamespace
 from typing import Any, Callable, Dict, List, Optional, Tuple, TYPE_CHECKING
 from urllib.parse import urlparse, parse_qs, urlunparse
 
+from agent.agent_runtime_helpers import AsyncCapabilityError
+
 # NOTE: `from openai import OpenAI` is deliberately NOT at module top — the
 # openai SDK pulls a large type tree (~240 ms cold, including responses/*,
 # graders/*). We expose `OpenAI` here as a thin proxy that imports the SDK on
@@ -369,14 +371,6 @@ def _normalize_aux_provider(provider: Optional[str]) -> str:
         normalized = suffix
     if normalized == "codex":
         return "openai-codex"
-    if normalized == "main":
-        # Resolve to the user's actual main provider so named custom providers
-        # and non-aggregator providers (DeepSeek, Alibaba, etc.) work correctly.
-        main_prov = (_read_main_provider() or "").strip().lower()
-        if main_prov and main_prov not in {"auto", "main", ""}:
-            normalized = main_prov
-        else:
-            return "custom"
     return _PROVIDER_ALIASES.get(normalized, normalized)
 
 
@@ -2158,70 +2152,17 @@ async def _refresh_nous_recommended_model(
     return None
 
 
-def _read_main_model() -> str:
-    """Read the user's configured main model from config.yaml.
-
-    config.yaml model.default is the single source of truth for the active
-    model. Environment variables are no longer consulted.
-
-    Runtime override: when an AIAgent is active with a CLI/gateway-provided
-    model that differs from config.yaml, ``set_runtime_main()`` records the
-    override in a process-local global. This is consulted FIRST so tools
-    that gate on "the active main model" (e.g. ``vision_analyze``'s native
-    fast path) see the live runtime, not the persisted config default.
-    """
-    override = _runtime_main_value("model")
-    if isinstance(override, str) and override.strip():
-        return override.strip()
-    try:
-        from hermes_cli.config import load_config_readonly
-        cfg = load_config_readonly()
-        model_cfg = cfg.get("model", {})
-        if isinstance(model_cfg, str) and model_cfg.strip():
-            return model_cfg.strip()
-        if isinstance(model_cfg, dict):
-            default = model_cfg.get("default", "")
-            if isinstance(default, str) and default.strip():
-                return default.strip()
-    except Exception:
-        pass
-    return ""
-
-
-def _read_main_provider() -> str:
-    """Read the user's configured main provider from config.yaml.
-
-    Returns the lowercase provider id (e.g. "alibaba", "openrouter") or ""
-    if not configured.
-
-    Runtime override: see ``_read_main_model`` — same mechanism for the
-    provider half of the runtime tuple.
-    """
-    override = _runtime_main_value("provider")
-    if isinstance(override, str) and override.strip():
-        return override.strip().lower()
-    try:
-        from hermes_cli.config import load_config_readonly
-        cfg = load_config_readonly()
-        model_cfg = cfg.get("model", {})
-        if isinstance(model_cfg, dict):
-            provider = model_cfg.get("provider", "")
-            if isinstance(provider, str) and provider.strip():
-                return provider.strip().lower()
-    except Exception:
-        pass
-    return ""
-
-
-async def _read_main_model_async() -> str:
+async def _read_main_model(config: Optional[Dict[str, Any]] = None) -> str:
     """Read the configured main model through the async config boundary."""
     override = _runtime_main_value("model")
     if isinstance(override, str) and override.strip():
         return override.strip()
     try:
-        from hermes_cli.config import load_config_readonly_async
+        if config is None:
+            from hermes_cli.config import load_config_readonly_async
 
-        cfg = await load_config_readonly_async()
+            config = await load_config_readonly_async()
+        cfg = config
         model_cfg = cfg.get("model", {})
         if isinstance(model_cfg, str) and model_cfg.strip():
             return model_cfg.strip()
@@ -2234,70 +2175,22 @@ async def _read_main_model_async() -> str:
     return ""
 
 
-async def _read_main_provider_async() -> str:
+async def _read_main_provider(config: Optional[Dict[str, Any]] = None) -> str:
     """Read the configured main provider through the async config boundary."""
     override = _runtime_main_value("provider")
     if isinstance(override, str) and override.strip():
         return override.strip().lower()
     try:
-        from hermes_cli.config import load_config_readonly_async
+        if config is None:
+            from hermes_cli.config import load_config_readonly_async
 
-        cfg = await load_config_readonly_async()
+            config = await load_config_readonly_async()
+        cfg = config
         model_cfg = cfg.get("model", {})
         if isinstance(model_cfg, dict):
             provider = model_cfg.get("provider", "")
             if isinstance(provider, str) and provider.strip():
                 return provider.strip().lower()
-    except Exception:
-        pass
-    return ""
-
-
-def _read_main_api_key() -> str:
-    """Read the user's main model API key from the runtime override or config.
-
-    Mirrors ``_read_main_model`` / ``_read_main_provider``: checks the
-    process-local ``_RUNTIME_MAIN_API_KEY`` override first (set by
-    ``set_runtime_main`` when an AIAgent is active), then falls back to
-    ``model.api_key`` in config.yaml.
-
-    Used by the ``custom`` provider fallback chain so that auxiliary tasks
-    configured with an explicit ``base_url`` but empty ``api_key`` inherit
-    the main model's credentials instead of falling to ``no-key-required``
-    (issue #9318).
-    """
-    override = _runtime_main_value("api_key")
-    if isinstance(override, str) and override.strip():
-        return override.strip()
-    try:
-        from hermes_cli.config import load_config
-        cfg = load_config()
-        model_cfg = cfg.get("model", {})
-        if isinstance(model_cfg, dict):
-            key = model_cfg.get("api_key", "")
-            if isinstance(key, str) and key.strip():
-                return key.strip()
-    except Exception:
-        pass
-    return ""
-
-
-def _read_main_base_url() -> str:
-    """Read the main model's base_url from the runtime override or config.
-
-    Same override-then-config pattern as ``_read_main_api_key``.
-    """
-    override = _runtime_main_value("base_url")
-    if isinstance(override, str) and override.strip():
-        return override.strip()
-    try:
-        from hermes_cli.config import load_config
-        cfg = load_config()
-        model_cfg = cfg.get("model", {})
-        if isinstance(model_cfg, dict):
-            base = model_cfg.get("base_url", "")
-            if isinstance(base, str) and base.strip():
-                return base.strip()
     except Exception:
         pass
     return ""
@@ -2329,10 +2222,9 @@ def _resolve_moa_aggregator(
         or a malformed aggregator slot).
     """
     try:
-        from hermes_cli.config import load_config_readonly
         from hermes_cli.moa_config import resolve_moa_preset
 
-        cfg = config if config is not None else load_config_readonly()
+        cfg = config or {}
         preset = resolve_moa_preset(cfg.get("moa") or {}, preset_name or None)
         agg = preset.get("aggregator") or {}
         agg_provider = str(agg.get("provider") or "").strip()
@@ -2346,25 +2238,7 @@ def _resolve_moa_aggregator(
     return None, None
 
 
-def _read_main_model_for_aux() -> str:
-    """Main model with MoA presets unwrapped to the aggregator's model.
-
-    When the main provider is ``moa``, ``_read_main_model()`` returns a MoA
-    *preset name* (e.g. "opus-gpt") — never a valid wire model id on any
-    provider. Auxiliary fallback chains that pre-fill a missing model from
-    the main model must use this reader instead, so unset aux models default
-    to the preset's acting (aggregator) model. Returns "" when the main
-    provider is moa but the preset cannot be resolved — sending nothing is
-    strictly better than sending a preset name that 400s.
-    """
-    model = _read_main_model()
-    if (_read_main_provider() or "").strip().lower() == "moa":
-        _, agg_model = _resolve_moa_aggregator(model)
-        return agg_model or ""
-    return model
-
-
-async def _read_main_model_for_aux_async(
+async def _read_main_model_for_aux(
     config: Optional[Dict[str, Any]] = None,
 ) -> str:
     """Resolve the active auxiliary model without synchronous config I/O."""
@@ -2399,32 +2273,12 @@ async def _read_main_model_for_aux_async(
     return model
 
 
-def _read_main_api_key_if_same_host(aux_base_url: str) -> str:
-    """Return the main api_key only when *aux_base_url* points at the same
-    host as the main model's base_url.
-
-    The #9318 use case is an auxiliary task sharing the main model's
-    self-hosted gateway (same host, different model) with an empty per-task
-    api_key. Inheriting unconditionally would send the main credential to
-    ANY host a misconfigured aux base_url names — a cross-host credential
-    leak. A host mismatch keeps the previous fail-safe behavior
-    (``no-key-required`` → 401).
-    """
-    aux_host = base_url_hostname(aux_base_url)
-    if not aux_host:
-        return ""
-    main_host = base_url_hostname(_read_main_base_url())
-    if not main_host or aux_host != main_host:
-        return ""
-    return _read_main_api_key()
-
-
-async def _read_main_api_key_if_same_host_async(
+async def _read_main_api_key_if_same_host(
     aux_base_url: str,
     *,
     config: Optional[Dict[str, Any]] = None,
 ) -> str:
-    """Async counterpart that reads the persisted credential without blocking."""
+    """Read the persisted credential without blocking when hosts match."""
     aux_host = base_url_hostname(aux_base_url)
     if not aux_host:
         return ""
@@ -2801,7 +2655,7 @@ async def _try_custom_endpoint(
         return None, None
     if custom_base.lower().startswith(_CODEX_AUX_BASE_URL.lower()):
         return None, None
-    model = await _read_main_model_for_aux_async(config=config) or "gpt-4o-mini"
+    model = await _read_main_model_for_aux(config=config) or "gpt-4o-mini"
     logger.debug("Auxiliary client: custom endpoint (%s, api_mode=%s)", model, custom_mode or "chat_completions")
     _clean_base, _dq = _extract_url_query_params(custom_base)
     _extra = {"default_query": _dq} if _dq else {}
@@ -3696,11 +3550,11 @@ async def _pool_cache_hint(
 ) -> str:
     """Return a stable cache discriminator for pooled providers."""
     normalized = _normalize_aux_provider(provider)
-    if normalized == "auto":
+    if normalized in {"auto", "main"}:
         runtime = _normalize_main_runtime(main_runtime)
         runtime_provider = runtime.get("provider")
         if not runtime_provider:
-            runtime_provider = await _read_main_provider_async()
+            runtime_provider = await _read_main_provider()
         normalized = _normalize_aux_provider(runtime_provider)
     if normalized in {"", "auto", "custom"}:
         return ""
@@ -4063,7 +3917,7 @@ async def _try_payment_fallback(
     skip = failed_provider.lower().strip()
     # Also skip Step-1 main-provider path if it maps to the same backend.
     # (e.g. main_provider="openrouter" → skip "openrouter" in chain)
-    main_provider = await _read_main_provider_async()
+    main_provider = await _read_main_provider()
     skip_labels = {skip}
     if main_provider and main_provider.lower() in skip:
         skip_labels.add(main_provider.lower())
@@ -4081,7 +3935,16 @@ async def _try_payment_fallback(
             _log_skip_unhealthy(label, task)
             tried.append(f"{label} (unhealthy)")
             continue
-        client, model = await try_fn()
+        try:
+            client, model = await try_fn()
+        except AsyncCapabilityError as exc:
+            logger.debug(
+                "Auxiliary fallback: skipping %s without native async support: %s",
+                label,
+                exc,
+            )
+            tried.append(f"{label} (async unsupported)")
+            continue
         if client is not None:
             logger.info(
                 "Auxiliary %s: %s on %s — falling back to %s (%s)",
@@ -4102,6 +3965,8 @@ async def _try_main_agent_model_fallback(
     task: str = None,
     reason: str = "error",
     failed_model: Optional[str] = None,
+    *,
+    config: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Optional[Any], Optional[str], str]:
     """Last-resort fallback to the user's main agent provider + model.
 
@@ -4131,12 +3996,19 @@ async def _try_main_agent_model_fallback(
     Returns:
         (client, model, provider_label) or (None, None, "") if no fallback.
     """
-    main_provider = (await _read_main_provider_async() or "").strip()
-    main_model = (await _read_main_model_async() or "").strip()
+    if config is None:
+        from hermes_cli.config import load_config_readonly_async
+
+        config = await load_config_readonly_async()
+    main_provider = (await _read_main_provider(config) or "").strip()
+    main_model = (await _read_main_model(config) or "").strip()
     if main_provider.lower() == "moa":
         # MoA virtual provider: fall back to the preset's aggregator — the
         # acting model — instead of the unreachable "moa"/<preset-name> pair.
-        _agg_provider, _agg_model = _resolve_moa_aggregator(main_model)
+        _agg_provider, _agg_model = _resolve_moa_aggregator(
+            main_model,
+            config=config,
+        )
         if not _agg_provider or not _agg_model:
             return None, None, ""
         main_provider, main_model = _agg_provider, _agg_model
@@ -4317,6 +4189,10 @@ async def _try_configured_fallback_chain(
     """
     if not task:
         return None, None, ""
+    if config is None:
+        from hermes_cli.config import load_config_readonly_async
+
+        config = await load_config_readonly_async()
 
     task_config = _get_auxiliary_task_config(task, config=config)
     chain = task_config.get("fallback_chain")
@@ -4492,7 +4368,7 @@ async def _try_main_fallback_chain(
         return None, None, ""
 
     failed_norm = (failed_provider or "").strip().lower()
-    main_norm = (await _read_main_provider_async() or "").strip().lower()
+    main_norm = (await _read_main_provider(config) or "").strip().lower()
     skip = {p for p in (failed_norm, main_norm, "auto") if p}
     tried: List[str] = []
     min_ctx = _task_minimum_context_length(task)
@@ -4765,7 +4641,16 @@ async def _resolve_auto(
             _log_skip_unhealthy(label)
             tried.append(f"{label} (unhealthy)")
             continue
-        client, model = await try_fn()
+        try:
+            client, model = await try_fn()
+        except AsyncCapabilityError as exc:
+            logger.debug(
+                "Auxiliary auto-detect: skipping %s without native async support: %s",
+                label,
+                exc,
+            )
+            tried.append(f"{label} (async unsupported)")
+            continue
         if client is not None:
             if tried:
                 logger.info("Auxiliary auto-detect: using %s (%s) — skipped: %s",
@@ -4858,6 +4743,14 @@ async def resolve_provider_client(
     original_provider = (provider or "").strip().lower()
     # Normalise aliases
     provider = _normalize_aux_provider(provider)
+    if provider == "main":
+        main_provider = _normalize_aux_provider(await _read_main_provider(config))
+        provider = (
+            main_provider
+            if main_provider not in {"", "auto", "main"}
+            else "custom"
+        )
+        original_provider = provider
 
     # MoA virtual provider chokepoint: "moa" is not a real HTTP provider —
     # its acting model is the preset's aggregator slot. The two resolver
@@ -4921,7 +4814,7 @@ async def resolve_provider_client(
     # sent to Codex after the main lane fell back to gpt-5.5). Let _resolve_auto()
     # return the actual current runtime model when the caller did not explicitly
     # request one. (# compression-current-model)
-    async_main_model = await _read_main_model_for_aux_async(config)
+    async_main_model = await _read_main_model_for_aux(config)
     if not model and provider != "auto":
         model = _get_aux_model_for_provider(provider) or async_main_model or model
 
@@ -5097,7 +4990,7 @@ async def resolve_provider_client(
             custom_key = (
                 (explicit_api_key or "").strip()
                 or os.getenv("OPENAI_API_KEY", "").strip()
-                or await _read_main_api_key_if_same_host_async(
+                or await _read_main_api_key_if_same_host(
                     custom_base, config=config,
                 )
                 or "no-key-required"  # local servers don't need auth
@@ -5625,7 +5518,10 @@ async def _resolve_strict_vision_backend(
 
 
 async def _strict_vision_backend_available(provider: str) -> bool:
-    return (await _resolve_strict_vision_backend(provider))[0] is not None
+    try:
+        return (await _resolve_strict_vision_backend(provider))[0] is not None
+    except AsyncCapabilityError:
+        return False
 
 
 async def get_available_vision_backends() -> List[str]:
@@ -5637,7 +5533,7 @@ async def get_available_vision_backends() -> List[str]:
     """
     available: List[str] = []
     # 1. Active provider — if the user configured a provider, try it first.
-    main_provider = _read_main_provider()
+    main_provider = await _read_main_provider()
     if main_provider and main_provider not in {"auto", ""}:
         if main_provider == "anthropic":
             # Credential resolution is coroutine-only. The native async
@@ -5648,7 +5544,10 @@ async def get_available_vision_backends() -> List[str]:
             if await _strict_vision_backend_available(main_provider):
                 available.append(main_provider)
         else:
-            client, _ = await resolve_provider_client(main_provider, _read_main_model())
+            client, _ = await resolve_provider_client(
+                main_provider,
+                await _read_main_model(),
+            )
             if client is not None:
                 available.append(main_provider)
     # 2. OpenRouter, 3. Nous — skip if already covered by main provider.
@@ -5727,8 +5626,12 @@ async def resolve_vision_provider_client(
         #                   live from the catalog — tried when
         #                   DEEPINFRA_API_KEY is set)
         #   5. Stop
-        main_provider = str(runtime.get("provider") or _read_main_provider())
-        main_model = str(runtime.get("model") or _read_main_model())
+        main_provider = str(
+            runtime.get("provider") or await _read_main_provider(config_snapshot)
+        )
+        main_model = str(
+            runtime.get("model") or await _read_main_model(config_snapshot)
+        )
         if main_provider.strip().lower() == "moa":
             # MoA virtual provider: main_model is a preset NAME, and every
             # capability probe below (_PROVIDERS_WITHOUT_VISION,
@@ -5736,7 +5639,10 @@ async def resolve_vision_provider_client(
             # would run against a provider/model pair that doesn't exist on
             # any wire. Unwrap to the preset's aggregator slot first so the
             # checks and the eventual client target the real acting model.
-            _agg_provider, _agg_model = _resolve_moa_aggregator(main_model)
+            _agg_provider, _agg_model = _resolve_moa_aggregator(
+                main_model,
+                config=config_snapshot,
+            )
             if _agg_provider and _agg_model:
                 main_provider, main_model = _agg_provider, _agg_model
                 # Drop the moa:// facade endpoint from the runtime view used
@@ -6421,7 +6327,7 @@ def _resolve_task_provider_model(
     def _unwrap_moa_provider(prov: str, mdl: Optional[str]) -> Tuple[str, Optional[str]]:
         if prov.strip().lower() != "moa":
             return prov, mdl
-        agg_provider, agg_model = _resolve_moa_aggregator(mdl)
+        agg_provider, agg_model = _resolve_moa_aggregator(mdl, config=config)
         if agg_provider and agg_model:
             return agg_provider, agg_model
         return prov, mdl
@@ -6552,11 +6458,7 @@ def _get_auxiliary_task_config(
     """
     if not task:
         return {}
-    try:
-        if config is None:
-            from hermes_cli.config import load_config_readonly
-            config = load_config_readonly()
-    except ImportError:
+    if config is None:
         return {}
     aux = config.get("auxiliary", {}) if isinstance(config, dict) else {}
     task_config = aux.get(task, {}) if isinstance(aux, dict) else {}
@@ -8085,7 +7987,9 @@ async def call_llm(
                 if fb_client is None:
                     fb_client, fb_model, fb_label = await _try_main_agent_model_fallback(
                         resolved_provider, task, reason=reason,
-                        failed_model=_chain_failed_model)
+                        failed_model=_chain_failed_model,
+                        config=config_snapshot,
+                    )
 
             if fb_client is not None:
                 fb_resp = await _call_fallback_candidate(
