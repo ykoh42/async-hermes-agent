@@ -1,5 +1,7 @@
 """Regression tests for empty-response recovery transcript persistence."""
 
+import pytest
+
 from run_agent import AIAgent
 
 
@@ -9,7 +11,7 @@ class _CapturingSessionDB:
     def __init__(self):
         self.rows = []
 
-    def append_message(self, session_id, role, content=None, **kwargs):
+    async def append_message(self, session_id, role, content=None, **kwargs):
         self.rows.append({"role": role, "content": content})
         return len(self.rows)
 
@@ -32,13 +34,15 @@ def _agent_with_stubbed_persistence():
     agent._session_db = None
     agent._session_messages = []
     agent.flushed_session_db_messages = []
-    agent._flush_messages_to_session_db = lambda messages, conversation_history=None: (
+    async def _capture_flush(messages, conversation_history=None):
         agent.flushed_session_db_messages.append([m.copy() for m in messages])
-    )
+
+    agent._flush_messages_to_session_db_unlocked = _capture_flush
     return agent
 
 
-def test_persist_session_strips_trailing_empty_recovery_scaffolding():
+@pytest.mark.asyncio
+async def test_persist_session_strips_trailing_empty_recovery_scaffolding():
     """After stripping scaffolding, also rewind past orphan trailing tool-result
     messages that the failed iteration left behind. Otherwise the next user
     message lands after a bare ``tool`` and produces a protocol-invalid
@@ -70,7 +74,7 @@ def test_persist_session_strips_trailing_empty_recovery_scaffolding():
         },
     ]
 
-    AIAgent._persist_session(agent, messages, conversation_history=[])
+    await AIAgent._persist_session(agent, messages, conversation_history=[])
 
     # After strip + rewind, only the original user message remains. The
     # assistant(tool_calls) + tool pair is dropped because its iteration
@@ -82,14 +86,15 @@ def test_persist_session_strips_trailing_empty_recovery_scaffolding():
     assert all(not msg.get("_empty_recovery_synthetic") for msg in messages)
 
 
-def test_persist_session_keeps_unmarked_terminal_empty_response():
+@pytest.mark.asyncio
+async def test_persist_session_keeps_unmarked_terminal_empty_response():
     agent = _agent_with_stubbed_persistence()
     messages = [
         {"role": "user", "content": "run the task"},
         {"role": "assistant", "content": "(empty)"},
     ]
 
-    AIAgent._persist_session(agent, messages, conversation_history=[])
+    await AIAgent._persist_session(agent, messages, conversation_history=[])
 
     assert messages == [
         {"role": "user", "content": "run the task"},
@@ -100,7 +105,8 @@ def test_persist_session_keeps_unmarked_terminal_empty_response():
 
 
 
-def test_flush_never_writes_buried_empty_recovery_scaffolding():
+@pytest.mark.asyncio
+async def test_flush_never_writes_buried_empty_recovery_scaffolding():
     """When an empty-after-tools nudge is followed by a tool-calling response,
     the synthetic ``(empty)`` + nudge pair stays buried in the live message
     list (only the trailing copies are ever dropped). The append-only flush
@@ -136,7 +142,7 @@ def test_flush_never_writes_buried_empty_recovery_scaffolding():
         {"role": "assistant", "content": "All done."},
     ]
 
-    agent._flush_messages_to_session_db(messages, conversation_history=[])
+    await agent._flush_messages_to_session_db(messages, conversation_history=[])
 
     persisted = agent._session_db.rows
     assert all(row["content"] != "(empty)" for row in persisted)
@@ -148,13 +154,14 @@ def test_flush_never_writes_buried_empty_recovery_scaffolding():
     assert persisted[-1]["content"] == "All done."
 
 
-def test_flush_skips_thinking_prefill_scaffolding():
+@pytest.mark.asyncio
+async def test_flush_skips_thinking_prefill_scaffolding():
     agent = _agent_with_capturing_db()
     messages = [
         {"role": "user", "content": "hi"},
         {"role": "assistant", "content": "", "_thinking_prefill": True},
         {"role": "assistant", "content": "Hello!"},
     ]
-    agent._flush_messages_to_session_db(messages, conversation_history=[])
+    await agent._flush_messages_to_session_db(messages, conversation_history=[])
 
     assert [r["content"] for r in agent._session_db.rows] == ["hi", "Hello!"]
