@@ -464,17 +464,12 @@ def _build_safe_env(user_env: Optional[dict]) -> dict:
     its subprocesses can consume those credentials without duplicating them
     in every MCP server's ``env:`` block.
     """
-    try:
-        from hermes_cli.env_loader import get_secret_source
-    except Exception:  # pragma: no cover — early bootstrap/import fallback
-        get_secret_source = None
     env = {}
     for key, value in os.environ.items():
         if (
             key in _SAFE_ENV_KEYS
             or key.upper() in _SAFE_ENV_KEYS_CASE_INSENSITIVE
             or key.startswith("XDG_")
-            or (get_secret_source is not None and get_secret_source(key))
         ):
             env[key] = value
     if user_env:
@@ -3951,9 +3946,7 @@ class _LockCookie:
             except Exception:
                 pass
             try:
-                close_result = self._fh.close()
-                if inspect.isawaitable(close_result):
-                    await close_result
+                await self._fh.close()
             except Exception:
                 pass
             self._fh = None
@@ -6012,7 +6005,7 @@ async def refresh_agent_mcp_tools(
 
 
 def _reinject_post_build_tools(agent, tools_list: list, name_set: set) -> set:
-    """Append memory-provider and context-engine tools onto staged locals.
+    """Append context-engine tools onto staged locals.
 
     Mirrors the post-``get_tool_definitions`` injection in ``agent_init`` so a
     snapshot rebuild reconstructs the FULL tool surface, not just the
@@ -6033,24 +6026,6 @@ def _reinject_post_build_tools(agent, tools_list: list, name_set: set) -> set:
         tools_list.append({"type": "function", "function": schema})
         name_set.add(name)
         return True
-
-    # Memory-provider tools (mem0/honcho/byterover/supermemory/…).
-    try:
-        memory_manager = getattr(agent, "_memory_manager", None)
-        get_mem_schemas = getattr(memory_manager, "get_all_tool_schemas", None) if memory_manager else None
-        if callable(get_mem_schemas):
-            # Honor the same toolset gate inject_memory_provider_tools uses.
-            from agent.memory_manager import memory_provider_tools_enabled
-            if memory_provider_tools_enabled(
-                getattr(agent, "enabled_toolsets", None),
-                getattr(agent, "disabled_toolsets", None),
-                memory_tool_present="memory" in name_set,
-            ):
-                for schema in get_mem_schemas():
-                    if isinstance(schema, dict):
-                        _add(schema)
-    except Exception:
-        logger.debug("Memory-provider tool re-injection skipped", exc_info=True)
 
     # Context-engine tools (lcm_grep/lcm_describe/…) — the `context_engine`
     # toolset is intentionally empty, so these only exist via this append.

@@ -48,24 +48,17 @@ async def test_refresh_adds_late_landing_tools(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_refresh_preserves_memory_provider_and_context_engine_tools(monkeypatch):
+async def test_refresh_preserves_context_engine_tools(monkeypatch):
     """B1 regression: a rebuild must NOT drop post-build-injected tools.
 
     get_tool_definitions() returns only the registry-derived tools. agent_init
-    appends memory-provider tools (mem0/honcho/…) and context-engine tools
-    (lcm_*) directly onto agent.tools AFTER that. A naive
+    appends context-engine tools (lcm_*) directly onto agent.tools AFTER that. A naive
     `agent.tools = get_tool_definitions()` would silently delete them on every
     refresh. The helper must re-inject them.
     """
-    # Agent already carries: a built-in, a memory-provider tool, a context tool.
-    agent = _agent(["read_file", "memory_search", "lcm_grep"])
+    # Agent already carries a built-in and a context-engine tool.
+    agent = _agent(["read_file", "lcm_grep"])
 
-    # Provider exposes its schemas; context compressor exposes lcm_*.
-    agent._memory_manager = types.SimpleNamespace(
-        get_all_tool_schemas=lambda: [
-            {"name": "memory_search", "description": "", "parameters": {}}
-        ]
-    )
     agent.context_compressor = types.SimpleNamespace(
         get_tool_schemas=lambda: [
             {"name": "lcm_grep", "description": "", "parameters": {}}
@@ -75,7 +68,7 @@ async def test_refresh_preserves_memory_provider_and_context_engine_tools(monkey
 
     import model_tools
     # The registry now ALSO has a newly-connected MCP tool, but does NOT contain
-    # the memory/context tools (they're never in get_tool_definitions output).
+    # the context tools (they're never in get_tool_definitions output).
     monkeypatch.setattr(
         model_tools, "get_tool_definitions",
         lambda **kw: [_tool("read_file"), _tool("mcp_new_server_tool")],
@@ -85,36 +78,8 @@ async def test_refresh_preserves_memory_provider_and_context_engine_tools(monkey
 
     # The new MCP tool landed AND the injected families survived.
     assert "mcp_new_server_tool" in agent.valid_tool_names
-    assert "memory_search" in agent.valid_tool_names   # not clobbered
     assert "lcm_grep" in agent.valid_tool_names         # not clobbered
     assert added == {"mcp_new_server_tool"}
-
-
-@pytest.mark.asyncio
-async def test_refresh_does_not_reinject_disabled_memory_provider_tools(monkeypatch):
-    """A refresh removes stale provider tools when memory becomes disabled."""
-    agent = _agent(
-        ["read_file", "memory_search"],
-        enabled=["all"],
-        disabled=["memory"],
-    )
-    agent._memory_manager = types.SimpleNamespace(
-        get_all_tool_schemas=lambda: [
-            {"name": "memory_search", "description": "", "parameters": {}}
-        ]
-    )
-
-    import model_tools
-    monkeypatch.setattr(
-        model_tools,
-        "get_tool_definitions",
-        lambda **kw: [_tool("read_file")],
-    )
-
-    await mcp_tool.refresh_agent_mcp_tools(agent)
-
-    assert "memory_search" not in agent.valid_tool_names
-    assert all(t["function"]["name"] != "memory_search" for t in agent.tools)
 
 
 @pytest.mark.asyncio

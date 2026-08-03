@@ -57,7 +57,7 @@ def _flatten_choice(c) -> str:
     return str(c).strip()
 
 
-def _invoke_callback(callback, question, choices, multi_select):
+async def _invoke_callback(callback, question, choices, multi_select):
     """Invoke the platform callback, passing multi_select if supported.
 
     Uses signature inspection (not a ``TypeError`` retry) to decide whether
@@ -65,8 +65,6 @@ def _invoke_callback(callback, question, choices, multi_select):
     approach would re-invoke a *compatible* callback that raised TypeError
     internally, potentially prompting the user twice.
     """
-    import inspect
-
     accepts_multi = False
     try:
         sig = inspect.signature(callback)
@@ -80,8 +78,8 @@ def _invoke_callback(callback, question, choices, multi_select):
         accepts_multi = False
 
     if accepts_multi:
-        return callback(question, choices, multi_select=multi_select)
-    return callback(question, choices)
+        return await callback(question, choices, multi_select=multi_select)
+    return await callback(question, choices)
 
 
 def _parse_multi_select_response(raw_response) -> List[str]:
@@ -131,14 +129,15 @@ async def clarify_tool(
 
     if callback is None:
         return tool_error("Clarify tool is not available in this execution context.")
+    if not inspect.iscoroutinefunction(callback):
+        return tool_error(
+            "Clarify requires an async platform callback in async-hermes-agent."
+        )
 
     try:
-        raw_response = _invoke_callback(callback, question, choices, multi_select)
-        if not inspect.isawaitable(raw_response):
-            return tool_error(
-                "Clarify requires an async platform callback in async-hermes-agent."
-            )
-        raw_response = await raw_response
+        raw_response = await _invoke_callback(
+            callback, question, choices, multi_select
+        )
     except Exception as exc:
         return tool_error(f"Failed to get user input: {exc}")
 

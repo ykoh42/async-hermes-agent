@@ -1500,7 +1500,7 @@ async def video_analyze_tool(
 
         if await aiofiles.os.path.isfile(local_path):
             from agent.file_safety import raise_if_read_blocked
-            raise_if_read_blocked(str(local_path))
+            await raise_if_read_blocked(str(local_path))
             logger.info("Using local video file: %s", video_url)
             temp_video_path = local_path
             should_cleanup = False

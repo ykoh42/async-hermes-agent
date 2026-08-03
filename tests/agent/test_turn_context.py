@@ -69,7 +69,6 @@ class _FakeAgent:
         self.context_compressor.should_compress_info = _fake_should_compress_info
         self._cached_system_prompt = "SYSTEM"
         self._memory_store = None
-        self._memory_manager = None
         self._memory_nudge_interval = 0
         self._turns_since_memory = 0
         self._user_turn_count = 0
@@ -315,7 +314,6 @@ async def test_between_turns_refresh_adds_late_tool_when_servers_registered():
 
     assert "mcp_x_tool" in agent.valid_tool_names
     assert any(t["function"]["name"] == "mcp_x_tool" for t in agent.tools)
-
 
 
 

@@ -69,7 +69,8 @@ async def test_utf16_le_bom_preserves_non_ascii_values(tmp_path, monkeypatch):
     assert b"\xef\xbf\xbd" not in after
 
 
-def test_utf32_le_bom_leaves_file_untouched(tmp_path, caplog):
+@pytest.mark.asyncio
+async def test_utf32_le_bom_leaves_file_untouched(tmp_path, caplog):
     """UTF-32-LE BOM: refuse-to-mangle (leave bytes untouched + warning).
 
     UTF-32-LE's BOM starts with UTF-16-LE's FF FE; sniff order must check
@@ -88,7 +89,7 @@ def test_utf32_le_bom_leaves_file_untouched(tmp_path, caplog):
     env_file.write_bytes(raw)
 
     with caplog.at_level(logging.WARNING, logger="hermes_cli.env_loader"):
-        _sanitize_env_file_if_needed(env_file)
+        await _sanitize_env_file_if_needed(env_file)
 
     assert env_file.read_bytes() == raw  # untouched
     assert any("UTF-32" in r.message for r in caplog.records)
@@ -96,7 +97,8 @@ def test_utf32_le_bom_leaves_file_untouched(tmp_path, caplog):
 
 
 
-def test_utf32_warning_fires_once_per_path(tmp_path, caplog, monkeypatch):
+@pytest.mark.asyncio
+async def test_utf32_warning_fires_once_per_path(tmp_path, caplog, monkeypatch):
     """Three sanitize calls on the same UTF-32 file → exactly one warning.
 
     Matches house style for warn-once (module-level seen-set, same class as
@@ -116,9 +118,9 @@ def test_utf32_warning_fires_once_per_path(tmp_path, caplog, monkeypatch):
     env_file.write_bytes(raw)
 
     with caplog.at_level(logging.WARNING, logger="hermes_cli.env_loader"):
-        _sanitize_env_file_if_needed(env_file)
-        _sanitize_env_file_if_needed(env_file)
-        _sanitize_env_file_if_needed(env_file)
+        await _sanitize_env_file_if_needed(env_file)
+        await _sanitize_env_file_if_needed(env_file)
+        await _sanitize_env_file_if_needed(env_file)
 
     utf32_warnings = [r for r in caplog.records if "UTF-32" in r.message]
     assert len(utf32_warnings) == 1

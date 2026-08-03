@@ -2321,34 +2321,12 @@ async def _run_single_child(
 
 async def _finalize_child_results(
     results: List[Dict[str, Any]],
-    task_list: List[Dict[str, Any]],
     children: List[tuple[int, Dict[str, Any], Any]],
     parent_agent,
 ) -> None:
-    """Apply host-owned summary, memory, hook, and cost contracts once."""
+    """Apply host-owned summary, hook, and cost contracts once."""
     await _apply_summary_budget(results, parent_agent)
     child_by_index = {index: child for index, _task, child in children}
-
-    memory_manager = getattr(parent_agent, "_memory_manager", None)
-    if memory_manager is not None:
-        for entry in results:
-            try:
-                task_index = entry.get("task_index", -1)
-                task_goal = (
-                    task_list[task_index]["goal"]
-                    if isinstance(task_index, int)
-                    and 0 <= task_index < len(task_list)
-                    else ""
-                )
-                child = child_by_index.get(task_index)
-                await memory_manager.on_delegation(
-                    task=task_goal,
-                    result=entry.get("summary", "") or "",
-                    child_session_id=getattr(child, "session_id", ""),
-                )
-            except Exception:
-                logger.debug("Delegation memory hook failed", exc_info=True)
-
     try:
         from hermes_cli.plugins import invoke_hook
     except Exception:
@@ -2421,7 +2399,6 @@ async def _run_child_lifecycle(
     task = {"goal": goal}
     await _finalize_child_results(
         [result],
-        [{"goal": ""} for _ in range(task_index)] + [task],
         [(task_index, task, child)],
         parent_agent,
     )
@@ -2654,7 +2631,7 @@ async def delegate_task(
                 )
 
         results.sort(key=lambda entry: entry["task_index"])
-        await _finalize_child_results(results, task_list, children, parent_agent)
+        await _finalize_child_results(results, children, parent_agent)
         return {
             "results": results,
             "total_duration_seconds": round(time.monotonic() - overall_start, 2),

@@ -700,9 +700,9 @@ _DEV_FIXTURES: dict[str, dict] = {
 def dev_fixture_credits_state() -> Optional[CreditsState]:
     """Return a fixture CreditsState for HERMES_DEV_CREDITS_FIXTURE, or None.
 
-    The env value is a state name, OR a path to a file whose contents are a state
-    name (re-read each call → flip states live without a restart). Unknown name /
-    "clear" / "none" / unset → None (normal behaviour). Throwaway test scaffolding.
+    The env value is a state name. Unknown name / "clear" / "none" / unset
+    returns None (normal behaviour). Throwaway test scaffolding stays purely
+    in-memory so response-header processing never performs filesystem I/O.
 
     Hard prod-leak guard: a fixture applies ONLY when the dev flag HERMES_DEV_CREDITS
     is also on, so a stray HERMES_DEV_CREDITS_FIXTURE (leaked into a shell profile, a
@@ -714,14 +714,7 @@ def dev_fixture_credits_state() -> Optional[CreditsState]:
     raw = os.environ.get("HERMES_DEV_CREDITS_FIXTURE", "").strip()
     if not raw:
         return None
-    name = raw
-    if os.path.sep in raw or "/" in raw:  # looks like a path → read the name from the file
-        try:
-            with open(raw, "r", encoding="utf-8") as fh:
-                name = fh.read().strip()
-        except OSError:
-            return None
-    spec = _DEV_FIXTURES.get(name.lower())
+    spec = _DEV_FIXTURES.get(raw.lower())
     if not spec:
         return None
     # Stamp the fields the REAL parser always guarantees, so a fixture state is

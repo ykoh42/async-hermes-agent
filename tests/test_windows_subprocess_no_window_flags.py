@@ -179,32 +179,6 @@ def _patch_hide_flags(monkeypatch):
 # documented ValueError fallback reads sys.getwindowsversion() instead.
 
 
-def test_env_probe_run_hides_console_window(monkeypatch):
-    from tools import env_probe
-
-    captured = []
-
-    def fake_run(cmd, **kwargs):
-        captured.append((cmd, kwargs))
-        return _Completed(stdout="", returncode=0)
-
-    monkeypatch.setattr(env_probe, "windows_hide_flags", lambda: _CREATE_NO_WINDOW)
-    monkeypatch.setattr(env_probe.subprocess, "run", fake_run)
-
-    rc, out, err = env_probe._run(["python3", "--version"], timeout=1.0)
-
-    assert rc == 0
-    assert len(captured) == 1, captured
-    cmd, kwargs = captured[0]
-    assert cmd == ["python3", "--version"]
-    assert kwargs["creationflags"] == _CREATE_NO_WINDOW
-    # The temp-file capture contract (#67964) must survive: stdout/stderr are
-    # file objects (not PIPE) so a lingering grandchild can't wedge the probe.
-    assert kwargs["stdout"] is not None and kwargs["stdout"] != subprocess.PIPE
-    assert kwargs["stderr"] is not None and kwargs["stderr"] != subprocess.PIPE
-    assert kwargs["stdin"] == subprocess.DEVNULL
-
-
 
 
 

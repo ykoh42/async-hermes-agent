@@ -9,8 +9,6 @@ import time
 from types import SimpleNamespace
 from typing import Any, Callable, Dict, List
 
-from agent.stream_single_writer import claim_stream_writer, stream_writer_is_current
-
 logger = logging.getLogger(__name__)
 
 _TERMINAL_EVENT_TYPES = frozenset({
@@ -439,10 +437,8 @@ async def run_codex_stream(
                     commentary_text_deltas = []
     finally:
         close = getattr(stream, "aclose", None) or getattr(stream, "close", None)
-        if callable(close):
-            close_result = close()
-            if inspect.isawaitable(close_result):
-                await close_result
+        if inspect.iscoroutinefunction(close):
+            await close()
 
     return _consume_codex_event_stream(events, model=request.get("model"))
 

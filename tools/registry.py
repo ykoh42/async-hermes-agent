@@ -14,7 +14,6 @@ Import chain (circular-import safe):
     run_agent.py, cli.py, batch_runner.py, etc.
 """
 
-import ast
 import importlib
 import inspect
 import json
@@ -22,7 +21,6 @@ import logging
 import sys
 import threading
 import time
-from pathlib import Path
 from typing import Callable, Dict, List, Optional, Set
 
 logger = logging.getLogger(__name__)
@@ -49,6 +47,10 @@ _TRAINING_RUNTIME_TOOL_MODULES = frozenset({
     "web_tools",
 })
 
+_BUILTIN_TOOL_MODULES = tuple(
+    f"tools.{module_name}" for module_name in sorted(_TRAINING_RUNTIME_TOOL_MODULES)
+)
+
 # A few legacy modules are imported for helpers (for example compression resets
 # file-read deduplication) and historically registered a synchronous model tool
 # as an import side effect. Discovery filtering alone cannot prevent that. Keep
@@ -70,91 +72,17 @@ _ASYNC_RUNTIME_HANDLER_MODULES = frozenset({
 })
 
 
-def _is_registry_register_call(node: ast.AST) -> bool:
-    """Return True when *node* is a ``registry.register(...)`` call expression."""
-    if not isinstance(node, ast.Expr) or not isinstance(node.value, ast.Call):
-        return False
-    func = node.value.func
-    return (
-        isinstance(func, ast.Attribute)
-        and func.attr == "register"
-        and isinstance(func.value, ast.Name)
-        and func.value.id == "registry"
-    )
+def discover_builtin_tools(tools_dir=None) -> List[str]:
+    """Import the retained built-in tool modules and return their names.
 
-
-def _module_registers_tools(module_path: Path) -> bool:
-    """Return True when the module contains a top-level ``registry.register(...)`` call.
-
-    Only inspects module-body statements so that helper modules which happen
-    to call ``registry.register()`` inside a function are not picked up.
-
-    A cheap text prefilter avoids the ``ast.parse`` cost for files that do not
-    mention both ``registry`` and ``register`` — a necessary condition for a
-    top-level ``registry.register()`` call to exist.
+    ``tools_dir`` remains accepted for source compatibility but is intentionally
+    unused: the async runtime has a fixed, audited tool waist and performs no
+    import-time filesystem scan. Plugins and MCP tools still register through
+    the same registry at runtime.
     """
-    try:
-        source = module_path.read_text(encoding="utf-8")
-    except OSError:
-        return False
-    if "registry" not in source or "register" not in source:
-        return False
-    try:
-        tree = ast.parse(source, filename=str(module_path))
-    except SyntaxError:
-        return False
-
-    return any(_is_registry_register_call(stmt) for stmt in tree.body)
-
-
-def discover_builtin_tools(tools_dir: Optional[Path] = None) -> List[str]:
-    """Import built-in self-registering tool modules and return their module names.
-
-    The per-file AST scan (:func:`_module_registers_tools`) costs ~145 ms over
-    ~100 files on a warm cache, so verdicts are memoized on disk keyed by
-    ``(mtime_ns, size)``. A file whose mtime_ns+size match the cached entry is
-    trusted without re-reading; any mismatch (or a corrupt/missing cache file)
-    falls back to a fresh scan for that file. The cache write is best-effort
-    and atomic, so concurrent processes can race harmlessly.
-    """
-    tools_path = Path(tools_dir) if tools_dir is not None else Path(__file__).resolve().parent
-
-    cache = _load_discovery_cache()
-    fresh_cache: Dict[str, list] = {}
-    cache_dirty = False
-
-    module_names: List[str] = []
-    for path in sorted(tools_path.glob("*.py")):
-        if path.name in {"__init__.py", "registry.py", "mcp_tool.py"}:
-            continue
-        if path.stem not in _TRAINING_RUNTIME_TOOL_MODULES:
-            continue
-        abs_path = str(path.resolve())
-        try:
-            st = path.stat()
-            stat_key = (st.st_mtime_ns, st.st_size)
-        except OSError:
-            continue
-        cached = cache.get(abs_path)
-        if (
-            isinstance(cached, (list, tuple))
-            and len(cached) == 3
-            and (cached[0], cached[1]) == stat_key
-        ):
-            registers = bool(cached[2])
-        else:
-            registers = _module_registers_tools(path)
-            cache_dirty = True
-        fresh_cache[abs_path] = [stat_key[0], stat_key[1], registers]
-        if registers:
-            module_names.append(f"tools.{path.stem}")
-
-    # Drop entries for files that no longer exist; rewrite only when changed.
-    if cache_dirty or set(fresh_cache) != set(cache):
-        _save_discovery_cache(fresh_cache)
-
+    del tools_dir
     imported: List[str] = []
-    for mod_name in module_names:
+    for mod_name in _BUILTIN_TOOL_MODULES:
         try:
             importlib.import_module(mod_name)
             imported.append(mod_name)
@@ -163,45 +91,22 @@ def discover_builtin_tools(tools_dir: Optional[Path] = None) -> List[str]:
     return imported
 
 
-def _discovery_cache_path() -> Optional[Path]:
-    """Path of the tool-discovery verdict cache, or None if unresolvable."""
-    try:
-        # Deferred import keeps tools/registry.py a no-deps leaf at module
-        # import time (hermes_constants itself is stdlib-only, so no cycle).
-        from hermes_constants import get_hermes_home
-
-        return Path(get_hermes_home()) / "cache" / "tool_discovery_cache.json"
-    except Exception:
-        return None
-
-
-def _load_discovery_cache() -> Dict[str, list]:
-    """The async distribution performs a deterministic in-memory scan."""
-    return {}
-
-
-def _save_discovery_cache(cache: Dict[str, list]) -> None:
-    """The async distribution does not persist discovery state."""
-    return None
-
-
 class ToolEntry:
     """Metadata for a single registered tool."""
 
     __slots__ = (
-        "name", "toolset", "schema", "handler", "is_async", "check_fn",
+        "name", "toolset", "schema", "handler", "check_fn",
         "requires_env", "description", "emoji",
         "max_result_size_chars", "dynamic_schema_overrides",
     )
 
-    def __init__(self, name, toolset, schema, handler, is_async, check_fn,
+    def __init__(self, name, toolset, schema, handler, check_fn,
                  requires_env, description, emoji,
                  max_result_size_chars=None, dynamic_schema_overrides=None):
         self.name = name
         self.toolset = toolset
         self.schema = schema
         self.handler = handler
-        self.is_async = is_async
         self.check_fn = check_fn
         self.requires_env = requires_env
         self.description = description
@@ -457,7 +362,6 @@ class ToolRegistry:
         handler: Callable,
         check_fn: Callable = None,
         requires_env: list = None,
-        is_async: bool = True,
         description: str = "",
         emoji: str = "",
         max_result_size_chars: int | float | None = None,
@@ -472,6 +376,11 @@ class ToolRegistry:
         registrations that would shadow an existing tool from a different
         toolset are rejected to prevent accidental overwrites.
         """
+        if not inspect.iscoroutinefunction(handler):
+            raise TypeError(
+                f"Tool '{name}' must use an async handler in async-hermes-agent"
+            )
+
         handler_module = getattr(handler, "__module__", "") or ""
         if (
             handler_module.startswith("tools.")
@@ -526,7 +435,6 @@ class ToolRegistry:
                 toolset=toolset,
                 schema=schema,
                 handler=handler,
-                is_async=bool(is_async),
                 check_fn=check_fn,
                 requires_env=requires_env or [],
                 description=description or schema.get("description", ""),
@@ -718,17 +626,7 @@ class ToolRegistry:
         if not entry:
             return tool_error(f"Unknown tool: {name}")
         try:
-            if not entry.is_async:
-                raise RuntimeError(
-                    f"Tool '{name}' is synchronous and unavailable in async-hermes-agent"
-                )
-            result = entry.handler(args, **kwargs)
-            if not inspect.isawaitable(result):
-                raise RuntimeError(
-                    f"Tool '{name}' declared native async but returned a "
-                    f"{type(result).__name__} instead of an awaitable"
-                )
-            result = await result
+            result = await entry.handler(args, **kwargs)
             return self._normalize_handler_result(name, result)
         except Exception as e:
             logger.exception("Tool %s dispatch error: %s", name, e)

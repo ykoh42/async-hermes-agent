@@ -438,15 +438,41 @@ class LocalEnvironment:
                     scrub_secrets=True,
                 ),
             )
-            input_bytes = stdin_data.encode() if stdin_data is not None else None
+            stdout_chunks: list[bytes] = []
+            stderr_chunks: list[bytes] = []
+
+            async def _drain(
+                stream: asyncio.StreamReader | None,
+                chunks: list[bytes],
+            ) -> None:
+                if stream is None:
+                    return
+                while chunk := await stream.read(64 * 1024):
+                    chunks.append(chunk)
+
+            readers = [
+                asyncio.create_task(_drain(process.stdout, stdout_chunks)),
+                asyncio.create_task(_drain(process.stderr, stderr_chunks)),
+            ]
+            if process.stdin is not None:
+                try:
+                    process.stdin.write(stdin_data.encode())
+                    await process.stdin.drain()
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+                finally:
+                    process.stdin.close()
             try:
-                stdout, stderr = await asyncio.wait_for(
-                    process.communicate(input_bytes), timeout=limit
-                )
+                await asyncio.wait_for(process.wait(), timeout=limit)
             except TimeoutError:
                 await _terminate_process(process)
+                await _finish_stream_readers(readers)
+                output = _decode_process_output(stdout_chunks, stderr_chunks)
+                timeout_message = f"Command timed out after {limit:g}s"
                 return {
-                    "output": f"Command timed out after {limit:g}s",
+                    "output": (
+                        f"{output.rstrip()}\n{timeout_message}" if output else timeout_message
+                    ),
                     "returncode": 124,
                 }
             except asyncio.CancelledError:
@@ -455,11 +481,13 @@ class LocalEnvironment:
                 # after the child has been reaped so cancellation cannot leak
                 # a process or file descriptors into the next turn.
                 await _terminate_process(process)
+                await _finish_stream_readers(readers)
                 raise
+            await _finish_stream_readers(readers)
         except OSError as exc:
             return {"output": f"Failed to execute command: {exc}", "returncode": 1}
 
-        output = (stdout or b"").decode(errors="replace") + (stderr or b"").decode(errors="replace")
+        output = _decode_process_output(stdout_chunks, stderr_chunks)
         match = re.search(rf"\n{re.escape(marker)}([^\n]*)\n?$", output)
         if match:
             new_cwd = match.group(1).strip()
@@ -468,6 +496,24 @@ class LocalEnvironment:
                 async with self._lock:
                     self.cwd = new_cwd
         return {"output": output, "returncode": process.returncode}
+
+
+async def _finish_stream_readers(readers: list[asyncio.Task[None]]) -> None:
+    """Collect available output without waiting on pipes inherited by children."""
+    _, pending = await asyncio.wait(readers, timeout=0.25)
+    for task in pending:
+        task.cancel()
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
+
+
+def _decode_process_output(
+    stdout_chunks: list[bytes],
+    stderr_chunks: list[bytes],
+) -> str:
+    return b"".join(stdout_chunks).decode(errors="replace") + b"".join(
+        stderr_chunks
+    ).decode(errors="replace")
 
 
 async def _nearest_existing_directory(path: str) -> str | None:
@@ -694,17 +740,16 @@ async def terminal_tool(
 
     callback = _get_approval_callback()
     if callback is not None and not force:
-        decision = callback(
+        if not inspect.iscoroutinefunction(callback):
+            raise RuntimeError(
+                "Async Hermes requires a coroutine terminal approval callback"
+            )
+        decision = await callback(
             command=command,
             task_id=task_id,
             session_id=session_id,
             background=background,
         )
-        if not inspect.isawaitable(decision):
-            raise RuntimeError(
-                "Async Hermes requires a coroutine terminal approval callback"
-            )
-        decision = await decision
         approved = decision is True or str(decision).strip().lower() in {
             "approve",
             "approved",

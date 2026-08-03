@@ -16,7 +16,11 @@ from pathlib import Path, PurePosixPath
 import aiofiles
 import aiofiles.os
 
-from agent.file_safety import get_read_block_error, get_write_denied_error
+from agent.file_safety import (
+    get_cross_profile_warning,
+    get_read_block_error,
+    get_write_denied_error,
+)
 from tools.binary_extensions import has_binary_extension
 from tools.file_operations import (
     MAX_LINE_LENGTH,
@@ -395,7 +399,7 @@ def _resolve_base_dir(
         # terminal backend ever reports a relative cwd, anchor it to the process
         # cwd once, here, so the result no longer depends on cwd at resolve().
         base = Path(os.getcwd()) / base
-    return base.resolve()
+    return Path(os.path.abspath(base))
 
 
 def _resolve_path_for_task(filepath: str, task_id: str = "default") -> Path | PurePosixPath:
@@ -430,50 +434,9 @@ def _resolve_path_for_task(filepath: str, task_id: str = "default") -> Path | Pu
 
     p = Path(expanded)
     if p.is_absolute():
-        return p.resolve()
+        return Path(os.path.abspath(p))
     resolved = _resolve_base_dir(task_id, container_paths=False) / p
-    return resolved.resolve()
-
-
-def _path_resolution_warning(filepath: str, resolved: Path, task_id: str = "default") -> str | None:
-    """Warn when a relative path resolved OUTSIDE the task's workspace root.
-
-    Surfaces the worktree-cwd divergence the moment it would matter: if the
-    agent passes a relative path but it resolves under a directory that is not
-    the workspace root (i.e. the edit is about to land in a different checkout
-    than the one the agent is working in), return a message naming the absolute
-    target. ``None`` when the path is absolute, the base is unknown, or the
-    resolved path is correctly under the workspace root.
-
-    The workspace root is the live terminal cwd when known, else a registered
-    task/session cwd override, else a sentinel-free absolute ``$TERMINAL_CWD``
-    — so a worktree or Desktop session whose terminal registry is still empty
-    (no ``cd`` run yet) is warned on the very first write.
-    """
-    try:
-        if Path(_expand_tilde(filepath)).is_absolute():
-            return None
-        workspace_root = _authoritative_workspace_root(task_id)
-        if not workspace_root:
-            return None  # No authoritative workspace root to compare against.
-        if _uses_container_paths(task_id):
-            root = _normalize_without_host_deref(Path(_expand_tilde(workspace_root)))
-        else:
-            root = Path(_expand_tilde(workspace_root)).resolve()
-        # Is `resolved` inside `root`?
-        try:
-            resolved.relative_to(root)
-            return None  # Inside the workspace — expected.
-        except ValueError:
-            return (
-                f"Relative path {filepath!r} resolved to {str(resolved)!r}, which is "
-                f"OUTSIDE the active workspace ({str(root)!r}). The edit will land in "
-                f"a different directory than the terminal's cwd. If this is not "
-                f"intended (e.g. a git-worktree session writing into the main "
-                f"checkout), pass an absolute path under the workspace instead."
-            )
-    except Exception:
-        return None
+    return Path(os.path.abspath(resolved))
 
 
 def _is_blocked_device_path(path: str) -> bool:
@@ -512,7 +475,7 @@ def _is_blocked_device_path(path: str) -> bool:
     return False
 
 
-def _is_blocked_device(filepath: str, base_dir: str | Path | None = None) -> bool:
+async def _is_blocked_device(filepath: str, base_dir: str | Path | None = None) -> bool:
     """Return True if the path would hang the process (infinite output or blocking input).
 
     Check the literal path first so aliases like /dev/stdin are caught before
@@ -530,7 +493,7 @@ def _is_blocked_device(filepath: str, base_dir: str | Path | None = None) -> boo
     current = normalized
     for _ in range(20):
         try:
-            target = os.readlink(current)
+            target = await aiofiles.os.readlink(current)
         except OSError:
             break
         if not os.path.isabs(target):
@@ -544,7 +507,8 @@ def _is_blocked_device(filepath: str, base_dir: str | Path | None = None) -> boo
         current = target
 
     try:
-        resolved = os.path.normpath(os.path.realpath(normalized))
+        realpath = aiofiles.os.wrap(os.path.realpath)
+        resolved = os.path.normpath(await realpath(normalized))
     except (OSError, ValueError):
         return False
     if _is_blocked_device_path(resolved):
@@ -568,24 +532,26 @@ _hermes_config_resolved: str | None = None
 _hermes_config_resolved_loaded = False
 
 
-def _get_hermes_config_resolved() -> str | None:
-    """Return the resolved absolute path of the Hermes config file (cached)."""
+def _get_hermes_config_path() -> str | None:
+    """Return the absolute Hermes config path without filesystem access."""
     global _hermes_config_resolved, _hermes_config_resolved_loaded
     if _hermes_config_resolved_loaded:
         return _hermes_config_resolved
     _hermes_config_resolved_loaded = True
     try:
         from hermes_cli.config import get_config_path
-        _hermes_config_resolved = str(get_config_path().resolve())
+        _hermes_config_resolved = os.path.abspath(get_config_path())
     except Exception:
         try:
-            _hermes_config_resolved = str(Path(_expand_tilde("~/.hermes/config.yaml")).resolve())
+            _hermes_config_resolved = os.path.abspath(
+                _expand_tilde("~/.hermes/config.yaml")
+            )
         except Exception:
             _hermes_config_resolved = None
     return _hermes_config_resolved
 
 
-def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None:
+async def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None:
     """Return an error message if the path targets a sensitive system location."""
     try:
         resolved = str(_resolve_path_for_task(filepath, task_id))
@@ -605,13 +571,14 @@ def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None
     # approvals.mode and other security settings live here; a malicious or
     # prompt-injected agent could silently disable exec approval by writing to
     # this file.
-    hermes_config = _get_hermes_config_resolved()
+    hermes_config = _get_hermes_config_path()
     # macOS resolves ``/tmp`` through the ``/private`` symlink.  Canonicalize
     # both values so the config guard is stable regardless of the spelling the
     # caller used.
-    canonical_resolved = os.path.realpath(resolved)
-    canonical_normalized = os.path.realpath(normalized)
-    canonical_config = os.path.realpath(hermes_config) if hermes_config else None
+    realpath = aiofiles.os.wrap(os.path.realpath)
+    canonical_resolved = await realpath(resolved)
+    canonical_normalized = await realpath(normalized)
+    canonical_config = await realpath(hermes_config) if hermes_config else None
     if canonical_config and (
         canonical_resolved == canonical_config
         or canonical_normalized == canonical_config
@@ -624,69 +591,17 @@ def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None
     return None
 
 
-def _get_container_mirror_prefix_for_task(task_id: str = "default") -> str | None:
-    """Container mirrors do not exist in the local-only training runtime."""
-    return None
-
-
-def _check_cross_profile_path(filepath: str, task_id: str = "default") -> str | None:
-    """Return a soft-guard warning when ``filepath`` lands in another Hermes
-    profile's scoped area, a host-side sandbox-mirror of authoritative profile
-    state, or the Docker container's sandbox mirror of Hermes state.
-
-    Three detectors run in order:
-
-    * cross-profile — writes that hit another profile's
-      ``skills/plugins/cron/memories`` directory.
-    * sandbox-mirror (#32049) — writes that hit the
-      ``…/sandboxes/<backend>/<task>/home/.hermes/…`` mirror created by a
-      non-local terminal backend (Docker, Daytona, etc.), where the host
-      Hermes process never reads the mirror and the authoritative file is
-      left untouched.
-    * container-mirror (#32049 follow-up) — writes from inside a Docker
-      container whose bind-mounted home strips the ``sandboxes/`` prefix, so
-      the agent sees a plain ``/root/.hermes/…`` path.
-
-    Returns ``None`` when the write is in-scope or outside Hermes scope.
-    All detectors are soft guards — the agent can override any by
-    passing ``cross_profile=True`` to its write tool after explicit user
-    direction. Defense-in-depth, NOT a security boundary — the terminal
-    tool runs as the same OS user and can write any of these paths
-    directly. See ``agent/file_safety.classify_cross_profile_target``,
-    ``classify_sandbox_mirror_target`` and ``classify_container_mirror_target``
-    for the detection rules.
-    """
-    try:
-        from agent.file_safety import (
-            get_container_mirror_warning,
-            get_cross_profile_warning,
-            get_sandbox_mirror_warning,
-        )
-    except Exception:
-        # Fail open on import error — the existing sensitive-path guard
-        # plus the write_denied list still apply.
-        return None
-
-    # Resolve via the task's cwd so a relative ``skills/foo/SKILL.md``
-    # in a session that cd'd into ``~/.hermes/profiles/other/`` is
-    # classified against the right base.
+async def _check_cross_profile_path(
+    filepath: str,
+    task_id: str = "default",
+) -> str | None:
+    """Apply the retained local-runtime cross-profile soft guard."""
     try:
         resolved = str(_resolve_path_for_task(filepath, task_id))
     except (OSError, ValueError):
         resolved = filepath
 
-    warning = get_cross_profile_warning(resolved)
-    if warning is not None:
-        return warning
-
-    warning = get_sandbox_mirror_warning(resolved)
-    if warning is not None:
-        return warning
-
-    return get_container_mirror_warning(
-        resolved,
-        mirror_prefix=_get_container_mirror_prefix_for_task(task_id),
-    )
+    return await get_cross_profile_warning(resolved)
 
 
 
@@ -786,24 +701,7 @@ def _invalidate_dedup_for_path(filepath: str, task_id: str) -> None:
             }
 
 
-def _update_read_timestamp(filepath: str, task_id: str) -> None:
-    """Refresh mtime/dedup state after a successful write or patch."""
-    _invalidate_dedup_for_path(filepath, task_id)
-    try:
-        resolved = str(_resolve_path(filepath, task_id))
-        mtime = os.path.getmtime(resolved)
-    except (OSError, ValueError):
-        return
-    with _read_tracker_lock:
-        state = _read_tracker.get(task_id)
-        if state:
-            state.setdefault("read_timestamps", {})[resolved] = mtime
-            _cap_read_tracker_data(state)
-
-
-
-
-def _search_result_read_block_error(
+async def _search_result_read_block_error(
     path: str,
     task_id: str = "default",
 ) -> str | None:
@@ -811,11 +709,11 @@ def _search_result_read_block_error(
     try:
         resolved = _resolve_path_for_task(path, task_id)
     except (OSError, ValueError, RuntimeError):
-        return get_read_block_error(path)
-    return get_read_block_error(str(resolved))
+        return await get_read_block_error(path)
+    return await get_read_block_error(str(resolved))
 
 
-def _filter_search_output_lines(
+async def _filter_search_output_lines(
     lines: list[str],
     task_id: str,
 ) -> tuple[list[str], int]:
@@ -824,7 +722,7 @@ def _filter_search_output_lines(
     omitted = 0
     for line in lines:
         candidate = line.split(":", 1)[0] if ":" in line else line
-        if _search_result_read_block_error(candidate, task_id):
+        if await _search_result_read_block_error(candidate, task_id):
             omitted += 1
             continue
         safe.append(line)
@@ -987,14 +885,14 @@ SEARCH_FILES_SCHEMA = {
 # compatibility backend: a caller either awaits the native handler or receives
 # the explicit unsupported-backend error from ``_native_file_path``.
 
-_async_file_locks: dict[str, asyncio.Lock] = {}
-_async_file_locks_guard = asyncio.Lock()
+_file_locks: dict[str, asyncio.Lock] = {}
+_file_locks_guard = asyncio.Lock()
 
 
-async def _async_file_lock(path: Path) -> asyncio.Lock:
+async def _file_lock(path: Path) -> asyncio.Lock:
     key = str(path)
-    async with _async_file_locks_guard:
-        return _async_file_locks.setdefault(key, asyncio.Lock())
+    async with _file_locks_guard:
+        return _file_locks.setdefault(key, asyncio.Lock())
 
 
 def _native_file_path(path: str, task_id: str) -> Path | str:
@@ -1097,7 +995,7 @@ async def _handle_read_file(args, **kw):
 
     offset, limit = normalize_read_pagination(args.get("offset", 1), args.get("limit", 500))
     device_base = None if Path(_expand_tilde(path)).is_absolute() else _resolve_base_dir(task_id)
-    if _is_blocked_device(path, base_dir=device_base):
+    if await _is_blocked_device(path, base_dir=device_base):
         return tool_error(
             f"Cannot read '{path}': this is a device file that would block or produce infinite output."
         )
@@ -1110,7 +1008,7 @@ async def _handle_read_file(args, **kw):
             f"Cannot read binary file '{path}' ({resolved.suffix.lower()}). "
             "Use vision_analyze for images, or terminal to inspect binary files."
         )
-    block_error = get_read_block_error(str(resolved))
+    block_error = await get_read_block_error(str(resolved))
     if block_error:
         return tool_error(block_error)
 
@@ -1243,11 +1141,11 @@ async def _handle_write_file(args, **kw):
         return tool_error("write_file: missing required field 'path'.")
     if not isinstance(content, str):
         return tool_error("write_file: missing required string field 'content'.")
-    sensitive_error = _check_sensitive_path(path, task_id)
+    sensitive_error = await _check_sensitive_path(path, task_id)
     if sensitive_error:
         return tool_error(sensitive_error)
     if not args.get("cross_profile", False):
-        profile_warning = _check_cross_profile_path(path, task_id)
+        profile_warning = await _check_cross_profile_path(path, task_id)
         if profile_warning:
             return tool_error(profile_warning)
     if _is_internal_file_tool_content(content):
@@ -1258,16 +1156,16 @@ async def _handle_write_file(args, **kw):
     resolved = _native_file_path(path, task_id)
     if isinstance(resolved, str):
         return resolved
-    denied_error = get_write_denied_error(str(resolved))
+    denied_error = await get_write_denied_error(str(resolved))
     if denied_error:
         return tool_error(denied_error)
     if not args.get("cross_profile", False):
-        profile_error = _check_cross_profile_path(str(resolved), task_id)
+        profile_error = await _check_cross_profile_path(str(resolved), task_id)
         if profile_error:
             return tool_error(profile_error)
     cross_warning = file_state.check_stale(task_id, str(resolved))
     stale_warning = await _check_file_staleness(path, task_id)
-    lock = await _async_file_lock(resolved)
+    lock = await _file_lock(resolved)
     try:
         async with lock:
             try:
@@ -1415,11 +1313,11 @@ async def _handle_v4a_patch(args: dict, task_id: str) -> str:
                 f"V4A patch header contains '..' traversal: {raw_path!r}. "
                 "Use an absolute or cwd-relative path without '..'."
             )
-        sensitive_error = _check_sensitive_path(raw_path, task_id)
+        sensitive_error = await _check_sensitive_path(raw_path, task_id)
         if sensitive_error:
             return tool_error(sensitive_error)
         if not args.get("cross_profile", False):
-            profile_error = _check_cross_profile_path(raw_path, task_id)
+            profile_error = await _check_cross_profile_path(raw_path, task_id)
             if profile_error:
                 return tool_error(profile_error)
 
@@ -1428,13 +1326,13 @@ async def _handle_v4a_patch(args: dict, task_id: str) -> str:
         resolved = _native_file_path(raw_path, task_id)
         if isinstance(resolved, str):
             return resolved
-        denied_error = get_write_denied_error(str(resolved))
+        denied_error = await get_write_denied_error(str(resolved))
         if denied_error:
             return tool_error(denied_error)
         resolved_by_raw[raw_path] = resolved
 
     paths = sorted(set(resolved_by_raw.values()), key=str)
-    locks = [await _async_file_lock(path) for path in paths]
+    locks = [await _file_lock(path) for path in paths]
     async with contextlib.AsyncExitStack() as stack:
         for lock in locks:
             await stack.enter_async_context(lock)
@@ -1543,23 +1441,23 @@ async def _handle_patch(args, **kw):
         return tool_error("patch: mode='replace' requires 'path'.")
     if not isinstance(old_string, str) or not isinstance(new_string, str):
         return tool_error("patch: mode='replace' requires old_string and new_string.")
-    sensitive_error = _check_sensitive_path(path, task_id)
+    sensitive_error = await _check_sensitive_path(path, task_id)
     if sensitive_error:
         return tool_error(sensitive_error)
 
     resolved = _native_file_path(path, task_id)
     if isinstance(resolved, str):
         return resolved
-    denied_error = get_write_denied_error(str(resolved))
+    denied_error = await get_write_denied_error(str(resolved))
     if denied_error:
         return tool_error(denied_error)
     if not args.get("cross_profile", False):
-        profile_error = _check_cross_profile_path(str(resolved), task_id)
+        profile_error = await _check_cross_profile_path(str(resolved), task_id)
         if profile_error:
             return tool_error(profile_error)
     cross_warning = file_state.check_stale(task_id, str(resolved))
     stale_warning = await _check_file_staleness(path, task_id)
-    lock = await _async_file_lock(resolved)
+    lock = await _file_lock(resolved)
     try:
         async with lock:
             async with aiofiles.open(resolved, "r", encoding="utf-8", errors="replace", newline="") as handle:
@@ -1645,7 +1543,7 @@ async def _handle_search_files(args, **kw):
     resolved = _native_file_path(args.get("path", "."), task_id)
     if isinstance(resolved, str):
         return resolved
-    block_error = get_read_block_error(str(resolved))
+    block_error = await get_read_block_error(str(resolved))
     if block_error:
         return tool_error(block_error)
 
@@ -1673,7 +1571,7 @@ async def _handle_search_files(args, **kw):
     if process.returncode not in {0, 1}:
         return tool_error(stderr.decode(errors="replace") or "search_files failed")
     all_lines = stdout.decode(errors="replace").splitlines()
-    all_lines, omitted = _filter_search_output_lines(all_lines, task_id)
+    all_lines, omitted = await _filter_search_output_lines(all_lines, task_id)
     page = all_lines[offset:offset + limit]
     result = {
         "matches": page,

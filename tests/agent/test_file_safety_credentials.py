@@ -18,6 +18,8 @@ from pathlib import Path
 
 import pytest
 
+pytestmark = pytest.mark.asyncio
+
 
 @pytest.fixture()
 def fake_home(tmp_path, monkeypatch):
@@ -46,21 +48,21 @@ def _create(home: Path, rel: str | Path) -> Path:
 
 
 
-def test_arbitrary_hermes_home_file_not_blocked(fake_home):
+async def test_arbitrary_hermes_home_file_not_blocked(fake_home):
     """Non-credential files inside HERMES_HOME stay readable."""
     from agent.file_safety import get_read_block_error
 
     safe = _create(fake_home, "session_log.txt")
-    assert get_read_block_error(str(safe)) is None
+    assert await get_read_block_error(str(safe)) is None
 
 
-def test_subdirectory_named_auth_json_not_blocked(fake_home):
+async def test_subdirectory_named_auth_json_not_blocked(fake_home):
     """Only the top-level auth.json is the credential store; a file with the
     same name in a subdirectory (e.g., a skill mock) must remain readable."""
     from agent.file_safety import get_read_block_error
 
     nested = _create(fake_home, Path("skills") / "my-skill" / "auth.json")
-    assert get_read_block_error(str(nested)) is None
+    assert await get_read_block_error(str(nested)) is None
 
 
 
@@ -135,12 +137,12 @@ async def test_search_tool_filters_credential_results(fake_home):
 
 
 
-def test_webhook_subscriptions_blocked(fake_home):
+async def test_webhook_subscriptions_blocked(fake_home):
     """webhook_subscriptions.json holds per-route HMAC secrets — blocked."""
     from agent.file_safety import get_read_block_error
 
     subs = _create(fake_home, "webhook_subscriptions.json")
-    err = get_read_block_error(str(subs))
+    err = await get_read_block_error(str(subs))
     assert err is not None
     assert "credential store" in err
 
@@ -151,7 +153,7 @@ def test_webhook_subscriptions_blocked(fake_home):
 
 
 
-def test_identically_named_hermes_files_outside_home_not_blocked(
+async def test_identically_named_hermes_files_outside_home_not_blocked(
     fake_home, tmp_path
 ):
     """Hermes-specific filenames (``auth.json``, ``mcp-tokens/``, ``google_oauth.json``)
@@ -166,41 +168,41 @@ def test_identically_named_hermes_files_outside_home_not_blocked(
     # auth.json outside HERMES_HOME — readable (per-location gate).
     p = project / "auth.json"
     p.write_text("not secret here", encoding="utf-8")
-    assert get_read_block_error(str(p)) is None, (
+    assert await get_read_block_error(str(p)) is None, (
         "auth.json outside HERMES_HOME should NOT be blocked"
     )
 
     google_oauth = project / "auth" / "google_oauth.json"
     google_oauth.parent.mkdir()
     google_oauth.write_text("not really a token", encoding="utf-8")
-    assert get_read_block_error(str(google_oauth)) is None
+    assert await get_read_block_error(str(google_oauth)) is None
 
     tokens = project / "mcp-tokens"
     tokens.mkdir()
     tok_file = tokens / "token.json"
     tok_file.write_text("not really a token", encoding="utf-8")
-    assert get_read_block_error(str(tok_file)) is None
+    assert await get_read_block_error(str(tok_file)) is None
 
 
-def test_non_secret_auth_subtree_file_not_blocked(fake_home):
+async def test_non_secret_auth_subtree_file_not_blocked(fake_home):
     """Only the known Google OAuth token path is blocked, not all auth/*."""
     from agent.file_safety import get_read_block_error
 
     note = _create(fake_home, Path("auth") / "notes.json")
-    assert get_read_block_error(str(note)) is None
+    assert await get_read_block_error(str(note)) is None
 
 
-def test_config_yaml_not_blocked(fake_home):
+async def test_config_yaml_not_blocked(fake_home):
     """config.yaml is NOT a credential file — agent should still be
     able to read it for debugging.  (Writes are denied separately by
     is_write_denied; reads stay allowed.)"""
     from agent.file_safety import get_read_block_error
 
     cfg = _create(fake_home, "config.yaml")
-    assert get_read_block_error(str(cfg)) is None
+    assert await get_read_block_error(str(cfg)) is None
 
 
-def test_profile_mode_blocks_root_credentials(tmp_path, monkeypatch):
+async def test_profile_mode_blocks_root_credentials(tmp_path, monkeypatch):
     """Under a profile, HERMES_HOME = <root>/profiles/<name>, but
     <root>/auth.json must ALSO be blocked — credentials at root are
     inherited by every profile."""
@@ -217,28 +219,28 @@ def test_profile_mode_blocks_root_credentials(tmp_path, monkeypatch):
     # Profile-local credential store: blocked
     profile_auth = profile / "auth.json"
     profile_auth.write_text("x")
-    assert "credential store" in (get_read_block_error(str(profile_auth)) or "")
+    assert "credential store" in (await get_read_block_error(str(profile_auth)) or "")
 
     # Root-level credential store: ALSO blocked (this is the widening)
     root_auth = root / "auth.json"
     root_auth.write_text("x")
-    assert "credential store" in (get_read_block_error(str(root_auth)) or "")
+    assert "credential store" in (await get_read_block_error(str(root_auth)) or "")
 
     # Root-level .env: blocked too
     root_env = root / ".env"
     root_env.write_text("x")
-    assert "credential store" in (get_read_block_error(str(root_env)) or "")
+    assert "credential store" in (await get_read_block_error(str(root_env)) or "")
 
     # Root-level Google OAuth token store: blocked too
     root_google_oauth = root / "auth" / "google_oauth.json"
     root_google_oauth.parent.mkdir(parents=True, exist_ok=True)
     root_google_oauth.write_text("x")
     assert "credential store" in (
-        get_read_block_error(str(root_google_oauth)) or ""
+        await get_read_block_error(str(root_google_oauth)) or ""
     )
 
     # Root-level mcp-tokens: blocked
     root_tok = root / "mcp-tokens" / "gh.json"
     root_tok.parent.mkdir(parents=True, exist_ok=True)
     root_tok.write_text("x")
-    assert "MCP token" in (get_read_block_error(str(root_tok)) or "")
+    assert "MCP token" in (await get_read_block_error(str(root_tok)) or "")

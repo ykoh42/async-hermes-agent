@@ -7,7 +7,6 @@ from unittest.mock import MagicMock
 import agent.display as display_module
 from agent.display import (
     build_tool_preview,
-    capture_local_edit_snapshot,
     extract_edit_diff,
     get_cute_tool_message,
     redact_tool_args_for_display,
@@ -150,29 +149,6 @@ class TestEditDiffPreview:
 
 
 
-    def test_extract_edit_diff_uses_local_snapshot_for_write_file(self, tmp_path):
-        target = tmp_path / "note.txt"
-        target.write_text("old\n", encoding="utf-8")
-
-        snapshot = capture_local_edit_snapshot("write_file", {"path": str(target)})
-
-        target.write_text("new\n", encoding="utf-8")
-
-        diff = extract_edit_diff(
-            "write_file",
-            '{"bytes_written": 4}',
-            function_args={"path": str(target)},
-            snapshot=snapshot,
-        )
-
-        assert diff is not None
-        assert "--- a/" in diff
-        assert "+++ b/" in diff
-        assert "-old" in diff
-        assert "+new" in diff
-
-
-
     def test_render_edit_diff_with_delta_handles_renderer_errors(self, monkeypatch):
         printer = MagicMock()
 
@@ -275,4 +251,3 @@ class TestBuildStatusPhrase:
             assert build_status_phrase("terminal", {"command": "ls"}) is None
         finally:
             set_friendly_tool_labels(True)
-

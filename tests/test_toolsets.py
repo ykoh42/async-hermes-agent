@@ -13,7 +13,7 @@ from toolsets import (
 )
 
 
-def _dummy_handler(args, **kwargs):
+async def _dummy_handler(args, **kwargs):
     return "{}"
 
 

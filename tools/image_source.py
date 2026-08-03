@@ -11,24 +11,8 @@ credential-guard pipeline applies, and only the type check at the end differs
 (extension-table typing plus an mp4 magic sniff, rather than image magic
 bytes). Every existing call site keeps the image-only default unchanged.
 
-Security (terminal-backend confinement, GHSA-gpxw-6wxv-w3qq): under a non-local
-terminal backend the file tools are confined to the sandbox (SECURITY.md 2.2),
-but vision read images host-side. This resolver enforces the same boundary:
-
-  * local backend            -> read any host path (chosen posture, unchanged)
-  * non-local backend:
-      path in a media cache   -> host-read (the gateway/download caches live on
-                                 the host and are bind-mounted into the sandbox)
-      path anywhere else      -> read the bytes *inside the sandbox* via exec-read
-                                 (the agent can already ``cat`` any container file;
-                                 this stays within the sandbox boundary and never
-                                 reaches the host's ``/etc/passwd`` / ``~/.ssh``).
-
-So a prompt-injected ``vision_analyze('/etc/passwd')`` under Docker reads the
-*container's* file (what every other tool sees), not the host's — no escape —
-while container-only images (tmpfs ``/workspace``, root-owned) are still
-deliverable. This is the unified delivery + confinement model: the same
-mechanism that fixes "vision can't see container files" also closes the escape.
+The async library retains only the local terminal backend, so local paths are
+resolved and read through the same awaited filesystem boundary as file tools.
 """
 from __future__ import annotations
 
@@ -50,6 +34,7 @@ from typing import Optional
 # still reach the resizer so it can be downscaled under the payload cap. Capping
 # raw bytes at 20MB here would reject every 20-50MB photo before resize can run.
 _MAX_INGEST_BYTES = 50 * 1024 * 1024
+_realpath = aiofiles.os.wrap(os.path.realpath)
 
 
 class ImageResolutionError(Exception):
@@ -124,12 +109,7 @@ async def resolve_image_source(
     # like "pic.png" (accepted on main; a path-shape gate here regressed them).
     candidate = s[len("file://"):] if s.lower().startswith("file://") else s
     p = Path(os.path.expanduser(candidate))
-    # Confinement decision (see module docstring). Under a non-local backend
-    # a path is host-readable ONLY if it lands in a media cache (after
-    # translating a container-visible cache path back to its host mount);
-    # every other path is read inside the sandbox via exec-read, so a host
-    # path outside the caches never yields the host's bytes.
-    host_target = _permitted_host_read_target(p, ctx)
+    host_target = await _permitted_host_read_target(p, ctx)
     if (
         host_target is not None
         and await aiofiles.os.path.isfile(host_target)
@@ -147,7 +127,7 @@ async def resolve_image_source(
             raise_if_read_blocked = None
         if raise_if_read_blocked is not None:
             try:
-                raise_if_read_blocked(str(host_target))
+                await raise_if_read_blocked(str(host_target))
             except ValueError as exc:
                 raise SourceUnsafe(str(exc), src=s, origin="file")
         async with aiofiles.open(host_target, "rb") as image_file:
@@ -220,65 +200,15 @@ async def _download_to_bytes(url: str) -> bytes:
             pass
 
 
-def _is_local_terminal_backend() -> bool:
-    """True when the terminal backend runs directly on the host.
-
-    Mirrors ``tools.browser_tool._is_local_backend`` and terminal_tool's own
-    dispatch, which key off ``TERMINAL_ENV``.
-    """
-    return os.getenv("TERMINAL_ENV", "local").strip().lower() in ("local", "")
-
-
-def _media_cache_roots() -> list:
-    """Agent-managed media cache directories under HERMES_HOME (host side).
-
-    The only host paths vision may read under a non-local backend: gateway-
-    downloaded inbound media and the tools' own URL-download temp dirs. Covers
-    the consolidated ``cache/`` layout and the legacy flat directories.
-    """
-    from hermes_constants import get_hermes_home
-
-    home = get_hermes_home()
-    return [
-        home / "cache",  # cache/images, cache/vision, cache/video(s), cache/audio
-        home / "image_cache",
-        home / "audio_cache",
-        home / "video_cache",
-        home / "temp_vision_images",
-        home / "temp_video_files",
-    ]
-
-
-def _permitted_host_read_target(p: Path, ctx: ResolveContext) -> Optional[Path]:
-    """Return the host path to read, or ``None`` if a host read is not permitted.
-
-    - Local backend: any path is permitted (chosen posture). Returns ``p``.
-    - Non-local backend: permitted only if the path resolves inside a media
-      cache root. A container-visible cache path (e.g. ``/root/.hermes/cache/
-      images/x.png``) is first translated back to its host mount; anything that
-      is not under a cache returns ``None`` so the caller routes it to the
-      in-sandbox exec-read instead of reading the host filesystem.
-    """
-    if _is_local_terminal_backend():
-        try:
-            return p.resolve()
-        except Exception:  # noqa: BLE001 — unresolved path: let is_file() fail downstream
-            return p
-
-    from tools.credential_files import from_agent_visible_cache_path
-
-    host_candidate = Path(from_agent_visible_cache_path(str(p)))
+async def _permitted_host_read_target(
+    path: Path,
+    _context: ResolveContext,
+) -> Path:
+    """Resolve a local media path without blocking the event loop."""
     try:
-        real = host_candidate.resolve()
-    except Exception:  # noqa: BLE001 — cannot resolve -> not a safe host read
-        return None
-    for root in _media_cache_roots():
-        try:
-            real.relative_to(root.resolve())
-            return real
-        except ValueError:
-            continue
-    return None
+        return Path(await _realpath(path))
+    except OSError:
+        return path
 
 
 def _get_active_env(task_id: Optional[str]):

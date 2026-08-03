@@ -102,40 +102,6 @@ async def refresh_state_db(tmp_path: Path):
         await db.close()
 
 
-class TestGoalMigratesOnRotation:
-    @pytest.mark.asyncio
-    async def test_goal_follows_compression_rotation(self, tmp_path: Path):
-        db = SessionDB(tmp_path / "state.db")
-        parent = "PARENT_GOAL_ROT"
-        await db.create_session(parent, source="cli")
-        agent = _build_agent_with_db(db, parent)
-
-        # Set a persistent goal on the parent via the real persistence path.
-        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path / ".hermes")}):
-            (tmp_path / ".hermes").mkdir(exist_ok=True)
-            import hermes_cli.goals as goals
-            # Point the goal DB at the same state.db the agent uses.
-            with patch.object(
-                goals,
-                "_get_session_db",
-                new_callable=AsyncMock,
-                side_effect=lambda: SessionDB(tmp_path / "state.db"),
-            ):
-                await goals.save_goal(parent, goals.GoalState(goal="finish the migration"))
-
-                await agent._compress_context(
-                    _msgs(), "sys", approx_tokens=120_000
-                )
-                child = agent.session_id
-                assert child != parent  # rotation happened
-
-                migrated = await goals.load_goal(child)
-                assert migrated is not None
-                assert migrated.goal == "finish the migration"
-        await agent.close()
-        await db.close()
-
-
 class TestOrphanRollbackOnCreateFailure:
     @pytest.mark.asyncio
     async def test_rolls_back_to_parent_when_child_create_fails(self, tmp_path: Path):

@@ -9,7 +9,7 @@ transport is bound to a dead worker loop.
 The three-layer defence:
 1. ``neuter_async_httpx_del()`` replaces ``__del__`` with a no-op.
 2. A custom asyncio exception handler silences residual errors.
-3. ``cleanup_stale_async_clients()`` evicts stale cache entries.
+3. ``cleanup_stale_clients()`` evicts stale cache entries.
 """
 
 import asyncio
@@ -71,7 +71,7 @@ class TestNeuterAsyncHttpxDel:
 
 
 # ---------------------------------------------------------------------------
-# Layer 3: cleanup_stale_async_clients
+# Layer 3: cleanup_stale_clients
 # ---------------------------------------------------------------------------
 
 class TestCleanupStaleAsyncClients:
@@ -82,7 +82,7 @@ class TestCleanupStaleAsyncClients:
         from agent.auxiliary_client import (
             _client_cache,
             _client_cache_lock,
-            cleanup_stale_async_clients,
+            cleanup_stale_clients,
         )
 
         closed_loop = asyncio.new_event_loop()
@@ -93,7 +93,7 @@ class TestCleanupStaleAsyncClients:
         async with _client_cache_lock:
             _client_cache[key] = (client, "test-model", closed_loop)
 
-        await cleanup_stale_async_clients()
+        await cleanup_stale_clients()
 
         async with _client_cache_lock:
             assert key not in _client_cache
@@ -103,7 +103,7 @@ class TestCleanupStaleAsyncClients:
         from agent.auxiliary_client import (
             _client_cache,
             _client_cache_lock,
-            cleanup_stale_async_clients,
+            cleanup_stale_clients,
         )
 
         key = ("test_live", "", "", "", (), False, "", "", "test-model")
@@ -114,7 +114,7 @@ class TestCleanupStaleAsyncClients:
                 asyncio.get_running_loop(),
             )
 
-        await cleanup_stale_async_clients()
+        await cleanup_stale_clients()
 
         async with _client_cache_lock:
             assert key in _client_cache

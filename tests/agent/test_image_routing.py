@@ -192,11 +192,12 @@ def _png_bytes() -> bytes:
     )
 
 
+@pytest.mark.asyncio
 class TestBuildNativeContentParts:
-    def test_text_then_image(self, tmp_path: Path):
+    async def test_text_then_image(self, tmp_path: Path):
         img = tmp_path / "cat.png"
         img.write_bytes(_png_bytes())
-        parts, skipped = build_native_content_parts("hello", [str(img)])
+        parts, skipped = await build_native_content_parts("hello", [str(img)])
         assert skipped == []
         assert len(parts) == 2
         assert parts[0]["type"] == "text"
@@ -209,7 +210,7 @@ class TestBuildNativeContentParts:
 
 
 
-    def test_path_hint_appended(self, tmp_path: Path):
+    async def test_path_hint_appended(self, tmp_path: Path):
         """The local path of each attached image is appended to the user
         text part so MCP/skill tools that take ``image_url: str`` can be
         invoked on the same image (issue #18960). Mirrors text-mode
@@ -217,7 +218,7 @@ class TestBuildNativeContentParts:
         """
         img = tmp_path / "scan.png"
         img.write_bytes(_png_bytes())
-        parts, _ = build_native_content_parts("attach this", [str(img)])
+        parts, _ = await build_native_content_parts("attach this", [str(img)])
         text_part = next(p for p in parts if p.get("type") == "text")
         assert "[Image attached at:" in text_part["text"]
         assert str(img) in text_part["text"]
@@ -225,12 +226,14 @@ class TestBuildNativeContentParts:
         assert text_part["text"].startswith("attach this")
 
 
-    def test_multiple_images(self, tmp_path: Path):
+    async def test_multiple_images(self, tmp_path: Path):
         img1 = tmp_path / "a.png"
         img2 = tmp_path / "b.png"
         img1.write_bytes(_png_bytes())
         img2.write_bytes(_png_bytes())
-        parts, skipped = build_native_content_parts("compare these", [str(img1), str(img2)])
+        parts, skipped = await build_native_content_parts(
+            "compare these", [str(img1), str(img2)]
+        )
         assert skipped == []
         image_parts = [p for p in parts if p.get("type") == "image_url"]
         assert len(image_parts) == 2
@@ -247,37 +250,38 @@ class TestBuildNativeContentParts:
 # ─── Oversize handling ───────────────────────────────────────────────────────
 
 
+@pytest.mark.asyncio
 class TestLargeImageHandling:
     """Large images attach at native size; shrink is handled reactively at
     retry time in ``run_agent._try_shrink_image_parts_in_messages`` rather
     than proactively here.
     """
 
-    def test_large_image_passes_through_unchanged(self, tmp_path: Path):
+    async def test_large_image_passes_through_unchanged(self, tmp_path: Path):
         """A multi-MB image is attached as-is — no resize, no skip."""
         from agent import image_routing as _ir
 
         img = tmp_path / "medium.png"
         # 200 KB of real bytes; not huge but enough to verify no size gate fires.
         img.write_bytes(b"\x89PNG\r\n\x1a\n" + b"X" * 200_000)
-        url = _ir._file_to_data_url(img)
+        url = await _ir._file_to_data_url(img)
         assert url is not None
         assert url.startswith("data:image/png;base64,")
         # Base64 expansion means output is ~4/3 of input, plus header.
         assert len(url) > 200_000
 
-    def test_missing_file_returns_none(self, tmp_path: Path):
+    async def test_missing_file_returns_none(self, tmp_path: Path):
         from agent import image_routing as _ir
         missing = tmp_path / "does_not_exist.png"
-        assert _ir._file_to_data_url(missing) is None
+        assert await _ir._file_to_data_url(missing) is None
 
-    def test_build_native_parts_no_provider_kwarg(self, tmp_path: Path):
+    async def test_build_native_parts_no_provider_kwarg(self, tmp_path: Path):
         """build_native_content_parts takes text + paths, no provider kwarg."""
         from agent import image_routing as _ir
 
         img = tmp_path / "cat.png"
         img.write_bytes(_png_bytes())
-        parts, skipped = _ir.build_native_content_parts("hi", [str(img)])
+        parts, skipped = await _ir.build_native_content_parts("hi", [str(img)])
         assert skipped == []
         assert len(parts) == 2
         assert parts[0]["type"] == "text"
@@ -332,12 +336,13 @@ class TestExtractImageRefs:
 # ─── build_native_content_parts with URLs ────────────────────────────────────
 
 
+@pytest.mark.asyncio
 class TestBuildNativeContentPartsURLs:
     """URL pass-through support added so kanban task bodies (and other
     inbound surfaces) can route remote image URLs straight to the model."""
 
-    def test_url_only_no_local_paths(self):
-        parts, skipped = build_native_content_parts(
+    async def test_url_only_no_local_paths(self):
+        parts, skipped = await build_native_content_parts(
             "what is this?",
             [],
             image_urls=["https://example.com/diagram.png"],
@@ -352,10 +357,10 @@ class TestBuildNativeContentPartsURLs:
             "image_url": {"url": "https://example.com/diagram.png"},
         }
 
-    def test_mixed_path_and_url(self, tmp_path: Path):
+    async def test_mixed_path_and_url(self, tmp_path: Path):
         img = tmp_path / "local.png"
         img.write_bytes(_png_bytes())
-        parts, skipped = build_native_content_parts(
+        parts, skipped = await build_native_content_parts(
             "compare these",
             [str(img)],
             image_urls=["https://example.com/remote.jpg"],
@@ -377,6 +382,7 @@ class TestBuildNativeContentPartsURLs:
 # ─── Format compatibility: transcode non-universal formats to PNG ────────────
 
 
+@pytest.mark.asyncio
 class TestFormatCompatibility:
     """Some image formats Discord (and other chat platforms) accept aren't
     accepted by every major vision provider. Anthropic for example returns
@@ -392,12 +398,12 @@ class TestFormatCompatibility:
 
 
 
-    def test_svg_sniffed_correctly(self):
+    async def test_svg_sniffed_correctly(self):
         from agent.image_routing import _sniff_mime_from_bytes
         assert _sniff_mime_from_bytes(b'<svg xmlns="http://www.w3.org/2000/svg"/>') == "image/svg+xml"
         assert _sniff_mime_from_bytes(b'<?xml version="1.0"?><svg/>') == "image/svg+xml"
 
-    def test_bmp_transcoded_to_png(self, tmp_path: Path):
+    async def test_bmp_transcoded_to_png(self, tmp_path: Path):
         """BMP file should land as image/png in the data URL, not image/bmp,
         because not every provider (Anthropic) accepts BMP."""
         import pytest
@@ -406,36 +412,36 @@ class TestFormatCompatibility:
 
         img_path = tmp_path / "scan.bmp"
         Image.new("RGB", (4, 4), (255, 0, 0)).save(img_path, format="BMP")
-        url = _file_to_data_url(img_path)
+        url = await _file_to_data_url(img_path)
         assert url is not None
         assert url.startswith("data:image/png;base64,"), (
             f"BMP must be transcoded to PNG for cross-provider compatibility, got: {url[:60]}"
         )
 
 
-    def test_png_passes_through_no_transcode(self, tmp_path: Path):
+    async def test_png_passes_through_no_transcode(self, tmp_path: Path):
         """Universal-safe formats must NOT be re-encoded — preserves bytes."""
         from agent.image_routing import _file_to_data_url
 
         img_path = tmp_path / "ok.png"
         img_path.write_bytes(_png_bytes())
-        url = _file_to_data_url(img_path)
+        url = await _file_to_data_url(img_path)
         assert url is not None
         assert url.startswith("data:image/png;base64,")
         b64 = url.split(",", 1)[1]
         assert base64.b64decode(b64) == _png_bytes()
 
-    def test_file_to_data_url_blocks_read_denied_image_path(self, tmp_path: Path):
+    async def test_file_to_data_url_blocks_read_denied_image_path(self, tmp_path: Path):
         """Native image routing must honor the shared credential read guard."""
         from agent.image_routing import _file_to_data_url
 
         img_path = tmp_path / ".env"
         img_path.write_bytes(_png_bytes())
 
-        assert _file_to_data_url(img_path) is None
+        assert await _file_to_data_url(img_path) is None
 
 
-    def test_native_content_parts_blocks_image_symlink_to_read_denied_file(self, tmp_path: Path):
+    async def test_native_content_parts_blocks_image_symlink_to_read_denied_file(self, tmp_path: Path):
         from agent.image_routing import build_native_content_parts
         import os
         import pytest
@@ -448,7 +454,9 @@ class TestFormatCompatibility:
         except (OSError, NotImplementedError) as exc:
             pytest.skip(f"symlinks unavailable: {exc}")
 
-        parts, skipped = build_native_content_parts("inspect this", [str(img_link)])
+        parts, skipped = await build_native_content_parts(
+            "inspect this", [str(img_link)]
+        )
 
         assert skipped == [str(img_link)]
         assert all(part.get("type") != "image_url" for part in parts)

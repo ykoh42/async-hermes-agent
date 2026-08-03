@@ -492,12 +492,14 @@ async def _store_full_text(url: str, content: str) -> Optional[str]:
     (storage is best-effort; truncated content is still returned to the model).
     """
     try:
+        import aiofiles
+        import aiofiles.os
         import hashlib
         from urllib.parse import urlparse
         from hermes_constants import get_hermes_dir
 
         cache_dir = get_hermes_dir("cache/web", "web_cache")
-        cache_dir.mkdir(parents=True, exist_ok=True)
+        await aiofiles.os.makedirs(cache_dir, exist_ok=True)
 
         host = (urlparse(url).hostname or "page").replace(":", "_")
         slug = re.sub(r"[^A-Za-z0-9._-]", "-", host)[:60].strip("-") or "page"
@@ -512,8 +514,6 @@ async def _store_full_text(url: str, content: str) -> Optional[str]:
                 + f"\n\n[... stored copy truncated at {MAX_STORED_TEXT_CHARS:,} chars "
                 f"of {len(content):,}; re-extract a more specific URL for the rest ...]"
             )
-        import aiofiles
-
         async with aiofiles.open(path, "w", encoding="utf-8") as handle:
             await handle.write(content)
         return str(path)

@@ -88,6 +88,7 @@ from agent.skill_utils import (
 )
 
 logger = logging.getLogger(__name__)
+_realpath = aiofiles.os.wrap(os.path.realpath)
 
 # Per-session skill discovery cache.  _find_all_skills() re-reads every
 # SKILL.md on every call; with hundreds of skills this is wasteful.
@@ -198,7 +199,7 @@ async def _external_skills_dirs() -> List[Path]:
     if not isinstance(raw_dirs, list):
         return []
 
-    local_skills = _skills_dir().resolve()
+    local_skills = Path(await _realpath(_skills_dir()))
     roots: list[Path] = []
     seen: set[Path] = set()
     for raw_dir in raw_dirs:
@@ -208,7 +209,7 @@ async def _external_skills_dirs() -> List[Path]:
         candidate = Path(os.path.expanduser(os.path.expandvars(value)))
         if not candidate.is_absolute():
             candidate = get_hermes_home() / candidate
-        candidate = candidate.resolve()
+        candidate = Path(await _realpath(candidate))
         if candidate == local_skills or candidate in seen:
             continue
         try:
@@ -984,17 +985,18 @@ async def skill_view(
             direct_md = direct / "SKILL.md"
             if await aiofiles.os.path.isfile(direct_md):
                 candidates.append((direct, direct_md, root))
-                seen.add(direct_md.resolve())
+                seen.add(Path(await _realpath(direct_md)))
             legacy_md = root / f"{name}.md"
             if await aiofiles.os.path.isfile(legacy_md):
                 candidates.append((None, legacy_md, root))
-                seen.add(legacy_md.resolve())
+                seen.add(Path(await _realpath(legacy_md)))
             async for candidate in _iter_skill_index_files(root, "SKILL.md"):
-                if candidate.resolve() in seen:
+                resolved_candidate = Path(await _realpath(candidate))
+                if resolved_candidate in seen:
                     continue
                 if candidate.parent.name == name:
                     candidates.append((candidate.parent, candidate, root))
-                    seen.add(candidate.resolve())
+                    seen.add(resolved_candidate)
                     continue
                 try:
                     frontmatter, _ = _parse_frontmatter(
@@ -1004,7 +1006,7 @@ async def skill_view(
                     continue
                 if frontmatter.get("name") == name:
                     candidates.append((candidate.parent, candidate, root))
-                    seen.add(candidate.resolve())
+                    seen.add(resolved_candidate)
         if not candidates:
             return json.dumps({
                 "success": False,
@@ -1027,14 +1029,18 @@ async def skill_view(
         if file_path:
             if skill_dir is None:
                 return tool_error("This legacy flat skill has no linked files.", success=False)
-            from tools.path_security import has_traversal_component, validate_within_dir
+            from tools.path_security import has_traversal_component
 
             if has_traversal_component(file_path):
                 return tool_error("Path traversal ('..') is not allowed.", success=False)
             target = skill_dir / file_path
-            traversal_error = validate_within_dir(target, skill_dir)
-            if traversal_error:
-                return tool_error(traversal_error, success=False)
+            try:
+                resolved_target = Path(await _realpath(target))
+                resolved_target.relative_to(Path(await _realpath(skill_dir)))
+            except (ValueError, OSError) as exc:
+                return tool_error(
+                    f"Path escapes allowed directory: {exc}", success=False
+                )
             if not await aiofiles.os.path.isfile(target):
                 return tool_error(
                     f"File '{file_path}' not found in skill '{name}'.", success=False
@@ -1052,16 +1058,6 @@ async def skill_view(
                 "is_binary": True,
             }, ensure_ascii=False)
 
-        try:
-            from tools.skill_manager_tool import mark_background_review_skill_read
-
-            mark_background_review_skill_read(target)
-        except Exception:
-            logger.debug(
-                "Could not record background-review skill read for %s",
-                target,
-                exc_info=True,
-            )
         if file_path:
             return json.dumps({
                 "success": True,

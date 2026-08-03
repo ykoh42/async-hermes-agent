@@ -24,7 +24,6 @@ class _Agent:
         self.tools = []
         self._compression_feasibility_checked = True
         self.compression_in_place = False
-        self._memory_manager = None
         self._session_db = None
         self._todo_store = _TodoStore()
         self._cached_system_prompt = None

@@ -85,11 +85,9 @@ async def test_cancel_is_cooperative_and_forged_handle_is_unknown(lifecycle):
 
 @pytest.mark.asyncio
 async def test_public_lifecycle_runs_host_aggregation(monkeypatch):
-    memory = AsyncMock()
     parent = SimpleNamespace(
         session_id="parent-aggregate",
         enabled_toolsets=["file"],
-        _memory_manager=memory,
         _current_turn_id="turn-1",
         session_estimated_cost_usd=1.0,
         session_cost_source="none",
@@ -124,9 +122,6 @@ async def test_public_lifecycle_runs_host_aggregation(monkeypatch):
     handle = await service.launch(SubagentLaunchRequest(goal="aggregate me"))
     assert (await service.wait(handle, timeout_seconds=1)).state is SubagentState.SUCCEEDED
 
-    memory.on_delegation.assert_awaited_once_with(
-        task="aggregate me", result="aggregated", child_session_id="child-session"
-    )
     hook.assert_awaited_once_with(
         "subagent_stop",
         parent_session_id="parent-aggregate",

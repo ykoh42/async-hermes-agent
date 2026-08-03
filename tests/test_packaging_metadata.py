@@ -9,44 +9,6 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
-def _distribution_name(requirement: str) -> str:
-    """Extract the PEP 508 distribution name from a requirement string.
-
-    Robust to markers (``; python_version < '3.12'``), direct references
-    (``name @ https://...``), extras (``name[extra]``) and every version
-    operator (``==``, ``>=``, ``<=``, ``~=``, ``!=``, ``<``, ``>``), so a
-    future dep declared with any valid specifier shape doesn't silently
-    mis-parse here.
-    """
-    spec = requirement.split(";", 1)[0]  # drop environment markers
-    spec = spec.split("@", 1)[0]  # drop direct-reference URLs
-    spec = spec.split("[", 1)[0]  # drop extras
-    spec = re.split(r"[=<>!~]", spec, maxsplit=1)[0]  # drop any version operator
-    return spec.strip().lower()
-
-
-def test_packaging_declared_as_core_dependency():
-    """Regression for #40503.
-
-    ``packaging`` is imported directly on three production paths
-    (plugins/memory/hindsight/__init__.py, tools/lazy_deps.py,
-    hermes_cli/main.py) yet was undeclared, so it only reached users
-    transitively. The slim Docker image shipped without it, silently
-    disabling Hindsight append-mode and version-constraint checks. It must
-    be a declared core dependency so it installs everywhere and the
-    update-repair step (``_verify_core_dependencies_installed``) guards it.
-    """
-    data = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
-    core = data["project"]["dependencies"]
-    names = {_distribution_name(dep) for dep in core}
-    assert "packaging" in names, (
-        "packaging is imported on production paths (hindsight version compare, "
-        "lazy_deps version constraints, requirement parsing) and must be a "
-        "declared core dependency, not a transitive — see #40503"
-    )
-
-
-
 # Minimum non-vulnerable Starlette: CVE-2026-48710 ("BadHost") was fixed in
 # 1.0.1. Anything below that lets a malformed Host header desync
 # ``request.url.path`` from the dispatched ASGI path, bypassing path-based

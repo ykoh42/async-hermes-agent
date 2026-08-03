@@ -14,8 +14,6 @@ ContextVar semantics give us the right isolation for free:
 
 * concurrent agents in one process (gateway sessions, delegate subagents)
   never see each other's accounting context;
-* worker threads spawned via ``tools.thread_context.propagate_context_to_thread``
-  (MoA fan-out, background review) inherit the parent turn's context;
 * asyncio tasks inherit the context of the code that created them.
 
 MoA reference/aggregator slots are explicitly EXCLUDED from recording:

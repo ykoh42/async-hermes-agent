@@ -237,32 +237,33 @@ class TestClarifyToolMultiSelect:
 class TestInvokeCallbackDispatch:
     """_invoke_callback uses signature inspection, never a TypeError retry."""
 
-    def test_internal_typeerror_not_swallowed_or_retried(self):
+    @pytest.mark.asyncio
+    async def test_internal_typeerror_not_swallowed_or_retried(self):
         """A compatible callback that raises TypeError internally must be
         invoked exactly once and its error surfaced — not retried with the
         legacy 2-arg form (which would prompt the user twice)."""
         from tools.clarify_tool import _invoke_callback
         calls = []
 
-        def bad_callback(question, choices, multi_select=False):
+        async def bad_callback(question, choices, multi_select=False):
             calls.append(1)
             raise TypeError("internal bug")
 
-        import pytest
         with pytest.raises(TypeError, match="internal bug"):
-            _invoke_callback(bad_callback, "Q?", ["a"], True)
+            await _invoke_callback(bad_callback, "Q?", ["a"], True)
         assert len(calls) == 1
 
 
-    def test_var_keyword_callback_receives_flag(self):
+    @pytest.mark.asyncio
+    async def test_var_keyword_callback_receives_flag(self):
         from tools.clarify_tool import _invoke_callback
         seen = {}
 
-        def kw_cb(question, choices, **kwargs):
+        async def kw_cb(question, choices, **kwargs):
             seen.update(kwargs)
             return "ok"
 
-        _invoke_callback(kw_cb, "Q?", ["a"], True)
+        await _invoke_callback(kw_cb, "Q?", ["a"], True)
         assert seen.get("multi_select") is True
 
 

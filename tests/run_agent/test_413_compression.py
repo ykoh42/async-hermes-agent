@@ -470,7 +470,6 @@ class TestPreflightCompression:
         agent.compression_enabled = False
         agent._memory_enabled = True
         agent._user_profile_enabled = False
-        agent._memory_manager = None
         agent._cached_system_prompt = (
             "cached system prompt\n\n<memory>same facts</memory>"
         )
@@ -508,7 +507,6 @@ class TestPreflightCompression:
         agent.compression_enabled = False
         agent._memory_enabled = True
         agent._user_profile_enabled = False
-        agent._memory_manager = None
         agent._cached_system_prompt = (
             "system prompt\n\nMEMORY (your personal notes) [1% — 10/2,200 chars]\nold fact"
         )

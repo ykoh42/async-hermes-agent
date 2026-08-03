@@ -15,10 +15,12 @@ from __future__ import annotations
 import json
 import logging
 import os
-import tempfile
 import time
+import uuid
 from typing import Any, Mapping, Optional
-from utils import atomic_replace
+
+import aiofiles
+import aiofiles.os
 
 logger = logging.getLogger(__name__)
 
@@ -68,7 +70,7 @@ def _parse_reset_seconds(headers: Optional[Mapping[str, str]]) -> Optional[float
     return None
 
 
-def record_nous_rate_limit(
+async def record_nous_rate_limit(
     *,
     headers: Optional[Mapping[str, str]] = None,
     error_context: Optional[dict[str, Any]] = None,
@@ -106,7 +108,7 @@ def record_nous_rate_limit(
     path = _state_path()
     try:
         state_dir = os.path.dirname(path)
-        os.makedirs(state_dir, exist_ok=True)
+        await aiofiles.os.makedirs(state_dir, exist_ok=True)
 
         state = {
             "reset_at": reset_at,
@@ -114,17 +116,17 @@ def record_nous_rate_limit(
             "reset_seconds": reset_at - now,
         }
 
-        # Atomic write: write to temp file + rename
-        fd, tmp_path = tempfile.mkstemp(dir=state_dir, suffix=".tmp")
+        # Atomic write: write to temp file + rename.
+        tmp_path = os.path.join(state_dir, f".{_STATE_FILENAME}.{uuid.uuid4().hex}.tmp")
         try:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                json.dump(state, f)
-            atomic_replace(tmp_path, path)
+            async with aiofiles.open(tmp_path, "w", encoding="utf-8") as handle:
+                await handle.write(json.dumps(state))
+                await handle.flush()
+            await aiofiles.os.replace(tmp_path, path)
         except Exception:
-            # Clean up temp file on failure
             try:
-                os.unlink(tmp_path)
-            except OSError:
+                await aiofiles.os.remove(tmp_path)
+            except FileNotFoundError:
                 pass
             raise
 
@@ -136,7 +138,7 @@ def record_nous_rate_limit(
         logger.debug("Failed to write Nous rate limit state: %s", exc)
 
 
-def nous_rate_limit_remaining() -> Optional[float]:
+async def nous_rate_limit_remaining() -> Optional[float]:
     """Check if Nous Portal is currently rate-limited.
 
     Returns:
@@ -144,26 +146,26 @@ def nous_rate_limit_remaining() -> Optional[float]:
     """
     path = _state_path()
     try:
-        with open(path, encoding="utf-8") as f:
-            state = json.load(f)
+        async with aiofiles.open(path, encoding="utf-8") as handle:
+            state = json.loads(await handle.read())
         reset_at = state.get("reset_at", 0)
         remaining = reset_at - time.time()
         if remaining > 0:
             return remaining
         # Expired — clean up
         try:
-            os.unlink(path)
-        except OSError:
+            await aiofiles.os.remove(path)
+        except FileNotFoundError:
             pass
         return None
     except (FileNotFoundError, json.JSONDecodeError, KeyError, TypeError):
         return None
 
 
-def clear_nous_rate_limit() -> None:
+async def clear_nous_rate_limit() -> None:
     """Clear the rate limit state (e.g., after a successful Nous request)."""
     try:
-        os.unlink(_state_path())
+        await aiofiles.os.remove(_state_path())
     except FileNotFoundError:
         pass
     except OSError as exc:

@@ -36,6 +36,7 @@ except ModuleNotFoundError:
 import asyncio
 import copy
 import hashlib
+import inspect
 import json
 import logging
 logger = logging.getLogger(__name__)
@@ -200,7 +201,7 @@ from agent.tool_dispatch_helpers import (
     _extract_error_preview,
     _trajectory_normalize_msg,  # noqa: F401  # re-exported for tests that `from run_agent import _trajectory_normalize_msg`
 )
-from utils import atomic_json_write, base_url_host_matches, base_url_hostname, env_float, is_truthy_value, model_forces_max_completion_tokens
+from utils import base_url_host_matches, base_url_hostname, env_float, is_truthy_value, model_forces_max_completion_tokens
 
 
 # Internal flags that mark a message as ephemeral empty-response/prefill
@@ -2758,7 +2759,7 @@ class AIAgent:
         except Exception:
             pass
 
-    def _dump_api_request_debug(
+    async def _dump_api_request_debug(
         self,
         api_kwargs: Dict[str, Any],
         *,
@@ -2767,7 +2768,9 @@ class AIAgent:
     ) -> Optional[Path]:
         """Forwarder — see ``agent.agent_runtime_helpers.dump_api_request_debug``."""
         from agent.agent_runtime_helpers import dump_api_request_debug
-        return dump_api_request_debug(self, api_kwargs, reason=reason, error=error)
+        return await dump_api_request_debug(
+            self, api_kwargs, reason=reason, error=error
+        )
 
     @staticmethod
     def _clean_session_content(content: str) -> str:
@@ -2944,20 +2947,6 @@ class AIAgent:
             self._interrupt_message = message
             self._pending_redirect = None
 
-        # Codex app-server owns its model/tool loop and watches a private
-        # interrupt event rather than Hermes' per-thread flag.
-        if getattr(self, "api_mode", None) == "codex_app_server":
-            _codex_session = getattr(self, "_codex_session", None)
-            _request_interrupt = getattr(_codex_session, "request_interrupt", None)
-            if callable(_request_interrupt):
-                try:
-                    _request_interrupt()
-                except Exception:
-                    logger.debug(
-                        "Failed to interrupt Codex app-server turn",
-                        exc_info=True,
-                    )
-
         # A cron turn performs its API request on the conversation thread to
         # avoid the nested interrupt-worker deadlock.  Unlike the normal worker
         # path, its client is registered here so this cross-thread interrupt can
@@ -3071,34 +3060,12 @@ class AIAgent:
         the displayed partial reasoning as plain assistant context, appends the
         correction as a real user message, and retries. During tool execution
         it degrades to ``steer()`` so the tool can finish at a safe boundary.
-        Codex app-server has a native ``turn/steer`` operation and uses it
-        directly instead of cancelling.
-
         Returns ``False`` when there is no live turn or the text is empty, so
         surfaces can fall back to their existing next-turn queue.
         """
         if not text or not text.strip():
             return False
         cleaned = text.strip()
-
-        # Codex owns its internal reasoning/tool loop, so use its first-class
-        # active-turn steering protocol rather than interrupting the subprocess.
-        if getattr(self, "api_mode", None) == "codex_app_server":
-            _codex_session = getattr(self, "_codex_session", None)
-            _native_steer = getattr(_codex_session, "request_steer", None)
-            if callable(_native_steer):
-                _redirect_lock = getattr(self, "_pending_redirect_lock", None)
-                if _redirect_lock is not None:
-                    with _redirect_lock:
-                        if self._interrupt_requested:
-                            return False
-                elif self._interrupt_requested:
-                    return False
-                try:
-                    return bool(_native_steer(cleaned))
-                except Exception:
-                    logger.debug("Codex app-server turn/steer failed", exc_info=True)
-                    return False
 
         # Never kill a tool merely to deliver conversational guidance. The
         # existing steer drain puts it on the final tool result before the next
@@ -3708,21 +3675,7 @@ class AIAgent:
         }
 
     async def shutdown_memory_provider(self, messages: list = None) -> None:
-        """Finish native context state at a real session boundary.
-
-        The old external ``MemoryManager`` lifecycle is synchronous and can
-        run arbitrary provider I/O. It is rejected rather than being invoked
-        from an event loop. The built-in compressor hook is local state
-        bookkeeping; external context engines are rejected during async
-        runtime initialization as well.
-        """
-        if getattr(self, "_memory_manager", None) is not None:
-            from agent.agent_runtime_helpers import AsyncCapabilityError
-
-            raise AsyncCapabilityError(
-                "External MemoryManager providers have no native async shutdown "
-                "API and are disabled in async-hermes-agent."
-            )
+        """Finish native context state at a real session boundary."""
         # Notify the built-in context engine of the session boundary.
         if hasattr(self, "context_compressor") and self.context_compressor:
             try:
@@ -3734,20 +3687,7 @@ class AIAgent:
                 pass
 
     async def commit_memory_session(self, messages: list = None) -> None:
-        """Commit built-in context-engine state at a compression boundary.
-
-        External ``MemoryManager`` providers retain a synchronous lifecycle
-        contract and are therefore rejected instead of being dispatched from
-        an async turn. The built-in context compressor's boundary hook is
-        local state bookkeeping and remains synchronous by design.
-        """
-        if self._memory_manager is not None:
-            from agent.agent_runtime_helpers import AsyncCapabilityError
-
-            raise AsyncCapabilityError(
-                "External MemoryManager providers have no native async session "
-                "boundary API and are disabled in async-hermes-agent."
-            )
+        """Commit built-in context-engine state at a compression boundary."""
         # Notify context engine of session end too — same lifecycle moment as
         # the memory manager's on_session_end. Without this, engines that
         # accumulate per-session state (DAGs, summaries) leak that state from
@@ -4537,13 +4477,8 @@ class AIAgent:
             self._async_client = client
             self._async_client_source = self.client
 
-        # Keep the OpenAI SDK lazy at module import time, but reject its real
-        # blocking client before invoking it.  Attribute probing is unsafe
-        # here because mocks and user clients may synthesize arbitrary
-        # attributes (for example ``_sync``) on access.
-        from openai._base_client import SyncAPIClient
-
-        if isinstance(client, SyncAPIClient):
+        create_completion = client.chat.completions.create
+        if not inspect.iscoroutinefunction(inspect.unwrap(create_completion)):
             raise RuntimeError(
                 f"provider={self.provider!r} resolves to a synchronous adapter. "
                 "The async-first core does not run providers in a thread; add "
@@ -4555,7 +4490,7 @@ class AIAgent:
             request["stream"] = True
             request.setdefault("stream_options", {"include_usage": True})
 
-        result = await client.chat.completions.create(**request)
+        result = await create_completion(**request)
 
         if not use_streaming or hasattr(result, "choices"):
             return result
@@ -4584,16 +4519,9 @@ class AIAgent:
             accumulator.feed(chunk)
 
         close = getattr(result, "aclose", None) or getattr(result, "close", None)
-        if callable(close):
+        if inspect.iscoroutinefunction(close):
             await close()
         return accumulator.finish()
-
-    async def _run_codex_app_server_turn(self, **kwargs):
-        """Reject the optional app-server runtime until it has a native transport."""
-        raise RuntimeError(
-            "codex_app_server has no native async implementation; it is disabled "
-            "in async-hermes-agent rather than being run in a worker thread."
-        )
 
     # ── Unified streaming API call ─────────────────────────────────────────
 
@@ -4640,12 +4568,6 @@ class AIAgent:
 
     def _record_streamed_assistant_text(self, text: str) -> None:
         """Accumulate visible assistant text emitted through stream callbacks."""
-        # Single-writer guard (#65991): a superseded stream must not pollute the
-        # turn's accumulated text (which also feeds the interim-visible-text
-        # de-dup comparison), even when a caller reaches this directly (the
-        # tool-suppressed content path) rather than through _fire_stream_delta.
-        if self._stream_writer_superseded():
-            return
         if isinstance(text, str) and text:
             self._current_streamed_assistant_text = (
                 getattr(self, "_current_streamed_assistant_text", "") + text
@@ -4831,88 +4753,8 @@ class AIAgent:
         except Exception:
             logger.debug("interim_assistant_callback error", exc_info=True)
 
-    def _ensure_stream_writer_state(self) -> None:
-        """Lazily create the single-writer guard fields (#65991).
-
-        The fields are normally set in ``agent_init``, but agents constructed
-        via ``AIAgent.__new__`` (test doubles, legacy/partially-initialized
-        instances) skip that path. Claiming/checking the writer must not crash
-        those agents, so initialize the fields on first use.
-        """
-        if getattr(self, "_stream_writer_lock", None) is None:
-            self._stream_writer_lock = threading.Lock()
-        if not hasattr(self, "_stream_writer_token"):
-            self._stream_writer_token = 0
-        if getattr(self, "_stream_writer_tls", None) is None:
-            self._stream_writer_tls = threading.local()
-        if not hasattr(self, "_stream_writer_dropped"):
-            self._stream_writer_dropped = 0
-
-    def _claim_stream_writer(self) -> int:
-        """Claim exclusive ownership of the streaming delta sink for the calling
-        stream attempt and return its monotonic writer token (#65991).
-
-        Every streaming attempt (each provider path, each retry) calls this
-        right before it begins consuming its stream. Claiming bumps the shared
-        token, so any earlier attempt still alive on another thread is
-        immediately superseded: its cached token no longer matches and the sink
-        fences its late chunks out. The token is stored per-thread, so a thread
-        that never claimed (a non-streaming caller) is never treated as a
-        writer and can never be fenced.
-        """
-        self._ensure_stream_writer_state()
-        with self._stream_writer_lock:
-            self._stream_writer_token += 1
-            token = self._stream_writer_token
-        self._stream_writer_tls.token = token
-        return token
-
-    def _stream_writer_is_current(self, token: int) -> bool:
-        """True when ``token`` (from a prior _claim_stream_writer) is still the
-        active writer — i.e. no newer stream attempt has claimed the sink since
-        (#65991). Lets a stream loop bail out the instant it is superseded."""
-        return token == getattr(self, "_stream_writer_token", token)
-
-    def _stream_writer_superseded(self) -> bool:
-        """True when the calling thread claimed the delta sink but a newer
-        stream attempt has since claimed it — i.e. this thread is a stale
-        writer whose chunks must be dropped (#65991).
-
-        A thread that never claimed (``token is None``) is not a writer and is
-        never reported as superseded, so non-streaming delta callers are
-        unaffected.
-        """
-        tls = getattr(self, "_stream_writer_tls", None)
-        token = getattr(tls, "token", None) if tls is not None else None
-        if token is None:
-            return False
-        return token != getattr(self, "_stream_writer_token", token)
-
-    def _note_dropped_stream_writer(self, where: str) -> None:
-        """Record + log that a superseded stream's delta was discarded."""
-        try:
-            self._stream_writer_dropped = int(getattr(self, "_stream_writer_dropped", 0)) + 1
-        except Exception:
-            self._stream_writer_dropped = 1
-        # Log sparsely (first drop, then powers of two) so a chatty superseded
-        # stream can't flood the log, but a real provider problem is still
-        # visible. A silent discard would hide genuine failures.
-        _n = self._stream_writer_dropped
-        if _n == 1 or (_n & (_n - 1)) == 0:
-            logger.warning(
-                "Dropped delta from a superseded stream writer at %s "
-                "(discarded=%d this turn) — a stale stream tried to write into "
-                "the turn after a retry superseded it.",
-                where, _n,
-            )
-
     def _fire_stream_delta(self, text: str) -> None:
         """Fire all registered stream delta callbacks (display + TTS)."""
-        # Single-writer guard (#65991): a superseded stream must not interleave
-        # its tokens into the turn alongside the retry that replaced it.
-        if self._stream_writer_superseded():
-            self._note_dropped_stream_writer("_fire_stream_delta")
-            return
         # If a tool iteration set the break flag, prepend a single paragraph
         # break before the first real text delta.  This prevents the original
         # problem (text concatenation across tool boundaries) without stacking
@@ -4966,11 +4808,6 @@ class AIAgent:
 
     def _fire_reasoning_delta(self, text: str) -> None:
         """Fire reasoning callback if registered."""
-        # Single-writer guard (#65991): fence out a superseded stream's
-        # reasoning deltas the same way as content deltas.
-        if self._stream_writer_superseded():
-            self._note_dropped_stream_writer("_fire_reasoning_delta")
-            return
         cb = self.reasoning_callback
         if cb is not None:
             try:

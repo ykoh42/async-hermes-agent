@@ -86,7 +86,7 @@ _CLONE_ALL_STRIP: list[str] = [
 #   hermes-agent  — git repo checkout (~84 MB source + ~3 GB venv)
 #   .worktrees    — git worktrees
 #   profiles      — sibling named profiles (recursive copy never intended)
-#   bin           — installed binaries (tirith etc., ~10 MB) shared per-host
+#   bin           — installed helper binaries shared per-host
 #   node_modules  — npm packages (hundreds of MB)
 #
 # See ``_DEFAULT_EXPORT_EXCLUDE_ROOT`` below for the broader export-side
@@ -205,7 +205,7 @@ _DEFAULT_EXPORT_EXCLUDE_ROOT = frozenset({
     "hermes-agent",         # repo checkout (multi-GB)
     ".worktrees",           # git worktrees
     "profiles",             # other profiles — never recursive-export
-    "bin",                  # installed binaries (tirith, etc.)
+    "bin",                  # installed helper binaries
     "node_modules",         # npm packages
     # Databases & runtime state
     "state.db", "state.db-shm", "state.db-wal",

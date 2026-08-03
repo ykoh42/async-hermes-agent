@@ -113,14 +113,6 @@ class TestSourceLinesAreGuarded:
             ".content.strip() — apply `(... or \"\").strip()` guard"
         )
 
-    def test_skills_guard_guarded(self):
-        src = self._read_file("tools/skills_guard.py")
-        assert ".message.content.strip()" not in src, (
-            "tools/skills_guard.py still has unguarded "
-            ".content.strip() — apply `(... or \"\").strip()` guard"
-        )
-
-
 # ── extract_content_or_reasoning() ────────────────────────────────────────
 
 class TestExtractContentOrReasoning:

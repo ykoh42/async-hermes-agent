@@ -609,7 +609,7 @@ class PluginLlm:
         self,
         *,
         plugin_id: str,
-        policy_loader: Optional[Callable[[str], _TrustPolicy]] = None,
+        policy_loader: Optional[Callable[[str], Awaitable[_TrustPolicy]]] = None,
         caller: Optional[Callable[..., Awaitable[Any]]] = None,
     ) -> None:
         self._plugin_id = plugin_id
@@ -630,9 +630,9 @@ class PluginLlm:
         purpose: Optional[str] = None,
     ) -> PluginLlmCompleteResult:
         """Run a host-owned completion against the active model."""
-        policy = self._policy_loader(self._plugin_id)
-        if inspect.isawaitable(policy):
-            policy = await policy
+        if not inspect.iscoroutinefunction(self._policy_loader):
+            raise TypeError("Plugin LLM policy loaders must be async")
+        policy = await self._policy_loader(self._plugin_id)
         eff_provider, eff_model, eff_agent, eff_profile = _check_overrides(
             policy,
             requested_provider=provider,
@@ -688,9 +688,9 @@ class PluginLlm:
         if not input:
             raise ValueError("complete_structured requires at least one input block")
 
-        policy = self._policy_loader(self._plugin_id)
-        if inspect.isawaitable(policy):
-            policy = await policy
+        if not inspect.iscoroutinefunction(self._policy_loader):
+            raise TypeError("Plugin LLM policy loaders must be async")
+        policy = await self._policy_loader(self._plugin_id)
         eff_provider, eff_model, eff_agent, eff_profile = _check_overrides(
             policy,
             requested_provider=provider,
@@ -823,9 +823,12 @@ def make_plugin_llm_for_test(
     Used by unit tests that don't want to round-trip through config.yaml
     or hit a real provider. Not part of the public plugin API.
     """
+    async def load_policy(_plugin_id: str) -> _TrustPolicy:
+        return policy
+
     return PluginLlm(
         plugin_id=plugin_id,
-        policy_loader=lambda _pid: policy,
+        policy_loader=load_policy,
         caller=caller,
     )
 

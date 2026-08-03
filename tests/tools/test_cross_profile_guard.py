@@ -1,5 +1,4 @@
-"""Tests for the cross-profile soft guard wired into write_file / patch /
-skill_manage.
+"""Tests for the cross-profile soft guard wired into write_file and patch.
 
 The classifier is tested in tests/agent/test_file_safety_cross_profile.py.
 This file tests that the tool surfaces:
@@ -7,8 +6,6 @@ This file tests that the tool surfaces:
   1. Refuse cross-profile writes by default and return the warning.
   2. Accept cross-profile writes when cross_profile=True is passed.
   3. Continue to accept in-profile writes normally.
-  4. skill_manage's "not found" error names other profiles where the
-     skill exists.
 """
 from __future__ import annotations
 
@@ -153,53 +150,6 @@ class TestPatchCrossProfileGuard:
         assert result.get("error"), f"V4A cross-profile must block: {result}"
         assert "cross-profile" in result["error"].lower()
         assert target.read_text() == original
-
-
-# ---------------------------------------------------------------------------
-# skill_manage — error message naming other profile (item D)
-# ---------------------------------------------------------------------------
-
-
-class TestSkillManageCrossProfileErrorUX:
-    def _make_skill_in_profile(self, profile_dir: Path, name: str):
-        d = profile_dir / "skills" / name
-        d.mkdir(parents=True, exist_ok=True)
-        (d / "SKILL.md").write_text(
-            f"---\nname: {name}\ndescription: a skill.\n---\n"
-        )
-
-    def test_error_names_other_profile_when_skill_lives_there(
-        self, fake_hermes, monkeypatch
-    ):
-        """The original incident shape — model expects 'foo' in active
-        profile, but 'foo' lives in default. Error must point at default."""
-        self._make_skill_in_profile(fake_hermes["root"], "default-only-skill")
-
-        # Re-import the module so SKILLS_DIR picks up HERMES_HOME (set in
-        # the fixture). Skill_manager_tool computes SKILLS_DIR at import.
-        import importlib
-        import tools.skill_manager_tool
-        importlib.reload(tools.skill_manager_tool)
-        from tools.skill_manager_tool import _skill_not_found_error
-
-        err = _skill_not_found_error("default-only-skill")
-        assert "not found in active profile 'hermes-security'" in err
-        assert "default" in err
-        assert "cross_profile=True" in err
-
-
-    def test_genuinely_missing_skill_keeps_helpful_hint(
-        self, fake_hermes, monkeypatch
-    ):
-        """When no profile has the skill, error falls back to skills_list hint."""
-        import importlib
-        import tools.skill_manager_tool
-        importlib.reload(tools.skill_manager_tool)
-        from tools.skill_manager_tool import _skill_not_found_error
-
-        err = _skill_not_found_error("totally-imaginary-skill")
-        assert "not found in active profile 'hermes-security'" in err
-        assert "skills_list" in err
 
 
 # ---------------------------------------------------------------------------

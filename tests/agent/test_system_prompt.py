@@ -20,7 +20,6 @@ def _make_agent(**overrides):
         _environment_probe=False,
         _kanban_worker_guidance="",
         _memory_store=None,
-        _memory_manager=None,
         model="",
         provider="",
         platform="",

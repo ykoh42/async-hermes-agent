@@ -4,8 +4,8 @@ import json
 import os
 import stat
 import sys
-from io import BytesIO
 from unittest.mock import AsyncMock, MagicMock, patch
+from urllib.parse import urlparse
 
 import pytest
 
@@ -17,12 +17,11 @@ from tools.mcp_oauth import (
     build_oauth_auth,
     remove_oauth_tokens,
     _find_free_port,
-    _can_open_browser,
     _is_interactive,
     _wait_for_callback,
+    _apply_pasted_callback,
     _make_callback_handler,
     _make_redirect_handler,
-    _paste_callback_reader,
 )
 
 
@@ -32,23 +31,29 @@ def _set_interactive_stdin(monkeypatch, *, is_tty: bool = True) -> None:
     monkeypatch.setattr("tools.mcp_oauth.sys.stdin", mock_stdin)
 
 
-def _hit_callback_when_ready(url: str, timeout: float = 15.0) -> None:
+async def _hit_callback_when_ready(url: str, timeout: float = 15.0) -> None:
     """Drive the loopback callback as soon as the waiter's server answers.
 
     Polls instead of sleeping a fixed interval: the reserved socket is bound
     but NOT listening until ``_wait_for_callback`` adopts it, so attempts
     before adoption fail fast with a connection error.
     """
-    import time
-    import urllib.request
-
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
+    target = urlparse(url)
+    deadline = asyncio.get_running_loop().time() + timeout
+    while asyncio.get_running_loop().time() < deadline:
         try:
-            urllib.request.urlopen(url, timeout=5)
+            reader, writer = await asyncio.open_connection(target.hostname, target.port)
+            request_target = target.path + (f"?{target.query}" if target.query else "")
+            writer.write(
+                f"GET {request_target} HTTP/1.1\r\nHost: {target.hostname}\r\n\r\n".encode()
+            )
+            await writer.drain()
+            await reader.read()
+            writer.close()
+            await writer.wait_closed()
             return
         except OSError:
-            time.sleep(0.01)
+            await asyncio.sleep(0.01)
     raise AssertionError(f"callback listener never came up: {url}")
 
 
@@ -154,41 +159,26 @@ class TestBuildOAuthAuth:
 # Utility functions
 # ---------------------------------------------------------------------------
 
-class TestUtilities:
-    def test_can_open_browser_false_in_ssh(self, monkeypatch):
-        monkeypatch.setenv("SSH_CLIENT", "1.2.3.4 1234 22")
-        assert _can_open_browser() is False
-
-    def test_can_open_browser_true_with_display(self, monkeypatch):
-        monkeypatch.delenv("SSH_CLIENT", raising=False)
-        monkeypatch.delenv("SSH_TTY", raising=False)
-        monkeypatch.setenv("DISPLAY", ":0")
-        monkeypatch.setattr(os, "name", "posix")
-        assert _can_open_browser() is True
-
-
 class TestRedirectHandlerSshHint:
     """_make_redirect_handler must print an SSH tunnel hint on remote sessions."""
 
-    def _run(self, coro):
-        return asyncio.get_event_loop().run_until_complete(coro)
-
-    def test_ssh_hint_shown_on_ssh_session(self, monkeypatch, capsys):
+    @pytest.mark.asyncio
+    async def test_ssh_hint_shown_on_ssh_session(self, monkeypatch, capsys):
         import tools.mcp_oauth as mco
         monkeypatch.setattr(mco, "_is_interactive", lambda: True)
         monkeypatch.setenv("SSH_CLIENT", "1.2.3.4 1234 22")
         monkeypatch.delenv("SSH_TTY", raising=False)
-        monkeypatch.setattr(mco, "_can_open_browser", lambda: False)
 
         handler = _make_redirect_handler(49200)
-        self._run(handler("https://example.com/auth?foo=bar"))
+        await handler("https://example.com/auth?foo=bar")
 
         err = capsys.readouterr().err
         assert "49200" in err
         assert "ssh -N -L" in err
         assert "Remote session detected" in err
 
-    def test_configured_redirect_uri_shows_proxy_hint_not_tunnel(self, monkeypatch, capsys):
+    @pytest.mark.asyncio
+    async def test_configured_redirect_uri_shows_proxy_hint_not_tunnel(self, monkeypatch, capsys):
         """With a proxy redirect_uri, the SSH hint must not push the loopback tunnel.
 
         The Funnel/proxy callback reaches this machine on its own, so the
@@ -198,12 +188,11 @@ class TestRedirectHandlerSshHint:
         monkeypatch.setattr(mco, "_oauth_port", 49203)
         monkeypatch.setattr(mco, "_is_interactive", lambda: True)
         monkeypatch.setenv("SSH_CLIENT", "1.2.3.4 1234 22")
-        monkeypatch.setattr(mco, "_can_open_browser", lambda: False)
 
         handler = _make_redirect_handler(
             49203, redirect_uri="https://oauth.example.ts.net/callback"
         )
-        self._run(handler("https://example.com/auth"))
+        await handler("https://example.com/auth")
 
         err = capsys.readouterr().err
         assert "https://oauth.example.ts.net/callback" in err
@@ -247,28 +236,26 @@ class TestPathTraversal:
 class TestCallbackHandlerIsolation:
     """Verify concurrent OAuth flows don't share state."""
 
-    def _fake_get(self, HandlerClass, path):
-        handler = HandlerClass.__new__(HandlerClass)
-        handler.path = path
-        handler.wfile = BytesIO()
-        handler.send_response = MagicMock()
-        handler.send_header = MagicMock()
-        handler.end_headers = MagicMock()
-        handler.do_GET()
+    async def _serve_callback(self, query: str):
+        handler, result = _make_callback_handler()
+        server = await asyncio.start_server(handler, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        try:
+            await _hit_callback_when_ready(f"http://127.0.0.1:{port}/callback?{query}")
+        finally:
+            server.close()
+            await server.wait_closed()
+        return result
 
-    def test_handler_writes_to_own_result(self):
-        HandlerClass, result = _make_callback_handler()
-        assert result["auth_code"] is None
-
-        self._fake_get(HandlerClass, "/callback?code=test123&state=mystate")
-
+    @pytest.mark.asyncio
+    async def test_handler_writes_to_own_result(self):
+        result = await self._serve_callback("code=test123&state=mystate")
         assert result["auth_code"] == "test123"
         assert result["state"] == "mystate"
 
-    def test_handler_captures_error(self):
-        HandlerClass, result = _make_callback_handler()
-
-        self._fake_get(HandlerClass, "/callback?error=access_denied")
+    @pytest.mark.asyncio
+    async def test_handler_captures_error(self):
+        result = await self._serve_callback("error=access_denied")
 
         assert result["auth_code"] is None
         assert result["error"] == "access_denied"
@@ -318,7 +305,6 @@ class TestCallbackPortReservation:
         """E2E: reserve → _wait_for_callback binds the SAME socket and the
         callback round-trips through it."""
         import asyncio
-        import threading
         import tools.mcp_oauth as mod
 
         cfg: dict = {}
@@ -329,11 +315,9 @@ class TestCallbackPortReservation:
 
         async def drive():
             task = asyncio.create_task(mod._wait_for_callback())
-            threading.Thread(
-                target=_hit_callback_when_ready,
-                args=(f"http://127.0.0.1:{port}/callback?code=abc123&state=xyz",),
-                daemon=True,
-            ).start()
+            await _hit_callback_when_ready(
+                f"http://127.0.0.1:{port}/callback?code=abc123&state=xyz"
+            )
             return await asyncio.wait_for(task, timeout=20)
 
         code, state = await drive()
@@ -352,7 +336,6 @@ class TestCallbackPortReservation:
         A's redirect (pointing at A's port) would never be received.
         """
         import asyncio
-        import threading
         import tools.mcp_oauth as mod
 
         monkeypatch.setattr(mod, "_is_interactive", lambda: False)
@@ -370,11 +353,9 @@ class TestCallbackPortReservation:
             task = asyncio.create_task(waiter_a())
             # The redirect goes to flow A's port — where A's waiter must be
             # listening despite the clobbered global.
-            threading.Thread(
-                target=_hit_callback_when_ready,
-                args=(f"http://127.0.0.1:{port_a}/callback?code=flowA&state=sA",),
-                daemon=True,
-            ).start()
+            await _hit_callback_when_ready(
+                f"http://127.0.0.1:{port_a}/callback?code=flowA&state=sA"
+            )
             return await asyncio.wait_for(task, timeout=20)
 
         try:
@@ -488,10 +469,15 @@ class TestWaitForCallbackNoBlocking:
         # EOF on the paste reader so only the HTTP-listener timeout drives it.
         monkeypatch.setattr("sys.stdin", MagicMock(readline=lambda: ""))
 
-        async def instant_sleep(_seconds):
-            pass
+        real_wait_for = mod.asyncio.wait_for
 
-        with patch.object(mod.asyncio, "sleep", instant_sleep):
+        async def immediate_timeout(awaitable, *, timeout):
+            if timeout == 300.0:
+                awaitable.close()
+                raise asyncio.TimeoutError
+            return await real_wait_for(awaitable, timeout=timeout)
+
+        with patch.object(mod.asyncio, "wait_for", immediate_timeout):
             with patch("builtins.input", side_effect=AssertionError("input() must not be called")):
                 with pytest.raises(OAuthNonInteractiveError, match="callback timed out"):
                     asyncio.run(_wait_for_callback())
@@ -533,17 +519,14 @@ class TestNonInteractiveFailFastAtCallbackBoundary:
         mod._oauth_port = _find_free_port()
         monkeypatch.setattr(mod, "_is_interactive", lambda: False)
 
-        # Binding the callback listener or entering the poll loop is the bug.
-        fake_server = MagicMock(side_effect=AssertionError("must not bind callback listener"))
-        monkeypatch.setattr(mod, "HTTPServer", fake_server)
-
-        async def no_sleep(_seconds):
-            raise AssertionError("must not wait for the callback timeout")
-        monkeypatch.setattr(mod.asyncio, "sleep", no_sleep)
+        start_server = AsyncMock(
+            side_effect=AssertionError("must not bind callback listener")
+        )
+        monkeypatch.setattr(mod.asyncio, "start_server", start_server)
 
         with pytest.raises(OAuthNonInteractiveError, match="interactive session"):
             asyncio.run(mod._wait_for_callback())
-        fake_server.assert_not_called()
+        start_server.assert_not_awaited()
 
     def test_redirect_handler_rejects_and_does_not_open_browser(self, monkeypatch, capsys):
         """Non-interactive redirect must not print an auth URL or open a browser."""
@@ -551,10 +534,6 @@ class TestNonInteractiveFailFastAtCallbackBoundary:
         import asyncio
 
         monkeypatch.setattr(mod, "_is_interactive", lambda: False)
-        monkeypatch.setattr(
-            "webbrowser.open", MagicMock(side_effect=AssertionError("must not open browser"))
-        )
-
         with pytest.raises(OAuthNonInteractiveError, match="browser authorization"):
             asyncio.run(mod._make_redirect_handler(49300)("https://idp.example.com/authorize?x=1"))
 
@@ -574,11 +553,9 @@ class TestNonInteractiveFailFastAtCallbackBoundary:
         import asyncio
 
         monkeypatch.setattr(mod, "_is_interactive", lambda: True)
-        # Local (non-SSH) interactive session with no browser available, so the
-        # handler falls through to the manual-URL print without opening a tab.
+        # Local (non-SSH) interactive session prints the URL for the caller to open.
         monkeypatch.delenv("SSH_CLIENT", raising=False)
         monkeypatch.delenv("SSH_TTY", raising=False)
-        monkeypatch.setattr(mod, "_can_open_browser", lambda: False)
 
         asyncio.run(mod._make_redirect_handler(49302)("https://idp.example.com/authorize?x=9"))
 
@@ -656,29 +633,23 @@ async def test_build_oauth_auth_preserves_server_url_path():
 
 
 class TestPasteCallbackReader:
-    """_paste_callback_reader parses redirect URLs / query strings from stdin."""
+    """Pasted redirect parsing is independent from async stdin transport."""
 
     def _empty_result(self):
-        return {"auth_code": None, "state": None, "error": None}
+        return {
+            "auth_code": None,
+            "state": None,
+            "error": None,
+            "ready": asyncio.Event(),
+        }
 
-    def test_parses_pasted_callback(self, monkeypatch):
+    def test_parses_pasted_callback(self):
         result = self._empty_result()
         pasted = "http://127.0.0.1:37949/callback?code=abc&state=xyz\n"
-        monkeypatch.setattr("sys.stdin", MagicMock(readline=lambda: pasted))
-        _paste_callback_reader(result)
+        _apply_pasted_callback(pasted, result)
         assert result["auth_code"] == "abc"
         assert result["state"] == "xyz"
         assert result["error"] is None
-
-
-    def test_swallows_stdin_errors(self, monkeypatch):
-        """OSError / interrupt on readline must not propagate."""
-        result = self._empty_result()
-        def raise_oserror():
-            raise OSError("stdin closed")
-        monkeypatch.setattr("sys.stdin", MagicMock(readline=raise_oserror))
-        _paste_callback_reader(result)  # must not raise
-        assert result["auth_code"] is None
 
 
 class TestWaitForCallbackPasteIntegration:
@@ -688,16 +659,13 @@ class TestWaitForCallbackPasteIntegration:
         import tools.mcp_oauth as mod
         mod._oauth_port = _find_free_port()
         monkeypatch.setattr(mod, "_is_interactive", lambda: True)
-        # Make stdin readline block forever so HTTP listener path drives the test;
-        # we just want to verify the prompt was printed and the thread spawned.
-        def block_forever():
-            import threading
-            threading.Event().wait()
-        monkeypatch.setattr("sys.stdin", MagicMock(readline=block_forever))
+        async def timeout(awaitable, **_kwargs):
+            awaitable.close()
+            raise asyncio.TimeoutError
 
-        async def instant_sleep(_):
-            pass
-        with patch.object(mod.asyncio, "sleep", instant_sleep):
+        monkeypatch.setattr(mod.asyncio, "wait_for", timeout)
+        monkeypatch.setattr(mod, "_wait_for_pasted_callback", AsyncMock())
+        with patch.object(mod.asyncio, "wait_for", timeout):
             with pytest.raises(OAuthNonInteractiveError):
                 asyncio.run(_wait_for_callback())
         err = capsys.readouterr().err
@@ -712,10 +680,11 @@ class TestWaitForCallbackPasteIntegration:
         mock_stdin.isatty.return_value = True
         monkeypatch.setattr(mod.sys, "stdin", mock_stdin)
 
-        async def instant_sleep(_):
-            pass
+        async def timeout(awaitable, **_kwargs):
+            awaitable.close()
+            raise asyncio.TimeoutError
 
-        with patch.object(mod.asyncio, "sleep", instant_sleep):
+        with patch.object(mod.asyncio, "wait_for", timeout):
             with mod.suppress_interactive_oauth():
                 with pytest.raises(OAuthNonInteractiveError):
                     asyncio.run(_wait_for_callback())
@@ -728,22 +697,30 @@ class TestPasteCallbackSkipToken:
     """User can type `skip` (or similar) at the paste prompt to bail out."""
 
     def _empty_result(self):
-        return {"auth_code": None, "state": None, "error": None}
+        return {
+            "auth_code": None,
+            "state": None,
+            "error": None,
+            "ready": asyncio.Event(),
+        }
 
     @pytest.mark.parametrize("token", ["skip", "QUIT"])
-    def test_skip_tokens_set_sentinel(self, monkeypatch, token):
+    def test_skip_tokens_set_sentinel(self, token):
         from tools.mcp_oauth import _USER_SKIPPED_SENTINEL
         result = self._empty_result()
-        monkeypatch.setattr("sys.stdin", MagicMock(readline=lambda: token + "\n"))
-        _paste_callback_reader(result)
+        _apply_pasted_callback(token + "\n", result)
         assert result["error"] == _USER_SKIPPED_SENTINEL
         assert result["auth_code"] is None
 
-    def test_skip_does_not_overwrite_http_winner(self, monkeypatch):
+    def test_skip_does_not_overwrite_http_winner(self):
         """If HTTP listener already wrote a code, `skip` must not stomp it."""
-        result = {"auth_code": "from_http", "state": "x", "error": None}
-        monkeypatch.setattr("sys.stdin", MagicMock(readline=lambda: "skip\n"))
-        _paste_callback_reader(result)
+        result = {
+            "auth_code": "from_http",
+            "state": "x",
+            "error": None,
+            "ready": asyncio.Event(),
+        }
+        _apply_pasted_callback("skip\n", result)
         assert result["auth_code"] == "from_http"
         assert result["error"] is None
 
@@ -756,11 +733,11 @@ class TestWaitForCallbackSkipIntegration:
         import tools.mcp_oauth as mod
         mod._oauth_port = _find_free_port()
         monkeypatch.setattr(mod, "_is_interactive", lambda: True)
-        monkeypatch.setattr("sys.stdin", MagicMock(readline=lambda: "skip\n"))
+        async def paste_skip(result):
+            _apply_pasted_callback("skip\n", result)
 
-        async def instant_sleep(_):
-            pass
-        with patch.object(mod.asyncio, "sleep", instant_sleep):
+        monkeypatch.setattr(mod, "_wait_for_pasted_callback", paste_skip)
+        with patch.object(mod, "_raise_if_non_interactive", lambda _message: None):
             with pytest.raises(OAuthNonInteractiveError, match="user_skipped"):
                 asyncio.run(_wait_for_callback())
 
@@ -800,7 +777,9 @@ def test_wait_for_callback_port_in_use_reports_clear_error(monkeypatch):
 
     monkeypatch.setattr(mo, "_is_interactive", lambda: True)
     with patch.object(mo, "_oauth_port", 54321), patch.object(
-        mo, "HTTPServer", side_effect=OSError("address already in use")
+        mo.asyncio,
+        "start_server",
+        AsyncMock(side_effect=OSError("address already in use")),
     ):
         with pytest.raises(mo.OAuthNonInteractiveError) as excinfo:
             asyncio.run(mo._wait_for_callback())

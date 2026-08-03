@@ -26,7 +26,6 @@ from agent.codex_responses_adapter import _normalize_codex_response
 import run_agent
 from run_agent import AIAgent
 from agent.error_classifier import FailoverReason
-from agent.memory_manager import MemoryManager
 from agent.prompt_builder import DEFAULT_AGENT_IDENTITY
 
 
@@ -1064,94 +1063,6 @@ class TestTaskCompletionGuidance:
             assert TASK_COMPLETION_GUIDANCE not in await a._build_system_prompt()
 
 
-class TestEnvironmentProbeIntegration:
-    """Tests for the local Python toolchain probe wiring (config.yaml
-    ``agent.environment_probe``).  The probe itself is unit-tested in
-    tests/tools/test_env_probe.py; this class confirms it lands in the
-    system prompt when enabled and stays out when disabled."""
-
-    def _make_agent(self, model="anthropic/claude-opus-4.8",
-                    environment_probe=True):
-        with (
-            patch(
-                "run_agent.get_tool_definitions",
-                return_value=_make_tool_defs("terminal"),
-            ),
-            patch("run_agent.check_toolset_requirements", return_value={}),
-            patch("run_agent.OpenAI"),
-            patch(
-                "hermes_cli.config.load_config",
-                return_value={"agent": {"environment_probe": environment_probe}},
-            ), patch(
-                "hermes_cli.config.load_config_readonly",
-                return_value={"agent": {"environment_probe": environment_probe}},
-            ),
-        ):
-            a = AIAgent(
-                model=model,
-                api_key="test-key-1234567890",
-                base_url="https://openrouter.ai/api/v1",
-                quiet_mode=True,
-                skip_context_files=True,
-                skip_memory=True,
-            )
-            a.client = MagicMock()
-            return a
-
-    @pytest.mark.asyncio
-    async def test_probe_appears_when_problem_detected(self, monkeypatch):
-        """When the probe finds something off, the line lands in the prompt."""
-        from tools import env_probe
-        env_probe._reset_cache_for_tests()
-        monkeypatch.setattr(env_probe, "_python_version_of",
-                            lambda b: {"python3": "3.11.15"}.get(b))
-        monkeypatch.setattr(env_probe, "_has_pip_module", lambda b: False)
-        monkeypatch.setattr(env_probe, "_detect_pep668", lambda b: True)
-        monkeypatch.setattr(env_probe, "_pip_python_version", lambda: "3.12")
-        monkeypatch.setattr(env_probe.shutil, "which",
-                            lambda name: None if name == "uv" else "/usr/bin/" + name)
-
-        # Prompt construction only peeks at a completed result on the async
-        # path; explicit callers may still prime this optional diagnostic.
-        env_probe.get_environment_probe_line()
-        agent = self._make_agent(environment_probe=True)
-        prompt = await agent._build_system_prompt()
-        assert "Python toolchain:" in prompt
-        assert "3.11.15" in prompt
-
-    @pytest.mark.asyncio
-    async def test_probe_silent_on_clean_env(self, monkeypatch):
-        """Clean environment → probe emits nothing → no line in prompt."""
-        from tools import env_probe
-        env_probe._reset_cache_for_tests()
-        monkeypatch.setattr(env_probe, "_python_version_of",
-                            lambda b: "3.13.3" if b == "python3" else None)
-        monkeypatch.setattr(env_probe, "_has_pip_module", lambda b: True)
-        monkeypatch.setattr(env_probe, "_detect_pep668", lambda b: False)
-        monkeypatch.setattr(env_probe, "_pip_python_version", lambda: "3.13")
-        monkeypatch.setattr(env_probe.shutil, "which", lambda name: None)
-
-        agent = self._make_agent(environment_probe=True)
-        prompt = await agent._build_system_prompt()
-        assert "Python toolchain:" not in prompt
-
-    @pytest.mark.asyncio
-    async def test_probe_disabled_by_config(self, monkeypatch):
-        """Even with detectable problems, the probe stays out when disabled."""
-        from tools import env_probe
-        env_probe._reset_cache_for_tests()
-        monkeypatch.setattr(env_probe, "_python_version_of",
-                            lambda b: {"python3": "3.11.15"}.get(b))
-        monkeypatch.setattr(env_probe, "_has_pip_module", lambda b: False)
-        monkeypatch.setattr(env_probe, "_detect_pep668", lambda b: True)
-        monkeypatch.setattr(env_probe, "_pip_python_version", lambda: "3.12")
-        monkeypatch.setattr(env_probe.shutil, "which", lambda name: None)
-
-        agent = self._make_agent(environment_probe=False)
-        prompt = await agent._build_system_prompt()
-        assert "Python toolchain:" not in prompt
-
-
 class TestInvalidateSystemPrompt:
     @pytest.mark.asyncio
     async def test_clears_cache(self, agent):
@@ -1849,31 +1760,6 @@ class TestConcurrentToolExecution:
         assert "result_fast" in messages[1]["content"]
 
 
-    @pytest.mark.asyncio
-    async def test_sync_only_tool_fails_before_dispatch(self, agent):
-        """The native scheduler rejects a legacy handler instead of a thread fallback."""
-        tc1 = _mock_tool_call(name="web_search", arguments='{"q": "alpha"}', call_id="c1")
-        tc2 = _mock_tool_call(name="web_search", arguments='{"q": "beta"}', call_id="c2")
-        mock_msg = _mock_assistant_msg(content="", tool_calls=[tc1, tc2])
-        messages = []
-
-        with (
-            patch(
-                "tools.registry.registry.get_entry",
-                return_value=SimpleNamespace(is_async=False),
-            ),
-            pytest.raises(RuntimeError, match="Native async handlers are required"),
-        ):
-            await agent._execute_tool_calls(mock_msg, messages, "task-1")
-
-        assert messages == []
-
-
-
-
-
-
-
 
     @pytest.mark.asyncio
     async def test_tool_callbacks_fire_in_order(self, agent):
@@ -2036,8 +1922,6 @@ class TestConcurrentToolExecution:
         agent._context_engine_tool_names = {"context_query"}
         assert agent_runtime_owns_post_tool_hook(agent, "context_query") is True
 
-        agent._memory_manager = SimpleNamespace(has_tool=lambda name: name == "memory_extra")
-        assert agent_runtime_owns_post_tool_hook(agent, "memory_extra") is True
         assert agent_runtime_owns_post_tool_hook(agent, "web_search") is False
 
 
@@ -4492,7 +4376,6 @@ async def test_copilot_acp_fails_fast_without_native_async_transport():
         patch("run_agent.get_tool_definitions", return_value=_make_tool_defs("web_search")),
         patch("run_agent.check_toolset_requirements", return_value={}),
         patch("run_agent.OpenAI") as mock_openai,
-        patch("agent.copilot_acp_client.CopilotACPClient") as mock_acp_client,
     ):
         agent = AIAgent(
             api_key="copilot-acp",
@@ -4507,7 +4390,6 @@ async def test_copilot_acp_fails_fast_without_native_async_transport():
 
     assert agent.client is None
     mock_openai.assert_not_called()
-    mock_acp_client.assert_not_called()
 
     with pytest.raises(RuntimeError, match="Copilot ACP uses a blocking subprocess transport"):
         await agent._ensure_provider_runtime()

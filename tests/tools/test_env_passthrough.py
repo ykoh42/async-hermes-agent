@@ -189,7 +189,7 @@ class TestTerminalIntegration:
         """_make_run_env must NOT expose a blocklisted var to subprocess env
         even after a skill attempts to register it via passthrough."""
         from tools.environments.local import (
-            _make_run_env,
+            build_subprocess_env,
             _HERMES_PROVIDER_ENV_BLOCKLIST,
         )
 
@@ -197,12 +197,12 @@ class TestTerminalIntegration:
         os.environ[blocked_var] = "secret_value"
         try:
             # Without passthrough — blocked
-            result_before = _make_run_env({})
+            result_before = build_subprocess_env()
             assert blocked_var not in result_before
 
             # Skill tries to register it — must be refused, so still blocked
             register_env_passthrough([blocked_var])
-            result_after = _make_run_env({})
+            result_after = build_subprocess_env()
             assert blocked_var not in result_after
         finally:
             os.environ.pop(blocked_var, None)

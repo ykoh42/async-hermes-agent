@@ -231,13 +231,12 @@ async def _invoke_middleware(kind: str, **kwargs: Any) -> List[Any]:
     payload = middleware_payload(**kwargs)
     for callback in callbacks:
         try:
-            result = callback(**payload)
-            if not inspect.isawaitable(result):
+            if not inspect.iscoroutinefunction(callback):
                 raise AsyncMiddlewareCapabilityError(
                     "Async Hermes requires coroutine middleware callbacks; "
                     f"{getattr(callback, '__name__', repr(callback))} is synchronous"
                 )
-            result = await result
+            result = await callback(**payload)
             if result is not None:
                 results.append(result)
         except AsyncMiddlewareCapabilityError:
@@ -310,13 +309,12 @@ async def _run_execution_chain(
         call_kwargs[payload_key] = payload
         call_kwargs["next_call"] = next_call
         try:
-            result = callback(**call_kwargs)
-            if not inspect.isawaitable(result):
+            if not inspect.iscoroutinefunction(callback):
                 raise AsyncMiddlewareCapabilityError(
                     "Async Hermes requires coroutine middleware callbacks; "
                     f"{getattr(callback, '__name__', repr(callback))} is synchronous"
                 )
-            return await result
+            return await callback(**call_kwargs)
         except _DownstreamExecutionError as exc:
             raise exc.original
         except AsyncMiddlewareCapabilityError:

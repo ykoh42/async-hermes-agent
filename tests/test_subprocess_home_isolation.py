@@ -113,73 +113,6 @@ class TestGetSubprocessHome:
 
 
 # ---------------------------------------------------------------------------
-# _make_run_env() injection
-# ---------------------------------------------------------------------------
-
-class TestMakeRunEnvHomeInjection:
-    """Verify _make_run_env() applies the subprocess HOME policy."""
-
-    def test_host_auto_preserves_real_home_when_profile_home_exists(self, tmp_path, monkeypatch):
-        hermes_home = tmp_path / "hermes"
-        hermes_home.mkdir()
-        (hermes_home / "home").mkdir()
-        real_home = tmp_path / "real-home"
-        real_home.mkdir()
-        monkeypatch.setattr(hermes_constants, "is_container", lambda: False)
-        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
-        monkeypatch.setenv("HOME", str(real_home))
-        monkeypatch.setenv("PATH", "/usr/bin:/bin")
-
-        from tools.environments.local import _make_run_env
-        result = _make_run_env({})
-
-        assert result["HOME"] == str(real_home)
-        assert result["HERMES_REAL_HOME"] == str(real_home)
-
-    def test_profile_mode_injects_profile_home_when_profile_home_exists(self, tmp_path, monkeypatch):
-        hermes_home = tmp_path / "hermes"
-        hermes_home.mkdir()
-        (hermes_home / "home").mkdir()
-        real_home = tmp_path / "real-home"
-        real_home.mkdir()
-        monkeypatch.setattr(hermes_constants, "is_container", lambda: False)
-        monkeypatch.setenv("TERMINAL_HOME_MODE", "profile")
-        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
-        monkeypatch.setenv("HOME", str(real_home))
-        monkeypatch.setenv("PATH", "/usr/bin:/bin")
-
-        from tools.environments.local import _make_run_env
-        result = _make_run_env({})
-
-        assert result["HOME"] == str(hermes_home / "home")
-        assert result["HERMES_REAL_HOME"] == str(real_home)
-
-    def test_no_injection_when_home_dir_missing(self, tmp_path, monkeypatch):
-        hermes_home = tmp_path / "hermes"
-        hermes_home.mkdir()
-        # No home/ subdirectory
-        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
-        monkeypatch.setenv("HOME", "/root")
-        monkeypatch.setenv("PATH", "/usr/bin:/bin")
-
-        from tools.environments.local import _make_run_env
-        result = _make_run_env({})
-
-        assert result["HOME"] == "/root"
-
-    def test_no_injection_when_hermes_home_unset(self, monkeypatch):
-        monkeypatch.delenv("HERMES_HOME", raising=False)
-        monkeypatch.setenv("HOME", "/home/user")
-        monkeypatch.setenv("PATH", "/usr/bin:/bin")
-
-        from tools.environments.local import _make_run_env
-        result = _make_run_env({})
-
-        assert result["HOME"] == "/home/user"
-
-
-
-# ---------------------------------------------------------------------------
 # _sanitize_subprocess_env() injection
 # ---------------------------------------------------------------------------
 
@@ -258,4 +191,3 @@ class TestProfileBootstrap:
 # ---------------------------------------------------------------------------
 # Python process HOME unchanged
 # ---------------------------------------------------------------------------
-

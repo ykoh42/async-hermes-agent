@@ -57,15 +57,6 @@ def test_conversation_and_chat_are_coroutines():
         main as trajectory_main,
     )
     from hermes_cli.middleware import run_llm_execution_middleware
-    from hermes_cli.goals import (
-        GoalManager,
-        _get_session_db,
-        draft_contract,
-        judge_goal,
-        load_goal,
-        migrate_goal_to_session,
-        save_goal,
-    )
 
     assert inspect.iscoroutinefunction(AIAgent.run_conversation)
     assert inspect.iscoroutinefunction(AIAgent.chat)
@@ -76,6 +67,7 @@ def test_conversation_and_chat_are_coroutines():
     assert inspect.iscoroutinefunction(AIAgent._persist_session)
     assert inspect.iscoroutinefunction(AIAgent._flush_messages_to_session_db)
     assert inspect.iscoroutinefunction(AIAgent._save_session_log)
+    assert inspect.iscoroutinefunction(AIAgent._dump_api_request_debug)
     assert inspect.iscoroutinefunction(AIAgent.shutdown_memory_provider)
     assert inspect.iscoroutinefunction(AIAgent.commit_memory_session)
     assert inspect.iscoroutinefunction(AIAgent._handle_max_iterations)
@@ -108,18 +100,6 @@ def test_conversation_and_chat_are_coroutines():
     assert inspect.iscoroutinefunction(_create_with_progress)
     assert inspect.iscoroutinefunction(_create_with_stream)
     assert inspect.iscoroutinefunction(run_llm_execution_middleware)
-    assert inspect.iscoroutinefunction(_get_session_db)
-    assert inspect.iscoroutinefunction(load_goal)
-    assert inspect.iscoroutinefunction(save_goal)
-    assert inspect.iscoroutinefunction(migrate_goal_to_session)
-    assert inspect.iscoroutinefunction(judge_goal)
-    assert inspect.iscoroutinefunction(draft_contract)
-    for method_name in (
-        "load", "set", "set_contract", "pause", "resume", "clear", "mark_done",
-        "add_subgoal", "remove_subgoal", "clear_subgoals", "wait_on",
-        "wait_on_session", "wait_for_seconds", "stop_waiting", "evaluate_after_turn",
-    ):
-        assert inspect.iscoroutinefunction(getattr(GoalManager, method_name))
     assert inspect.iscoroutinefunction(AIAgent._try_activate_fallback)
     assert inspect.iscoroutinefunction(AIAgent._try_recover_primary_transport)
     assert inspect.iscoroutinefunction(AIAgent._recover_with_credential_pool)
@@ -129,7 +109,6 @@ def test_conversation_and_chat_are_coroutines():
     assert inspect.iscoroutinefunction(load_pool)
     active_entries = list(registry._tools.values())
     assert active_entries
-    assert all(entry.is_async for entry in active_entries)
     assert all(inspect.iscoroutinefunction(entry.handler) for entry in active_entries)
 
 
@@ -238,7 +217,9 @@ async def test_async_session_db_meta_and_gateway_listing_match_native_shape(tmp_
 async def test_native_file_read_deduplicates_and_write_invalidates(tmp_path, monkeypatch):
     """File-loop guards survive the sync-backend removal on native I/O."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    monkeypatch.setattr("tools.file_tools._check_sensitive_path", lambda *_args: None)
+    monkeypatch.setattr(
+        "tools.file_tools._check_sensitive_path", AsyncMock(return_value=None)
+    )
     path = tmp_path / "sample.txt"
     task_id = f"native-file-{tmp_path.name}"
     path.write_text("first\nsecond\n", encoding="utf-8")
@@ -373,30 +354,7 @@ async def test_async_plugin_lifecycle_requires_coroutine_callbacks():
 
 
 @pytest.mark.asyncio
-async def test_external_memory_manager_fails_fast_without_running_sync_hooks():
-    """An optional legacy memory provider cannot block an async turn."""
-    from agent.agent_runtime_helpers import AsyncCapabilityError
-    from agent.conversation_compression import compress_context
-
-    class SyncManager:
-        def sync_all(self, *_args, **_kwargs):
-            pytest.fail("legacy memory sync must never run on the async loop")
-
-        def queue_prefetch_all(self, *_args, **_kwargs):
-            pytest.fail("legacy memory prefetch must never run on the async loop")
-
-    agent = AIAgent.__new__(AIAgent)
-    agent._memory_manager = SyncManager()
-
-    with pytest.raises(AsyncCapabilityError, match="External MemoryManager"):
-        await agent.shutdown_memory_provider([])
-
-    with pytest.raises(AsyncCapabilityError, match="External MemoryManager"):
-        await compress_context(agent, [], "system")
-
-
-@pytest.mark.asyncio
-async def test_deferred_runtime_rejects_sync_only_extension_surfaces_early():
+async def test_deferred_runtime_rejects_sync_only_context_engine_early():
     """Provider construction must stop before an external legacy extension runs."""
     from agent.agent_init import initialize_deferred_runtime
     from agent.agent_runtime_helpers import AsyncCapabilityError
@@ -405,7 +363,6 @@ async def test_deferred_runtime_rejects_sync_only_extension_surfaces_early():
         state = {
             "_deferred_provider_runtime": {"provider": "openrouter", "model": "test"},
             "_async_provider_init_lock": None,
-            "_memory_manager": None,
             "_async_unsupported_context_engine": None,
         }
         state.update(attributes)
@@ -413,7 +370,6 @@ async def test_deferred_runtime_rejects_sync_only_extension_surfaces_early():
         with pytest.raises(AsyncCapabilityError):
             await initialize_deferred_runtime(agent)
 
-    await assert_rejected(_memory_manager=object())
     await assert_rejected(_async_unsupported_context_engine="third-party")
 
 
@@ -1031,8 +987,8 @@ def test_native_file_tool_imports_expand_the_async_model_surface():
     """File tools join the model surface only after native migration."""
     from tools import file_tools  # noqa: F401
 
-    assert registry.get_entry("read_file").is_async is True
-    assert registry.get_entry("write_file").is_async is True
+    assert inspect.iscoroutinefunction(registry.get_entry("read_file").handler)
+    assert inspect.iscoroutinefunction(registry.get_entry("write_file").handler)
 
 
 @pytest.mark.asyncio
@@ -1047,7 +1003,9 @@ async def test_native_file_tools_do_not_use_a_sync_dispatch_bridge(monkeypatch, 
     monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
     # macOS test temp directories live under /private/var, a system prefix
     # the production write guard correctly protects from model edits.
-    monkeypatch.setattr(file_tools, "_check_sensitive_path", lambda *_args: None)
+    monkeypatch.setattr(
+        file_tools, "_check_sensitive_path", AsyncMock(return_value=None)
+    )
     monkeypatch.setattr(
         asyncio,
         "to_thread",
@@ -1105,7 +1063,9 @@ async def test_native_v4a_patch_is_async_and_validates_before_mutating(monkeypat
     from tools.registry import registry as active_registry
 
     monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
-    monkeypatch.setattr(file_tools, "_check_sensitive_path", lambda *_args: None)
+    monkeypatch.setattr(
+        file_tools, "_check_sensitive_path", AsyncMock(return_value=None)
+    )
     monkeypatch.setattr(
         asyncio,
         "to_thread",
@@ -1347,12 +1307,6 @@ async def test_run_conversation_serializes_turns_for_one_agent(monkeypatch, tmp_
         )
 
     agent._execute_model_request = slow_model
-    monkeypatch.setattr(
-        "tools.env_probe.get_environment_probe_line",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            AssertionError("async prompt construction must not wait for env_probe")
-        ),
-    )
     monkeypatch.setattr(
         asyncio,
         "to_thread",
@@ -1919,7 +1873,6 @@ async def test_in_place_compression_uses_native_async_sqlite_path(tmp_path, monk
         api_mode=None,
         compression_in_place=True,
         _cached_system_prompt="stable system prompt",
-        _memory_manager=None,
         _todo_store=SimpleNamespace(format_for_injection=lambda: ""),
         _emit_status=lambda *_args: None,
         _emit_warning=lambda *_args: None,
@@ -2012,7 +1965,6 @@ async def test_rotating_compression_publishes_child_with_native_async_sqlite(tmp
         api_mode=None,
         compression_in_place=False,
         _cached_system_prompt="stable system prompt",
-        _memory_manager=None,
         _todo_store=SimpleNamespace(format_for_injection=lambda: ""),
         _emit_status=lambda *_args: None,
         _emit_warning=lambda *_args: None,

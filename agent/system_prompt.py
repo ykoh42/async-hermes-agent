@@ -388,21 +388,6 @@ async def build_system_prompt_parts(agent: Any, system_message: Optional[str] = 
         stable_parts.extend(coding_trailing_parts)
         post_workspace_parts = stable_parts
 
-    # Local Python toolchain probe — include only a previously completed
-    # diagnostic. Prompt construction runs in the async turn prologue, so it
-    # must never start or synchronously wait for subprocess probes here.
-    # Gated by config.yaml ``agent.environment_probe`` (default True).
-    if getattr(agent, "_environment_probe", True):
-        try:
-            from tools.env_probe import get_cached_environment_probe_line
-
-            _probe_line = get_cached_environment_probe_line()
-            if _probe_line:
-                post_workspace_parts.append(_probe_line)
-        except Exception:
-            # Optional diagnostic failure must never block prompt build.
-            pass
-
     # Active-profile hint — names the Hermes profile the agent is running
     # under so it doesn't conflate ~/.hermes/skills/ (default profile) with
     # ~/.hermes/profiles/<active>/skills/ (this profile's). Deterministic
@@ -517,15 +502,6 @@ async def build_system_prompt_parts(agent: Any, system_message: Optional[str] = 
             user_block = agent._memory_store.format_for_system_prompt("user")
             if user_block:
                 volatile_parts.append(user_block)
-
-    # External memory provider system prompt block (additive to built-in)
-    if agent._memory_manager:
-        try:
-            _ext_mem_block = agent._memory_manager.build_system_prompt()
-            if _ext_mem_block:
-                volatile_parts.append(_ext_mem_block)
-        except Exception:
-            pass
 
     from hermes_time import now as _hermes_now
     now = _hermes_now()

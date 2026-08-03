@@ -553,12 +553,12 @@ async def _write_through_provider_state_to_global_root(
         if real_home_env:
             real_root = Path(real_home_env) / ".hermes" / "auth.json"
             try:
-                if global_path.resolve(strict=False) == real_root.resolve(strict=False):
+                if os.path.abspath(global_path) == os.path.abspath(real_root):
                     return
             except Exception:
                 return
     try:
-        async with auth_mod._async_auth_store_transaction(global_path):
+        async with auth_mod._auth_store_transaction(global_path):
             auth_store = await auth_mod._load_auth_store(global_path)
             auth_mod._store_provider_state(
                 auth_store,
@@ -819,7 +819,7 @@ class CredentialPool:
         state: Optional[Dict[str, Any]] = None
         write_through_to_root = False
         try:
-            async with auth_mod._async_auth_store_transaction():
+            async with auth_mod._auth_store_transaction():
                 auth_store = await auth_mod._load_auth_store()
                 providers = auth_store.get("providers")
                 write_through_to_root = not (
@@ -1786,14 +1786,6 @@ async def _seed_from_env(
         )
         return source in provider_sources
 
-    def _secret_source_for_env(env_var: str) -> Optional[str]:
-        try:
-            from hermes_cli.env_loader import get_secret_source
-            source_label = get_secret_source(env_var)
-        except Exception:
-            source_label = None
-        return str(source_label).strip() if source_label else None
-
     def _env_payload(
         *,
         source: str,
@@ -1809,9 +1801,6 @@ async def _seed_from_env(
             "base_url": base_url,
             "label": env_var,
         }
-        secret_source = _secret_source_for_env(env_var)
-        if secret_source:
-            payload["secret_source"] = secret_source
         return payload
 
     if provider == "openrouter":

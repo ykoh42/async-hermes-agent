@@ -348,13 +348,16 @@ async def _locate_session_db(session_id: str):
         if await aiofiles.os.path.isdir(profiles_root):
             iterator = await aiofiles.os.scandir(profiles_root)
             try:
-                names = sorted(
-                    entry.name
-                    for entry in iterator
-                    if entry.is_dir() and entry.name != "default"
+                candidate_names = sorted(
+                    entry.name for entry in iterator if entry.name != "default"
                 )
             finally:
                 iterator.close()
+            names = [
+                name
+                for name in candidate_names
+                if await aiofiles.os.path.isdir(profiles_root / name)
+            ]
             targets.extend(
                 (name, profiles_mod.get_profile_dir(name)) for name in names
             )

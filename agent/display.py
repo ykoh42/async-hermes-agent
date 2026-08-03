@@ -5,14 +5,7 @@ Used by AIAgent._execute_tool_calls for CLI feedback.
 """
 
 import logging
-import os
 import re
-import sys
-import threading
-import time
-from dataclasses import dataclass, field
-from difflib import unified_diff
-from pathlib import Path
 from typing import Any
 
 from utils import safe_json_loads
@@ -68,12 +61,6 @@ def _diff_plus():  return _diff_ansi()["plus"]
 _MAX_INLINE_DIFF_FILES = 6
 _MAX_INLINE_DIFF_LINES = 80
 
-
-@dataclass
-class LocalEditSnapshot:
-    """Pre-tool filesystem snapshot used to render diffs locally after writes."""
-    paths: list[Path] = field(default_factory=list)
-    before: dict[str, str | None] = field(default_factory=dict)
 
 # =========================================================================
 # Configurable tool preview length (0 = no limit)
@@ -672,142 +659,11 @@ def build_tool_label(tool_name: str, args: dict, max_len: int | None = None) -> 
 # Inline diff previews for write actions
 # =========================================================================
 
-def _resolved_path(path: str) -> Path:
-    """Resolve a possibly-relative filesystem path against the current cwd."""
-    candidate = Path(os.path.expanduser(path))
-    if candidate.is_absolute():
-        return candidate
-    return Path.cwd() / candidate
-
-
-def _snapshot_text(path: Path) -> str | None:
-    """Return UTF-8 file content, or None for missing/unreadable files."""
-    try:
-        return path.read_text(encoding="utf-8")
-    except (FileNotFoundError, IsADirectoryError, UnicodeDecodeError, OSError):
-        return None
-
-
-def _display_diff_path(path: Path) -> str:
-    """Prefer cwd-relative paths in diffs when available."""
-    try:
-        return str(path.resolve().relative_to(Path.cwd().resolve()))
-    except Exception:
-        return str(path)
-
-
-def _resolve_skill_manage_paths(args: dict) -> list[Path]:
-    """Resolve skill_manage write targets to filesystem paths."""
-    action = args.get("action")
-    name = args.get("name")
-    if not action or not name:
-        return []
-
-    from tools.skill_manager_tool import _find_skill, _resolve_skill_dir
-
-    if action == "create":
-        skill_dir = _resolve_skill_dir(name, args.get("category"))
-        return [skill_dir / "SKILL.md"]
-
-    existing = _find_skill(name)
-    if not existing:
-        return []
-
-    skill_dir = Path(existing["path"])
-    if action in {"edit", "patch"}:
-        file_path = args.get("file_path")
-        return [skill_dir / file_path] if file_path else [skill_dir / "SKILL.md"]
-    if action in {"write_file", "remove_file"}:
-        file_path = args.get("file_path")
-        return [skill_dir / file_path] if file_path else []
-    if action == "delete":
-        files = [path for path in sorted(skill_dir.rglob("*")) if path.is_file()]
-        return files
-    return []
-
-
-def _resolve_local_edit_paths(tool_name: str, function_args: dict | None) -> list[Path]:
-    """Resolve local filesystem targets for write-capable tools."""
-    if not isinstance(function_args, dict):
-        return []
-
-    if tool_name == "write_file":
-        path = function_args.get("path")
-        return [_resolved_path(path)] if path else []
-
-    if tool_name == "patch":
-        path = function_args.get("path")
-        return [_resolved_path(path)] if path else []
-
-    if tool_name == "skill_manage":
-        return _resolve_skill_manage_paths(function_args)
-
-    return []
-
-
-def capture_local_edit_snapshot(tool_name: str, function_args: dict | None) -> LocalEditSnapshot | None:
-    """Capture before-state for local write previews."""
-    paths = _resolve_local_edit_paths(tool_name, function_args)
-    if not paths:
-        return None
-
-    snapshot = LocalEditSnapshot(paths=paths)
-    for path in paths:
-        snapshot.before[str(path)] = _snapshot_text(path)
-    return snapshot
-
-
-def _result_succeeded(result: str | None) -> bool:
-    """Conservatively detect whether a tool result represents success."""
-    if not result:
-        return False
-    data = safe_json_loads(result)
-    if data is None:
-        return False
-    if not isinstance(data, dict):
-        return False
-    if data.get("error"):
-        return False
-    if "success" in data:
-        return bool(data.get("success"))
-    return True
-
-
-def _diff_from_snapshot(snapshot: LocalEditSnapshot | None) -> str | None:
-    """Generate unified diff text from a stored before-state and current files."""
-    if not snapshot:
-        return None
-
-    chunks: list[str] = []
-    for path in snapshot.paths:
-        before = snapshot.before.get(str(path))
-        after = _snapshot_text(path)
-        if before == after:
-            continue
-
-        display_path = _display_diff_path(path)
-        diff = "".join(
-            unified_diff(
-                [] if before is None else before.splitlines(keepends=True),
-                [] if after is None else after.splitlines(keepends=True),
-                fromfile=f"a/{display_path}",
-                tofile=f"b/{display_path}",
-            )
-        )
-        if diff:
-            chunks.append(diff)
-
-    if not chunks:
-        return None
-    return "".join(chunk if chunk.endswith("\n") else chunk + "\n" for chunk in chunks)
-
-
 def extract_edit_diff(
     tool_name: str,
     result: str | None,
     *,
     function_args: dict | None = None,
-    snapshot: LocalEditSnapshot | None = None,
 ) -> str | None:
     """Extract a unified diff from a file-edit tool result."""
     if tool_name == "patch" and result:
@@ -817,11 +673,7 @@ def extract_edit_diff(
             if isinstance(diff, str) and diff.strip():
                 return diff
 
-    if tool_name not in {"write_file", "patch", "skill_manage"}:
-        return None
-    if not _result_succeeded(result):
-        return None
-    return _diff_from_snapshot(snapshot)
+    return None
 
 
 def _emit_inline_diff(diff_text: str, print_fn) -> bool:
@@ -938,7 +790,6 @@ def render_edit_diff_with_delta(
     result: str | None,
     *,
     function_args: dict | None = None,
-    snapshot: LocalEditSnapshot | None = None,
     print_fn=None,
 ) -> bool:
     """Render an edit diff inline without taking over the terminal UI."""
@@ -946,7 +797,6 @@ def render_edit_diff_with_delta(
         tool_name,
         result,
         function_args=function_args,
-        snapshot=snapshot,
     )
     if not diff:
         return False
@@ -958,234 +808,20 @@ def render_edit_diff_with_delta(
     return _emit_inline_diff("\n".join(rendered_lines), print_fn)
 
 
-# =========================================================================
-# KawaiiSpinner
-# =========================================================================
-
-class KawaiiSpinner:
-    """Animated spinner with kawaii faces for CLI feedback during tool execution."""
-
-    SPINNERS = {
-        'dots': ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'],
-        'bounce': ['⠁', '⠂', '⠄', '⡀', '⢀', '⠠', '⠐', '⠈'],
-        'grow': ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█', '▇', '▆', '▅', '▄', '▃', '▂'],
-        'arrows': ['←', '↖', '↑', '↗', '→', '↘', '↓', '↙'],
-        'star': ['✶', '✷', '✸', '✹', '✺', '✹', '✸', '✷'],
-        'moon': ['🌑', '🌒', '🌓', '🌔', '🌕', '🌖', '🌗', '🌘'],
-        'pulse': ['◜', '◠', '◝', '◞', '◡', '◟'],
-        'brain': ['🧠', '💭', '💡', '✨', '💫', '🌟', '💡', '💭'],
-        'sparkle': ['⁺', '˚', '*', '✧', '✦', '✧', '*', '˚'],
-    }
-
-    KAWAII_WAITING = [
-        "(｡◕‿◕｡)", "(◕‿◕✿)", "٩(◕‿◕｡)۶", "(✿◠‿◠)", "( ˘▽˘)っ",
-        "♪(´ε` )", "(◕ᴗ◕✿)", "ヾ(＾∇＾)", "(≧◡≦)", "(★ω★)",
-    ]
-
-    KAWAII_THINKING = [
-        "(｡•́︿•̀｡)", "(◔_◔)", "(¬‿¬)", "( •_•)>⌐■-■", "(⌐■_■)",
-        "(´･_･`)", "◉_◉", "(°ロ°)", "( ˘⌣˘)♡", "ヽ(>∀<☆)☆",
-        "٩(๑❛ᴗ❛๑)۶", "(⊙_⊙)", "(¬_¬)", "( ͡° ͜ʖ ͡°)", "ಠ_ಠ",
-    ]
-
-    THINKING_VERBS = [
-        "pondering", "contemplating", "musing", "cogitating", "ruminating",
-        "deliberating", "mulling", "reflecting", "processing", "reasoning",
-        "analyzing", "computing", "synthesizing", "formulating", "brainstorming",
-    ]
-
-    @classmethod
-    def get_waiting_faces(cls) -> list:
-        """Return waiting faces from the active skin, falling back to KAWAII_WAITING."""
-        try:
-            skin = _get_skin()
-            if skin:
-                faces = skin.spinner.get("waiting_faces", [])
-                if faces:
-                    return faces
-        except Exception:
-            pass
-        return cls.KAWAII_WAITING
-
-    @classmethod
-    def get_thinking_faces(cls) -> list:
-        """Return thinking faces from the active skin, falling back to KAWAII_THINKING."""
-        try:
-            skin = _get_skin()
-            if skin:
-                faces = skin.spinner.get("thinking_faces", [])
-                if faces:
-                    return faces
-        except Exception:
-            pass
-        return cls.KAWAII_THINKING
-
-    @classmethod
-    def get_thinking_verbs(cls) -> list:
-        """Return thinking verbs from the active skin, falling back to THINKING_VERBS."""
-        try:
-            skin = _get_skin()
-            if skin:
-                verbs = skin.spinner.get("thinking_verbs", [])
-                if verbs:
-                    return verbs
-        except Exception:
-            pass
-        return cls.THINKING_VERBS
-
-    def __init__(self, message: str = "", spinner_type: str = 'dots', print_fn=None):
-        self.message = message
-        self.spinner_frames = self.SPINNERS.get(spinner_type, self.SPINNERS['dots'])
-        self.running = False
-        self.thread = None
-        self.frame_idx = 0
-        self.start_time = None
-        self.last_line_len = 0
-        # Optional callable to route all output through (e.g. a no-op for silent
-        # background agents).  When set, bypasses self._out entirely so that
-        # agents with _print_fn overridden remain fully silent.
-        self._print_fn = print_fn
-        # Capture stdout NOW, before any redirect_stdout(devnull) from
-        # child agents can replace sys.stdout with a black hole.
-        self._out = sys.stdout
-
-    def _write(self, text: str, end: str = '\n', flush: bool = False):
-        """Write to the stdout captured at spinner creation time.
-
-        If a print_fn was supplied at construction, all output is routed through
-        it instead — allowing callers to silence the spinner with a no-op lambda.
-        """
-        if self._print_fn is not None:
-            try:
-                self._print_fn(text)
-            except Exception:
-                pass
-            return
-        try:
-            self._out.write(text + end)
-            if flush:
-                self._out.flush()
-        except (ValueError, OSError):
-            pass
-
-    @property
-    def _is_tty(self) -> bool:
-        """Check if output is a real terminal, safe against closed streams."""
-        try:
-            return hasattr(self._out, 'isatty') and self._out.isatty()
-        except (ValueError, OSError):
-            return False
-
-    def _animate(self):
-        # When stdout is not a real terminal (e.g. Docker, systemd, pipe),
-        # skip the animation entirely — it creates massive log bloat.
-        # Just log the start once and let stop() log the completion.
-        if not self._is_tty:
-            self._write(f"  [tool] {self.message}", flush=True)
-            while self.running:
-                time.sleep(0.5)
-            return
-
-        # Cache skin wings at start (avoid per-frame imports)
-        skin = _get_skin()
-        wings = skin.get_spinner_wings() if skin else []
-
-        while self.running:
-            if os.getenv("HERMES_SPINNER_PAUSE"):
-                time.sleep(0.1)
-                continue
-            frame = self.spinner_frames[self.frame_idx % len(self.spinner_frames)]
-            elapsed = time.time() - self.start_time
-            if wings:
-                left, right = wings[self.frame_idx % len(wings)]
-                line = f"  {left} {frame} {self.message} {right} ({elapsed:.1f}s)"
-            else:
-                line = f"  {frame} {self.message} ({elapsed:.1f}s)"
-            pad = max(self.last_line_len - len(line), 0)
-            self._write(f"\r{line}{' ' * pad}", end='', flush=True)
-            self.last_line_len = len(line)
-            self.frame_idx += 1
-            time.sleep(0.12)
-
-    def start(self):
-        if self.running:
-            return
-        self.running = True
-        self.start_time = time.time()
-        self.thread = threading.Thread(target=self._animate, daemon=True)
-        self.thread.start()
-
-    def update_text(self, new_message: str):
-        self.message = new_message
-
-    def print_above(self, text: str):
-        """Print a line above the spinner without disrupting animation.
-
-        Clears the current spinner line, prints the text, and lets the
-        next animation tick redraw the spinner on the line below.
-        Thread-safe: uses the captured stdout reference (self._out).
-        Works inside redirect_stdout(devnull) because _write bypasses
-        sys.stdout and writes to the stdout captured at spinner creation.
-        """
-        if not self.running:
-            self._write(f"  {text}", flush=True)
-            return
-        # Clear spinner line with spaces (not \033[K) to avoid garbled escape
-        # codes when prompt_toolkit's patch_stdout is active — same approach
-        # as stop(). Then print text; spinner redraws on next tick.
-        blanks = ' ' * max(self.last_line_len + 5, 40)
-        self._write(f"\r{blanks}\r  {text}", flush=True)
-
-    def stop(self, final_message: str = None):
-        self.running = False
-        if self.thread:
-            self.thread.join(timeout=0.5)
-
-        is_tty = self._is_tty
-        if is_tty:
-            # Clear the spinner line with spaces instead of \033[K to avoid
-            # garbled escape codes when prompt_toolkit's patch_stdout is active.
-            blanks = ' ' * max(self.last_line_len + 5, 40)
-            self._write(f"\r{blanks}\r", end='', flush=True)
-        if final_message:
-            elapsed = f" ({time.time() - self.start_time:.1f}s)" if self.start_time else ""
-            if is_tty:
-                self._write(f"  {final_message}", flush=True)
-            else:
-                self._write(f"  [done] {final_message}{elapsed}", flush=True)
-
-    def __enter__(self):
-        self.start()
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self.stop()
-        return False
-
-
-# =========================================================================
-# Cute tool message (completion line that replaces the spinner)
-# =========================================================================
-
 _ERROR_SUFFIX_MAX_LEN = 48
 
 
-def _trim_error(msg: str) -> str:
-    """Shrink an error message for inline display in a tool status line.
-
-    Strips overly long absolute paths down to just the filename so the
-    suffix stays readable on narrow terminals.
-    """
-    msg = msg.strip()
-    # Common case: "File not found: /very/long/absolute/path/foo.py"
-    if "File not found:" in msg:
-        _, _, tail = msg.partition("File not found:")
+def _trim_error(message: str) -> str:
+    """Shrink an error message for an inline tool-status suffix."""
+    message = message.strip()
+    if "File not found:" in message:
+        _, _, tail = message.partition("File not found:")
         tail = tail.strip()
         if "/" in tail:
-            msg = f"File not found: {tail.rsplit('/', 1)[-1]}"
-    if len(msg) > _ERROR_SUFFIX_MAX_LEN:
-        msg = msg[: _ERROR_SUFFIX_MAX_LEN - 3] + "..."
-    return msg
+            message = f"File not found: {tail.rsplit('/', 1)[-1]}"
+    if len(message) > _ERROR_SUFFIX_MAX_LEN:
+        message = message[: _ERROR_SUFFIX_MAX_LEN - 3] + "..."
+    return message
 
 
 def _detect_tool_failure(tool_name: str, result: str | None) -> tuple[bool, str]:

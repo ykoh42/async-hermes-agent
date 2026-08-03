@@ -58,7 +58,6 @@ class _FakeAgent:
         )
         self._cached_system_prompt = "SYSTEM"
         self._memory_store = None
-        self._memory_manager = None
         self._memory_nudge_interval = 0
         self._turns_since_memory = 0
         self._user_turn_count = 0

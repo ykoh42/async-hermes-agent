@@ -1,7 +1,6 @@
 """Regression tests for AIAgent.commit_memory_session.
 
-Issue #22394: commit_memory_session was calling MemoryManager.on_session_end
-but never ContextEngine.on_session_end. Context engines that accumulate
+Context engines that accumulate
 per-session state (LCM-style DAGs, summary stores) leaked that state from a
 rotated-out session into whatever continued under the same compressor
 instance.
@@ -25,7 +24,6 @@ def _make_minimal_agent(context_compressor, session_id="abc"):
     from run_agent import AIAgent
 
     obj = SimpleNamespace(
-        _memory_manager=None,
         context_compressor=context_compressor,
         session_id=session_id,
     )
@@ -43,7 +41,6 @@ async def test_commit_memory_session_notifies_context_engine():
     await agent.commit_memory_session(msgs)
 
     ctx.on_session_end.assert_called_once_with("sess-42", msgs)
-
 
 
 

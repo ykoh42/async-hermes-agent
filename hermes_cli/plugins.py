@@ -397,7 +397,6 @@ class PluginContext:
         handler: Callable,
         check_fn: Callable | None = None,
         requires_env: list | None = None,
-        is_async: bool = False,
         description: str = "",
         emoji: str = "",
         override: bool = False,
@@ -435,7 +434,6 @@ class PluginContext:
             handler=handler,
             check_fn=check_fn,
             requires_env=requires_env,
-            is_async=is_async,
             description=description,
             emoji=emoji,
             override=override,
@@ -728,53 +726,6 @@ class PluginContext:
             "Plugin '%s' registered browser provider: %s",
             self.manifest.name, provider.name,
         )
-
-    # -- secret source registration -------------------------------------------
-
-    def register_secret_source(self, source) -> None:
-        """Register an external secret-manager backend.
-
-        ``source`` must be an instance of
-        :class:`agent.secret_sources.base.SecretSource`.  Registered
-        sources run during ``load_hermes_dotenv()`` startup — after
-        ``~/.hermes/.env`` loads, before Hermes reads credentials — when
-        their ``secrets.<source.name>`` config section is enabled.  The
-        orchestrator (``agent.secret_sources.registry.apply_all``) owns
-        ordering, mapped-vs-bulk precedence, conflict warnings, and
-        provenance; the source only fetches.
-
-        NOTE ON TIMING: plugin discovery happens later in startup than
-        the first ``load_hermes_dotenv()`` call, so a plugin-registered
-        source is not consulted by the initial env load of the process
-        that discovers it.  It IS consulted by every subsequently
-        spawned Hermes process (gateway children, cron sessions,
-        subagents), and immediately after a
-        ``reset_secret_source_cache()`` re-pull.  Plugin sources are
-        therefore best for supplying credentials to the running fleet;
-        the bundled sources cover first-process bootstrap.
-
-        Contract requirements (rejected with a warning otherwise):
-        inherit from ``SecretSource``, ``api_version`` matching
-        ``SECRET_SOURCE_API_VERSION``, lowercase unique ``name``,
-        ``shape`` of ``"mapped"`` or ``"bulk"``, unique ``scheme`` (when
-        set), and a ``fetch()`` that never raises and never prompts.
-        See the base-module docstring for the full contract.
-        """
-        from agent.secret_sources.base import SecretSource
-        from agent.secret_sources.registry import register_source
-
-        if not isinstance(source, SecretSource):
-            logger.warning(
-                "Plugin '%s' tried to register a secret source that does "
-                "not inherit from SecretSource. Ignoring.",
-                self.manifest.name,
-            )
-            return
-        if register_source(source):
-            logger.info(
-                "Plugin '%s' registered secret source: %s",
-                self.manifest.name, source.name,
-            )
 
     # -- TTS provider registration -------------------------------------------
 
@@ -1827,13 +1778,12 @@ class PluginManager:
         results: List[Any] = []
         for callback in callbacks:
             try:
-                result = callback(**kwargs)
-                if not inspect.isawaitable(result):
+                if not inspect.iscoroutinefunction(callback):
                     raise AsyncPluginCapabilityError(
                         "Async Hermes requires coroutine lifecycle hooks; "
                         f"{getattr(callback, '__name__', repr(callback))} is synchronous"
                     )
-                result = await result
+                result = await callback(**kwargs)
                 if result is not None:
                     results.append(result)
             except AsyncPluginCapabilityError:
@@ -2132,7 +2082,11 @@ async def resolve_pre_tool_block(
         if callback is None:
             return f"BLOCKED: plugin approval required for {tool_name}"
         try:
-            decision = callback(
+            if not inspect.iscoroutinefunction(callback):
+                raise AsyncPluginCapabilityError(
+                    "Async Hermes requires a coroutine approval callback"
+                )
+            decision = await callback(
                 tool_name=tool_name,
                 reason=details.message or "",
                 rule_key=details.rule_key or tool_name,
@@ -2140,11 +2094,6 @@ async def resolve_pre_tool_block(
                 task_id=task_id,
                 session_id=session_id,
             )
-            if not inspect.isawaitable(decision):
-                raise AsyncPluginCapabilityError(
-                    "Async Hermes requires a coroutine approval callback"
-                )
-            decision = await decision
         except AsyncPluginCapabilityError:
             raise
         except Exception:

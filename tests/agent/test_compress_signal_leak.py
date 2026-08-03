@@ -15,7 +15,6 @@ async def test_signal_cleared_on_entry_between_calls(monkeypatch):
     agent = MagicMock()
     agent._cached_system_prompt = ""
     agent.tools = None
-    agent._memory_manager = None
     agent.session_id = "s1"
     agent._build_system_prompt = AsyncMock(return_value="sys prompt")
     agent._emit_warning = MagicMock()

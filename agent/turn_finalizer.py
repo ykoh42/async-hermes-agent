@@ -655,9 +655,6 @@ async def finalize_turn(
     # Clear stream callback so it doesn't leak into future calls
     agent._stream_callback = None
 
-    # External MemoryManager providers are rejected before the first model
-    # request. Turn finalization therefore owns only built-in async state.
-
     # Plugin hook: on_session_end
     # Fired at the very end of every run_conversation call.
     # Plugins can use this for cleanup, flushing buffers, etc.

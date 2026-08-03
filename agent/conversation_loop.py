@@ -38,7 +38,6 @@ from agent.conversation_compression import (
     conversation_history_after_compression,
 )
 from agent.context_engine import automatic_compaction_status_message
-from agent.display import KawaiiSpinner
 from agent.error_classifier import FailoverReason, classify_api_error
 from agent.turn_context import (
     _compression_warrants_another_preflight_pass,
@@ -1228,20 +1227,6 @@ async def run_conversation(
     # stale prior turn's usage.
     agent._last_turn_usage = None
 
-    # Optional opt-in runtime: if api_mode == codex_app_server, hand the
-    # turn to the codex app-server subprocess (terminal/file ops/patching
-    # all run inside Codex). Default Hermes path is bypassed entirely.
-    # See agent/transports/codex_app_server_session.py for the adapter
-    # and references/codex-app-server-runtime.md for the rationale.
-    if agent.api_mode == "codex_app_server":
-        return await agent._run_codex_app_server_turn(
-            user_message=user_message,
-            original_user_message=original_user_message,
-            messages=messages,
-            effective_task_id=effective_task_id,
-            should_review_memory=_should_review_memory,
-        )
-
     while (api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0) or agent._budget_grace_call:
         _redirect_text = agent._drain_pending_redirect()
         if _redirect_text:
@@ -1956,27 +1941,12 @@ async def run_conversation(
                     int(getattr(_compressor, "threshold_tokens", 0) or 0),
                 )
         
-        # Thinking spinner for quiet mode (animated during API call)
-        thinking_spinner = None
-        
         if not agent.quiet_mode:
             agent._vprint(f"\n{agent.log_prefix}🔄 Making API call #{api_call_count}/{agent.max_iterations}...")
             agent._vprint(f"{agent.log_prefix}   📊 Request size: {len(api_messages)} messages, ~{approx_tokens:,} tokens (~{total_chars:,} chars)")
             agent._vprint(f"{agent.log_prefix}   🔧 Available tools: {len(agent.tools) if agent.tools else 0}")
-        else:
-            # Animated thinking spinner in quiet mode
-            face = random.choice(KawaiiSpinner.get_thinking_faces())
-            verb = random.choice(KawaiiSpinner.get_thinking_verbs())
-            if agent.thinking_callback:
-                # CLI TUI mode: use prompt_toolkit widget instead of raw spinner
-                # (works in both streaming and non-streaming modes)
-                agent.thinking_callback(f"{face} {verb}...")
-            elif not agent._has_stream_consumers() and agent._should_start_quiet_spinner():
-                # Raw KawaiiSpinner only when no streaming consumers and the
-                # spinner output has a safe sink.
-                spinner_type = random.choice(['brain', 'sparkle', 'pulse', 'moon', 'star'])
-                thinking_spinner = KawaiiSpinner(f"{face} {verb}...", spinner_type=spinner_type, print_fn=agent._print_fn)
-                thinking_spinner.start()
+        elif agent.thinking_callback:
+            agent.thinking_callback("Thinking...")
         
         # Log request details if verbose
         if agent.verbose_logging:
@@ -2007,7 +1977,7 @@ async def run_conversation(
                         nous_rate_limit_remaining,
                         format_remaining as _fmt_nous_remaining,
                     )
-                    _nous_remaining = nous_rate_limit_remaining()
+                    _nous_remaining = await nous_rate_limit_remaining()
                     if _nous_remaining is not None and _nous_remaining > 0:
                         _nous_msg = (
                             f"Nous Portal rate limit active — "
@@ -2167,7 +2137,7 @@ async def run_conversation(
                     pass
 
                 if env_var_enabled("HERMES_DUMP_REQUESTS"):
-                    agent._dump_api_request_debug(api_kwargs, reason="preflight")
+                    await agent._dump_api_request_debug(api_kwargs, reason="preflight")
 
                 # This object is private to the in-process MoA facade.  Add it
                 # only after middleware, hooks, and debug dumps so none of them
@@ -2186,11 +2156,7 @@ async def run_conversation(
                 # consumers are registered, and falls back to non-
                 # streaming automatically if the provider doesn't
                 # support it.
-                def _stop_spinner():
-                    nonlocal thinking_spinner
-                    if thinking_spinner:
-                        thinking_spinner.stop("")
-                        thinking_spinner = None
+                def _stop_thinking():
                     if agent.thinking_callback:
                         agent.thinking_callback("")
 
@@ -2218,7 +2184,7 @@ async def run_conversation(
                     return await agent._execute_model_request(
                         next_api_kwargs,
                         use_streaming=_use_streaming,
-                        on_first_delta=_stop_spinner,
+                        on_first_delta=_stop_thinking,
                     )
 
                 _model_request_active = getattr(agent, "_model_request_active", None)
@@ -2270,9 +2236,6 @@ async def run_conversation(
                     # redirect() observed the request as active just before this
                     # call returned. Discard that now-stale response and rebuild
                     # from the correction rather than silently losing it.
-                    if thinking_spinner:
-                        thinking_spinner.stop("")
-                        thinking_spinner = None
                     if agent.thinking_callback:
                         agent.thinking_callback("")
                     if agent.clear_interrupt(preserve_redirect=True):
@@ -2285,9 +2248,6 @@ async def run_conversation(
                 
                 # Stop thinking spinner silently -- the response box or tool
                 # execution messages that follow are more informative.
-                if thinking_spinner:
-                    thinking_spinner.stop("")
-                    thinking_spinner = None
                 if agent.thinking_callback:
                     agent.thinking_callback("")
                 
@@ -2397,9 +2357,6 @@ async def run_conversation(
                     )
                     # Stop spinner silently — retry status is now buffered
                     # and only surfaced if every retry+fallback exhausts.
-                    if thinking_spinner:
-                        thinking_spinner.stop("")
-                        thinking_spinner = None
                     if agent.thinking_callback:
                         agent.thinking_callback("")
                     
@@ -2649,9 +2606,6 @@ async def run_conversation(
                         reason=FailoverReason.content_policy_blocked.value,
                     )
 
-                    if thinking_spinner:
-                        thinking_spinner.stop("")
-                        thinking_spinner = None
                     if agent.thinking_callback:
                         agent.thinking_callback("")
 
@@ -3278,16 +3232,13 @@ async def run_conversation(
                 if agent.provider == "nous":
                     try:
                         from agent.nous_rate_guard import clear_nous_rate_limit
-                        clear_nous_rate_limit()
+                        await clear_nous_rate_limit()
                     except Exception:
                         pass
                 agent._touch_activity(f"API call #{api_call_count} completed")
                 break  # Success, exit retry loop
 
             except InterruptedError:
-                if thinking_spinner:
-                    thinking_spinner.stop("")
-                    thinking_spinner = None
                 if agent.thinking_callback:
                     agent.thinking_callback("")
                 if agent._has_pending_redirect():
@@ -3321,9 +3272,6 @@ async def run_conversation(
             except Exception as api_error:
                 # Stop spinner silently — retry status is buffered and
                 # only flushed when every retry+fallback is exhausted.
-                if thinking_spinner:
-                    thinking_spinner.stop("")
-                    thinking_spinner = None
                 if agent.thinking_callback:
                     agent.thinking_callback("")
 
@@ -3832,7 +3780,6 @@ async def run_conversation(
                 ):
                     _retry.anthropic_auth_retry_attempted = True
                     from agent.anthropic_adapter import _is_oauth_token
-                    from agent.azure_identity_adapter import is_token_provider
                     if getattr(agent, "_is_anthropic_oauth", False):
                         raise AsyncCapabilityError(
                             "Anthropic OAuth renewal has no native async implementation. "
@@ -3841,19 +3788,9 @@ async def run_conversation(
                     # Credential refresh didn't help — show diagnostic info
                     key = agent._anthropic_api_key
                     print(f"{agent.log_prefix}🔐 Anthropic 401 — authentication failed.")
-                    if is_token_provider(key):
-                        # Azure Foundry Entra ID — the bearer token is
-                        # minted per-request by an httpx event hook on a
-                        # custom http_client passed to the SDK. The 401
-                        # means Azure rejected the JWT (RBAC role missing,
-                        # az login expired, IMDS unreachable, etc.).
-                        print(f"{agent.log_prefix}   Auth method: Microsoft Entra ID (httpx event hook)")
-                        print(f"{agent.log_prefix}   Run `hermes doctor` for credential-chain diagnostics, or")
-                        print(f"{agent.log_prefix}   `az login` if your developer session expired.")
-                    else:
-                        auth_method = "Bearer (OAuth/setup-token)" if _is_oauth_token(key) else "x-api-key (API key)"
-                        print(f"{agent.log_prefix}   Auth method: {auth_method}")
-                        print(f"{agent.log_prefix}   Token prefix: {key[:12]}..." if isinstance(key, str) and len(key) > 12 else f"{agent.log_prefix}   Token: (empty or short)")
+                    auth_method = "Bearer (OAuth/setup-token)" if _is_oauth_token(key) else "x-api-key (API key)"
+                    print(f"{agent.log_prefix}   Auth method: {auth_method}")
+                    print(f"{agent.log_prefix}   Token prefix: {key[:12]}..." if isinstance(key, str) and len(key) > 12 else f"{agent.log_prefix}   Token: (empty or short)")
                     print(f"{agent.log_prefix}   Troubleshooting:")
                     from hermes_constants import display_hermes_home as _dhh_fn
                     _dhh = _dhh_fn()
@@ -4355,7 +4292,7 @@ async def run_conversation(
                             last_known_state=agent._rate_limit_state,
                         )
                         if _genuine_nous_rate_limit:
-                            record_nous_rate_limit(
+                            await record_nous_rate_limit(
                                 headers=_err_hdrs,
                                 error_context=error_context,
                             )
@@ -4844,7 +4781,7 @@ async def run_conversation(
                         _retry.primary_recovery_attempted = False
                         continue
                     if api_kwargs is not None:
-                        agent._dump_api_request_debug(
+                        await agent._dump_api_request_debug(
                             api_kwargs, reason="non_retryable_client_error", error=api_error,
                         )
                     # Terminal — flush buffered context so the user sees
@@ -5185,7 +5122,7 @@ async def run_conversation(
                         _provider, _model, len(api_messages), f"{approx_tokens:,}",
                     )
                     if api_kwargs is not None:
-                        agent._dump_api_request_debug(
+                        await agent._dump_api_request_debug(
                             api_kwargs, reason="max_retries_exhausted", error=api_error,
                         )
                     await agent._persist_session(messages, conversation_history)

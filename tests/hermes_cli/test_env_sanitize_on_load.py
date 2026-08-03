@@ -4,6 +4,8 @@ import tempfile
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 
 def test_load_env_preserves_concatenated_text_as_value_data():
     """Verify load_env() does not infer assignments within a physical line.
@@ -62,7 +64,8 @@ def test_load_env_normal_file_unchanged():
         env_path.unlink(missing_ok=True)
 
 
-def test_env_loader_does_not_split_concatenated_text():
+@pytest.mark.asyncio
+async def test_env_loader_does_not_split_concatenated_text():
     """Verify sanitization preserves one assignment per physical line."""
     from hermes_cli.env_loader import _sanitize_env_file_if_needed
 
@@ -76,7 +79,7 @@ def test_env_loader_does_not_split_concatenated_text():
         env_path = Path(f.name)
 
     try:
-        _sanitize_env_file_if_needed(env_path)
+        await _sanitize_env_file_if_needed(env_path)
         with open(env_path, encoding="utf-8") as f:
             lines = f.readlines()
         assert lines == [corrupted]

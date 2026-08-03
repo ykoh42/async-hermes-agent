@@ -40,6 +40,8 @@ Payment / credit exhaustion fallback:
   their OpenRouter balance but has Codex OAuth or another provider available.
 """
 
+from __future__ import annotations
+
 import asyncio
 import contextlib
 import contextvars
@@ -55,59 +57,10 @@ import time
 import uuid
 from pathlib import Path  # noqa: F401 — used by test mocks
 from types import SimpleNamespace
-from typing import Any, Callable, Dict, List, Optional, Tuple, TYPE_CHECKING
+from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import urlparse, parse_qs, urlunparse
 
 from agent.agent_runtime_helpers import AsyncCapabilityError
-
-# NOTE: `from openai import OpenAI` is deliberately NOT at module top — the
-# openai SDK pulls a large type tree (~240 ms cold, including responses/*,
-# graders/*). We expose `OpenAI` here as a thin proxy that imports the SDK on
-# first call and forwards, so:
-#   (a) the 15+ in-module `OpenAI(...)` construction sites work unchanged
-#       (Python's function-scope name lookup resolves `OpenAI` to the proxy
-#       object bound in module globals here, without triggering any import);
-#   (b) external code can still do `auxiliary_client.OpenAI` or
-#       `patch("agent.auxiliary_client.OpenAI", ...)` — tests see the proxy,
-#       and patch replaces the module attribute as usual;
-#   (c) `OpenAI` as a type annotation resolves at runtime to the proxy class
-#       (which is harmless — annotations aren't type-checked at runtime).
-# See tests/agent/test_auxiliary_client.py for patch patterns this supports.
-if TYPE_CHECKING:
-    from openai import OpenAI  # noqa: F401 — type hints only
-
-_OPENAI_CLS_CACHE: Optional[type] = None
-
-
-def _load_openai_cls() -> type:
-    """Import and cache ``openai.OpenAI``."""
-    global _OPENAI_CLS_CACHE
-    if _OPENAI_CLS_CACHE is None:
-        from openai import OpenAI as _cls
-        _OPENAI_CLS_CACHE = _cls
-    return _OPENAI_CLS_CACHE
-
-
-class _OpenAIProxy:
-    """Module-level proxy that looks like the ``openai.OpenAI`` class.
-
-    Forwards ``OpenAI(...)`` calls and ``isinstance(x, OpenAI)`` checks to the
-    real SDK class, importing the SDK lazily on first use.
-    """
-
-    __slots__ = ()
-
-    def __call__(self, *args, **kwargs):
-        return _load_openai_cls()(*args, **kwargs)
-
-    def __instancecheck__(self, obj):
-        return isinstance(obj, _load_openai_cls())
-
-    def __repr__(self):
-        return "<lazy openai.OpenAI proxy>"
-
-
-OpenAI = _OpenAIProxy()  # module-level name, resolves lazily on call/isinstance
 
 from agent.credential_pool import load_pool
 from agent.model_metadata import (
@@ -1178,10 +1131,8 @@ class _CodexCompletionsAdapter:
             close = getattr(self._client, "aclose", None) or getattr(
                 self._client, "close", None
             )
-            if callable(close):
-                close_result = close()
-                if inspect.isawaitable(close_result):
-                    await close_result
+            if inspect.iscoroutinefunction(close):
+                await close()
             await _evict_cached_client_instance(self._client)
             raise TimeoutError(
                 f"Codex auxiliary Responses stream exceeded {float(total_timeout):.1f}s total timeout"
@@ -1272,10 +1223,8 @@ class CodexAuxiliaryClient:
         close_fn = getattr(self._real_client, "aclose", None) or getattr(
             self._real_client, "close", None
         )
-        if callable(close_fn):
-            result = close_fn()
-            if inspect.isawaitable(result):
-                await result
+        if inspect.iscoroutinefunction(close_fn):
+            await close_fn()
 
 
 class _AnthropicCompletionsAdapter:
@@ -1467,10 +1416,8 @@ class AnthropicAuxiliaryClient:
         close_fn = getattr(self._real_client, "aclose", None) or getattr(
             self._real_client, "close", None
         )
-        if callable(close_fn):
-            result = close_fn()
-            if inspect.isawaitable(result):
-                await result
+        if inspect.iscoroutinefunction(close_fn):
+            await close_fn()
 
 
 class _BedrockCompletionsAdapter:
@@ -1574,13 +1521,6 @@ async def _maybe_wrap_anthropic(
             return client_obj
     except ImportError:
         pass
-    try:
-        from agent.copilot_acp_client import CopilotACPClient
-        if _safe_isinstance(client_obj, CopilotACPClient):
-            return client_obj
-    except ImportError:
-        pass
-
     # Explicit non-anthropic api_mode wins over URL heuristics.
     if api_mode and api_mode != "anthropic_messages":
         return client_obj
@@ -2061,7 +2001,7 @@ async def _try_nous(
     # to avoid piling more requests onto the tapped RPH bucket.
     try:
         from agent.nous_rate_guard import nous_rate_limit_remaining
-        _remaining = nous_rate_limit_remaining()
+        _remaining = await nous_rate_limit_remaining()
         if _remaining is not None and _remaining > 0:
             logger.debug(
                 "Auxiliary: skipping Nous Portal (rate-limited, resets in %.0fs)",
@@ -2741,9 +2681,8 @@ async def _try_azure_foundry(
 
     * ``auth_mode: api_key`` (default) gets the static
       ``AZURE_FOUNDRY_API_KEY`` string.
-    * ``auth_mode: entra_id`` gets a callable bearer-token provider
-      (``Callable[[], str]`` from
-      :mod:`agent.azure_identity_adapter`).
+    * ``auth_mode: entra_id`` fails fast because its bearer provider is
+      synchronous and cannot be used by the async runtime.
     * Per-model ``api_mode`` auto-routing for GPT-5.x / o-series /
       codex models works.
     * ``model.entra.{tenant_id,client_id,authority,scope}`` config
@@ -5136,8 +5075,8 @@ async def resolve_provider_client(
     # static ``AZURE_FOUNDRY_API_KEY`` env var. That misses two important
     # cases for the ``azure-foundry`` provider:
     #
-    #   1. ``model.auth_mode: entra_id`` — no static key exists; we need
-    #      a callable bearer-token provider from ``azure_identity_adapter``.
+    #   1. ``model.auth_mode: entra_id`` — rejected explicitly because its
+    #      bearer-provider callback is synchronous.
     #   2. Non-default ``model.base_url`` (Foundry projects path) — the
     #      env-var-only resolver doesn't apply config-yaml-driven URL
     #      overrides.
@@ -5998,17 +5937,9 @@ async def _close_cached_client(client: Any) -> None:
     if client is None:
         return
     try:
-        async_close = getattr(client, "aclose", None)
-        if callable(async_close):
-            close_result = async_close()
-            if inspect.isawaitable(close_result):
-                await close_result
-                return
-        sync_close = getattr(client, "close", None)
-        if callable(sync_close):
-            close_result = sync_close()
-            if inspect.isawaitable(close_result):
-                await close_result
+        close = getattr(client, "aclose", None) or getattr(client, "close", None)
+        if inspect.iscoroutinefunction(close):
+            await close()
     except Exception:
         logger.debug("Failed to close auxiliary client", exc_info=True)
 
@@ -6025,7 +5956,7 @@ async def shutdown_cached_clients() -> None:
         await _close_cached_client(client)
 
 
-async def cleanup_stale_async_clients() -> None:
+async def cleanup_stale_clients() -> None:
     """Drop cached clients whose owning event loop has already closed.
 
     Call this after each agent turn to proactively clean up stale clients
@@ -7195,16 +7126,9 @@ async def _aggregate_chat_stream(
             acc.feed(chunk)
     finally:
         try:
-            async_close = getattr(chunks, "aclose", None)
-            close_result = async_close() if callable(async_close) else None
-            if inspect.isawaitable(close_result):
-                await close_result
-            else:
-                sync_close = getattr(chunks, "close", None)
-                if callable(sync_close):
-                    close_result = sync_close()
-                    if inspect.isawaitable(close_result):
-                        await close_result
+            close = getattr(chunks, "aclose", None) or getattr(chunks, "close", None)
+            if inspect.iscoroutinefunction(close):
+                await close()
         except Exception:
             pass
     return acc.finish()

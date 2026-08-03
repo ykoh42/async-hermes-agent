@@ -4,14 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import json
-from pathlib import Path
 import logging
 import time
 from dataclasses import dataclass
 from typing import Any, Optional
 
 from agent.display import (
-    KawaiiSpinner,
     build_tool_preview as _build_tool_preview,
     build_tool_label as _build_tool_label,
     get_cute_tool_message as _get_cute_tool_message_impl,
@@ -381,13 +379,6 @@ def _begin_tool_execution(
     touch_activity = getattr(agent, "_touch_activity", None)
     if callable(touch_activity):
         touch_activity(f"executing tool: {function_name}")
-    try:
-        from tools.environments.base import set_activity_callback
-
-        set_activity_callback(agent._touch_activity)
-    except Exception:
-        pass
-
     if agent.tool_progress_callback:
         try:
             display_args = (
@@ -501,11 +492,7 @@ async def execute_tool_calls_segmented(
     unsupported = [
         getattr(tc.function, "name", "")
         for tc in tool_calls
-        if (
-            (entry := registry.get_entry(getattr(tc.function, "name", "")))
-            is None
-            or not entry.is_async
-        )
+        if registry.get_entry(getattr(tc.function, "name", "")) is None
     ]
     if unsupported:
         from agent.agent_runtime_helpers import AsyncCapabilityError

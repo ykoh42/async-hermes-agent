@@ -813,6 +813,10 @@ class TestShutdown:
         from toolsets import resolve_toolset, validate_toolset
 
         _servers.clear()
+
+        async def ping_handler(*_args, **_kwargs):
+            return "{}"
+
         registry.register(
             name="mcp__test__ping",
             toolset="mcp-test",
@@ -821,7 +825,7 @@ class TestShutdown:
                 "description": "Ping",
                 "parameters": {"type": "object", "properties": {}},
             },
-            handler=lambda *_args, **_kwargs: "{}",
+            handler=ping_handler,
         )
         registry.register_toolset_alias("test", "mcp-test")
 
@@ -925,28 +929,6 @@ class TestBuildSafeEnv:
         assert "OPENAI_API_KEY" not in result
         assert "DATABASE_URL" not in result
         assert "API_SECRET" not in result
-
-    def test_secret_source_injected_vars_are_passed(self, monkeypatch):
-        """Vars tagged by an external secret source (Bitwarden/1Password) are
-        deliberately allowed for MCP stdio servers."""
-        from hermes_cli import env_loader
-        from tools.mcp_tool import _build_safe_env
-
-        monkeypatch.setitem(env_loader._SECRET_SOURCES, "ALPACA_API_KEY", "bitwarden")
-        monkeypatch.setitem(env_loader._SECRET_SOURCES, "NOTION_TOKEN", "onepassword")
-        fake_env = {
-            "PATH": "/usr/bin",
-            "ALPACA_API_KEY": "from-bws-key",
-            "NOTION_TOKEN": "from-op",
-            "UNTRACKED_SECRET_KEY": "still-filtered",
-        }
-        with patch.dict("os.environ", fake_env, clear=True):
-            result = _build_safe_env(None)
-
-        assert result["PATH"] == "/usr/bin"
-        assert result["ALPACA_API_KEY"] == "from-bws-key"
-        assert result["NOTION_TOKEN"] == "from-op"
-        assert "UNTRACKED_SECRET_KEY" not in result
 
     def test_windows_location_vars_passed_without_secrets(self):
         """Windows launcher tools need location vars, but secrets stay filtered."""
@@ -2120,7 +2102,8 @@ class TestRegistryCollisionWarning:
 
         reg = ToolRegistry()
         schema = {"name": "my_tool", "description": "test", "parameters": {"type": "object", "properties": {}}}
-        handler = lambda args, **kw: "{}"
+        async def handler(args, **kw):
+            return "{}"
 
         reg.register(name="my_tool", toolset="builtin", schema=schema, handler=handler)
 
@@ -2149,9 +2132,13 @@ class TestMCPBuiltinCollisionGuard:
             "description": "A hypothetical built-in",
             "parameters": {"type": "object", "properties": {}},
         }
+
+        async def builtin_handler(_args, **_kwargs):
+            return "{}"
+
         mock_registry.register(
             name="mcp__abc__search", toolset="web",
-            schema=builtin_schema, handler=lambda a, **k: "{}",
+            schema=builtin_schema, handler=builtin_handler,
         )
 
         mock_tools = [_make_mcp_tool("search", "Search the web")]
@@ -2188,9 +2175,13 @@ class TestMCPBuiltinCollisionGuard:
             "description": "From another MCP server",
             "parameters": {"type": "object", "properties": {}},
         }
+
+        async def mcp_handler(_args, **_kwargs):
+            return "{}"
+
         mock_registry.register(
             name="mcp__srv__do_thing", toolset="mcp-old",
-            schema=mcp_schema, handler=lambda a, **k: "{}",
+            schema=mcp_schema, handler=mcp_handler,
         )
 
         mock_tools = [_make_mcp_tool("do_thing", "Do a thing")]
@@ -2238,11 +2229,15 @@ class TestSanitizeMcpNameComponent:
         from toolsets import resolve_toolset, validate_toolset
 
         reg = ToolRegistry()
+
+        async def search_handler(*_args, **_kwargs):
+            return "{}"
+
         reg.register(
             name="mcp__ai_exa_exa__search",
             toolset="mcp-ai.exa/exa",
             schema={"name": "mcp__ai_exa_exa__search", "description": "Search", "parameters": {"type": "object", "properties": {}}},
-            handler=lambda *_args, **_kwargs: "{}",
+            handler=search_handler,
         )
         reg.register_toolset_alias("ai.exa/exa", "mcp-ai.exa/exa")
 

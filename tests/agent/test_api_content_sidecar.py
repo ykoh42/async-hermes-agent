@@ -184,7 +184,6 @@ class _FakeAgent:
         )
         self._cached_system_prompt = "SYSTEM"
         self._memory_store = None
-        self._memory_manager = None
         self._memory_nudge_interval = 0
         self._turns_since_memory = 0
         self._user_turn_count = 0
@@ -281,21 +280,6 @@ class TestPrologueStamping:
             ctx = await _build(agent)
         assert "api_content" not in ctx.messages[ctx.current_turn_user_idx]
         assert agent.api_content_at_persist is None
-
-    @pytest.mark.asyncio
-    async def test_no_stamp_for_codex_app_server(self):
-        """codex_app_server turns bypass the api_messages build, so the
-        injected bytes are never sent — stamping would persist a lie."""
-        agent = _FakeAgent()
-        agent.api_mode = "codex_app_server"
-        with patch(
-            "hermes_cli.lifecycle.invoke_hook",
-            new_callable=AsyncMock,
-            return_value=[{"context": "PLUGIN-CTX"}],
-        ):
-            ctx = await _build(agent)
-        assert "api_content" not in ctx.messages[ctx.current_turn_user_idx]
-
 
 # ---------------------------------------------------------------------------
 # Flush: persist-override rows keep the sent bytes in the sidecar (#48677)

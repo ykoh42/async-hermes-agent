@@ -102,7 +102,6 @@ def _apply_runtime_config(agent: Any, config: Dict[str, Any]) -> None:
     agent._parallel_tool_call_guidance = bool(
         agent_config.get("parallel_tool_call_guidance", True)
     )
-    agent._environment_probe = bool(agent_config.get("environment_probe", True))
     try:
         agent._api_max_retries = max(1, int(agent_config.get("api_max_retries", 3)))
     except (TypeError, ValueError):
@@ -1050,7 +1049,7 @@ def init_agent(
     agent._deferred_provider_runtime = None
     agent.acp_command = acp_command or command
     agent.acp_args = list(acp_args or args or [])
-    if api_mode in {"chat_completions", "codex_responses", "anthropic_messages", "bedrock_converse", "codex_app_server"}:
+    if api_mode in {"chat_completions", "codex_responses", "anthropic_messages", "bedrock_converse"}:
         agent.api_mode = api_mode
     elif agent.provider == "openai-codex":
         agent.api_mode = "codex_responses"
@@ -1183,7 +1182,6 @@ def init_agent(
     agent._interrupt_message = None  # Optional message that triggered interrupt
     agent._execution_thread_id: int | None = None  # Set at run_conversation() start
     agent._interrupt_thread_signal_pending = False
-    agent._client_lock = threading.RLock()
     agent._model_request_active = threading.Event()
     agent._supports_active_turn_redirect = True
 
@@ -1346,21 +1344,6 @@ def init_agent(
     # repeated commentary is not re-sent before normalization can deduplicate it.
     agent._delivered_interim_texts: set[str] = set()
 
-    # Single-writer guard for the streaming delta sink (#65991). A stale/
-    # superseded stream (e.g. one the stale-stream detector reconnected past,
-    # whose socket abort raced and never actually stopped the old worker) must
-    # NOT keep writing tokens into the turn alongside the retry's stream —
-    # otherwise two coherent responses interleave token-by-token into one
-    # transcript. Every streaming attempt claims a monotonic writer token; the
-    # delta sink drops chunks whose calling thread holds a stale token. The
-    # threading.local means threads that never claimed (non-streaming callers)
-    # are never fenced, so the guard can only ever drop a superseded stream,
-    # never the single legitimate writer.
-    agent._stream_writer_lock = threading.Lock()
-    agent._stream_writer_token = 0
-    agent._stream_writer_tls = threading.local()
-    agent._stream_writer_dropped = 0
-
     # Optional current-turn user-message override used when the API-facing
     # user message intentionally differs from the persisted transcript
     # (e.g. CLI voice mode adds a temporary prefix for the live call only).
@@ -1417,6 +1400,13 @@ def init_agent(
             # Credential lookup and refresh are deliberately deferred to the
             # native async first-turn lifecycle.
             effective_key = api_key or ""
+            if callable(effective_key) and not isinstance(effective_key, str):
+                from agent.agent_runtime_helpers import AsyncCapabilityError
+
+                raise AsyncCapabilityError(
+                    "Callable credential providers are synchronous and unsupported "
+                    "by async-hermes-agent. Configure a static provider API key."
+                )
 
             agent.api_key = effective_key
             agent._anthropic_api_key = effective_key
@@ -1445,16 +1435,7 @@ def init_agent(
             }
             if not agent.quiet_mode:
                 print(f"🤖 AI Agent initialized with model: {agent.model} (Anthropic native)")
-                # ``effective_key`` may be a callable Entra ID bearer
-                # provider for Azure Foundry anthropic_messages mode.
-                # The Anthropic adapter installs an httpx event hook
-                # that mints a fresh JWT per request — we never
-                # invoke or inspect the callable in the banner.
-                from agent.azure_identity_adapter import is_token_provider
-
-                if is_token_provider(effective_key):
-                    print("🔑 Using credentials: Microsoft Entra ID")
-                elif isinstance(effective_key, str) and len(effective_key) > 12:
+                if isinstance(effective_key, str) and len(effective_key) > 12:
                     print(f"🔑 Using token: {effective_key[:8]}...{effective_key[-4:]}")
     elif agent.provider == "moa":
         # The facade is created at the first awaited runtime boundary.
@@ -1890,14 +1871,6 @@ def init_agent(
         except Exception:
             logger.debug("Persistent memory initialization skipped", exc_info=True)
 
-    # External memory providers are optional extensions.  The built-in
-    # file-backed USER.md/MEMORY.md path above remains available even when no
-    # provider plugin is installed.
-    agent._memory_manager = None
-
-    from agent.memory_manager import inject_memory_provider_tools as _inject_memory_provider_tools
-    _inject_memory_provider_tools(agent)
-
     # Tool-use enforcement config: "auto" (default — matches hardcoded
     # model list), true (always), false (never), or list of substrings.
     _agent_section = _agent_cfg.get("agent", {})
@@ -1927,7 +1900,6 @@ def init_agent(
     # the probe is skipped entirely (no subprocess calls, no system-prompt
     # line).  Useful for users on exotic setups where the probe heuristics
     # are noisy.
-    agent._environment_probe = bool(_agent_section.get("environment_probe", True))
     # Do not warm the local toolchain probe here. ``__init__`` is state-only
     # in the async package; launching subprocess work here would violate the
     # lazy lifecycle contract. The prompt may use an already-cached result,
@@ -2169,16 +2141,6 @@ def init_agent(
             2000,
         ),
     )
-    codex_app_server_auto_compaction = str(
-        _compression_cfg.get("codex_app_server_auto", "native") or "native"
-    ).lower()
-    if codex_app_server_auto_compaction not in {"native", "hermes", "off"}:
-        _ra().logger.warning(
-            "Invalid compression.codex_app_server_auto=%r; using 'native'. "
-            "Valid values are: native, hermes, off.",
-            codex_app_server_auto_compaction,
-        )
-        codex_app_server_auto_compaction = "native"
     # Opt-in idle compaction: compact a session up front when it resumes after
     # this many seconds of inactivity (0 = disabled). Time-based, so it
     # complements the size-based threshold above. Consumed by build_turn_context().
@@ -2646,7 +2608,6 @@ def init_agent(
         _cc._micro_compact_defrag_threshold_tokens = (
             compression_micro_compact_defrag_tokens
         )
-    agent.codex_app_server_auto_compaction = codex_app_server_auto_compaction
     agent.max_compression_attempts = compression_max_attempts
     agent.compression_idle_compact_after_seconds = (
         compression_idle_compact_after_seconds
@@ -2949,7 +2910,7 @@ async def initialize_deferred_runtime(agent: Any) -> bool:
 
             loaded_env_paths = await load_hermes_dotenv(
                 hermes_home=get_hermes_home(),
-                project_env=Path(__file__).resolve().parent.parent / ".env",
+                project_env=Path(__file__).absolute().parent.parent / ".env",
             )
             agent._dotenv_loaded = True
             for env_path in loaded_env_paths:
@@ -2970,13 +2931,6 @@ async def initialize_deferred_runtime(agent: Any) -> bool:
                 "contract and is disabled in async-hermes-agent. Use the built-in "
                 "'compressor' engine or provide a native async implementation."
             )
-        if getattr(agent, "_memory_manager", None) is not None:
-            raise AsyncCapabilityError(
-                "External MemoryManager providers have no native async lifecycle "
-                "contract and are disabled in async-hermes-agent. The built-in "
-                "file-backed memory tool remains available."
-            )
-
         if getattr(agent, "_runtime_config_loaded", False):
             config_snapshot = getattr(agent, "_runtime_config_snapshot", {})
             if not isinstance(config_snapshot, dict):
@@ -3025,12 +2979,6 @@ async def initialize_deferred_runtime(agent: Any) -> bool:
             raise AsyncCapabilityError(
                 "Copilot ACP uses a blocking subprocess transport and is disabled "
                 "in async-hermes-agent until it has a native async implementation."
-            )
-        if str(pending.get("api_mode") or "").strip() == "codex_app_server":
-            raise AsyncCapabilityError(
-                "Codex app-server compaction uses a blocking JSON-RPC transport and "
-                "is disabled in async-hermes-agent until a native async session "
-                "implementation is available."
             )
         if requested == "moa":
             # MoA has no external credentials or HTTP endpoint.  Its native

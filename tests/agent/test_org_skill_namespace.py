@@ -6,7 +6,7 @@ Covers the design agreed 2026-07-23 (bare-name first-class org skills):
  2. Fail-loud collisions — a personal/org name clash lists BOTH sides flagged;
     skill_view's existing multi-candidate guard refuses the bare name.
  3. Load-time provenance header — org skill content announces org + author.
- 4. Org mirrors are read-only (skill_manage guards) and curation-exempt.
+ 4. Org provenance remains visible through the retained list/view surface.
 """
 
 import json
@@ -113,10 +113,16 @@ class TestListingCollisionsAndLabels:
         skills = tmp_path / "skills"
         skills.mkdir(parents=True, exist_ok=True)
         monkeypatch.setattr(pb, "get_skills_dir", lambda: skills, raising=True)
+        async def _no_external_skills():
+            return []
+
+        async def _no_disabled_skills(*_args, **_kwargs):
+            return set()
+
         monkeypatch.setattr(
-            pb, "get_all_skills_dirs", lambda: [skills], raising=True
+            "tools.skills_tool._external_skills_dirs", _no_external_skills
         )
-        monkeypatch.setattr(pb, "get_disabled_skill_names", lambda *a, **k: set())
+        monkeypatch.setattr(pb, "_get_disabled_skill_names", _no_disabled_skills)
         monkeypatch.setattr(
             pb, "_skills_prompt_snapshot_path", lambda: tmp_path / "snap.json"
         )
@@ -157,53 +163,3 @@ class TestListingCollisionsAndLabels:
         _mark_active(skills, "org-1")
         out = await pb.build_skills_system_prompt()
         assert "[name collision" not in out
-
-
-class TestOrgSkillsAreEditableInPlace:
-    """The learning loop must work ON shared skills, not around them.
-
-    Refusing edits to `_org/` froze exactly the skills the most people use:
-    the agent is instructed to patch a skill the moment it finds a gap, and
-    "fork it to a personal skill first" is not something an agent does
-    mid-task. So edits land in place; org updates never clobber them; the
-    user (or auto-propose) shares them back.
-    """
-
-    def _org_skill(self, tmp_path, monkeypatch):
-        from tools import skill_manager_tool as smt
-        from agent import skill_utils as _sku
-
-        skills = tmp_path / "skills"
-        d = _mk_skill(
-            skills, f"{sku.ORG_MIRROR_DIR_NAME}/org-1/shared-x", name="shared-x"
-        )
-        _mark_active(skills, "org-1")
-        monkeypatch.setattr(smt, "_skills_dir", lambda: skills)
-        monkeypatch.setattr(
-            _sku, "get_all_skills_dirs", lambda: [skills], raising=True
-        )
-        return smt, skills, d
-
-    def test_patch_is_allowed_and_applied(self, tmp_path, monkeypatch):
-        smt, _skills, d = self._org_skill(tmp_path, monkeypatch)
-        result = smt._patch_skill("shared-x", "body", "improved")
-        assert result["success"] is True, result.get("error")
-        assert "improved" in (d / "SKILL.md").read_text(encoding="utf-8")
-
-    def test_delete_is_still_refused(self, tmp_path, monkeypatch):
-        smt, _skills, d = self._org_skill(tmp_path, monkeypatch)
-        guard = smt._org_mirror_write_guard("shared-x", d, "delete")
-        assert guard is not None and guard["success"] is False
-        assert "admin" in guard["error"]
-
-    def test_curation_is_allowed(self, tmp_path, monkeypatch):
-        from tools import skill_usage as su
-
-        skills = tmp_path / "skills"
-        d = _mk_skill(
-            skills, f"{sku.ORG_MIRROR_DIR_NAME}/org-1/shared-x", name="shared-x"
-        )
-        monkeypatch.setattr(su, "_skills_dir", lambda: skills)
-        # The curator must be able to improve shared skills — they are the
-        # highest-leverage ones in the system.
-        assert su.is_curation_eligible("shared-x", d) is True

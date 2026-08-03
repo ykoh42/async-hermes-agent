@@ -1000,7 +1000,7 @@ class BatchRunner:
         # Prepare configuration for batch tasks.
         #
         # ``self.api_key`` may be a zero-arg callable (Azure Foundry Entra ID
-        # bearer provider returned by ``agent.azure_identity_adapter``). Batch
+        # credential provider). Batch
         # tasks share the event loop, so keep the callable out of the task
         # configuration and let the agent resolve credentials from config when
         # needed, just as the old process worker did.

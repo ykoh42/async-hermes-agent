@@ -2429,6 +2429,7 @@ class TestAuxiliaryAuthRefreshRetry:
     @pytest.mark.asyncio
     async def test_refresh_provider_credentials_force_refreshes_anthropic_oauth_and_evicts_cache(self, monkeypatch):
         stale_client = MagicMock()
+        stale_client.aclose = AsyncMock()
         cache_key = ("anthropic", False, None, None, None)
 
         monkeypatch.setenv("ANTHROPIC_TOKEN", "")
@@ -2455,7 +2456,7 @@ class TestAuxiliaryAuthRefreshRetry:
 
         mock_refresh_oauth.assert_awaited_once_with("refresh-token")
         mock_write.assert_awaited_once_with("fresh-token", "refresh-token-2", 9999999999999)
-        stale_client.close.assert_called_once()
+        stale_client.aclose.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_refresh_provider_credentials_rejects_sync_vertex_refresh(self):

@@ -53,7 +53,7 @@ from hermes_cli.config import (
 )
 from hermes_constants import OPENROUTER_BASE_URL, secure_parent_dir
 from agent.credential_persistence import sanitize_borrowed_credential_payload
-from utils import atomic_replace, atomic_yaml_write, env_float, is_truthy_value
+from utils import env_float, is_truthy_value
 
 logger = logging.getLogger(__name__)
 
@@ -764,7 +764,7 @@ async def _resolve_zai_base_url(
         # break resolution — detection already succeeded; worst case the
         # next start re-probes.
         try:
-            async with _async_auth_store_transaction():
+            async with _auth_store_transaction():
                 # Reload auth_store under lock to avoid overwriting concurrent changes
                 auth_store = await _load_auth_store()
                 state_under_lock = _load_provider_state(auth_store, "zai") or {}
@@ -982,15 +982,15 @@ def _global_auth_file_path() -> Optional[Path]:
 
 _auth_target_lock_holders: Dict[str, threading.local] = {}
 _auth_target_lock_holders_guard = threading.Lock()
-_async_auth_store_locks: Dict[Tuple[int, str], asyncio.Lock] = {}
-_async_auth_store_locks_guard = threading.Lock()
+_auth_store_locks: Dict[Tuple[int, str], asyncio.Lock] = {}
+_auth_store_locks_guard = threading.Lock()
 
 
 
 
 
 
-def _async_auth_store_lock_for(target_path: Path) -> asyncio.Lock:
+def _auth_store_lock_for(target_path: Path) -> asyncio.Lock:
     """Return this event loop's lock for one auth-store path.
 
     The synchronous CLI still owns ``_auth_store_lock``.  The async agent must
@@ -1005,12 +1005,12 @@ def _async_auth_store_lock_for(target_path: Path) -> asyncio.Lock:
     except Exception:
         path_key = str(target_path)
     key = (id(loop), path_key)
-    with _async_auth_store_locks_guard:
-        return _async_auth_store_locks.setdefault(key, asyncio.Lock())
+    with _auth_store_locks_guard:
+        return _auth_store_locks.setdefault(key, asyncio.Lock())
 
 
 @asynccontextmanager
-async def _async_auth_store_transaction(
+async def _auth_store_transaction(
     target_path: Optional[Path] = None,
     *,
     timeout_seconds: float = AUTH_LOCK_TIMEOUT_SECONDS,
@@ -1024,15 +1024,16 @@ async def _async_auth_store_transaction(
     and the atomic replace below prevents torn JSON files.
     """
     auth_path = target_path or _auth_file_path()
-    task_lock = _async_auth_store_lock_for(auth_path)
+    task_lock = _auth_store_lock_for(auth_path)
     async with task_lock:
         lock_path = auth_path.with_suffix(".lock")
-        lock_path.parent.mkdir(parents=True, exist_ok=True)
-        fd: Optional[int] = None
+        await aiofiles.os.makedirs(lock_path.parent, exist_ok=True)
+        lock_handle = None
         acquired = False
         try:
             if fcntl is not None:
-                fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
+                lock_handle = await aiofiles.open(lock_path, "a+")
+                fd = lock_handle.fileno()
                 deadline = time.monotonic() + max(0.0, float(timeout_seconds))
                 while True:
                     try:
@@ -1045,12 +1046,12 @@ async def _async_auth_store_transaction(
                         await asyncio.sleep(0.05)
             yield
         finally:
-            if fd is not None:
+            if lock_handle is not None:
                 try:
                     if acquired:
-                        fcntl.flock(fd, fcntl.LOCK_UN)
+                        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
                 finally:
-                    os.close(fd)
+                    await lock_handle.close()
 
 
 
@@ -1146,7 +1147,7 @@ async def _load_auth_store(auth_file: Optional[Path] = None) -> Dict[str, Any]:
     repair/copy workflow, while a running agent must only log and fail closed.
     """
     auth_file = auth_file or _auth_file_path()
-    if not auth_file.exists():
+    if not await aiofiles.os.path.exists(auth_file):
         return {"version": AUTH_STORE_VERSION, "providers": {}}
     try:
         async with aiofiles.open(auth_file, "r", encoding="utf-8") as handle:
@@ -1179,14 +1180,14 @@ async def _load_auth_store(auth_file: Optional[Path] = None) -> Dict[str, Any]:
 async def _load_global_auth_store() -> Dict[str, Any]:
     """Read the profile fallback store without blocking an async turn."""
     global_path = _global_auth_file_path()
-    if global_path is None or not global_path.exists():
+    if global_path is None or not await aiofiles.os.path.exists(global_path):
         return {}
     if os.environ.get("PYTEST_CURRENT_TEST"):
         real_home_env = os.environ.get("HOME", "")
         if real_home_env:
             real_root = Path(real_home_env) / ".hermes" / "auth.json"
             try:
-                if global_path.resolve(strict=False) == real_root.resolve(strict=False):
+                if os.path.abspath(global_path) == os.path.abspath(real_root):
                     return {}
             except Exception:
                 pass
@@ -1303,29 +1304,34 @@ async def _save_auth_store(
     tiny synchronous syscall: it is atomic and cannot wait on filesystem I/O.
     """
     auth_file = target_path or _auth_file_path()
-    auth_file.parent.mkdir(parents=True, exist_ok=True)
+    await aiofiles.os.makedirs(auth_file.parent, exist_ok=True)
     secure_parent_dir(auth_file)
     auth_store["version"] = AUTH_STORE_VERSION
     auth_store["updated_at"] = datetime.now(timezone.utc).isoformat()
     payload = json.dumps(auth_store, indent=2) + "\n"
     tmp_path = auth_file.with_name(f"{auth_file.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}")
-    fd = os.open(
-        str(tmp_path),
-        os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-        stat.S_IRUSR | stat.S_IWUSR,
-    )
-    os.close(fd)
+    def secure_opener(file: str, flags: int) -> int:
+        return os.open(
+            file,
+            flags | os.O_EXCL,
+            stat.S_IRUSR | stat.S_IWUSR,
+        )
+
     try:
-        async with aiofiles.open(tmp_path, "w", encoding="utf-8") as handle:
+        async with aiofiles.open(
+            tmp_path,
+            "w",
+            encoding="utf-8",
+            opener=secure_opener,
+        ) as handle:
             await handle.write(payload)
             await handle.flush()
-        os.replace(tmp_path, auth_file)
+        await aiofiles.os.replace(tmp_path, auth_file)
         return auth_file
     finally:
         try:
-            if tmp_path.exists():
-                tmp_path.unlink()
-        except OSError:
+            await aiofiles.os.remove(tmp_path)
+        except FileNotFoundError:
             pass
 
 
@@ -1342,7 +1348,7 @@ async def write_credential_pool(
     The transaction itself is non-blocking for the event loop.
     """
     removed = {rid for rid in (removed_ids or ()) if rid}
-    async with _async_auth_store_transaction():
+    async with _auth_store_transaction():
         auth_store = await _load_auth_store()
         pool = auth_store.get("credential_pool")
         if not isinstance(pool, dict):

@@ -221,15 +221,4 @@ def build_profile_secret_scope(hermes_home: Path) -> Dict[str, str]:
     home = Path(hermes_home)
     secrets = load_env_file(home / ".env")
 
-    try:
-        from hermes_cli.env_loader import get_secret_source_values
-        external_secrets = get_secret_source_values(home)
-    except Exception:
-        external_secrets = {}
-
-    for key, value in external_secrets.items():
-        if _is_global_env(key):
-            continue
-        secrets[key] = value
-
     return secrets

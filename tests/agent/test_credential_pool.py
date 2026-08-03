@@ -618,35 +618,6 @@ async def test_credential_pool_never_selects_empty_borrowed_entry():
     assert await pool.acquire_lease() is None
 
 
-async def test_load_pool_persists_bitwarden_origin_metadata_without_secret(tmp_path, monkeypatch):
-    """Bitwarden-injected env vars retain source metadata but not raw values."""
-    sentinel = "S3NTINEL_DO_NOT_PERSIST_BITWARDEN"
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
-    monkeypatch.setenv("OPENROUTER_API_KEY", sentinel)
-    monkeypatch.setattr(
-        "hermes_cli.env_loader.get_secret_source",
-        lambda env_var: "bitwarden" if env_var == "OPENROUTER_API_KEY" else None,
-    )
-    _write_auth_store(tmp_path, {"version": 1, "providers": {}})
-
-    from agent.credential_pool import load_pool
-
-    pool = await load_pool("openrouter")
-    entry = await pool.select()
-
-    assert entry is not None
-    assert entry.access_token == sentinel
-    assert entry.source == "env:OPENROUTER_API_KEY"
-
-    auth_text = (tmp_path / "hermes" / "auth.json").read_text()
-    assert sentinel not in auth_text
-    persisted = json.loads(auth_text)["credential_pool"]["openrouter"][0]
-    assert persisted["source"] == "env:OPENROUTER_API_KEY"
-    assert persisted["secret_source"] == "bitwarden"
-    assert "access_token" not in persisted
-
-
-
 async def test_load_pool_sanitizes_legacy_raw_borrowed_entry_when_value_unchanged(tmp_path, monkeypatch):
     """Existing raw env-seeded pool entries are rewritten even if the env value matches."""
     sentinel = "S3NTINEL_DO_NOT_PERSIST_LEGACY_RAW"

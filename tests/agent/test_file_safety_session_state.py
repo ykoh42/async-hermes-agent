@@ -13,6 +13,8 @@ from pathlib import Path
 
 import pytest
 
+pytestmark = pytest.mark.asyncio
+
 
 @pytest.fixture()
 def fake_homes(tmp_path, monkeypatch):
@@ -34,15 +36,15 @@ def fake_homes(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("relative", ["state.db", "sessions/session_abc.json"])
-def test_session_state_paths_are_write_denied(fake_homes, relative):
-    from agent.file_safety import is_write_denied
+async def test_session_state_paths_are_write_denied(fake_homes, relative):
+    from agent.file_safety import get_write_denied_error
 
     _root, profile = fake_homes
     target = profile / relative
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text("existing transcript", encoding="utf-8")
 
-    assert is_write_denied(str(target)) is True
+    assert await get_write_denied_error(str(target)) is not None
 
 
 

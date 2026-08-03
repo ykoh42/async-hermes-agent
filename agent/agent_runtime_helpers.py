@@ -29,9 +29,13 @@ import logging
 import re
 import threading
 import time
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+
+import aiofiles
+import aiofiles.os
 
 from hermes_cli.timeouts import get_provider_request_timeout
 from agent.prompt_builder import format_steer_marker
@@ -40,7 +44,7 @@ from agent.trajectory import convert_scratchpad_to_think
 from agent.credential_pool import STATUS_EXHAUSTED
 from agent.error_classifier import FailoverReason
 from agent.turn_context import drop_stale_api_content
-from utils import base_url_host_matches, base_url_hostname, env_var_enabled, atomic_json_write
+from utils import base_url_host_matches, base_url_hostname, env_var_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -79,8 +83,7 @@ def agent_runtime_owns_post_tool_hook(agent: Any, function_name: str) -> bool:
         return True
     if getattr(agent, "_context_engine_tool_names", None) and function_name in agent._context_engine_tool_names:
         return True
-    memory_manager = getattr(agent, "_memory_manager", None)
-    return bool(memory_manager and memory_manager.has_tool(function_name))
+    return False
 
 
 def convert_to_trajectory_format(agent, messages: List[Dict[str, Any]], user_query: str, completed: bool) -> List[Dict[str, Any]]:
@@ -1749,7 +1752,7 @@ def extract_reasoning(agent, assistant_message) -> Optional[str]:
 
 
 
-def dump_api_request_debug(
+async def dump_api_request_debug(
     agent,
     api_kwargs: Dict[str, Any],
     *,
@@ -1830,7 +1833,24 @@ def dump_api_request_debug(
         from agent.redact import redact_sensitive_text
         _serialized = json.dumps(dump_payload, ensure_ascii=False, indent=2, default=str)
         _redacted_payload = json.loads(redact_sensitive_text(_serialized, force=True))
-        atomic_json_write(dump_file, _redacted_payload, default=str)
+        temporary = dump_file.with_name(f".{dump_file.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            async with aiofiles.open(temporary, "w", encoding="utf-8") as handle:
+                await handle.write(
+                    json.dumps(
+                        _redacted_payload,
+                        ensure_ascii=False,
+                        indent=2,
+                        default=str,
+                    )
+                )
+                await handle.flush()
+            await aiofiles.os.replace(temporary, dump_file)
+        finally:
+            try:
+                await aiofiles.os.remove(temporary)
+            except FileNotFoundError:
+                pass
 
         agent._vprint(f"{agent.log_prefix}🧾 Request debug dump written to: {dump_file}")
 

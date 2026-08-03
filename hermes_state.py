@@ -590,7 +590,7 @@ class SessionDB:
             if not self.read_only and not await aiofiles.os.path.exists(self._db_path.parent):
                 await aiofiles.os.makedirs(self._db_path.parent, exist_ok=True)
             database = (
-                f"file:{self._db_path.resolve()}?mode=ro"
+                f"file:{os.path.abspath(self._db_path)}?mode=ro"
                 if self.read_only
                 else self._db_path
             )

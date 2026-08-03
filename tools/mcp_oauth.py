@@ -44,20 +44,18 @@ import secrets
 import socket
 import stat
 import sys
-import threading
 import time
-import webbrowser
 from contextlib import contextmanager
-from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 import aiofiles
 import aiofiles.os
-from hermes_constants import secure_parent_dir
 
 logger = logging.getLogger(__name__)
+_realpath = aiofiles.os.wrap(os.path.realpath)
+_chmod = aiofiles.os.wrap(os.chmod)
 
 # ---------------------------------------------------------------------------
 # Lazy imports -- MCP SDK with OAuth support is optional
@@ -149,12 +147,8 @@ class OAuthNonInteractiveError(RuntimeError):
 # Port used by the most recent build_oauth_auth() call.  Exposed so that
 # tests can verify the callback server and the redirect_uri share a port.
 _oauth_port: int | None = None
-# Interactivity gate for OAuth stdin prompts. A ContextVar (NOT threading.local)
-# is required: background MCP discovery sets this on the discovery thread, but
-# the actual connect+OAuth runs on the dedicated `mcp-event-loop` thread via
-# run_coroutine_threadsafe. asyncio copies the *calling context* into the
-# scheduled coroutine, so a ContextVar propagates across that boundary while a
-# threading.local would not — see #35927. Default True (interactive allowed).
+# Interactivity gate for OAuth stdin prompts. ContextVar keeps concurrent
+# discovery and connection tasks isolated without process-global mutation.
 _oauth_interactive_enabled: "contextvars.ContextVar[bool]" = contextvars.ContextVar(
     "_oauth_interactive_enabled", default=True
 )
@@ -345,35 +339,13 @@ def force_interactive_oauth():
 def suppress_interactive_oauth():
     """Disable stdin-based OAuth prompts for the current execution context.
 
-    Uses a ContextVar so the suppression propagates from a background-discovery
-    thread onto the coroutine scheduled (via run_coroutine_threadsafe) on the
-    dedicated MCP event-loop thread — where the OAuth callback actually runs
-    (#35927). A threading.local would not cross that thread boundary.
+    Uses a ContextVar so suppression propagates into child connection tasks.
     """
     token = _oauth_interactive_enabled.set(False)
     try:
         yield
     finally:
         _oauth_interactive_enabled.reset(token)
-
-
-def _can_open_browser() -> bool:
-    """Return True if opening a browser is likely to work."""
-    # Explicit SSH session → no local display
-    if os.environ.get("SSH_CLIENT") or os.environ.get("SSH_TTY"):
-        return False
-    # macOS and Windows usually have a display
-    if os.name == "nt":
-        return True
-    try:
-        if os.uname().sysname == "Darwin":
-            return True
-    except AttributeError:
-        pass
-    # Linux/other posix: need DISPLAY or WAYLAND_DISPLAY
-    if os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"):
-        return True
-    return False
 
 
 async def _read_json(path: Path) -> dict | None:
@@ -391,16 +363,28 @@ async def _read_json(path: Path) -> dict | None:
 async def _write_json(path: Path, data: dict) -> None:
     """Atomically write OAuth state through the native async file boundary."""
     await aiofiles.os.makedirs(path.parent, exist_ok=True)
-    secure_parent_dir(path)
+    resolved_parent = Path(await _realpath(path.parent))
+    if resolved_parent != Path("/") and len(resolved_parent.parts) >= 3:
+        try:
+            await _chmod(resolved_parent, 0o700)
+        except OSError:
+            pass
     tmp = path.with_suffix(f".tmp.{os.getpid()}.{secrets.token_hex(4)}")
-    try:
-        fd = os.open(
-            str(tmp),
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+
+    def secure_opener(file: str, flags: int) -> int:
+        return os.open(
+            file,
+            flags | os.O_EXCL,
             stat.S_IRUSR | stat.S_IWUSR,
         )
-        os.close(fd)
-        async with aiofiles.open(tmp, "w", encoding="utf-8") as handle:
+
+    try:
+        async with aiofiles.open(
+            tmp,
+            "w",
+            encoding="utf-8",
+            opener=secure_opener,
+        ) as handle:
             await handle.write(json.dumps(data, indent=2, default=str))
             await handle.flush()
         await aiofiles.os.replace(tmp, path)
@@ -662,26 +646,33 @@ class HermesTokenStorage:
 # ---------------------------------------------------------------------------
 
 
-def _make_callback_handler() -> tuple[type, dict]:
-    """Create a per-flow callback HTTP handler class with its own result dict.
+def _make_callback_handler():
+    """Create a native-async HTTP callback and isolated result state."""
+    result: dict[str, Any] = {
+        "auth_code": None,
+        "state": None,
+        "error": None,
+        "ready": asyncio.Event(),
+    }
 
-    Returns ``(HandlerClass, result_dict)`` where *result_dict* is a mutable
-    dict that the handler writes ``auth_code`` and ``state`` into when the
-    OAuth redirect arrives.  Each call returns a fresh pair so concurrent
-    flows don't stomp on each other.
-    """
-    result: dict[str, Any] = {"auth_code": None, "state": None, "error": None}
-
-    class _Handler(BaseHTTPRequestHandler):
-        def do_GET(self) -> None:  # noqa: N802
-            params = parse_qs(urlparse(self.path).query)
+    async def handle_callback(
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+    ) -> None:
+        try:
+            request_line = await asyncio.wait_for(reader.readline(), timeout=10)
+            parts = request_line.decode("ascii", errors="replace").split()
+            target = parts[1] if len(parts) >= 2 else "/"
+            params = parse_qs(urlparse(target).query)
             code = params.get("code", [None])[0]
             state = params.get("state", [None])[0]
             error = params.get("error", [None])[0]
 
-            result["auth_code"] = code
-            result["state"] = state
-            result["error"] = error
+            if result["auth_code"] is None and result["error"] is None:
+                result["auth_code"] = code
+                result["state"] = state
+                result["error"] = error
+                result["ready"].set()
 
             body = (
                 "<html><body><h2>Authorization Successful</h2>"
@@ -690,15 +681,25 @@ def _make_callback_handler() -> tuple[type, dict]:
                 "<html><body><h2>Authorization Failed</h2>"
                 f"<p>Error: {error or 'unknown'}</p></body></html>"
             )
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.end_headers()
-            self.wfile.write(body.encode())
+            payload = body.encode()
+            writer.write(
+                b"HTTP/1.1 200 OK\r\n"
+                b"Content-Type: text/html; charset=utf-8\r\n"
+                b"Connection: close\r\n"
+                + f"Content-Length: {len(payload)}\r\n\r\n".encode("ascii")
+                + payload
+            )
+            await writer.drain()
+        except (OSError, UnicodeError, asyncio.TimeoutError):
+            logger.debug("OAuth callback connection failed", exc_info=True)
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except OSError:
+                pass
 
-        def log_message(self, fmt: str, *args: Any) -> None:
-            logger.debug("OAuth callback: %s", fmt % args)
-
-    return _Handler, result
+    return handle_callback, result
 
 
 # ---------------------------------------------------------------------------
@@ -788,17 +789,7 @@ def _make_redirect_handler(port: int, redirect_uri: str | None = None):
                 file=sys.stderr,
             )
 
-        if _can_open_browser():
-            try:
-                opened = webbrowser.open(authorization_url)
-                if opened:
-                    print("  (Browser opened automatically.)\n", file=sys.stderr)
-                else:
-                    print("  (Could not open browser — please open the URL manually.)\n", file=sys.stderr)
-            except Exception:
-                print("  (Could not open browser — please open the URL manually.)\n", file=sys.stderr)
-        else:
-            print("  (Headless environment detected — open the URL manually.)\n", file=sys.stderr)
+        print("  Open the URL in a browser to continue.\n", file=sys.stderr)
 
     return _redirect_handler
 
@@ -867,7 +858,7 @@ def _make_callback_waiter(port: int):
             "authorization without binding a callback listener."
         )
 
-        handler_cls, result = _make_callback_handler()
+        callback_handler, result = _make_callback_handler()
 
         # Start a temporary server on this flow's port, adopting the socket
         # reserved at port-selection time when one exists. Holding the bound
@@ -878,20 +869,16 @@ def _make_callback_waiter(port: int):
         # TIME_WAIT socket from a previous flow cannot block the next one
         # (#44590).
         try:
-            server = HTTPServer(
-                ("127.0.0.1", port), handler_cls, bind_and_activate=False
-            )
             reserved = _reserved_sockets.pop(port, None)
             if reserved is not None:
-                # Adopt the reserved (already bound) socket and start listening.
-                server.socket.close()
-                server.socket = reserved
-                server.server_address = reserved.getsockname()
-                server.server_activate()
+                server = await asyncio.start_server(callback_handler, sock=reserved)
             else:
-                server.allow_reuse_address = True
-                server.server_bind()
-                server.server_activate()
+                server = await asyncio.start_server(
+                    callback_handler,
+                    host="127.0.0.1",
+                    port=port,
+                    reuse_address=True,
+                )
         except OSError as exc:
             # The loopback callback port is genuinely in use: a concurrent OAuth
             # flow, a leftover listener, or a fixed `oauth.redirect_port` that
@@ -904,14 +891,7 @@ def _make_callback_waiter(port: int):
                 "in the server config, then retry."
             ) from exc
 
-        server_thread = threading.Thread(target=server.handle_request, daemon=True)
-        server_thread.start()
-
-        # Optional paste-fallback thread: only on interactive TTYs. Reads one
-        # line from stdin and writes the parsed code/state into the shared
-        # result dict. The HTTP listener and this thread race for the result;
-        # whichever fills it first wins.
-        paste_thread: threading.Thread | None = None
+        paste_task: asyncio.Task | None = None
         if _is_interactive():
             print(
                 "\n  Or paste the redirect URL here (or the ``?code=...&state=...`` "
@@ -920,22 +900,18 @@ def _make_callback_waiter(port: int):
                 file=sys.stderr,
                 flush=True,
             )
-            paste_thread = threading.Thread(
-                target=_paste_callback_reader, args=(result,), daemon=True
-            )
-            paste_thread.start()
+            paste_task = asyncio.create_task(_wait_for_pasted_callback(result))
 
-        timeout = 300.0
-        poll_interval = 0.5
-        elapsed = 0.0
         try:
-            while elapsed < timeout:
-                if result["auth_code"] is not None or result["error"] is not None:
-                    break
-                await asyncio.sleep(poll_interval)
-                elapsed += poll_interval
+            await asyncio.wait_for(result["ready"].wait(), timeout=300.0)
+        except asyncio.TimeoutError:
+            pass
         finally:
-            server.server_close()
+            server.close()
+            await server.wait_closed()
+            if paste_task is not None:
+                paste_task.cancel()
+                await asyncio.gather(paste_task, return_exceptions=True)
 
         if result["error"] == _USER_SKIPPED_SENTINEL:
             raise OAuthNonInteractiveError("user_skipped")
@@ -952,8 +928,40 @@ def _make_callback_waiter(port: int):
     return _wait
 
 
-def _paste_callback_reader(result: dict) -> None:
-    """Read one line from stdin, parse it as an OAuth redirect, write to result.
+async def _wait_for_pasted_callback(result: dict) -> None:
+    """Wait for one terminal line without blocking the event loop."""
+    loop = asyncio.get_running_loop()
+    try:
+        descriptor = sys.stdin.fileno()
+    except (AttributeError, OSError, ValueError):
+        return
+
+    future = loop.create_future()
+
+    def read_ready() -> None:
+        if future.done():
+            return
+        try:
+            future.set_result(sys.stdin.readline())
+        except (KeyboardInterrupt, OSError, ValueError) as exc:
+            future.set_exception(exc)
+
+    try:
+        loop.add_reader(descriptor, read_ready)
+    except (AttributeError, NotImplementedError, OSError):
+        return
+    try:
+        line = await future
+    except (KeyboardInterrupt, OSError, ValueError):
+        return
+    finally:
+        loop.remove_reader(descriptor)
+
+    _apply_pasted_callback(line, result)
+
+
+def _apply_pasted_callback(line: str, result: dict) -> None:
+    """Parse one pasted OAuth redirect line into the callback result.
 
     Accepts any of:
       - Full redirect URL: ``http://127.0.0.1:37949/callback?code=...&state=...``
@@ -964,13 +972,8 @@ def _paste_callback_reader(result: dict) -> None:
         :class:`OAuthNonInteractiveError` so MCP connection setup treats this
         as a non-fatal "user opted out" and continues without that server.
 
-    Failures to parse, EOF, or interrupts are swallowed — this is best-effort
-    fallback alongside the HTTP listener, which remains the primary path.
+    Invalid or empty input is ignored; the HTTP listener remains primary.
     """
-    try:
-        line = sys.stdin.readline()
-    except (KeyboardInterrupt, OSError, ValueError):
-        return
     if not line:
         return  # EOF
     line = line.strip()
@@ -989,6 +992,7 @@ def _paste_callback_reader(result: dict) -> None:
         if result.get("auth_code") is not None or result.get("error") is not None:
             return
         result["error"] = _USER_SKIPPED_SENTINEL
+        result["ready"].set()
         print(
             "  OAuth skipped. Run `hermes mcp login <server>` later to "
             "authenticate, or set ``enabled: false`` on that server in "
@@ -1032,6 +1036,7 @@ def _paste_callback_reader(result: dict) -> None:
     result["auth_code"] = code
     result["state"] = state
     result["error"] = error
+    result["ready"].set()
     if code:
         print("  Got authorization code from paste — completing flow.", file=sys.stderr)
 

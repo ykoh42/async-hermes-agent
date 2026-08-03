@@ -42,7 +42,6 @@ def _make_parent(depth: int = 0, session_id: str = "parent-1"):
     parent._print_fn = None
     parent.tool_progress_callback = None
     parent.thinking_callback = None
-    parent._memory_manager = None
     parent.session_id = session_id
     return parent
 
@@ -76,7 +75,7 @@ def _stub_child_builder(monkeypatch):
 def _register_capturing_hook():
     captured = []
 
-    def _cb(**kwargs):
+    async def _cb(**kwargs):
         kwargs["_thread"] = threading.current_thread()
         captured.append(kwargs)
 

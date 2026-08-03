@@ -35,13 +35,14 @@ import json
 import logging
 import math
 import os
-import tempfile
 import time
 import uuid
 import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+
+import aiofiles.tempfile
 
 from agent.context_engine import (
     automatic_compaction_status_message,
@@ -489,13 +490,6 @@ async def recover_rotated_compression_session(
     agent: Any,
 ) -> Optional[List[Dict[str, Any]]]:
     """Recover a stale live agent before a new turn writes to its old parent."""
-    if getattr(agent, "_memory_manager", None) is not None:
-        from agent.agent_runtime_helpers import AsyncCapabilityError
-
-        raise AsyncCapabilityError(
-            "External MemoryManager providers have no native async compression "
-            "boundary API and are disabled in async-hermes-agent."
-        )
     session_db = (
         agent._session_db
         if getattr(agent, "_session_db", None) is not None
@@ -1234,13 +1228,6 @@ async def compress_context(
         prompt — the session is NOT rotated.  Callers should detect the
         no-op via ``len(returned) == len(input)`` and stop the retry loop.
     """
-    if getattr(agent, "_memory_manager", None) is not None:
-        from agent.agent_runtime_helpers import AsyncCapabilityError
-
-        raise AsyncCapabilityError(
-            "External MemoryManager providers have no native async compression "
-            "boundary API and are disabled in async-hermes-agent."
-        )
     if (
         defer_context_engine_notification
         and callable(getattr(agent, _PENDING_CONTEXT_ENGINE_NOTIFICATION, None))
@@ -1274,36 +1261,6 @@ async def compress_context(
         })
     except Exception:
         pass
-
-    # Codex app-server sessions: the codex agent owns the real thread context;
-    # Hermes' summarizer would only rewrite a local mirror without shrinking
-    # the actual thread (#36801). Route compaction to the app server's own
-    # thread/compact mechanism. Behavior is controlled by
-    # ``compression.codex_app_server_auto`` (native|hermes|off).
-    # The memory-provider context handoff below is intentionally Hermes-only:
-    # the app server does not expose its native summary prompt, so there is no
-    # truthful injection point for ``on_pre_compress()`` return text here.
-    if getattr(agent, "api_mode", None) == "codex_app_server":
-        _codex_fence_entered = False
-        if commit_fence is not None:
-            _codex_fence_entered = commit_fence.begin_commit()
-            if not _codex_fence_entered:
-                existing_prompt = getattr(agent, "_cached_system_prompt", None)
-                if not existing_prompt:
-                    existing_prompt = await agent._build_system_prompt(system_message)
-                return messages, existing_prompt
-        try:
-            return await _compress_context_via_codex_app_server(
-                agent,
-                messages,
-                system_message,
-                approx_tokens=approx_tokens,
-                task_id=task_id,
-                force=force,
-            )
-        finally:
-            if _codex_fence_entered:
-                commit_fence.finish_commit()
 
     # Every automatic entrypoint must honor the latest durable cooldown and
     # breaker state. Another agent may have cleared a guard since this
@@ -1937,7 +1894,6 @@ async def compress_context(
         # block during on_pre_compress(), so they retain the rebuild path.
         if (
             cached_system_prompt is not None
-            and getattr(agent, "_memory_manager", None) is None
             and _cached_prompt_reflects_builtin_memory(agent, cached_system_prompt)
         ):
             new_system_prompt = cached_system_prompt
@@ -2082,17 +2038,6 @@ async def compress_context(
                         pass
                     agent._session_db_created = True
                     split_status = "rotated_committed"
-                    # Carry a persistent /goal onto the continuation session.
-                    # Compression mints a fresh child id; load_goal does a flat
-                    # per-session lookup with no parent walk, so without this an
-                    # active goal silently dies at the boundary (#33618).
-                    try:
-                        from hermes_cli.goals import migrate_goal_to_session
-                        await migrate_goal_to_session(
-                            old_session_id, agent.session_id, reason="compression"
-                        )
-                    except Exception as _goal_err:
-                        logger.debug("Could not migrate goal on compression: %s", _goal_err)
                     # Auto-number the title for the continuation session
                     if old_title:
                         try:
@@ -2288,155 +2233,6 @@ async def compress_context(
                 commit_fence.finish_commit()
 
 
-async def _compress_context_via_codex_app_server(
-    agent: Any,
-    messages: list,
-    system_message: Optional[str],
-    *,
-    approx_tokens: Optional[int] = None,
-    task_id: str = "default",
-    force: bool = False,
-) -> Tuple[list, str]:
-    """Route compaction to Codex app-server for Codex-owned threads.
-
-    Hermes' normal compressor rewrites the local OpenAI-style transcript.
-    That does not shrink the actual Codex app-server thread context. For this
-    runtime, ask Codex to compact its own thread and keep Hermes' transcript
-    unchanged.
-    """
-    auto_mode = str(
-        getattr(agent, "codex_app_server_auto_compaction", "native") or "native"
-    ).lower()
-    if auto_mode not in {"native", "hermes", "off"}:
-        auto_mode = "native"
-    if not force and auto_mode != "hermes":
-        logger.info(
-            "codex app-server compaction skipped: mode=%s force=false "
-            "(session=%s messages=%d tokens=~%s)",
-            auto_mode,
-            getattr(agent, "session_id", None) or "none",
-            len(messages),
-            f"{approx_tokens:,}" if approx_tokens else "unknown",
-        )
-        existing_prompt = getattr(agent, "_cached_system_prompt", None)
-        if not existing_prompt:
-            existing_prompt = await agent._build_system_prompt(system_message)
-        return messages, existing_prompt
-
-    codex_session = getattr(agent, "_codex_session", None)
-    if codex_session is None:
-        logger.info(
-            "codex app-server compaction skipped: no active codex thread "
-            "(session=%s messages=%d tokens=~%s)",
-            getattr(agent, "session_id", None) or "none",
-            len(messages),
-            f"{approx_tokens:,}" if approx_tokens else "unknown",
-        )
-        existing_prompt = getattr(agent, "_cached_system_prompt", None)
-        if not existing_prompt:
-            existing_prompt = await agent._build_system_prompt(system_message)
-        return messages, existing_prompt
-
-    logger.info(
-        "codex app-server compaction started: session=%s messages=%d tokens=~%s",
-        getattr(agent, "session_id", None) or "none",
-        len(messages),
-        f"{approx_tokens:,}" if approx_tokens else "unknown",
-    )
-    try:
-        agent._emit_status(COMPACTION_STATUS)
-    except Exception:
-        pass
-
-    _compaction_done_emitted = False
-
-    def _complete_compaction_lifecycle() -> None:
-        nonlocal _compaction_done_emitted
-        if _compaction_done_emitted:
-            return
-        _compaction_done_emitted = True
-        _emit_compaction_done(agent)
-
-    _activity_heartbeat: Optional[_AsyncCompressionActivityHeartbeat] = None
-    try:
-        _activity_heartbeat = _AsyncCompressionActivityHeartbeat(agent).start()
-        compact = getattr(codex_session, "acompact_thread", None)
-        if not callable(compact):
-            raise RuntimeError(
-                "Codex app-server session has no native async compact_thread()"
-            )
-        result = compact()
-        if not inspect.isawaitable(result):
-            raise RuntimeError(
-                "Codex app-server compact_thread() is synchronous; refusing to "
-                "block the async event loop"
-            )
-        result = await result
-    except BaseException:
-        if _activity_heartbeat is not None:
-            await _activity_heartbeat.stop("context compression failed")
-        _complete_compaction_lifecycle()
-        raise
-
-    if getattr(result, "interrupted", False) or getattr(result, "error", None):
-        await _activity_heartbeat.stop("context compression failed")
-    else:
-        await _activity_heartbeat.stop("context compression completed")
-
-    if getattr(result, "should_retire", False):
-        try:
-            codex_session.close()
-        except Exception:
-            pass
-        agent._codex_session = None
-
-    if getattr(result, "interrupted", False) or getattr(result, "error", None):
-        try:
-            agent._emit_warning(
-                f"⚠ Codex app-server compaction failed: {result.error}"
-            )
-        except Exception:
-            pass
-        existing_prompt = getattr(agent, "_cached_system_prompt", None)
-        if not existing_prompt:
-            existing_prompt = await agent._build_system_prompt(system_message)
-        _complete_compaction_lifecycle()
-        return messages, existing_prompt
-
-    try:
-        from agent.codex_runtime import (
-            _record_codex_app_server_compaction,
-            _record_codex_app_server_usage,
-        )
-
-        _record_codex_app_server_compaction(
-            agent,
-            result,
-            approx_tokens=approx_tokens,
-            force=True,
-        )
-        # An empty usage report must consume the pending post-compaction verdict
-        # rather than leaving preflight deferral armed until some unrelated later
-        # Codex turn supplies usage. Minimal external test engines may not expose
-        # the ContextEngine update hook; preserve their existing bookkeeping.
-        if hasattr(agent.context_compressor, "update_from_response"):
-            _record_codex_app_server_usage(agent, result)
-    except Exception:
-        logger.debug("codex compaction bookkeeping failed", exc_info=True)
-
-    logger.info(
-        "codex app-server compaction done: session=%s thread=%s turn=%s",
-        getattr(agent, "session_id", None) or "none",
-        getattr(result, "thread_id", None) or "",
-        getattr(result, "turn_id", None) or "",
-    )
-    existing_prompt = getattr(agent, "_cached_system_prompt", None)
-    if not existing_prompt:
-        existing_prompt = await agent._build_system_prompt(system_message)
-    _complete_compaction_lifecycle()
-    return messages, existing_prompt
-
-
 async def try_shrink_image_parts_in_messages(
     api_messages: list,
     *,
@@ -2505,7 +2301,7 @@ async def try_shrink_image_parts_in_messages(
         except Exception:
             return None
 
-    def _shrink_data_url(url: str) -> tuple:
+    async def _shrink_data_url(url: str) -> tuple:
         """Return ``(resized_url, unshrinkable)`` for a data URL.
 
         ``resized_url`` is a smaller/dimension-correct data URL, or None when
@@ -2553,23 +2349,17 @@ async def try_shrink_image_parts_in_messages(
                 "image/png": ".png", "image/gif": ".gif", "image/webp": ".webp",
                 "image/jpeg": ".jpg", "image/jpg": ".jpg", "image/bmp": ".bmp",
             }.get(mime, ".jpg")
-            tmp = tempfile.NamedTemporaryFile(
-                prefix="hermes_shrink_", suffix=suffix, delete=False,
-            )
-            try:
-                tmp.write(raw)
-                tmp.close()
+            async with aiofiles.tempfile.NamedTemporaryFile(
+                prefix="hermes_shrink_", suffix=suffix
+            ) as tmp:
+                await tmp.write(raw)
+                await tmp.flush()
                 resized = _resize_image_for_vision(
                     Path(tmp.name),
                     mime_type=mime,
                     max_base64_bytes=target_bytes,
                     max_dimension=max_dimension,
                 )
-            finally:
-                try:
-                    Path(tmp.name).unlink(missing_ok=True)
-                except Exception:
-                    pass
             if not resized:
                 # Resize returned nothing — Pillow couldn't help.
                 return None, True
@@ -2663,7 +2453,7 @@ async def try_shrink_image_parts_in_messages(
             if ptype == "image":
                 source = part.get("source")
                 url = _source_to_data_url(source)
-                resized, unshrinkable = _shrink_data_url(url or "")
+                resized, unshrinkable = await _shrink_data_url(url or "")
                 if resized and isinstance(source, dict):
                     if new_content is None:
                         new_content = list(content)
@@ -2682,7 +2472,7 @@ async def try_shrink_image_parts_in_messages(
             # OpenAI Responses: {"image_url": "data:..."}
             if isinstance(image_value, dict):
                 url = image_value.get("url", "")
-                resized, unshrinkable = _shrink_data_url(url)
+                resized, unshrinkable = await _shrink_data_url(url)
                 if resized:
                     if new_content is None:
                         new_content = list(content)
@@ -2694,7 +2484,7 @@ async def try_shrink_image_parts_in_messages(
                 elif unshrinkable:
                     unshrinkable_oversized += 1
             elif isinstance(image_value, str):
-                resized, unshrinkable = _shrink_data_url(image_value)
+                resized, unshrinkable = await _shrink_data_url(image_value)
                 if resized:
                     if new_content is None:
                         new_content = list(content)
