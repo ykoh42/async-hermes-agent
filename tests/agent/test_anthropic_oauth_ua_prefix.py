@@ -32,8 +32,8 @@ class TestOAuthUserAgentPrefix:
         with patch("agent.anthropic_adapter._get_anthropic_sdk", return_value=mock_sdk):
             build_anthropic_client("sk-ant-oauth-abc123", "https://api.anthropic.com")
 
-        # Inspect the kwargs passed to Anthropic()
-        call_kwargs = mock_sdk.Anthropic.call_args[1]
+        # Inspect the kwargs passed to the native async SDK client.
+        call_kwargs = mock_sdk.AsyncAnthropic.call_args[1]
         headers = call_kwargs.get("default_headers", {})
         ua = headers.get("user-agent", "") or headers.get("User-Agent", "")
 

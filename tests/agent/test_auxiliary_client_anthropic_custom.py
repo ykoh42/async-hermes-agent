@@ -9,7 +9,7 @@ OpenAI-wire client that speaks the wrong protocol.
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -45,8 +45,8 @@ async def test_custom_endpoint_anthropic_messages_builds_anthropic_wrapper():
             "api_mode": "anthropic_messages",
         },
     ), patch(
-        "agent.auxiliary_client._read_main_model",
-        return_value="claude-sonnet-4-6",
+        "agent.auxiliary_client._read_main_model_for_aux_async",
+        new=AsyncMock(return_value="claude-sonnet-4-6"),
     ):
         adapter_patch, fake_client = _install_anthropic_adapter_mocks()
         with adapter_patch:
@@ -78,8 +78,8 @@ async def test_custom_endpoint_anthropic_messages_falls_back_when_sdk_missing():
             "api_mode": "anthropic_messages",
         },
     ), patch(
-        "agent.auxiliary_client._read_main_model",
-        return_value="claude-sonnet-4-6",
+        "agent.auxiliary_client._read_main_model_for_aux_async",
+        new=AsyncMock(return_value="claude-sonnet-4-6"),
     ), patch(
         "agent.anthropic_adapter.build_anthropic_client",
         side_effect=import_error,
@@ -107,8 +107,8 @@ async def test_custom_endpoint_chat_completions_still_uses_openai_wire():
             "api_key": "key",
         },
     ), patch(
-        "agent.auxiliary_client._read_main_model",
-        return_value="my-model",
+        "agent.auxiliary_client._read_main_model_for_aux_async",
+        new=AsyncMock(return_value="my-model"),
     ):
         client, model = await _try_custom_endpoint()
 
