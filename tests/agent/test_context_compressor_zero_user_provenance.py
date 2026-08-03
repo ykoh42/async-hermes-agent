@@ -19,7 +19,7 @@ from agent.conversation_compression import (
     _ensure_compressed_has_user_turn,
     compress_context,
 )
-from hermes_state import SessionDB
+from hermes_state import AsyncSessionDB
 from tools.todo_tool import TODO_INJECTION_HEADER
 
 
@@ -85,7 +85,7 @@ def _assistant_turns(start: int, count: int) -> list[dict]:
     ]
 
 
-def _lifecycle_agent(db: SessionDB, session_id: str):
+def _lifecycle_agent(db: AsyncSessionDB, session_id: str):
     with patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}):
         from run_agent import AIAgent
 
@@ -180,7 +180,7 @@ async def test_zero_user_provenance_survives_iterative_compaction(compressor):
             quiet_mode=True,
         )
     resumed.tail_token_budget = 80
-    # SessionDB persists the summary content/role but not arbitrary internal
+    # AsyncSessionDB persists the summary content/role but not arbitrary internal
     # message keys. Simulate that round trip: the exact sentinel must recover
     # false provenance even when both in-process metadata keys are absent.
     persisted_handoff = dict(first_handoffs[0])
@@ -214,9 +214,9 @@ async def test_compress_context_todo_snapshot_stays_synthetic_across_two_boundar
 ):
     hermes_home = tmp_path / "hermes-home"
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
-    db = SessionDB(db_path=tmp_path / "state.db")
+    db = AsyncSessionDB(tmp_path / "state.db")
     session_id = "zero-user-todo-lifecycle"
-    db.create_session(session_id, source="cron", model="test/model")
+    await db.create_session(session_id, source="cron", model="test/model")
 
     first_agent = _lifecycle_agent(db, session_id)
     with patch(
@@ -243,7 +243,7 @@ async def test_compress_context_todo_snapshot_stays_synthetic_across_two_boundar
         and str(message.get("content") or "").startswith(TODO_INJECTION_HEADER)
         for message in first
     )
-    projected = db.get_messages_as_conversation(session_id)
+    projected = await db.get_messages_as_conversation(session_id)
     assert projected
     assert all(
         COMPRESSED_SUMMARY_METADATA_KEY not in message
@@ -274,9 +274,7 @@ async def test_compress_context_todo_snapshot_stays_synthetic_across_two_boundar
     assert "User asked:" not in handoff["content"]
     await first_agent.close()
     await second_agent.close()
-    db.close()
-
-
+    await db.close()
 
 
 
