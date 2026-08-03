@@ -23,15 +23,12 @@ def _write_config(tmp_path, config_dict):
 
 
 class TestNormalizeVisionProvider:
-    """_normalize_vision_provider should resolve 'main' to actual main provider."""
+    """Vision provider normalization is pure and does not read config."""
 
 
-    def test_main_resolves_to_openrouter(self, tmp_path):
-        _write_config(tmp_path, {
-            "model": {"default": "anthropic/claude-sonnet-4", "provider": "openrouter"},
-        })
+    def test_main_alias_is_preserved_for_async_resolution(self):
         from agent.auxiliary_client import _normalize_vision_provider
-        assert _normalize_vision_provider("main") == "openrouter"
+        assert _normalize_vision_provider("main") == "main"
 
 
 
@@ -80,10 +77,14 @@ class TestResolveProviderClientMainAlias:
             "model": {"default": "gpt-5.4", "provider": "github-copilot"},
         })
         with (
-            patch("hermes_cli.auth.resolve_api_key_provider_credentials", return_value={
-                "api_key": "ghu_test_token",
-                "base_url": "https://api.githubcopilot.com",
-            }),
+            patch(
+                "hermes_cli.auth.resolve_api_key_provider_credentials_async",
+                new_callable=AsyncMock,
+                return_value={
+                    "api_key": "ghu_test_token",
+                    "base_url": "https://api.githubcopilot.com",
+                },
+            ),
             patch("agent.auxiliary_client._create_openai_client") as mock_openai,
         ):
             mock_openai.return_value = MagicMock()
@@ -138,10 +139,14 @@ class TestResolveProviderClientModelNormalization:
             "model": {"default": "zai/glm-5.1", "provider": "zai"},
         })
         with (
-            patch("hermes_cli.auth.resolve_api_key_provider_credentials", return_value={
-                "api_key": "glm-key",
-                "base_url": "https://api.z.ai/api/paas/v4",
-            }),
+            patch(
+                "hermes_cli.auth.resolve_api_key_provider_credentials_async",
+                new_callable=AsyncMock,
+                return_value={
+                    "api_key": "glm-key",
+                    "base_url": "https://api.z.ai/api/paas/v4",
+                },
+            ),
             patch("agent.auxiliary_client._create_openai_client") as mock_openai,
         ):
             mock_openai.return_value = MagicMock()
@@ -177,11 +182,19 @@ class TestResolveVisionProviderClientModelNormalization:
             "model": {"default": "zai/glm-5.1", "provider": "zai"},
         })
         with (
-            patch("agent.auxiliary_client._read_nous_auth", return_value=None),
-            patch("hermes_cli.auth.resolve_api_key_provider_credentials", return_value={
-                "api_key": "glm-key",
-                "base_url": "https://api.z.ai/api/paas/v4",
-            }),
+            patch(
+                "agent.auxiliary_client._read_nous_auth",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+            patch(
+                "hermes_cli.auth.resolve_api_key_provider_credentials_async",
+                new_callable=AsyncMock,
+                return_value={
+                    "api_key": "glm-key",
+                    "base_url": "https://api.z.ai/api/paas/v4",
+                },
+            ),
             patch("agent.auxiliary_client._create_openai_client") as mock_openai,
         ):
             mock_openai.return_value = MagicMock()

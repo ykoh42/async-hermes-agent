@@ -2531,14 +2531,10 @@ def _resolve_custom_runtime(
     This covers both env-driven OPENAI_BASE_URL setups and config-saved custom
     endpoints where the base URL lives in config.yaml instead of the live
     environment. Keep this resolver read-only and local: the generic
-    synchronous runtime resolver also probes credential pools, which is not a
+    generic runtime resolver also probes credential pools, which is not a
     valid operation from the native-async auxiliary path.
     """
     try:
-        if config is None:
-            from hermes_cli.config import load_config_readonly
-
-            config = load_config_readonly()
         model_config = config.get("model", {}) if isinstance(config, dict) else {}
         if not isinstance(model_config, dict):
             model_config = {}
@@ -2571,8 +2567,11 @@ def _resolve_custom_runtime(
     return custom_base, custom_key.strip(), custom_mode
 
 
-def _current_custom_base_url() -> str:
-    custom_base, _, _ = _resolve_custom_runtime()
+def _current_custom_base_url(
+    *,
+    config: Optional[Dict[str, Any]] = None,
+) -> str:
+    custom_base, _, _ = _resolve_custom_runtime(config=config)
     return custom_base or ""
 
 
@@ -3656,6 +3655,7 @@ async def _retry_same_provider(
     effective_extra_body: dict,
     reasoning_config: Optional[dict],
     extra_headers: Optional[Dict[str, str]] = None,
+    config: Optional[Dict[str, Any]] = None,
 ) -> Any:
     if task == "vision":
         _, retry_client, retry_model = await resolve_vision_provider_client(
@@ -3663,6 +3663,7 @@ async def _retry_same_provider(
             model=final_model,
             base_url=resolved_base_url,
             api_key=resolved_api_key,
+            config=config,
         )
     else:
         retry_client, retry_model = await _get_cached_client(
@@ -3671,6 +3672,7 @@ async def _retry_same_provider(
             base_url=resolved_base_url,
             api_key=resolved_api_key,
             api_mode=resolved_api_mode,
+            config=config,
         )
     if retry_client is None:
         raise RuntimeError(
@@ -3690,9 +3692,10 @@ async def _retry_same_provider(
         reasoning_config=reasoning_config,
         base_url=retry_base or resolved_base_url,
         task=task,
+        config=config,
     )
     # Preserve per-request attribution headers across the rebuilt-client
-    # retry — see the sync variant above (#60293).
+    # retry (#60293).
     if extra_headers:
         retry_kwargs["extra_headers"] = dict(extra_headers)
     if _is_anthropic_compat_endpoint(resolved_provider, retry_base):
@@ -3823,7 +3826,7 @@ async def _call_fallback_candidate(
         temperature=temperature, max_tokens=max_tokens,
         tools=tools, timeout=effective_timeout,
         extra_body=effective_extra_body, reasoning_config=reasoning_config,
-        base_url=fb_base, task=task)
+        base_url=fb_base, task=task, config=config)
     try:
         return await _validate_llm_response(
             await _relay_completion(
@@ -3842,7 +3845,7 @@ async def _call_fallback_candidate(
             and await _refresh_provider_credentials(fb_provider)
         ):
             retry_client, retry_model = await _get_cached_client(
-                fb_provider, fb_model)
+                fb_provider, fb_model, config=config)
             if retry_client is not None:
                 retry_kwargs = _build_call_kwargs(
                     fb_provider, retry_model or fb_model, messages,
@@ -3850,7 +3853,8 @@ async def _call_fallback_candidate(
                     tools=tools, timeout=effective_timeout,
                     extra_body=effective_extra_body,
                     reasoning_config=reasoning_config,
-                    base_url=str(getattr(retry_client, "base_url", "") or fb_base), task=task)
+                    base_url=str(getattr(retry_client, "base_url", "") or fb_base),
+                    task=task, config=config)
                 try:
                     return await _validate_llm_response(
                         await _relay_completion(
@@ -5536,6 +5540,7 @@ async def resolve_vision_provider_client(
     base_url: Optional[str] = None,
     api_key: Optional[str] = None,
     main_runtime: Optional[Dict[str, Any]] = None,
+    config: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Optional[str], Optional[Any], Optional[str]]:
     """Resolve the client actually used for vision tasks.
 
@@ -5545,16 +5550,17 @@ async def resolve_vision_provider_client(
     stays conservative and only tries vision backends known to work today.
     """
     runtime = _normalize_main_runtime(main_runtime)
-    from hermes_cli.config import load_config_readonly_async
+    if config is None:
+        from hermes_cli.config import load_config_readonly_async
 
-    config_snapshot = await load_config_readonly_async()
+        config = await load_config_readonly_async()
     requested, resolved_model, resolved_base_url, resolved_api_key, resolved_api_mode = _resolve_task_provider_model(
         "vision",
         provider,
         model,
         base_url,
         api_key,
-        config=config_snapshot,
+        config=config,
     )
     requested = _normalize_vision_provider(requested)
 
@@ -5599,10 +5605,10 @@ async def resolve_vision_provider_client(
         #                   DEEPINFRA_API_KEY is set)
         #   5. Stop
         main_provider = str(
-            runtime.get("provider") or await _read_main_provider(config_snapshot)
+            runtime.get("provider") or await _read_main_provider(config)
         )
         main_model = str(
-            runtime.get("model") or await _read_main_model(config_snapshot)
+            runtime.get("model") or await _read_main_model(config)
         )
         if main_provider.strip().lower() == "moa":
             # MoA virtual provider: main_model is a preset NAME, and every
@@ -5613,7 +5619,7 @@ async def resolve_vision_provider_client(
             # checks and the eventual client target the real acting model.
             _agg_provider, _agg_model = _resolve_moa_aggregator(
                 main_model,
-                config=config_snapshot,
+                config=config,
             )
             if _agg_provider and _agg_model:
                 main_provider, main_model = _agg_provider, _agg_model
@@ -5698,7 +5704,9 @@ async def resolve_vision_provider_client(
                     else:
                         # No live runtime recorded (non-gateway caller): fall
                         # back to resolving the configured custom endpoint.
-                        custom_base, custom_key, custom_mode = _resolve_custom_runtime()
+                        custom_base, custom_key, custom_mode = _resolve_custom_runtime(
+                            config=config
+                        )
                         if custom_base:
                             rpc_base_url = custom_base
                             rpc_api_key = custom_key
@@ -5788,6 +5796,7 @@ def auxiliary_max_tokens_param(
     *,
     model: Optional[str] = None,
     provider: Optional[str] = None,
+    config: Optional[Dict[str, Any]] = None,
 ) -> dict:
     """Return the correct max tokens kwarg for the auxiliary client's provider.
 
@@ -5798,7 +5807,7 @@ def auxiliary_max_tokens_param(
     fronting the newer families are also recognised — URL-only detection
     misses the case where a custom base URL serves e.g. ``gpt-5.4``.
     """
-    custom_base = "" if provider else _current_custom_base_url()
+    custom_base = "" if provider else _current_custom_base_url(config=config)
     or_key = os.getenv("OPENROUTER_API_KEY")
     # Use max_completion_tokens for direct OpenAI-compatible providers that reject
     # max_tokens on newer GPT-4o/o-series/GPT-5-style models.
@@ -6692,6 +6701,7 @@ def _build_call_kwargs(
     reasoning_config: Optional[dict] = None,
     base_url: Optional[str] = None,
     task: Optional[str] = None,
+    config: Optional[Dict[str, Any]] = None,
 ) -> dict:
     """Build kwargs for .chat.completions.create() with model/provider adjustments."""
     kwargs: Dict[str, Any] = {
@@ -6739,7 +6749,7 @@ def _build_call_kwargs(
         # NVIDIA chat path already sends an output cap via the provider profile;
         # preserve it on the auxiliary path too.
         _effective_base = base_url or (
-            _current_custom_base_url() if provider == "custom" else ""
+            _current_custom_base_url(config=config) if provider == "custom" else ""
         )
         _provider_norm = str(provider or "").strip().lower()
         _is_nvidia_nim = (
@@ -6779,7 +6789,7 @@ def _build_call_kwargs(
             # parameter name instead of a hardcoded max_tokens that 400s.
             kwargs.update(
                 auxiliary_max_tokens_param(
-                    max_tokens, model=model, provider=provider,
+                    max_tokens, model=model, provider=provider, config=config,
                 )
             )
 
@@ -6813,7 +6823,7 @@ def _build_call_kwargs(
     # shapes. Providers without a reasoning-aware profile retain the generic
     # ``extra_body.reasoning`` fallback used by Codex-compatible adapters.
     effective_base = base_url or (
-        _current_custom_base_url() if provider == "custom" else ""
+        _current_custom_base_url(config=config) if provider == "custom" else ""
     )
     profile_body: Dict[str, Any] = {}
     profile_reasoning_extra: Dict[str, Any] = {}
@@ -7482,6 +7492,7 @@ async def call_llm(
             base_url=resolved_base_url or base_url,
             api_key=resolved_api_key or api_key,
             main_runtime=main_runtime,
+            config=config_snapshot,
         )
         if client is None and resolved_provider != "auto" and not resolved_base_url:
             logger.warning(
@@ -7492,6 +7503,7 @@ async def call_llm(
                 provider="auto",
                 model=resolved_model,
                 main_runtime=main_runtime,
+                config=config_snapshot,
             )
         if client is None:
             raise RuntimeError(
@@ -7566,7 +7578,8 @@ async def call_llm(
         temperature=temperature, max_tokens=max_tokens,
         tools=tools, timeout=effective_timeout, extra_body=effective_extra_body,
         reasoning_config=reasoning_config,
-        base_url=_client_base or resolved_base_url, task=task)
+        base_url=_client_base or resolved_base_url, task=task,
+        config=config_snapshot)
     if extra_headers:
         kwargs["extra_headers"] = dict(extra_headers)
 
@@ -7819,6 +7832,7 @@ async def call_llm(
                     effective_timeout=effective_timeout,
                     effective_extra_body=effective_extra_body,
                     reasoning_config=reasoning_config,
+                    config=config_snapshot,
                 )
 
         # ── Same-provider credential-pool recovery (mirrors sync) ─────
@@ -7862,6 +7876,7 @@ async def call_llm(
                         effective_timeout=effective_timeout,
                         effective_extra_body=effective_extra_body,
                         reasoning_config=reasoning_config,
+                        config=config_snapshot,
                     )
                 except Exception as retry2_err:
                     if (_is_payment_error(retry2_err) or _is_auth_error(retry2_err)
