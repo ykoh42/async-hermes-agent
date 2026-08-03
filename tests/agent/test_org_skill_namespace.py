@@ -74,7 +74,8 @@ class TestTokenGatedDiscovery:
 
 
 class TestSnapshotEntryProvenance:
-    def test_org_entry_strips_prefix_and_carries_provenance(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_org_entry_strips_prefix_and_carries_provenance(self, tmp_path):
         skills = tmp_path / "skills"
         d = _mk_skill(
             skills, f"{sku.ORG_MIRROR_DIR_NAME}/org-1/devops/beta", name="beta"
@@ -85,17 +86,22 @@ class TestSnapshotEntryProvenance:
             ),
             encoding="utf-8",
         )
-        entry = _build_snapshot_entry(d / "SKILL.md", skills, {"name": "beta"}, "d")
+        entry = await _build_snapshot_entry(
+            d / "SKILL.md", skills, {"name": "beta"}, "d"
+        )
         assert entry["org_id"] == "org-1"
         assert entry["org_author"] == "bens-macbook-a1b2c3"
         # Category derives from the path WITHIN the mirror, not _org/org-1/...
         assert entry["category"] == "devops"
         assert entry["skill_name"] == "beta"
 
-    def test_personal_entry_unchanged(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_personal_entry_unchanged(self, tmp_path):
         skills = tmp_path / "skills"
         d = _mk_skill(skills, "devops/beta", name="beta")
-        entry = _build_snapshot_entry(d / "SKILL.md", skills, {"name": "beta"}, "d")
+        entry = await _build_snapshot_entry(
+            d / "SKILL.md", skills, {"name": "beta"}, "d"
+        )
         assert "org_id" not in entry
         assert entry["category"] == "devops"
 
@@ -117,7 +123,8 @@ class TestListingCollisionsAndLabels:
         pb.clear_skills_system_prompt_cache()
         return skills, pb
 
-    def test_org_skill_listed_with_provenance_tag(self, tmp_path, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_org_skill_listed_with_provenance_tag(self, tmp_path, monkeypatch):
         skills, pb = self._render(tmp_path, monkeypatch)
         _mk_skill(skills, "personal-a")
         _mk_skill(skills, f"{sku.ORG_MIRROR_DIR_NAME}/org-1/shared-x", name="shared-x")
@@ -125,28 +132,30 @@ class TestListingCollisionsAndLabels:
             json.dumps({"author_device": "bens-macbook"}), encoding="utf-8"
         )
         _mark_active(skills, "org-1")
-        out = pb.build_skills_system_prompt()
+        out = await pb.build_skills_system_prompt()
         assert "org:org-1" in out
         assert "[org-shared: by bens-macbook]" in out
         assert "personal-a" in out
 
-    def test_collision_flags_both_sides(self, tmp_path, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_collision_flags_both_sides(self, tmp_path, monkeypatch):
         skills, pb = self._render(tmp_path, monkeypatch)
         _mk_skill(skills, "k8s-debug", body="personal version\n")
         _mk_skill(
             skills, f"{sku.ORG_MIRROR_DIR_NAME}/org-1/k8s-debug", name="k8s-debug"
         )
         _mark_active(skills, "org-1")
-        out = pb.build_skills_system_prompt()
+        out = await pb.build_skills_system_prompt()
         # BOTH entries flagged — neither silently wins.
         assert out.count("[name collision") == 2
 
-    def test_no_collision_flag_when_unique(self, tmp_path, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_no_collision_flag_when_unique(self, tmp_path, monkeypatch):
         skills, pb = self._render(tmp_path, monkeypatch)
         _mk_skill(skills, "personal-a")
         _mk_skill(skills, f"{sku.ORG_MIRROR_DIR_NAME}/org-1/shared-x", name="shared-x")
         _mark_active(skills, "org-1")
-        out = pb.build_skills_system_prompt()
+        out = await pb.build_skills_system_prompt()
         assert "[name collision" not in out
 
 

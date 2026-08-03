@@ -375,6 +375,19 @@ class SkillReadinessStatus(str, Enum):
     UNSUPPORTED = "unsupported"
 
 
+_INJECTION_PATTERNS = (
+    "ignore previous instructions",
+    "ignore all previous",
+    "you are now",
+    "disregard your",
+    "forget your instructions",
+    "new instructions:",
+    "system prompt:",
+    "<system>",
+    "]]>",
+)
+
+
 def skill_matches_platform(frontmatter: Dict[str, Any]) -> bool:
     """Check if a skill is compatible with the current OS platform.
 
@@ -810,27 +823,157 @@ async def skills_list(category: str = None, task_id: str = None) -> str:
         return tool_error(str(exc), success=False)
 
 
+async def _serve_plugin_skill(skill_md: Path, namespace: str, bare: str) -> str:
+    """Read a registered plugin skill through the native async file boundary."""
+    from hermes_cli.config import load_config_readonly_async
+    from hermes_cli.plugins import get_plugin_manager
+
+    config = await load_config_readonly_async()
+    if namespace in set(cfg_get(config, "plugins", "disabled", default=[]) or []):
+        return json.dumps(
+            {
+                "success": False,
+                "error": (
+                    f"Plugin '{namespace}' is disabled. "
+                    f"Re-enable with: hermes plugins enable {namespace}"
+                ),
+            },
+            ensure_ascii=False,
+        )
+
+    try:
+        content = await _read_skill_text(skill_md)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        return json.dumps(
+            {
+                "success": False,
+                "error": f"Failed to read skill '{namespace}:{bare}': {exc}",
+            },
+            ensure_ascii=False,
+        )
+
+    try:
+        frontmatter, _ = _parse_frontmatter(content)
+    except Exception:
+        frontmatter = {}
+
+    if not skill_matches_platform(frontmatter):
+        return json.dumps(
+            {
+                "success": False,
+                "error": (
+                    f"Skill '{namespace}:{bare}' is not supported on this platform."
+                ),
+                "readiness_status": SkillReadinessStatus.UNSUPPORTED.value,
+            },
+            ensure_ascii=False,
+        )
+
+    if any(pattern in content.lower() for pattern in _INJECTION_PATTERNS):
+        logger.warning(
+            "Plugin skill '%s:%s' contains patterns that may indicate prompt injection",
+            namespace,
+            bare,
+        )
+
+    description = str(frontmatter.get("description", ""))
+    if len(description) > MAX_DESCRIPTION_LENGTH:
+        description = description[: MAX_DESCRIPTION_LENGTH - 3] + "..."
+
+    siblings = [
+        sibling
+        for sibling in get_plugin_manager().list_plugin_skills(namespace)
+        if sibling != bare
+    ]
+    if siblings:
+        banner = (
+            f"[Bundle context: This skill is part of the '{namespace}' plugin.\n"
+            f"Sibling skills: {', '.join(siblings)}.\n"
+            "Use qualified form to invoke siblings "
+            f"(e.g. {namespace}:{siblings[0]}).]\n\n"
+        )
+    else:
+        banner = (
+            f"[Bundle context: This skill is part of the '{namespace}' plugin.]\n\n"
+        )
+
+    return json.dumps(
+        {
+            "success": True,
+            "name": f"{namespace}:{bare}",
+            "content": f"{banner}{content}",
+            "description": description,
+            "linked_files": None,
+            "readiness_status": SkillReadinessStatus.AVAILABLE.value,
+        },
+        ensure_ascii=False,
+    )
+
+
 async def skill_view(
     name: str,
     file_path: str = None,
     task_id: str = None,
     preprocess: bool = True,
 ) -> str:
-    """Native async implementation behind the ``skill_view`` tool.
-
-    Local and externally configured file-backed skills are the async-first
-    training surface. Plugin-specific preprocessing remains deliberately
-    unavailable until its own lifecycle has a native async implementation.
-    """
+    """View a local, externally configured, or plugin-provided skill."""
     try:
         lookup_error = _skill_lookup_path_error(name)
         if lookup_error:
             return tool_error(lookup_error, success=False)
         if ":" in name:
-            return tool_error(
-                "Plugin-provided skills do not yet have a native async loader.",
-                success=False,
-            )
+            from agent.skill_utils import is_valid_namespace, parse_qualified_name
+            from hermes_cli.plugins import get_plugin_manager
+
+            namespace, bare = parse_qualified_name(name)
+            if not is_valid_namespace(namespace):
+                return json.dumps(
+                    {
+                        "success": False,
+                        "error": (
+                            f"Invalid namespace '{namespace}' in '{name}'. "
+                            "Namespaces must match [a-zA-Z0-9_-]+."
+                        ),
+                    },
+                    ensure_ascii=False,
+                )
+
+            manager = get_plugin_manager()
+            plugin_skill_md = manager.find_plugin_skill(name)
+            if plugin_skill_md is not None:
+                if not await aiofiles.os.path.isfile(plugin_skill_md):
+                    manager.remove_plugin_skill(name)
+                    return json.dumps(
+                        {
+                            "success": False,
+                            "error": (
+                                f"Skill '{name}' file no longer exists at "
+                                f"{plugin_skill_md}. The registry entry has been "
+                                "cleaned up — try again after the plugin is reloaded."
+                            ),
+                        },
+                        ensure_ascii=False,
+                    )
+                return await _serve_plugin_skill(plugin_skill_md, namespace, bare)
+
+            available = manager.list_plugin_skills(namespace)
+            if available:
+                return json.dumps(
+                    {
+                        "success": False,
+                        "error": f"Skill '{bare}' not found in plugin '{namespace}'.",
+                        "available_skills": [
+                            f"{namespace}:{skill}" for skill in available
+                        ],
+                        "hint": (
+                            f"The '{namespace}' plugin provides "
+                            f"{len(available)} skill(s)."
+                        ),
+                    },
+                    ensure_ascii=False,
+                )
         active = _skills_dir()
         roots = [active] if await aiofiles.os.path.isdir(active) else []
         roots.extend(await _external_skills_dirs_async())
@@ -959,6 +1102,15 @@ async def skill_view(
             if not entry.get("optional")
             and not bool(env_snapshot.get(entry["name"]) or os.getenv(entry["name"]))
         ]
+        available_environment_variables = [
+            entry["name"]
+            for entry in required_environment_variables
+            if entry["name"] not in missing_environment_variables
+        ]
+        if available_environment_variables:
+            from tools.env_passthrough import register_env_passthrough
+
+            register_env_passthrough(available_environment_variables)
         readiness_status = (
             SkillReadinessStatus.SETUP_NEEDED
             if missing_environment_variables

@@ -25,7 +25,10 @@ def _fresh_cache(monkeypatch, tmp_path):
     monkeypatch.setattr(
         "agent.skill_utils.get_external_skills_dirs", lambda: []
     )
-    monkeypatch.setattr(st, "_get_disabled_skill_names", lambda: set())
+    async def no_disabled_skills():
+        return set()
+
+    monkeypatch.setattr(st, "_get_disabled_skill_names", no_disabled_skills)
     yield
     st._SKILLS_CACHE.clear()
 
@@ -62,7 +65,10 @@ async def test_cache_hit_serves_copies_not_cache_objects(tmp_path):
 async def test_disabled_and_full_views_cached_separately(tmp_path, monkeypatch):
     _write_skill(tmp_path, "cat-a", "skill-one")
     _write_skill(tmp_path, "cat-a", "skill-two")
-    monkeypatch.setattr(st, "_get_disabled_skill_names", lambda: {"skill-two"})
+    async def disabled_skills():
+        return {"skill-two"}
+
+    monkeypatch.setattr(st, "_get_disabled_skill_names", disabled_skills)
 
     filtered = sorted(s["name"] for s in await st._find_all_skills())
     everything = sorted(s["name"] for s in await st._find_all_skills(skip_disabled=True))

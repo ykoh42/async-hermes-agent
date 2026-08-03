@@ -161,7 +161,8 @@ class TestWriteFileSizeLimit:
 class TestHandPlacedSkillsNoLimit:
     """Skills dropped directly on disk are not constrained."""
 
-    def test_oversized_handplaced_skill_loads(self, isolate_skills, tmp_path):
+    @pytest.mark.asyncio
+    async def test_oversized_handplaced_skill_loads(self, isolate_skills, tmp_path):
         """A hand-placed 200k skill can still be read via skill_view."""
         from tools.skills_tool import skill_view
 
@@ -171,7 +172,7 @@ class TestHandPlacedSkillsNoLimit:
         huge = huge.replace("name: test-skill", "name: manual-giant")
         (skill_dir / "SKILL.md").write_text(huge, encoding="utf-8")
 
-        result = json.loads(skill_view("manual-giant"))
+        result = json.loads(await skill_view("manual-giant"))
         assert "content" in result
         # The full content is returned — no truncation at the storage layer
         assert len(result["content"]) > MAX_SKILL_CONTENT_CHARS
