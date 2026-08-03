@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import sys
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -76,6 +77,10 @@ def patch_load_config(monkeypatch):
         monkeypatch.setattr(
             "hermes_cli.config.load_config_readonly",
             lambda: {"model": model_cfg},
+        )
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config_readonly_async",
+            AsyncMock(return_value={"model": model_cfg}),
         )
     return _apply
 
@@ -211,14 +216,10 @@ class TestAuxAzureFoundryEntra:
         assert received["api_key"]().startswith("jwt-for-")
 
     @pytest.mark.asyncio
-    async def test_entra_anthropic_messages_uses_bearer_hook(
+    async def test_entra_anthropic_messages_fails_without_async_bearer_transport(
         self, monkeypatch, fake_azure_identity, patch_load_config,
     ):
-        """Entra ID + anthropic_messages: runtime returns a callable
-        api_key; ``_maybe_wrap_anthropic`` → ``build_anthropic_client``
-        detects the callable and installs the bearer-injecting httpx
-        event hook on a custom ``httpx.Client`` passed to the
-        Anthropic SDK via ``http_client=``."""
+        """Never revive the removed synchronous Entra bearer hook."""
         from agent import auxiliary_client as _aux
         from agent import anthropic_adapter as _anthropic
 
@@ -245,22 +246,10 @@ class TestAuxAzureFoundryEntra:
             "auth_mode": "entra_id",
             "default": "claude-sonnet-4-5",
         })
-        client, resolved = await _aux._try_azure_foundry(model="claude-sonnet-4-5")
-        assert client is not None
-        assert resolved == "claude-sonnet-4-5"
-        # The Anthropic SDK constructor received a custom http_client
-        # (the bearer-injecting hook) and a placeholder auth_token.
-        anthropic_kwargs = received.get("anthropic") or {}
-        assert "http_client" in anthropic_kwargs, (
-            "build_anthropic_client must pass a custom http_client when "
-            "given a callable api_key, otherwise the SDK cannot mint "
-            "fresh tokens per request"
-        )
-        assert anthropic_kwargs.get("auth_token") == "entra-id-bearer-via-http-hook"
-        # Verify the http_client actually has our event hook installed.
-        http_client = anthropic_kwargs["http_client"]
-        hooks = getattr(http_client, "event_hooks", {})
-        assert "request" in hooks and len(hooks["request"]) >= 1
+        with pytest.raises(RuntimeError, match="native async bearer transport"):
+            await _aux._try_azure_foundry(model="claude-sonnet-4-5")
+
+        assert "anthropic" not in received
 
 
 # ---------------------------------------------------------------------------

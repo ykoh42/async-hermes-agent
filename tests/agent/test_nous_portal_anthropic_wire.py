@@ -82,24 +82,36 @@ class TestRuntimeResolution:
     def _stub_portal_credentials(self, monkeypatch):
         monkeypatch.setattr(rp, "load_config", lambda: {})
         monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "nous")
-        async def empty_pool(_provider):
-            return SimpleNamespace(has_credentials=lambda: False)
-
-        monkeypatch.setattr(rp, "load_pool", empty_pool)
-        monkeypatch.setattr(
-            rp,
-            "resolve_nous_runtime_credentials",
-            lambda **kw: {
-                "base_url": PORTAL_URL,
-                "api_key": "portal-invoke-jwt",
-                "source": "portal",
-                "expires_at": None,
-            },
+        entry = SimpleNamespace(
+            provider="nous",
+            source="device_code",
+            runtime_api_key="portal-invoke-jwt",
+            agent_key="portal-invoke-jwt",
+            agent_key_expires_at="2099-01-01T00:00:00+00:00",
+            scope="inference:invoke",
+            runtime_base_url=PORTAL_URL,
         )
+
+        async def select():
+            return entry
+
+        async def portal_pool(_provider):
+            return SimpleNamespace(
+                provider="nous",
+                has_credentials=lambda: True,
+                select=select,
+            )
+
+        monkeypatch.setattr(rp, "load_pool", portal_pool)
+        monkeypatch.setattr(rp, "_agent_key_is_usable", lambda *a, **k: True)
 
     @pytest.mark.asyncio
     async def test_anthropic_model_resolves_to_the_messages_wire(self, monkeypatch):
-        monkeypatch.setattr(rp, "_get_model_config", lambda: {"provider": "nous"})
+        monkeypatch.setattr(
+            rp,
+            "_get_model_config",
+            lambda *_args, **_kwargs: {"provider": "nous"},
+        )
 
         resolved = await rp.resolve_runtime_provider(
             requested="nous", target_model="anthropic/claude-opus-5"
@@ -120,7 +132,10 @@ class TestRuntimeResolution:
         monkeypatch.setattr(
             rp,
             "_get_model_config",
-            lambda: {"provider": "nous", "default": "hermes-4-405b"},
+            lambda *_args, **_kwargs: {
+                "provider": "nous",
+                "default": "hermes-4-405b",
+            },
         )
 
         resolved = await rp.resolve_runtime_provider(
@@ -163,7 +178,11 @@ class TestPoolRuntimeResolution:
             return self._pool(portal_entry)
 
         monkeypatch.setattr(rp, "load_pool", load_pool)
-        monkeypatch.setattr(rp, "_get_model_config", lambda: {"provider": "nous"})
+        monkeypatch.setattr(
+            rp,
+            "_get_model_config",
+            lambda *_args, **_kwargs: {"provider": "nous"},
+        )
 
         resolved = await rp.resolve_runtime_provider(
             requested="nous", target_model="anthropic/claude-opus-4.8"
@@ -289,7 +308,7 @@ class TestPortalBodyFields:
     transport consults — so the Anthropic branch has to merge them in itself.
     """
 
-    def _build(self, provider="nous", session_id="sess-abc123"):
+    async def _build(self, provider="nous", session_id="sess-abc123"):
         from agent.chat_completion_helpers import build_api_kwargs
         from agent.transports.anthropic import AnthropicTransport
 
@@ -309,15 +328,20 @@ class TestPortalBodyFields:
             _anthropic_base_url=PORTAL_URL,
             _oauth_1m_beta_disabled=False,
             _get_transport=lambda: transport,
-            _prepare_anthropic_messages_for_api=lambda msgs: msgs,
+            _prepare_anthropic_messages_for_api=AsyncMock(
+                side_effect=lambda msgs: msgs
+            ),
             _anthropic_preserve_dots=lambda: False,
         )
-        return build_api_kwargs(agent, [{"role": "user", "content": "hi"}])
+        return await build_api_kwargs(
+            agent, [{"role": "user", "content": "hi"}]
+        )
 
-    def test_portal_tags_reach_the_messages_request(self):
+    @pytest.mark.asyncio
+    async def test_portal_tags_reach_the_messages_request(self):
         from agent.portal_tags import hermes_client_tag
 
-        tags = self._build()["extra_body"]["tags"]
+        tags = (await self._build())["extra_body"]["tags"]
 
         assert "product=hermes-agent" in tags
         assert hermes_client_tag() in tags
@@ -325,8 +349,9 @@ class TestPortalBodyFields:
             "Portal skips non-string tag entries unpredictably"
         )
 
-    def test_session_id_reaches_the_messages_request(self):
-        extra_body = self._build(session_id="sess-abc123")["extra_body"]
+    @pytest.mark.asyncio
+    async def test_session_id_reaches_the_messages_request(self):
+        extra_body = (await self._build(session_id="sess-abc123"))["extra_body"]
 
         assert extra_body["session_id"] == "sess-abc123"
         assert "conversation=sess-abc123" in extra_body["tags"]

@@ -1189,7 +1189,7 @@ async def test_least_used_strategy_selects_lowest_count(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(
         "agent.credential_pool._seed_from_env",
-        lambda provider, entries: (False, set()),
+        AsyncMock(return_value=(False, set())),
     )
     _write_auth_store(
         tmp_path,
@@ -1344,8 +1344,8 @@ async def test_load_pool_does_not_seed_claude_code_when_anthropic_not_configured
     assert pool.entries() == []
 
 
-async def test_load_pool_seeds_copilot_via_gh_auth_token(tmp_path, monkeypatch):
-    """Copilot credentials from `gh auth token` should be seeded into the pool."""
+async def test_load_pool_does_not_run_blocking_copilot_cli_discovery(tmp_path, monkeypatch):
+    """Pool loading must not invoke the synchronous ``gh auth token`` path."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
     _write_auth_store(tmp_path, {"version": 1, "credential_pool": {}})
 
@@ -1357,18 +1357,13 @@ async def test_load_pool_seeds_copilot_via_gh_auth_token(tmp_path, monkeypatch):
     from agent.credential_pool import load_pool
     pool = await load_pool("copilot")
 
-    assert pool.has_credentials()
-    entries = pool.entries()
-    assert len(entries) == 1
-    assert entries[0].source == "gh_cli"
-    assert entries[0].access_token == "gho_fake_token_abc123"
-    assert entries[0].base_url == "https://api.githubcopilot.com"
+    assert not pool.has_credentials()
 
 
 
 
-async def test_load_pool_seeds_qwen_oauth_via_cli_tokens(tmp_path, monkeypatch):
-    """Qwen OAuth credentials from ~/.qwen/oauth_creds.json should be seeded into the pool."""
+async def test_load_pool_does_not_read_qwen_cli_tokens(tmp_path, monkeypatch):
+    """Pool loading must not cross the synchronous Qwen CLI token boundary."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
     _write_auth_store(tmp_path, {"version": 1, "credential_pool": {}})
 
@@ -1387,11 +1382,7 @@ async def test_load_pool_seeds_qwen_oauth_via_cli_tokens(tmp_path, monkeypatch):
     from agent.credential_pool import load_pool
     pool = await load_pool("qwen-oauth")
 
-    assert pool.has_credentials()
-    entries = pool.entries()
-    assert len(entries) == 1
-    assert entries[0].source == "qwen-cli"
-    assert entries[0].access_token == "qwen_fake_token_xyz"
+    assert not pool.has_credentials()
 
 
 async def test_load_pool_does_not_seed_qwen_oauth_when_no_token(tmp_path, monkeypatch):
@@ -1690,7 +1681,10 @@ async def _make_anthropic_claude_code_pool(tmp_path, monkeypatch, *, access_toke
     monkeypatch.delenv("ANTHROPIC_TOKEN", raising=False)
     monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
     _write_auth_store(tmp_path, {"version": 1, "credential_pool": {}})
-    monkeypatch.setattr("hermes_cli.auth.is_provider_explicitly_configured", lambda pid: pid == "anthropic")
+    monkeypatch.setattr(
+        "agent.credential_pool._is_provider_explicitly_configured_async",
+        AsyncMock(return_value=True),
+    )
     monkeypatch.setattr(
         "agent.anthropic_adapter.read_hermes_oauth_credentials",
         AsyncMock(return_value=None),
