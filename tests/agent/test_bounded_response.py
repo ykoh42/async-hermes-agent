@@ -19,6 +19,7 @@ import time
 
 import httpx
 import pytest
+import pytest_asyncio
 
 from agent.bounded_response import (
     read_error_body_or_default,
@@ -91,23 +92,22 @@ def server_base():
         httpd.shutdown()
 
 
-@pytest.fixture()
-def client():
+@pytest_asyncio.fixture()
+async def client():
     # Generous read timeout so the bounding is provably done by our helper,
     # not by httpx's own timeout.
-    c = httpx.Client(
+    c = httpx.AsyncClient(
         timeout=httpx.Timeout(connect=5.0, read=45.0, write=5.0, pool=5.0)
     )
-    try:
+    async with c:
         yield c
-    finally:
-        c.close()
 
 
-def test_oversize_body_is_capped(server_base, client):
+@pytest.mark.asyncio
+async def test_oversize_body_is_capped(server_base, client):
     start = time.monotonic()
-    with client.stream("POST", server_base + "/oversize") as response:
-        text = read_streaming_error_body(
+    async with client.stream("POST", server_base + "/oversize") as response:
+        text = await read_streaming_error_body(
             response, max_bytes=64 * 1024, timeout_s=10.0
         )
     elapsed = time.monotonic() - start
@@ -124,7 +124,8 @@ def test_oversize_body_is_capped(server_base, client):
 
 
 
-def test_or_default_returns_text_when_present(server_base, client):
-    with client.stream("POST", server_base + "/normal") as response:
-        result = read_error_body_or_default(response)
+@pytest.mark.asyncio
+async def test_or_default_returns_text_when_present(server_base, client):
+    async with client.stream("POST", server_base + "/normal") as response:
+        result = await read_error_body_or_default(response)
     assert result is not None and "RESOURCE_EXHAUSTED" in result

@@ -26,7 +26,7 @@ from typing import Any, AsyncIterator, Dict, Iterator, List, Optional
 
 import httpx
 
-from agent.bounded_response import read_streaming_error_body_async
+from agent.bounded_response import read_streaming_error_body
 from agent.gemini_schema import sanitize_gemini_tool_parameters
 
 logger = logging.getLogger(__name__)
@@ -1060,7 +1060,7 @@ class GeminiNativeClient:
                 "POST", url, json=request, headers=stream_headers, timeout=timeout
             ) as response:
                 if response.status_code != 200:
-                    body_text = await read_streaming_error_body_async(response)
+                    body_text = await read_streaming_error_body(response)
                     raise gemini_http_error(response, body_text=body_text)
                 tool_call_indices: Dict[str, Dict[str, Any]] = {}
                 async for event in _iter_sse_events_async(response):
