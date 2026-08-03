@@ -38,32 +38,41 @@ _RESOLVES = [(2, 1, 6, "", ("93.184.216.34", 0))]
 class TestValidateImageUrl:
     """Tests for URL validation, including urlparse-based netloc check."""
 
-    def test_accepts_valid_http_and_https_urls(self):
-        with patch("tools.url_safety.socket.getaddrinfo", return_value=_RESOLVES):
-            assert _validate_image_url("https://example.com/image.jpg") is True
-            assert _validate_image_url("http://cdn.example.org/photo.png") is True
+    @pytest.mark.asyncio
+    async def test_accepts_valid_http_and_https_urls(self):
+        loop = MagicMock()
+        loop.getaddrinfo = AsyncMock(return_value=_RESOLVES)
+        with patch("tools.url_safety.asyncio.get_running_loop", return_value=loop):
+            assert await _validate_image_url("https://example.com/image.jpg") is True
+            assert await _validate_image_url("http://cdn.example.org/photo.png") is True
             # CDN endpoints that redirect to images should still pass.
-            assert _validate_image_url("https://cdn.example.com/abcdef123") is True
-            assert _validate_image_url("https://img.example.com/pic?w=200&h=200") is True
-            assert _validate_image_url("http://example.com:8080/image.png") is True
-            assert _validate_image_url("https://example.com/") is True
+            assert await _validate_image_url("https://cdn.example.com/abcdef123") is True
+            assert await _validate_image_url("https://img.example.com/pic?w=200&h=200") is True
+            assert await _validate_image_url("http://example.com:8080/image.png") is True
+            assert await _validate_image_url("https://example.com/") is True
 
-    def test_localhost_url_blocked_by_ssrf(self):
+    @pytest.mark.asyncio
+    async def test_localhost_url_blocked_by_ssrf(self):
         """localhost URLs are blocked by SSRF protection."""
-        assert _validate_image_url("http://localhost:8080/image.png") is False
+        loop = MagicMock()
+        loop.getaddrinfo = AsyncMock(
+            return_value=[(2, 1, 6, "", ("127.0.0.1", 8080))]
+        )
+        with patch("tools.url_safety.asyncio.get_running_loop", return_value=loop):
+            assert await _validate_image_url("http://localhost:8080/image.png") is False
 
-
-    def test_rejects_malformed_and_non_string_inputs(self):
+    @pytest.mark.asyncio
+    async def test_rejects_malformed_and_non_string_inputs(self):
         # http:// alone has no network location — urlparse catches this.
-        assert _validate_image_url("http://") is False
-        assert _validate_image_url("https://") is False
-        assert _validate_image_url("http:") is False
-        assert _validate_image_url("") is False
-        assert _validate_image_url("   ") is False
-        assert _validate_image_url(None) is False
-        assert _validate_image_url(12345) is False
-        assert _validate_image_url(True) is False
-        assert _validate_image_url(["https://example.com"]) is False
+        assert await _validate_image_url("http://") is False
+        assert await _validate_image_url("https://") is False
+        assert await _validate_image_url("http:") is False
+        assert await _validate_image_url("") is False
+        assert await _validate_image_url("   ") is False
+        assert await _validate_image_url(None) is False
+        assert await _validate_image_url(12345) is False
+        assert await _validate_image_url(True) is False
+        assert await _validate_image_url(["https://example.com"]) is False
 
 
 # ---------------------------------------------------------------------------
@@ -142,7 +151,8 @@ class TestHandleVisionAnalyze:
                 st.enter_context(patch.dict(os.environ, {}, clear=False))
                 if config is not None:
                     st.enter_context(patch(
-                        "hermes_cli.config.load_config", return_value=config,
+                        "hermes_cli.config.load_config_readonly_async",
+                        new=AsyncMock(return_value=config),
                     ))
                 if env_model is None:
                     os.environ.pop("AUXILIARY_VISION_MODEL", None)
@@ -224,11 +234,11 @@ class TestErrorLoggingExcInfo:
             with (
                 patch("tools.vision_tools.call_llm", new_callable=AsyncMock, return_value=mock_response),
             ):
-                # Make unlink fail to trigger the cleanup warning.
-                def failing_unlink(self, *args, **kwargs):
-                    raise PermissionError("no permission")
-
-                with patch.object(Path, "unlink", failing_unlink):
+                # Make the native async cleanup fail to trigger the warning.
+                with patch(
+                    "tools.vision_tools.aiofiles.os.remove",
+                    new=AsyncMock(side_effect=PermissionError("no permission")),
+                ):
                     await vision_analyze_tool(data_url, "describe", "test/model")
 
             warning_records = [
@@ -254,7 +264,10 @@ class TestVisionConfig:
             mock_response.choices = [mock_choice]
 
             with (
-                patch("hermes_cli.config.load_config", return_value=config),
+                patch(
+                    "hermes_cli.config.load_config_readonly_async",
+                    new=AsyncMock(return_value=config),
+                ),
                 patch(
                     "tools.vision_tools._image_to_base64_data_url",
                     return_value="data:image/png;base64,abc",
@@ -339,8 +352,14 @@ class TestVisionSafetyGuards:
         }
 
         with (
-            patch("tools.website_policy.check_website_access", return_value=blocked),
-            patch("tools.url_safety.is_safe_url", return_value=True),
+            patch(
+                "tools.website_policy.async_check_website_access",
+                new=AsyncMock(return_value=blocked),
+            ),
+            patch(
+                "tools.url_safety.async_is_safe_url",
+                new=AsyncMock(return_value=True),
+            ),
             patch("tools.vision_tools._download_image", new_callable=AsyncMock) as mock_download,
         ):
             result = json.loads(await vision_analyze_tool("https://blocked.test/cat.png", "describe"))
@@ -353,7 +372,7 @@ class TestVisionSafetyGuards:
     async def test_download_blocks_redirected_final_url(self, tmp_path):
         from tools.vision_tools import _download_image
 
-        def fake_check(url):
+        async def fake_check(url):
             if url == "https://allowed.test/cat.png":
                 return None
             if url == "https://blocked.test/final.png":
@@ -373,17 +392,21 @@ class TestVisionSafetyGuards:
             def raise_for_status(self):
                 return None
 
+        mock_client = AsyncMock()
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+        mock_client.get = AsyncMock(return_value=FakeResponse())
         with (
-            patch("tools.vision_tools.check_website_access", side_effect=fake_check),
-            patch("tools.vision_tools.httpx.AsyncClient") as mock_client_cls,
+            patch(
+                "tools.vision_tools.async_check_website_access",
+                new=AsyncMock(side_effect=fake_check),
+            ),
+            patch(
+                "tools.url_safety.create_ssrf_safe_async_client",
+                return_value=mock_client,
+            ),
             pytest.raises(PermissionError, match="Blocked by website policy"),
         ):
-            mock_client = AsyncMock()
-            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-            mock_client.__aexit__ = AsyncMock(return_value=False)
-            mock_client.get = AsyncMock(return_value=FakeResponse())
-            mock_client_cls.return_value = mock_client
-
             await _download_image("https://allowed.test/cat.png", tmp_path / "cat.png", max_retries=1)
 
         assert not (tmp_path / "cat.png").exists()
@@ -731,8 +754,14 @@ class TestDownloadRetryClassification:
 
         mock_client = self._make_client_raising_status(503)
         with (
-            patch("tools.vision_tools.httpx.AsyncClient", return_value=mock_client),
-            patch("tools.vision_tools.check_website_access", return_value=None),
+            patch(
+                "tools.url_safety.create_ssrf_safe_async_client",
+                return_value=mock_client,
+            ),
+            patch(
+                "tools.vision_tools.async_check_website_access",
+                new=AsyncMock(return_value=None),
+            ),
             patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep,
             pytest.raises(httpx.HTTPStatusError),
         ):

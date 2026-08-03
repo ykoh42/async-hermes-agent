@@ -11,7 +11,7 @@ and checks it in ``_tool_result_content_for_active_model``.
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -79,33 +79,44 @@ class TestProviderSupportsVisionToolMessages:
 
 
 class TestToolResultContentProactiveDowngrade:
-    def test_xiaomi_downgrades_to_text_summary(self):
+    @pytest.mark.asyncio
+    async def test_xiaomi_downgrades_to_text_summary(self):
         """Xiaomi: vision=True but supports_vision_tool_messages=False → text."""
         agent = _make_agent("xiaomi", "mimo-v2.5")
         result = _multimodal_result(text="screenshot captured")
 
-        with patch.object(agent, "_model_supports_vision", return_value=True):
-            content = agent._tool_result_content_for_active_model("browser_screenshot", result)
+        with patch.object(
+            agent, "_model_supports_vision", new=AsyncMock(return_value=True)
+        ):
+            content = await agent._tool_result_content_for_active_model(
+                "browser_screenshot", result
+            )
 
         assert isinstance(content, str)
         assert "screenshot captured" in content
 
-    def test_xiaomi_non_multimodal_passes_through(self):
+    @pytest.mark.asyncio
+    async def test_xiaomi_non_multimodal_passes_through(self):
         """Non-multimodal results should pass through unchanged."""
         agent = _make_agent("xiaomi", "mimo-v2.5")
         result = "plain text result"
 
-        content = agent._tool_result_content_for_active_model("some_tool", result)
+        content = await agent._tool_result_content_for_active_model("some_tool", result)
 
         assert content == "plain text result"
 
-    def test_openrouter_vision_keeps_list_content(self):
+    @pytest.mark.asyncio
+    async def test_openrouter_vision_keeps_list_content(self):
         """OpenRouter with vision: list content preserved."""
         agent = _make_agent("openrouter", "gpt-4o")
         result = _multimodal_result()
 
-        with patch.object(agent, "_model_supports_vision", return_value=True):
-            content = agent._tool_result_content_for_active_model("browser_screenshot", result)
+        with patch.object(
+            agent, "_model_supports_vision", new=AsyncMock(return_value=True)
+        ):
+            content = await agent._tool_result_content_for_active_model(
+                "browser_screenshot", result
+            )
 
         assert isinstance(content, list)
         assert any(p.get("type") == "image_url" for p in content if isinstance(p, dict))
@@ -113,14 +124,19 @@ class TestToolResultContentProactiveDowngrade:
 
 
 
-    def test_reactive_cache_still_works(self):
+    @pytest.mark.asyncio
+    async def test_reactive_cache_still_works(self):
         """In-session cache (_no_list_tool_content_models) still triggers."""
         agent = _make_agent("openrouter", "some-model")
         agent._no_list_tool_content_models = {("openrouter", "some-model")}
         result = _multimodal_result(text="cached downgrade")
 
-        with patch.object(agent, "_model_supports_vision", return_value=True):
-            content = agent._tool_result_content_for_active_model("browser_screenshot", result)
+        with patch.object(
+            agent, "_model_supports_vision", new=AsyncMock(return_value=True)
+        ):
+            content = await agent._tool_result_content_for_active_model(
+                "browser_screenshot", result
+            )
 
         assert isinstance(content, str)
         assert "cached downgrade" in content
@@ -149,5 +165,4 @@ class TestProviderProfileField:
         profile = get_provider_profile("xiaomi")
         assert profile is not None
         assert profile.supports_vision_tool_messages is False
-
 

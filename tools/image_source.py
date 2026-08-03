@@ -150,8 +150,6 @@ async def resolve_image_source(
                 raise_if_read_blocked(str(host_target))
             except ValueError as exc:
                 raise SourceUnsafe(str(exc), src=s, origin="file")
-        import aiofiles
-
         async with aiofiles.open(host_target, "rb") as image_file:
             data = await image_file.read()
         return _finalize(data, "", "file", s, permitted)

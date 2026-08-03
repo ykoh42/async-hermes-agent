@@ -226,16 +226,7 @@ def _image_url_shape_ok(url: str) -> bool:
     return True
 
 
-def _validate_image_url(url: str) -> bool:
-    """Validate image URL for sync callers and tests (SSRF via sync DNS check)."""
-    if not _image_url_shape_ok(url):
-        return False
-    # Block private/internal addresses to prevent SSRF
-    from tools.url_safety import is_safe_url
-    return is_safe_url(url)
-
-
-async def _validate_image_url_async(url: str) -> bool:
+async def _validate_image_url(url: str) -> bool:
     """Validate remote image URL without blocking the event loop on DNS."""
     if not _image_url_shape_ok(url):
         return False
@@ -1720,7 +1711,7 @@ async def video_analyze_tool(
             logger.info("Using local video file: %s", video_url)
             temp_video_path = local_path
             should_cleanup = False
-        elif await _validate_image_url_async(video_url):
+        elif await _validate_image_url(video_url):
             blocked = await async_check_website_access(video_url)
             if blocked:
                 raise PermissionError(blocked["message"])
