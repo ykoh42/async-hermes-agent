@@ -14,7 +14,9 @@ import contextlib
 import io
 from pathlib import Path
 
-from hermes_state import SessionDB
+import pytest
+
+from hermes_state import AsyncSessionDB
 from run_agent import AIAgent
 
 
@@ -41,7 +43,7 @@ def _make_agent(monkeypatch, tmp_path: Path, **prune_keys):
     monkeypatch.setattr(config_mod, "load_config", lambda: _config(**prune_keys))
 
     monkeypatch.setattr(config_mod, "load_config_readonly", lambda: _config(**prune_keys))
-    db = SessionDB(db_path=tmp_path / "state.db")
+    db = AsyncSessionDB(tmp_path / "state.db")
     with contextlib.redirect_stdout(io.StringIO()):
         agent = AIAgent(
             base_url="https://chatgpt.com/backend-api/codex",
@@ -55,19 +57,23 @@ def _make_agent(monkeypatch, tmp_path: Path, **prune_keys):
             session_db=db,
             session_id="proactive-prune-config-test",
         )
-    return agent
+    return agent, db
 
 
 class TestProactivePruneConfig:
-    def test_default_is_disabled_when_unset(self, monkeypatch, tmp_path):
-        agent = _make_agent(monkeypatch, tmp_path)
+    @pytest.mark.asyncio
+    async def test_default_is_disabled_when_unset(self, monkeypatch, tmp_path):
+        agent, db = _make_agent(monkeypatch, tmp_path)
         cc = agent.context_compressor
         assert cc.proactive_prune_tokens == 0
         assert cc.proactive_prune_min_result_chars == 8000
         assert cc.proactive_prune_min_reclaim_tokens == 4096
+        await agent.close()
+        await db.close()
 
-    def test_custom_values_are_honored(self, monkeypatch, tmp_path):
-        agent = _make_agent(
+    @pytest.mark.asyncio
+    async def test_custom_values_are_honored(self, monkeypatch, tmp_path):
+        agent, db = _make_agent(
             monkeypatch,
             tmp_path,
             proactive_prune_tokens=48_000,
@@ -78,13 +84,17 @@ class TestProactivePruneConfig:
         assert cc.proactive_prune_tokens == 48_000
         assert cc.proactive_prune_min_result_chars == 12_000
         assert cc.proactive_prune_min_reclaim_tokens == 8_192
+        await agent.close()
+        await db.close()
 
-    def test_boolean_is_rejected_not_coerced(self, monkeypatch, tmp_path):
+    @pytest.mark.asyncio
+    async def test_boolean_is_rejected_not_coerced(self, monkeypatch, tmp_path):
         # bool subclasses int: YAML `proactive_prune_tokens: true` must fall
         # back to disabled, never coerce to 1 token.
-        agent = _make_agent(monkeypatch, tmp_path, proactive_prune_tokens=True)
+        agent, db = _make_agent(monkeypatch, tmp_path, proactive_prune_tokens=True)
         assert agent.context_compressor.proactive_prune_tokens == 0
-
+        await agent.close()
+        await db.close()
 
 
 
