@@ -229,8 +229,8 @@ class MemoryProvider(ABC):
         """
         return ""
 
-    def on_delegation(self, task: str, result: str, *,
-                      child_session_id: str = "", **kwargs) -> None:
+    async def on_delegation(self, task: str, result: str, *,
+                            child_session_id: str = "", **kwargs) -> None:
         """Called on the PARENT agent when a subagent completes.
 
         The parent's memory provider gets the task+result pair as an

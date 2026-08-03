@@ -1,5 +1,4 @@
 """Behavioral coverage for #68545's centralized journal-mode setting."""
-
 from __future__ import annotations
 
 import sqlite3
@@ -80,7 +79,6 @@ def test_apply_wal_with_fallback_honors_delete_config(monkeypatch, tmp_path):
     finally:
         conn.close()
 
-
 def test_apply_wal_with_fallback_defaults_to_wal(monkeypatch, tmp_path):
     from hermes_state import apply_wal_with_fallback
 
@@ -128,102 +126,3 @@ def test_configured_delete_never_live_downgrades_existing_wal(monkeypatch, tmp_p
         assert conn.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
     finally:
         conn.close()
-
-
-@pytest.mark.skip(reason="optional gateway/cron/plugin database adapters are removed from the training runtime")
-def test_real_db_openers_honor_configured_delete(monkeypatch, tmp_path):
-    """All helper-routed file-backed openers must behaviorally use DELETE."""
-    _configure_mode(monkeypatch, tmp_path, "delete")
-    _disable_vulnerable_gate(monkeypatch)
-
-    from agent import verification_evidence
-    from cron import executions
-    from gateway import delivery_ledger
-    from gateway.platforms.api_server import ResponseStore
-    from hermes_cli import kanban_db, projects_db
-    from hermes_state import SessionDB
-    from plugins.memory.holographic.store import MemoryStore
-    from plugins.platforms.discord.recovery import DiscordRecoveryStore
-    from tools import async_delegation
-
-    observed: dict[str, str] = {}
-
-    for name, connect in (
-        ("async_delegation", async_delegation._connect),
-        ("delivery_ledger", delivery_ledger._connect),
-        ("verification_evidence", verification_evidence._connect),
-    ):
-        conn = connect()
-        try:
-            observed[name] = conn.execute("PRAGMA journal_mode").fetchone()[0].lower()
-        finally:
-            conn.close()
-
-    monkeypatch.setattr(executions, "EXECUTIONS_FILE", tmp_path / "cron" / "executions.db")
-    executions.EXECUTIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    cron_conn = executions._connect()
-    try:
-        executions._initialize_schema(cron_conn)
-        observed["cron_executions"] = cron_conn.execute(
-            "PRAGMA journal_mode"
-        ).fetchone()[0].lower()
-    finally:
-        cron_conn.close()
-
-    discord = DiscordRecoveryStore(hermes_home=tmp_path)
-    observed["discord_recovery"] = discord.call(
-        lambda conn: conn.execute("PRAGMA journal_mode").fetchone()[0].lower()
-    )
-
-    session_db = SessionDB(db_path=tmp_path / "state.db")
-    try:
-        observed["session_db"] = session_db._conn.execute(
-            "PRAGMA journal_mode"
-        ).fetchone()[0].lower()
-    finally:
-        session_db.close()
-
-    kanban_conn = kanban_db.connect(db_path=tmp_path / "kanban.db")
-    try:
-        observed["kanban"] = kanban_conn.execute(
-            "PRAGMA journal_mode"
-        ).fetchone()[0].lower()
-    finally:
-        kanban_conn.close()
-
-    projects_conn = projects_db.connect(db_path=tmp_path / "projects.db")
-    try:
-        observed["projects"] = projects_conn.execute(
-            "PRAGMA journal_mode"
-        ).fetchone()[0].lower()
-    finally:
-        projects_conn.close()
-
-    holographic = MemoryStore(db_path=tmp_path / "memory_store.db")
-    try:
-        observed["holographic"] = holographic._conn.execute(
-            "PRAGMA journal_mode"
-        ).fetchone()[0].lower()
-    finally:
-        holographic.close()
-
-    response_store = ResponseStore(db_path=str(tmp_path / "response_store.db"))
-    try:
-        observed["response_store"] = response_store._conn.execute(
-            "PRAGMA journal_mode"
-        ).fetchone()[0].lower()
-    finally:
-        response_store.close()
-
-    assert observed == {
-        "async_delegation": "delete",
-        "delivery_ledger": "delete",
-        "verification_evidence": "delete",
-        "cron_executions": "delete",
-        "discord_recovery": "delete",
-        "session_db": "delete",
-        "kanban": "delete",
-        "projects": "delete",
-        "holographic": "delete",
-        "response_store": "delete",
-    }

@@ -14,6 +14,7 @@ import json
 import re
 import shlex
 import asyncio
+import contextvars
 import signal
 import threading
 import time
@@ -43,7 +44,9 @@ _CONTAINER_BACKENDS = frozenset()
 _background_processes: dict[str, set[asyncio.subprocess.Process]] = {}
 _background_reapers: dict[asyncio.subprocess.Process, asyncio.Task] = {}
 
-_approval_callback: Callable[..., Any] | None = None
+_approval_callback: contextvars.ContextVar[Callable[..., Any] | None] = (
+    contextvars.ContextVar("terminal_approval_callback", default=None)
+)
 _sudo_password_callback: Callable[..., Any] | None = None
 
 
@@ -127,12 +130,11 @@ def _start_cleanup_thread() -> None:
 
 
 def _get_approval_callback() -> Callable[..., Any] | None:
-    return _approval_callback
+    return _approval_callback.get()
 
 
 def set_approval_callback(callback: Callable[..., Any] | None) -> None:
-    global _approval_callback
-    _approval_callback = callback
+    _approval_callback.set(callback)
 
 
 def _get_sudo_password_callback() -> Callable[..., Any] | None:
@@ -144,8 +146,145 @@ def set_sudo_password_callback(callback: Callable[..., Any] | None) -> None:
     _sudo_password_callback = callback
 
 
+def _read_shell_token(command: str, start: int) -> tuple[str, int]:
+    """Read one shell token, preserving quotes and escapes."""
+    index = start
+    length = len(command)
+
+    while index < length:
+        char = command[index]
+        if char.isspace() or char in ";|&()":
+            break
+        if char == "'":
+            index += 1
+            while index < length and command[index] != "'":
+                index += 1
+            if index < length:
+                index += 1
+            continue
+        if char == '"':
+            index += 1
+            while index < length:
+                inner = command[index]
+                if inner == "\\" and index + 1 < length:
+                    index += 2
+                    continue
+                if inner == '"':
+                    index += 1
+                    break
+                index += 1
+            continue
+        if char == "\\" and index + 1 < length:
+            index += 2
+            continue
+        index += 1
+
+    return command[start:index], index
+
+
 def _rewrite_compound_background(command: str, *_args: Any, **_kwargs: Any) -> str:
-    return command
+    """Wrap top-level ``A && B &`` as ``A && { B & }``.
+
+    Bash otherwise backgrounds the whole compound in a subshell, which can
+    keep pipes open and wait forever for a long-running ``B``. Quoted text,
+    redirects, subshells, and existing brace groups are left unchanged.
+    """
+    length = len(command)
+    index = 0
+    paren_depth = 0
+    brace_depth = 0
+    last_chain_end = -1
+    rewrites: list[tuple[int, int]] = []
+
+    while index < length:
+        char = command[index]
+
+        if char == "\n" and paren_depth == 0 and brace_depth == 0:
+            last_chain_end = -1
+            index += 1
+            continue
+        if char.isspace():
+            index += 1
+            continue
+        if char == "#":
+            newline = command.find("\n", index)
+            if newline == -1:
+                break
+            index = newline
+            continue
+        if char == "\\" and index + 1 < length:
+            index += 2
+            continue
+        if char in ("'", '"'):
+            _, next_index = _read_shell_token(command, index)
+            index = max(next_index, index + 1)
+            continue
+        if char == "(":
+            paren_depth += 1
+            index += 1
+            continue
+        if char == ")":
+            paren_depth = max(0, paren_depth - 1)
+            index += 1
+            continue
+        if char == "{" and index + 1 < length and (
+            command[index + 1].isspace() or command[index + 1] == "\n"
+        ):
+            brace_depth += 1
+            index += 1
+            continue
+        if char == "}" and brace_depth > 0:
+            brace_depth -= 1
+            last_chain_end = -1
+            index += 1
+            continue
+        if paren_depth > 0 or brace_depth > 0:
+            index += 1
+            continue
+        if command.startswith("&&", index) or command.startswith("||", index):
+            last_chain_end = index + 2
+            index += 2
+            continue
+        if char == ";":
+            last_chain_end = -1
+            index += 1
+            continue
+        if char == "|":
+            last_chain_end = -1
+            index += 1
+            continue
+        if char == "&":
+            if index + 1 < length and command[index + 1] == ">":
+                index += 2
+                continue
+            previous = index - 1
+            while previous >= 0 and command[previous].isspace():
+                previous -= 1
+            if previous >= 0 and command[previous] in "<>":
+                index += 1
+                continue
+            if last_chain_end >= 0:
+                rewrites.append((last_chain_end, index))
+            last_chain_end = -1
+            index += 1
+            continue
+
+        _, next_index = _read_shell_token(command, index)
+        index = max(next_index, index + 1)
+
+    result = command
+    for chain_end, ampersand in reversed(rewrites):
+        insert_at = chain_end
+        while insert_at < ampersand and result[insert_at].isspace():
+            insert_at += 1
+        result = (
+            result[:insert_at]
+            + "{ "
+            + result[insert_at:ampersand]
+            + "& }"
+            + result[ampersand + 1 :]
+        )
+    return result
 
 
 def _transform_sudo_command(command: str, *_args: Any, **_kwargs: Any) -> tuple[str, str | None]:

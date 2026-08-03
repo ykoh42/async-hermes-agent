@@ -1,8 +1,8 @@
 """Contract tests for the public plugin subagent lifecycle API."""
 
-import time
+import asyncio
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -34,10 +34,10 @@ def lifecycle(monkeypatch):
     parent = SimpleNamespace(session_id="parent-1", enabled_toolsets=["file"])
     counter = iter(range(1000))
 
-    def build(**_kwargs):
+    async def build(**_kwargs):
         return FakeChild(f"sa-{next(counter)}")
 
-    def run(_index, _goal, child, _parent):
+    async def run(_index, _goal, child, _parent):
         for _ in range(20):
             if child.interrupted:
                 return {
@@ -46,7 +46,7 @@ def lifecycle(monkeypatch):
                     "api_calls": 0,
                     "duration_seconds": 0,
                 }
-            time.sleep(0.002)
+            await asyncio.sleep(0.002)
         return {
             "status": "completed",
             "summary": "safe summary",
@@ -63,10 +63,11 @@ def lifecycle(monkeypatch):
 
 
 
-def test_cancel_is_cooperative_and_forged_handle_is_unknown(lifecycle):
-    handle = lifecycle.launch(SubagentLaunchRequest(goal="x"))
+@pytest.mark.asyncio
+async def test_cancel_is_cooperative_and_forged_handle_is_unknown(lifecycle):
+    handle = await lifecycle.launch(SubagentLaunchRequest(goal="x"))
     assert lifecycle.cancel(handle, reason="test").accepted
-    terminal = lifecycle.wait(handle, timeout_seconds=1)
+    terminal = await lifecycle.wait(handle, timeout_seconds=1)
     assert terminal.state is SubagentState.CANCELLED
     forged = handle.__class__(**{**handle.to_dict(), "capability": "forged"})
     assert lifecycle.status(forged).state is SubagentState.UNKNOWN
@@ -82,8 +83,9 @@ def test_cancel_is_cooperative_and_forged_handle_is_unknown(lifecycle):
 
 
 
-def test_public_lifecycle_runs_host_aggregation(monkeypatch):
-    memory = Mock()
+@pytest.mark.asyncio
+async def test_public_lifecycle_runs_host_aggregation(monkeypatch):
+    memory = AsyncMock()
     parent = SimpleNamespace(
         session_id="parent-aggregate",
         enabled_toolsets=["file"],
@@ -95,12 +97,13 @@ def test_public_lifecycle_runs_host_aggregation(monkeypatch):
     )
     child = FakeChild("sa-aggregate")
     child.session_id = "child-session"
-    hook = Mock()
+    hook = AsyncMock()
 
-    monkeypatch.setattr("tools.delegate_tool._build_child_agent", lambda **_kwargs: child)
-    monkeypatch.setattr(
-        "tools.delegate_tool._run_single_child",
-        lambda *_args, **_kwargs: {
+    async def build_child(**_kwargs):
+        return child
+
+    async def run_child(*_args, **_kwargs):
+        return {
             "task_index": 0,
             "status": "completed",
             "summary": "aggregated",
@@ -108,18 +111,23 @@ def test_public_lifecycle_runs_host_aggregation(monkeypatch):
             "duration_seconds": 0.25,
             "_child_role": "leaf",
             "_child_cost_usd": 2.5,
-        },
+        }
+
+    monkeypatch.setattr("tools.delegate_tool._build_child_agent", build_child)
+    monkeypatch.setattr(
+        "tools.delegate_tool._run_single_child",
+        run_child,
     )
-    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", hook)
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook_async", hook)
 
     service = SubagentLifecycleService(lambda: parent)
-    handle = service.launch(SubagentLaunchRequest(goal="aggregate me"))
-    assert service.wait(handle, timeout_seconds=1).state is SubagentState.SUCCEEDED
+    handle = await service.launch(SubagentLaunchRequest(goal="aggregate me"))
+    assert (await service.wait(handle, timeout_seconds=1)).state is SubagentState.SUCCEEDED
 
-    memory.on_delegation.assert_called_once_with(
+    memory.on_delegation.assert_awaited_once_with(
         task="aggregate me", result="aggregated", child_session_id="child-session"
     )
-    hook.assert_called_once_with(
+    hook.assert_awaited_once_with(
         "subagent_stop",
         parent_session_id="parent-aggregate",
         parent_turn_id="turn-1",

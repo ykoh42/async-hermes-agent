@@ -36,7 +36,6 @@ _CANONICAL_TABLES = (
     "session_model_usage",
     "compression_locks",
     "gateway_routing",
-    "async_delegations",
 )
 
 _TOPIC_TABLES = (

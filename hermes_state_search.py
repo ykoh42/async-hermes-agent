@@ -726,7 +726,7 @@ class SessionSearchMixin:
         caller that needs real user-turn targets.
 
         Bookkeeping timeline rows (``display_kind`` set — e.g. model_switch,
-        async_delegation_complete, auto_continue, hidden) are excluded. They
+        auto_continue, hidden) are excluded. They
         are durable ``role='user'`` rows for the API transcript, but no client
         counts them as user turns (desktop demotes them to system / drops them;
         the CLI already uses ``not m.get("display_kind")``). Including them here

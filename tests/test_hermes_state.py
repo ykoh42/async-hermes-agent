@@ -2684,22 +2684,22 @@ class TestDisplayMetadataPersistence:
 
     def test_append_message_round_trips_display_fields(self, db):
         db.create_session("s1", source="cli")
-        meta = {"task_count": 2, "delegation_id": "del-1"}
+        meta = {"tool_count": 2, "turn_id": "turn-1"}
         db.append_message(
             "s1", "user", "event text",
-            display_kind="async_delegation_complete",
+            display_kind="tool_event",
             display_metadata=meta,
         )
         conv = db.get_messages_as_conversation("s1")
-        assert conv[0]["display_kind"] == "async_delegation_complete"
+        assert conv[0]["display_kind"] == "tool_event"
         assert conv[0]["display_metadata"] == meta
 
     def test_replace_messages_preserves_display_metadata(self, db):
         db.create_session("s1", source="cli")
-        meta = {"task_count": 3, "delegation_id": "del-2", "duration_seconds": 12.5}
+        meta = {"tool_count": 3, "turn_id": "turn-2", "duration_seconds": 12.5}
         db.append_message(
             "s1", "user", "event",
-            display_kind="async_delegation_complete",
+            display_kind="tool_event",
             display_metadata=meta,
         )
         # Reload via get_messages_as_conversation (which decodes display fields)
@@ -2707,7 +2707,7 @@ class TestDisplayMetadataPersistence:
         conv = db.get_messages_as_conversation("s1")
         db.replace_messages("s1", conv)
         reloaded = db.get_messages_as_conversation("s1")
-        assert reloaded[0]["display_kind"] == "async_delegation_complete"
+        assert reloaded[0]["display_kind"] == "tool_event"
         assert reloaded[0]["display_metadata"] == meta
 
 
@@ -2720,8 +2720,8 @@ class TestDisplayMetadataReadPaths:
     """
 
     META = {
-        "delegation_id": "deleg_0d84d484",
-        "task_count": 1,
+        "turn_id": "turn-0d84d484",
+        "tool_count": 1,
         "completed_count": 1,
         "failed_count": 0,
         "duration_seconds": 193.55,
@@ -2732,7 +2732,7 @@ class TestDisplayMetadataReadPaths:
         db.create_session("s1", source="desktop")
         message_id = db.append_message(
             "s1", "user", "event",
-            display_kind="async_delegation_complete",
+            display_kind="tool_event",
             display_metadata=TestDisplayMetadataReadPaths.META,
         )
         return message_id, db.append_message("s1", "assistant", "anchor")

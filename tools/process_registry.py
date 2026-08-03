@@ -171,14 +171,6 @@ class ProcessRegistry:
         # gateway drain this after each agent turn to auto-trigger new turns.
         import queue as _queue_mod
         self.completion_queue: _queue_mod.Queue = _queue_mod.Queue()
-        # Rehydrate durable delegation completions only at registry startup.
-        # Consumers still inject them as fresh turns through this existing rail.
-        try:
-            from tools.async_delegation import restore_undelivered_completions
-            restore_undelivered_completions(self.completion_queue)
-        except Exception as exc:
-            logger.warning("Could not restore async delegation completions: %s", exc)
-
         # Track sessions whose completion was already consumed by the agent
         # via wait/log.  Drain loops AND gateway/tui watchers skip notifications
         # for these — a blocking wait() or a full read_log() means the agent
@@ -1248,8 +1240,7 @@ class ProcessRegistry:
         not suppress autonomous delivery there.
 
         When a routing filter is supplied, addressed notifications must not be
-        drained into the wrong session. Async-delegation events always require
-        conversation payload; ordinary notifications require routing when they
+        drained into the wrong session. Notifications require routing when they
         carry ``session_key`` or ``origin_ui_session_id`` metadata. Two filter
         modes are supported, strongest first:
 
@@ -1263,10 +1254,8 @@ class ProcessRegistry:
           callers). Non-matching addressed events are re-queued.
 
         With neither set, all events are consumed (legacy single-session
-        behavior, backward compatible). Ownerless ordinary notifications also
-        retain that legacy behavior even when a filter is provided. When a
-        filter is provided, ownerless async-delegation events remain
-        fail-closed and require positive proof.
+        behavior, backward compatible). Ownerless notifications retain that
+        legacy behavior even when a filter is provided.
         """
         results: "list[tuple[dict, str]]" = []
         requeue: "list[dict]" = []
@@ -1275,16 +1264,12 @@ class ProcessRegistry:
                 evt = self.completion_queue.get_nowait()
             except Exception:
                 break
-            # Positive-proof ownership beats bare key equality. Delegation
-            # payloads always require proof; ordinary events require it once
-            # they carry routing metadata. Ownerless ordinary events preserve
-            # legacy single-session delivery.
-            is_async_delegation = evt.get("type") == "async_delegation"
+            # Positive-proof ownership beats bare key equality once an event
+            # carries routing metadata. Ownerless events preserve legacy
+            # single-session delivery.
             evt_session_key = str(evt.get("session_key") or "")
             evt_origin_sid = str(evt.get("origin_ui_session_id") or "")
-            requires_positive_proof = is_async_delegation or bool(
-                evt_session_key or evt_origin_sid
-            )
+            requires_positive_proof = bool(evt_session_key or evt_origin_sid)
             if owns_event is not None and requires_positive_proof:
                 try:
                     owned = bool(owns_event(evt))
@@ -1297,12 +1282,6 @@ class ProcessRegistry:
                 if evt_session_key != session_key:
                     requeue.append(evt)
                     continue
-            elif is_async_delegation and evt.get("restored"):
-                # Durable restore can enqueue previous-process payloads into a
-                # fresh registry. An unfiltered legacy drain cannot prove
-                # ownership, so leave those events queued for the owner.
-                requeue.append(evt)
-                continue
             # Local consumed/observed state may suppress only events this
             # session owns (or legacy ownerless ordinary events). Routing must
             # happen first so a foreign session cannot drop the owner's event.
@@ -2100,145 +2079,6 @@ def _format_age(seconds: float) -> str:
     return f"{h}h" if m == 0 else f"{h}h{m}m"
 
 
-def _format_async_delegation(evt: dict) -> str:
-    """Format an async-delegation completion into a self-contained re-injection.
-
-    Carries the FULL original task source (goal, the context the parent
-    supplied, toolsets, role, model) plus dispatch time, status, and the
-    complete result summary. When this re-enters the conversation the agent
-    may be deep in unrelated context and won't remember why the subagent
-    existed, so the block is written to stand entirely on its own — enough to
-    use the result OR re-dispatch if the world has moved on.
-    """
-    import time as _time
-
-    deleg_id = evt.get("delegation_id", "unknown")
-    goal = evt.get("goal", "") or ""
-    context = evt.get("context")
-    toolsets = evt.get("toolsets")
-    role = evt.get("role") or "leaf"
-    model = evt.get("model") or "?"
-    status = evt.get("status") or "completed"
-    summary = evt.get("summary")
-    error = evt.get("error")
-    api_calls = evt.get("api_calls", 0)
-    duration = evt.get("duration_seconds", "?")
-    dispatched_at = evt.get("dispatched_at")
-    completed_at = evt.get("completed_at") or _time.time()
-
-    # ----- Batch (fan-out) completion: consolidated multi-task block -----
-    # A whole delegate_task fan-out dispatched as one background unit finishes
-    # together and carries a per-task `results` list. Render every subagent's
-    # summary in one block so the model gets the consolidated outcome at once.
-    batch_results = evt.get("results")
-    if evt.get("is_batch") or isinstance(batch_results, list):
-        results = batch_results or []
-        goals = evt.get("goals") or []
-        n = len(results) if results else len(goals)
-        total_dur = evt.get("total_duration_seconds", duration)
-        lines = [
-            f"[ASYNC DELEGATION BATCH COMPLETE — {deleg_id}]",
-            f"A background fan-out of {n} subagent(s) you dispatched earlier "
-            "has finished. All ran in parallel and waited on each other; their "
-            "consolidated results are below. You may have moved on since "
-            "dispatching — act on these or re-dispatch if things have changed.",
-            "",
-        ]
-        if isinstance(dispatched_at, (int, float)):
-            ts = _time.strftime("%Y-%m-%d %H:%M:%S", _time.localtime(dispatched_at))
-            age = f" ({_format_age(completed_at - dispatched_at)} ago)"
-            lines.append(f"Dispatched: {ts}{age}")
-        if context:
-            lines.append(f"Context you provided: {context}")
-        if toolsets:
-            lines.append(f"Toolsets: {', '.join(toolsets)}")
-        lines.append(f"Role: {role}   Model: {model}   Total duration: {total_dur}s")
-        if error and not results:
-            lines.append("--- ERROR ---")
-            lines.append(f"The batch did not complete successfully: {error}")
-            return "\n".join(lines)
-        for r in sorted(results, key=lambda x: x.get("task_index", 0)):
-            idx = r.get("task_index", 0)
-            r_status = r.get("status", "?")
-            r_summary = r.get("summary")
-            r_error = r.get("error")
-            r_goal = goals[idx] if idx < len(goals) else r.get("goal", "")
-            icon = "✓" if r_status in ("completed", "success") else "✗"
-            lines.append("")
-            header = f"--- {icon} TASK {idx + 1}/{n}"
-            if r_goal:
-                header += f": {r_goal}"
-            header += f"  (status={r_status}"
-            if r.get("api_calls"):
-                header += f", api_calls={r['api_calls']}"
-            if r.get("duration_seconds") is not None:
-                header += f", {r['duration_seconds']}s"
-            header += ") ---"
-            lines.append(header)
-            if r_status in ("completed", "success") and r_summary:
-                lines.append(r_summary)
-            elif r_summary:
-                if r_error:
-                    lines.append(f"({r_status}: {r_error})")
-                lines.append("Partial output:")
-                lines.append(r_summary)
-            else:
-                lines.append(
-                    f"(no summary — status={r_status}"
-                    + (f": {r_error}" if r_error else "")
-                    + ")"
-                )
-            r_live = r.get("live_transcript")
-            if r_live:
-                lines.append(
-                    f"Full live transcript (complete tool/assistant trace): {r_live}"
-                )
-        return "\n".join(lines)
-
-    age = ""
-    if isinstance(dispatched_at, (int, float)):
-        age = f" ({_format_age(completed_at - dispatched_at)} ago)"
-
-    lines = [
-        f"[ASYNC DELEGATION COMPLETE — {deleg_id}]",
-        "A background subagent you dispatched earlier has finished. You may "
-        "have moved on since dispatching it; the full task source is below so "
-        "you can act on the result or re-dispatch if things have changed.",
-        "",
-    ]
-    if isinstance(dispatched_at, (int, float)):
-        ts = _time.strftime("%Y-%m-%d %H:%M:%S", _time.localtime(dispatched_at))
-        lines.append(f"Dispatched: {ts}{age}")
-    lines.append(f"Original goal: {goal}")
-    if context:
-        lines.append(f"Context you provided: {context}")
-    if toolsets:
-        lines.append(f"Toolsets: {', '.join(toolsets)}")
-    lines.append(f"Role: {role}   Model: {model}")
-    lines.append(f"Status: {status}   API calls: {api_calls}   Duration: {duration}s")
-    lines.append("--- RESULT ---")
-    if status in ("completed", "success") and summary:
-        lines.append(summary)
-    elif status == "interrupted":
-        lines.append(
-            "The subagent was interrupted before completing"
-            + (f": {error}" if error else ".")
-        )
-        if summary:
-            lines.append("Partial output:")
-            lines.append(summary)
-    else:
-        # error / timeout / failed
-        lines.append(
-            f"The subagent did not complete successfully (status={status})."
-            + (f"\n{error}" if error else "")
-        )
-        if summary:
-            lines.append("Partial output:")
-            lines.append(summary)
-    return "\n".join(lines)
-
-
 def format_process_notification(evt: dict) -> "str | None":
     """Format a process notification event into a [IMPORTANT: ...] message.
 
@@ -2266,9 +2106,6 @@ def format_process_notification(evt: dict) -> "str | None":
             text += f"\n({_sup} earlier matches were suppressed by rate limit)"
         text += "]"
         return text
-
-    if evt_type == "async_delegation":
-        return _format_async_delegation(evt)
 
     _exit = evt.get("exit_code", "?")
     _out = evt.get("output", "")

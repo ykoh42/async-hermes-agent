@@ -84,14 +84,6 @@ def _make_source(path: Path) -> dict[str, int]:
             """,
             ("telegram", "telegram:user-1:chat-1", "{}", 2.0),
         )
-        db._conn.execute(
-            """
-            INSERT INTO async_delegations (
-                delegation_id, origin_session, state, dispatched_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?)
-            """,
-            ("delegation-1", "recovery-session-0", "completed", 1.0, 2.0),
-        )
         # These are derived transition markers and must not reach the new DB.
         db.set_meta("fts_rebuild_high_water", "999")
         db.set_meta("fts_rebuild_progress", "500")

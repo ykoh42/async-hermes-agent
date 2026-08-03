@@ -1127,12 +1127,12 @@ class MemoryManager:
             except Exception as e:
                 logger.debug("notify_memory_tool_write failed for op %s: %s", action, e)
 
-    def on_delegation(self, task: str, result: str, *,
-                      child_session_id: str = "", **kwargs) -> None:
+    async def on_delegation(self, task: str, result: str, *,
+                            child_session_id: str = "", **kwargs) -> None:
         """Notify all providers that a subagent completed."""
         for provider in self._providers:
             try:
-                provider.on_delegation(
+                await provider.on_delegation(
                     task, result, child_session_id=child_session_id, **kwargs
                 )
             except Exception as e:

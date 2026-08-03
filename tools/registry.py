@@ -39,6 +39,7 @@ logger = logging.getLogger(__name__)
 # optional SDKs and their operational dependencies on every worker.
 _TRAINING_RUNTIME_TOOL_MODULES = frozenset({
     "clarify_tool",
+    "delegate_tool",
     "file_tools",
     "memory_tool",
     "skills_tool",
@@ -57,6 +58,7 @@ _TRAINING_RUNTIME_TOOL_MODULES = frozenset({
 # handler has been converted to native async and its module is added here.
 _ASYNC_RUNTIME_HANDLER_MODULES = frozenset({
     "tools.clarify_tool",
+    "tools.delegate_tool",
     "tools.file_tools",
     "tools.mcp_tool",
     "tools.memory_tool",
