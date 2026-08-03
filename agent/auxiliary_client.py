@@ -648,8 +648,9 @@ def _apply_user_default_headers(
     when nothing is configured. No allocation when there are no overrides.
     """
     try:
-        from hermes_cli.config import cfg_get, load_config_readonly
-        _cfg = config if config is not None else load_config_readonly()
+        from hermes_cli.config import cfg_get
+
+        _cfg = config or {}
         user_headers = cfg_get(_cfg, "model", "default_headers")
         # ``model.extra_headers`` is an accepted alias (matches the
         # per-provider ``extra_headers`` key on providers/custom_providers
@@ -686,18 +687,12 @@ def build_or_headers(or_config: dict | None = None) -> dict:
         ``HERMES_OPENROUTER_CACHE_TTL`` — integer seconds (1-86400).
             Overrides ``openrouter.response_cache_ttl`` in config.yaml.
 
-    *or_config* is the ``openrouter`` section from config.yaml.  When *None*,
-    falls back to reading config from disk via ``load_config_readonly()``.
+    *or_config* is the already-loaded ``openrouter`` section from config.yaml.
+    ``None`` uses the static defaults below and never performs file I/O.
     """
     headers = dict(_OR_HEADERS_BASE)
 
-    # Resolve config from disk if not provided.
-    if or_config is None:
-        try:
-            from hermes_cli.config import load_config_readonly
-            or_config = load_config_readonly().get("openrouter", {})
-        except Exception:
-            or_config = {}
+    or_config = or_config or {}
 
     # Determine cache enabled: env var overrides config.
     env_cache = os.environ.get("HERMES_OPENROUTER_CACHE", "").strip().lower()
@@ -3294,32 +3289,9 @@ def _is_transient_transport_error(exc: Exception) -> bool:
     return isinstance(status, int) and (status == 408 or 500 <= status < 600)
 
 
-_DEFAULT_TRANSIENT_RETRIES = 2
 # Base for exponential backoff between transient retries (seconds). Overridable
 # so tests can zero it out and not sleep real wall-clock time.
 _TRANSIENT_RETRY_BACKOFF_BASE = 1.0
-
-
-def _transient_retry_count() -> int:
-    """Number of same-provider retries for a transient transport blip.
-
-    Read from ``auxiliary.transient_retries`` in config.yaml (default 2 →
-    3 total attempts). Clamped to [0, 6] to bound worst-case wall time. A
-    connection blip to a pinned auxiliary target (e.g. a MoA reference
-    advisor) has no meaningful provider fallback, so a couple of retries with
-    backoff is the difference between recovering and silently losing the call.
-    Best-effort: any config-read failure falls back to the default.
-    """
-    try:
-        from hermes_cli.config import cfg_get, load_config
-
-        val = cfg_get(load_config(), "auxiliary", "transient_retries")
-        if val is None:
-            return _DEFAULT_TRANSIENT_RETRIES
-        n = int(val)
-        return max(0, min(n, 6))
-    except Exception:
-        return _DEFAULT_TRANSIENT_RETRIES
 
 
 def _is_auth_error(exc: Exception) -> bool:
@@ -7170,9 +7142,6 @@ def _provider_requires_stream(
     if base_url_host_matches(_url, "copilot.tencent.com"):
         return True
     try:
-        if config is None:
-            from hermes_cli.config import load_config_readonly
-            config = load_config_readonly()
         aux_cfg = (config or {}).get("auxiliary", {})
         markers = aux_cfg.get("stream_only_base_urls") or []
         if isinstance(markers, (list, tuple)):
@@ -7180,7 +7149,7 @@ def _provider_requires_stream(
                 if isinstance(marker, str) and marker.strip() and marker.strip().lower() in _url:
                     return True
     except Exception:
-        # Config read is best-effort; never break an aux call over it.
+        # Policy resolution is best-effort; never break an aux call over it.
         pass
     return False
 

@@ -31,24 +31,38 @@ def _write_config(tmp_path, config_dict):
 class TestApplyUserDefaultHeadersHelper:
     """Direct unit tests for the merge helper."""
 
-    def test_user_headers_merged_and_win(self, tmp_path):
-        _write_config(tmp_path, {
-            "model": {"default": "m", "default_headers": {"User-Agent": "curl/8.7.1", "X-Extra": "1"}},
-        })
+    def test_user_headers_merged_and_win(self):
         from agent.auxiliary_client import _apply_user_default_headers
-        merged = _apply_user_default_headers({"User-Agent": "OpenAI/Python 2.24.0"})
+        merged = _apply_user_default_headers(
+            {"User-Agent": "OpenAI/Python 2.24.0"},
+            config={
+                "model": {
+                    "default_headers": {
+                        "User-Agent": "curl/8.7.1",
+                        "X-Extra": "1",
+                    }
+                }
+            },
+        )
         assert merged["User-Agent"] == "curl/8.7.1"  # user wins
         assert merged["X-Extra"] == "1"
 
 
 
 
-    def test_none_values_skipped(self, tmp_path):
-        _write_config(tmp_path, {
-            "model": {"default": "m", "default_headers": {"User-Agent": "curl/8.7.1", "X-Drop": None}},
-        })
+    def test_none_values_skipped(self):
         from agent.auxiliary_client import _apply_user_default_headers
-        merged = _apply_user_default_headers({})
+        merged = _apply_user_default_headers(
+            {},
+            config={
+                "model": {
+                    "default_headers": {
+                        "User-Agent": "curl/8.7.1",
+                        "X-Drop": None,
+                    }
+                }
+            },
+        )
         assert merged == {"User-Agent": "curl/8.7.1"}
         assert "X-Drop" not in merged
 

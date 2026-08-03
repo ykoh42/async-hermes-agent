@@ -255,16 +255,15 @@ class TestProviderRequiresStream:
         assert _provider_requires_stream("auto", "") is False
 
     def test_config_marker_matches_custom_endpoint(self):
-        with patch(
-            "hermes_cli.config.load_config",
-            return_value={"auxiliary": {"stream_only_base_urls": ["my-proxy.example.com"]}},
-        ):
-            assert _provider_requires_stream(
-                "custom", "https://my-proxy.example.com/v1"
-            ) is True
-            assert _provider_requires_stream(
-                "custom", "https://other.example.com/v1"
-            ) is False
+        config = {
+            "auxiliary": {"stream_only_base_urls": ["my-proxy.example.com"]}
+        }
+        assert _provider_requires_stream(
+            "custom", "https://my-proxy.example.com/v1", config=config,
+        ) is True
+        assert _provider_requires_stream(
+            "custom", "https://other.example.com/v1", config=config,
+        ) is False
 
 
 
