@@ -18,7 +18,9 @@ import contextlib
 import io
 from pathlib import Path
 
-from hermes_state import SessionDB
+import pytest
+
+from hermes_state import AsyncSessionDB
 from run_agent import AIAgent
 
 
@@ -49,7 +51,7 @@ def _make_agent(monkeypatch, tmp_path: Path, *, max_attempts=None):
     monkeypatch.setattr(
         config_mod, "load_config_readonly", lambda: _config(max_attempts=max_attempts)
     )
-    db = SessionDB(db_path=tmp_path / "state.db")
+    db = AsyncSessionDB(tmp_path / "state.db")
     with contextlib.redirect_stdout(io.StringIO()):
         agent = AIAgent(
             base_url="https://chatgpt.com/backend-api/codex",
@@ -67,13 +69,17 @@ def _make_agent(monkeypatch, tmp_path: Path, *, max_attempts=None):
 
 
 class TestCompressionMaxAttemptsConfig:
-    def test_default_is_three_when_unset(self, monkeypatch, tmp_path):
+    @pytest.mark.asyncio
+    async def test_default_is_three_when_unset(self, monkeypatch, tmp_path):
         agent = _make_agent(monkeypatch, tmp_path)
         assert agent.max_compression_attempts == 3
+        await agent.close()
 
-    def test_custom_value_is_honored(self, monkeypatch, tmp_path):
+    @pytest.mark.asyncio
+    async def test_custom_value_is_honored(self, monkeypatch, tmp_path):
         agent = _make_agent(monkeypatch, tmp_path, max_attempts=6)
         assert agent.max_compression_attempts == 6
+        await agent.close()
 
 
 
@@ -81,7 +87,8 @@ class TestCompressionMaxAttemptsConfig:
 
 
 
-    def test_loop_pickup_degrades_to_default_when_attribute_missing(
+    @pytest.mark.asyncio
+    async def test_loop_pickup_degrades_to_default_when_attribute_missing(
         self, monkeypatch, tmp_path
     ):
         # The loop reads getattr(agent, "max_compression_attempts", 3): a
@@ -91,3 +98,4 @@ class TestCompressionMaxAttemptsConfig:
         agent = _make_agent(monkeypatch, tmp_path, max_attempts=7)
         assert getattr(agent, "max_compression_attempts", 3) == 7
         assert getattr(object(), "max_compression_attempts", 3) == 3
+        await agent.close()

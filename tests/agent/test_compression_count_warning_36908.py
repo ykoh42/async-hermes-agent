@@ -17,10 +17,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from hermes_state import SessionDB
+from hermes_state import AsyncSessionDB
 
 
-def _build_agent_with_db(db: SessionDB, session_id: str, compression_count: int):
+def _build_agent_with_db(
+    db: AsyncSessionDB, session_id: str, compression_count: int
+):
     with patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}):
         from run_agent import AIAgent
 
@@ -53,9 +55,9 @@ def _build_agent_with_db(db: SessionDB, session_id: str, compression_count: int)
 
 @pytest.mark.asyncio
 async def test_repeated_compression_warning_routed_through_emit_status(tmp_path: Path) -> None:
-    db = SessionDB(db_path=tmp_path / "state.db")
+    db = AsyncSessionDB(tmp_path / "state.db")
     sid = "PARENT_36908"
-    db.create_session(sid, source="cli")
+    await db.create_session(sid, source="cli")
 
     # compression_count == 2 → the "compressed N times" warning should fire.
     agent = _build_agent_with_db(db, sid, compression_count=2)
@@ -73,14 +75,14 @@ async def test_repeated_compression_warning_routed_through_emit_status(tmp_path:
     # ...and was stored for late-bound gateway status_callback replay.
     assert "compressed 2 times" in (getattr(agent, "_compression_warning", "") or "").lower()
     await agent.close()
-    db.close()
+    await db.close()
 
 
 @pytest.mark.asyncio
 async def test_no_warning_below_threshold(tmp_path: Path) -> None:
-    db = SessionDB(db_path=tmp_path / "state.db")
+    db = AsyncSessionDB(tmp_path / "state.db")
     sid = "PARENT_36908_ONCE"
-    db.create_session(sid, source="cli")
+    await db.create_session(sid, source="cli")
 
     # compression_count == 1 → no repeated-compression warning.
     agent = _build_agent_with_db(db, sid, compression_count=1)
@@ -92,4 +94,4 @@ async def test_no_warning_below_threshold(tmp_path: Path) -> None:
 
     assert not any("compressed" in m.lower() and "times" in m.lower() for m in emitted)
     await agent.close()
-    db.close()
+    await db.close()

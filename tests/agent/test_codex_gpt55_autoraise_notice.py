@@ -23,7 +23,7 @@ from pathlib import Path
 import pytest
 
 from hermes_constants import get_hermes_home
-from hermes_state import SessionDB
+from hermes_state import AsyncSessionDB
 from run_agent import AIAgent
 
 from agent.agent_init import (
@@ -61,7 +61,7 @@ def _make_codex_agent(monkeypatch, tmp_path: Path, *, show_notice: bool):
     monkeypatch.setattr(config_mod, "load_config", lambda: _config(show_notice=show_notice))
 
     monkeypatch.setattr(config_mod, "load_config_readonly", lambda: _config(show_notice=show_notice))
-    db = SessionDB(db_path=tmp_path / "state.db")
+    db = AsyncSessionDB(tmp_path / "state.db")
     stdout = io.StringIO()
 
     with contextlib.redirect_stdout(stdout):
@@ -93,7 +93,10 @@ def _threshold_ratio(agent: AIAgent) -> float:
 
 
 
-def test_codex_gpt55_autoraise_notice_deduped_across_agent_inits(monkeypatch, tmp_path):
+@pytest.mark.asyncio
+async def test_codex_gpt55_autoraise_notice_deduped_across_agent_inits(
+    monkeypatch, tmp_path
+):
     # Gateway spam scenario (#54432): the gateway rebuilds the agent per
     # inbound message. The first init shows the notice; the second stays
     # silent because the per-profile marker was recorded.
@@ -105,6 +108,8 @@ def test_codex_gpt55_autoraise_notice_deduped_across_agent_inits(monkeypatch, tm
     assert _threshold_ratio(agent2) == 0.85  # autoraise still applies
     assert "auto-compaction was raised" not in stdout2
     assert getattr(agent2, "_compression_warning") is None
+    await agent1.close()
+    await agent2.close()
 
 
 # ── per-profile dedupe marker (#54432) ───────────────────────────────────────
