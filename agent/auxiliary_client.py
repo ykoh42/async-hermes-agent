@@ -140,7 +140,11 @@ _LOGGED_UNSUPPORTED_EXTPROC_KEYS: set = set()
 _LOGGED_UNSUPPORTED_OAUTH_KEYS: set = set()
 
 
-def _resolve_aux_verify(base_url: Optional[str]) -> Any:
+def _resolve_aux_verify(
+    base_url: Optional[str],
+    *,
+    config: Optional[Dict[str, Any]] = None,
+) -> Any:
     """Resolve httpx ``verify`` for an auxiliary-client base_url.
 
     Mirrors the main client's TLS resolution so auxiliary calls (compression,
@@ -151,13 +155,10 @@ def _resolve_aux_verify(base_url: Optional[str]) -> Any:
     """
     try:
         from agent.ssl_verify import resolve_httpx_verify
-        from hermes_cli.config import (
-            get_custom_provider_tls_settings,
-            load_config_readonly,
-        )
+        from hermes_cli.config import get_custom_provider_tls_settings
 
         tls = get_custom_provider_tls_settings(
-            str(base_url or ""), config=load_config_readonly()
+            str(base_url or ""), config=config or {}
         )
         return resolve_httpx_verify(
             ca_bundle=tls.get("ssl_ca_cert"),
@@ -173,13 +174,15 @@ _WARNED_KEEPALIVE_IMPORT_SKEW = False
 
 def _openai_http_client_kwargs(
     base_url: Optional[str],
+    *,
+    config: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Inject keepalive httpx client with env-only proxy (not macOS system proxy)."""
     try:
         from agent.process_bootstrap import build_keepalive_http_client
         client = build_keepalive_http_client(
             str(base_url or ""),
-            verify=_resolve_aux_verify(base_url),
+            verify=_resolve_aux_verify(base_url, config=config),
         )
     except (ImportError, AttributeError):
         # Version-skewed installs (#64333): a process whose sys.path resolves
@@ -206,11 +209,17 @@ def _openai_http_client_kwargs(
         return {}
     return {"http_client": client}
 
-def _create_openai_client(*, api_key: str, base_url: str, **kwargs: Any) -> Any:
+def _create_openai_client(
+    *,
+    api_key: str,
+    base_url: str,
+    config: Optional[Dict[str, Any]] = None,
+    **kwargs: Any,
+) -> Any:
     """Create the native async OpenAI-compatible transport for an aux route."""
     from openai import AsyncOpenAI
 
-    kwargs = {**_openai_http_client_kwargs(base_url), **kwargs}
+    kwargs = {**_openai_http_client_kwargs(base_url, config=config), **kwargs}
     # Hermes owns auxiliary retry + provider/model fallback policy (the
     # same-provider transient retry in call_llm plus the except-chain
     # fallback). The OpenAI SDK's own default (max_retries=2 → up to 3
@@ -1899,7 +1908,9 @@ async def _resolve_api_key_provider(
             )
             if _merged_aux:
                 extra["default_headers"] = _merged_aux
-            _client = _create_openai_client(api_key=api_key, base_url=base_url, **extra)
+            _client = _create_openai_client(
+                api_key=api_key, base_url=base_url, config=config, **extra
+            )
             _client = await _maybe_wrap_anthropic(_client, model, api_key, raw_base_url)
             return _client, model
 
@@ -1951,7 +1962,9 @@ async def _resolve_api_key_provider(
         )
         if _merged_aux2:
             extra["default_headers"] = _merged_aux2
-        _client = _create_openai_client(api_key=api_key, base_url=base_url, **extra)
+        _client = _create_openai_client(
+            api_key=api_key, base_url=base_url, config=config, **extra
+        )
         _client = await _maybe_wrap_anthropic(_client, model, api_key, raw_base_url)
         return _client, model
 
@@ -1983,6 +1996,7 @@ async def _try_openrouter(
         return _create_openai_client(
             api_key=explicit_api_key,
             base_url=OPENROUTER_BASE_URL,
+            config=config,
             default_headers=build_or_headers(openrouter_config),
         ), model or _OPENROUTER_MODEL
 
@@ -1992,8 +2006,12 @@ async def _try_openrouter(
         if or_key:
             base_url = _pool_runtime_base_url(entry, OPENROUTER_BASE_URL) or OPENROUTER_BASE_URL
             logger.debug("Auxiliary client: OpenRouter via pool")
-            return _create_openai_client(api_key=or_key, base_url=base_url,
-                           default_headers=build_or_headers(openrouter_config)), model or _OPENROUTER_MODEL
+            return _create_openai_client(
+                api_key=or_key,
+                base_url=base_url,
+                config=config,
+                default_headers=build_or_headers(openrouter_config),
+            ), model or _OPENROUTER_MODEL
         # Pool exists but is exhausted (no usable runtime key) — fall through to
         # the OPENROUTER_API_KEY env-var path rather than failing outright.
         logger.debug("Auxiliary client: OpenRouter pool exhausted, trying OPENROUTER_API_KEY")
@@ -2003,8 +2021,12 @@ async def _try_openrouter(
         _mark_provider_unhealthy("openrouter", ttl=60)
         return None, None
     logger.debug("Auxiliary client: OpenRouter")
-    return _create_openai_client(api_key=or_key, base_url=OPENROUTER_BASE_URL,
-                   default_headers=build_or_headers(openrouter_config)), model or _OPENROUTER_MODEL
+    return _create_openai_client(
+        api_key=or_key,
+        base_url=OPENROUTER_BASE_URL,
+        config=config,
+        default_headers=build_or_headers(openrouter_config),
+    ), model or _OPENROUTER_MODEL
 
 
 async def _describe_openrouter_unavailable() -> str:
@@ -2020,7 +2042,11 @@ async def _describe_openrouter_unavailable() -> str:
     return "no usable OpenRouter credentials found"
 
 
-async def _try_nous(vision: bool = False) -> Tuple[Optional[OpenAI], Optional[str]]:
+async def _try_nous(
+    vision: bool = False,
+    *,
+    config: Optional[Dict[str, Any]] = None,
+) -> Tuple[Optional[OpenAI], Optional[str]]:
     # Check cross-session rate limit guard before attempting Nous —
     # if another session already recorded a 429, skip Nous entirely
     # to avoid piling more requests onto the tapped RPH bucket.
@@ -2099,6 +2125,7 @@ async def _try_nous(vision: bool = False) -> Tuple[Optional[OpenAI], Optional[st
         _create_openai_client(
             api_key=api_key,
             base_url=base_url,
+            config=config,
         ),
         model,
     )
@@ -2661,7 +2688,9 @@ async def _try_custom_endpoint(
     if _custom_headers:
         _extra["default_headers"] = _custom_headers
     if custom_mode == "codex_responses":
-        real_client = _create_openai_client(api_key=custom_key, base_url=_clean_base, **_extra)
+        real_client = _create_openai_client(
+            api_key=custom_key, base_url=_clean_base, config=config, **_extra
+        )
         return CodexAuxiliaryClient(real_client, model), model
     if custom_mode == "anthropic_messages":
         # Third-party Anthropic-compatible gateway (MiniMax, Zhipu GLM,
@@ -2675,21 +2704,29 @@ async def _try_custom_endpoint(
                 "Custom endpoint declares api_mode=anthropic_messages but the "
                 "anthropic SDK is not installed — falling back to OpenAI-wire."
             )
-            return _create_openai_client(api_key=custom_key, base_url=_clean_base, **_extra), model
+            return _create_openai_client(
+                api_key=custom_key, base_url=_clean_base, config=config, **_extra
+            ), model
         return (
             AnthropicAuxiliaryClient(real_client, model, custom_key, custom_base, is_oauth=False),
             model,
         )
     # URL-based anthropic detection for custom endpoints that didn't set
     # api_mode explicitly (e.g. kimi.com/coding reached via custom config).
-    _fallback_client = _create_openai_client(api_key=custom_key, base_url=_clean_base, **_extra)
+    _fallback_client = _create_openai_client(
+        api_key=custom_key, base_url=_clean_base, config=config, **_extra
+    )
     _fallback_client = await _maybe_wrap_anthropic(
         _fallback_client, model, custom_key, custom_base, custom_mode,
     )
     return _fallback_client, model
 
 
-async def _build_xai_oauth_aux_client(model: str) -> Tuple[Optional[Any], Optional[str]]:
+async def _build_xai_oauth_aux_client(
+    model: str,
+    *,
+    config: Optional[Dict[str, Any]] = None,
+) -> Tuple[Optional[Any], Optional[str]]:
     """Build a CodexAuxiliaryClient for an xAI Grok OAuth-authenticated session.
 
     xAI's ``/v1/responses`` endpoint speaks the OpenAI Responses API, so we
@@ -2716,12 +2753,17 @@ async def _build_xai_oauth_aux_client(model: str) -> Tuple[Optional[Any], Option
     real_client = _create_openai_client(
         api_key=api_key,
         base_url=base_url,
+        config=config,
         default_headers=hermes_xai_default_headers(),
     )
     return CodexAuxiliaryClient(real_client, model), model
 
 
-async def _build_codex_client(model: str) -> Tuple[Optional[Any], Optional[str]]:
+async def _build_codex_client(
+    model: str,
+    *,
+    config: Optional[Dict[str, Any]] = None,
+) -> Tuple[Optional[Any], Optional[str]]:
     """Build a CodexAuxiliaryClient for an explicitly-requested model.
 
     There is no auto-selection of the Codex model: the ChatGPT-account
@@ -2757,6 +2799,7 @@ async def _build_codex_client(model: str) -> Tuple[Optional[Any], Optional[str]]
     real_client = _create_openai_client(
         api_key=codex_token,
         base_url=base_url,
+        config=config,
         default_headers=_codex_cloudflare_headers(codex_token),
     )
     return CodexAuxiliaryClient(real_client, model), model
@@ -2768,6 +2811,7 @@ async def _try_azure_foundry(
     explicit_api_key: Optional[str] = None,
     explicit_base_url: Optional[str] = None,
     api_mode: Optional[str] = None,
+    config: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Optional[Any], Optional[str]]:
     """Resolve an Azure Foundry auxiliary client via the runtime resolver.
 
@@ -2794,13 +2838,15 @@ async def _try_azure_foundry(
     try:
         from hermes_cli.runtime_provider import _resolve_azure_foundry_runtime
         from hermes_cli.auth import AuthError
-        from hermes_cli.config import load_config_readonly_async
     except ImportError:
         return None, None
 
     try:
-        cfg = await load_config_readonly_async()
-        model_cfg = cfg.get("model") if isinstance(cfg, dict) else {}
+        if config is None:
+            from hermes_cli.config import load_config_readonly_async
+
+            config = await load_config_readonly_async()
+        model_cfg = config.get("model") if isinstance(config, dict) else {}
         if not isinstance(model_cfg, dict):
             model_cfg = {}
     except Exception:
@@ -2874,7 +2920,9 @@ async def _try_azure_foundry(
     if _dq:
         extra["default_query"] = _dq
 
-    client = _create_openai_client(api_key=api_key, base_url=_clean_base, **extra)
+    client = _create_openai_client(
+        api_key=api_key, base_url=_clean_base, config=config, **extra
+    )
 
     if runtime_api_mode == "codex_responses":
         # GPT-5.x / o-series / codex models on Azure Foundry are
@@ -4886,7 +4934,7 @@ async def resolve_provider_client(
             or model in _PROVIDER_VISION_MODELS.values()
             or (model or "").strip().lower() == "mimo-v2-omni"
         )
-        client, default = await _try_nous(vision=_is_vision)
+        client, default = await _try_nous(vision=_is_vision, config=config)
         if client is None:
             logger.warning("resolve_provider_client: nous requested "
                            "but Nous Portal not configured (run: hermes auth)")
@@ -4926,11 +4974,12 @@ async def resolve_provider_client(
             raw_client = _create_openai_client(
                 api_key=codex_token,
                 base_url=_CODEX_AUX_BASE_URL,
+                config=config,
                 default_headers=_codex_cloudflare_headers(codex_token),
             )
             return (raw_client, final_model)
         # Standard path: wrap in CodexAuxiliaryClient adapter
-        client, default = await _build_codex_client(model)
+        client, default = await _build_codex_client(model, config=config)
         if client is None:
             logger.warning("resolve_provider_client: openai-codex requested "
                            "but no Codex OAuth token found (run: hermes model)")
@@ -4947,7 +4996,7 @@ async def resolve_provider_client(
     # OpenRouter / Nous bills for side tasks they thought were running on
     # their xAI subscription.
     if provider == "xai-oauth":
-        client, default = await _build_xai_oauth_aux_client(model)
+        client, default = await _build_xai_oauth_aux_client(model, config=config)
         if client is None:
             logger.warning(
                 "resolve_provider_client: xai-oauth requested but no xAI "
@@ -5022,7 +5071,9 @@ async def resolve_provider_client(
             )
             if _merged_custom:
                 extra["default_headers"] = _merged_custom
-            client = _create_openai_client(api_key=custom_key, base_url=_clean_base, **extra)
+            client = _create_openai_client(
+                api_key=custom_key, base_url=_clean_base, config=config, **extra
+            )
             client = await _wrap_if_needed(client, final_model, custom_base, custom_key)
             return client, final_model
         # Try custom first, then API-key providers (Codex excluded here:
@@ -5131,13 +5182,23 @@ async def resolve_provider_client(
                         )
                         if _fb_headers:
                             _fb_extra["default_headers"] = _fb_headers
-                        client = _create_openai_client(api_key=custom_key, base_url=_fb_clean, **_fb_extra)
+                        client = _create_openai_client(
+                            api_key=custom_key,
+                            base_url=_fb_clean,
+                            config=config,
+                            **_fb_extra,
+                        )
                         return client, final_model
                     sync_anthropic = AnthropicAuxiliaryClient(
                         real_client, final_model, custom_key, custom_base, is_oauth=False,
                     )
                     return sync_anthropic, final_model
-                client = _create_openai_client(api_key=custom_key, base_url=_clean_base2, **_extra2)
+                client = _create_openai_client(
+                    api_key=custom_key,
+                    base_url=_clean_base2,
+                    config=config,
+                    **_extra2,
+                )
                 # codex_responses or inherited auto-detect (via _wrap_if_needed).
                 # _wrap_if_needed reads the closed-over `api_mode` (the task-level
                 # override). Named-provider entry api_mode=codex_responses also
@@ -5190,6 +5251,7 @@ async def resolve_provider_client(
             explicit_api_key=explicit_api_key,
             explicit_base_url=explicit_base_url,
             api_mode=api_mode,
+            config=config,
         )
         if client is None:
             logger.warning(
@@ -5288,8 +5350,12 @@ async def resolve_provider_client(
         _merged_main = _apply_user_default_headers(headers, config=config)
         if _merged_main:
             headers = _merged_main
-        client = _create_openai_client(api_key=api_key, base_url=base_url,
-                        **({"default_headers": headers} if headers else {}))
+        client = _create_openai_client(
+            api_key=api_key,
+            base_url=base_url,
+            config=config,
+            **({"default_headers": headers} if headers else {}),
+        )
 
         # Copilot GPT-5+ models (except gpt-5-mini) require the Responses
         # API — they are not accessible via /chat/completions.  Wrap the
@@ -5941,6 +6007,7 @@ async def _refresh_nous_auxiliary_client(
     api_mode: Optional[str] = None,
     main_runtime: Optional[Dict[str, Any]] = None,
     is_vision: bool = False,
+    config: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Optional[Any], Optional[str]]:
     """Refresh Nous runtime creds, rebuild the client, and replace the cache entry."""
     runtime = await _resolve_nous_runtime_api(force_refresh=True)
@@ -5948,7 +6015,9 @@ async def _refresh_nous_auxiliary_client(
         return None, model
 
     fresh_key, fresh_base_url = runtime
-    client = _create_openai_client(api_key=fresh_key, base_url=fresh_base_url)
+    client = _create_openai_client(
+        api_key=fresh_key, base_url=fresh_base_url, config=config
+    )
     final_model = model
 
     current_loop = None
@@ -7754,6 +7823,7 @@ async def call_llm(
                 api_key=resolved_api_key,
                 api_mode=resolved_api_mode,
                 is_vision=(task == "vision"),
+                config=config_snapshot,
             )
             if refreshed_client is not None:
                 logger.info(
@@ -7788,6 +7858,7 @@ async def call_llm(
                 api_key=resolved_api_key,
                 api_mode=resolved_api_mode,
                 is_vision=(task == "vision"),
+                config=config_snapshot,
             )
             if refreshed_client is not None:
                 logger.info("Auxiliary %s (async): refreshed Nous runtime credentials after 401, retrying",

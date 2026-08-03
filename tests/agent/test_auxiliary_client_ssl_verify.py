@@ -38,14 +38,18 @@ def test_build_keepalive_http_client_forwards_verify_context(clean_tls_env):
 
 
 
-def test_resolve_aux_verify_ssl_verify_false(clean_tls_env, monkeypatch):
-    import hermes_cli.config as cfg
+def test_resolve_aux_verify_ssl_verify_false(clean_tls_env):
     from agent import auxiliary_client
 
-    monkeypatch.setattr(
-        cfg,
-        "get_custom_provider_tls_settings",
-        lambda *a, **k: {"ssl_verify": False},
-    )
-    assert auxiliary_client._resolve_aux_verify("https://ollama.example.com/v1") is False
-
+    config = {
+        "custom_providers": [
+            {
+                "name": "ollama",
+                "base_url": "https://ollama.example.com/v1",
+                "ssl_verify": False,
+            }
+        ]
+    }
+    assert auxiliary_client._resolve_aux_verify(
+        "https://ollama.example.com/v1", config=config
+    ) is False
