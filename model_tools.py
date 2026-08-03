@@ -24,9 +24,10 @@ import os
 import json
 import re
 import logging
+import time
 from typing import Dict, Any, List, Optional, Tuple
 
-from tools.registry import discover_builtin_tools, registry
+from tools.registry import discover_builtin_tools, registry, tool_error
 from toolsets import resolve_toolset, validate_toolset
 
 logger = logging.getLogger(__name__)
@@ -826,15 +827,71 @@ async def handle_function_call(
     disabled_toolsets: Optional[List[str]] = None,
     **handler_context: Any,
 ) -> str | dict:
-    """Dispatch one native async registry tool.
+    """Dispatch one tool through the native async plugin lifecycle.
 
-    ``async-hermes-agent`` has one handler contract: every model-visible tool
-    is a coroutine and is awaited directly.  The private legacy dispatcher is
-    deliberately not reachable through this public name.
+    Request middleware, pre-tool policy, execution middleware, observer hooks,
+    and result transforms keep their established order. Callers that already
+    own those phases use the existing ``skip_*`` arguments so each phase fires
+    exactly once.
     """
     function_args = coerce_tool_args(function_name, function_args)
     if not isinstance(function_args, dict):
         function_args = {}
+    original_args = dict(function_args)
+    middleware_trace = list(tool_request_middleware_trace or [])
+
+    if not skip_tool_request_middleware:
+        from hermes_cli.middleware import apply_tool_request_middleware
+
+        request_result = await apply_tool_request_middleware(
+            function_name,
+            function_args,
+            task_id=task_id or "",
+            session_id=session_id or "",
+            tool_call_id=tool_call_id or "",
+            turn_id=turn_id or "",
+            api_request_id=api_request_id or "",
+        )
+        if isinstance(request_result.payload, dict):
+            function_args = request_result.payload
+        if isinstance(request_result.original_payload, dict):
+            original_args = request_result.original_payload
+        middleware_trace = list(request_result.trace)
+
+    if function_name in _AGENT_LOOP_TOOLS:
+        return tool_error(f"{function_name} must be handled by the agent loop")
+
+    if not skip_pre_tool_call_hook:
+        from hermes_cli.plugins import resolve_pre_tool_block_async
+
+        block_message = await resolve_pre_tool_block_async(
+            function_name,
+            function_args,
+            task_id=task_id or "",
+            session_id=session_id or "",
+            tool_call_id=tool_call_id or "",
+            turn_id=turn_id or "",
+            api_request_id=api_request_id or "",
+            middleware_trace=middleware_trace,
+        )
+        if block_message is not None:
+            result = tool_error(block_message)
+            await _emit_post_tool_call_hook(
+                function_name=function_name,
+                function_args=function_args,
+                result=result,
+                task_id=task_id,
+                session_id=session_id,
+                tool_call_id=tool_call_id,
+                turn_id=turn_id,
+                api_request_id=api_request_id,
+                status="blocked",
+                error_type="plugin_block",
+                error_message=block_message,
+                middleware_trace=middleware_trace,
+            )
+            return result
+
     if function_name not in _READ_SEARCH_TOOLS:
         try:
             from tools.file_tools import notify_other_tool_call
@@ -842,18 +899,77 @@ async def handle_function_call(
             notify_other_tool_call(task_id or "default")
         except Exception:
             logger.debug("file-read loop reset failed", exc_info=True)
-    return await registry.dispatch(
-        function_name,
-        function_args,
+
+    async def dispatch(next_args: Dict[str, Any]) -> str | dict:
+        return await registry.dispatch(
+            function_name,
+            next_args,
+            task_id=task_id,
+            tool_call_id=tool_call_id,
+            session_id=session_id,
+            turn_id=turn_id,
+            api_request_id=api_request_id,
+            user_task=user_task,
+            enabled_tools=enabled_tools,
+            **handler_context,
+        )
+
+    started = time.monotonic()
+    if skip_tool_execution_middleware:
+        result = await dispatch(function_args)
+    else:
+        from hermes_cli.middleware import run_tool_execution_middleware
+
+        result = await run_tool_execution_middleware(
+            function_name,
+            function_args,
+            dispatch,
+            original_args=original_args,
+            task_id=task_id or "",
+            session_id=session_id or "",
+            tool_call_id=tool_call_id or "",
+            turn_id=turn_id or "",
+            api_request_id=api_request_id or "",
+        )
+    duration_ms = int((time.monotonic() - started) * 1000)
+
+    await _emit_post_tool_call_hook(
+        function_name=function_name,
+        function_args=function_args,
+        result=result,
         task_id=task_id,
-        tool_call_id=tool_call_id,
         session_id=session_id,
+        tool_call_id=tool_call_id,
         turn_id=turn_id,
         api_request_id=api_request_id,
-        user_task=user_task,
-        enabled_tools=enabled_tools,
-        **handler_context,
+        duration_ms=duration_ms,
+        middleware_trace=middleware_trace,
     )
+
+    from hermes_cli.lifecycle import has_hook, invoke_hook_async
+
+    if has_hook("transform_tool_result"):
+        status, error_type, error_message = _tool_result_observer_fields(result)
+        hook_results = await invoke_hook_async(
+            "transform_tool_result",
+            tool_name=function_name,
+            args=function_args,
+            result=result,
+            task_id=task_id or "",
+            session_id=session_id or "",
+            tool_call_id=tool_call_id or "",
+            turn_id=turn_id or "",
+            api_request_id=api_request_id or "",
+            duration_ms=duration_ms,
+            status=status,
+            error_type=error_type,
+            error_message=error_message,
+        )
+        for hook_result in hook_results:
+            if isinstance(hook_result, str):
+                result = hook_result
+                break
+    return result
 
 
 # =============================================================================

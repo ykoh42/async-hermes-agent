@@ -1,8 +1,9 @@
 """Tests for model_tools.py — function call dispatch, agent-loop interception, legacy toolsets."""
 
 import json
-from unittest.mock import ANY, call, patch
+from unittest.mock import AsyncMock, patch
 
+import pytest
 
 from model_tools import (
     handle_function_call,
@@ -19,20 +20,23 @@ from model_tools import (
 # =========================================================================
 
 class TestHandleFunctionCall:
-    def test_agent_loop_tool_returns_error(self):
+    @pytest.mark.asyncio
+    async def test_agent_loop_tool_returns_error(self):
         for tool_name in _AGENT_LOOP_TOOLS:
-            result = json.loads(handle_function_call(tool_name, {}))
+            result = json.loads(await handle_function_call(tool_name, {}))
             assert "error" in result
             assert "agent loop" in result["error"].lower()
 
-    def test_unknown_tool_returns_error(self):
-        result = json.loads(handle_function_call("totally_fake_tool_xyz", {}))
+    @pytest.mark.asyncio
+    async def test_unknown_tool_returns_error(self):
+        result = json.loads(await handle_function_call("totally_fake_tool_xyz", {}))
         assert "error" in result
         assert "totally_fake_tool_xyz" in result["error"]
 
 
 
-    def test_post_tool_call_receives_non_negative_integer_duration_ms(self):
+    @pytest.mark.asyncio
+    async def test_post_tool_call_receives_non_negative_integer_duration_ms(self):
         """Regression: post_tool_call and transform_tool_result hooks must
         receive a non-negative integer ``duration_ms`` kwarg measuring
         dispatch latency.  Inspired by Claude Code 2.1.119, which added
@@ -41,9 +45,13 @@ class TestHandleFunctionCall:
         with (
             patch("model_tools.registry.dispatch", return_value='{"ok":true}'),
             patch("hermes_cli.plugins.has_hook", return_value=True),
-            patch("hermes_cli.plugins.invoke_hook") as mock_invoke_hook,
+            patch(
+                "hermes_cli.plugins.invoke_hook_async",
+                new_callable=AsyncMock,
+                return_value=[],
+            ) as mock_invoke_hook,
         ):
-            handle_function_call("web_search", {"q": "test"}, task_id="t1")
+            await handle_function_call("web_search", {"q": "test"}, task_id="t1")
 
         kwargs_by_hook = {
             c.args[0]: c.kwargs for c in mock_invoke_hook.call_args_list
@@ -61,43 +69,41 @@ class TestHandleFunctionCall:
         assert "duration_ms" not in kwargs_by_hook["pre_tool_call"]
 
 
-    def test_tool_request_and_execution_middleware_wrap_registry_dispatch(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_tool_request_and_execution_middleware_wrap_registry_dispatch(self, monkeypatch):
         seen = {}
 
-        def fake_invoke_middleware(kind, **kwargs):
-            if kind == "tool_request":
-                return [{
-                    "args": {**kwargs["args"], "rewritten": True},
-                    "source": "test-middleware",
-                    "reason": "rewrite",
-                }]
-            return []
+        async def request_middleware(**kwargs):
+            return {
+                "args": {**kwargs["args"], "rewritten": True},
+                "source": "test-middleware",
+                "reason": "rewrite",
+            }
 
-        def execution_middleware(**kwargs):
+        async def execution_middleware(**kwargs):
             seen["execution_args"] = kwargs["args"]
-            return kwargs["next_call"]({**kwargs["args"], "wrapped": True})
+            return await kwargs["next_call"]({**kwargs["args"], "wrapped": True})
 
-        def fake_dispatch(tool_name, args, **kwargs):
+        async def fake_dispatch(tool_name, args, **kwargs):
             seen["dispatch"] = (tool_name, args, kwargs)
             return json.dumps({"ok": True, "args": args})
 
         manager = type(
             "Manager",
             (),
-            {"_middleware": {"tool_request": [fake_invoke_middleware], "tool_execution": [execution_middleware]}},
+            {"_middleware": {"tool_request": [request_middleware], "tool_execution": [execution_middleware]}},
         )()
-        monkeypatch.setattr("hermes_cli.plugins.invoke_middleware", fake_invoke_middleware)
         monkeypatch.setattr("hermes_cli.plugins.get_plugin_manager", lambda: manager)
         hook_calls = []
-        monkeypatch.setattr(
-            "hermes_cli.plugins.invoke_hook",
-            lambda hook_name, **kwargs: hook_calls.append((hook_name, kwargs)) or [],
-        )
+        async def invoke_hook(hook_name, **kwargs):
+            hook_calls.append((hook_name, kwargs))
+            return []
+        monkeypatch.setattr("hermes_cli.plugins.invoke_hook_async", invoke_hook)
         monkeypatch.setattr("hermes_cli.plugins.has_hook", lambda name: True)
         monkeypatch.setattr("model_tools.registry.dispatch", fake_dispatch)
 
         result = json.loads(
-            handle_function_call(
+            await handle_function_call(
                 "web_search",
                 {"q": "test"},
                 task_id="task-1",
@@ -139,10 +145,11 @@ class TestAgentLoopTools:
 class TestPreToolCallBlocking:
     """Verify that pre_tool_call hooks can block tool execution."""
 
-    def test_blocked_tool_returns_error_and_skips_dispatch(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_blocked_tool_returns_error_and_skips_dispatch(self, monkeypatch):
         hook_calls = []
 
-        def fake_invoke_hook(hook_name, **kwargs):
+        async def fake_invoke_hook(hook_name, **kwargs):
             hook_calls.append((hook_name, kwargs))
             if hook_name == "pre_tool_call":
                 return [{"action": "block", "message": "Blocked by policy"}]
@@ -156,11 +163,13 @@ class TestPreToolCallBlocking:
             dispatch_called = True
             raise AssertionError("dispatch should not run when blocked")
 
-        monkeypatch.setattr("hermes_cli.plugins.invoke_hook", fake_invoke_hook)
+        monkeypatch.setattr("hermes_cli.plugins.invoke_hook_async", fake_invoke_hook)
         monkeypatch.setattr("hermes_cli.plugins.has_hook", lambda name: True)
         monkeypatch.setattr("model_tools.registry.dispatch", fake_dispatch)
 
-        result = json.loads(handle_function_call("read_file", {"path": "test.txt"}, task_id="t1"))
+        result = json.loads(
+            await handle_function_call("read_file", {"path": "test.txt"}, task_id="t1")
+        )
         assert result == {"error": "Blocked by policy"}
         assert not dispatch_called
         post_call = next(call for call in hook_calls if call[0] == "post_tool_call")
@@ -169,27 +178,31 @@ class TestPreToolCallBlocking:
         assert post_call[1]["error_message"] == "Blocked by policy"
         assert post_call[1]["duration_ms"] == 0
 
-    def test_blocked_tool_skips_read_loop_notification(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_blocked_tool_skips_read_loop_notification(self, monkeypatch):
         notifications = []
 
-        def fake_invoke_hook(hook_name, **kwargs):
+        async def fake_invoke_hook(hook_name, **kwargs):
             if hook_name == "pre_tool_call":
                 return [{"action": "block", "message": "Blocked"}]
             return []
 
-        monkeypatch.setattr("hermes_cli.plugins.invoke_hook", fake_invoke_hook)
+        monkeypatch.setattr("hermes_cli.plugins.invoke_hook_async", fake_invoke_hook)
         monkeypatch.setattr("model_tools.registry.dispatch",
                             lambda *a, **kw: (_ for _ in ()).throw(AssertionError("should not run")))
         monkeypatch.setattr("tools.file_tools.notify_other_tool_call",
                             lambda task_id: notifications.append(task_id))
 
-        result = json.loads(handle_function_call("web_search", {"q": "test"}, task_id="t1"))
+        result = json.loads(
+            await handle_function_call("web_search", {"q": "test"}, task_id="t1")
+        )
         assert result == {"error": "Blocked"}
         assert notifications == []
 
-    def test_invalid_hook_returns_do_not_block(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_invalid_hook_returns_do_not_block(self, monkeypatch):
         """Malformed hook returns should be ignored — tool executes normally."""
-        def fake_invoke_hook(hook_name, **kwargs):
+        async def fake_invoke_hook(hook_name, **kwargs):
             if hook_name == "pre_tool_call":
                 return [
                     "block",
@@ -198,27 +211,32 @@ class TestPreToolCallBlocking:
                 ]
             return []
 
-        monkeypatch.setattr("hermes_cli.plugins.invoke_hook", fake_invoke_hook)
-        monkeypatch.setattr("model_tools.registry.dispatch",
-                            lambda *a, **kw: json.dumps({"ok": True}))
+        monkeypatch.setattr("hermes_cli.plugins.invoke_hook_async", fake_invoke_hook)
+        async def dispatch(*_args, **_kwargs):
+            return json.dumps({"ok": True})
 
-        result = json.loads(handle_function_call("read_file", {"path": "test.txt"}, task_id="t1"))
+        monkeypatch.setattr("model_tools.registry.dispatch", dispatch)
+
+        result = json.loads(
+            await handle_function_call("read_file", {"path": "test.txt"}, task_id="t1")
+        )
         assert result == {"ok": True}
 
 
-    def test_relay_rewrite_is_visible_to_pre_tool_authorization(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_relay_rewrite_is_visible_to_pre_tool_authorization(self, monkeypatch):
         observed = {}
 
         def rewrite(**kwargs):
             assert kwargs["tool_name"] == "read_file"
             return {**kwargs["args"], "path": "approved.txt"}
 
-        def fake_invoke_hook(hook_name, **kwargs):
+        async def fake_invoke_hook(hook_name, **kwargs):
             if hook_name == "pre_tool_call":
                 observed["pre_tool_args"] = kwargs["args"]
             return []
 
-        def dispatch(_name, args, **_kwargs):
+        async def dispatch(_name, args, **_kwargs):
             observed["dispatch_args"] = args
             return json.dumps({"ok": True})
 
@@ -226,11 +244,11 @@ class TestPreToolCallBlocking:
             "hermes_cli.observability.relay_runtime.apply_tool_request_intercepts",
             rewrite,
         )
-        monkeypatch.setattr("hermes_cli.plugins.invoke_hook", fake_invoke_hook)
+        monkeypatch.setattr("hermes_cli.plugins.invoke_hook_async", fake_invoke_hook)
         monkeypatch.setattr("hermes_cli.plugins.has_hook", lambda name: True)
         monkeypatch.setattr("model_tools.registry.dispatch", dispatch)
 
-        handle_function_call(
+        await handle_function_call(
             "read_file",
             {"path": "original.txt"},
             task_id="t1",
@@ -250,7 +268,7 @@ class TestLegacyToolsetMap:
     def test_expected_legacy_names(self):
         expected = [
             "web_tools", "terminal_tools", "vision_tools",
-            "image_tools", "skills_tools", "browser_tools", "cronjob_tools",
+            "image_tools", "skills_tools", "browser_tools",
             "file_tools", "tts_tools",
         ]
         for name in expected:

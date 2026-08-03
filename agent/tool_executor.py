@@ -322,16 +322,6 @@ async def _run_agent_tool_execution_middleware(
             )
             return result
 
-        await _emit_terminal_post_tool_call(
-            agent,
-            function_name=function_name,
-            function_args=next_args,
-            result=result,
-            effective_task_id=effective_task_id,
-            tool_call_id=tool_call_id,
-            duration_ms=int((time.monotonic() - started) * 1000),
-            middleware_trace=list(trace),
-        )
         return result
 
     result = await run_tool_execution_middleware(
@@ -566,6 +556,9 @@ async def execute_tool_calls_segmented(
                     "enabled_tools": (
                         list(getattr(agent, "valid_tool_names", None) or []) or None
                     ),
+                    "skip_pre_tool_call_hook": True,
+                    "skip_tool_request_middleware": True,
+                    "skip_tool_execution_middleware": True,
                     "tool_request_middleware_trace": list(middleware_trace),
                 }
                 if name == "memory":

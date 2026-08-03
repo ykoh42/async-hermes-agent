@@ -1959,6 +1959,9 @@ class TestConcurrentToolExecution:
             await agent._execute_tool_calls(mock_msg, [], "task-1")
 
         assert observed[0]["tool_request_middleware_trace"] == trace
+        assert observed[0]["skip_pre_tool_call_hook"] is True
+        assert observed[0]["skip_tool_request_middleware"] is True
+        assert observed[0]["skip_tool_execution_middleware"] is True
 
     def test_browser_type_display_args_redact_api_key(self, agent):
         """The retained display helper never exposes a typed credential."""

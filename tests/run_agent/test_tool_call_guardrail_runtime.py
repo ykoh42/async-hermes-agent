@@ -109,7 +109,7 @@ async def test_default_path_warns_repeated_exact_failure_without_blocking_execut
         ) as dispatch,
         patch(
             "tools.registry.registry.get_entry",
-            return_value=SimpleNamespace(is_async=True),
+            return_value=SimpleNamespace(is_async=True, max_result_size_chars=None),
         ),
     ):
         await agent._execute_tool_calls(msg, messages, "task-1")
@@ -146,7 +146,7 @@ async def test_config_enabled_hard_stop_blocks_repeated_exact_failure_before_exe
         ) as dispatch,
         patch(
             "tools.registry.registry.get_entry",
-            return_value=SimpleNamespace(is_async=True),
+            return_value=SimpleNamespace(is_async=True, max_result_size_chars=None),
         ),
     ):
         await agent._execute_tool_calls(msg, messages, "task-1")
@@ -177,7 +177,7 @@ async def test_after_call_appends_guidance_to_tool_result_without_extra_messages
         ),
         patch(
             "tools.registry.registry.get_entry",
-            return_value=SimpleNamespace(is_async=True),
+            return_value=SimpleNamespace(is_async=True, max_result_size_chars=None),
         ),
     ):
         await agent._execute_tool_calls(msg, messages, "task-1")
@@ -216,7 +216,7 @@ async def test_same_tool_failure_warning_tells_model_to_recover_with_tools():
         ),
         patch(
             "tools.registry.registry.get_entry",
-            return_value=SimpleNamespace(is_async=True),
+            return_value=SimpleNamespace(is_async=True, max_result_size_chars=None),
         ),
     ):
         await agent._execute_tool_calls(msg, messages, "task-1")
@@ -256,7 +256,7 @@ async def test_config_enabled_hard_stop_concurrent_path_does_not_submit_blocked_
         patch("model_tools.handle_function_call", side_effect=fake_handle),
         patch(
             "tools.registry.registry.get_entry",
-            return_value=SimpleNamespace(is_async=True),
+            return_value=SimpleNamespace(is_async=True, max_result_size_chars=None),
         ),
     ):
         await agent._execute_tool_calls(msg, messages, "task-1")
@@ -329,7 +329,7 @@ async def test_request_middleware_rewrite_precedes_policy_and_dispatch():
         patch("model_tools.handle_function_call", side_effect=dispatch),
         patch(
             "tools.registry.registry.get_entry",
-            return_value=SimpleNamespace(is_async=True),
+            return_value=SimpleNamespace(is_async=True, max_result_size_chars=None),
         ),
     ):
         await agent._execute_tool_calls(msg, messages, "task-1")
@@ -373,7 +373,7 @@ async def test_request_middleware_rewrite_is_guarded_before_dispatch():
         ) as dispatch,
         patch(
             "tools.registry.registry.get_entry",
-            return_value=SimpleNamespace(is_async=True),
+            return_value=SimpleNamespace(is_async=True, max_result_size_chars=None),
         ),
     ):
         await agent._execute_tool_calls(msg, messages, "task-1")
@@ -404,7 +404,7 @@ async def test_plugin_pre_tool_block_wins_without_counting_as_toolguard_block():
         ) as dispatch,
         patch(
             "tools.registry.registry.get_entry",
-            return_value=SimpleNamespace(is_async=True),
+            return_value=SimpleNamespace(is_async=True, max_result_size_chars=None),
         ),
     ):
         await agent._execute_tool_calls(msg, messages, "task-1")
@@ -440,7 +440,7 @@ async def test_default_run_conversation_warns_without_guardrail_halt():
         ) as dispatch,
         patch(
             "tools.registry.registry.get_entry",
-            return_value=SimpleNamespace(is_async=True),
+            return_value=SimpleNamespace(is_async=True, max_result_size_chars=None),
         ),
         patch.object(agent, "_persist_session", new_callable=AsyncMock),
         patch.object(agent, "_save_trajectory", new_callable=AsyncMock),
@@ -498,7 +498,7 @@ async def test_guardrail_halt_emits_final_response_through_stream_delta_callback
         ),
         patch(
             "tools.registry.registry.get_entry",
-            return_value=SimpleNamespace(is_async=True),
+            return_value=SimpleNamespace(is_async=True, max_result_size_chars=None),
         ),
         patch.object(agent, "_persist_session", new_callable=AsyncMock),
         patch.object(agent, "_save_trajectory", new_callable=AsyncMock),
