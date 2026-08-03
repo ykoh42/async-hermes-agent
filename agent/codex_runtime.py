@@ -369,13 +369,35 @@ async def run_codex_stream(
 
     events = []
     first_text = True
+    active_message_phase: str | None = None
+    commentary_text_deltas: list[str] = []
     try:
         async for event in stream:
             events.append(event)
             event_type = _event_field(event, "type", "")
-            if "output_text.delta" in str(event_type):
+            if event_type == "response.output_item.added":
+                item = _event_field(event, "item")
+                if _item_field(item, "type", "") == "message":
+                    phase = _item_field(item, "phase", None)
+                    active_message_phase = (
+                        phase.strip().lower() if isinstance(phase, str) else None
+                    )
+                    if active_message_phase == "commentary":
+                        commentary_text_deltas = []
+                else:
+                    active_message_phase = None
+            elif "output_text.delta" in str(event_type):
                 delta = _event_field(event, "delta", "")
-                if delta:
+                if delta and active_message_phase == "commentary":
+                    commentary_text_deltas.append(delta)
+                elif delta and active_message_phase == "analysis":
+                    try:
+                        agent._fire_reasoning_delta(delta)
+                    except Exception:
+                        logger.debug(
+                            "Async Codex analysis callback failed", exc_info=True
+                        )
+                elif delta:
                     if first_text and on_first_delta is not None:
                         first_text = False
                         on_first_delta()
@@ -392,6 +414,29 @@ async def run_codex_stream(
                         logger.debug(
                             "Async Codex reasoning callback failed", exc_info=True
                         )
+            elif event_type == "response.output_item.done":
+                item = _event_field(event, "item")
+                phase = _item_field(item, "phase", None)
+                phase = phase.strip().lower() if isinstance(phase, str) else None
+                if phase == "commentary":
+                    commentary = "".join(commentary_text_deltas).strip()
+                    if not commentary:
+                        content = _item_field(item, "content", [])
+                        if isinstance(content, list):
+                            commentary = "".join(
+                                str(_item_field(part, "text", "") or "")
+                                for part in content
+                                if _item_field(part, "type", "") == "output_text"
+                            ).strip()
+                    if commentary and getattr(agent, "show_commentary", True):
+                        try:
+                            agent._fire_streamed_codex_commentary(commentary)
+                        except Exception:
+                            logger.debug(
+                                "Async Codex commentary callback failed",
+                                exc_info=True,
+                            )
+                    commentary_text_deltas = []
     finally:
         close = getattr(stream, "aclose", None) or getattr(stream, "close", None)
         if callable(close):
