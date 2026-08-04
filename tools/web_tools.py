@@ -687,7 +687,7 @@ async def web_search_tool(query: str, limit: int = 5) -> str:
         result_json = json.dumps(response_data, indent=2, ensure_ascii=False)
         debug_call_data["final_response_size"] = len(result_json)
         _debug.log_call("web_search_tool", debug_call_data)
-        _debug.save()
+        await _debug.save()
         return result_json
 
     except Exception as e:
@@ -696,7 +696,7 @@ async def web_search_tool(query: str, limit: int = 5) -> str:
 
         debug_call_data["error"] = error_msg
         _debug.log_call("web_search_tool", debug_call_data)
-        _debug.save()
+        await _debug.save()
 
         return tool_error(error_msg)
 
@@ -991,7 +991,7 @@ async def web_extract_tool(
         
         # Log debug information
         _debug.log_call("web_extract_tool", debug_call_data)
-        _debug.save()
+        await _debug.save()
         
         return cleaned_result
             
@@ -1001,7 +1001,7 @@ async def web_extract_tool(
         
         debug_call_data["error"] = error_msg
         _debug.log_call("web_extract_tool", debug_call_data)
-        _debug.save()
+        await _debug.save()
         
         return tool_error(error_msg)
 

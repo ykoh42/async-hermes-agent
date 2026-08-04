@@ -2,7 +2,7 @@
 
 import json
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -140,22 +140,25 @@ class TestRequiredEnvironmentVariablesNormalization:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.asyncio
 class TestGetCategoryFromPath:
-    def test_category_derived_from_layout(self, tmp_path):
+    async def test_category_derived_from_layout(self, tmp_path):
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
             categorized = tmp_path / "mlops" / "axolotl" / "SKILL.md"
             categorized.parent.mkdir(parents=True)
             categorized.touch()
-            assert _get_category_from_path(categorized) == "mlops"
+            assert await _get_category_from_path(categorized) == "mlops"
 
             top_level = tmp_path / "my-skill" / "SKILL.md"
             top_level.parent.mkdir(parents=True)
             top_level.touch()
-            assert _get_category_from_path(top_level) is None
+            assert await _get_category_from_path(top_level) is None
 
         # Paths outside SKILLS_DIR have no category.
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path / "skills"):
-            assert _get_category_from_path(tmp_path / "other" / "SKILL.md") is None
+            assert await _get_category_from_path(
+                tmp_path / "other" / "SKILL.md"
+            ) is None
 
 
 # ---------------------------------------------------------------------------
@@ -730,11 +733,12 @@ class TestSkillViewCollisionDetection:
     """
 
     def _patch_dirs(self, local_dir, external_dirs):
-        """Patch SKILLS_DIR (module-level) and get_external_skills_dirs at source."""
+        """Patch the local and native-async external skill roots."""
         return (
             patch("tools.skills_tool.SKILLS_DIR", local_dir),
             patch(
-                "agent.skill_utils.get_external_skills_dirs",
+                "tools.skills_tool._external_skills_dirs",
+                new_callable=AsyncMock,
                 return_value=list(external_dirs),
             ),
         )

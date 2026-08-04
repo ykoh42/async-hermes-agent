@@ -653,7 +653,7 @@ async def _paginate_full_list(list_method, items_attr: str, server_name: str):
     return items
 
 
-def _resolve_stdio_command(command: str, env: dict) -> tuple[str, dict]:
+async def _resolve_stdio_command(command: str, env: dict) -> tuple[str, dict]:
     """Resolve a stdio MCP command against the exact subprocess environment.
 
     This primarily exists to make bare ``npx``/``npm``/``node`` commands work
@@ -664,7 +664,9 @@ def _resolve_stdio_command(command: str, env: dict) -> tuple[str, dict]:
 
     if os.sep not in resolved_command:
         path_arg = resolved_env["PATH"] if "PATH" in resolved_env else None
-        which_hit = shutil.which(resolved_command, path=path_arg)
+        which_hit = await aiofiles.os.wrap(shutil.which)(
+            resolved_command, path=path_arg
+        )
         if which_hit:
             resolved_command = which_hit
         elif resolved_command in {"npx", "npm", "node"}:
@@ -689,7 +691,9 @@ def _resolve_stdio_command(command: str, env: dict) -> tuple[str, dict]:
                 os.path.join(os.sep, "usr", "local", "bin", resolved_command),
             ]
             for candidate in candidates:
-                if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+                if await aiofiles.os.path.isfile(
+                    candidate
+                ) and await aiofiles.os.access(candidate, os.X_OK):
                     resolved_command = candidate
                     break
 
@@ -1111,7 +1115,7 @@ def _validate_remote_mcp_url(server_name: str, url: Any) -> str:
     return stripped
 
 
-def _resolve_client_cert(server_name: str, config: dict):
+async def _resolve_client_cert(server_name: str, config: dict):
     """Resolve the ``client_cert`` / ``client_key`` config for mTLS.
 
     Returns whatever ``httpx``'s ``cert=`` parameter accepts, or ``None`` when
@@ -1135,14 +1139,14 @@ def _resolve_client_cert(server_name: str, config: dict):
     if raw_cert is None and raw_key is None:
         return None
 
-    def _expand(path: Any, label: str) -> str:
+    async def _expand(path: Any, label: str) -> str:
         if not isinstance(path, str) or not path.strip():
             raise ValueError(
                 f"MCP server '{server_name}': {label} must be a non-empty "
                 f"string path (got {type(path).__name__})"
             )
         expanded = os.path.expanduser(path.strip())
-        if not os.path.isfile(expanded):
+        if not await aiofiles.os.path.isfile(expanded):
             raise FileNotFoundError(
                 f"MCP server '{server_name}': {label} not found at "
                 f"{expanded!r}"
@@ -1157,12 +1161,12 @@ def _resolve_client_cert(server_name: str, config: dict):
                 f"a list [cert, key] OR client_cert + client_key, not both"
             )
         if len(raw_cert) == 2:
-            cert_path = _expand(raw_cert[0], "client_cert[0]")
-            key_path = _expand(raw_cert[1], "client_cert[1]")
+            cert_path = await _expand(raw_cert[0], "client_cert[0]")
+            key_path = await _expand(raw_cert[1], "client_cert[1]")
             return (cert_path, key_path)
         if len(raw_cert) == 3:
-            cert_path = _expand(raw_cert[0], "client_cert[0]")
-            key_path = _expand(raw_cert[1], "client_cert[1]")
+            cert_path = await _expand(raw_cert[0], "client_cert[0]")
+            key_path = await _expand(raw_cert[1], "client_cert[1]")
             password = raw_cert[2]
             if not isinstance(password, str):
                 raise ValueError(
@@ -1176,9 +1180,9 @@ def _resolve_client_cert(server_name: str, config: dict):
         )
 
     # String form for client_cert.
-    cert_path = _expand(raw_cert, "client_cert")
+    cert_path = await _expand(raw_cert, "client_cert")
     if raw_key is not None:
-        key_path = _expand(raw_key, "client_key")
+        key_path = await _expand(raw_key, "client_key")
         return (cert_path, key_path)
     # Single combined PEM file (cert + key in one file).
     return cert_path
@@ -2320,7 +2324,7 @@ class MCPServerTask:
             )
 
         safe_env = _build_safe_env(user_env)
-        command, safe_env = _resolve_stdio_command(command, safe_env)
+        command, safe_env = await _resolve_stdio_command(command, safe_env)
 
         # Check package against OSV malware database before spawning.  The
         # checker uses an async HTTP transport and is bounded with a wall-clock
@@ -2695,7 +2699,7 @@ class MCPServerTask:
             headers["mcp-protocol-version"] = LATEST_PROTOCOL_VERSION
         connect_timeout = config.get("connect_timeout", _DEFAULT_CONNECT_TIMEOUT)
         ssl_verify = config.get("ssl_verify", True)
-        client_cert = _resolve_client_cert(self.name, config)
+        client_cert = await _resolve_client_cert(self.name, config)
 
         # OAuth 2.1 PKCE: route through the central MCPOAuthManager so the
         # same provider instance is reused across reconnects, pre-flow
@@ -3047,7 +3051,7 @@ class MCPServerTask:
                         config["url"],
                         headers=_probe_headers,
                         ssl_verify=config.get("ssl_verify", True),
-                        client_cert=_resolve_client_cert(self.name, config),
+                        client_cert=await _resolve_client_cert(self.name, config),
                     )
                 except NonMcpEndpointError as exc:
                     logger.warning("%s", exc)

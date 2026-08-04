@@ -171,14 +171,6 @@ async def _external_skills_dirs() -> List[Path]:
 
     config_path = get_config_path()
     if not await aiofiles.os.path.isfile(config_path):
-        # Keep test/in-process callers that inject an external-root resolver
-        # working without making the normal configured path synchronous.  A
-        # patched resolver has no filesystem work of its own; production
-        # callers use the async YAML path below.
-        from agent import skill_utils as _skill_utils
-        legacy_resolver = getattr(_skill_utils, "get_external_skills_dirs", None)
-        if getattr(legacy_resolver, "__module__", "") == "unittest.mock":
-            return [Path(value) for value in (legacy_resolver() or [])]
         return []
     try:
         async with aiofiles.open(config_path, encoding="utf-8") as handle:
@@ -574,7 +566,7 @@ def _parse_frontmatter(content: str) -> Tuple[Dict[str, Any], str]:
     return parse_frontmatter(content)
 
 
-def _get_category_from_path(skill_path: Path) -> Optional[str]:
+async def _get_category_from_path(skill_path: Path) -> Optional[str]:
     """
     Extract category from skill path based on directory structure.
 
@@ -584,11 +576,7 @@ def _get_category_from_path(skill_path: Path) -> Optional[str]:
     # Try the active profile skills dir first (respects monkeypatching in tests),
     # then fall back to external dirs from config.
     dirs_to_check = [_skills_dir()]
-    try:
-        from agent.skill_utils import get_external_skills_dirs
-        dirs_to_check.extend(get_external_skills_dirs())
-    except Exception:
-        pass
+    dirs_to_check.extend(await _external_skills_dirs())
     for skills_dir in dirs_to_check:
         try:
             rel_path = skill_path.relative_to(skills_dir)
@@ -784,7 +772,7 @@ async def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any
                 skills.append({
                     "name": name,
                     "description": description,
-                    "category": _get_category_from_path(skill_md),
+                    "category": await _get_category_from_path(skill_md),
                 })
             except (OSError, UnicodeDecodeError, PermissionError) as exc:
                 logger.debug("Failed to read skill file %s: %s", skill_md, exc)

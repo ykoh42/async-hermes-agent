@@ -4,6 +4,7 @@ import sys
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
 
 from tools.mcp_tool import MCPServerTask, _format_connect_error, _resolve_stdio_command, _MCP_AVAILABLE
 
@@ -18,7 +19,8 @@ if not _MCP_AVAILABLE:
         _mcp_mod.ClientSession = MagicMock
 
 
-def test_resolve_stdio_command_falls_back_to_hermes_node_bin(tmp_path):
+@pytest.mark.asyncio
+async def test_resolve_stdio_command_falls_back_to_hermes_node_bin(tmp_path):
     node_bin = tmp_path / "node" / "bin"
     node_bin.mkdir(parents=True)
     npx_path = node_bin / "npx"
@@ -27,13 +29,14 @@ def test_resolve_stdio_command_falls_back_to_hermes_node_bin(tmp_path):
 
     with patch("tools.mcp_tool.shutil.which", return_value=None), \
          patch.dict("os.environ", {"HERMES_HOME": str(tmp_path)}, clear=False):
-        command, env = _resolve_stdio_command("npx", {"PATH": "/usr/bin"})
+        command, env = await _resolve_stdio_command("npx", {"PATH": "/usr/bin"})
 
     assert command == str(npx_path)
     assert env["PATH"].split(os.pathsep)[0] == str(node_bin)
 
 
-def test_resolve_stdio_command_falls_back_to_usr_local_bin():
+@pytest.mark.asyncio
+async def test_resolve_stdio_command_falls_back_to_usr_local_bin():
     """When ``npx`` isn't on the filtered PATH and isn't under ``$HERMES_HOME/node/bin``
     or ``~/.local/bin``, the resolver should still locate it at ``/usr/local/bin/npx``.
 
@@ -56,9 +59,11 @@ def test_resolve_stdio_command_falls_back_to_usr_local_bin():
         return path == target
 
     with patch("tools.mcp_tool.shutil.which", return_value=None), \
-         patch("tools.mcp_tool.os.path.isfile", side_effect=_fake_isfile), \
-         patch("tools.mcp_tool.os.access", side_effect=_fake_access):
-        command, env = _resolve_stdio_command("npx", {"PATH": "/opt/data/bin:/usr/bin:/bin"})
+         patch("tools.mcp_tool.aiofiles.os.path.isfile", side_effect=_fake_isfile), \
+         patch("tools.mcp_tool.aiofiles.os.access", side_effect=_fake_access):
+        command, env = await _resolve_stdio_command(
+            "npx", {"PATH": "/opt/data/bin:/usr/bin:/bin"}
+        )
 
     assert command == target
     # /usr/local/bin must be prepended so npx's shebang (`/usr/bin/env node`)

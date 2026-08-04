@@ -615,7 +615,11 @@ async def execute_tool_calls_segmented(
             subdirectory_hints = getattr(agent, "_subdirectory_hints", None)
             if subdirectory_hints is not None:
                 check_hints = getattr(subdirectory_hints, "check_tool_call", None)
-                hints = check_hints(name, managed.args) if callable(check_hints) else ""
+                hints = (
+                    await check_hints(name, managed.args)
+                    if callable(check_hints)
+                    else ""
+                )
                 if hints:
                     if _is_multimodal_tool_result(result):
                         _append_subdir_hint_to_multimodal(result, hints)

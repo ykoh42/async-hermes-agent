@@ -824,7 +824,7 @@ def _build_child_system_prompt(
     return "\n".join(parts)
 
 
-def _resolve_workspace_hint(parent_agent) -> Optional[str]:
+async def _resolve_workspace_hint(parent_agent) -> Optional[str]:
     """Best-effort local workspace hint for child prompts.
 
     We only inject a path when we have a concrete absolute directory. This avoids
@@ -846,7 +846,7 @@ def _resolve_workspace_hint(parent_agent) -> Optional[str]:
             text = os.path.abspath(os.path.expanduser(str(candidate)))
         except Exception:
             continue
-        if os.path.isabs(text) and os.path.isdir(text):
+        if os.path.isabs(text) and await aiofiles.os.path.isdir(text):
             return text
     return None
 
@@ -1274,7 +1274,7 @@ async def _build_child_agent(
     if effective_role == "orchestrator" and "delegation" not in child_toolsets:
         child_toolsets.append("delegation")
 
-    workspace_hint = _resolve_workspace_hint(parent_agent)
+    workspace_hint = await _resolve_workspace_hint(parent_agent)
     child_prompt = _build_child_system_prompt(
         goal,
         context,

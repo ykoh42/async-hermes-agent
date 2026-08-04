@@ -96,20 +96,23 @@ class TestDetermineMimeType:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.asyncio
 class TestImageToBase64DataUrl:
-    def test_returns_data_url_with_detected_or_given_mime(self, tmp_path):
+    async def test_returns_data_url_with_detected_or_given_mime(self, tmp_path):
         img = tmp_path / "test.png"
         img.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 8)
-        assert _image_to_base64_data_url(img).startswith("data:image/png;base64,")
+        assert (await _image_to_base64_data_url(img)).startswith(
+            "data:image/png;base64,"
+        )
 
         other = tmp_path / "test.bin"
         other.write_bytes(b"\x00" * 16)
-        result = _image_to_base64_data_url(other, mime_type="image/webp")
+        result = await _image_to_base64_data_url(other, mime_type="image/webp")
         assert result.startswith("data:image/webp;base64,")
 
-    def test_file_not_found_raises(self, tmp_path):
+    async def test_file_not_found_raises(self, tmp_path):
         with pytest.raises(FileNotFoundError):
-            _image_to_base64_data_url(tmp_path / "nonexistent.png")
+            await _image_to_base64_data_url(tmp_path / "nonexistent.png")
 
 
 # ---------------------------------------------------------------------------
@@ -610,10 +613,11 @@ class TestVisionRegistration:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.asyncio
 class TestResizeImageForVision:
     """Tests for the auto-resize function."""
 
-    def test_small_image_returned_as_is(self, tmp_path):
+    async def test_small_image_returned_as_is(self, tmp_path):
         """Images under the limit should be returned unchanged."""
         # Create a small 10x10 red PNG
         try:
@@ -624,23 +628,28 @@ class TestResizeImageForVision:
         path = tmp_path / "small.png"
         img.save(path, "PNG")
 
-        result = _resize_image_for_vision(path, mime_type="image/png")
+        result = await _resize_image_for_vision(path, mime_type="image/png")
         assert result.startswith("data:image/png;base64,")
         assert len(result) < _MAX_BASE64_BYTES
 
 
-    def test_no_pillow_returns_original(self, tmp_path):
+    async def test_no_pillow_returns_original(self, tmp_path):
         """Without Pillow, oversized images should be returned as-is."""
         # Create a dummy file
         path = tmp_path / "test.png"
         # Write enough bytes to exceed a tiny limit
         path.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 1000)
 
-        with patch("tools.vision_tools._image_to_base64_data_url") as mock_b64:
+        with patch(
+            "tools.vision_tools._image_to_base64_data_url",
+            new_callable=AsyncMock,
+        ) as mock_b64:
             # Simulate a large base64 result
             mock_b64.return_value = "data:image/png;base64," + "A" * 200
             with patch.dict("sys.modules", {"PIL": None, "PIL.Image": None}):
-                result = _resize_image_for_vision(path, max_base64_bytes=100)
+                result = await _resize_image_for_vision(
+                    path, max_base64_bytes=100
+                )
                 # Should return the original (oversized) data url
                 assert len(result) > 100
 
@@ -650,6 +659,7 @@ class TestResizeImageForVision:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.asyncio
 class TestImageExceedsDimension:
     """The proactive embed path checks pixel dimensions, not just bytes.
 
@@ -660,7 +670,7 @@ class TestImageExceedsDimension:
     embed-time resize fires on dimensions too.
     """
 
-    def test_tall_small_byte_image_flagged(self, tmp_path):
+    async def test_tall_small_byte_image_flagged(self, tmp_path):
         try:
             from PIL import Image
         except ImportError:
@@ -669,21 +679,25 @@ class TestImageExceedsDimension:
         img = Image.new("RGB", (1200, 12000), (40, 40, 40))
         path = tmp_path / "tall.png"
         img.save(path, "PNG")
-        assert _image_exceeds_dimension(path, _EMBED_MAX_DIMENSION) is True
+        assert await _image_exceeds_dimension(path, _EMBED_MAX_DIMENSION) is True
 
 
-    def test_undetectable_dimensions_return_false(self, tmp_path):
+    async def test_undetectable_dimensions_return_false(self, tmp_path):
         # Without Pillow — or with bytes Pillow can't parse — we can't inspect
         # dimensions, so return False: the byte-based checks still apply and a
         # missing soft dep never breaks the embed path.
         path = tmp_path / "x.png"
         path.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 100)
         with patch.dict("sys.modules", {"PIL": None, "PIL.Image": None}):
-            assert _image_exceeds_dimension(path, _EMBED_MAX_DIMENSION) is False
+            assert await _image_exceeds_dimension(
+                path, _EMBED_MAX_DIMENSION
+            ) is False
 
         corrupt = tmp_path / "corrupt.png"
         corrupt.write_bytes(b"not an image at all")
-        assert _image_exceeds_dimension(corrupt, _EMBED_MAX_DIMENSION) is False
+        assert await _image_exceeds_dimension(
+            corrupt, _EMBED_MAX_DIMENSION
+        ) is False
 
 
 # ---------------------------------------------------------------------------

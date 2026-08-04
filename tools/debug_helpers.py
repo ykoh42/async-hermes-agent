@@ -14,7 +14,7 @@ Usage in a tool module:
     _debug.log_call("web_search", {"query": q, "results": len(r)})
 
     # Save the debug log (no-op when debug mode is off)
-    _debug.save()
+    await _debug.save()
 
     # Expose debug info to external callers
     def get_debug_session_info():
@@ -27,6 +27,9 @@ import logging
 import os
 import uuid
 from typing import Any, Dict
+
+import aiofiles
+import aiofiles.os
 
 from hermes_constants import get_hermes_home
 
@@ -49,7 +52,6 @@ class DebugSession:
         self._start_time = datetime.datetime.now().isoformat() if self.enabled else ""
 
         if self.enabled:
-            self.log_dir.mkdir(parents=True, exist_ok=True)
             logger.debug("%s debug mode enabled - Session ID: %s",
                          tool_name, self.session_id)
 
@@ -67,13 +69,14 @@ class DebugSession:
             **call_data,
         })
 
-    def save(self) -> None:
+    async def save(self) -> None:
         """Flush the in-memory log to a JSON file in the logs directory."""
         if not self.enabled:
             return
         try:
             filename = f"{self.tool_name}_debug_{self.session_id}.json"
             filepath = self.log_dir / filename
+            await aiofiles.os.makedirs(self.log_dir, exist_ok=True)
             payload = {
                 "session_id": self.session_id,
                 "start_time": self._start_time,
@@ -82,8 +85,8 @@ class DebugSession:
                 "total_calls": len(self._calls),
                 "tool_calls": self._calls,
             }
-            with open(filepath, "w", encoding="utf-8") as f:
-                json.dump(payload, f, indent=2, ensure_ascii=False)
+            async with aiofiles.open(filepath, "w", encoding="utf-8") as handle:
+                await handle.write(json.dumps(payload, indent=2, ensure_ascii=False))
             logger.debug("%s debug log saved: %s", self.tool_name, filepath)
         except Exception as e:
             logger.error("Error saving %s debug log: %s", self.tool_name, e)

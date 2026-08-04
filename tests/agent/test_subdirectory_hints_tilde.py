@@ -10,13 +10,16 @@ do not depend on the richer ``project`` fixture from
 ``test_subdirectory_hints.py`` so the file is runnable standalone.
 """
 
+import pytest
+
 from agent.subdirectory_hints import SubdirectoryHintTracker
 
 
+@pytest.mark.asyncio
 class TestSubdirectoryHintTrackerTildeRobustness:
     """Regression: literal ``~`` in tool-call args must not crash the walker."""
 
-    def test_tilde_approximately_in_command_does_not_crash(self, tmp_path):
+    async def test_tilde_approximately_in_command_does_not_crash(self, tmp_path):
         """LLMs use ``~`` for "approximately" (e.g. ``~500 agencies``).
 
         ``pathlib.Path('~500-700').expanduser()`` raises ``RuntimeError`` —
@@ -33,15 +36,15 @@ class TestSubdirectoryHintTrackerTildeRobustness:
             "EOF"
         )
         # Must not raise — return value can be None / empty
-        tracker.check_tool_call("terminal", {"command": cmd})
+        await tracker.check_tool_call("terminal", {"command": cmd})
 
 
-    def test_valid_tilde_user_still_works(self, tmp_path):
+    async def test_valid_tilde_user_still_works(self, tmp_path):
         """The fix must not regress the legitimate-tilde-user path.
 
         ``~`` alone resolves to ``Path.home()`` and should still be
         recognised as a candidate path (no exception either way).
         """
         tracker = SubdirectoryHintTracker(working_dir=str(tmp_path))
-        tracker.check_tool_call("terminal", {"command": "ls ~/Documents"})
+        await tracker.check_tool_call("terminal", {"command": "ls ~/Documents"})
         # No exception, no assertion required

@@ -13,11 +13,15 @@ the conversation without modifying the system prompt (preserving prompt caching)
 Inspired by Block/goose's SubdirectoryHintTracker.
 """
 
+import asyncio
 import logging
 import os
 import shlex
 from pathlib import Path
 from typing import Dict, Any, Optional, Set
+
+import aiofiles
+import aiofiles.os
 
 from agent.prompt_builder import _scan_context_content
 
@@ -62,7 +66,9 @@ class SubdirectoryHintTracker:
         tracker = SubdirectoryHintTracker(working_dir="/path/to/project")
 
         # After each tool call:
-        hints = tracker.check_tool_call("read_file", {"path": "backend/src/main.py"})
+        hints = await tracker.check_tool_call(
+            "read_file", {"path": "backend/src/main.py"}
+        )
         if hints:
             tool_result += hints  # append to the tool result string
     """
@@ -70,10 +76,11 @@ class SubdirectoryHintTracker:
     def __init__(self, working_dir: Optional[str] = None):
         self.working_dir = Path(working_dir or os.getcwd()).resolve()
         self._loaded_dirs: Set[Path] = set()
+        self._lock = asyncio.Lock()
         # Pre-mark the working dir as loaded (startup context handles it)
         self._loaded_dirs.add(self.working_dir)
 
-    def check_tool_call(
+    async def check_tool_call(
         self,
         tool_name: str,
         tool_args: Dict[str, Any],
@@ -82,22 +89,23 @@ class SubdirectoryHintTracker:
 
         Returns formatted hint text to append to the tool result, or None.
         """
-        dirs = self._extract_directories(tool_name, tool_args)
-        if not dirs:
-            return None
+        async with self._lock:
+            dirs = await self._extract_directories(tool_name, tool_args)
+            if not dirs:
+                return None
 
-        all_hints = []
-        for d in dirs:
-            hints = self._load_hints_for_directory(d)
-            if hints:
-                all_hints.append(hints)
+            all_hints = []
+            for directory in dirs:
+                hints = await self._load_hints_for_directory(directory)
+                if hints:
+                    all_hints.append(hints)
 
         if not all_hints:
             return None
 
         return "\n\n" + "\n\n".join(all_hints)
 
-    def _extract_directories(
+    async def _extract_directories(
         self, tool_name: str, args: Dict[str, Any]
     ) -> list:
         """Extract directory paths from tool call arguments."""
@@ -107,17 +115,17 @@ class SubdirectoryHintTracker:
         for key in _PATH_ARG_KEYS:
             val = args.get(key)
             if isinstance(val, str) and val.strip():
-                self._add_path_candidate(val, candidates)
+                await self._add_path_candidate(val, candidates)
 
         # Shell commands — extract path-like tokens
         if tool_name in _COMMAND_TOOLS:
             cmd = args.get("command", "")
             if isinstance(cmd, str):
-                self._extract_paths_from_command(cmd, candidates)
+                await self._extract_paths_from_command(cmd, candidates)
 
         return list(candidates)
 
-    def _add_path_candidate(self, raw_path: str, candidates: Set[Path]):
+    async def _add_path_candidate(self, raw_path: str, candidates: Set[Path]):
         """Resolve a raw path and add its directory + ancestors to candidates.
 
         Walks up from the resolved directory toward the filesystem root,
@@ -130,15 +138,18 @@ class SubdirectoryHintTracker:
             p = Path(raw_path).expanduser()
             if not p.is_absolute():
                 p = self.working_dir / p
-            p = p.resolve()
+            p = Path(await aiofiles.os.wrap(os.path.realpath)(p))
             # Use parent if it's a file path (has extension or doesn't exist as dir)
-            if p.suffix or (p.exists() and p.is_file()):
+            if p.suffix or (
+                await aiofiles.os.path.exists(p)
+                and await aiofiles.os.path.isfile(p)
+            ):
                 p = p.parent
             # Walk up ancestors — stop at already-loaded or root
             for _ in range(_MAX_ANCESTOR_WALK):
                 if p in self._loaded_dirs:
                     break
-                if self._is_valid_subdir(p):
+                if await self._is_valid_subdir(p):
                     candidates.add(p)
                 parent = p.parent
                 if parent == p:
@@ -147,7 +158,9 @@ class SubdirectoryHintTracker:
         except (OSError, ValueError, RuntimeError):
             pass
 
-    def _extract_paths_from_command(self, cmd: str, candidates: Set[Path]):
+    async def _extract_paths_from_command(
+        self, cmd: str, candidates: Set[Path]
+    ) -> None:
         """Extract path-like tokens from a shell command string."""
         try:
             tokens = shlex.split(cmd)
@@ -164,9 +177,9 @@ class SubdirectoryHintTracker:
             # Skip URLs
             if token.startswith(("http://", "https://", "git@")):
                 continue
-            self._add_path_candidate(token, candidates)
+            await self._add_path_candidate(token, candidates)
 
-    def _is_valid_subdir(self, path: Path) -> bool:
+    async def _is_valid_subdir(self, path: Path) -> bool:
         """Check if path is a valid directory to scan for hints.
 
         Only allow subdirectories within the working directory tree.
@@ -175,7 +188,7 @@ class SubdirectoryHintTracker:
         cross-agent context contamination and instruction mixup.
         """
         try:
-            if not path.is_dir():
+            if not await aiofiles.os.path.isdir(path):
                 return False
         except OSError:
             return False
@@ -195,7 +208,9 @@ class SubdirectoryHintTracker:
                 return False
         return True
 
-    def _load_hints_for_directory(self, directory: Path) -> Optional[str]:
+    async def _load_hints_for_directory(
+        self, directory: Path
+    ) -> Optional[str]:
         """Load hint files from a directory. Returns formatted text or None.
 
         Only loads hints from directories within the working directory tree.
@@ -222,12 +237,15 @@ class SubdirectoryHintTracker:
         for filename in _HINT_FILENAMES:
             hint_path = directory / filename
             try:
-                if not hint_path.is_file():
+                if not await aiofiles.os.path.isfile(hint_path):
                     continue
             except OSError:
                 continue
             try:
-                content = hint_path.read_text(encoding="utf-8").strip()
+                async with aiofiles.open(
+                    hint_path, "r", encoding="utf-8"
+                ) as handle:
+                    content = (await handle.read()).strip()
                 if not content:
                     continue
                 # Same security scan as startup context loading

@@ -32,6 +32,7 @@ import base64
 import asyncio
 import aiofiles
 import aiofiles.os
+import io
 import json
 import logging
 import os
@@ -150,7 +151,7 @@ _ANTHROPIC_SUPPORTED_MEDIA_TYPES = frozenset(
 )
 
 
-def _rasterize_svg_to_png(svg_path: Path, out_path: Path) -> bool:
+async def _rasterize_svg_to_png(svg_path: Path, out_path: Path) -> bool:
     """Best-effort SVG → PNG rasterization. Returns True on success.
 
     Tries, in order: cairosvg, svglib+reportlab, then system rasterizers
@@ -159,45 +160,63 @@ def _rasterize_svg_to_png(svg_path: Path, out_path: Path) -> bool:
     rather than embedding an unsupported media_type that would wedge the
     session.
     """
-    # 1) cairosvg (pure-python-ish, most common)
+    try:
+        async with aiofiles.open(svg_path, "rb") as handle:
+            svg_data = await handle.read()
+    except OSError:
+        return False
+
+    # 1) cairosvg (CPU-only conversion, most common)
     try:
         import cairosvg  # type: ignore
-        cairosvg.svg2png(url=str(svg_path), write_to=str(out_path))
-        return out_path.exists() and out_path.stat().st_size > 0
+
+        png_data = cairosvg.svg2png(bytestring=svg_data)
+        async with aiofiles.open(out_path, "wb") as handle:
+            await handle.write(png_data)
+        return bool((await aiofiles.os.stat(out_path)).st_size)
     except Exception:
         pass
     # 2) svglib + reportlab
     try:
         from svglib.svglib import svg2rlg  # type: ignore
         from reportlab.graphics import renderPM  # type: ignore
-        drawing = svg2rlg(str(svg_path))
+        drawing = svg2rlg(io.BytesIO(svg_data))
         if drawing is not None:
-            renderPM.drawToFile(drawing, str(out_path), fmt="PNG")
-            return out_path.exists() and out_path.stat().st_size > 0
+            png_data = renderPM.drawToString(drawing, fmt="PNG")
+            async with aiofiles.open(out_path, "wb") as handle:
+                await handle.write(png_data)
+            return bool((await aiofiles.os.stat(out_path)).st_size)
     except Exception:
         pass
     # 3) system rasterizers
-    import shutil as _shutil
-    import subprocess as _subprocess
     for cmd in (
         ["rsvg-convert", "-o", str(out_path), str(svg_path)],
         ["inkscape", str(svg_path), "--export-type=png",
          f"--export-filename={out_path}"],
     ):
-        if _shutil.which(cmd[0]):
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
             try:
-                _subprocess.run(
-                    cmd, check=True, capture_output=True, timeout=30,
-                    stdin=_subprocess.DEVNULL,
-                )
-                if out_path.exists() and out_path.stat().st_size > 0:
-                    return True
-            except Exception:
+                await asyncio.wait_for(process.communicate(), timeout=30)
+            except TimeoutError:
+                process.kill()
+                await process.wait()
                 continue
+            if process.returncode == 0 and bool(
+                (await aiofiles.os.stat(out_path)).st_size
+            ):
+                return True
+        except (FileNotFoundError, OSError):
+            continue
     return False
 
 
-def _normalize_to_supported_image(
+async def _normalize_to_supported_image(
     image_path: Path, detected_mime: str
 ) -> tuple[Optional[Path], Optional[str], Optional[str]]:
     """Ensure an image is in a vision-provider-supported format.
@@ -217,12 +236,12 @@ def _normalize_to_supported_image(
         return image_path, detected_mime, None
 
     out_dir = get_hermes_dir("cache/vision", "temp_vision_images")
-    out_dir.mkdir(parents=True, exist_ok=True)
+    await aiofiles.os.makedirs(out_dir, exist_ok=True)
     out_path = out_dir / f"converted_{uuid.uuid4()}.png"
 
     # SVG: needs a rasterizer (Pillow cannot render SVG).
     if detected_mime == "image/svg+xml":
-        if _rasterize_svg_to_png(image_path, out_path):
+        if await _rasterize_svg_to_png(image_path, out_path):
             return out_path, "image/png", None
         return (
             None,
@@ -237,11 +256,17 @@ def _normalize_to_supported_image(
     # Other non-supported raster formats (BMP, TIFF, ...): re-encode via Pillow.
     try:
         from PIL import Image as _PILImage
-        with _PILImage.open(image_path) as _img:
+
+        async with aiofiles.open(image_path, "rb") as handle:
+            image_data = await handle.read()
+        with _PILImage.open(io.BytesIO(image_data)) as _img:
             if _img.mode not in ("RGB", "RGBA", "L"):
                 _img = _img.convert("RGBA")
-            _img.save(out_path, format="PNG")
-        if out_path.exists() and out_path.stat().st_size > 0:
+            output = io.BytesIO()
+            _img.save(output, format="PNG")
+        async with aiofiles.open(out_path, "wb") as handle:
+            await handle.write(output.getvalue())
+        if (await aiofiles.os.stat(out_path)).st_size > 0:
             return out_path, "image/png", None
     except Exception as _exc:
         logger.warning("Failed to normalize %s image to PNG: %s",
@@ -417,7 +442,9 @@ def _determine_mime_type(image_path: Path) -> str:
     return mime_types.get(extension, 'image/jpeg')
 
 
-def _image_to_base64_data_url(image_path: Path, mime_type: Optional[str] = None) -> str:
+async def _image_to_base64_data_url(
+    image_path: Path, mime_type: Optional[str] = None
+) -> str:
     """
     Convert an image file to a base64-encoded data URL.
     
@@ -429,7 +456,8 @@ def _image_to_base64_data_url(image_path: Path, mime_type: Optional[str] = None)
         str: Base64-encoded data URL (e.g., "data:image/jpeg;base64,...")
     """
     # Read the image as bytes
-    data = image_path.read_bytes()
+    async with aiofiles.open(image_path, "rb") as handle:
+        data = await handle.read()
     
     # Encode to base64
     encoded = base64.b64encode(data).decode("ascii")
@@ -482,7 +510,7 @@ def _is_image_size_error(error: Exception) -> bool:
     ))
 
 
-def _image_exceeds_dimension(image_path: Path, max_dimension: int) -> bool:
+async def _image_exceeds_dimension(image_path: Path, max_dimension: int) -> bool:
     """True if the image's longest side exceeds ``max_dimension`` px.
 
     Anthropic enforces an 8000px per-side cap independently of the 5 MB byte
@@ -494,15 +522,21 @@ def _image_exceeds_dimension(image_path: Path, max_dimension: int) -> bool:
     """
     try:
         from PIL import Image as _PILImage
-        with _PILImage.open(image_path) as _img:
+
+        async with aiofiles.open(image_path, "rb") as handle:
+            image_data = await handle.read()
+        with _PILImage.open(io.BytesIO(image_data)) as _img:
             return max(_img.size) > max_dimension
     except Exception:
         return False
 
 
-def _resize_image_for_vision(image_path: Path, mime_type: Optional[str] = None,
-                              max_base64_bytes: int = _RESIZE_TARGET_BYTES,
-                              max_dimension: Optional[int] = None) -> str:
+async def _resize_image_for_vision(
+    image_path: Path,
+    mime_type: Optional[str] = None,
+    max_base64_bytes: int = _RESIZE_TARGET_BYTES,
+    max_dimension: Optional[int] = None,
+) -> str:
     """Convert an image to a base64 data URL, auto-resizing if too large.
 
     Tries Pillow first to progressively downscale oversized images.  If Pillow
@@ -519,7 +553,9 @@ def _resize_image_for_vision(image_path: Path, mime_type: Optional[str] = None,
     """
     # Quick file-size estimate: base64 expands by ~4/3, plus data URL header.
     # Skip the expensive full-read + encode if Pillow can resize directly.
-    file_size = image_path.stat().st_size
+    file_size = (await aiofiles.os.stat(image_path)).st_size
+    async with aiofiles.open(image_path, "rb") as handle:
+        image_data = await handle.read()
     estimated_b64 = (file_size * 4) // 3 + 100  # ~header overhead
     needs_resize_for_bytes = estimated_b64 > max_base64_bytes
 
@@ -528,7 +564,7 @@ def _resize_image_for_vision(image_path: Path, mime_type: Optional[str] = None,
     if max_dimension is not None:
         try:
             from PIL import Image as _PILQuick
-            with _PILQuick.open(image_path) as _quick_img:
+            with _PILQuick.open(io.BytesIO(image_data)) as _quick_img:
                 if max(_quick_img.size) > max_dimension:
                     needs_resize_for_dims = True
         except Exception:
@@ -536,7 +572,7 @@ def _resize_image_for_vision(image_path: Path, mime_type: Optional[str] = None,
 
     if not needs_resize_for_bytes and not needs_resize_for_dims:
         # Small enough — just encode directly.
-        data_url = _image_to_base64_data_url(image_path, mime_type=mime_type)
+        data_url = await _image_to_base64_data_url(image_path, mime_type=mime_type)
         if len(data_url) <= max_base64_bytes:
             return data_url
     else:
@@ -549,7 +585,7 @@ def _resize_image_for_vision(image_path: Path, mime_type: Optional[str] = None,
     except ImportError:
         logger.info("Pillow not installed — cannot auto-resize oversized image")
         if data_url is None:
-            data_url = _image_to_base64_data_url(image_path, mime_type=mime_type)
+            data_url = await _image_to_base64_data_url(image_path, mime_type=mime_type)
         return data_url  # caller will raise the size error
 
     logger.info("Image file is %.1f MB (estimated base64 %.1f MB, limit %.1f MB, max_dimension=%s), auto-resizing...",
@@ -562,11 +598,11 @@ def _resize_image_for_vision(image_path: Path, mime_type: Optional[str] = None,
     out_mime = "image/png" if pil_format == "PNG" else "image/jpeg"
 
     try:
-        img = Image.open(image_path)
+        img = Image.open(io.BytesIO(image_data))
     except Exception as exc:
         logger.info("Pillow cannot open image for resizing: %s", exc)
         if data_url is None:
-            data_url = _image_to_base64_data_url(image_path, mime_type=mime_type)
+            data_url = await _image_to_base64_data_url(image_path, mime_type=mime_type)
         return data_url  # fall through to size-check in caller
     # Convert RGBA to RGB for JPEG output
     if pil_format == "JPEG" and img.mode in {"RGBA", "P"}:
@@ -630,7 +666,9 @@ def _resize_image_for_vision(image_path: Path, mime_type: Optional[str] = None,
         return candidate
 
     # Shouldn't reach here, but fall back to full encode
-    return data_url or _image_to_base64_data_url(image_path, mime_type=mime_type)
+    return data_url or await _image_to_base64_data_url(
+        image_path, mime_type=mime_type
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -867,8 +905,10 @@ async def _vision_analyze_native(
         # baked into immutable history wedges the session with a 400 on every
         # resume.  Convert here so it can never enter history. Offloaded — the
         # rasterizers/Pillow are blocking.
-        normalized_path, detected_mime_type, _norm_err = _normalize_to_supported_image(
-            temp_image_path, detected_mime_type,
+        normalized_path, detected_mime_type, _norm_err = (
+            await _normalize_to_supported_image(
+                temp_image_path, detected_mime_type,
+            )
         )
         if _norm_err or normalized_path is None:
             return tool_error(
@@ -885,7 +925,7 @@ async def _vision_analyze_native(
             should_cleanup = True
             image_size_bytes = (await aiofiles.os.stat(temp_image_path)).st_size
 
-        image_data_url = _image_to_base64_data_url(
+        image_data_url = await _image_to_base64_data_url(
             temp_image_path, mime_type=detected_mime_type,
         )
 
@@ -898,11 +938,11 @@ async def _vision_analyze_native(
         # target (4 MB / 7900px, headroom under both ceilings) whenever the
         # payload exceeds either limit, not just at the 20 MB hard ceiling.
         _over_bytes = len(image_data_url) > _EMBED_TARGET_BYTES
-        _over_dims = _image_exceeds_dimension(
+        _over_dims = await _image_exceeds_dimension(
             temp_image_path, _EMBED_MAX_DIMENSION,
         )
         if _over_bytes or _over_dims:
-            image_data_url = _resize_image_for_vision(
+            image_data_url = await _resize_image_for_vision(
                 temp_image_path, mime_type=detected_mime_type,
                 max_base64_bytes=_EMBED_TARGET_BYTES,
                 max_dimension=_EMBED_MAX_DIMENSION,
@@ -1038,8 +1078,10 @@ async def vision_analyze_tool(
         # Normalize unsupported formats (SVG, BMP, ...) to PNG. Vision providers
         # reject these media types; convert before encoding. Offloaded — the
         # rasterizers/Pillow are blocking.
-        normalized_path, detected_mime_type, _norm_err = _normalize_to_supported_image(
-            temp_image_path, detected_mime_type,
+        normalized_path, detected_mime_type, _norm_err = (
+            await _normalize_to_supported_image(
+                temp_image_path, detected_mime_type,
+            )
         )
         if _norm_err or normalized_path is None:
             raise ValueError(_norm_err or "Image normalization failed.")
@@ -1057,7 +1099,7 @@ async def vision_analyze_tool(
         # Encoding is CPU-only; all source resolution and API I/O around it is
         # native async.
         logger.info("Converting image to base64...")
-        image_data_url = _image_to_base64_data_url(
+        image_data_url = await _image_to_base64_data_url(
             temp_image_path, mime_type=detected_mime_type)
         data_size_kb = len(image_data_url) / 1024
         logger.info("Image converted to base64 (%.1f KB)", data_size_kb)
@@ -1065,7 +1107,7 @@ async def vision_analyze_tool(
         # Hard limit (20 MB) — no provider accepts payloads this large.
         if len(image_data_url) > _MAX_BASE64_BYTES:
             # Try to resize down to 5 MB before giving up.
-            image_data_url = _resize_image_for_vision(
+            image_data_url = await _resize_image_for_vision(
                 temp_image_path, mime_type=detected_mime_type)
             if len(image_data_url) > _MAX_BASE64_BYTES:
                 raise ValueError(
@@ -1142,7 +1184,7 @@ async def vision_analyze_tool(
                     len(image_data_url) / (1024 * 1024),
                     _RESIZE_TARGET_BYTES / (1024 * 1024),
                 )
-                image_data_url = _resize_image_for_vision(
+                image_data_url = await _resize_image_for_vision(
                     temp_image_path, mime_type=detected_mime_type)
                 messages[0]["content"][1]["image_url"]["url"] = image_data_url
                 response = await call_llm(**call_kwargs)
@@ -1173,7 +1215,7 @@ async def vision_analyze_tool(
         
         # Log debug information
         _debug.log_call("vision_analyze_tool", debug_call_data)
-        _debug.save()
+        await _debug.save()
         
         return json.dumps(result, indent=2, ensure_ascii=False)
         
@@ -1222,7 +1264,7 @@ async def vision_analyze_tool(
         
         debug_call_data["error"] = error_msg
         _debug.log_call("vision_analyze_tool", debug_call_data)
-        _debug.save()
+        await _debug.save()
         
         return json.dumps(result, indent=2, ensure_ascii=False)
     
@@ -1608,7 +1650,7 @@ async def video_analyze_tool(
         debug_call_data["success"] = True
         debug_call_data["analysis_length"] = analysis_length
         _debug.log_call("video_analyze_tool", debug_call_data)
-        _debug.save()
+        await _debug.save()
 
         return json.dumps(result, indent=2, ensure_ascii=False)
 
@@ -1657,7 +1699,7 @@ async def video_analyze_tool(
 
         debug_call_data["error"] = error_msg
         _debug.log_call("video_analyze_tool", debug_call_data)
-        _debug.save()
+        await _debug.save()
 
         return json.dumps(result, indent=2, ensure_ascii=False)
 

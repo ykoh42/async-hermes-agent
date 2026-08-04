@@ -25,24 +25,25 @@ import pytest
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.asyncio
 class TestResolveClientCert:
-    def test_returns_none_when_unset(self):
+    async def test_returns_none_when_unset(self):
         from tools.mcp_tool import _resolve_client_cert
 
-        assert _resolve_client_cert("srv", {}) is None
-        assert _resolve_client_cert("srv", {"url": "https://x"}) is None
+        assert await _resolve_client_cert("srv", {}) is None
+        assert await _resolve_client_cert("srv", {"url": "https://x"}) is None
 
-    def test_string_form_single_pem(self, tmp_path):
+    async def test_string_form_single_pem(self, tmp_path):
         from tools.mcp_tool import _resolve_client_cert
 
         pem = tmp_path / "combined.pem"
         pem.write_text("dummy")
 
-        result = _resolve_client_cert("srv", {"client_cert": str(pem)})
+        result = await _resolve_client_cert("srv", {"client_cert": str(pem)})
         assert result == str(pem)
 
 
-    def test_list_form_two_elements(self, tmp_path):
+    async def test_list_form_two_elements(self, tmp_path):
         from tools.mcp_tool import _resolve_client_cert
 
         cert = tmp_path / "client.crt"
@@ -50,13 +51,13 @@ class TestResolveClientCert:
         cert.write_text("cert")
         key.write_text("key")
 
-        result = _resolve_client_cert("srv", {
+        result = await _resolve_client_cert("srv", {
             "client_cert": [str(cert), str(key)],
         })
         assert result == (str(cert), str(key))
 
 
-    def test_password_must_be_string(self, tmp_path):
+    async def test_password_must_be_string(self, tmp_path):
         from tools.mcp_tool import _resolve_client_cert
 
         cert = tmp_path / "client.crt"
@@ -65,7 +66,7 @@ class TestResolveClientCert:
         key.write_text("key")
 
         with pytest.raises(ValueError, match=r"key passphrase.*must be a string"):
-            _resolve_client_cert("srv", {
+            await _resolve_client_cert("srv", {
                 "client_cert": [str(cert), str(key), 42],
             })
 
