@@ -6,53 +6,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 
-class TestCleanupStaleAsyncClients:
-    """Verify that cache lifecycle remains on the event loop."""
-
-    @pytest.mark.asyncio
-    async def test_removes_stale_entries(self):
-        from agent.auxiliary_client import (
-            _client_cache,
-            _client_cache_lock,
-            cleanup_stale_clients,
-        )
-
-        closed_loop = asyncio.new_event_loop()
-        closed_loop.close()
-        key = ("test_stale", "", "", "", (), False, "", "", "test-model")
-        client = MagicMock()
-        client._client = MagicMock(is_closed=False)
-        async with _client_cache_lock:
-            _client_cache[key] = (client, "test-model", closed_loop)
-
-        await cleanup_stale_clients()
-
-        async with _client_cache_lock:
-            assert key not in _client_cache
-
-    @pytest.mark.asyncio
-    async def test_keeps_current_loop_entries(self):
-        from agent.auxiliary_client import (
-            _client_cache,
-            _client_cache_lock,
-            cleanup_stale_clients,
-        )
-
-        key = ("test_live", "", "", "", (), False, "", "", "test-model")
-        async with _client_cache_lock:
-            _client_cache[key] = (
-                MagicMock(),
-                "test-model",
-                asyncio.get_running_loop(),
-            )
-
-        await cleanup_stale_clients()
-
-        async with _client_cache_lock:
-            assert key in _client_cache
-            _client_cache.pop(key, None)
-
-
 class TestClientCacheBoundedGrowth:
     @pytest.mark.asyncio
     async def test_same_key_replaces_stale_loop_entry(self):

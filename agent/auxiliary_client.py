@@ -5850,25 +5850,6 @@ async def shutdown_cached_clients() -> None:
         await _close_cached_client(client)
 
 
-async def cleanup_stale_clients() -> None:
-    """Drop cached clients whose owning event loop has already closed.
-
-    A closed loop can no longer await its owned transport, so stale cache
-    entries are detached before the next loop creates a replacement.
-    """
-    async with _client_cache_lock:
-        stale_clients = []
-        for key, entry in _client_cache.items():
-            client, _default, cached_loop = entry
-            if cached_loop is not None and cached_loop.is_closed():
-                stale_clients.append(client)
-        for key, entry in list(_client_cache.items()):
-            if entry[0] in stale_clients:
-                del _client_cache[key]
-    for client in stale_clients:
-        _force_close_async_httpx(client)
-
-
 def _is_openrouter_client(client: Any) -> bool:
     for obj in (client, getattr(client, "_client", None), getattr(client, "client", None)):
         if obj and base_url_host_matches(str(getattr(obj, "base_url", "") or ""), "openrouter.ai"):
