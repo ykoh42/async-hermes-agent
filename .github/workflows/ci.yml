@@ -44,6 +44,13 @@ jobs:
       - name: Lint
         run: uv run ruff check .
 
+      - name: Reject blocking calls in the async runtime
+        run: >-
+          uv run ruff check
+          --select ASYNC210,ASYNC220,ASYNC221,ASYNC222,ASYNC230,ASYNC251
+          agent tools run_agent.py model_tools.py batch_runner.py hermes_state.py
+          trajectory_compressor.py
+
       - name: Test
         run: uv run pytest -q -W error::pytest.PytestUnhandledThreadExceptionWarning
         env:
