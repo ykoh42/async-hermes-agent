@@ -1,13 +1,8 @@
 """Tests for trajectory_compressor AsyncOpenAI event loop binding.
 
-The AsyncOpenAI client was created once at __init__ time and stored as an
-instance attribute. When process_directory() calls asyncio.run() — which
-creates and closes a fresh event loop — the client's internal httpx
-transport remains bound to the now-closed loop. A second call to
-process_directory() would fail with "Event loop is closed".
-
-The fix creates the AsyncOpenAI client lazily via _get_client() so
-each asyncio.run() gets a client bound to the current loop.
+The compressor constructor remains synchronous and side-effect-free. Its
+AsyncOpenAI transport is created lazily by _get_client() so it binds to the
+event loop that performs the first request.
 """
 
 from types import SimpleNamespace

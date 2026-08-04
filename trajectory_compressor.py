@@ -391,10 +391,9 @@ class TrajectoryCompressor:
                 raise RuntimeError(
                     f"Missing API key. Set {self.config.api_key_env} "
                     f"environment variable.")
-            # AsyncOpenAI is created lazily in _get_client() so it
-            # binds to the current event loop — avoids "Event loop is closed"
-            # when process_directory() is called multiple times (each call
-            # creates a new loop via asyncio.run()).
+            # AsyncOpenAI is created lazily in _get_client() so construction
+            # stays side-effect-free and the transport binds to the caller's
+            # active event loop.
             self.client = None
             self._client_api_key = api_key
 
