@@ -8,6 +8,8 @@ primed the way conversation_loop does it.
 """
 import time
 
+import pytest
+
 from agent.credits_tracker import CreditsState, evaluate_credits_notices
 
 
@@ -101,7 +103,7 @@ class _FakeAgent:
         self.emitted.append(([n.key for n in show], clear))
 
 
-def _seed(agent, fixture):
+async def _seed(agent, fixture):
     import os
 
     from agent.credits_tracker import seed_credits_at_session_start
@@ -109,7 +111,7 @@ def _seed(agent, fixture):
     os.environ["HERMES_DEV_CREDITS"] = "1"  # fixtures gate on the dev flag
     os.environ["HERMES_DEV_CREDITS_FIXTURE"] = fixture
     try:
-        return seed_credits_at_session_start(agent)
+        return await seed_credits_at_session_start(agent)
     finally:
         os.environ.pop("HERMES_DEV_CREDITS_FIXTURE", None)
         os.environ.pop("HERMES_DEV_CREDITS", None)
@@ -125,12 +127,13 @@ def _seed(agent, fixture):
 
 
 
-def test_live_crossing_after_seed_still_fires_grant_spent():
+@pytest.mark.asyncio
+async def test_live_crossing_after_seed_still_fires_grant_spent():
     """The gate opens when the session observes the grant NOT yet spent — a healthy
     seed followed by a grant-exhausted header is a real in-session crossing and must
     still announce grant_spent once."""
     a = _FakeAgent()
-    assert _seed(a, "healthy") is True
+    assert await _seed(a, "healthy") is True
     a.emitted = []
     a._credits_state = _state(  # the grant_exhausted shape, as a live header would carry it
         remaining_micros=12_340_000, subscription_micros=0,
@@ -142,18 +145,20 @@ def test_live_crossing_after_seed_still_fires_grant_spent():
     assert a.emitted == [(["credits.grant_spent"], [])]
 
 
-def test_seed_is_idempotent():
+@pytest.mark.asyncio
+async def test_seed_is_idempotent():
     a = _FakeAgent()
-    _seed(a, "sub_90pct")
+    await _seed(a, "sub_90pct")
     a.emitted = []
     # second call must no-op (state already populated)
-    assert _seed(a, "sub_90pct") is False
+    assert await _seed(a, "sub_90pct") is False
     assert a.emitted == []
 
 
-def test_seed_skips_non_nous():
+@pytest.mark.asyncio
+async def test_seed_skips_non_nous():
     from agent.credits_tracker import seed_credits_at_session_start
 
     a = _FakeAgent(provider="openrouter")
-    assert seed_credits_at_session_start(a) is False
+    assert await seed_credits_at_session_start(a) is False
     assert a._credits_state is None

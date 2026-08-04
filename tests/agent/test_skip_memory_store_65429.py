@@ -6,8 +6,7 @@ used to get a memory tool wired to ``store=None`` (the built-in
 memory call failed silently and the main auto-capture path was dead.
 
 The fix creates the built-in store whenever memory is enabled in config OR the
-memory toolset is explicitly enabled, while the external-provider block stays
-gated on ``skip_memory``.
+memory toolset is explicitly enabled.
 """
 
 import pytest
@@ -54,32 +53,26 @@ def test_skip_memory_with_memory_toolset_creates_store(monkeypatch, tmp_path):
 
 
 
-def test_skip_memory_memory_tool_handler_works_and_provider_skipped(
+@pytest.mark.asyncio
+async def test_skip_memory_memory_tool_handler_works(
     monkeypatch, tmp_path
 ):
     """End-to-end behavioral check for #65429.
 
     The memory tool handler must actually WORK (not return the
     "Memory is not available" store=None error) on a skip_memory=True agent
-    with the memory toolset enabled, while the external memory provider
-    sync/prefetch stays skipped (no MemoryManager is created).
+    with the memory toolset enabled.
     """
     import json
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hm"))
     agent = _make_agent(monkeypatch, enabled_toolsets=["memory"], skip_memory=True)
 
-    # Provider sync/prefetch must remain skipped: skip_memory still gates the
-    # external memory provider block.
-    assert agent._memory_manager is None, (
-        "skip_memory=True must still skip the external memory provider"
-    )
-
     # Dispatch through the same entry point the tool executor uses
     # (agent/tool_executor.py wires store=agent._memory_store).
     from tools.memory_tool import memory_tool
 
-    raw = memory_tool(
+    raw = await memory_tool(
         action="add",
         target="memory",
         content="User prefers concise answers.",
@@ -96,3 +89,4 @@ def test_skip_memory_memory_tool_handler_works_and_provider_skipped(
     memory_md = tmp_path / "hm" / "memories" / "MEMORY.md"
     assert memory_md.exists()
     assert "User prefers concise answers." in memory_md.read_text()
+    await agent.close()

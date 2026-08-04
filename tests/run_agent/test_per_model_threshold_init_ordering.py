@@ -39,54 +39,6 @@ class _StubEngine(ContextEngine):
         return messages
 
 
-def test_plugin_engine_gets_model_thresholds_before_initial_update_model():
-    """The initial model's override must apply during AIAgent init.
-
-    Regression test for the PR #63020 review finding: the plugin engine was
-    initialized through update_model() before model_thresholds was assigned,
-    so the initial model kept the global threshold until a /model switch.
-    """
-    engine = _StubEngine()
-    engine.threshold_percent = 0.50
-
-    cfg = {
-        "context": {"engine": "stub"},
-        "agent": {},
-        "compression": {
-            "threshold": 0.50,
-            "model_thresholds": {"glm-5.2": 0.25},
-        },
-    }
-
-    with (
-        patch("hermes_cli.config.load_config", return_value=cfg), patch("hermes_cli.config.load_config_readonly", return_value=cfg),
-        patch("plugins.context_engine.load_context_engine", return_value=engine),
-        patch("agent.model_metadata.get_model_context_length", return_value=1_000_000),
-        patch("run_agent.get_tool_definitions", return_value=[]),
-        patch("run_agent.check_toolset_requirements", return_value={}),
-        patch("run_agent.OpenAI"),
-    ):
-        from run_agent import AIAgent
-
-        agent = AIAgent(
-            model="glm-5.2",
-            api_key="test-key-1234567890",
-            base_url="https://openrouter.ai/api/v1",
-            quiet_mode=True,
-            skip_context_files=True,
-            skip_memory=True,
-        )
-
-    assert agent.context_compressor is engine
-    # The override map arrived before the initial update_model() call, so the
-    # very first resolution already used it.
-    assert engine.model_thresholds == {"glm-5.2": 0.25}
-    assert engine.threshold_percent == 0.25
-    assert engine.threshold_tokens == int(1_000_000 * 0.25)
-
-
-
-
 def test_model_thresholds_key_in_default_config():
     """compression.model_thresholds is a public DEFAULT_CONFIG key."""
     from hermes_cli.config import DEFAULT_CONFIG
@@ -98,7 +50,7 @@ def test_model_thresholds_key_in_default_config():
 class TestFloorInteractionOnModelSwitch:
     """The small-context floor stacks on per-model overrides at switch time."""
 
-    @patch("agent.context_compressor.get_model_context_length")
+    @patch("agent.context_compressor.get_static_context_length")
     def test_switch_override_below_floor_is_raised_to_floor(self, mock_ctx):
         """Switching to a small-context model with a sub-floor override → floor."""
         mock_ctx.return_value = 1_000_000

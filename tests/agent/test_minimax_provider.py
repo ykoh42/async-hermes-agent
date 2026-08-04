@@ -1,6 +1,10 @@
 """Tests for MiniMax provider hardening — context lengths, thinking, catalog, beta headers, transport."""
 
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
+
+import pytest
+
+pytestmark = pytest.mark.asyncio
 
 
 class TestMinimaxContextLengths:
@@ -10,25 +14,25 @@ class TestMinimaxContextLengths:
     Source: https://platform.minimax.io/docs/api-reference/text-anthropic-api
     """
 
-    def test_minimax_prefix_has_correct_context(self):
+    async def test_minimax_prefix_has_correct_context(self):
         from agent.model_metadata import DEFAULT_CONTEXT_LENGTHS
         assert DEFAULT_CONTEXT_LENGTHS["minimax"] == 204_800
 
-    def test_minimax_models_resolve_via_prefix(self):
+    async def test_minimax_models_resolve_via_prefix(self):
         from agent.model_metadata import get_model_context_length
         # M2.x models resolve to 204,800 via the "minimax" catch-all
         for model in ("MiniMax-M2.7", "MiniMax-M2.5", "MiniMax-M2.1", "MiniMax-M2"):
-            ctx = get_model_context_length(model, "")
+            ctx = await get_model_context_length(model, "")
             assert ctx == 204_800, f"{model} expected 204800, got {ctx}"
 
-    def test_minimax_m3_resolves_to_1m(self):
+    async def test_minimax_m3_resolves_to_1m(self):
         from agent.model_metadata import get_model_context_length
         # M3 must beat the generic "minimax" catch-all (204,800) and resolve to
         # a 1M-class context. The exact value depends on the source: our
         # hardcoded catalog says 1,000,000; the OpenRouter catalog reports
         # 1,048,576 (1024²). Either is correct — assert "≥ 1M, not 204,800".
         for model in ("MiniMax-M3", "minimax/minimax-m3", "minimax-m3"):
-            ctx = get_model_context_length(model, "")
+            ctx = await get_model_context_length(model, "")
             assert ctx >= 1_000_000, f"{model} expected 1M-class, got {ctx}"
 
 
@@ -39,7 +43,7 @@ class TestMinimaxM3StaleCacheGuard:
     to 1M, while leaving correct M2.x entries (204,800) untouched.
     """
 
-    def test_suggests_minimax_m3(self):
+    async def test_suggests_minimax_m3(self):
         from agent.model_metadata import _model_name_suggests_minimax_m3
         assert _model_name_suggests_minimax_m3("MiniMax-M3")
         assert _model_name_suggests_minimax_m3("minimax/minimax-m3")
@@ -48,7 +52,7 @@ class TestMinimaxM3StaleCacheGuard:
 
 
 
-    def test_m2_cache_not_clobbered(self, tmp_path, monkeypatch):
+    async def test_m2_cache_not_clobbered(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         import importlib
         import agent.model_metadata as mm
@@ -56,8 +60,8 @@ class TestMinimaxM3StaleCacheGuard:
         base = "https://api.minimaxi.com/anthropic"
         # 204,800 is the CORRECT value for M2.x — guard must not touch it.
         for slug in ("MiniMax-M2.7", "MiniMax-M2.5", "MiniMax-M2.1"):
-            mm.save_context_length(slug, base, 204_800)
-            ctx = mm.get_model_context_length(
+            await mm.save_context_length(slug, base, 204_800)
+            ctx = await mm.get_model_context_length(
                 slug, base_url=base, api_key="", provider="minimax-cn"
             )
             assert ctx == 204_800, f"{slug} should stay 204800, got {ctx}"
@@ -73,7 +77,7 @@ class TestMinimaxThinkingSupport:
     thinking (which is Claude 4.6-only).
     """
 
-    def test_minimax_m27_gets_manual_thinking(self):
+    async def test_minimax_m27_gets_manual_thinking(self):
         from agent.anthropic_adapter import build_anthropic_kwargs
         kwargs = build_anthropic_kwargs(
             model="MiniMax-M2.7",
@@ -88,7 +92,7 @@ class TestMinimaxThinkingSupport:
         # MiniMax should NOT get adaptive thinking or output_config
         assert "output_config" not in kwargs
 
-    def test_minimax_m25_gets_manual_thinking(self):
+    async def test_minimax_m25_gets_manual_thinking(self):
         from agent.anthropic_adapter import build_anthropic_kwargs
         kwargs = build_anthropic_kwargs(
             model="MiniMax-M2.5",
@@ -100,7 +104,7 @@ class TestMinimaxThinkingSupport:
         assert "thinking" in kwargs
         assert kwargs["thinking"]["type"] == "enabled"
 
-    def test_thinking_still_works_for_claude(self):
+    async def test_thinking_still_works_for_claude(self):
         from agent.anthropic_adapter import build_anthropic_kwargs
         kwargs = build_anthropic_kwargs(
             model="claude-sonnet-4-20250514",
@@ -128,7 +132,7 @@ class TestMinimaxAuxModel:
     ``"highspeed"``.
     """
 
-    def test_minimax_aux_is_standard(self):
+    async def test_minimax_aux_is_standard(self):
         # Import model_tools to trigger plugin discovery so the
         # ProviderProfile objects are registered in the providers
         # registry before _get_aux_model_for_provider() is called.
@@ -142,7 +146,7 @@ class TestMinimaxAuxModel:
         assert _get_aux_model_for_provider("minimax") == "MiniMax-M3"
         assert _get_aux_model_for_provider("minimax-cn") == "MiniMax-M3"
 
-    def test_minimax_aux_not_highspeed(self):
+    async def test_minimax_aux_not_highspeed(self):
         import model_tools  # noqa: F401
         from agent.auxiliary_client import _get_aux_model_for_provider
         assert "highspeed" not in _get_aux_model_for_provider("minimax")
@@ -167,13 +171,13 @@ class TestMinimaxBetaHeaders:
         from agent.anthropic_adapter import build_anthropic_client
         with patch("agent.anthropic_adapter._anthropic_sdk") as mock_sdk:
             build_anthropic_client(api_key, base_url=base_url)
-            kwargs = mock_sdk.Anthropic.call_args[1]
+            kwargs = mock_sdk.AsyncAnthropic.call_args[1]
             headers = kwargs.get("default_headers", {})
             return headers.get("anthropic-beta", "")
 
     # -- MiniMax global --------------------------------------------------
 
-    def test_minimax_global_omits_tool_streaming(self):
+    async def test_minimax_global_omits_tool_streaming(self):
         betas = self._build_and_get_betas(
             "mm-key-123", base_url="https://api.minimax.io/anthropic"
         )
@@ -192,12 +196,12 @@ class TestMinimaxBetaHeaders:
 
     # -- _common_betas_for_base_url unit tests ---------------------------
 
-    def test_common_betas_none_url(self):
+    async def test_common_betas_none_url(self):
         from agent.anthropic_adapter import _common_betas_for_base_url, _COMMON_BETAS
         assert _common_betas_for_base_url(None) == _COMMON_BETAS
 
 
-    def test_common_betas_minimax_url(self):
+    async def test_common_betas_minimax_url(self):
         from agent.anthropic_adapter import _common_betas_for_base_url, _TOOL_STREAMING_BETA
         betas = _common_betas_for_base_url("https://api.minimax.io/anthropic")
         assert _TOOL_STREAMING_BETA not in betas
@@ -215,18 +219,18 @@ class TestMinimaxApiMode:
     (e.g. /model switch) get the correct api_mode.
     """
 
-    def test_minimax_returns_anthropic_messages(self):
+    async def test_minimax_returns_anthropic_messages(self):
         from hermes_cli.providers import determine_api_mode
         assert determine_api_mode("minimax") == "anthropic_messages"
 
 
-    def test_minimax_with_url_also_works(self):
+    async def test_minimax_with_url_also_works(self):
         from hermes_cli.providers import determine_api_mode
         # Even with explicit base_url, provider lookup takes priority
         assert determine_api_mode("minimax", "https://api.minimax.io/anthropic") == "anthropic_messages"
 
 
-    def test_openai_returns_chat_completions(self):
+    async def test_openai_returns_chat_completions(self):
         from hermes_cli.providers import determine_api_mode
         # Sanity check: standard providers are unaffected
         result = determine_api_mode("deepseek")
@@ -240,13 +244,13 @@ class TestMinimaxMaxOutput:
     cross-referenced with MiniMax API behavior).
     """
 
-    def test_minimax_m27_output_limit(self):
+    async def test_minimax_m27_output_limit(self):
         from agent.anthropic_adapter import _get_anthropic_max_output
         assert _get_anthropic_max_output("MiniMax-M2.7") == 131_072
 
 
 
-    def test_claude_output_unaffected(self):
+    async def test_claude_output_unaffected(self):
         from agent.anthropic_adapter import _get_anthropic_max_output
         # Sanity: Claude limits are not broken by the MiniMax entry
         assert _get_anthropic_max_output("claude-sonnet-4-6") == 64_000
@@ -260,7 +264,7 @@ class TestMinimaxPreserveDots:
     hyphens — the endpoint expects the exact name with dots.
     """
 
-    def test_minimax_provider_preserves_dots(self):
+    async def test_minimax_provider_preserves_dots(self):
         from types import SimpleNamespace
         agent = SimpleNamespace(provider="minimax", base_url="")
         from run_agent import AIAgent
@@ -274,7 +278,7 @@ class TestMinimaxPreserveDots:
 
 
 
-    def test_normalize_preserves_m25_free_dot(self):
+    async def test_normalize_preserves_m25_free_dot(self):
         from agent.anthropic_adapter import normalize_model_name
         assert normalize_model_name("minimax-m2.5-free", preserve_dots=True) == "minimax-m2.5-free"
 
@@ -291,9 +295,10 @@ class TestMinimaxSwitchModelCredentialGuard:
     to the MiniMax endpoint.
     """
 
-    def test_switch_to_minimax_does_not_resolve_anthropic_token(self):
-        """switch_model() should NOT call resolve_anthropic_token() for MiniMax."""
-        from unittest.mock import patch, MagicMock
+    @pytest.mark.asyncio
+    async def test_switch_to_minimax_does_not_resolve_anthropic_token(self):
+        """switch_model() passes only the MiniMax key to its async runtime."""
+        from unittest.mock import MagicMock
 
         with patch("run_agent.AIAgent.__init__", return_value=None):
             from run_agent import AIAgent
@@ -311,19 +316,36 @@ class TestMinimaxSwitchModelCredentialGuard:
             agent._anthropic_client = MagicMock()
             agent._fallback_chain = []
 
-        with patch("agent.anthropic_adapter.build_anthropic_client") as mock_build, \
-             patch("agent.anthropic_adapter.resolve_anthropic_token", return_value="sk-ant-leaked") as mock_resolve, \
-             patch("agent.anthropic_adapter._is_oauth_token", return_value=False):
+        async def apply_deferred_runtime():
+            runtime = agent._deferred_provider_runtime
+            assert runtime["provider"] == "minimax"
+            assert runtime["api_key"] == "mm-key-123"
+            assert runtime["base_url"] == "https://api.minimax.io/anthropic"
+            agent.provider = runtime["provider"]
+            agent.requested_provider = runtime["provider"]
+            agent.model = runtime["model"]
+            agent.api_key = runtime["api_key"]
+            agent.base_url = runtime["base_url"]
+            agent.api_mode = runtime["api_mode"]
+            agent._anthropic_api_key = runtime["api_key"]
+            agent._anthropic_base_url = runtime["base_url"]
+            agent._is_anthropic_oauth = False
 
-            agent.switch_model(
+        agent._ensure_provider_runtime = AsyncMock(side_effect=apply_deferred_runtime)
+        agent._persist_pending_billing_route = AsyncMock()
+
+        with patch(
+            "agent.anthropic_adapter.resolve_anthropic_token",
+            return_value="sk-ant-leaked",
+        ) as mock_resolve:
+            await agent.switch_model(
                 new_model="MiniMax-M2.7",
                 new_provider="minimax",
                 api_mode="anthropic_messages",
                 api_key="mm-key-123",
                 base_url="https://api.minimax.io/anthropic",
             )
-            # resolve_anthropic_token should NOT be called for non-Anthropic providers
-            mock_resolve.assert_not_called()
-            # The key passed to build_anthropic_client should be the MiniMax key
-            build_args = mock_build.call_args
-            assert build_args[0][0] == "mm-key-123"
+
+        mock_resolve.assert_not_called()
+        agent._ensure_provider_runtime.assert_awaited_once()
+        assert agent._primary_runtime["anthropic_api_key"] == "mm-key-123"

@@ -84,11 +84,8 @@ class _LimitAgent:
     def clear_interrupt(self):
         pass
 
-    def _sync_external_memory_for_turn(self, **_kwargs):
-        pass
 
-
-def _finalize(
+async def _finalize(
     agent,
     *,
     final_response,
@@ -96,7 +93,7 @@ def _finalize(
     api_call_count=60,
     pending_verification_response=None,
 ):
-    return finalize_turn(
+    return await finalize_turn(
         agent,
         final_response=final_response,
         api_call_count=api_call_count,
@@ -136,13 +133,14 @@ def _finalize(
         ("provider_failure", False, True),
     ],
 )
-def test_pending_response_does_not_mask_later_terminal_exit(
+@pytest.mark.asyncio
+async def test_pending_response_does_not_mask_later_terminal_exit(
     monkeypatch, exit_reason, interrupted, failed
 ):
     monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
     agent = _LimitAgent()
 
-    result = finalize_turn(
+    result = await finalize_turn(
         agent,
         final_response=None,
         api_call_count=60,
@@ -165,7 +163,9 @@ def test_pending_response_does_not_mask_later_terminal_exit(
     assert agent._handle_max_iterations_called is False
 
 
-def test_pending_response_records_kanban_timeout(monkeypatch):
+@pytest.mark.asyncio
+async def test_pending_response_records_kanban_timeout(monkeypatch):
+    pytest.importorskip("hermes_cli.kanban_db")
     monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
     monkeypatch.setenv("HERMES_KANBAN_TASK", "task-123")
     record = MagicMock(name="record_task_failure")
@@ -174,7 +174,7 @@ def test_pending_response_records_kanban_timeout(monkeypatch):
     monkeypatch.setattr("hermes_cli.kanban_db._record_task_failure", record)
     agent = _LimitAgent()
 
-    result = _finalize(
+    result = await _finalize(
         agent,
         final_response=None,
         exit_reason="unknown",
@@ -196,7 +196,8 @@ def test_pending_response_records_kanban_timeout(monkeypatch):
     )
 
 
-def test_published_pending_candidate_is_not_duplicated_by_finalizer(monkeypatch):
+@pytest.mark.asyncio
+async def test_published_pending_candidate_is_not_duplicated_by_finalizer(monkeypatch):
     """When budget exhaustion preserves a verification candidate that is
     already the tail assistant message, the finalizer must NOT append a
     duplicate. The content-comparison guard prevents this. (#65919 §7)
@@ -205,7 +206,7 @@ def test_published_pending_candidate_is_not_duplicated_by_finalizer(monkeypatch)
     agent = _LimitAgent()
     report = "the composed report"
 
-    result = finalize_turn(
+    result = await finalize_turn(
         agent,
         final_response=report,
         api_call_count=60,
@@ -233,5 +234,3 @@ def test_published_pending_candidate_is_not_duplicated_by_finalizer(monkeypatch)
     assert agent.persisted_messages is not None
     persisted_roles = [m["role"] for m in agent.persisted_messages]
     assert persisted_roles == ["user", "assistant"]
-
-

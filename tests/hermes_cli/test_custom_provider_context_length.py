@@ -8,12 +8,16 @@ from __future__ import annotations
 
 from unittest.mock import patch
 
+import pytest
+
+pytestmark = pytest.mark.asyncio
+
 from hermes_cli.config import get_custom_provider_context_length
 
 
 class TestGetCustomProviderContextLength:
 
-    def test_trailing_slash_insensitive(self):
+    async def test_trailing_slash_insensitive(self):
         custom = [
             {
                 "base_url": "https://example.invalid/v1/",
@@ -42,7 +46,7 @@ class TestGetCustomProviderContextLength:
         )
 
 
-    def test_empty_inputs_return_none(self):
+    async def test_empty_inputs_return_none(self):
         assert get_custom_provider_context_length("", "http://x", [{"base_url": "http://x", "models": {"": {"context_length": 1}}}]) is None
         assert get_custom_provider_context_length("m", "", [{"base_url": "", "models": {"m": {"context_length": 1}}}]) is None
         assert get_custom_provider_context_length("m", "http://x", None) is None
@@ -67,7 +71,7 @@ class TestGetModelContextLengthHonorsOverride:
             patch.object(_mm, "_is_known_provider_base_url", return_value=False),
         ]
 
-    def test_custom_providers_override_wins_over_default_fallback(self):
+    async def test_custom_providers_override_wins_over_default_fallback(self):
         from agent.model_metadata import get_model_context_length
         custom = [
             {
@@ -79,7 +83,7 @@ class TestGetModelContextLengthHonorsOverride:
         for p in patches:
             p.start()
         try:
-            ctx = get_model_context_length(
+            ctx = await get_model_context_length(
                 "gpt-5.5",
                 base_url="https://example.invalid/v1",
                 provider="custom",
@@ -90,7 +94,7 @@ class TestGetModelContextLengthHonorsOverride:
                 p.stop()
         assert ctx == 1_050_000
 
-    def test_explicit_config_context_length_still_wins(self):
+    async def test_explicit_config_context_length_still_wins(self):
         """Top-level model.context_length (step 0) outranks custom_providers (step 0b).
 
         Users who set both should see the top-level value — that's the
@@ -103,7 +107,7 @@ class TestGetModelContextLengthHonorsOverride:
                 "models": {"m": {"context_length": 1_050_000}},
             }
         ]
-        ctx = get_model_context_length(
+        ctx = await get_model_context_length(
             "m",
             base_url="https://example.invalid/v1",
             provider="custom",
@@ -112,7 +116,7 @@ class TestGetModelContextLengthHonorsOverride:
         )
         assert ctx == 500_000
 
-    def test_no_override_falls_through_to_default(self):
+    async def test_no_override_falls_through_to_default(self):
         """With custom_providers=None and all probes disabled, resolver
         returns DEFAULT_FALLBACK_CONTEXT (256K after the stepdown bump).
         """
@@ -121,7 +125,7 @@ class TestGetModelContextLengthHonorsOverride:
         for p in patches:
             p.start()
         try:
-            ctx = get_model_context_length(
+            ctx = await get_model_context_length(
                 "unknown-model",
                 base_url="https://example.invalid/v1",
                 provider="custom",
@@ -134,7 +138,7 @@ class TestGetModelContextLengthHonorsOverride:
 
 
 class TestContextProbeTiers:
-    def test_256k_is_top_tier_and_default(self):
+    async def test_256k_is_top_tier_and_default(self):
         """The stepdown probe starts at 256K and 256K is the new default."""
         from agent.model_metadata import CONTEXT_PROBE_TIERS, DEFAULT_FALLBACK_CONTEXT
 

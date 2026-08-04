@@ -38,32 +38,41 @@ _RESOLVES = [(2, 1, 6, "", ("93.184.216.34", 0))]
 class TestValidateImageUrl:
     """Tests for URL validation, including urlparse-based netloc check."""
 
-    def test_accepts_valid_http_and_https_urls(self):
-        with patch("tools.url_safety.socket.getaddrinfo", return_value=_RESOLVES):
-            assert _validate_image_url("https://example.com/image.jpg") is True
-            assert _validate_image_url("http://cdn.example.org/photo.png") is True
+    @pytest.mark.asyncio
+    async def test_accepts_valid_http_and_https_urls(self):
+        loop = MagicMock()
+        loop.getaddrinfo = AsyncMock(return_value=_RESOLVES)
+        with patch("tools.url_safety.asyncio.get_running_loop", return_value=loop):
+            assert await _validate_image_url("https://example.com/image.jpg") is True
+            assert await _validate_image_url("http://cdn.example.org/photo.png") is True
             # CDN endpoints that redirect to images should still pass.
-            assert _validate_image_url("https://cdn.example.com/abcdef123") is True
-            assert _validate_image_url("https://img.example.com/pic?w=200&h=200") is True
-            assert _validate_image_url("http://example.com:8080/image.png") is True
-            assert _validate_image_url("https://example.com/") is True
+            assert await _validate_image_url("https://cdn.example.com/abcdef123") is True
+            assert await _validate_image_url("https://img.example.com/pic?w=200&h=200") is True
+            assert await _validate_image_url("http://example.com:8080/image.png") is True
+            assert await _validate_image_url("https://example.com/") is True
 
-    def test_localhost_url_blocked_by_ssrf(self):
+    @pytest.mark.asyncio
+    async def test_localhost_url_blocked_by_ssrf(self):
         """localhost URLs are blocked by SSRF protection."""
-        assert _validate_image_url("http://localhost:8080/image.png") is False
+        loop = MagicMock()
+        loop.getaddrinfo = AsyncMock(
+            return_value=[(2, 1, 6, "", ("127.0.0.1", 8080))]
+        )
+        with patch("tools.url_safety.asyncio.get_running_loop", return_value=loop):
+            assert await _validate_image_url("http://localhost:8080/image.png") is False
 
-
-    def test_rejects_malformed_and_non_string_inputs(self):
+    @pytest.mark.asyncio
+    async def test_rejects_malformed_and_non_string_inputs(self):
         # http:// alone has no network location — urlparse catches this.
-        assert _validate_image_url("http://") is False
-        assert _validate_image_url("https://") is False
-        assert _validate_image_url("http:") is False
-        assert _validate_image_url("") is False
-        assert _validate_image_url("   ") is False
-        assert _validate_image_url(None) is False
-        assert _validate_image_url(12345) is False
-        assert _validate_image_url(True) is False
-        assert _validate_image_url(["https://example.com"]) is False
+        assert await _validate_image_url("http://") is False
+        assert await _validate_image_url("https://") is False
+        assert await _validate_image_url("http:") is False
+        assert await _validate_image_url("") is False
+        assert await _validate_image_url("   ") is False
+        assert await _validate_image_url(None) is False
+        assert await _validate_image_url(12345) is False
+        assert await _validate_image_url(True) is False
+        assert await _validate_image_url(["https://example.com"]) is False
 
 
 # ---------------------------------------------------------------------------
@@ -87,20 +96,23 @@ class TestDetermineMimeType:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.asyncio
 class TestImageToBase64DataUrl:
-    def test_returns_data_url_with_detected_or_given_mime(self, tmp_path):
+    async def test_returns_data_url_with_detected_or_given_mime(self, tmp_path):
         img = tmp_path / "test.png"
         img.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 8)
-        assert _image_to_base64_data_url(img).startswith("data:image/png;base64,")
+        assert (await _image_to_base64_data_url(img)).startswith(
+            "data:image/png;base64,"
+        )
 
         other = tmp_path / "test.bin"
         other.write_bytes(b"\x00" * 16)
-        result = _image_to_base64_data_url(other, mime_type="image/webp")
+        result = await _image_to_base64_data_url(other, mime_type="image/webp")
         assert result.startswith("data:image/webp;base64,")
 
-    def test_file_not_found_raises(self, tmp_path):
+    async def test_file_not_found_raises(self, tmp_path):
         with pytest.raises(FileNotFoundError):
-            _image_to_base64_data_url(tmp_path / "nonexistent.png")
+            await _image_to_base64_data_url(tmp_path / "nonexistent.png")
 
 
 # ---------------------------------------------------------------------------
@@ -142,7 +154,8 @@ class TestHandleVisionAnalyze:
                 st.enter_context(patch.dict(os.environ, {}, clear=False))
                 if config is not None:
                     st.enter_context(patch(
-                        "hermes_cli.config.load_config", return_value=config,
+                        "hermes_cli.config.load_config_readonly",
+                        new=AsyncMock(return_value=config),
                     ))
                 if env_model is None:
                     os.environ.pop("AUXILIARY_VISION_MODEL", None)
@@ -222,13 +235,13 @@ class TestErrorLoggingExcInfo:
             mock_response.choices = [mock_choice]
 
             with (
-                patch("tools.vision_tools.async_call_llm", new_callable=AsyncMock, return_value=mock_response),
+                patch("tools.vision_tools.call_llm", new_callable=AsyncMock, return_value=mock_response),
             ):
-                # Make unlink fail to trigger the cleanup warning.
-                def failing_unlink(self, *args, **kwargs):
-                    raise PermissionError("no permission")
-
-                with patch.object(Path, "unlink", failing_unlink):
+                # Make the native async cleanup fail to trigger the warning.
+                with patch(
+                    "tools.vision_tools.aiofiles.os.remove",
+                    new=AsyncMock(side_effect=PermissionError("no permission")),
+                ):
                     await vision_analyze_tool(data_url, "describe", "test/model")
 
             warning_records = [
@@ -254,13 +267,16 @@ class TestVisionConfig:
             mock_response.choices = [mock_choice]
 
             with (
-                patch("hermes_cli.config.load_config", return_value=config),
+                patch(
+                    "hermes_cli.config.load_config_readonly",
+                    new=AsyncMock(return_value=config),
+                ),
                 patch(
                     "tools.vision_tools._image_to_base64_data_url",
                     return_value="data:image/png;base64,abc",
                 ),
                 patch(
-                    "tools.vision_tools.async_call_llm",
+                    "tools.vision_tools.call_llm",
                     new_callable=AsyncMock,
                     return_value=mock_response,
                 ) as mock_llm,
@@ -289,7 +305,7 @@ class TestVisionSafetyGuards:
         secret = tmp_path / "secret.txt"
         secret.write_text("TOP-SECRET=1\n", encoding="utf-8")
 
-        with patch("tools.vision_tools.async_call_llm", new_callable=AsyncMock) as mock_llm:
+        with patch("tools.vision_tools.call_llm", new_callable=AsyncMock) as mock_llm:
             result = json.loads(await vision_analyze_tool(str(secret), "extract text"))
 
         assert result["success"] is False
@@ -309,7 +325,7 @@ class TestVisionSafetyGuards:
         secret = tmp_path / ".env"
         secret.write_text("OPENAI_API_KEY=sk-super-secret\n", encoding="utf-8")
 
-        with patch("tools.vision_tools.async_call_llm", new_callable=AsyncMock) as mock_llm:
+        with patch("tools.vision_tools.call_llm", new_callable=AsyncMock) as mock_llm:
             result = json.loads(await vision_analyze_tool(str(secret), "extract text"))
 
         assert result["success"] is False
@@ -339,8 +355,14 @@ class TestVisionSafetyGuards:
         }
 
         with (
-            patch("tools.website_policy.check_website_access", return_value=blocked),
-            patch("tools.url_safety.is_safe_url", return_value=True),
+            patch(
+                "tools.website_policy.check_website_access",
+                new=AsyncMock(return_value=blocked),
+            ),
+            patch(
+                "tools.url_safety.is_safe_url",
+                new=AsyncMock(return_value=True),
+            ),
             patch("tools.vision_tools._download_image", new_callable=AsyncMock) as mock_download,
         ):
             result = json.loads(await vision_analyze_tool("https://blocked.test/cat.png", "describe"))
@@ -353,7 +375,7 @@ class TestVisionSafetyGuards:
     async def test_download_blocks_redirected_final_url(self, tmp_path):
         from tools.vision_tools import _download_image
 
-        def fake_check(url):
+        async def fake_check(url):
             if url == "https://allowed.test/cat.png":
                 return None
             if url == "https://blocked.test/final.png":
@@ -373,17 +395,21 @@ class TestVisionSafetyGuards:
             def raise_for_status(self):
                 return None
 
+        mock_client = AsyncMock()
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+        mock_client.get = AsyncMock(return_value=FakeResponse())
         with (
-            patch("tools.vision_tools.check_website_access", side_effect=fake_check),
-            patch("tools.vision_tools.httpx.AsyncClient") as mock_client_cls,
+            patch(
+                "tools.vision_tools.check_website_access",
+                new=AsyncMock(side_effect=fake_check),
+            ),
+            patch(
+                "tools.url_safety.create_ssrf_safe_client",
+                return_value=mock_client,
+            ),
             pytest.raises(PermissionError, match="Blocked by website policy"),
         ):
-            mock_client = AsyncMock()
-            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-            mock_client.__aexit__ = AsyncMock(return_value=False)
-            mock_client.get = AsyncMock(return_value=FakeResponse())
-            mock_client_cls.return_value = mock_client
-
             await _download_image("https://allowed.test/cat.png", tmp_path / "cat.png", max_retries=1)
 
         assert not (tmp_path / "cat.png").exists()
@@ -395,7 +421,8 @@ class TestVisionSafetyGuards:
 
 
 class TestVisionRequirements:
-    def test_check_requirements_accepts_codex_auth(self, monkeypatch, tmp_path):
+    @pytest.mark.asyncio
+    async def test_check_requirements_accepts_codex_auth(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         (tmp_path / "auth.json").write_text(
             '{"active_provider":"openai-codex","providers":{"openai-codex":{"tokens":{"access_token":"codex-access-token","refresh_token":"codex-refresh-token"}}}}'
@@ -409,7 +436,7 @@ class TestVisionRequirements:
         monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
         monkeypatch.delenv("OPENAI_API_KEY", raising=False)
 
-        assert check_vision_requirements() is True
+        assert await check_vision_requirements() is True
 
 
 # ---------------------------------------------------------------------------
@@ -443,7 +470,7 @@ class TestLocalPathForms:
                 return_value="data:image/png;base64,abc",
             ),
             patch(
-                "tools.vision_tools.async_call_llm",
+                "tools.vision_tools.call_llm",
                 new_callable=AsyncMock,
                 return_value=mock_response,
             ),
@@ -476,7 +503,7 @@ class TestLocalPathForms:
                 return_value="data:image/png;base64,abc",
             ),
             patch(
-                "tools.vision_tools.async_call_llm",
+                "tools.vision_tools.call_llm",
                 new_callable=AsyncMock,
                 return_value=mock_response,
             ),
@@ -508,7 +535,7 @@ class TestBase64SizeLimit:
 
         # Patch the hard limit to a small value so the test runs fast.
         with patch("tools.vision_tools._MAX_BASE64_BYTES", 1000), \
-             patch("tools.vision_tools.async_call_llm", new_callable=AsyncMock) as mock_llm:
+             patch("tools.vision_tools.call_llm", new_callable=AsyncMock) as mock_llm:
             result = json.loads(await vision_analyze_tool(str(img), "describe this"))
 
         assert result["success"] is False
@@ -525,7 +552,7 @@ class TestBase64SizeLimit:
         mock_response.choices = [mock_choice]
 
         with patch(
-            "tools.vision_tools.async_call_llm",
+            "tools.vision_tools.call_llm",
             new_callable=AsyncMock,
             return_value=mock_response,
         ):
@@ -561,7 +588,7 @@ class TestErrorClassification:
                 return_value="data:image/png;base64,abc",
             ),
             patch(
-                "tools.vision_tools.async_call_llm",
+                "tools.vision_tools.call_llm",
                 new_callable=AsyncMock,
                 side_effect=api_error,
             ),
@@ -574,18 +601,11 @@ class TestErrorClassification:
 
 
 class TestVisionRegistration:
-    def test_vision_analyze_registered_with_schema(self):
+    def test_vision_analyze_is_excluded_from_the_minimal_training_toolset(self):
         from tools.registry import registry
 
         entry = registry._tools.get("vision_analyze")
-        assert entry is not None
-        assert entry.toolset == "vision"
-        assert entry.is_async is True
-        assert callable(entry.handler)
-
-        props = entry.schema.get("parameters", {}).get("properties", {})
-        assert "image_url" in props
-        assert "question" in props
+        assert entry is None
 
 
 # ---------------------------------------------------------------------------
@@ -593,10 +613,11 @@ class TestVisionRegistration:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.asyncio
 class TestResizeImageForVision:
     """Tests for the auto-resize function."""
 
-    def test_small_image_returned_as_is(self, tmp_path):
+    async def test_small_image_returned_as_is(self, tmp_path):
         """Images under the limit should be returned unchanged."""
         # Create a small 10x10 red PNG
         try:
@@ -607,23 +628,28 @@ class TestResizeImageForVision:
         path = tmp_path / "small.png"
         img.save(path, "PNG")
 
-        result = _resize_image_for_vision(path, mime_type="image/png")
+        result = await _resize_image_for_vision(path, mime_type="image/png")
         assert result.startswith("data:image/png;base64,")
         assert len(result) < _MAX_BASE64_BYTES
 
 
-    def test_no_pillow_returns_original(self, tmp_path):
+    async def test_no_pillow_returns_original(self, tmp_path):
         """Without Pillow, oversized images should be returned as-is."""
         # Create a dummy file
         path = tmp_path / "test.png"
         # Write enough bytes to exceed a tiny limit
         path.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 1000)
 
-        with patch("tools.vision_tools._image_to_base64_data_url") as mock_b64:
+        with patch(
+            "tools.vision_tools._image_to_base64_data_url",
+            new_callable=AsyncMock,
+        ) as mock_b64:
             # Simulate a large base64 result
             mock_b64.return_value = "data:image/png;base64," + "A" * 200
             with patch.dict("sys.modules", {"PIL": None, "PIL.Image": None}):
-                result = _resize_image_for_vision(path, max_base64_bytes=100)
+                result = await _resize_image_for_vision(
+                    path, max_base64_bytes=100
+                )
                 # Should return the original (oversized) data url
                 assert len(result) > 100
 
@@ -633,6 +659,7 @@ class TestResizeImageForVision:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.asyncio
 class TestImageExceedsDimension:
     """The proactive embed path checks pixel dimensions, not just bytes.
 
@@ -643,7 +670,7 @@ class TestImageExceedsDimension:
     embed-time resize fires on dimensions too.
     """
 
-    def test_tall_small_byte_image_flagged(self, tmp_path):
+    async def test_tall_small_byte_image_flagged(self, tmp_path):
         try:
             from PIL import Image
         except ImportError:
@@ -652,21 +679,25 @@ class TestImageExceedsDimension:
         img = Image.new("RGB", (1200, 12000), (40, 40, 40))
         path = tmp_path / "tall.png"
         img.save(path, "PNG")
-        assert _image_exceeds_dimension(path, _EMBED_MAX_DIMENSION) is True
+        assert await _image_exceeds_dimension(path, _EMBED_MAX_DIMENSION) is True
 
 
-    def test_undetectable_dimensions_return_false(self, tmp_path):
+    async def test_undetectable_dimensions_return_false(self, tmp_path):
         # Without Pillow — or with bytes Pillow can't parse — we can't inspect
         # dimensions, so return False: the byte-based checks still apply and a
         # missing soft dep never breaks the embed path.
         path = tmp_path / "x.png"
         path.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 100)
         with patch.dict("sys.modules", {"PIL": None, "PIL.Image": None}):
-            assert _image_exceeds_dimension(path, _EMBED_MAX_DIMENSION) is False
+            assert await _image_exceeds_dimension(
+                path, _EMBED_MAX_DIMENSION
+            ) is False
 
         corrupt = tmp_path / "corrupt.png"
         corrupt.write_bytes(b"not an image at all")
-        assert _image_exceeds_dimension(corrupt, _EMBED_MAX_DIMENSION) is False
+        assert await _image_exceeds_dimension(
+            corrupt, _EMBED_MAX_DIMENSION
+        ) is False
 
 
 # ---------------------------------------------------------------------------
@@ -737,8 +768,14 @@ class TestDownloadRetryClassification:
 
         mock_client = self._make_client_raising_status(503)
         with (
-            patch("tools.vision_tools.httpx.AsyncClient", return_value=mock_client),
-            patch("tools.vision_tools.check_website_access", return_value=None),
+            patch(
+                "tools.url_safety.create_ssrf_safe_client",
+                return_value=mock_client,
+            ),
+            patch(
+                "tools.vision_tools.check_website_access",
+                new=AsyncMock(return_value=None),
+            ),
             patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep,
             pytest.raises(httpx.HTTPStatusError),
         ):
@@ -748,143 +785,3 @@ class TestDownloadRetryClassification:
         # All three attempts used, two backoff sleeps between them.
         assert mock_client.get.await_count == 3
         assert mock_sleep.await_count == 2
-
-
-# ---------------------------------------------------------------------------
-# CPU-burst concurrency cap — a single turn (or several concurrent sessions in
-# one process) can launch dozens of vision_analyze calls at once. Only the
-# CPU-bound encode/resize is bounded (to host cores), so a video-frame storm
-# can't saturate every core and starve the dashboard event loop — while the
-# network-bound LLM calls stay fully concurrent for legitimate multi-image work.
-# ---------------------------------------------------------------------------
-
-
-class TestVisionCpuBurstCap:
-    """The bounded CPU executor caps concurrent encode/resize, not LLM calls."""
-
-    def test_worker_count_tracks_host_cpus_with_env_override(self):
-        from tools import vision_tools as vt
-
-        def resolve(host_cpus, env_value=None):
-            with (
-                patch.dict(os.environ, {}, clear=False),
-                patch("tools.vision_tools._detect_host_cpus", return_value=host_cpus),
-                patch("hermes_cli.config.load_config", side_effect=Exception),
-            ):
-                if env_value is None:
-                    os.environ.pop("HERMES_VISION_MAX_CONCURRENCY", None)
-                else:
-                    os.environ["HERMES_VISION_MAX_CONCURRENCY"] = env_value
-                return vt._resolve_vision_cpu_workers()
-
-        # No fixed ceiling: a 64-core host gets 64 encode workers. The cap
-        # tracks the actual resource (cores), not a magic number.
-        assert resolve(64) == 64
-        assert resolve(2) == 2
-        # Explicit override is honored verbatim — including ABOVE core count,
-        # so operators can raise it for heavy multi-image workloads.
-        assert resolve(2, "16") == 16
-        # 0 is ignored (cap can never be disabled) → falls back to host cores.
-        assert resolve(2, "0") == 2
-
-    @pytest.mark.asyncio
-    async def test_encode_runs_on_dedicated_cpu_executor(self):
-        """Encode/resize must execute on a ``vision-encode`` thread, off the loop.
-
-        Regression guard: the CPU burst is what saturated cores and starved the
-        loop. It must run on the bounded vision executor, not the caller's loop
-        thread nor the shared default pool.
-        """
-        import importlib
-        import threading
-        from concurrent.futures import ThreadPoolExecutor
-
-        vt = importlib.import_module("tools.vision_tools")
-
-        # The executor is dedicated, not the shared default pool.
-        assert isinstance(vt._vision_cpu_executor, ThreadPoolExecutor)
-        assert vt._vision_cpu_executor._max_workers == vt._VISION_CPU_WORKERS
-
-        seen_threads = []
-
-        def fake_encode(path, mime_type=None):
-            seen_threads.append(threading.current_thread().name)
-            return "data:image/jpeg;base64,AAAA"
-
-        result = await vt._run_encode_on_cpu_executor(fake_encode, "p", mime_type="image/jpeg")
-        assert result == "data:image/jpeg;base64,AAAA"
-        assert len(seen_threads) == 1
-        assert seen_threads[0].startswith("vision-encode"), seen_threads
-
-    @pytest.mark.asyncio
-    async def test_encode_bursts_bounded_but_llm_stays_concurrent(self):
-        """Encode concurrency is clamped to the cap; the LLM call is not.
-
-        Drives many native-path calls whose encode step is the only thing on
-        the CPU executor. With the executor sized to CAP, no more than CAP
-        encodes ever run at once — even though all N calls are in flight
-        simultaneously (proving the analyses themselves are NOT serialized).
-        """
-        import asyncio
-        import importlib
-        from concurrent.futures import ThreadPoolExecutor
-
-        vt = importlib.import_module("tools.vision_tools")
-
-        CAP = 3
-        N = 12
-        enc_inflight = 0
-        enc_peak = 0
-        calls_inflight = 0
-        calls_peak = 0
-        import threading as _t
-        enc_lock = _t.Lock()
-
-        def slow_encode(path, mime_type=None):
-            nonlocal enc_inflight, enc_peak
-            with enc_lock:
-                enc_inflight += 1
-                enc_peak = max(enc_peak, enc_inflight)
-            try:
-                _t.Event().wait(0.04)  # simulate CPU burst
-            finally:
-                with enc_lock:
-                    enc_inflight -= 1
-            return "data:image/jpeg;base64,AAAA"
-
-        async def fake_native(image_url, question, task_id=None):
-            nonlocal calls_inflight, calls_peak
-            calls_inflight += 1
-            calls_peak = max(calls_peak, calls_inflight)
-            try:
-                # The encode is the capped CPU step.
-                await vt._run_encode_on_cpu_executor(slow_encode, "p", mime_type="image/jpeg")
-                # The "LLM call" is NOT capped — overlaps freely.
-                await asyncio.sleep(0.02)
-            finally:
-                calls_inflight -= 1
-            return json.dumps({"ok": True})
-
-        with (
-            patch.object(vt, "_vision_cpu_executor",
-                         ThreadPoolExecutor(max_workers=CAP, thread_name_prefix="vision-encode")),
-            patch.object(vt, "_should_use_native_vision_fast_path", return_value=True),
-            patch.object(vt, "_vision_analyze_native", side_effect=fake_native),
-        ):
-            await asyncio.gather(*[
-                vt._handle_vision_analyze(
-                    {"image_url": f"https://example.com/frame_{i}.png",
-                     "question": "what is this"}
-                )
-                for i in range(N)
-            ])
-
-        assert enc_peak <= CAP, f"encode peak {enc_peak} exceeded cap {CAP}"
-        assert enc_peak == CAP, f"expected to saturate encode cap {CAP}, got {enc_peak}"
-        # The analyses themselves were NOT serialized to the cap — all N ran
-        # concurrently, which is the whole point (multi-image workflows keep
-        # their concurrency; only the CPU burst is bounded).
-        assert calls_peak > CAP, (
-            f"analyses were serialized to the cap (peak={calls_peak}); only the "
-            "encode burst should be bounded, not the whole call"
-        )

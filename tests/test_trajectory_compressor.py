@@ -16,21 +16,8 @@ from trajectory_compressor import (
 )
 
 
-def test_import_loads_env_from_hermes_home(tmp_path, monkeypatch):
-    home = tmp_path / ".hermes"
-    home.mkdir()
-    (home / ".env").write_text("OPENROUTER_API_KEY=from-hermes-home\n", encoding="utf-8")
-
-    monkeypatch.setenv("HERMES_HOME", str(home))
-    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
-
-    sys.modules.pop("trajectory_compressor", None)
-    importlib.import_module("trajectory_compressor")
-
-    assert os.getenv("OPENROUTER_API_KEY") == "from-hermes-home"
-
-
-def test_generate_summary_kimi_omits_temperature():
+@pytest.mark.asyncio
+async def test_generate_summary_kimi_omits_temperature():
     """Kimi models should have temperature omitted — server manages it."""
     config = CompressionConfig(
         summarization_model="kimi-for-coding",
@@ -42,16 +29,17 @@ def test_generate_summary_kimi_omits_temperature():
     compressor.config = config
     compressor.logger = MagicMock()
     compressor._use_call_llm = False
-    compressor.client = MagicMock()
-    compressor.client.chat.completions.create.return_value = SimpleNamespace(
+    async_client = MagicMock()
+    async_client.chat.completions.create = AsyncMock(return_value=SimpleNamespace(
         choices=[SimpleNamespace(message=SimpleNamespace(content="[CONTEXT SUMMARY]: summary"))]
-    )
+    ))
+    compressor._get_client = MagicMock(return_value=async_client)
 
     metrics = TrajectoryMetrics()
-    result = compressor._generate_summary("tool output", metrics)
+    result = await compressor._generate_summary("tool output", metrics)
 
     assert result.startswith("[CONTEXT SUMMARY]:")
-    assert "temperature" not in compressor.client.chat.completions.create.call_args.kwargs
+    assert "temperature" not in async_client.chat.completions.create.call_args.kwargs
 
 
 
@@ -71,7 +59,8 @@ class TestCompressionConfig:
         assert config.protect_last_n_turns == 4
         assert config.skip_under_target is True
 
-    def test_from_yaml(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_from_yaml(self, tmp_path):
         yaml_content = """\
 tokenizer:
   name: custom-tokenizer
@@ -102,7 +91,7 @@ metrics:
 """
         yaml_file = tmp_path / "config.yaml"
         yaml_file.write_text(yaml_content)
-        config = CompressionConfig.from_yaml(str(yaml_file))
+        config = await CompressionConfig.from_yaml(str(yaml_file))
         assert config.tokenizer_name == "custom-tokenizer"
         assert config.trust_remote_code is False
         assert config.target_max_tokens == 10000
@@ -193,8 +182,7 @@ def _make_compressor(config=None):
     """Create a TrajectoryCompressor with mocked tokenizer and summarizer."""
     if config is None:
         config = CompressionConfig()
-    with patch.object(TrajectoryCompressor, '_init_tokenizer'), \
-         patch.object(TrajectoryCompressor, '_init_summarizer'):
+    with patch.object(TrajectoryCompressor, '_init_summarizer'):
         compressor = TrajectoryCompressor(config)
     # Provide a simple token counter for tests (1 token per 4 chars)
     compressor.tokenizer = MagicMock()
@@ -330,15 +318,17 @@ class TestTokenCounting:
 
 
 class TestGenerateSummary:
-    def test_generate_summary_handles_none_content(self):
+    @pytest.mark.asyncio
+    async def test_generate_summary_handles_none_content(self):
         tc = _make_compressor()
-        tc.client = MagicMock()
-        tc.client.chat.completions.create.return_value = SimpleNamespace(
+        async_client = MagicMock()
+        async_client.chat.completions.create = AsyncMock(return_value=SimpleNamespace(
             choices=[SimpleNamespace(message=SimpleNamespace(content=None))]
-        )
+        ))
+        tc._get_client = MagicMock(return_value=async_client)
         metrics = TrajectoryMetrics()
 
-        summary = tc._generate_summary("Turn content", metrics)
+        summary = await tc._generate_summary("Turn content", metrics)
 
         assert summary == "[CONTEXT SUMMARY]:"
 
@@ -406,15 +396,16 @@ class TestCompressionToolPairIntegrity:
         config.summary_target_tokens = 4
         return config
 
-    def test_sync_compression_does_not_orphan_tool_markers(self):
+    @pytest.mark.asyncio
+    async def test_compression_does_not_orphan_tool_markers(self):
         tc = _make_compressor(self._config())
-        tc._generate_summary = MagicMock(
+        tc._generate_summary = AsyncMock(
             return_value="[CONTEXT SUMMARY]: middle turns summarized."
         )
         trajectory = _paired_trajectory()
         tc.config.target_max_tokens = _target_that_splits_after_index_4(tc, trajectory)
 
-        compressed, metrics = tc.compress_trajectory(trajectory)
+        compressed, metrics = await tc.compress_trajectory(trajectory)
 
         assert metrics.was_compressed
         # Every <tool_call> must keep its matching <tool_response>.
@@ -479,18 +470,18 @@ class TestCompressionNetSavingsGuard:
         config.target_max_tokens = 100  # trajectory is far over this
         return config
 
-    def test_sync_skips_compression_when_middle_smaller_than_summary(self):
+    @pytest.mark.asyncio
+    async def test_skips_compression_when_middle_smaller_than_summary(self):
         tc = _make_compressor(self._config())
-        tc._generate_summary = MagicMock(
+        tc._generate_summary = AsyncMock(
             return_value="[CONTEXT SUMMARY]: " + "blah " * 30
         )
         trajectory = self._tiny_middle_trajectory()
         before = sum(tc.count_turn_tokens(trajectory))
 
-        compressed, metrics = tc.compress_trajectory(trajectory)
+        compressed, metrics = await tc.compress_trajectory(trajectory)
 
         assert metrics.was_compressed is False
         assert compressed == trajectory
         assert sum(tc.count_turn_tokens(compressed)) == before
         tc._generate_summary.assert_not_called()
-

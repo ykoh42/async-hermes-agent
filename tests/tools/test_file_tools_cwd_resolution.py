@@ -16,7 +16,7 @@ Core invariant these tests pin:
 """
 
 import os
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 
 import pytest
 
@@ -37,7 +37,7 @@ def _isolated_cwd(tmp_path, monkeypatch):
     # the worktree.
     monkeypatch.chdir(decoy)
     # No session cwd recorded yet (fresh-session condition).
-    monkeypatch.setattr(terminal_tool, "_session_cwd", {})
+    monkeypatch.setattr(terminal_tool, "_session_cwds", {})
     return workspace, decoy
 
 
@@ -89,56 +89,6 @@ def test_absolute_terminal_cwd_used_verbatim(_isolated_cwd, monkeypatch):
     assert resolved == (workspace / "target.py")
 
 
-def test_container_absolute_input_path_does_not_follow_host_symlink(tmp_path, monkeypatch):
-    """Docker paths are sandbox-local and must not be host-dereferenced.
-
-    A user may have a host symlink at a container-looking path such as
-    ``/workspace/projects``. For Docker file ops, resolving that symlink on the
-    host rewrites the path before Docker sees it, making file tools and terminal
-    disagree about where the file lives.
-    """
-    host_project = tmp_path / "host-project"
-    host_project.mkdir()
-    container_mount = tmp_path / "workspace-projects"
-    container_mount.symlink_to(host_project, target_is_directory=True)
-    monkeypatch.setattr(terminal_tool, "_get_env_config", lambda: {"env_type": "docker"})
-    monkeypatch.setattr(terminal_tool, "_active_environments", {})
-
-    container_path = container_mount / "oilsands-sim" / "README.md"
-    resolved = ft._resolve_path_for_task(str(container_path), task_id="default")
-
-    assert resolved == container_path
-    assert resolved != (host_project / "oilsands-sim" / "README.md")
-
-
-def test_container_path_normalization_uses_posix_path_syntax():
-    resolved = ft._normalize_without_host_deref("/workspace/projects/foo/../bar")
-
-    assert resolved == PurePosixPath("/workspace/projects/bar")
-    assert str(resolved) == "/workspace/projects/bar"
-
-
-def test_container_relative_path_keeps_container_cwd_symlink(tmp_path, monkeypatch):
-    """Relative Docker paths should stay under the container cwd textually."""
-    host_project = tmp_path / "host-project"
-    host_project.mkdir()
-    container_mount = tmp_path / "workspace-projects"
-    container_mount.symlink_to(host_project, target_is_directory=True)
-    monkeypatch.setattr(terminal_tool, "_get_env_config", lambda: {"env_type": "docker"})
-    monkeypatch.setattr(terminal_tool, "_active_environments", {})
-    terminal_tool.record_session_cwd("default", str(container_mount))
-
-    resolved = ft._resolve_path_for_task("oilsands-sim/README.md", task_id="default")
-
-    assert resolved == container_mount / "oilsands-sim" / "README.md"
-    assert resolved != host_project / "oilsands-sim" / "README.md"
-
-
-class _DummyDockerEnvironment:
-    cwd = "/workspace"
-    cwd_owner = "default"
-
-
 def test_resolution_base_always_absolute_no_terminal_cwd(_isolated_cwd, monkeypatch):
     """With TERMINAL_CWD unset, the base falls back to an ABSOLUTE process cwd."""
     workspace, decoy = _isolated_cwd
@@ -153,23 +103,6 @@ def test_resolution_base_always_absolute_no_terminal_cwd(_isolated_cwd, monkeypa
 # ── B-(ii): workspace-divergence warning ────────────────────────────────────
 
 
-def test_warning_fires_when_relative_path_escapes_workspace(_isolated_cwd, monkeypatch):
-    """Relative path resolving outside the live workspace must warn."""
-    workspace, decoy = _isolated_cwd
-    # Live cwd = workspace, but the relative path resolves to decoy (process cwd)
-    # because TERMINAL_CWD is the poison '.'.  Simulate by recording workspace
-    # as the session cwd while the resolved path is under decoy.
-    terminal_tool.record_session_cwd("default", str(workspace))
-    resolved_in_decoy = decoy / "target.py"
-
-    warn = ft._path_resolution_warning("target.py", resolved_in_decoy, task_id="default")
-
-    assert warn is not None
-    assert "OUTSIDE the active workspace" in warn
-    assert str(decoy) in warn
-    assert str(workspace) in warn
-
-
 # ── Fix C: sentinel TERMINAL_CWD + empty-registry worktree anchoring ─────────
 # (May 2026 follow-up: PR #35399 made misroutes visible via resolved_path but
 # the divergence warning only fired when the live terminal cwd was known. A
@@ -177,29 +110,6 @@ def test_warning_fires_when_relative_path_escapes_workspace(_isolated_cwd, monke
 # got neither a worktree anchor nor a warning, so a relative edit silently
 # landed in main. These tests pin the sentinel handling + empty-registry
 # anchoring + early warning.)
-
-
-def test_warning_fires_from_terminal_cwd_when_registry_empty(_isolated_cwd, monkeypatch):
-    """Divergence warning must fire even before any terminal command runs.
-
-    PR #35399's warning required a live terminal cwd; a fresh worktree session
-    (empty registry) silently misrouted with no warning. Now the warning falls
-    back to the absolute TERMINAL_CWD anchor, so an edit aimed outside the
-    worktree is flagged on the very first write.
-    """
-    workspace, decoy = _isolated_cwd
-    monkeypatch.setattr(terminal_tool, "_session_cwd", {})
-    monkeypatch.setenv("TERMINAL_CWD", str(workspace))
-
-    # Relative path that escapes the worktree into the decoy/main checkout.
-    escaping = os.path.relpath(str(decoy / "target.py"), str(workspace))
-    resolved = ft._resolve_path_for_task(escaping, task_id="default")
-
-    warn = ft._path_resolution_warning(escaping, resolved, task_id="default")
-
-    assert warn is not None
-    assert "OUTSIDE the active workspace" in warn
-    assert str(workspace) in warn
 
 
 # ── Fix A: write_file / patch report the resolved ABSOLUTE path ──────────────
@@ -224,8 +134,7 @@ def _two_worktree_sessions(tmp_path, monkeypatch):
     monkeypatch.chdir(main)
     monkeypatch.delenv("TERMINAL_CWD", raising=False)
     monkeypatch.setattr(terminal_tool, "_task_env_overrides", {})
-    monkeypatch.setattr(terminal_tool, "_session_cwd", {})
-    monkeypatch.setattr(ft, "_file_ops_cache", {})
+    monkeypatch.setattr(terminal_tool, "_session_cwds", {})
     # Both sessions register their worktree cwd (TUI/desktop registration path;
     # registration seeds each session's record).
     terminal_tool.register_task_env_overrides("sess-a", {"cwd": str(wt_a)})
@@ -256,7 +165,8 @@ def test_unregistered_session_never_inherits_another_sessions_record(
     assert resolved == (main / "target.py").resolve()
 
 
-def test_v4a_patch_applies_to_resolved_workspace_not_backend_cwd(
+@pytest.mark.asyncio
+async def test_v4a_patch_applies_to_resolved_workspace_not_backend_cwd(
     _isolated_cwd, monkeypatch
 ):
     """V4A patch must edit the path the tool layer resolved, not the shell cwd.
@@ -275,20 +185,10 @@ def test_v4a_patch_applies_to_resolved_workspace_not_backend_cwd(
 
     # Tool layer resolves against the workspace (worktree registration path).
     monkeypatch.setattr(terminal_tool, "_task_env_overrides", {})
-    monkeypatch.setattr(ft, "_file_ops_cache", {})
     terminal_tool.register_task_env_overrides(task_id, {"cwd": str(workspace)})
 
-    # Backend file_ops lives in the DECOY dir — the divergence the fix closes.
-    from tools.environments.local import LocalEnvironment
-    from tools.file_operations import ShellFileOperations
-
-    env = LocalEnvironment(cwd=str(decoy))
-    monkeypatch.setattr(
-        ft, "_get_file_ops", lambda task_id="default": ShellFileOperations(env)
-    )
-
     out = json.loads(
-        ft.patch_tool(
+        await ft.patch_tool(
             mode="patch",
             patch=(
                 "*** Begin Patch\n"

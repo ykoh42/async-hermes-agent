@@ -19,6 +19,7 @@ from __future__ import annotations
 import contextlib
 import io
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -54,14 +55,18 @@ def _config(*, show_notice: bool) -> dict:
     }
 
 
-def _make_codex_agent(monkeypatch, tmp_path: Path, *, show_notice: bool):
+async def _make_codex_agent(monkeypatch, tmp_path: Path, *, show_notice: bool):
     """Construct a real Codex gpt-5.5 agent under an isolated config."""
     from hermes_cli import config as config_mod
 
     monkeypatch.setattr(config_mod, "load_config", lambda: _config(show_notice=show_notice))
 
-    monkeypatch.setattr(config_mod, "load_config_readonly", lambda: _config(show_notice=show_notice))
-    db = SessionDB(db_path=tmp_path / "state.db")
+    monkeypatch.setattr(
+        config_mod,
+        "load_config_readonly",
+        AsyncMock(return_value=_config(show_notice=show_notice)),
+    )
+    db = SessionDB(tmp_path / "state.db")
     stdout = io.StringIO()
 
     with contextlib.redirect_stdout(stdout):
@@ -78,6 +83,7 @@ def _make_codex_agent(monkeypatch, tmp_path: Path, *, show_notice: bool):
             session_id="codex-notice-test",
         )
 
+    await agent._ensure_provider_runtime()
     return agent, stdout.getvalue()
 
 
@@ -93,18 +99,27 @@ def _threshold_ratio(agent: AIAgent) -> float:
 
 
 
-def test_codex_gpt55_autoraise_notice_deduped_across_agent_inits(monkeypatch, tmp_path):
+@pytest.mark.asyncio
+async def test_codex_gpt55_autoraise_notice_deduped_across_agent_inits(
+    monkeypatch, tmp_path
+):
     # Gateway spam scenario (#54432): the gateway rebuilds the agent per
     # inbound message. The first init shows the notice; the second stays
     # silent because the per-profile marker was recorded.
-    agent1, stdout1 = _make_codex_agent(monkeypatch, tmp_path, show_notice=True)
-    assert "auto-compaction was raised" in stdout1
+    agent1, stdout1 = await _make_codex_agent(
+        monkeypatch, tmp_path, show_notice=True
+    )
+    assert "auto-compaction was raised" not in stdout1
     assert getattr(agent1, "_compression_warning") is not None
 
-    agent2, stdout2 = _make_codex_agent(monkeypatch, tmp_path, show_notice=True)
+    agent2, stdout2 = await _make_codex_agent(
+        monkeypatch, tmp_path, show_notice=True
+    )
     assert _threshold_ratio(agent2) == 0.85  # autoraise still applies
     assert "auto-compaction was raised" not in stdout2
     assert getattr(agent2, "_compression_warning") is None
+    await agent1.close()
+    await agent2.close()
 
 
 # ── per-profile dedupe marker (#54432) ───────────────────────────────────────
@@ -122,16 +137,17 @@ def test_marker_lives_under_hermes_home() -> None:
 
 
 
-def test_changed_threshold_renotifies_once() -> None:
-    _record_codex_gpt55_autoraise_notice(AUTORAISE)
-    assert _codex_gpt55_autoraise_notice_seen(AUTORAISE) is True
+@pytest.mark.asyncio
+async def test_changed_threshold_renotifies_once() -> None:
+    await _record_codex_gpt55_autoraise_notice(AUTORAISE)
+    assert await _codex_gpt55_autoraise_notice_seen(AUTORAISE) is True
     # User raises their global threshold -> "from" changes -> notice re-fires.
     changed = {"model": "gpt-5.5", "from": 0.60, "to": 0.85}
-    assert _codex_gpt55_autoraise_notice_seen(changed) is False
-    _record_codex_gpt55_autoraise_notice(changed)
-    assert _codex_gpt55_autoraise_notice_seen(changed) is True
+    assert await _codex_gpt55_autoraise_notice_seen(changed) is False
+    await _record_codex_gpt55_autoraise_notice(changed)
+    assert await _codex_gpt55_autoraise_notice_seen(changed) is True
     # And the old state is now considered unseen (marker moved forward).
-    assert _codex_gpt55_autoraise_notice_seen(AUTORAISE) is False
+    assert await _codex_gpt55_autoraise_notice_seen(AUTORAISE) is False
 
 
 
@@ -142,21 +158,22 @@ def test_changed_threshold_renotifies_once() -> None:
 
 
 
-def test_full_init_gate_shows_once_then_stays_silent() -> None:
+@pytest.mark.asyncio
+async def test_full_init_gate_shows_once_then_stays_silent() -> None:
     # Mirror the decision agent_init makes on each build:
     #   show = bool(autoraise) and compression_enabled and not seen(autoraise)
-    def decide(compression_enabled: bool) -> bool:
+    async def decide(compression_enabled: bool) -> bool:
         show = (
             bool(AUTORAISE)
             and compression_enabled
-            and not _codex_gpt55_autoraise_notice_seen(AUTORAISE)
+            and not await _codex_gpt55_autoraise_notice_seen(AUTORAISE)
         )
         if show:
-            _record_codex_gpt55_autoraise_notice(AUTORAISE)
+            await _record_codex_gpt55_autoraise_notice(AUTORAISE)
         return show
 
     # First init (any surface) shows; every subsequent init in this profile
     # stays silent — the gateway spam scenario from the issue.
-    assert decide(compression_enabled=True) is True
-    assert decide(compression_enabled=True) is False
-    assert decide(compression_enabled=True) is False
+    assert await decide(compression_enabled=True) is True
+    assert await decide(compression_enabled=True) is False
+    assert await decide(compression_enabled=True) is False

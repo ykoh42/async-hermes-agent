@@ -21,6 +21,8 @@ from __future__ import annotations
 
 from typing import Any, Dict, List
 
+import pytest
+
 from agent.context_engine import ContextEngine
 
 # Reuse the minimal agent harness that exercises the real finalize_turn path.
@@ -77,12 +79,13 @@ def _agent_with_engine() -> _StubAgent:
     return agent
 
 
-def test_finalize_turn_forwards_canonical_usage_when_available():
+@pytest.mark.asyncio
+async def test_finalize_turn_forwards_canonical_usage_when_available():
     """A completed turn forwards the stashed canonical usage dict intact."""
     agent = _agent_with_engine()
     agent._last_turn_usage = dict(CANONICAL_USAGE)
 
-    _run(agent, final_response="done")
+    await _run(agent, final_response="done")
 
     captured = agent.context_compressor.captured
     assert captured.get("seen") is True
@@ -93,7 +96,8 @@ def test_finalize_turn_forwards_canonical_usage_when_available():
     assert captured["kwargs"]["turn_id"] == "turn-1"
 
 
-def test_finalize_turn_forwards_none_when_no_response_usage():
+@pytest.mark.asyncio
+async def test_finalize_turn_forwards_none_when_no_response_usage():
     """An early-failure/interrupt turn (no stashed usage) forwards None."""
     agent = _agent_with_engine()
     # _last_turn_usage left unset, mirroring a turn that never reached a
@@ -101,14 +105,15 @@ def test_finalize_turn_forwards_none_when_no_response_usage():
     if hasattr(agent, "_last_turn_usage"):
         delattr(agent, "_last_turn_usage")
 
-    _run(agent, final_response="done")
+    await _run(agent, final_response="done")
 
     captured = agent.context_compressor.captured
     assert captured.get("seen") is True
     assert captured["usage"] is None
 
 
-def test_finalization_seam_observes_interrupted_turn_with_none_usage():
+@pytest.mark.asyncio
+async def test_finalization_seam_observes_interrupted_turn_with_none_usage():
     """Pins the documented coverage contract for on_turn_complete().
 
     on_turn_complete() fires from the turn-finalization seam and reports
@@ -129,7 +134,7 @@ def test_finalization_seam_observes_interrupted_turn_with_none_usage():
     if hasattr(agent, "_last_turn_usage"):
         delattr(agent, "_last_turn_usage")  # never reached a provider response
 
-    finalize_turn(
+    await finalize_turn(
         agent,
         final_response="interrupted mid-turn",
         api_call_count=1,

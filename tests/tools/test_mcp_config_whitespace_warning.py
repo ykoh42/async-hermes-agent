@@ -8,6 +8,7 @@ leading spaces), which otherwise surfaces as opaque auth/connect failures.
 import logging
 
 import pytest
+import yaml
 
 from tools import mcp_tool
 from tools.mcp_tool import _warn_hidden_whitespace
@@ -103,20 +104,23 @@ def test_distinct_servers_warned_separately(caplog):
     assert len(warn_records) == 2
 
 
-def test_load_mcp_config_emits_warning(tmp_path, monkeypatch, caplog):
+@pytest.mark.asyncio
+async def test_load_mcp_config_emits_warning(tmp_path, monkeypatch, caplog):
     """E2E through _load_mcp_config with a real config load path."""
-    from unittest.mock import patch as mock_patch
-
     servers = {
         "pasted": {
             "url": "https://example.com/mcp",
             "headers": {"Authorization": "Bearer tok\n"},
         }
     }
-    with mock_patch("hermes_cli.config.load_config",
-                    return_value={"mcp_servers": servers}), \
-         caplog.at_level(logging.WARNING, logger="tools.mcp_tool"):
-        result = mcp_tool._load_mcp_config()
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        yaml.safe_dump({"mcp_servers": servers}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("hermes_cli.config.get_config_path", lambda: config_path)
+    with caplog.at_level(logging.WARNING, logger="tools.mcp_tool"):
+        result = await mcp_tool._load_mcp_config()
 
     assert "pasted" in result
     # Value passes through unmutated.

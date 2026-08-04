@@ -1,13 +1,24 @@
 import pytest
+from unittest.mock import AsyncMock, MagicMock
 
 
 def _set_xai_oauth_unavailable(monkeypatch):
-    from hermes_cli import auth
+    from agent import credential_pool
 
-    monkeypatch.setattr(auth, "resolve_xai_oauth_runtime_credentials", lambda **_: {})
+    pool = MagicMock()
+    pool.select = AsyncMock(return_value=None)
+    pool.try_refresh_matching = AsyncMock(return_value=None)
+    monkeypatch.setattr(
+        credential_pool,
+        "load_pool",
+        AsyncMock(return_value=pool),
+    )
 
 
-def test_xai_credentials_fail_closed_without_profile_scope(tmp_path, monkeypatch):
+@pytest.mark.asyncio
+async def test_xai_credentials_fail_closed_without_profile_scope(
+    tmp_path, monkeypatch
+):
     from agent import secret_scope
     from hermes_cli.config import invalidate_env_cache
     from tools.xai_http import resolve_xai_http_credentials
@@ -22,14 +33,15 @@ def test_xai_credentials_fail_closed_without_profile_scope(tmp_path, monkeypatch
     secret_scope.set_multiplex_active(True)
     try:
         with pytest.raises(secret_scope.UnscopedSecretError):
-            resolve_xai_http_credentials(force_refresh=True)
+            await resolve_xai_http_credentials(force_refresh=True)
     finally:
         secret_scope.reset_secret_scope(token)
         secret_scope.set_multiplex_active(previous_multiplex)
         invalidate_env_cache()
 
 
-def test_xai_credentials_do_not_fall_back_to_environ_when_scope_has_no_key(
+@pytest.mark.asyncio
+async def test_xai_credentials_do_not_fall_back_to_environ_when_scope_has_no_key(
     tmp_path, monkeypatch
 ):
     from agent import secret_scope
@@ -45,7 +57,7 @@ def test_xai_credentials_do_not_fall_back_to_environ_when_scope_has_no_key(
     token = secret_scope.set_secret_scope({})
     secret_scope.set_multiplex_active(True)
     try:
-        credentials = resolve_xai_http_credentials(force_refresh=True)
+        credentials = await resolve_xai_http_credentials(force_refresh=True)
         assert credentials == {
             "provider": "xai",
             "api_key": "",

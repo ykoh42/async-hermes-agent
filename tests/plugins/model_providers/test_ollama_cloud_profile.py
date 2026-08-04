@@ -183,45 +183,48 @@ class TestOllamaModelSupportsThinking:
             def __init__(self, *a, **k):
                 pass
 
-            def __enter__(self):
+            async def __aenter__(self):
                 return self
 
-            def __exit__(self, *a):
+            async def __aexit__(self, *a):
                 return False
 
-            def post(self, *a, **k):
+            async def post(self, *a, **k):
                 if raise_exc:
                     raise raise_exc
                 return _Resp()
 
-        monkeypatch.setattr(httpx, "Client", _Client)
+        monkeypatch.setattr(httpx, "AsyncClient", _Client)
 
-    def test_thinking_capability_true(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_thinking_capability_true(self, monkeypatch):
         from hermes_cli.models import ollama_model_supports_thinking
 
         self._patch_show(monkeypatch, capabilities=["completion", "tools", "thinking"])
         assert (
-            ollama_model_supports_thinking(
+            await ollama_model_supports_thinking(
                 "deepseek-v4-pro", "https://ollama.com/v1", "key"
             )
             is True
         )
 
 
-    def test_probe_failure_returns_none(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_probe_failure_returns_none(self, monkeypatch):
         from hermes_cli.models import ollama_model_supports_thinking
 
         self._patch_show(monkeypatch, status=404)
         assert (
-            ollama_model_supports_thinking("x", "https://ollama.com/v1", "key") is None
+            await ollama_model_supports_thinking("x", "https://ollama.com/v1", "key") is None
         )
 
-    def test_exception_returns_none(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_exception_returns_none(self, monkeypatch):
         from hermes_cli.models import ollama_model_supports_thinking
 
         self._patch_show(monkeypatch, raise_exc=RuntimeError("boom"))
         assert (
-            ollama_model_supports_thinking("x", "https://ollama.com/v1", "key") is None
+            await ollama_model_supports_thinking("x", "https://ollama.com/v1", "key") is None
         )
 
 

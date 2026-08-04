@@ -55,18 +55,19 @@ def _make_agent():
 _HISTORY = [{"role": "user", "content": "old"}, {"role": "assistant", "content": "older"}]
 
 
-def test_preflight_lock_skip_does_not_set_blocked_flag():
+@pytest.mark.asyncio
+async def test_preflight_lock_skip_does_not_set_blocked_flag():
     agent = _make_agent()
     calls = []
 
-    def _lock_skip_compress(messages, _system_message, **_kwargs):
+    async def _lock_skip_compress(messages, _system_message, **_kwargs):
         calls.append(1)
         agent._compression_skipped_due_to_lock = "pid=1:tid=2:agent=aa:nonce=bb"
         return messages, "SYSTEM"
 
     agent._compress_context = _lock_skip_compress
 
-    ctx = _build(agent, conversation_history=list(_HISTORY))
+    ctx = await _build(agent, conversation_history=list(_HISTORY))
 
     # Exactly one pass: the defer stops the loop without arming the blocker.
     assert calls == [1]
@@ -77,17 +78,18 @@ def test_preflight_lock_skip_does_not_set_blocked_flag():
 
 
 
-def test_preflight_magicmock_flag_value_is_not_a_defer():
+@pytest.mark.asyncio
+async def test_preflight_magicmock_flag_value_is_not_a_defer():
     """Type-pin: truthy junk (MagicMock auto-attribute shape) must not be
     treated as lock contention — the blocker arms as for a plain no-op."""
     agent = _make_agent()
 
-    def _junk_flag_compress(messages, _system_message, **_kwargs):
+    async def _junk_flag_compress(messages, _system_message, **_kwargs):
         agent._compression_skipped_due_to_lock = MagicMock()
         return messages, "SYSTEM"
 
     agent._compress_context = _junk_flag_compress
 
-    ctx = _build(agent, conversation_history=list(_HISTORY))
+    ctx = await _build(agent, conversation_history=list(_HISTORY))
 
     assert ctx.preflight_compression_blocked is True

@@ -24,7 +24,9 @@ Scenario:
 from __future__ import annotations
 
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
 
 from agent.turn_retry_state import TurnRetryState
 from run_agent import AIAgent
@@ -61,6 +63,7 @@ def _make_agent_with_fallback(fb_chain):
             fallback_model=fb_chain,
         )
         agent.client = MagicMock()
+        agent._runtime_config_loaded = True
         return agent
 
 
@@ -92,7 +95,8 @@ class TestFallbackChainResetOnTransportRecovery:
     via the same call sequence the conversation loop performs, without
     needing to drive the full ``run_conversation`` loop."""
 
-    def test_fallback_chain_resets_after_primary_recovery(self):
+    @pytest.mark.asyncio
+    async def test_fallback_chain_resets_after_primary_recovery(self):
         """Simulate the conversation_loop sequence:
 
         ``_fallback_index`` was bumped to ``len(_fallback_chain)`` by an
@@ -113,14 +117,13 @@ class TestFallbackChainResetOnTransportRecovery:
                 "provider": "zai",
                 "model": "glm-4.7",
                 "base_url": "https://open.bigmodel.cn/api/coding/paas/v4",
+                "api_key": "primary-key-abcdef12",
             }
         ]
         agent = _make_agent_with_fallback(fb_chain)
 
-        # Simulate the pre-recovery state: a prior eager-fallback
-        # attempt walked the chain and bumped the index, but never set
-        # _fallback_activated (resolve_provider_client returned None
-        # and the recursive call exhausted the single-entry chain).
+        # Simulate the pre-recovery state: a prior eager-fallback attempt
+        # walked the chain and bumped the index, but never activated.
         agent._fallback_index = len(agent._fallback_chain)
         agent._fallback_activated = False
 
@@ -135,23 +138,11 @@ class TestFallbackChainResetOnTransportRecovery:
 
         # Confirm the fallback would actually activate now (provider is
         # different model under same zai provider).
-        mock_fb_client = MagicMock()
-        mock_fb_client.api_key = "primary-key-abcdef12"
-        mock_fb_client.base_url = "https://open.bigmodel.cn/api/coding/paas/v4"
-        mock_fb_client._custom_headers = None
-        mock_fb_client.default_headers = None
-
-        with (
-            patch(
-                "agent.auxiliary_client.resolve_provider_client",
-                return_value=(mock_fb_client, "glm-4.7"),
-            ),
-            patch(
-                "hermes_cli.model_normalize.normalize_model_for_provider",
-                side_effect=lambda m, p: m,
-            ),
+        with patch(
+            "hermes_cli.model_normalize.normalize_model_for_provider",
+            side_effect=lambda m, p: m,
         ):
-            ok = agent._try_activate_fallback()
+            ok = await agent._try_activate_fallback()
 
         assert ok is True, "fallback chain must be re-attemptable after reset"
         assert agent._fallback_activated is True
@@ -169,6 +160,7 @@ class TestFallbackChainResetOnTransportRecovery:
                 "provider": "zai",
                 "model": "glm-4.7",
                 "base_url": "https://open.bigmodel.cn/api/coding/paas/v4",
+                "api_key": "primary-key-abcdef12",
             }
         ]
         agent = _make_agent_with_fallback(fb_chain)
@@ -219,7 +211,8 @@ class TestFallbackChainResetOnTransportRecovery:
         )
         assert retry_state.primary_recovery_attempted is True
 
-    def test_run_conversation_fallbacks_on_429_after_timeout_recovery(self):
+    @pytest.mark.asyncio
+    async def test_run_conversation_fallbacks_on_429_after_timeout_recovery(self):
         """Full loop regression for #32646.
 
         Start the turn with the fallback chain already burned, matching
@@ -234,6 +227,7 @@ class TestFallbackChainResetOnTransportRecovery:
                 "provider": "zai",
                 "model": "glm-4.7",
                 "base_url": "https://open.bigmodel.cn/api/coding/paas/v4",
+                "api_key": "primary-key-abcdef12",
             }
         ]
         agent = _make_agent_with_fallback(fb_chain)
@@ -241,7 +235,7 @@ class TestFallbackChainResetOnTransportRecovery:
 
         calls = []
 
-        def fake_api_call(api_kwargs):
+        async def fake_api_call(*_args, **_kwargs):
             calls.append((agent.provider, agent.model))
             attempt = len(calls)
             if attempt == 1:
@@ -253,30 +247,20 @@ class TestFallbackChainResetOnTransportRecovery:
                 raise RateLimitError()
             return _mock_response("Recovered via fallback")
 
-        mock_fb_client = MagicMock()
-        mock_fb_client.api_key = "primary-key-abcdef12"
-        mock_fb_client.base_url = "https://open.bigmodel.cn/api/coding/paas/v4"
-        mock_fb_client._custom_headers = None
-        mock_fb_client.default_headers = None
-
         with (
-            patch.object(agent, "_interruptible_api_call", side_effect=fake_api_call),
+            patch.object(agent, "_execute_model_request", side_effect=fake_api_call),
             patch.object(agent, "_persist_session"),
             patch.object(agent, "_save_trajectory"),
             patch.object(agent, "_cleanup_task_resources"),
             patch("run_agent.OpenAI", return_value=MagicMock()),
-            patch("agent.agent_runtime_helpers.time.sleep"),
-            patch(
-                "agent.auxiliary_client.resolve_provider_client",
-                return_value=(mock_fb_client, "glm-4.7"),
-            ) as mock_resolve,
+            patch("agent.agent_runtime_helpers.asyncio.sleep", new_callable=AsyncMock),
             patch(
                 "hermes_cli.model_normalize.normalize_model_for_provider",
                 side_effect=lambda m, p: m,
             ),
             patch("agent.model_metadata.get_model_context_length", return_value=200000),
         ):
-            result = agent.run_conversation("hello")
+            result = await agent.run_conversation("hello")
 
         assert result["completed"] is True
         assert result["final_response"] == "Recovered via fallback"
@@ -286,7 +270,6 @@ class TestFallbackChainResetOnTransportRecovery:
             ("zai", "glm-5.1"),
             ("zai", "glm-4.7"),
         ]
-        mock_resolve.assert_called_once()
         assert agent._fallback_activated is True
         assert agent.model == "glm-4.7"
 

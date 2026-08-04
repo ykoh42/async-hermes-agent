@@ -14,9 +14,10 @@ The fix adds two safeguards:
    an ineffective compression so should_compress() anti-thrashing fires.
 """
 
-from unittest.mock import patch, MagicMock
+from unittest.mock import AsyncMock, patch
 
 import time
+import pytest
 
 from agent.context_compressor import ContextCompressor, _CHARS_PER_TOKEN
 
@@ -37,7 +38,7 @@ def _make_compressor(**kwargs) -> ContextCompressor:
     # NOTE: 96K < 512K, so the small-context floor raises the effective
     # threshold_percent to 0.75 → threshold_tokens = 72_000. Tests use
     # 73_000 as the "over threshold" probe value.
-    with patch("agent.context_compressor.get_model_context_length", return_value=96000):
+    with patch("agent.context_compressor.get_static_context_length", return_value=96000):
         return ContextCompressor(**defaults)
 
 
@@ -63,7 +64,8 @@ class TestCompressNoOpRegistersIneffective:
     head_end (which makes compress_end = head_end + 1, same as
     compress_start after alignment)."""
 
-    def test_no_op_increments_counter(self):
+    @pytest.mark.asyncio
+    async def test_no_op_increments_counter(self):
         """compress_start >= compress_end -> _ineffective_compression_count += 1"""
         comp = _make_compressor(
             summary_target_ratio=0.45,
@@ -78,14 +80,15 @@ class TestCompressNoOpRegistersIneffective:
         original = comp._find_tail_cut_by_tokens
         comp._find_tail_cut_by_tokens = lambda msgs, he: he  # force no-op
 
-        result = comp.compress(messages, current_tokens=73_000)
+        await comp.compress(messages, current_tokens=73_000)
 
         assert comp._ineffective_compression_count >= 1, (
             f"Expected ineffective_compression_count >= 1, got {comp._ineffective_compression_count}"
         )
 
 
-    def test_two_no_ops_block_should_compress(self):
+    @pytest.mark.asyncio
+    async def test_two_no_ops_block_should_compress(self):
         """After 2 no-op compressions, should_compress returns False."""
         comp = _make_compressor(
             summary_target_ratio=0.45,
@@ -95,8 +98,8 @@ class TestCompressNoOpRegistersIneffective:
         comp.last_prompt_tokens = 73_000
         comp._find_tail_cut_by_tokens = lambda msgs, he: he  # force no-op
 
-        comp.compress(messages, current_tokens=73_000)
-        comp.compress(messages, current_tokens=73_000)
+        await comp.compress(messages, current_tokens=73_000)
+        await comp.compress(messages, current_tokens=73_000)
 
         assert comp._ineffective_compression_count >= 2
         assert not comp.should_compress(73_000), (
@@ -143,17 +146,18 @@ class TestTailCutRawBudgetFallback:
 class TestEffectiveCompressionResetsCounter:
     """When compression actually saves tokens, the ineffective counter resets."""
 
-    def test_effective_compression_resets_counter(self):
+    @pytest.mark.asyncio
+    async def test_effective_compression_resets_counter(self):
         """After an effective compression, _ineffective_compression_count = 0."""
         comp = _make_compressor(
             summary_target_ratio=0.20,
             config_context_length=96000,
         )
         messages = _build_session(30, words_per_turn=100)
-        comp._generate_summary = MagicMock(return_value="Compacted summary of earlier turns.")
+        comp._generate_summary = AsyncMock(return_value="Compacted summary of earlier turns.")
         comp.last_prompt_tokens = 73_000
 
-        comp.compress(messages, current_tokens=73_000)
+        await comp.compress(messages, current_tokens=73_000)
 
         assert comp._ineffective_compression_count == 0, (
             f"Expected 0 ineffective compressions with effective compression, "

@@ -14,6 +14,7 @@ gateway/run.py for messaging). This module defines the schema, validation, and
 a thin dispatcher that delegates to a platform-provided callback.
 """
 
+import inspect
 import json
 from typing import List, Optional, Callable
 
@@ -56,7 +57,7 @@ def _flatten_choice(c) -> str:
     return str(c).strip()
 
 
-def _invoke_callback(callback, question, choices, multi_select):
+async def _invoke_callback(callback, question, choices, multi_select):
     """Invoke the platform callback, passing multi_select if supported.
 
     Uses signature inspection (not a ``TypeError`` retry) to decide whether
@@ -64,8 +65,6 @@ def _invoke_callback(callback, question, choices, multi_select):
     approach would re-invoke a *compatible* callback that raised TypeError
     internally, potentially prompting the user twice.
     """
-    import inspect
-
     accepts_multi = False
     try:
         sig = inspect.signature(callback)
@@ -79,8 +78,8 @@ def _invoke_callback(callback, question, choices, multi_select):
         accepts_multi = False
 
     if accepts_multi:
-        return callback(question, choices, multi_select=multi_select)
-    return callback(question, choices)
+        return await callback(question, choices, multi_select=multi_select)
+    return await callback(question, choices)
 
 
 def _parse_multi_select_response(raw_response) -> List[str]:
@@ -109,71 +108,52 @@ def _parse_multi_select_response(raw_response) -> List[str]:
     return [s.strip() for s in raw.split(",") if s.strip()]
 
 
-def clarify_tool(
+
+
+async def clarify_tool(
     question: str,
     choices: Optional[List[str]] = None,
     multi_select: bool = False,
     callback: Optional[Callable] = None,
 ) -> str:
-    """
-    Ask the user a question, optionally with multiple-choice options.
-
-    Args:
-        question:     The question text to present.
-        choices:      Up to 4 predefined answer choices. When omitted the
-                      question is purely open-ended.
-        multi_select: When True, the user can select multiple choices
-                      (checkboxes).  The ``user_response`` in the output JSON
-                      will be a list of strings instead of a single string.
-                      Has no effect when ``choices`` is omitted.
-        callback:     Platform-provided function that handles the actual UI
-                      interaction.  Signature:
-                      ``callback(question, choices, multi_select=False) -> str``.
-                      The optional ``multi_select`` keyword is passed so the
-                      platform can render checkboxes instead of radio buttons.
-                      Injected by the agent runner (cli.py / gateway).
-
-    Returns:
-        JSON string with the user's response.
-    """
+    """Native async implementation of the model-visible clarify tool."""
     if not question or not question.strip():
         return tool_error("Question text is required.")
 
     question = question.strip()
-
-    # Validate and trim choices
     if choices is not None:
         if not isinstance(choices, list):
             return tool_error("choices must be a list of strings.")
-        # LLMs sometimes emit dict-shaped choices (e.g. [{"description": "..."}])
-        # instead of bare strings. _flatten_choice unwraps them to their
-        # user-facing text here — the single platform-agnostic entry point —
-        # so the CLI panel, Discord buttons, and Telegram list all render clean
-        # text and the resolved answer is never a raw Python dict repr.
-        choices = [s for s in (_flatten_choice(c) for c in choices) if s]
-        if len(choices) > MAX_CHOICES:
-            choices = choices[:MAX_CHOICES]
-        if not choices:
-            choices = None  # empty list → open-ended
+        choices = [choice for choice in (_flatten_choice(item) for item in choices) if choice]
+        choices = choices[:MAX_CHOICES] or None
 
     if callback is None:
         return tool_error("Clarify tool is not available in this execution context.")
+    if not inspect.iscoroutinefunction(callback):
+        return tool_error(
+            "Clarify requires an async platform callback in async-hermes-agent."
+        )
 
     try:
-        raw_response = _invoke_callback(callback, question, choices, multi_select)
+        raw_response = await _invoke_callback(
+            callback, question, choices, multi_select
+        )
     except Exception as exc:
         return tool_error(f"Failed to get user input: {exc}")
 
-    if multi_select and choices is not None:
-        user_response = _parse_multi_select_response(raw_response)
-    else:
-        user_response = str(raw_response).strip()
-
-    return json.dumps({
-        "question": question,
-        "choices_offered": choices,
-        "user_response": user_response,
-    }, ensure_ascii=False)
+    user_response = (
+        _parse_multi_select_response(raw_response)
+        if multi_select and choices is not None
+        else str(raw_response).strip()
+    )
+    return json.dumps(
+        {
+            "question": question,
+            "choices_offered": choices,
+            "user_response": user_response,
+        },
+        ensure_ascii=False,
+    )
 
 
 def check_clarify_requirements() -> bool:
@@ -252,15 +232,22 @@ CLARIFY_SCHEMA = {
 # --- Registry ---
 from tools.registry import registry, tool_error
 
+
+async def _handle_clarify(args: dict, **kwargs) -> str:
+    """Adapt the registry's JSON-object contract to ``clarify_tool``."""
+    return await clarify_tool(
+        question=args.get("question", ""),
+        choices=args.get("choices"),
+        multi_select=args.get("multi_select", False),
+        callback=kwargs.get("callback"),
+    )
+
+
 registry.register(
     name="clarify",
     toolset="clarify",
     schema=CLARIFY_SCHEMA,
-    handler=lambda args, **kw: clarify_tool(
-        question=args.get("question", ""),
-        choices=args.get("choices"),
-        multi_select=args.get("multi_select", False),
-        callback=kw.get("callback")),
+    handler=_handle_clarify,
     check_fn=check_clarify_requirements,
     emoji="❓",
 )

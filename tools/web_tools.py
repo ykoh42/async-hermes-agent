@@ -4,16 +4,13 @@ Standalone Web Tools Module
 
 This module provides generic web tools that work with multiple backend providers.
 Backend is selected during ``hermes tools`` setup (web.backend in config.yaml).
-When available, Hermes can route Firecrawl calls through a Nous-hosted tool-gateway
-for Nous Subscribers only.
-
 Available tools:
 - web_search_tool: Search the web for information
 - web_extract_tool: Extract content from specific web pages
 
 Backend compatibility:
 - Exa: https://exa.ai (search, extract)
-- Firecrawl: https://docs.firecrawl.dev/introduction (search, extract; direct or derived firecrawl-gateway.<domain> for Nous Subscribers)
+- Firecrawl: https://docs.firecrawl.dev/introduction (search, extract; cloud or self-hosted)
 - Parallel: https://docs.parallel.ai (search, extract)
 - Tavily: https://tavily.com (search, extract)
 
@@ -41,21 +38,14 @@ import logging
 import os
 import re
 import asyncio
-from typing import List, Dict, Any, Optional, TYPE_CHECKING
+import contextvars
+from typing import List, Dict, Any, Optional
 import httpx  # noqa: F401 — kept at module top so tests can patch tools.web_tools.httpx
-# After the web-provider plugin migration (PR #25182), the Firecrawl SDK
-# proxy, client construction, and response-shape normalizers all live in
-# plugins.web.firecrawl.provider. We re-export the names that external
-# code, integration tests, and unit-test patches reach for so the public
-# surface stays stable.
-if TYPE_CHECKING:
-    from firecrawl import Firecrawl  # noqa: F401 — type hints only
+
+_web_config_snapshot: contextvars.ContextVar[dict] = contextvars.ContextVar(
+    "web_config_snapshot", default={}
+)
 from plugins.web.firecrawl.provider import (
-    Firecrawl,  # noqa: F401  # re-exported for tests that mock.patch("tools.web_tools.Firecrawl")
-    _firecrawl_backend_help_suffix,
-    _get_firecrawl_client,  # noqa: F401  # re-exported for tests that `from tools.web_tools import _get_firecrawl_client`
-    _get_firecrawl_gateway_url,
-    _is_tool_gateway_ready,
     check_firecrawl_api_key,
 )
 # Tavily helpers re-exported for backward-compat with existing unit tests
@@ -65,11 +55,8 @@ from plugins.web.tavily.provider import (  # noqa: F401 — backward-compat name
     _normalize_tavily_search_results,
     _tavily_request,
 )
-# Parallel + Exa clients re-exported for backward-compat with existing
-# unit tests (tests/tools/test_web_tools_config.py imports _get_parallel_client
-# / _get_async_parallel_client / _get_exa_client directly).
+# Parallel + Exa clients are imported for provider setup and tests.
 from plugins.web.parallel.provider import (  # noqa: F401 — backward-compat names
-    _get_async_parallel_client,
     _get_parallel_client,
 )
 from plugins.web.exa.provider import _get_exa_client  # noqa: F401
@@ -77,27 +64,11 @@ from plugins.web.exa.provider import _get_exa_client  # noqa: F401
 # Module-level cache slots for the per-vendor clients. The plugins read/write
 # these via tools.web_tools so unit tests that reset
 # ``tools.web_tools._<vendor>_client = None`` between cases keep working.
-_firecrawl_client: Optional[Any] = None
-_firecrawl_client_config: Optional[Any] = None
 _parallel_client: Optional[Any] = None
-_async_parallel_client: Optional[Any] = None
 _exa_client: Optional[Any] = None
 
 from tools.debug_helpers import DebugSession
-# Imported solely so unit tests can monkeypatch these names on
-# tools.web_tools (the firecrawl plugin reads them via its own import chain).
-from tools.managed_tool_gateway import (  # noqa: F401 — backward-compat names for tests
-    build_vendor_gateway_url,
-    peek_nous_access_token as _peek_nous_access_token,
-    read_nous_access_token as _read_nous_access_token,
-    resolve_managed_tool_gateway,
-)
-from tools.tool_backend_helpers import (  # noqa: F401
-    managed_nous_tools_enabled,
-    nous_tool_gateway_unavailable_message,
-    prefers_gateway,
-)
-from tools.url_safety import async_is_safe_url, normalize_url_for_request, sensitive_query_param_name
+from tools.url_safety import is_safe_url, normalize_url_for_request, sensitive_query_param_name
 import sys
 
 logger = logging.getLogger(__name__)
@@ -144,16 +115,22 @@ def _has_env(name: str) -> bool:
     return bool(_env_value(name))
 
 def _load_web_config() -> dict:
-    """Load the ``web:`` section from ~/.hermes/config.yaml."""
+    """Return settings captured at the current async tool boundary."""
+    return _web_config_snapshot.get()
+
+
+async def _refresh_web_config() -> dict:
     try:
-        from hermes_cli.config import load_config
-        # ``or {}``: a present-but-null ``web:`` section (YAML ``web:`` with no
-        # body) makes ``.get("web", {})`` return None, which would break every
-        # caller that does ``_load_web_config().get(...)``. Honor the ``-> dict``
-        # contract so callers never see None.
-        return load_config().get("web") or {}
-    except (ImportError, Exception):
-        return {}
+        from hermes_cli.config import load_config_readonly
+
+        config = await load_config_readonly()
+        web = config.get("web") or {} if isinstance(config, dict) else {}
+    except Exception:
+        web = {}
+    if not isinstance(web, dict):
+        web = {}
+    _web_config_snapshot.set(web)
+    return web
 
 
 # The built-in web backends whose availability is driven by hardcoded
@@ -232,18 +209,12 @@ def _get_backend() -> str:
         return configured
 
     # Fallback for manual / legacy config — pick the highest-priority
-    # available backend. Explicit user credentials (TAVILY_API_KEY etc.)
-    # beat the managed-tool-gateway probe so a deliberate setup is not
-    # pre-empted by a Nous OAuth token whose subscription tier may not
-    # actually grant web-search access (the gateway then fails at runtime
-    # with "no subscription" and the tool returns an error to the agent
-    # without falling back). Free-tier backends trail the paid ones.
+    # available backend. Free-tier backends trail the paid ones.
     backend_candidates = (
         ("tavily", _has_env("TAVILY_API_KEY")),
         ("exa", _has_env("EXA_API_KEY")),
         ("parallel", _has_env("PARALLEL_API_KEY")),
         ("firecrawl", _has_env("FIRECRAWL_API_KEY") or _has_env("FIRECRAWL_API_URL")),
-        ("firecrawl", _is_tool_gateway_ready()),
         ("searxng", _has_env("SEARXNG_URL")),
         ("brave-free", _has_env("BRAVE_SEARCH_API_KEY")),
         ("ddgs", _ddgs_package_importable()),
@@ -341,7 +312,7 @@ def _is_backend_available(backend: str) -> bool:
         return _ddgs_package_importable()
     if backend == "xai":
         # Cheap probe — env var OR auth.json has OAuth tokens. Must not
-        # call resolve_xai_http_credentials() here because the OAuth path
+        # await resolve_xai_http_credentials() here because the OAuth path
         # can trigger a network token refresh, and _is_backend_available
         # runs on every web_search dispatch + every `hermes tools` repaint.
         try:
@@ -366,38 +337,14 @@ def _ddgs_package_importable() -> bool:
     except ImportError:
         return False
 
-# ─── Firecrawl Client ────────────────────────────────────────────────────────
-
-# ─── Firecrawl Client ────────────────────────────────────────────────────────
-# After PR #25182, the firecrawl client, lazy SDK proxy, dual-auth config
-# resolution, response normalizers, and check_firecrawl_api_key() all live
-# in plugins.web.firecrawl.provider and are re-exported at the top of this
-# module so external callers (integration tests, tool-registry gating) and
-# unit tests that patch tools.web_tools.<name> continue to work.
-
-
 def _web_requires_env() -> list[str]:
-    """Return tool metadata env vars for the currently enabled web backends.
-
-    The gateway env vars are always reported — they're metadata strings
-    used by the tool registry to light up the tool when the variable is
-    set.  Gating them on ``managed_nous_tools_enabled()`` only saved
-    string noise in the metadata list, but cost a synchronous HTTP
-    refresh against the Nous portal on every CLI startup (invoked at
-    tool-registration time).  The behavioral contract is: if the env var
-    is set, the tool sees it; if not, it doesn't.  Not-logged-in users
-    simply don't have the vars set, so the extra entries are harmless.
-    """
+    """Return credential metadata for the bundled web backends."""
     return [
         "EXA_API_KEY",
         "PARALLEL_API_KEY",
         "TAVILY_API_KEY",
         "FIRECRAWL_API_KEY",
         "FIRECRAWL_API_URL",
-        "FIRECRAWL_GATEWAY_URL",
-        "TOOL_GATEWAY_DOMAIN",
-        "TOOL_GATEWAY_SCHEME",
-        "TOOL_GATEWAY_USER_TOKEN",
     ]
 
 
@@ -407,11 +354,8 @@ def _web_requires_env() -> list[str]:
 #   - parallel: plugins/web/parallel/provider.py
 #   - tavily:   plugins/web/tavily/provider.py
 #   - firecrawl: plugins/web/firecrawl/provider.py
-# The names from the firecrawl plugin (Firecrawl proxy, _get_firecrawl_client,
-# _to_plain_object, _normalize_result_list, _extract_web_search_results,
-# _extract_scrape_payload, _is_tool_gateway_ready, etc.) are re-exported at
-# the top of this module for backward-compat with integration tests and
-# unit-test patches.
+# Firecrawl credential checks are re-exported at the top of this module for
+# the setup flow.
 
 
 # Default budget (characters) of clean page text sent to the model. Pages at
@@ -477,7 +421,7 @@ def convert_base64_images_to_links(text: str) -> str:
     return out
 
 
-def _store_full_text(url: str, content: str) -> Optional[str]:
+async def _store_full_text(url: str, content: str) -> Optional[str]:
     """Write the full extracted page to cache/web and return its absolute path.
 
     The file is mounted read-only into remote backends (Docker/Modal/SSH) via
@@ -486,12 +430,14 @@ def _store_full_text(url: str, content: str) -> Optional[str]:
     (storage is best-effort; truncated content is still returned to the model).
     """
     try:
+        import aiofiles
+        import aiofiles.os
         import hashlib
         from urllib.parse import urlparse
         from hermes_constants import get_hermes_dir
 
         cache_dir = get_hermes_dir("cache/web", "web_cache")
-        cache_dir.mkdir(parents=True, exist_ok=True)
+        await aiofiles.os.makedirs(cache_dir, exist_ok=True)
 
         host = (urlparse(url).hostname or "page").replace(":", "_")
         slug = re.sub(r"[^A-Za-z0-9._-]", "-", host)[:60].strip("-") or "page"
@@ -506,14 +452,15 @@ def _store_full_text(url: str, content: str) -> Optional[str]:
                 + f"\n\n[... stored copy truncated at {MAX_STORED_TEXT_CHARS:,} chars "
                 f"of {len(content):,}; re-extract a more specific URL for the rest ...]"
             )
-        path.write_text(content, encoding="utf-8")
+        async with aiofiles.open(path, "w", encoding="utf-8") as handle:
+            await handle.write(content)
         return str(path)
     except Exception as exc:  # noqa: BLE001
         logger.debug("Failed to store full web_extract text for %s: %s", url, exc)
         return None
 
 
-def _truncate_with_footer(
+async def _truncate_with_footer(
     content: str,
     url: str,
     char_limit: int,
@@ -544,7 +491,7 @@ def _truncate_with_footer(
         tail = tail[nl + 1:]
 
     total = len(content)
-    stored_path = _store_full_text(url, content)
+    stored_path = await _store_full_text(url, content)
 
     footer_lines = [
         "",
@@ -615,7 +562,7 @@ def _ensure_web_plugins_loaded() -> None:
         logger.warning("Web plugin discovery failed (non-fatal): %s", exc)
 
 
-def web_search_tool(query: str, limit: int = 5) -> str:
+async def web_search_tool(query: str, limit: int = 5) -> str:
     """
     Search the web for information using available search API backend.
 
@@ -649,6 +596,8 @@ def web_search_tool(query: str, limit: int = 5) -> str:
     Raises:
         Exception: If search fails or API key is not set
     """
+    await _refresh_web_config()
+
     try:
         limit = int(limit)
     except (TypeError, ValueError):
@@ -674,7 +623,9 @@ def web_search_tool(query: str, limit: int = 5) -> str:
         # Dispatch through the web search registry. All 7 providers
         # (brave-free, ddgs, searxng, exa, parallel, tavily, firecrawl)
         # now live as plugins; the dispatcher is just a registry lookup +
-        # delegation. Sync only — every provider's search() is sync.
+        # delegation. Every provider is native async; sync implementations are
+        # rejected by the provider contract instead of being hidden behind a
+        # thread-pool compatibility bridge.
         _ensure_web_plugins_loaded()
         from agent.web_search_registry import (
             get_active_search_provider,
@@ -719,13 +670,20 @@ def web_search_tool(query: str, limit: int = 5) -> str:
                 "Web search via %s: '%s' (limit: %d)",
                 provider.name, query, limit,
             )
-            response_data = provider.search(query, limit)
+            import inspect
+
+            if not inspect.iscoroutinefunction(provider.search):
+                raise TypeError(
+                    f"Web search provider {provider.name!r} does not implement "
+                    "native async search()"
+                )
+            response_data = await provider.search(query, limit)
 
         debug_call_data["results_count"] = len(response_data.get("data", {}).get("web", []))
         result_json = json.dumps(response_data, indent=2, ensure_ascii=False)
         debug_call_data["final_response_size"] = len(result_json)
         _debug.log_call("web_search_tool", debug_call_data)
-        _debug.save()
+        await _debug.save()
         return result_json
 
     except Exception as e:
@@ -734,7 +692,7 @@ def web_search_tool(query: str, limit: int = 5) -> str:
 
         debug_call_data["error"] = error_msg
         _debug.log_call("web_search_tool", debug_call_data)
-        _debug.save()
+        await _debug.save()
 
         return tool_error(error_msg)
 
@@ -772,6 +730,8 @@ async def web_extract_tool(
     Raises:
         Exception: If extraction fails or API key is not set
     """
+    await _refresh_web_config()
+
     # Block URLs containing embedded secrets (exfiltration prevention).
     # URL-decode first so percent-encoded secrets (%73k- = sk-) are caught.
     from agent.redact import _PREFIX_RE
@@ -841,7 +801,7 @@ async def web_extract_tool(
         safe_indices = []
         ssrf_blocked: Dict[int, Dict[str, Any]] = {}
         for index, url in zip(normalized_indices, normalized_urls):
-            if not await async_is_safe_url(url):
+            if not await is_safe_url(url):
                 ssrf_blocked[index] = {
                     "url": url, "title": "", "content": "",
                     "error": "Blocked: URL targets a private or internal network address",
@@ -858,11 +818,9 @@ async def web_extract_tool(
 
             # All seven providers (brave-free, ddgs, searxng, exa, parallel,
             # tavily, firecrawl) now live as plugins. The dispatcher is a
-            # registry lookup + delegation. Some providers' extract() is
-            # async (parallel, firecrawl), others sync (exa, tavily) — we
-            # detect coroutine functions and await; sync functions run
-            # inline (the policy gate, SSRF re-check, etc. live inside the
-            # provider itself for the firecrawl per-URL loop).
+            # registry lookup + delegation. Every provider implements the
+            # native async extract contract; a sync SDK implementation is
+            # rejected instead of hidden behind a worker thread.
             _ensure_web_plugins_loaded()
             from agent.web_search_registry import (
                 get_active_extract_provider,
@@ -930,17 +888,14 @@ async def web_extract_tool(
                 "Web extract via %s: %d URL(s)", provider.name, len(safe_urls)
             )
 
-            # Async-or-sync dispatch: parallel + firecrawl have async
-            # extract(); exa + tavily are sync.
             import inspect
-            if inspect.iscoroutinefunction(provider.extract):
-                results = await provider.extract(safe_urls, format=format)
-            else:
-                # Run sync extract() in a thread so we don't block the
-                # event loop on network I/O.
-                results = await asyncio.to_thread(
-                    provider.extract, safe_urls, format=format
+
+            if not inspect.iscoroutinefunction(provider.extract):
+                raise TypeError(
+                    f"Web extract provider {provider.name!r} does not implement "
+                    "native async extract()"
                 )
+            results = await provider.extract(safe_urls, format=format)
 
         # Reconstruct the original input order across invalid, blocked, and
         # provider-processed entries. Providers are expected to preserve the
@@ -989,7 +944,9 @@ async def web_extract_tool(
             if not raw_content:
                 continue
             clean = convert_base64_images_to_links(raw_content)
-            model_text, truncated = _truncate_with_footer(clean, url, effective_char_limit)
+            model_text, truncated = await _truncate_with_footer(
+                clean, url, effective_char_limit
+            )
             result["content"] = model_text
             if truncated:
                 debug_call_data["pages_truncated"] += 1
@@ -1030,7 +987,7 @@ async def web_extract_tool(
         
         # Log debug information
         _debug.log_call("web_extract_tool", debug_call_data)
-        _debug.save()
+        await _debug.save()
         
         return cleaned_result
             
@@ -1040,7 +997,7 @@ async def web_extract_tool(
         
         debug_call_data["error"] = error_msg
         _debug.log_call("web_extract_tool", debug_call_data)
-        _debug.save()
+        await _debug.save()
         
         return tool_error(error_msg)
 
@@ -1093,7 +1050,6 @@ if __name__ == "__main__":
 
     # Check if API keys are available
     web_available = check_web_api_key()
-    tool_gateway_available = _is_tool_gateway_ready()
     from hermes_cli.config import get_env_value as _gev
     firecrawl_key_available = bool((_gev("FIRECRAWL_API_KEY") or "").strip())
     firecrawl_url_available = bool((_gev("FIRECRAWL_API_URL") or "").strip())
@@ -1117,15 +1073,13 @@ if __name__ == "__main__":
             print(f"   Using self-hosted Firecrawl: {(_gev('FIRECRAWL_API_URL') or '').strip().rstrip('/')}")
         elif firecrawl_key_available:
             print("   Using direct Firecrawl cloud API")
-        elif tool_gateway_available:
-            print(f"   Using Firecrawl tool-gateway: {_get_firecrawl_gateway_url()}")
         else:
             print("   Firecrawl backend selected but not configured")
     else:
         print("❌ No web search backend configured")
         print(
-            "Set EXA_API_KEY, PARALLEL_API_KEY, TAVILY_API_KEY, FIRECRAWL_API_KEY, FIRECRAWL_API_URL"
-            f"{_firecrawl_backend_help_suffix()}"
+            "Set EXA_API_KEY, PARALLEL_API_KEY, TAVILY_API_KEY, "
+            "FIRECRAWL_API_KEY, or FIRECRAWL_API_URL"
         )
 
     if not web_available:
@@ -1210,11 +1164,30 @@ WEB_EXTRACT_SCHEMA = {
     }
 }
 
+
+async def _handle_web_search(args: dict, **_kwargs) -> str:
+    """Adapt the registry argument object to the public search function."""
+    return await web_search_tool(
+        args.get("query", ""),
+        limit=args.get("limit", 5),
+    )
+
+
+async def _handle_web_extract(args: dict, **_kwargs) -> str:
+    """Adapt the registry argument object to the public extract function."""
+    urls = args.get("urls")
+    return await web_extract_tool(
+        urls[:5] if isinstance(urls, list) else [],
+        "markdown",
+        char_limit=args.get("char_limit"),
+    )
+
+
 registry.register(
     name="web_search",
     toolset="web",
     schema=WEB_SEARCH_SCHEMA,
-    handler=lambda args, **kw: web_search_tool(args.get("query", ""), limit=args.get("limit", 5)),
+    handler=_handle_web_search,
     check_fn=check_web_api_key,
     requires_env=_web_requires_env(),
     emoji="🔍",
@@ -1224,14 +1197,9 @@ registry.register(
     name="web_extract",
     toolset="web",
     schema=WEB_EXTRACT_SCHEMA,
-    handler=lambda args, **kw: web_extract_tool(
-        args.get("urls", [])[:5] if isinstance(args.get("urls"), list) else [],
-        "markdown",
-        char_limit=args.get("char_limit"),
-    ),
+    handler=_handle_web_extract,
     check_fn=check_web_api_key,
     requires_env=_web_requires_env(),
-    is_async=True,
     emoji="📄",
     max_result_size_chars=100_000,
 )

@@ -10,6 +10,8 @@ full summaries verbatim into the parent.
 import os
 import tempfile
 
+import aiofiles
+import aiofiles.os
 import pytest
 
 import tools.delegate_tool as dt
@@ -27,19 +29,21 @@ class _FakeParent:
         self.session_prompt_tokens = used_tokens
 
 
-def test_small_summaries_pass_through_untouched():
+@pytest.mark.asyncio
+async def test_small_summaries_pass_through_untouched():
     parent = _FakeParent(context_length=200_000, used_tokens=10_000, max_tokens=8_000)
     results = [
         {"task_index": 0, "summary": "short result A", "status": "completed"},
         {"task_index": 1, "summary": "short result B", "status": "completed"},
     ]
-    dt._apply_summary_budget(results, parent)
+    await dt._apply_summary_budget(results, parent)
     assert results[0]["summary"] == "short result A"
     assert "summary_truncated" not in results[0]
     assert "summary_truncated" not in results[1]
 
 
-def test_batch_overflow_trimmed_and_spilled_losslessly(monkeypatch):
+@pytest.mark.asyncio
+async def test_batch_overflow_trimmed_and_spilled_losslessly(monkeypatch):
     # Isolate spill directory to a temp HERMES_HOME.
     with tempfile.TemporaryDirectory() as td:
         monkeypatch.setenv("HERMES_HOME", os.path.join(td, ".hermes"))
@@ -50,7 +54,7 @@ def test_batch_overflow_trimmed_and_spilled_losslessly(monkeypatch):
         results = [
             {"task_index": i, "summary": big, "status": "completed"} for i in range(5)
         ]
-        dt._apply_summary_budget(results, parent)
+        await dt._apply_summary_budget(results, parent)
         for r in results:
             assert r["summary_truncated"] is True
             assert len(r["summary"]) < len(big)
@@ -58,10 +62,10 @@ def test_batch_overflow_trimmed_and_spilled_losslessly(monkeypatch):
             assert "HEAD_MARKER" in r["summary"]
             assert "TAIL_MARKER" in r["summary"]
             path = r.get("summary_full_path")
-            assert path and os.path.exists(path)
+            assert path and await aiofiles.os.path.exists(path)
             # The spill file holds the FULL original text — nothing is lost.
-            with open(path, encoding="utf-8") as fh:
-                assert fh.read() == big
+            async with aiofiles.open(path, encoding="utf-8") as handle:
+                assert await handle.read() == big
             # The footer points the parent at the full version with an offset.
             assert "read_file" in r["summary"]
             assert "offset=" in r["summary"]
@@ -69,10 +73,11 @@ def test_batch_overflow_trimmed_and_spilled_losslessly(monkeypatch):
             assert os.path.join("cache", "delegation") in path
 
 
-def test_empty_results_is_noop():
+@pytest.mark.asyncio
+async def test_empty_results_is_noop():
     # No summaries → nothing to do, must not raise.
-    dt._apply_summary_budget([], _FakeParent(131_000, 1_000, 8_000))
-    dt._apply_summary_budget(
+    await dt._apply_summary_budget([], _FakeParent(131_000, 1_000, 8_000))
+    await dt._apply_summary_budget(
         [{"task_index": 0, "status": "failed", "summary": None}],
         _FakeParent(131_000, 1_000, 8_000),
     )

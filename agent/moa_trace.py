@@ -29,12 +29,15 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
+import aiofiles
+import aiofiles.os
+
 from hermes_constants import get_hermes_home
 
 logger = logging.getLogger(__name__)
 
 
-def _traces_enabled_and_dir() -> Optional[Path]:
+async def _traces_enabled_and_dir() -> Optional[Path]:
     """Return the trace directory if ``moa.save_traces`` is on, else None.
 
     Reads config lazily per call (config is cheap to load and this only runs on
@@ -42,9 +45,9 @@ def _traces_enabled_and_dir() -> Optional[Path]:
     ``moa.trace_dir`` overrides the default ``<hermes_home>/moa-traces/``.
     """
     try:
-        from hermes_cli.config import load_config
+        from hermes_cli.config import load_config_readonly
 
-        moa_cfg = (load_config() or {}).get("moa") or {}
+        moa_cfg = (await load_config_readonly() or {}).get("moa") or {}
     except Exception:  # pragma: no cover - defensive: never break a turn over tracing
         return None
     if not moa_cfg.get("save_traces"):
@@ -94,7 +97,7 @@ def _slot_trace(acct: Any, label: str) -> dict[str, Any]:
     }
 
 
-def save_moa_turn(
+async def save_moa_turn(
     *,
     session_id: Optional[str],
     preset_name: str,
@@ -120,11 +123,11 @@ def save_moa_turn(
     that resolved text was unavailable, it falls back to None and the record
     points at the session store via ``output_location``.
     """
-    base = _traces_enabled_and_dir()
+    base = await _traces_enabled_and_dir()
     if base is None:
         return
     try:
-        base.mkdir(parents=True, exist_ok=True)
+        await aiofiles.os.makedirs(base, exist_ok=True)
         path = base / f"{_sanitize_session_id(session_id)}.jsonl"
         # output_location tells an offline reader where the acting text lives:
         # embedded here when we have it (both non-streaming inline capture and
@@ -161,7 +164,7 @@ def save_moa_turn(
                 "output_location": _output_location,
             },
         }
-        with path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+        async with aiofiles.open(path, "a", encoding="utf-8") as handle:
+            await handle.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
     except Exception as exc:  # pragma: no cover - tracing must never break a turn
         logger.debug("MoA trace write failed (session=%s): %s", session_id, exc)

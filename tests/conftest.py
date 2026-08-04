@@ -168,7 +168,6 @@ _CREDENTIAL_NAMES = frozenset({
     "FEISHU_APP_SECRET",
     "FEISHU_ENCRYPT_KEY",
     "FEISHU_VERIFICATION_TOKEN",
-    "DINGTALK_CLIENT_SECRET",
     "QQ_CLIENT_SECRET",
     "QQ_STT_API_KEY",
     "WECOM_SECRET",
@@ -182,7 +181,6 @@ _CREDENTIAL_NAMES = frozenset({
     "SUDO_PASSWORD",
     "GATEWAY_PROXY_KEY",
     "API_SERVER_KEY",
-    "TOOL_GATEWAY_USER_TOKEN",
     "TELEGRAM_WEBHOOK_SECRET",
     "WEBHOOK_SECRET",
     "AI_GATEWAY_API_KEY",
@@ -308,7 +306,6 @@ _HERMES_BEHAVIORAL_VARS = frozenset({
     "SMS_ALLOWED_USERS",
     "MATTERMOST_ALLOWED_USERS",
     "MATRIX_ALLOWED_USERS",
-    "DINGTALK_ALLOWED_USERS",
     "FEISHU_ALLOWED_USERS",
     "WECOM_ALLOWED_USERS",
     "PHOTON_ALLOWED_USERS",
@@ -353,9 +350,6 @@ _HERMES_BEHAVIORAL_VARS = frozenset({
     "MATRIX_HOME_CHANNEL",
     "MATRIX_HOME_CHANNEL_THREAD_ID",
     "MATRIX_HOME_CHANNEL_NAME",
-    "DINGTALK_HOME_CHANNEL",
-    "DINGTALK_HOME_CHANNEL_THREAD_ID",
-    "DINGTALK_HOME_CHANNEL_NAME",
     "FEISHU_HOME_CHANNEL",
     "FEISHU_HOME_CHANNEL_THREAD_ID",
     "FEISHU_HOME_CHANNEL_NAME",
@@ -393,7 +387,6 @@ _HERMES_BEHAVIORAL_VARS = frozenset({
     "DISCORD_FREE_RESPONSE_CHANNELS",
     "TELEGRAM_REQUIRE_MENTION",
     "WHATSAPP_REQUIRE_MENTION",
-    "DINGTALK_REQUIRE_MENTION",
     "MATRIX_REQUIRE_MENTION",
 })
 
@@ -546,10 +539,13 @@ def _neutralize_macos_keychain_creds(request, monkeypatch):
     except Exception:
         return None
 
+    async def no_keychain_credentials(*_args, **_kwargs):
+        return None
+
     monkeypatch.setattr(
         _anthropic_adapter,
         "_read_claude_code_credentials_from_keychain",
-        lambda *_args, **_kwargs: None,
+        no_keychain_credentials,
         raising=False,
     )
     return None
@@ -1414,38 +1410,3 @@ def _audio_playback_guard(request, monkeypatch):
         monkeypatch.setattr(_voice, "play_audio_file", _blocked_play_audio_file)
 
     yield
-
-
-@pytest.fixture(autouse=True)
-def _isolate_computer_use_approval_state():
-    """Reset computer-use approval globals after every test.
-
-    ``tools.computer_use.tool`` keeps three module-globals for the CLI
-    approval flow: ``_approval_callback`` (set by the CLI console on init)
-    plus the per-session unlock stores ``_always_allow`` /
-    ``_session_auto_approve``. A test that installs a callback — or drives
-    CLI init far enough that the real one is registered — and does not reset
-    it poisons every later computer-use test in the same process:
-
-    * a leaked callback that raises (dead UI/queue infra, or a stale
-      two-argument signature — the real contract is ``(action, args,
-      summary)``) turns into ``verdict = "deny"`` in ``_request_approval``,
-      so dispatch tests fail with an empty backend call list;
-    * a leaked callback that blocks (the real CLI one waits on an answer
-      queue) hangs the whole single-process run forever — pytest-timeout is
-      the only thing that can cut it.
-
-    Both symptoms are order-dependent: the affected files pass in isolation
-    and only fail in full-suite runs. Teardown-only, so tests that install
-    their own callback keep it for their own duration.
-    """
-    yield
-    try:
-        from tools.computer_use import tool as _cu_tool
-
-        _cu_tool.set_approval_callback(None)
-        with _cu_tool._approval_lock:
-            _cu_tool._always_allow.clear()
-            _cu_tool._session_auto_approve.clear()
-    except Exception:
-        pass

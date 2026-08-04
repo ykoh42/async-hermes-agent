@@ -9,16 +9,19 @@ from __future__ import annotations
 
 import re
 
+import pytest
+
 import tools.web_tools as wt
 
 
-def test_store_full_text_is_bounded(tmp_path, monkeypatch):
+@pytest.mark.asyncio
+async def test_store_full_text_is_bounded(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     # Force the cache dir under the temp home.
     from hermes_constants import get_hermes_dir  # noqa: F401
     huge = "x\n" * (wt.MAX_STORED_TEXT_CHARS)  # > MAX_STORED_TEXT_CHARS chars
     assert len(huge) > wt.MAX_STORED_TEXT_CHARS
-    path = wt._store_full_text("https://example.com/big", huge)
+    path = await wt._store_full_text("https://example.com/big", huge)
     assert path is not None
     stored = open(path, encoding="utf-8").read()
     # Stored copy capped (+ short marker), not the full unbounded blob.
@@ -26,10 +29,11 @@ def test_store_full_text_is_bounded(tmp_path, monkeypatch):
     assert "stored copy truncated" in stored
 
 
-def test_small_page_not_truncated_no_footer(tmp_path, monkeypatch):
+@pytest.mark.asyncio
+async def test_small_page_not_truncated_no_footer(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     content = "short page\nwith a few lines\n"
-    model_text, truncated = wt._truncate_with_footer(
+    model_text, truncated = await wt._truncate_with_footer(
         content, "https://example.com/s", char_limit=15000
     )
     assert not truncated

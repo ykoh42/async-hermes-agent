@@ -71,8 +71,6 @@ def docker_container_info():
         "exec_user": "hermes",
         "hermes_bin": "/data/current-package/bin/hermes",
     }
-
-
 @pytest.fixture
 def podman_container_info():
     return {
@@ -81,37 +79,5 @@ def podman_container_info():
         "exec_user": "hermes",
         "hermes_bin": "/data/current-package/bin/hermes",
     }
-
-
-def test_exec_in_container_calls_execvp(docker_container_info):
-    """Verifies os.execvp is called with correct args: runtime, tty flags,
-    user, env vars, container name, binary, and CLI args."""
-    from hermes_cli.main import _exec_in_container
-
-    with patch("shutil.which", return_value="/usr/bin/docker"), \
-         patch("subprocess.run") as mock_run, \
-         patch("sys.stdin") as mock_stdin, \
-         patch("os.execvp") as mock_execvp, \
-         patch.dict(os.environ, {"TERM": "xterm-256color", "LANG": "en_US.UTF-8"},
-                    clear=False):
-        mock_stdin.isatty.return_value = True
-        mock_run.return_value = MagicMock(returncode=0)
-
-        _exec_in_container(docker_container_info, ["chat", "-m", "opus"])
-
-    mock_execvp.assert_called_once()
-    cmd = mock_execvp.call_args[0][1]
-    assert cmd[0] == "/usr/bin/docker"
-    assert cmd[1] == "exec"
-    assert "-it" in cmd
-    idx_u = cmd.index("-u")
-    assert cmd[idx_u + 1] == "hermes"
-    e_indices = [i for i, v in enumerate(cmd) if v == "-e"]
-    e_values = [cmd[i + 1] for i in e_indices]
-    assert "TERM=xterm-256color" in e_values
-    assert "LANG=en_US.UTF-8" in e_values
-    assert "hermes-agent" in cmd
-    assert "/data/current-package/bin/hermes" in cmd
-    assert "chat" in cmd
 
 

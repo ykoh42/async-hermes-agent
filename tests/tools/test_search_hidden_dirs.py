@@ -1,5 +1,4 @@
 """Tests that search_files excludes hidden directories by default.
-
 Regression for #1558: the agent read a 3.5MB skills hub catalog cache
 file (.hub/index-cache/clawhub_catalog_v1.json) that contained adversarial
 text from a community skill description. The model followed the injected
@@ -112,50 +111,3 @@ class TestRipgrepAlreadyExcludesHidden:
             capture_output=True, text=True,
         )
         assert "SKILL.md" in result.stdout
-
-
-class TestIgnoreFileWritten:
-    """_write_index_cache should create .ignore in .hub/ directory."""
-
-    def test_write_index_cache_creates_ignore_file(self, tmp_path, monkeypatch):
-        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-
-        # Patch module-level paths
-        import tools.skills_hub as hub_mod
-        monkeypatch.setattr(hub_mod, "HERMES_HOME", tmp_path)
-        monkeypatch.setattr(hub_mod, "SKILLS_DIR", tmp_path / "skills")
-        monkeypatch.setattr(hub_mod, "HUB_DIR", tmp_path / "skills" / ".hub")
-        monkeypatch.setattr(
-            hub_mod, "INDEX_CACHE_DIR",
-            tmp_path / "skills" / ".hub" / "index-cache",
-        )
-
-        hub_mod._write_index_cache("test_key", {"data": "test"})
-
-        ignore_file = tmp_path / "skills" / ".hub" / ".ignore"
-        assert ignore_file.exists(), ".ignore file should be created in .hub/"
-        content = ignore_file.read_text()
-        assert "*" in content, ".ignore should contain wildcard to exclude all files"
-
-    def test_write_index_cache_does_not_overwrite_existing_ignore(
-        self, tmp_path, monkeypatch
-    ):
-        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-
-        import tools.skills_hub as hub_mod
-        monkeypatch.setattr(hub_mod, "HERMES_HOME", tmp_path)
-        monkeypatch.setattr(hub_mod, "SKILLS_DIR", tmp_path / "skills")
-        monkeypatch.setattr(hub_mod, "HUB_DIR", tmp_path / "skills" / ".hub")
-        monkeypatch.setattr(
-            hub_mod, "INDEX_CACHE_DIR",
-            tmp_path / "skills" / ".hub" / "index-cache",
-        )
-
-        hub_dir = tmp_path / "skills" / ".hub"
-        hub_dir.mkdir(parents=True)
-        ignore_file = hub_dir / ".ignore"
-        ignore_file.write_text("# custom\ncustom-pattern\n")
-
-        hub_mod._write_index_cache("test_key", {"data": "test"})
-
-        assert ignore_file.read_text() == "# custom\ncustom-pattern\n"

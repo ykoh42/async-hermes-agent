@@ -11,6 +11,7 @@ Auth supports:
 """
 
 import copy
+import asyncio
 import json
 import logging
 import os
@@ -21,6 +22,10 @@ import subprocess
 from pathlib import Path
 from urllib.parse import urlparse
 
+import aiofiles
+import aiofiles.os
+import httpx
+
 from hermes_constants import get_hermes_home
 from typing import Any, Dict, List, Optional, Tuple
 from utils import base_url_host_matches, base_url_hostname, normalize_proxy_env_vars
@@ -28,14 +33,9 @@ from agent.secret_scope import get_secret as _get_secret
 
 
 def _getenv(name: str, default: str = "") -> str:
-    """Profile-scoped replacement for os.getenv on credential reads.
-
-    Routes through the secret scope (Workstream A): identical to os.getenv
-    when multiplexing is off, scope-aware (and fail-closed on an unscoped
-    read) when on. Mirrors the same wrapper in hermes_cli/runtime_provider.py.
-    """
-    val = _get_secret(name, default)
-    return val if val is not None else default
+    """Profile-scoped credential lookup with legacy single-profile semantics."""
+    value = _get_secret(name, default)
+    return value if value is not None else default
 
 # NOTE: `import anthropic` is deliberately NOT at module top — the SDK pulls
 # ~220 ms of imports (anthropic.types, anthropic.lib.tools._beta_runner, etc.)
@@ -50,14 +50,6 @@ def _get_anthropic_sdk():
     """Return the ``anthropic`` SDK module, importing lazily. None if not installed."""
     global _anthropic_sdk
     if _anthropic_sdk is ...:
-        try:
-            from tools.lazy_deps import ensure as _lazy_ensure
-            _lazy_ensure("provider.anthropic", prompt=False)
-        except ImportError:
-            pass
-        except Exception:
-            # FeatureUnavailable — fall through to ImportError handling below
-            pass
         try:
             import anthropic as _sdk
             _anthropic_sdk = _sdk
@@ -701,77 +693,19 @@ def _build_anthropic_client_with_bearer_hook(
     *,
     drop_context_1m_beta: bool = False,
 ):
-    """Anthropic-on-Foundry Entra ID variant of :func:`build_anthropic_client`.
+    """Reject the legacy synchronous Entra bearer transport.
 
-    Anthropic SDK 0.86.0 stores ``api_key`` / ``auth_token`` as static
-    strings; there is no callable-token contract. To get per-request
-    bearer refresh (Microsoft's documented Foundry pattern), we hand
-    the SDK a custom ``httpx.Client`` whose request event hook mints a
-    fresh JWT from the Entra credential chain and rewrites
-    ``Authorization: Bearer <jwt>`` on every outbound request. The SDK
-    ignores its own auth logic when ``http_client`` is provided (the
-    hook strips any pre-set Authorization).
-
-    The placeholder ``auth_token`` is required because the SDK raises
-    ``AnthropicError`` at construction if neither ``api_key`` nor
-    ``auth_token`` is set — but the hook overrides it per-request so
-    the placeholder value never reaches Azure.
+    The previous implementation built a synchronous ``httpx.Client`` and a
+    synchronous ``anthropic.Anthropic`` instance. Keeping that path behind a
+    coroutine API would silently block the event loop, so Entra bearer auth is
+    explicitly unsupported until an async credential transport is available.
+    Static API keys continue through :class:`AsyncAnthropic`.
     """
-    _anthropic_sdk = _get_anthropic_sdk()
-    if _anthropic_sdk is None:
-        raise ImportError(
-            "The 'anthropic' package is required for Azure Foundry Anthropic-style "
-            "endpoints with Entra ID auth. Install with: pip install 'anthropic>=0.39.0'"
-        )
-
-    normalize_proxy_env_vars()
-
-    from httpx import Timeout
-    from agent.azure_identity_adapter import build_bearer_http_client
-
-    _read_timeout = timeout if (isinstance(timeout, (int, float)) and timeout > 0) else 900.0
-    timeout_obj = Timeout(timeout=float(_read_timeout), connect=10.0)
-
-    # Strip any trailing /v1 — the Anthropic SDK appends /v1/messages.
-    normalized_base_url = _normalize_base_url_text(base_url)
-    if normalized_base_url:
-        import re as _re
-        normalized_base_url = _re.sub(r"/v1/?$", "", normalized_base_url.rstrip("/"))
-
-    http_client = build_bearer_http_client(token_provider, timeout=timeout_obj)
-
-    kwargs = {
-        "timeout": timeout_obj,
-        "http_client": http_client,
-        # Delegate retry to hermes's outer loop (honors Retry-After); the SDK
-        # default max_retries=2 ignores it and double-retries. (#26293)
-        "max_retries": 0,
-        # The SDK requires *something* for api_key/auth_token. Our
-        # event hook overrides Authorization per request so this value
-        # is never sent. The sentinel string makes accidental leaks
-        # diagnosable in logs.
-        "auth_token": "entra-id-bearer-via-http-hook",
-    }
-
-    if normalized_base_url:
-        if _is_azure_anthropic_endpoint(normalized_base_url) and "api-version" not in normalized_base_url:
-            kwargs["base_url"] = normalized_base_url
-            kwargs["default_query"] = {"api-version": "2025-04-15"}
-        else:
-            kwargs["base_url"] = normalized_base_url
-
-    common_betas = _common_betas_for_base_url(
-        normalized_base_url,
-        drop_context_1m_beta=drop_context_1m_beta,
+    raise RuntimeError(
+        "Azure Foundry Anthropic Entra ID requires a native async bearer "
+        "transport; the legacy synchronous token hook is disabled. Use a "
+        "static API key or an async-compatible provider transport."
     )
-    if common_betas:
-        kwargs["default_headers"] = {"anthropic-beta": ",".join(common_betas)}
-
-    client = _anthropic_sdk.Anthropic(**kwargs)
-    # Same env-inference trap as build_anthropic_client: auth_token-only
-    # construction would otherwise also send ANTHROPIC_API_KEY as X-Api-Key.
-    client.api_key = None
-    return client
 
 
 def build_anthropic_client(
@@ -787,12 +721,9 @@ def build_anthropic_client(
 
     * a static ``str`` — the historical contract for all key-based and
       OAuth flows.
-    * a ``Callable[[], str]`` — an Entra ID bearer token provider from
-      :mod:`agent.azure_identity_adapter`. The Anthropic SDK itself
-      requires a static string, so when given a callable we construct
-      a custom ``httpx.Client`` with a request event hook that mints a
-      fresh JWT per outbound request and rewrites the ``Authorization``
-      header. The SDK never sees the callable directly.
+    * a ``Callable[[], str]`` — currently rejected because the old bearer
+      hook requires a synchronous Anthropic client and would block the async
+      runtime. This fails fast instead of silently falling back to a thread.
 
     If *timeout* is provided it overrides the default 900s read timeout.  The
     connect timeout stays at 10s.  Callers pass this from the per-provider /
@@ -806,7 +737,8 @@ def build_anthropic_client(
     its default on fresh clients so 1M-capable subscriptions keep the
     capability.
 
-    Returns an anthropic.Anthropic instance.
+    The Hermes runtime is coroutine-native, so this function always returns
+    an ``anthropic.AsyncAnthropic`` instance.
     """
     _anthropic_sdk = _get_anthropic_sdk()
     if _anthropic_sdk is None:
@@ -815,8 +747,8 @@ def build_anthropic_client(
             "Install it with: pip install 'anthropic>=0.39.0'"
         )
 
-    # Callable api_key → Entra ID bearer provider path. Delegated to a
-    # helper so the existing static-key code below stays unchanged.
+    # Callable api_key → Entra ID bearer provider path. Do not construct a
+    # synchronous SDK client from the async runtime.
     if callable(api_key) and not isinstance(api_key, str):
         return _build_anthropic_client_with_bearer_hook(
             api_key, base_url, timeout,
@@ -900,7 +832,13 @@ def build_anthropic_client(
         if common_betas:
             kwargs["default_headers"] = {"anthropic-beta": ",".join(common_betas)}
 
-    client = _anthropic_sdk.Anthropic(**kwargs)
+    client_class = getattr(_anthropic_sdk, "AsyncAnthropic", None)
+    if client_class is None:
+        raise ImportError(
+            "The installed 'anthropic' package does not provide "
+            "AsyncAnthropic; upgrade it before using Hermes's async runtime."
+        )
+    client = client_class(**kwargs)
     # Bearer-only construction leaves ``api_key`` unset, so the SDK fills it
     # from ``ANTHROPIC_API_KEY`` (Hermes loads that into the process env from
     # ``~/.hermes/.env``). The result is dual auth —
@@ -941,7 +879,13 @@ def build_anthropic_bedrock_client(region: str):
         )
     from httpx import Timeout
 
-    return _anthropic_sdk.AnthropicBedrock(
+    client_class = getattr(_anthropic_sdk, "AsyncAnthropicBedrock", None)
+    if client_class is None:
+        raise ImportError(
+            "The installed 'anthropic' package does not provide "
+            "AsyncAnthropicBedrock; upgrade it before using Hermes's async runtime."
+        )
+    return client_class(
         aws_region=region,
         timeout=Timeout(timeout=900.0, connect=10.0),
         # Delegate retry to hermes's outer loop (honors Retry-After); the SDK
@@ -951,130 +895,78 @@ def build_anthropic_bedrock_client(region: str):
     )
 
 
-def _read_claude_code_credentials_from_keychain() -> Optional[Dict[str, Any]]:
-    """Read Claude Code OAuth credentials from the macOS Keychain.
 
-    Claude Code >=2.1.114 stores credentials in the macOS Keychain under the
-    service name "Claude Code-credentials" rather than (or in addition to)
-    the JSON file at ~/.claude/.credentials.json.
-
-    The password field contains a JSON string with the same claudeAiOauth
-    structure as the JSON file.
-
-    Returns dict with {accessToken, refreshToken?, expiresAt?} or None.
-    """
+async def _read_claude_code_credentials_from_keychain() -> Optional[Dict[str, Any]]:
+    """Read Claude Code OAuth credentials from macOS Keychain asynchronously."""
     if platform.system() != "Darwin":
         return None
-
     try:
-        # Read the "Claude Code-credentials" generic password entry
-        result = subprocess.run(
-            ["security", "find-generic-password",
-             "-s", "Claude Code-credentials",
-             "-w"],
-            capture_output=True,
-            text=True, encoding='utf-8', errors='replace',
-            timeout=5,
-            stdin=subprocess.DEVNULL,
+        process = await asyncio.create_subprocess_exec(
+            "security",
+            "find-generic-password",
+            "-s",
+            "Claude Code-credentials",
+            "-w",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
         )
-    except (OSError, subprocess.TimeoutExpired):
+        stdout, _ = await asyncio.wait_for(process.communicate(), timeout=5)
+    except (OSError, TimeoutError):
         logger.debug("Keychain: security command not available or timed out")
         return None
-
-    if result.returncode != 0:
-        logger.debug("Keychain: no entry found for 'Claude Code-credentials'")
+    if process.returncode != 0:
         return None
-
-    raw = result.stdout.strip()
-    if not raw:
-        return None
-
     try:
-        data = json.loads(raw)
+        data = json.loads(stdout.decode("utf-8", errors="replace").strip())
     except json.JSONDecodeError:
         logger.debug("Keychain: credentials payload is not valid JSON")
         return None
-
-    oauth_data = data.get("claudeAiOauth")
-    if oauth_data and isinstance(oauth_data, dict):
-        access_token = oauth_data.get("accessToken", "")
-        if access_token:
-            return {
-                "accessToken": access_token,
-                "refreshToken": oauth_data.get("refreshToken", ""),
-                "expiresAt": oauth_data.get("expiresAt", 0),
-                "source": "macos_keychain",
-            }
-
-    return None
-
-
-def _read_claude_code_credentials_from_file() -> Optional[Dict[str, Any]]:
-    """Read Claude Code OAuth credentials from ~/.claude/.credentials.json.
-
-    Returns dict with {accessToken, refreshToken?, expiresAt?, source} or None.
-    """
-    cred_path = Path.home() / ".claude" / ".credentials.json"
-    if not cred_path.exists():
-        return None
-    try:
-        data = json.loads(cred_path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError, IOError) as e:
-        logger.debug("Failed to read ~/.claude/.credentials.json: %s", e)
-        return None
-
-    oauth_data = data.get("claudeAiOauth")
-    if not (oauth_data and isinstance(oauth_data, dict)):
-        return None
-    access_token = oauth_data.get("accessToken", "")
-    if not access_token:
+    oauth_data = data.get("claudeAiOauth") if isinstance(data, dict) else None
+    if not isinstance(oauth_data, dict) or not oauth_data.get("accessToken"):
         return None
     return {
-        "accessToken": access_token,
+        "accessToken": oauth_data["accessToken"],
+        "refreshToken": oauth_data.get("refreshToken", ""),
+        "expiresAt": oauth_data.get("expiresAt", 0),
+        "source": "macos_keychain",
+    }
+
+
+async def _read_claude_code_credentials_from_file() -> Optional[Dict[str, Any]]:
+    """Read Claude Code OAuth credentials from its JSON file asynchronously."""
+    cred_path = Path.home() / ".claude" / ".credentials.json"
+    if not await aiofiles.os.path.exists(cred_path):
+        return None
+    try:
+        async with aiofiles.open(cred_path, encoding="utf-8") as handle:
+            data = json.loads(await handle.read())
+    except (json.JSONDecodeError, OSError, IOError) as exc:
+        logger.debug("Failed to read ~/.claude/.credentials.json: %s", exc)
+        return None
+    oauth_data = data.get("claudeAiOauth") if isinstance(data, dict) else None
+    if not isinstance(oauth_data, dict) or not oauth_data.get("accessToken"):
+        return None
+    return {
+        "accessToken": oauth_data["accessToken"],
         "refreshToken": oauth_data.get("refreshToken", ""),
         "expiresAt": oauth_data.get("expiresAt", 0),
         "source": "claude_code_credentials_file",
     }
 
 
-def read_claude_code_credentials() -> Optional[Dict[str, Any]]:
-    """Read refreshable Claude Code OAuth credentials.
-
-    Reads from two possible sources and reconciles them:
-      1. macOS Keychain (Darwin only) — "Claude Code-credentials" entry
-      2. ~/.claude/.credentials.json file
-
-    Selection rules when both are present:
-      - If exactly one is non-expired, prefer that one. (Handles the case
-        where Claude Code refreshes one source but not the other — observed
-        in the wild on Claude Code 2.1.x.)
-      - Otherwise, prefer the source with the later ``expiresAt`` so that
-        any subsequent refresh uses the most recent ``refreshToken``.
-
-    This intentionally excludes ~/.claude.json primaryApiKey. Opencode's
-    subscription flow is OAuth/setup-token based with refreshable credentials,
-    and native direct Anthropic provider usage should follow that path rather
-    than auto-detecting Claude's first-party managed key.
-
-    Returns dict with {accessToken, refreshToken?, expiresAt?, source} or None.
-    """
-    kc_creds = _read_claude_code_credentials_from_keychain()
-    file_creds = _read_claude_code_credentials_from_file()
-
-    if kc_creds and file_creds:
-        kc_valid = is_claude_code_token_valid(kc_creds)
-        file_valid = is_claude_code_token_valid(file_creds)
-        if kc_valid and not file_valid:
-            return kc_creds
-        if file_valid and not kc_valid:
-            return file_creds
-        # Both valid or both expired: prefer the later expiresAt so the
-        # downstream refresh path uses the freshest refresh_token.
-        kc_exp = kc_creds.get("expiresAt", 0) or 0
-        file_exp = file_creds.get("expiresAt", 0) or 0
-        return kc_creds if kc_exp >= file_exp else file_creds
-
-    return kc_creds or file_creds
+async def read_claude_code_credentials() -> Optional[Dict[str, Any]]:
+    """Read and reconcile the keychain and file-based Claude Code credentials."""
+    keychain, file = await asyncio.gather(
+        _read_claude_code_credentials_from_keychain(),
+        _read_claude_code_credentials_from_file(),
+    )
+    if keychain and file:
+        keychain_valid = is_claude_code_token_valid(keychain)
+        file_valid = is_claude_code_token_valid(file)
+        if keychain_valid != file_valid:
+            return keychain if keychain_valid else file
+        return keychain if (keychain.get("expiresAt", 0) or 0) >= (file.get("expiresAt", 0) or 0) else file
+    return keychain or file
 
 
 def is_claude_code_token_valid(creds: Dict[str, Any]) -> bool:
@@ -1092,144 +984,82 @@ def is_claude_code_token_valid(creds: Dict[str, Any]) -> bool:
     return now_ms < (expires_at - 60_000)
 
 
-def refresh_anthropic_oauth_pure(refresh_token: str, *, use_json: bool = False) -> Dict[str, Any]:
-    """Refresh an Anthropic OAuth token without mutating local credential files."""
+async def refresh_anthropic_oauth_pure(
+    refresh_token: str, *, use_json: bool = False,
+) -> Dict[str, Any]:
+    """Refresh an Anthropic OAuth token through the native async transport."""
     import time
-    import urllib.parse
-    import urllib.request
 
     if not refresh_token:
         raise ValueError("refresh_token is required")
-
     client_id = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
     if use_json:
-        data = json.dumps({
+        payload: Any = {
             "grant_type": "refresh_token",
             "refresh_token": refresh_token,
             "client_id": client_id,
-        }).encode()
-        content_type = "application/json"
-    else:
-        data = urllib.parse.urlencode({
-            "grant_type": "refresh_token",
-            "refresh_token": refresh_token,
-            "client_id": client_id,
-        }).encode()
-        content_type = "application/x-www-form-urlencoded"
-
-    token_endpoints = [
-        "https://platform.claude.com/v1/oauth/token",
-        "https://console.anthropic.com/v1/oauth/token",
-    ]
-    last_error = None
-    for endpoint in token_endpoints:
-        req = urllib.request.Request(
-            endpoint,
-            data=data,
-            headers={
-                "Content-Type": content_type,
-                "User-Agent": _OAUTH_TOKEN_USER_AGENT,
-            },
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                result = json.loads(resp.read().decode())
-        except Exception as exc:
-            last_error = exc
-            logger.debug("Anthropic token refresh failed at %s: %s", endpoint, exc)
-            continue
-
-        access_token = result.get("access_token", "")
-        if not access_token:
-            raise ValueError("Anthropic refresh response was missing access_token")
-        next_refresh = result.get("refresh_token", refresh_token)
-        expires_in = result.get("expires_in", 3600)
-        return {
-            "access_token": access_token,
-            "refresh_token": next_refresh,
-            "expires_at_ms": int(time.time() * 1000) + (expires_in * 1000),
         }
+        headers = {
+            "Content-Type": "application/json",
+            "User-Agent": _OAUTH_TOKEN_USER_AGENT,
+        }
+        request_kwargs = {"json": payload}
+    else:
+        payload = {
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+            "client_id": client_id,
+        }
+        headers = {
+            "Content-Type": "application/x-www-form-urlencoded",
+            "User-Agent": _OAUTH_TOKEN_USER_AGENT,
+        }
+        request_kwargs = {"data": payload}
 
+    last_error: Optional[Exception] = None
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        for endpoint in (
+            "https://platform.claude.com/v1/oauth/token",
+            "https://console.anthropic.com/v1/oauth/token",
+        ):
+            try:
+                response = await client.post(endpoint, headers=headers, **request_kwargs)
+                response.raise_for_status()
+                result = response.json()
+            except Exception as exc:
+                last_error = exc
+                logger.debug("Anthropic async token refresh failed at %s: %s", endpoint, exc)
+                continue
+            access_token = result.get("access_token", "")
+            if not access_token:
+                raise ValueError("Anthropic refresh response was missing access_token")
+            expires_in = result.get("expires_in", 3600)
+            return {
+                "access_token": access_token,
+                "refresh_token": result.get("refresh_token", refresh_token),
+                "expires_at_ms": int(time.time() * 1000) + (expires_in * 1000),
+            }
     if last_error is not None:
         raise last_error
     raise ValueError("Anthropic token refresh failed")
 
 
-def _refresh_oauth_token(creds: Dict[str, Any]) -> Optional[str]:
-    """Attempt to refresh an expired Claude Code OAuth token.
-
-    Claude Code's OAuth refresh tokens are single-use: a successful refresh
-    rotates the pair and invalidates the old refresh token. Claude Code itself
-    also refreshes on its own schedule (IDE/CLI activity), so by the time
-    Hermes notices an expired token, Claude Code may have already rotated it.
-    POSTing our now-stale refresh token in that window races Claude Code and
-    fails with ``invalid_grant``.
-
-    So before refreshing, re-read the live credential sources. If Claude Code
-    has already produced a valid token, adopt it and skip the POST entirely.
-    Only fall back to refreshing ourselves when no fresh credential is found.
-    """
-    # Claude Code may have already refreshed — adopt its token rather than
-    # racing it with our (possibly already-rotated) refresh token. Only adopt
-    # when the live re-read produced a DIFFERENT token with a real future
-    # expiry: re-adopting the same credential we were just handed would be a
-    # no-op, and a 0/absent ``expiresAt`` means "managed key / unknown expiry"
-    # (see is_claude_code_token_valid) which must NOT be treated as a fresh
-    # refresh here.
-    current = read_claude_code_credentials()
-    if current:
-        current_token = current.get("accessToken", "")
-        current_exp = current.get("expiresAt", 0) or 0
-        if (
-            current_token
-            and current_token != creds.get("accessToken", "")
-            and current_exp > 0
-            and is_claude_code_token_valid(current)
-        ):
-            logger.debug("Adopted Claude Code's already-refreshed OAuth token")
-            return current_token
-
-    refresh_token = (current or {}).get("refreshToken", "") or creds.get("refreshToken", "")
-    if not refresh_token:
-        logger.debug("No refresh token available — cannot refresh")
-        return None
-
-    try:
-        refreshed = refresh_anthropic_oauth_pure(refresh_token, use_json=False)
-        _write_claude_code_credentials(
-            refreshed["access_token"],
-            refreshed["refresh_token"],
-            refreshed["expires_at_ms"],
-        )
-        logger.debug("Successfully refreshed Claude Code OAuth token")
-        return refreshed["access_token"]
-    except Exception as e:
-        logger.debug("Failed to refresh Claude Code token: %s", e)
-        return None
-
-
-def _write_claude_code_credentials(
+async def _write_claude_code_credentials(
     access_token: str,
     refresh_token: str,
     expires_at_ms: int,
     *,
     scopes: Optional[list] = None,
 ) -> None:
-    """Write refreshed credentials back to ~/.claude/.credentials.json.
-
-    The optional *scopes* list (e.g. ``["user:inference", "user:profile", ...]``)
-    is persisted so that Claude Code's own auth check recognises the credential
-    as valid.  Claude Code >=2.1.81 gates on the presence of ``"user:inference"``
-    in the stored scopes before it will use the token.
-    """
+    """Atomically update Claude Code credentials through async filesystem APIs."""
     cred_path = Path.home() / ".claude" / ".credentials.json"
+    existing: Dict[str, Any] = {}
     try:
-        # Read existing file to preserve other fields
-        existing = {}
-        if cred_path.exists():
-            existing = json.loads(cred_path.read_text(encoding="utf-8"))
-
+        if await aiofiles.os.path.exists(cred_path):
+            async with aiofiles.open(cred_path, encoding="utf-8") as handle:
+                parsed = json.loads(await handle.read())
+            if isinstance(parsed, dict):
+                existing = parsed
         oauth_data: Dict[str, Any] = {
             "accessToken": access_token,
             "refreshToken": refresh_token,
@@ -1237,174 +1067,89 @@ def _write_claude_code_credentials(
         }
         if scopes is not None:
             oauth_data["scopes"] = scopes
-        elif "claudeAiOauth" in existing and "scopes" in existing["claudeAiOauth"]:
-            # Preserve previously-stored scopes when the refresh response
-            # does not include a scope field.
-            oauth_data["scopes"] = existing["claudeAiOauth"]["scopes"]
-
+        elif isinstance(existing.get("claudeAiOauth"), dict):
+            previous_scopes = existing["claudeAiOauth"].get("scopes")
+            if previous_scopes is not None:
+                oauth_data["scopes"] = previous_scopes
         existing["claudeAiOauth"] = oauth_data
 
-        cred_path.parent.mkdir(parents=True, exist_ok=True)
-        # Per-process random suffix avoids collisions between concurrent
-        # writers and stale leftovers from a prior crashed write.
-        _tmp_cred = cred_path.with_suffix(f".tmp.{os.getpid()}.{secrets.token_hex(4)}")
+        await aiofiles.os.makedirs(cred_path.parent, exist_ok=True)
+        tmp_path = cred_path.with_suffix(f".tmp.{os.getpid()}.{secrets.token_hex(4)}")
+
+        def secure_opener(path: str, flags: int) -> int:
+            return os.open(path, flags | os.O_EXCL, stat.S_IRUSR | stat.S_IWUSR)
+
         try:
-            # Create the temp file atomically at 0o600. The previous
-            # write_text + post-replace chmod opened a TOCTOU window where
-            # both the temp file and the destination briefly inherited the
-            # process umask (commonly 0o644 = world-readable), exposing
-            # Claude Code OAuth tokens to other local users between create
-            # and chmod. Mirrors agent/google_oauth.py (#19673) and
-            # tools/mcp_oauth.py (#21148). Parent dir (~/.claude/) is
-            # owned by Claude Code itself, so we leave its mode alone.
-            fd = os.open(
-                str(_tmp_cred),
-                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-                stat.S_IRUSR | stat.S_IWUSR,
-            )
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                json.dump(existing, fh, indent=2)
-                fh.flush()
-                os.fsync(fh.fileno())
-            os.replace(_tmp_cred, cred_path)
-        except OSError:
+            async with aiofiles.open(
+                tmp_path,
+                "w",
+                encoding="utf-8",
+                opener=secure_opener,
+            ) as handle:
+                await handle.write(json.dumps(existing, indent=2))
+                await handle.flush()
+            await aiofiles.os.replace(tmp_path, cred_path)
+        finally:
             try:
-                _tmp_cred.unlink(missing_ok=True)
+                if await aiofiles.os.path.exists(tmp_path):
+                    await aiofiles.os.remove(tmp_path)
             except OSError:
                 pass
-            raise
-    except (OSError, IOError) as e:
-        logger.debug("Failed to write refreshed credentials: %s", e)
+    except (OSError, IOError, json.JSONDecodeError) as exc:
+        logger.debug("Failed to write refreshed credentials: %s", exc)
 
 
-def _resolve_claude_code_token_from_credentials(creds: Optional[Dict[str, Any]] = None) -> Optional[str]:
-    """Resolve a token from Claude Code credential files, refreshing if needed."""
-    creds = creds or read_claude_code_credentials()
-    if creds and is_claude_code_token_valid(creds):
-        logger.debug("Using Claude Code credentials (auto-detected)")
-        return creds["accessToken"]
+async def _refresh_oauth_token(creds: Dict[str, Any]) -> Optional[str]:
+    """Refresh expired Claude Code credentials through the native async path."""
+    current = await read_claude_code_credentials()
+    if current and (
+        current.get("accessToken") != creds.get("accessToken")
+        and current.get("expiresAt", 0)
+        and is_claude_code_token_valid(current)
+    ):
+        return current["accessToken"]
+    refresh_token = (current or {}).get("refreshToken") or creds.get("refreshToken")
+    if not refresh_token:
+        return None
+    try:
+        refreshed = await refresh_anthropic_oauth_pure(refresh_token)
+        await _write_claude_code_credentials(
+            refreshed["access_token"],
+            refreshed["refresh_token"],
+            refreshed["expires_at_ms"],
+        )
+        return refreshed["access_token"]
+    except Exception as exc:
+        logger.debug("Failed to refresh Claude Code token: %s", exc)
+        return None
+
+
+async def resolve_anthropic_token() -> Optional[str]:
+    """Resolve Anthropic credentials without blocking the agent event loop."""
+    creds = await read_claude_code_credentials()
     if creds:
-        logger.debug("Claude Code credentials expired — attempting refresh")
-        refreshed = _refresh_oauth_token(creds)
+        if is_claude_code_token_valid(creds):
+            return creds["accessToken"]
+        refreshed = await _refresh_oauth_token(creds)
         if refreshed:
             return refreshed
-        logger.debug("Token refresh failed — re-run 'claude setup-token' to reauthenticate")
-    return None
-
-
-def _prefer_refreshable_claude_code_token(env_token: str, creds: Optional[Dict[str, Any]]) -> Optional[str]:
-    """Prefer Claude Code creds when a persisted env OAuth token would shadow refresh.
-
-    Hermes historically persisted setup tokens into ANTHROPIC_TOKEN. That makes
-    later refresh impossible because the static env token wins before we ever
-    inspect Claude Code's refreshable credential file. If we have a refreshable
-    Claude Code credential record, prefer it over the static env OAuth token.
-    """
-    if not env_token or not _is_oauth_token(env_token) or not isinstance(creds, dict):
-        return None
-    if not creds.get("refreshToken"):
-        return None
-
-    resolved = _resolve_claude_code_token_from_credentials(creds)
-    if resolved and resolved != env_token:
-        logger.debug(
-            "Preferring Claude Code credential file over static env OAuth token so refresh can proceed"
-        )
-        return resolved
-    return None
-
-
-def _resolve_anthropic_pool_token() -> Optional[str]:
-    """Return the first available Anthropic OAuth token from credential_pool.
-
-    Read-only: enumerates with ``clear_expired=False, refresh=False`` so a bare
-    token *resolve* (which runs from diagnostic/read-only call sites such as
-    ``account_usage`` and ``hermes models``) never mutates ``~/.hermes/auth.json``
-    or makes a network refresh call. Refresh-on-expiry is owned by the API call
-    path's pool recovery, not the resolver.
-    """
-    try:
-        from agent.credential_pool import AUTH_TYPE_OAUTH, load_pool
-    except Exception:
-        return None
-
-    try:
-        pool = load_pool("anthropic")
-        # Enumerate read-only (clear_expired=False, refresh=False): never persist
-        # to auth.json or trigger a network refresh from a bare resolve. select()
-        # is deliberately NOT used — it runs clear_expired=True, refresh=True,
-        # which would violate this read-only contract.
-        entries, _pending = pool._available_entries(clear_expired=False, refresh=False)
-    except Exception:
-        logger.debug("Failed to read Anthropic credential_pool", exc_info=True)
-        return None
-
-    for entry in entries:
-        if getattr(entry, "auth_type", None) != AUTH_TYPE_OAUTH:
-            continue
-        # access_token is a declared field but a persisted entry can carry an
-        # explicit null (or a partially-written OAuth entry), so coerce before
-        # strip — a bare None.strip() here would escape the try/excepts above
-        # and crash the whole resolver, taking down the source #5 fallback too.
-        # Matches the aux-client analog (auxiliary_client.py: str(key or "")).
-        token = (getattr(entry, "access_token", None) or "").strip()
+    for env_var in ("ANTHROPIC_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"):
+        token = _getenv(env_var).strip()
         if token:
             return token
+    try:
+        from agent.credential_pool import AUTH_TYPE_OAUTH, load_pool
 
-    return None
-
-
-def resolve_anthropic_token() -> Optional[str]:
-    """Resolve an Anthropic token from all available sources.
-
-    Priority:
-      1. ANTHROPIC_TOKEN env var (OAuth/setup token saved by Hermes)
-      2. CLAUDE_CODE_OAUTH_TOKEN env var
-      3. Claude Code credentials (~/.claude.json or ~/.claude/.credentials.json)
-         — with automatic refresh if expired and a refresh token is available
-      4. Anthropic credential_pool OAuth entry (~/.hermes/auth.json)
-      5. ANTHROPIC_API_KEY env var (regular API key, or legacy fallback)
-
-    Returns the token string or None.
-    """
-    creds = read_claude_code_credentials()
-
-    # 1. Hermes-managed OAuth/setup token env var
-    token = _getenv("ANTHROPIC_TOKEN").strip()
-    if token:
-        preferred = _prefer_refreshable_claude_code_token(token, creds)
-        if preferred:
-            return preferred
-        return token
-
-    # 2. CLAUDE_CODE_OAUTH_TOKEN (used by Claude Code for setup-tokens)
-    cc_token = _getenv("CLAUDE_CODE_OAUTH_TOKEN").strip()
-    if cc_token:
-        preferred = _prefer_refreshable_claude_code_token(cc_token, creds)
-        if preferred:
-            return preferred
-        return cc_token
-
-    # 3. Claude Code credential file
-    resolved_claude_token = _resolve_claude_code_token_from_credentials(creds)
-    if resolved_claude_token:
-        return resolved_claude_token
-
-    # 4. Hermes credential_pool OAuth entry.
-    resolved_pool_token = _resolve_anthropic_pool_token()
-    if resolved_pool_token:
-        return resolved_pool_token
-
-    # 5. Regular API key, or a legacy OAuth token saved in ANTHROPIC_API_KEY.
-    # This remains as a compatibility fallback for pre-migration Hermes configs.
-    api_key = _getenv("ANTHROPIC_API_KEY").strip()
-    if api_key:
-        return api_key
-
-    return None
+        pool = await load_pool("anthropic")
+        for entry in pool.entries():
+            if entry.auth_type == AUTH_TYPE_OAUTH and entry.access_token:
+                return entry.access_token
+    except Exception:
+        logger.debug("Failed to resolve Anthropic credential-pool token", exc_info=True)
+    return _getenv("ANTHROPIC_API_KEY").strip() or None
 
 
-def run_oauth_setup_token() -> Optional[str]:
+async def run_oauth_setup_token() -> Optional[str]:
     """Run 'claude setup-token' interactively and return the resulting token.
 
     Checks multiple sources after the subprocess completes:
@@ -1429,12 +1174,13 @@ def run_oauth_setup_token() -> Optional[str]:
     # concern does not apply to an interactive login the user explicitly
     # invokes.  noqa: subprocess-stdin
     try:
-        subprocess.run([claude_path, "setup-token"])
+        process = await asyncio.create_subprocess_exec(claude_path, "setup-token")
+        await process.wait()
     except (KeyboardInterrupt, EOFError):
         return None
 
     # Check if credentials were saved to Claude Code's config files
-    creds = read_claude_code_credentials()
+    creds = await read_claude_code_credentials()
     if creds and is_claude_code_token_valid(creds):
         return creds["accessToken"]
 
@@ -1477,159 +1223,22 @@ def _get_hermes_oauth_file() -> Path:
     return get_hermes_home() / ".anthropic_oauth.json"
 
 
-def _generate_pkce() -> tuple:
-    """Generate PKCE code_verifier and code_challenge (S256)."""
-    import base64
-    import hashlib
-    import secrets
-
-    verifier = base64.urlsafe_b64encode(secrets.token_bytes(32)).rstrip(b"=").decode()
-    challenge = base64.urlsafe_b64encode(
-        hashlib.sha256(verifier.encode()).digest()
-    ).rstrip(b"=").decode()
-    return verifier, challenge
 
 
-def run_hermes_oauth_login_pure() -> Optional[Dict[str, Any]]:
-    """Run Hermes-native OAuth PKCE flow and return credential state."""
-    import secrets
-    import time
-    import webbrowser
-
-    verifier, challenge = _generate_pkce()
-    oauth_state = secrets.token_urlsafe(32)
-
-    params = {
-        "code": "true",
-        "client_id": _OAUTH_CLIENT_ID,
-        "response_type": "code",
-        "redirect_uri": _OAUTH_REDIRECT_URI,
-        "scope": _OAUTH_SCOPES,
-        "code_challenge": challenge,
-        "code_challenge_method": "S256",
-        "state": oauth_state,
-    }
-    from urllib.parse import urlencode
-
-    auth_url = f"https://claude.ai/oauth/authorize?{urlencode(params)}"
-
-    print()
-    print("Authorize Hermes with your Claude Pro/Max subscription.")
-    print()
-    print("╭─ Claude Pro/Max Authorization ────────────────────╮")
-    print("│                                                   │")
-    print("│  Open this link in your browser:                  │")
-    print("╰───────────────────────────────────────────────────╯")
-    print()
-    print(f"  {auth_url}")
-    print()
-
-    try:
-        from hermes_cli.auth import _can_open_graphical_browser as _can_open_gui
-    except Exception:
-        _can_open_gui = lambda: True  # noqa: E731 — degrade to prior behavior
-
-    if _can_open_gui():
-        try:
-            webbrowser.open(auth_url)
-            print("  (Browser opened automatically)")
-        except Exception:
-            pass
-
-    print()
-    print("After authorizing, you'll see a code. Paste it below.")
-    print()
-    try:
-        auth_code = input("Authorization code: ").strip()
-    except (KeyboardInterrupt, EOFError):
-        return None
-
-    if not auth_code:
-        print("No code entered.")
-        return None
-
-    splits = auth_code.split("#")
-    code = splits[0]
-    received_state = splits[1] if len(splits) > 1 else ""
-
-    # Validate state to prevent CSRF (RFC 6749 §10.12)
-    if received_state != oauth_state:
-        logger.warning("OAuth state mismatch — possible CSRF, aborting")
-        return None
-
-    try:
-        import urllib.request
-
-        exchange_data = json.dumps({
-            "grant_type": "authorization_code",
-            "client_id": _OAUTH_CLIENT_ID,
-            "code": code,
-            "state": received_state,
-            "redirect_uri": _OAUTH_REDIRECT_URI,
-            "code_verifier": verifier,
-        }).encode()
-
-        # Anthropic migrated the OAuth token endpoint to platform.claude.com;
-        # console.anthropic.com now 404s. Try the new host first, then fall
-        # back to console for older deployments (mirrors the refresh path).
-        # UA is _OAUTH_TOKEN_USER_AGENT (a non-claude-code UA) — see the
-        # constant's definition for why the token endpoint must not send
-        # claude-code/ (429 UA-prefix block).
-        result = None
-        last_error = None
-        for endpoint in _OAUTH_TOKEN_URLS:
-            req = urllib.request.Request(
-                endpoint,
-                data=exchange_data,
-                headers={
-                    "Content-Type": "application/json",
-                    "User-Agent": _OAUTH_TOKEN_USER_AGENT,
-                },
-                method="POST",
-            )
-            try:
-                with urllib.request.urlopen(req, timeout=15) as resp:
-                    result = json.loads(resp.read().decode())
-                break
-            except Exception as exc:
-                last_error = exc
-                logger.debug("Anthropic token exchange failed at %s: %s", endpoint, exc)
-                continue
-
-        if result is None:
-            raise last_error if last_error is not None else ValueError(
-                "Anthropic token exchange failed"
-            )
-    except Exception as e:
-        print(f"Token exchange failed: {e}")
-        return None
-
-    access_token = result.get("access_token", "")
-    refresh_token = result.get("refresh_token", "")
-    expires_in = result.get("expires_in", 3600)
-
-    if not access_token:
-        print("No access token in response.")
-        return None
-
-    expires_at_ms = int(time.time() * 1000) + (expires_in * 1000)
-    return {
-        "access_token": access_token,
-        "refresh_token": refresh_token,
-        "expires_at_ms": expires_at_ms,
-    }
 
 
-def read_hermes_oauth_credentials() -> Optional[Dict[str, Any]]:
-    """Read Hermes-managed OAuth credentials from ~/.hermes/.anthropic_oauth.json."""
+async def read_hermes_oauth_credentials() -> Optional[Dict[str, Any]]:
+    """Read Hermes-managed OAuth credentials without blocking the event loop."""
     oauth_file = _get_hermes_oauth_file()
-    if oauth_file.exists():
-        try:
-            data = json.loads(oauth_file.read_text(encoding="utf-8"))
-            if data.get("accessToken"):
-                return data
-        except (json.JSONDecodeError, OSError, IOError) as e:
-            logger.debug("Failed to read Hermes OAuth credentials: %s", e)
+    if not await aiofiles.os.path.exists(oauth_file):
+        return None
+    try:
+        async with aiofiles.open(oauth_file, encoding="utf-8") as handle:
+            data = json.loads(await handle.read())
+        if data.get("accessToken"):
+            return data
+    except (json.JSONDecodeError, OSError, IOError) as exc:
+        logger.debug("Failed to read Hermes OAuth credentials: %s", exc)
     return None
 
 
@@ -2311,14 +1920,13 @@ def _convert_user_message(content: Any) -> Dict[str, Any]:
     """Validate and convert a user message to anthropic format."""
     if isinstance(content, list):
         converted_blocks = _convert_content_to_anthropic(content)
-        kept_blocks = _fix_blank_text_blocks_in_list(
-            converted_blocks,
-            placeholder_text="(empty message)",
-            msg_index=-1,
-            role="user",
-            location="_convert_user_message",
-        )
-        return {"role": "user", "content": kept_blocks}
+        if not converted_blocks or all(
+            (b.get("text") or "").strip() == ""
+            for b in converted_blocks
+            if isinstance(b, dict) and b.get("type") == "text"
+        ):
+            converted_blocks = [{"type": "text", "text": "(empty message)"}]
+        return {"role": "user", "content": converted_blocks}
     else:
         if not content or (isinstance(content, str) and not content.strip()):
             content = "(empty message)"
@@ -2621,114 +2229,9 @@ def _ensure_leading_user_turn(result: List[Dict[str, Any]]) -> None:
     Mirror the Bedrock Converse adapter, which unconditionally prepends a
     minimal user turn when the first message is not user
     (convert_messages_to_converse).
-
-    The inserted text block must be non-whitespace: Anthropic separately
-    rejects any text content block whose text is empty or whitespace-only
-    ("text content blocks must contain non-whitespace text"), so a single
-    space here traded the "leading assistant turn" 400 for that one (#69512
-    class). Uses the same placeholder as every other synthesized filler
-    block in this module for consistency.
     """
     if result and result[0].get("role") != "user":
-        result.insert(
-            0, {"role": "user", "content": [{"type": "text", "text": _EMPTY_TEXT_PLACEHOLDER}]}
-        )
-
-
-def _fix_blank_text_blocks_in_list(
-    blocks: List[Any],
-    *,
-    placeholder_text: str,
-    msg_index: int,
-    role: Any,
-    location: str,
-) -> List[Any]:
-    """Drop blank/whitespace-only text blocks from ``blocks``, in place logic.
-
-    Non-text blocks (tool_use, tool_result, image, document, thinking, …)
-    and the relative order of everything else are left untouched. A
-    cache_control marker riding on a dropped block is relocated onto the
-    last surviving text/tool_use block so a breakpoint is never silently
-    lost. If nothing survives, a single non-blank placeholder text block
-    takes the dropped blocks' place (carrying the relocated cache_control,
-    if any) so the message never has empty content.
-
-    Returns a new list; does not mutate ``blocks``.
-    """
-    kept: List[Any] = []
-    relocated_cache_control = None
-    for block_index, blk in enumerate(blocks):
-        if (
-            isinstance(blk, dict)
-            and blk.get("type") == "text"
-            and not (isinstance(blk.get("text"), str) and blk["text"].strip())
-        ):
-            if isinstance(blk.get("cache_control"), dict):
-                relocated_cache_control = blk["cache_control"]
-            logger.warning(
-                "Pre-call sanitizer: dropped blank text content block "
-                "(message_index=%d role=%s location=%s block_index=%d "
-                "block_type=text)",
-                msg_index,
-                role,
-                location,
-                block_index,
-            )
-            continue
-        kept.append(blk)
-    if not kept:
-        placeholder: Dict[str, Any] = {"type": "text", "text": placeholder_text}
-        if relocated_cache_control is not None:
-            placeholder["cache_control"] = relocated_cache_control
-        kept.append(placeholder)
-    elif relocated_cache_control is not None:
-        _apply_assistant_cache_control_to_last_cacheable_block(kept, relocated_cache_control)
-    return kept
-
-
-def _scrub_blank_text_blocks(result: List[Dict[str, Any]]) -> None:
-    """Final provider-boundary guard against blank Anthropic text blocks.
-
-    Anthropic rejects any text content block whose ``text`` is empty or
-    whitespace-only with HTTP 400 ("text content blocks must contain
-    non-whitespace text"). ``_convert_assistant_message``,
-    ``_convert_user_message`` and ``_ensure_leading_user_turn`` already
-    avoid emitting these for the paths that build them, but this pass runs
-    last — after every other transform in ``convert_messages_to_anthropic``
-    — so a blank block from any current or future producer (including one
-    nested inside a ``tool_result``'s own content list) never reaches the
-    wire. Diagnostics are structural only: message index, role, content
-    location, block index/type. Never logs message text, tool arguments,
-    tokens, or credentials. Mutates ``result`` in place.
-    """
-    for msg_index, msg in enumerate(result):
-        if not isinstance(msg, dict):
-            continue
-        role = msg.get("role")
-        content = msg.get("content")
-        if not isinstance(content, list) or not content:
-            continue
-        placeholder_text = _EMPTY_TEXT_PLACEHOLDER if role == "assistant" else "(empty message)"
-        new_content = _fix_blank_text_blocks_in_list(
-            content,
-            placeholder_text=placeholder_text,
-            msg_index=msg_index,
-            role=role,
-            location="content",
-        )
-        for blk in new_content:
-            if not isinstance(blk, dict) or blk.get("type") != "tool_result":
-                continue
-            inner = blk.get("content")
-            if isinstance(inner, list) and inner:
-                blk["content"] = _fix_blank_text_blocks_in_list(
-                    inner,
-                    placeholder_text="(no output)",
-                    msg_index=msg_index,
-                    role=role,
-                    location="tool_result",
-                )
-        msg["content"] = new_content
+        result.insert(0, {"role": "user", "content": [{"type": "text", "text": " "}]})
 
 
 def convert_messages_to_anthropic(
@@ -2792,7 +2295,6 @@ def convert_messages_to_anthropic(
     _ensure_leading_user_turn(result)
     _manage_thinking_signatures(result, base_url, model)
     _evict_old_screenshots(result)
-    _scrub_blank_text_blocks(result)
 
     return system, result
 
@@ -3092,7 +2594,7 @@ def _is_stream_unavailable_error(exc: Exception) -> bool:
     return False
 
 
-def create_anthropic_message(
+async def create_anthropic_message(
     client: Any,
     api_kwargs: dict,
     *,
@@ -3101,69 +2603,53 @@ def create_anthropic_message(
     on_stream_event=None,
     on_response=None,
 ) -> Any:
-    """Create an Anthropic message, aggregating via stream when available.
+    """Async counterpart to :func:`create_anthropic_message`.
 
-    Some Anthropic-compatible gateways are SSE-only: they ignore non-streaming
-    requests and return ``text/event-stream`` even for ``messages.create()``.
-    The SDK can surface that as raw text, so callers that expect a Message then
-    crash on ``.content``.  Prefer ``messages.stream().get_final_message()`` to
-    match the main turn path, falling back to ``create()`` only for providers
-    that explicitly do not support streaming, such as restricted Bedrock roles.
-
-    ``on_stream_event``: optional callable invoked once per streamed event
-    (best-effort, exceptions swallowed). Lets callers report forward progress
-    to liveness watchdogs — e.g. the auxiliary compression path ticking its
-    progress hook so a slow-but-generating summary model isn't treated as
-    hung. Only fires on the streaming path; the ``create()`` fallback has no
-    events to report.
-
-    ``on_response``: optional callable invoked once with the underlying httpx
-    response before the message is aggregated (best-effort, exceptions
-    swallowed). Response *headers* carry out-of-band provider state that the
-    parsed ``Message`` drops — Nous Portal's ``x-nous-credits-*`` balance family
-    in particular. Only fires on the streaming path, which is the one the main
-    turn loop takes.
+    This uses the Anthropic SDK's native async context manager and iterator;
+    it does not run the synchronous Messages adapter in a worker thread.
+    Callbacks remain deliberately synchronous because they only update
+    in-memory agent/UI state and are not transport operations.
     """
-    sanitize_anthropic_kwargs(api_kwargs, log_prefix=log_prefix)
+    import inspect
 
+    sanitize_anthropic_kwargs(api_kwargs, log_prefix=log_prefix)
     messages_api = getattr(client, "messages", None)
     stream_fn = getattr(messages_api, "stream", None)
     if prefer_stream and callable(stream_fn):
         stream_kwargs = dict(api_kwargs)
         stream_kwargs.pop("stream", None)
         try:
-            with stream_fn(**stream_kwargs) as stream:
+            async with stream_fn(**stream_kwargs) as stream:
                 if callable(on_response):
                     try:
                         on_response(getattr(stream, "response", None))
                     except Exception:
                         logger.debug(
                             "%son_response callback failed",
-                            log_prefix, exc_info=True,
+                            log_prefix,
+                            exc_info=True,
                         )
-                if callable(on_stream_event):
-                    # Consume the event stream manually so each event can
-                    # tick the caller's progress callback; get_final_message
-                    # then returns the accumulated snapshot.
-                    for _event in stream:
+                async for event in stream:
+                    if callable(on_stream_event):
                         try:
-                            on_stream_event(_event)
+                            on_stream_event(event)
                         except Exception:
                             logger.debug(
                                 "%son_stream_event callback failed",
-                                log_prefix, exc_info=True,
+                                log_prefix,
+                                exc_info=True,
                             )
-                return stream.get_final_message()
+                return await stream.get_final_message()
         except Exception as exc:
             if not _is_stream_unavailable_error(exc):
                 raise
             logger.debug(
-                "%sAnthropic Messages stream unavailable; falling back to "
-                "messages.create(): %s",
+                "%sAnthropic Messages async stream unavailable; falling back "
+                "to messages.create(): %s",
                 log_prefix,
                 exc,
             )
 
     create_kwargs = dict(api_kwargs)
     create_kwargs.pop("stream", None)
-    return messages_api.create(**create_kwargs)
+    return await messages_api.create(**create_kwargs)

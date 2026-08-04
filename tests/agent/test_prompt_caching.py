@@ -402,7 +402,7 @@ class TestNormalizationOrdering:
 
         src = inspect.getsource(conversation_loop)
         # Anchor on the call-block request plan, not the retry helper.
-        anchor = src.index("Build the request-local cache sections")
+        anchor = src.index("Apply Anthropic prompt caching")
         mark = src.index("build_prompt_cache_plan(\n", anchor)
         for earlier in (
             'am["content"].strip()',              # whitespace normalization
@@ -463,7 +463,6 @@ class TestStripAnthropicCacheControl:
         assert isinstance(content, list) and len(content) == 2
         assert content[0] == {"type": "text", "text": "see"}
         assert content[1]["type"] == "image_url"
-
 
 
 

@@ -10,12 +10,13 @@ from pathlib import Path
 
 import hermes_cli.plugins as plugins_mod
 import model_tools
+import pytest
 
 
 _UNSET = object()
 
 
-def _run_handle_function_call(
+async def _run_handle_function_call(
     monkeypatch,
     *,
     tool_name="dummy_tool",
@@ -26,10 +27,10 @@ def _run_handle_function_call(
     """Drive ``handle_function_call`` with a mocked registry dispatch."""
     from tools.registry import registry
 
-    monkeypatch.setattr(
-        registry, "dispatch",
-        lambda name, args, **kw: dispatch_result,
-    )
+    async def dispatch(_name, _args, **_kwargs):
+        return dispatch_result
+
+    monkeypatch.setattr(registry, "dispatch", dispatch)
     # Skip unrelated side effects (read-loop tracker).
     monkeypatch.setattr(model_tools, "_READ_SEARCH_TOOLS", frozenset())
 
@@ -41,7 +42,7 @@ def _run_handle_function_call(
         # post_tool_call / transform_tool_result emit paths.
         monkeypatch.setattr("hermes_cli.plugins.has_hook", lambda name: True)
 
-    return model_tools.handle_function_call(
+    return await model_tools.handle_function_call(
         tool_name,
         tool_args or {},
         task_id="t1",
@@ -57,23 +58,28 @@ def _run_handle_function_call(
 
 
 
-def test_first_valid_string_return_replaces_result(monkeypatch):
-    out = _run_handle_function_call(
+@pytest.mark.asyncio
+async def test_first_valid_string_return_replaces_result(monkeypatch):
+    async def hook(_hook_name, **_kwargs):
+        return [None, {"x": 1}, "first", "second"]
+
+    out = await _run_handle_function_call(
         monkeypatch,
-        invoke_hook=lambda hook_name, **kw: [None, {"x": 1}, "first", "second"],
+        invoke_hook=hook,
     )
     assert out == "first"
 
 
-def test_hook_receives_expected_kwargs(monkeypatch):
+@pytest.mark.asyncio
+async def test_hook_receives_expected_kwargs(monkeypatch):
     captured = {}
 
-    def _hook(hook_name, **kwargs):
+    async def _hook(hook_name, **kwargs):
         if hook_name == "transform_tool_result":
             captured.update(kwargs)
         return []
 
-    out = _run_handle_function_call(
+    out = await _run_handle_function_call(
         monkeypatch,
         tool_name="my_tool",
         tool_args={"a": 1, "b": "x"},
@@ -91,26 +97,28 @@ def test_hook_receives_expected_kwargs(monkeypatch):
 
 
 
-def test_post_tool_call_remains_observational(monkeypatch):
+@pytest.mark.asyncio
+async def test_post_tool_call_remains_observational(monkeypatch):
     """post_tool_call return values must NOT replace the result."""
-    def _hook(hook_name, **kw):
+    async def _hook(hook_name, **kw):
         if hook_name == "post_tool_call":
             # Observers returning a string must be ignored.
             return ["observer return should be ignored"]
         return []
 
-    out = _run_handle_function_call(
+    out = await _run_handle_function_call(
         monkeypatch,
         invoke_hook=_hook,
     )
     assert out == '{"output": "original"}'
 
 
-def test_transform_tool_result_runs_after_post_tool_call(monkeypatch):
+@pytest.mark.asyncio
+async def test_transform_tool_result_runs_after_post_tool_call(monkeypatch):
     """post_tool_call sees ORIGINAL result; transform_tool_result sees same and may replace."""
     observed = []
 
-    def _hook(hook_name, **kw):
+    async def _hook(hook_name, **kw):
         if hook_name == "post_tool_call":
             observed.append(("post_tool_call", kw["result"]))
             return []
@@ -119,7 +127,7 @@ def test_transform_tool_result_runs_after_post_tool_call(monkeypatch):
             return ["rewritten"]
         return []
 
-    out = _run_handle_function_call(
+    out = await _run_handle_function_call(
         monkeypatch,
         dispatch_result='{"raw": "value"}',
         invoke_hook=_hook,
@@ -132,7 +140,8 @@ def test_transform_tool_result_runs_after_post_tool_call(monkeypatch):
     ]
 
 
-def test_transform_tool_result_integration_with_real_plugin(monkeypatch, tmp_path):
+@pytest.mark.asyncio
+async def test_transform_tool_result_integration_with_real_plugin(monkeypatch, tmp_path):
     """End-to-end: load a real plugin from HERMES_HOME and verify it rewrites results."""
     import yaml
 
@@ -143,8 +152,9 @@ def test_transform_tool_result_integration_with_real_plugin(monkeypatch, tmp_pat
     (plugin_dir / "plugin.yaml").write_text("name: transform_result_canon\n", encoding="utf-8")
     (plugin_dir / "__init__.py").write_text(
         "def register(ctx):\n"
-        '    ctx.register_hook("transform_tool_result", '
-        'lambda **kw: f\'CANON[{kw["tool_name"]}]\' + kw["result"])\n',
+        "    async def transform(**kw):\n"
+        "        return f'CANON[{kw[\"tool_name\"]}]' + kw[\"result\"]\n"
+        '    ctx.register_hook("transform_tool_result", transform)\n',
         encoding="utf-8",
     )
     # Plugins are opt-in — must be listed in plugins.enabled to load.
@@ -158,7 +168,7 @@ def test_transform_tool_result_integration_with_real_plugin(monkeypatch, tmp_pat
     plugins_mod._plugin_manager = plugins_mod.PluginManager()
     plugins_mod.discover_plugins()
 
-    out = _run_handle_function_call(
+    out = await _run_handle_function_call(
         monkeypatch,
         tool_name="some_tool",
         dispatch_result='{"payload": 42}',

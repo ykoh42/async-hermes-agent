@@ -65,7 +65,7 @@ class SearXNGWebSearchProvider(WebSearchProvider):
     def supports_extract(self) -> bool:
         return False
 
-    def search(self, query: str, limit: int = 5) -> Dict[str, Any]:
+    async def search(self, query: str, limit: int = 5) -> Dict[str, Any]:
         """Execute a search against the configured SearXNG instance."""
         import httpx
 
@@ -80,13 +80,13 @@ class SearXNGWebSearchProvider(WebSearchProvider):
         }
 
         try:
-            resp = httpx.get(
-                f"{base_url}/search",
-                params=params,
-                timeout=15,
-                headers={"Accept": "application/json"},
-            )
-            resp.raise_for_status()
+            async with httpx.AsyncClient(timeout=15) as client:
+                resp = await client.get(
+                    f"{base_url}/search",
+                    params=params,
+                    headers={"Accept": "application/json"},
+                )
+                resp.raise_for_status()
         except httpx.HTTPStatusError as exc:
             logger.warning("SearXNG HTTP error: %s", exc)
             return {

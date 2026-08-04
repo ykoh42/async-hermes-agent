@@ -1,26 +1,30 @@
 """Test that call_llm vision path passes resolved provider args, not raw ones."""
 
-from unittest.mock import patch, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
 
 
-def test_vision_call_uses_resolved_provider_args():
+@pytest.mark.asyncio
+async def test_vision_call_uses_resolved_provider_args():
     """Resolved provider/model/key/url from config must reach resolve_vision_provider_client."""
     from agent.auxiliary_client import call_llm
 
     fake_client = MagicMock()
-    fake_client.chat.completions.create.return_value = MagicMock(
+    fake_client.chat.completions.create = AsyncMock(return_value=MagicMock(
         choices=[MagicMock(message=MagicMock(content="description"))],
         usage=MagicMock(prompt_tokens=10, completion_tokens=5),
-    )
+    ))
 
     with patch(
         "agent.auxiliary_client._resolve_task_provider_model",
         return_value=("my-resolved-provider", "my-resolved-model", "http://resolved", "resolved-key", "chat_completions"),
     ), patch(
         "agent.auxiliary_client.resolve_vision_provider_client",
+        new_callable=AsyncMock,
         return_value=("my-resolved-provider", fake_client, "my-resolved-model"),
     ) as mock_vision:
-        call_llm(
+        await call_llm(
             "vision",
             provider="raw-provider",
             model="raw-model",
@@ -37,7 +41,8 @@ def test_vision_call_uses_resolved_provider_args():
     assert call_args.kwargs["api_key"] == "resolved-key"
 
 
-def test_vision_base_url_override_keeps_explicit_provider():
+@pytest.mark.asyncio
+async def test_vision_base_url_override_keeps_explicit_provider():
     """Explicit provider should still drive credential resolution with custom base_url."""
     from agent.auxiliary_client import resolve_vision_provider_client
 
@@ -53,9 +58,10 @@ def test_vision_base_url_override_keeps_explicit_provider():
         ),
     ), patch(
         "agent.auxiliary_client.resolve_provider_client",
+        new_callable=AsyncMock,
         return_value=(fake_client, "glm-4v"),
     ) as mock_resolve:
-        provider, client, model = resolve_vision_provider_client()
+        provider, client, model = await resolve_vision_provider_client()
 
     assert provider == "zai"
     assert client is fake_client

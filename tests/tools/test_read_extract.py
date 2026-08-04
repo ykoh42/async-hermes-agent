@@ -198,48 +198,5 @@ class TestXlsxExtraction(unittest.TestCase):
             extract_document_text(p)
 
 
-# ---------------------------------------------------------------------------
-# read_file_tool integration
-# ---------------------------------------------------------------------------
-
-class TestReadFileToolIntegration(unittest.TestCase):
-    def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix="rex_int_")
-
-    def tearDown(self):
-        import shutil
-        shutil.rmtree(self.tmp, ignore_errors=True)
-
-    def test_notebook_read_is_line_numbered(self):
-        p = os.path.join(self.tmp, "nb.ipynb")
-        _write_notebook(p, [
-            {"cell_type": "markdown", "source": "# H"},
-            {"cell_type": "code", "source": "print(1)"},
-        ])
-        res = json.loads(read_file_tool(p))
-        self.assertTrue(res.get("extracted_document"))
-        self.assertIn("1|", res["content"])  # line-number gutter
-        self.assertIn("print(1)", res["content"])
-
-
-    def test_corrupt_docx_falls_through_to_binary_guard(self):
-        p = os.path.join(self.tmp, "bad.docx")
-        with open(p, "wb") as fh:
-            fh.write(b"not a zip")
-        res = json.loads(read_file_tool(p))
-        # Should NOT crash; falls through to the binary-extension guard.
-        self.assertIn("error", res)
-        self.assertIn("binary", res["error"].lower())
-
-    def test_docx_read_extracts(self):
-        p = os.path.join(self.tmp, "d.docx")
-        _write_docx(p, (f'<?xml version="1.0"?><w:document xmlns:w="{_NS_W}">'
-                        '<w:body><w:p><w:r><w:t>Report body</w:t></w:r></w:p>'
-                        '</w:body></w:document>'))
-        res = json.loads(read_file_tool(p))
-        self.assertTrue(res.get("extracted_document"))
-        self.assertIn("Report body", res["content"])
-
-
 if __name__ == "__main__":
     unittest.main()

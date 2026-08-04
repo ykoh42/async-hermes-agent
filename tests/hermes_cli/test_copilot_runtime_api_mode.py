@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -53,7 +54,8 @@ def test_copilot_runtime_api_mode_still_uses_default_without_target(monkeypatch)
         ("claude-opus-4.8", "gpt-5.5", "codex_responses"),
     ],
 )
-def test_resolver_routes_copilot_by_target_model_for_every_credential_path(
+@pytest.mark.asyncio
+async def test_resolver_routes_copilot_by_target_model_for_every_credential_path(
     monkeypatch,
     credential_source,
     configured_model,
@@ -61,15 +63,15 @@ def test_resolver_routes_copilot_by_target_model_for_every_credential_path(
     expected_mode,
 ):
     """The public resolver must propagate the target through every auth path."""
-    from hermes_cli import models
     from hermes_cli import runtime_provider as rp
 
     model_cfg = {"provider": "copilot", "default": configured_model}
-    monkeypatch.setattr(rp, "_get_model_config", lambda: model_cfg)
-    monkeypatch.setattr(rp, "resolve_provider", lambda *_args, **_kwargs: "copilot")
-    # Keep this a real copilot_model_api_mode decision without making a live
-    # catalog request. The API-mode contract is determined by the model family.
-    monkeypatch.setattr(models, "fetch_github_model_catalog", lambda **_kwargs: [])
+    monkeypatch.setattr(rp, "_get_model_config", lambda *args, **kwargs: model_cfg)
+    monkeypatch.setattr(
+        rp,
+        "resolve_provider",
+        AsyncMock(return_value="copilot"),
+    )
 
     kwargs = {"requested": "copilot", "target_model": target_model}
     if credential_source == "pool":
@@ -80,31 +82,47 @@ def test_resolver_routes_copilot_by_target_model_for_every_credential_path(
             base_url="https://api.githubcopilot.com",
             source="pool",
         )
+        async def _select():
+            return entry
+
+        async def _load_pool(_provider):
+            return pool
+
         pool = SimpleNamespace(
             has_credentials=lambda: True,
-            select=lambda: entry,
+            select=_select,
         )
-        monkeypatch.setattr(rp, "load_pool", lambda _provider: pool)
+        monkeypatch.setattr(rp, "load_pool", _load_pool)
     elif credential_source == "explicit":
         kwargs["explicit_api_key"] = "explicit-token"
+
+        async def _unexpected_pool(_provider):
+            pytest.fail("explicit credentials must bypass the pool")
+
         monkeypatch.setattr(
             rp,
             "load_pool",
-            lambda _provider: pytest.fail("explicit credentials must bypass the pool"),
+            _unexpected_pool,
         )
     else:
-        monkeypatch.setattr(rp, "load_pool", lambda _provider: None)
-        monkeypatch.setattr(
-            rp,
-            "resolve_api_key_provider_credentials",
-            lambda _provider: {
+        async def _no_pool(_provider):
+            return None
+
+        async def _resolve_credentials(_provider):
+            return {
                 "api_key": f"{credential_source}-token",
                 "base_url": "https://api.githubcopilot.com",
                 "source": credential_source,
-            },
+            }
+
+        monkeypatch.setattr(rp, "load_pool", _no_pool)
+        monkeypatch.setattr(
+            rp.auth_mod,
+            "resolve_api_key_provider_credentials",
+            _resolve_credentials,
         )
 
-    runtime = rp.resolve_runtime_provider(**kwargs)
+    runtime = await rp.resolve_runtime_provider(**kwargs)
 
     assert runtime["provider"] == "copilot"
     assert runtime["api_mode"] == expected_mode

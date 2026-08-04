@@ -63,7 +63,7 @@ async def test_external_refresh_picked_up_without_restart(tmp_path, monkeypatch)
     }))
 
     mgr = MCPOAuthManager()
-    provider = mgr.get_or_build_provider(
+    provider = await mgr.get_or_build_provider(
         "srv", "https://example.com/mcp", None,
     )
     assert provider is not None
@@ -124,7 +124,7 @@ async def test_handle_401_deduplicates_concurrent_callers(tmp_path, monkeypatch)
     }))
 
     mgr = MCPOAuthManager()
-    provider = mgr.get_or_build_provider(
+    provider = await mgr.get_or_build_provider(
         "srv", "https://example.com/mcp", None,
     )
     assert provider is not None
@@ -167,9 +167,9 @@ async def test_provider_is_reused_across_reconnects(tmp_path, monkeypatch):
     reset_manager_for_tests()
 
     mgr = MCPOAuthManager()
-    p1 = mgr.get_or_build_provider("srv", "https://example.com/mcp", None)
+    p1 = await mgr.get_or_build_provider("srv", "https://example.com/mcp", None)
 
     # Simulate a reconnect: _run_http calls get_or_build_provider again
-    p2 = mgr.get_or_build_provider("srv", "https://example.com/mcp", None)
+    p2 = await mgr.get_or_build_provider("srv", "https://example.com/mcp", None)
 
     assert p1 is p2, "manager must cache the provider across reconnects"

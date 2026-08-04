@@ -13,8 +13,9 @@ Covers:
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
 
 from run_agent import AIAgent
 
@@ -46,29 +47,36 @@ PLAIN_USER_MSG = {"role": "user", "content": "hello, no images here"}
 
 
 class TestPrepareAnthropicMessages:
-    def test_no_images_passes_through(self):
+    @pytest.mark.asyncio
+    async def test_no_images_passes_through(self):
         agent = _make_agent()
         msgs = [PLAIN_USER_MSG]
-        out = agent._prepare_anthropic_messages_for_api(msgs)
+        out = await agent._prepare_anthropic_messages_for_api(msgs)
         assert out is msgs  # unchanged reference
 
-    def test_vision_capable_passes_images_through(self):
+    @pytest.mark.asyncio
+    async def test_vision_capable_passes_images_through(self):
         """The Anthropic adapter handles image_url/input_image natively."""
         agent = _make_agent()
-        with patch.object(agent, "_model_supports_vision", return_value=True):
-            out = agent._prepare_anthropic_messages_for_api([IMG_PARTS_USER_MSG])
+        with patch.object(
+            agent, "_model_supports_vision", new=AsyncMock(return_value=True)
+        ):
+            out = await agent._prepare_anthropic_messages_for_api([IMG_PARTS_USER_MSG])
         # Passes through unchanged — image_url parts still present.
         assert out[0]["content"][1]["type"] == "image_url"
 
-    def test_non_vision_replaces_images_with_text(self):
+    @pytest.mark.asyncio
+    async def test_non_vision_replaces_images_with_text(self):
         agent = _make_agent()
-        with patch.object(agent, "_model_supports_vision", return_value=False), \
+        with patch.object(
+            agent, "_model_supports_vision", new=AsyncMock(return_value=False)
+        ), \
              patch.object(
                  agent,
                  "_describe_image_for_anthropic_fallback",
                  return_value="[Image description: a cat]",
              ):
-            out = agent._prepare_anthropic_messages_for_api([IMG_PARTS_USER_MSG])
+            out = await agent._prepare_anthropic_messages_for_api([IMG_PARTS_USER_MSG])
         # Content collapsed to a string containing the description + user text.
         content = out[0]["content"]
         assert isinstance(content, str)
@@ -82,38 +90,46 @@ class TestPrepareAnthropicMessages:
 
 
 class TestPrepareMessagesForNonVision:
-    def test_no_images_passes_through(self):
+    @pytest.mark.asyncio
+    async def test_no_images_passes_through(self):
         agent = _make_agent()
         msgs = [PLAIN_USER_MSG]
-        out = agent._prepare_messages_for_non_vision_model(msgs)
+        out = await agent._prepare_messages_for_non_vision_model(msgs)
         assert out is msgs
 
-    def test_vision_capable_passes_through(self):
+    @pytest.mark.asyncio
+    async def test_vision_capable_passes_through(self):
         """For vision-capable models on chat.completions path, provider handles pixels."""
         agent = _make_agent()
         agent.provider = "openrouter"
         agent.model = "anthropic/claude-sonnet-4"
-        with patch.object(agent, "_model_supports_vision", return_value=True):
-            out = agent._prepare_messages_for_non_vision_model([IMG_PARTS_USER_MSG])
+        with patch.object(
+            agent, "_model_supports_vision", new=AsyncMock(return_value=True)
+        ):
+            out = await agent._prepare_messages_for_non_vision_model([IMG_PARTS_USER_MSG])
         assert out[0]["content"][1]["type"] == "image_url"
 
-    def test_non_vision_strips_images(self):
+    @pytest.mark.asyncio
+    async def test_non_vision_strips_images(self):
         agent = _make_agent()
         agent.provider = "openrouter"
         agent.model = "qwen/qwen3-235b-a22b"
-        with patch.object(agent, "_model_supports_vision", return_value=False), \
+        with patch.object(
+            agent, "_model_supports_vision", new=AsyncMock(return_value=False)
+        ), \
              patch.object(
                  agent,
                  "_describe_image_for_anthropic_fallback",
                  return_value="[Image description: a dog]",
              ):
-            out = agent._prepare_messages_for_non_vision_model([IMG_PARTS_USER_MSG])
+            out = await agent._prepare_messages_for_non_vision_model([IMG_PARTS_USER_MSG])
         content = out[0]["content"]
         assert isinstance(content, str)
         assert "[Image description: a dog]" in content
         assert "image_url" not in content
 
-    def test_multiple_messages_with_mixed_content(self):
+    @pytest.mark.asyncio
+    async def test_multiple_messages_with_mixed_content(self):
         agent = _make_agent()
         agent.model = "qwen/qwen3-235b"
         msgs = [
@@ -121,13 +137,15 @@ class TestPrepareMessagesForNonVision:
             {"role": "assistant", "content": "ack"},
             IMG_PARTS_USER_MSG,
         ]
-        with patch.object(agent, "_model_supports_vision", return_value=False), \
+        with patch.object(
+            agent, "_model_supports_vision", new=AsyncMock(return_value=False)
+        ), \
              patch.object(
                  agent,
                  "_describe_image_for_anthropic_fallback",
                  return_value="[Image: thing]",
              ):
-            out = agent._prepare_messages_for_non_vision_model(msgs)
+            out = await agent._prepare_messages_for_non_vision_model(msgs)
         # First two messages unchanged (no images), third stripped.
         assert out[0]["content"] == "first turn"
         assert out[1]["content"] == "ack"
@@ -139,52 +157,68 @@ class TestPrepareMessagesForNonVision:
 
 
 class TestModelSupportsVision:
-    def test_missing_provider_or_model_returns_false(self):
+    @pytest.mark.asyncio
+    async def test_missing_provider_or_model_returns_false(self):
         agent = _make_agent()
         agent.provider = ""
         agent.model = "claude-sonnet-4"
-        assert agent._model_supports_vision() is False
+        assert await agent._model_supports_vision() is False
         agent.provider = "anthropic"
         agent.model = ""
-        assert agent._model_supports_vision() is False
+        assert await agent._model_supports_vision() is False
 
-    def test_uses_get_model_capabilities(self):
+    @pytest.mark.asyncio
+    async def test_uses_get_model_capabilities(self):
         agent = _make_agent()
         fake_caps = MagicMock()
         fake_caps.supports_vision = True
-        with patch("agent.models_dev.get_model_capabilities", return_value=fake_caps):
-            assert agent._model_supports_vision() is True
+        with patch(
+            "agent.models_dev.get_model_capabilities",
+            new=AsyncMock(return_value=fake_caps),
+        ):
+            assert await agent._model_supports_vision() is True
         fake_caps.supports_vision = False
-        with patch("agent.models_dev.get_model_capabilities", return_value=fake_caps):
-            assert agent._model_supports_vision() is False
+        with patch(
+            "agent.models_dev.get_model_capabilities",
+            new=AsyncMock(return_value=fake_caps),
+        ):
+            assert await agent._model_supports_vision() is False
 
-    def test_none_caps_returns_false(self):
+    @pytest.mark.asyncio
+    async def test_none_caps_returns_false(self):
         agent = _make_agent()
-        with patch("agent.models_dev.get_model_capabilities", return_value=None):
-            assert agent._model_supports_vision() is False
+        with patch(
+            "agent.models_dev.get_model_capabilities",
+            new=AsyncMock(return_value=None),
+        ):
+            assert await agent._model_supports_vision() is False
 
 
-    def test_top_level_model_override_wins(self):
+    @pytest.mark.asyncio
+    async def test_top_level_model_override_wins(self, tmp_path):
         agent = _make_agent()
         agent.provider = "custom"
         agent.model = "my-llava"
-        with patch("hermes_cli.config.load_config", return_value={"model": {"supports_vision": True}}), \
-             patch("agent.models_dev.get_model_capabilities", return_value=None):
-            assert agent._model_supports_vision() is True
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text("model:\n  supports_vision: true\n", encoding="utf-8")
+        with patch("hermes_cli.config.get_config_path", return_value=config_path):
+            assert await agent._model_supports_vision() is True
 
 
-    def test_named_custom_provider_resolved_via_config_provider(self):
+    @pytest.mark.asyncio
+    async def test_named_custom_provider_resolved_via_config_provider(self, tmp_path):
         # Named custom providers get runtime self.provider rewritten to
         # "custom" while the config keeps the original name under
         # model.provider. The override must still resolve.
         agent = _make_agent()
         agent.provider = "custom"
         agent.model = "my-llava"
-        cfg = {
-            "model": {"provider": "my-vllm", "default": "my-llava"},
-            "providers": {"my-vllm": {"models": {"my-llava": {"supports_vision": True}}}},
-        }
-        with patch("hermes_cli.config.load_config", return_value=cfg), \
-             patch("agent.models_dev.get_model_capabilities", return_value=None):
-            assert agent._model_supports_vision() is True
-
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(
+            "model:\n  provider: my-vllm\n  default: my-llava\n"
+            "providers:\n  my-vllm:\n    models:\n      my-llava:\n"
+            "        supports_vision: true\n",
+            encoding="utf-8",
+        )
+        with patch("hermes_cli.config.get_config_path", return_value=config_path):
+            assert await agent._model_supports_vision() is True

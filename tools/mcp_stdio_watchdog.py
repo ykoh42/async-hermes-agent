@@ -25,7 +25,7 @@ instead, which:
   2. transparently passes stdin/stdout/stderr through — the MCP stdio
      protocol talks directly over those pipes, so the supervisor must be a
      no-op relay, not a bytes-in-the-middle proxy;
-  3. runs a background thread that polls the direct POSIX parent identity:
+  3. polls the direct POSIX parent identity in its own supervisor process:
      compare current ``getppid()`` against the parent PID recorded when the
      wrapper was created;
   4. the instant the original parent is gone, terminates the real child's
@@ -47,7 +47,6 @@ import os
 import signal
 import subprocess
 import sys
-import threading
 import time
 
 _POLL_INTERVAL_S = 2.0
@@ -92,14 +91,6 @@ def _terminate_process_group(proc: subprocess.Popen) -> None:
             continue
 
 
-def _watchdog_loop(proc: subprocess.Popen, original_ppid: int) -> None:
-    while proc.poll() is None:
-        if _is_orphaned(original_ppid):
-            _terminate_process_group(proc)
-            return
-        time.sleep(_POLL_INTERVAL_S)
-
-
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Parent-death watchdog for a stdio MCP subprocess.",
@@ -139,15 +130,13 @@ def main(argv: list[str] | None = None) -> int:
     signal.signal(signal.SIGTERM, _forward_shutdown)
     signal.signal(signal.SIGINT, _forward_shutdown)
 
-    watchdog = threading.Thread(
-        target=_watchdog_loop,
-        args=(proc, args.ppid),
-        daemon=True,
-    )
-    watchdog.start()
-
     try:
-        return proc.wait()
+        while proc.poll() is None:
+            if _is_orphaned(args.ppid):
+                _terminate_process_group(proc)
+                return proc.returncode or 1
+            time.sleep(_POLL_INTERVAL_S)
+        return proc.returncode or 0
     except KeyboardInterrupt:
         _terminate_process_group(proc)
         return 130

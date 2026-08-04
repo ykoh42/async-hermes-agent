@@ -17,9 +17,8 @@ silently overwritten by Message B before Message A's agent finished
 running.  Background-task notifications and tool calls therefore routed
 to the wrong thread.
 
-``contextvars.ContextVar`` values are *task-local*: each ``asyncio``
-task (and any ``run_in_executor`` thread it spawns) gets its own copy,
-so concurrent messages never interfere.
+``contextvars.ContextVar`` values are *task-local*: each ``asyncio`` task gets
+its own copy, so concurrent messages never interfere.
 
 **Backward compatibility**
 

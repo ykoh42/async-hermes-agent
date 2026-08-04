@@ -20,14 +20,10 @@ returned text into their existing error builders instead of touching
 ``response.text`` (which would be unbounded / would raise after a partial
 stream read).
 
-A subtlety the implementation must respect: ``httpx``'s ``iter_bytes()`` blocks
-*inside* the C/socket read while waiting for the next chunk. A wall-clock check
-placed only between yielded chunks cannot interrupt a server that opens the
-body and then stalls mid-chunk — control never returns to Python until httpx's
-own (often 30s+) read timeout fires. To guarantee a bounded stop regardless of
-socket behavior, the read runs on a daemon worker thread and the caller waits
-on it with a hard deadline; on timeout we close the response (which unblocks /
-cancels the read) and return whatever partial bytes were collected.
+A subtlety the implementation must respect: a wall-clock check placed only
+between yielded chunks cannot interrupt a server that stalls mid-chunk. The
+async response iterator therefore runs under an asyncio deadline; cancellation
+closes the response and returns whatever partial bytes were collected.
 
 Ported and adapted from openclaw/openclaw#95108 ("bound Anthropic error
 streams"), generalized to cover Hermes's three streaming error-body sites
@@ -36,8 +32,8 @@ streams"), generalized to cover Hermes's three streaming error-body sites
 
 from __future__ import annotations
 
+import asyncio
 import logging
-import threading
 from typing import List, Optional
 
 import httpx
@@ -53,86 +49,56 @@ DEFAULT_ERROR_BODY_MAX_BYTES = 64 * 1024
 DEFAULT_ERROR_BODY_TIMEOUT_S = 10.0
 
 
-def read_streaming_error_body(
+async def read_streaming_error_body(
     response: httpx.Response,
     *,
     max_bytes: int = DEFAULT_ERROR_BODY_MAX_BYTES,
     timeout_s: float = DEFAULT_ERROR_BODY_TIMEOUT_S,
 ) -> str:
-    """Read a non-OK streaming response body with a byte cap and a hard deadline.
+    """Native-async bounded error-body read for async HTTP responses.
 
-    Returns the decoded body text (UTF-8, errors replaced), truncated to
-    ``max_bytes``. Never raises: any transport error, stall, or oversize
-    condition is swallowed and the best-effort partial text (or an empty
-    string) is returned, because this runs on the error path and must not
-    mask the original HTTP failure with a read error.
-
-    The byte cap protects against huge bodies; the wall-clock deadline (enforced
-    via a worker thread so it can interrupt a socket read that stalls mid-chunk)
-    protects against bodies that open and then hang.
+    The active agent transport must not hand an ``httpx.AsyncByteStream`` to
+    the synchronous worker-thread helper above.  Cancellation of the async
+    iterator is sufficient to release the response stream; the provider's
+    own read timeout remains the lower-level socket guard.
     """
     chunks: List[bytes] = []
-    state = {"truncated": False}
-    done = threading.Event()
+    total = 0
 
-    def _drain() -> None:
-        total = 0
-        try:
-            for chunk in response.iter_bytes():
-                if not chunk:
-                    continue
-                remaining = max_bytes - total
-                if remaining <= 0:
-                    state["truncated"] = True
-                    break
-                if len(chunk) > remaining:
-                    chunks.append(chunk[:remaining])
-                    total += remaining
-                    state["truncated"] = True
-                    break
-                chunks.append(chunk)
-                total += len(chunk)
-        except Exception as exc:  # noqa: BLE001 - error path must not raise
-            logger.debug("bounded error-body read failed: %s", exc)
-        finally:
-            done.set()
+    async def _drain() -> None:
+        nonlocal total
+        async for chunk in response.aiter_bytes():
+            if not chunk:
+                continue
+            remaining = max_bytes - total
+            if remaining <= 0:
+                break
+            chunks.append(chunk[:remaining])
+            total += min(len(chunk), remaining)
+            if len(chunk) > remaining:
+                break
 
-    worker = threading.Thread(
-        target=_drain, name="bounded-error-body-read", daemon=True
-    )
-    worker.start()
-    finished = done.wait(timeout=timeout_s)
-
-    if not finished:
+    try:
+        await asyncio.wait_for(_drain(), timeout=timeout_s)
+    except (asyncio.TimeoutError, asyncio.CancelledError):
+        if isinstance(asyncio.current_task(), asyncio.Task) and asyncio.current_task().cancelling():
+            raise
         logger.debug(
-            "bounded error-body read: hard timeout after %.1fs (%d bytes so far)",
+            "bounded async error-body read: hard timeout after %.1fs (%d bytes so far)",
             timeout_s,
-            sum(len(c) for c in chunks),
+            total,
         )
-        # Closing the response cancels the in-flight socket read, letting the
-        # worker thread unwind. We do not join (it is a daemon and may be
-        # blocked in C); the partial `chunks` collected so far are returned.
-        _safe_close(response)
-    else:
-        _safe_close(response)
-
-    if state["truncated"]:
-        logger.debug(
-            "bounded error-body read: capped at %d bytes (max=%d)",
-            sum(len(c) for c in chunks),
-            max_bytes,
-        )
+    except Exception as exc:  # noqa: BLE001 - error path must not mask HTTP failure
+        logger.debug("bounded async error-body read failed: %s", exc)
+    finally:
+        try:
+            await response.aclose()
+        except Exception:
+            pass
     return b"".join(chunks).decode("utf-8", errors="replace")
 
 
-def _safe_close(response: httpx.Response) -> None:
-    try:
-        response.close()
-    except Exception:  # noqa: BLE001
-        pass
-
-
-def read_error_body_or_default(
+async def read_error_body_or_default(
     response: httpx.Response,
     *,
     max_bytes: int = DEFAULT_ERROR_BODY_MAX_BYTES,
@@ -142,7 +108,7 @@ def read_error_body_or_default(
 
     Convenience for callers that distinguish "no body" from "empty string".
     """
-    text = read_streaming_error_body(
+    text = await read_streaming_error_body(
         response, max_bytes=max_bytes, timeout_s=timeout_s
     )
     return text or None

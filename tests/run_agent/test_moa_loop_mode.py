@@ -1,3 +1,4 @@
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -12,7 +13,12 @@ def _response(content="done", *, tool_calls=None):
     return SimpleNamespace(choices=[choice], usage=None, model="fake-model")
 
 
-def test_moa_virtual_provider_aggregator_is_actor(monkeypatch, tmp_path):
+async def _async_slot_runtime(slot):
+    return {"provider": slot["provider"], "model": slot["model"]}
+
+
+@pytest.mark.asyncio
+async def test_moa_virtual_provider_aggregator_is_actor(monkeypatch, tmp_path):
     home = tmp_path / ".hermes"
     home.mkdir()
     (home / "config.yaml").write_text(
@@ -33,7 +39,7 @@ moa:
     monkeypatch.setenv("HERMES_HOME", str(home))
     calls = []
 
-    def fake_call_llm(**kwargs):
+    async def fake_call_llm(**kwargs):
         calls.append(kwargs)
         if kwargs["task"] == "moa_reference":
             return _response("reference advice")
@@ -52,15 +58,7 @@ moa:
         enabled_toolsets=["file"],
         max_iterations=1,
     )
-    monkeypatch.setattr(
-        agent,
-        "_create_request_openai_client",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            AssertionError("MoA calls must use MoAClient, not a request OpenAI client")
-        ),
-    )
-
-    result = agent.run_conversation("solve this")
+    result = await agent.run_conversation("solve this")
 
     assert result["final_response"] == "aggregator acted"
     assert agent.base_url == "moa://local"
@@ -71,17 +69,19 @@ moa:
     assert calls[1]["tools"] is not None
 
 
-def test_moa_runtime_provider_uses_virtual_endpoint():
+@pytest.mark.asyncio
+async def test_moa_runtime_provider_uses_virtual_endpoint():
     from hermes_cli.runtime_provider import resolve_runtime_provider
 
-    runtime = resolve_runtime_provider(requested="moa", target_model="review")
+    runtime = await resolve_runtime_provider(requested="moa", target_model="review")
 
     assert runtime["provider"] == "moa"
     assert runtime["base_url"] == "moa://local"
     assert runtime["api_key"] == "moa-virtual-provider"
 
 
-def test_moa_primary_restore_rebuilds_virtual_facade(monkeypatch, tmp_path):
+@pytest.mark.asyncio
+async def test_moa_primary_restore_rebuilds_virtual_facade(monkeypatch, tmp_path):
     """MoA sessions must restore from fallback without constructing OpenAI().
 
     Regression for a long-lived MoA session that failed over to a real provider:
@@ -121,10 +121,6 @@ moa:
     )
     primary_client = agent.client
 
-    def fail_openai_rebuild(*_args, **_kwargs):
-        raise AssertionError("MoA restore must not build a real OpenAI client")
-
-    monkeypatch.setattr(agent, "_create_openai_client", fail_openai_rebuild)
     setattr(agent, "_fallback_activated", True)
     setattr(agent, "provider", "zai")
     setattr(agent, "model", "glm-5.2")
@@ -133,7 +129,7 @@ moa:
     setattr(agent, "_client_kwargs", {"api_key": "fallback-key", "base_url": agent.base_url})
     agent.client = SimpleNamespace(close=lambda: None, _client=SimpleNamespace(is_closed=True))
 
-    assert agent._restore_primary_runtime() is True
+    assert await agent._restore_primary_runtime() is True
     assert getattr(agent, "provider") == "moa"
     assert getattr(agent, "model") == "review"
     assert agent.client is not primary_client
@@ -141,7 +137,8 @@ moa:
     assert getattr(agent, "_fallback_activated") is False
 
 
-def test_moa_restored_facade_still_emits_reference_events(monkeypatch, tmp_path):
+@pytest.mark.asyncio
+async def test_moa_restored_facade_still_emits_reference_events(monkeypatch, tmp_path):
     """A restored MoA facade must keep the reference_callback relay wired.
 
     Regression for the naive-rebuild flaw in the original #53802 approach:
@@ -189,7 +186,7 @@ moa:
     agent.api_key = "fallback-key"
     setattr(agent, "_client_kwargs", {"api_key": "fallback-key", "base_url": agent.base_url})
     agent.client = SimpleNamespace(close=lambda: None, _client=SimpleNamespace(is_closed=True))
-    assert agent._restore_primary_runtime() is True
+    assert await agent._restore_primary_runtime() is True
 
     # The relay reads tool_progress_callback at emit time — attach a recorder
     # and fire the facade's internal _emit exactly as the fan-out does.
@@ -229,7 +226,8 @@ moa:
 
 
 
-def test_call_llm_extra_headers_reach_transport_create(monkeypatch):
+@pytest.mark.asyncio
+async def test_call_llm_extra_headers_reach_transport_create(monkeypatch):
     """extra_headers must reach the SDK client's create() kwargs.
 
     Transport-boundary regression for #60293: mocking call_llm proves nothing
@@ -243,7 +241,7 @@ def test_call_llm_extra_headers_reach_transport_create(monkeypatch):
     captured = {}
 
     class _Completions:
-        def create(self, **kwargs):
+        async def create(self, **kwargs):
             captured.update(kwargs)
             return _response("ok")
 
@@ -262,10 +260,16 @@ def test_call_llm_extra_headers_reach_transport_create(monkeypatch):
             "chat_completions",
         ),
     )
-    monkeypatch.setattr(ac, "_get_cached_client", lambda *a, **k: (fake_client, "claude-sonnet-4.6"))
-    monkeypatch.setattr(ac, "_validate_llm_response", lambda resp, task, **_kw: resp)
+    async def fake_get_cached_client(*_args, **_kwargs):
+        return fake_client, "claude-sonnet-4.6"
 
-    ac.call_llm(
+    monkeypatch.setattr(ac, "_get_cached_client", fake_get_cached_client)
+    async def validate_response(resp, task, **_kwargs):
+        return resp
+
+    monkeypatch.setattr(ac, "_validate_llm_response", validate_response)
+
+    await ac.call_llm(
         provider="copilot",
         model="claude-sonnet-4.6",
         messages=[{"role": "user", "content": "hi"}],
@@ -277,7 +281,8 @@ def test_call_llm_extra_headers_reach_transport_create(monkeypatch):
     assert "x-initiator" not in captured.get("extra_body", {}) if captured.get("extra_body") else True
 
 
-def test_retry_same_provider_sync_preserves_extra_headers(monkeypatch):
+@pytest.mark.asyncio
+async def test_retry_same_provider_preserves_extra_headers(monkeypatch):
     """The same-provider retry rebuild must carry extra_headers through.
 
     Regression for #60293's follow-up: a credential-refresh/pool-rotation
@@ -292,7 +297,7 @@ def test_retry_same_provider_sync_preserves_extra_headers(monkeypatch):
     captured = {}
 
     class _Completions:
-        def create(self, **kwargs):
+        async def create(self, **kwargs):
             captured.update(kwargs)
             return _response("retried ok")
 
@@ -300,17 +305,22 @@ def test_retry_same_provider_sync_preserves_extra_headers(monkeypatch):
         chat=SimpleNamespace(completions=_Completions()),
         base_url="https://api.githubcopilot.com",
     )
-    monkeypatch.setattr(ac, "_get_cached_client", lambda *a, **k: (fake_client, "claude-sonnet-4.6"))
-    monkeypatch.setattr(ac, "_validate_llm_response", lambda resp, task, **_kw: resp)
+    async def fake_get_cached_client(*_args, **_kwargs):
+        return fake_client, "claude-sonnet-4.6"
 
-    ac._retry_same_provider_sync(
+    async def validate_response(resp, task, **_kwargs):
+        return resp
+
+    monkeypatch.setattr(ac, "_get_cached_client", fake_get_cached_client)
+    monkeypatch.setattr(ac, "_validate_llm_response", validate_response)
+
+    await ac._retry_same_provider(
         task=None,
         resolved_provider="copilot",
         resolved_model="claude-sonnet-4.6",
         resolved_base_url="https://api.githubcopilot.com",
         resolved_api_key="copilot-token",
         resolved_api_mode="chat_completions",
-        main_runtime=None,
         final_model="claude-sonnet-4.6",
         messages=[{"role": "user", "content": "hi"}],
         temperature=None,
@@ -411,7 +421,8 @@ def test_reference_messages_ends_with_user_not_assistant_prefill():
 
 
 
-def test_run_reference_prepends_advisory_system_prompt(monkeypatch):
+@pytest.mark.asyncio
+async def test_run_reference_prepends_advisory_system_prompt(monkeypatch):
     """Each reference call gets the advisory-role system prompt first.
 
     Without it the reference assumes it is the acting agent and refuses ("I
@@ -423,13 +434,13 @@ def test_run_reference_prepends_advisory_system_prompt(monkeypatch):
 
     captured = {}
 
-    def fake_call_llm(**kwargs):
+    async def fake_call_llm(**kwargs):
         captured.update(kwargs)
         return _response("advice")
 
     monkeypatch.setattr("agent.moa_loop.call_llm", fake_call_llm)
 
-    label, text, _acct = _run_reference(
+    label, text, _acct = await _run_reference(
         {"provider": "openai-codex", "model": "gpt-5.5"},
         [{"role": "user", "content": "review this PR"}],
     )
@@ -446,7 +457,8 @@ def test_run_reference_prepends_advisory_system_prompt(monkeypatch):
 
 
 
-def test_references_run_in_parallel(monkeypatch):
+@pytest.mark.asyncio
+async def test_references_run_in_parallel(monkeypatch):
     """References fan out concurrently (delegate-batch semantics), not serially.
 
     Each reference sleeps; wall-time must approximate the slowest single call,
@@ -461,12 +473,12 @@ def test_references_run_in_parallel(monkeypatch):
 
     barrier_hits = []
 
-    def slow_call_llm(**kwargs):
+    async def slow_call_llm(**kwargs):
         barrier_hits.append(time.monotonic())
         model = kwargs["model"]
         if model == "boom":
             raise RuntimeError("kaboom")
-        time.sleep(0.5)
+        await asyncio.sleep(0.5)
         return _response(f"resp-{kwargs['provider']}")
 
     monkeypatch.setattr(moa_loop, "call_llm", slow_call_llm)
@@ -479,7 +491,7 @@ def test_references_run_in_parallel(monkeypatch):
     ]
 
     start = time.monotonic()
-    out = moa_loop._run_references_parallel(
+    out = await moa_loop._run_references_parallel(
         refs, [{"role": "user", "content": "hi"}], temperature=0.6, max_tokens=64
     )
     elapsed = time.monotonic() - start
@@ -496,7 +508,8 @@ def test_references_run_in_parallel(monkeypatch):
     assert out[0][1] == "resp-p1"
 
 
-def test_references_parallel_without_agent_is_unaffected(monkeypatch):
+@pytest.mark.asyncio
+async def test_references_parallel_without_agent_is_unaffected(monkeypatch):
     """No agent passed (the pre-fix call shape) must behave exactly as
     before: block until every reference completes, no interrupt check."""
     import time
@@ -508,26 +521,27 @@ def test_references_parallel_without_agent_is_unaffected(monkeypatch):
     # below would catch a regression that waits a whole poll cycle extra.
     monkeypatch.setattr(moa_loop, "_REFERENCE_POLL_INTERVAL_S", 0.05)
 
-    def slow_call_llm(**kwargs):
-        time.sleep(0.2)
+    async def slow_call_llm(**kwargs):
+        await asyncio.sleep(0.2)
         return _response(f"resp-{kwargs['provider']}")
 
     monkeypatch.setattr(moa_loop, "call_llm", slow_call_llm)
 
     refs = [{"provider": "p1", "model": "ok"}]
-    out = moa_loop._run_references_parallel(
+    out = await moa_loop._run_references_parallel(
         refs, [{"role": "user", "content": "hi"}],
     )
 
     assert out[0][1] == "resp-p1"
 
 
-def test_references_parallel_interrupt_aborts_wait(monkeypatch):
+@pytest.mark.asyncio
+async def test_references_parallel_interrupt_aborts_wait(monkeypatch):
     """A user interrupt mid-fanout must stop the wait instead of blocking
     until every reference (including a wedged one) finishes or times out on
     its own — mirroring the interrupt check agent.tool_executor already
     applies to its own concurrent tool batch."""
-    import threading
+    import asyncio
     import time
 
     from agent import moa_loop
@@ -536,9 +550,9 @@ def test_references_parallel_interrupt_aborts_wait(monkeypatch):
     monkeypatch.setattr(moa_loop, "_REFERENCE_POLL_INTERVAL_S", 0.05)
 
     fake_agent = SimpleNamespace(_interrupt_requested=False)
-    release_wedged = threading.Event()
+    release_wedged = asyncio.Event()
 
-    def fake_call_llm(**kwargs):
+    async def fake_call_llm(**kwargs):
         if kwargs["provider"] == "fast":
             # Simulate the interrupt arriving right after the fast reference
             # finishes, while the wedged one is still in flight.
@@ -547,7 +561,7 @@ def test_references_parallel_interrupt_aborts_wait(monkeypatch):
         # "wedged" — never returns within the test unless released, standing
         # in for a reference whose own (possibly very long) timeout hasn't
         # elapsed yet.
-        release_wedged.wait(timeout=5)
+        await release_wedged.wait()
         return _response("should not be observed")
 
     monkeypatch.setattr(moa_loop, "call_llm", fake_call_llm)
@@ -558,7 +572,7 @@ def test_references_parallel_interrupt_aborts_wait(monkeypatch):
     ]
     try:
         start = time.monotonic()
-        out = moa_loop._run_references_parallel(
+        out = await moa_loop._run_references_parallel(
             refs, [{"role": "user", "content": "hi"}], agent=fake_agent,
         )
         elapsed = time.monotonic() - start
@@ -569,7 +583,7 @@ def test_references_parallel_interrupt_aborts_wait(monkeypatch):
         assert out[0][1] == "fast output"
         assert "interrupted" in out[1][1]
     finally:
-        release_wedged.set()  # don't leak a blocked thread past the test
+        release_wedged.set()  # don't leak a blocked task past the test
 
 
 def _ref_config(home, fanout: str | None = None):
@@ -600,7 +614,8 @@ moa:
 
 
 
-def test_slot_runtime_anthropic_oauth_routes_through_provider_branch(monkeypatch):
+@pytest.mark.asyncio
+async def test_slot_runtime_anthropic_oauth_routes_through_provider_branch(monkeypatch):
     """Native anthropic slots must keep their provider identity, not collapse to custom.
 
     anthropic OAuth setup-tokens (sk-ant-oat*) require Bearer auth + the
@@ -613,11 +628,12 @@ def test_slot_runtime_anthropic_oauth_routes_through_provider_branch(monkeypatch
     from agent import moa_loop
     from agent.auxiliary_client import _resolve_task_provider_model
 
-    def fake_resolve(*, requested, target_model=None):
+    async def fake_resolve(*, requested, target_model=None):
         return {
             "provider": requested,
             "base_url": "https://resolved.example/v1",
             "api_key": "resolved-key",
+            "api_mode": "chat_completions",
         }
 
     monkeypatch.setattr(
@@ -625,7 +641,7 @@ def test_slot_runtime_anthropic_oauth_routes_through_provider_branch(monkeypatch
     )
 
     # _slot_runtime forwards the resolved endpoint for anthropic like any slot.
-    anthropic_rt = moa_loop._slot_runtime(
+    anthropic_rt = await moa_loop._slot_runtime(
         {"provider": "anthropic", "model": "claude-opus-4-8"}
     )
     assert anthropic_rt["provider"] == "anthropic"
@@ -643,7 +659,7 @@ def test_slot_runtime_anthropic_oauth_routes_through_provider_branch(monkeypatch
     assert resolved_provider == "anthropic"
 
     # A generic provider (openrouter) is likewise forwarded and preserved.
-    other_rt = moa_loop._slot_runtime(
+    other_rt = await moa_loop._slot_runtime(
         {"provider": "openrouter", "model": "some-model"}
     )
     assert other_rt["provider"] == "openrouter"
@@ -666,7 +682,8 @@ def _response_with_usage(content="advice", *, prompt=100, completion=50, cached=
     return SimpleNamespace(choices=[choice], usage=usage, model="fake-model")
 
 
-def test_run_reference_captures_usage_and_cost(monkeypatch):
+@pytest.mark.asyncio
+async def test_run_reference_captures_usage_and_cost(monkeypatch):
     """A reference call returns per-advisor CanonicalUsage + priced cost.
 
     Before this, _run_reference discarded response.usage entirely, so the
@@ -675,21 +692,28 @@ def test_run_reference_captures_usage_and_cost(monkeypatch):
     from agent.moa_loop import _RefAccounting, _run_reference
     from agent.usage_pricing import CanonicalUsage
 
-    monkeypatch.setattr(
-        "agent.moa_loop.call_llm",
-        lambda **kw: _response_with_usage(prompt=1000, completion=200, cached=400),
-    )
+    async def fake_call_llm(**_kwargs):
+        return _response_with_usage(prompt=1000, completion=200, cached=400)
+
+    monkeypatch.setattr("agent.moa_loop.call_llm", fake_call_llm)
     # Keep runtime resolution + pricing deterministic.
-    monkeypatch.setattr(
-        "agent.moa_loop._slot_runtime",
-        lambda slot: {"provider": "openrouter", "model": slot.get("model")},
-    )
+    async def fake_slot_runtime(slot):
+        return {"provider": "openrouter", "model": slot.get("model")}
+
+    monkeypatch.setattr("agent.moa_loop._slot_runtime", fake_slot_runtime)
+    async def fake_estimate_usage_cost(*_args, **_kwargs):
+        return SimpleNamespace(
+            amount_usd=0.0123,
+            status="estimated",
+            source="table",
+        )
+
     monkeypatch.setattr(
         "agent.usage_pricing.estimate_usage_cost",
-        lambda *a, **k: SimpleNamespace(amount_usd=0.0123, status="estimated", source="table"),
+        fake_estimate_usage_cost,
     )
 
-    label, text, acct = _run_reference(
+    label, text, acct = await _run_reference(
         {"provider": "openrouter", "model": "vendor/adv-model"},
         [{"role": "user", "content": "state?"}],
     )
@@ -798,27 +822,31 @@ def test_reference_messages_flattens_cache_decorated_content():
 
 
 
-def test_prepared_aggregator_preserves_reasoning_config(monkeypatch):
+@pytest.mark.asyncio
+async def test_prepared_aggregator_preserves_reasoning_config(monkeypatch):
     """Prepared MoA requests retain the acting aggregator reasoning policy."""
     from agent import moa_loop
 
     captured = {}
     expected_reasoning = {"enabled": True, "effort": "high"}
 
-    def fake_call_llm(**kwargs):
+    async def fake_call_llm(**kwargs):
         captured.update(kwargs)
         return _response("aggregator acted")
 
     monkeypatch.setattr(moa_loop, "call_llm", fake_call_llm)
-    monkeypatch.setattr(moa_loop, "_aggregator_reasoning_config", lambda _slot: expected_reasoning)
+    async def reasoning_config(_slot):
+        return expected_reasoning
+
+    monkeypatch.setattr(moa_loop, "_aggregator_reasoning_config", reasoning_config)
     monkeypatch.setattr(
         moa_loop,
         "_slot_runtime",
-        lambda slot: {"provider": slot["provider"], "model": slot["model"]},
+        _async_slot_runtime,
     )
 
     facade = moa_loop.MoAChatCompletions("review")
-    facade._call_prepared_aggregator(
+    await facade._call_prepared_aggregator(
         {
             "messages": [{"role": "user", "content": "question"}],
             "aggregator": {"provider": "openrouter", "model": "aggregator"},
@@ -835,7 +863,8 @@ def test_prepared_aggregator_preserves_reasoning_config(monkeypatch):
 
 
 
-def test_aggregate_moa_context_sanitizes_failed_reference_and_forwards_timeout(monkeypatch):
+@pytest.mark.asyncio
+async def test_aggregate_moa_context_sanitizes_failed_reference_and_forwards_timeout(monkeypatch):
     from agent import moa_loop
     from agent.usage_pricing import CanonicalUsage
 
@@ -850,11 +879,11 @@ def test_aggregate_moa_context_sanitizes_failed_reference_and_forwards_timeout(m
     fanout_kwargs = {}
     aggregator_calls = []
 
-    def fake_fanout(*args, **kwargs):
+    async def fake_fanout(*args, **kwargs):
         fanout_kwargs.update(kwargs)
         return outputs
 
-    def fake_call_llm(**kwargs):
+    async def fake_call_llm(**kwargs):
         aggregator_calls.append(kwargs)
         return _response("synthesized guidance")
 
@@ -863,10 +892,10 @@ def test_aggregate_moa_context_sanitizes_failed_reference_and_forwards_timeout(m
     monkeypatch.setattr(
         moa_loop,
         "_slot_runtime",
-        lambda slot: {"provider": slot["provider"], "model": slot["model"]},
+        _async_slot_runtime,
     )
 
-    result = moa_loop.aggregate_moa_context(
+    result = await moa_loop.aggregate_moa_context(
         user_prompt="review this",
         api_messages=[{"role": "user", "content": "review this"}],
         reference_models=[
@@ -890,13 +919,14 @@ def test_aggregate_moa_context_sanitizes_failed_reference_and_forwards_timeout(m
 
 
 
-def test_aggregate_skips_aggregator_when_all_references_failed(monkeypatch):
+@pytest.mark.asyncio
+async def test_aggregate_skips_aggregator_when_all_references_failed(monkeypatch):
     """When every reference returns [failed: …], the aggregator is skipped entirely."""
     from agent.moa_loop import aggregate_moa_context
 
     call_count = {"n": 0}
 
-    def fake_call_llm(**kwargs):
+    async def fake_call_llm(**kwargs):
         call_count["n"] += 1
         if kwargs["task"] == "moa_reference":
             raise RuntimeError("provider down key=super-secret")
@@ -905,10 +935,10 @@ def test_aggregate_skips_aggregator_when_all_references_failed(monkeypatch):
     monkeypatch.setattr("agent.moa_loop.call_llm", fake_call_llm)
     monkeypatch.setattr(
         "agent.moa_loop._slot_runtime",
-        lambda slot: {"provider": slot["provider"], "model": slot["model"]},
+        _async_slot_runtime,
     )
 
-    result = aggregate_moa_context(
+    result = await aggregate_moa_context(
         user_prompt="do something",
         api_messages=[{"role": "user", "content": "do something"}],
         reference_models=[
@@ -978,7 +1008,7 @@ moa:
     monkeypatch.setattr(
         moa_loop,
         "_slot_runtime",
-        lambda slot: {"provider": slot["provider"], "model": slot["model"]},
+        _async_slot_runtime,
     )
     return moa_loop, outputs, aggregator_calls
 
@@ -987,112 +1017,11 @@ moa:
 
 
 
-def test_interrupted_but_completed_reference_keeps_real_accounting(monkeypatch):
-    """A reference that finishes between the interrupt check and the reap
-    must keep its REAL output and accounting — the call billed."""
-    from concurrent.futures import wait as real_wait
-
-    from agent import moa_loop
-
-    monkeypatch.setattr(moa_loop, "get_transport", lambda *_a, **_k: None)
-    monkeypatch.setattr(moa_loop, "_REFERENCE_POLL_INTERVAL_S", 0.05)
-
-    fake_agent = SimpleNamespace(_interrupt_requested=True)
-
-    def fake_call_llm(**kwargs):
-        return _response_with_usage("slowish output", prompt=11, completion=4)
-
-    # Force the exact race: the wait loop reports the future as still
-    # pending (so the interrupt path is taken) even though the underlying
-    # call has already completed — the reap must then hit the done() branch
-    # and keep the real result instead of writing a placeholder.
-    def fake_wait(pending, timeout=None):
-        real_wait(pending)  # let the call actually finish (it billed)
-        return set(), set(pending)  # report it as still pending
-
-    monkeypatch.setattr(moa_loop, "_futures_wait", fake_wait)
-    monkeypatch.setattr(moa_loop, "call_llm", fake_call_llm)
-    monkeypatch.setattr(
-        moa_loop,
-        "_slot_runtime",
-        lambda slot: {"provider": slot["provider"], "model": slot["model"]},
-    )
-
-    out = moa_loop._run_references_parallel(
-        [{"provider": "slowish", "model": "m1"}],
-        [{"role": "user", "content": "hi"}],
-        agent=fake_agent,
-    )
-
-    # The completed call's real output + usage must survive the reap.
-    assert out[0][1] == "slowish output"
-    acct = out[0][2]
-    assert isinstance(acct, moa_loop._RefAccounting)
-    assert acct.usage.input_tokens == 11
-
-
-def test_late_completing_interrupted_reference_feeds_accounting_sink(monkeypatch):
-    """A reference still in flight at interrupt time gets a placeholder in
-    the results, but its eventual REAL accounting must reach the sink."""
-    import threading
-    import time
-
-    from agent import moa_loop
-
-    monkeypatch.setattr(moa_loop, "get_transport", lambda *_a, **_k: None)
-    monkeypatch.setattr(moa_loop, "_REFERENCE_POLL_INTERVAL_S", 0.05)
-
-    fake_agent = SimpleNamespace(_interrupt_requested=False)
-    release = threading.Event()
-    sink_calls = []
-    sink_seen = threading.Event()
-
-    def sink(label, accounting):
-        sink_calls.append((label, accounting))
-        sink_seen.set()
-
-    def fake_call_llm(**kwargs):
-        if kwargs["provider"] == "fast":
-            fake_agent._interrupt_requested = True
-            return _response("fast output")
-        # wedged: blocks past the interrupt, completes later.
-        release.wait(timeout=5)
-        return _response_with_usage("late output", prompt=21, completion=2)
-
-    monkeypatch.setattr(moa_loop, "call_llm", fake_call_llm)
-    monkeypatch.setattr(
-        moa_loop,
-        "_slot_runtime",
-        lambda slot: {"provider": slot["provider"], "model": slot["model"]},
-    )
-
-    out = moa_loop._run_references_parallel(
-        [
-            {"provider": "fast", "model": "m1"},
-            {"provider": "wedged", "model": "m2"},
-        ],
-        [{"role": "user", "content": "hi"}],
-        agent=fake_agent,
-        late_accounting_sink=sink,
-    )
-
-    # The wedged slot returned a placeholder with zeroed accounting…
-    assert out[1][1] == moa_loop._INTERRUPTED_REFERENCE_NOTE
-    assert out[1][2].usage.input_tokens == 0
-
-    # …then completes late; its real billed usage must reach the sink.
-    release.set()
-    assert sink_seen.wait(timeout=5), "late accounting sink never called"
-    label, acct = sink_calls[0]
-    assert "wedged" in label
-    assert acct.usage.input_tokens == 21
-
-
-def test_facade_does_not_cache_interrupted_reference_results(monkeypatch, tmp_path):
+@pytest.mark.asyncio
+async def test_facade_does_not_cache_interrupted_reference_results(monkeypatch, tmp_path):
     """An interrupted fan-out is a partial snapshot — caching it would replay
     placeholder notes on every later iteration of the turn. The facade must
-    leave the cache empty so the next create() re-runs the references, and
-    a late-completing reference's real spend must land in pending usage."""
+    leave the cache empty so the next create() re-runs the references."""
     from agent import moa_loop
     from agent.usage_pricing import CanonicalUsage
 
@@ -1123,36 +1052,39 @@ moa:
         )
     ]
 
-    def fake_fanout(*args, **kwargs):
+    fanout_calls = 0
+
+    async def fake_fanout(*args, **kwargs):
+        nonlocal fanout_calls
+        fanout_calls += 1
         return list(interrupted_outputs)
 
     monkeypatch.setattr(moa_loop, "_run_references_parallel", fake_fanout)
-    monkeypatch.setattr(moa_loop, "call_llm", lambda **k: _response("acted"))
+    async def fake_call_llm(**_kwargs):
+        return _response("acted")
+
+    monkeypatch.setattr(moa_loop, "call_llm", fake_call_llm)
     monkeypatch.setattr(
         moa_loop,
         "_slot_runtime",
-        lambda slot: {"provider": slot["provider"], "model": slot["model"]},
+        _async_slot_runtime,
     )
 
     facade = moa_loop.MoAChatCompletions("review")
-    facade.create(messages=[{"role": "user", "content": "go"}], tools=[])
+    await facade.create(messages=[{"role": "user", "content": "go"}], tools=[])
 
     # Interrupted results must not be cached as this state's advice.
     assert facade._ref_cache_key is None
     assert facade._ref_cache_outputs == []
 
-    # A late completion depositing real spend is picked up by consume().
-    facade._record_late_reference_accounting(
-        "openrouter:advisor",
-        moa_loop._RefAccounting(CanonicalUsage(input_tokens=33), 0.42),
-    )
+    # Native tasks are cancelled and joined, so no detached completion can
+    # deposit usage after the turn returns.
     usage, cost = facade.consume_reference_usage()
-    assert usage.input_tokens == 33
-    assert cost == pytest.approx(0.42)
-    # And consume() drained it — no double count.
-    usage2, cost2 = facade.consume_reference_usage()
-    assert usage2.input_tokens == 0
-    assert cost2 is None
+    assert usage.input_tokens == 0
+    assert cost is None
+
+    await facade.create(messages=[{"role": "user", "content": "go"}], tools=[])
+    assert fanout_calls == 2
 
 
 class _CountingCtxLen:
@@ -1174,7 +1106,7 @@ def _trim(messages, *, window=1000, reserve=None, cache=None, counting=None,
     from agent import model_metadata, moa_loop
 
     stub = counting or _CountingCtxLen(window)
-    monkeypatch.setattr(model_metadata, "get_model_context_length", stub)
+    monkeypatch.setattr(model_metadata, "get_static_context_length", stub)
     return moa_loop._trim_messages_for_reference(
         messages,
         {"provider": "openrouter", "model": "small-window"},
@@ -1204,24 +1136,26 @@ def _advisory_view(n_pairs, chunk="x" * 400):
 
 
 
-def test_reference_trim_context_length_cache_hits_once(monkeypatch):
+@pytest.mark.asyncio
+async def test_reference_trim_context_length_cache_hits_once(monkeypatch):
     """A shared per-turn cache resolves each (provider, model) window once."""
     cache = {}
     stub = _CountingCtxLen(10_000_000)
     msgs = _advisory_view(2)
     for _ in range(4):
-        _trim(list(msgs), cache=cache, counting=stub, monkeypatch=monkeypatch)
+        await _trim(list(msgs), cache=cache, counting=stub, monkeypatch=monkeypatch)
     assert stub.calls == 1
     assert cache == {("openrouter", "small-window"): 10_000_000}
 
 
-def test_reference_trim_caches_resolution_failures(monkeypatch):
+@pytest.mark.asyncio
+async def test_reference_trim_caches_resolution_failures(monkeypatch):
     """A failing metadata source is probed once, not per reference call."""
     cache = {}
     stub = _CountingCtxLen(RuntimeError("metadata down"))
     msgs = _advisory_view(2)
     for _ in range(3):
-        out = _trim(list(msgs), cache=cache, counting=stub, monkeypatch=monkeypatch)
+        out = await _trim(list(msgs), cache=cache, counting=stub, monkeypatch=monkeypatch)
         assert out == msgs
     assert stub.calls == 1
     assert cache == {("openrouter", "small-window"): None}

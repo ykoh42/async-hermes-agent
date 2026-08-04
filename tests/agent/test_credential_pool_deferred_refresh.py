@@ -11,8 +11,10 @@ lock. These tests pin the two invariants that make that safe:
    auth.json.
 """
 
-import threading
+import asyncio
 from dataclasses import replace
+
+import pytest
 
 from agent.credential_pool import (
     AUTH_TYPE_OAUTH,
@@ -35,17 +37,14 @@ def _codex_entry(entry_id: str = "codex-1") -> PooledCredential:
     )
 
 
-def test_select_does_not_hold_pool_lock_during_deferred_refresh(monkeypatch):
+@pytest.mark.asyncio
+async def test_select_does_not_hold_pool_lock_during_deferred_refresh(monkeypatch):
     pool = CredentialPool("openai-codex", [_codex_entry()])
     lock_free_during_refresh = {}
 
-    def _fake_refresh(entry, *, force):
-        # If select() still held the pool lock here, this non-blocking
-        # acquire would fail — the regression this PR exists to fix.
-        acquired = pool._lock.acquire(blocking=False)
-        lock_free_during_refresh["value"] = acquired
-        if acquired:
-            pool._lock.release()
+    async def _fake_refresh(entry, *, force):
+        async with pool._lock:
+            lock_free_during_refresh["value"] = True
         refreshed = replace(entry, access_token="at-fresh", expires_at_ms=2**53)
         pool._replace_entry(entry, refreshed)
         return refreshed
@@ -54,9 +53,12 @@ def test_select_does_not_hold_pool_lock_during_deferred_refresh(monkeypatch):
         pool, "_entry_needs_refresh", lambda e: e.access_token == "at-stale"
     )
     monkeypatch.setattr(pool, "_refresh_entry", _fake_refresh)
-    monkeypatch.setattr(pool, "_persist", lambda **kw: None)
+    async def _no_persist(**_kwargs):
+        return None
 
-    selected = pool.select()
+    monkeypatch.setattr(pool, "_persist", _no_persist)
+
+    selected = await pool.select()
 
     assert lock_free_during_refresh.get("value") is True, (
         "select() held the pool lock during the deferred refresh network window"
@@ -65,29 +67,28 @@ def test_select_does_not_hold_pool_lock_during_deferred_refresh(monkeypatch):
     assert selected.access_token == "at-fresh"
 
 
-def test_deferred_mutations_serialize_against_concurrent_rotation(monkeypatch):
-    """_replace_entry/_persist from the deferred path must contend on the
-    pool lock: with the lock held by another thread, the deferred mutation
-    must block rather than mutate concurrently."""
+@pytest.mark.asyncio
+async def test_deferred_refreshes_are_serialized(monkeypatch):
+    """Concurrent selectors share one refresh and observe one final entry."""
     pool = CredentialPool("openai-codex", [_codex_entry()])
-    monkeypatch.setattr(pool, "_persist", lambda **kw: None)
+    calls = 0
 
-    entry = pool._entries[0]
-    refreshed = replace(entry, access_token="at-fresh")
+    async def _fake_refresh(entry, *, force):
+        nonlocal calls
+        calls += 1
+        await asyncio.sleep(0)
+        refreshed = replace(entry, access_token="at-fresh", expires_at_ms=2**53)
+        pool._replace_entry(entry, refreshed)
+        return refreshed
 
-    mutated = threading.Event()
+    monkeypatch.setattr(
+        pool, "_entry_needs_refresh", lambda entry: entry.access_token == "at-stale"
+    )
+    monkeypatch.setattr(pool, "_refresh_entry", _fake_refresh)
 
-    def _deferred_mutation():
-        pool._replace_entry(entry, refreshed)  # self-locking
-        mutated.set()
+    first, second = await asyncio.gather(pool.select(), pool.select())
 
-    with pool._lock:
-        t = threading.Thread(target=_deferred_mutation)
-        t.start()
-        # While we hold the lock, the deferred mutation must NOT complete.
-        assert not mutated.wait(timeout=0.3), (
-            "_replace_entry mutated the pool while another thread held the lock"
-        )
-    t.join(timeout=5)
-    assert mutated.is_set()
+    assert calls == 1
+    assert first is not None and first.access_token == "at-fresh"
+    assert second is not None and second.access_token == "at-fresh"
     assert pool._entries[0].access_token == "at-fresh"

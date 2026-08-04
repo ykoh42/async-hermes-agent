@@ -2,6 +2,8 @@
 
 import json
 
+import pytest
+
 from tools.todo_tool import TodoStore, todo_tool
 
 
@@ -93,16 +95,18 @@ class TestMergeMode:
 
 
 class TestTodoToolFunction:
-    def test_read_mode(self):
+    @pytest.mark.asyncio
+    async def test_read_mode(self):
         store = TodoStore()
         store.write([{"id": "1", "content": "Task", "status": "pending"}])
-        result = json.loads(todo_tool(store=store))
+        result = json.loads(await todo_tool(store=store))
         assert result["summary"]["total"] == 1
         assert result["summary"]["pending"] == 1
 
 
-    def test_no_store_returns_error(self):
-        result = json.loads(todo_tool())
+    @pytest.mark.asyncio
+    async def test_no_store_returns_error(self):
+        result = json.loads(await todo_tool())
         assert "error" in result
 
 

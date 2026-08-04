@@ -1,28 +1,14 @@
-"""Firecrawl web search + extract — plugin form.
+"""Firecrawl web search + extract provider.
 
-Subclasses :class:`agent.web_search_provider.WebSearchProvider`. This is
-the largest provider migrated in this PR; it captures the full inline
-firecrawl implementation that previously lived in tools/web_tools.py:
+Subclasses :class:`agent.web_search_provider.WebSearchProvider` and uses
+Firecrawl's HTTP API directly through :class:`httpx.AsyncClient`.
 
-  - :data:`Firecrawl` lazy proxy that defers the ~200ms SDK import to
-    first use (re-exported by tools.web_tools for backward compat with
-    existing tests that mock that name).
-  - :func:`_get_firecrawl_client` with direct + managed-gateway dual
-    mode, controlled by ``web.use_gateway`` config when both are
-    configured.
-  - :func:`check_firecrawl_api_key` re-exported (tests + tools_config
-    setup hint depend on this name living in tools.web_tools).
+  - :func:`check_firecrawl_api_key` is re-exported by ``tools.web_tools``
+    because the tools setup flow depends on that name.
   - :func:`_extract_web_search_results` / :func:`_extract_scrape_payload`
-    response-shape normalizers that handle SDK / direct API / gateway
-    response variants.
+    normalize direct API response variants.
   - Per-URL extract loop with 60s timeout, redirect-aware SSRF re-check,
     website-policy gating, and format-aware content selection.
-
-Async note: the underlying SDK is sync. ``extract()`` is declared
-``async def`` because it performs per-URL I/O that benefits from
-running in an executor; the implementation wraps each scrape in
-:func:`asyncio.to_thread` with :func:`asyncio.wait_for(timeout=60)` to
-guard against hung fetches.
 
 Config keys this provider responds to::
 
@@ -30,25 +16,17 @@ Config keys this provider responds to::
       search_backend: "firecrawl"     # explicit per-capability
       extract_backend: "firecrawl"    # explicit per-capability
       backend: "firecrawl"            # shared fallback (default)
-      use_gateway: false              # prefer managed gateway when both
-                                      # direct + gateway credentials exist
-
 Env vars::
 
     FIRECRAWL_API_KEY=...            # direct cloud auth
     FIRECRAWL_API_URL=...            # self-hosted Firecrawl
-    FIRECRAWL_GATEWAY_URL=...        # Nous tool-gateway (subscribers)
-    TOOL_GATEWAY_DOMAIN=...          # alternate gateway env
-    TOOL_GATEWAY_SCHEME=...
-    TOOL_GATEWAY_USER_TOKEN=...
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
-import os
-from typing import Any, Dict, List, Optional, TYPE_CHECKING
+from typing import Any, Dict, List, Optional
 
 from agent.web_search_provider import WebSearchProvider
 from tools.url_safety import is_safe_url
@@ -57,71 +35,8 @@ from tools.website_policy import check_website_access
 logger = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# Lazy Firecrawl SDK proxy
-# ---------------------------------------------------------------------------
-# The firecrawl SDK pulls ~200ms of imports (httpcore, firecrawl.v1/v2 type
-# trees) on a cold CLI. We only need it when the backend is actually
-# "firecrawl", so defer the import to first use via a callable proxy.
-#
-# Tests that do ``patch("tools.web_tools.Firecrawl", ...)`` continue to
-# work because tools/web_tools.py re-exports ``Firecrawl`` from this
-# module — so the patched name still references the same proxy instance.
-
-if TYPE_CHECKING:
-    from firecrawl import Firecrawl as FirecrawlSDK  # noqa: F401 — type hints only
-
-_FIRECRAWL_CLS_CACHE: Optional[type] = None
-
-
-def _load_firecrawl_cls() -> type:
-    """Import and cache ``firecrawl.Firecrawl``."""
-    global _FIRECRAWL_CLS_CACHE
-    if _FIRECRAWL_CLS_CACHE is None:
-        try:
-            from tools.lazy_deps import ensure as _lazy_ensure
-
-            _lazy_ensure("search.firecrawl", prompt=False)
-        except ImportError:
-            pass
-        except Exception as exc:  # noqa: BLE001 — surface install hint
-            raise ImportError(str(exc))
-        from firecrawl import Firecrawl as _cls  # noqa: WPS433 — deliberately lazy
-
-        _FIRECRAWL_CLS_CACHE = _cls
-    return _FIRECRAWL_CLS_CACHE
-
-
-class _FirecrawlProxy:
-    """Callable proxy that looks like ``firecrawl.Firecrawl`` but imports lazily."""
-
-    __slots__ = ()
-
-    def __call__(self, *args: Any, **kwargs: Any) -> Any:
-        return _load_firecrawl_cls()(*args, **kwargs)
-
-    def __instancecheck__(self, obj: Any) -> bool:
-        return isinstance(obj, _load_firecrawl_cls())
-
-    def __repr__(self) -> str:
-        return "<lazy firecrawl.Firecrawl proxy>"
-
-
-Firecrawl = _FirecrawlProxy()
-
-
-# ---------------------------------------------------------------------------
-# Client construction (direct vs managed-gateway)
-# ---------------------------------------------------------------------------
-#
-# The canonical cache slots live on :mod:`tools.web_tools` so tests that do
-# ``tools.web_tools._firecrawl_client = None`` between cases see fresh
-# state. The plugin reads/writes through that public module — see
-# :func:`_get_firecrawl_client` below.
-
-
-def _get_direct_firecrawl_config() -> Optional[tuple]:
-    """Return explicit direct Firecrawl kwargs + cache key, or None when unset."""
+def _get_direct_firecrawl_config() -> Optional[Dict[str, str]]:
+    """Return direct Firecrawl request configuration, or ``None`` when unset."""
     from hermes_cli.config import get_env_value
 
     api_key = (get_env_value("FIRECRAWL_API_KEY") or "").strip()
@@ -136,30 +51,7 @@ def _get_direct_firecrawl_config() -> Optional[tuple]:
     if api_url:
         kwargs["api_url"] = api_url
 
-    return kwargs, ("direct", api_url or None, api_key or None)
-
-
-def _get_firecrawl_gateway_url() -> str:
-    """Return the configured Firecrawl gateway URL."""
-    import tools.web_tools as _wt
-
-    return _wt.build_vendor_gateway_url("firecrawl")
-
-
-def _is_tool_gateway_ready() -> bool:
-    """Return True when gateway URL + Nous Subscriber token are available.
-
-    Reads ``peek_nous_access_token`` and ``resolve_managed_tool_gateway``
-    via :mod:`tools.web_tools` rather than direct imports, so unit tests
-    that ``patch("tools.web_tools._peek_nous_access_token", ...)`` see
-    their patches honored. The names are re-exported on
-    :mod:`tools.web_tools` for exactly this reason.
-    """
-    import tools.web_tools as _wt
-
-    return _wt.resolve_managed_tool_gateway(
-        "firecrawl", token_reader=_wt._peek_nous_access_token
-    ) is not None
+    return kwargs
 
 
 def _has_direct_firecrawl_config() -> bool:
@@ -168,117 +60,26 @@ def _has_direct_firecrawl_config() -> bool:
 
 
 def check_firecrawl_api_key() -> bool:
-    """Return True when Firecrawl backend (direct or gateway) is usable.
+    """Return True when a direct or self-hosted Firecrawl backend is usable.
 
     Re-exported by :mod:`tools.web_tools` for backward compatibility with
     existing tests and the ``hermes tools`` setup flow.
     """
-    return _has_direct_firecrawl_config() or _is_tool_gateway_ready()
-
-
-def _firecrawl_backend_help_suffix() -> str:
-    """Return optional managed-gateway guidance for Firecrawl help text."""
-    import tools.web_tools as _wt
-
-    if not _wt.managed_nous_tools_enabled():
-        return ""
-    return (
-        ", or use the Nous Tool Gateway via your subscription "
-        "(FIRECRAWL_GATEWAY_URL or TOOL_GATEWAY_DOMAIN)"
-    )
+    return _has_direct_firecrawl_config()
 
 
 def _raise_web_backend_configuration_error() -> None:
     """Raise a clear error for unsupported web backend configuration."""
-    import tools.web_tools as _wt
-
     message = (
         "Web tools are not configured. "
         "Set FIRECRAWL_API_KEY for cloud Firecrawl or set FIRECRAWL_API_URL "
         "for a self-hosted Firecrawl instance."
     )
-    if _wt.managed_nous_tools_enabled():
-        message += (
-            " With your Nous subscription you can also use the Tool Gateway. "
-            "run `hermes tools` and select Nous Subscription as the web provider."
-        )
-    else:
-        message += " " + _wt.nous_tool_gateway_unavailable_message(
-            "managed Firecrawl web tools",
-        )
     raise ValueError(message)
 
 
-def _get_firecrawl_client() -> Any:
-    """Get or create the cached Firecrawl client.
-
-    When ``web.use_gateway`` is set in config, the managed Tool Gateway is
-    preferred even if direct Firecrawl credentials are present. Otherwise
-    direct Firecrawl takes precedence when explicitly configured.
-
-    Raises ValueError when neither path is usable.
-
-    The cached client is stored on :mod:`tools.web_tools` (as
-    ``_firecrawl_client`` and ``_firecrawl_client_config``) rather than on
-    this plugin module so that unit tests that reset the cache via
-    ``tools.web_tools._firecrawl_client = None`` keep working. Helper
-    functions (``prefers_gateway``, ``resolve_managed_tool_gateway``,
-    ``_read_nous_access_token``, ``Firecrawl``) are also looked up via
-    :mod:`tools.web_tools` for the same reason — see
-    :func:`_is_tool_gateway_ready`.
-    """
-    import tools.web_tools as _wt
-
-    direct_config = _get_direct_firecrawl_config()
-    if direct_config is not None and not _wt.prefers_gateway("web"):
-        kwargs, client_config = direct_config
-    else:
-        managed_gateway = _wt.resolve_managed_tool_gateway(
-            "firecrawl", token_reader=_wt._read_nous_access_token
-        )
-        if managed_gateway is None:
-            logger.error(
-                "Firecrawl client initialization failed: "
-                "missing direct config and tool-gateway auth."
-            )
-            _raise_web_backend_configuration_error()
-
-        kwargs = {
-            "api_key": managed_gateway.nous_user_token,
-            "api_url": managed_gateway.gateway_origin,
-        }
-        client_config = (
-            "tool-gateway",
-            kwargs["api_url"],
-            managed_gateway.nous_user_token,
-        )
-
-    cached = getattr(_wt, "_firecrawl_client", None)
-    cached_config = getattr(_wt, "_firecrawl_client_config", None)
-    if cached is not None and cached_config == client_config:
-        return cached
-
-    # Construct via the re-exported Firecrawl proxy on tools.web_tools so
-    # unit tests patching ``tools.web_tools.Firecrawl`` see their mock.
-    _wt._firecrawl_client = _wt.Firecrawl(**kwargs)
-    _wt._firecrawl_client_config = client_config
-    return _wt._firecrawl_client
-
-
-def _reset_client_for_tests() -> None:
-    """Drop the cached Firecrawl client so tests can re-instantiate cleanly.
-
-    Clears the canonical slots on :mod:`tools.web_tools` (where
-    :func:`_get_firecrawl_client` reads/writes them).
-    """
-    import tools.web_tools as _wt
-
-    _wt._firecrawl_client = None
-    _wt._firecrawl_client_config = None
-
-
 # ---------------------------------------------------------------------------
-# Response shape normalization (SDK / direct / gateway differ)
+# Response shape normalization
 # ---------------------------------------------------------------------------
 
 
@@ -306,7 +107,7 @@ def _to_plain_object(value: Any) -> Any:
 
 
 def _normalize_result_list(values: Any) -> List[Dict[str, Any]]:
-    """Normalize mixed SDK/list payloads into a list of dicts."""
+    """Normalize mixed list payloads into a list of dictionaries."""
     if not isinstance(values, list):
         return []
 
@@ -319,7 +120,7 @@ def _normalize_result_list(values: Any) -> List[Dict[str, Any]]:
 
 
 def _extract_web_search_results(response: Any) -> List[Dict[str, Any]]:
-    """Extract Firecrawl search results across SDK/direct/gateway response shapes."""
+    """Extract Firecrawl search results across direct API response shapes."""
     response_plain = _to_plain_object(response)
 
     if isinstance(response_plain, dict):
@@ -350,7 +151,7 @@ def _extract_web_search_results(response: Any) -> List[Dict[str, Any]]:
 
 
 def _extract_scrape_payload(scrape_result: Any) -> Dict[str, Any]:
-    """Normalize Firecrawl scrape payload shape across SDK and gateway variants."""
+    """Normalize Firecrawl scrape payload shape across direct API variants."""
     result_plain = _to_plain_object(scrape_result)
     if not isinstance(result_plain, dict):
         return {}
@@ -368,7 +169,38 @@ def _extract_scrape_payload(scrape_result: Any) -> Dict[str, Any]:
 
 
 class FirecrawlWebSearchProvider(WebSearchProvider):
-    """Firecrawl search + extract provider with dual auth paths."""
+    """Native-async Firecrawl search + extract provider."""
+
+    @staticmethod
+    def _request_config() -> tuple[str, str]:
+        """Resolve the active Firecrawl HTTP origin and bearer token."""
+        direct_config = _get_direct_firecrawl_config()
+        if direct_config is None:
+            _raise_web_backend_configuration_error()
+        return (
+            (direct_config.get("api_url") or "https://api.firecrawl.dev/v1").rstrip("/"),
+            direct_config.get("api_key", ""),
+        )
+
+    @classmethod
+    async def _request(cls, endpoint: str, payload: Dict[str, Any]) -> Any:
+        import httpx
+
+        origin, token = cls._request_config()
+        if not origin.endswith("/v1"):
+            origin = f"{origin}/v1"
+        async with httpx.AsyncClient(timeout=60) as client:
+            response = await client.post(
+                f"{origin}/{endpoint.lstrip('/')}",
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": "application/json",
+                    "User-Agent": "Hermes-Agent",
+                },
+                json=payload,
+            )
+            response.raise_for_status()
+            return response.json()
 
     @property
     def name(self) -> str:
@@ -379,7 +211,7 @@ class FirecrawlWebSearchProvider(WebSearchProvider):
         return "Firecrawl"
 
     def is_available(self) -> bool:
-        """Return True when direct Firecrawl OR managed-gateway path is configured."""
+        """Return True when direct or self-hosted Firecrawl is configured."""
         return check_firecrawl_api_key()
 
     def supports_search(self) -> bool:
@@ -388,18 +220,11 @@ class FirecrawlWebSearchProvider(WebSearchProvider):
     def supports_extract(self) -> bool:
         return True
 
-    def search(self, query: str, limit: int = 5) -> Dict[str, Any]:
+    async def search(self, query: str, limit: int = 5) -> Dict[str, Any]:
         """Execute a Firecrawl search.
 
-        Sync; matches the legacy ``_get_firecrawl_client().search(...)``
-        call directly. Normalizes the response across SDK/direct/gateway
-        shapes via :func:`_extract_web_search_results`.
-
-        Pre-flight errors (``ValueError`` from configuration check,
-        ``ImportError`` from missing SDK) propagate to the dispatcher's
-        top-level handler, which wraps them as ``tool_error(...)`` —
-        matching the legacy ``{"error": "Error searching web: ..."}``
-        envelope. Only in-flight errors are caught and surfaced as
+        Normalizes the direct HTTP response via
+        :func:`_extract_web_search_results`. In-flight errors are surfaced as
         ``{"success": False, "error": ...}``.
         """
         from tools.interrupt import is_interrupted
@@ -408,11 +233,11 @@ class FirecrawlWebSearchProvider(WebSearchProvider):
             return {"success": False, "error": "Interrupted"}
 
         logger.info("Firecrawl search: '%s' (limit=%d)", query, limit)
-        # _get_firecrawl_client() raises ValueError on unconfigured systems —
-        # let it propagate so the dispatcher emits the legacy envelope shape.
-        client = _get_firecrawl_client()
         try:
-            response = client.search(query=query, limit=limit)
+            response = await self._request(
+                "search",
+                {"query": query, "limit": max(1, min(int(limit), 100))},
+            )
             web_results = _extract_web_search_results(response)
             logger.info("Firecrawl: found %d search results", len(web_results))
             return {"success": True, "data": {"web": web_results}}
@@ -423,7 +248,7 @@ class FirecrawlWebSearchProvider(WebSearchProvider):
     async def extract(self, urls: List[str], **kwargs: Any) -> List[Dict[str, Any]]:
         """Extract content from one or more URLs via Firecrawl.
 
-        Async; each URL is scraped in a background thread with a 60s
+        Async; each URL is scraped through the native HTTP API with a 60s
         timeout. After scraping, the final URL (post-redirect) is
         re-checked against website-access policy.
 
@@ -461,7 +286,7 @@ class FirecrawlWebSearchProvider(WebSearchProvider):
                 continue
 
             # Pre-scrape website policy gate
-            blocked = check_website_access(url)
+            blocked = await check_website_access(url)
             if blocked:
                 logger.info(
                     "Blocked web_extract for %s by rule %s",
@@ -487,10 +312,9 @@ class FirecrawlWebSearchProvider(WebSearchProvider):
                 logger.info("Firecrawl scraping: %s", url)
                 try:
                     scrape_result = await asyncio.wait_for(
-                        asyncio.to_thread(
-                            _get_firecrawl_client().scrape,
-                            url=url,
-                            formats=formats,
+                        self._request(
+                            "scrape",
+                            {"url": url, "formats": formats},
                         ),
                         timeout=60,
                     )
@@ -527,7 +351,7 @@ class FirecrawlWebSearchProvider(WebSearchProvider):
                 final_url = metadata.get("sourceURL", url)
 
                 # Re-check SSRF safety after any redirect reported by Firecrawl.
-                if not is_safe_url(final_url):
+                if not await is_safe_url(final_url):
                     logger.info(
                         "Blocked redirected web_extract for unsafe final URL: %s",
                         final_url,
@@ -547,7 +371,7 @@ class FirecrawlWebSearchProvider(WebSearchProvider):
                     continue
 
                 # Re-check website-access policy after any redirect
-                final_blocked = check_website_access(final_url)
+                final_blocked = await check_website_access(final_url)
                 if final_blocked:
                     logger.info(
                         "Blocked redirected web_extract for %s by rule %s",
@@ -602,11 +426,8 @@ class FirecrawlWebSearchProvider(WebSearchProvider):
     def get_setup_schema(self) -> Dict[str, Any]:
         return {
             "name": "Firecrawl",
-            "badge": "paid · optional gateway",
-            "tag": (
-                "Full search + extract; supports direct API and "
-                "Nous tool-gateway routing."
-            ),
+            "badge": "paid · self-hostable",
+            "tag": "Full search + extract via direct or self-hosted Firecrawl.",
             "env_vars": [
                 {
                     "key": "FIRECRAWL_API_KEY",

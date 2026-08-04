@@ -5,6 +5,7 @@ resources returned through MCP resource blocks were silently dropped from
 tool results, so a PDF-returning MCP tool appeared to return metadata only.
 """
 
+import asyncio
 import base64
 import json
 from types import SimpleNamespace
@@ -31,20 +32,18 @@ def _embedded(resource):
 @pytest.fixture()
 def doc_cache(tmp_path, monkeypatch):
     """Point the document cache at a temp dir."""
-    import gateway.platforms.base as base
-
-    monkeypatch.setattr(base, "DOCUMENT_CACHE_DIR", tmp_path)
-    monkeypatch.setenv("HERMES_DOCUMENT_CACHE_DIR", str(tmp_path))
-    # _resolve_cache_dir consults the module constant; patching the constant
-    # is sufficient because the import-default comparison detects the change.
-    return tmp_path
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    return tmp_path / "cache" / "documents"
 
 
 class TestRenderResourceBlock:
-    def test_embedded_pdf_blob_is_materialized(self, doc_cache):
+    @pytest.mark.asyncio
+    async def test_embedded_pdf_blob_is_materialized(self, doc_cache):
         from tools.mcp_tool import _render_mcp_resource_block
 
-        out = _render_mcp_resource_block(_embedded(_blob_resource(PDF_BYTES)), "slack")
+        out = await _render_mcp_resource_block(
+            _embedded(_blob_resource(PDF_BYTES)), "slack"
+        )
         assert "saved to" in out
         assert "application/pdf" in out
         # Extract path and verify bytes round-trip
@@ -54,23 +53,31 @@ class TestRenderResourceBlock:
         assert "report.pdf" in path
 
 
-    def test_malformed_base64_fails_explicitly(self):
+    @pytest.mark.asyncio
+    async def test_malformed_base64_fails_explicitly(self):
         from tools.mcp_tool import _render_mcp_resource_block
 
         res = SimpleNamespace(uri="x://y", mimeType="application/pdf", blob="!!!not-base64!!!", text=None)
-        out = _render_mcp_resource_block(_embedded(res), "srv")
+        out = await _render_mcp_resource_block(_embedded(res), "srv")
         assert "could not be decoded" in out
 
-    def test_non_resource_block_returns_empty(self):
+    @pytest.mark.asyncio
+    async def test_non_resource_block_returns_empty(self):
         from tools.mcp_tool import _render_mcp_resource_block
 
-        assert _render_mcp_resource_block(SimpleNamespace(type="text", text="hi"), "srv") == ""
+        assert (
+            await _render_mcp_resource_block(
+                SimpleNamespace(type="text", text="hi"), "srv"
+            )
+            == ""
+        )
 
-    def test_path_traversal_uri_is_neutralized(self, doc_cache):
+    @pytest.mark.asyncio
+    async def test_path_traversal_uri_is_neutralized(self, doc_cache):
         from tools.mcp_tool import _render_mcp_resource_block
 
         res = _blob_resource(PDF_BYTES, uri="evil://host/../../etc/passwd")
-        out = _render_mcp_resource_block(_embedded(res), "srv")
+        out = await _render_mcp_resource_block(_embedded(res), "srv")
         assert "saved to" in out
         path = out.split("saved to ", 1)[1].split(" (", 1)[0]
         assert str(doc_cache) in path
@@ -93,7 +100,8 @@ class TestResourceFilename:
 
 
 class TestPreDecodeSizeCap:
-    def test_oversized_b64_rejected_before_decode(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_oversized_b64_rejected_before_decode(self, monkeypatch):
         import tools.mcp_tool as m
 
         monkeypatch.setattr(m, "_MCP_RESOURCE_MAX_B64_CHARS", 16)
@@ -103,33 +111,35 @@ class TestPreDecodeSizeCap:
         )
         called = []
         monkeypatch.setattr(base64, "b64decode", lambda *a, **k: called.append(1))
-        out = m._render_mcp_resource_block(_embedded(res), "srv")
+        out = await m._render_mcp_resource_block(_embedded(res), "srv")
         assert "too large" in out
         assert not called
 
 
 class TestAudioBlock:
-    def test_non_audio_returns_empty(self):
+    @pytest.mark.asyncio
+    async def test_non_audio_returns_empty(self):
         from tools.mcp_tool import _cache_mcp_audio_block
 
         block = SimpleNamespace(data=base64.b64encode(b"x").decode(), mimeType="application/pdf")
-        assert _cache_mcp_audio_block(block) == ""
+        assert await _cache_mcp_audio_block(block) == ""
 
-    def test_audio_block_cached_as_media(self, tmp_path, monkeypatch):
-        import gateway.platforms.base as base
+    @pytest.mark.asyncio
+    async def test_audio_block_cached_as_media(self, tmp_path, monkeypatch):
         from tools.mcp_tool import _cache_mcp_audio_block
 
-        monkeypatch.setattr(base, "AUDIO_CACHE_DIR", tmp_path)
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         block = SimpleNamespace(
             data=base64.b64encode(b"RIFFfakewav").decode(),
             mimeType="audio/wav",
         )
-        out = _cache_mcp_audio_block(block)
+        out = await _cache_mcp_audio_block(block)
         assert out.startswith("MEDIA:")
 
 
 class TestToolResultLoopOrdering:
-    def test_mixed_blocks_preserve_order(self, doc_cache):
+    @pytest.mark.asyncio
+    async def test_mixed_blocks_preserve_order(self, doc_cache):
         """Simulate the tool-result block loop with text + pdf resource."""
         from tools.mcp_tool import (
             _cache_mcp_image_block,
@@ -146,25 +156,28 @@ class TestToolResultLoopOrdering:
             if getattr(block, "text", None):
                 parts.append(block.text)
                 continue
-            tag = _cache_mcp_image_block(block) or _cache_mcp_audio_block(block)
+            tag = await _cache_mcp_image_block(block)
+            if not tag:
+                tag = await _cache_mcp_audio_block(block)
             if tag:
                 parts.append(tag)
                 continue
-            rendered = _render_mcp_resource_block(block, "slack")
+            rendered = await _render_mcp_resource_block(block, "slack")
             if rendered:
                 parts.append(rendered)
         assert len(parts) == 2
         assert parts[0].startswith("File ID")
         assert "saved to" in parts[1]
 
-    def test_existing_image_behavior_unchanged(self):
+    @pytest.mark.asyncio
+    async def test_existing_image_behavior_unchanged(self):
         from tools.mcp_tool import _cache_mcp_image_block
 
         block = SimpleNamespace(
             data=base64.b64encode(b"some bytes").decode("ascii"),
             mimeType="application/pdf",
         )
-        assert _cache_mcp_image_block(block) == ""
+        assert await _cache_mcp_image_block(block) == ""
 
 
 class TestErrorPathResourceText:
@@ -172,38 +185,23 @@ class TestErrorPathResourceText:
 
     @pytest.fixture()
     def _handler(self, monkeypatch):
-        import asyncio
         from unittest.mock import AsyncMock, MagicMock, patch as mock_patch
 
         from tools import mcp_tool
 
         fake_session = MagicMock()
-        fake_server = SimpleNamespace(session=fake_session, _rpc_lock=None)
-
-        def _fake_run_on_mcp_loop(coro_or_factory, timeout=30):
-            coro = coro_or_factory() if callable(coro_or_factory) else coro_or_factory
-            loop = asyncio.new_event_loop()
-            try:
-                async def _install_lock_and_run():
-                    for srv in list(mcp_tool._servers.values()):
-                        if getattr(srv, "_rpc_lock", None) is None:
-                            srv._rpc_lock = asyncio.Lock()
-                    return await coro
-
-                return loop.run_until_complete(_install_lock_and_run())
-            finally:
-                loop.close()
+        fake_server = SimpleNamespace(session=fake_session, _rpc_lock=asyncio.Lock())
 
         mcp_tool._reset_server_error("test-server")
         try:
-            with mock_patch.dict(mcp_tool._servers, {"test-server": fake_server}), \
-                 mock_patch("tools.mcp_tool._run_on_mcp_loop", side_effect=_fake_run_on_mcp_loop):
+            with mock_patch.dict(mcp_tool._servers, {"test-server": fake_server}):
                 fake_session.call_tool = AsyncMock()
                 yield fake_session, mcp_tool._make_tool_handler("test-server", "my-tool", 30.0)
         finally:
             mcp_tool._reset_server_error("test-server")
 
-    def test_error_embedded_resource_text_surfaced(self, _handler):
+    @pytest.mark.asyncio
+    async def test_error_embedded_resource_text_surfaced(self, _handler):
         from unittest.mock import AsyncMock
 
         session, handler = _handler
@@ -212,10 +210,11 @@ class TestErrorPathResourceText:
         session.call_tool = AsyncMock(return_value=SimpleNamespace(
             content=[_embedded(res)], isError=True, structuredContent=None,
         ))
-        data = json.loads(handler({}))
+        data = json.loads(await handler({}))
         assert "quota exceeded for workspace W1" in data["error"]
 
-    def test_error_mixed_text_and_resource(self, _handler):
+    @pytest.mark.asyncio
+    async def test_error_mixed_text_and_resource(self, _handler):
         from unittest.mock import AsyncMock
 
         session, handler = _handler
@@ -225,16 +224,17 @@ class TestErrorPathResourceText:
             content=[SimpleNamespace(type="text", text="tool failed"), _embedded(res)],
             isError=True, structuredContent=None,
         ))
-        data = json.loads(handler({}))
+        data = json.loads(await handler({}))
         assert "tool failed" in data["error"]
         assert "details in resource" in data["error"]
 
-    def test_error_with_no_text_blocks_falls_back(self, _handler):
+    @pytest.mark.asyncio
+    async def test_error_with_no_text_blocks_falls_back(self, _handler):
         from unittest.mock import AsyncMock
 
         session, handler = _handler
         session.call_tool = AsyncMock(return_value=SimpleNamespace(
             content=[], isError=True, structuredContent=None,
         ))
-        data = json.loads(handler({}))
+        data = json.loads(await handler({}))
         assert data["error"] == "MCP tool returned an error"

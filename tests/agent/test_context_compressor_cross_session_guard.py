@@ -15,14 +15,15 @@ handoff summary is found in the current messages.
 import sys
 import types
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
+
+import pytest
 
 # Ensure repo root is importable
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 # Stub out optional heavy dependencies not installed in the test environment
 sys.modules.setdefault("fire", types.SimpleNamespace(Fire=lambda *a, **k: None))
-sys.modules.setdefault("firecrawl", types.SimpleNamespace(Firecrawl=object))
 sys.modules.setdefault("fal_client", types.SimpleNamespace())
 
 from agent.context_compressor import ContextCompressor
@@ -87,7 +88,8 @@ def _conversation_with_handoff(n_exchanges=12):
     return msgs
 
 
-def test_stale_previous_summary_cleared_when_no_handoff():
+@pytest.mark.asyncio
+async def test_stale_previous_summary_cleared_when_no_handoff():
     """Cross-session guard: stale _previous_summary cleared when no handoff."""
     c = _make_compressor()
     # Simulate state left by a prior cron session's compaction
@@ -95,9 +97,12 @@ def test_stale_previous_summary_cleared_when_no_handoff():
 
     messages = _conversation_without_handoff()
 
-    with patch.object(c, "_generate_summary",
-                      return_value="[CONTEXT COMPACTION] Fresh summary."):
-        result = c.compress(messages)
+    with patch.object(
+        c,
+        "_generate_summary",
+        new=AsyncMock(return_value="[CONTEXT COMPACTION] Fresh summary."),
+    ):
+        result = await c.compress(messages)
 
     assert c._previous_summary is None, (
         "compress() must clear stale _previous_summary when no handoff "
@@ -109,7 +114,8 @@ def test_stale_previous_summary_cleared_when_no_handoff():
     )
 
 
-def test_previous_summary_preserved_when_handoff_found():
+@pytest.mark.asyncio
+async def test_previous_summary_preserved_when_handoff_found():
     """When a handoff IS found, _previous_summary should be preserved for
     iterative update within the same session."""
     c = _make_compressor()
@@ -117,9 +123,12 @@ def test_previous_summary_preserved_when_handoff_found():
 
     messages = _conversation_with_handoff()
 
-    with patch.object(c, "_generate_summary",
-                      return_value="[CONTEXT COMPACTION] Updated summary."):
-        c.compress(messages)
+    with patch.object(
+        c,
+        "_generate_summary",
+        new=AsyncMock(return_value="[CONTEXT COMPACTION] Updated summary."),
+    ):
+        await c.compress(messages)
 
     # When a handoff IS found, the staleness guard must NOT fire.
     # _previous_summary should be updated, not cleared.
@@ -129,7 +138,8 @@ def test_previous_summary_preserved_when_handoff_found():
     )
 
 
-def test_no_false_positive_when_previous_summary_already_none():
+@pytest.mark.asyncio
+async def test_no_false_positive_when_previous_summary_already_none():
     """When _previous_summary is already None and no handoff found, nothing
     should break (the guard is a no-op in this case)."""
     c = _make_compressor()
@@ -137,9 +147,12 @@ def test_no_false_positive_when_previous_summary_already_none():
 
     messages = _conversation_without_handoff()
 
-    with patch.object(c, "_generate_summary",
-                      return_value="[CONTEXT COMPACTION] Fresh summary."):
-        c.compress(messages)
+    with patch.object(
+        c,
+        "_generate_summary",
+        new=AsyncMock(return_value="[CONTEXT COMPACTION] Fresh summary."),
+    ):
+        await c.compress(messages)
 
     # Should still be None — guard is no-op
     assert c._previous_summary is None

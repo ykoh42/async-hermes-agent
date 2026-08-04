@@ -12,14 +12,16 @@ Covers the July 2026 compression tuning pass:
    floored at 75% (raise-only — a higher configured value always wins).
 """
 
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
+
+import pytest
 
 import agent.context_compressor as cc
 from agent.context_compressor import ContextCompressor
 
 
 def _make(ctx: int, pct: float = 0.50) -> ContextCompressor:
-    with patch.object(cc, "get_model_context_length", return_value=ctx):
+    with patch.object(cc, "get_static_context_length", return_value=ctx):
         comp = ContextCompressor(
             model="test/model", threshold_percent=pct, quiet_mode=True,
         )
@@ -67,7 +69,8 @@ class TestReasoningExcludedFromSummarizer:
         assert "other answer" in ser
 
 
-    def test_summarizer_output_think_block_stripped_before_store(self):
+    @pytest.mark.asyncio
+    async def test_summarizer_output_think_block_stripped_before_store(self):
         comp = _make(128_000)
 
         class FakeMsg:
@@ -79,8 +82,13 @@ class TestReasoningExcludedFromSummarizer:
         class FakeResp:
             choices = [FakeChoice()]
 
-        with patch.object(cc, "call_llm", return_value=FakeResp()):
-            out = comp._generate_summary([{"role": "user", "content": "hi"}])
+        with patch.object(
+            cc,
+            "call_llm",
+            new_callable=AsyncMock,
+            return_value=FakeResp(),
+        ):
+            out = await comp._generate_summary([{"role": "user", "content": "hi"}])
         assert out is not None
         assert "OUTPUT_TRACE" not in out
         assert "## Active Task" in out
@@ -91,7 +99,8 @@ class TestReasoningExcludedFromSummarizer:
 
 
 class TestSummaryBudgetEnvelope:
-    def test_no_max_tokens_wire_cap_on_summary_call(self):
+    @pytest.mark.asyncio
+    async def test_no_max_tokens_wire_cap_on_summary_call(self):
         """The summary budget is PROMPT GUIDANCE only ("Target ~N tokens").
 
         A wire-level max_tokens cap truncates summaries mid-section on the
@@ -112,12 +121,12 @@ class TestSummaryBudgetEnvelope:
         class FakeResp:
             choices = [FakeChoice()]
 
-        def fake_call_llm(**kw):
+        async def fake_call_llm(**kw):
             captured.update(kw)
             return FakeResp()
 
         with patch.object(cc, "call_llm", side_effect=fake_call_llm):
-            out = comp._generate_summary([{"role": "user", "content": "hi"}])
+            out = await comp._generate_summary([{"role": "user", "content": "hi"}])
         assert out is not None
         assert "max_tokens" not in captured
         # The budget still lands as prompt guidance, within the envelope.

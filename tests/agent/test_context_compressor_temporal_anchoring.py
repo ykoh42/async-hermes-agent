@@ -12,14 +12,16 @@ proves ``compress()`` routes into ``_generate_summary``.
 """
 
 from datetime import datetime, timezone
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
 
 import hermes_time
 from agent.context_compressor import ContextCompressor, HISTORICAL_TASK_HEADING
 
 
 def _compressor() -> ContextCompressor:
-    with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+    with patch("agent.context_compressor.get_static_context_length", return_value=100000):
         return ContextCompressor(
             model="test/model",
             threshold_percent=0.85,
@@ -53,16 +55,18 @@ def _fixed_now():
 
 
 
-def test_clock_failure_omits_rule_but_compaction_still_runs():
+@pytest.mark.asyncio
+async def test_clock_failure_omits_rule_but_compaction_still_runs():
     compressor = _compressor()
 
     def _boom():
         raise RuntimeError("clock unavailable")
 
     with patch.object(hermes_time, "now", _boom), patch(
-        "agent.context_compressor.call_llm", return_value=_response("summary")
+        "agent.context_compressor.call_llm",
+        new=AsyncMock(return_value=_response("summary")),
     ) as mock_call:
-        result = compressor._generate_summary(_turns())
+        result = await compressor._generate_summary(_turns())
 
     # call_llm was still invoked -> compaction was not blocked by the clock error.
     assert mock_call.called
@@ -73,14 +77,16 @@ def test_clock_failure_omits_rule_but_compaction_still_runs():
     assert HISTORICAL_TASK_HEADING in prompt
 
 
-def test_anchoring_rule_uses_date_from_hermes_time_now():
+@pytest.mark.asyncio
+async def test_anchoring_rule_uses_date_from_hermes_time_now():
     """The date is taken from hermes_time.now(), which respects the user's TZ."""
     compressor = _compressor()
     fixed = datetime(2025, 12, 31, 23, 30, tzinfo=timezone.utc)
     with patch.object(hermes_time, "now", lambda: fixed), patch(
-        "agent.context_compressor.call_llm", return_value=_response("summary")
+        "agent.context_compressor.call_llm",
+        new=AsyncMock(return_value=_response("summary")),
     ) as mock_call:
-        compressor._generate_summary(_turns())
+        await compressor._generate_summary(_turns())
 
     prompt = mock_call.call_args.kwargs["messages"][0]["content"]
     assert "2025-12-31" in prompt

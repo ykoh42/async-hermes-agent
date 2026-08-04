@@ -86,7 +86,7 @@ def _already_compacted_session(
 @pytest.fixture()
 def compressor_128k():
     with patch(
-        "agent.context_compressor.get_model_context_length",
+        "agent.context_compressor.get_static_context_length",
         return_value=128_000,
     ):
         c = ContextCompressor(
@@ -98,7 +98,10 @@ def compressor_128k():
             quiet_mode=True,
             config_context_length=128_000,
         )
-    c._generate_summary = lambda *a, **k: "compact summary of earlier investigation"
+    async def _generate_summary(*_args, **_kwargs):
+        return "compact summary of earlier investigation"
+
+    c._generate_summary = _generate_summary
     return c
 
 
@@ -106,7 +109,8 @@ class TestProtectedTailPressure61932:
 
 
 
-    def test_compress_escapes_cannot_compress_further_dead_end(
+    @pytest.mark.asyncio
+    async def test_compress_escapes_cannot_compress_further_dead_end(
         self, compressor_128k
     ):
         """Full compress path must materially reduce an over-context tail.
@@ -127,7 +131,7 @@ class TestProtectedTailPressure61932:
         last_progress = False
         for _pass in range(3):
             o_len, o_tok = len(cur), tok
-            out = c.compress(list(cur), current_tokens=tok)
+            out = await c.compress(list(cur), current_tokens=tok)
             n_tok = estimate_messages_tokens_rough(out)
             last_progress = _compression_made_progress(
                 o_len, len(out), o_tok, n_tok
@@ -146,7 +150,8 @@ class TestProtectedTailPressure61932:
         # progress (never a pure no-op dead-end above the window).
         assert tok < c.threshold_tokens or last_progress
 
-    def test_all_oversized_tail_dead_end_shape_now_compresses(
+    @pytest.mark.asyncio
+    async def test_all_oversized_tail_dead_end_shape_now_compresses(
         self, compressor_128k
     ):
         """Exact #61932 dead-end: the protected tail ALONE holds everything.
@@ -174,7 +179,7 @@ class TestProtectedTailPressure61932:
         before = estimate_messages_tokens_rough(msgs)
         assert before > c.context_length, "fixture must start over-context"
 
-        out = c.compress(list(msgs), current_tokens=before)
+        out = await c.compress(list(msgs), current_tokens=before)
         after = estimate_messages_tokens_rough(out)
 
         # The dead-end is broken: one pass reclaims the bulk of the tail.
@@ -203,4 +208,3 @@ class TestProtectedTailPressure61932:
             assert rid in call_ids, f"orphaned tool result {rid!r}"
         for cid in call_ids:
             assert cid in tool_result_ids, f"orphaned tool call {cid!r}"
-

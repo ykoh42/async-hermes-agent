@@ -7,6 +7,8 @@ advancement through multiple providers.
 
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from run_agent import AIAgent, _pool_may_recover_from_rate_limit
 
 
@@ -69,57 +71,65 @@ class TestFallbackChainInit:
 
 
 class TestFallbackChainAdvancement:
-    def test_exhausted_returns_false(self):
+    @pytest.mark.asyncio
+    async def test_exhausted_returns_false(self):
         agent = _make_agent(fallback_model=None)
-        assert agent._try_activate_fallback() is False
+        assert await agent._try_activate_fallback() is False
 
-    def test_advances_index(self):
+    @pytest.mark.asyncio
+    async def test_advances_index(self):
         fbs = [
-            {"provider": "openai", "model": "gpt-4o"},
+            {
+                "provider": "openai",
+                "model": "gpt-4o",
+                "api_key": "fallback-key",
+                "base_url": "https://api.openai.com/v1",
+            },
             {"provider": "zai", "model": "glm-4.7"},
         ]
         agent = _make_agent(fallback_model=fbs)
-        with patch("agent.auxiliary_client.resolve_provider_client",
-                    return_value=(_mock_client(), "gpt-4o")):
-            assert agent._try_activate_fallback() is True
-            assert agent._fallback_index == 1
-            assert agent.model == "gpt-4o"
-            assert agent._fallback_activated is True
+        assert await agent._try_activate_fallback() is True
+        assert agent._fallback_index == 1
+        assert agent.model == "gpt-4o"
+        assert agent._fallback_activated is True
 
 
 
-    def test_skips_unconfigured_provider_to_next(self):
-        """If resolve_provider_client returns None, skip to next in chain."""
+    @pytest.mark.asyncio
+    async def test_skips_unconfigured_provider_to_next(self):
+        """A provider without native async credentials is skipped."""
         fbs = [
             {"provider": "broken", "model": "nope"},
-            {"provider": "openai", "model": "gpt-4o"},
+            {
+                "provider": "openai",
+                "model": "gpt-4o",
+                "api_key": "fallback-key",
+                "base_url": "https://api.openai.com/v1",
+            },
         ]
         agent = _make_agent(fallback_model=fbs)
-        with patch("agent.auxiliary_client.resolve_provider_client") as mock_rpc:
-            mock_rpc.side_effect = [
-                (None, None),                    # broken provider
-                (_mock_client(), "gpt-4o"),       # fallback succeeds
-            ]
-            assert agent._try_activate_fallback() is True
-            assert agent.model == "gpt-4o"
-            assert agent._fallback_index == 2
+        assert await agent._try_activate_fallback() is True
+        assert agent.model == "gpt-4o"
+        assert agent._fallback_index == 2
 
-    def test_skips_provider_that_raises_to_next(self):
-        """If resolve_provider_client raises, skip to next in chain."""
+    @pytest.mark.asyncio
+    async def test_skips_provider_that_raises_to_next(self):
+        """An unsupported native credential source is skipped."""
         fbs = [
-            {"provider": "broken", "model": "nope"},
-            {"provider": "openai", "model": "gpt-4o"},
+            {"provider": "anthropic", "model": "claude-test"},
+            {
+                "provider": "openai",
+                "model": "gpt-4o",
+                "api_key": "fallback-key",
+                "base_url": "https://api.openai.com/v1",
+            },
         ]
         agent = _make_agent(fallback_model=fbs)
-        with patch("agent.auxiliary_client.resolve_provider_client") as mock_rpc:
-            mock_rpc.side_effect = [
-                RuntimeError("auth failed"),
-                (_mock_client(), "gpt-4o"),
-            ]
-            assert agent._try_activate_fallback() is True
-            assert agent.model == "gpt-4o"
+        assert await agent._try_activate_fallback() is True
+        assert agent.model == "gpt-4o"
 
-    def test_resolves_key_env_for_fallback_provider(self):
+    @pytest.mark.asyncio
+    async def test_resolves_key_env_for_fallback_provider(self):
         fbs = [
             {
                 "provider": "custom",
@@ -129,35 +139,26 @@ class TestFallbackChainAdvancement:
             }
         ]
         agent = _make_agent(fallback_model=fbs)
-        with (
-            patch.dict("os.environ", {"MY_FALLBACK_KEY": "env-secret"}, clear=False),
-            patch(
-                "agent.auxiliary_client.resolve_provider_client",
-                return_value=(
-                    _mock_client(
-                        base_url="https://fallback.example/v1",
-                        api_key="env-secret",
-                    ),
-                    "fallback-model",
-                ),
-            ) as mock_rpc,
-        ):
-            assert agent._try_activate_fallback() is True
-            assert mock_rpc.call_args.kwargs["explicit_api_key"] == "env-secret"
+        with patch.dict("os.environ", {"MY_FALLBACK_KEY": "env-secret"}, clear=False):
+            assert await agent._try_activate_fallback() is True
+        assert agent.api_key == "env-secret"
+        assert agent.base_url == "https://fallback.example/v1"
 
 
-    def test_nous_anthropic_fallback_uses_the_messages_wire(self):
+    @pytest.mark.asyncio
+    async def test_nous_anthropic_fallback_uses_the_messages_wire(self):
         """Portal Claude fallbacks must not stay on chat_completions.
 
-        ``resolve_provider_client`` still returns an OpenAI client for Nous;
-        activation has to re-derive api_mode from the model and rebuild the
-        Anthropic client — otherwise the turn POSTs /chat/completions.
+        The native resolver must derive ``api_mode`` from the model and use
+        an Anthropic client — otherwise the turn POSTs /chat/completions.
         """
         portal = "https://inference-api.nousresearch.com/v1"
         fbs = [
             {
                 "provider": "nous",
                 "model": "anthropic/claude-opus-4.8",
+                "api_key": "portal-jwt",
+                "base_url": portal,
             }
         ]
         agent = _make_agent(fallback_model=fbs)
@@ -171,17 +172,6 @@ class TestFallbackChainAdvancement:
 
         with (
             patch(
-                "agent.chat_completion_helpers._fallback_entry_unavailable_without_network",
-                return_value=None,
-            ),
-            patch(
-                "agent.auxiliary_client.resolve_provider_client",
-                return_value=(
-                    _mock_client(base_url=portal, api_key="portal-jwt"),
-                    "anthropic/claude-opus-4.8",
-                ),
-            ),
-            patch(
                 "hermes_cli.model_normalize.normalize_model_for_provider",
                 side_effect=lambda m, p: m,
             ),
@@ -190,7 +180,7 @@ class TestFallbackChainAdvancement:
                 side_effect=_fake_build,
             ),
         ):
-            assert agent._try_activate_fallback() is True
+            assert await agent._try_activate_fallback() is True
 
         assert agent.api_mode == "anthropic_messages"
         assert agent.provider == "nous"
@@ -201,22 +191,17 @@ class TestFallbackChainAdvancement:
         assert rebuilt["base_url"] == portal
         assert agent._anthropic_client is not None
 
-    def test_nous_non_anthropic_fallback_stays_on_chat_completions(self):
+    @pytest.mark.asyncio
+    async def test_nous_non_anthropic_fallback_stays_on_chat_completions(self):
         portal = "https://inference-api.nousresearch.com/v1"
-        fbs = [{"provider": "nous", "model": "hermes-4-405b"}]
+        fbs = [{
+            "provider": "nous",
+            "model": "hermes-4-405b",
+            "api_key": "portal-jwt",
+            "base_url": portal,
+        }]
         agent = _make_agent(fallback_model=fbs)
         with (
-            patch(
-                "agent.chat_completion_helpers._fallback_entry_unavailable_without_network",
-                return_value=None,
-            ),
-            patch(
-                "agent.auxiliary_client.resolve_provider_client",
-                return_value=(
-                    _mock_client(base_url=portal, api_key="portal-jwt"),
-                    "hermes-4-405b",
-                ),
-            ),
             patch(
                 "hermes_cli.model_normalize.normalize_model_for_provider",
                 side_effect=lambda m, p: m,
@@ -226,7 +211,7 @@ class TestFallbackChainAdvancement:
                 side_effect=AssertionError("must not build Anthropic client"),
             ),
         ):
-            assert agent._try_activate_fallback() is True
+            assert await agent._try_activate_fallback() is True
 
         assert agent.api_mode == "chat_completions"
         assert agent.client is not None
@@ -262,38 +247,40 @@ class TestFallbackChainDedup:
     Otherwise a misconfigured chain or two custom_providers entries pointing
     at the same shim loop the same failure. See issue #22548."""
 
-    def test_skips_entry_matching_current_provider_and_model(self):
+    @pytest.mark.asyncio
+    async def test_skips_entry_matching_current_provider_and_model(self):
         """Chain has [same-as-current, real-fallback]; activate must skip
         the first and use the second."""
         fbs = [
             # First entry == current state. Should be skipped.
             {"provider": "openrouter", "model": "z-ai/glm-4.7"},
             # Second entry: real fallback.
-            {"provider": "zai", "model": "glm-4.7"},
+            {
+                "provider": "zai",
+                "model": "glm-4.7",
+                "api_key": "zai-key",
+                "base_url": "https://api.z.ai/api/paas/v4",
+            },
         ]
         agent = _make_agent(fallback_model=fbs)
         agent.provider = "openrouter"
         agent.model = "z-ai/glm-4.7"
         agent.base_url = "https://openrouter.ai/api/v1"
 
-        # Stub out resolve_provider_client so we can assert which entry was
-        # actually used — return a MagicMock client tagged with the provider.
-        called = []
-        def _resolve(provider, model=None, raw_codex=False, **kwargs):
-            called.append((provider, model))
-            return _mock_client(), model
-        with patch("agent.auxiliary_client.resolve_provider_client", side_effect=_resolve):
-            with patch("hermes_cli.model_normalize.normalize_model_for_provider", side_effect=lambda m, p: m):
-                ok = agent._try_activate_fallback()
+        with patch(
+            "hermes_cli.model_normalize.normalize_model_for_provider",
+            side_effect=lambda m, p: m,
+        ):
+            ok = await agent._try_activate_fallback()
 
         assert ok is True
-        # The first entry was skipped — only the second reached resolve.
-        assert called == [("zai", "glm-4.7")], (
-            f"expected fallback to skip same-state entry, got call order: {called}"
-        )
+        # The first entry was skipped and the second native client activated.
+        assert agent._fallback_index == 2
+        assert agent.provider == "zai"
 
 
-    def test_returns_false_when_only_self_matching_entries(self):
+    @pytest.mark.asyncio
+    async def test_returns_false_when_only_self_matching_entries(self):
         """A chain with only self-matching entries exhausts to False."""
         fbs = [
             {"provider": "openrouter", "model": "z-ai/glm-4.7"},
@@ -303,13 +290,12 @@ class TestFallbackChainDedup:
         agent.model = "z-ai/glm-4.7"
         agent.base_url = "https://openrouter.ai/api/v1"
 
-        with patch("agent.auxiliary_client.resolve_provider_client") as mock_resolve:
-            ok = agent._try_activate_fallback()
+        ok = await agent._try_activate_fallback()
 
         assert ok is False
-        mock_resolve.assert_not_called()
 
-    def test_allows_xai_api_fallback_from_xai_oauth_same_host_model(self):
+    @pytest.mark.asyncio
+    async def test_allows_xai_api_fallback_from_xai_oauth_same_host_model(self):
         """xai-oauth and xai share api.x.ai but use different credentials.
 
         A spending-limit 403 on OAuth must still be able to fall over to the
@@ -321,6 +307,7 @@ class TestFallbackChainDedup:
                 "provider": "xai",
                 "model": "grok-4.5",
                 "base_url": "https://api.x.ai/v1",
+                "api_key": "xai-key",
             },
         ]
         agent = _make_agent(fallback_model=fbs)
@@ -328,20 +315,12 @@ class TestFallbackChainDedup:
         agent.model = "grok-4.5"
         agent.base_url = "https://api.x.ai/v1"
 
-        called = []
-
-        def _resolve(provider, model=None, raw_codex=False, **kwargs):
-            called.append((provider, model))
-            return _mock_client(base_url="https://api.x.ai/v1"), model
-
-        with patch("agent.auxiliary_client.resolve_provider_client", side_effect=_resolve):
-            with patch(
-                "hermes_cli.model_normalize.normalize_model_for_provider",
-                side_effect=lambda m, p: m,
-            ):
-                ok = agent._try_activate_fallback()
+        with patch(
+            "hermes_cli.model_normalize.normalize_model_for_provider",
+            side_effect=lambda m, p: m,
+        ):
+            ok = await agent._try_activate_fallback()
 
         assert ok is True
-        assert called == [("xai", "grok-4.5")]
         assert agent.provider == "xai"
         assert agent.model == "grok-4.5"

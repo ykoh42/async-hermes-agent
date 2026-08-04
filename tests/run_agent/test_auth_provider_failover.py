@@ -17,6 +17,8 @@ fell through to "switch providers manually" advice and never called
 
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from run_agent import AIAgent
 from agent.error_classifier import classify_api_error, FailoverReason
 from agent.turn_retry_state import TurnRetryState
@@ -84,17 +86,19 @@ class TestAuthFailoverActivation:
             and agent._fallback_index < len(agent._fallback_chain)
         )
 
-    def test_auth_failover_fires_when_chain_present(self):
-        agent = _make_agent(fallback_model=[{"provider": "openai", "model": "gpt-4o"}])
+    @pytest.mark.asyncio
+    async def test_auth_failover_fires_when_chain_present(self):
+        agent = _make_agent(fallback_model=[{
+            "provider": "openai",
+            "model": "gpt-4o",
+            "api_key": "fallback-key",
+            "base_url": "https://api.openai.com/v1",
+        }])
         retry = TurnRetryState()
         classified = classify_api_error(_auth_error(401))
         assert self._should_failover(agent, classified, retry) is True
         # And the activation primitive actually advances on an auth reason.
-        with patch(
-            "agent.auxiliary_client.resolve_provider_client",
-            return_value=(_mock_client(), "gpt-4o"),
-        ):
-            advanced = agent._try_activate_fallback(reason=classified.reason)
+        advanced = await agent._try_activate_fallback(reason=classified.reason)
         assert advanced is True
         assert agent._fallback_index == 1
 

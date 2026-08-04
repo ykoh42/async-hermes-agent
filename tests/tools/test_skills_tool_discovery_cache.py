@@ -25,7 +25,10 @@ def _fresh_cache(monkeypatch, tmp_path):
     monkeypatch.setattr(
         "agent.skill_utils.get_external_skills_dirs", lambda: []
     )
-    monkeypatch.setattr(st, "_get_disabled_skill_names", lambda: set())
+    async def no_disabled_skills():
+        return set()
+
+    monkeypatch.setattr(st, "_get_disabled_skill_names", no_disabled_skills)
     yield
     st._SKILLS_CACHE.clear()
 
@@ -40,29 +43,34 @@ def _write_skill(root, category, name, description="a skill"):
     return d
 
 
-def test_cache_hit_serves_copies_not_cache_objects(tmp_path):
+@pytest.mark.asyncio
+async def test_cache_hit_serves_copies_not_cache_objects(tmp_path):
     """Callers mutate the returned dicts (web_server annotates
     s['enabled']/s['usage']) — the cache must hand out per-call copies."""
     _write_skill(tmp_path, "cat-a", "skill-one")
-    first = st._find_all_skills()
+    first = await st._find_all_skills()
     assert [s["name"] for s in first] == ["skill-one"]
 
     # Mutate what the first caller got; the next (cached) call must be clean.
     first[0]["enabled"] = False
     first.append({"name": "junk"})
 
-    second = st._find_all_skills()
+    second = await st._find_all_skills()
     assert [s["name"] for s in second] == ["skill-one"]
     assert "enabled" not in second[0], "cache poisoned by caller mutation"
     assert second is not first
 
 
-def test_disabled_and_full_views_cached_separately(tmp_path, monkeypatch):
+@pytest.mark.asyncio
+async def test_disabled_and_full_views_cached_separately(tmp_path, monkeypatch):
     _write_skill(tmp_path, "cat-a", "skill-one")
     _write_skill(tmp_path, "cat-a", "skill-two")
-    monkeypatch.setattr(st, "_get_disabled_skill_names", lambda: {"skill-two"})
+    async def disabled_skills():
+        return {"skill-two"}
 
-    filtered = sorted(s["name"] for s in st._find_all_skills())
-    everything = sorted(s["name"] for s in st._find_all_skills(skip_disabled=True))
+    monkeypatch.setattr(st, "_get_disabled_skill_names", disabled_skills)
+
+    filtered = sorted(s["name"] for s in await st._find_all_skills())
+    everything = sorted(s["name"] for s in await st._find_all_skills(skip_disabled=True))
     assert filtered == ["skill-one"]
     assert everything == ["skill-one", "skill-two"]

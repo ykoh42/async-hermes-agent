@@ -700,9 +700,9 @@ _DEV_FIXTURES: dict[str, dict] = {
 def dev_fixture_credits_state() -> Optional[CreditsState]:
     """Return a fixture CreditsState for HERMES_DEV_CREDITS_FIXTURE, or None.
 
-    The env value is a state name, OR a path to a file whose contents are a state
-    name (re-read each call → flip states live without a restart). Unknown name /
-    "clear" / "none" / unset → None (normal behaviour). Throwaway test scaffolding.
+    The env value is a state name. Unknown name / "clear" / "none" / unset
+    returns None (normal behaviour). Throwaway test scaffolding stays purely
+    in-memory so response-header processing never performs filesystem I/O.
 
     Hard prod-leak guard: a fixture applies ONLY when the dev flag HERMES_DEV_CREDITS
     is also on, so a stray HERMES_DEV_CREDITS_FIXTURE (leaked into a shell profile, a
@@ -714,14 +714,7 @@ def dev_fixture_credits_state() -> Optional[CreditsState]:
     raw = os.environ.get("HERMES_DEV_CREDITS_FIXTURE", "").strip()
     if not raw:
         return None
-    name = raw
-    if os.path.sep in raw or "/" in raw:  # looks like a path → read the name from the file
-        try:
-            with open(raw, "r", encoding="utf-8") as fh:
-                name = fh.read().strip()
-        except OSError:
-            return None
-    spec = _DEV_FIXTURES.get(name.lower())
+    spec = _DEV_FIXTURES.get(raw.lower())
     if not spec:
         return None
     # Stamp the fields the REAL parser always guarantees, so a fixture state is
@@ -796,7 +789,7 @@ def _hydrate_seed_state(agent, state) -> None:
         emit()
 
 
-def seed_credits_at_session_start(agent) -> bool:
+async def seed_credits_at_session_start(agent) -> bool:
     """Hydrate agent._credits_state from /api/oauth/account (or a dev fixture) and
     fire the notice policy, so depletion / usage-band warnings show at session OPEN.
 
@@ -825,25 +818,7 @@ def seed_credits_at_session_start(agent) -> bool:
             _hydrate_seed_state(agent, fixture)
             return True
 
-        # Real portal fetch is FIRE-AND-FORGET: a slow/unreachable portal must never
-        # delay session "ready". A daemon thread hydrates + emits when it resolves,
-        # re-checking idempotency first (a live inference header may land before it).
-        import threading
-
-        def _bg_seed() -> None:
-            try:
-                from hermes_cli.nous_account import get_nous_portal_account_info
-                info = get_nous_portal_account_info(force_fresh=True)
-                if getattr(agent, "_credits_state", None) is not None:
-                    return  # a live inference header beat us — don't clobber it
-                state = _credits_state_from_account(info)
-                if state is not None:
-                    _hydrate_seed_state(agent, state)
-            except Exception:
-                logger.debug("credits ▸ session-start seed (background) failed", exc_info=True)
-
-        threading.Thread(target=_bg_seed, name="credits-seed", daemon=True).start()
-        return True
+        return False
     except Exception:
         # Fail-open: any auth/portal hiccup leaves _credits_state as-is, never blocks.
         # Innermost log across all four call sites (TUI build / CLI build / first

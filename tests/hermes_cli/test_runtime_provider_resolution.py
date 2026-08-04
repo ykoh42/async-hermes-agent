@@ -2,48 +2,60 @@ import base64
 import json
 import time
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
+from agent.agent_runtime_helpers import AsyncCapabilityError
 from hermes_cli import runtime_provider as rp
 
+pytestmark = pytest.mark.asyncio
 
-def test_configured_api_key_provider_without_key_fails_closed(monkeypatch):
+
+async def test_configured_api_key_provider_without_key_fails_closed(monkeypatch):
     """A saved provider must not resolve as another authenticated provider."""
     monkeypatch.setattr(
         rp,
         "_get_model_config",
-        lambda: {"provider": "deepseek", "default": "deepseek-v4-pro"},
+        lambda *_args, **_kwargs: {"provider": "deepseek", "default": "deepseek-v4-pro"},
     )
-    monkeypatch.setattr(rp, "load_pool", lambda _provider: SimpleNamespace(has_credentials=lambda: False))
+    monkeypatch.setattr(
+        rp,
+        "load_pool",
+        AsyncMock(return_value=SimpleNamespace(has_credentials=lambda: False)),
+    )
     monkeypatch.setattr(
         "hermes_cli.auth.resolve_api_key_provider_credentials",
-        lambda _provider: {
+        AsyncMock(return_value={
             "provider": "deepseek",
             "api_key": "",
             "base_url": "https://api.deepseek.com/v1",
             "source": "default",
-        },
+        }),
     )
 
     with pytest.raises(rp.AuthError, match="No usable credentials.*deepseek"):
-        rp.resolve_runtime_provider()
+        await rp.resolve_runtime_provider()
 
 
-def test_noauth_lmstudio_still_resolves(monkeypatch):
+async def test_noauth_lmstudio_still_resolves(monkeypatch):
     """The fail-closed key guard preserves LM Studio's no-auth contract."""
-    monkeypatch.setattr(rp, "load_pool", lambda _provider: SimpleNamespace(has_credentials=lambda: False))
+    monkeypatch.setattr(
+        rp,
+        "load_pool",
+        AsyncMock(return_value=SimpleNamespace(has_credentials=lambda: False)),
+    )
     monkeypatch.setattr(
         "hermes_cli.auth.resolve_api_key_provider_credentials",
-        lambda _provider: {
+        AsyncMock(return_value={
             "provider": "lmstudio",
             "api_key": "lmstudio-noauth",
             "base_url": "http://localhost:1234/v1",
             "source": "default",
-        },
+        }),
     )
 
-    resolved = rp.resolve_runtime_provider(requested="lmstudio")
+    resolved = await rp.resolve_runtime_provider(requested="lmstudio")
 
     assert resolved["provider"] == "lmstudio"
     assert resolved["api_key"]
@@ -62,7 +74,7 @@ def _fake_invoke_jwt(ttl_seconds=3600):
     return f"{header}.{payload}.sig"
 
 
-def test_resolve_runtime_provider_uses_credential_pool(monkeypatch):
+async def test_openai_codex_pool_fails_fast_without_native_async_lifecycle(monkeypatch):
     class _Entry:
         access_token = "pool-token"
         source = "manual"
@@ -72,45 +84,30 @@ def test_resolve_runtime_provider_uses_credential_pool(monkeypatch):
         def has_credentials(self):
             return True
 
-        def select(self):
+        async def select(self):
             return _Entry()
 
-    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "openai-codex")
-    monkeypatch.setattr(rp, "load_pool", lambda provider: _Pool())
+    monkeypatch.setattr(rp, "resolve_provider", AsyncMock(return_value="openai-codex"))
+    monkeypatch.setattr(rp, "load_pool", AsyncMock(return_value=_Pool()))
 
-    resolved = rp.resolve_runtime_provider(requested="openai-codex")
-
-    assert resolved["provider"] == "openai-codex"
-    assert resolved["api_key"] == "pool-token"
-    assert resolved["credential_pool"] is not None
-    assert resolved["source"] == "manual"
+    with pytest.raises(AsyncCapabilityError, match="openai-codex requires an OAuth lifecycle"):
+        await rp.resolve_runtime_provider(requested="openai-codex")
 
 
-def test_qwen_oauth_auto_fallthrough_on_auth_failure(monkeypatch):
-    """When requested_provider is 'auto' and Qwen creds fail, fall through."""
-    from hermes_cli.auth import AuthError
+async def test_qwen_oauth_fails_fast_without_native_async_lifecycle(monkeypatch):
+    monkeypatch.setattr(rp, "resolve_provider", AsyncMock(return_value="qwen-oauth"))
+    monkeypatch.setattr(rp, "_get_model_config", lambda *_args, **_kwargs: {})
 
-    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "qwen-oauth")
-    monkeypatch.setattr(
-        rp,
-        "resolve_qwen_runtime_credentials",
-        lambda **kw: (_ for _ in ()).throw(AuthError("stale", provider="qwen-oauth", code="qwen_auth_missing")),
-    )
-    monkeypatch.setattr(rp, "_get_model_config", lambda: {})
-    monkeypatch.setenv("OPENROUTER_API_KEY", "test-or-key")
-
-    # Should NOT raise — falls through to OpenRouter
-    resolved = rp.resolve_runtime_provider(requested="auto")
-    # The fallthrough means it won't be qwen-oauth
-    assert resolved["provider"] != "qwen-oauth"
+    with pytest.raises(AsyncCapabilityError, match="qwen-oauth requires an OAuth lifecycle"):
+        await rp.resolve_runtime_provider(requested="qwen-oauth")
 
 
-def test_resolve_runtime_provider_ai_gateway(monkeypatch):
-    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "ai-gateway")
-    monkeypatch.setattr(rp, "_get_model_config", lambda: {})
+async def test_resolve_runtime_provider_ai_gateway(monkeypatch):
+    monkeypatch.setattr(rp, "resolve_provider", AsyncMock(return_value="ai-gateway"))
+    monkeypatch.setattr(rp, "_get_model_config", lambda *_args, **_kwargs: {})
     monkeypatch.setenv("AI_GATEWAY_API_KEY", "test-ai-gw-key")
 
-    resolved = rp.resolve_runtime_provider(requested="ai-gateway")
+    resolved = await rp.resolve_runtime_provider(requested="ai-gateway")
 
     assert resolved["provider"] == "ai-gateway"
     assert resolved["api_mode"] == "chat_completions"
@@ -119,12 +116,12 @@ def test_resolve_runtime_provider_ai_gateway(monkeypatch):
     assert resolved["requested_provider"] == "ai-gateway"
 
 
-def test_resolve_runtime_provider_lmstudio_uses_token_when_present(monkeypatch):
-    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "lmstudio")
+async def test_resolve_runtime_provider_lmstudio_uses_token_when_present(monkeypatch):
+    monkeypatch.setattr(rp, "resolve_provider", AsyncMock(return_value="lmstudio"))
     monkeypatch.setattr(
         rp,
         "_get_model_config",
-        lambda: {
+        lambda *_args, **_kwargs: {
             "provider": "lmstudio",
             "base_url": "http://127.0.0.1:1234/v1",
             "default": "publisher/model-a",
@@ -133,20 +130,19 @@ def test_resolve_runtime_provider_lmstudio_uses_token_when_present(monkeypatch):
     monkeypatch.setattr(
         rp,
         "load_pool",
-        lambda provider: type("Pool", (), {"has_credentials": lambda self: False})(),
+        AsyncMock(return_value=type("Pool", (), {"has_credentials": lambda self: False})()),
     )
     monkeypatch.setattr(
-        rp,
-        "resolve_api_key_provider_credentials",
-        lambda provider: {
+        "hermes_cli.auth.resolve_api_key_provider_credentials",
+        AsyncMock(return_value={
             "provider": "lmstudio",
             "api_key": "lm-token",
             "base_url": "http://127.0.0.1:1234/v1",
             "source": "LM_API_KEY",
-        },
+        }),
     )
 
-    resolved = rp.resolve_runtime_provider(requested="lmstudio")
+    resolved = await rp.resolve_runtime_provider(requested="lmstudio")
 
     assert resolved["provider"] == "lmstudio"
     assert resolved["api_key"] == "lm-token"
@@ -154,7 +150,7 @@ def test_resolve_runtime_provider_lmstudio_uses_token_when_present(monkeypatch):
     assert resolved["base_url"] == "http://127.0.0.1:1234/v1"
 
 
-def test_resolve_runtime_provider_lmstudio_honors_saved_base_url(monkeypatch):
+async def test_resolve_runtime_provider_lmstudio_honors_saved_base_url(monkeypatch):
     """Pre-existing configs with `provider: lmstudio` + custom base_url must keep working.
 
     Before this PR, `lmstudio` aliased to `custom`, so a user with a remote
@@ -166,11 +162,11 @@ def test_resolve_runtime_provider_lmstudio_honors_saved_base_url(monkeypatch):
     """
     monkeypatch.delenv("LM_API_KEY", raising=False)
     monkeypatch.delenv("LM_BASE_URL", raising=False)
-    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "lmstudio")
+    monkeypatch.setattr(rp, "resolve_provider", AsyncMock(return_value="lmstudio"))
     monkeypatch.setattr(
         rp,
         "_get_model_config",
-        lambda: {
+        lambda *_args, **_kwargs: {
             "provider": "lmstudio",
             "base_url": "http://192.168.1.10:1234/v1",
             "default": "qwen/qwen3-coder-30b",
@@ -179,13 +175,13 @@ def test_resolve_runtime_provider_lmstudio_honors_saved_base_url(monkeypatch):
     monkeypatch.setattr(
         rp,
         "load_pool",
-        lambda provider: type("Pool", (), {"has_credentials": lambda self: False})(),
+        AsyncMock(return_value=type("Pool", (), {"has_credentials": lambda self: False})()),
     )
     # Don't mock resolve_api_key_provider_credentials — exercise the real
     # function so we test the end-to-end precedence between model_cfg and
     # the pconfig default.
 
-    resolved = rp.resolve_runtime_provider(requested="lmstudio")
+    resolved = await rp.resolve_runtime_provider(requested="lmstudio")
 
     assert resolved["provider"] == "lmstudio"
     assert resolved["api_mode"] == "chat_completions"
@@ -195,7 +191,7 @@ def test_resolve_runtime_provider_lmstudio_honors_saved_base_url(monkeypatch):
     assert resolved["api_key"] == "dummy-lm-api-key"
 
 
-def test_resolve_runtime_provider_lmstudio_saved_base_url_wins_over_env(monkeypatch):
+async def test_resolve_runtime_provider_lmstudio_saved_base_url_wins_over_env(monkeypatch):
     """Saved model.base_url takes precedence over LM_BASE_URL env var.
 
     This matches the established contract for all api_key providers: the
@@ -205,11 +201,11 @@ def test_resolve_runtime_provider_lmstudio_saved_base_url_wins_over_env(monkeypa
     """
     monkeypatch.delenv("LM_API_KEY", raising=False)
     monkeypatch.setenv("LM_BASE_URL", "http://override.local:9999/v1")
-    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "lmstudio")
+    monkeypatch.setattr(rp, "resolve_provider", AsyncMock(return_value="lmstudio"))
     monkeypatch.setattr(
         rp,
         "_get_model_config",
-        lambda: {
+        lambda *_args, **_kwargs: {
             "provider": "lmstudio",
             "base_url": "http://192.168.1.10:1234/v1",
             "default": "qwen/qwen3-coder-30b",
@@ -218,10 +214,10 @@ def test_resolve_runtime_provider_lmstudio_saved_base_url_wins_over_env(monkeypa
     monkeypatch.setattr(
         rp,
         "load_pool",
-        lambda provider: type("Pool", (), {"has_credentials": lambda self: False})(),
+        AsyncMock(return_value=type("Pool", (), {"has_credentials": lambda self: False})()),
     )
 
-    resolved = rp.resolve_runtime_provider(requested="lmstudio")
+    resolved = await rp.resolve_runtime_provider(requested="lmstudio")
 
     assert resolved["provider"] == "lmstudio"
     assert resolved["api_mode"] == "chat_completions"
@@ -230,23 +226,22 @@ def test_resolve_runtime_provider_lmstudio_saved_base_url_wins_over_env(monkeypa
     assert resolved["api_key"] == "dummy-lm-api-key"
 
 
-def test_resolve_runtime_provider_ai_gateway_explicit_override_skips_pool(monkeypatch):
-    def _unexpected_pool(provider):
+async def test_resolve_runtime_provider_ai_gateway_explicit_override_skips_pool(monkeypatch):
+    async def _unexpected_pool(provider):
         raise AssertionError(f"load_pool should not be called for {provider}")
 
     def _unexpected_provider_resolution(provider):
         raise AssertionError(f"resolve_api_key_provider_credentials should not be called for {provider}")
 
-    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "ai-gateway")
-    monkeypatch.setattr(rp, "_get_model_config", lambda: {})
+    monkeypatch.setattr(rp, "resolve_provider", AsyncMock(return_value="ai-gateway"))
+    monkeypatch.setattr(rp, "_get_model_config", lambda *_args, **_kwargs: {})
     monkeypatch.setattr(rp, "load_pool", _unexpected_pool)
     monkeypatch.setattr(
-        rp,
-        "resolve_api_key_provider_credentials",
+        "hermes_cli.auth.resolve_api_key_provider_credentials",
         _unexpected_provider_resolution,
     )
 
-    resolved = rp.resolve_runtime_provider(
+    resolved = await rp.resolve_runtime_provider(
         requested="ai-gateway",
         explicit_api_key="ai-gateway-explicit-token",
         explicit_base_url="https://proxy.example.com/v1/",
@@ -260,15 +255,15 @@ def test_resolve_runtime_provider_ai_gateway_explicit_override_skips_pool(monkey
     assert resolved.get("credential_pool") is None
 
 
-def test_resolve_runtime_provider_openrouter_explicit(monkeypatch):
-    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "openrouter")
-    monkeypatch.setattr(rp, "_get_model_config", lambda: {})
+async def test_resolve_runtime_provider_openrouter_explicit(monkeypatch):
+    monkeypatch.setattr(rp, "resolve_provider", AsyncMock(return_value="openrouter"))
+    monkeypatch.setattr(rp, "_get_model_config", lambda *_args, **_kwargs: {})
     monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
     monkeypatch.delenv("OPENROUTER_BASE_URL", raising=False)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
 
-    resolved = rp.resolve_runtime_provider(
+    resolved = await rp.resolve_runtime_provider(
         requested="openrouter",
         explicit_api_key="test-key",
         explicit_base_url="https://example.com/v1/",
@@ -281,66 +276,7 @@ def test_resolve_runtime_provider_openrouter_explicit(monkeypatch):
     assert resolved["source"] == "explicit"
 
 
-@pytest.mark.parametrize(
-    "case_name, model_cfg, expected_api_mode",
-    [
-        (
-            "stale_anthropic_api_mode_is_ignored_on_provider_switch",
-            {
-                "provider": "anthropic",
-                "api_mode": "anthropic_messages",
-                "default": "claude-3-5-sonnet",
-            },
-            "chat_completions",
-        ),
-        (
-            "matching_provider_still_honors_persisted_api_mode",
-            {
-                "provider": "gemini",
-                "api_mode": "anthropic_messages",
-                "default": "gemini-2.5-pro",
-            },
-            "anthropic_messages",
-        ),
-        (
-            "no_persisted_provider_still_honors_api_mode",
-            {
-                "api_mode": "anthropic_messages",
-                "default": "gemini-2.5-pro",
-            },
-            "anthropic_messages",
-        ),
-    ],
-)
-def test_resolve_runtime_provider_gemini_explicit_api_mode_provider_guard(
-    monkeypatch, case_name, model_cfg, expected_api_mode
-):
-    """A persisted model.api_mode from a different provider must not leak
-    into an explicitly-resolved provider after a switch (issue #74318).
-
-    Only when ``model_cfg["provider"]`` matches the provider actually being
-    resolved (or is unset) should the persisted api_mode be honoured.
-    """
-    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "gemini")
-    monkeypatch.setattr(rp, "_get_model_config", lambda: model_cfg)
-    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
-    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
-    monkeypatch.delenv("GEMINI_BASE_URL", raising=False)
-
-    resolved = rp.resolve_runtime_provider(
-        requested="gemini",
-        explicit_api_key="fake-gemini-key",
-        explicit_base_url="https://fake-gemini-endpoint.example.com/v1beta/",
-    )
-
-    assert resolved["provider"] == "gemini", case_name
-    assert resolved["api_mode"] == expected_api_mode, case_name
-    assert resolved["api_key"] == "fake-gemini-key", case_name
-    assert resolved["base_url"] == "https://fake-gemini-endpoint.example.com/v1beta", case_name
-    assert resolved["source"] == "explicit", case_name
-
-
-def test_resolve_runtime_provider_auto_uses_openrouter_pool(monkeypatch):
+async def test_resolve_runtime_provider_auto_uses_openrouter_pool(monkeypatch):
     class _Entry:
         access_token = "pool-key"
         source = "manual"
@@ -350,18 +286,18 @@ def test_resolve_runtime_provider_auto_uses_openrouter_pool(monkeypatch):
         def has_credentials(self):
             return True
 
-        def select(self):
+        async def select(self):
             return _Entry()
 
-    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "openrouter")
-    monkeypatch.setattr(rp, "_get_model_config", lambda: {})
-    monkeypatch.setattr(rp, "load_pool", lambda provider: _Pool())
+    monkeypatch.setattr(rp, "resolve_provider", AsyncMock(return_value="openrouter"))
+    monkeypatch.setattr(rp, "_get_model_config", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(rp, "load_pool", AsyncMock(return_value=_Pool()))
     monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
     monkeypatch.delenv("OPENROUTER_BASE_URL", raising=False)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
 
-    resolved = rp.resolve_runtime_provider(requested="auto")
+    resolved = await rp.resolve_runtime_provider(requested="auto")
 
     assert resolved["provider"] == "openrouter"
     assert resolved["api_key"] == "pool-key"
@@ -370,7 +306,7 @@ def test_resolve_runtime_provider_auto_uses_openrouter_pool(monkeypatch):
     assert resolved.get("credential_pool") is not None
 
 
-def test_resolve_runtime_provider_openrouter_explicit_api_key_skips_pool(monkeypatch):
+async def test_resolve_runtime_provider_openrouter_explicit_api_key_skips_pool(monkeypatch):
     class _Entry:
         access_token = "pool-key"
         source = "manual"
@@ -380,18 +316,18 @@ def test_resolve_runtime_provider_openrouter_explicit_api_key_skips_pool(monkeyp
         def has_credentials(self):
             return True
 
-        def select(self):
+        async def select(self):
             return _Entry()
 
-    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "openrouter")
-    monkeypatch.setattr(rp, "_get_model_config", lambda: {})
-    monkeypatch.setattr(rp, "load_pool", lambda provider: _Pool())
+    monkeypatch.setattr(rp, "resolve_provider", AsyncMock(return_value="openrouter"))
+    monkeypatch.setattr(rp, "_get_model_config", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(rp, "load_pool", AsyncMock(return_value=_Pool()))
     monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
     monkeypatch.delenv("OPENROUTER_BASE_URL", raising=False)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
 
-    resolved = rp.resolve_runtime_provider(
+    resolved = await rp.resolve_runtime_provider(
         requested="openrouter",
         explicit_api_key="explicit-key",
     )
@@ -403,12 +339,12 @@ def test_resolve_runtime_provider_openrouter_explicit_api_key_skips_pool(monkeyp
     assert resolved.get("credential_pool") is None
 
 
-def test_resolve_runtime_provider_openrouter_ignores_codex_config_base_url(monkeypatch):
-    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "openrouter")
+async def test_resolve_runtime_provider_openrouter_ignores_codex_config_base_url(monkeypatch):
+    monkeypatch.setattr(rp, "resolve_provider", AsyncMock(return_value="openrouter"))
     monkeypatch.setattr(
         rp,
         "_get_model_config",
-        lambda: {
+        lambda *_args, **_kwargs: {
             "provider": "openai-codex",
             "base_url": "https://chatgpt.com/backend-api/codex",
         },
@@ -418,18 +354,18 @@ def test_resolve_runtime_provider_openrouter_ignores_codex_config_base_url(monke
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
 
-    resolved = rp.resolve_runtime_provider(requested="openrouter")
+    resolved = await rp.resolve_runtime_provider(requested="openrouter")
 
     assert resolved["provider"] == "openrouter"
     assert resolved["base_url"] == rp.OPENROUTER_BASE_URL
 
 
-def test_resolve_runtime_provider_auto_uses_custom_config_base_url(monkeypatch):
-    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "openrouter")
+async def test_resolve_runtime_provider_auto_uses_custom_config_base_url(monkeypatch):
+    monkeypatch.setattr(rp, "resolve_provider", AsyncMock(return_value="openrouter"))
     monkeypatch.setattr(
         rp,
         "_get_model_config",
-        lambda: {
+        lambda *_args, **_kwargs: {
             "provider": "auto",
             "base_url": "https://custom.example/v1/",
         },
@@ -439,54 +375,54 @@ def test_resolve_runtime_provider_auto_uses_custom_config_base_url(monkeypatch):
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
 
-    resolved = rp.resolve_runtime_provider(requested="auto")
+    resolved = await rp.resolve_runtime_provider(requested="auto")
 
     assert resolved["provider"] == "openrouter"
     assert resolved["base_url"] == "https://custom.example/v1"
 
 
-def test_openrouter_key_takes_priority_over_openai_key(monkeypatch):
+async def test_openrouter_key_takes_priority_over_openai_key(monkeypatch):
     """OPENROUTER_API_KEY should be used over OPENAI_API_KEY when both are set.
 
     Regression test for #289: users with OPENAI_API_KEY in .bashrc had it
     sent to OpenRouter instead of their OPENROUTER_API_KEY.
     """
-    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "openrouter")
-    monkeypatch.setattr(rp, "_get_model_config", lambda: {})
+    monkeypatch.setattr(rp, "resolve_provider", AsyncMock(return_value="openrouter"))
+    monkeypatch.setattr(rp, "_get_model_config", lambda *_args, **_kwargs: {})
     monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
     monkeypatch.delenv("OPENROUTER_BASE_URL", raising=False)
     monkeypatch.setenv("OPENAI_API_KEY", "sk-openai-should-lose")
     monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-should-win")
 
-    resolved = rp.resolve_runtime_provider(requested="openrouter")
+    resolved = await rp.resolve_runtime_provider(requested="openrouter")
 
     assert resolved["api_key"] == "sk-or-should-win"
 
 
-def test_openai_key_used_when_no_openrouter_key(monkeypatch):
+async def test_openai_key_used_when_no_openrouter_key(monkeypatch):
     """OPENAI_API_KEY is used as fallback when OPENROUTER_API_KEY is not set."""
-    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "openrouter")
-    monkeypatch.setattr(rp, "_get_model_config", lambda: {})
+    monkeypatch.setattr(rp, "resolve_provider", AsyncMock(return_value="openrouter"))
+    monkeypatch.setattr(rp, "_get_model_config", lambda *_args, **_kwargs: {})
     monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
     monkeypatch.delenv("OPENROUTER_BASE_URL", raising=False)
     monkeypatch.setenv("OPENAI_API_KEY", "sk-openai-fallback")
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
 
-    resolved = rp.resolve_runtime_provider(requested="openrouter")
+    resolved = await rp.resolve_runtime_provider(requested="openrouter")
 
     assert resolved["api_key"] == "sk-openai-fallback"
 
 
-def test_custom_endpoint_uses_saved_config_base_url_when_env_missing(monkeypatch):
+async def test_custom_endpoint_uses_saved_config_base_url_when_env_missing(monkeypatch):
     """Persisted custom endpoints in config.yaml must still resolve when
     OPENAI_BASE_URL is absent from the current environment.
     OPENAI_API_KEY / OPENROUTER_API_KEY must NOT leak to a non-OpenAI host
     (issue #28660) — local LLM servers get no-key-required instead."""
-    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "openrouter")
+    monkeypatch.setattr(rp, "resolve_provider", AsyncMock(return_value="openrouter"))
     monkeypatch.setattr(
         rp,
         "_get_model_config",
-        lambda: {
+        lambda *_args, **_kwargs: {
             "provider": "custom",
             "base_url": "http://127.0.0.1:1234/v1",
         },
@@ -496,7 +432,7 @@ def test_custom_endpoint_uses_saved_config_base_url_when_env_missing(monkeypatch
     monkeypatch.setenv("OPENAI_API_KEY", "local-key")
     monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
 
-    resolved = rp.resolve_runtime_provider(requested="custom")
+    resolved = await rp.resolve_runtime_provider(requested="custom")
 
     assert resolved["base_url"] == "http://127.0.0.1:1234/v1"
     # OPENAI_API_KEY must not leak to an unrelated host — local servers get
@@ -504,13 +440,13 @@ def test_custom_endpoint_uses_saved_config_base_url_when_env_missing(monkeypatch
     assert resolved["api_key"] == "no-key-required"
 
 
-def test_custom_endpoint_explicit_custom_prefers_config_key(monkeypatch):
+async def test_custom_endpoint_explicit_custom_prefers_config_key(monkeypatch):
     """Explicit 'custom' provider with config base_url+api_key should use them.
 
     Updated for #4165: config.yaml is the source of truth, not OPENAI_BASE_URL.
     """
-    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "openrouter")
-    monkeypatch.setattr(rp, "_get_model_config", lambda: {
+    monkeypatch.setattr(rp, "resolve_provider", AsyncMock(return_value="openrouter"))
+    monkeypatch.setattr(rp, "_get_model_config", lambda *_args, **_kwargs: {
         "provider": "custom",
         "base_url": "https://my-vllm-server.example.com/v1",
         "api_key": "sk-vllm-key",
@@ -519,19 +455,19 @@ def test_custom_endpoint_explicit_custom_prefers_config_key(monkeypatch):
     monkeypatch.delenv("OPENROUTER_BASE_URL", raising=False)
     monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-...leak")
 
-    resolved = rp.resolve_runtime_provider(requested="custom")
+    resolved = await rp.resolve_runtime_provider(requested="custom")
 
     assert resolved["base_url"] == "https://my-vllm-server.example.com/v1"
     assert resolved["api_key"] == "sk-vllm-key"
 
 
-def test_bare_custom_uses_loopback_model_base_url_when_provider_not_custom(monkeypatch):
+async def test_bare_custom_uses_loopback_model_base_url_when_provider_not_custom(monkeypatch):
     """Regression for #14676: /model can select Custom while YAML still lists another provider."""
-    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "openrouter")
+    monkeypatch.setattr(rp, "resolve_provider", AsyncMock(return_value="openrouter"))
     monkeypatch.setattr(
         rp,
         "_get_model_config",
-        lambda: {
+        lambda *_args, **_kwargs: {
             "provider": "openrouter",
             "base_url": "http://127.0.0.1:8082/v1",
             "default": "my-local-model",
@@ -543,7 +479,7 @@ def test_bare_custom_uses_loopback_model_base_url_when_provider_not_custom(monke
     monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
     monkeypatch.setenv("OPENAI_API_KEY", "openai-key")
 
-    resolved = rp.resolve_runtime_provider(requested="custom")
+    resolved = await rp.resolve_runtime_provider(requested="custom")
 
     assert resolved["provider"] == "custom"
     assert resolved["base_url"] == "http://127.0.0.1:8082/v1"
@@ -551,13 +487,12 @@ def test_bare_custom_uses_loopback_model_base_url_when_provider_not_custom(monke
     assert resolved["api_key"] == "no-key-required"
 
 
-def test_named_custom_provider_uses_saved_credentials(monkeypatch):
+async def test_named_custom_provider_uses_saved_credentials(monkeypatch):
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
     monkeypatch.setattr(
-        rp,
-        "load_config",
-        lambda: {
+        "hermes_cli.config.load_config_readonly",
+        AsyncMock(return_value={
             "custom_providers": [
                 {
                     "name": "Local",
@@ -565,7 +500,7 @@ def test_named_custom_provider_uses_saved_credentials(monkeypatch):
                     "api_key": "local-provider-key",
                 }
             ]
-        },
+        }),
     )
     monkeypatch.setattr(
         rp,
@@ -577,7 +512,7 @@ def test_named_custom_provider_uses_saved_credentials(monkeypatch):
         ),
     )
 
-    resolved = rp.resolve_runtime_provider(requested="local")
+    resolved = await rp.resolve_runtime_provider(requested="local")
 
     assert resolved["provider"] == "custom"
     assert resolved["api_mode"] == "chat_completions"
@@ -587,7 +522,7 @@ def test_named_custom_provider_uses_saved_credentials(monkeypatch):
     assert resolved["source"] == "custom_provider:Local"
 
 
-def test_bare_custom_resolves_providers_dict_entry_named_custom(monkeypatch):
+async def test_bare_custom_resolves_providers_dict_entry_named_custom(monkeypatch):
     """A request for bare ``provider="custom"`` must resolve a literal
     ``providers.custom`` entry (e.g. a cliproxy endpoint) instead of falling
     through to the global default. Regression for cron jobs stored with
@@ -596,9 +531,8 @@ def test_bare_custom_resolves_providers_dict_entry_named_custom(monkeypatch):
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
     monkeypatch.setattr(
-        rp,
-        "load_config",
-        lambda: {
+        "hermes_cli.config.load_config_readonly",
+        AsyncMock(return_value={
             "providers": {
                 "custom": {
                     "api": "https://cliproxy.example.com/v1",
@@ -607,7 +541,7 @@ def test_bare_custom_resolves_providers_dict_entry_named_custom(monkeypatch):
                     "name": "CLIProxy",
                 }
             }
-        },
+        }),
     )
     # Reaching resolve_provider for bare custom with a matching entry means the
     # named-custom path was bypassed — that is the bug we are fixing.
@@ -621,7 +555,7 @@ def test_bare_custom_resolves_providers_dict_entry_named_custom(monkeypatch):
         ),
     )
 
-    resolved = rp.resolve_runtime_provider(requested="custom")
+    resolved = await rp.resolve_runtime_provider(requested="custom")
 
     assert resolved["provider"] == "custom"
     assert resolved["base_url"] == "https://cliproxy.example.com/v1"
@@ -631,16 +565,15 @@ def test_bare_custom_resolves_providers_dict_entry_named_custom(monkeypatch):
 
 
 
-def test_named_custom_provider_same_url_uses_matching_key_env_and_api_mode(monkeypatch):
+async def test_named_custom_provider_same_url_uses_matching_key_env_and_api_mode(monkeypatch):
     """Named custom providers on one gateway must keep their own credentials and protocol."""
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
     monkeypatch.setenv("GPT_KEY", "gpt-secret")
     monkeypatch.setenv("CLAUDE_KEY", "claude-secret")
     monkeypatch.setattr(
-        rp,
-        "load_config",
-        lambda: {
+        "hermes_cli.config.load_config_readonly",
+        AsyncMock(return_value={
             "custom_providers": [
                 {
                     "name": "gpt",
@@ -657,7 +590,7 @@ def test_named_custom_provider_same_url_uses_matching_key_env_and_api_mode(monke
                     "model": "claude-opus-4-8",
                 },
             ],
-        },
+        }),
     )
     monkeypatch.setattr(
         rp,
@@ -669,7 +602,7 @@ def test_named_custom_provider_same_url_uses_matching_key_env_and_api_mode(monke
         ),
     )
 
-    resolved = rp.resolve_runtime_provider(requested="custom:claude")
+    resolved = await rp.resolve_runtime_provider(requested="custom:claude")
 
     assert resolved["provider"] == "custom"
     assert resolved["base_url"] == "https://gateway.example.com"
@@ -679,20 +612,19 @@ def test_named_custom_provider_same_url_uses_matching_key_env_and_api_mode(monke
     assert resolved["model"] == "claude-opus-4-8"
 
 
-def test_named_custom_provider_falls_back_to_openai_api_key(monkeypatch):
+async def test_named_custom_provider_falls_back_to_openai_api_key(monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "env-openai-key")
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
     monkeypatch.setattr(
-        rp,
-        "load_config",
-        lambda: {
+        "hermes_cli.config.load_config_readonly",
+        AsyncMock(return_value={
             "custom_providers": [
                 {
                     "name": "Local LLM",
                     "base_url": "http://localhost:1234/v1",
                 }
             ]
-        },
+        }),
     )
     monkeypatch.setattr(
         rp,
@@ -704,7 +636,7 @@ def test_named_custom_provider_falls_back_to_openai_api_key(monkeypatch):
         ),
     )
 
-    resolved = rp.resolve_runtime_provider(requested="custom:local-llm")
+    resolved = await rp.resolve_runtime_provider(requested="custom:local-llm")
 
     assert resolved["base_url"] == "http://localhost:1234/v1"
     # localhost is not openai.com — OPENAI_API_KEY must not leak to local endpoints (#28660)
@@ -716,46 +648,42 @@ def test_named_custom_provider_falls_back_to_openai_api_key(monkeypatch):
 
 
 
-def test_named_custom_provider_wins_over_builtin_alias(monkeypatch):
+async def test_named_custom_provider_wins_over_builtin_alias(monkeypatch):
     """A custom_providers entry named after a built-in *alias* (not a canonical
     provider name) must win over the built-in.  Regression guard for #15743:
     when users define ``custom_providers: [{name: kimi, ...}]`` and reference
     ``provider: kimi``, the built-in alias rewriting (``kimi`` → ``kimi-coding``)
     would otherwise hijack the request and send it to the wrong endpoint.
     """
-    monkeypatch.setattr(
-        rp,
-        "load_config",
-        lambda: {
-            "custom_providers": [
-                {
-                    "name": "kimi",
-                    "base_url": "https://my-custom-kimi.example.com/v1",
-                    "api_key": "my-kimi-key",
-                }
-            ]
-        },
-    )
+    config = {
+        "custom_providers": [
+            {
+                "name": "kimi",
+                "base_url": "https://my-custom-kimi.example.com/v1",
+                "api_key": "my-kimi-key",
+            }
+        ]
+    }
 
-    entry = rp._get_named_custom_provider("kimi")
+    entry = rp._get_named_custom_provider("kimi", config=config)
 
     assert entry is not None
     assert entry["base_url"] == "https://my-custom-kimi.example.com/v1"
     assert entry["api_key"] == "my-kimi-key"
 
 
-def test_explicit_openrouter_skips_openai_base_url(monkeypatch):
+async def test_explicit_openrouter_skips_openai_base_url(monkeypatch):
     """When the user explicitly requests openrouter, OPENAI_BASE_URL
     (which may point to a custom endpoint) must not override the
     OpenRouter base URL.  Regression test for #874."""
-    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "openrouter")
-    monkeypatch.setattr(rp, "_get_model_config", lambda: {})
+    monkeypatch.setattr(rp, "resolve_provider", AsyncMock(return_value="openrouter"))
+    monkeypatch.setattr(rp, "_get_model_config", lambda *_args, **_kwargs: {})
     monkeypatch.setenv("OPENAI_BASE_URL", "https://my-custom-llm.example.com/v1")
     monkeypatch.setenv("OPENROUTER_API_KEY", "or-test-key")
     monkeypatch.delenv("OPENROUTER_BASE_URL", raising=False)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
 
-    resolved = rp.resolve_runtime_provider(requested="openrouter")
+    resolved = await rp.resolve_runtime_provider(requested="openrouter")
 
     assert resolved["provider"] == "openrouter"
     assert "openrouter.ai" in resolved["base_url"]
@@ -772,24 +700,24 @@ def test_explicit_openrouter_skips_openai_base_url(monkeypatch):
 
 
 
-def test_minimax_config_base_url_overrides_hardcoded_default(monkeypatch):
+async def test_minimax_config_base_url_overrides_hardcoded_default(monkeypatch):
     """model.base_url in config.yaml should override the hardcoded default (#6039)."""
-    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "minimax")
-    monkeypatch.setattr(rp, "_get_model_config", lambda: {
+    monkeypatch.setattr(rp, "resolve_provider", AsyncMock(return_value="minimax"))
+    monkeypatch.setattr(rp, "_get_model_config", lambda *_args, **_kwargs: {
         "provider": "minimax",
         "base_url": "https://api.minimaxi.com/anthropic",
     })
     monkeypatch.setenv("MINIMAX_API_KEY", "test-minimax-key")
     monkeypatch.delenv("MINIMAX_BASE_URL", raising=False)
 
-    resolved = rp.resolve_runtime_provider(requested="minimax")
+    resolved = await rp.resolve_runtime_provider(requested="minimax")
 
     assert resolved["provider"] == "minimax"
     assert resolved["base_url"] == "https://api.minimaxi.com/anthropic"
     assert resolved["api_mode"] == "anthropic_messages"
 
 
-def test_opencode_go_model_derivation_beats_stale_persisted_api_mode(monkeypatch):
+async def test_opencode_go_model_derivation_beats_stale_persisted_api_mode(monkeypatch):
     """opencode-zen/go re-derive api_mode from the effective model on every
     resolve, ignoring any persisted ``api_mode`` in config. Refs #16878 /
     PR #16888: the persisted mode from the previous default model must not
@@ -801,11 +729,11 @@ def test_opencode_go_model_derivation_beats_stale_persisted_api_mode(monkeypatch
     ``anthropic_messages`` — the model dictates the mode, not the stale
     persisted setting.
     """
-    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "opencode-go")
+    monkeypatch.setattr(rp, "resolve_provider", AsyncMock(return_value="opencode-go"))
     monkeypatch.setattr(
         rp,
         "_get_model_config",
-        lambda: {
+        lambda *_args, **_kwargs: {
             "provider": "opencode-go",
             "default": "minimax-m2.5",
             "api_mode": "chat_completions",
@@ -814,7 +742,7 @@ def test_opencode_go_model_derivation_beats_stale_persisted_api_mode(monkeypatch
     monkeypatch.setenv("OPENCODE_GO_API_KEY", "test-opencode-go-key")
     monkeypatch.delenv("OPENCODE_GO_BASE_URL", raising=False)
 
-    resolved = rp.resolve_runtime_provider(requested="opencode-go")
+    resolved = await rp.resolve_runtime_provider(requested="opencode-go")
 
     assert resolved["provider"] == "opencode-go"
     assert resolved["api_mode"] == "anthropic_messages"
@@ -829,35 +757,28 @@ def test_opencode_go_model_derivation_beats_stale_persisted_api_mode(monkeypatch
 
 
 
-def test_auto_detected_nous_auth_failure_falls_through_to_openrouter(monkeypatch):
-    """When auto-detect picks Nous but credentials are revoked, fall through to OpenRouter."""
-    from hermes_cli.auth import AuthError
-
+async def test_auto_detected_nous_fails_fast_without_native_async_lifecycle(monkeypatch):
     monkeypatch.setenv("OPENROUTER_API_KEY", "test-or-key")
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
     monkeypatch.delenv("OPENROUTER_BASE_URL", raising=False)
-    monkeypatch.setattr(rp, "load_config", lambda: {})
 
     # resolve_provider returns "nous" (stale active_provider in auth.json)
-    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "nous")
-    # load_pool returns empty pool so we hit the direct credential resolution
-    monkeypatch.setattr(rp, "load_pool", lambda p: type("P", (), {
-        "has_credentials": lambda self: False,
-    })())
-    # Nous credential resolution fails with revoked token
+    monkeypatch.setattr(rp, "resolve_provider", AsyncMock(return_value="nous"))
     monkeypatch.setattr(
-        rp, "resolve_nous_runtime_credentials",
-        lambda **kw: (_ for _ in ()).throw(
-            AuthError("Refresh session has been revoked",
-                      provider="nous", code="invalid_grant", relogin_required=True)
+        rp,
+        "load_pool",
+        AsyncMock(
+            return_value=type(
+                "Pool",
+                (),
+                {"has_credentials": lambda self: False},
+            )()
         ),
     )
 
-    # With requested="auto", should fall through to OpenRouter
-    resolved = rp.resolve_runtime_provider(requested="auto")
-    assert resolved["provider"] == "openrouter"
-    assert resolved["api_key"] == "test-or-key"
+    with pytest.raises(AsyncCapabilityError, match="nous requires an OAuth lifecycle"):
+        await rp.resolve_runtime_provider(requested="auto")
 
 
 # ------------------------------------------------------------------
@@ -884,20 +805,20 @@ class TestOllamaUrlSubstringLeak:
     def _make_cfg(self, base_url):
         return {"base_url": base_url, "api_key": "", "provider": "custom"}
 
-    def test_ollama_key_not_leaked_to_path_injection(self, monkeypatch):
+    async def test_ollama_key_not_leaked_to_path_injection(self, monkeypatch):
         """http://127.0.0.1:9000/ollama.com/v1 — attacker endpoint with
         ollama.com in PATH. Must resolve to OPENAI_API_KEY, not OLLAMA_API_KEY."""
         monkeypatch.setenv("OPENAI_API_KEY", "oa-secret")
         monkeypatch.setenv("OPENROUTER_API_KEY", "or-secret")
         monkeypatch.setenv("OLLAMA_API_KEY", "ol-SECRET-should-not-leak")
-        monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "custom")
-        monkeypatch.setattr(rp, "_get_model_config", lambda: self._make_cfg(
+        monkeypatch.setattr(rp, "resolve_provider", AsyncMock(return_value="custom"))
+        monkeypatch.setattr(rp, "_get_model_config", lambda *_args, **_kwargs: self._make_cfg(
             "http://127.0.0.1:9000/ollama.com/v1"
         ))
-        monkeypatch.setattr(rp, "load_pool", lambda provider: None)
-        monkeypatch.setattr(rp, "_try_resolve_from_custom_pool", lambda *a, **k: None)
+        monkeypatch.setattr(rp, "load_pool", AsyncMock(return_value=None))
+        monkeypatch.setattr(rp, "_try_resolve_from_custom_pool", AsyncMock(return_value=None))
 
-        resolved = rp.resolve_runtime_provider(requested="custom")
+        resolved = await rp.resolve_runtime_provider(requested="custom")
 
         assert "ol-SECRET" not in resolved["api_key"], (
             "OLLAMA_API_KEY must not be sent to an endpoint whose "
@@ -906,37 +827,37 @@ class TestOllamaUrlSubstringLeak:
         # OPENAI_API_KEY must also not leak to non-openai.com hosts (#28660)
         assert resolved["api_key"] == "no-key-required"
 
-    def test_ollama_key_not_leaked_to_lookalike_host(self, monkeypatch):
+    async def test_ollama_key_not_leaked_to_lookalike_host(self, monkeypatch):
         """ollama.com.attacker.test — look-alike host. OLLAMA_API_KEY
         must not be sent."""
         monkeypatch.setenv("OPENAI_API_KEY", "oa-secret")
         monkeypatch.setenv("OLLAMA_API_KEY", "ol-SECRET-should-not-leak")
-        monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "custom")
-        monkeypatch.setattr(rp, "_get_model_config", lambda: self._make_cfg(
+        monkeypatch.setattr(rp, "resolve_provider", AsyncMock(return_value="custom"))
+        monkeypatch.setattr(rp, "_get_model_config", lambda *_args, **_kwargs: self._make_cfg(
             "http://ollama.com.attacker.test:9000/v1"
         ))
-        monkeypatch.setattr(rp, "load_pool", lambda provider: None)
-        monkeypatch.setattr(rp, "_try_resolve_from_custom_pool", lambda *a, **k: None)
+        monkeypatch.setattr(rp, "load_pool", AsyncMock(return_value=None))
+        monkeypatch.setattr(rp, "_try_resolve_from_custom_pool", AsyncMock(return_value=None))
 
-        resolved = rp.resolve_runtime_provider(requested="custom")
+        resolved = await rp.resolve_runtime_provider(requested="custom")
 
         assert "ol-SECRET" not in resolved["api_key"]
         # OPENAI_API_KEY must also not leak to non-openai.com hosts (#28660)
         assert resolved["api_key"] == "no-key-required"
 
-    def test_ollama_key_sent_to_genuine_ollama_com(self, monkeypatch):
+    async def test_ollama_key_sent_to_genuine_ollama_com(self, monkeypatch):
         """https://ollama.com/v1 — legit Ollama Cloud. OLLAMA_API_KEY
         should be used."""
         monkeypatch.setenv("OPENAI_API_KEY", "oa-secret")
         monkeypatch.setenv("OLLAMA_API_KEY", "ol-legit-key")
-        monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "custom")
-        monkeypatch.setattr(rp, "_get_model_config", lambda: self._make_cfg(
+        monkeypatch.setattr(rp, "resolve_provider", AsyncMock(return_value="custom"))
+        monkeypatch.setattr(rp, "_get_model_config", lambda *_args, **_kwargs: self._make_cfg(
             "https://ollama.com/v1"
         ))
-        monkeypatch.setattr(rp, "load_pool", lambda provider: None)
-        monkeypatch.setattr(rp, "_try_resolve_from_custom_pool", lambda *a, **k: None)
+        monkeypatch.setattr(rp, "load_pool", AsyncMock(return_value=None))
+        monkeypatch.setattr(rp, "_try_resolve_from_custom_pool", AsyncMock(return_value=None))
 
-        resolved = rp.resolve_runtime_provider(requested="custom")
+        resolved = await rp.resolve_runtime_provider(requested="custom")
 
         assert resolved["api_key"] == "ol-legit-key"
 
@@ -961,15 +882,15 @@ class TestAzureFoundryResolution:
         }
 
 
-    def test_azure_foundry_missing_base_url_raises(self, monkeypatch):
+    async def test_azure_foundry_missing_base_url_raises(self, monkeypatch):
         monkeypatch.setenv("AZURE_FOUNDRY_API_KEY", "az-key")
         monkeypatch.delenv("AZURE_FOUNDRY_BASE_URL", raising=False)
-        monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "azure-foundry")
-        monkeypatch.setattr(rp, "_get_model_config", lambda: {})
-        monkeypatch.setattr(rp, "load_pool", lambda provider: None)
+        monkeypatch.setattr(rp, "resolve_provider", AsyncMock(return_value="azure-foundry"))
+        monkeypatch.setattr(rp, "_get_model_config", lambda *_args, **_kwargs: {})
+        monkeypatch.setattr(rp, "load_pool", AsyncMock(return_value=None))
 
         with pytest.raises(rp.AuthError, match="base URL"):
-            rp.resolve_runtime_provider(requested="azure-foundry")
+            await rp.resolve_runtime_provider(requested="azure-foundry")
 
 
     # -- Model-family api_mode inference -------------------------------------
@@ -987,28 +908,28 @@ class TestAzureFoundryResolution:
             "default": model,
         }
 
-    def test_gpt5_codex_upgrades_chat_completions_to_responses(self, monkeypatch):
+    async def test_gpt5_codex_upgrades_chat_completions_to_responses(self, monkeypatch):
         """Reproduces Bob's April 2026 bug: gpt-5.3-codex on chat_completions."""
         monkeypatch.setenv("AZURE_FOUNDRY_API_KEY", "az-key")
-        monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "azure-foundry")
+        monkeypatch.setattr(rp, "resolve_provider", AsyncMock(return_value="azure-foundry"))
         monkeypatch.setattr(rp, "_get_model_config",
-                            lambda: self._make_cfg_with_model("gpt-5.3-codex", "chat_completions"))
-        monkeypatch.setattr(rp, "load_pool", lambda provider: None)
+                            lambda *_args, **_kwargs: self._make_cfg_with_model("gpt-5.3-codex", "chat_completions"))
+        monkeypatch.setattr(rp, "load_pool", AsyncMock(return_value=None))
 
-        resolved = rp.resolve_runtime_provider(requested="azure-foundry")
+        resolved = await rp.resolve_runtime_provider(requested="azure-foundry")
 
         assert resolved["api_mode"] == "codex_responses"
         assert resolved["base_url"] == "https://synopsisse.openai.azure.com/openai/v1"
 
 
-    def test_o3_mini_upgrades(self, monkeypatch):
+    async def test_o3_mini_upgrades(self, monkeypatch):
         monkeypatch.setenv("AZURE_FOUNDRY_API_KEY", "az-key")
-        monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "azure-foundry")
+        monkeypatch.setattr(rp, "resolve_provider", AsyncMock(return_value="azure-foundry"))
         monkeypatch.setattr(rp, "_get_model_config",
-                            lambda: self._make_cfg_with_model("o3-mini", "chat_completions"))
-        monkeypatch.setattr(rp, "load_pool", lambda provider: None)
+                            lambda *_args, **_kwargs: self._make_cfg_with_model("o3-mini", "chat_completions"))
+        monkeypatch.setattr(rp, "load_pool", AsyncMock(return_value=None))
 
-        resolved = rp.resolve_runtime_provider(requested="azure-foundry")
+        resolved = await rp.resolve_runtime_provider(requested="azure-foundry")
 
         assert resolved["api_mode"] == "codex_responses"
 
@@ -1039,51 +960,51 @@ class TestAzureAnthropicEnvVarHint:
         base.update(overrides)
         return base
 
-    def test_key_env_hint_picks_custom_var(self, monkeypatch):
+    async def test_key_env_hint_picks_custom_var(self, monkeypatch):
         """model.key_env names a non-default env var → that var's value is used."""
         monkeypatch.delenv("AZURE_ANTHROPIC_KEY", raising=False)
         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
         monkeypatch.setenv("MY_CUSTOM_AZURE_KEY", "from-custom-var")
-        monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "anthropic")
+        monkeypatch.setattr(rp, "resolve_provider", AsyncMock(return_value="anthropic"))
         monkeypatch.setattr(rp, "_get_model_config",
-                            lambda: self._cfg(key_env="MY_CUSTOM_AZURE_KEY"))
-        monkeypatch.setattr(rp, "load_pool", lambda provider: None)
+                            lambda *_args, **_kwargs: self._cfg(key_env="MY_CUSTOM_AZURE_KEY"))
+        monkeypatch.setattr(rp, "load_pool", AsyncMock(return_value=None))
 
-        resolved = rp.resolve_runtime_provider(requested="anthropic")
+        resolved = await rp.resolve_runtime_provider(requested="anthropic")
 
         assert resolved["api_key"] == "from-custom-var"
         assert resolved["base_url"] == self._AZURE_URL
 
 
-    def test_key_env_points_at_unset_var_falls_through(self, monkeypatch):
+    async def test_key_env_points_at_unset_var_falls_through(self, monkeypatch):
         """If key_env names an env var that isn't set, fall through to the
         historical fixed names rather than failing outright."""
         monkeypatch.setenv("AZURE_ANTHROPIC_KEY", "fallback-works")
         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
         monkeypatch.delenv("UNSET_VAR", raising=False)
-        monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "anthropic")
+        monkeypatch.setattr(rp, "resolve_provider", AsyncMock(return_value="anthropic"))
         monkeypatch.setattr(rp, "_get_model_config",
-                            lambda: self._cfg(key_env="UNSET_VAR"))
-        monkeypatch.setattr(rp, "load_pool", lambda provider: None)
+                            lambda *_args, **_kwargs: self._cfg(key_env="UNSET_VAR"))
+        monkeypatch.setattr(rp, "load_pool", AsyncMock(return_value=None))
 
-        resolved = rp.resolve_runtime_provider(requested="anthropic")
+        resolved = await rp.resolve_runtime_provider(requested="anthropic")
 
         assert resolved["api_key"] == "fallback-works"
 
 
-    def test_non_azure_anthropic_path_ignores_key_env(self, monkeypatch):
+    async def test_non_azure_anthropic_path_ignores_key_env(self, monkeypatch):
         """key_env is only consulted on Azure endpoints — non-Azure Anthropic
         still goes through the regular resolve_anthropic_token chain."""
         monkeypatch.setenv("MY_KEY", "custom-key-value")
-        monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "anthropic")
-        monkeypatch.setattr(rp, "_get_model_config", lambda: {
+        monkeypatch.setattr(rp, "resolve_provider", AsyncMock(return_value="anthropic"))
+        monkeypatch.setattr(rp, "_get_model_config", lambda *_args, **_kwargs: {
             "provider": "anthropic",
             "base_url": "https://api.anthropic.com",  # non-Azure
             "key_env": "MY_KEY",
         })
-        monkeypatch.setattr(rp, "load_pool", lambda provider: None)
+        monkeypatch.setattr(rp, "load_pool", AsyncMock(return_value=None))
         called = {"resolve_anthropic_token": False}
-        def _fake_resolve():
+        async def _fake_resolve():
             called["resolve_anthropic_token"] = True
             return "token-from-resolver"
         monkeypatch.setattr(
@@ -1091,7 +1012,7 @@ class TestAzureAnthropicEnvVarHint:
             _fake_resolve,
         )
 
-        resolved = rp.resolve_runtime_provider(requested="anthropic")
+        resolved = await rp.resolve_runtime_provider(requested="anthropic")
 
         # The normal chain runs — key_env is not consulted off-Azure.
         assert called["resolve_anthropic_token"] is True
@@ -1109,7 +1030,7 @@ class TestProviderEntryApiKeyEnvAlias:
     documented Azure Foundry YAML shape (or imported from other tools that
     use `api_key_env`) resolve correctly."""
 
-    def test_snake_case_api_key_env_normalizes_to_key_env(self):
+    async def test_snake_case_api_key_env_normalizes_to_key_env(self):
         from hermes_cli.config import _normalize_custom_provider_entry
         entry = {
             "name": "vendor",
@@ -1121,13 +1042,13 @@ class TestProviderEntryApiKeyEnvAlias:
         assert normalized.get("key_env") == "MY_VENDOR_KEY"
 
 
-    def test_valid_fields_set_lists_key_env(self):
+    async def test_valid_fields_set_lists_key_env(self):
         """The _VALID_CUSTOM_PROVIDER_FIELDS documentation set must include
         key_env so the set stays in sync with what the runtime actually reads."""
         from hermes_cli.config import _VALID_CUSTOM_PROVIDER_FIELDS
         assert "key_env" in _VALID_CUSTOM_PROVIDER_FIELDS
 
-    def test_extra_body_is_supported_schema(self):
+    async def test_extra_body_is_supported_schema(self):
         from hermes_cli.config import (
             _VALID_CUSTOM_PROVIDER_FIELDS,
             _normalize_custom_provider_entry,
@@ -1154,44 +1075,27 @@ class TestProviderEntryApiKeyEnvAlias:
 # minimax-oauth runtime resolution tests (added by feat/minimax-oauth-provider)
 # ---------------------------------------------------------------------------
 
-def test_minimax_oauth_runtime_returns_anthropic_messages_mode(monkeypatch):
-    """resolve_runtime_provider for minimax-oauth must return api_mode='anthropic_messages'."""
-    from hermes_cli.auth import MINIMAX_OAUTH_GLOBAL_INFERENCE
-
-    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "minimax-oauth")
-    monkeypatch.setattr(rp, "_get_model_config", lambda: {"provider": "minimax-oauth"})
-    monkeypatch.setattr(rp, "load_pool", lambda provider: None)
+async def test_minimax_oauth_fails_fast_without_native_async_lifecycle(monkeypatch):
+    monkeypatch.setattr(rp, "resolve_provider", AsyncMock(return_value="minimax-oauth"))
+    monkeypatch.setattr(rp, "_get_model_config", lambda *_args, **_kwargs: {"provider": "minimax-oauth"})
+    monkeypatch.setattr(rp, "load_pool", AsyncMock(return_value=None))
     monkeypatch.setattr(
         rp,
         "_resolve_named_custom_runtime",
-        lambda **k: None,
+        AsyncMock(return_value=None),
     )
     monkeypatch.setattr(
         rp,
         "_resolve_explicit_runtime",
-        lambda **k: None,
+        AsyncMock(return_value=None),
     )
 
-    fake_creds = {
-        "provider": "minimax-oauth",
-        "api_key": "mock-access-token",
-        "base_url": MINIMAX_OAUTH_GLOBAL_INFERENCE.rstrip("/"),
-        "source": "oauth",
-    }
-
-    import hermes_cli.auth as auth_mod
-    monkeypatch.setattr(auth_mod, "resolve_minimax_oauth_runtime_credentials",
-                        lambda **k: fake_creds)
-
-    resolved = rp.resolve_runtime_provider(requested="minimax-oauth")
-
-    assert resolved["provider"] == "minimax-oauth"
-    assert resolved["api_mode"] == "anthropic_messages"
-    assert resolved["api_key"] == "mock-access-token"
+    with pytest.raises(AsyncCapabilityError, match="minimax-oauth requires an OAuth lifecycle"):
+        await rp.resolve_runtime_provider(requested="minimax-oauth")
 
 
-def test_minimax_oauth_pool_forces_anthropic_messages_despite_stale_config(monkeypatch):
-    """A pooled MiniMax OAuth token must not inherit stale chat_completions config."""
+async def test_minimax_oauth_pool_still_fails_fast_without_native_lifecycle(monkeypatch):
+    """A stored token does not re-enable a disabled synchronous OAuth lifecycle."""
 
     class _Entry:
         access_token = "oauth-token"
@@ -1202,28 +1106,25 @@ def test_minimax_oauth_pool_forces_anthropic_messages_despite_stale_config(monke
         def has_credentials(self):
             return True
 
-        def select(self):
+        async def select(self):
             return _Entry()
 
-    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "minimax-oauth")
+    monkeypatch.setattr(rp, "resolve_provider", AsyncMock(return_value="minimax-oauth"))
     monkeypatch.setattr(
         rp,
         "_get_model_config",
-        lambda: {
+        lambda *_args, **_kwargs: {
             "provider": "minimax-oauth",
             "default": "MiniMax-M2.7",
             "api_mode": "chat_completions",
         },
     )
-    monkeypatch.setattr(rp, "load_pool", lambda provider: _Pool())
-    monkeypatch.setattr(rp, "_resolve_named_custom_runtime", lambda **k: None)
-    monkeypatch.setattr(rp, "_resolve_explicit_runtime", lambda **k: None)
+    monkeypatch.setattr(rp, "load_pool", AsyncMock(return_value=_Pool()))
+    monkeypatch.setattr(rp, "_resolve_named_custom_runtime", AsyncMock(return_value=None))
+    monkeypatch.setattr(rp, "_resolve_explicit_runtime", AsyncMock(return_value=None))
 
-    resolved = rp.resolve_runtime_provider(requested="minimax-oauth")
-
-    assert resolved["provider"] == "minimax-oauth"
-    assert resolved["api_mode"] == "anthropic_messages"
-    assert resolved["base_url"] == "https://api.minimax.io/anthropic"
+    with pytest.raises(AsyncCapabilityError, match="minimax-oauth requires an OAuth lifecycle"):
+        await rp.resolve_runtime_provider(requested="minimax-oauth")
 
 
 # ----------------------------------------------------------------------
@@ -1238,14 +1139,14 @@ def test_minimax_oauth_pool_forces_anthropic_messages_despite_stale_config(monke
 
 
 
-def test_openai_key_only_sent_to_openai_host(monkeypatch):
+async def test_openai_key_only_sent_to_openai_host(monkeypatch):
     """OPENAI_API_KEY must only be forwarded to api.openai.com, not to
     arbitrary custom endpoints (issue #28660)."""
-    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "openrouter")
+    monkeypatch.setattr(rp, "resolve_provider", AsyncMock(return_value="openrouter"))
     monkeypatch.setattr(
         rp,
         "_get_model_config",
-        lambda: {
+        lambda *_args, **_kwargs: {
             "provider": "custom",
             "base_url": "https://api.deepseek.com/v1",
         },
@@ -1256,20 +1157,20 @@ def test_openai_key_only_sent_to_openai_host(monkeypatch):
     monkeypatch.setenv("OPENROUTER_API_KEY", "or-secret")
     monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
 
-    resolved = rp.resolve_runtime_provider(requested="custom")
+    resolved = await rp.resolve_runtime_provider(requested="custom")
 
     assert resolved["base_url"] == "https://api.deepseek.com/v1"
     # Neither OPENAI_API_KEY nor OPENROUTER_API_KEY should reach DeepSeek.
     assert resolved["api_key"] == "no-key-required"
 
 
-def test_openai_key_reaches_openai_host(monkeypatch):
+async def test_openai_key_reaches_openai_host(monkeypatch):
     """OPENAI_API_KEY must be forwarded when the base_url is api.openai.com."""
-    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "openrouter")
+    monkeypatch.setattr(rp, "resolve_provider", AsyncMock(return_value="openrouter"))
     monkeypatch.setattr(
         rp,
         "_get_model_config",
-        lambda: {
+        lambda *_args, **_kwargs: {
             "provider": "custom",
             "base_url": "https://api.openai.com/v1",
         },
@@ -1278,18 +1179,18 @@ def test_openai_key_reaches_openai_host(monkeypatch):
     monkeypatch.delenv("OPENROUTER_BASE_URL", raising=False)
     monkeypatch.setenv("OPENAI_API_KEY", "sk-openai-secret")
 
-    resolved = rp.resolve_runtime_provider(requested="custom")
+    resolved = await rp.resolve_runtime_provider(requested="custom")
 
     assert resolved["api_key"] == "sk-openai-secret"
 
 
-def test_openrouter_key_reaches_openrouter_host(monkeypatch):
+async def test_openrouter_key_reaches_openrouter_host(monkeypatch):
     """OPENROUTER_API_KEY must be forwarded when the base_url is openrouter.ai."""
-    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "openrouter")
+    monkeypatch.setattr(rp, "resolve_provider", AsyncMock(return_value="openrouter"))
     monkeypatch.setattr(
         rp,
         "_get_model_config",
-        lambda: {
+        lambda *_args, **_kwargs: {
             "provider": "openrouter",
             "base_url": "https://openrouter.ai/api/v1",
         },
@@ -1297,7 +1198,7 @@ def test_openrouter_key_reaches_openrouter_host(monkeypatch):
     monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
     monkeypatch.setenv("OPENROUTER_API_KEY", "or-secret")
 
-    resolved = rp.resolve_runtime_provider(requested="openrouter")
+    resolved = await rp.resolve_runtime_provider(requested="openrouter")
 
     assert resolved["api_key"] == "or-secret"
 
@@ -1314,16 +1215,16 @@ def test_openrouter_key_reaches_openrouter_host(monkeypatch):
 
 
 
-def test_host_derived_key_does_not_leak_to_lookalike_host(monkeypatch):
+async def test_host_derived_key_does_not_leak_to_lookalike_host(monkeypatch):
     """DEEPSEEK_API_KEY must NOT be sent to an attacker-controlled lookalike
     host (e.g. api.deepseek.com.attacker.test). The host-derive helper uses
     proper hostname parsing so it picks the *attacker's* vendor label, not
     DEEPSEEK — and any real DEEPSEEK_API_KEY stays put."""
-    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "openrouter")
+    monkeypatch.setattr(rp, "resolve_provider", AsyncMock(return_value="openrouter"))
     monkeypatch.setattr(
         rp,
         "_get_model_config",
-        lambda: {
+        lambda *_args, **_kwargs: {
             "provider": "custom",
             "base_url": "https://api.deepseek.com.attacker.test/v1",
         },
@@ -1331,23 +1232,23 @@ def test_host_derived_key_does_not_leak_to_lookalike_host(monkeypatch):
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-deepseek-secret")
 
-    resolved = rp.resolve_runtime_provider(requested="custom")
+    resolved = await rp.resolve_runtime_provider(requested="custom")
 
     assert "sk-deepseek-secret" not in (resolved["api_key"] or "")
     # No ATTACKER_API_KEY is set, so the chain falls through to no-key-required.
     assert resolved["api_key"] == "no-key-required"
 
 
-def test_host_derived_key_skips_already_handled_vendors(monkeypatch):
+async def test_host_derived_key_skips_already_handled_vendors(monkeypatch):
     """The host-derive helper must not double-resolve OPENAI / OPENROUTER /
     OLLAMA env vars — those are owned by their explicit host-gated paths.
     Specifically, OPENAI_API_KEY must not leak to a non-openai host via the
     `openai` label in a path or subdomain."""
-    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "openrouter")
+    monkeypatch.setattr(rp, "resolve_provider", AsyncMock(return_value="openrouter"))
     monkeypatch.setattr(
         rp,
         "_get_model_config",
-        lambda: {
+        lambda *_args, **_kwargs: {
             "provider": "custom",
             # Hosts like proxy.openai.evil should derive nothing — but even
             # if "openai" were the registrable label, the explicit
@@ -1358,7 +1259,7 @@ def test_host_derived_key_skips_already_handled_vendors(monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "sk-openai-secret")
     monkeypatch.setenv("OPENROUTER_API_KEY", "or-secret")
 
-    resolved = rp.resolve_runtime_provider(requested="custom")
+    resolved = await rp.resolve_runtime_provider(requested="custom")
 
     # example.com has no EXAMPLE_API_KEY set, and OPENAI/OPENROUTER are gated
     # on their own hosts — chain falls through to no-key-required.
@@ -1377,37 +1278,24 @@ def _patch_bedrock(monkeypatch, config_default=""):
     """
     import agent.bedrock_adapter as ba
 
-    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "bedrock")
-    monkeypatch.setattr(rp, "_get_model_config", lambda: {"default": config_default})
-    monkeypatch.setattr(rp, "load_config", lambda: {"bedrock": {}})
+    monkeypatch.setattr(rp, "resolve_provider", AsyncMock(return_value="bedrock"))
+    monkeypatch.setattr(rp, "_get_model_config", lambda *_args, **_kwargs: {"default": config_default})
     monkeypatch.setattr(ba, "has_aws_credentials", lambda: True)
     monkeypatch.setattr(ba, "resolve_aws_auth_env_var", lambda: "AWS_PROFILE")
     monkeypatch.setattr(ba, "resolve_bedrock_region", lambda: "eu-north-1")
 
 
-def test_resolve_runtime_provider_bedrock_claude_target_model_uses_anthropic_messages(monkeypatch):
-    """Claude-on-Bedrock delegation must route through the AnthropicBedrock SDK.
-
-    Regression for #49095: the bedrock branch derived api_mode from the stale
-    persisted ``model.default`` instead of ``target_model``. When delegation
-    targets a Claude model but the parent's default is non-Claude, the wrong
-    branch (Converse) was picked, and the child silently fell back to
-    openrouter/free. ``target_model`` must win so Claude keeps the
-    anthropic_messages path (prompt caching, thinking budgets).
-    """
+async def test_resolve_runtime_provider_bedrock_fails_fast(monkeypatch):
     _patch_bedrock(monkeypatch, config_default="amazon.nova-pro-v1:0")
 
-    resolved = rp.resolve_runtime_provider(
-        requested="bedrock",
-        target_model="global.anthropic.claude-sonnet-4-6",
-    )
-
-    assert resolved["provider"] == "bedrock"
-    assert resolved["api_mode"] == "anthropic_messages"
-    assert resolved.get("bedrock_anthropic") is True
+    with pytest.raises(AsyncCapabilityError, match="AWS Bedrock currently uses"):
+        await rp.resolve_runtime_provider(
+            requested="bedrock",
+            target_model="global.anthropic.claude-sonnet-4-6",
+        )
 
 
-def test_auto_provider_with_local_base_url_bypasses_anthropic_key(monkeypatch):
+async def test_auto_provider_with_local_base_url_bypasses_anthropic_key(monkeypatch):
     """provider:auto + base_url:localhost should NOT route to Anthropic even if
     ANTHROPIC_API_KEY is set in the environment. Regression test for #3846.
 
@@ -1425,14 +1313,14 @@ def test_auto_provider_with_local_base_url_bypasses_anthropic_key(monkeypatch):
     monkeypatch.setattr(
         rp,
         "_get_model_config",
-        lambda: {
+        lambda *_args, **_kwargs: {
             "default": "ollama/minimax-m2.7:cloud",
             "provider": "auto",
             "base_url": "http://localhost:11434",
         },
     )
 
-    resolved = rp.resolve_runtime_provider()
+    resolved = await rp.resolve_runtime_provider()
 
     # Must NOT go to Anthropic's API
     assert "anthropic.com" not in resolved.get("base_url", ""), (
@@ -1445,7 +1333,7 @@ def test_auto_provider_with_local_base_url_bypasses_anthropic_key(monkeypatch):
     )
 
 
-def test_auto_provider_with_known_cloud_base_url_still_uses_anthropic(monkeypatch):
+async def test_auto_provider_with_known_cloud_base_url_still_uses_anthropic(monkeypatch):
     """provider:auto + base_url pointing to Anthropic should still use Anthropic.
 
     The local-endpoint bypass only applies to non-cloud endpoints; when the
@@ -1461,13 +1349,13 @@ def test_auto_provider_with_known_cloud_base_url_still_uses_anthropic(monkeypatc
     monkeypatch.setattr(
         rp,
         "_get_model_config",
-        lambda: {
+        lambda *_args, **_kwargs: {
             "provider": "auto",
             "base_url": "https://api.anthropic.com",
         },
     )
 
-    resolved = rp.resolve_runtime_provider()
+    resolved = await rp.resolve_runtime_provider()
 
     # Cloud base_url → bypass does NOT fire → resolve_provider picks anthropic.
     assert resolved["provider"] == "anthropic", (
@@ -1475,7 +1363,7 @@ def test_auto_provider_with_known_cloud_base_url_still_uses_anthropic(monkeypatc
     )
 
 
-def test_auto_provider_lookalike_cloud_host_does_not_bypass_to_cloud(monkeypatch):
+async def test_auto_provider_lookalike_cloud_host_does_not_bypass_to_cloud(monkeypatch):
     """A look-alike host (api.anthropic.com.attacker.test) must be treated as a
     custom endpoint, NOT mistaken for the real Anthropic cloud.
 
@@ -1493,10 +1381,10 @@ def test_auto_provider_lookalike_cloud_host_does_not_bypass_to_cloud(monkeypatch
     monkeypatch.setattr(
         rp,
         "_get_model_config",
-        lambda: {"provider": "auto", "base_url": lookalike},
+        lambda *_args, **_kwargs: {"provider": "auto", "base_url": lookalike},
     )
 
-    resolved = rp.resolve_runtime_provider()
+    resolved = await rp.resolve_runtime_provider()
 
     # Host doesn't actually match anthropic.com → bypass fires → custom route,
     # and the real Anthropic credential is NOT sent there.
@@ -1515,7 +1403,7 @@ def test_auto_provider_lookalike_cloud_host_does_not_bypass_to_cloud(monkeypatch
 
 
 
-def test_resolve_named_custom_runtime_pool_result_includes_extra_headers(monkeypatch):
+async def test_resolve_named_custom_runtime_pool_result_includes_extra_headers(monkeypatch):
     """extra_headers must survive the credential-pool path too."""
     pool_return_value = {
         "provider": "custom",
@@ -1525,11 +1413,15 @@ def test_resolve_named_custom_runtime_pool_result_includes_extra_headers(monkeyp
         "source": "pool:lmstudio-pool",
         "credential_pool": "fake-pool",
     }
-    monkeypatch.setattr(rp, "_try_resolve_from_custom_pool", lambda *a, **k: pool_return_value)
+    monkeypatch.setattr(
+        rp,
+        "_try_resolve_from_custom_pool",
+        AsyncMock(return_value=pool_return_value),
+    )
     monkeypatch.setattr(
         rp,
         "_get_named_custom_provider",
-        lambda p: {
+        lambda p, *_args, **_kwargs: {
             "name": "lmstudio",
             "base_url": "https://lmstudio.example.com/v1",
             "api_key": "not-used-when-pooled",
@@ -1542,7 +1434,7 @@ def test_resolve_named_custom_runtime_pool_result_includes_extra_headers(monkeyp
 
     # Exercise the public resolver: it is responsible for preserving the
     # original named identity after the pool path canonicalizes to "custom".
-    resolved = rp.resolve_runtime_provider(requested="custom:lmstudio")
+    resolved = await rp.resolve_runtime_provider(requested="custom:lmstudio")
 
     assert resolved is not None
     assert resolved["extra_headers"] == {

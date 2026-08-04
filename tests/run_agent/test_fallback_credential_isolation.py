@@ -12,7 +12,9 @@ fallback calls, contaminating primary state with fallback-provider errors.
 """
 
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
 
 
 
@@ -32,6 +34,7 @@ def _make_pool(provider, n_entries=1):
     entry.base_url = f"https://{provider}.example.com/v1"
     pool.current.return_value = entry
     pool.mark_exhausted_and_rotate.return_value = entry
+    pool.entries = MagicMock(return_value=[entry])
     return pool
 
 
@@ -120,7 +123,8 @@ class TestFallbackCredentialIsolation:
             "Pool should be preserved when fallback provider matches pool provider"
         )
 
-    def test_fallback_attaches_matching_pool_after_clear(self):
+    @pytest.mark.asyncio
+    async def test_fallback_attaches_matching_pool_after_clear(self):
         """Provider-switch fallback should attach the fallback provider's pool."""
         from agent.chat_completion_helpers import try_activate_fallback
 
@@ -130,7 +134,12 @@ class TestFallbackCredentialIsolation:
             base_url="https://ollama.com/v1",
             api_mode="chat_completions",
         )
-        agent._fallback_chain = [{"provider": "openai-codex", "model": "gpt-5.5"}]
+        agent._fallback_chain = [{
+            "provider": "openai-codex",
+            "model": "gpt-5.5",
+            "api_key": "codex-key",
+            "base_url": "https://chatgpt.com/backend-api/codex",
+        }]
         agent._credential_pool = _make_pool("ollama-cloud")
         agent._buffer_status = MagicMock()
         agent._is_azure_openai_url.return_value = False
@@ -148,16 +157,25 @@ class TestFallbackCredentialIsolation:
         )
         fallback_pool = _make_pool("openai-codex")
 
+        async def initialize_fallback_runtime():
+            agent.client = fallback_client
+            agent.api_key = fallback_client.api_key
+            agent.base_url = str(fallback_client.base_url)
+            agent.api_mode = "codex_responses"
+            return True
+
+        agent._ensure_provider_runtime = AsyncMock(
+            side_effect=initialize_fallback_runtime,
+        )
+
         with patch(
-            "agent.auxiliary_client.resolve_provider_client",
-            return_value=(fallback_client, "gpt-5.5"),
-        ) as resolve_provider_client, patch(
             "agent.credential_pool.load_pool",
+            new_callable=AsyncMock,
             return_value=fallback_pool,
         ) as load_pool:
-            assert try_activate_fallback(agent) is True
+            assert await try_activate_fallback(agent) is True
 
-        resolve_provider_client.assert_called_once()
+        agent._ensure_provider_runtime.assert_awaited_once()
         load_pool.assert_called_once_with("openai-codex")
         assert agent.provider == "openai-codex"
         assert agent.model == "gpt-5.5"

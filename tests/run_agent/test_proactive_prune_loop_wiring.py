@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import json
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -106,6 +106,9 @@ def agent():
             max_iterations=10,
         )
     a.client = MagicMock()
+    a.client.chat.completions.create = AsyncMock()
+    a._deferred_provider_runtime = None
+    a.provider = a.requested_provider = "openrouter"
     a._cached_system_prompt = "You are helpful."
     a._use_prompt_caching = False
     a._disable_streaming = True
@@ -116,7 +119,7 @@ def agent():
     return a
 
 
-def _run_tool_loop(agent, n_tool_iterations: int):
+async def _run_tool_loop(agent, n_tool_iterations: int):
     responses = [_tool_response(i) for i in range(n_tool_iterations)]
     responses.append(_stop_response())
     agent.client.chat.completions.create.side_effect = responses
@@ -126,17 +129,19 @@ def _run_tool_loop(agent, n_tool_iterations: int):
         patch.object(agent, "_save_trajectory"),
         patch.object(agent, "_cleanup_task_resources"),
         patch(
-            "run_agent.handle_function_call",
-            lambda name, args, task_id=None, **kwargs: json.dumps({"ok": True}),
+            "model_tools.handle_function_call",
+            new_callable=AsyncMock,
+            return_value=json.dumps({"ok": True}),
         ),
     ):
-        result = agent.run_conversation("do a lot of tool work")
+        result = await agent.run_conversation("do a lot of tool work")
 
     return result
 
 
 class TestProactivePruneLoopWiring:
-    def test_prune_consulted_when_compression_stands_down(self, agent):
+    @pytest.mark.asyncio
+    async def test_prune_consulted_when_compression_stands_down(self, agent):
         calls = []
 
         def _prune(messages, current_tokens=None):
@@ -144,12 +149,13 @@ class TestProactivePruneLoopWiring:
             return messages, 0  # no-op contract: input object back
 
         agent.context_compressor.prune_tool_results_only = _prune
-        result = _run_tool_loop(agent, n_tool_iterations=3)
+        result = await _run_tool_loop(agent, n_tool_iterations=3)
         assert result["completed"] is True
         assert len(calls) == 3  # one shot per tool iteration
         assert all(t == 120_000 for t in calls)  # fed the real usage reading
 
-    def test_committed_prune_replaces_messages(self, agent):
+    @pytest.mark.asyncio
+    async def test_committed_prune_replaces_messages(self, agent):
         marker = "[old tool output pruned]"
 
         def _prune(messages, current_tokens=None):
@@ -164,27 +170,29 @@ class TestProactivePruneLoopWiring:
             return pruned, changed
 
         agent.context_compressor.prune_tool_results_only = _prune
-        result = _run_tool_loop(agent, n_tool_iterations=2)
+        result = await _run_tool_loop(agent, n_tool_iterations=2)
         assert result["completed"] is True
         tool_rows = [m for m in result["messages"] if m.get("role") == "tool"]
         assert tool_rows, "expected tool rows in the final transcript"
         assert all(m["content"] == marker for m in tool_rows)
 
-    def test_noop_input_object_commits_nothing(self, agent):
+    @pytest.mark.asyncio
+    async def test_noop_input_object_commits_nothing(self, agent):
         """Engine returns the INPUT object with a (bogus) non-zero count —
         the caller's ``result is not input`` gate must refuse the commit."""
         def _prune(messages, current_tokens=None):
             return messages, 5  # lies about count but returns input object
 
         agent.context_compressor.prune_tool_results_only = _prune
-        result = _run_tool_loop(agent, n_tool_iterations=2)
+        result = await _run_tool_loop(agent, n_tool_iterations=2)
         assert result["completed"] is True
         tool_rows = [m for m in result["messages"] if m.get("role") == "tool"]
         # tool output may be wrapped in an untrusted_tool_result envelope —
         # assert the original payload survived un-pruned.
         assert all('"ok": true' in m["content"] for m in tool_rows)
 
-    def test_engine_without_method_does_not_raise(self, agent):
+    @pytest.mark.asyncio
+    async def test_engine_without_method_does_not_raise(self, agent):
         """Plugin engines predating the hook / minimal doubles lack the
         method entirely — the getattr guard treats absence as a no-op."""
         compressor = SimpleNamespace(
@@ -198,15 +206,16 @@ class TestProactivePruneLoopWiring:
             get_active_compression_failure_cooldown=lambda: None,
         )
         agent.context_compressor = compressor
-        result = _run_tool_loop(agent, n_tool_iterations=2)
+        result = await _run_tool_loop(agent, n_tool_iterations=2)
         assert result["completed"] is True
 
-    def test_raising_prune_is_swallowed(self, agent):
+    @pytest.mark.asyncio
+    async def test_raising_prune_is_swallowed(self, agent):
         def _prune(messages, current_tokens=None):
             raise RuntimeError("boom")
 
         agent.context_compressor.prune_tool_results_only = _prune
-        result = _run_tool_loop(agent, n_tool_iterations=2)
+        result = await _run_tool_loop(agent, n_tool_iterations=2)
         assert result["completed"] is True
         tool_rows = [m for m in result["messages"] if m.get("role") == "tool"]
         # tool output may be wrapped in an untrusted_tool_result envelope —

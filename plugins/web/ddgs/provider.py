@@ -10,15 +10,14 @@ whether the package is importable; the plugin still registers either way so
 ``hermes tools`` can prompt the user to install it.
 
 Isolation note (#68096): ``ddgs``/``primp`` can block inside native code while
-holding the Python GIL. A ``ThreadPoolExecutor`` + ``future.result(timeout=…)``
-cap (see #52118) cannot fire in that state — the waiter never reacquires the
-GIL — so the whole Hermes process freezes through Ctrl+C/SIGTERM. Each search
-therefore runs in a disposable child process the parent can terminate/kill.
+holding the Python GIL. A worker-thread timeout cannot fire in that state, so
+the whole Hermes process freezes through Ctrl+C/SIGTERM. Each search therefore
+runs in a disposable child process that the async parent can terminate/kill.
 """
 
 from __future__ import annotations
 
-import concurrent.futures as cf
+import asyncio
 import json
 import logging
 import os
@@ -81,7 +80,7 @@ def _run_ddgs_search(query: str, safe_limit: int) -> list[dict[str, Any]]:
 _test_hook: Optional[str] = None
 
 # Last worker Popen started by ``_run_ddgs_search_bounded`` (test reap checks).
-_last_worker_proc: Optional[subprocess.Popen] = None
+_last_worker_proc: Optional[Any] = None
 
 
 def _plugins_path_entry() -> str:
@@ -105,45 +104,11 @@ def _plugins_path_entry() -> str:
     )
 
 
-def _terminate_and_reap(
-    proc: Optional[subprocess.Popen],
-    *,
-    grace: float = _TERMINATE_GRACE_SECS,
-) -> None:
-    """Terminate a worker, escalate to kill, and wait so no orphan remains.
-
-    Does not close the parent's pipe ends — the caller must finish any
-    ``communicate()``/reader first. Closing stdout while another thread is
-    blocked in ``read()`` deadlocks on some platforms.
-    """
-    if proc is None:
-        return
-
-    def _wait_until_dead(seconds: float) -> bool:
-        deadline = time.monotonic() + seconds
-        while time.monotonic() < deadline:
-            if proc.poll() is not None:
-                return True
-            time.sleep(0.05)
-        return proc.poll() is not None
-
-    try:
-        if proc.poll() is None:
-            proc.terminate()
-            _wait_until_dead(grace)
-        if proc.poll() is None:
-            proc.kill()
-            if not _wait_until_dead(grace):
-                logger.warning("DDGS worker pid=%s did not exit after kill", proc.pid)
-    except Exception as exc:  # noqa: BLE001 — best-effort cleanup
-        logger.debug("DDGS worker reap error: %s", exc)
-
-
-def _run_ddgs_search_bounded(query: str, safe_limit: int) -> list[dict[str, Any]]:
+async def _run_ddgs_search_bounded(query: str, safe_limit: int) -> list[dict[str, Any]]:
     """Run ``_run_ddgs_search`` in a disposable process with a hard deadline.
 
     The parent never joins the child while it may be inside native code holding
-    *its* GIL — it only polls a communicator thread and, on timeout/interrupt,
+    *its* GIL — it polls an asyncio subprocess task and, on timeout/interrupt,
     terminates the child OS process. Raises ``TimeoutError``,
     ``_SearchInterrupted``, or ``RuntimeError``.
     """
@@ -184,25 +149,22 @@ def _run_ddgs_search_bounded(query: str, safe_limit: int) -> list[dict[str, Any]
         # Own session so a hung primp/libcurl grandchild can be reaped with the worker.
         extra_kwargs["start_new_session"] = True
 
-    proc = subprocess.Popen(
-        [sys.executable, worker_path],
+    proc = await asyncio.create_subprocess_exec(
+        sys.executable,
+        worker_path,
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         # DEVNULL avoids the classic deadlock where a chatty child fills the
         # stderr pipe buffer while the parent only drains stdout.
         stderr=subprocess.DEVNULL,
         env=env,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
         **extra_kwargs,
     )
     _last_worker_proc = proc
 
-    # ``communicate`` runs in a side thread so the parent can poll interrupt /
-    # deadline without blocking. Killing the child unblocks communicate.
-    pool = cf.ThreadPoolExecutor(max_workers=1)
-    fut = pool.submit(proc.communicate, json.dumps(request))
+    communicate_task = asyncio.create_task(
+        proc.communicate(json.dumps(request).encode("utf-8"))
+    )
     timed_out = False
     interrupted = False
     raw = ""
@@ -216,23 +178,32 @@ def _run_ddgs_search_bounded(query: str, safe_limit: int) -> list[dict[str, Any]
             if remaining <= 0:
                 timed_out = True
                 break
-            try:
-                out, _err = fut.result(timeout=min(_POLL_INTERVAL_SECS, remaining))
-                raw = out or ""
+            done, _ = await asyncio.wait(
+                {communicate_task},
+                timeout=min(_POLL_INTERVAL_SECS, remaining),
+            )
+            if communicate_task in done:
+                out, _err = await communicate_task
+                raw = (out or b"").decode("utf-8", errors="replace")
                 break
-            except cf.TimeoutError:
-                continue
     finally:
-        _terminate_and_reap(proc)
-        # After kill, communicate should return promptly; don't block forever.
-        if not fut.done():
+        if proc.returncode is None:
+            proc.terminate()
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=_TERMINATE_GRACE_SECS)
+        except asyncio.TimeoutError:
+            if proc.returncode is None:
+                proc.kill()
             try:
-                out, _err = fut.result(timeout=_TERMINATE_GRACE_SECS)
-                if not raw:
-                    raw = out or ""
-            except Exception:  # noqa: BLE001
+                await asyncio.wait_for(proc.wait(), timeout=_TERMINATE_GRACE_SECS)
+            except asyncio.TimeoutError:
+                logger.warning("DDGS worker pid=%s did not exit after kill", proc.pid)
+        if not communicate_task.done():
+            communicate_task.cancel()
+            try:
+                await communicate_task
+            except asyncio.CancelledError:
                 pass
-        pool.shutdown(wait=False, cancel_futures=True)
 
     if interrupted:
         raise _SearchInterrupted("DuckDuckGo search interrupted")
@@ -244,7 +215,7 @@ def _run_ddgs_search_bounded(query: str, safe_limit: int) -> list[dict[str, Any]
     raw = raw.strip()
     if not raw:
         raise RuntimeError(
-            f"DDGS worker exited without a result (code={proc.poll()})"
+            f"DDGS worker exited without a result (code={proc.returncode})"
         )
 
     try:
@@ -300,7 +271,7 @@ class DDGSWebSearchProvider(WebSearchProvider):
     def supports_extract(self) -> bool:
         return False
 
-    def search(self, query: str, limit: int = 5) -> Dict[str, Any]:
+    async def search(self, query: str, limit: int = 5) -> Dict[str, Any]:
         """Execute a DuckDuckGo search and return normalized results.
 
         The synchronous ``ddgs`` call runs in a disposable child process with
@@ -320,7 +291,7 @@ class DDGSWebSearchProvider(WebSearchProvider):
         safe_limit = max(1, int(limit))
 
         try:
-            web_results = _run_ddgs_search_bounded(query, safe_limit)
+            web_results = await _run_ddgs_search_bounded(query, safe_limit)
         except TimeoutError:
             logger.warning(
                 "DDGS search timed out after %ds for query: %r",

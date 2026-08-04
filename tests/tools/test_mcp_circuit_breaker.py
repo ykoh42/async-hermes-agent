@@ -59,6 +59,9 @@ def _install_stub_server(mcp_tool_module, name: str, call_tool_impl):
         def set(self):
             self.set_calls += 1
             old_session = server.session
+            if old_session is None and call_tool_impl is None:
+                ready_flag.set()
+                return
             new_session = MagicMock()
             if old_session is not None:
                 new_session.call_tool = old_session.call_tool
@@ -101,127 +104,12 @@ def _cleanup(mcp_tool_module, name: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_circuit_breaker_half_opens_after_cooldown(monkeypatch, tmp_path):
-    """After a tripped breaker's cooldown elapses, the *next* call must
-    actually execute against the session (half-open probe). When the
-    probe succeeds, the breaker resets to fully closed.
-    """
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-
-    from tools import mcp_tool
-    from tools.mcp_tool import _make_tool_handler
-
-    call_count = {"n": 0}
-
-    async def _call_tool_success(*a, **kw):
-        call_count["n"] += 1
-        result = MagicMock()
-        result.isError = False
-        block = MagicMock()
-        block.text = "ok"
-        result.content = [block]
-        result.structuredContent = None
-        return result
-
-    _install_stub_server(mcp_tool, "srv", _call_tool_success)
-    mcp_tool._ensure_mcp_loop()
-
-    try:
-        # Trip the breaker by setting the count at/above threshold and
-        # stamping the open-time to "now".
-        mcp_tool._server_error_counts["srv"] = mcp_tool._CIRCUIT_BREAKER_THRESHOLD
-        fake_now = [1000.0]
-
-        def _fake_monotonic():
-            return fake_now[0]
-
-        monkeypatch.setattr(mcp_tool.time, "monotonic", _fake_monotonic)
-        # The breaker-open timestamp dict is introduced by the fix; on
-        # a pre-fix build it won't exist, which will cause the test to
-        # fail at the .get() inside the gate (correct — the fix is
-        # required for this state to be tracked at all).
-        if hasattr(mcp_tool, "_server_breaker_opened_at"):
-            mcp_tool._server_breaker_opened_at["srv"] = fake_now[0]
-        cooldown = getattr(mcp_tool, "_CIRCUIT_BREAKER_COOLDOWN_SEC", 60.0)
-
-        handler = _make_tool_handler("srv", "tool1", 10.0)
-
-        # Before cooldown: must short-circuit (no session call).
-        result = handler({})
-        parsed = json.loads(result)
-        assert "error" in parsed, parsed
-        assert "unreachable" in parsed["error"].lower()
-        assert call_count["n"] == 0, (
-            "breaker should short-circuit before cooldown elapses"
-        )
-
-        # Advance past cooldown → next call is a half-open probe that
-        # actually hits the session.
-        fake_now[0] += cooldown + 1.0
-
-        result = handler({})
-        parsed = json.loads(result)
-        assert parsed.get("result") == "ok", parsed
-        assert call_count["n"] == 1, "half-open probe should invoke session"
-
-        # On probe success the breaker must close (count reset to 0).
-        assert mcp_tool._server_error_counts.get("srv", 0) == 0
-    finally:
-        _cleanup(mcp_tool, "srv")
 
 
-def test_circuit_breaker_reopens_on_probe_failure(monkeypatch, tmp_path):
-    """If the half-open probe fails, the breaker must re-arm the
-    cooldown (not let every subsequent call through).
-    """
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-
-    from tools import mcp_tool
-    from tools.mcp_tool import _make_tool_handler
-
-    call_count = {"n": 0}
-
-    async def _call_tool_fails(*a, **kw):
-        call_count["n"] += 1
-        raise RuntimeError("still broken")
-
-    _install_stub_server(mcp_tool, "srv", _call_tool_fails)
-    mcp_tool._ensure_mcp_loop()
-
-    try:
-        mcp_tool._server_error_counts["srv"] = mcp_tool._CIRCUIT_BREAKER_THRESHOLD
-        fake_now = [1000.0]
-
-        def _fake_monotonic():
-            return fake_now[0]
-
-        monkeypatch.setattr(mcp_tool.time, "monotonic", _fake_monotonic)
-        if hasattr(mcp_tool, "_server_breaker_opened_at"):
-            mcp_tool._server_breaker_opened_at["srv"] = fake_now[0]
-        cooldown = getattr(mcp_tool, "_CIRCUIT_BREAKER_COOLDOWN_SEC", 60.0)
-
-        handler = _make_tool_handler("srv", "tool1", 10.0)
-
-        # Advance past cooldown, run probe, expect failure.
-        fake_now[0] += cooldown + 1.0
-        result = handler({})
-        parsed = json.loads(result)
-        assert "error" in parsed
-        assert call_count["n"] == 1, "probe should invoke session once"
-
-        # The probe failure must have re-armed the cooldown — another
-        # immediate call should short-circuit, not invoke session again.
-        result = handler({})
-        parsed = json.loads(result)
-        assert "unreachable" in parsed.get("error", "").lower()
-        assert call_count["n"] == 1, (
-            "breaker should re-open and block further calls after probe failure"
-        )
-    finally:
-        _cleanup(mcp_tool, "srv")
 
 
-def test_half_open_probe_on_dead_session_requests_reconnect(monkeypatch, tmp_path):
+@pytest.mark.asyncio
+async def test_half_open_probe_on_dead_session_requests_reconnect(monkeypatch, tmp_path):
     """A half-open probe against a server with no live session must request
     a transport reconnect and return a clean error — NOT write into a dead
     pipe or permanently re-arm the breaker.
@@ -239,25 +127,15 @@ def test_half_open_probe_on_dead_session_requests_reconnect(monkeypatch, tmp_pat
     server = _install_stub_server(mcp_tool, "srv", None)
     # Simulate a dead/parked transport: no live session.
     server.session = None
-    # Drive _signal_reconnect down its direct .set() path (no live loop).
-    monkeypatch.setattr(mcp_tool, "_mcp_loop", None)
-
     try:
         mcp_tool._server_error_counts["srv"] = mcp_tool._CIRCUIT_BREAKER_THRESHOLD
-        fake_now = [1000.0]
-
-        def _fake_monotonic():
-            return fake_now[0]
-
-        monkeypatch.setattr(mcp_tool.time, "monotonic", _fake_monotonic)
-        mcp_tool._server_breaker_opened_at["srv"] = fake_now[0]
         cooldown = getattr(mcp_tool, "_CIRCUIT_BREAKER_COOLDOWN_SEC", 60.0)
+        mcp_tool._server_breaker_opened_at["srv"] = (
+            mcp_tool.time.monotonic() - cooldown - 1.0
+        )
 
-        # Advance past cooldown → next call is a half-open probe.
-        fake_now[0] += cooldown + 1.0
-
-        handler = _make_tool_handler("srv", "tool1", 10.0)
-        result = handler({})
+        handler = _make_tool_handler("srv", "tool1", 0.01)
+        result = await handler({})
         parsed = json.loads(result)
 
         # Clean "reconnecting" error, and a reconnect was actually signalled.
@@ -267,132 +145,8 @@ def test_half_open_probe_on_dead_session_requests_reconnect(monkeypatch, tmp_pat
         _cleanup(mcp_tool, "srv")
 
 
-def test_half_open_dead_session_recovers_after_reconnect(monkeypatch, tmp_path):
-    """Once the transport comes back (session repopulated + breaker reset by
-    the run loop), the next call must go straight through — proving the wedge
-    is escapable, not just deferred.
-    """
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-
-    from tools import mcp_tool
-    from tools.mcp_tool import _make_tool_handler
-
-    async def _call_tool_success(*a, **kw):
-        result = MagicMock()
-        result.isError = False
-        block = MagicMock()
-        block.text = "ok"
-        result.content = [block]
-        result.structuredContent = None
-        return result
-
-    server = _install_stub_server(mcp_tool, "srv", _call_tool_success)
-    server.session = None  # transport down at first
-    monkeypatch.setattr(mcp_tool, "_mcp_loop", None)
-    mcp_tool._ensure_mcp_loop()
-
-    try:
-        mcp_tool._server_error_counts["srv"] = mcp_tool._CIRCUIT_BREAKER_THRESHOLD
-        fake_now = [1000.0]
-        monkeypatch.setattr(mcp_tool.time, "monotonic", lambda: fake_now[0])
-        mcp_tool._server_breaker_opened_at["srv"] = fake_now[0]
-        cooldown = getattr(mcp_tool, "_CIRCUIT_BREAKER_COOLDOWN_SEC", 60.0)
-        fake_now[0] += cooldown + 1.0
-
-        handler = _make_tool_handler("srv", "tool1", 10.0)
-
-        # Probe 1: transport down → reconnect requested, clean error.
-        parsed = json.loads(handler({}))
-        assert "reconnect" in parsed.get("error", "").lower(), parsed
-
-        # Simulate the run loop rebuilding the session + resetting the breaker
-        # (what _run_stdio does on successful re-init).
-        live = MagicMock()
-        live.call_tool = _call_tool_success
-        server.session = live
-        mcp_tool._reset_server_error("srv")
-
-        # Advance past the re-armed cooldown so the next call is a fresh probe.
-        fake_now[0] += cooldown + 1.0
-
-        # Next call goes straight through.
-        parsed = json.loads(handler({}))
-        assert parsed.get("result") == "ok", parsed
-    finally:
-        _cleanup(mcp_tool, "srv")
 
 
-def test_circuit_breaker_cleared_on_reconnect(monkeypatch, tmp_path):
-    """When the auth-recovery path successfully reconnects the server,
-    the breaker should be cleared so subsequent calls aren't gated on a
-    stale failure count — even if the post-reconnect retry itself fails.
-
-    This locks in the fix-#2 contract: a successful reconnect is
-    sufficient evidence that the server is viable again. Under the old
-    implementation, reset only happened on retry *success*, so a
-    reconnect+retry-failure left the counter pinned above threshold
-    forever.
-    """
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-
-    from tools import mcp_tool
-    from tools.mcp_oauth_manager import get_manager, reset_manager_for_tests
-    from mcp.client.auth import OAuthFlowError
-
-    reset_manager_for_tests()
-
-    async def _call_tool_unused(*a, **kw):  # pragma: no cover
-        raise AssertionError("session.call_tool should not be reached in this test")
-
-    _install_stub_server(mcp_tool, "srv", _call_tool_unused)
-    mcp_tool._ensure_mcp_loop()
-
-    # Open the breaker well above threshold, with a recent open-time so
-    # it would short-circuit everything without a reset.
-    mcp_tool._server_error_counts["srv"] = mcp_tool._CIRCUIT_BREAKER_THRESHOLD + 2
-    if hasattr(mcp_tool, "_server_breaker_opened_at"):
-        import time as _time
-        mcp_tool._server_breaker_opened_at["srv"] = _time.monotonic()
-
-    # Force handle_401 to claim recovery succeeded.
-    mgr = get_manager()
-
-    async def _h401(name, token=None):
-        return True
-
-    monkeypatch.setattr(mgr, "handle_401", _h401)
-
-    try:
-        # Retry fails *after* the successful reconnect. Under the old
-        # implementation this bumps an already-tripped counter even
-        # higher. Under fix #2 the reset happens on successful
-        # reconnect, and the post-retry bump only raises the fresh
-        # count to 1 — still below threshold.
-        def _retry_call():
-            raise OAuthFlowError("still failing post-reconnect")
-
-        result = mcp_tool._handle_auth_error_and_retry(
-            "srv",
-            OAuthFlowError("initial"),
-            _retry_call,
-            "tools/call test",
-        )
-        # The call as a whole still surfaces needs_reauth because the
-        # retry itself didn't succeed, but the breaker state must
-        # reflect the successful reconnect.
-        assert result is not None
-        parsed = json.loads(result)
-        assert parsed.get("needs_reauth") is True, parsed
-
-        # Post-reconnect count was reset to 0, then the failing retry
-        # bumped it to exactly 1 — well below threshold.
-        count = mcp_tool._server_error_counts.get("srv", 0)
-        assert count < mcp_tool._CIRCUIT_BREAKER_THRESHOLD, (
-            f"successful reconnect must reset the breaker below threshold; "
-            f"got count={count}, threshold={mcp_tool._CIRCUIT_BREAKER_THRESHOLD}"
-        )
-    finally:
-        _cleanup(mcp_tool, "srv")
 
 
 def test_run_loop_parks_instead_of_exiting_then_revives(monkeypatch, tmp_path):

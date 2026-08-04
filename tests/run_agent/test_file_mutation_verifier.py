@@ -263,55 +263,28 @@ class TestFormatFooter:
         assert len(bullet_lines) == 11  # 10 shown + 1 summary
 
 
-    def test_footer_path_not_extracted_by_gateway(self):
-        """End-to-end: the gateway's extract_local_files must NOT pull a
-        config.yaml path out of the rendered footer (#35584)."""
-        import os
-        import tempfile
-        from gateway.platforms.base import BasePlatformAdapter
-
-        tmp = tempfile.mkdtemp(prefix="hermes_footer_")
-        try:
-            cfg = os.path.join(tmp, "config.yaml")
-            with open(cfg, "w") as fh:
-                fh.write("openrouter_api_key: sk-LEAK\n")
-            footer = AIAgent._format_file_mutation_failure_footer(
-                {cfg: {
-                    "tool": "patch",
-                    "error_preview": (
-                        f"Write denied: '{cfg}' is a protected "
-                        "system/credential file."
-                    ),
-                }},
-            )
-            response = "I updated your config.\n\n" + footer
-            paths, _ = BasePlatformAdapter.extract_local_files(response)
-            assert paths == [], f"footer leaked deliverable path(s): {paths}"
-        finally:
-            import shutil
-            shutil.rmtree(tmp, ignore_errors=True)
-
-
 # ---------------------------------------------------------------------------
 # _file_mutation_verifier_enabled — env + config precedence
 # ---------------------------------------------------------------------------
 
 
 class TestVerifierEnabled:
-    def test_default_is_enabled(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_default_is_enabled(self, monkeypatch):
         monkeypatch.delenv("HERMES_FILE_MUTATION_VERIFIER", raising=False)
         agent = _bare_agent()
         # With no env and no config present, safe default is True.
         # load_config may surface a user config.yaml in some envs — stub it.
         import hermes_cli.config as _cfg_mod
         monkeypatch.setattr(_cfg_mod, "load_config", lambda: {})
-        assert agent._file_mutation_verifier_enabled() is True
+        assert await agent._file_mutation_verifier_enabled() is True
 
+    @pytest.mark.asyncio
     @pytest.mark.parametrize("value", ["0", "false", "FALSE", "no", "off"])
-    def test_env_disables(self, monkeypatch, value):
+    async def test_env_disables(self, monkeypatch, value):
         monkeypatch.setenv("HERMES_FILE_MUTATION_VERIFIER", value)
         agent = _bare_agent()
-        assert agent._file_mutation_verifier_enabled() is False
+        assert await agent._file_mutation_verifier_enabled() is False
 
 
 

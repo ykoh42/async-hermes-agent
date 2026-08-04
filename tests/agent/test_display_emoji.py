@@ -24,8 +24,8 @@ class TestGetToolEmoji:
                 result = get_tool_emoji("x", default="⚙️")
                 assert result == "⚙️"
 
-    def test_skin_override_only_for_matching_tool(self):
-        """Skin override for one tool doesn't affect others."""
+    def test_registry_emoji_is_used_without_ui_skin_overrides(self):
+        """The async harness keeps display metadata in the tool registry."""
         skin = MagicMock()
         skin.tool_emojis = {"terminal": "⚔"}
         mock_reg = MagicMock()
@@ -35,26 +35,5 @@ class TestGetToolEmoji:
         mock_module.registry = mock_reg
         with mock_patch("agent.display._get_skin", return_value=skin), \
              mock_patch.dict(sys.modules, {"tools.registry": mock_module}):
-            assert get_tool_emoji("terminal") == "⚔"  # skin override
-            assert get_tool_emoji("web_search") == "🔍"  # registry fallback
-
-
-class TestSkinConfigToolEmojis:
-    """Verify SkinConfig handles tool_emojis field correctly."""
-
-
-    def test_skin_config_accepts_tool_emojis(self):
-        from hermes_cli.skin_engine import SkinConfig
-        emojis = {"terminal": "⚔", "web_search": "🔮"}
-        skin = SkinConfig(name="test", tool_emojis=emojis)
-        assert skin.tool_emojis == emojis
-
-    def test_build_skin_config_includes_tool_emojis(self):
-        from hermes_cli.skin_engine import _build_skin_config
-        data = {
-            "name": "custom",
-            "tool_emojis": {"terminal": "🗡️", "patch": "⚒️"},
-        }
-        skin = _build_skin_config(data)
-        assert skin.tool_emojis == {"terminal": "🗡️", "patch": "⚒️"}
-
+            assert get_tool_emoji("terminal") == "🔍"
+            assert get_tool_emoji("web_search") == "🔍"

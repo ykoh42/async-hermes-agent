@@ -27,7 +27,9 @@ from __future__ import annotations
 
 import base64
 import json
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
 
 
 
@@ -151,7 +153,8 @@ class TestPrimaryClientWiring:
 # ---------------------------------------------------------------------------
 
 class TestAuxiliaryClientWiring:
-    def test_build_codex_client_passes_codex_headers(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_build_codex_client_passes_codex_headers(self, monkeypatch):
         """_build_codex_client builds the OpenAI client used for compression /
         vision / title generation when routed through Codex. Must emit codex
         headers."""
@@ -162,33 +165,34 @@ class TestAuxiliaryClientWiring:
         # _read_codex_access_token.
         monkeypatch.setattr(
             auxiliary_client, "_select_pool_entry",
-            lambda provider: (False, None),
+            AsyncMock(return_value=(False, None)),
         )
         monkeypatch.setattr(
             auxiliary_client, "_read_codex_access_token",
-            lambda: token,
+            AsyncMock(return_value=token),
         )
-        with patch("agent.auxiliary_client.OpenAI") as mock_openai:
+        with patch("agent.auxiliary_client._create_openai_client") as mock_openai:
             mock_openai.return_value = MagicMock()
-            client, model = auxiliary_client._build_codex_client("gpt-5.4")
+            client, model = await auxiliary_client._build_codex_client("gpt-5.4")
             assert client is not None
             headers = mock_openai.call_args.kwargs.get("default_headers") or {}
             assert headers.get("originator") == "codex_cli_rs"
             assert headers.get("ChatGPT-Account-ID") == "acct-aux-try-codex"
             assert headers.get("User-Agent", "").startswith("codex_cli_rs/")
 
-    def test_resolve_provider_client_raw_codex_passes_codex_headers(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_resolve_provider_client_raw_codex_passes_codex_headers(self, monkeypatch):
         """The ``raw_codex=True`` branch (used by the main agent loop for direct
         responses.stream() access) must also emit codex headers."""
         from agent import auxiliary_client
         token = _make_codex_jwt("acct-aux-raw-codex")
         monkeypatch.setattr(
             auxiliary_client, "_read_codex_access_token",
-            lambda: token,
+            AsyncMock(return_value=token),
         )
-        with patch("agent.auxiliary_client.OpenAI") as mock_openai:
+        with patch("agent.auxiliary_client._create_openai_client") as mock_openai:
             mock_openai.return_value = MagicMock()
-            client, model = auxiliary_client.resolve_provider_client(
+            client, model = await auxiliary_client.resolve_provider_client(
                 "openai-codex", model="gpt-5.4", raw_codex=True,
             )
             assert client is not None

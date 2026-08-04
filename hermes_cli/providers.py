@@ -456,48 +456,7 @@ def get_provider(name: str, *, allow_network: bool = True) -> Optional[ProviderD
     """
     canonical = normalize_provider(name)
 
-    # Try to get models.dev data
-    try:
-        from agent.models_dev import get_provider_info as _mdev_provider
-        # Keep the single-argument call on the default path: test sites
-        # monkeypatch get_provider_info with single-arg lambdas.
-        mdev_info = (
-            _mdev_provider(canonical)
-            if allow_network
-            else _mdev_provider(canonical, allow_network=False)
-        )
-    except Exception:
-        mdev_info = None
-
     overlay = HERMES_OVERLAYS.get(canonical)
-
-    if mdev_info is not None:
-        # Merge models.dev + overlay
-        transport = overlay.transport if overlay else "openai_chat"
-        is_agg = overlay.is_aggregator if overlay else False
-        auth = overlay.auth_type if overlay else "api_key"
-        base_url_env = overlay.base_url_env_var if overlay else ""
-        base_url_override = overlay.base_url_override if overlay else ""
-
-        # Combine env vars: models.dev env + hermes extra
-        env_vars = list(mdev_info.env)
-        if overlay and overlay.extra_env_vars:
-            for ev in overlay.extra_env_vars:
-                if ev not in env_vars:
-                    env_vars.append(ev)
-
-        return ProviderDef(
-            id=canonical,
-            name=mdev_info.name,
-            transport=transport,
-            api_key_env_vars=tuple(env_vars),
-            base_url=base_url_override or mdev_info.api,
-            base_url_env_var=base_url_env,
-            is_aggregator=is_agg,
-            auth_type=auth,
-            doc=mdev_info.doc,
-            source="models.dev",
-        )
 
     if overlay is not None:
         # Hermes-only provider (not in models.dev)
@@ -927,21 +886,5 @@ def resolve_provider_full(
     custom_pdef = resolve_custom_provider(name, custom_providers)
     if custom_pdef is not None:
         return custom_pdef
-
-    # 3. Try models.dev directly (for providers not in our ALIASES)
-    try:
-        from agent.models_dev import get_provider_info as _mdev_provider
-        mdev_info = _mdev_provider(canonical)
-        if mdev_info is not None:
-            return ProviderDef(
-                id=canonical,
-                name=mdev_info.name,
-                transport="openai_chat",
-                api_key_env_vars=mdev_info.env,
-                base_url=mdev_info.api,
-                source="models.dev",
-            )
-    except Exception:
-        pass
 
     return None

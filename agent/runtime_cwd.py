@@ -12,6 +12,7 @@ contextvar; CLI/cron fall through to `TERMINAL_CWD`/launch cwd.
 
 import logging
 import os
+import aiofiles.os
 from contextvars import ContextVar, Token
 from pathlib import Path
 from typing import Any
@@ -57,35 +58,29 @@ def _session_cwd_override() -> str:
     return str(value).strip()
 
 
-def resolve_agent_cwd() -> Path:
+async def resolve_agent_cwd() -> Path:
+    """Resolve the agent cwd without synchronous filesystem probes."""
     override = _session_cwd_override()
     if override:
         p = Path(override).expanduser()
-        if p.is_dir():
+        if await aiofiles.os.path.isdir(p):
             return p
         logger.warning("configured working directory does not exist: %s", override)
     raw = os.environ.get("TERMINAL_CWD", "").strip()
     if raw:
         p = Path(raw).expanduser()
-        if p.is_dir():
+        if await aiofiles.os.path.isdir(p):
             return p
         logger.warning("TERMINAL_CWD does not exist: %s", raw)
     return Path(os.getcwd())
 
 
-def resolve_context_cwd() -> Path | None:
-    # None means "no configured cwd": build_context_files_prompt then falls back
-    # to the launch dir (os.getcwd()), correct for a local CLI launched inside a
-    # real project. A configured path is validated here (previously it was passed
-    # through unchecked, diverging from resolve_agent_cwd). An explicitly
-    # configured path is otherwise honored verbatim — including the Hermes
-    # source tree itself, which is a legitimate workspace when the user is
-    # developing Hermes (per-surface policy for fallback-picked directories
-    # lives in build_context_files_prompt; see #64590).
+async def resolve_context_cwd() -> Path | None:
+    """Resolve an explicitly configured context cwd, if one is valid."""
     override = _session_cwd_override()
     if override:
         p = Path(override).expanduser()
-        if not p.is_dir():
+        if not await aiofiles.os.path.isdir(p):
             logger.warning("configured working directory does not exist: %s", override)
         else:
             return p
@@ -93,7 +88,7 @@ def resolve_context_cwd() -> Path | None:
     raw = os.environ.get("TERMINAL_CWD", "").strip()
     if raw:
         p = Path(raw).expanduser()
-        if not p.is_dir():
+        if not await aiofiles.os.path.isdir(p):
             logger.warning("TERMINAL_CWD does not exist: %s", raw)
         else:
             return p

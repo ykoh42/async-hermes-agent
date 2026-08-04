@@ -23,26 +23,17 @@ Design:
 - Frozen snapshot pattern: system prompt is stable, tool responses show live state
 """
 
+import asyncio
 import json
 import logging
 import time
-from contextlib import contextmanager
+import uuid
 from pathlib import Path
 from hermes_constants import get_hermes_home
 from typing import Dict, Any, List, Optional, Tuple
 
-from utils import atomic_write_text
-
-# fcntl is Unix-only; on Windows use msvcrt for file locking
-msvcrt = None
-try:
-    import fcntl
-except ImportError:
-    fcntl = None
-    try:
-        import msvcrt
-    except ImportError:
-        pass
+import aiofiles
+import aiofiles.os
 
 logger = logging.getLogger(__name__)
 
@@ -172,6 +163,15 @@ class MemoryStore:
         # Per-turn counter of failed at-capacity consolidation attempts; reset
         # at each turn boundary by reset_consolidation_failures() (#42405).
         self._consolidation_failures = 0
+        self._write_lock = None
+
+    def _get_write_lock(self) -> asyncio.Lock:
+        """Return the per-store lock used by native async mutations."""
+        lock = self._write_lock
+        if lock is None:
+            lock = asyncio.Lock()
+            self._write_lock = lock
+        return lock
 
     def reset_consolidation_failures(self) -> None:
         """Reset the per-turn consolidation-failure counter (call at turn start)."""
@@ -200,40 +200,20 @@ class MemoryStore:
             ),
         }
 
-    def load_from_disk(self):
-        """Load entries from MEMORY.md and USER.md, capture system prompt snapshot.
-
-        The frozen snapshot is what enters the system prompt. We scan each
-        entry for injection/promptware patterns at snapshot-build time —
-        ANY hit replaces the entry text in the snapshot with a placeholder
-        like ``[BLOCKED: …]``, so a poisoned-on-disk memory file (supply
-        chain, compromised tool, sister-session write) cannot inject into
-        the system prompt.
-
-        The live ``memory_entries`` / ``user_entries`` lists keep the
-        original text so the user can still SEE poisoned entries via
-        see poisoned entries by inspecting the source files directly, and remove them — silently dropping them would hide the attack from the user.
-
-        Scanning is deterministic from disk bytes, so the snapshot remains
-        stable for the entire session (prefix-cache invariant holds).
-        """
+    async def load_from_disk(self) -> None:
+        """Load the frozen memory snapshot without blocking an agent turn."""
         mem_dir = get_memory_dir()
-        mem_dir.mkdir(parents=True, exist_ok=True)
-
-        self.memory_entries = self._read_file(mem_dir / "MEMORY.md")
-        self.user_entries = self._read_file(mem_dir / "USER.md")
-
-        # Deduplicate entries (preserves order, keeps first occurrence)
+        await aiofiles.os.makedirs(mem_dir, exist_ok=True)
+        self.memory_entries = await self._read_file(mem_dir / "MEMORY.md")
+        self.user_entries = await self._read_file(mem_dir / "USER.md")
         self.memory_entries = list(dict.fromkeys(self.memory_entries))
         self.user_entries = list(dict.fromkeys(self.user_entries))
-
-        # Sanitize entries for the system-prompt snapshot only.  Live state
-        # (memory_entries / user_entries) keeps the raw text so the user
-        # can see + remove poisoned entries via the memory tool.
-        sanitized_memory = self._sanitize_entries_for_snapshot(self.memory_entries, "MEMORY.md")
-        sanitized_user = self._sanitize_entries_for_snapshot(self.user_entries, "USER.md")
-
-        # Capture frozen snapshot for system prompt injection
+        sanitized_memory = self._sanitize_entries_for_snapshot(
+            self.memory_entries, "MEMORY.md"
+        )
+        sanitized_user = self._sanitize_entries_for_snapshot(
+            self.user_entries, "USER.md"
+        )
         self._system_prompt_snapshot = {
             "memory": self._render_block("memory", sanitized_memory),
             "user": self._render_block("user", sanitized_user),
@@ -276,94 +256,36 @@ class MemoryStore:
         return sanitized
 
     @staticmethod
-    @contextmanager
-    def _file_lock(path: Path):
-        """Acquire an exclusive file lock for read-modify-write safety.
-
-        Uses a separate .lock file so the memory file itself can still be
-        atomically replaced via os.replace().
-        """
-        lock_path = path.with_suffix(path.suffix + ".lock")
-        lock_path.parent.mkdir(parents=True, exist_ok=True)
-
-        if fcntl is None and msvcrt is None:
-            yield
-            return
-
-        fd = open(lock_path, "a+", encoding="utf-8")
-        try:
-            if fcntl:
-                fcntl.flock(fd, fcntl.LOCK_EX)
-            else:
-                fd.seek(0)
-                msvcrt.locking(fd.fileno(), msvcrt.LK_LOCK, 1)
-            yield
-        finally:
-            if fcntl:
-                try:
-                    fcntl.flock(fd, fcntl.LOCK_UN)
-                except (OSError, IOError):
-                    pass
-            elif msvcrt:
-                try:
-                    fd.seek(0)
-                    msvcrt.locking(fd.fileno(), msvcrt.LK_UNLCK, 1)
-                except (OSError, IOError):
-                    pass
-            fd.close()
-
-    @staticmethod
     def _path_for(target: str) -> Path:
         mem_dir = get_memory_dir()
         if target == "user":
             return mem_dir / "USER.md"
         return mem_dir / "MEMORY.md"
 
-    def _reload_target(self, target: str, *, skip_drift: bool = False):
-        """Re-read entries from disk into in-memory state.
-
-        Called under file lock to get the latest state before mutating.
-        Returns the backup path if external drift was detected (the on-disk
-        file contains content that wouldn't round-trip through our
-        parser/serializer, OR an entry larger than the store's char limit).
-        When drift is detected the caller must abort the mutation —
-        flushing would discard the un-roundtrippable content.
-        Returns ``None`` on clean reload.
-
-        Returns the ``_READ_FAILED`` sentinel when the file EXISTS but could not
-        be read. The caller MUST abort: the on-disk entries are unknown, so
-        overwriting from an assumed-empty view would wipe them. This is the real
-        exposure behind ``add`` — it skips the drift guard because appending is
-        safe, but that reasoning only holds when the reload actually saw the
-        file. A failed read reported as ``[]`` turned ``add`` into a full-file
-        rewrite down to a single entry.
-
-        When *skip_drift* is True the round-trip / entry-size check is
-        bypassed.  Used by the ``add`` action which appends without
-        rewriting, so existing content is never clobbered.
-        """
+    async def _reload_target(
+        self,
+        target: str,
+        *,
+        skip_drift: bool = False,
+    ):
+        """Refresh a mutable target from its checked on-disk snapshot."""
         path = self._path_for(target)
-        raw, read_ok = self._read_raw_checked(path)
+        raw, read_ok = await self._read_raw_checked(path)
         if not read_ok:
-            # Leave in-memory entries untouched and tell the caller to abort;
-            # persisting over an unreadable file would destroy it.
             return _READ_FAILED
-        # Derive BOTH the drift check and the entry parse from the same raw
-        # snapshot. The drift guard used to re-read the file itself and treat
-        # a failed second read as "no drift" — so a read failure between the
-        # checked reload and the drift check let replace/remove/apply_batch
-        # rewrite the file from a stale view, silently discarding whatever an
-        # external writer had just added. One read, one snapshot, no window.
-        bak = None if skip_drift else self._detect_external_drift(target, raw)
-        fresh = self._parse_entries(raw)
-        fresh = list(dict.fromkeys(fresh))  # deduplicate
-        self._set_entries(target, fresh)
-        return bak
+        backup = (
+            None
+            if skip_drift
+            else await self._detect_external_drift(target, raw)
+        )
+        self._set_entries(target, list(dict.fromkeys(self._parse_entries(raw))))
+        return backup
 
-    def save_to_disk(self, target: str):
-        """Persist entries to the appropriate file. Called after every mutation."""
-        get_memory_dir().mkdir(parents=True, exist_ok=True)
-        self._write_file(self._path_for(target), self._entries_for(target))
+    async def save_to_disk(self, target: str) -> None:
+        """Atomically persist one memory target through ``aiofiles``."""
+        mem_dir = get_memory_dir()
+        await aiofiles.os.makedirs(mem_dir, exist_ok=True)
+        await self._write_file(self._path_for(target), self._entries_for(target))
 
     def _entries_for(self, target: str) -> List[str]:
         if target == "user":
@@ -387,285 +309,210 @@ class MemoryStore:
             return self.user_char_limit
         return self.memory_char_limit
 
-    def add(self, target: str, content: str) -> Dict[str, Any]:
-        """Append a new entry. Returns error if it would exceed the char limit."""
+    async def add(self, target: str, content: str) -> Dict[str, Any]:
+        """Append one memory entry with native async persistence."""
         content = content.strip()
         if not content:
             return {"success": False, "error": "Content cannot be empty."}
-
-        # Scan for injection/exfiltration before accepting
         scan_error = _scan_memory_content(content)
         if scan_error:
             return {"success": False, "error": scan_error}
 
-        with self._file_lock(self._path_for(target)):
-            # Re-read from disk under lock to pick up writes from other sessions.
-            # For add (append-only), we skip the drift guard — appending never
-            # clobbers existing content, so round-trip mismatches from prior
-            # tool-written entries in the same session are harmless.  The drift
-            # guard remains active for replace/remove where full-file rewrite
-            # would discard un-roundtrippable content (issue #26045).
-            #
-            # But "append never clobbers" only holds when the reload actually
-            # read the file. add rewrites the WHOLE file from the parsed
-            # entries, so a file that exists but read as empty (transient lock,
-            # permission blip, I/O error) would be rewritten down to just the
-            # new entry — wiping every prior memory. Refuse instead.
-            if self._reload_target(target, skip_drift=True) is _READ_FAILED:
+        async with self._get_write_lock():
+            if await self._reload_target(target, skip_drift=True) is _READ_FAILED:
                 return _read_failed_error(self._path_for(target))
-
             entries = self._entries_for(target)
-            limit = self._char_limit(target)
-
-            # Reject exact duplicates
             if content in entries:
                 return self._success_response(target, "Entry already exists (no duplicate added).")
-
-            # Calculate what the new total would be
             new_entries = entries + [content]
-            new_total = len(ENTRY_DELIMITER.join(new_entries))
-
-            if new_total > limit:
+            limit = self._char_limit(target)
+            if len(ENTRY_DELIMITER.join(new_entries)) > limit:
                 current = self._char_count(target)
                 return self._consolidation_failure({
                     "success": False,
                     "error": (
-                        f"Memory at {current:,}/{limit:,} chars. "
-                        f"Adding this entry ({len(content)} chars) would exceed the limit. "
-                        f"Consolidate now: use 'replace' to merge overlapping entries into "
-                        f"shorter ones or 'remove' stale or less important entries (see "
-                        f"current_entries below), then retry this add — all in this turn."
+                        f"Memory at {current:,}/{limit:,} chars. Adding this entry "
+                        f"({len(content)} chars) would exceed the limit. Consolidate now: "
+                        "use 'replace' to merge overlapping entries into shorter ones or "
+                        "'remove' stale or less important entries (see current_entries below), "
+                        "then retry this add — all in this turn."
                     ),
                     "current_entries": entries,
                     "usage": f"{current:,}/{limit:,}",
                 })
-
-            entries.append(content)
-            self._set_entries(target, entries)
-            self.save_to_disk(target)
-
+            self._set_entries(target, new_entries)
+            await self.save_to_disk(target)
         return self._success_response(target, "Entry added.")
 
-    def replace(self, target: str, old_text: str, new_content: str) -> Dict[str, Any]:
-        """Find entry containing old_text substring, replace it with new_content."""
+    async def replace(
+        self,
+        target: str,
+        old_text: str,
+        new_content: str,
+    ) -> Dict[str, Any]:
+        """Native-async replacement with atomic file publication."""
         old_text = old_text.strip()
         new_content = new_content.strip()
         if not old_text:
             return {"success": False, "error": "old_text cannot be empty."}
         if not new_content:
-            return {"success": False, "error": "new_content cannot be empty. Use 'remove' to delete entries."}
-
-        # Scan replacement content for injection/exfiltration
+            return {
+                "success": False,
+                "error": "new_content cannot be empty. Use 'remove' to delete entries.",
+            }
         scan_error = _scan_memory_content(new_content)
         if scan_error:
             return {"success": False, "error": scan_error}
 
-        with self._file_lock(self._path_for(target)):
-            bak = self._reload_target(target)
-            if bak is _READ_FAILED:
+        async with self._get_write_lock():
+            backup = await self._reload_target(target)
+            if backup is _READ_FAILED:
                 return _read_failed_error(self._path_for(target))
-            if bak:
-                return _drift_error(self._path_for(target), bak)
-
+            if backup:
+                return _drift_error(self._path_for(target), backup)
             entries = self._entries_for(target)
-            matches = [(i, e) for i, e in enumerate(entries) if old_text in e]
-
+            matches = [(index, entry) for index, entry in enumerate(entries) if old_text in entry]
             if not matches:
                 return self._consolidation_failure({
                     "success": False,
-                    "error": f"No entry matched '{old_text}'. Check current_entries below and retry with the exact text of the entry you want to replace.",
+                    "error": (
+                        f"No entry matched '{old_text}'. Check current_entries below and retry "
+                        "with the exact text of the entry you want to replace."
+                    ),
                     "current_entries": entries,
                 })
-
-            if len(matches) > 1:
-                # If all matches are identical (exact duplicates), operate on the first one
-                unique_texts = {e for _, e in matches}
-                if len(unique_texts) > 1:
-                    previews = self._previews([e for _, e in matches])
-                    return {
-                        "success": False,
-                        "error": f"Multiple entries matched '{old_text}'. Be more specific.",
-                        "matches": previews,
-                    }
-                # All identical -- safe to replace just the first
-
-            idx = matches[0][0]
+            if len({entry for _, entry in matches}) > 1:
+                return {
+                    "success": False,
+                    "error": f"Multiple entries matched '{old_text}'. Be more specific.",
+                    "matches": self._previews([entry for _, entry in matches]),
+                }
+            updated = list(entries)
+            updated[matches[0][0]] = new_content
             limit = self._char_limit(target)
-
-            # Check that replacement doesn't blow the budget
-            test_entries = entries.copy()
-            test_entries[idx] = new_content
-            new_total = len(ENTRY_DELIMITER.join(test_entries))
-
-            if new_total > limit:
+            total = len(ENTRY_DELIMITER.join(updated))
+            if total > limit:
                 current = self._char_count(target)
                 return self._consolidation_failure({
                     "success": False,
                     "error": (
-                        f"Replacement would put memory at {new_total:,}/{limit:,} chars. "
-                        f"Shorten the new content, or 'remove' other stale or less important "
-                        f"entries to make room (see current_entries below), then retry — all "
-                        f"in this turn."
+                        f"Replacement would put memory at {total:,}/{limit:,} chars. "
+                        "Shorten the new content, or 'remove' other stale or less important "
+                        "entries to make room (see current_entries below), then retry — all in this turn."
                     ),
                     "current_entries": entries,
                     "usage": f"{current:,}/{limit:,}",
                 })
-
-            entries[idx] = new_content
-            self._set_entries(target, entries)
-            self.save_to_disk(target)
-
+            self._set_entries(target, updated)
+            await self.save_to_disk(target)
         return self._success_response(target, "Entry replaced.")
 
-    def remove(self, target: str, old_text: str) -> Dict[str, Any]:
-        """Remove the entry containing old_text substring."""
+    async def remove(self, target: str, old_text: str) -> Dict[str, Any]:
+        """Native-async removal with the existing ambiguity guard."""
         old_text = old_text.strip()
         if not old_text:
             return {"success": False, "error": "old_text cannot be empty."}
-
-        with self._file_lock(self._path_for(target)):
-            bak = self._reload_target(target)
-            if bak is _READ_FAILED:
+        async with self._get_write_lock():
+            backup = await self._reload_target(target)
+            if backup is _READ_FAILED:
                 return _read_failed_error(self._path_for(target))
-            if bak:
-                return _drift_error(self._path_for(target), bak)
-
+            if backup:
+                return _drift_error(self._path_for(target), backup)
             entries = self._entries_for(target)
-            matches = [(i, e) for i, e in enumerate(entries) if old_text in e]
-
+            matches = [(index, entry) for index, entry in enumerate(entries) if old_text in entry]
             if not matches:
                 return self._consolidation_failure({
                     "success": False,
                     "error": f"No entry matched '{old_text}'. Check current_entries below and retry with the exact text of the entry you want to remove.",
                     "current_entries": entries,
                 })
-
-            if len(matches) > 1:
-                # If all matches are identical (exact duplicates), remove the first one
-                unique_texts = {e for _, e in matches}
-                if len(unique_texts) > 1:
-                    previews = self._previews([e for _, e in matches])
-                    return {
-                        "success": False,
-                        "error": f"Multiple entries matched '{old_text}'. Be more specific.",
-                        "matches": previews,
-                    }
-                # All identical -- safe to remove just the first
-
-            idx = matches[0][0]
-            entries.pop(idx)
-            self._set_entries(target, entries)
-            self.save_to_disk(target)
-
+            if len({entry for _, entry in matches}) > 1:
+                return {
+                    "success": False,
+                    "error": f"Multiple entries matched '{old_text}'. Be more specific.",
+                    "matches": self._previews([entry for _, entry in matches]),
+                }
+            updated = list(entries)
+            updated.pop(matches[0][0])
+            self._set_entries(target, updated)
+            await self.save_to_disk(target)
         return self._success_response(target, "Entry removed.")
 
-    def apply_batch(self, target: str, operations: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """Apply a sequence of add/replace/remove ops to one target atomically.
-
-        All operations are validated and applied against the FINAL budget --
-        intermediate overflow is irrelevant. This lets the model free space
-        (remove/replace) and add new entries in a SINGLE tool call instead of
-        the multi-turn consolidate-then-retry dance that re-sends the whole
-        conversation context several times.
-
-        Semantics: all-or-nothing. If any op is malformed, doesn't match, or
-        the net result would exceed the char limit, NOTHING is written and an
-        error is returned describing the first failure plus the live state.
-        """
+    async def apply_batch(
+        self,
+        target: str,
+        operations: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """Apply a batch atomically through the native async file path."""
         if not operations:
             return {"success": False, "error": "operations list is empty."}
-
-        # Scan every add/replace content for injection/exfil BEFORE touching
-        # disk -- a single poisoned op rejects the whole batch.
-        for i, op in enumerate(operations):
-            act = (op or {}).get("action")
-            new_content = (op or {}).get("content")
-            if act in {"add", "replace"} and new_content:
-                scan_error = _scan_memory_content(new_content)
+        for index, operation in enumerate(operations):
+            action = (operation or {}).get("action")
+            content = (operation or {}).get("content")
+            if action in {"add", "replace"} and content:
+                scan_error = _scan_memory_content(content)
                 if scan_error:
-                    return {"success": False, "error": f"Operation {i + 1}: {scan_error}"}
+                    return {"success": False, "error": f"Operation {index + 1}: {scan_error}"}
 
-        with self._file_lock(self._path_for(target)):
-            bak = self._reload_target(target)
-            if bak is _READ_FAILED:
+        async with self._get_write_lock():
+            backup = await self._reload_target(target)
+            if backup is _READ_FAILED:
                 return _read_failed_error(self._path_for(target))
-            if bak:
-                return _drift_error(self._path_for(target), bak)
-
-            # Work on a copy; only commit if the whole batch validates.
-            working: List[str] = list(self._entries_for(target))
-            limit = self._char_limit(target)
-
-            for i, op in enumerate(operations):
-                op = op or {}
-                act = op.get("action")
-                content = (op.get("content") or "").strip()
-                old_text = (op.get("old_text") or "").strip()
-                pos = f"Operation {i + 1} ({act or 'unknown'})"
-
-                if act == "add":
+            if backup:
+                return _drift_error(self._path_for(target), backup)
+            working = list(self._entries_for(target))
+            for index, operation in enumerate(operations):
+                operation = operation or {}
+                action = operation.get("action")
+                content = (operation.get("content") or "").strip()
+                old_text = (operation.get("old_text") or "").strip()
+                label = f"Operation {index + 1} ({action or 'unknown'})"
+                if action == "add":
                     if not content:
-                        return self._batch_error(target, f"{pos}: content is required.")
-                    if content in working:
-                        continue  # idempotent -- skip duplicate, don't fail the batch
-                    working.append(content)
-
-                elif act == "replace":
+                        return self._batch_error(target, f"{label}: content is required.")
+                    if content not in working:
+                        working.append(content)
+                elif action in {"replace", "remove"}:
                     if not old_text:
-                        return self._batch_error(target, f"{pos}: old_text is required.")
-                    if not content:
-                        return self._batch_error(
-                            target,
-                            f"{pos}: content is required (use action='remove' to delete).",
-                        )
-                    matches = [j for j, e in enumerate(working) if old_text in e]
+                        return self._batch_error(target, f"{label}: old_text is required.")
+                    matches = [pos for pos, entry in enumerate(working) if old_text in entry]
                     if not matches:
-                        return self._batch_error(target, f"{pos}: no entry matched '{old_text}'.")
-                    if len({working[j] for j in matches}) > 1:
+                        return self._batch_error(target, f"{label}: no entry matched '{old_text}'.")
+                    if len({working[pos] for pos in matches}) > 1:
                         return self._batch_error(
                             target,
-                            f"{pos}: '{old_text}' matched multiple distinct entries -- be more specific.",
+                            f"{label}: '{old_text}' matched multiple distinct entries -- be more specific.",
                         )
-                    working[matches[0]] = content
-
-                elif act == "remove":
-                    if not old_text:
-                        return self._batch_error(target, f"{pos}: old_text is required.")
-                    matches = [j for j, e in enumerate(working) if old_text in e]
-                    if not matches:
-                        return self._batch_error(target, f"{pos}: no entry matched '{old_text}'.")
-                    if len({working[j] for j in matches}) > 1:
-                        return self._batch_error(
-                            target,
-                            f"{pos}: '{old_text}' matched multiple distinct entries -- be more specific.",
-                        )
-                    working.pop(matches[0])
-
+                    if action == "replace":
+                        if not content:
+                            return self._batch_error(
+                                target,
+                                f"{label}: content is required (use action='remove' to delete).",
+                            )
+                        working[matches[0]] = content
+                    else:
+                        working.pop(matches[0])
                 else:
                     return self._batch_error(
                         target,
-                        f"{pos}: unknown action. Use add, replace, or remove.",
+                        f"{label}: unknown action. Use add, replace, or remove.",
                     )
-
-            # Budget check against the FINAL state only.
-            new_total = len(ENTRY_DELIMITER.join(working)) if working else 0
-            if new_total > limit:
+            limit = self._char_limit(target)
+            total = len(ENTRY_DELIMITER.join(working)) if working else 0
+            if total > limit:
                 current = self._char_count(target)
                 return self._consolidation_failure({
                     "success": False,
                     "error": (
                         f"After applying all {len(operations)} operations, memory would be at "
-                        f"{new_total:,}/{limit:,} chars -- over the limit. Remove or shorten more "
-                        f"entries in the same batch (see current_entries below), then retry."
+                        f"{total:,}/{limit:,} chars -- over the limit. Remove or shorten more "
+                        "entries in the same batch (see current_entries below), then retry."
                     ),
                     "current_entries": self._entries_for(target),
                     "usage": f"{current:,}/{limit:,}",
                 })
-
-            # Commit.
             self._set_entries(target, working)
-            self.save_to_disk(target)
-
+            await self.save_to_disk(target)
         return self._success_response(target, f"Applied {len(operations)} operation(s).")
 
     def _batch_error(self, target: str, message: str) -> Dict[str, Any]:
@@ -747,26 +594,13 @@ class MemoryStore:
         return f"{separator}\n{header}\n{separator}\n{content}"
 
     @staticmethod
-    def _read_raw_checked(path: Path) -> Tuple[str, bool]:
-        """Read a memory file's raw text, distinguishing unreadable from empty.
-
-        Returns ``(raw, read_ok)``. ``read_ok`` is False ONLY when the file
-        EXISTS but could not be read — an absent file is a clean ``("", True)``.
-        Invalid UTF-8 counts as unreadable too: the bytes on disk hold content
-        we cannot faithfully round-trip, so a rewrite would corrupt or discard
-        it just like a failed read. Read-modify-write callers must treat
-        ``read_ok=False`` as "abort" rather than "empty store", or a transient
-        read failure would let them persist over — and wipe — the on-disk
-        memory (issue #26045 is about the same class: never rewrite a file
-        from a view that isn't the real one).
-
-        No file locking needed: _write_file uses atomic rename, so readers
-        always see either the previous complete file or the new complete file.
-        """
-        if not path.exists():
+    async def _read_raw_checked(path: Path) -> Tuple[str, bool]:
+        """Read a memory file, distinguishing unreadable from an absent file."""
+        if not await aiofiles.os.path.exists(path):
             return "", True
         try:
-            return path.read_text(encoding="utf-8"), True
+            async with aiofiles.open(path, encoding="utf-8") as handle:
+                return await handle.read(), True
         except (OSError, IOError, UnicodeDecodeError):
             return "", False
 
@@ -781,235 +615,48 @@ class MemoryStore:
         return [e for e in entries if e]
 
     @staticmethod
-    def _read_entries_checked(path: Path) -> Tuple[List[str], bool]:
-        """Read + parse a memory file, distinguishing unreadable from empty.
-
-        Returns ``(entries, read_ok)`` — see ``_read_raw_checked`` for the
-        ``read_ok`` contract.
-        """
-        raw, read_ok = MemoryStore._read_raw_checked(path)
-        if not read_ok:
-            return [], False
-        return MemoryStore._parse_entries(raw), True
-
-    @staticmethod
-    def _read_file(path: Path) -> List[str]:
-        """Read a memory file and split into entries (empty list on any error).
-
-        Retained for read-only callers (``load_from_disk``) that build in-memory
-        state without persisting; a failed read degrading to ``[]`` there is
-        harmless because nothing is written back. Read-modify-write paths use
-        ``_read_raw_checked`` so they can refuse to overwrite an unreadable
-        file — see ``_reload_target``.
-        """
-        return MemoryStore._read_entries_checked(path)[0]
-
-    def _detect_external_drift(self, target: str, raw: str) -> Optional[str]:
-        """Return a backup-path string if on-disk content shows external drift.
-
-        *raw* is the file content already read by the caller's checked read
-        (``_read_raw_checked``). Drift detection MUST operate on that same
-        snapshot — an earlier version re-read the file here and treated a
-        failed second read as "no drift", which let a mutation proceed from a
-        stale first snapshot and rewrite away content an external writer added
-        between the two reads.
-
-        The memory file is supposed to be a list of small entries the tool
-        wrote, joined by §. Detect drift via two signals:
-
-        1. Round-trip mismatch — re-parsing and re-serializing the file
-           doesn't produce identical bytes (rare; would catch oddly-encoded
-           delimiters).
-        2. Entry-size overflow — any single parsed entry exceeds the
-           store's whole-file char limit. The tool budgets the ENTIRE store
-           against that limit; no single tool-written entry can exceed it.
-           When we see one entry larger than the limit, an external writer
-           (patch tool, shell append, manual edit, sister session) appended
-           free-form content into what the tool will treat as one entry.
-           Flushing would then truncate that entry to the model's new
-           content, discarding the appended bytes — issue #26045.
-
-        Returns the absolute path of the .bak file when drift was found and
-        backed up; returns None when the file looks tool-shaped.
-
-        Note: this is an INSTANCE method (not static) because we need the
-        per-target char_limit for signal #2.
-        """
+    async def _read_file(path: Path) -> List[str]:
+        """Read entries without risking a later write after a failed read."""
+        raw, read_ok = await MemoryStore._read_raw_checked(path)
+        return MemoryStore._parse_entries(raw) if read_ok else []
+    async def _detect_external_drift(
+        self,
+        target: str,
+        raw: str,
+    ) -> Optional[str]:
+        """Async drift guard used before a native read-modify-write commit."""
         path = self._path_for(target)
         if not raw.strip():
             return None
-
-        parsed = [e.strip() for e in raw.split(ENTRY_DELIMITER) if e.strip()]
+        parsed = [entry.strip() for entry in raw.split(ENTRY_DELIMITER) if entry.strip()]
         roundtrip = ENTRY_DELIMITER.join(parsed)
-
-        char_limit = self._char_limit(target)
-        max_entry_len = max((len(e) for e in parsed), default=0)
-
-        drift_detected = (raw.strip() != roundtrip) or (max_entry_len > char_limit)
-        if not drift_detected:
+        max_entry_len = max((len(entry) for entry in parsed), default=0)
+        if raw.strip() == roundtrip and max_entry_len <= self._char_limit(target):
             return None
-
-        # Drift confirmed — snapshot the file so the operator can recover
-        # whatever the external writer added, then return the .bak path so
-        # the caller can refuse the mutation.
-        ts = int(time.time())
-        bak_path = path.with_suffix(path.suffix + f".bak.{ts}")
+        backup = path.with_suffix(path.suffix + f".bak.{int(time.time())}")
         try:
-            bak_path.write_text(raw, encoding="utf-8")
+            async with aiofiles.open(backup, "w", encoding="utf-8") as handle:
+                await handle.write(raw)
         except (OSError, IOError):
-            return str(bak_path) + " (BACKUP FAILED — file unchanged on disk)"
-        return str(bak_path)
+            return str(backup) + " (BACKUP FAILED — file unchanged on disk)"
+        return str(backup)
 
     @staticmethod
-    def _write_file(path: Path, entries: List[str]):
-        """Write entries to a memory file using atomic temp-file + rename.
-
-        Previous implementation used open("w") + flock, but "w" truncates the
-        file *before* the lock is acquired, creating a race window where
-        concurrent readers see an empty file. Atomic rename avoids this:
-        readers always see either the old complete file or the new one.
-        """
+    async def _write_file(path: Path, entries: List[str]) -> None:
+        """Atomically write memory entries without a synchronous file call."""
         content = ENTRY_DELIMITER.join(entries) if entries else ""
+        temporary = path.with_name(f".mem_{path.name}.{uuid.uuid4().hex}.tmp")
         try:
-            atomic_write_text(path, content, tmp_prefix=".mem_")
-        except (OSError, IOError) as e:
-            raise RuntimeError(f"Failed to write memory file {path}: {e}")
-
-
-def load_on_disk_store() -> "MemoryStore":
-    """Build a fresh on-disk :class:`MemoryStore`, honoring configured char limits.
-
-    Use this from any context that has no live agent (the messaging gateway, the
-    Desktop GUI, the bare CLI ``/memory`` handler) but still needs to read or
-    apply approved memory writes. Mirrors how the live agent constructs its store
-    in ``agent/agent_init.py`` — including the user's ``memory.memory_char_limit``
-    / ``memory.user_char_limit`` overrides — so an approval applied without a live
-    agent enforces the SAME caps as one applied with one.
-
-    Falls back to the built-in defaults if config can't be loaded, so this can
-    never raise on a missing/unreadable config.
-    """
-    memory_char_limit = 2200
-    user_char_limit = 1375
-    try:
-        from hermes_cli.config import load_config
-
-        mem_cfg = (load_config() or {}).get("memory", {}) or {}
-        memory_char_limit = int(mem_cfg.get("memory_char_limit", memory_char_limit))
-        user_char_limit = int(mem_cfg.get("user_char_limit", user_char_limit))
-    except Exception:
-        pass  # config optional — fall back to defaults rather than break /memory
-
-    store = MemoryStore(
-        memory_char_limit=memory_char_limit,
-        user_char_limit=user_char_limit,
-    )
-    store.load_from_disk()
-    return store
-
-
-def _apply_write_gate(action: str, target: str, content: Optional[str],
-                      old_text: Optional[str]) -> Optional[str]:
-    """Evaluate the memory write gate. Returns a JSON tool-result string when
-    the write should NOT proceed normally (blocked or staged), or None when the
-    caller should perform the real write.
-
-    Only the mutating actions (add/replace/remove) are gated.
-    """
-    if action not in {"add", "replace", "remove"}:
-        return None
-
-    try:
-        from tools import write_approval as wa
-    except Exception:
-        # If the gate module can't load, fail open (current behaviour) rather
-        # than blocking all memory writes.
-        return None
-
-    # Build a small inline summary/detail for the foreground approval prompt.
-    label = "user profile" if target == "user" else "memory"
-    if action == "add":
-        summary = f"add to {label}"
-        detail = content or ""
-    elif action == "replace":
-        summary = f"replace in {label}"
-        detail = f"old: {old_text}\nnew: {content}"
-    else:  # remove
-        summary = f"remove from {label}"
-        detail = old_text or ""
-
-    decision = wa.evaluate_gate(wa.MEMORY, inline_summary=summary, inline_detail=detail)
-
-    if decision.allow:
-        return None
-
-    if decision.blocked:
-        return tool_error(decision.message, success=False)
-
-    # stage
-    payload = {
-        "action": action,
-        "target": target,
-        "content": content,
-        "old_text": old_text,
-    }
-    record = wa.stage_write(
-        wa.MEMORY, payload,
-        summary=f"{summary}: {detail[:120]}",
-        origin=wa.current_origin(),
-    )
-    return json.dumps(
-        {"success": True, "staged": True, "pending_id": record["id"],
-         "message": decision.message},
-        ensure_ascii=False,
-    )
-
-
-def _apply_batch_write_gate(target: str, operations: List[Dict[str, Any]]) -> Optional[str]:
-    """Evaluate the write gate for a batch of memory operations.
-
-    Returns a JSON tool-result string when the batch should NOT proceed
-    (blocked or staged), or None when the caller should perform the real
-    batch write. The whole batch is gated as a single unit.
-    """
-    try:
-        from tools import write_approval as wa
-    except Exception:
-        return None
-
-    label = "user profile" if target == "user" else "memory"
-    summary = f"apply {len(operations)} op(s) to {label}"
-    detail_lines = []
-    for op in operations:
-        op = op or {}
-        act = op.get("action", "?")
-        if act == "remove":
-            detail_lines.append(f"- remove: {op.get('old_text', '')}")
-        elif act == "replace":
-            detail_lines.append(f"- replace: {op.get('old_text', '')} -> {op.get('content', '')}")
-        else:
-            detail_lines.append(f"- {act}: {op.get('content', '')}")
-    detail = "\n".join(detail_lines)
-
-    decision = wa.evaluate_gate(wa.MEMORY, inline_summary=summary, inline_detail=detail)
-
-    if decision.allow:
-        return None
-
-    if decision.blocked:
-        return tool_error(decision.message, success=False)
-
-    payload = {"action": "batch", "target": target, "operations": operations}
-    record = wa.stage_write(
-        wa.MEMORY, payload,
-        summary=f"{summary}: {detail[:120]}",
-        origin=wa.current_origin(),
-    )
-    return json.dumps(
-        {"success": True, "staged": True, "pending_id": record["id"],
-         "message": decision.message},
-        ensure_ascii=False,
-    )
+            async with aiofiles.open(temporary, "w", encoding="utf-8") as handle:
+                await handle.write(content)
+            await aiofiles.os.replace(temporary, path)
+        except (OSError, IOError) as exc:
+            try:
+                if await aiofiles.os.path.exists(temporary):
+                    await aiofiles.os.remove(temporary)
+            except OSError:
+                pass
+            raise RuntimeError(f"Failed to write memory file {path}: {exc}") from exc
 
 
 def _missing_old_text_error(store: "MemoryStore", target: str, action: str) -> str:
@@ -1044,7 +691,9 @@ def _missing_old_text_error(store: "MemoryStore", target: str, action: str) -> s
     )
 
 
-def memory_tool(
+
+
+async def memory_tool(
     action: str = None,
     target: str = "memory",
     content: str = None,
@@ -1052,73 +701,48 @@ def memory_tool(
     operations: Optional[List[Dict[str, Any]]] = None,
     store: Optional[MemoryStore] = None,
 ) -> str:
-    """
-    Single entry point for the memory tool. Dispatches to MemoryStore methods.
-
-    Two shapes:
-      - Single op: action + (content / old_text).
-      - Batch:     operations=[{action, content?, old_text?}, ...] applied
-                   atomically against the final char budget in ONE call.
-
-    Returns JSON string with results.
-    """
+    """Native-async handler for the model-visible memory tool."""
     if store is None:
-        return tool_error("Memory is not available. It may be disabled in config or this environment.", success=False)
-
-    # Some strict providers fill optional schema fields with JSON null rather
-    # than omitting them.  Treat ``target: null`` as omitted so memory writes
-    # still use the documented default store instead of failing validation.
+        return tool_error(
+            "Memory is not available. It may be disabled in config or this environment.",
+            success=False,
+        )
     if target is None:
         target = "memory"
-
     if target not in {"memory", "user"}:
-        return tool_error(f"Invalid target '{target}'. Use 'memory' or 'user'.", success=False)
+        return tool_error(
+            f"Invalid target '{target}'. Use 'memory' or 'user'.", success=False
+        )
 
-    # --- Batch path -------------------------------------------------------
     if operations:
         if not isinstance(operations, list):
-            return tool_error("operations must be a list of {action, content?, old_text?} objects.", success=False)
-        gate_result = _apply_batch_write_gate(target, operations)
-        if gate_result is not None:
-            return gate_result
-        result = store.apply_batch(target, operations)
-        return json.dumps(result, ensure_ascii=False)
+            return tool_error(
+                "operations must be a list of {action, content?, old_text?} objects.",
+                success=False,
+            )
+        return json.dumps(
+            await store.apply_batch(target, operations), ensure_ascii=False
+        )
 
-    # --- Single-op path ---------------------------------------------------
-    # Validate required params BEFORE the gate so an invalid write is rejected
-    # immediately instead of being staged and only failing at approve time.
     if action == "add" and not content:
         return tool_error("Content is required for 'add' action.", success=False)
     if action == "replace" and (not old_text or not content):
-        missing = "old_text" if not old_text else "content"
         if not old_text:
-            # The client/model omitted old_text. Replace is inherently targeted
-            # -- we can't guess which entry. Return the current inventory plus a
-            # retry instruction so the model can reissue with old_text set,
-            # instead of hitting a dead-end error. (issues #43412, #49466)
             return _missing_old_text_error(store, target, "replace")
-        return tool_error(f"{missing} is required for 'replace' action.", success=False)
+        return tool_error("content is required for 'replace' action.", success=False)
     if action == "remove" and not old_text:
         return _missing_old_text_error(store, target, "remove")
 
-    # Approval gate: when on, stages the write (background/gateway) or prompts
-    # inline (interactive CLI); when off (default) passes straight through.
-    gate_result = _apply_write_gate(action, target, content, old_text)
-    if gate_result is not None:
-        return gate_result
-
     if action == "add":
-        result = store.add(target, content)
-
+        result = await store.add(target, content)
     elif action == "replace":
-        result = store.replace(target, old_text, content)
-
+        result = await store.replace(target, old_text, content)
     elif action == "remove":
-        result = store.remove(target, old_text)
-
+        result = await store.remove(target, old_text)
     else:
-        return tool_error(f"Unknown action '{action}'. Use: add, replace, remove", success=False)
-
+        return tool_error(
+            f"Unknown action '{action}'. Use: add, replace, remove", success=False
+        )
     return json.dumps(result, ensure_ascii=False)
 
 
@@ -1127,25 +751,6 @@ def check_memory_requirements() -> bool:
     return True
 
 
-def apply_memory_pending(payload: Dict[str, Any], store: "MemoryStore") -> Dict[str, Any]:
-    """Replay a staged memory write directly against the store, bypassing the
-    write gate. Called by the /memory approve handler.
-
-    Returns the store's result dict.
-    """
-    action = payload.get("action")
-    target = payload.get("target", "memory")
-    content = payload.get("content") or ""
-    old_text = payload.get("old_text") or ""
-    if action == "batch":
-        return store.apply_batch(target, payload.get("operations") or [])
-    if action == "add":
-        return store.add(target, content)
-    if action == "replace":
-        return store.replace(target, old_text, content)
-    if action == "remove":
-        return store.remove(target, old_text)
-    return {"success": False, "error": f"Unknown staged action '{action}'."}
 # OpenAI Function-Calling Schema
 # =============================================================================
 
@@ -1220,21 +825,24 @@ MEMORY_SCHEMA = {
 # --- Registry ---
 from tools.registry import registry, tool_error
 
-registry.register(
-    name="memory",
-    toolset="memory",
-    schema=MEMORY_SCHEMA,
-    handler=lambda args, **kw: memory_tool(
+
+async def _handle_memory(args: dict, **kwargs) -> str:
+    """Adapt the registry's JSON-object contract to ``memory_tool``."""
+    return await memory_tool(
         action=args.get("action", ""),
         target=args.get("target", "memory"),
         content=args.get("content"),
         old_text=args.get("old_text"),
         operations=args.get("operations"),
-        store=kw.get("store")),
+        store=kwargs.get("store"),
+    )
+
+
+registry.register(
+    name="memory",
+    toolset="memory",
+    schema=MEMORY_SCHEMA,
+    handler=_handle_memory,
     check_fn=check_memory_requirements,
     emoji="🧠",
 )
-
-
-
-

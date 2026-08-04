@@ -1,7 +1,7 @@
 """Tests for hermes_cli.copilot_auth — Copilot token validation and resolution."""
 
 import pytest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 
 class TestTokenValidation:
@@ -19,28 +19,34 @@ class TestResolveToken:
     """Token resolution with env var priority."""
 
 
-    def test_gh_token_second_priority(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_gh_token_second_priority(self, monkeypatch):
         from hermes_cli.copilot_auth import resolve_copilot_token
         monkeypatch.delenv("COPILOT_GITHUB_TOKEN", raising=False)
         monkeypatch.setenv("GH_TOKEN", "gho_gh_second")
         monkeypatch.setenv("GITHUB_TOKEN", "gho_github_third")
-        token, source = resolve_copilot_token()
+        token, source = await resolve_copilot_token()
         assert token == "gho_gh_second"
         assert source == "GH_TOKEN"
 
 
 
 
-    def test_gh_cli_classic_pat_raises(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_gh_cli_classic_pat_raises(self, monkeypatch):
         from hermes_cli.copilot_auth import resolve_copilot_token
         monkeypatch.delenv("COPILOT_GITHUB_TOKEN", raising=False)
         monkeypatch.delenv("GH_TOKEN", raising=False)
         monkeypatch.delenv("GITHUB_TOKEN", raising=False)
-        with patch("hermes_cli.copilot_auth._try_gh_cli_token", return_value="ghp_classic"):
+        with patch(
+            "hermes_cli.copilot_auth._try_gh_cli_token",
+            new=AsyncMock(return_value="ghp_classic"),
+        ):
             with pytest.raises(ValueError, match="classic PAT"):
-                resolve_copilot_token()
+                await resolve_copilot_token()
 
-    def test_invalid_env_var_skips_gh_cli_fallback(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_invalid_env_var_skips_gh_cli_fallback(self, monkeypatch):
         """When an env var is set but holds an unsupported classic PAT,
         resolve_copilot_token must NOT fall back to ``gh auth token``.
 
@@ -54,19 +60,20 @@ class TestResolveToken:
         monkeypatch.delenv("GH_TOKEN", raising=False)
         monkeypatch.setenv("GITHUB_TOKEN", "ghp_classic_pat_nope")
         with patch("hermes_cli.copilot_auth._try_gh_cli_token") as mock_cli:
-            token, source = resolve_copilot_token()
+            token, source = await resolve_copilot_token()
         assert token == ""
         assert source == ""
         mock_cli.assert_not_called()
 
-    def test_all_env_vars_invalid_skips_gh_cli_fallback(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_all_env_vars_invalid_skips_gh_cli_fallback(self, monkeypatch):
         """All three env vars set to classic PATs → no gh CLI call."""
         from hermes_cli.copilot_auth import resolve_copilot_token
         monkeypatch.setenv("COPILOT_GITHUB_TOKEN", "ghp_one")
         monkeypatch.setenv("GH_TOKEN", "ghp_two")
         monkeypatch.setenv("GITHUB_TOKEN", "ghp_three")
         with patch("hermes_cli.copilot_auth._try_gh_cli_token") as mock_cli:
-            token, source = resolve_copilot_token()
+            token, source = await resolve_copilot_token()
         assert token == ""
         assert source == ""
         mock_cli.assert_not_called()
@@ -136,4 +143,3 @@ class TestEnvVarOrder:
         assert "COPILOT_GITHUB_TOKEN" in copilot.api_key_env_vars
         # COPILOT_GITHUB_TOKEN should be first
         assert copilot.api_key_env_vars[0] == "COPILOT_GITHUB_TOKEN"
-

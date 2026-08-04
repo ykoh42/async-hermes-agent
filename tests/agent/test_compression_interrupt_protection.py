@@ -12,11 +12,10 @@ compression task only (timeouts and other aux tasks stay interruptible).
 
 from __future__ import annotations
 
-from unittest.mock import patch
-
-import pytest
+from unittest.mock import AsyncMock, patch
 
 import agent.auxiliary_client as aux
+import pytest
 
 
 class TestAuxInterruptProtection:
@@ -54,7 +53,8 @@ class TestCompressionProtectsSummaryCall:
     """The compressor must wrap its summary call_llm in aux_interrupt_protection
     so a mid-flight interrupt doesn't abort it (#23975)."""
 
-    def test_compressor_call_site_uses_protection(self):
+    @pytest.mark.asyncio
+    async def test_compressor_call_site_uses_protection(self):
         # The summary call must run inside aux_interrupt_protection. We assert
         # the protection flag is ACTIVE at the moment call_llm is invoked.
         from agent.context_compressor import ContextCompressor
@@ -68,13 +68,13 @@ class TestCompressionProtectsSummaryCall:
                 message = _Msg()
             choices = [_Choice()]
 
-        def fake_call_llm(**kwargs):
+        async def fake_call_llm(**kwargs):
             # Capture whether protection was active during the call.
             seen["protected"] = aux._aux_interrupt_protected()
             seen["task"] = kwargs.get("task")
             return _Resp()
 
-        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+        with patch("agent.context_compressor.get_static_context_length", return_value=100000):
             c = ContextCompressor(model="test", quiet_mode=True)
 
         msgs = [
@@ -84,7 +84,7 @@ class TestCompressionProtectsSummaryCall:
             {"role": "assistant", "content": "done"},
         ]
         with patch("agent.context_compressor.call_llm", side_effect=fake_call_llm):
-            summary = c._generate_summary(msgs)
+            summary = await c._generate_summary(msgs)
 
         assert summary is not None
         assert seen.get("task") == "compression"
@@ -94,12 +94,13 @@ class TestCompressionProtectsSummaryCall:
         # Protection must be cleared after the call returns.
         assert aux._aux_interrupt_protected() is False
 
-    def test_explicit_interrupt_is_not_degraded_into_summary_fallback(self):
+    @pytest.mark.asyncio
+    async def test_explicit_interrupt_is_not_degraded_into_summary_fallback(self):
         """Ctrl+C cancellation must escape summary fallback so the outer
         compression transaction can abort without rotating the session."""
         from agent.context_compressor import ContextCompressor
 
-        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+        with patch("agent.context_compressor.get_static_context_length", return_value=100000):
             c = ContextCompressor(model="test", quiet_mode=True)
 
         msgs = [
@@ -110,21 +111,19 @@ class TestCompressionProtectsSummaryCall:
         ]
         with aux.aux_interrupt_protection(cancel_check=lambda: True), patch(
             "agent.context_compressor.call_llm",
-            side_effect=aux.AuxiliaryExplicitCancellation(),
+            new=AsyncMock(side_effect=aux.AuxiliaryExplicitCancellation()),
         ):
-            try:
-                c._generate_summary(msgs)
-            except aux.AuxiliaryExplicitCancellation as exc:
-                assert exc.cause == "explicit_host_cancel"
-            else:
-                raise AssertionError("compression swallowed an explicit interrupt")
+            with pytest.raises(aux.AuxiliaryExplicitCancellation) as exc_info:
+                await c._generate_summary(msgs)
+            assert exc_info.value.cause == "explicit_host_cancel"
 
-    def test_non_explicit_interrupted_error_remains_provider_failure(self):
+    @pytest.mark.asyncio
+    async def test_non_explicit_interrupted_error_remains_provider_failure(self):
         """An unrelated provider/OS InterruptedError must keep the established
         summary-failure fallback semantics when no host cancel was requested."""
         from agent.context_compressor import ContextCompressor
 
-        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+        with patch("agent.context_compressor.get_static_context_length", return_value=100000):
             c = ContextCompressor(model="test", quiet_mode=True)
 
         msgs = [
@@ -135,15 +134,16 @@ class TestCompressionProtectsSummaryCall:
         ]
         with patch(
             "agent.context_compressor.call_llm",
-            side_effect=InterruptedError("provider syscall interrupted"),
+            new=AsyncMock(side_effect=InterruptedError("provider syscall interrupted")),
         ):
-            assert c._generate_summary(msgs) is None
+            assert await c._generate_summary(msgs) is None
 
-    def test_explicit_interrupt_restores_rehydration_state(self):
+    @pytest.mark.asyncio
+    async def test_explicit_interrupt_restores_rehydration_state(self):
         """Cancellation after the handoff scan must be a compressor no-op."""
         from agent.context_compressor import ContextCompressor
 
-        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+        with patch("agent.context_compressor.get_static_context_length", return_value=100000):
             c = ContextCompressor(
                 model="test",
                 protect_first_n=1,
@@ -166,10 +166,10 @@ class TestCompressionProtectsSummaryCall:
         with patch.object(
             c,
             "_generate_summary",
-            side_effect=aux.AuxiliaryExplicitCancellation(),
+            new=AsyncMock(side_effect=aux.AuxiliaryExplicitCancellation()),
         ):
             with pytest.raises(aux.AuxiliaryExplicitCancellation):
-                c.compress(msgs)
+                await c.compress(msgs)
 
         assert c._previous_summary == "foreign-session-summary"
         assert c._summary_has_user_turn is False

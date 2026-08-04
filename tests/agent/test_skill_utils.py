@@ -292,13 +292,3 @@ class TestBOMToleranceSiblingSites:
 
         out = _strip_yaml_frontmatter("\ufeff---\nfoo: bar\n---\nBody text\n")
         assert out.strip() == "Body text"
-
-    def test_blueprints_split_frontmatter_bom(self):
-        # str.lstrip() does NOT strip U+FEFF (it is not whitespace), so the
-        # pre-existing lstrip() in _split_frontmatter never covered it.
-        from tools.blueprints import _split_frontmatter
-
-        fm = _split_frontmatter("\ufeff---\nname: bp\n---\nbody")
-        assert fm is not None
-        assert fm.get("name") == "bp"
-

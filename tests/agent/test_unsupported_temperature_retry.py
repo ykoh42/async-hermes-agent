@@ -20,7 +20,7 @@ endpoint). An allow/deny-list is not maintainable across providers.
 
 The universal fix is reactive: when a call returns an
 ``Unsupported parameter: temperature`` 400, retry once without temperature.
-These tests lock in that behaviour for both sync and async paths.
+These tests lock in the native async retry behaviour.
 """
 
 from unittest.mock import patch, MagicMock, AsyncMock
@@ -29,7 +29,6 @@ import pytest
 
 from agent.auxiliary_client import (
     call_llm,
-    async_call_llm,
     _is_unsupported_temperature_error,
 )
 
@@ -80,7 +79,9 @@ class TestCallLlmUnsupportedTemperatureRetry:
     def _setup(self, first_exc):
         client = MagicMock()
         client.base_url = "https://api.openai.com/v1"
-        client.chat.completions.create.side_effect = [first_exc, _dummy_response()]
+        client.chat.completions.create = AsyncMock(
+            side_effect=[first_exc, _dummy_response()]
+        )
         return client
 
     @pytest.mark.parametrize("error_message", [
@@ -88,7 +89,8 @@ class TestCallLlmUnsupportedTemperatureRetry:
         "Error code: 400 - {'error': {'code': 'unsupported_parameter', 'param': 'temperature'}}",
         "Provider error: this model does not support temperature",
     ])
-    def test_retries_once_without_temperature(self, error_message):
+    @pytest.mark.asyncio
+    async def test_retries_once_without_temperature(self, error_message):
         client = self._setup(RuntimeError(error_message))
 
         with (
@@ -97,9 +99,10 @@ class TestCallLlmUnsupportedTemperatureRetry:
             patch("agent.auxiliary_client._get_cached_client",
                   return_value=(client, "gpt-5.5")),
             patch("agent.auxiliary_client._validate_llm_response",
+                  new_callable=AsyncMock,
                   side_effect=lambda resp, _task, **_kw: resp),
         ):
-            result = call_llm(
+            result = await call_llm(
                 task="compression",
                 messages=[{"role": "user", "content": "remember this"}],
                 temperature=0.3,
@@ -120,14 +123,15 @@ class TestCallLlmUnsupportedTemperatureRetry:
         assert "max_tokens" not in retry_kwargs
         assert retry_kwargs["model"] == first_kwargs["model"]
 
-    def test_non_temperature_400_does_not_retry_as_temperature(self):
+    @pytest.mark.asyncio
+    async def test_non_temperature_400_does_not_retry_as_temperature(self):
         """Unrelated 400s (e.g. bad tool role) must not silently drop temp."""
         client = MagicMock()
         client.base_url = "https://api.openai.com/v1"
         non_temp_err = RuntimeError(
             "HTTP 400: Invalid value: 'tool'. Supported values are: 'assistant'..."
         )
-        client.chat.completions.create.side_effect = non_temp_err
+        client.chat.completions.create = AsyncMock(side_effect=non_temp_err)
 
         with (
             patch("agent.auxiliary_client._resolve_task_provider_model",
@@ -135,12 +139,13 @@ class TestCallLlmUnsupportedTemperatureRetry:
             patch("agent.auxiliary_client._get_cached_client",
                   return_value=(client, "gpt-5.5")),
             patch("agent.auxiliary_client._validate_llm_response",
+                  new_callable=AsyncMock,
                   side_effect=lambda resp, _task, **_kw: resp),
             patch("agent.auxiliary_client._try_payment_fallback",
-                  return_value=None),
+                  new=AsyncMock(return_value=None)),
         ):
             with pytest.raises(RuntimeError, match="Invalid value"):
-                call_llm(
+                await call_llm(
                     task="compression",
                     messages=[{"role": "user", "content": "x"}],
                     temperature=0.3,
@@ -149,7 +154,8 @@ class TestCallLlmUnsupportedTemperatureRetry:
         # Should NOT have retried (non-temperature 400 doesn't match)
         assert client.chat.completions.create.call_count == 1
 
-    def test_no_retry_when_temperature_not_in_kwargs(self):
+    @pytest.mark.asyncio
+    async def test_no_retry_when_temperature_not_in_kwargs(self):
         """If caller didn't send temperature, don't invent a temperature-retry."""
         client = MagicMock()
         client.base_url = "https://api.openai.com/v1"
@@ -157,7 +163,7 @@ class TestCallLlmUnsupportedTemperatureRetry:
         # (Pathological but possible with misleading error text.)  The guard
         # ``"temperature" in kwargs`` must prevent an unnecessary retry.
         err = RuntimeError("HTTP 400: Unsupported parameter: temperature")
-        client.chat.completions.create.side_effect = err
+        client.chat.completions.create = AsyncMock(side_effect=err)
 
         with (
             patch("agent.auxiliary_client._resolve_task_provider_model",
@@ -165,82 +171,16 @@ class TestCallLlmUnsupportedTemperatureRetry:
             patch("agent.auxiliary_client._get_cached_client",
                   return_value=(client, "gpt-5.5")),
             patch("agent.auxiliary_client._validate_llm_response",
+                  new_callable=AsyncMock,
                   side_effect=lambda resp, _task, **_kw: resp),
             patch("agent.auxiliary_client._try_payment_fallback",
-                  return_value=None),
+                  new=AsyncMock(return_value=None)),
         ):
             with pytest.raises(RuntimeError):
-                call_llm(
+                await call_llm(
                     task="compression",
                     messages=[{"role": "user", "content": "x"}],
                     temperature=None,  # explicit: no temperature sent
                     max_tokens=500,
                 )
         assert client.chat.completions.create.call_count == 1
-
-
-class TestAsyncCallLlmUnsupportedTemperatureRetry:
-    """``async_call_llm`` mirror of the sync retry semantics."""
-
-    @pytest.mark.asyncio
-    async def test_async_retries_once_without_temperature(self):
-        client = MagicMock()
-        client.base_url = "https://api.openai.com/v1"
-        client.chat.completions.create = AsyncMock(side_effect=[
-            RuntimeError("HTTP 400: Unsupported parameter: temperature"),
-            _dummy_response(),
-        ])
-
-        with (
-            patch("agent.auxiliary_client._resolve_task_provider_model",
-                  return_value=("openai-codex", "gpt-5.5", None, None, None)),
-            patch("agent.auxiliary_client._get_cached_client",
-                  return_value=(client, "gpt-5.5")),
-            patch("agent.auxiliary_client._validate_llm_response",
-                  side_effect=lambda resp, _task, **_kw: resp),
-        ):
-            result = await async_call_llm(
-                task="session_search",
-                messages=[{"role": "user", "content": "query"}],
-                temperature=0.3,
-                max_tokens=500,
-            )
-
-        assert result == {"ok": True}
-        assert client.chat.completions.create.await_count == 2
-        first_kwargs = client.chat.completions.create.call_args_list[0].kwargs
-        retry_kwargs = client.chat.completions.create.call_args_list[1].kwargs
-        assert first_kwargs["temperature"] == 0.3
-        assert "temperature" not in retry_kwargs
-        # max_tokens is intentionally omitted on OpenAI-compatible endpoints
-        # (#34530); assert it's absent and that model survives the retry.
-        assert "max_tokens" not in first_kwargs
-        assert "max_tokens" not in retry_kwargs
-        assert retry_kwargs["model"] == first_kwargs["model"]
-
-    @pytest.mark.asyncio
-    async def test_async_non_temperature_400_does_not_retry(self):
-        client = MagicMock()
-        client.base_url = "https://api.openai.com/v1"
-        client.chat.completions.create = AsyncMock(
-            side_effect=RuntimeError("HTTP 400: Invalid value: 'tool'"),
-        )
-
-        with (
-            patch("agent.auxiliary_client._resolve_task_provider_model",
-                  return_value=("openai-codex", "gpt-5.5", None, None, None)),
-            patch("agent.auxiliary_client._get_cached_client",
-                  return_value=(client, "gpt-5.5")),
-            patch("agent.auxiliary_client._validate_llm_response",
-                  side_effect=lambda resp, _task, **_kw: resp),
-            patch("agent.auxiliary_client._try_payment_fallback",
-                  return_value=None),
-        ):
-            with pytest.raises(RuntimeError, match="Invalid value"):
-                await async_call_llm(
-                    task="session_search",
-                    messages=[{"role": "user", "content": "x"}],
-                    temperature=0.3,
-                    max_tokens=500,
-                )
-        assert client.chat.completions.create.await_count == 1

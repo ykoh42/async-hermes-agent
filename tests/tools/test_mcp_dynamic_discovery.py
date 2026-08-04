@@ -52,9 +52,12 @@ class TestRefreshTools:
         from toolsets import resolve_toolset
 
         # Seed initial state: one old tool registered
+        async def old_handler(value):
+            return value
+
         mock_registry.register(
             name="mcp__live_srv__old_tool", toolset="mcp-live_srv", schema={},
-            handler=lambda x: x, check_fn=lambda: True, is_async=False,
+            handler=old_handler, check_fn=lambda: True,
             description="", emoji="",
         )
         server._registered_tool_names = ["mcp__live_srv__old_tool"]
@@ -118,7 +121,11 @@ class TestDeregister:
 
     def test_removes_tool(self):
         reg = ToolRegistry()
-        reg.register(name="foo", toolset="ts1", schema={}, handler=lambda x: x)
+
+        async def handler(value):
+            return value
+
+        reg.register(name="foo", toolset="ts1", schema={}, handler=handler)
         assert "foo" in reg.get_all_tool_names()
         reg.deregister("foo")
         assert "foo" not in reg.get_all_tool_names()

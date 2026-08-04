@@ -4,6 +4,8 @@ The module landed in #56832's extraction without its tests; these cover the
 fingerprint keying, read/write round-trip, and invalidation behavior.
 """
 
+import pytest
+
 import tools.mcp_schema_cache as msc
 
 
@@ -35,39 +37,44 @@ class TestCacheRoundTrip:
     def _isolate(self, monkeypatch, tmp_path):
         monkeypatch.setattr(msc, "_cache_path", lambda: tmp_path / "cache.json")
 
-    def test_write_then_read_with_matching_fingerprint(self, monkeypatch, tmp_path):
+    @pytest.mark.asyncio
+    async def test_write_then_read_with_matching_fingerprint(self, monkeypatch, tmp_path):
         self._isolate(monkeypatch, tmp_path)
         tools = [{"name": "t1", "description": "d", "inputSchema": {"type": "object"}}]
-        msc.write_cache_entry("srv", "fp1", tools=tools, utility_tools=[])
-        entry = msc.get_cached_entry("srv", "fp1")
+        await msc.write_cache_entry("srv", "fp1", tools=tools, utility_tools=[])
+        entry = await msc.get_cached_entry("srv", "fp1")
         assert entry is not None
         assert msc.tools_from_cache_entry(entry) == tools
         assert msc.utility_tools_from_cache_entry(entry) == []
-        assert msc.has_cached_entry("srv", "fp1")
+        assert await msc.has_cached_entry("srv", "fp1")
 
-    def test_fingerprint_mismatch_returns_none(self, monkeypatch, tmp_path):
+    @pytest.mark.asyncio
+    async def test_fingerprint_mismatch_returns_none(self, monkeypatch, tmp_path):
         self._isolate(monkeypatch, tmp_path)
-        msc.write_cache_entry("srv", "fp1", tools=[], utility_tools=[])
-        assert msc.get_cached_entry("srv", "OTHER") is None
-        assert not msc.has_cached_entry("srv", "OTHER")
+        await msc.write_cache_entry("srv", "fp1", tools=[], utility_tools=[])
+        assert await msc.get_cached_entry("srv", "OTHER") is None
+        assert not await msc.has_cached_entry("srv", "OTHER")
 
-    def test_missing_server_returns_none(self, monkeypatch, tmp_path):
+    @pytest.mark.asyncio
+    async def test_missing_server_returns_none(self, monkeypatch, tmp_path):
         self._isolate(monkeypatch, tmp_path)
-        assert msc.get_cached_entry("nope", "fp") is None
+        assert await msc.get_cached_entry("nope", "fp") is None
 
-    def test_clear_cache_entry(self, monkeypatch, tmp_path):
+    @pytest.mark.asyncio
+    async def test_clear_cache_entry(self, monkeypatch, tmp_path):
         self._isolate(monkeypatch, tmp_path)
-        msc.write_cache_entry("srv", "fp1", tools=[], utility_tools=[])
-        msc.clear_cache_entry("srv")
-        assert msc.get_cached_entry("srv", "fp1") is None
+        await msc.write_cache_entry("srv", "fp1", tools=[], utility_tools=[])
+        await msc.clear_cache_entry("srv")
+        assert await msc.get_cached_entry("srv", "fp1") is None
 
-    def test_corrupt_cache_file_is_tolerated(self, monkeypatch, tmp_path):
+    @pytest.mark.asyncio
+    async def test_corrupt_cache_file_is_tolerated(self, monkeypatch, tmp_path):
         self._isolate(monkeypatch, tmp_path)
         (tmp_path / "cache.json").write_text("{not json", encoding="utf-8")
-        assert msc.get_cached_entry("srv", "fp") is None
+        assert await msc.get_cached_entry("srv", "fp") is None
         # And writes recover the file.
-        msc.write_cache_entry("srv", "fp", tools=[], utility_tools=[])
-        assert msc.has_cached_entry("srv", "fp")
+        await msc.write_cache_entry("srv", "fp", tools=[], utility_tools=[])
+        assert await msc.has_cached_entry("srv", "fp")
 
     def test_malformed_entry_shapes_are_tolerated(self):
         assert msc.tools_from_cache_entry({"tools": "nope"}) == []
@@ -75,7 +82,8 @@ class TestCacheRoundTrip:
 
 
 class TestCacheFileLocation:
-    def test_cache_lives_under_hermes_home_cache_dir_with_0600(
+    @pytest.mark.asyncio
+    async def test_cache_lives_under_hermes_home_cache_dir_with_0600(
         self, monkeypatch, tmp_path
     ):
         # Real path (no _cache_path monkeypatch): HERMES_HOME/cache/…, 0o600,
@@ -85,28 +93,29 @@ class TestCacheFileLocation:
         monkeypatch.setattr(hermes_constants, "get_hermes_home", lambda: tmp_path)
         path = msc._cache_path()
         assert path == tmp_path / "cache" / "mcp_schema_cache.json"
-        msc.write_cache_entry("srv", "fp", tools=[], utility_tools=[])
+        await msc.write_cache_entry("srv", "fp", tools=[], utility_tools=[])
         assert path.exists()
         assert (path.stat().st_mode & 0o777) == 0o600
 
 
 class TestWriteSkip:
-    def test_identical_payload_skips_rewrite(self, monkeypatch, tmp_path):
+    @pytest.mark.asyncio
+    async def test_identical_payload_skips_rewrite(self, monkeypatch, tmp_path):
         monkeypatch.setattr(msc, "_cache_path", lambda: tmp_path / "cache.json")
         saves = []
         real_save = msc._save_all
 
-        def _counting_save(data):
+        async def _counting_save(data):
             saves.append(1)
-            real_save(data)
+            await real_save(data)
 
         monkeypatch.setattr(msc, "_save_all", _counting_save)
         tools = [{"name": "t1", "description": "d", "inputSchema": {}}]
-        msc.write_cache_entry("srv", "fp1", tools=tools, utility_tools=[])
+        await msc.write_cache_entry("srv", "fp1", tools=tools, utility_tools=[])
         assert len(saves) == 1
         # Identical payload (reconnect / list_changed refresh) → no rewrite.
-        msc.write_cache_entry("srv", "fp1", tools=list(tools), utility_tools=[])
+        await msc.write_cache_entry("srv", "fp1", tools=list(tools), utility_tools=[])
         assert len(saves) == 1
         # Changed payload → rewrite.
-        msc.write_cache_entry("srv", "fp2", tools=tools, utility_tools=[])
+        await msc.write_cache_entry("srv", "fp2", tools=tools, utility_tools=[])
         assert len(saves) == 2

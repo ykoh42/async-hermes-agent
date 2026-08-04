@@ -13,10 +13,9 @@ compression timeout, while honouring the four constraints from the issue:
     their own timeouts).
   * An explicit per-call ``timeout=`` override is **not** floored.
   * The floor is a minimum — a config value already above it is unchanged.
-  * Both the sync (``call_llm``) and async (``async_call_llm``) paths are
-    covered.
+  * The native async ``call_llm`` path preserves the timeout contract.
 
-These tests exercise the real ``call_llm`` / ``async_call_llm`` production
+These tests exercise the real native async ``call_llm`` production
 paths with a mocked LLM client and assert the timeout that actually reaches
 ``client.chat.completions.create``.
 """
@@ -25,7 +24,7 @@ from unittest.mock import patch, MagicMock, AsyncMock
 
 import pytest
 
-from agent.auxiliary_client import call_llm, async_call_llm
+from agent.auxiliary_client import call_llm
 
 # The committed bounded floor for config-derived compression timeouts.
 # Behaviour contract (see AGENTS.md "Behavior contracts over snapshots"):
@@ -42,13 +41,6 @@ def _ok_response():
     return {"ok": True}
 
 
-def _client_sync():
-    client = MagicMock()
-    client.base_url = "https://api.openai.com/v1"
-    client.chat.completions.create.return_value = _ok_response()
-    return client
-
-
 def _client_async():
     client = MagicMock()
     client.base_url = "https://api.openai.com/v1"
@@ -56,31 +48,45 @@ def _client_async():
     return client
 
 
-def _patches(client, *, task_timeout):
+def _patches(client, *, task_timeout, async_validation=False):
     """Common mocks: provider resolution, cached client, response validation,
     and the config-derived task timeout."""
+    validation_patch = (
+        patch(
+            "agent.auxiliary_client._validate_llm_response",
+            new_callable=AsyncMock,
+            side_effect=lambda resp, _task, **_kw: resp,
+        )
+        if async_validation
+        else patch(
+            "agent.auxiliary_client._validate_llm_response_shape",
+            side_effect=lambda resp, _task, **_kw: resp,
+        )
+    )
     return (
         patch("agent.auxiliary_client._resolve_task_provider_model",
               return_value=("openai-codex", "gpt-5.5", None, None, None)),
         patch("agent.auxiliary_client._get_cached_client",
               return_value=(client, "gpt-5.5")),
-        patch("agent.auxiliary_client._validate_llm_response",
-              side_effect=lambda resp, _task, **_kw: resp),
+        validation_patch,
         patch("agent.auxiliary_client._get_task_timeout",
               return_value=task_timeout),
     )
 
 
-class TestCompressionTimeoutFloorSync:
-    """Sync ``call_llm`` applies the floor to config-derived compression timeouts."""
+class TestCompressionTimeoutFloor:
+    """Native async ``call_llm`` applies timeout floors."""
 
-    def test_config_derived_compression_timeout_is_raised_to_floor(self):
+    @pytest.mark.asyncio
+    async def test_config_derived_compression_timeout_is_raised_to_floor(self):
         """Layer 1: compression with a 120 s config timeout must reach the
         client with at least the 300 s floor."""
-        client = _client_sync()
-        p1, p2, p3, p4 = _patches(client, task_timeout=COMPRESSION_CONFIG_TIMEOUT)
+        client = _client_async()
+        p1, p2, p3, p4 = _patches(
+            client, task_timeout=COMPRESSION_CONFIG_TIMEOUT, async_validation=True
+        )
         with p1, p2, p3, p4:
-            call_llm(
+            await call_llm(
                 task="compression",
                 messages=[{"role": "user", "content": "summarise this"}],
             )
@@ -94,14 +100,15 @@ class TestCompressionTimeoutFloorSync:
         )
 
 
-    def test_non_compression_task_is_not_floored(self):
+    @pytest.mark.asyncio
+    async def test_non_compression_task_is_not_floored(self):
         """Layer 4: only ``compression`` gets the floor; another auxiliary
         task with the same low config timeout must pass it through."""
-        client = _client_sync()
+        client = _client_async()
         low = 30.0
-        p1, p2, p3, p4 = _patches(client, task_timeout=low)
+        p1, p2, p3, p4 = _patches(client, task_timeout=low, async_validation=True)
         with p1, p2, p3, p4:
-            call_llm(
+            await call_llm(
                 task="title_generation",
                 messages=[{"role": "user", "content": "x"}],
             )
@@ -112,31 +119,32 @@ class TestCompressionTimeoutFloorSync:
 
 
 
-class TestCompressionTimeoutFloorAsync:
-    """Async ``async_call_llm`` mirrors the sync floor (Layer 2)."""
-
     @pytest.mark.asyncio
-    async def test_async_config_derived_compression_timeout_is_raised_to_floor(self):
+    async def test_config_derived_compression_timeout_is_raised_to_floor_for_second_callsite(self):
         client = _client_async()
-        p1, p2, p3, p4 = _patches(client, task_timeout=COMPRESSION_CONFIG_TIMEOUT)
+        p1, p2, p3, p4 = _patches(
+            client, task_timeout=COMPRESSION_CONFIG_TIMEOUT, async_validation=True
+        )
         with p1, p2, p3, p4:
-            await async_call_llm(
+            await call_llm(
                 task="compression",
                 messages=[{"role": "user", "content": "summarise this"}],
             )
         timeout = client.chat.completions.create.call_args.kwargs["timeout"]
         assert timeout >= COMPRESSION_TIMEOUT_FLOOR, (
-            f"async compression timeout {timeout} should be >= floor "
+            f"compression timeout {timeout} should be >= floor "
             f"{COMPRESSION_TIMEOUT_FLOOR}"
         )
 
     @pytest.mark.asyncio
-    async def test_async_explicit_per_call_timeout_is_not_floored(self):
+    async def test_explicit_per_call_timeout_is_not_floored(self):
         client = _client_async()
         explicit = 45.0
-        p1, p2, p3, p4 = _patches(client, task_timeout=COMPRESSION_CONFIG_TIMEOUT)
+        p1, p2, p3, p4 = _patches(
+            client, task_timeout=COMPRESSION_CONFIG_TIMEOUT, async_validation=True
+        )
         with p1, p2, p3, p4:
-            await async_call_llm(
+            await call_llm(
                 task="compression",
                 messages=[{"role": "user", "content": "x"}],
                 timeout=explicit,
@@ -145,12 +153,14 @@ class TestCompressionTimeoutFloorAsync:
         assert timeout == explicit
 
     @pytest.mark.asyncio
-    async def test_async_non_compression_task_is_not_floored(self):
+    async def test_non_compression_session_search_timeout_is_not_floored(self):
         client = _client_async()
         low = 30.0
-        p1, p2, p3, p4 = _patches(client, task_timeout=low)
+        p1, p2, p3, p4 = _patches(
+            client, task_timeout=low, async_validation=True
+        )
         with p1, p2, p3, p4:
-            await async_call_llm(
+            await call_llm(
                 task="session_search",
                 messages=[{"role": "user", "content": "x"}],
             )

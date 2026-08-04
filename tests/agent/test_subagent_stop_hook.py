@@ -2,7 +2,7 @@
 
 Covers wire-up from tools.delegate_tool.delegate_task:
   * fires once per child in both single-task and batch modes
-  * runs on the parent thread (no re-entrancy for hook authors)
+  * runs in the parent task (no detached hook work)
   * carries child_role when the agent exposes _delegate_role
   * carries child_role=None when _delegate_role is not set (pre-M3)
   * exposes a detached, metadata-only tool_call_history
@@ -11,13 +11,16 @@ Covers wire-up from tools.delegate_tool.delegate_task:
 from __future__ import annotations
 
 import json
-import threading
-from unittest.mock import MagicMock, patch
+import asyncio
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from tools.delegate_tool import _summarize_tool_arguments, delegate_task
 from hermes_cli import plugins
+
+
+pytestmark = pytest.mark.asyncio
 
 
 def _make_parent(depth: int = 0, session_id: str = "parent-1"):
@@ -35,11 +38,9 @@ def _make_parent(depth: int = 0, session_id: str = "parent-1"):
     parent._session_db = None
     parent._delegate_depth = depth
     parent._active_children = []
-    parent._active_children_lock = threading.Lock()
     parent._print_fn = None
     parent.tool_progress_callback = None
     parent.thinking_callback = None
-    parent._memory_manager = None
     parent.session_id = session_id
     return parent
 
@@ -59,7 +60,7 @@ def _stub_child_builder(monkeypatch):
     """Replace _build_child_agent with a MagicMock factory so delegate_task
     never transitively imports run_agent / openai.  Keeps the test runnable
     in environments without heavyweight runtime deps installed."""
-    def _fake_build_child(task_index, **kwargs):
+    async def _fake_build_child(task_index, **kwargs):
         child = MagicMock()
         child._delegate_saved_tool_names = []
         child._credential_pool = None
@@ -73,8 +74,8 @@ def _stub_child_builder(monkeypatch):
 def _register_capturing_hook():
     captured = []
 
-    def _cb(**kwargs):
-        kwargs["_thread"] = threading.current_thread()
+    async def _cb(**kwargs):
+        kwargs["_task"] = asyncio.current_task()
         captured.append(kwargs)
 
     mgr = plugins.get_plugin_manager()
@@ -86,10 +87,12 @@ def _register_capturing_hook():
 
 
 class TestSingleTask:
-    def test_fires_once(self):
+    async def test_fires_once(self):
         captured = _register_capturing_hook()
 
-        with patch("tools.delegate_tool._run_single_child") as mock_run:
+        with patch(
+            "tools.delegate_tool._run_single_child", new_callable=AsyncMock
+        ) as mock_run:
             mock_run.return_value = {
                 "task_index": 0,
                 "status": "completed",
@@ -98,7 +101,7 @@ class TestSingleTask:
                 "duration_seconds": 5.0,
                 "_child_role": "analyst",
             }
-            delegate_task(goal="do X", parent_agent=_make_parent())
+            await delegate_task(goal="do X", parent_agent=_make_parent())
 
         assert len(captured) == 1
         payload = captured[0]
@@ -107,30 +110,34 @@ class TestSingleTask:
         assert payload["child_summary"] == "Done!"
         assert payload["duration_ms"] == 5000
 
-    def test_fires_on_parent_thread(self):
+    async def test_fires_in_parent_task(self):
         captured = _register_capturing_hook()
-        main_thread = threading.current_thread()
+        parent_task = asyncio.current_task()
 
-        with patch("tools.delegate_tool._run_single_child") as mock_run:
+        with patch(
+            "tools.delegate_tool._run_single_child", new_callable=AsyncMock
+        ) as mock_run:
             mock_run.return_value = {
                 "task_index": 0, "status": "completed",
                 "summary": "x", "api_calls": 1, "duration_seconds": 0.1,
                 "_child_role": None,
             }
-            delegate_task(goal="go", parent_agent=_make_parent())
+            await delegate_task(goal="go", parent_agent=_make_parent())
 
-        assert captured[0]["_thread"] is main_thread
+        assert captured[0]["_task"] is parent_task
 
-    def test_payload_includes_parent_session_id(self):
+    async def test_payload_includes_parent_session_id(self):
         captured = _register_capturing_hook()
 
-        with patch("tools.delegate_tool._run_single_child") as mock_run:
+        with patch(
+            "tools.delegate_tool._run_single_child", new_callable=AsyncMock
+        ) as mock_run:
             mock_run.return_value = {
                 "task_index": 0, "status": "completed",
                 "summary": "x", "api_calls": 1, "duration_seconds": 0.1,
                 "_child_role": None,
             }
-            delegate_task(
+            await delegate_task(
                 goal="go",
                 parent_agent=_make_parent(session_id="sess-xyz"),
             )
@@ -142,10 +149,12 @@ class TestSingleTask:
 
 
 class TestBatchMode:
-    def test_fires_per_child(self):
+    async def test_fires_per_child(self):
         captured = _register_capturing_hook()
 
-        with patch("tools.delegate_tool._run_single_child") as mock_run:
+        with patch(
+            "tools.delegate_tool._run_single_child", new_callable=AsyncMock
+        ) as mock_run:
             mock_run.side_effect = [
                 {"task_index": 0, "status": "completed",
                  "summary": "A", "api_calls": 1, "duration_seconds": 1.0,
@@ -157,7 +166,7 @@ class TestBatchMode:
                  "summary": "C", "api_calls": 3, "duration_seconds": 3.0,
                  "_child_role": "role-c"},
             ]
-            delegate_task(
+            await delegate_task(
                 tasks=[
                     {"goal": "A"}, {"goal": "B"}, {"goal": "C"},
                 ],
@@ -168,11 +177,13 @@ class TestBatchMode:
         roles = sorted(c["child_role"] for c in captured)
         assert roles == ["role-a", "role-b", "role-c"]
 
-    def test_all_fires_on_parent_thread(self):
+    async def test_all_fire_in_parent_task(self):
         captured = _register_capturing_hook()
-        main_thread = threading.current_thread()
+        parent_task = asyncio.current_task()
 
-        with patch("tools.delegate_tool._run_single_child") as mock_run:
+        with patch(
+            "tools.delegate_tool._run_single_child", new_callable=AsyncMock
+        ) as mock_run:
             mock_run.side_effect = [
                 {"task_index": 0, "status": "completed",
                  "summary": "A", "api_calls": 1, "duration_seconds": 1.0,
@@ -181,23 +192,25 @@ class TestBatchMode:
                  "summary": "B", "api_calls": 2, "duration_seconds": 2.0,
                  "_child_role": None},
             ]
-            delegate_task(
+            await delegate_task(
                 tasks=[{"goal": "A"}, {"goal": "B"}],
                 parent_agent=_make_parent(),
             )
 
         for payload in captured:
-            assert payload["_thread"] is main_thread
+            assert payload["_task"] is parent_task
 
 
 # ── payload shape ─────────────────────────────────────────────────────────
 
 
 class TestPayloadShape:
-    def test_includes_redacted_tool_call_history(self):
+    async def test_includes_redacted_tool_call_history(self):
         captured = _register_capturing_hook()
 
-        with patch("tools.delegate_tool._run_single_child") as mock_run:
+        with patch(
+            "tools.delegate_tool._run_single_child", new_callable=AsyncMock
+        ) as mock_run:
             mock_run.return_value = {
                 "task_index": 0,
                 "status": "completed",
@@ -221,7 +234,7 @@ class TestPayloadShape:
                     "result": "secret output",
                 }],
             }
-            delegate_task(goal="do X", parent_agent=_make_parent())
+            await delegate_task(goal="do X", parent_agent=_make_parent())
 
         assert captured[0]["tool_call_history"] == [{
             "tool_name": "write_file",
@@ -240,18 +253,20 @@ class TestPayloadShape:
 
 
 
-    def test_result_does_not_leak_child_role_field(self):
+    async def test_result_does_not_leak_child_role_field(self):
         """The internal _child_role key must be stripped before the
         result dict is serialised to JSON."""
         _register_capturing_hook()
 
-        with patch("tools.delegate_tool._run_single_child") as mock_run:
+        with patch(
+            "tools.delegate_tool._run_single_child", new_callable=AsyncMock
+        ) as mock_run:
             mock_run.return_value = {
                 "task_index": 0, "status": "completed",
                 "summary": "x", "api_calls": 1, "duration_seconds": 0.1,
                 "_child_role": "leaf",
             }
-            raw = delegate_task(goal="do X", parent_agent=_make_parent())
+            raw = await delegate_task(goal="do X", parent_agent=_make_parent())
 
         parsed = json.loads(raw)
         assert "results" in parsed

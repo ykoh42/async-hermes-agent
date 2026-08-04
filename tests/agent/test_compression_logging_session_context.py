@@ -15,9 +15,10 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import hermes_logging
+import pytest
 from hermes_state import SessionDB
 
 
@@ -38,10 +39,10 @@ def _build_agent_with_db(db: SessionDB, session_id: str):
         )
 
     compressor = MagicMock()
-    compressor.compress.return_value = [
+    compressor.compress = AsyncMock(return_value=[
         {"role": "user", "content": "[CONTEXT COMPACTION] summary"},
         {"role": "user", "content": "tail"},
-    ]
+    ])
     compressor.compression_count = 1
     compressor.last_prompt_tokens = 0
     compressor.last_completion_tokens = 0
@@ -57,10 +58,11 @@ def _build_agent_with_db(db: SessionDB, session_id: str):
     return agent
 
 
-def test_logging_session_context_follows_compression_rotation(tmp_path: Path) -> None:
-    db = SessionDB(db_path=tmp_path / "state.db")
+@pytest.mark.asyncio
+async def test_logging_session_context_follows_compression_rotation(tmp_path: Path) -> None:
+    db = SessionDB(tmp_path / "state.db")
     parent_sid = "PARENT_LOGCTX_SESSION"
-    db.create_session(parent_sid, source="cli")
+    await db.create_session(parent_sid, source="cli")
 
     agent = _build_agent_with_db(db, parent_sid)
 
@@ -68,7 +70,7 @@ def test_logging_session_context_follows_compression_rotation(tmp_path: Path) ->
     hermes_logging.set_session_context(parent_sid)
     try:
         messages = [{"role": "user", "content": f"m{i}"} for i in range(20)]
-        agent._compress_context(messages, "sys", approx_tokens=120_000)
+        await agent._compress_context(messages, "sys", approx_tokens=120_000)
 
         # The id actually rotated (sanity — otherwise the assertion is vacuous).
         assert agent.session_id != parent_sid
@@ -82,3 +84,5 @@ def test_logging_session_context_follows_compression_rotation(tmp_path: Path) ->
         )
     finally:
         hermes_logging.clear_session_context()
+        await agent.close()
+        await db.close()

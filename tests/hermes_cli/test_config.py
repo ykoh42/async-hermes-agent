@@ -23,9 +23,7 @@ from hermes_cli.config import (
     remove_env_value,
     save_config,
     save_env_value,
-    save_env_value_secure,
     sanitize_env_file,
-    set_config_value,
     write_platform_config_field,
     _sanitize_env_lines,
 )
@@ -246,20 +244,6 @@ class TestSaveAndLoadRoundtrip:
 
 
 
-class TestSaveEnvValueSecure:
-
-    def test_secure_save_returns_metadata_only(self, tmp_path):
-        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
-            result = save_env_value_secure("GITHUB_TOKEN", "ghp_test_secret")
-            assert result == {
-                "success": True,
-                "stored_as": "GITHUB_TOKEN",
-                "validated": False,
-            }
-            assert "secret" not in str(result).lower()
-
-
-
     def test_save_env_value_preserves_existing_file_mode_on_posix(self, tmp_path):
         """Regression for #31518: pre-existing .env mode (e.g. 0640 for a
         Docker bind-mount that the operator chose) survives subsequent
@@ -433,7 +417,9 @@ class TestSanitizeEnvLines:
 
 
     def test_migrate_reports_normalized_line_formatting(self, capsys):
-        latest_version = DEFAULT_CONFIG["_config_version"]
+        import hermes_cli.config as config_mod
+
+        latest_version = config_mod.DEFAULT_CONFIG["_config_version"]
         with (
             patch("hermes_cli.config.sanitize_env_file", return_value=2),
             patch(
@@ -445,7 +431,7 @@ class TestSanitizeEnvLines:
             patch("hermes_cli.config.get_missing_config_fields", return_value=[]),
             patch("hermes_cli.config.get_missing_skill_config_vars", return_value=[]),
         ):
-            migrate_config(interactive=False)
+            config_mod.migrate_config(interactive=False)
 
         assert capsys.readouterr().out == (
             "  ✓ Normalized .env line formatting (2 line(s) changed)\n"
@@ -659,7 +645,7 @@ class TestConfigSupportFloor:
         )
         assert expected_fragment in captured.out
         assert expected_fragment in captured.err
-        assert "run `hermes setup` to regenerate" in captured.out
+        assert "run `hermes doctor --fix`" in captured.out
         assert "_config_version: 12" in captured.out
         assert any(expected_fragment in w for w in results["warnings"])
         # No 'Config version: X → Y' line — nothing was migrated.
@@ -1078,14 +1064,6 @@ class TestEnvWriteDenylist:
 
 
 
-    def test_save_env_value_secure_inherits_denylist(self):
-        """The ``_secure`` variant goes through ``save_env_value`` so
-        it inherits the gate — verify, don't assume."""
-        with pytest.raises(ValueError, match="denylist"):
-            save_env_value_secure("LD_PRELOAD", "/tmp/evil.so")
-
-
-
 class TestWriteApprovalMigration:
     """Version 28→29 renames memory/skills write_mode → write_approval (bool).
 
@@ -1174,7 +1152,7 @@ class TestMigrationWriteInvariant:
         # No default-only top-level section the user never wrote lands on disk —
         # neither from per-version seeds nor the catch-all finalizer.
         for default_key in (
-            "timezone", "curator", "auxiliary", "tts", "compression",
+            "timezone", "auxiliary", "tts", "compression",
             "whatsapp", "bedrock",
         ):
             assert default_key not in raw, (
@@ -1182,7 +1160,6 @@ class TestMigrationWriteInvariant:
                 f"version bump — the default-dump regression returned"
             )
         # Defaults still take effect transparently via the read-time merge.
-        assert loaded["curator"]["enabled"] == DEFAULT_CONFIG["curator"]["enabled"]
         assert loaded["display"]["compact"] == DEFAULT_CONFIG["display"]["compact"]
 
 
@@ -1333,31 +1310,6 @@ class TestConfigNormalizationDoesNotOverwriteUserValues:
 
 
 
-class TestCodexAppServerAutoConfig:
-    """codex_app_server_auto ships a default and survives migration untouched."""
-
-    def _write(self, tmp_path, body):
-        (tmp_path / "config.yaml").write_text(body, encoding="utf-8")
-
-    def test_default_config_has_native_mode(self):
-        assert DEFAULT_CONFIG["compression"]["codex_app_server_auto"] == "native"
-        assert DEFAULT_CONFIG["compression"]["codex_gpt55_autoraise"] is True
-
-    def test_preserves_existing_codex_app_server_auto_value(self, tmp_path):
-        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
-            self._write(
-                tmp_path,
-                "_config_version: 31\n"
-                "compression:\n"
-                "  codex_app_server_auto: hermes\n",
-            )
-
-            migrate_config(interactive=False, quiet=True)
-
-            raw = yaml.safe_load((tmp_path / "config.yaml").read_text())
-            assert raw["compression"]["codex_app_server_auto"] == "hermes"
-
-
 class TestIsProviderEnabled:
     """``is_provider_enabled`` gates ``providers.<name>`` blocks for the
     model picker, ``/models`` listings and the runtime resolver. Default
@@ -1386,7 +1338,8 @@ class TestProviderEnabledRuntimeGate:
     full runtime resolution has its own fixture-heavy tests; here we
     only assert the early-exit raises a typed error."""
 
-    def test_disabled_custom_provider_raises_valueerror(self, tmp_path, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_disabled_custom_provider_raises_valueerror(self, tmp_path, monkeypatch):
         cfg = {
             "model": {"default": "claude-sonnet-4-6", "provider": "claude-agent-sdk"},
             "providers": {
@@ -1407,7 +1360,7 @@ class TestProviderEnabledRuntimeGate:
 
         from hermes_cli.runtime_provider import resolve_runtime_provider
         with pytest.raises(ValueError, match="disabled"):
-            resolve_runtime_provider(requested="my-fork")
+            await resolve_runtime_provider(requested="my-fork")
 
 
 # ---------------------------------------------------------------------------

@@ -11,13 +11,16 @@ gives Anthropic-specific, actionable guidance (folds in PR #40073's UX).
 """
 from __future__ import annotations
 
+import pytest
+
 from agent.conversation_loop import _billing_or_entitlement_message
 
 
-def test_anthropic_subscription_exhausted_guidance():
+@pytest.mark.asyncio
+async def test_anthropic_subscription_exhausted_guidance():
     """Anthropic billing guidance points at the exact settings page and
     the cycle-reset option, not the generic 'add credits' line."""
-    msg = _billing_or_entitlement_message(
+    msg = await _billing_or_entitlement_message(
         capability="model access",
         provider="anthropic",
         base_url="https://api.anthropic.com",
@@ -32,10 +35,11 @@ def test_anthropic_subscription_exhausted_guidance():
     assert "claude-opus-4-7" in msg
 
 
-def test_non_anthropic_billing_guidance_unaffected():
+@pytest.mark.asyncio
+async def test_non_anthropic_billing_guidance_unaffected():
     """A non-Anthropic provider keeps the generic billing guidance and does
     NOT get the Anthropic-specific claude.ai settings link."""
-    msg = _billing_or_entitlement_message(
+    msg = await _billing_or_entitlement_message(
         capability="model access",
         provider="openrouter",
         base_url="https://openrouter.ai/api/v1",

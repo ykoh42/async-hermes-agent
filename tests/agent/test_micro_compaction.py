@@ -29,6 +29,13 @@ from agent.context_compressor import (
 )
 
 
+def _async_summary(value):
+    async def summarize(_text):
+        return value
+
+    return summarize
+
+
 def _compressor(summary="ROLLING SUMMARY") -> ContextCompressor:
     cc = ContextCompressor(
         model="test-model",
@@ -41,7 +48,7 @@ def _compressor(summary="ROLLING SUMMARY") -> ContextCompressor:
     )
     cc._micro_compact_enabled = True
     # Stand in for the auxiliary summarizer LLM.
-    cc._micro_summarize_one = lambda _text: summary
+    cc._micro_summarize_one = _async_summary(summary)
     return cc
 
 
@@ -57,12 +64,13 @@ def _summary_markers(messages: list) -> list:
     return [m for m in messages if m.get(COMPRESSED_SUMMARY_METADATA_KEY)]
 
 
+@pytest.mark.asyncio
 class TestMicroCompaction:
-    def test_absorbs_one_exchange_and_leaves_a_summary_marker(self):
+    async def test_absorbs_one_exchange_and_leaves_a_summary_marker(self):
         cc = _compressor()
         messages = _conversation()
 
-        result = cc._micro_compact(list(messages))
+        result = await cc._micro_compact(list(messages))
 
         # The absorbed assistant turn is gone from the transcript.
         assert any("answer 0" in str(m.get("content")) for m in messages)
@@ -77,14 +85,14 @@ class TestMicroCompaction:
         # into the neighbouring real user turn — metadata gone, cursor lost.
         assert markers[0]["role"] == "assistant"
 
-    def test_disabled_is_a_no_op(self):
+    async def test_disabled_is_a_no_op(self):
         cc = _compressor()
         cc._micro_compact_enabled = False
         messages = _conversation()
 
-        assert cc._micro_compact(list(messages)) == messages
+        assert await cc._micro_compact(list(messages)) == messages
 
-    def test_is_off_unless_explicitly_enabled(self):
+    async def test_is_off_unless_explicitly_enabled(self):
         # A pass rewrites already-sent history, breaking the prompt-cache
         # prefix, so nobody inherits it from an update: it stays off until
         # `compression.micro_compact` opts in.
@@ -97,46 +105,46 @@ class TestMicroCompaction:
             config_context_length=40960,
             provider="test",
         )
-        cc._micro_summarize_one = lambda _text: "ROLLING SUMMARY"
+        cc._micro_summarize_one = _async_summary("ROLLING SUMMARY")
         messages = _conversation()
 
         assert cc._micro_compact_enabled is False
-        assert cc._micro_compact(list(messages)) == messages
+        assert await cc._micro_compact(list(messages)) == messages
 
-    def test_cadence_of_one_runs_every_turn(self):
+    async def test_cadence_of_one_runs_every_turn(self):
         cc = _compressor()
         cc._micro_compact_every_n_turns = 1
         messages = _conversation(exchanges=8)
 
-        first = cc._micro_compact(list(messages))
-        second = cc._micro_compact(list(first))
+        first = await cc._micro_compact(list(messages))
+        second = await cc._micro_compact(list(first))
 
         assert cc._micro_compact_cursor > 0
         assert len(_summary_markers(first)) == 1
         # Each turn absorbed something, so the transcript kept shrinking.
         assert len(second) < len(first)
 
-    def test_cadence_skips_turns_until_a_pass_is_due(self):
+    async def test_cadence_skips_turns_until_a_pass_is_due(self):
         cc = _compressor()
         cc._micro_compact_every_n_turns = 3
         messages = _conversation(exchanges=8)
 
-        first = cc._micro_compact(list(messages))
-        second = cc._micro_compact(list(first))
+        first = await cc._micro_compact(list(messages))
+        second = await cc._micro_compact(list(first))
 
         # Cache prefix untouched on the turns in between.
         assert _summary_markers(first) == []
         assert _summary_markers(second) == []
         assert cc._micro_compact_cursor == 0
 
-        third = cc._micro_compact(list(second))
+        third = await cc._micro_compact(list(second))
 
         assert len(_summary_markers(third)) == 1
         assert not any("answer 0" in str(m.get("content")) for m in third)
         # Counter rearmed for the next window.
         assert cc._micro_compact_turns_since_pass == 0
 
-    def test_cadence_is_clamped_to_at_least_one(self):
+    async def test_cadence_is_clamped_to_at_least_one(self):
         # A bogus 0 or negative must not disable compaction silently, nor
         # divide-by-zero: it degrades to "every turn".
         for bogus in (0, -5):
@@ -144,17 +152,17 @@ class TestMicroCompaction:
             cc._micro_compact_every_n_turns = bogus
             messages = _conversation(exchanges=8)
 
-            result = cc._micro_compact(list(messages))
+            result = await cc._micro_compact(list(messages))
 
             assert len(_summary_markers(result)) == 1
 
-    def test_cursor_advances_across_successive_turns(self):
+    async def test_cursor_advances_across_successive_turns(self):
         cc = _compressor()
         messages = _conversation(exchanges=8)
 
-        first = cc._micro_compact(list(messages))
+        first = await cc._micro_compact(list(messages))
         cursor_after_first = cc._micro_compact_cursor
-        second = cc._micro_compact(list(first))
+        second = await cc._micro_compact(list(first))
 
         assert cursor_after_first > 0
         assert cc._micro_compact_cursor >= cursor_after_first
@@ -162,16 +170,16 @@ class TestMicroCompaction:
         # summary rather than stacking a second summary block.
         assert len(_summary_markers(second)) == 1
 
-    def test_protected_head_and_tail_survive(self):
+    async def test_protected_head_and_tail_survive(self):
         cc = _compressor()
         messages = _conversation()
 
-        result = cc._micro_compact(list(messages))
+        result = await cc._micro_compact(list(messages))
 
         assert result[0] == messages[0], "system prompt must be preserved"
         assert result[-1] == messages[-1], "most recent turn must be preserved"
 
-    def test_user_messages_are_never_absorbed(self):
+    async def test_user_messages_are_never_absorbed(self):
         """Every byte the user typed stays in the transcript — by design.
 
         Assistant output is largely an account of what was done and survives
@@ -189,7 +197,7 @@ class TestMicroCompaction:
         originals = [m["content"] for m in messages if m["role"] == "user"]
 
         for _ in range(5):
-            messages = cc._micro_compact(messages)
+            messages = await cc._micro_compact(messages)
 
         surviving_text = "\n\n".join(
             m["content"] for m in messages
@@ -200,7 +208,7 @@ class TestMicroCompaction:
                 f"user text {original!r} must survive verbatim"
             )
 
-    def test_cursor_is_derived_from_the_spliced_list(self):
+    async def test_cursor_is_derived_from_the_spliced_list(self):
         """The cursor must never carry over a pre-splice index.
 
         A splice collapses an assistant plus its tool results -- often several
@@ -231,7 +239,7 @@ class TestMicroCompaction:
                              "content": "T" * 500})
 
         for _ in range(4):
-            msgs = cc._micro_compact(msgs)
+            msgs = await cc._micro_compact(msgs)
             marker_idx = next(
                 i for i, m in enumerate(msgs)
                 if m.get(COMPRESSED_SUMMARY_METADATA_KEY)
@@ -240,7 +248,7 @@ class TestMicroCompaction:
                 "cursor must sit just past the marker in the spliced list"
             )
 
-    def test_resume_does_not_destroy_the_accumulated_summary(self):
+    async def test_resume_does_not_destroy_the_accumulated_summary(self):
         """A resumed session must not throw away compacted history.
 
         The rolling summary lives in memory; a resumed process starts with an
@@ -251,44 +259,44 @@ class TestMicroCompaction:
         msgs = _conversation(exchanges=10)
         first = _compressor(summary="IMPORTANT HISTORY: decisions and paths")
         for _ in range(3):
-            msgs = first._micro_compact(msgs)
+            msgs = await first._micro_compact(msgs)
         assert any("IMPORTANT HISTORY" in m["content"] for m in _summary_markers(msgs))
 
         # Fresh compressor over the same transcript = resume.
         resumed = _compressor(summary="MERGED: history plus newest exchange")
         assert resumed._micro_compact_rolling_summary == ""
-        result = resumed._micro_compact(msgs)
+        result = await resumed._micro_compact(msgs)
 
         markers = _summary_markers(result)
         assert len(markers) == 1
         assert "MERGED" in markers[0]["content"]
 
-    def test_resume_keeps_the_old_marker_when_rehydration_fails(self):
+    async def test_resume_keeps_the_old_marker_when_rehydration_fails(self):
         """If the prior summary can't be recovered, it must not be dropped."""
         msgs = _conversation(exchanges=10)
         first = _compressor(summary="IMPORTANT HISTORY: decisions and paths")
         for _ in range(3):
-            msgs = first._micro_compact(msgs)
+            msgs = await first._micro_compact(msgs)
 
         resumed = _compressor(summary="BRAND NEW SUMMARY")
         resumed._rolling_summary_from_marker = staticmethod(lambda _c: "")
-        result = resumed._micro_compact(msgs)
+        result = await resumed._micro_compact(msgs)
 
         markers = _summary_markers(result)
         assert len(markers) == 2, "must retain the un-carried history"
         assert any("IMPORTANT HISTORY" in m["content"] for m in markers)
 
-    def test_rolling_summary_round_trips_through_a_marker(self):
+    async def test_rolling_summary_round_trips_through_a_marker(self):
         cc = _compressor()
         cc._micro_compact_rolling_summary = "decisions: use the existing helper"
         msgs = _conversation(exchanges=6)
-        result = cc._micro_compact(msgs)
+        result = await cc._micro_compact(msgs)
         marker = _summary_markers(result)[0]
 
         assert (cc._rolling_summary_from_marker(marker["content"])
                 == cc._micro_compact_rolling_summary)
 
-    def test_short_conversation_is_untouched(self):
+    async def test_short_conversation_is_untouched(self):
         cc = _compressor()
         messages = [
             {"role": "system", "content": "sys"},
@@ -296,33 +304,33 @@ class TestMicroCompaction:
             {"role": "assistant", "content": "hello"},
         ]
 
-        assert cc._micro_compact(list(messages)) == messages
+        assert await cc._micro_compact(list(messages)) == messages
 
-    def test_summarizer_failure_leaves_conversation_intact(self):
+    async def test_summarizer_failure_leaves_conversation_intact(self):
         cc = _compressor()
-        cc._micro_summarize_one = lambda _text: None
+        cc._micro_summarize_one = _async_summary(None)
         messages = _conversation()
 
-        result = cc._micro_compact(list(messages))
+        result = await cc._micro_compact(list(messages))
 
         assert result == messages
         assert cc._micro_compact_consecutive_failures == 1
 
-    def test_poison_exchange_is_skipped_after_repeated_failures(self):
+    async def test_poison_exchange_is_skipped_after_repeated_failures(self):
         """A repeatedly unsummarizable exchange must not stall every turn."""
         cc = _compressor()
-        cc._micro_summarize_one = lambda _text: None
+        cc._micro_summarize_one = _async_summary(None)
         messages = _conversation()
 
         for _ in range(_MICRO_COMPACT_MAX_CONSECUTIVE_FAILURES):
-            cc._micro_compact(list(messages))
+            await cc._micro_compact(list(messages))
 
         # The cursor has moved past the stuck exchange and the strike count
         # is reset, so the next turn attempts new material.
         assert cc._micro_compact_cursor > 0
         assert cc._micro_compact_consecutive_failures == 0
 
-    def test_repeated_compaction_shrinks_context_and_keeps_one_marker(self):
+    async def test_repeated_compaction_shrinks_context_and_keeps_one_marker(self):
         """The whole point: successive turns must reduce the transcript.
 
         The rolling summary is cumulative, so an earlier marker's text is a
@@ -337,7 +345,7 @@ class TestMicroCompaction:
         # Cumulative summary, like the real summarizer produces.
         state = {"n": 0}
 
-        def growing(_text):
+        async def growing(_text):
             state["n"] += 1
             return "SUMMARY " + " ".join(f"ex{i}" for i in range(state["n"]))
 
@@ -346,13 +354,13 @@ class TestMicroCompaction:
         messages = _conversation(exchanges=12)
         before = estimate_messages_tokens_rough(messages)
         for _ in range(6):
-            messages = cc._micro_compact(messages)
+            messages = await cc._micro_compact(messages)
         after = estimate_messages_tokens_rough(messages)
 
         assert len(_summary_markers(messages)) == 1
         assert after < before, f"context grew: {before} -> {after}"
 
-    def test_emits_content_free_token_telemetry(self, caplog):
+    async def test_emits_content_free_token_telemetry(self, caplog):
         """Each pass logs one JSON line with the token accounting.
 
         Message counts barely move even when the saving is large, so the token
@@ -365,7 +373,7 @@ class TestMicroCompaction:
         messages = _conversation(exchanges=8)
 
         with caplog.at_level(logging.INFO, logger="agent.context_compressor"):
-            result = cc._micro_compact(messages)
+            result = await cc._micro_compact(messages)
 
         lines = [
             r.getMessage() for r in caplog.records
@@ -384,7 +392,7 @@ class TestMicroCompaction:
         blob = json.dumps(payload)
         assert "answer 0" not in blob and "question 0" not in blob
 
-    def test_telemetry_reports_occupancy_without_forcing_resolution(self, caplog):
+    async def test_telemetry_reports_occupancy_without_forcing_resolution(self, caplog):
         """Occupancy is the headline: how full the window is being kept.
 
         It must be read from the cached threshold only. The public
@@ -400,7 +408,7 @@ class TestMicroCompaction:
         messages = _conversation(exchanges=8)
 
         with caplog.at_level(logging.INFO, logger="agent.context_compressor"):
-            cc._micro_compact(messages)
+            await cc._micro_compact(messages)
 
         line = next(r.getMessage() for r in caplog.records
                     if "micro compaction telemetry:" in r.getMessage())
@@ -411,7 +419,7 @@ class TestMicroCompaction:
             payload["tokens_after"] / 10_000 * 100, abs=0.1
         )
 
-    def test_emitter_never_forces_window_resolution(self, caplog):
+    async def test_emitter_never_forces_window_resolution(self, caplog):
         """The emitter reads the cached threshold, never the property.
 
         In a real pass the threshold is already resolved by the time
@@ -448,7 +456,7 @@ class TestMicroCompaction:
         assert payload["occupancy_pct"] is None
         assert payload["threshold_tokens"] is None
 
-    def test_first_pass_costs_marker_overhead_then_pays_it_back(self):
+    async def test_first_pass_costs_marker_overhead_then_pays_it_back(self):
         """The first pass can grow the transcript; later passes recover it.
 
         Inserting the summary marker costs a fixed ~400 tokens of scaffolding
@@ -465,27 +473,27 @@ class TestMicroCompaction:
         messages = _conversation(exchanges=10)
         start = estimate_messages_tokens_rough(messages)
 
-        messages = cc._micro_compact(messages)
+        messages = await cc._micro_compact(messages)
         after_first = estimate_messages_tokens_rough(messages)
 
         for _ in range(5):
-            messages = cc._micro_compact(messages)
+            messages = await cc._micro_compact(messages)
         after_many = estimate_messages_tokens_rough(messages)
 
         assert after_first > start, "expected one-time marker overhead"
         assert after_many < after_first, "later passes must recover it"
 
-    def test_cumulative_savings_accumulate_across_passes(self):
+    async def test_cumulative_savings_accumulate_across_passes(self):
         cc = _compressor()
         messages = _conversation(exchanges=10)
 
         for _ in range(4):
-            messages = cc._micro_compact(messages)
+            messages = await cc._micro_compact(messages)
 
         assert cc._micro_compact_passes == 4
         assert cc._micro_compact_tokens_saved_total > 0
 
-    def test_defrag_triggers_once_the_rolling_summary_grows(self):
+    async def test_defrag_triggers_once_the_rolling_summary_grows(self):
         """Defrag rewrites the summary text and the marker — nothing else.
 
         The original implementation spliced the whole remaining middle (user
@@ -496,13 +504,13 @@ class TestMicroCompaction:
         cc = _compressor(summary="FRESH DEFRAGGED SUMMARY")
         messages = _conversation(exchanges=8)
         # Seed a real marker + oversized rolling summary, as after many passes.
-        messages = cc._micro_compact(list(messages))
+        messages = await cc._micro_compact(list(messages))
         cc._micro_compact_rolling_summary = "x" * 40_000  # far over the threshold
         cursor_before = cc._micro_compact_cursor
         shape_before = [m.get("role") for m in messages]
 
         assert cc._needs_defrag() is True
-        result = cc._micro_compact(list(messages))
+        result = await cc._micro_compact(list(messages))
 
         assert cc._micro_compact_rolling_summary == "FRESH DEFRAGGED SUMMARY"
         markers = _summary_markers(result)
@@ -512,7 +520,7 @@ class TestMicroCompaction:
         assert [m.get("role") for m in result] == shape_before
         assert cc._micro_compact_cursor == cursor_before
 
-    def test_defrag_never_absorbs_user_messages(self):
+    async def test_defrag_never_absorbs_user_messages(self):
         """Defrag must not touch user turns — the feature's core invariant.
 
         The original implementation serialized head..tail (user turns
@@ -526,7 +534,7 @@ class TestMicroCompaction:
             messages.append({"role": "assistant", "content": f"answer {i} " + "z" * 400})
 
         cc._micro_compact_rolling_summary = "x" * 40_000  # force defrag
-        result = cc._micro_compact(list(messages))
+        result = await cc._micro_compact(list(messages))
 
         surviving = [
             m["content"] for m in result
@@ -537,26 +545,26 @@ class TestMicroCompaction:
                 f"user prompt {i} was absorbed by defrag"
             )
 
-    def test_defrag_summarizes_only_the_summary_text(self):
+    async def test_defrag_summarizes_only_the_summary_text(self):
         """The defrag aux call receives the rolling summary, not the transcript."""
         cc = _compressor()
         captured = {}
 
-        def capture(text):
+        async def capture(text):
             captured["text"] = text
             return "DEFRAGGED"
 
         cc._micro_summarize_one = capture
         cc._micro_compact_rolling_summary = "OLD-SUMMARY " + "x" * 40_000
         messages = _conversation(exchanges=8)
-        cc._micro_compact(list(messages))
+        await cc._micro_compact(list(messages))
 
         assert "OLD-SUMMARY" in captured["text"]
         assert "[USER]" not in captured["text"], (
             "defrag must never serialize transcript user turns"
         )
 
-    def test_spliced_transcript_survives_repair_message_sequence(self):
+    async def test_spliced_transcript_survives_repair_message_sequence(self):
         """The compacted transcript must survive the production repair pass.
 
         conversation_loop runs repair_message_sequence before EVERY API call.
@@ -577,7 +585,7 @@ class TestMicroCompaction:
         messages = _conversation(exchanges=8)
 
         for _ in range(3):
-            messages = cc._micro_compact(messages)
+            messages = await cc._micro_compact(messages)
             repairs = repair_message_sequence(_DummyAgent(), messages)
             assert repairs == 0, (
                 "micro-compacted transcript must already be alternation-valid"
@@ -592,7 +600,7 @@ class TestMicroCompaction:
             ]
             assert not polluted, "summary text leaked into a real user message"
 
-    def test_spliced_transcript_has_no_consecutive_same_role_messages(self):
+    async def test_spliced_transcript_has_no_consecutive_same_role_messages(self):
         """Alternation invariant, checked directly on tool-bearing turns."""
         cc = _compressor()
         msgs = [{"role": "system", "content": "sys"}]
@@ -615,24 +623,24 @@ class TestMicroCompaction:
             msgs.append({"role": "assistant", "content": f"followup {i} " + "y" * 200})
 
         for _ in range(4):
-            msgs = cc._micro_compact(msgs)
+            msgs = await cc._micro_compact(msgs)
             for a, b in zip(msgs, msgs[1:]):
                 ra, rb = a.get("role"), b.get("role")
                 assert not (ra == rb and ra in ("user", "assistant")), (
                     f"consecutive {ra} messages after micro-compaction"
                 )
 
-    def test_marker_reports_no_user_provenance(self):
+    async def test_marker_reports_no_user_provenance(self):
         """Micro markers absorb only assistant/tool content (#64650)."""
         from agent.context_compressor import COMPRESSED_SUMMARY_HAS_USER_TURN_KEY
 
         cc = _compressor()
-        result = cc._micro_compact(_conversation(exchanges=6))
+        result = await cc._micro_compact(_conversation(exchanges=6))
         marker = _summary_markers(result)[0]
 
         assert marker[COMPRESSED_SUMMARY_HAS_USER_TURN_KEY] is False
 
-    def test_supersede_never_drops_a_batch_compaction_marker(self):
+    async def test_supersede_never_drops_a_batch_compaction_marker(self):
         """A batch marker holds history the rolling summary does NOT contain.
 
         Sequence: micro absorbs some exchanges (rolling summary = those k
@@ -645,7 +653,7 @@ class TestMicroCompaction:
         """
         cc = _compressor(summary="MICRO SUMMARY (exchanges 1..k only)")
         msgs = _conversation(exchanges=8)
-        msgs = cc._micro_compact(msgs)
+        msgs = await cc._micro_compact(msgs)
         assert cc._micro_compact_rolling_summary
 
         # Simulate a batch-compaction marker replacing the middle (batch
@@ -661,13 +669,13 @@ class TestMicroCompaction:
         )
         msgs = msgs[:micro_idx] + [batch_marker] + msgs[micro_idx + 3:]
 
-        out = cc._micro_compact(msgs)
+        out = await cc._micro_compact(msgs)
 
         assert any(
             "CRITICAL HISTORY" in str(m.get("content")) for m in out
         ), "batch-compaction summary destroyed by micro supersede"
 
-    def test_defrag_never_rewrites_a_batch_compaction_marker(self):
+    async def test_defrag_never_rewrites_a_batch_compaction_marker(self):
         """Defrag rewrites only micro-tagged markers, never batch markers."""
         cc = _compressor(summary="DEFRAGGED")
         msgs = [{"role": "system", "content": "sys"}]
@@ -681,12 +689,12 @@ class TestMicroCompaction:
             msgs.append({"role": "assistant", "content": f"a{i} " + "z" * 400})
 
         cc._micro_compact_rolling_summary = "x" * 40_000  # force defrag
-        result = cc._micro_compact(list(msgs))
+        result = await cc._micro_compact(list(msgs))
 
         batch = [m for m in result if "CRITICAL HISTORY" in str(m.get("content"))]
         assert batch, "batch marker content overwritten by defrag"
 
-    def test_batch_compress_resets_micro_state(self):
+    async def test_batch_compress_resets_micro_state(self):
         """compress() success path invalidates the stale rolling summary.
 
         Without the reset, the in-memory micro summary (exchanges 1..k)
@@ -695,16 +703,16 @@ class TestMicroCompaction:
         """
         cc = _compressor()
         msgs = _conversation(exchanges=8)
-        msgs = cc._micro_compact(msgs)
+        msgs = await cc._micro_compact(msgs)
         assert cc._micro_compact_rolling_summary
         assert cc._micro_compact_cursor > 0
 
-        cc.compress(msgs, force=True)
+        await cc.compress(msgs, force=True)
 
         assert cc._micro_compact_rolling_summary == ""
         assert cc._micro_compact_cursor == 0
 
-    def test_persist_disabled_agent_never_micro_compacts(self):
+    async def test_persist_disabled_agent_never_micro_compacts(self):
         """finalize_turn must skip micro-compaction on isolated fork agents.
 
         The background-review fork sets _persist_disabled=True; running a
@@ -724,7 +732,7 @@ class TestMicroCompaction:
             "micro-compaction gate must check agent._persist_disabled"
         )
 
-    def test_splice_preserves_db_persisted_stamps(self):
+    async def test_splice_preserves_db_persisted_stamps(self):
         """Surviving messages keep their _db_persisted stamps through a splice.
 
         Micro-compaction archives in place under the SAME session id, so the
@@ -741,8 +749,8 @@ class TestMicroCompaction:
         for m in messages:
             m[_DB_PERSISTED_MARKER] = True
 
-        # No DB bound -> _sync_micro_compact_to_db no-ops (the failure shape).
-        result = cc._micro_compact(messages)
+        # No DB supplied -> async persistence is a no-op (the failure shape).
+        result = await cc._micro_compact(messages)
 
         unstamped = [
             m for m in result
@@ -751,65 +759,4 @@ class TestMicroCompaction:
         ]
         assert not unstamped, (
             "splice must not strip _db_persisted from surviving messages"
-        )
-
-
-class TestDefragFlushCursorInvalidation:
-    """Sibling of the finalize_turn pop site (#75170): defrag pops
-    _DB_PERSISTED_MARKER from the live marker dict in place, so the bounded
-    flush-scan cursor must be invalidated or the rewritten summary is
-    identity-skipped and never re-persisted."""
-
-    def _defrag_setup(self):
-        from agent.context_compressor import _DB_PERSISTED_MARKER
-
-        cc = _compressor(summary="FRESH DEFRAGGED SUMMARY")
-        messages = _conversation(exchanges=8)
-        messages = cc._micro_compact(list(messages))
-        # Simulate an incremental flush having stamped the marker row.
-        for m in messages:
-            if m.get(COMPRESSED_SUMMARY_METADATA_KEY):
-                m[_DB_PERSISTED_MARKER] = True
-        cc._micro_compact_rolling_summary = "x" * 40_000  # force defrag
-        return cc, messages
-
-    def test_defrag_marker_pop_raises_invalidation_flag(self):
-        from agent.context_compressor import _DB_PERSISTED_MARKER
-
-        cc, messages = self._defrag_setup()
-        assert cc._flush_scan_cursor_invalidated is False
-
-        result = cc._micro_compact(list(messages))
-
-        markers = _summary_markers(result)
-        assert len(markers) == 1
-        # The pop happened in place on the live dict...
-        assert not markers[0].get(_DB_PERSISTED_MARKER)
-        # ...so the compressor must flag the flush-scan cursor stale.
-        assert cc._flush_scan_cursor_invalidated is True
-
-    def test_no_defrag_no_flag(self):
-        cc = _compressor()
-        messages = _conversation(exchanges=8)
-        cc._micro_compact(list(messages))
-        assert cc._flush_scan_cursor_invalidated is False
-
-    def test_finalizer_consumes_flag_and_invalidates_agent_cursor(self):
-        """finalize_turn's micro-compaction block must translate the
-        compressor flag into agent._db_flush_scan_prefix = None (and reset
-        the flag) so the next flush re-examines the rewritten marker row."""
-        import inspect
-
-        from agent import turn_finalizer
-
-        src = inspect.getsource(turn_finalizer.finalize_turn)
-        micro_block = src.split("Post-turn micro-compaction", 1)[1]
-        micro_block = micro_block.split("agent._persist_session", 1)[0]
-        assert "_flush_scan_cursor_invalidated" in micro_block, (
-            "finalize_turn must consume the compressor's cursor-invalidation "
-            "flag raised by the defrag marker pop"
-        )
-        assert "agent._db_flush_scan_prefix = None" in micro_block, (
-            "finalize_turn must invalidate the bounded flush-scan cursor "
-            "when the defrag pop stripped a live marker's stamp"
         )

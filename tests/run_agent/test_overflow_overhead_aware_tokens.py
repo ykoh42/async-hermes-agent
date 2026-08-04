@@ -17,7 +17,7 @@ handler used a different (likely messages-only) estimate.
 import pytest
 
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch, call
+from unittest.mock import AsyncMock, MagicMock, patch, call
 
 from run_agent import AIAgent
 import run_agent
@@ -78,6 +78,9 @@ def agent():
             skip_memory=True,
         )
         a.client = MagicMock()
+        a.client.chat.completions.create = AsyncMock()
+        a._runtime_config_loaded = True
+        a._deferred_provider_runtime = None
         a._cached_system_prompt = "You are helpful."
         a._use_prompt_caching = False
         a.compression_enabled = True
@@ -108,7 +111,8 @@ class TestHTTP413OverheadAwareTokens:
     """The 413 recovery handler must call estimate_request_tokens_rough with
     tools=agent.tools (non-None) and pass the result as approx_tokens."""
 
-    def test_413_passes_overhead_aware_tokens_to_compress(self, agent):
+    @pytest.mark.asyncio
+    async def test_413_passes_overhead_aware_tokens_to_compress(self, agent):
         """approx_tokens passed to _compress_context equals the overhead-aware estimate."""
         err = Exception("Request entity too large")
         err.status_code = 413
@@ -129,7 +133,7 @@ class TestHTTP413OverheadAwareTokens:
                 [{"role": "user", "content": "compressed"}],
                 "compressed prompt",
             )
-            result = agent.run_conversation("hello", conversation_history=_prefill())
+            result = await agent.run_conversation("hello", conversation_history=_prefill())
 
         # _compress_context must have been called at least once for compression
         mock_compress.assert_called()
@@ -146,7 +150,8 @@ class TestHTTP413OverheadAwareTokens:
             f"{[kw.get('approx_tokens') for kw in compress_kwargs_list]}"
         )
 
-    def test_413_estimate_called_with_non_none_tools(self, agent):
+    @pytest.mark.asyncio
+    async def test_413_estimate_called_with_non_none_tools(self, agent):
         """estimate_request_tokens_rough must receive tools=<non-None> in the 413 handler."""
         err = Exception("Request entity too large")
         err.status_code = 413
@@ -173,7 +178,7 @@ class TestHTTP413OverheadAwareTokens:
                 [{"role": "user", "content": "compressed"}],
                 "compressed prompt",
             )
-            agent.run_conversation("hello", conversation_history=_prefill())
+            await agent.run_conversation("hello", conversation_history=_prefill())
 
         # At least one estimate call from the 413 handler must have non-None tools
         handler_calls_with_tools = [c for c in estimate_calls if c["tools"] is not None]
@@ -206,7 +211,8 @@ class TestContextOverflowOverheadAwareTokens:
         err.status_code = 400
         return err
 
-    def test_context_overflow_passes_overhead_aware_tokens_to_compress(self, agent):
+    @pytest.mark.asyncio
+    async def test_context_overflow_passes_overhead_aware_tokens_to_compress(self, agent):
         """approx_tokens passed to _compress_context equals the overhead-aware estimate."""
         err = self._make_context_overflow_error()
         ok_resp = _mock_response(content="Recovered", finish_reason="stop")
@@ -226,7 +232,7 @@ class TestContextOverflowOverheadAwareTokens:
                 [{"role": "user", "content": "compressed"}],
                 "compressed prompt",
             )
-            result = agent.run_conversation("hello", conversation_history=_prefill())
+            result = await agent.run_conversation("hello", conversation_history=_prefill())
 
         mock_compress.assert_called()
 
@@ -241,7 +247,8 @@ class TestContextOverflowOverheadAwareTokens:
             f"{[kw.get('approx_tokens') for kw in compress_kwargs_list]}"
         )
 
-    def test_context_overflow_estimate_called_with_non_none_tools(self, agent):
+    @pytest.mark.asyncio
+    async def test_context_overflow_estimate_called_with_non_none_tools(self, agent):
         """estimate_request_tokens_rough must receive tools=<non-None> in the context-overflow handler."""
         err = self._make_context_overflow_error()
         ok_resp = _mock_response(content="Recovered", finish_reason="stop")
@@ -267,7 +274,7 @@ class TestContextOverflowOverheadAwareTokens:
                 [{"role": "user", "content": "compressed"}],
                 "compressed prompt",
             )
-            agent.run_conversation("hello", conversation_history=_prefill())
+            await agent.run_conversation("hello", conversation_history=_prefill())
 
         handler_calls_with_tools = [c for c in estimate_calls if c["tools"] is not None]
         assert handler_calls_with_tools, (
@@ -276,7 +283,8 @@ class TestContextOverflowOverheadAwareTokens:
             + str([c["tools"] for c in estimate_calls])
         )
 
-    def test_prompt_too_long_variant_passes_overhead_aware_tokens(self, agent):
+    @pytest.mark.asyncio
+    async def test_prompt_too_long_variant_passes_overhead_aware_tokens(self, agent):
         """Anthropic 'prompt is too long' error also routes to context_overflow handler."""
         err = Exception(
             "Error code: 400 - {'type': 'error', 'error': {'type': 'invalid_request_error', "
@@ -300,7 +308,7 @@ class TestContextOverflowOverheadAwareTokens:
                 [{"role": "user", "content": "compressed"}],
                 "compressed prompt",
             )
-            result = agent.run_conversation("hello", conversation_history=_prefill())
+            result = await agent.run_conversation("hello", conversation_history=_prefill())
 
         mock_compress.assert_called()
         compress_kwargs_list = [c.kwargs for c in mock_compress.call_args_list]
@@ -335,7 +343,8 @@ class TestLongContextTierOverheadAwareTokens:
         err.status_code = 429
         return err
 
-    def test_long_context_tier_passes_overhead_aware_tokens_to_compress(self, agent):
+    @pytest.mark.asyncio
+    async def test_long_context_tier_passes_overhead_aware_tokens_to_compress(self, agent):
         """approx_tokens passed to _compress_context equals the overhead-aware estimate."""
         err = self._make_long_context_tier_error()
         ok_resp = _mock_response(content="Recovered after context tier", finish_reason="stop")
@@ -355,7 +364,7 @@ class TestLongContextTierOverheadAwareTokens:
                 [{"role": "user", "content": "compressed"}],
                 "compressed prompt",
             )
-            result = agent.run_conversation("hello", conversation_history=_prefill())
+            result = await agent.run_conversation("hello", conversation_history=_prefill())
 
         mock_compress.assert_called()
         compress_kwargs_list = [c.kwargs for c in mock_compress.call_args_list]
@@ -368,7 +377,8 @@ class TestLongContextTierOverheadAwareTokens:
             f"Got: {[kw.get('approx_tokens') for kw in compress_kwargs_list]}"
         )
 
-    def test_long_context_tier_estimate_called_with_non_none_tools(self, agent):
+    @pytest.mark.asyncio
+    async def test_long_context_tier_estimate_called_with_non_none_tools(self, agent):
         """estimate_request_tokens_rough must receive tools=<non-None> in the long-context handler."""
         err = self._make_long_context_tier_error()
         ok_resp = _mock_response(content="Recovered", finish_reason="stop")
@@ -394,7 +404,7 @@ class TestLongContextTierOverheadAwareTokens:
                 [{"role": "user", "content": "compressed"}],
                 "compressed prompt",
             )
-            agent.run_conversation("hello", conversation_history=_prefill())
+            await agent.run_conversation("hello", conversation_history=_prefill())
 
         handler_calls_with_tools = [c for c in estimate_calls if c["tools"] is not None]
         assert handler_calls_with_tools, (

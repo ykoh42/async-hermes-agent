@@ -18,6 +18,7 @@ Env: TS_BENCH_REPS (default 2), TS_UE_MODES, TS_UE_SCALE, TS_UE_SUMMARY.
 """
 from __future__ import annotations
 
+import asyncio
 import json, os, re, shutil, sys, time, traceback
 from pathlib import Path
 from typing import Any, Dict, List
@@ -156,7 +157,7 @@ SCENARIOS: List[Dict[str, Any]] = [
 ]
 
 
-def run_one(scenario, mode, scale, rep, out_dir: Path):
+async def run_one(scenario, mode, scale, rep, out_dir: Path):
     enabled = mode in ("bridge", "listing")
     model = os.environ.get("TS_UE_MODEL", "anthropic/claude-opus-4.8")
     # 830-tool catalogs need headroom: full listing ~ names+descs won't fit 4K,
@@ -206,7 +207,7 @@ def run_one(scenario, mode, scale, rep, out_dir: Path):
                 pass
             return cu
         _cl.normalize_usage = _norm_spy
-        result = agent.run_conversation(
+        result = await agent.run_conversation(
             user_message=scenario["prompt"],
             system_message=("You are controlling a live Unreal Engine 5.8 editor. The editor is "
                             "already running and connected through your Unreal (mcp-unreal) tools — "
@@ -269,7 +270,7 @@ def run_one(scenario, mode, scale, rep, out_dir: Path):
     return rec
 
 
-def main():
+async def main():
     out_dir = _THIS_DIR / "out_ue"
     out_dir.mkdir(exist_ok=True)
     scale = os.environ.get("TS_UE_SCALE", "full")
@@ -280,7 +281,7 @@ def main():
             continue
         for mode in modes:
             for rep in range(1, N_REPS + 1):
-                rec = run_one(scenario, mode, scale, rep, out_dir)
+                rec = await run_one(scenario, mode, scale, rep, out_dir)
                 print(f"{scenario['id']:18} {mode:8} {scale:6} rep{rep}: api={rec['api_calls']} "
                       f"in={rec['prompt_tokens_total']:>8,} t={rec['elapsed_seconds']:>6}s "
                       f"ok={rec['success']} err={bool(rec['error'])}", flush=True)
@@ -293,4 +294,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

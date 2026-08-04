@@ -15,7 +15,9 @@ non-retryable path did not.  These tests lock the contract: whichever
 terminal path is taken, ``result['error']`` is a short, HTML-free summary.
 """
 
-from unittest.mock import MagicMock, patch
+import pytest
+
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import run_agent
 from run_agent import AIAgent
@@ -70,6 +72,8 @@ def _make_agent() -> AIAgent:
             skip_memory=True,
         )
     a.client = MagicMock()
+    a.client.chat.completions.create = AsyncMock()
+    a._deferred_provider_runtime = None
     a._cached_system_prompt = "You are helpful."
     a._use_prompt_caching = False
     a.compression_enabled = False
@@ -90,7 +94,8 @@ def test_summarize_collapses_cloudflare_challenge_page():
     assert "403" in summary
 
 
-def test_non_retryable_failure_error_is_summarized_not_raw_html():
+@pytest.mark.asyncio
+async def test_non_retryable_failure_error_is_summarized_not_raw_html():
     """The terminal non-retryable dict must carry a short, HTML-free error.
 
     This is the exact field path: a 403 Cloudflare challenge with no fallback
@@ -109,12 +114,12 @@ def test_non_retryable_failure_error_is_summarized_not_raw_html():
         patch.object(agent, "_save_trajectory"),
         patch.object(agent, "_cleanup_task_resources"),
     ):
-        result = agent.run_conversation("daily briefing please")
+        result = await agent.run_conversation("daily briefing please")
 
     # Guard against a vacuous pass: the mocked 403 must actually be the
     # failure that aborted the turn.  (The previous revision never reached
     # this call and still "passed".)
-    assert agent.client.chat.completions.create.called
+    assert agent.client.chat.completions.create.await_count == 1
     assert result.get("failed") is True
     error = result.get("error") or ""
     # The whole point of the fix: no raw HTML / Cloudflare markup leaks.

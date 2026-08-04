@@ -1,7 +1,7 @@
 """Comprehensive tests for ANSI escape sequence stripping (ECMA-48).
 
 The strip_ansi function in tools/ansi_strip.py is the source-level fix for
-ANSI codes leaking into the model's context via terminal/execute_code output.
+ANSI codes leaking into the model's context via terminal output.
 It must strip ALL terminal escape sequences while preserving legitimate text.
 """
 

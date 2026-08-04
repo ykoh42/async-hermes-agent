@@ -9,6 +9,8 @@ providers (violating role alternation), which retriggered the empty-retry
 recovery every turn.
 """
 
+import pytest
+
 from run_agent import AIAgent
 
 
@@ -216,7 +218,8 @@ def test_cursor_rewinds_when_compaction_happens_before_cursor():
 
 
 
-def test_flush_guard_clamps_overshooting_cursor():
+@pytest.mark.asyncio
+async def test_flush_guard_clamps_overshooting_cursor():
     """_flush_messages_to_session_db safety net: an overshooting cursor must
     not produce a negative-start slice that skips everything (#44837)."""
 
@@ -224,7 +227,7 @@ def test_flush_guard_clamps_overshooting_cursor():
         def __init__(self):
             self.rows = []
 
-        def append_message(self, **kw):
+        async def append_message(self, **kw):
             self.rows.append(kw)
 
         def append_messages_batch(self, session_id, messages, **kw):
@@ -243,7 +246,7 @@ def test_flush_guard_clamps_overshooting_cursor():
         {"role": "assistant", "content": "a"},
     ]
 
-    AIAgent._flush_messages_to_session_db(agent, messages, conversation_history=[])
+    await AIAgent._flush_messages_to_session_db(agent, messages, conversation_history=[])
 
     # min(5, 2) = 2 → nothing skipped below start_idx, cursor settles at 2
     assert agent._last_flushed_db_idx == 2
@@ -368,7 +371,6 @@ def test_sanitize_drops_empty_tool_calls_array():
 # "all messages must have non-empty content except for the optional final
 # assistant message" (INVALID_REQUEST_BODY). sanitize_api_messages now heals
 # such turns on the per-call copy so the session recovers itself in memory.
-
 
 
 

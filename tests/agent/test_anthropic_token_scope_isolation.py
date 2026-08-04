@@ -29,7 +29,7 @@ STATUS
 """
 
 import pytest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from agent import secret_scope as ss
 from agent.anthropic_adapter import resolve_anthropic_token
@@ -50,8 +50,15 @@ def _pin_file_and_pool_sources():
     This isolates the three os.getenv() call sites (sources 1, 2, 5) so each
     test exercises exactly the env-var reading behaviour under scope control.
     """
-    with patch("agent.anthropic_adapter.read_claude_code_credentials", return_value=None), \
-         patch("agent.anthropic_adapter._resolve_anthropic_pool_token", return_value=None):
+    empty_pool = MagicMock()
+    empty_pool.entries.return_value = []
+    with patch(
+        "agent.anthropic_adapter.read_claude_code_credentials",
+        new=AsyncMock(return_value=None),
+    ), patch(
+        "agent.credential_pool.load_pool",
+        new=AsyncMock(return_value=empty_pool),
+    ):
         yield
 
 
@@ -62,7 +69,8 @@ def _pin_file_and_pool_sources():
 class TestApiKeyScopeIsolation:
     """ANTHROPIC_API_KEY (source 5, line 1245) must read from scope, not os.environ."""
 
-    def test_scoped_api_key_used_over_environ(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_scoped_api_key_used_over_environ(self, monkeypatch):
         """Profile scope's ANTHROPIC_API_KEY wins over os.environ value.
 
         Bug: os.getenv("ANTHROPIC_API_KEY") at line 1245 reads the wrong profile's
@@ -76,7 +84,7 @@ class TestApiKeyScopeIsolation:
         ss.set_multiplex_active(True)
         tok = ss.set_secret_scope({"ANTHROPIC_API_KEY": "sk-ant-api-CORRECT-PROFILE"})
         try:
-            result = resolve_anthropic_token()
+            result = await resolve_anthropic_token()
         finally:
             ss.reset_secret_scope(tok)
 
@@ -86,7 +94,8 @@ class TestApiKeyScopeIsolation:
             f"Bug confirmed at anthropic_adapter.py:1245 — os.getenv bypasses get_secret()."
         )
 
-    def test_two_profiles_return_different_keys(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_two_profiles_return_different_keys(self, monkeypatch):
         """Each profile scope must resolve to its own ANTHROPIC_API_KEY.
 
         This is the canonical credential-isolation invariant.
@@ -100,13 +109,13 @@ class TestApiKeyScopeIsolation:
 
         tok_a = ss.set_secret_scope({"ANTHROPIC_API_KEY": "sk-ant-api-PROFILE-A"})
         try:
-            result_a = resolve_anthropic_token()
+            result_a = await resolve_anthropic_token()
         finally:
             ss.reset_secret_scope(tok_a)
 
         tok_b = ss.set_secret_scope({"ANTHROPIC_API_KEY": "sk-ant-api-PROFILE-B"})
         try:
-            result_b = resolve_anthropic_token()
+            result_b = await resolve_anthropic_token()
         finally:
             ss.reset_secret_scope(tok_b)
 
@@ -129,7 +138,10 @@ class TestApiKeyScopeIsolation:
 class TestOAuthTokenLeakageFromEnviron:
     """ANTHROPIC_TOKEN in os.environ must not override the active profile scope."""
 
-    def test_anthropic_token_env_does_not_shadow_scoped_api_key(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_anthropic_token_env_does_not_shadow_scoped_api_key(
+        self, monkeypatch
+    ):
         """An ANTHROPIC_TOKEN present in os.environ from another profile must not be used.
 
         Scenario: Profile B's OAuth token was set in os.environ (e.g., by a previous
@@ -148,7 +160,7 @@ class TestOAuthTokenLeakageFromEnviron:
         ss.set_multiplex_active(True)
         tok = ss.set_secret_scope({"ANTHROPIC_API_KEY": "sk-ant-api-PROFILE-A"})
         try:
-            result = resolve_anthropic_token()
+            result = await resolve_anthropic_token()
         finally:
             ss.reset_secret_scope(tok)
 
@@ -160,7 +172,8 @@ class TestOAuthTokenLeakageFromEnviron:
             f"Expected Profile A's API key but got {result!r}."
         )
 
-    def test_anthropic_token_in_scope_is_used(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_anthropic_token_in_scope_is_used(self, monkeypatch):
         """When ANTHROPIC_TOKEN IS in the active profile scope, it must be used.
 
         This verifies the positive case: scoped OAuth tokens work after the fix.
@@ -172,7 +185,7 @@ class TestOAuthTokenLeakageFromEnviron:
         ss.set_multiplex_active(True)
         tok = ss.set_secret_scope({"ANTHROPIC_TOKEN": "sk-ant-oat-PROFILE-A-OWN-OAUTH"})
         try:
-            result = resolve_anthropic_token()
+            result = await resolve_anthropic_token()
         finally:
             ss.reset_secret_scope(tok)
 
@@ -188,7 +201,8 @@ class TestOAuthTokenLeakageFromEnviron:
 class TestClaudeCodeOAuthTokenLeakage:
     """CLAUDE_CODE_OAUTH_TOKEN in os.environ must not override the active profile scope."""
 
-    def test_cc_oauth_env_does_not_shadow_scoped_api_key(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_cc_oauth_env_does_not_shadow_scoped_api_key(self, monkeypatch):
         """CLAUDE_CODE_OAUTH_TOKEN from os.environ must not be used when it's not in scope.
 
         Bug: os.getenv("CLAUDE_CODE_OAUTH_TOKEN") at line 1226 reads the global env
@@ -202,7 +216,7 @@ class TestClaudeCodeOAuthTokenLeakage:
         ss.set_multiplex_active(True)
         tok = ss.set_secret_scope({"ANTHROPIC_API_KEY": "sk-ant-api-PROFILE-X"})
         try:
-            result = resolve_anthropic_token()
+            result = await resolve_anthropic_token()
         finally:
             ss.reset_secret_scope(tok)
 
@@ -235,7 +249,8 @@ class TestCronSchedulerUnscopedCall:
     cron scheduler must be updated to call set_secret_scope() for each job's profile.
     """
 
-    def test_unscoped_call_in_multiplex_mode_fails_closed(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_unscoped_call_in_multiplex_mode_fails_closed(self, monkeypatch):
         """An unscoped resolve_anthropic_token() in multiplex mode must raise UnscopedSecretError.
 
         Bug: os.getenv() at lines 1218/1226/1245 never raises — silently returning
@@ -251,4 +266,4 @@ class TestCronSchedulerUnscopedCall:
         # No set_secret_scope() call — simulates cron scheduler context
 
         with pytest.raises(ss.UnscopedSecretError, match="ANTHROPIC"):
-            resolve_anthropic_token()
+            await resolve_anthropic_token()

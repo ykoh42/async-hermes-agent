@@ -13,7 +13,7 @@ anthropic_messages) and assert that every mutated field returns to its
 pre-swap value when the rebuild raises.
 """
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -25,6 +25,7 @@ def _make_agent_openrouter():
     agent = AIAgent.__new__(AIAgent)
 
     agent.provider = "openrouter"
+    agent.requested_provider = "openrouter"
     agent.model = "x-ai/grok-4"
     agent.base_url = "https://openrouter.ai/api/v1"
     agent.api_key = "or-key-original"
@@ -46,6 +47,15 @@ def _make_agent_openrouter():
     agent._fallback_chain = []
     agent._fallback_model = None
     agent._config_context_length = None
+    agent._deferred_provider_runtime = None
+    agent._anthropic_client_source = None
+    agent._credential_pool = MagicMock(provider="openrouter")
+    agent._credential_pool.provider = "openrouter"
+    agent._credential_pool_entry_id = None
+    agent._use_prompt_caching = False
+    agent._use_native_cache_layout = False
+    agent.reasoning_config = None
+    agent._persist_pending_billing_route = AsyncMock()
 
     return agent
 
@@ -55,6 +65,7 @@ def _make_agent_anthropic():
     agent = AIAgent.__new__(AIAgent)
 
     agent.provider = "anthropic"
+    agent.requested_provider = "anthropic"
     agent.model = "claude-sonnet-4-5"
     agent.base_url = "https://api.anthropic.com"
     agent.api_key = "sk-ant-original"
@@ -73,32 +84,71 @@ def _make_agent_anthropic():
     agent._fallback_chain = []
     agent._fallback_model = None
     agent._config_context_length = None
+    agent._deferred_provider_runtime = None
+    agent._anthropic_client_source = None
+    agent._credential_pool = MagicMock(provider="anthropic")
+    agent._credential_pool.provider = "anthropic"
+    agent._credential_pool_entry_id = None
+    agent._use_prompt_caching = True
+    agent._use_native_cache_layout = True
+    agent.reasoning_config = None
+    agent._persist_pending_billing_route = AsyncMock()
 
     return agent
 
 
-def test_openai_client_rebuild_failure_rolls_back_to_original_state():
+def _install_runtime_boundary(agent, *, client=None, error=None):
+    """Install a native runtime seam that can fail after partial mutation."""
+
+    async def ensure_provider_runtime():
+        pending = agent._deferred_provider_runtime
+        agent.model = pending["model"]
+        agent.provider = pending["provider"]
+        agent.requested_provider = pending["provider"]
+        agent.base_url = pending["base_url"]
+        agent.api_key = pending["api_key"]
+        agent.api_mode = pending["api_mode"]
+        if agent.api_mode == "anthropic_messages":
+            agent._anthropic_api_key = agent.api_key
+            agent._anthropic_base_url = agent.base_url
+            agent._anthropic_client = client or MagicMock(name="NewAnthropicClient")
+            agent.client = None
+        else:
+            agent.client = client or MagicMock(name="NewOpenAIClient")
+            agent._client_kwargs = {
+                "api_key": agent.api_key,
+                "base_url": agent.base_url,
+            }
+            agent._anthropic_client = None
+        if error is not None:
+            raise error
+        agent._deferred_provider_runtime = None
+        return True
+
+    agent._ensure_provider_runtime = ensure_provider_runtime
+
+
+@pytest.mark.asyncio
+async def test_openai_client_rebuild_failure_rolls_back_to_original_state():
     """When OpenAI client construction fails, every mutated field must restore."""
     agent = _make_agent_openrouter()
 
     original_client = agent.client
     original_kwargs = dict(agent._client_kwargs)
 
-    # _create_openai_client raises mid-swap (simulates bad key / network error)
-    def boom(*_a, **_kw):
-        raise RuntimeError("simulated client build failure")
+    _install_runtime_boundary(
+        agent,
+        error=RuntimeError("simulated client build failure"),
+    )
 
-    agent._create_openai_client = boom
-
-    with patch("hermes_cli.timeouts.get_provider_request_timeout", return_value=None):
-        with pytest.raises(RuntimeError, match="simulated client build failure"):
-            agent.switch_model(
-                new_model="openai/gpt-5",
-                new_provider="openai-codex",
-                api_key="codex-key-new",
-                base_url="https://chatgpt.com/backend-api/codex/responses",
-                api_mode="chat_completions",
-            )
+    with pytest.raises(RuntimeError, match="simulated client build failure"):
+        await agent.switch_model(
+            new_model="openai/gpt-5",
+            new_provider="openai-codex",
+            api_key="codex-key-new",
+            base_url="https://chatgpt.com/backend-api/codex/responses",
+            api_mode="chat_completions",
+        )
 
     # Core invariant: agent state is unchanged from before the call
     assert agent.model == "x-ai/grok-4"
@@ -110,7 +160,8 @@ def test_openai_client_rebuild_failure_rolls_back_to_original_state():
     assert agent._client_kwargs == original_kwargs
 
 
-def test_anthropic_client_rebuild_failure_rolls_back_to_original_state():
+@pytest.mark.asyncio
+async def test_anthropic_client_rebuild_failure_rolls_back_to_original_state():
     """When build_anthropic_client raises, every mutated field must restore."""
     agent = _make_agent_anthropic()
 
@@ -118,26 +169,18 @@ def test_anthropic_client_rebuild_failure_rolls_back_to_original_state():
     original_anthropic_key = agent._anthropic_api_key
     original_anthropic_base = agent._anthropic_base_url
 
-    with (
-        patch(
-            "agent.anthropic_adapter.build_anthropic_client",
-            side_effect=RuntimeError("simulated anthropic build failure"),
-        ),
-        patch(
-            "agent.anthropic_adapter.resolve_anthropic_token",
-            return_value="sk-ant-resolved",
-        ),
-        patch("agent.anthropic_adapter._is_oauth_token", return_value=False),
-        patch("hermes_cli.timeouts.get_provider_request_timeout", return_value=None),
-    ):
-        with pytest.raises(RuntimeError, match="simulated anthropic build failure"):
-            agent.switch_model(
-                new_model="claude-opus-4-6",
-                new_provider="opencode-zen",
-                api_key="zen-key-new",
-                base_url="https://opencode.example/v1",
-                api_mode="anthropic_messages",
-            )
+    _install_runtime_boundary(
+        agent,
+        error=RuntimeError("simulated anthropic build failure"),
+    )
+    with pytest.raises(RuntimeError, match="simulated anthropic build failure"):
+        await agent.switch_model(
+            new_model="claude-opus-4-6",
+            new_provider="opencode-zen",
+            api_key="zen-key-new",
+            base_url="https://opencode.example/v1",
+            api_mode="anthropic_messages",
+        )
 
     # Anthropic-specific state restored
     assert agent._anthropic_client is original_anthropic_client
@@ -152,27 +195,24 @@ def test_anthropic_client_rebuild_failure_rolls_back_to_original_state():
     assert agent.api_key == "sk-ant-original"
 
 
-def test_cross_branch_anthropic_to_openai_rebuild_failure_rolls_back():
+@pytest.mark.asyncio
+async def test_cross_branch_anthropic_to_openai_rebuild_failure_rolls_back():
     """Switching from anthropic_messages to chat_completions: failure must
     restore the anthropic state, not leave the agent half-converted."""
     agent = _make_agent_anthropic()
 
     original_anthropic_client = agent._anthropic_client
 
-    def boom(*_a, **_kw):
-        raise RuntimeError("openai client failed")
+    _install_runtime_boundary(agent, error=RuntimeError("openai client failed"))
 
-    agent._create_openai_client = boom
-
-    with patch("hermes_cli.timeouts.get_provider_request_timeout", return_value=None):
-        with pytest.raises(RuntimeError, match="openai client failed"):
-            agent.switch_model(
-                new_model="x-ai/grok-4",
-                new_provider="openrouter",
-                api_key="or-key-new",
-                base_url="https://openrouter.ai/api/v1",
-                api_mode="chat_completions",
-            )
+    with pytest.raises(RuntimeError, match="openai client failed"):
+        await agent.switch_model(
+            new_model="x-ai/grok-4",
+            new_provider="openrouter",
+            api_key="or-key-new",
+            base_url="https://openrouter.ai/api/v1",
+            api_mode="chat_completions",
+        )
 
     # Anthropic client preserved (not nulled by the openai branch)
     assert agent._anthropic_client is original_anthropic_client
@@ -182,21 +222,21 @@ def test_cross_branch_anthropic_to_openai_rebuild_failure_rolls_back():
     assert agent.base_url == "https://api.anthropic.com"
 
 
-def test_successful_switch_still_works_after_rollback_refactor():
+@pytest.mark.asyncio
+async def test_successful_switch_still_works_after_rollback_refactor():
     """Sanity check: the try/except wrapper hasn't broken the happy path."""
     agent = _make_agent_openrouter()
 
     new_client = MagicMock(name="NewClient")
-    agent._create_openai_client = lambda *_a, **_kw: new_client
+    _install_runtime_boundary(agent, client=new_client)
 
-    with patch("hermes_cli.timeouts.get_provider_request_timeout", return_value=None):
-        agent.switch_model(
-            new_model="openai/gpt-5",
-            new_provider="openrouter",
-            api_key="or-key-new",
-            base_url="https://openrouter.ai/api/v1",
-            api_mode="chat_completions",
-        )
+    await agent.switch_model(
+        new_model="openai/gpt-5",
+        new_provider="openrouter",
+        api_key="or-key-new",
+        base_url="https://openrouter.ai/api/v1",
+        api_mode="chat_completions",
+    )
 
     assert agent.model == "openai/gpt-5"
     assert agent.provider == "openrouter"

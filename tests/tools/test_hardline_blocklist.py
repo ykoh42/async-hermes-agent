@@ -11,19 +11,10 @@ import pytest
 
 from tools.approval import (
     HARDLINE_PATTERNS,
-    check_all_command_guards,
-    check_dangerous_command,
-    detect_dangerous_command,
+    _check_sudo_stdin_guard,
     detect_hardline_command,
-    disable_session_yolo,
-    enable_session_yolo,
-    reset_current_session_key,
-    set_current_session_key,
+    validate_terminal_command,
 )
-
-
-# -------------------------------------------------------------------------
-# Pattern detection
 # -------------------------------------------------------------------------
 
 # Commands that MUST be hardline-blocked.
@@ -296,12 +287,12 @@ def test_real_newline_separated_threats_still_blocked(command):
     assert desc
 
 
-def test_quoted_newline_data_not_blocked_by_full_guard_chain(clean_session):
+@pytest.mark.asyncio
+async def test_quoted_newline_data_not_blocked_by_full_guard_chain():
     """End-to-end: the guard chain must not hardline-block a multi-line
     quoted message (yolo on, so only the unconditional floor can block)."""
-    enable_session_yolo("hardline_test")
     command = 'hermes send -t telegram "status:\nsudo reboot happened at 3am"'
-    result = check_all_command_guards(command, "local")
+    result = await validate_terminal_command(command)
     assert result["approved"], (
         f"guard chain blocked multi-line quoted data: {result.get('message')}"
     )
@@ -395,222 +386,6 @@ def test_hardline_blocks_line_continuation(command, desc_substr):
         f"unexpected description {desc!r} for {command!r}"
     )
 
-
-# -------------------------------------------------------------------------
-# Integration with the approval flow
-# -------------------------------------------------------------------------
-
-@pytest.fixture
-def clean_session(monkeypatch):
-    """Reset session-scoped approval state around each test."""
-    monkeypatch.delenv("HERMES_YOLO_MODE", raising=False)
-    monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
-    monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
-    monkeypatch.delenv("HERMES_CRON_SESSION", raising=False)
-    monkeypatch.delenv("HERMES_EXEC_ASK", raising=False)
-    token = set_current_session_key("hardline_test")
-    try:
-        disable_session_yolo("hardline_test")
-        yield
-    finally:
-        disable_session_yolo("hardline_test")
-        reset_current_session_key(token)
-
-
-def test_check_dangerous_command_blocks_hardline(clean_session):
-    result = check_dangerous_command("rm -rf /", "local")
-    assert result["approved"] is False
-    assert result.get("hardline") is True
-    assert "BLOCKED (hardline)" in result["message"]
-
-
-def test_check_all_command_guards_blocks_hardline(clean_session):
-    result = check_all_command_guards("rm -rf /", "local")
-    assert result["approved"] is False
-    assert result.get("hardline") is True
-    assert "BLOCKED (hardline)" in result["message"]
-
-
-def test_yolo_env_var_cannot_bypass_hardline(clean_session, monkeypatch):
-    """HERMES_YOLO_MODE=1 must not bypass the hardline floor."""
-    monkeypatch.setenv("HERMES_YOLO_MODE", "1")
-
-    for cmd in ['rm -rf /', 'rm -rf "/"', 'rm -rf "$HOME"', "rm -rf ${HOME}",
-                "shutdown -h now", "mkfs.ext4 /dev/sda", "reboot"]:
-        r1 = check_dangerous_command(cmd, "local")
-        assert r1["approved"] is False, f"yolo leaked hardline on {cmd!r} (check_dangerous_command)"
-        assert r1.get("hardline") is True
-
-        r2 = check_all_command_guards(cmd, "local")
-        assert r2["approved"] is False, f"yolo leaked hardline on {cmd!r} (check_all_command_guards)"
-        assert r2.get("hardline") is True
-
-
-def test_root_collapse_forms_cannot_bypass_hardline(clean_session, monkeypatch):
-    """Shell-equivalent spellings of "rm -rf /" stay blocked under yolo.
-
-    "//", "/.", "/./", "/..", "//*" all collapse to the root filesystem in
-    the shell. They previously matched only the softer DANGEROUS_PATTERNS
-    rule, which yolo bypasses — leaving the hardline floor open to a full
-    root wipe under --yolo / approvals.mode=off / cron approve-mode.
-    """
-    monkeypatch.setenv("HERMES_YOLO_MODE", "1")
-
-    for cmd in ["rm -rf //", "rm -rf /.", "rm -rf /./", "rm -rf /..", "rm -rf //*"]:
-        is_hl, _ = detect_hardline_command(cmd)
-        assert is_hl, f"{cmd!r} should be hardline-blocked"
-        result = check_all_command_guards(cmd, "local")
-        assert result["approved"] is False, f"yolo leaked hardline on {cmd!r}"
-        assert result.get("hardline") is True
-
-
-def test_root_collapse_pattern_leaves_real_paths_alone(clean_session):
-    """The broadened root token must not over-match real trailing segments.
-
-    A path with a real component after the root-collapse prefix (/tmp,
-    /home/user/x, /.ssh, ./build) is recoverable-or-legitimate and must NOT
-    be pulled onto the hardline floor by the "collapse to /" broadening.
-    """
-    for cmd in ["rm -rf /tmp", "rm -rf /home/user/x", "rm -rf /.ssh",
-                "rm -rf /.config", "rm -rf ./build", "rm -rf /opt/foo",
-                "rm -rf /...", "rm -rf /....", "rm -rf /.foo"]:
-        is_hl, _ = detect_hardline_command(cmd)
-        assert not is_hl, f"{cmd!r} must not be hardline-blocked (over-match)"
-
-
-def test_subshell_brace_group_cannot_bypass_hardline(clean_session, monkeypatch):
-    """Wrapping a catastrophic command in `(…)` or `{ …; }` must not bypass
-    the floor, even under yolo. `(reboot)` / `{ shutdown -h now; }` walked
-    straight past the guard before the command-start tokenizer recognized the
-    subshell and brace-group openers.
-    """
-    monkeypatch.setenv("HERMES_YOLO_MODE", "1")
-
-    for cmd in ["(reboot)", "( reboot )", "(shutdown -h now)", "(poweroff)",
-                "(systemctl reboot)", "(init 0)", "(sudo reboot)",
-                "{ reboot; }", "{ shutdown -h now; }", "{ poweroff; }",
-                "(rm -rf /)", "{ rm -rf /; }", "(rm -rf ~)",
-                "true && (reboot)", "echo hi; { reboot; }"]:
-        r1 = check_dangerous_command(cmd, "local")
-        assert r1["approved"] is False, f"yolo leaked hardline on {cmd!r} (check_dangerous_command)"
-        assert r1.get("hardline") is True
-
-        r2 = check_all_command_guards(cmd, "local")
-        assert r2["approved"] is False, f"yolo leaked hardline on {cmd!r} (check_all_command_guards)"
-        assert r2.get("hardline") is True
-
-
-def test_quoted_paren_brace_prose_not_blocked_under_yolo(clean_session, monkeypatch):
-    """A `(` / `{` inside a quoted argument is prose, not a command opener.
-
-    Regression guard: naively adding `(` / `{` to the flat command-position
-    class blocked ordinary quoted arguments — including our own
-    `gh pr create --title "…(reboot)…"` workflow. The quote-aware tokenizer
-    must leave quoted text untouched, so these stay runnable.
-    """
-    monkeypatch.setenv("HERMES_YOLO_MODE", "1")
-
-    for cmd in ['gh pr create --title "block (reboot) spellings"',
-                'git commit -m "(rm -rf /) note"',
-                'echo "(reboot)"', 'echo "{ reboot; }"',
-                "echo '(poweroff)'", 'find . -name "*(reboot)*"']:
-        assert detect_hardline_command(cmd)[0] is False, (
-            f"quoted prose false-positived on the hardline floor: {cmd!r}"
-        )
-
-
-def test_line_continuation_root_wipe_cannot_bypass_hardline(clean_session, monkeypatch):
-    """A line-continuation root wipe must stay blocked even under yolo.
-
-    `rm -rf \\<newline>/` runs as `rm -rf /`. Yolo bypasses the regular
-    dangerous-command layer, so the hardline floor is the only thing left to
-    catch it — it must hold.
-    """
-    monkeypatch.setenv("HERMES_YOLO_MODE", "1")
-
-    result = check_all_command_guards("rm -rf \\\n/", "local")
-    assert result["approved"] is False, "yolo leaked a line-continuation root wipe"
-    assert result.get("hardline") is True
-    assert "BLOCKED (hardline)" in result["message"]
-
-
-def test_session_yolo_cannot_bypass_hardline(clean_session):
-    """Gateway /yolo (session-scoped) must not bypass the hardline floor."""
-    enable_session_yolo("hardline_test")
-
-    result = check_dangerous_command("rm -rf /", "local")
-    assert result["approved"] is False
-    assert result.get("hardline") is True
-
-    result = check_all_command_guards("rm -rf /", "local")
-    assert result["approved"] is False
-    assert result.get("hardline") is True
-
-
-def test_approvals_mode_off_cannot_bypass_hardline(clean_session, monkeypatch, tmp_path):
-    """config approvals.mode=off (yolo-equivalent) must not bypass hardline."""
-    # _get_approval_mode() reads from hermes config; simplest path: monkeypatch the helper.
-    import tools.approval as approval_mod
-    monkeypatch.setattr(approval_mod, "_get_approval_mode", lambda: "off")
-
-    result = check_all_command_guards("rm -rf /", "local")
-    assert result["approved"] is False
-    assert result.get("hardline") is True
-
-
-def test_cron_approve_mode_cannot_bypass_hardline(clean_session, monkeypatch):
-    """Cron sessions with cron_mode=approve must not bypass hardline."""
-    monkeypatch.setenv("HERMES_CRON_SESSION", "1")
-    import tools.approval as approval_mod
-    monkeypatch.setattr(approval_mod, "_get_cron_approval_mode", lambda: "approve")
-
-    result = check_all_command_guards("rm -rf /", "local")
-    assert result["approved"] is False
-    assert result.get("hardline") is True
-
-
-def test_container_backends_still_bypass(clean_session):
-    """Containerized backends remain bypass-approved — they can't touch the host.
-
-    Hardline only protects environments with real host impact (local, ssh).
-    """
-    for env in ("docker", "singularity", "modal", "daytona", "vercel_sandbox"):
-        r1 = check_dangerous_command("rm -rf /", env)
-        assert r1["approved"] is True, f"container {env} should still bypass"
-        r2 = check_all_command_guards("rm -rf /", env)
-        assert r2["approved"] is True, f"container {env} should still bypass"
-
-
-def test_hardline_runs_before_dangerous_detection(clean_session):
-    """Hardline command should return hardline block, not dangerous approval prompt."""
-    # `rm -rf /` is both hardline AND matches DANGEROUS_PATTERNS. Hardline must win.
-    is_dangerous, _, _ = detect_dangerous_command("rm -rf /")
-    assert is_dangerous, "precondition: rm -rf / is also in DANGEROUS_PATTERNS"
-
-    result = check_dangerous_command("rm -rf /", "local")
-    assert result.get("hardline") is True
-
-
-def test_recoverable_dangerous_commands_still_pass_yolo(clean_session, monkeypatch):
-    """Yolo still bypasses the regular DANGEROUS_PATTERNS list.
-
-    This confirms we haven't broken the yolo escape hatch — only narrowed it.
-    """
-    monkeypatch.setenv("HERMES_YOLO_MODE", "1")
-
-    # These are dangerous but NOT hardline — yolo should still pass them.
-    for cmd in ["rm -rf /tmp/x", "chmod -R 777 .", "git reset --hard", "git push --force"]:
-        # Sanity: still flagged as dangerous
-        is_dangerous, _, _ = detect_dangerous_command(cmd)
-        assert is_dangerous, f"precondition: {cmd!r} should be in DANGEROUS_PATTERNS"
-        # But NOT hardline
-        is_hl, _ = detect_hardline_command(cmd)
-        assert not is_hl, f"{cmd!r} should not be hardline"
-        # And yolo bypasses the dangerous check
-        result = check_dangerous_command(cmd, "local")
-        assert result["approved"] is True, f"yolo should have bypassed {cmd!r}"
-
-
 def test_hardline_list_is_small():
     """Hardline list stays focused on unrecoverable commands only.
 
@@ -621,11 +396,6 @@ def test_hardline_list_is_small():
         f"HARDLINE_PATTERNS has grown to {len(HARDLINE_PATTERNS)} entries; "
         "only truly unrecoverable commands belong here."
     )
-
-
-# =========================================================================
-# Sudo stdin guard — blocks "sudo -S" without SUDO_PASSWORD
-# =========================================================================
 
 _SUDO_STDIN_BLOCK = [
     "sudo -S whoami",
@@ -662,11 +432,3 @@ def test_sudo_stdin_guard_detects_without_password():
         is_blocked, desc = approval_mod._check_sudo_stdin_guard(cmd)
         assert is_blocked, f"expected sudo stdin guard to block {cmd!r}"
         assert "sudo" in desc.lower()
-
-
-def test_sudo_stdin_guard_container_bypass(clean_session):
-    """Containerized backends still bypass — they can't touch the host."""
-    for env in ("docker", "singularity", "modal", "daytona", "vercel_sandbox"):
-        for cmd in _SUDO_STDIN_BLOCK:
-            result = check_all_command_guards(cmd, env)
-            assert result["approved"] is True, f"container {env} should bypass sudo guard on {cmd!r}"

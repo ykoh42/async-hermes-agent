@@ -21,6 +21,7 @@ Output: ./out/<scenario_id>__<enabled|disabled>.json
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
@@ -353,7 +354,7 @@ def reset_module_state():
         del sys.modules[k]
 
 
-def run_one_scenario(scenario: Dict[str, Any], enabled: bool, out_dir: Path) -> Dict[str, Any]:
+async def run_one_scenario(scenario: Dict[str, Any], enabled: bool, out_dir: Path) -> Dict[str, Any]:
     """Run one (scenario, enabled) combination. Returns the recorded transcript."""
     reset_module_state()
     home = setup_isolated_home(enabled=enabled)
@@ -398,7 +399,7 @@ def run_one_scenario(scenario: Dict[str, Any], enabled: bool, out_dir: Path) -> 
             platform="cli",
             max_iterations=15,
         )
-        result = agent.run_conversation(
+        result = await agent.run_conversation(
             user_message=scenario["prompt"],
             system_message=(
                 "You are a test agent. Complete the user's task using available "
@@ -509,7 +510,7 @@ def _extract_bridge_calls(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]
     return out
 
 
-def main():
+async def main():
     out_dir = _THIS_DIR / "out"
     out_dir.mkdir(exist_ok=True)
     print(f"Writing transcripts to: {out_dir}")
@@ -519,7 +520,7 @@ def main():
         for enabled in (True, False):
             label = "enabled" if enabled else "disabled"
             print(f"\n{'='*72}\nScenario {scenario['id']} (tool_search={label})\n{'='*72}")
-            record = run_one_scenario(scenario, enabled, out_dir)
+            record = await run_one_scenario(scenario, enabled, out_dir)
             n_bridge = len(record["bridge_calls"])
             n_under = len(record["underlying_tool_calls"])
             err = record["error"]
@@ -550,4 +551,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

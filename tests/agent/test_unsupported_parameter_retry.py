@@ -22,7 +22,6 @@ import pytest
 
 from agent.auxiliary_client import (
     call_llm,
-    async_call_llm,
     _is_unsupported_parameter_error,
     _is_unsupported_temperature_error,
 )
@@ -68,40 +67,14 @@ class TestMaxTokensRetryHardening:
     and (b) also matches the generic phrasings via the helper.
     """
 
-    def test_sync_max_tokens_retry_skipped_when_max_tokens_is_none(self):
+    @pytest.mark.asyncio
+    async def test_max_tokens_retry_skipped_when_max_tokens_is_none(self):
         """No max_tokens kwarg → must not pop/retry even if the error mentions it.
 
         Before the hardening, ``kwargs.pop("max_tokens", None)`` was safe but
         ``kwargs["max_completion_tokens"] = max_tokens`` would set a None
         value and hit the provider again. The gate skips the whole branch.
         """
-        client = MagicMock()
-        client.base_url = "https://api.openai.com/v1"
-        err = RuntimeError("HTTP 400: Unsupported parameter: max_tokens")
-        client.chat.completions.create.side_effect = err
-
-        with (
-            patch("agent.auxiliary_client._resolve_task_provider_model",
-                  return_value=("openai-codex", "gpt-5.5", None, None, None)),
-            patch("agent.auxiliary_client._get_cached_client",
-                  return_value=(client, "gpt-5.5")),
-            patch("agent.auxiliary_client._validate_llm_response",
-                  side_effect=lambda resp, _task, **_kw: resp),
-        ):
-            with pytest.raises(RuntimeError):
-                call_llm(
-                    task="session_search",
-                    messages=[{"role": "user", "content": "hi"}],
-                    temperature=0.3,
-                    # max_tokens omitted on purpose
-                )
-
-        # Only the initial attempt — no retry because the gate blocked it
-        assert client.chat.completions.create.call_count == 1
-
-
-    @pytest.mark.asyncio
-    async def test_async_max_tokens_retry_skipped_when_max_tokens_is_none(self):
         client = MagicMock()
         client.base_url = "https://api.openai.com/v1"
         err = RuntimeError("HTTP 400: Unsupported parameter: max_tokens")
@@ -113,14 +86,16 @@ class TestMaxTokensRetryHardening:
             patch("agent.auxiliary_client._get_cached_client",
                   return_value=(client, "gpt-5.5")),
             patch("agent.auxiliary_client._validate_llm_response",
+                  new_callable=AsyncMock,
                   side_effect=lambda resp, _task, **_kw: resp),
         ):
             with pytest.raises(RuntimeError):
-                await async_call_llm(
+                await call_llm(
                     task="session_search",
                     messages=[{"role": "user", "content": "hi"}],
                     temperature=0.3,
+                    # max_tokens omitted on purpose
                 )
 
+        # Only the initial attempt — no retry because the gate blocked it
         assert client.chat.completions.create.call_count == 1
-

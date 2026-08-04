@@ -16,7 +16,7 @@ instead of rebuilding).  Covers:
 from __future__ import annotations
 
 import logging
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -32,11 +32,19 @@ def _make_agent(session_db=None, prebuilt_prompt: str = "BUILT_PROMPT"):
     agent.provider = "openrouter"
     agent.platform = "cli"
     agent._session_db = session_db
+    if session_db is not None:
+        get_session = AsyncMock(return_value=session_db.get_session.return_value)
+        get_session.side_effect = session_db.get_session.side_effect
+        update_system_prompt = AsyncMock()
+        update_system_prompt.side_effect = session_db.update_system_prompt.side_effect
+        session_db.get_session = get_session
+        session_db.update_system_prompt = update_system_prompt
+        agent._get_async_session_db = MagicMock(return_value=session_db)
     # MagicMock attributes are truthy by default; the static-prefix
     # reconstruction is gated on _use_prompt_caching, so default it off
     # for the legacy restore tests (the reconstruction tests enable it).
     agent._use_prompt_caching = False
-    agent._build_system_prompt = MagicMock(return_value=prebuilt_prompt)
+    agent._build_system_prompt = AsyncMock(return_value=prebuilt_prompt)
     return agent
 
 
@@ -46,7 +54,8 @@ def _make_agent(session_db=None, prebuilt_prompt: str = "BUILT_PROMPT"):
 
 
 class TestStoredPromptReuse:
-    def test_present_row_is_reused_verbatim(self, caplog):
+    @pytest.mark.asyncio
+    async def test_present_row_is_reused_verbatim(self, caplog):
         """Continuing session with a stored prompt → reuse byte-for-byte."""
         stored = "Stored prompt from turn 1 — byte-identical reuse"
         db = MagicMock()
@@ -54,7 +63,7 @@ class TestStoredPromptReuse:
         agent = _make_agent(session_db=db)
 
         with caplog.at_level(logging.WARNING, logger="agent.conversation_loop"):
-            _restore_or_build_system_prompt(agent, None, [{"role": "user", "content": "hi"}])
+            await _restore_or_build_system_prompt(agent, None, [{"role": "user", "content": "hi"}])
 
         assert agent._cached_system_prompt == stored
         agent._build_system_prompt.assert_not_called()
@@ -62,17 +71,19 @@ class TestStoredPromptReuse:
         # No warnings on the happy path
         assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
 
-    def test_present_row_with_unicode_preserved(self):
+    @pytest.mark.asyncio
+    async def test_present_row_with_unicode_preserved(self):
         """Non-ASCII bytes in the stored prompt are not mangled."""
         stored = "Stored prompt with unicode: ☤ ⚗ ◆ — and emoji 🦊"
         db = MagicMock()
         db.get_session.return_value = {"system_prompt": stored}
         agent = _make_agent(session_db=db)
 
-        _restore_or_build_system_prompt(agent, None, [{"role": "user", "content": "hi"}])
+        await _restore_or_build_system_prompt(agent, None, [{"role": "user", "content": "hi"}])
         assert agent._cached_system_prompt == stored
 
-    def test_present_row_with_stale_runtime_identity_rebuilds(self, caplog):
+    @pytest.mark.asyncio
+    async def test_present_row_with_stale_runtime_identity_rebuilds(self, caplog):
         """Stored prompts are cache gold unless their runtime identity is stale.
 
         A live /model switch updates the agent and DB model_config immediately.
@@ -102,7 +113,7 @@ class TestStoredPromptReuse:
         agent.model = "openai/gpt-5.5"
 
         with caplog.at_level(logging.INFO, logger="agent.conversation_loop"):
-            _restore_or_build_system_prompt(agent, None, [{"role": "user", "content": "hi"}])
+            await _restore_or_build_system_prompt(agent, None, [{"role": "user", "content": "hi"}])
 
         assert agent._cached_system_prompt.endswith(
             "Model: openai/gpt-5.5\nProvider: openrouter"
@@ -120,13 +131,14 @@ class TestStoredPromptReuse:
 
 
 class TestLegitimateFreshBuild:
-    def test_no_history_skips_db_and_builds_fresh(self, caplog):
+    @pytest.mark.asyncio
+    async def test_no_history_skips_db_and_builds_fresh(self, caplog):
         """First turn with empty history → build fresh, don't touch the DB."""
         db = MagicMock()
         agent = _make_agent(session_db=db)
 
         with caplog.at_level(logging.WARNING, logger="agent.conversation_loop"):
-            _restore_or_build_system_prompt(agent, None, [])
+            await _restore_or_build_system_prompt(agent, None, [])
 
         # No history → DB read skipped entirely
         db.get_session.assert_not_called()
@@ -136,10 +148,11 @@ class TestLegitimateFreshBuild:
         db.update_system_prompt.assert_called_once_with(agent.session_id, "BUILT_PROMPT")
         assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
 
-    def test_no_db_skips_persistence(self):
+    @pytest.mark.asyncio
+    async def test_no_db_skips_persistence(self):
         """When session DB is None, build and skip persistence silently."""
         agent = _make_agent(session_db=None)
-        _restore_or_build_system_prompt(agent, None, [])
+        await _restore_or_build_system_prompt(agent, None, [])
         agent._build_system_prompt.assert_called_once()
         assert agent._cached_system_prompt == "BUILT_PROMPT"
 
@@ -153,7 +166,8 @@ class TestSilentFailureWarnings:
 
 
 
-    def test_db_write_failure_warns_loudly(self, caplog):
+    @pytest.mark.asyncio
+    async def test_db_write_failure_warns_loudly(self, caplog):
         """update_system_prompt raising → WARNING (was DEBUG before)."""
         db = MagicMock()
         # No prior row (first turn)
@@ -162,7 +176,7 @@ class TestSilentFailureWarnings:
         agent = _make_agent(session_db=db)
 
         with caplog.at_level(logging.WARNING, logger="agent.conversation_loop"):
-            _restore_or_build_system_prompt(agent, None, [])
+            await _restore_or_build_system_prompt(agent, None, [])
 
         # Built and assigned the cache anyway
         agent._build_system_prompt.assert_called_once()
@@ -174,7 +188,8 @@ class TestSilentFailureWarnings:
             for m in warnings
         ), f"Expected write-failure warning, got: {warnings}"
 
-    def test_no_history_with_null_row_does_not_warn(self, caplog):
+    @pytest.mark.asyncio
+    async def test_no_history_with_null_row_does_not_warn(self, caplog):
         """First turn (no history) hitting a null row is not surprising — no warn."""
         db = MagicMock()
         db.get_session.return_value = {"system_prompt": None}
@@ -182,7 +197,7 @@ class TestSilentFailureWarnings:
 
         with caplog.at_level(logging.WARNING, logger="agent.conversation_loop"):
             # Empty history → DB read is skipped entirely
-            _restore_or_build_system_prompt(agent, None, [])
+            await _restore_or_build_system_prompt(agent, None, [])
 
         db.get_session.assert_not_called()
         # No "rebuilding from scratch" warning because history is empty
@@ -196,7 +211,8 @@ class TestSilentFailureWarnings:
 
 
 class TestPromptStabilityInvariant:
-    def test_restored_prompt_is_byte_identical_to_stored(self):
+    @pytest.mark.asyncio
+    async def test_restored_prompt_is_byte_identical_to_stored(self):
         """The restored prompt must equal the stored bytes exactly — no
         normalization, trimming, or concat that could shift the prefix.
 
@@ -213,7 +229,7 @@ class TestPromptStabilityInvariant:
         db.get_session.return_value = {"system_prompt": stored}
         agent = _make_agent(session_db=db)
 
-        _restore_or_build_system_prompt(agent, None, [{"role": "user", "content": "hi"}])
+        await _restore_or_build_system_prompt(agent, None, [{"role": "user", "content": "hi"}])
 
         # Identity check — must be the same object reference for maximum
         # confidence we're not slicing/copying/normalizing.
@@ -237,7 +253,8 @@ class TestStaticPrefixReconstructionOnRestore:
     single-breakpoint layout after turn 1 (flagged on PR #68258 review).
     """
 
-    def test_restore_reconstructs_static_prefix_when_it_matches(self):
+    @pytest.mark.asyncio
+    async def test_restore_reconstructs_static_prefix_when_it_matches(self):
         stable = "STATIC IDENTITY AND GUIDANCE"
         stored = stable + "\n\nper-session context\n\nvolatile tail"
         db = MagicMock()
@@ -252,7 +269,7 @@ class TestStaticPrefixReconstructionOnRestore:
             "agent.system_prompt.build_system_prompt_parts",
             return_value={"stable": stable, "context": "", "volatile": ""},
         ):
-            _restore_or_build_system_prompt(
+            await _restore_or_build_system_prompt(
                 agent, None, [{"role": "user", "content": "hi"}]
             )
 
@@ -260,7 +277,8 @@ class TestStaticPrefixReconstructionOnRestore:
         assert agent._cached_system_prompt == stored
         assert agent._cached_system_prompt_static == stable
 
-    def test_restore_leaves_static_unset_on_prefix_mismatch(self):
+    @pytest.mark.asyncio
+    async def test_restore_leaves_static_unset_on_prefix_mismatch(self):
         """Stable-tier drift (skills edited since persist) → no static prefix,
         legacy layout, restored bytes still authoritative."""
         stored = "OLD STATIC HEAD\n\nper-session context"
@@ -276,14 +294,15 @@ class TestStaticPrefixReconstructionOnRestore:
             "agent.system_prompt.build_system_prompt_parts",
             return_value={"stable": "NEW STATIC HEAD", "context": "", "volatile": ""},
         ):
-            _restore_or_build_system_prompt(
+            await _restore_or_build_system_prompt(
                 agent, None, [{"role": "user", "content": "hi"}]
             )
 
         assert agent._cached_system_prompt == stored
         assert agent._cached_system_prompt_static is None
 
-    def test_restore_survives_parts_builder_exception(self):
+    @pytest.mark.asyncio
+    async def test_restore_survives_parts_builder_exception(self):
         """Prefix reconstruction is fail-open: a parts-builder crash must not
         break the byte-identical restore."""
         stored = "Stored prompt — must survive"
@@ -299,7 +318,7 @@ class TestStaticPrefixReconstructionOnRestore:
             "agent.system_prompt.build_system_prompt_parts",
             side_effect=RuntimeError("boom"),
         ):
-            _restore_or_build_system_prompt(
+            await _restore_or_build_system_prompt(
                 agent, None, [{"role": "user", "content": "hi"}]
             )
 
@@ -324,7 +343,8 @@ class TestReconstructStaticPrefixMemoization:
         agent._cached_system_prompt_static = None
         return agent
 
-    def test_failed_rebuild_is_memoized_per_stored_prompt(self):
+    @pytest.mark.asyncio
+    async def test_failed_rebuild_is_memoized_per_stored_prompt(self):
         from unittest.mock import patch as _patch
 
         from agent.system_prompt import reconstruct_static_prefix
@@ -335,13 +355,14 @@ class TestReconstructStaticPrefixMemoization:
             "agent.system_prompt.build_system_prompt_parts",
             return_value={"stable": "MISMATCH", "context": "", "volatile": ""},
         ) as build:
-            reconstruct_static_prefix(agent)
-            reconstruct_static_prefix(agent)
-            reconstruct_static_prefix(agent)
+            await reconstruct_static_prefix(agent)
+            await reconstruct_static_prefix(agent)
+            await reconstruct_static_prefix(agent)
         assert build.call_count == 1
         assert agent._cached_system_prompt_static is None
 
-    def test_changed_stored_prompt_retries_once(self):
+    @pytest.mark.asyncio
+    async def test_changed_stored_prompt_retries_once(self):
         from unittest.mock import patch as _patch
 
         from agent.system_prompt import reconstruct_static_prefix
@@ -351,15 +372,16 @@ class TestReconstructStaticPrefixMemoization:
             "agent.system_prompt.build_system_prompt_parts",
             return_value={"stable": "MISMATCH", "context": "", "volatile": ""},
         ) as build:
-            reconstruct_static_prefix(agent)
+            await reconstruct_static_prefix(agent)
             # A new stored prompt (e.g. after compression) invalidates the
             # failure memo and gets exactly one fresh attempt.
             agent._cached_system_prompt = "NEW STORED"
-            reconstruct_static_prefix(agent)
-            reconstruct_static_prefix(agent)
+            await reconstruct_static_prefix(agent)
+            await reconstruct_static_prefix(agent)
         assert build.call_count == 2
 
-    def test_success_clears_failure_memo_and_early_returns(self):
+    @pytest.mark.asyncio
+    async def test_success_clears_failure_memo_and_early_returns(self):
         from unittest.mock import patch as _patch
 
         from agent.system_prompt import reconstruct_static_prefix
@@ -371,8 +393,8 @@ class TestReconstructStaticPrefixMemoization:
             "agent.system_prompt.build_system_prompt_parts",
             return_value={"stable": stable, "context": "", "volatile": ""},
         ) as build:
-            reconstruct_static_prefix(agent)
-            reconstruct_static_prefix(agent)
+            await reconstruct_static_prefix(agent)
+            await reconstruct_static_prefix(agent)
         # Second call early-returns on the already-valid static prefix.
         assert build.call_count == 1
         assert agent._cached_system_prompt_static == stable

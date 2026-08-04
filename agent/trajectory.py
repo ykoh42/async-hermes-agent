@@ -6,7 +6,9 @@ the file-write logic live here.
 """
 
 import json
+import asyncio
 import logging
+import aiofiles
 from datetime import datetime
 from typing import Any, Dict, List
 
@@ -27,8 +29,8 @@ def has_incomplete_scratchpad(content: str) -> bool:
     return "<REASONING_SCRATCHPAD>" in content and "</REASONING_SCRATCHPAD>" not in content
 
 
-def save_trajectory(trajectory: List[Dict[str, Any]], model: str,
-                    completed: bool, filename: str = None):
+async def save_trajectory(trajectory: List[Dict[str, Any]], model: str,
+                          completed: bool, filename: str = None):
     """Append a trajectory entry to a JSONL file.
 
     Args:
@@ -48,9 +50,23 @@ def save_trajectory(trajectory: List[Dict[str, Any]], model: str,
         "completed": completed,
     }
 
+    line = json.dumps(entry, ensure_ascii=False) + "\n"
+
+    async def _append() -> None:
+        async with aiofiles.open(filename, "a", encoding="utf-8") as handle:
+            await handle.write(line)
+            await handle.flush()
+
     try:
-        with open(filename, "a", encoding="utf-8") as f:
-            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        # Keep one JSONL record intact when the owning turn is cancelled. The
+        # write task is short and remains shielded long enough to close the
+        # file before cancellation is propagated to the caller.
+        write_task = asyncio.create_task(_append())
+        try:
+            await asyncio.shield(write_task)
+        except asyncio.CancelledError:
+            await asyncio.shield(write_task)
+            raise
         logger.info("Trajectory saved to %s", filename)
     except Exception as e:
         logger.warning("Failed to save trajectory: %s", e)

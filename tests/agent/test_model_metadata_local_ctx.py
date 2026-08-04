@@ -4,9 +4,20 @@ get_model_context_length.
 All tests use synthetic inputs — no filesystem or live server required.
 """
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+
+pytestmark = pytest.mark.asyncio
+
+
+def _make_async_client():
+    client = MagicMock()
+    client.__aenter__ = AsyncMock(return_value=client)
+    client.__aexit__ = AsyncMock(return_value=False)
+    client.get = AsyncMock()
+    client.post = AsyncMock()
+    return client
 
 
 
@@ -41,7 +52,7 @@ class TestQueryLocalContextLengthOllama:
         return resp
 
 
-    def test_ollama_parameters_num_ctx(self):
+    async def test_ollama_parameters_num_ctx(self):
         """Falls back to num_ctx in parameters string when model_info lacks context_length."""
         from agent.model_metadata import _query_local_context_length
 
@@ -51,35 +62,31 @@ class TestQueryLocalContextLengthOllama:
         })
         models_resp = self._make_resp(404, {})
 
-        client_mock = MagicMock()
-        client_mock.__enter__ = lambda s: client_mock
-        client_mock.__exit__ = MagicMock(return_value=False)
+        client_mock = _make_async_client()
         client_mock.post.return_value = show_resp
         client_mock.get.return_value = models_resp
 
-        with patch("agent.model_metadata.detect_local_server_type", return_value="ollama"), \
-             patch("httpx.Client", return_value=client_mock):
-            result = _query_local_context_length("some-model", "http://localhost:11434/v1")
+        with patch("agent.model_metadata.detect_local_server_type", new=AsyncMock(return_value="ollama")), \
+             patch("httpx.AsyncClient", return_value=client_mock):
+            result = await _query_local_context_length("some-model", "http://localhost:11434/v1")
 
         assert result == 32768
 
 
-    def test_ollama_show_404_falls_through(self):
+    async def test_ollama_show_404_falls_through(self):
         """When /api/show returns 404, falls through to /v1/models/{model}."""
         from agent.model_metadata import _query_local_context_length
 
         show_resp = self._make_resp(404, {})
         model_detail_resp = self._make_resp(200, {"max_model_len": 65536})
 
-        client_mock = MagicMock()
-        client_mock.__enter__ = lambda s: client_mock
-        client_mock.__exit__ = MagicMock(return_value=False)
+        client_mock = _make_async_client()
         client_mock.post.return_value = show_resp
         client_mock.get.return_value = model_detail_resp
 
-        with patch("agent.model_metadata.detect_local_server_type", return_value="ollama"), \
-             patch("httpx.Client", return_value=client_mock):
-            result = _query_local_context_length("some-model", "http://localhost:11434/v1")
+        with patch("agent.model_metadata.detect_local_server_type", new=AsyncMock(return_value="ollama")), \
+             patch("httpx.AsyncClient", return_value=client_mock):
+            result = await _query_local_context_length("some-model", "http://localhost:11434/v1")
 
         assert result == 65536
 
@@ -93,40 +100,36 @@ class TestQueryLocalContextLengthVllm:
         resp.json.return_value = body
         return resp
 
-    def test_vllm_max_model_len(self):
+    async def test_vllm_max_model_len(self):
         """Reads max_model_len from /v1/models/{model} response."""
         from agent.model_metadata import _query_local_context_length
 
         detail_resp = self._make_resp(200, {"id": "omnicoder-9b", "max_model_len": 100000})
         list_resp = self._make_resp(404, {})
 
-        client_mock = MagicMock()
-        client_mock.__enter__ = lambda s: client_mock
-        client_mock.__exit__ = MagicMock(return_value=False)
+        client_mock = _make_async_client()
         client_mock.post.return_value = self._make_resp(404, {})
         client_mock.get.return_value = detail_resp
 
-        with patch("agent.model_metadata.detect_local_server_type", return_value="vllm"), \
-             patch("httpx.Client", return_value=client_mock):
-            result = _query_local_context_length("omnicoder-9b", "http://localhost:8000/v1")
+        with patch("agent.model_metadata.detect_local_server_type", new=AsyncMock(return_value="vllm")), \
+             patch("httpx.AsyncClient", return_value=client_mock):
+            result = await _query_local_context_length("omnicoder-9b", "http://localhost:8000/v1")
 
         assert result == 100000
 
-    def test_vllm_context_length_key(self):
+    async def test_vllm_context_length_key(self):
         """Reads context_length from /v1/models/{model} response."""
         from agent.model_metadata import _query_local_context_length
 
         detail_resp = self._make_resp(200, {"id": "some-model", "context_length": 32768})
 
-        client_mock = MagicMock()
-        client_mock.__enter__ = lambda s: client_mock
-        client_mock.__exit__ = MagicMock(return_value=False)
+        client_mock = _make_async_client()
         client_mock.post.return_value = self._make_resp(404, {})
         client_mock.get.return_value = detail_resp
 
-        with patch("agent.model_metadata.detect_local_server_type", return_value="vllm"), \
-             patch("httpx.Client", return_value=client_mock):
-            result = _query_local_context_length("some-model", "http://localhost:8000/v1")
+        with patch("agent.model_metadata.detect_local_server_type", new=AsyncMock(return_value="vllm")), \
+             patch("httpx.AsyncClient", return_value=client_mock):
+            result = await _query_local_context_length("some-model", "http://localhost:8000/v1")
 
         assert result == 32768
 
@@ -140,7 +143,7 @@ class TestQueryLocalContextLengthModelsList:
         resp.json.return_value = body
         return resp
 
-    def test_models_list_max_model_len(self):
+    async def test_models_list_max_model_len(self):
         """Finds context length for model in /v1/models list."""
         from agent.model_metadata import _query_local_context_length
 
@@ -159,19 +162,17 @@ class TestQueryLocalContextLengthModelsList:
                 return detail_resp  # /v1/models/omnicoder-9b
             return list_resp  # /v1/models
 
-        client_mock = MagicMock()
-        client_mock.__enter__ = lambda s: client_mock
-        client_mock.__exit__ = MagicMock(return_value=False)
+        client_mock = _make_async_client()
         client_mock.post.return_value = self._make_resp(404, {})
         client_mock.get.side_effect = side_effect
 
-        with patch("agent.model_metadata.detect_local_server_type", return_value=None), \
-             patch("httpx.Client", return_value=client_mock):
-            result = _query_local_context_length("omnicoder-9b", "http://localhost:1234")
+        with patch("agent.model_metadata.detect_local_server_type", new=AsyncMock(return_value=None)), \
+             patch("httpx.AsyncClient", return_value=client_mock):
+            result = await _query_local_context_length("omnicoder-9b", "http://localhost:1234")
 
         assert result == 131072
 
-    def test_models_list_model_not_found_returns_none(self):
+    async def test_models_list_model_not_found_returns_none(self):
         """Returns None when model is not in the /v1/models list."""
         from agent.model_metadata import _query_local_context_length
 
@@ -187,15 +188,13 @@ class TestQueryLocalContextLengthModelsList:
                 return detail_resp
             return list_resp
 
-        client_mock = MagicMock()
-        client_mock.__enter__ = lambda s: client_mock
-        client_mock.__exit__ = MagicMock(return_value=False)
+        client_mock = _make_async_client()
         client_mock.post.return_value = self._make_resp(404, {})
         client_mock.get.side_effect = side_effect
 
-        with patch("agent.model_metadata.detect_local_server_type", return_value=None), \
-             patch("httpx.Client", return_value=client_mock):
-            result = _query_local_context_length("omnicoder-9b", "http://localhost:1234")
+        with patch("agent.model_metadata.detect_local_server_type", new=AsyncMock(return_value=None)), \
+             patch("httpx.AsyncClient", return_value=client_mock):
+            result = await _query_local_context_length("omnicoder-9b", "http://localhost:1234")
 
         assert result is None
 
@@ -210,10 +209,8 @@ class TestQueryLocalContextLengthLmStudio:
         return resp
 
     def _make_client(self, native_resp, detail_resp, list_resp):
-        """Build a mock httpx.Client with sequenced GET responses."""
-        client_mock = MagicMock()
-        client_mock.__enter__ = lambda s: client_mock
-        client_mock.__exit__ = MagicMock(return_value=False)
+        """Build a mock httpx.AsyncClient with sequenced GET responses."""
+        client_mock = _make_async_client()
         client_mock.post.return_value = self._make_resp(404, {})
 
         responses = [native_resp, detail_resp, list_resp]
@@ -229,7 +226,7 @@ class TestQueryLocalContextLengthLmStudio:
         client_mock.get.side_effect = get_side_effect
         return client_mock
 
-    def test_lmstudio_exact_key_match(self):
+    async def test_lmstudio_exact_key_match(self):
         """Resolves loaded ctx when key matches exactly."""
         from agent.model_metadata import _query_local_context_length
 
@@ -247,9 +244,9 @@ class TestQueryLocalContextLengthLmStudio:
             self._make_resp(404, {}),
         )
 
-        with patch("agent.model_metadata.detect_local_server_type", return_value="lm-studio"), \
-             patch("httpx.Client", return_value=client_mock):
-            result = _query_local_context_length(
+        with patch("agent.model_metadata.detect_local_server_type", new=AsyncMock(return_value="lm-studio")), \
+             patch("httpx.AsyncClient", return_value=client_mock):
+            result = await _query_local_context_length(
                 "nvidia/nvidia-nemotron-super-49b-v1", "http://192.168.1.22:1234/v1"
             )
 
@@ -259,7 +256,7 @@ class TestQueryLocalContextLengthLmStudio:
 
 
 
-    def test_lmstudio_native_api_base_url_is_not_doubled(self):
+    async def test_lmstudio_native_api_base_url_is_not_doubled(self):
         from agent.model_metadata import _query_local_context_length
 
         native_resp = self._make_resp(200, {
@@ -277,48 +274,44 @@ class TestQueryLocalContextLengthLmStudio:
             self._make_resp(404, {}),
         )
 
-        with patch("agent.model_metadata.detect_local_server_type", return_value="lm-studio"), \
-             patch("httpx.Client", return_value=client_mock):
-            result = _query_local_context_length("publisher/model-a", "http://localhost:1234/api/v1")
+        with patch("agent.model_metadata.detect_local_server_type", new=AsyncMock(return_value="lm-studio")), \
+             patch("httpx.AsyncClient", return_value=client_mock):
+            result = await _query_local_context_length("publisher/model-a", "http://localhost:1234/api/v1")
 
         assert result == 32768
         assert client_mock.get.call_args_list[0].args[0] == "http://127.0.0.1:1234/api/v1/models"
 
 
 class TestDetectLocalServerTypeAuth:
-    def test_passes_bearer_token_to_probe_requests(self):
+    async def test_passes_bearer_token_to_probe_requests(self):
         from agent.model_metadata import detect_local_server_type
 
         resp = MagicMock()
         resp.status_code = 200
 
-        client_mock = MagicMock()
-        client_mock.__enter__ = lambda s: client_mock
-        client_mock.__exit__ = MagicMock(return_value=False)
+        client_mock = _make_async_client()
         client_mock.get.return_value = resp
 
-        with patch("httpx.Client", return_value=client_mock) as mock_client:
-            result = detect_local_server_type("http://localhost:1234/v1", api_key="lm-token")
+        with patch("httpx.AsyncClient", return_value=client_mock) as mock_client:
+            result = await detect_local_server_type("http://localhost:1234/v1", api_key="lm-token")
 
         assert result == "lm-studio"
         assert mock_client.call_args.kwargs["headers"] == {
             "Authorization": "Bearer lm-token"
         }
 
-    def test_native_api_base_url_is_not_doubled(self):
+    async def test_native_api_base_url_is_not_doubled(self):
         from agent.model_metadata import detect_local_server_type
 
         resp = MagicMock()
         resp.status_code = 200
 
-        client_mock = MagicMock()
-        client_mock.__enter__ = lambda s: client_mock
-        client_mock.__exit__ = MagicMock(return_value=False)
+        client_mock = _make_async_client()
         client_mock.get.return_value = resp
 
         result = None
-        with patch("httpx.Client", return_value=client_mock):
-            result = detect_local_server_type("http://localhost:1234/api/v1")
+        with patch("httpx.AsyncClient", return_value=client_mock):
+            result = await detect_local_server_type("http://localhost:1234/api/v1")
 
         assert result == "lm-studio"
         assert client_mock.get.call_args_list[0].args[0] == "http://127.0.0.1:1234/api/v1/models"
@@ -327,39 +320,35 @@ class TestDetectLocalServerTypeAuth:
 class TestDetectLocalServerTypeLocalhostIPv4:
     """detect_local_server_type should resolve localhost to 127.0.0.1."""
 
-    def test_localhost_resolved_to_ipv4(self):
+    async def test_localhost_resolved_to_ipv4(self):
         """Probes should use 127.0.0.1, not localhost, to avoid IPv6 timeout."""
         from agent.model_metadata import detect_local_server_type
 
         resp = MagicMock()
         resp.status_code = 200
 
-        client_mock = MagicMock()
-        client_mock.__enter__ = lambda s: client_mock
-        client_mock.__exit__ = MagicMock(return_value=False)
+        client_mock = _make_async_client()
         client_mock.get.return_value = resp
 
-        with patch("httpx.Client", return_value=client_mock):
-            detect_local_server_type("http://localhost:8317/v1")
+        with patch("httpx.AsyncClient", return_value=client_mock):
+            await detect_local_server_type("http://localhost:8317/v1")
 
         for call in client_mock.get.call_args_list:
             url = call[0][0]
             assert "localhost" not in url, f"Probe URL still uses localhost: {url}"
             assert "127.0.0.1" in url
 
-    def test_non_localhost_urls_unchanged(self):
+    async def test_non_localhost_urls_unchanged(self):
         """Non-localhost URLs should not be modified."""
         from agent.model_metadata import detect_local_server_type
 
-        client_mock = MagicMock()
-        client_mock.__enter__ = lambda s: client_mock
-        client_mock.__exit__ = MagicMock(return_value=False)
+        client_mock = _make_async_client()
         resp = MagicMock()
         resp.status_code = 404
         client_mock.get.return_value = resp
 
-        with patch("httpx.Client", return_value=client_mock):
-            detect_local_server_type("http://192.168.1.100:8080")
+        with patch("httpx.AsyncClient", return_value=client_mock):
+            await detect_local_server_type("http://192.168.1.100:8080")
 
         for call in client_mock.get.call_args_list:
             url = call[0][0]
@@ -376,7 +365,7 @@ class TestFetchEndpointModelMetadataLmStudio:
         resp.json.return_value = body
         return resp
 
-    def test_uses_native_models_endpoint_only(self):
+    async def test_uses_native_models_endpoint_only(self):
         from agent.model_metadata import fetch_endpoint_model_metadata
 
         native_resp = self._make_resp(
@@ -394,23 +383,26 @@ class TestFetchEndpointModelMetadataLmStudio:
             }
         )
 
-        with patch("agent.model_metadata.detect_local_server_type", return_value="lm-studio"), \
-             patch("agent.model_metadata.requests.get", return_value=native_resp) as mock_get:
-            result = fetch_endpoint_model_metadata(
+        client = _make_async_client()
+        client.get.return_value = native_resp
+        with patch("agent.model_metadata.detect_local_server_type", new=AsyncMock(return_value="lm-studio")), \
+             patch("httpx.AsyncClient", return_value=client) as mock_client:
+            result = await fetch_endpoint_model_metadata(
                 "http://localhost:1234/v1",
                 api_key="lm-token",
                 force_refresh=True,
             )
 
-        assert mock_get.call_count == 1
-        assert mock_get.call_args[0][0] == "http://localhost:1234/api/v1/models"
-        assert mock_get.call_args.kwargs["headers"] == {
+        client.get.assert_awaited_once_with(
+            "http://127.0.0.1:1234/api/v1/models"
+        )
+        assert mock_client.call_args.kwargs["headers"] == {
             "Authorization": "Bearer lm-token"
         }
         assert result["lmstudio-community/Qwen3.5-27B-GGUF/Qwen3.5-27B-Q8_0.gguf"]["context_length"] == 131072
         assert result["Qwen3.5-27B-GGUF/Qwen3.5-27B-Q8_0.gguf"]["context_length"] == 131072
 
-    def test_native_api_base_url_is_not_doubled(self):
+    async def test_native_api_base_url_is_not_doubled(self):
         from agent.model_metadata import fetch_endpoint_model_metadata
 
         native_resp = self._make_resp(
@@ -427,33 +419,35 @@ class TestFetchEndpointModelMetadataLmStudio:
             }
         )
 
-        with patch("agent.model_metadata.detect_local_server_type", return_value="lm-studio"), \
-             patch("agent.model_metadata.requests.get", return_value=native_resp) as mock_get:
-            result = fetch_endpoint_model_metadata(
+        client = _make_async_client()
+        client.get.return_value = native_resp
+        with patch("agent.model_metadata.detect_local_server_type", new=AsyncMock(return_value="lm-studio")), \
+             patch("httpx.AsyncClient", return_value=client):
+            result = await fetch_endpoint_model_metadata(
                 "http://localhost:1234/api/v1",
                 force_refresh=True,
             )
 
-        assert mock_get.call_args[0][0] == "http://localhost:1234/api/v1/models"
+        client.get.assert_awaited_once_with(
+            "http://127.0.0.1:1234/api/v1/models"
+        )
         assert result["publisher/model-a"]["context_length"] == 65536
 
 
 class TestQueryLocalContextLengthNetworkError:
     """_query_local_context_length handles network failures gracefully."""
 
-    def test_connection_error_returns_none(self):
+    async def test_connection_error_returns_none(self):
         """Returns None when the server is unreachable."""
         from agent.model_metadata import _query_local_context_length
 
-        client_mock = MagicMock()
-        client_mock.__enter__ = lambda s: client_mock
-        client_mock.__exit__ = MagicMock(return_value=False)
+        client_mock = _make_async_client()
         client_mock.post.side_effect = Exception("Connection refused")
         client_mock.get.side_effect = Exception("Connection refused")
 
-        with patch("agent.model_metadata.detect_local_server_type", return_value=None), \
-             patch("httpx.Client", return_value=client_mock):
-            result = _query_local_context_length("omnicoder-9b", "http://localhost:11434/v1")
+        with patch("agent.model_metadata.detect_local_server_type", new=AsyncMock(return_value=None)), \
+             patch("httpx.AsyncClient", return_value=client_mock):
+            result = await _query_local_context_length("omnicoder-9b", "http://localhost:11434/v1")
 
         assert result is None
 
@@ -467,7 +461,7 @@ class TestGetModelContextLengthLocalFallback:
 
 
 
-    def test_local_endpoint_stale_cache_reconciled_from_live_probe(self):
+    async def test_local_endpoint_stale_cache_reconciled_from_live_probe(self):
         """Stale disk cache must yield to a live local max_model_len probe."""
         from agent.model_metadata import get_model_context_length
 
@@ -483,7 +477,7 @@ class TestGetModelContextLengthLocalFallback:
              patch("agent.model_metadata._query_local_context_length", return_value=32768), \
              patch("agent.model_metadata._invalidate_cached_context_length") as mock_invalidate, \
              patch("agent.model_metadata.save_context_length") as mock_save:
-            result = get_model_context_length(model, base, provider="custom")
+            result = await get_model_context_length(model, base, provider="custom")
 
         assert result == 32768
         mock_invalidate.assert_called_once_with(model, base)
@@ -491,7 +485,7 @@ class TestGetModelContextLengthLocalFallback:
 
 
 
-    def test_local_endpoint_server_returns_none_falls_back_to_2m(self):
+    async def test_local_endpoint_server_returns_none_falls_back_to_2m(self):
         """When local server returns None, still falls back to 2M probe tier."""
         from agent.model_metadata import get_model_context_length, CONTEXT_PROBE_TIERS
 
@@ -500,19 +494,19 @@ class TestGetModelContextLengthLocalFallback:
              patch("agent.model_metadata.fetch_model_metadata", return_value={}), \
              patch("agent.model_metadata.is_local_endpoint", return_value=True), \
              patch("agent.model_metadata._query_local_context_length", return_value=None):
-            result = get_model_context_length("omnicoder-9b", "http://localhost:11434/v1")
+            result = await get_model_context_length("omnicoder-9b", "http://localhost:11434/v1")
 
         assert result == CONTEXT_PROBE_TIERS[0]
 
 
-    def test_cached_result_skips_local_query(self):
+    async def test_cached_result_skips_local_query(self):
         """Cached context length is returned without querying the local server."""
         from agent.model_metadata import get_model_context_length
 
         with patch("agent.model_metadata.get_cached_context_length", return_value=65536), \
              patch("agent.model_metadata.is_local_endpoint", return_value=False), \
              patch("agent.model_metadata._query_local_context_length") as mock_query:
-            result = get_model_context_length(
+            result = await get_model_context_length(
                 "omnicoder-9b", "https://api.example.com/v1"
             )
 
@@ -533,64 +527,58 @@ class TestLocalContextProbeTTLCache:
         resp.json.return_value = body
         return resp
 
-    def test_second_call_within_ttl_does_not_reprobe(self):
+    async def test_second_call_within_ttl_does_not_reprobe(self):
         from agent.model_metadata import _query_local_context_length
 
         show_resp = self._make_resp(200, {"model_info": {"llama.context_length": 32768}})
         models_resp = self._make_resp(404, {})
-        client_mock = MagicMock()
-        client_mock.__enter__ = lambda s: client_mock
-        client_mock.__exit__ = MagicMock(return_value=False)
+        client_mock = _make_async_client()
         client_mock.post.return_value = show_resp
         client_mock.get.return_value = models_resp
 
-        with patch("agent.model_metadata.detect_local_server_type", return_value="ollama") as detect, \
-             patch("httpx.Client", return_value=client_mock):
-            first = _query_local_context_length("m", "http://localhost:11434/v1")
-            second = _query_local_context_length("m", "http://localhost:11434/v1")
+        with patch("agent.model_metadata.detect_local_server_type", new=AsyncMock(return_value="ollama")) as detect, \
+             patch("httpx.AsyncClient", return_value=client_mock):
+            first = await _query_local_context_length("m", "http://localhost:11434/v1")
+            second = await _query_local_context_length("m", "http://localhost:11434/v1")
 
         assert first == 32768
         assert second == 32768
         # Only the first call hits the network; the second is served from cache.
         assert detect.call_count == 1
 
-    def test_different_key_still_probes(self):
+    async def test_different_key_still_probes(self):
         from agent.model_metadata import _query_local_context_length
 
         show_resp = self._make_resp(200, {"model_info": {"llama.context_length": 32768}})
         models_resp = self._make_resp(404, {})
-        client_mock = MagicMock()
-        client_mock.__enter__ = lambda s: client_mock
-        client_mock.__exit__ = MagicMock(return_value=False)
+        client_mock = _make_async_client()
         client_mock.post.return_value = show_resp
         client_mock.get.return_value = models_resp
 
-        with patch("agent.model_metadata.detect_local_server_type", return_value="ollama") as detect, \
-             patch("httpx.Client", return_value=client_mock):
-            _query_local_context_length("m1", "http://localhost:11434/v1")
-            _query_local_context_length("m2", "http://localhost:11434/v1")
+        with patch("agent.model_metadata.detect_local_server_type", new=AsyncMock(return_value="ollama")) as detect, \
+             patch("httpx.AsyncClient", return_value=client_mock):
+            await _query_local_context_length("m1", "http://localhost:11434/v1")
+            await _query_local_context_length("m2", "http://localhost:11434/v1")
 
         assert detect.call_count == 2
 
 
-    def test_none_result_not_cached(self):
+    async def test_none_result_not_cached(self):
         """A failed probe (None) must NOT be memoized — a retry within the TTL
         window must re-probe so a server that comes up mid-startup is caught."""
         from agent.model_metadata import _query_local_context_length
 
         # First probe: server unreachable -> detect returns None, all queries miss -> None.
         fail_resp = self._make_resp(404, {})
-        client_mock = MagicMock()
-        client_mock.__enter__ = lambda s: client_mock
-        client_mock.__exit__ = MagicMock(return_value=False)
+        client_mock = _make_async_client()
         client_mock.post.return_value = fail_resp
         client_mock.get.return_value = fail_resp
 
-        with patch("agent.model_metadata.detect_local_server_type", return_value=None) as detect, \
-             patch("httpx.Client", return_value=client_mock):
-            first = _query_local_context_length("m", "http://localhost:11434/v1")
+        with patch("agent.model_metadata.detect_local_server_type", new=AsyncMock(return_value=None)) as detect, \
+             patch("httpx.AsyncClient", return_value=client_mock):
+            first = await _query_local_context_length("m", "http://localhost:11434/v1")
             # Retry within TTL must re-probe (None was not cached).
-            second = _query_local_context_length("m", "http://localhost:11434/v1")
+            second = await _query_local_context_length("m", "http://localhost:11434/v1")
 
         assert first is None
         assert second is None

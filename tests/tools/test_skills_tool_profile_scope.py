@@ -4,6 +4,8 @@ import importlib
 import json
 from pathlib import Path
 
+import pytest
+
 
 def _write_skill(root: Path, category: str, name: str, description: str) -> Path:
     skill_dir = root / "skills" / category / name
@@ -27,7 +29,10 @@ def _reload_skills_tool(import_home: Path, monkeypatch):
     return importlib.reload(skills_tool)
 
 
-def test_skill_view_uses_live_profile_home_after_module_import(tmp_path, monkeypatch):
+@pytest.mark.asyncio
+async def test_skill_view_uses_live_profile_home_after_module_import(
+    tmp_path, monkeypatch
+):
     """skill_view should not stay pinned to HERMES_HOME from import time."""
     default_home = tmp_path / "default-home"
     profile_home = tmp_path / "profiles" / "orchestrator"
@@ -45,7 +50,9 @@ def test_skill_view_uses_live_profile_home_after_module_import(tmp_path, monkeyp
     monkeypatch.setenv("HERMES_HOME", str(profile_home))
 
     result = json.loads(
-        skills_tool.skill_view("kanban-orchestrator-operations", preprocess=False)
+        await skills_tool.skill_view(
+            "kanban-orchestrator-operations", preprocess=False
+        )
     )
 
     assert result["success"] is True
@@ -54,7 +61,8 @@ def test_skill_view_uses_live_profile_home_after_module_import(tmp_path, monkeyp
     assert "orchestrator profile" in result["content"]
 
 
-def test_explicit_skills_dir_monkeypatch_still_wins(tmp_path, monkeypatch):
+@pytest.mark.asyncio
+async def test_explicit_skills_dir_monkeypatch_still_wins(tmp_path, monkeypatch):
     """Existing tests can still override tools.skills_tool.SKILLS_DIR directly."""
     default_home = tmp_path / "default-home"
     profile_home = tmp_path / "profiles" / "orchestrator"
@@ -76,7 +84,9 @@ def test_explicit_skills_dir_monkeypatch_still_wins(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(profile_home))
     monkeypatch.setattr(skills_tool, "SKILLS_DIR", patched_root / "skills")
 
-    result = json.loads(skills_tool.skill_view("patched-skill", preprocess=False))
+    result = json.loads(
+        await skills_tool.skill_view("patched-skill", preprocess=False)
+    )
 
     assert result["success"] is True
     assert Path(result["skill_dir"]) == patched_skill_dir

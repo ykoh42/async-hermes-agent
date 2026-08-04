@@ -1,13 +1,11 @@
 """Tests for tools/skills_tool.py — skill discovery and viewing."""
 
 import json
-import os
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
-import tools.skills_tool as skills_tool_module
 from tools.skills_tool import (
     _get_required_environment_variables,
     _parse_frontmatter,
@@ -137,41 +135,30 @@ class TestRequiredEnvironmentVariablesNormalization:
             }
         ]
 
-    def test_empty_env_file_value_is_treated_as_missing(self, monkeypatch):
-        monkeypatch.setenv("FILLED_KEY", "value")
-        monkeypatch.setenv("EMPTY_HOST_KEY", "")
-
-        from tools.skills_tool import _is_env_var_persisted
-
-        assert _is_env_var_persisted("EMPTY_FILE_KEY", {"EMPTY_FILE_KEY": ""}) is False
-        assert (
-            _is_env_var_persisted("FILLED_FILE_KEY", {"FILLED_FILE_KEY": "x"}) is True
-        )
-        assert _is_env_var_persisted("EMPTY_HOST_KEY", {}) is False
-        assert _is_env_var_persisted("FILLED_KEY", {}) is True
-
-
 # ---------------------------------------------------------------------------
 # _get_category_from_path
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.asyncio
 class TestGetCategoryFromPath:
-    def test_category_derived_from_layout(self, tmp_path):
+    async def test_category_derived_from_layout(self, tmp_path):
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
             categorized = tmp_path / "mlops" / "axolotl" / "SKILL.md"
             categorized.parent.mkdir(parents=True)
             categorized.touch()
-            assert _get_category_from_path(categorized) == "mlops"
+            assert await _get_category_from_path(categorized) == "mlops"
 
             top_level = tmp_path / "my-skill" / "SKILL.md"
             top_level.parent.mkdir(parents=True)
             top_level.touch()
-            assert _get_category_from_path(top_level) is None
+            assert await _get_category_from_path(top_level) is None
 
         # Paths outside SKILLS_DIR have no category.
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path / "skills"):
-            assert _get_category_from_path(tmp_path / "other" / "SKILL.md") is None
+            assert await _get_category_from_path(
+                tmp_path / "other" / "SKILL.md"
+            ) is None
 
 
 # ---------------------------------------------------------------------------
@@ -179,8 +166,9 @@ class TestGetCategoryFromPath:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.asyncio
 class TestFindAllSkills:
-    def test_finds_skills_and_skips_non_skill_trees(self, tmp_path):
+    async def test_finds_skills_and_skips_non_skill_trees(self, tmp_path):
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
             _make_skill(tmp_path, "skill-a")
             _make_skill(tmp_path, "skill-b")
@@ -212,13 +200,13 @@ class TestFindAllSkills:
                 encoding="utf-8",
             )
 
-            skills = _find_all_skills()
+            skills = await _find_all_skills()
 
         assert {s["name"] for s in skills} == {"skill-a", "skill-b", "axolotl"}
         assert [s["category"] for s in skills if s["name"] == "axolotl"] == ["mlops"]
 
 
-    def test_description_falls_back_to_body_and_is_truncated(self, tmp_path):
+    async def test_description_falls_back_to_body_and_is_truncated(self, tmp_path):
         no_desc = tmp_path / "no-desc"
         no_desc.mkdir()
         (no_desc / "SKILL.md").write_text(
@@ -231,13 +219,13 @@ class TestFindAllSkills:
         )
 
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
-            skills = {s["name"]: s for s in _find_all_skills()}
+            skills = {s["name"]: s for s in await _find_all_skills()}
 
         # If no description in frontmatter, the first non-header line is used.
         assert skills["no-desc"]["description"] == "First paragraph."
         assert len(skills["long"]["description"]) <= MAX_DESCRIPTION_LENGTH
 
-    def test_finds_skills_in_symlinked_category_dir(self, tmp_path):
+    async def test_finds_skills_in_symlinked_category_dir(self, tmp_path):
         external_root = tmp_path / "repo"
         skills_root = tmp_path / "skills"
         skills_root.mkdir()
@@ -246,7 +234,7 @@ class TestFindAllSkills:
         _make_skill(external_category.parent, "knowledge-brain", category="linked")
 
         with patch("tools.skills_tool.SKILLS_DIR", skills_root):
-            skills = _find_all_skills()
+            skills = await _find_all_skills()
 
         assert [s["name"] for s in skills] == ["knowledge-brain"]
         assert skills[0]["category"] == "linked"
@@ -257,28 +245,29 @@ class TestFindAllSkills:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.asyncio
 class TestSkillsList:
-    def test_empty_creates_directory(self, tmp_path):
+    async def test_empty_creates_directory(self, tmp_path):
         skills_dir = tmp_path / "skills"
         with patch("tools.skills_tool.SKILLS_DIR", skills_dir):
-            raw = skills_list()
+            raw = await skills_list()
         result = json.loads(raw)
         assert result["success"] is True
         assert result["skills"] == []
         assert skills_dir.exists()
 
-    def test_category_filter(self, tmp_path):
+    async def test_category_filter(self, tmp_path):
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
             _make_skill(tmp_path, "skill-a", category="devops")
             _make_skill(tmp_path, "skill-b", category="mlops")
-            all_result = json.loads(skills_list())
-            filtered = json.loads(skills_list(category="devops"))
+            all_result = json.loads(await skills_list())
+            filtered = json.loads(await skills_list(category="devops"))
 
         assert all_result["count"] == 2
         assert filtered["count"] == 1
         assert filtered["skills"][0]["name"] == "skill-a"
 
-    def test_category_filter_finds_symlinked_category(self, tmp_path):
+    async def test_category_filter_finds_symlinked_category(self, tmp_path):
         external_root = tmp_path / "repo"
         skills_root = tmp_path / "skills"
         skills_root.mkdir()
@@ -287,7 +276,7 @@ class TestSkillsList:
         _make_skill(external_category.parent, "knowledge-brain", category="linked")
 
         with patch("tools.skills_tool.SKILLS_DIR", skills_root):
-            raw = skills_list(category="linked")
+            raw = await skills_list(category="linked")
 
         result = json.loads(raw)
         assert result["success"] is True
@@ -301,8 +290,9 @@ class TestSkillsList:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.asyncio
 class TestSkillView:
-    def test_view_resolves_by_dir_name_and_frontmatter_name(self, tmp_path):
+    async def test_view_resolves_by_dir_name_and_frontmatter_name(self, tmp_path):
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
             _make_skill(
                 tmp_path,
@@ -322,8 +312,8 @@ class TestSkillView:
                 "# real-skill-name\n\n"
                 "Step 1: Do the thing.\n"
             )
-            by_dir = json.loads(skill_view("my-skill"))
-            by_name = json.loads(skill_view("real-skill-name"))
+            by_dir = json.loads(await skill_view("my-skill"))
+            by_name = json.loads(await skill_view("real-skill-name"))
 
         assert by_dir["success"] is True
         assert by_dir["name"] == "my-skill"
@@ -335,16 +325,16 @@ class TestSkillView:
         assert "Step 1" in by_name["content"]
 
 
-    def test_view_reference_files(self, tmp_path):
+    async def test_view_reference_files(self, tmp_path):
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
             skill_dir = _make_skill(tmp_path, "my-skill")
             refs_dir = skill_dir / "references"
             refs_dir.mkdir()
             (refs_dir / "api.md").write_text("# API Docs\nEndpoint info.")
 
-            existing = json.loads(skill_view("my-skill", file_path="references/api.md"))
-            missing = json.loads(skill_view("my-skill", file_path="references/nope.md"))
-            skill = json.loads(skill_view("my-skill"))
+            existing = json.loads(await skill_view("my-skill", file_path="references/api.md"))
+            missing = json.loads(await skill_view("my-skill", file_path="references/nope.md"))
+            skill = json.loads(await skill_view("my-skill"))
 
         assert existing["success"] is True
         assert "Endpoint info" in existing["content"]
@@ -353,13 +343,13 @@ class TestSkillView:
         assert skill["linked_files"] is not None
         assert "references" in skill["linked_files"]
 
-    def test_disabled_skill_blocked_enabled_allowed(self, tmp_path):
+    async def test_disabled_skill_blocked_enabled_allowed(self, tmp_path):
         with (
             patch("tools.skills_tool.SKILLS_DIR", tmp_path),
             patch("tools.skills_tool._is_skill_disabled", return_value=True),
         ):
             _make_skill(tmp_path, "hidden-skill")
-            blocked = json.loads(skill_view("hidden-skill"))
+            blocked = json.loads(await skill_view("hidden-skill"))
         assert blocked["success"] is False
         assert "disabled" in blocked["error"].lower()
 
@@ -368,10 +358,10 @@ class TestSkillView:
             patch("tools.skills_tool._is_skill_disabled", return_value=False),
         ):
             _make_skill(tmp_path, "active-skill")
-            allowed = json.loads(skill_view("active-skill"))
+            allowed = json.loads(await skill_view("active-skill"))
         assert allowed["success"] is True
 
-    def test_view_finds_skill_in_symlinked_category_dir(self, tmp_path):
+    async def test_view_finds_skill_in_symlinked_category_dir(self, tmp_path):
         external_root = tmp_path / "repo"
         skills_root = tmp_path / "skills"
         skills_root.mkdir()
@@ -380,40 +370,17 @@ class TestSkillView:
         _make_skill(external_category.parent, "knowledge-brain", category="linked")
 
         with patch("tools.skills_tool.SKILLS_DIR", skills_root):
-            raw = skill_view("knowledge-brain")
+            raw = await skill_view("knowledge-brain")
 
         result = json.loads(raw)
         assert result["success"] is True
         assert result["name"] == "knowledge-brain"
 
 
+@pytest.mark.asyncio
 class TestSkillViewSecureSetupOnLoad:
-    def test_requests_missing_required_env_and_continues(self, tmp_path, monkeypatch):
+    async def test_reports_missing_required_environment(self, tmp_path, monkeypatch):
         monkeypatch.delenv("TENOR_API_KEY", raising=False)
-        calls = []
-
-        def fake_secret_callback(var_name, prompt, metadata=None):
-            calls.append(
-                {
-                    "var_name": var_name,
-                    "prompt": prompt,
-                    "metadata": metadata,
-                }
-            )
-            os.environ[var_name] = "stored-in-test"
-            return {
-                "success": True,
-                "stored_as": var_name,
-                "validated": False,
-                "skipped": False,
-            }
-
-        monkeypatch.setattr(
-            skills_tool_module,
-            "_secret_capture_callback",
-            fake_secret_callback,
-            raising=False,
-        )
 
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
             _make_skill(
@@ -427,42 +394,18 @@ class TestSkillViewSecureSetupOnLoad:
                     "    required_for: full functionality\n"
                 ),
             )
-            raw = skill_view("gif-search")
+            raw = await skill_view("gif-search")
 
         result = json.loads(raw)
         assert result["success"] is True
         assert result["name"] == "gif-search"
-        assert calls == [
-            {
-                "var_name": "TENOR_API_KEY",
-                "prompt": "Tenor API key",
-                "metadata": {
-                    "skill_name": "gif-search",
-                    "help": "Get a key from https://developers.google.com/tenor",
-                    "required_for": "full functionality",
-                },
-            }
-        ]
         assert result["required_environment_variables"][0]["name"] == "TENOR_API_KEY"
-        assert result["setup_skipped"] is False
+        assert result["missing_required_environment_variables"] == ["TENOR_API_KEY"]
+        assert result["setup_needed"] is True
+        assert result["readiness_status"] == "setup_needed"
 
-    def test_allows_skipping_secure_setup_and_still_loads(self, tmp_path, monkeypatch):
+    async def test_missing_environment_does_not_block_skill_loading(self, tmp_path, monkeypatch):
         monkeypatch.delenv("TENOR_API_KEY", raising=False)
-
-        def fake_secret_callback(var_name, prompt, metadata=None):
-            return {
-                "success": True,
-                "stored_as": var_name,
-                "validated": False,
-                "skipped": True,
-            }
-
-        monkeypatch.setattr(
-            skills_tool_module,
-            "_secret_capture_callback",
-            fake_secret_callback,
-            raising=False,
-        )
 
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
             _make_skill(
@@ -474,11 +417,11 @@ class TestSkillViewSecureSetupOnLoad:
                     "    prompt: Tenor API key\n"
                 ),
             )
-            raw = skill_view("gif-search")
+            raw = await skill_view("gif-search")
 
         result = json.loads(raw)
         assert result["success"] is True
-        assert result["setup_skipped"] is True
+        assert result["setup_needed"] is True
         assert result["content"].startswith("---")
 
 # ---------------------------------------------------------------------------
@@ -514,10 +457,11 @@ class TestSkillMatchesPlatform:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.asyncio
 class TestFindAllSkillsPlatformFiltering:
     """Test that _find_all_skills respects the platforms field."""
 
-    def test_discovery_filters_on_platform(self, tmp_path):
+    async def test_discovery_filters_on_platform(self, tmp_path):
         with (
             patch("tools.skills_tool.SKILLS_DIR", tmp_path),
             patch("agent.skill_utils.sys") as mock_sys,
@@ -526,18 +470,18 @@ class TestFindAllSkillsPlatformFiltering:
             _make_skill(tmp_path, "mac-only", frontmatter_extra="platforms: [macos]\n")
 
             mock_sys.platform = "linux"
-            linux = {s["name"] for s in _find_all_skills()}
+            linux = {s["name"] for s in await _find_all_skills()}
             mock_sys.platform = "darwin"
-            darwin = {s["name"] for s in _find_all_skills()}
+            darwin = {s["name"] for s in await _find_all_skills()}
             mock_sys.platform = "win32"
-            win = {s["name"] for s in _find_all_skills()}
+            win = {s["name"] for s in await _find_all_skills()}
 
         assert linux == {"universal-skill"}
         assert darwin == {"universal-skill", "mac-only"}
         # Skills without a platforms field appear on every platform.
         assert win == {"universal-skill"}
 
-    def test_multi_platform_skill(self, tmp_path):
+    async def test_multi_platform_skill(self, tmp_path):
         with (
             patch("tools.skills_tool.SKILLS_DIR", tmp_path),
             patch("agent.skill_utils.sys") as mock_sys,
@@ -546,11 +490,11 @@ class TestFindAllSkillsPlatformFiltering:
                 tmp_path, "cross-plat", frontmatter_extra="platforms: [macos, linux]\n"
             )
             mock_sys.platform = "darwin"
-            skills_darwin = _find_all_skills()
+            skills_darwin = await _find_all_skills()
             mock_sys.platform = "linux"
-            skills_linux = _find_all_skills()
+            skills_linux = await _find_all_skills()
             mock_sys.platform = "win32"
-            skills_win = _find_all_skills()
+            skills_win = await _find_all_skills()
         assert len(skills_darwin) == 1
         assert len(skills_linux) == 1
         assert len(skills_win) == 0
@@ -561,8 +505,9 @@ class TestFindAllSkillsPlatformFiltering:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.asyncio
 class TestFindAllSkillsSecureSetup:
-    def test_listing_shape_independent_of_env_var_prereqs(self, tmp_path, monkeypatch):
+    async def test_listing_shape_independent_of_env_var_prereqs(self, tmp_path, monkeypatch):
         # A remote backend must not be probed just to build the listing.
         monkeypatch.setenv("TERMINAL_ENV", "docker")
         monkeypatch.delenv("NONEXISTENT_API_KEY_XYZ", raising=False)
@@ -580,7 +525,7 @@ class TestFindAllSkillsSecureSetup:
                 frontmatter_extra="prerequisites:\n  env_vars: [MY_PRESENT_KEY]\n",
             )
             _make_skill(tmp_path, "simple-skill")
-            skills = _find_all_skills()
+            skills = await _find_all_skills()
 
         assert {s["name"] for s in skills} == {"needs-key", "has-key", "simple-skill"}
         for skill in skills:
@@ -588,8 +533,9 @@ class TestFindAllSkillsSecureSetup:
             assert "missing_prerequisites" not in skill
 
 
+@pytest.mark.asyncio
 class TestSkillViewPrerequisites:
-    def test_legacy_prerequisites_expose_required_env_setup_metadata(
+    async def test_legacy_prerequisites_expose_required_env_setup_metadata(
         self, tmp_path, monkeypatch
     ):
         monkeypatch.delenv("MISSING_KEY_XYZ", raising=False)
@@ -599,7 +545,7 @@ class TestSkillViewPrerequisites:
                 "gated-skill",
                 frontmatter_extra="prerequisites:\n  env_vars: [MISSING_KEY_XYZ]\n",
             )
-            raw = skill_view("gated-skill")
+            raw = await skill_view("gated-skill")
         result = json.loads(raw)
         assert result["success"] is True
         assert result["setup_needed"] is True
@@ -612,7 +558,7 @@ class TestSkillViewPrerequisites:
         ]
 
 
-    def test_remote_backend_treats_persisted_env_as_available(
+    async def test_remote_backend_treats_persisted_env_as_available(
         self, tmp_path, monkeypatch
     ):
         monkeypatch.setenv("TERMINAL_ENV", "docker")
@@ -627,7 +573,7 @@ class TestSkillViewPrerequisites:
 
             save_env_value("PERSISTED_REMOTE_KEY", "persisted-value")
             monkeypatch.delenv("PERSISTED_REMOTE_KEY", raising=False)
-            raw = skill_view("remote-ready")
+            raw = await skill_view("remote-ready")
 
         result = json.loads(raw)
         assert result["success"] is True
@@ -635,16 +581,16 @@ class TestSkillViewPrerequisites:
         assert result["missing_required_environment_variables"] == []
         assert result["readiness_status"] == "available"
 
-    def test_no_setup_metadata_when_no_required_envs(self, tmp_path):
+    async def test_no_setup_metadata_when_no_required_envs(self, tmp_path):
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
             _make_skill(tmp_path, "plain-skill")
-            raw = skill_view("plain-skill")
+            raw = await skill_view("plain-skill")
         result = json.loads(raw)
         assert result["success"] is True
         assert result["setup_needed"] is False
         assert result["required_environment_variables"] == []
 
-    def test_skill_view_treats_backend_only_env_as_setup_needed(
+    async def test_skill_view_treats_backend_only_env_as_setup_needed(
         self, tmp_path, monkeypatch
     ):
         monkeypatch.setenv("TERMINAL_ENV", "docker")
@@ -655,13 +601,13 @@ class TestSkillViewPrerequisites:
                 "backend-ready",
                 frontmatter_extra="prerequisites:\n  env_vars: [BACKEND_ONLY_KEY]\n",
             )
-            raw = skill_view("backend-ready")
+            raw = await skill_view("backend-ready")
         result = json.loads(raw)
         assert result["success"] is True
         assert result["setup_needed"] is True
         assert result["missing_required_environment_variables"] == ["BACKEND_ONLY_KEY"]
 
-    def test_local_env_missing_keeps_setup_needed(self, tmp_path, monkeypatch):
+    async def test_local_env_missing_keeps_setup_needed(self, tmp_path, monkeypatch):
         monkeypatch.setenv("TERMINAL_ENV", "local")
         monkeypatch.delenv("SHELL_ONLY_KEY", raising=False)
 
@@ -671,7 +617,7 @@ class TestSkillViewPrerequisites:
                 "shell-ready",
                 frontmatter_extra="prerequisites:\n  env_vars: [SHELL_ONLY_KEY]\n",
             )
-            raw = skill_view("shell-ready")
+            raw = await skill_view("shell-ready")
 
         result = json.loads(raw)
         assert result["success"] is True
@@ -683,29 +629,11 @@ class TestSkillViewPrerequisites:
         "backend",
         ["ssh", "daytona", "docker", "singularity", "modal", "vercel_sandbox"],
     )
-    def test_remote_backend_becomes_available_after_local_secret_capture(
+    async def test_remote_backend_reports_missing_environment(
         self, tmp_path, monkeypatch, backend
     ):
         monkeypatch.setenv("TERMINAL_ENV", backend)
         monkeypatch.delenv("TENOR_API_KEY", raising=False)
-        calls = []
-
-        def fake_secret_callback(var_name, prompt, metadata=None):
-            calls.append((var_name, prompt, metadata))
-            os.environ[var_name] = "captured-locally"
-            return {
-                "success": True,
-                "stored_as": var_name,
-                "validated": False,
-                "skipped": False,
-            }
-
-        monkeypatch.setattr(
-            skills_tool_module,
-            "_secret_capture_callback",
-            fake_secret_callback,
-            raising=False,
-        )
 
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
             _make_skill(
@@ -717,18 +645,16 @@ class TestSkillViewPrerequisites:
                     "    prompt: Tenor API key\n"
                 ),
             )
-            raw = skill_view("gif-search")
+            raw = await skill_view("gif-search")
 
         result = json.loads(raw)
         assert result["success"] is True
-        assert len(calls) == 1
-        assert result["setup_needed"] is False
-        assert result["readiness_status"] == "available"
-        assert result["missing_required_environment_variables"] == []
-        assert "setup_note" not in result
+        assert result["setup_needed"] is True
+        assert result["readiness_status"] == "setup_needed"
+        assert result["missing_required_environment_variables"] == ["TENOR_API_KEY"]
 
 
-    def test_legacy_flat_md_skill_preserves_frontmatter_metadata(self, tmp_path):
+    async def test_legacy_flat_md_skill_preserves_frontmatter_metadata(self, tmp_path):
         flat_skill = tmp_path / "legacy-skill.md"
         flat_skill.write_text(
             """\
@@ -751,7 +677,7 @@ Do the legacy thing.
         )
 
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
-            raw = skill_view("legacy-skill")
+            raw = await skill_view("legacy-skill")
 
         result = json.loads(raw)
         assert result["success"] is True
@@ -762,29 +688,11 @@ Do the legacy thing.
             {"name": "LEGACY_KEY", "prompt": "Legacy key"}
         ]
 
-    def test_successful_secret_capture_reloads_empty_env_placeholder(
+    async def test_persisted_environment_makes_skill_available(
         self, tmp_path, monkeypatch
     ):
-        monkeypatch.setenv("TERMINAL_ENV", "local")
         monkeypatch.delenv("TENOR_API_KEY", raising=False)
-
-        def fake_secret_callback(var_name, prompt, metadata=None):
-            from hermes_cli.config import save_env_value
-
-            save_env_value(var_name, "captured-value")
-            return {
-                "success": True,
-                "stored_as": var_name,
-                "validated": False,
-                "skipped": False,
-            }
-
-        monkeypatch.setattr(
-            skills_tool_module,
-            "_secret_capture_callback",
-            fake_secret_callback,
-            raising=False,
-        )
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
 
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
             _make_skill(
@@ -796,10 +704,8 @@ Do the legacy thing.
                     "    prompt: Tenor API key\n"
                 ),
             )
-            from hermes_cli.config import save_env_value
-
-            save_env_value("TENOR_API_KEY", "")
-            raw = skill_view("gif-search")
+            (tmp_path / ".env").write_text("TENOR_API_KEY=captured-value\n")
+            raw = await skill_view("gif-search")
 
         result = json.loads(raw)
         assert result["success"] is True
@@ -808,6 +714,7 @@ Do the legacy thing.
         assert result["readiness_status"] == "available"
 
 
+@pytest.mark.asyncio
 class TestSkillViewCollisionDetection:
     """Regression tests for skill_view name collision handling.
 
@@ -826,16 +733,17 @@ class TestSkillViewCollisionDetection:
     """
 
     def _patch_dirs(self, local_dir, external_dirs):
-        """Patch SKILLS_DIR (module-level) and get_external_skills_dirs at source."""
+        """Patch the local and native-async external skill roots."""
         return (
             patch("tools.skills_tool.SKILLS_DIR", local_dir),
             patch(
-                "agent.skill_utils.get_external_skills_dirs",
+                "tools.skills_tool._external_skills_dirs",
+                new_callable=AsyncMock,
                 return_value=list(external_dirs),
             ),
         )
 
-    def test_nested_local_collides_with_top_level_external(self, tmp_path):
+    async def test_nested_local_collides_with_top_level_external(self, tmp_path):
         """The original bug scenario: nested local + top-level external,
         same name. Now refuses with both paths surfaced."""
         local_dir = tmp_path / "local"
@@ -853,7 +761,7 @@ class TestSkillViewCollisionDetection:
 
         p1, p2 = self._patch_dirs(local_dir, [external_dir])
         with p1, p2:
-            raw = skill_view("explore-codebase")
+            raw = await skill_view("explore-codebase")
 
         result = json.loads(raw)
         assert result["success"] is False
@@ -866,7 +774,7 @@ class TestSkillViewCollisionDetection:
         assert "hint" in result
 
 
-    def test_support_markdown_does_not_collide_with_real_skill(self, tmp_path):
+    async def test_support_markdown_does_not_collide_with_real_skill(self, tmp_path):
         """Supporting reference docs named <skill>.md are not skills.
 
         A real-world regression had creative/sketch/SKILL.md become
@@ -894,7 +802,7 @@ class TestSkillViewCollisionDetection:
 
         p1, p2 = self._patch_dirs(local_dir, [external_dir])
         with p1, p2:
-            raw = skill_view("sketch")
+            raw = await skill_view("sketch")
 
         result = json.loads(raw)
         assert result["success"] is True
@@ -902,7 +810,7 @@ class TestSkillViewCollisionDetection:
         assert "REAL SKETCH SKILL" in result["content"]
 
 
-    def test_two_externals_same_name_also_refuse(self, tmp_path):
+    async def test_two_externals_same_name_also_refuse(self, tmp_path):
         """Collision detection is symmetric — two external dirs with
         same-name skills also trigger the refusal."""
         local_dir = tmp_path / "local"
@@ -917,7 +825,7 @@ class TestSkillViewCollisionDetection:
 
         p1, p2 = self._patch_dirs(local_dir, [ext_a, ext_b])
         with p1, p2:
-            raw = skill_view("pr")
+            raw = await skill_view("pr")
 
         result = json.loads(raw)
         assert result["success"] is False

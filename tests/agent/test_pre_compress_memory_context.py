@@ -45,7 +45,8 @@ def _summary_response(content="## Goal\nCompaction complete."):
     return response
 
 
-def test_memory_context_injected_into_initial_summary_prompt_with_focus():
+@pytest.mark.asyncio
+async def test_memory_context_injected_into_initial_summary_prompt_with_focus():
     compressor = _make_compressor()
     turns = [
         {"role": "user", "content": "Fix the auth bug"},
@@ -53,12 +54,12 @@ def test_memory_context_injected_into_initial_summary_prompt_with_focus():
     ]
     prompts = []
 
-    def mock_call_llm(**kwargs):
+    async def mock_call_llm(**kwargs):
         prompts.append(kwargs["messages"][0]["content"])
         return _summary_response()
 
     with patch("agent.context_compressor.call_llm", mock_call_llm):
-        compressor._generate_summary(
+        await compressor._generate_summary(
             turns,
             focus_topic="authentication",
             memory_context="User uses JWT tokens with a one-hour expiry.",
@@ -70,7 +71,8 @@ def test_memory_context_injected_into_initial_summary_prompt_with_focus():
     assert 'FOCUS TOPIC: "authentication"' in prompts[0]
 
 
-def test_memory_context_injected_into_iterative_summary_prompt():
+@pytest.mark.asyncio
+async def test_memory_context_injected_into_iterative_summary_prompt():
     compressor = _make_compressor()
     compressor._previous_summary = "Previous checkpoint."
     turns = [
@@ -79,12 +81,12 @@ def test_memory_context_injected_into_iterative_summary_prompt():
     ]
     prompts = []
 
-    def mock_call_llm(**kwargs):
+    async def mock_call_llm(**kwargs):
         prompts.append(kwargs["messages"][0]["content"])
         return _summary_response("## Goal\nMigration updated.")
 
     with patch("agent.context_compressor.call_llm", mock_call_llm):
-        compressor._generate_summary(
+        await compressor._generate_summary(
             turns,
             memory_context="Checkpoint id: ctx-123",
         )
@@ -95,7 +97,8 @@ def test_memory_context_injected_into_iterative_summary_prompt():
     assert "Checkpoint id: ctx-123" in prompts[0]
 
 
-def test_memory_context_is_strictly_redacted_before_summary_llm(monkeypatch):
+@pytest.mark.asyncio
+async def test_memory_context_is_strictly_redacted_before_summary_llm(monkeypatch):
     compressor = _make_compressor()
     prefix_secret = "sk-" + "b" * 30
     query_secret = "opaque-query-secret"
@@ -106,13 +109,13 @@ def test_memory_context_is_strictly_redacted_before_summary_llm(monkeypatch):
     encoded_hyphen_secret = "ENCODED_HYPHEN_SECRET"
     prompts = []
 
-    def mock_call_llm(**kwargs):
+    async def mock_call_llm(**kwargs):
         prompts.append(kwargs["messages"][0]["content"])
         return _summary_response()
 
     monkeypatch.setattr("agent.redact._REDACT_ENABLED", False)
     with patch("agent.context_compressor.call_llm", mock_call_llm):
-        compressor._generate_summary(
+        await compressor._generate_summary(
             [{"role": "user", "content": "Continue"}],
             memory_context=(
                 f"api key: {prefix_secret}\n"
@@ -146,7 +149,8 @@ def test_memory_context_is_strictly_redacted_before_summary_llm(monkeypatch):
 
 
 
-def test_whitespace_memory_context_is_not_injected():
+@pytest.mark.asyncio
+async def test_whitespace_memory_context_is_not_injected():
     compressor = _make_compressor()
     turns = [
         {"role": "user", "content": "Hello"},
@@ -154,16 +158,15 @@ def test_whitespace_memory_context_is_not_injected():
     ]
     prompts = []
 
-    def mock_call_llm(**kwargs):
+    async def mock_call_llm(**kwargs):
         prompts.append(kwargs["messages"][0]["content"])
         return _summary_response()
 
     with patch("agent.context_compressor.call_llm", mock_call_llm):
-        compressor._generate_summary(turns, memory_context="  \n\t ")
+        await compressor._generate_summary(turns, memory_context="  \n\t ")
 
     assert len(prompts) == 1
     assert "MEMORY PROVIDER CONTEXT" not in prompts[0]
-
 
 
 

@@ -16,7 +16,9 @@ contract for the generic tool-result seam.
 """
 
 from pathlib import Path
+import textwrap
 
+import pytest
 import yaml
 
 import hermes_cli.plugins as plugins_mod
@@ -31,8 +33,7 @@ def _make_enabled_plugin(hermes_home: Path, name: str, register_body: str) -> Pa
         yaml.safe_dump({"name": name, "version": "0.1.0"}), encoding="utf-8",
     )
     (plugin_dir / "__init__.py").write_text(
-        "def register(ctx):\n"
-        f"    {register_body}\n",
+        "def register(ctx):\n" + textwrap.indent(register_body, "    ") + "\n",
         encoding="utf-8",
     )
     cfg_path = hermes_home / "config.yaml"
@@ -48,16 +49,18 @@ def test_transform_llm_output_in_valid_hooks():
     assert "transform_llm_output" in VALID_HOOKS
 
 
-def test_hook_receives_expected_kwargs(tmp_path, monkeypatch):
+@pytest.mark.asyncio
+async def test_hook_receives_expected_kwargs(tmp_path, monkeypatch):
     """Hook callback should see response_text + session_id + model + platform."""
     hermes_home = tmp_path / "hermes_test"
     hermes_home.mkdir(exist_ok=True)
     _make_enabled_plugin(
         hermes_home, "capture_hook",
         register_body=(
-            'ctx.register_hook("transform_llm_output", '
-            'lambda **kw: f"{kw[\'response_text\']}|{kw[\'session_id\']}|'
-            '{kw[\'model\']}|{kw[\'platform\']}")'
+            "async def callback(**kw):\n"
+            "    return f\"{kw['response_text']}|{kw['session_id']}|"
+            "{kw['model']}|{kw['platform']}\"\n"
+            'ctx.register_hook("transform_llm_output", callback)'
         ),
     )
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
@@ -65,7 +68,7 @@ def test_hook_receives_expected_kwargs(tmp_path, monkeypatch):
     mgr = PluginManager()
     mgr.discover_and_load()
 
-    results = mgr.invoke_hook(
+    results = await mgr.invoke_hook(
         "transform_llm_output",
         response_text="hello world",
         session_id="s1",
@@ -79,7 +82,8 @@ def test_hook_receives_expected_kwargs(tmp_path, monkeypatch):
 
 
 
-def test_hook_exception_does_not_replace_response(tmp_path, monkeypatch):
+@pytest.mark.asyncio
+async def test_hook_exception_does_not_replace_response(tmp_path, monkeypatch):
     """A plugin raising an exception must not break hook dispatch.
 
     PluginManager.invoke_hook catches per-callback exceptions, logs a
@@ -92,9 +96,9 @@ def test_hook_exception_does_not_replace_response(tmp_path, monkeypatch):
     _make_enabled_plugin(
         hermes_home, "raising_hook",
         register_body=(
-            'def _boom(**kw):\n'
-            '        raise RuntimeError("boom")\n'
-            '    ctx.register_hook("transform_llm_output", _boom)'
+            'async def _boom(**kw):\n'
+            '    raise RuntimeError("boom")\n'
+            'ctx.register_hook("transform_llm_output", _boom)'
         ),
     )
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
@@ -102,7 +106,7 @@ def test_hook_exception_does_not_replace_response(tmp_path, monkeypatch):
     mgr = PluginManager()
     mgr.discover_and_load()
 
-    results = mgr.invoke_hook(
+    results = await mgr.invoke_hook(
         "transform_llm_output",
         response_text="keep me",
         session_id="s1",
@@ -119,13 +123,14 @@ def test_hook_exception_does_not_replace_response(tmp_path, monkeypatch):
     assert final_response == "keep me"
 
 
-def test_no_plugins_returns_empty_results(tmp_path, monkeypatch):
+@pytest.mark.asyncio
+async def test_no_plugins_returns_empty_results(tmp_path, monkeypatch):
     """With no plugins loaded, invoke_hook returns [] and the response is unchanged."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes_empty"))
     plugins_mod._plugin_manager = PluginManager()
 
     mgr = plugins_mod._plugin_manager
-    results = mgr.invoke_hook(
+    results = await mgr.invoke_hook(
         "transform_llm_output",
         response_text="unchanged",
         session_id="",

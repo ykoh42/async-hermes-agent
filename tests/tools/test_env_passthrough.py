@@ -4,14 +4,12 @@ import os
 import pytest
 import yaml
 
-from agent import secret_scope as ss
 import tools.env_passthrough as _ep_mod
 from tools.env_passthrough import (
     clear_env_passthrough,
     get_all_passthrough,
     is_env_passthrough,
     register_env_passthrough,
-    resolve_passthrough_value,
 )
 
 
@@ -20,11 +18,9 @@ def _clean_passthrough():
     """Ensure a clean passthrough state for every test."""
     clear_env_passthrough()
     _ep_mod._config_passthrough = None
-    ss.set_multiplex_active(False)
     yield
     clear_env_passthrough()
     _ep_mod._config_passthrough = None
-    ss.set_multiplex_active(False)
 
 
 class TestSkillScopedPassthrough:
@@ -44,7 +40,7 @@ class TestConfigPassthrough:
     def test_reads_from_config(self, tmp_path, monkeypatch):
         config = {"terminal": {"env_passthrough": ["MY_CUSTOM_KEY", "ANOTHER_TOKEN"]}}
         config_path = tmp_path / "config.yaml"
-        config_path.write_text(yaml.dump(config), encoding="utf-8")
+        config_path.write_text(yaml.dump(config))
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         _ep_mod._config_passthrough = None
 
@@ -56,7 +52,7 @@ class TestConfigPassthrough:
     def test_union_of_skill_and_config(self, tmp_path, monkeypatch):
         config = {"terminal": {"env_passthrough": ["CONFIG_KEY"]}}
         config_path = tmp_path / "config.yaml"
-        config_path.write_text(yaml.dump(config), encoding="utf-8")
+        config_path.write_text(yaml.dump(config))
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         _ep_mod._config_passthrough = None
 
@@ -66,44 +62,8 @@ class TestConfigPassthrough:
         assert "SKILL_KEY" in all_pt
 
 
-class TestProfileScopedResolution:
-    def test_active_scope_overrides_process_fallback(self):
-        ss.set_multiplex_active(True)
-        token = ss.set_secret_scope({"SERVICE_TOKEN": "profile-b"})
-        try:
-            assert resolve_passthrough_value("SERVICE_TOKEN", "profile-a") == "profile-b"
-        finally:
-            ss.reset_secret_scope(token)
-
-    def test_active_scope_does_not_fall_back_to_another_profile(self):
-        ss.set_multiplex_active(True)
-        token = ss.set_secret_scope({})
-        try:
-            assert resolve_passthrough_value("SERVICE_TOKEN", "profile-a") is None
-        finally:
-            ss.reset_secret_scope(token)
-
-    def test_unscoped_multiplex_read_fails_closed(self):
-        ss.set_multiplex_active(True)
-        with pytest.raises(ss.UnscopedSecretError):
-            resolve_passthrough_value("SERVICE_TOKEN", "profile-a")
-
-    def test_single_profile_keeps_callers_fallback(self):
-        assert resolve_passthrough_value("SERVICE_TOKEN", "profile-a") == "profile-a"
-
-    def test_active_scope_keeps_explicit_global_override(self, monkeypatch):
-        """Global terminal settings still honor a caller-provided override."""
-        monkeypatch.setenv("TERMINAL_CWD", "/default")
-        ss.set_multiplex_active(True)
-        token = ss.set_secret_scope({})
-        try:
-            assert resolve_passthrough_value("TERMINAL_CWD", "/explicit") == "/explicit"
-        finally:
-            ss.reset_secret_scope(token)
-
-
-class TestExecuteCodeIntegration:
-    """Verify that the passthrough is checked in execute_code's env filtering."""
+class TestSandboxIntegration:
+    """Verify that passthrough is checked in sandbox environment filtering."""
 
     def test_secret_substring_blocked_by_default(self):
         """TENOR_API_KEY should be blocked without passthrough."""
@@ -154,113 +114,9 @@ class TestExecuteCodeIntegration:
         assert "TENOR_API_KEY" in child_env
         assert child_env["TENOR_API_KEY"] == "test123"
 
-    def test_execute_code_uses_active_profile_for_passthrough(self, monkeypatch):
-        """The execute_code child must receive the routed profile's value."""
-        from tools.code_execution_tool import _scrub_child_env
-
-        register_env_passthrough(["SERVICE_TOKEN"])
-        monkeypatch.setenv("SERVICE_TOKEN", "token-for-default")
-        ss.set_multiplex_active(True)
-        token = ss.set_secret_scope({"SERVICE_TOKEN": "token-for-routed-profile"})
-        try:
-            child_env = _scrub_child_env({"SERVICE_TOKEN": "token-for-default"})
-        finally:
-            ss.reset_secret_scope(token)
-            ss.set_multiplex_active(False)
-
-        assert child_env["SERVICE_TOKEN"] == "token-for-routed-profile"
-
-    def test_execute_code_omits_missing_scoped_passthrough(self, monkeypatch):
-        """A missing routed secret must not leak into the execute_code child."""
-        from tools.code_execution_tool import _scrub_child_env
-
-        register_env_passthrough(["SERVICE_TOKEN"])
-        monkeypatch.setenv("SERVICE_TOKEN", "token-for-default")
-        ss.set_multiplex_active(True)
-        token = ss.set_secret_scope({})
-        try:
-            child_env = _scrub_child_env({"SERVICE_TOKEN": "token-for-default"})
-        finally:
-            ss.reset_secret_scope(token)
-            ss.set_multiplex_active(False)
-
-        assert "SERVICE_TOKEN" not in child_env
-
 
 class TestTerminalIntegration:
     """Verify that the passthrough is checked in terminal's env sanitizers."""
-
-    def test_background_terminal_uses_active_profile_for_passthrough(self, monkeypatch):
-        """Background/PTY terminal children must use the routed profile value."""
-        from tools.environments.local import _sanitize_subprocess_env
-
-        register_env_passthrough(["SERVICE_TOKEN"])
-        monkeypatch.setenv("SERVICE_TOKEN", "token-for-default")
-        ss.set_multiplex_active(True)
-        token = ss.set_secret_scope({"SERVICE_TOKEN": "token-for-routed-profile"})
-        try:
-            child_env = _sanitize_subprocess_env(
-                {"SERVICE_TOKEN": "token-for-default"},
-                {"SERVICE_TOKEN": "token-for-default"},
-            )
-        finally:
-            ss.reset_secret_scope(token)
-            ss.set_multiplex_active(False)
-
-        assert child_env["SERVICE_TOKEN"] == "token-for-routed-profile"
-
-    def test_background_terminal_omits_missing_scoped_passthrough(self, monkeypatch):
-        """A missing routed secret must not leak into background terminal work."""
-        from tools.environments.local import _sanitize_subprocess_env
-
-        register_env_passthrough(["SERVICE_TOKEN"])
-        monkeypatch.setenv("SERVICE_TOKEN", "token-for-default")
-        ss.set_multiplex_active(True)
-        token = ss.set_secret_scope({})
-        try:
-            child_env = _sanitize_subprocess_env({"SERVICE_TOKEN": "token-for-default"})
-        finally:
-            ss.reset_secret_scope(token)
-            ss.set_multiplex_active(False)
-
-        assert "SERVICE_TOKEN" not in child_env
-
-    def test_shared_local_snapshot_re_resolves_current_profile(self, monkeypatch, tmp_path):
-        """A persistent shell snapshot must not retain the previous profile's value."""
-        from tools.environments.local import LocalEnvironment
-
-        register_env_passthrough(["SERVICE_TOKEN"])
-        monkeypatch.setenv("SERVICE_TOKEN", "token-for-default")
-        ss.set_multiplex_active(True)
-        env = None
-        token_b = None
-        token_c = None
-        try:
-            token_a = ss.set_secret_scope({"SERVICE_TOKEN": "token-for-profile-a"})
-            try:
-                env = LocalEnvironment(cwd=str(tmp_path))
-                assert env.execute("printf '%s' \"$SERVICE_TOKEN\"")["output"] == "token-for-profile-a"
-            finally:
-                ss.reset_secret_scope(token_a)
-
-            token_b = ss.set_secret_scope({"SERVICE_TOKEN": "token-for-profile-b"})
-            result = env.execute("printf '%s' \"$SERVICE_TOKEN\"")
-            ss.reset_secret_scope(token_b)
-            token_b = None
-
-            token_c = ss.set_secret_scope({})
-            missing = env.execute("printf '%s' \"${SERVICE_TOKEN-unset}\"")
-        finally:
-            if token_b is not None:
-                ss.reset_secret_scope(token_b)
-            if token_c is not None:
-                ss.reset_secret_scope(token_c)
-            ss.set_multiplex_active(False)
-            if env is not None:
-                env.cleanup()
-
-        assert result["output"] == "token-for-profile-b"
-        assert missing["output"] == "unset"
 
     def test_blocklisted_var_blocked_by_default(self):
         from tools.environments.local import _sanitize_subprocess_env, _HERMES_PROVIDER_ENV_BLOCKLIST
@@ -276,7 +132,7 @@ class TestTerminalIntegration:
         """GHSA-rhgp-j443-p4rf: register_env_passthrough must NOT accept
         Hermes provider credentials — that was the bypass where a skill
         could declare ANTHROPIC_TOKEN / OPENAI_API_KEY as passthrough and
-        defeat the execute_code sandbox scrubbing."""
+        defeat the terminal sandbox scrubbing."""
         from tools.environments.local import (
             _sanitize_subprocess_env,
             _HERMES_PROVIDER_ENV_BLOCKLIST,
@@ -333,7 +189,7 @@ class TestTerminalIntegration:
         """_make_run_env must NOT expose a blocklisted var to subprocess env
         even after a skill attempts to register it via passthrough."""
         from tools.environments.local import (
-            _make_run_env,
+            build_subprocess_env,
             _HERMES_PROVIDER_ENV_BLOCKLIST,
         )
 
@@ -341,12 +197,12 @@ class TestTerminalIntegration:
         os.environ[blocked_var] = "secret_value"
         try:
             # Without passthrough — blocked
-            result_before = _make_run_env({})
+            result_before = build_subprocess_env()
             assert blocked_var not in result_before
 
             # Skill tries to register it — must be refused, so still blocked
             register_env_passthrough([blocked_var])
-            result_after = _make_run_env({})
+            result_after = build_subprocess_env()
             assert blocked_var not in result_after
         finally:
             os.environ.pop(blocked_var, None)
@@ -366,18 +222,18 @@ class TestTerminalIntegration:
     def test_provider_blocklist_import_failure_fails_closed(self, monkeypatch):
         """If the dynamic provider blocklist can't be imported, provider
         credentials must be treated as protected and refused passthrough —
-        otherwise a skill could tunnel a Hermes credential into the
-        execute_code child (regression for #37950 / GHSA-rhgp-j443-p4rf).
+        otherwise a skill could tunnel a Hermes credential into a terminal
+        child (regression for #37950 / GHSA-rhgp-j443-p4rf).
 
         Verifies the full path: _is_hermes_provider_credential returns True,
-        register_env_passthrough refuses the var, and _scrub_child_env keeps
+        register_env_passthrough refuses the var, and the terminal sanitizer keeps
         it out of the child env. A non-Hermes key is also rejected here (the
         fallback is conservative: when we can't tell, we fail closed), which
         is the safe direction.
         """
         import builtins
 
-        from tools.code_execution_tool import _scrub_child_env
+        from tools.environments.local import _sanitize_subprocess_env
 
         real_import = builtins.__import__
 
@@ -398,15 +254,13 @@ class TestTerminalIntegration:
         assert not is_env_passthrough("OPENAI_API_KEY")
         assert not is_env_passthrough("ANTHROPIC_API_KEY")
 
-        # And the credential never reaches the execute_code child.
-        child_env = _scrub_child_env(
+        # And the credential never reaches the terminal child.
+        child_env = _sanitize_subprocess_env(
             {
                 "OPENAI_API_KEY": "synthetic-secret",
                 "ANTHROPIC_API_KEY": "synthetic-secret",
                 "PATH": "/usr/bin",
-            },
-            is_passthrough=is_env_passthrough,
-            is_windows=False,
+            }
         )
         assert "OPENAI_API_KEY" not in child_env
         assert "ANTHROPIC_API_KEY" not in child_env

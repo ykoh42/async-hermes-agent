@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
+
+import pytest
 
 
 
@@ -73,31 +76,26 @@ def test_ambient_context_isolated_between_contexts():
     assert not any(t.startswith("conversation=") for t in nous_portal_tags())
 
 
-def test_ambient_context_propagates_via_thread_context_helper():
-    """propagate_context_to_thread carries the tag onto executor workers (MoA path)."""
-    from concurrent.futures import ThreadPoolExecutor
-
+@pytest.mark.asyncio
+async def test_ambient_context_propagates_to_child_tasks():
+    """Child tasks inherit the active conversation context."""
     from agent.portal_tags import (
         conversation_tag,
         nous_portal_tags,
         reset_conversation_context,
         set_conversation_context,
     )
-    from tools.thread_context import propagate_context_to_thread
+
+    async def collect_tags():
+        await asyncio.sleep(0)
+        return nous_portal_tags()
 
     token = set_conversation_context("moa-root")
     try:
-        with ThreadPoolExecutor(max_workers=1) as ex:
-            plain = ex.submit(nous_portal_tags).result()
-            propagated = ex.submit(
-                propagate_context_to_thread(nous_portal_tags)
-            ).result()
+        tags = await asyncio.create_task(collect_tags())
     finally:
         reset_conversation_context(token)
-
-    # Bare submit loses the ContextVar; the propagation wrapper keeps it.
-    assert not any(t.startswith("conversation=") for t in plain)
-    assert conversation_tag("moa-root") in propagated
+    assert conversation_tag("moa-root") in tags
 
 
 
@@ -145,7 +143,8 @@ def test_nous_sticky_key_matches_conversation_tag():
 
 
 
-def test_compress_context_preserves_ambient_context(monkeypatch):
+@pytest.mark.asyncio
+async def test_compress_context_preserves_ambient_context(monkeypatch):
     """In-turn compaction inherits the turn's root and restores it untouched."""
     import agent.conversation_compression as cc
     from agent.portal_tags import (
@@ -157,20 +156,20 @@ def test_compress_context_preserves_ambient_context(monkeypatch):
 
     seen = {}
 
-    def _fake_compress(agent, messages, system_message, **kwargs):
+    async def _fake_compress(agent, messages, system_message, **kwargs):
         seen["conversation"] = get_conversation_context()
         return ([], "")
 
     monkeypatch.setattr(cc, "compress_context", _fake_compress)
 
     class _Agent:
-        def _conversation_root_id(self):
+        async def _conversation_root_id(self):
             # A rotated segment id must never win over the ambient root.
             return "segment-after-compaction"
 
     token = set_conversation_context("outer-root")
     try:
-        AIAgent._compress_context(_Agent(), [], "sys")
+        await AIAgent._compress_context(_Agent(), [], "sys")
         assert seen["conversation"] == "outer-root"
         assert get_conversation_context() == "outer-root"
     finally:

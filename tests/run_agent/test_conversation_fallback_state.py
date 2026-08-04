@@ -1,6 +1,6 @@
 """Regression tests for conversation loop fallback state management."""
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -36,7 +36,8 @@ def _response(*, content, finish_reason, tool_calls=None):
     return SimpleNamespace(choices=[choice], model="test/model", usage=None)
 
 
-def test_substantive_tool_only_turn_invalidates_older_housekeeping_fallback():
+@pytest.mark.asyncio
+async def test_substantive_tool_only_turn_invalidates_older_housekeeping_fallback():
     """
     Regression test for #63860.
 
@@ -83,8 +84,9 @@ def test_substantive_tool_only_turn_invalidates_older_housekeeping_fallback():
     agent.compression_enabled = False
     agent.save_trajectories = False
     agent.valid_tool_names = {"todo", "web_search"}
+    agent._deferred_provider_runtime = None
     agent.client = MagicMock()
-    agent.client.chat.completions.create.side_effect = [
+    agent.client.chat.completions.create = AsyncMock(side_effect=[
         # Turn 1: Content + housekeeping tool
         _response(
             content="I'll begin the work.",
@@ -101,15 +103,15 @@ def test_substantive_tool_only_turn_invalidates_older_housekeeping_fallback():
         _response(content="", finish_reason="stop"),
         # Turn 4: Nudge response
         _response(content="Recovered after nudge.", finish_reason="stop"),
-    ]
+    ])
 
     with (
-        patch("run_agent.handle_function_call", return_value="ok"),
-        patch.object(agent, "_persist_session"),
-        patch.object(agent, "_save_trajectory"),
-        patch.object(agent, "_cleanup_task_resources"),
+        patch("model_tools.handle_function_call", new=AsyncMock(return_value="ok")),
+        patch.object(agent, "_persist_session", new=AsyncMock()),
+        patch.object(agent, "_save_trajectory", new=AsyncMock()),
+        patch.object(agent, "_cleanup_task_resources", new=AsyncMock()),
     ):
-        result = agent.run_conversation("do the full task")
+        result = await agent.run_conversation("do the full task")
 
     assert result["final_response"] == "Recovered after nudge.", (
         f"Expected nudge recovery response, got: {result['final_response']}. "
@@ -123,5 +125,3 @@ def test_substantive_tool_only_turn_invalidates_older_housekeeping_fallback():
         f"Expected text_response exit, got: {result['turn_exit_reason']}. "
         f"This indicates the wrong fallback path was taken."
     )
-
-

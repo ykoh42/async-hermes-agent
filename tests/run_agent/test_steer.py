@@ -7,7 +7,7 @@ and prompt-cache integrity.
 """
 from __future__ import annotations
 
-import threading
+import asyncio
 
 import pytest
 
@@ -22,19 +22,13 @@ def _bare_agent() -> AIAgent:
     """
     agent = object.__new__(AIAgent)
     agent._pending_steer = None
-    agent._pending_steer_lock = threading.Lock()
     agent._pending_redirect = None
-    agent._pending_redirect_lock = threading.Lock()
-    agent._model_request_active = threading.Event()
+    agent._model_request_active = asyncio.Event()
     agent._executing_tools = False
-    agent._execution_thread_id = None
-    agent._interrupt_thread_signal_pending = False
+    agent._interrupt_event = asyncio.Event()
     agent._interrupt_requested = False
     agent._interrupt_message = None
     agent._active_children = []
-    agent._active_children_lock = threading.Lock()
-    agent._tool_worker_threads = None
-    agent._tool_worker_threads_lock = None
     agent._current_streamed_assistant_text = ""
     agent._stream_needs_break = False
     agent._strip_think_blocks = lambda content: content
@@ -114,70 +108,24 @@ class TestActiveTurnRedirect:
         assert seen == ["visible provider thinking"]
         assert not getattr(agent, "_current_streamed_reasoning_text", "")
 
-    def test_response_completion_before_redirect_lock_rejects_correction(self):
+    def test_response_completion_before_redirect_rejects_correction(self):
         agent = _bare_agent()
         agent._model_request_active.set()
-        started = threading.Event()
-        outcome = {}
+        agent._model_request_active.clear()
 
-        def redirect():
-            started.set()
-            outcome["accepted"] = agent.redirect("late correction")
-
-        with agent._pending_redirect_lock:
-            worker = threading.Thread(target=redirect)
-            worker.start()
-            assert started.wait(timeout=1)
-            # Mirrors conversation_loop clearing the request-active marker
-            # under this same lock before redirect can commit its slot.
-            agent._model_request_active.clear()
-        worker.join(timeout=1)
-
-        assert outcome["accepted"] is False
+        assert agent.redirect("late correction") is False
         assert agent._pending_redirect is None
 
-    def test_hard_stop_wins_concurrent_redirect(self):
+    def test_hard_stop_supersedes_accepted_redirect(self):
         agent = _bare_agent()
         agent._model_request_active.set()
-        start = threading.Barrier(3)
-        outcome = {}
+        assert agent.redirect("change course") is True
 
-        def redirect():
-            start.wait()
-            outcome["redirect"] = agent.redirect("change course")
+        agent.interrupt("stop requested")
 
-        def hard_stop():
-            start.wait()
-            agent.interrupt("stop requested")
-
-        redirect_thread = threading.Thread(target=redirect)
-        stop_thread = threading.Thread(target=hard_stop)
-        redirect_thread.start()
-        stop_thread.start()
-        start.wait()
-        redirect_thread.join(timeout=1)
-        stop_thread.join(timeout=1)
-
-        assert redirect_thread.is_alive() is False
-        assert stop_thread.is_alive() is False
         assert agent._interrupt_requested is True
         assert agent._interrupt_message == "stop requested"
         assert agent._pending_redirect is None
-
-    def test_codex_app_server_hard_stop_reaches_native_session(self):
-        agent = _bare_agent()
-        calls = []
-        agent.api_mode = "codex_app_server"
-        agent._codex_session = type(
-            "_CodexSession",
-            (),
-            {"request_interrupt": lambda self: calls.append("interrupt")},
-        )()
-
-        agent.interrupt()
-
-        assert calls == ["interrupt"]
-
 
     def test_redirect_during_tool_execution_uses_safe_steer_boundary(self):
         agent = _bare_agent()
@@ -381,23 +329,21 @@ class TestSteerInjection:
 
 
 
-class TestSteerThreadSafety:
-    def test_concurrent_steer_calls_preserve_all_text(self):
+class TestSteerTaskSafety:
+    @pytest.mark.asyncio
+    async def test_concurrent_steer_calls_preserve_all_text(self):
         agent = _bare_agent()
         N = 200
 
-        def worker(idx: int) -> None:
+        async def worker(idx: int) -> None:
+            await asyncio.sleep(0)
             agent.steer(f"note-{idx}")
 
-        threads = [threading.Thread(target=worker, args=(i,)) for i in range(N)]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join()
+        await asyncio.gather(*(worker(i) for i in range(N)))
 
         text = agent._drain_pending_steer()
         assert text is not None
-        # Every single note must be preserved — none dropped by the lock.
+        # Every note is preserved because steer() contains no await boundary.
         lines = text.split("\n")
         assert len(lines) == N
         assert set(lines) == {f"note-{i}" for i in range(N)}
@@ -412,11 +358,6 @@ class TestSteerClearedOnInterrupt:
         # Minimal surface needed by clear_interrupt()
         agent._interrupt_requested = True
         agent._interrupt_message = None
-        agent._interrupt_thread_signal_pending = False
-        agent._execution_thread_id = None
-        agent._tool_worker_threads = None
-        agent._tool_worker_threads_lock = None
-
         agent.steer("will be dropped")
         agent._pending_redirect = "also drop this"
         assert agent._pending_steer == "will be dropped"

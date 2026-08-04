@@ -17,7 +17,7 @@ the persistence boundary, and uses an OAuth-callback-style URL to prove
 redaction deliberately passes through.
 """
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -42,7 +42,7 @@ def _redaction_globally_disabled(monkeypatch):
 
 def _compressor() -> ContextCompressor:
     with patch(
-        "agent.context_compressor.get_model_context_length",
+        "agent.context_compressor.get_static_context_length",
         return_value=100000,
     ):
         return ContextCompressor(model="test/model", quiet_mode=True)
@@ -112,14 +112,17 @@ def test_fallback_summary_redacts_secrets():
     _assert_clean(summary)
 
 
-def test_summary_output_redacts_llm_echoed_secrets():
+@pytest.mark.asyncio
+async def test_summary_output_redacts_llm_echoed_secrets():
     c = _compressor()
     leaked = f"Summary leaked OPENAI_API_KEY {SECRET} and {OAUTH_URL}"
 
     with patch(
-        "agent.context_compressor.call_llm", return_value=_response(leaked)
+        "agent.context_compressor.call_llm",
+        new_callable=AsyncMock,
+        return_value=_response(leaked),
     ):
-        summary = c._generate_summary([{"role": "user", "content": "hi"}])
+        summary = await c._generate_summary([{"role": "user", "content": "hi"}])
 
     assert summary is not None
     _assert_clean(summary)
@@ -127,7 +130,8 @@ def test_summary_output_redacts_llm_echoed_secrets():
     _assert_clean(c._previous_summary)
 
 
-def test_manual_focus_topic_redacted_before_summary_prompt():
+@pytest.mark.asyncio
+async def test_manual_focus_topic_redacted_before_summary_prompt():
     c = _compressor()
     turns = [
         {"role": "user", "content": "Summarize safely"},
@@ -136,9 +140,10 @@ def test_manual_focus_topic_redacted_before_summary_prompt():
 
     with patch(
         "agent.context_compressor.call_llm",
+        new_callable=AsyncMock,
         return_value=_response("## Goal\nSafe summary."),
     ) as mock_call:
-        result = c._generate_summary(
+        result = await c._generate_summary(
             turns, focus_topic=f"manual focus {SECRET} {OAUTH_URL}"
         )
 
@@ -161,16 +166,18 @@ def test_auto_focus_topic_redacted():
     _assert_clean(focus)
 
 
-def test_previous_summary_redacted_before_iterative_prompt_reentry():
+@pytest.mark.asyncio
+async def test_previous_summary_redacted_before_iterative_prompt_reentry():
     """Legacy persisted summaries may predate compaction redaction."""
     c = _compressor()
     c._previous_summary = f"Old summary leaked {SECRET} and {OAUTH_URL}"
 
     with patch(
         "agent.context_compressor.call_llm",
+        new_callable=AsyncMock,
         return_value=_response("updated summary"),
     ) as mock_call:
-        result = c._generate_summary(
+        result = await c._generate_summary(
             [
                 {"role": "user", "content": "new turn"},
                 {"role": "assistant", "content": "new work"},
@@ -187,10 +194,11 @@ def test_previous_summary_redacted_before_iterative_prompt_reentry():
     assert "access_token=opaque-token-456" not in c._previous_summary
 
 
-def test_resumed_handoff_summary_redacted_before_iterative_prompt():
+@pytest.mark.asyncio
+async def test_resumed_handoff_summary_redacted_before_iterative_prompt():
     """Persisted handoff messages may contain pre-fix secrets after resume."""
     with patch(
-        "agent.context_compressor.get_model_context_length",
+        "agent.context_compressor.get_static_context_length",
         return_value=100000,
     ):
         c = ContextCompressor(
@@ -214,9 +222,10 @@ def test_resumed_handoff_summary_redacted_before_iterative_prompt():
 
     with patch(
         "agent.context_compressor.call_llm",
+        new_callable=AsyncMock,
         return_value=_response("updated summary"),
     ) as mock_call:
-        c.compress(messages)
+        await c.compress(messages)
 
     prompt = mock_call.call_args.kwargs["messages"][0]["content"]
     assert "PREVIOUS SUMMARY:" in prompt

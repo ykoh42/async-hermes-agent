@@ -22,12 +22,13 @@ class TestParseEnvVar:
             assert _parse_env_var("TERMINAL_TIMEOUT", "180") == 300
 
 
-    def test_get_env_config_parses_docker_forward_env_json(self):
+    @pytest.mark.asyncio
+    async def test_get_env_config_parses_docker_forward_env_json(self):
         with patch.dict("os.environ", {
             "TERMINAL_ENV": "docker",
             "TERMINAL_DOCKER_FORWARD_ENV": '["GITHUB_TOKEN", "NPM_TOKEN"]',
         }, clear=False):
-            config = _tt_mod._get_env_config()
+            config = await _tt_mod._get_env_config()
             assert config["docker_forward_env"] == ["GITHUB_TOKEN", "NPM_TOKEN"]
 
 

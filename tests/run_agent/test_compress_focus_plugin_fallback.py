@@ -23,7 +23,6 @@ def _make_agent_with_engine(engine):
     agent.quiet_mode = True
     agent._todo_store = MagicMock()
     agent._todo_store.format_for_injection.return_value = ""
-    agent._memory_manager = None
     agent._session_db = None
     agent._cached_system_prompt = None
     agent.log_prefix = ""

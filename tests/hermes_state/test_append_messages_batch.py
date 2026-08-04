@@ -10,6 +10,7 @@ import json
 import sqlite3
 
 import pytest
+import pytest_asyncio
 
 from hermes_state import (
     CompressionSessionClosedError,
@@ -17,12 +18,12 @@ from hermes_state import (
 )
 
 
-@pytest.fixture()
-def db(tmp_path):
+@pytest_asyncio.fixture()
+async def db(tmp_path):
     d = SessionDB(db_path=tmp_path / "state.db")
-    d.create_session("sess-batch", source="cli")
+    await d.create_session("sess-batch", source="cli")
     yield d
-    d.close()
+    await d.close()
 
 
 def _turn_messages():
@@ -45,17 +46,18 @@ def _turn_messages():
     ]
 
 
+@pytest.mark.asyncio
 class TestAppendMessagesBatch:
-    def test_batch_rows_identical_to_single_appends(self, db, tmp_path):
+    async def test_batch_rows_identical_to_single_appends(self, db, tmp_path):
         """The batch writer stores the same bytes append_message would."""
         db2 = SessionDB(db_path=tmp_path / "state2.db")
-        db2.create_session("sess-batch", source="cli")
+        await db2.create_session("sess-batch", source="cli")
         try:
             msgs = _turn_messages()
-            db.append_messages_batch("sess-batch", msgs)
+            await db.append_messages_batch("sess-batch", msgs)
             for m in msgs:
                 role = m["role"]
-                db2.append_message(
+                await db2.append_message(
                     session_id="sess-batch",
                     role=role,
                     content=m.get("content"),
@@ -71,20 +73,22 @@ class TestAppendMessagesBatch:
                 "role, content, tool_call_id, tool_calls, tool_name, "
                 "finish_reason, reasoning_content, observed, active"
             )
-            rows_a = db._conn.execute(
+            conn_a = await db._get_connection()
+            conn_b = await db2._get_connection()
+            rows_a = await (await conn_a.execute(
                 f"SELECT {cols} FROM messages ORDER BY id"
-            ).fetchall()
-            rows_b = db2._conn.execute(
+            )).fetchall()
+            rows_b = await (await conn_b.execute(
                 f"SELECT {cols} FROM messages ORDER BY id"
-            ).fetchall()
+            )).fetchall()
             assert [tuple(r) for r in rows_a] == [tuple(r) for r in rows_b]
         finally:
-            db2.close()
+            await db2.close()
 
-    def test_reasoning_gated_to_assistant_rows(self, db):
+    async def test_reasoning_gated_to_assistant_rows(self, db):
         """_insert_message_rows role-gates reasoning fields; a tool row
         carrying reasoning keys must not persist them."""
-        db.append_messages_batch(
+        await db.append_messages_batch(
             "sess-batch",
             [
                 {
@@ -96,76 +100,72 @@ class TestAppendMessagesBatch:
                 }
             ],
         )
-        row = db._conn.execute(
+        connection = await db._get_connection()
+        row = await (await connection.execute(
             "SELECT reasoning_content FROM messages"
-        ).fetchone()
+        )).fetchone()
         assert row[0] is None
 
-    def test_counters_aggregate_once(self, db):
-        db.append_messages_batch("sess-batch", _turn_messages())
-        row = db._conn.execute(
+    async def test_counters_aggregate_once(self, db):
+        await db.append_messages_batch("sess-batch", _turn_messages())
+        connection = await db._get_connection()
+        row = await (await connection.execute(
             "SELECT message_count, tool_call_count FROM sessions WHERE id = ?",
             ("sess-batch",),
-        ).fetchone()
+        )).fetchone()
         assert row["message_count"] == 4
         assert row["tool_call_count"] == 1
 
-    def test_returns_inserted_count(self, db):
-        assert db.append_messages_batch("sess-batch", _turn_messages()) == 4
+    async def test_returns_inserted_count(self, db):
+        assert await db.append_messages_batch("sess-batch", _turn_messages()) == 4
 
-    def test_empty_batch_is_noop(self, db):
-        assert db.append_messages_batch("sess-batch", []) == 0
-        row = db._conn.execute(
+    async def test_empty_batch_is_noop(self, db):
+        assert await db.append_messages_batch("sess-batch", []) == 0
+        connection = await db._get_connection()
+        row = await (await connection.execute(
             "SELECT message_count FROM sessions WHERE id = ?", ("sess-batch",)
-        ).fetchone()
+        )).fetchone()
         assert row["message_count"] == 0
 
-    def test_atomicity_all_or_nothing(self, db, monkeypatch):
+    async def test_atomicity_all_or_nothing(self, db, monkeypatch):
         """A failure mid-batch leaves ZERO rows and untouched counters."""
-        real_insert = SessionDB._insert_message_rows
-
-        def failing_insert(self_db, conn, session_id, messages):
-            real_conn_execute = conn.execute
-            calls = {"n": 0}
-
-            def exec_counting(sql, *args):
-                if sql.lstrip().startswith("INSERT INTO messages"):
-                    calls["n"] += 1
-                    if calls["n"] == 3:
-                        raise sqlite3.OperationalError("boom mid-batch")
-                return real_conn_execute(sql, *args)
-
-            conn.execute = exec_counting
-            try:
-                return real_insert(self_db, conn, session_id, messages)
-            finally:
-                conn.execute = real_conn_execute
+        async def failing_insert(self_db, conn, session_id, messages):
+            await conn.execute(
+                "INSERT INTO messages (session_id, role, content, timestamp) "
+                "VALUES (?, 'user', 'partial', ?)",
+                (session_id, 1.0),
+            )
+            raise sqlite3.OperationalError("boom mid-batch")
 
         monkeypatch.setattr(SessionDB, "_insert_message_rows", failing_insert)
         with pytest.raises(sqlite3.OperationalError):
-            db.append_messages_batch("sess-batch", _turn_messages())
+            await db.append_messages_batch("sess-batch", _turn_messages())
         monkeypatch.undo()
 
-        count = db._conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+        connection = await db._get_connection()
+        count = (await (await connection.execute(
+            "SELECT COUNT(*) FROM messages"
+        )).fetchone())[0]
         assert count == 0
-        row = db._conn.execute(
+        row = await (await connection.execute(
             "SELECT message_count, tool_call_count FROM sessions WHERE id = ?",
             ("sess-batch",),
-        ).fetchone()
+        )).fetchone()
         assert row["message_count"] == 0
         assert row["tool_call_count"] == 0
 
-    def test_compression_closed_session_rejected(self, db):
-        db._conn.execute(
+    async def test_compression_closed_session_rejected(self, db):
+        connection = await db._get_connection()
+        await connection.execute(
             "UPDATE sessions SET ended_at = 1.0, end_reason = 'compression' "
             "WHERE id = ?",
             ("sess-batch",),
         )
-        db._conn.commit()
+        await connection.commit()
         with pytest.raises(CompressionSessionClosedError):
-            db.append_messages_batch("sess-batch", _turn_messages())
+            await db.append_messages_batch("sess-batch", _turn_messages())
 
-    def test_multimodal_content_encoded(self, db):
+    async def test_multimodal_content_encoded(self, db):
         msgs = [
             {
                 "role": "user",
@@ -175,13 +175,16 @@ class TestAppendMessagesBatch:
                 ],
             }
         ]
-        db.append_messages_batch("sess-batch", msgs)
-        raw = db._conn.execute("SELECT content FROM messages").fetchone()[0]
+        await db.append_messages_batch("sess-batch", msgs)
+        connection = await db._get_connection()
+        raw = (await (await connection.execute(
+            "SELECT content FROM messages"
+        )).fetchone())[0]
         # encoded via _encode_content — same sentinel prefix as append_message
-        loaded = db.get_messages("sess-batch")
+        loaded = await db.get_messages("sess-batch")
         assert loaded, raw
 
-    def test_tool_calls_json_string_not_double_encoded(self, db):
+    async def test_tool_calls_json_string_not_double_encoded(self, db):
         msgs = [
             {
                 "role": "assistant",
@@ -189,6 +192,9 @@ class TestAppendMessagesBatch:
                 "tool_calls": json.dumps([{"name": "t", "arguments": "{}"}]),
             }
         ]
-        db.append_messages_batch("sess-batch", msgs)
-        raw = db._conn.execute("SELECT tool_calls FROM messages").fetchone()[0]
+        await db.append_messages_batch("sess-batch", msgs)
+        connection = await db._get_connection()
+        raw = (await (await connection.execute(
+            "SELECT tool_calls FROM messages"
+        )).fetchone())[0]
         assert json.loads(raw) == [{"name": "t", "arguments": "{}"}]

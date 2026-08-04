@@ -31,14 +31,14 @@ def _response(content="synthesized guidance"):
 def captured_calls(monkeypatch):
     calls = []
 
-    def fake_call_llm(**kwargs):
+    async def fake_call_llm(**kwargs):
         calls.append(kwargs)
         return _response()
 
     monkeypatch.setattr("agent.moa_loop.call_llm", fake_call_llm)
     monkeypatch.setattr(
         "agent.moa_loop._run_references_parallel",
-        lambda *a, **k: [("advisor-a", "advice from a", None)],
+        lambda *a, **k: _fake_references(),
     )
     return calls
 
@@ -47,25 +47,29 @@ def _aggregator_kwargs(calls):
     return next(c for c in calls if c.get("task") == "moa_aggregator")
 
 
-def test_aggregator_synthesis_gets_cache_control_on_native_anthropic_route(
+async def _fake_references():
+    return [("advisor-a", "advice from a", None)]
+
+
+@pytest.mark.asyncio
+async def test_aggregator_synthesis_gets_cache_control_on_native_anthropic_route(
     captured_calls, monkeypatch
 ):
     """A cache-honoring aggregator slot (native Anthropic) must get
     cache_control breakpoints on its synthesis call."""
     from agent import moa_loop
 
-    monkeypatch.setattr(
-        moa_loop,
-        "_slot_runtime",
-        lambda slot: {
+    async def fake_slot_runtime(slot):
+        return {
             "provider": "anthropic",
             "model": "claude-opus-4.8",
             "base_url": "",
             "api_mode": "anthropic_messages",
-        },
-    )
+        }
 
-    moa_loop.aggregate_moa_context(
+    monkeypatch.setattr(moa_loop, "_slot_runtime", fake_slot_runtime)
+
+    await moa_loop.aggregate_moa_context(
         user_prompt="what should I do next?",
         api_messages=[{"role": "user", "content": "help me plan"}],
         reference_models=[{"provider": "openrouter", "model": "openai/gpt-5.5"}],
@@ -85,25 +89,25 @@ def test_aggregator_synthesis_gets_cache_control_on_native_anthropic_route(
     ), "aggregator synthesis message must carry a cache_control breakpoint"
 
 
-def test_aggregator_synthesis_untouched_on_non_caching_route(
+@pytest.mark.asyncio
+async def test_aggregator_synthesis_untouched_on_non_caching_route(
     captured_calls, monkeypatch
 ):
     """A non-cache-honoring aggregator slot (plain OpenAI) must not be
     decorated — proves the guard doesn't over-fire."""
     from agent import moa_loop
 
-    monkeypatch.setattr(
-        moa_loop,
-        "_slot_runtime",
-        lambda slot: {
+    async def fake_slot_runtime(slot):
+        return {
             "provider": "openai",
             "model": "gpt-5.5",
             "base_url": "",
             "api_mode": "chat_completions",
-        },
-    )
+        }
 
-    moa_loop.aggregate_moa_context(
+    monkeypatch.setattr(moa_loop, "_slot_runtime", fake_slot_runtime)
+
+    await moa_loop.aggregate_moa_context(
         user_prompt="what should I do next?",
         api_messages=[{"role": "user", "content": "help me plan"}],
         reference_models=[{"provider": "openrouter", "model": "openai/gpt-5.5"}],
@@ -115,20 +119,20 @@ def test_aggregator_synthesis_untouched_on_non_caching_route(
     assert isinstance(synth_message["content"], str), "must stay undecorated (plain string content)"
 
 
-def test_prepared_aggregator_plans_tools_without_decorating_prepared_state(monkeypatch):
+@pytest.mark.asyncio
+async def test_prepared_aggregator_plans_tools_without_decorating_prepared_state(monkeypatch):
     from agent import moa_loop
 
     calls = []
-    monkeypatch.setattr(moa_loop, "call_llm", lambda **kwargs: calls.append(kwargs) or _response())
+    async def fake_call_llm(**kwargs):
+        calls.append(kwargs)
+        return _response()
+
+    monkeypatch.setattr(moa_loop, "call_llm", fake_call_llm)
     monkeypatch.setattr(
         moa_loop,
         "_slot_runtime",
-        lambda slot: {
-            "provider": "anthropic",
-            "model": "claude-sonnet-4-6",
-            "base_url": "https://api.anthropic.com",
-            "api_mode": "anthropic_messages",
-        },
+        _native_anthropic_runtime,
     )
     completions = moa_loop.MoAChatCompletions.__new__(moa_loop.MoAChatCompletions)
     completions._pending_trace = None
@@ -146,8 +150,17 @@ def test_prepared_aggregator_plans_tools_without_decorating_prepared_state(monke
     canonical_prepared = copy.deepcopy(prepared)
     tools = [{"type": "function", "function": {"name": "lookup", "parameters": {"type": "object", "properties": {}}}}]
 
-    completions._call_prepared_aggregator(prepared, {"tools": tools})
+    await completions._call_prepared_aggregator(prepared, {"tools": tools})
 
     assert "cache_control" in calls[0]["tools"][-1]
     assert "cache_control" not in tools[-1]
     assert prepared == canonical_prepared
+
+
+async def _native_anthropic_runtime(slot):
+    return {
+        "provider": "anthropic",
+        "model": "claude-sonnet-4-6",
+        "base_url": "https://api.anthropic.com",
+        "api_mode": "anthropic_messages",
+    }

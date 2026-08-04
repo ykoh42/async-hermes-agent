@@ -2,7 +2,7 @@
 
 import os
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -112,7 +112,7 @@ def _lifecycle_agent(db: SessionDB, session_id: str):
 @pytest.fixture()
 def compressor() -> ContextCompressor:
     with patch(
-        "agent.context_compressor.get_model_context_length",
+        "agent.context_compressor.get_static_context_length",
         return_value=100_000,
     ):
         instance = ContextCompressor(
@@ -126,7 +126,8 @@ def compressor() -> ContextCompressor:
     return instance
 
 
-def test_generate_summary_rejects_fabricated_user_ask(compressor):
+@pytest.mark.asyncio
+async def test_generate_summary_rejects_fabricated_user_ask(compressor):
     fabricated = f"""{HISTORICAL_TASK_HEADING}
 User asked: 'Waar zijn de bestanden gedownload?'
 
@@ -136,9 +137,9 @@ Vind de bestanden.
 
     with patch(
         "agent.context_compressor.call_llm",
-        return_value=_response(fabricated),
+        new=AsyncMock(return_value=_response(fabricated)),
     ):
-        result = compressor._generate_summary(_assistant_tool_turns(0, 2))
+        result = await compressor._generate_summary(_assistant_tool_turns(0, 2))
 
     assert result is None
     assert compressor._previous_summary is None
@@ -147,12 +148,17 @@ Vind de bestanden.
 
 
 
-def test_zero_user_provenance_survives_iterative_compaction(compressor):
+@pytest.mark.asyncio
+async def test_zero_user_provenance_survives_iterative_compaction(compressor):
     messages = _assistant_tool_turns(0, 12)
     first_summary = f"{SUMMARY_PREFIX}\n{_valid_zero_user_summary('First pass').strip()}"
 
-    with patch.object(compressor, "_generate_summary", return_value=first_summary):
-        first = compressor.compress(messages, current_tokens=90_000)
+    with patch.object(
+        compressor,
+        "_generate_summary",
+        new=AsyncMock(return_value=first_summary),
+    ):
+        first = await compressor.compress(messages, current_tokens=90_000)
 
     first_handoffs = [
         message
@@ -163,7 +169,7 @@ def test_zero_user_provenance_survives_iterative_compaction(compressor):
     assert first_handoffs[0][COMPRESSED_SUMMARY_HAS_USER_TURN_KEY] is False
 
     with patch(
-        "agent.context_compressor.get_model_context_length",
+        "agent.context_compressor.get_static_context_length",
         return_value=100_000,
     ):
         resumed = ContextCompressor(
@@ -189,9 +195,9 @@ def test_zero_user_provenance_survives_iterative_compaction(compressor):
     with patch.object(
         resumed,
         "_generate_summary",
-        side_effect=assert_provenance_then_summarize,
+        new=AsyncMock(side_effect=assert_provenance_then_summarize),
     ):
-        second = resumed.compress(second_input, current_tokens=90_000)
+        second = await resumed.compress(second_input, current_tokens=90_000)
 
     second_handoffs = [
         message
@@ -202,21 +208,22 @@ def test_zero_user_provenance_survives_iterative_compaction(compressor):
     assert second_handoffs[0][COMPRESSED_SUMMARY_HAS_USER_TURN_KEY] is False
 
 
-def test_compress_context_todo_snapshot_stays_synthetic_across_two_boundaries(
+@pytest.mark.asyncio
+async def test_compress_context_todo_snapshot_stays_synthetic_across_two_boundaries(
     tmp_path, monkeypatch
 ):
     hermes_home = tmp_path / "hermes-home"
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
-    db = SessionDB(db_path=tmp_path / "state.db")
+    db = SessionDB(tmp_path / "state.db")
     session_id = "zero-user-todo-lifecycle"
-    db.create_session(session_id, source="cron", model="test/model")
+    await db.create_session(session_id, source="cron", model="test/model")
 
     first_agent = _lifecycle_agent(db, session_id)
     with patch(
         "agent.context_compressor.call_llm",
-        return_value=_response(_valid_zero_user_summary("First boundary")),
+        new=AsyncMock(return_value=_response(_valid_zero_user_summary("First boundary"))),
     ):
-        first, _ = compress_context(
+        first, _ = await compress_context(
             first_agent,
             _assistant_turns(0, 24),
             "system",
@@ -236,7 +243,7 @@ def test_compress_context_todo_snapshot_stays_synthetic_across_two_boundaries(
         and str(message.get("content") or "").startswith(TODO_INJECTION_HEADER)
         for message in first
     )
-    projected = db.get_messages_as_conversation(session_id)
+    projected = await db.get_messages_as_conversation(session_id)
     assert projected
     assert all(
         COMPRESSED_SUMMARY_METADATA_KEY not in message
@@ -247,9 +254,9 @@ def test_compress_context_todo_snapshot_stays_synthetic_across_two_boundaries(
     second_agent = _lifecycle_agent(db, session_id)
     with patch(
         "agent.context_compressor.call_llm",
-        return_value=_response(_valid_zero_user_summary("Second boundary")),
+        new=AsyncMock(return_value=_response(_valid_zero_user_summary("Second boundary"))),
     ):
-        second, _ = compress_context(
+        second, _ = await compress_context(
             second_agent,
             [*projected, *_assistant_turns(30, 24)],
             "system",
@@ -265,10 +272,9 @@ def test_compress_context_todo_snapshot_stays_synthetic_across_two_boundaries(
     assert handoff[COMPRESSED_SUMMARY_HAS_USER_TURN_KEY] is False
     assert "Second boundary" in handoff["content"]
     assert "User asked:" not in handoff["content"]
-    db.close()
-
-
-
+    await first_agent.close()
+    await second_agent.close()
+    await db.close()
 
 
 

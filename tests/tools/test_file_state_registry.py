@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """Tests for the cross-agent FileStateRegistry (tools/file_state.py).
 
-Covers the three layers added for safe concurrent subagent file edits:
+Covers the two registry layers used for safe concurrent subagent file edits:
 
   1. Cross-agent staleness detection via ``check_stale``
-  2. Per-path serialization via ``lock_path``
-  3. Delegate-completion reminder via ``writes_since``
+  2. Delegate-completion reminder via ``writes_since``
 
 Plus integration through the real ``read_file_tool`` / ``write_file_tool``
 / ``patch_tool`` handlers so the full hook wiring is exercised.
@@ -19,7 +18,6 @@ from __future__ import annotations
 import json
 import os
 import tempfile
-import threading
 import time
 import unittest
 
@@ -75,55 +73,6 @@ class FileStateRegistryUnitTests(unittest.TestCase):
         self.assertIn("sibling", warn.lower())
 
 
-    def test_lock_path_serializes_same_path(self):
-        p = self._mk()
-        events: list[tuple[str, int]] = []
-        lock = threading.Lock()
-
-        def worker(i: int) -> None:
-            with file_state.lock_path(p):
-                with lock:
-                    events.append(("enter", i))
-                time.sleep(0.01)
-                with lock:
-                    events.append(("exit", i))
-
-        threads = [threading.Thread(target=worker, args=(i,)) for i in range(4)]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join()
-
-        # Every enter must be immediately followed by its matching exit.
-        self.assertEqual(len(events), 8)
-        for i in range(0, 8, 2):
-            self.assertEqual(events[i][0], "enter")
-            self.assertEqual(events[i + 1][0], "exit")
-            self.assertEqual(events[i][1], events[i + 1][1])
-
-    def test_lock_path_is_per_path_not_global(self):
-        a = self._mk()
-        b = self._mk()
-        b_entered = threading.Event()
-
-        def hold_a() -> None:
-            with file_state.lock_path(a):
-                b_entered.wait(timeout=2.0)
-
-        def enter_b() -> None:
-            time.sleep(0.02)  # let A grab its lock
-            with file_state.lock_path(b):
-                b_entered.set()
-
-        ta = threading.Thread(target=hold_a)
-        tb = threading.Thread(target=enter_b)
-        ta.start()
-        tb.start()
-        self.assertTrue(b_entered.wait(timeout=3.0))
-        ta.join(timeout=3.0)
-        tb.join(timeout=3.0)
-
-
     def test_kill_switch_env_var(self):
         p = self._mk()
         os.environ["HERMES_DISABLE_FILE_STATE_GUARD"] = "1"
@@ -140,11 +89,11 @@ class FileStateRegistryUnitTests(unittest.TestCase):
             del os.environ["HERMES_DISABLE_FILE_STATE_GUARD"]
 
 
-class FileToolsIntegrationTests(unittest.TestCase):
+class FileToolsIntegrationTests(unittest.IsolatedAsyncioTestCase):
     """Integration through the real file_tools handlers.
 
     These exercise the wiring: read_file_tool → registry.record_read,
-    write_file_tool / patch_tool → check_stale + lock_path + note_write.
+    write_file_tool / patch_tool → check_stale + note_write.
     """
 
     def setUp(self) -> None:
@@ -162,15 +111,15 @@ class FileToolsIntegrationTests(unittest.TestCase):
             f.write(content)
         return p
 
-    def test_sibling_agent_write_surfaces_warning_through_handler(self):
+    async def test_sibling_agent_write_surfaces_warning_through_handler(self):
         p = self._write_seed("shared.txt")
-        r = json.loads(read_file_tool(path=p, task_id="agentA"))
+        r = json.loads(await read_file_tool(path=p, task_id="agentA"))
         self.assertNotIn("error", r)
 
-        w_b = json.loads(write_file_tool(path=p, content="B wrote\n", task_id="agentB"))
+        w_b = json.loads(await write_file_tool(path=p, content="B wrote\n", task_id="agentB"))
         self.assertNotIn("error", w_b)
 
-        w_a = json.loads(write_file_tool(path=p, content="A stale\n", task_id="agentA"))
+        w_a = json.loads(await write_file_tool(path=p, content="A stale\n", task_id="agentA"))
         warn = w_a.get("_warning", "")
         self.assertTrue(warn, f"expected warning, got: {w_a}")
         # The cross-agent message names the sibling task_id.
@@ -178,10 +127,10 @@ class FileToolsIntegrationTests(unittest.TestCase):
         self.assertIn("sibling", warn.lower())
 
 
-    def test_net_new_file_no_warning(self):
+    async def test_net_new_file_no_warning(self):
         p = os.path.join(self._tmpdir, "brand_new.txt")
         # Nobody has read or written this before.
-        w = json.loads(write_file_tool(path=p, content="hi\n", task_id="agentX"))
+        w = json.loads(await write_file_tool(path=p, content="hi\n", task_id="agentX"))
         self.assertFalse(w.get("_warning"))
         self.assertNotIn("error", w)
 

@@ -11,7 +11,8 @@ import pytest
 
 
 @pytest.mark.no_isolate
-def test_register_wakes_stale_cached_server(monkeypatch, tmp_path):
+@pytest.mark.asyncio
+async def test_register_wakes_stale_cached_server(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
 
     from tools import mcp_tool
@@ -48,7 +49,7 @@ def test_register_wakes_stale_cached_server(monkeypatch, tmp_path):
     monkeypatch.setitem(mcp_tool._servers, "healthy-srv", alive)
 
     try:
-        result = mcp_tool.register_mcp_servers({
+        result = await mcp_tool.register_mcp_servers({
             "parked-srv": {"url": "http://127.0.0.1:9/mcp"},
             "healthy-srv": {"url": "http://127.0.0.1:9/mcp"},
         })

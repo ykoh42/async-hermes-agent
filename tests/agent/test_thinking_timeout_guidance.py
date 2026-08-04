@@ -14,8 +14,7 @@ Two layers:
    allowlist AND the error message has a transport-kill signature,
    the user gets actionable guidance (raise stale_timeout, lower
    reasoning_budget, or switch models) instead of the misleading
-   "use execute_code with Python's open() for large files" advice
-   that fires for the unrelated large-file-write stream-drop case.
+   large-file-write advice that fires for an unrelated stream-drop case.
 
 Both behaviors were previously broken: the existing
 ``test_disconnect_large_session_context_overflow`` test in
@@ -179,7 +178,6 @@ class TestBuildThinkingTimeoutGuidance:
         assert any(p in text for p in (
             "NVIDIA NIM", "OpenAI", "Anthropic", "DeepSeek",
         ))
-
 
 
 

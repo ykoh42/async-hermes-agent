@@ -86,7 +86,7 @@ _CLONE_ALL_STRIP: list[str] = [
 #   hermes-agent  — git repo checkout (~84 MB source + ~3 GB venv)
 #   .worktrees    — git worktrees
 #   profiles      — sibling named profiles (recursive copy never intended)
-#   bin           — installed binaries (tirith etc., ~10 MB) shared per-host
+#   bin           — installed helper binaries shared per-host
 #   node_modules  — npm packages (hundreds of MB)
 #
 # See ``_DEFAULT_EXPORT_EXCLUDE_ROOT`` below for the broader export-side
@@ -205,7 +205,7 @@ _DEFAULT_EXPORT_EXCLUDE_ROOT = frozenset({
     "hermes-agent",         # repo checkout (multi-GB)
     ".worktrees",           # git worktrees
     "profiles",             # other profiles — never recursive-export
-    "bin",                  # installed binaries (tirith, etc.)
+    "bin",                  # installed helper binaries
     "node_modules",         # npm packages
     # Databases & runtime state
     "state.db", "state.db-shm", "state.db-wal",
@@ -250,7 +250,7 @@ _RESERVED_NAMES = frozenset({
 
 # Hermes subcommands that cannot be used as profile names/aliases
 _HERMES_SUBCOMMANDS = frozenset({
-    "chat", "model", "gateway", "setup", "whatsapp", "login", "logout",
+    "chat", "login", "logout",
     "status", "cron", "doctor", "dump", "config", "pairing", "skills", "tools",
     "mcp", "sessions", "insights", "version", "update", "uninstall",
     "profile", "plugins", "honcho", "acp",
@@ -1839,13 +1839,17 @@ def get_active_profile_name() -> str:
     """
     from hermes_constants import get_hermes_home
     hermes_home = get_hermes_home()
-    resolved = hermes_home.resolve()
+    # ``abspath`` is lexical path normalization; unlike ``Path.resolve()`` it
+    # does not touch the filesystem.  Profile detection is therefore a small
+    # CPU-only helper and should remain synchronous rather than being routed
+    # through aiofiles' thread-backed ``os.path`` wrappers.
+    resolved = Path(os.path.abspath(hermes_home))
 
-    default_resolved = _get_default_hermes_home().resolve()
+    default_resolved = Path(os.path.abspath(_get_default_hermes_home()))
     if resolved == default_resolved:
         return "default"
 
-    profiles_root = _get_profiles_root().resolve()
+    profiles_root = Path(os.path.abspath(_get_profiles_root()))
     try:
         rel = resolved.relative_to(profiles_root)
         parts = rel.parts

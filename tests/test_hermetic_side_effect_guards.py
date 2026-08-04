@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import webbrowser
 
+import pytest
+
 
 def test_webbrowser_open_calls_are_neutralized(monkeypatch):
     """OAuth/browser tests should never reach the real browser registry."""
@@ -48,19 +50,21 @@ def _isolate_anthropic_credentials(monkeypatch, tmp_path):
     return aa
 
 
-def test_claude_code_credential_read_does_not_touch_macos_keychain(
+@pytest.mark.asyncio
+async def test_claude_code_credential_read_does_not_touch_macos_keychain(
     monkeypatch, tmp_path
 ):
     """The real credential reader should be safe under the suite guard."""
     aa = _isolate_anthropic_credentials(monkeypatch, tmp_path)
 
-    assert aa.read_claude_code_credentials() is None
+    assert await aa.read_claude_code_credentials() is None
 
 
-def test_anthropic_token_resolution_does_not_touch_macos_keychain(
+@pytest.mark.asyncio
+async def test_anthropic_token_resolution_does_not_touch_macos_keychain(
     monkeypatch, tmp_path
 ):
     """Token resolution should be safe under the same suite guard."""
     aa = _isolate_anthropic_credentials(monkeypatch, tmp_path)
 
-    assert aa.resolve_anthropic_token() is None
+    assert await aa.resolve_anthropic_token() is None

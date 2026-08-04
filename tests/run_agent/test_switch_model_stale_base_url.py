@@ -39,14 +39,15 @@ def _make_agent_with_compressor(provider="copilot", base_url="https://api.github
     return agent
 
 
+@pytest.mark.asyncio
 @patch("agent.model_metadata.get_model_context_length", return_value=131_072)
-def test_switch_model_rejects_stale_base_url_on_provider_change(mock_ctx_len):
+async def test_switch_model_rejects_stale_base_url_on_provider_change(mock_ctx_len):
     """A provider change with no resolved base_url must fail loud instead of
     silently keeping the previous provider's endpoint (#47828)."""
     agent = _make_agent_with_compressor(provider="copilot", base_url="https://api.githubcopilot.com")
 
     with pytest.raises(ValueError, match="no base_url resolved"):
-        agent.switch_model("MiniMax-M3", "custom:minimax", api_key="sk-minimax", base_url="")
+        await agent.switch_model("MiniMax-M3", "custom:minimax", api_key="sk-minimax", base_url="")
 
     # Rollback must leave the agent fully on the old (provider, base_url) pair —
     # not a mismatched new-model/old-endpoint hybrid.

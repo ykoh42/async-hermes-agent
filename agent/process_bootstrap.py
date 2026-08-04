@@ -3,7 +3,7 @@
 Three concerns, all tied to ``AIAgent`` boot-time / runtime IO setup:
 
 1. **Lazy OpenAI SDK import** — ``_load_openai_cls`` + ``_OpenAIProxy``
-   defer the 240ms-ish ``from openai import OpenAI`` cost until first use,
+   defer the 240ms-ish ``from openai import AsyncOpenAI`` cost until first use,
    while preserving ``isinstance(client, OpenAI)`` checks and
    ``patch("run_agent.OpenAI", ...)`` test patterns.
 
@@ -37,16 +37,16 @@ _OPENAI_CLS_CACHE = None
 
 
 def _load_openai_cls() -> type:
-    """Import and cache ``openai.OpenAI``."""
+    """Import and cache ``openai.AsyncOpenAI``."""
     global _OPENAI_CLS_CACHE
     if _OPENAI_CLS_CACHE is None:
-        from openai import OpenAI as _cls
+        from openai import AsyncOpenAI as _cls
         _OPENAI_CLS_CACHE = _cls
     return _OPENAI_CLS_CACHE
 
 
 class _OpenAIProxy:
-    """Module-level proxy that looks like ``openai.OpenAI`` but imports lazily."""
+    """Lazy factory retaining Hermes' stable ``OpenAI`` import name."""
 
     __slots__ = ()
 
@@ -57,7 +57,7 @@ class _OpenAIProxy:
         return isinstance(obj, _load_openai_cls())
 
     def __repr__(self):
-        return "<lazy openai.OpenAI proxy>"
+        return "<lazy openai.AsyncOpenAI proxy>"
 
 
 class _SafeWriter:
@@ -70,8 +70,7 @@ class _SafeWriter:
     run_conversation() — especially via double-fault when an except handler
     also tries to print.
 
-    Additionally, when subagents run in ThreadPoolExecutor threads, the shared
-    stdout handle can close between thread teardown and cleanup, raising
+    The shared stdout handle can also close during process teardown, raising
     ``ValueError: I/O operation on closed file`` instead of OSError.
 
     This wrapper delegates all writes to the underlying stream and silently
@@ -145,10 +144,11 @@ def _get_proxy_for_base_url(base_url: Optional[str]) -> Optional[str]:
 def build_keepalive_http_client(
     base_url: str = "",
     *,
-    async_mode: bool = False,
     verify: Any = True,
 ) -> Optional[Any]:
-    """Build an httpx client for OpenAI SDK calls with env-only proxy policy.
+    """Build the native async httpx client for OpenAI SDK calls.
+
+    The Hermes runtime never hides a blocking transport behind an async API.
 
     Uses explicit ``HTTPS_PROXY`` / ``NO_PROXY`` env vars via
     ``_get_proxy_for_base_url``. Plain no-proxy mounts disable httpx's default
@@ -182,8 +182,8 @@ def build_keepalive_http_client(
         # Generous read=None for SSE streaming endpoints.
         timeout = httpx.Timeout(connect=15.0, read=None, write=15.0, pool=10.0)
 
-        transport_cls = httpx.AsyncHTTPTransport if async_mode else httpx.HTTPTransport
-        client_cls = httpx.AsyncClient if async_mode else httpx.Client
+        transport_cls = httpx.AsyncHTTPTransport
+        client_cls = httpx.AsyncClient
         mounts = {}
         if proxy is None:
             mounts = {
@@ -209,7 +209,8 @@ def _install_safe_stdio() -> None:
             setattr(sys, stream_name, _SafeWriter(stream))
 
 
-# Module-level proxy instance — drops in for ``openai.OpenAI``.  Imported as
+# Module-level proxy instance — creates ``openai.AsyncOpenAI`` while preserving
+# Hermes' long-standing import/patch location. Imported as
 # ``from agent.process_bootstrap import OpenAI`` (or re-exported via
 # ``run_agent`` for legacy tests).
 OpenAI = _OpenAIProxy()

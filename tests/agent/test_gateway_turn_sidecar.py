@@ -11,8 +11,9 @@ cannot apply and the fact would otherwise silently drop.
 
 from __future__ import annotations
 
+import asyncio
 import types
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -57,7 +58,6 @@ class _FakeAgent:
         )
         self._cached_system_prompt = "SYSTEM"
         self._memory_store = None
-        self._memory_manager = None
         self._memory_nudge_interval = 0
         self._turns_since_memory = 0
         self._user_turn_count = 0
@@ -68,15 +68,19 @@ class _FakeAgent:
         self._memory_write_origin = "assistant_tool"
         self._stream_context_scrubber = None
         self._stream_think_scrubber = None
+        self._persist_lock = asyncio.Lock()
 
-    def _ensure_db_session(self):
+    async def _ensure_db_session(self):
         pass
 
-    def _restore_primary_runtime(self):
+    async def _restore_primary_runtime(self):
         pass
 
-    def _cleanup_dead_connections(self):
-        return False
+    async def _persist_pending_billing_route(self):
+        pass
+
+    def _get_session_persist_lock(self):
+        return self._persist_lock
 
     def _emit_status(self, _msg):
         pass
@@ -90,11 +94,11 @@ class _FakeAgent:
     def _safe_print(self, *_a, **_k):
         pass
 
-    def _persist_session(self, messages, _history=None):
+    async def _persist_session(self, messages, _history=None):
         pass
 
 
-def _build(agent, **overrides):
+async def _build(agent, **overrides):
     kwargs = dict(
         agent=agent,
         user_message="hello",
@@ -103,7 +107,7 @@ def _build(agent, **overrides):
         task_id=None,
         stream_callback=None,
         persist_user_message=None,
-        restore_or_build_system_prompt=lambda *a, **k: None,
+        restore_or_build_system_prompt=AsyncMock(),
         install_safe_stdio=lambda: None,
         sanitize_surrogates=lambda s: s,
         summarize_user_message_for_log=lambda s: str(s),
@@ -112,7 +116,7 @@ def _build(agent, **overrides):
         ra=lambda: types.SimpleNamespace(_set_interrupt=lambda *a, **k: None),
     )
     kwargs.update(overrides)
-    return build_turn_context(**kwargs)
+    return await build_turn_context(**kwargs)
 
 
 @pytest.fixture(autouse=True)
@@ -145,14 +149,15 @@ class TestConsumeIsOneShot:
 
 
 class TestStringContentSidecarDelivery:
-    def test_notes_ride_the_api_content_sidecar(self):
+    @pytest.mark.asyncio
+    async def test_notes_ride_the_api_content_sidecar(self):
         """String user message: the note lands in the API copy only — the
         stored content stays clean and the sidecar persists the exact sent
         bytes (replay keeps them byte-stable in history)."""
         agent = _FakeAgent()
         agent._gateway_turn_context_notes = RESET_NOTE
-        with patch("hermes_cli.plugins.invoke_hook", return_value=[]):
-            ctx = _build(agent)
+        with patch("hermes_cli.lifecycle.invoke_hook", new=AsyncMock(return_value=[])):
+            ctx = await _build(agent)
         msg = ctx.messages[ctx.current_turn_user_idx]
         assert msg["content"] == "hello"
         assert msg["api_content"] == "hello\n\n" + RESET_NOTE
@@ -163,26 +168,29 @@ class TestStringContentSidecarDelivery:
         # Consumed: a later turn on the same cached agent replays nothing.
         assert agent._gateway_turn_context_notes == ""
 
-    def test_notes_append_after_plugin_context(self):
+    @pytest.mark.asyncio
+    async def test_notes_append_after_plugin_context(self):
         agent = _FakeAgent()
         agent._gateway_turn_context_notes = VC_NOTE
         with patch(
-            "hermes_cli.plugins.invoke_hook",
-            return_value=[{"context": "PLUGIN-CTX"}],
+            "hermes_cli.lifecycle.invoke_hook",
+            new=AsyncMock(return_value=[{"context": "PLUGIN-CTX"}]),
         ):
-            ctx = _build(agent)
+            ctx = await _build(agent)
         msg = ctx.messages[ctx.current_turn_user_idx]
         assert msg["api_content"] == "hello\n\nPLUGIN-CTX\n\n" + VC_NOTE
 
-    def test_no_notes_means_no_stamp(self):
+    @pytest.mark.asyncio
+    async def test_no_notes_means_no_stamp(self):
         agent = _FakeAgent()
-        with patch("hermes_cli.plugins.invoke_hook", return_value=[]):
-            ctx = _build(agent)
+        with patch("hermes_cli.lifecycle.invoke_hook", new=AsyncMock(return_value=[])):
+            ctx = await _build(agent)
         assert "api_content" not in ctx.messages[ctx.current_turn_user_idx]
 
 
 class TestMultimodalFallback:
-    def test_notes_appended_as_text_part_on_list_content(self):
+    @pytest.mark.asyncio
+    async def test_notes_appended_as_text_part_on_list_content(self):
         """Multimodal turns can't take the string sidecar
         (compose_user_api_content returns None for lists) — the must-deliver
         fact is appended as a durable text part instead of dropping."""
@@ -192,8 +200,8 @@ class TestMultimodalFallback:
             {"type": "text", "text": "look at this"},
             {"type": "image_url", "image_url": {"url": "https://x/img.png"}},
         ]
-        with patch("hermes_cli.plugins.invoke_hook", return_value=[]):
-            ctx = _build(agent, user_message=content)
+        with patch("hermes_cli.lifecycle.invoke_hook", new=AsyncMock(return_value=[])):
+            ctx = await _build(agent, user_message=content)
         msg = ctx.messages[ctx.current_turn_user_idx]
         assert msg["content"][-1] == {"type": "text", "text": RESET_NOTE}
         # No string sidecar for list content.

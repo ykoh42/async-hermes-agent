@@ -13,6 +13,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 
 
 def _write_config(tmp_path: Path, body: str) -> None:
@@ -91,7 +93,8 @@ def test_default_base_is_90s(monkeypatch, tmp_path):
 
 
 
-def test_explicit_user_config_overrides_default(monkeypatch, tmp_path):
+@pytest.mark.asyncio
+async def test_explicit_user_config_overrides_default(monkeypatch, tmp_path):
     """If the user explicitly sets a stale_timeout, the new defaults don't apply."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     (tmp_path / ".env").write_text("", encoding="utf-8")
@@ -107,6 +110,7 @@ providers:
     importlib.reload(to_mod)
 
     agent = _make_agent(tmp_path)
+    await agent._ensure_provider_runtime()
     assert agent._compute_non_stream_stale_timeout({"input": "hi"}) == 1800.0
 
 

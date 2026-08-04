@@ -1,7 +1,6 @@
 """Test that skill_view registers required env vars in the passthrough registry."""
 
 import json
-from unittest.mock import patch
 
 import pytest
 
@@ -35,7 +34,8 @@ def _create_skill(tmp_path, name, frontmatter_extra=""):
 
 
 class TestSkillViewRegistersPassthrough:
-    def test_available_env_vars_registered(self, tmp_path, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_available_env_vars_registered(self, tmp_path, monkeypatch):
         """When a skill declares required_environment_variables and the var IS set,
         it should be registered in the passthrough."""
         _create_skill(
@@ -53,27 +53,25 @@ class TestSkillViewRegistersPassthrough:
         # Set the env var so it's "available"
         monkeypatch.setenv("TENOR_API_KEY", "test-value-123")
 
-        # Patch the secret capture callback to not prompt
-        with patch("tools.skills_tool._secret_capture_callback", None):
-            from tools.skills_tool import skill_view
+        from tools.skills_tool import skill_view
 
-            result = json.loads(skill_view(name="test-skill"))
+        result = json.loads(await skill_view(name="test-skill"))
 
         assert result["success"] is True
         assert is_env_passthrough("TENOR_API_KEY")
 
 
-    def test_no_env_vars_skill_no_registration(self, tmp_path, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_no_env_vars_skill_no_registration(self, tmp_path, monkeypatch):
         """Skills without required_environment_variables shouldn't register anything."""
         _create_skill(tmp_path, "simple-skill")
         monkeypatch.setattr(
             "tools.skills_tool.SKILLS_DIR", tmp_path
         )
 
-        with patch("tools.skills_tool._secret_capture_callback", None):
-            from tools.skills_tool import skill_view
+        from tools.skills_tool import skill_view
 
-            result = json.loads(skill_view(name="simple-skill"))
+        result = json.loads(await skill_view(name="simple-skill"))
 
         assert result["success"] is True
         from tools.env_passthrough import get_all_passthrough

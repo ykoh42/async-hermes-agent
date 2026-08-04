@@ -4,6 +4,8 @@ import json
 import os
 from unittest.mock import patch
 
+import pytest
+
 from tools.debug_helpers import DebugSession
 
 
@@ -44,9 +46,10 @@ class TestDebugSessionEnabled:
         assert len(ds.session_id) > 0
 
 
-    def test_save_empty_log(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_save_empty_log(self, tmp_path):
         ds = self._make_enabled(tmp_path)
-        ds.save()
+        await ds.save()
         files = list(tmp_path.glob("*.json"))
         assert len(files) == 1
         data = json.loads(files[0].read_text())

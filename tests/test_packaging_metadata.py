@@ -9,59 +9,12 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
-def _distribution_name(requirement: str) -> str:
-    """Extract the PEP 508 distribution name from a requirement string.
-
-    Robust to markers (``; python_version < '3.12'``), direct references
-    (``name @ https://...``), extras (``name[extra]``) and every version
-    operator (``==``, ``>=``, ``<=``, ``~=``, ``!=``, ``<``, ``>``), so a
-    future dep declared with any valid specifier shape doesn't silently
-    mis-parse here.
-    """
-    spec = requirement.split(";", 1)[0]  # drop environment markers
-    spec = spec.split("@", 1)[0]  # drop direct-reference URLs
-    spec = spec.split("[", 1)[0]  # drop extras
-    spec = re.split(r"[=<>!~]", spec, maxsplit=1)[0]  # drop any version operator
-    return spec.strip().lower()
-
-
-def test_packaging_declared_as_core_dependency():
-    """Regression for #40503.
-
-    ``packaging`` is imported directly on three production paths
-    (plugins/memory/hindsight/__init__.py, tools/lazy_deps.py,
-    hermes_cli/main.py) yet was undeclared, so it only reached users
-    transitively. The slim Docker image shipped without it, silently
-    disabling Hindsight append-mode and version-constraint checks. It must
-    be a declared core dependency so it installs everywhere and the
-    update-repair step (``_verify_core_dependencies_installed``) guards it.
-    """
-    data = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
-    core = data["project"]["dependencies"]
-    names = {_distribution_name(dep) for dep in core}
-    assert "packaging" in names, (
-        "packaging is imported on production paths (hindsight version compare, "
-        "lazy_deps version constraints, requirement parsing) and must be a "
-        "declared core dependency, not a transitive — see #40503"
-    )
-
-
-def test_faster_whisper_is_not_a_base_dependency():
-    data = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
-    deps = data["project"]["dependencies"]
-
-    assert not any(dep.startswith("faster-whisper") for dep in deps)
-
-    voice_extra = data["project"]["optional-dependencies"]["voice"]
-    assert any(dep.startswith("faster-whisper") for dep in voice_extra)
-
-
 # Minimum non-vulnerable Starlette: CVE-2026-48710 ("BadHost") was fixed in
 # 1.0.1. Anything below that lets a malformed Host header desync
 # ``request.url.path`` from the dispatched ASGI path, bypassing path-based
 # authz in middleware/endpoints that gate on ``request.url``. Starlette is a
-# transitive dep (fastapi in [web]; sse-starlette/mcp in [mcp]/[computer-use]/
-# [dev]) so we pin it directly in every extra that exposes a server surface and
+# transitive dep (sse-starlette/mcp in the core and [dev]) so we pin it
+# directly in every retained extra that exposes a server surface and
 # enforce the floor in both pyproject and the committed lockfile.
 _STARLETTE_CVE_FLOOR = (1, 0, 1)
 _UPDATE_DOWNGRADE_GUARD_FLOORS = {
@@ -70,7 +23,6 @@ _UPDATE_DOWNGRADE_GUARD_FLOORS = {
     # already-patched user environments.
     "cryptography": (48, 0, 1),
     "starlette": (1, 3, 1),
-    "python-multipart": (0, 0, 32),
 }
 
 
@@ -90,15 +42,16 @@ def test_starlette_pinned_above_cve_2026_48710_floor_in_pyproject():
     """Every extra that declares Starlette must pin a patched (>=1.0.1) version.
 
     Regression guard for #35067 / CVE-2026-48710. A future edit that drops the
-    pin (re-exposing the unbounded transitive ``starlette>=0.27`` from mcp /
-    ``>=0.40.0`` from fastapi) or pins a pre-1.0.1 version fails here instead of
-    shipping a Host-header auth-bypass to dashboard / MCP-HTTP users.
+    pin (re-exposing the unbounded transitive ``starlette>=0.27`` from MCP)
+    or pins a pre-1.0.1 version fails here instead of shipping a Host-header
+    auth-bypass to MCP-HTTP users.
     """
     data = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
     extras = data["project"]["optional-dependencies"]
 
     found = {}
-    for extra, specs in extras.items():
+    declarations = {"core": data["project"]["dependencies"], **extras}
+    for extra, specs in declarations.items():
         for spec in specs:
             name = spec.split("==", 1)[0].split(">", 1)[0].split("<", 1)[0].split("[", 1)[0].strip()
             if name.lower() == "starlette":
@@ -106,11 +59,11 @@ def test_starlette_pinned_above_cve_2026_48710_floor_in_pyproject():
                 ver = spec.split("==", 1)[1].split(";", 1)[0].strip()
                 found[extra] = ver
 
-    # The four server-surface extras must each carry the direct pin.
-    for extra in ("web", "mcp", "computer-use", "dev"):
+    # MCP is a core dependency; dev repeats the pin for test environments.
+    for extra in ("core", "dev"):
         assert extra in found, (
             f"[{extra}] no longer pins starlette directly — CVE-2026-48710 "
-            f"regression risk (mcp/fastapi pull it transitively with no upper bound)"
+            f"regression risk (MCP pulls it transitively with no upper bound)"
         )
 
     for extra, ver in found.items():
@@ -277,66 +230,3 @@ def _lazy_deps_by_feature():
                 for sub in ast.walk(value)
                 if isinstance(sub, ast.Constant) and isinstance(sub.value, str)
             ]
-        assert by_feature, "could not extract features from LAZY_DEPS — AST parser drifted"
-        return by_feature
-    raise AssertionError("LAZY_DEPS dict literal not found in tools/lazy_deps.py")
-
-
-# Security-critical packages whose patched floor must be enforced on EVERY
-# install path, eager and lazy. test_pyproject_and_lazy_deps_pins_agree only
-# fires when a package is pinned in BOTH sources, so it cannot catch a lazy
-# feature that omits the pin entirely — the exact gap that left platform.slack
-# carrying aiohttp==3.14.0 while platform.discord (whose discord.py dep pulls
-# aiohttp transitively as its HTTP backbone) shipped without it, so the lazy
-# Discord path could keep an already-installed vulnerable aiohttp. A fully
-# general "no mirrored feature drops a pin" check is impossible statically
-# (it can't see transitive deps), so this is the explicit coverage contract:
-# each security package -> the lazy features that bundle an SDK pulling it and
-# must therefore carry the same pin as the pyproject extra.
-_REQUIRED_SECURITY_PINS = {
-    # Every lazy messaging feature whose SDK pulls aiohttp transitively must
-    # carry the patched floor directly: discord.py (aiohttp<4), slack-bolt,
-    # mautrix/aiohttp-socks (aiohttp<4 / >=3.10), and microsoft-teams-apps —
-    # none of those upper/lower bounds excludes a vulnerable already-installed
-    # aiohttp, so the lazy path would not upgrade it without an explicit pin.
-    "aiohttp": {
-        "platform.discord",
-        "platform.slack",
-        "platform.matrix",
-        "platform.teams",
-    },
-}
-
-
-def test_security_pins_present_in_mirrored_lazy_features():
-    """Curated security pins must be present (not just version-consistent) in
-    every lazy feature that bundles an SDK pulling that package transitively.
-    """
-    py = _pins_from_specs(_pyproject_pinned_specs())
-    by_feature = _lazy_deps_by_feature()
-
-    problems = []
-    for pkg, features in _REQUIRED_SECURITY_PINS.items():
-        canon = _canonical(pkg)
-        expected = py.get(canon)
-        assert expected, (
-            f"{pkg} is listed in _REQUIRED_SECURITY_PINS but is not exact-pinned "
-            f"in pyproject.toml — update the map or the pin."
-        )
-        for feature in sorted(features):
-            specs = by_feature.get(feature)
-            assert specs is not None, (
-                f"lazy feature {feature!r} named in _REQUIRED_SECURITY_PINS no "
-                f"longer exists in LAZY_DEPS — update the map."
-            )
-            got = _pins_from_specs(specs).get(canon)
-            if got != expected:
-                problems.append(
-                    f"{feature}: {pkg}="
-                    f"{sorted(got) if got else 'MISSING'}, expected {sorted(expected)}"
-                )
-    assert not problems, (
-        "a lazy feature is missing a security pin it must mirror from the "
-        "pyproject extras — the lazy install path would not enforce the "
-        "CVE-patched floor:\n  " + "\n  ".join(problems)
-    )

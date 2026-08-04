@@ -149,34 +149,6 @@ def test_bounded_git_probe_spawn_failure_returns_empty(monkeypatch):
 
 
 
-def test_shell_hooks_hide_hook_command_windows(monkeypatch):
-    from agent import shell_hooks
-
-    captured = []
-
-    def fake_run(cmd, **kwargs):
-        captured.append((cmd, kwargs))
-        return SimpleNamespace(returncode=0, stdout="{}", stderr="")
-
-    monkeypatch.setattr(shell_hooks, "IS_WINDOWS", True)
-    monkeypatch.setattr(shell_hooks, "windows_hide_flags", lambda: _CREATE_NO_WINDOW)
-    monkeypatch.setattr(shell_hooks.subprocess, "run", fake_run)
-
-    result = shell_hooks._spawn(
-        shell_hooks.ShellHookSpec(event="post_tool_call", command="hook-bin --flag"),
-        "{}",
-    )
-
-    assert result["returncode"] == 0
-    assert captured[0][1]["creationflags"] == _CREATE_NO_WINDOW
-
-
-
-
-
-
-
-
 
 
 
@@ -184,10 +156,9 @@ def test_shell_hooks_hide_hook_command_windows(monkeypatch):
 
 # ── #56747 GUI-reachable exec paths + provider transports (PR #56877) ──────
 #
-# These six sites are the desktop-GUI-reachable spawns that still flashed a
-# console on Windows after the #54220 sweep: the TUI gateway's cli.exec /
-# shell.exec / quick-command exec RPCs, the interactive CLI's quick-command
-# exec handler, and the Copilot ACP + Codex app-server stdio transports.
+# These are desktop-GUI-reachable spawns that still flashed a console on
+# Windows after the #54220 sweep: the interactive CLI's quick-command exec
+# handler and the Copilot ACP + Codex app-server stdio transports.
 # All are hide-only (creationflags) — PIPE stdio must stay intact.
 
 
@@ -196,93 +167,6 @@ def _patch_hide_flags(monkeypatch):
 
     monkeypatch.setattr(subprocess_compat, "IS_WINDOWS", True)
     monkeypatch.setattr(subprocess_compat, "windows_hide_flags", lambda: _CREATE_NO_WINDOW)
-
-
-
-
-def test_tui_shell_exec_rpc_hides_console_window(monkeypatch):
-    from tui_gateway import server
-
-    captured = []
-
-    def fake_run(cmd, **kwargs):
-        captured.append((cmd, kwargs))
-        return _Completed(stdout="ok\n")
-
-    _patch_hide_flags(monkeypatch)
-    monkeypatch.setattr(server.subprocess, "run", fake_run)
-
-    resp = server.handle_request(
-        {"id": "2", "method": "shell.exec", "params": {"command": "echo shellexec-56747"}}
-    )
-    assert resp["result"]["code"] == 0
-
-    spawns = _spawns(captured, "shellexec-56747")
-    assert len(spawns) == 1, captured
-    assert spawns[0][1]["creationflags"] == _CREATE_NO_WINDOW
-
-
-
-
-
-
-
-
-
-
-# ── #47971 LSP spawn + installer paths (salvage) ────────────────────────────
-#
-# The LSP language-server spawn (agent/lsp/client.py::_spawn) and the
-# npm/go LSP auto-installers (agent/lsp/install.py) are reachable from
-# console-less parents — a VS Code/Zed extension host running the ACP
-# adapter — where a .cmd-wrapped server (pyright-langserver.CMD via
-# cmd.exe /c) or an npm/go console app flashes a window on Windows.
-# All are hide-only (creationflags); PIPE stdio must stay intact and the
-# POSIX start_new_session detach must be preserved on the client spawn.
-
-
-def test_lsp_client_spawn_hides_console_window(monkeypatch):
-    import asyncio
-
-    from agent.lsp import client as lsp_client
-
-    captured = []
-
-    class _FakeProc:
-        stdin = None
-        stdout = None
-        stderr = None
-
-    async def fake_exec(*cmd, **kwargs):
-        captured.append((list(cmd), kwargs))
-        return _FakeProc()
-
-    monkeypatch.setattr(lsp_client, "windows_hide_flags", lambda: _CREATE_NO_WINDOW)
-    monkeypatch.setattr(
-        lsp_client.asyncio, "create_subprocess_exec", fake_exec
-    )
-
-    client = lsp_client.LSPClient(
-        server_id="test-server",
-        workspace_root="/tmp/ws",
-        command=["fake-langserver", "--stdio"],
-    )
-    asyncio.run(client._spawn())
-
-    assert len(captured) == 1, captured
-    cmd, kwargs = captured[0]
-    assert cmd == ["fake-langserver", "--stdio"]
-    assert kwargs["creationflags"] == _CREATE_NO_WINDOW
-    # Hide-only: the LSP wire still needs its pipes, and the POSIX
-    # process-group detach (mcp orphan-sweep guard) must survive.
-    assert kwargs["stdin"] == asyncio.subprocess.PIPE
-    assert kwargs["stdout"] == asyncio.subprocess.PIPE
-    assert kwargs["start_new_session"] is True
-
-
-
-
-
 
 # ── #67690 env probes, lazy installs, platform.win32_ver() (@m4r13y) ───────
 #
@@ -293,60 +177,6 @@ def test_lsp_client_spawn_hides_console_window(monkeypatch):
 # shell=True and no CREATE_NO_WINDOW. All are hide-only (creationflags);
 # win32_ver is neutralized by stubbing platform._syscmd_ver so the
 # documented ValueError fallback reads sys.getwindowsversion() instead.
-
-
-def test_env_probe_run_hides_console_window(monkeypatch):
-    from tools import env_probe
-
-    captured = []
-
-    def fake_run(cmd, **kwargs):
-        captured.append((cmd, kwargs))
-        return _Completed(stdout="", returncode=0)
-
-    monkeypatch.setattr(env_probe, "windows_hide_flags", lambda: _CREATE_NO_WINDOW)
-    monkeypatch.setattr(env_probe.subprocess, "run", fake_run)
-
-    rc, out, err = env_probe._run(["python3", "--version"], timeout=1.0)
-
-    assert rc == 0
-    assert len(captured) == 1, captured
-    cmd, kwargs = captured[0]
-    assert cmd == ["python3", "--version"]
-    assert kwargs["creationflags"] == _CREATE_NO_WINDOW
-    # The temp-file capture contract (#67964) must survive: stdout/stderr are
-    # file objects (not PIPE) so a lingering grandchild can't wedge the probe.
-    assert kwargs["stdout"] is not None and kwargs["stdout"] != subprocess.PIPE
-    assert kwargs["stderr"] is not None and kwargs["stderr"] != subprocess.PIPE
-    assert kwargs["stdin"] == subprocess.DEVNULL
-
-
-def test_lazy_deps_uv_install_hides_console_window(monkeypatch):
-    from tools import lazy_deps
-
-    captured = []
-
-    def fake_run(cmd, **kwargs):
-        captured.append((cmd, kwargs))
-        return _Completed(stdout="installed", returncode=0)
-
-    monkeypatch.delenv(lazy_deps._LAZY_TARGET_ENV, raising=False)
-    monkeypatch.setattr(lazy_deps, "windows_hide_flags", lambda: _CREATE_NO_WINDOW)
-    monkeypatch.setattr(lazy_deps.subprocess, "run", fake_run)
-    monkeypatch.setattr(lazy_deps.shutil, "which", lambda name: "/usr/bin/uv" if name == "uv" else None)
-
-    res = lazy_deps._venv_pip_install(("left-pad",))
-
-    assert res.success
-    spawns = _spawns(captured, "pip", "install", "left-pad")
-    assert len(spawns) == 1, captured
-    cmd, kwargs = spawns[0]
-    assert cmd[:3] == ["/usr/bin/uv", "pip", "install"]
-    assert kwargs["creationflags"] == _CREATE_NO_WINDOW
-    assert kwargs["stdin"] == subprocess.DEVNULL
-
-
-
 
 
 

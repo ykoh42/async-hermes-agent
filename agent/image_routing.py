@@ -46,6 +46,9 @@ import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+import aiofiles
+import aiofiles.os
+
 logger = logging.getLogger(__name__)
 
 
@@ -332,21 +335,6 @@ def _resolve_inference_base_url(
     return ""
 
 
-def _should_probe_ollama_vision(provider: str, base_url: str) -> bool:
-    """True when the active provider likely fronts a local Ollama server."""
-    p = (provider or "").strip().lower()
-    if p == "ollama":
-        return True
-    if not base_url:
-        return False
-    try:
-        from agent.model_metadata import detect_local_server_type
-
-        return detect_local_server_type(base_url) == "ollama"
-    except Exception:
-        return False
-
-
 def _coerce_mode(raw: Any) -> str:
     """Normalize a config value into one of the valid modes."""
     if not isinstance(raw, str):
@@ -384,7 +372,7 @@ def _explicit_aux_vision_override(cfg: Optional[Dict[str, Any]]) -> bool:
     return True
 
 
-def _lookup_supports_vision(
+async def _lookup_supports_vision(
     provider: str,
     model: str,
     cfg: Optional[Dict[str, Any]] = None,
@@ -432,7 +420,7 @@ def _lookup_supports_vision(
     caps = None
     try:
         from agent.models_dev import get_model_capabilities
-        caps = get_model_capabilities(provider, model)
+        caps = await get_model_capabilities(provider, model)
     except Exception as exc:  # pragma: no cover - defensive
         logger.debug("image_routing: caps lookup failed for %s:%s — %s", provider, model, exc)
     if caps is not None:
@@ -441,11 +429,18 @@ def _lookup_supports_vision(
     base_url = _resolve_inference_base_url(cfg, provider)
     if not base_url and (provider or "").strip().lower() == "ollama":
         base_url = "http://localhost:11434/v1"
-    if _should_probe_ollama_vision(provider, base_url):
+    # Do not run the synchronous local-server probe here: it performs a
+    # blocking HTTP request.  Provider identity and the conventional Ollama
+    # port are sufficient to select the native async capability probe.
+    looks_like_ollama = (
+        (provider or "").strip().lower() == "ollama"
+        or "11434" in (base_url or "")
+    )
+    if looks_like_ollama:
         try:
             from agent.model_metadata import query_ollama_supports_vision
 
-            ollama_vision = query_ollama_supports_vision(model, base_url)
+            ollama_vision = await query_ollama_supports_vision(model, base_url)
             if ollama_vision is not None:
                 return ollama_vision
         except Exception as exc:  # pragma: no cover - defensive
@@ -458,7 +453,7 @@ def _lookup_supports_vision(
     return None
 
 
-def decide_image_input_mode(
+async def decide_image_input_mode(
     provider: str,
     model: str,
     cfg: Optional[Dict[str, Any]],
@@ -489,7 +484,7 @@ def decide_image_input_mode(
     # main models — it should not preempt native vision on a model that
     # can natively inspect the pixels (issue #29135).
     if requested_provider:
-        supports = _lookup_supports_vision(
+        supports = await _lookup_supports_vision(
             provider,
             model,
             cfg,
@@ -498,7 +493,7 @@ def decide_image_input_mode(
     else:
         # Keep the long-standing three-argument call contract for callers and
         # tests that replace the capability lookup hook.
-        supports = _lookup_supports_vision(provider, model, cfg)
+        supports = await _lookup_supports_vision(provider, model, cfg)
     if supports is True:
         return "native"
     if _explicit_aux_vision_override(cfg):
@@ -666,7 +661,7 @@ def _guess_mime(path: Path, raw: Optional[bytes] = None) -> str:
     }.get(suffix, "image/jpeg")
 
 
-def _file_to_data_url(path: Path) -> Optional[str]:
+async def _file_to_data_url(path: Path) -> Optional[str]:
     """Encode a local image as a base64 data URL at its native size.
 
     Size limits are NOT enforced here — the agent retry loop
@@ -691,7 +686,7 @@ def _file_to_data_url(path: Path) -> Optional[str]:
     try:
         from agent.file_safety import raise_if_read_blocked
 
-        raise_if_read_blocked(str(path))
+        await raise_if_read_blocked(str(path))
     except ValueError as exc:
         logger.warning("image_routing: blocked local image attachment %s -- %s", path, exc)
         return None
@@ -700,7 +695,8 @@ def _file_to_data_url(path: Path) -> Optional[str]:
         pass
 
     try:
-        raw = path.read_bytes()
+        async with aiofiles.open(path, "rb") as handle:
+            raw = await handle.read()
     except Exception as exc:
         logger.warning("image_routing: failed to read %s — %s", path, exc)
         return None
@@ -725,7 +721,7 @@ def _file_to_data_url(path: Path) -> Optional[str]:
     return f"data:{mime};base64,{b64}"
 
 
-def build_native_content_parts(
+async def build_native_content_parts(
     user_text: str,
     image_paths: List[str],
     image_urls: Optional[List[str]] = None,
@@ -770,10 +766,10 @@ def build_native_content_parts(
 
     for raw_path in image_paths:
         p = Path(raw_path)
-        if not p.exists() or not p.is_file():
+        if not await aiofiles.os.path.isfile(p):
             skipped.append(str(raw_path))
             continue
-        data_url = _file_to_data_url(p)
+        data_url = await _file_to_data_url(p)
         if not data_url:
             skipped.append(str(raw_path))
             continue

@@ -11,14 +11,19 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import threading
+import os
+import time
+import asyncio
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+import aiofiles
+import aiofiles.os
 
 logger = logging.getLogger(__name__)
 
 _CACHE_FILENAME = "mcp_schema_cache.json"
-_cache_lock = threading.Lock()
+_cache_lock = asyncio.Lock()
 
 
 def _cache_path() -> Path:
@@ -42,31 +47,43 @@ def config_fingerprint(config: dict) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
 
 
-def _load_all() -> Dict[str, Any]:
+async def _load_all() -> Dict[str, Any]:
     path = _cache_path()
-    if not path.exists():
+    if not await aiofiles.os.path.exists(path):
         return {}
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        async with aiofiles.open(path, encoding="utf-8") as handle:
+            data = json.loads(await handle.read())
         return data if isinstance(data, dict) else {}
     except Exception as exc:
         logger.debug("Could not read MCP schema cache %s: %s", path, exc)
         return {}
 
 
-def _save_all(data: Dict[str, Any]) -> None:
-    from utils import atomic_json_write
+async def _save_all(data: Dict[str, Any]) -> None:
+    """Atomically persist the user-writable cache without blocking the loop."""
+    path = _cache_path()
+    await aiofiles.os.makedirs(path.parent, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
+    try:
+        async with aiofiles.open(temporary, "w", encoding="utf-8") as handle:
+            await handle.write(json.dumps(data, ensure_ascii=False, indent=2))
+            await handle.flush()
+            await aiofiles.os.wrap(os.fsync)(handle.fileno())
+        await aiofiles.os.wrap(os.chmod)(temporary, 0o600)
+        await aiofiles.os.replace(temporary, path)
+    finally:
+        try:
+            if await aiofiles.os.path.exists(temporary):
+                await aiofiles.os.remove(temporary)
+        except OSError:
+            pass
 
-    # Cache dir + 0o600: sibling precedent in tools/registry.py
-    # _save_discovery_cache; the cache file is trusted input on the lazy
-    # registration path, so keep it user-only.
-    atomic_json_write(_cache_path(), data, mode=0o600)
 
-
-def get_cached_entry(server_name: str, fingerprint: str) -> Optional[dict]:
+async def get_cached_entry(server_name: str, fingerprint: str) -> Optional[dict]:
     """Return cached entry when fingerprint matches, else None."""
-    with _cache_lock:
-        entry = _load_all().get(server_name)
+    async with _cache_lock:
+        entry = (await _load_all()).get(server_name)
     if not isinstance(entry, dict):
         return None
     if entry.get("fingerprint") != fingerprint:
@@ -74,11 +91,11 @@ def get_cached_entry(server_name: str, fingerprint: str) -> Optional[dict]:
     return entry
 
 
-def has_cached_entry(server_name: str, fingerprint: str) -> bool:
-    return get_cached_entry(server_name, fingerprint) is not None
+async def has_cached_entry(server_name: str, fingerprint: str) -> bool:
+    return await get_cached_entry(server_name, fingerprint) is not None
 
 
-def write_cache_entry(
+async def write_cache_entry(
     server_name: str,
     fingerprint: str,
     *,
@@ -91,23 +108,23 @@ def write_cache_entry(
         "tools": tools,
         "utility_tools": utility_tools or [],
     }
-    with _cache_lock:
-        data = _load_all()
+    async with _cache_lock:
+        data = await _load_all()
         # Write-through fires on every registration (reconnects,
         # list_changed refreshes); skip the load-all+rewrite churn when the
         # entry is byte-identical to what is already on disk.
         if data.get(server_name) == entry:
             return
         data[server_name] = entry
-        _save_all(data)
+        await _save_all(data)
 
 
-def clear_cache_entry(server_name: str) -> None:
-    with _cache_lock:
-        data = _load_all()
+async def clear_cache_entry(server_name: str) -> None:
+    async with _cache_lock:
+        data = await _load_all()
         if server_name in data:
             del data[server_name]
-            _save_all(data)
+            await _save_all(data)
 
 
 def tools_from_cache_entry(entry: dict) -> List[dict]:

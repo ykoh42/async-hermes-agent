@@ -10,15 +10,14 @@ hook, behavior is byte-for-byte the old non-streaming call.
 import threading
 import time
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
 from agent.auxiliary_client import (
-    _acreate_with_stream,
     _aggregate_chat_stream,
-    _aggregate_chat_stream_async,
     _aux_stream_total_ceiling,
+    _create_with_stream,
     _create_with_progress,
     _notify_aux_progress,
     _provider_requires_stream,
@@ -56,13 +55,30 @@ class _FakeClient:
         completions = SimpleNamespace(create=self._create)
         self.chat = SimpleNamespace(completions=completions)
 
-    def _create(self, **kwargs):
+    async def _create(self, **kwargs):
         self.calls.append(kwargs)
         if kwargs.get("stream"):
             if self._stream_error is not None:
                 raise self._stream_error
-            return iter(self._stream_chunks or [])
+            return _AsyncStream(self._stream_chunks or [])
         return self._response
+
+
+class _AsyncStream:
+    def __init__(self, items):
+        self._items = list(items)
+        self.closed = False
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if not self._items:
+            raise StopAsyncIteration
+        return self._items.pop(0)
+
+    async def aclose(self):
+        self.closed = True
 
 
 _COMPLETE = SimpleNamespace(
@@ -112,7 +128,8 @@ class TestAuxProgressHook:
 
 class TestCreateWithProgress:
 
-    def test_hook_upgrades_to_streaming_and_ticks_per_chunk(self):
+    @pytest.mark.asyncio
+    async def test_hook_upgrades_to_streaming_and_ticks_per_chunk(self):
         chunks = [
             _chunk(reasoning="thinking..."),
             _chunk(content="Hello "),
@@ -123,7 +140,7 @@ class TestCreateWithProgress:
         client = _FakeClient(stream_chunks=chunks)
         ticks = []
         with aux_progress_hook(lambda: ticks.append(1)):
-            result = _create_with_progress(
+            result = await _create_with_progress(
                 client, {"model": "m1", "messages": [], "timeout": 30},
             )
         assert client.calls[0]["stream"] is True
@@ -134,13 +151,14 @@ class TestCreateWithProgress:
         # 1 dispatch tick + 1 per chunk
         assert len(ticks) >= len(chunks) + 1
 
-    def test_streaming_rejected_falls_back_to_plain_call(self):
+    @pytest.mark.asyncio
+    async def test_streaming_rejected_falls_back_to_plain_call(self):
         client = _FakeClient(
             response=_COMPLETE,
             stream_error=RuntimeError("stream is not supported by this model"),
         )
         with aux_progress_hook(lambda: None):
-            result = _create_with_progress(
+            result = await _create_with_progress(
                 client, {"model": "m1", "messages": []},
             )
         assert result is _COMPLETE
@@ -157,7 +175,8 @@ class TestCreateWithProgress:
 # ---------------------------------------------------------------------------
 
 class TestAggregateChatStream:
-    def test_tool_call_deltas_are_reassembled(self):
+    @pytest.mark.asyncio
+    async def test_tool_call_deltas_are_reassembled(self):
         tc0 = SimpleNamespace(
             index=0, id="call_1",
             function=SimpleNamespace(name="do_thing", arguments='{"a"'),
@@ -170,7 +189,7 @@ class TestAggregateChatStream:
             _chunk(tool_calls=[tc0]),
             _chunk(tool_calls=[tc1], finish_reason="tool_calls"),
         ]
-        result = _aggregate_chat_stream(iter(chunks))
+        result = await _aggregate_chat_stream(_AsyncStream(chunks))
         tool_calls = result.choices[0].message.tool_calls
         assert len(tool_calls) == 1
         assert tool_calls[0].id == "call_1"
@@ -178,20 +197,12 @@ class TestAggregateChatStream:
         assert tool_calls[0].function.arguments == '{"a": 1}'
         assert result.choices[0].finish_reason == "tool_calls"
 
-
-    def test_stream_close_is_called(self):
-        closed = []
-
-        class _Stream:
-            def __iter__(self):
-                return iter([_chunk(content="ok", finish_reason="stop")])
-
-            def close(self):
-                closed.append(True)
-
-        result = _aggregate_chat_stream(_Stream())
+    @pytest.mark.asyncio
+    async def test_stream_close_is_called(self):
+        stream = _AsyncStream([_chunk(content="ok", finish_reason="stop")])
+        result = await _aggregate_chat_stream(stream)
         assert result.choices[0].message.content == "ok"
-        assert closed == [True]
+        assert stream.closed is True
 
 
 
@@ -244,37 +255,38 @@ class TestProviderRequiresStream:
         assert _provider_requires_stream("auto", "") is False
 
     def test_config_marker_matches_custom_endpoint(self):
-        with patch(
-            "hermes_cli.config.load_config",
-            return_value={"auxiliary": {"stream_only_base_urls": ["my-proxy.example.com"]}},
-        ):
-            assert _provider_requires_stream(
-                "custom", "https://my-proxy.example.com/v1"
-            ) is True
-            assert _provider_requires_stream(
-                "custom", "https://other.example.com/v1"
-            ) is False
+        config = {
+            "auxiliary": {"stream_only_base_urls": ["my-proxy.example.com"]}
+        }
+        assert _provider_requires_stream(
+            "custom", "https://my-proxy.example.com/v1", config=config,
+        ) is True
+        assert _provider_requires_stream(
+            "custom", "https://other.example.com/v1", config=config,
+        ) is False
 
 
 
 class TestForceStream:
-    def test_force_stream_streams_without_a_hook(self):
+    @pytest.mark.asyncio
+    async def test_force_stream_streams_without_a_hook(self):
         chunks = [_chunk(content="hi", finish_reason="stop")]
         client = _FakeClient(stream_chunks=chunks)
         # NO aux_progress_hook installed — force_stream alone must stream.
-        result = _create_with_progress(
+        result = await _create_with_progress(
             client, {"model": "m1", "messages": []}, force_stream=True,
         )
         assert client.calls[0]["stream"] is True
         assert result.choices[0].message.content == "hi"
 
-    def test_force_stream_does_not_retry_nonstreaming_on_failure(self):
+    @pytest.mark.asyncio
+    async def test_force_stream_does_not_retry_nonstreaming_on_failure(self):
         client = _FakeClient(
             response=_COMPLETE,
             stream_error=RuntimeError("HTTP 400 bad request"),
         )
         with pytest.raises(RuntimeError, match="bad request"):
-            _create_with_progress(
+            await _create_with_progress(
                 client, {"model": "m1", "messages": []}, force_stream=True,
             )
         # No silent non-streaming retry — the provider rejects those anyway.
@@ -283,7 +295,7 @@ class TestForceStream:
 
 class TestAsyncStreamAggregation:
     @pytest.mark.asyncio
-    async def test_async_stream_is_consumed_with_async_for(self):
+    async def test_stream_is_consumed_with_async_for(self):
         # The sweeper review of PR #60686 flagged that awaiting create() and
         # then iterating synchronously raises — the async contract is
         # ``async for``. Verify the async aggregator consumes a real async
@@ -319,7 +331,7 @@ class TestAsyncStreamAggregation:
                 self.closed = True
 
         stream = _AsyncStream(raw_chunks)
-        result = await _aggregate_chat_stream_async(stream)
+        result = await _aggregate_chat_stream(stream)
         msg = result.choices[0].message
         assert msg.content == "part1 part2"
         assert msg.tool_calls[0].function.name == "lookup"
@@ -352,7 +364,7 @@ class TestAsyncStreamAggregation:
                 calls.append(kwargs)
                 return _AsyncStream([_chunk(content="ok", finish_reason="stop")])
 
-        result = await _acreate_with_stream(
+        result = await _create_with_stream(
             _AsyncClient(), {"model": "m1", "messages": [], "timeout": 30},
         )
         assert calls[0]["stream"] is True

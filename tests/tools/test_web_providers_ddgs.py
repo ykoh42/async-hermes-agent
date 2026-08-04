@@ -61,10 +61,13 @@ def _force_inprocess_search(monkeypatch, prov):
     spawn workers would not see that fake. Isolation behavior is covered by
     dedicated process tests below.
     """
+    async def run_in_process(query, safe_limit):
+        return prov._run_ddgs_search(query, safe_limit)
+
     monkeypatch.setattr(
         prov,
         "_run_ddgs_search_bounded",
-        lambda query, safe_limit: prov._run_ddgs_search(query, safe_limit),
+        run_in_process,
         raising=True,
     )
 
@@ -90,7 +93,8 @@ class TestDDGSProviderIsConfigured:
 
 
 class TestDDGSProviderSearch:
-    def test_happy_path_normalizes_results(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_happy_path_normalizes_results(self, monkeypatch):
         _install_fake_ddgs(monkeypatch, text_results=[
             {"title": "A", "href": "https://a.example.com", "body": "desc A"},
             {"title": "B", "href": "https://b.example.com", "body": "desc B"},
@@ -99,7 +103,7 @@ class TestDDGSProviderSearch:
         import plugins.web.ddgs.provider as prov
         _force_inprocess_search(monkeypatch, prov)
 
-        result = prov.DDGSWebSearchProvider().search("q", limit=5)
+        result = await prov.DDGSWebSearchProvider().search("q", limit=5)
 
         assert result["success"] is True
         web = result["data"]["web"]
@@ -108,17 +112,19 @@ class TestDDGSProviderSearch:
         assert web[2]["position"] == 3
 
 
-    def test_empty_results(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_empty_results(self, monkeypatch):
         _install_fake_ddgs(monkeypatch, text_results=[])
         import plugins.web.ddgs.provider as prov
         _force_inprocess_search(monkeypatch, prov)
 
-        result = prov.DDGSWebSearchProvider().search("nothing", limit=5)
+        result = await prov.DDGSWebSearchProvider().search("nothing", limit=5)
         assert result["success"] is True
         assert result["data"]["web"] == []
 
     @pytest.mark.live_system_guard_bypass
-    def test_hung_search_times_out_and_returns_failure(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_hung_search_times_out_and_returns_failure(self, monkeypatch):
         """#36776 / #68096: a hung worker must be bounded by the wall-clock
         timeout and reaped — even when the child never returns to Python."""
         _install_fake_ddgs(monkeypatch)
@@ -130,7 +136,7 @@ class TestDDGSProviderSearch:
         monkeypatch.setattr("tools.interrupt.is_interrupted", lambda: False)
 
         start = time.monotonic()
-        result = prov.DDGSWebSearchProvider().search("hangs forever", limit=5)
+        result = await prov.DDGSWebSearchProvider().search("hangs forever", limit=5)
         elapsed = time.monotonic() - start
 
         assert result["success"] is False
@@ -138,7 +144,8 @@ class TestDDGSProviderSearch:
         assert elapsed < 5.0, f"search did not return promptly ({elapsed:.1f}s)"
         _assert_worker_reaped(prov)
 
-    def test_fast_search_not_affected_by_timeout_wrapper(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_fast_search_not_affected_by_timeout_wrapper(self, monkeypatch):
         """Happy-path guard: the timeout wrapper must not break a normal,
         fast search — results flow through unchanged."""
         _install_fake_ddgs(
@@ -148,7 +155,7 @@ class TestDDGSProviderSearch:
         import plugins.web.ddgs.provider as prov
         _force_inprocess_search(monkeypatch, prov)
 
-        result = prov.DDGSWebSearchProvider().search("q", limit=5)
+        result = await prov.DDGSWebSearchProvider().search("q", limit=5)
         assert result["success"] is True
         assert result["data"]["web"][0]["url"] == "https://e.com"
         assert result["data"]["web"][0]["title"] == "T"
@@ -163,14 +170,15 @@ def _assert_worker_reaped(prov) -> None:
     """Assert the last DDGS worker process has exited."""
     proc = prov._last_worker_proc
     assert proc is not None, "expected a DDGS worker process to have been started"
-    assert proc.poll() is not None, (
+    assert proc.returncode is not None, (
         f"DDGS worker still alive (pid={proc.pid}, returncode={proc.returncode})"
     )
 
 
 @pytest.mark.live_system_guard_bypass
 class TestDDGSProcessIsolation:
-    def test_gil_holding_worker_times_out_and_is_reaped(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_gil_holding_worker_times_out_and_is_reaped(self, monkeypatch):
         """#68096: parent deadline still fires when the child holds its GIL."""
         _install_fake_ddgs(monkeypatch)
         import plugins.web.ddgs.provider as prov
@@ -181,7 +189,7 @@ class TestDDGSProcessIsolation:
         monkeypatch.setattr("tools.interrupt.is_interrupted", lambda: False)
 
         start = time.monotonic()
-        result = prov.DDGSWebSearchProvider().search("gil hold", limit=5)
+        result = await prov.DDGSWebSearchProvider().search("gil hold", limit=5)
         elapsed = time.monotonic() - start
 
         assert result["success"] is False
@@ -189,7 +197,8 @@ class TestDDGSProcessIsolation:
         assert elapsed < 5.0, f"GIL-hold search did not time out promptly ({elapsed:.1f}s)"
         _assert_worker_reaped(prov)
 
-    def test_interrupt_terminates_worker_promptly(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_interrupt_terminates_worker_promptly(self, monkeypatch):
         """TUI/gateway interrupt must kill the DDGS child before the deadline."""
         _install_fake_ddgs(monkeypatch)
         import plugins.web.ddgs.provider as prov
@@ -207,7 +216,7 @@ class TestDDGSProcessIsolation:
         monkeypatch.setattr("tools.interrupt.is_interrupted", _interrupt_after_poll)
 
         start = time.monotonic()
-        result = prov.DDGSWebSearchProvider().search("interrupt me", limit=5)
+        result = await prov.DDGSWebSearchProvider().search("interrupt me", limit=5)
         elapsed = time.monotonic() - start
 
         assert result["success"] is False
@@ -216,14 +225,15 @@ class TestDDGSProcessIsolation:
         _assert_worker_reaped(prov)
 
 
-    def test_no_orphan_after_successful_search(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_no_orphan_after_successful_search(self, monkeypatch):
         _install_fake_ddgs(monkeypatch)
         import plugins.web.ddgs.provider as prov
 
         monkeypatch.setattr(prov, "_test_hook", "empty", raising=True)
         monkeypatch.setattr("tools.interrupt.is_interrupted", lambda: False)
 
-        result = prov.DDGSWebSearchProvider().search("q", limit=5)
+        result = await prov.DDGSWebSearchProvider().search("q", limit=5)
         assert result["success"] is True
         _assert_worker_reaped(prov)
 
@@ -245,7 +255,6 @@ class TestDDGSBackendWiring:
         for key in ("FIRECRAWL_API_KEY", "FIRECRAWL_API_URL", "PARALLEL_API_KEY",
                     "TAVILY_API_KEY", "EXA_API_KEY", "SEARXNG_URL", "BRAVE_SEARCH_API_KEY"):
             monkeypatch.delenv(key, raising=False)
-        monkeypatch.setattr(web_tools, "_is_tool_gateway_ready", lambda: False)
         monkeypatch.setattr(web_tools, "_ddgs_package_importable", lambda: True)
         assert web_tools._get_backend() == "ddgs"
 
@@ -271,22 +280,19 @@ class TestDDGSSearchOnlyErrors:
         from agent.web_search_registry import _reset_for_tests
         _reset_for_tests()
 
-    def test_web_extract_returns_search_only_error(self, monkeypatch):
-        import asyncio
+    @pytest.mark.asyncio
+    async def test_web_extract_returns_search_only_error(self, monkeypatch):
         from tools import web_tools
 
         monkeypatch.setattr(web_tools, "_load_web_config", lambda: {"backend": "ddgs"})
         monkeypatch.setattr(web_tools, "_ddgs_package_importable", lambda: True)
-        monkeypatch.setattr(web_tools, "_is_tool_gateway_ready", lambda: False)
         async def _allow_ssrf(_url: str) -> bool:
             return True
 
-        monkeypatch.setattr(web_tools, "async_is_safe_url", _allow_ssrf)
+        monkeypatch.setattr(web_tools, "is_safe_url", _allow_ssrf)
         monkeypatch.setattr("tools.interrupt.is_interrupted", lambda: False, raising=False)
 
-        result_str = asyncio.get_event_loop().run_until_complete(
-            web_tools.web_extract_tool(["https://example.com"])
-        )
+        result_str = await web_tools.web_extract_tool(["https://example.com"])
         result = json.loads(result_str)
         assert result["success"] is False
         assert "search-only" in result["error"].lower()

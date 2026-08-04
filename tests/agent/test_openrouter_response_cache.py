@@ -1,8 +1,6 @@
 """Tests for OpenRouter response caching header injection."""
 
 from types import SimpleNamespace
-from unittest.mock import patch
-
 import pytest
 
 
@@ -48,12 +46,11 @@ class TestBuildOrHeaders:
         assert h1 == h2
 
 
-    def test_none_config_load_config_fails_gracefully(self):
-        """When load_config() fails, build_or_headers still returns base headers."""
+    def test_none_config_uses_base_headers_without_io(self):
+        """A missing snapshot uses base headers without reading config."""
         from agent.auxiliary_client import build_or_headers
 
-        with patch("hermes_cli.config.load_config", side_effect=RuntimeError("boom")), patch("hermes_cli.config.load_config_readonly", side_effect=RuntimeError("boom")):
-            headers = build_or_headers(or_config=None)
+        headers = build_or_headers(or_config=None)
         # Should have base attribution but no cache headers
         assert "HTTP-Referer" in headers
         assert "X-OpenRouter-Cache" not in headers

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import threading
 from unittest.mock import MagicMock
 
 from agent.interrupt_compat import request_hard_interrupt
@@ -62,15 +61,12 @@ def test_inherited_hard_interrupt_bypasses_legacy_subclass_override() -> None:
     class LegacySubclass(AIAgent):
         def __init__(self) -> None:
             self.legacy_calls: list[str | None] = []
-            self._hard_interrupt_requested = threading.Event()
-            self._pending_redirect_lock = threading.RLock()
+            import asyncio
+
+            self._hard_interrupt_requested = asyncio.Event()
             self._pending_redirect = None
-            self._execution_thread_id = None
-            self._interrupt_thread_signal_pending = False
-            self._tool_worker_threads: set[int] = set()
-            self._tool_worker_threads_lock = threading.Lock()
             self._active_children: list[object] = []
-            self._active_children_lock = threading.Lock()
+            self._interrupt_event = asyncio.Event()
             self.quiet_mode = True
             self.api_mode = "test"
 
@@ -92,12 +88,10 @@ def test_tui_subagent_interrupt_is_an_explicit_hard_stop() -> None:
 
     agent = _ModernAgent()
     subagent_id = "sa-hard-stop-test"
-    with delegate_tool._active_subagents_lock:
-        delegate_tool._active_subagents[subagent_id] = {"agent": agent}
+    delegate_tool._active_subagents[subagent_id] = {"agent": agent}
     try:
         assert delegate_tool.interrupt_subagent(subagent_id) is True
     finally:
-        with delegate_tool._active_subagents_lock:
-            delegate_tool._active_subagents.pop(subagent_id, None)
+        delegate_tool._active_subagents.pop(subagent_id, None)
 
     assert agent.calls == [("hard", f"Interrupted via TUI ({subagent_id})")]

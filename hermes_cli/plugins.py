@@ -33,14 +33,12 @@ so plugin-defined tools appear alongside the built-in tools.
 
 from __future__ import annotations
 
-import asyncio
 import importlib.metadata
 import importlib.util
 import inspect
 import logging
 import os
 import sys
-import threading
 import types
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -171,22 +169,6 @@ VALID_HOOKS: Set[str] = {
     #   {"action": "allow"}  /  None             -> normal dispatch
     # Kwargs: event: MessageEvent, gateway: GatewayRunner, session_store.
     "pre_gateway_dispatch",
-    # Approval lifecycle hooks. Fired by tools/approval.py when a dangerous
-    # command needs an approval decision -- fires for CLI-interactive prompts,
-    # gateway/ACP approvals, and smart-mode auxiliary-LLM decisions.
-    # Observers only: return values are ignored. Plugins cannot veto or
-    # pre-answer an approval from these hooks (use pre_tool_call to block
-    # a tool before it reaches approval).
-    #
-    # Kwargs for pre_approval_request:
-    #   command: str, description: str, pattern_key: str, pattern_keys: list[str],
-    #   session_key: str, surface: "cli" | "gateway" | "smart"
-    # Kwargs for post_approval_response: same as above plus
-    #   choice: "once" | "session" | "always" | "deny" | "timeout"
-    #           | "smart_approve" | "smart_deny"
-    #   decided_by: "aux_llm"  -- only on surface="smart"
-    "pre_approval_request",
-    "post_approval_response",
     # Kanban task lifecycle hooks. Fired by hermes_cli.kanban_db when a task
     # transitions state, AFTER the change is committed to the board DB (so the
     # hook always sees durable state and a slow plugin can never hold the
@@ -415,7 +397,6 @@ class PluginContext:
         handler: Callable,
         check_fn: Callable | None = None,
         requires_env: list | None = None,
-        is_async: bool = False,
         description: str = "",
         emoji: str = "",
         override: bool = False,
@@ -453,7 +434,6 @@ class PluginContext:
             handler=handler,
             check_fn=check_fn,
             requires_env=requires_env,
-            is_async=is_async,
             description=description,
             emoji=emoji,
             override=override,
@@ -518,31 +498,6 @@ class PluginContext:
             cli._pending_input.put(msg)
         return True
 
-    # -- CLI command registration --------------------------------------------
-
-    def register_cli_command(
-        self,
-        name: str,
-        help: str,
-        setup_fn: Callable,
-        handler_fn: Callable | None = None,
-        description: str = "",
-    ) -> None:
-        """Register a CLI subcommand (e.g. ``hermes honcho ...``).
-
-        The *setup_fn* receives an argparse subparser and should add any
-        arguments/sub-subparsers.  If *handler_fn* is provided it is set
-        as the default dispatch function via ``set_defaults(func=...)``."""
-        self._manager._cli_commands[name] = {
-            "name": name,
-            "help": help,
-            "description": description,
-            "setup_fn": setup_fn,
-            "handler_fn": handler_fn,
-            "plugin": self.manifest.name,
-        }
-        logger.debug("Plugin %s registered CLI command: %s", self.manifest.name, name)
-
     # -- slash command registration -------------------------------------------
 
     def register_command(
@@ -556,10 +511,6 @@ class PluginContext:
 
         The handler signature is ``fn(raw_args: str) -> str | None``.
         It may also be an async callable — the gateway dispatch handles both.
-
-        Unlike ``register_cli_command()`` (which creates ``hermes <subcommand>``
-        terminal commands), this registers in-session slash commands that users
-        invoke during a conversation.
 
         ``args_hint`` is an optional short string (e.g. ``"<file>"`` or
         ``"dias:7 formato:json"``) used by gateway adapters to surface the
@@ -601,7 +552,7 @@ class PluginContext:
 
     # -- tool dispatch -------------------------------------------------------
 
-    def dispatch_tool(self, tool_name: str, args: dict, **kwargs) -> str:
+    async def dispatch_tool(self, tool_name: str, args: dict, **kwargs) -> str:
         """Dispatch a tool call through the registry, with parent agent context.
 
         This is the public interface for plugin slash commands that need to call
@@ -628,7 +579,7 @@ class PluginContext:
             if agent is not None:
                 kwargs["parent_agent"] = agent
 
-        return registry.dispatch(tool_name, args, **kwargs)
+        return await registry.dispatch(tool_name, args, **kwargs)
 
     # -- context engine registration -----------------------------------------
 
@@ -687,46 +638,6 @@ class PluginContext:
         logger.info(
             "Plugin '%s' registered image_gen provider: %s",
             self.manifest.name, provider.name,
-        )
-
-    # -- dashboard auth provider registration --------------------------------
-
-    def register_dashboard_auth_provider(self, provider) -> None:
-        """Register a dashboard authentication provider.
-
-        ``provider`` must be an instance of
-        :class:`hermes_cli.dashboard_auth.DashboardAuthProvider`. Used by
-        the dashboard OAuth auth gate, which engages when the dashboard
-        binds to a non-loopback host without ``--insecure``.
-
-        Misbehaving providers (wrong type, duplicate name) are logged at
-        WARNING and silently ignored — never raised — so a broken plugin
-        cannot crash the host. Same convention as
-        ``register_image_gen_provider``.
-        """
-        from hermes_cli.dashboard_auth import (
-            DashboardAuthProvider, register_provider,
-        )
-
-        if not isinstance(provider, DashboardAuthProvider):
-            logger.warning(
-                "Plugin '%s' tried to register a dashboard-auth provider "
-                "that does not inherit from DashboardAuthProvider. Ignoring.",
-                self.manifest.name,
-            )
-            return
-        try:
-            register_provider(provider)
-        except (TypeError, ValueError) as e:
-            logger.warning(
-                "Plugin '%s' failed to register dashboard-auth provider "
-                "%r: %s",
-                self.manifest.name, getattr(provider, "name", "?"), e,
-            )
-            return
-        logger.info(
-            "Plugin '%s' registered dashboard-auth provider: %s (%s)",
-            self.manifest.name, provider.name, provider.display_name,
         )
 
     # -- video gen provider registration -------------------------------------
@@ -815,53 +726,6 @@ class PluginContext:
             "Plugin '%s' registered browser provider: %s",
             self.manifest.name, provider.name,
         )
-
-    # -- secret source registration -------------------------------------------
-
-    def register_secret_source(self, source) -> None:
-        """Register an external secret-manager backend.
-
-        ``source`` must be an instance of
-        :class:`agent.secret_sources.base.SecretSource`.  Registered
-        sources run during ``load_hermes_dotenv()`` startup — after
-        ``~/.hermes/.env`` loads, before Hermes reads credentials — when
-        their ``secrets.<source.name>`` config section is enabled.  The
-        orchestrator (``agent.secret_sources.registry.apply_all``) owns
-        ordering, mapped-vs-bulk precedence, conflict warnings, and
-        provenance; the source only fetches.
-
-        NOTE ON TIMING: plugin discovery happens later in startup than
-        the first ``load_hermes_dotenv()`` call, so a plugin-registered
-        source is not consulted by the initial env load of the process
-        that discovers it.  It IS consulted by every subsequently
-        spawned Hermes process (gateway children, cron sessions,
-        subagents), and immediately after a
-        ``reset_secret_source_cache()`` re-pull.  Plugin sources are
-        therefore best for supplying credentials to the running fleet;
-        the bundled sources cover first-process bootstrap.
-
-        Contract requirements (rejected with a warning otherwise):
-        inherit from ``SecretSource``, ``api_version`` matching
-        ``SECRET_SOURCE_API_VERSION``, lowercase unique ``name``,
-        ``shape`` of ``"mapped"`` or ``"bulk"``, unique ``scheme`` (when
-        set), and a ``fetch()`` that never raises and never prompts.
-        See the base-module docstring for the full contract.
-        """
-        from agent.secret_sources.base import SecretSource
-        from agent.secret_sources.registry import register_source
-
-        if not isinstance(source, SecretSource):
-            logger.warning(
-                "Plugin '%s' tried to register a secret source that does "
-                "not inherit from SecretSource. Ignoring.",
-                self.manifest.name,
-            )
-            return
-        if register_source(source):
-            logger.info(
-                "Plugin '%s' registered secret source: %s",
-                self.manifest.name, source.name,
-            )
 
     # -- TTS provider registration -------------------------------------------
 
@@ -1126,10 +990,10 @@ class PluginContext:
                 f"must contain only alphanumeric characters and underscores"
             )
 
-        # Lazy import to avoid circular: hermes_cli.main imports plugins indirectly
-        from hermes_cli.main import _AUX_TASKS as _BUILTIN_AUX_TASKS
-
-        builtin_keys = {k for k, _name, _desc in _BUILTIN_AUX_TASKS}
+        # This library build has no CLI-owned auxiliary-task catalog. Core
+        # tasks are registered by their runtime owners; plugin keys only need
+        # collision checks against other plugin registrations here.
+        builtin_keys: set[str] = set()
         if key in builtin_keys:
             raise ValueError(
                 f"Plugin '{self.manifest.name}' cannot register auxiliary task "
@@ -1273,7 +1137,6 @@ class PluginManager:
         self._middleware: Dict[str, List[Callable]] = {}
         self._plugin_tool_names: Set[str] = set()
         self._plugin_platform_names: Set[str] = set()
-        self._cli_commands: Dict[str, dict] = {}
         self._context_engine = None  # Set by a plugin via register_context_engine()
         self._plugin_commands: Dict[str, dict] = {}  # Slash commands registered by plugins
         self._discovered: bool = False
@@ -1314,7 +1177,6 @@ class PluginManager:
             self._middleware.clear()
             self._plugin_tool_names.clear()
             self._plugin_platform_names.clear()
-            self._cli_commands.clear()
             self._plugin_commands.clear()
             self._plugin_skills.clear()
             self._aux_tasks.clear()
@@ -1829,15 +1691,11 @@ class PluginManager:
                 ]
                 loaded.enabled = True
                 logger.debug(
-                    "  registered: %d tool(s), %d hook(s), %d middleware, %d slash command(s), %d CLI command(s)",
+                    "  registered: %d tool(s), %d hook(s), %d middleware, %d slash command(s)",
                     len(loaded.tools_registered),
                     len(loaded.hooks_registered),
                     len(loaded.middleware_registered),
                     len(loaded.commands_registered),
-                    sum(
-                        1 for c in self._cli_commands
-                        if self._cli_commands[c].get("plugin") == manifest.name
-                    ),
                 )
 
         except Exception as exc:
@@ -1908,39 +1766,33 @@ class PluginManager:
     # Hook invocation
     # -----------------------------------------------------------------------
 
-    def invoke_hook(self, hook_name: str, **kwargs: Any) -> List[Any]:
-        """Call all registered callbacks for *hook_name*.
+    async def invoke_hook(self, hook_name: str, **kwargs: Any) -> List[Any]:
+        """Invoke lifecycle hooks through the native async plugin contract.
 
-        Each callback is wrapped in its own try/except so a misbehaving
-        plugin cannot break the core agent loop.
-
-        Returns a list of non-``None`` return values from callbacks.
-
-        For ``pre_llm_call``, callbacks may return a dict describing
-        context to inject into the current turn's user message::
-
-            {"context": "recalled text..."}
-            "recalled text..."          # plain string, equivalent
-
-        Context is ALWAYS injected into the user message, never the
-        system prompt.  This preserves the prompt cache prefix — the
-        system prompt stays identical across turns so cached tokens
-        are reused.  All injected context is ephemeral — never
-        persisted to session DB.
+        An async agent cannot safely guess whether a third-party synchronous
+        callback performs I/O.  Such callbacks are rejected explicitly rather
+        than being hidden in a worker thread or allowed to stall every turn.
         """
         kwargs.setdefault("telemetry_schema_version", OBSERVER_SCHEMA_VERSION)
         callbacks = self._hooks.get(hook_name, [])
         results: List[Any] = []
-        for cb in callbacks:
+        for callback in callbacks:
             try:
-                ret = cb(**kwargs)
-                if ret is not None:
-                    results.append(ret)
+                if not inspect.iscoroutinefunction(callback):
+                    raise AsyncPluginCapabilityError(
+                        "Async Hermes requires coroutine lifecycle hooks; "
+                        f"{getattr(callback, '__name__', repr(callback))} is synchronous"
+                    )
+                result = await callback(**kwargs)
+                if result is not None:
+                    results.append(result)
+            except AsyncPluginCapabilityError:
+                raise
             except Exception as exc:
                 logger.warning(
                     "Hook '%s' callback %s raised: %s",
                     hook_name,
-                    getattr(cb, "__name__", repr(cb)),
+                    getattr(callback, "__name__", repr(callback)),
                     exc,
                 )
         return results
@@ -1952,29 +1804,6 @@ class PluginManager:
     def has_middleware(self, kind: str) -> bool:
         """Return True when at least one callback is registered for middleware."""
         return bool(self._middleware.get(kind))
-
-    def invoke_middleware(self, kind: str, **kwargs: Any) -> List[Any]:
-        """Call registered middleware callbacks for *kind*.
-
-        Each callback is isolated so one plugin cannot break the base runtime
-        path. Middleware that wants to change behavior must return the shape
-        documented by the caller-specific contract.
-        """
-        callbacks = self._middleware.get(kind, [])
-        results: List[Any] = []
-        for cb in callbacks:
-            try:
-                ret = cb(**kwargs)
-                if ret is not None:
-                    results.append(ret)
-            except Exception as exc:
-                logger.warning(
-                    "Middleware '%s' callback %s raised: %s",
-                    kind,
-                    getattr(cb, "__name__", repr(cb)),
-                    exc,
-                )
-        return results
 
     # -----------------------------------------------------------------------
     # Slack action handler accessor
@@ -2065,20 +1894,13 @@ def discover_plugins(force: bool = False) -> None:
     get_plugin_manager().discover_and_load(force=force)
 
 
-def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
-    """Invoke a lifecycle hook on loaded plugins.
-
-    Returns a list of non-``None`` return values from plugin callbacks.
-    """
-    return get_plugin_manager().invoke_hook(hook_name, **kwargs)
+class AsyncPluginCapabilityError(RuntimeError):
+    """Raised when an unconverted plugin reaches the native async runtime."""
 
 
-def invoke_middleware(kind: str, **kwargs: Any) -> List[Any]:
-    """Invoke registered middleware callbacks.
-
-    Returns a list of non-``None`` return values from middleware callbacks.
-    """
-    return get_plugin_manager().invoke_middleware(kind, **kwargs)
+async def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
+    """Await native lifecycle hooks without a sync compatibility bridge."""
+    return await get_plugin_manager().invoke_hook(hook_name, **kwargs)
 
 
 def has_middleware(kind: str) -> bool:
@@ -2095,9 +1917,6 @@ def has_hook(hook_name: str) -> bool:
     return get_plugin_manager().has_hook(hook_name)
 
 
-_thread_tool_whitelist = threading.local()
-
-
 @dataclass(frozen=True)
 class _PreToolCallDirective:
     action: Optional[str] = None
@@ -2105,74 +1924,8 @@ class _PreToolCallDirective:
     rule_key: Optional[str] = None
 
 
-def set_thread_tool_whitelist(
-    allowed: Optional[Set[str]],
-    deny_msg_fmt: str = "Tool '{tool_name}' denied: not in this thread's tool whitelist",
-) -> None:
-    _thread_tool_whitelist.allowed = allowed
-    _thread_tool_whitelist.fmt = deny_msg_fmt
-
-
-def clear_thread_tool_whitelist() -> None:
-    _thread_tool_whitelist.allowed = None
-
-
-def _get_pre_tool_call_directive_details(
-    tool_name: str,
-    args: Optional[Dict[str, Any]],
-    task_id: str = "",
-    session_id: str = "",
-    tool_call_id: str = "",
-    turn_id: str = "",
-    api_request_id: str = "",
-    middleware_trace: Optional[List[Dict[str, Any]]] = None,
-) -> _PreToolCallDirective:
-    """Check ``pre_tool_call`` hooks for a blocking or approval directive.
-
-    Plugins that need to enforce policy (rate limiting, security
-    restrictions, approval workflows) can return one of::
-
-        {"action": "block",   "message": "Reason the tool was blocked"}
-        {"action": "approve", "message": "Why this needs human confirmation"}
-        {"action": "approve", "message": "...", "rule_key": "write_file:ssh"}
-
-    from their ``pre_tool_call`` callback.
-
-    - ``block`` vetoes the tool call outright (the message becomes the tool
-      result the model sees).
-    - ``approve`` ESCALATES to the existing human-approval gate
-      (``prompt_dangerous_approval`` on CLI, the approval callback on the
-      gateway) — the same mechanism Tier-2 dangerous shell patterns use.
-      This lets a plugin require a human ``[o]nce/[s]ession/[a]lways/[d]eny``
-      decision on ANY tool, not just terminal command strings. The caller is
-      responsible for invoking the gate (see
-      :func:`tools.approval.request_tool_approval`).
-    - ``rule_key`` is optional and only honored for ``approve`` directives. It
-      lets plugins choose the allowlist grain for `[a]lways` approvals.
-
-    The first valid directive wins. Invalid or irrelevant hook return values
-    are silently ignored so existing observer-only hooks are unaffected.
-    """
-    allowed = getattr(_thread_tool_whitelist, "allowed", None)
-    if allowed is not None and tool_name not in allowed:
-        fmt = getattr(_thread_tool_whitelist, "fmt", "Tool '{tool_name}' denied")
-        return _PreToolCallDirective(
-            action="block",
-            message=fmt.format(tool_name=tool_name),
-        )
-
-    hook_results = invoke_hook(
-        "pre_tool_call",
-        tool_name=tool_name,
-        args=args if isinstance(args, dict) else {},
-        task_id=task_id,
-        session_id=session_id,
-        tool_call_id=tool_call_id,
-        turn_id=turn_id,
-        api_request_id=api_request_id,
-        middleware_trace=list(middleware_trace or []),
-    )
-
+def _first_pre_tool_call_directive(hook_results: List[Any]) -> _PreToolCallDirective:
+    """Return the first valid policy directive from hook results."""
     for result in hook_results:
         if not isinstance(result, dict):
             continue
@@ -2194,7 +1947,32 @@ def _get_pre_tool_call_directive_details(
     return _PreToolCallDirective()
 
 
-def get_pre_tool_call_directive(
+async def _get_pre_tool_call_directive_details(
+    tool_name: str,
+    args: Optional[Dict[str, Any]],
+    task_id: str = "",
+    session_id: str = "",
+    tool_call_id: str = "",
+    turn_id: str = "",
+    api_request_id: str = "",
+    middleware_trace: Optional[List[Dict[str, Any]]] = None,
+) -> _PreToolCallDirective:
+    """Check async ``pre_tool_call`` hooks for a policy directive."""
+    hook_results = await invoke_hook(
+        "pre_tool_call",
+        tool_name=tool_name,
+        args=args if isinstance(args, dict) else {},
+        task_id=task_id,
+        session_id=session_id,
+        tool_call_id=tool_call_id,
+        turn_id=turn_id,
+        api_request_id=api_request_id,
+        middleware_trace=list(middleware_trace or []),
+    )
+    return _first_pre_tool_call_directive(hook_results)
+
+
+async def get_pre_tool_call_directive(
     tool_name: str,
     args: Optional[Dict[str, Any]],
     task_id: str = "",
@@ -2211,7 +1989,7 @@ def get_pre_tool_call_directive(
     that need approve-specific metadata use
     :func:`_get_pre_tool_call_directive_details`.
     """
-    details = _get_pre_tool_call_directive_details(
+    details = await _get_pre_tool_call_directive_details(
         tool_name, args, task_id=task_id, session_id=session_id,
         tool_call_id=tool_call_id, turn_id=turn_id,
         api_request_id=api_request_id, middleware_trace=middleware_trace,
@@ -2219,7 +1997,7 @@ def get_pre_tool_call_directive(
     return (details.action, details.message)
 
 
-def get_pre_tool_call_block_message(
+async def get_pre_tool_call_block_message(
     tool_name: str,
     args: Optional[Dict[str, Any]],
     task_id: str = "",
@@ -2229,22 +2007,21 @@ def get_pre_tool_call_block_message(
     api_request_id: str = "",
     middleware_trace: Optional[List[Dict[str, Any]]] = None,
 ) -> Optional[str]:
-    """Back-compat shim: return only a ``block`` message (or ``None``).
-
-    Deprecated in favor of :func:`get_pre_tool_call_directive`, which also
-    surfaces the ``approve`` escalation directive. Kept so any external caller
-    importing the old name keeps working; ``approve`` directives are invisible
-    to this shim (it only reports blocks).
-    """
-    directive, message = get_pre_tool_call_directive(
-        tool_name, args, task_id=task_id, session_id=session_id,
-        tool_call_id=tool_call_id, turn_id=turn_id,
-        api_request_id=api_request_id, middleware_trace=middleware_trace,
+    """Return a plugin's async ``pre_tool_call`` block message, if any."""
+    directive, message = await get_pre_tool_call_directive(
+        tool_name,
+        args,
+        task_id=task_id,
+        session_id=session_id,
+        tool_call_id=tool_call_id,
+        turn_id=turn_id,
+        api_request_id=api_request_id,
+        middleware_trace=middleware_trace,
     )
     return message if directive == "block" else None
 
 
-def resolve_pre_tool_block(
+async def resolve_pre_tool_block(
     tool_name: str,
     args: Optional[Dict[str, Any]],
     task_id: str = "",
@@ -2254,48 +2031,60 @@ def resolve_pre_tool_block(
     api_request_id: str = "",
     middleware_trace: Optional[List[Dict[str, Any]]] = None,
 ) -> Optional[str]:
-    """Resolve the pre_tool_call directive to a final block message (or None).
-
-    Single entry point for every tool-dispatch site: fetches the plugin
-    directive and, for an ``approve`` escalation, invokes the human-approval
-    gate (:func:`tools.approval.request_tool_approval`). Returns the message
-    the tool result should carry when the call is blocked, or ``None`` when
-    the call may proceed.
-
-    Centralizing this keeps the security-critical fail-closed logic in ONE
-    place instead of copy-pasted across the concurrent/sequential/helper
-    dispatch paths: an ``approve`` directive whose gate errors, denies, or
-    times out is fail-closed to a block; ``block`` blocks with its message;
-    anything else proceeds.
-    """
-    details = _get_pre_tool_call_directive_details(
-        tool_name, args, task_id=task_id, session_id=session_id,
-        tool_call_id=tool_call_id, turn_id=turn_id,
-        api_request_id=api_request_id, middleware_trace=middleware_trace,
+    """Resolve a pre-tool policy directive through the async approval callback."""
+    details = await _get_pre_tool_call_directive_details(
+        tool_name,
+        args,
+        task_id=task_id,
+        session_id=session_id,
+        tool_call_id=tool_call_id,
+        turn_id=turn_id,
+        api_request_id=api_request_id,
+        middleware_trace=middleware_trace,
     )
     if details.action == "block":
         return details.message
     if details.action == "approve":
+        from tools.terminal_tool import _get_approval_callback
+
+        callback = _get_approval_callback()
+        if callback is None:
+            return f"BLOCKED: plugin approval required for {tool_name}"
         try:
-            from tools.approval import request_tool_approval
-            result = request_tool_approval(
-                tool_name,
-                details.message or "",
+            if not inspect.iscoroutinefunction(callback):
+                raise AsyncPluginCapabilityError(
+                    "Async Hermes requires a coroutine approval callback"
+                )
+            decision = await callback(
+                tool_name=tool_name,
+                reason=details.message or "",
                 rule_key=details.rule_key or tool_name,
+                args=args if isinstance(args, dict) else {},
+                task_id=task_id,
+                session_id=session_id,
             )
+        except AsyncPluginCapabilityError:
+            raise
         except Exception:
-            # Fail-closed: if the gate itself errors, block rather than
-            # silently execute an action a plugin flagged for approval.
-            return f"BLOCKED: plugin approval gate failed for {tool_name}"
-        if not result.get("approved"):
+            logger.exception("Plugin approval callback failed for %s", tool_name)
+            return f"BLOCKED: plugin approval callback failed for {tool_name}"
+
+        approved = decision is True or str(decision).strip().lower() in {
+            "approve",
+            "approved",
+            "allow",
+            "yes",
+        }
+        if not approved:
             return str(
-                result.get("message")
-                or f"BLOCKED: plugin approval required for {tool_name}"
+                decision.get("message")
+                if isinstance(decision, dict) and decision.get("message")
+                else f"BLOCKED: plugin approval denied for {tool_name}"
             )
     return None
 
 
-def get_pre_verify_continue_message(
+async def get_pre_verify_continue_message(
     *,
     session_id: str = "",
     platform: str = "",
@@ -2322,7 +2111,7 @@ def get_pre_verify_continue_message(
     self-throttle (``if attempt`` …), the same way a ``pre_tool_call`` hook
     scopes on ``tool_name``.
     """
-    hook_results = invoke_hook(
+    hook_results = await invoke_hook(
         "pre_verify",
         session_id=session_id,
         platform=platform,
@@ -2365,55 +2154,6 @@ def get_plugin_command_handler(name: str) -> Optional[Callable]:
     """Return the handler for a plugin-registered slash command, or ``None``."""
     entry = _ensure_plugins_discovered()._plugin_commands.get(name)
     return entry["handler"] if entry else None
-
-
-_PLUGIN_COMMAND_AWAIT_TIMEOUT_SECS = 30.0
-
-
-def resolve_plugin_command_result(result: Any) -> Any:
-    """Resolve a plugin command return value, awaiting async handlers when needed.
-
-    Sync CLI/TUI dispatch sites call plugin handlers from plain functions.
-    If a handler is async, await it directly when no loop is running; if
-    we're already inside an active loop, run it in a helper thread with its
-    own loop so the caller still gets a concrete result synchronously. The
-    threaded path is bounded by a 30s timeout so a hung async handler cannot
-    wedge the terminal indefinitely.
-    """
-    if not inspect.isawaitable(result):
-        return result
-
-    try:
-        asyncio.get_running_loop()
-    except RuntimeError:
-        return asyncio.run(result)
-
-    outcome: Dict[str, Any] = {}
-    failure: Dict[str, BaseException] = {}
-    done = threading.Event()
-
-    def _runner() -> None:
-        try:
-            outcome["value"] = asyncio.run(result)
-        except BaseException as exc:  # pragma: no cover - re-raised below
-            failure["exc"] = exc
-        finally:
-            done.set()
-
-    thread = threading.Thread(
-        target=_runner,
-        name="hermes-plugin-command-await",
-        daemon=True,
-    )
-    thread.start()
-    if not done.wait(timeout=_PLUGIN_COMMAND_AWAIT_TIMEOUT_SECS):
-        raise TimeoutError(
-            "Plugin command async handler did not complete within "
-            f"{_PLUGIN_COMMAND_AWAIT_TIMEOUT_SECS:.0f}s"
-        )
-    if "exc" in failure:
-        raise failure["exc"]
-    return outcome.get("value")
 
 
 def get_plugin_commands() -> Dict[str, dict]:

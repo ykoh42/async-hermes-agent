@@ -6,6 +6,8 @@ parameter correctly.  Inspired by Claude Code's /compact <focus>.
 
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from agent.context_compressor import ContextCompressor
 
 
@@ -36,7 +38,8 @@ def _make_compressor():
     return compressor
 
 
-def test_focus_topic_injected_into_summary_prompt():
+@pytest.mark.asyncio
+async def test_focus_topic_injected_into_summary_prompt():
     """When focus_topic is provided, the LLM prompt includes focus guidance."""
     compressor = _make_compressor()
     turns = [
@@ -46,7 +49,7 @@ def test_focus_topic_injected_into_summary_prompt():
 
     captured_prompt = {}
 
-    def mock_call_llm(**kwargs):
+    async def mock_call_llm(**kwargs):
         captured_prompt["messages"] = kwargs["messages"]
         resp = MagicMock()
         resp.choices = [MagicMock()]
@@ -54,7 +57,9 @@ def test_focus_topic_injected_into_summary_prompt():
         return resp
 
     with patch("agent.context_compressor.call_llm", mock_call_llm):
-        result = compressor._generate_summary(turns, focus_topic="database schema")
+        result = await compressor._generate_summary(
+            turns, focus_topic="database schema"
+        )
 
     assert result is not None
     prompt_text = captured_prompt["messages"][0]["content"]
@@ -63,7 +68,8 @@ def test_focus_topic_injected_into_summary_prompt():
     assert "60-70%" in prompt_text
 
 
-def test_no_focus_topic_no_injection():
+@pytest.mark.asyncio
+async def test_no_focus_topic_no_injection():
     """Without focus_topic, the prompt doesn't contain focus guidance."""
     compressor = _make_compressor()
     turns = [
@@ -73,7 +79,7 @@ def test_no_focus_topic_no_injection():
 
     captured_prompt = {}
 
-    def mock_call_llm(**kwargs):
+    async def mock_call_llm(**kwargs):
         captured_prompt["messages"] = kwargs["messages"]
         resp = MagicMock()
         resp.choices = [MagicMock()]
@@ -81,12 +87,10 @@ def test_no_focus_topic_no_injection():
         return resp
 
     with patch("agent.context_compressor.call_llm", mock_call_llm):
-        result = compressor._generate_summary(turns)
+        result = await compressor._generate_summary(turns)
 
     prompt_text = captured_prompt["messages"][0]["content"]
     assert "FOCUS TOPIC" not in prompt_text
-
-
 
 
 

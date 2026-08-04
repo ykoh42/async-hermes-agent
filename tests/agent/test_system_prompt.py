@@ -5,6 +5,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+
 from agent.system_prompt import build_system_prompt, build_system_prompt_parts
 
 
@@ -18,7 +20,6 @@ def _make_agent(**overrides):
         _environment_probe=False,
         _kanban_worker_guidance="",
         _memory_store=None,
-        _memory_manager=None,
         model="",
         provider="",
         platform="",
@@ -29,7 +30,7 @@ def _make_agent(**overrides):
     return SimpleNamespace(**base)
 
 
-def _captured_context_cwd(agent):
+async def _captured_context_cwd(agent):
     """The cwd build_system_prompt_parts hands to build_context_files_prompt."""
     captured = {}
 
@@ -42,44 +43,43 @@ def _captured_context_cwd(agent):
 
     with (
         patch("run_agent.load_soul_md", return_value=""),
-        patch("run_agent.build_nous_subscription_prompt", return_value=""),
         patch("run_agent.build_environment_hints", return_value=""),
         patch("run_agent.build_context_files_prompt", side_effect=fake_context_files),
     ):
-        build_system_prompt_parts(agent)
+        await build_system_prompt_parts(agent)
     return captured["cwd"]
 
 
 class TestContextFileCwd:
-    def test_none_when_terminal_cwd_unset(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_none_when_terminal_cwd_unset(self, monkeypatch):
         # Unset → None, so discovery falls back to the launch dir inside
         # build_context_files_prompt (the local-CLI #19242 contract).
         monkeypatch.delenv("TERMINAL_CWD", raising=False)
-        assert _captured_context_cwd(_make_agent()) is None
+        assert await _captured_context_cwd(_make_agent()) is None
 
-    def test_configured_dir_when_terminal_cwd_set(self, monkeypatch, tmp_path):
+    @pytest.mark.asyncio
+    async def test_configured_dir_when_terminal_cwd_set(self, monkeypatch, tmp_path):
         monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
-        assert _captured_context_cwd(_make_agent()) == tmp_path
+        assert await _captured_context_cwd(_make_agent()) == tmp_path
 
 
-def _stable_prompt(agent):
+async def _stable_prompt(agent):
     with (
         patch("run_agent.load_soul_md", return_value=""),
-        patch("run_agent.build_nous_subscription_prompt", return_value=""),
         patch("run_agent.build_environment_hints", return_value=""),
         patch("run_agent.build_context_files_prompt", return_value=""),
     ):
-        return build_system_prompt_parts(agent)["stable"]
+        return (await build_system_prompt_parts(agent))["stable"]
 
 
-def _prompt_parts(agent):
+async def _prompt_parts(agent):
     with (
         patch("run_agent.load_soul_md", return_value=""),
-        patch("run_agent.build_nous_subscription_prompt", return_value=""),
         patch("run_agent.build_environment_hints", return_value=""),
         patch("run_agent.build_context_files_prompt", return_value=""),
     ):
-        return build_system_prompt_parts(agent)
+        return await build_system_prompt_parts(agent)
 
 
 def _init_code_repo(path):
@@ -92,45 +92,49 @@ def _init_code_repo(path):
 
 
 class TestCodingContextBlock:
-    def test_injected_when_active(self, monkeypatch, tmp_path):
+    @pytest.mark.asyncio
+    async def test_injected_when_active(self, monkeypatch, tmp_path):
         _init_code_repo(tmp_path)
         monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
         agent = _make_agent(valid_tool_names=["read_file"], platform="cli")
-        parts = _prompt_parts(agent)
+        parts = await _prompt_parts(agent)
         assert "coding agent" in parts["stable"]
         assert "Workspace" in parts["context"]
 
-    def test_absent_when_off(self, monkeypatch, tmp_path):
+    @pytest.mark.asyncio
+    async def test_absent_when_off(self, monkeypatch, tmp_path):
         _init_code_repo(tmp_path)
         monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
         agent = _make_agent(valid_tool_names=["read_file"], platform="cli")
         # Drive the real path: force the resolved mode to "off" via config.
-        with patch("agent.coding_context._coding_mode", return_value="off"):
-            stable = _stable_prompt(agent)
+        with patch("agent.coding_context._coding_mode_from_config", return_value="off"):
+            stable = await _stable_prompt(agent)
         assert "coding agent" not in stable
 
-    def test_absent_without_tools(self, monkeypatch, tmp_path):
+    @pytest.mark.asyncio
+    async def test_absent_without_tools(self, monkeypatch, tmp_path):
         _init_code_repo(tmp_path)
         monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
         agent = _make_agent(valid_tool_names=[], platform="cli")
-        assert "coding agent" not in _stable_prompt(agent)
+        assert "coding agent" not in await _stable_prompt(agent)
 
 
-def test_build_system_prompt_records_stable_prefix():
+@pytest.mark.asyncio
+async def test_build_system_prompt_records_stable_prefix():
     agent = _make_agent()
     with (
         patch("run_agent.load_soul_md", return_value=""),
-        patch("run_agent.build_nous_subscription_prompt", return_value=""),
         patch("run_agent.build_environment_hints", return_value=""),
         patch("run_agent.build_context_files_prompt", return_value="context"),
     ):
-        prompt = build_system_prompt(agent)
+        prompt = await build_system_prompt(agent)
 
     assert prompt.startswith(agent._cached_system_prompt_static)
     assert prompt[len(agent._cached_system_prompt_static):].startswith("\n\ncontext")
 
 
-def test_coding_prompt_preserves_legacy_workspace_order(monkeypatch):
+@pytest.mark.asyncio
+async def test_coding_prompt_preserves_legacy_workspace_order(monkeypatch):
     """The cache split must not reorder the stored coding prompt."""
     import agent.system_prompt as system_prompt
 
@@ -165,7 +169,6 @@ def test_coding_prompt_preserves_legacy_workspace_order(monkeypatch):
 
     with (
         patch("run_agent.load_soul_md", return_value=""),
-        patch("run_agent.build_nous_subscription_prompt", return_value=""),
         patch("run_agent.build_environment_hints", return_value=""),
         patch("run_agent.build_context_files_prompt", return_value="CONTEXT_FILES"),
         patch(
@@ -179,7 +182,7 @@ def test_coding_prompt_preserves_legacy_workspace_order(monkeypatch):
         patch("agent.file_safety._resolve_active_profile_name", return_value="default"),
         patch("hermes_time.now", return_value=datetime(2026, 1, 2)),
     ):
-        prompt = build_system_prompt(agent, system_message="SYSTEM_MESSAGE")
+        prompt = await build_system_prompt(agent, system_message="SYSTEM_MESSAGE")
 
     assert prompt == expected
     assert agent._cached_system_prompt_static == "\n\n".join(expected.split("\n\n")[:4])
@@ -188,7 +191,8 @@ def test_coding_prompt_preserves_legacy_workspace_order(monkeypatch):
 class TestTelegramRichMessagesHint:
     """Verify that TELEGRAM_RICH_MESSAGES_HINT is conditionally included."""
 
-    def test_base_hint_without_rich_messages(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_base_hint_without_rich_messages(self, monkeypatch):
         """When rich_messages is False (default), only the base hint is used."""
         agent = _make_agent(platform="telegram")
         # Mock config to return rich_messages: false (default)
@@ -196,21 +200,22 @@ class TestTelegramRichMessagesHint:
             mock_cfg.return_value = {
                 "platforms": {"telegram": {"extra": {"rich_messages": False}}}
             }
-            stable = _stable_prompt(agent)
+            stable = await _stable_prompt(agent)
         # Base hint should be present
         assert "Standard Markdown is automatically converted" in stable
         # Rich-messages extension should NOT be present
         assert "lean into it" not in stable
         assert "task lists" not in stable
 
-    def test_rich_hint_with_rich_messages_enabled(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_rich_hint_with_rich_messages_enabled(self, monkeypatch):
         """When rich_messages is True, the rich-messages extension is appended."""
         agent = _make_agent(platform="telegram")
         with patch("hermes_cli.config.load_config_readonly") as mock_cfg:
             mock_cfg.return_value = {
                 "platforms": {"telegram": {"extra": {"rich_messages": True}}}
             }
-            stable = _stable_prompt(agent)
+            stable = await _stable_prompt(agent)
         # Base hint should be present
         assert "Standard Markdown is automatically converted" in stable
         # Rich-messages extension should be present
@@ -218,11 +223,12 @@ class TestTelegramRichMessagesHint:
         assert "task lists" in stable
         assert "math/formulas" in stable
 
-    def test_base_hint_without_config(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_base_hint_without_config(self, monkeypatch):
         """When config has no telegram section, only base hint is used."""
         agent = _make_agent(platform="telegram")
         with patch("hermes_cli.config.load_config_readonly") as mock_cfg:
             mock_cfg.return_value = {}
-            stable = _stable_prompt(agent)
+            stable = await _stable_prompt(agent)
         assert "Standard Markdown is automatically converted" in stable
         assert "lean into it" not in stable

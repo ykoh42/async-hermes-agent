@@ -9,6 +9,7 @@ keepalive transport that suppresses automatic system-proxy detection.
 from unittest.mock import patch
 
 import httpx
+import pytest
 
 from agent.auxiliary_client import _create_openai_client, _openai_http_client_kwargs
 from agent.process_bootstrap import _get_proxy_for_base_url
@@ -22,8 +23,9 @@ def _pool_types(http_client) -> list:
     ]
 
 
-@patch("agent.auxiliary_client.OpenAI")
-def test_create_openai_client_routes_via_env_proxy(mock_openai, monkeypatch):
+@pytest.mark.asyncio
+@patch("openai.AsyncOpenAI")
+async def test_create_openai_client_routes_via_env_proxy(mock_openai, monkeypatch):
     for key in ("HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY",
                 "https_proxy", "http_proxy", "all_proxy", "NO_PROXY", "no_proxy"):
         monkeypatch.delenv(key, raising=False)
@@ -35,9 +37,9 @@ def test_create_openai_client_routes_via_env_proxy(mock_openai, monkeypatch):
     )
 
     http_client = mock_openai.call_args.kwargs.get("http_client")
-    assert isinstance(http_client, httpx.Client)
-    assert "HTTPProxy" in _pool_types(http_client)
-    http_client.close()
+    assert isinstance(http_client, httpx.AsyncClient)
+    assert "AsyncHTTPProxy" in _pool_types(http_client)
+    await http_client.aclose()
 
 
 
@@ -53,5 +55,3 @@ def test_get_proxy_for_base_url_respects_no_proxy(monkeypatch):
 
     assert _get_proxy_for_base_url("https://litellm.internal.example.com/v1") is None
     assert _get_proxy_for_base_url("https://api.openai.com/v1") == "http://127.0.0.1:7897"
-
-

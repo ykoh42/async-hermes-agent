@@ -19,6 +19,8 @@ from __future__ import annotations
 import base64
 from types import SimpleNamespace
 
+import pytest
+
 
 def _png_bytes():
     """Return a minimal valid PNG byte sequence.
@@ -49,7 +51,8 @@ class TestMimeExtension:
 
 
 class TestCacheMcpImageBlock:
-    def test_returns_media_tag_for_valid_image_block(self, tmp_path, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_returns_media_tag_for_valid_image_block(self, tmp_path, monkeypatch):
         """A well-formed ImageContent block with valid PNG bytes caches
         to the image dir and the helper returns a ``MEDIA:<path>`` tag."""
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
@@ -59,11 +62,10 @@ class TestCacheMcpImageBlock:
             data=base64.b64encode(_png_bytes()).decode("ascii"),
             mimeType="image/png",
         )
-        tag = _cache_mcp_image_block(block)
+        tag = await _cache_mcp_image_block(block)
         assert tag.startswith("MEDIA:"), f"expected MEDIA: tag, got {tag!r}"
         # The cached file should be in Hermes' image cache dir
-        from gateway.platforms.base import get_image_cache_dir
-        cache_dir = str(get_image_cache_dir().resolve())
+        cache_dir = str((tmp_path / "cache" / "images").resolve())
         assert tag.startswith(f"MEDIA:{cache_dir}"), (
             f"cached file not under HERMES_HOME image cache dir. "
             f"tag={tag!r}, cache_dir={cache_dir!r}"
@@ -73,7 +75,8 @@ class TestCacheMcpImageBlock:
         with open(path, "rb") as fh:
             assert fh.read() == _png_bytes()
 
-    def test_returns_empty_when_block_is_not_an_image(self, tmp_path, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_returns_empty_when_block_is_not_an_image(self, tmp_path, monkeypatch):
         """Non-image MIME types shouldn't trigger caching."""
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         from tools.mcp_tool import _cache_mcp_image_block
@@ -82,17 +85,21 @@ class TestCacheMcpImageBlock:
             data=base64.b64encode(b"some bytes").decode("ascii"),
             mimeType="application/pdf",
         )
-        assert _cache_mcp_image_block(block) == ""
+        assert await _cache_mcp_image_block(block) == ""
 
-    def test_returns_empty_when_block_has_no_data(self, tmp_path, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_returns_empty_when_block_has_no_data(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         from tools.mcp_tool import _cache_mcp_image_block
 
         block = SimpleNamespace(data=None, mimeType="image/png")
-        assert _cache_mcp_image_block(block) == ""
+        assert await _cache_mcp_image_block(block) == ""
 
 
-    def test_returns_empty_when_bytes_dont_look_like_an_image(self, tmp_path, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_returns_empty_when_bytes_dont_look_like_an_image(
+        self, tmp_path, monkeypatch
+    ):
         """``cache_image_from_bytes`` has a format sniff; if the claimed
         ``image/png`` is actually an HTML error page, the cache raises and
         we log + drop rather than propagate."""
@@ -103,9 +110,10 @@ class TestCacheMcpImageBlock:
             data=base64.b64encode(b"<html>error</html>").decode("ascii"),
             mimeType="image/png",
         )
-        assert _cache_mcp_image_block(block) == ""
+        assert await _cache_mcp_image_block(block) == ""
 
-    def test_handles_jpeg(self, tmp_path, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_handles_jpeg(self, tmp_path, monkeypatch):
         """JPEG signature should also be accepted."""
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         from tools.mcp_tool import _cache_mcp_image_block
@@ -116,6 +124,6 @@ class TestCacheMcpImageBlock:
             data=base64.b64encode(jpeg).decode("ascii"),
             mimeType="image/jpeg",
         )
-        tag = _cache_mcp_image_block(block)
+        tag = await _cache_mcp_image_block(block)
         assert tag.startswith("MEDIA:")
         assert tag.endswith(".jpg"), f"expected .jpg extension, got {tag!r}"

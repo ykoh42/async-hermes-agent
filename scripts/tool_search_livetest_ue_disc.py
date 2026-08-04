@@ -19,6 +19,7 @@ Scoring per family:
 """
 from __future__ import annotations
 
+import asyncio
 import json, os, shutil, sys, time, traceback
 from pathlib import Path
 from typing import Any, Dict, List
@@ -115,7 +116,7 @@ def score_survey(resp: str, truth: Dict[str, bool]) -> bool:
     return True
 
 
-def run_one(scenario, mode, rep, out_dir: Path):
+async def run_one(scenario, mode, rep, out_dir: Path):
     model = os.environ.get("TS_UE_MODEL", "anthropic/claude-opus-4.8")
     lmax = int(os.environ.get("TS_UE_LISTING_MAX", "30000"))
     hermes_home = base.setup_isolated_home(
@@ -155,7 +156,7 @@ def run_one(scenario, mode, rep, out_dir: Path):
                 pass
             return cu
         _cl.normalize_usage = _norm_spy
-        result = agent.run_conversation(
+        result = await agent.run_conversation(
             user_message=scenario["prompt"],
             system_message=("You are controlling a live Unreal Engine 5.8 editor, already connected "
                             "through your Unreal (mcp-unreal) tools — do not try to locate or launch "
@@ -212,7 +213,7 @@ def run_one(scenario, mode, rep, out_dir: Path):
     return rec
 
 
-def main():
+async def main():
     out_dir = _THIS_DIR / "out_ue_disc"
     out_dir.mkdir(exist_ok=True)
     modes = [m for m in os.environ.get("TS_UE_MODES", "listing,bridge").split(",") if m]
@@ -220,7 +221,7 @@ def main():
     for scenario in SCENARIOS:
         for mode in modes:
             for rep in range(1, N_REPS + 1):
-                rec = run_one(scenario, mode, rep, out_dir)
+                rec = await run_one(scenario, mode, rep, out_dir)
                 print(f"{scenario['id']:22} {mode:8} rep{rep}: ok={rec['success']} "
                       f"searches={rec['searches_used']} api={rec['api_calls']} "
                       f"in={rec['prompt_tokens_total']:>9,} t={rec['elapsed_seconds']:>5}s", flush=True)
@@ -231,4 +232,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

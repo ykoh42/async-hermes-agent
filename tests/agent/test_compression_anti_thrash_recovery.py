@@ -27,6 +27,12 @@ The recovery contract pinned here:
 
 from unittest.mock import patch
 
+import pytest
+
+from agent.conversation_compression import (
+    _hydrate_persisted_compression_guards,
+    _persist_compression_guards,
+)
 from agent.context_compressor import ContextCompressor
 from hermes_state import SessionDB
 
@@ -86,14 +92,16 @@ class TestRecoveryWindow:
 
 
 class TestRestartSemantics:
-    def test_restart_with_durable_tripped_counter_waits_a_full_window(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_restart_with_durable_tripped_counter_waits_a_full_window(self, tmp_path):
         """#69872 x #14694: a restart must not disarm OR shorten the guard."""
         db = SessionDB(db_path=tmp_path / "state.db")
-        db.create_session(session_id="sess-1", source="cli")
-        db.set_compression_ineffective_count("sess-1", 2)
+        await db.create_session(session_id="sess-1", source="cli")
+        await db.set_compression_ineffective_count("sess-1", 2)
 
         cc = _compressor()
         cc.bind_session_state(session_db=db, session_id="sess-1")
+        await _hydrate_persisted_compression_guards(cc, db, "sess-1")
         assert cc._ineffective_compression_count == 2
         # The recovery clock is process-local and must come up disarmed.
         assert cc._anti_thrash_recovery_deadline == 0.0
@@ -105,9 +113,11 @@ class TestRestartSemantics:
             return_value=base + cc._ANTI_THRASH_RECOVERY_SECONDS + 1,
         ):
             assert cc.should_compress(cc.threshold_tokens + 1) is True
+        await _persist_compression_guards(cc, db, "sess-1")
         # The probation reset is durable, so sibling agents on the same
         # session row (gateway hygiene) unblock too.
-        assert db.get_compression_ineffective_count("sess-1") == 1
+        assert await db.get_compression_ineffective_count("sess-1") == 1
+        await db.close()
 
     def test_session_reset_disarms_the_recovery_clock(self):
         cc = _compressor()

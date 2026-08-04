@@ -16,6 +16,7 @@ in-process mock provider.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import shutil
@@ -25,13 +26,14 @@ import tempfile
 import threading
 import types
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+import pytest_asyncio
 
 from agent.memory_manager import build_memory_context_block
 from agent.turn_context import build_turn_context, compose_user_api_content
-from hermes_state import SessionDB
+from hermes_state import SessionDB, SessionDB
 
 
 # ---------------------------------------------------------------------------
@@ -56,39 +58,42 @@ class TestComposeUserApiContent:
 # ---------------------------------------------------------------------------
 
 class TestSessionDbSidecar:
-    def _open(self, tmp_path):
+    async def _open(self, tmp_path):
         db = SessionDB(db_path=tmp_path / "state.db")
-        db.create_session("s1", source="cli")
+        await db.create_session("s1", source="cli")
         return db
 
-    def test_round_trip_is_verbatim_not_sanitized(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_round_trip_is_verbatim_not_sanitized(self, tmp_path):
         """api_content must bypass sanitize_context/strip on load — clean
         content loses the <memory-context> block and outer whitespace, the
         sidecar must not."""
-        db = self._open(tmp_path)
+        db = await self._open(tmp_path)
         sent = "  hello\n\n<memory-context>\nrecalled\n</memory-context>\n"
         try:
-            db.append_message("s1", "user", content="hello", api_content=sent)
-            msgs = db.get_messages_as_conversation("s1")
+            await db.append_message("s1", "user", content="hello", api_content=sent)
+            msgs = await db.get_messages_as_conversation("s1")
             assert msgs[0]["content"] == "hello"
             assert msgs[0]["api_content"] == sent  # byte-for-byte
         finally:
-            db.close()
+            await db.close()
 
 
-    def test_get_messages_exposes_column(self, tmp_path):
-        db = self._open(tmp_path)
+    @pytest.mark.asyncio
+    async def test_get_messages_exposes_column(self, tmp_path):
+        db = await self._open(tmp_path)
         try:
-            db.append_message("s1", "user", content="hello", api_content="hello+ctx")
-            rows = db.get_messages("s1")
+            await db.append_message("s1", "user", content="hello", api_content="hello+ctx")
+            rows = await db.get_messages("s1")
             assert rows[0]["api_content"] == "hello+ctx"
         finally:
-            db.close()
+            await db.close()
 
 
 
 class TestAutoMigration:
-    def test_reconciliation_adds_api_content_column(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_reconciliation_adds_api_content_column(self, tmp_path):
         """Opening a pre-sidecar DB adds the column declaratively (the
         SCHEMA_SQL diff in _reconcile_columns), no version-gated migration."""
         db_path = tmp_path / "legacy.db"
@@ -127,18 +132,19 @@ class TestAutoMigration:
 
         db = SessionDB(db_path=db_path)
         try:
+            connection = await db._get_connection()
             cols = {
                 row[1]
-                for row in db._conn.execute('PRAGMA table_info("messages")').fetchall()
+                for row in await (await connection.execute('PRAGMA table_info("messages")')).fetchall()
             }
             assert "api_content" in cols
             # Old rows read back NULL (no key); new writes round-trip.
-            db.append_message("s1", "user", content="new", api_content="new+ctx")
-            msgs = db.get_messages_as_conversation("s1")
+            await db.append_message("s1", "user", content="new", api_content="new+ctx")
+            msgs = await db.get_messages_as_conversation("s1")
             assert "api_content" not in msgs[0]
             assert msgs[1]["api_content"] == "new+ctx"
         finally:
-            db.close()
+            await db.close()
 
 
 # ---------------------------------------------------------------------------
@@ -178,7 +184,6 @@ class _FakeAgent:
         )
         self._cached_system_prompt = "SYSTEM"
         self._memory_store = None
-        self._memory_manager = None
         self._memory_nudge_interval = 0
         self._turns_since_memory = 0
         self._user_turn_count = 0
@@ -189,18 +194,22 @@ class _FakeAgent:
         self._memory_write_origin = "assistant_tool"
         self._stream_context_scrubber = None
         self._stream_think_scrubber = None
+        self._persist_lock = asyncio.Lock()
         # Captures the user message's api_content at persist time, proving
         # the stamp lands BEFORE the early persist writes the row.
         self.api_content_at_persist = "<unset>"
 
-    def _ensure_db_session(self):
+    async def _ensure_db_session(self):
         pass
 
-    def _restore_primary_runtime(self):
+    async def _restore_primary_runtime(self):
         pass
 
-    def _cleanup_dead_connections(self):
-        return False
+    async def _persist_pending_billing_route(self):
+        pass
+
+    def _get_session_persist_lock(self):
+        return self._persist_lock
 
     def _emit_status(self, _msg):
         pass
@@ -214,11 +223,11 @@ class _FakeAgent:
     def _safe_print(self, *_a, **_k):
         pass
 
-    def _persist_session(self, messages, _history=None):
+    async def _persist_session(self, messages, _history=None):
         self.api_content_at_persist = messages[-1].get("api_content")
 
 
-def _build(agent, **overrides):
+async def _build(agent, **overrides):
     kwargs = dict(
         agent=agent,
         user_message="hello",
@@ -236,7 +245,7 @@ def _build(agent, **overrides):
         ra=lambda: types.SimpleNamespace(_set_interrupt=lambda *a, **k: None),
     )
     kwargs.update(overrides)
-    return build_turn_context(**kwargs)
+    return await build_turn_context(**kwargs)
 
 
 @pytest.fixture(autouse=True)
@@ -246,41 +255,31 @@ def _stub_runtime_main():
 
 
 class TestPrologueStamping:
-    def test_stamps_api_content_from_plugin_context(self):
+    @pytest.mark.asyncio
+    async def test_stamps_api_content_from_gateway_context(self):
         agent = _FakeAgent()
-        with patch(
-            "hermes_cli.plugins.invoke_hook",
-            return_value=[{"context": "PLUGIN-CTX"}],
-        ):
-            ctx = _build(agent)
+        agent._gateway_turn_context_notes = "GATEWAY-NOTE"
+        ctx = await _build(agent)
         msg = ctx.messages[ctx.current_turn_user_idx]
         assert msg["content"] == "hello"  # clean content untouched
         assert msg["api_content"] == compose_user_api_content(
             "hello", ctx.ext_prefetch_cache, ctx.plugin_user_context
         )
-        assert msg["api_content"] == "hello\n\nPLUGIN-CTX"
+        assert msg["api_content"] == "hello\n\nGATEWAY-NOTE"
         # The early persist saw the stamped sidecar (written in one insert).
-        assert agent.api_content_at_persist == "hello\n\nPLUGIN-CTX"
+        assert agent.api_content_at_persist == "hello\n\nGATEWAY-NOTE"
 
-    def test_no_stamp_without_injections(self):
+    @pytest.mark.asyncio
+    async def test_no_stamp_without_injections(self):
         agent = _FakeAgent()
-        with patch("hermes_cli.plugins.invoke_hook", return_value=[]):
-            ctx = _build(agent)
+        with patch(
+            "hermes_cli.lifecycle.invoke_hook",
+            new_callable=AsyncMock,
+            return_value=[],
+        ):
+            ctx = await _build(agent)
         assert "api_content" not in ctx.messages[ctx.current_turn_user_idx]
         assert agent.api_content_at_persist is None
-
-    def test_no_stamp_for_codex_app_server(self):
-        """codex_app_server turns bypass the api_messages build, so the
-        injected bytes are never sent — stamping would persist a lie."""
-        agent = _FakeAgent()
-        agent.api_mode = "codex_app_server"
-        with patch(
-            "hermes_cli.plugins.invoke_hook",
-            return_value=[{"context": "PLUGIN-CTX"}],
-        ):
-            ctx = _build(agent)
-        assert "api_content" not in ctx.messages[ctx.current_turn_user_idx]
-
 
 # ---------------------------------------------------------------------------
 # Flush: persist-override rows keep the sent bytes in the sidecar (#48677)
@@ -302,10 +301,11 @@ class TestFlushOverrideSidecar:
         agent._session_db_created = True
         return agent
 
-    def test_override_moves_sent_bytes_to_sidecar(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_override_moves_sent_bytes_to_sidecar(self, tmp_path):
         db = SessionDB(db_path=tmp_path / "state.db")
         sid = "sess-ov"
-        db.create_session(session_id=sid, source="cli")
+        await db.create_session(session_id=sid, source="cli")
         try:
             agent = self._make_agent(db, sid)
             live = "[gateway note] observed context\n\nactual question"
@@ -313,22 +313,23 @@ class TestFlushOverrideSidecar:
             agent._persist_user_message_idx = 0
             agent._persist_user_message_override = "actual question"
             agent._persist_user_message_timestamp = None
-            agent._flush_messages_to_session_db(messages, None)
+            await agent._flush_messages_to_session_db(messages, None)
 
-            msgs = db.get_messages_as_conversation(sid)
+            msgs = await db.get_messages_as_conversation(sid)
             assert msgs[0]["content"] == "actual question"
             assert msgs[0]["api_content"] == live
             # The live dict is never mutated by the flush.
             assert messages[0]["content"] == live
         finally:
-            db.close()
+            await db.close()
 
-    def test_stamped_sidecar_wins_over_override_derivation(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_stamped_sidecar_wins_over_override_derivation(self, tmp_path):
         """When the prologue already stamped api_content (injections), the
         flush must keep those bytes — they are what actually went out."""
         db = SessionDB(db_path=tmp_path / "state.db")
         sid = "sess-ov2"
-        db.create_session(session_id=sid, source="cli")
+        await db.create_session(session_id=sid, source="cli")
         try:
             agent = self._make_agent(db, sid)
             messages = [
@@ -341,13 +342,13 @@ class TestFlushOverrideSidecar:
             agent._persist_user_message_idx = 0
             agent._persist_user_message_override = "clean text"
             agent._persist_user_message_timestamp = None
-            agent._flush_messages_to_session_db(messages, None)
+            await agent._flush_messages_to_session_db(messages, None)
 
-            msgs = db.get_messages_as_conversation(sid)
+            msgs = await db.get_messages_as_conversation(sid)
             assert msgs[0]["content"] == "clean text"
             assert msgs[0]["api_content"] == "live text\n\nPLUGIN-CTX"
         finally:
-            db.close()
+            await db.close()
 
 
 # ---------------------------------------------------------------------------
@@ -363,7 +364,9 @@ class _MockHandler(BaseHTTPRequestHandler):
         req = json.loads(self.rfile.read(length).decode())
         type(self).captured_requests.append(req)
         is_stream = req.get("stream") is True
-        if type(self).response_queue:
+        if "messages" not in req:
+            resp = _text_resp("probe")
+        elif type(self).response_queue:
             resp = type(self).response_queue.pop(0)
         else:
             resp = _text_resp("DONE")
@@ -419,8 +422,8 @@ def _text_resp(text: str) -> dict:
     }
 
 
-@pytest.fixture()
-def wire_env():
+@pytest_asyncio.fixture()
+async def wire_env():
     """Mock provider + isolated HERMES_HOME + a shared SessionDB.
 
     Yields (make_agent, handler, db, sid): ``make_agent()`` builds a fresh
@@ -458,17 +461,18 @@ def wire_env():
         agent.valid_tool_names = {"read_file"}
         return agent
 
+    async def _invoke_hook(hook, **_kwargs):
+        return [{"context": "PLUGIN-CTX"}] if hook == "pre_llm_call" else []
+
     try:
         with patch(
-            "hermes_cli.plugins.invoke_hook",
-            side_effect=lambda hook, **kw: (
-                [{"context": "PLUGIN-CTX"}] if hook == "pre_llm_call" else []
-            ),
+            "hermes_cli.lifecycle.invoke_hook",
+            side_effect=_invoke_hook,
         ):
             yield make_agent, _MockHandler, db, sid
     finally:
         srv.shutdown()
-        db.close()
+        await db.close()
         shutil.rmtree(test_home, ignore_errors=True)
         if prev_home is None:
             os.environ.pop("HERMES_HOME", None)
@@ -487,7 +491,8 @@ def _user_messages(req: dict) -> list:
 
 
 class TestWireInvariant:
-    def test_injection_sent_stamped_and_stable_within_turn(self, wire_env):
+    @pytest.mark.asyncio
+    async def test_injection_sent_stamped_and_stable_within_turn(self, wire_env):
         """The current turn's user message goes out with the injected context,
         the sidecar equals the sent bytes exactly, the field never reaches the
         wire, and every pass within the turn sends identical bytes."""
@@ -497,7 +502,7 @@ class TestWireInvariant:
         handler.response_queue.append(_tc_resp("read_file", '{"file_path": "/nonexistent-path"}'))
         handler.response_queue.append(_text_resp("done"))
 
-        agent.run_conversation("hello please", conversation_history=[], task_id="t")
+        await agent.run_conversation("hello please", conversation_history=[], task_id="t")
 
         reqs = _chat_requests(handler)
         assert len(reqs) == 2
@@ -512,30 +517,32 @@ class TestWireInvariant:
                 assert "api_content" not in m
 
         # Persisted row: clean content + exact sent bytes in the sidecar.
-        user_rows = [r for r in db.get_messages(sid) if r["role"] == "user"]
+        user_rows = [r for r in await db.get_messages(sid) if r["role"] == "user"]
         assert user_rows[0]["content"] == "hello please"
         assert user_rows[0]["api_content"] == sent_1
+        await agent.close()
 
-    def test_next_turn_replays_previous_turn_bytes(self, wire_env):
+    @pytest.mark.asyncio
+    async def test_next_turn_replays_previous_turn_bytes(self, wire_env):
         """The cache invariant: the serialized user message replayed in turn
         N+1 (history reloaded from the store) EQUALS the bytes turn N sent."""
         make_agent, handler, db, sid = wire_env
 
         # ── Turn N ──
         agent1 = make_agent()
-        agent1.run_conversation("hello please", conversation_history=[], task_id="t1")
+        await agent1.run_conversation("hello please", conversation_history=[], task_id="t1")
         turn_n_user = _user_messages(_chat_requests(handler)[0])[0]
         turn_n_bytes = json.dumps(turn_n_user, sort_keys=True)
 
         # ── Turn N+1: fresh agent, history reloaded from the store ──
-        history = db.get_messages_as_conversation(sid)
+        history = await db.get_messages_as_conversation(sid)
         # The stored history carries the sidecar, not the injected content.
         assert history[0]["content"] == "hello please"
         assert history[0]["api_content"] == turn_n_user["content"]
 
         handler.captured_requests = []
         agent2 = make_agent()
-        agent2.run_conversation(
+        await agent2.run_conversation(
             "second question", conversation_history=history, task_id="t2"
         )
 
@@ -545,6 +552,8 @@ class TestWireInvariant:
         # And the new current-turn message got its own injection + sidecar.
         current = _user_messages(_chat_requests(handler)[0])[-1]
         assert current["content"] == "second question\n\nPLUGIN-CTX"
+        await agent1.close()
+        await agent2.close()
 
 
 # ---------------------------------------------------------------------------
@@ -570,19 +579,22 @@ class TestReanchorCurrentTurnUserIdx:
 
 
 class TestPrologueMoaAndInPlaceBackfill:
-    def test_no_stamp_for_moa_turns(self):
+    @pytest.mark.asyncio
+    async def test_no_stamp_for_moa_turns(self):
         """MoA appends per-call aggregated context to the API copy AFTER the
         composition — a stamped sidecar would persist bytes that never match
         the wire."""
         agent = _FakeAgent()
         with patch(
-            "hermes_cli.plugins.invoke_hook",
+            "hermes_cli.lifecycle.invoke_hook",
+            new_callable=AsyncMock,
             return_value=[{"context": "PLUGIN-CTX"}],
         ):
-            ctx = _build(agent, moa_active=True)
+            ctx = await _build(agent, moa_active=True)
         assert "api_content" not in ctx.messages[ctx.current_turn_user_idx]
 
-    def test_inplace_compaction_backfills_sidecar_into_db(self):
+    @pytest.mark.asyncio
+    async def test_inplace_compaction_backfills_sidecar_into_db(self):
         """In-place preflight compaction inserts the current-turn user row
         BEFORE the stamp (archive_and_compact), and the crash persist
         identity-skips every compacted dict — the stamp must be pushed into
@@ -590,6 +602,8 @@ class TestPrologueMoaAndInPlaceBackfill:
         agent = _FakeAgent()
         agent.compression_enabled = True
         agent._session_db = MagicMock()
+        agent._session_db.set_latest_user_api_content = AsyncMock()
+        agent._get_async_session_db = lambda: agent._session_db
 
         calls = {"n": 0}
 
@@ -608,7 +622,7 @@ class TestPrologueMoaAndInPlaceBackfill:
             get_active_compression_failure_cooldown=lambda: None,
         )
 
-        def _compress(messages, _system, approx_tokens=None, task_id=None):
+        async def _compress(messages, _system, approx_tokens=None, task_id=None):
             # Emulate compress_context in in_place mode: archive_and_compact
             # already inserted these rows (api_content=NULL — the stamp has
             # not happened yet), fresh copies replace the live dicts.
@@ -629,47 +643,50 @@ class TestPrologueMoaAndInPlaceBackfill:
             {"role": "assistant", "content": big},
         ]
         with patch(
-            "hermes_cli.plugins.invoke_hook",
+            "hermes_cli.lifecycle.invoke_hook",
+            new_callable=AsyncMock,
             return_value=[{"context": "PLUGIN-CTX"}],
         ):
-            ctx = _build(agent, conversation_history=history)
+            ctx = await _build(agent, conversation_history=history)
 
         msg = ctx.messages[ctx.current_turn_user_idx]
         assert msg["content"] == "hello"
         assert msg["api_content"] == "hello\n\nPLUGIN-CTX"
-        agent._session_db.set_latest_user_api_content.assert_called_once_with(
+        agent._session_db.set_latest_user_api_content.assert_awaited_once_with(
             "sess-1", "hello", "hello\n\nPLUGIN-CTX"
         )
 
 
 class TestSetLatestUserApiContent:
-    def _open(self, tmp_path):
+    async def _open(self, tmp_path):
         db = SessionDB(db_path=tmp_path / "state.db")
-        db.create_session("s1", source="cli")
+        await db.create_session("s1", source="cli")
         return db
 
-    def test_updates_newest_active_user_row(self, tmp_path):
-        db = self._open(tmp_path)
+    @pytest.mark.asyncio
+    async def test_updates_newest_active_user_row(self, tmp_path):
+        db = await self._open(tmp_path)
         try:
-            db.append_message("s1", "user", content="q1")
-            db.append_message("s1", "assistant", content="a1")
-            db.append_message("s1", "user", content="q2")
-            assert db.set_latest_user_api_content("s1", "q2", "q2\n\nCTX") == 1
-            msgs = db.get_messages_as_conversation("s1")
+            await db.append_message("s1", "user", content="q1")
+            await db.append_message("s1", "assistant", content="a1")
+            await db.append_message("s1", "user", content="q2")
+            assert await db.set_latest_user_api_content("s1", "q2", "q2\n\nCTX") == 1
+            msgs = await db.get_messages_as_conversation("s1")
             assert "api_content" not in msgs[0]
             assert msgs[2]["api_content"] == "q2\n\nCTX"
         finally:
-            db.close()
+            await db.close()
 
-    def test_content_mismatch_writes_nothing(self, tmp_path):
-        db = self._open(tmp_path)
+    @pytest.mark.asyncio
+    async def test_content_mismatch_writes_nothing(self, tmp_path):
+        db = await self._open(tmp_path)
         try:
-            db.append_message("s1", "user", content="q1")
-            assert db.set_latest_user_api_content("s1", "other", "other+CTX") == 0
-            msgs = db.get_messages_as_conversation("s1")
+            await db.append_message("s1", "user", content="q1")
+            assert await db.set_latest_user_api_content("s1", "other", "other+CTX") == 0
+            msgs = await db.get_messages_as_conversation("s1")
             assert "api_content" not in msgs[0]
         finally:
-            db.close()
+            await db.close()
 
 
 class TestFlushCompressedSummaryOverrideGuard:
@@ -688,7 +705,8 @@ class TestFlushCompressedSummaryOverrideGuard:
         agent._session_db_created = True
         return agent
 
-    def test_override_skipped_for_compression_merged_row(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_override_skipped_for_compression_merged_row(self, tmp_path):
         """The #48677 override must not replace a compression-merged user
         message: that would silently drop the compaction summary from the
         durable clean transcript."""
@@ -696,7 +714,7 @@ class TestFlushCompressedSummaryOverrideGuard:
 
         db = SessionDB(db_path=tmp_path / "state.db")
         sid = "sess-merged"
-        db.create_session(session_id=sid, source="cli")
+        await db.create_session(session_id=sid, source="cli")
         try:
             agent = self._make_agent(db, sid)
             merged = "[prior context]\ncompaction summary\n\nactual question"
@@ -710,15 +728,16 @@ class TestFlushCompressedSummaryOverrideGuard:
             agent._persist_user_message_idx = 0
             agent._persist_user_message_override = "actual question"
             agent._persist_user_message_timestamp = None
-            agent._flush_messages_to_session_db(messages, None)
+            await agent._flush_messages_to_session_db(messages, None)
 
-            msgs = db.get_messages_as_conversation(sid)
+            msgs = await db.get_messages_as_conversation(sid)
             assert msgs[0]["content"] == merged  # summary survives
             assert "api_content" not in msgs[0]  # wire == row, no sidecar
         finally:
-            db.close()
+            await db.close()
 
-    def test_live_override_skipped_for_compression_merged_row(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_live_override_skipped_for_compression_merged_row(self, tmp_path):
         """Same invariant as the test above, for the in-memory path.
 
         ``finalize_turn`` calls ``_apply_persist_user_message_override`` and
@@ -731,7 +750,7 @@ class TestFlushCompressedSummaryOverrideGuard:
 
         db = SessionDB(db_path=tmp_path / "state.db")
         sid = "sess-merged-live"
-        db.create_session(session_id=sid, source="cli")
+        await db.create_session(session_id=sid, source="cli")
         try:
             agent = self._make_agent(db, sid)
             merged = "[prior context]\ncompaction summary\n\nactual question"
@@ -754,13 +773,14 @@ class TestFlushCompressedSummaryOverrideGuard:
             # The paired timestamp override is unrelated and still applies.
             assert messages[0]["timestamp"] == 1730000000
         finally:
-            db.close()
+            await db.close()
 
-    def test_live_override_still_applies_without_merge_marker(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_live_override_still_applies_without_merge_marker(self, tmp_path):
         """Negative control: an ordinary turn is still cleaned in place."""
         db = SessionDB(db_path=tmp_path / "state.db")
         sid = "sess-plain-live"
-        db.create_session(session_id=sid, source="cli")
+        await db.create_session(session_id=sid, source="cli")
         try:
             agent = self._make_agent(db, sid)
             messages = [
@@ -777,7 +797,7 @@ class TestFlushCompressedSummaryOverrideGuard:
 
             assert messages[0]["content"] == "actual question"
         finally:
-            db.close()
+            await db.close()
 
 
 class TestFlushSanitizeDivergenceCapture:
@@ -796,7 +816,8 @@ class TestFlushSanitizeDivergenceCapture:
         agent._session_db_created = True
         return agent
 
-    def test_user_content_sanitize_would_rewrite_is_captured(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_user_content_sanitize_would_rewrite_is_captured(self, tmp_path):
         """get_messages_as_conversation strips <memory-context> fences on
         load; the sent bytes must survive in the sidecar so a reloaded
         session replays what was actually on the wire."""
@@ -804,7 +825,7 @@ class TestFlushSanitizeDivergenceCapture:
 
         db = SessionDB(db_path=tmp_path / "state.db")
         sid = "sess-fence"
-        db.create_session(session_id=sid, source="cli")
+        await db.create_session(session_id=sid, source="cli")
         try:
             agent = self._make_agent(db, sid)
             raw = "what does a literal <memory-context> tag do?"
@@ -813,35 +834,37 @@ class TestFlushSanitizeDivergenceCapture:
                 {"role": "user", "content": raw},
                 {"role": "assistant", "content": "it fences recalled memory <memory-context>"},
             ]
-            agent._flush_messages_to_session_db(messages, None)
+            await agent._flush_messages_to_session_db(messages, None)
 
-            msgs = db.get_messages_as_conversation(sid)
+            msgs = await db.get_messages_as_conversation(sid)
             assert msgs[0]["content"] == sanitize_context(raw).strip()
             assert msgs[0]["api_content"] == raw
             assert msgs[1]["api_content"] == (
                 "it fences recalled memory <memory-context>"
             )
         finally:
-            db.close()
+            await db.close()
 
-    def test_plain_whitespace_padding_not_captured(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_plain_whitespace_padding_not_captured(self, tmp_path):
         """The api build strips every outgoing content string, so mere
         surrounding whitespace replays identically — no sidecar bloat."""
         db = SessionDB(db_path=tmp_path / "state.db")
         sid = "sess-ws"
-        db.create_session(session_id=sid, source="cli")
+        await db.create_session(session_id=sid, source="cli")
         try:
             agent = self._make_agent(db, sid)
             messages = [{"role": "user", "content": "  hello  \n"}]
-            agent._flush_messages_to_session_db(messages, None)
-            msgs = db.get_messages_as_conversation(sid)
+            await agent._flush_messages_to_session_db(messages, None)
+            msgs = await db.get_messages_as_conversation(sid)
             assert "api_content" not in msgs[0]
         finally:
-            db.close()
+            await db.close()
 
 
 class TestMaxIterationsSummaryReplay:
-    def test_summary_request_substitutes_sidecar_bytes(self):
+    @pytest.mark.asyncio
+    async def test_summary_request_substitutes_sidecar_bytes(self):
         """The forced-summary request must replay the same bytes every
         main-loop call sent — popping the sidecar without substituting sends
         CLEAN content and diverges the prefix at the earliest injected
@@ -860,13 +883,14 @@ class TestMaxIterationsSummaryReplay:
 
         captured = {}
 
-        class _Completions:
-            def create(self, **kwargs):
-                captured.update(kwargs)
-                return "RAW-RESPONSE"
+        async def _create(**kwargs):
+            captured.update(kwargs)
+            return "RAW-RESPONSE"
 
         client = types.SimpleNamespace(
-            chat=types.SimpleNamespace(completions=_Completions())
+            chat=types.SimpleNamespace(
+                completions=types.SimpleNamespace(create=_create)
+            )
         )
         transport = types.SimpleNamespace(
             normalize_response=lambda _r: types.SimpleNamespace(content="SUMMARY")
@@ -876,10 +900,9 @@ class TestMaxIterationsSummaryReplay:
             {"role": "user", "content": "q1", "api_content": "q1\n\nPLUGIN-CTX"},
             {"role": "assistant", "content": "a1"},
         ]
-        with patch.object(
-            agent, "_ensure_primary_openai_client", return_value=client
-        ), patch.object(agent, "_get_transport", return_value=transport):
-            out = handle_max_iterations(agent, messages, 5)
+        agent.client = client
+        with patch.object(agent, "_get_transport", return_value=transport):
+            out = await handle_max_iterations(agent, messages, 5)
 
         assert out == "SUMMARY"
         sent_users = [
@@ -923,6 +946,7 @@ class TestSessionRowExistsBeforePreflightCompaction:
         agent._cached_system_prompt = "SYSTEM"
         agent.compression_enabled = True
         agent.compression_in_place = in_place
+        agent._runtime_config_loaded = True
         agent._compression_feasibility_checked = True
 
         calls = {"n": 0}
@@ -937,11 +961,11 @@ class TestSessionRowExistsBeforePreflightCompaction:
             {"role": "user", "content": "hello"},
         ]
 
-        def _compress(_messages, **_kwargs):
+        async def _compress(_messages, **_kwargs):
             # The ordering invariant under test: the row must already exist
             # when compression starts — the DB writes right after this call
             # (archive_and_compact / child create_session) reference it.
-            seen["row_at_compress"] = db.get_session(sid)
+            seen["row_at_compress"] = await db.get_session(sid)
             return compacted
 
         compressor = MagicMock()
@@ -970,13 +994,20 @@ class TestSessionRowExistsBeforePreflightCompaction:
             {"role": "assistant", "content": big},
         ]
 
-    def test_in_place_first_turn_compaction_persists(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_in_place_first_turn_compaction_persists(self, tmp_path):
         db = SessionDB(db_path=tmp_path / "state.db")
         sid = "sess-fresh-inplace"
         try:
             agent, seen = self._make_agent(db, sid, in_place=True)
-            with patch("hermes_cli.plugins.invoke_hook", return_value=[]):
-                ctx = _build(agent, conversation_history=self._oversized_history())
+            with patch(
+                "hermes_cli.lifecycle.invoke_hook",
+                new_callable=AsyncMock,
+                return_value=[],
+            ):
+                ctx = await _build(
+                    agent, conversation_history=self._oversized_history()
+                )
 
             # The row was created before compression started — without it the
             # FK on messages.session_id rejects the compacted rows and the
@@ -984,20 +1015,25 @@ class TestSessionRowExistsBeforePreflightCompaction:
             assert seen["row_at_compress"] is not None
             assert agent.session_id == sid  # no rotation
             assert agent._last_compaction_in_place is True
-            contents = [m["content"] for m in db.get_messages(sid)]
+            contents = [m["content"] for m in await db.get_messages(sid)]
             assert "[CONTEXT COMPACTION] summary" in contents
             # And the live context is the compacted set.
             assert ctx.messages[ctx.current_turn_user_idx]["content"] == "hello"
         finally:
-            db.close()
+            await db.close()
 
-    def test_rotation_first_turn_compaction_creates_child(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_rotation_first_turn_compaction_creates_child(self, tmp_path):
         db = SessionDB(db_path=tmp_path / "state.db")
         sid = "sess-fresh-rot"
         try:
             agent, seen = self._make_agent(db, sid, in_place=False)
-            with patch("hermes_cli.plugins.invoke_hook", return_value=[]):
-                _build(agent, conversation_history=self._oversized_history())
+            with patch(
+                "hermes_cli.lifecycle.invoke_hook",
+                new_callable=AsyncMock,
+                return_value=[],
+            ):
+                await _build(agent, conversation_history=self._oversized_history())
 
             # The parent row existed before compression started — the child
             # INSERT's parent_session_id FK needs it; without it
@@ -1006,33 +1042,11 @@ class TestSessionRowExistsBeforePreflightCompaction:
             assert seen["row_at_compress"] is not None
             child = agent.session_id
             assert child != sid
-            child_row = db.get_session(child)
+            child_row = await db.get_session(child)
             assert child_row is not None
             assert child_row["parent_session_id"] == sid
-            parent_row = db.get_session(sid)
+            parent_row = await db.get_session(sid)
             assert parent_row is not None
             assert parent_row["end_reason"] == "compression"
         finally:
-            db.close()
-
-
-class TestStaleConfirmationRedactionDropsSidecar:
-    def test_redaction_pops_api_content(self):
-        """The expired-confirmation redaction rewrites content — replaying
-        the sidecar verbatim would resend the dangerous bytes it just
-        redacted."""
-        from agent.replay_cleanup import strip_stale_dangerous_confirmations
-
-        history = [
-            {
-                "role": "user",
-                "content": "confirm forced restart",
-                "api_content": "confirm forced restart\n\nPLUGIN-CTX",
-                "timestamp": 1000.0,
-            }
-        ]
-        cleaned = strip_stale_dangerous_confirmations(
-            history, now=1000.0 + 999999.0
-        )
-        assert cleaned[0]["content"] != "confirm forced restart"
-        assert "api_content" not in cleaned[0]
+            await db.close()

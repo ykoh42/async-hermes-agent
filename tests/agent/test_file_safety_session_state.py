@@ -13,6 +13,8 @@ from pathlib import Path
 
 import pytest
 
+pytestmark = pytest.mark.asyncio
+
 
 @pytest.fixture()
 def fake_homes(tmp_path, monkeypatch):
@@ -34,22 +36,23 @@ def fake_homes(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("relative", ["state.db", "sessions/session_abc.json"])
-def test_session_state_paths_are_write_denied(fake_homes, relative):
-    from agent.file_safety import is_write_denied
+async def test_session_state_paths_are_write_denied(fake_homes, relative):
+    from agent.file_safety import get_write_denied_error
 
     _root, profile = fake_homes
     target = profile / relative
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text("existing transcript", encoding="utf-8")
 
-    assert is_write_denied(str(target)) is True
+    assert await get_write_denied_error(str(target)) is not None
 
 
 
 
 
 
-def test_write_file_tool_preserves_existing_session_snapshot(fake_homes):
+@pytest.mark.asyncio
+async def test_write_file_tool_preserves_existing_session_snapshot(fake_homes):
     import tools.file_tools as ft
 
     _root, profile = fake_homes
@@ -57,7 +60,7 @@ def test_write_file_tool_preserves_existing_session_snapshot(fake_homes):
     target.parent.mkdir(parents=True)
     target.write_text("original transcript", encoding="utf-8")
 
-    result = json.loads(ft.write_file_tool(str(target), "tampered"))
+    result = json.loads(await ft.write_file_tool(str(target), "tampered"))
 
     assert "error" in result
     assert target.read_text(encoding="utf-8") == "original transcript"

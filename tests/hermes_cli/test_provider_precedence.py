@@ -7,20 +7,30 @@ explicit choice — e.g. a user OAuth-logged-into Anthropic but with
 OPENAI_API_KEY exported (or model.provider set) got routed to Anthropic.
 """
 import pytest
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 from hermes_cli.auth import resolve_provider, AuthError
 
 
 def _login(monkeypatch, provider_id):
     """Simulate a logged-in OAuth active_provider in auth.json."""
-    monkeypatch.setattr("hermes_cli.auth._load_auth_store",
-                        lambda: {"active_provider": provider_id})
-    monkeypatch.setattr("hermes_cli.auth.get_auth_status",
-                        lambda p: {"logged_in": p == provider_id})
+    monkeypatch.setattr(
+        "hermes_cli.auth._load_auth_store",
+        AsyncMock(
+            return_value={
+                "active_provider": provider_id,
+                "providers": {provider_id: {"access_token": "test-token"}},
+            }
+        ),
+    )
 
 
 def _config(monkeypatch, model_cfg):
-    monkeypatch.setattr("hermes_cli.config.load_config", lambda: {"model": model_cfg})
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly",
+        AsyncMock(return_value={"model": model_cfg}),
+    )
 
 
 def _no_aws(monkeypatch):
@@ -35,35 +45,39 @@ def _clear_provider_env(monkeypatch):
 
 
 class TestProviderPrecedence:
-    def test_config_provider_beats_stale_oauth(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_config_provider_beats_stale_oauth(self, monkeypatch):
         """config.yaml model.provider wins over a logged-in OAuth active_provider."""
         _clear_provider_env(monkeypatch)
         _no_aws(monkeypatch)
         _login(monkeypatch, "anthropic")           # stale OAuth login
         _config(monkeypatch, {"provider": "zai", "default": "glm-4.6"})
-        assert resolve_provider("auto") == "zai"
+        assert await resolve_provider("auto") == "zai"
 
-    def test_env_key_beats_stale_oauth(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_env_key_beats_stale_oauth(self, monkeypatch):
         """An exported provider API key wins over a logged-in OAuth active_provider."""
         _clear_provider_env(monkeypatch)
         _no_aws(monkeypatch)
         _login(monkeypatch, "anthropic")
         _config(monkeypatch, {"default": "some-model"})  # dict, NO provider key
         monkeypatch.setenv("OPENAI_API_KEY", "sk-test-key")
-        assert resolve_provider("auto") == "openrouter"
+        assert await resolve_provider("auto") == "openrouter"
 
 
-    def test_oauth_used_as_last_resort(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_oauth_used_as_last_resort(self, monkeypatch):
         """With NO config provider and NO env keys, the logged-in OAuth provider
         is still used (it's the last-resort fallback, not removed)."""
         _clear_provider_env(monkeypatch)
         _no_aws(monkeypatch)
         _login(monkeypatch, "anthropic")
         _config(monkeypatch, {})  # empty model config, no provider
-        assert resolve_provider("auto") == "anthropic"
+        assert await resolve_provider("auto") == "anthropic"
 
 
-    def test_warns_on_silent_oauth_fallthrough(self, monkeypatch, caplog):
+    @pytest.mark.asyncio
+    async def test_warns_on_silent_oauth_fallthrough(self, monkeypatch, caplog):
         """A populated model dict lacking `provider` that falls through to OAuth
         emits a WARN so the silent override is visible (#29285)."""
         import logging
@@ -72,11 +86,12 @@ class TestProviderPrecedence:
         _login(monkeypatch, "anthropic")
         _config(monkeypatch, {"default": "claude-x"})  # populated, no provider
         with caplog.at_level(logging.WARNING, logger="hermes_cli.auth"):
-            assert resolve_provider("auto") == "anthropic"
+            assert await resolve_provider("auto") == "anthropic"
         assert any("no `provider` key" in r.message for r in caplog.records)
 
 
-    def test_openrouter_pool_beats_stale_oauth(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_openrouter_pool_beats_stale_oauth(self, monkeypatch):
         """An OpenRouter credential-pool entry (no env var) wins over a logged-in
         OAuth provider — the pool rung sits above OAuth (#42130 + #29285)."""
         _clear_provider_env(monkeypatch)
@@ -88,5 +103,26 @@ class TestProviderPrecedence:
             def has_credentials(self):
                 return True
 
-        monkeypatch.setattr("agent.credential_pool.load_pool", lambda name: _Pool())
-        assert resolve_provider("auto") == "openrouter"
+            async def select(self):
+                return SimpleNamespace(
+                    runtime_api_key="pool-token",
+                    access_token="pool-token",
+                    runtime_base_url="https://openrouter.ai/api/v1",
+                    base_url="https://openrouter.ai/api/v1",
+                    source="pool",
+                )
+
+        async def _load_pool(name):
+            assert name == "openrouter"
+            return _Pool()
+
+        from hermes_cli import runtime_provider
+
+        monkeypatch.setattr(runtime_provider, "load_pool", _load_pool)
+        monkeypatch.setattr(
+            runtime_provider,
+            "resolve_requested_provider",
+            lambda requested, config: "auto",
+        )
+        runtime = await runtime_provider.resolve_runtime_provider(requested="auto")
+        assert runtime["provider"] == "openrouter"

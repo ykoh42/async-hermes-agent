@@ -13,12 +13,16 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
 
 from hermes_state import SessionDB
 
 
-def _build_agent_with_db(db: SessionDB, session_id: str, compression_count: int):
+def _build_agent_with_db(
+    db: SessionDB, session_id: str, compression_count: int
+):
     with patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}):
         from run_agent import AIAgent
 
@@ -34,10 +38,10 @@ def _build_agent_with_db(db: SessionDB, session_id: str, compression_count: int)
         )
 
     compressor = MagicMock()
-    compressor.compress.return_value = [
+    compressor.compress = AsyncMock(return_value=[
         {"role": "user", "content": "[CONTEXT COMPACTION] summary"},
         {"role": "user", "content": "tail"},
-    ]
+    ])
     compressor.compression_count = compression_count
     compressor.last_prompt_tokens = 0
     compressor.last_completion_tokens = 0
@@ -49,10 +53,11 @@ def _build_agent_with_db(db: SessionDB, session_id: str, compression_count: int)
     return agent
 
 
-def test_repeated_compression_warning_routed_through_emit_status(tmp_path: Path) -> None:
-    db = SessionDB(db_path=tmp_path / "state.db")
+@pytest.mark.asyncio
+async def test_repeated_compression_warning_routed_through_emit_status(tmp_path: Path) -> None:
+    db = SessionDB(tmp_path / "state.db")
     sid = "PARENT_36908"
-    db.create_session(sid, source="cli")
+    await db.create_session(sid, source="cli")
 
     # compression_count == 2 → the "compressed N times" warning should fire.
     agent = _build_agent_with_db(db, sid, compression_count=2)
@@ -61,7 +66,7 @@ def test_repeated_compression_warning_routed_through_emit_status(tmp_path: Path)
     agent._emit_status = lambda message: emitted.append(message)
 
     messages = [{"role": "user", "content": f"m{i}"} for i in range(20)]
-    agent._compress_context(messages, "sys", approx_tokens=120_000)
+    await agent._compress_context(messages, "sys", approx_tokens=120_000)
 
     # The warning reached the gateway-aware channel...
     assert any("compressed 2 times" in m.lower() for m in emitted), (
@@ -69,12 +74,15 @@ def test_repeated_compression_warning_routed_through_emit_status(tmp_path: Path)
     )
     # ...and was stored for late-bound gateway status_callback replay.
     assert "compressed 2 times" in (getattr(agent, "_compression_warning", "") or "").lower()
+    await agent.close()
+    await db.close()
 
 
-def test_no_warning_below_threshold(tmp_path: Path) -> None:
-    db = SessionDB(db_path=tmp_path / "state.db")
+@pytest.mark.asyncio
+async def test_no_warning_below_threshold(tmp_path: Path) -> None:
+    db = SessionDB(tmp_path / "state.db")
     sid = "PARENT_36908_ONCE"
-    db.create_session(sid, source="cli")
+    await db.create_session(sid, source="cli")
 
     # compression_count == 1 → no repeated-compression warning.
     agent = _build_agent_with_db(db, sid, compression_count=1)
@@ -82,6 +90,8 @@ def test_no_warning_below_threshold(tmp_path: Path) -> None:
     agent._emit_status = lambda message: emitted.append(message)
 
     messages = [{"role": "user", "content": f"m{i}"} for i in range(20)]
-    agent._compress_context(messages, "sys", approx_tokens=120_000)
+    await agent._compress_context(messages, "sys", approx_tokens=120_000)
 
     assert not any("compressed" in m.lower() and "times" in m.lower() for m in emitted)
+    await agent.close()
+    await db.close()

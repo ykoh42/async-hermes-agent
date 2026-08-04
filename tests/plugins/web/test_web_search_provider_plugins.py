@@ -41,9 +41,6 @@ def _clear_web_env(monkeypatch: pytest.MonkeyPatch) -> None:
         "PARALLEL_SEARCH_MODE",
         "FIRECRAWL_API_KEY",
         "FIRECRAWL_API_URL",
-        "FIRECRAWL_GATEWAY_URL",
-        "TOOL_GATEWAY_DOMAIN",
-        "TOOL_GATEWAY_USER_TOKEN",
         "XAI_API_KEY",
     ):
         monkeypatch.delenv(k, raising=False)
@@ -203,6 +200,27 @@ class TestIsAvailable:
         monkeypatch.setenv("FIRECRAWL_API_URL", "http://localhost:3002")
         assert p.is_available() is True
 
+    def test_firecrawl_request_config_uses_direct_async_http_settings(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from plugins.web.firecrawl.provider import FirecrawlWebSearchProvider
+
+        with pytest.raises(ValueError, match="Web tools are not configured"):
+            FirecrawlWebSearchProvider._request_config()
+
+        monkeypatch.setenv("FIRECRAWL_API_KEY", "fc-test")
+        assert FirecrawlWebSearchProvider._request_config() == (
+            "https://api.firecrawl.dev/v1",
+            "fc-test",
+        )
+
+        monkeypatch.delenv("FIRECRAWL_API_KEY")
+        monkeypatch.setenv("FIRECRAWL_API_URL", "http://localhost:3002/")
+        assert FirecrawlWebSearchProvider._request_config() == (
+            "http://localhost:3002",
+            "",
+        )
+
     def test_ddgs_always_available_when_package_importable(self) -> None:
         """DDGS is the always-on fallback — no API key required.
 
@@ -310,5 +328,3 @@ class TestAsyncExtractDispatch:
 
 class TestErrorResponseShapes:
     """When credentials are missing, plugins return typed errors, not raises."""
-
-

@@ -270,8 +270,6 @@ _EXTRA_ENV_KEYS = frozenset({
     "SIGNAL_ALLOWED_USERS", "SIGNAL_GROUP_ALLOWED_USERS",
     "SIGNAL_HOME_CHANNEL", "SIGNAL_HOME_CHANNEL_NAME",
     "SMS_HOME_CHANNEL", "SMS_HOME_CHANNEL_NAME",
-    "DINGTALK_CLIENT_ID", "DINGTALK_CLIENT_SECRET",
-    "DINGTALK_HOME_CHANNEL", "DINGTALK_HOME_CHANNEL_NAME",
     "FEISHU_APP_ID", "FEISHU_APP_SECRET", "FEISHU_ENCRYPT_KEY", "FEISHU_VERIFICATION_TOKEN",
     "FEISHU_HOME_CHANNEL", "FEISHU_HOME_CHANNEL_NAME",
     "YUANBAO_HOME_CHANNEL", "YUANBAO_HOME_CHANNEL_NAME",
@@ -316,14 +314,6 @@ _EXTRA_ENV_KEYS = frozenset({
     "LANGFUSE_PUBLIC_KEY",
     "LANGFUSE_SECRET_KEY",
     "LANGFUSE_BASE_URL",
-    # ACP (Agent Client Protocol) keys — profile-isolable so different
-    # profiles can use different ACP backends without cross-leak.
-    "HERMES_ACP_AUTH_METHOD",
-    "HERMES_ACP_AUTO_APPROVE",
-    "HERMES_COPILOT_ACP_COMMAND",
-    "HERMES_COPILOT_ACP_ARGS",
-    "COPILOT_CLI_PATH",
-    "COPILOT_ACP_BASE_URL",
 })
 import yaml
 
@@ -1157,8 +1147,7 @@ def _is_env_config_key(key: str) -> bool:
     api_keys = [
         'OPENROUTER_API_KEY', 'OPENAI_API_KEY', 'ANTHROPIC_API_KEY', 'VOICE_TOOLS_OPENAI_KEY',
         'EXA_API_KEY', 'PARALLEL_API_KEY', 'FIRECRAWL_API_KEY', 'FIRECRAWL_API_URL',
-        'FIRECRAWL_GATEWAY_URL', 'TOOL_GATEWAY_DOMAIN', 'TOOL_GATEWAY_SCHEME',
-        'TOOL_GATEWAY_USER_TOKEN', 'TAVILY_API_KEY',
+        'TAVILY_API_KEY',
         'BROWSERBASE_API_KEY', 'BROWSERBASE_PROJECT_ID', 'BROWSER_USE_API_KEY',
         'FAL_KEY', 'TELEGRAM_BOT_TOKEN', 'DISCORD_BOT_TOKEN',
         'TERMINAL_SSH_HOST', 'TERMINAL_SSH_USER', 'TERMINAL_SSH_KEY',
@@ -1167,7 +1156,7 @@ def _is_env_config_key(key: str) -> bool:
     ]
     return (
         key_upper in api_keys
-        or key_upper.endswith(('_API_KEY', '_TOKEN', '_SECRET'))
+        or key_upper.endswith(('_API_KEY', '_TOKEN'))
         or key_upper.startswith('TERMINAL_SSH')
     )
 
@@ -1686,9 +1675,7 @@ def get_custom_provider_extra_headers(
         entry_url = normalize_route_base_url(entry.get("base_url"))
         if not entry_url or entry_url != target_url:
             continue
-        headers = normalize_extra_headers(entry.get("extra_headers"))
-        if headers:
-            return headers
+        return normalize_extra_headers(entry.get("extra_headers"))
     return {}
 
 
@@ -3129,27 +3116,59 @@ def load_config() -> Dict[str, Any]:
     return _load_config_impl(want_deepcopy=True)
 
 
-def load_config_readonly() -> Dict[str, Any]:
-    """Fast-path variant of ``load_config()`` for callers that ONLY READ.
+async def load_config_readonly() -> Dict[str, Any]:
+    """Load behavioral configuration without synchronous file I/O.
 
-    Returns the cached config dict directly without the defensive deepcopy
-    that ``load_config()`` applies. **Mutating the returned dict (or any
-    nested structure) corrupts the in-process cache for every subsequent
-    caller** — only use this when you are absolutely sure your code path
-    will not write to the result. If you need to mutate or pass to
-    ``save_config``, call ``load_config()`` instead.
-
-    Why this exists: ``load_config()`` cache-hit cost is ~265us per call,
-    half of which (~135us) is the defensive deepcopy. The agent loop calls
-    into config reads (timeouts, thresholds, feature flags) ~20-50x per
-    conversation; skipping deepcopy here removes a measurable allocation
-    source and the GC pressure that comes with it.
-
-    Note: this returns a plain ``dict`` (not ``MappingProxyType``) so
-    existing ``isinstance(x, dict)`` guards downstream keep working. The
-    safety guarantee is purely documented, not enforced — be careful.
+    This is intentionally a read-only, uncached async snapshot for the agent
+    turn.  CLI/setup code keeps using :func:`load_config_readonly`, whose
+    process-wide cache and synchronous lock are useful there.  Async callers
+    must not enter that lock while the event loop is serving model/tool work.
     """
-    return _load_config_impl(want_deepcopy=False)
+    import aiofiles
+    import aiofiles.os
+
+    config_path = get_config_path()
+    config = copy.deepcopy(DEFAULT_CONFIG)
+
+    async def _read_yaml(path: Path) -> Dict[str, Any]:
+        try:
+            if not await aiofiles.os.path.isfile(path):
+                return {}
+            async with aiofiles.open(path, encoding="utf-8") as handle:
+                data = fast_safe_load(await handle.read()) or {}
+            return data if isinstance(data, dict) else {}
+        except FileNotFoundError:
+            return {}
+        except Exception as exc:
+            logger.debug("Async config read failed for %s: %s", path, exc)
+            return {}
+
+    user_config = await _read_yaml(config_path)
+    if "max_turns" in user_config:
+        agent_user_config = dict(user_config.get("agent") or {})
+        if agent_user_config.get("max_turns") is None:
+            agent_user_config["max_turns"] = user_config["max_turns"]
+        user_config["agent"] = agent_user_config
+        user_config.pop("max_turns", None)
+    config = _deep_merge(config, user_config)
+
+    normalized = _normalize_root_model_keys(_normalize_max_turns_config(config))
+    expanded = _expand_env_vars(normalized)
+
+    # Managed configuration is an optional policy overlay.  Read it through
+    # the same async helper when present; never call managed_scope's blocking
+    # loader from an active turn.
+    try:
+        from hermes_cli import managed_scope
+
+        managed_dir = managed_scope.get_managed_dir()
+    except Exception:
+        managed_dir = None
+    if managed_dir:
+        managed_config = await _read_yaml(Path(managed_dir) / "config.yaml")
+        if managed_config:
+            expanded = _deep_merge(expanded, _expand_env_vars(managed_config))
+    return expanded
 
 
 def write_platform_config_field(
@@ -3205,7 +3224,6 @@ TERMINAL_CONFIG_ENV_MAP = {
     "docker_mount_cwd_to_workspace": "TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE",
     "docker_network": "TERMINAL_DOCKER_NETWORK",
     "docker_extra_args": "TERMINAL_DOCKER_EXTRA_ARGS",
-    "docker_shm_size": "TERMINAL_DOCKER_SHM_SIZE",
     "docker_run_as_host_user": "TERMINAL_DOCKER_RUN_AS_HOST_USER",
     "docker_persist_across_processes": "TERMINAL_DOCKER_PERSIST_ACROSS_PROCESSES",
     "docker_orphan_reaper": "TERMINAL_DOCKER_ORPHAN_REAPER",
@@ -3241,29 +3259,20 @@ def apply_terminal_config_to_env(
     gives those child-process launch paths the same config bridge as classic
     CLI without importing ``cli.py`` and paying for its startup side effects.
 
-    Explicit keys in the user config's ``terminal`` section are authoritative
-    and override their matching env values.  Merged defaults only backfill
-    missing env vars; they never replace unrelated exported/.env values.
+    When the user config contains a ``terminal`` section, config.yaml is
+    authoritative and overrides existing env values.  Otherwise defaults only
+    backfill missing env vars so exported/.env values keep working.
     """
     target = os.environ if env is None else env
 
     raw_config = read_raw_config()
-    raw_terminal_cfg = raw_config.get("terminal")
-    file_has_terminal_config = isinstance(raw_terminal_cfg, dict)
-    if not file_has_terminal_config:
-        raw_terminal_cfg = {}
+    file_has_terminal_config = isinstance(raw_config.get("terminal"), dict)
     should_override = file_has_terminal_config if override is None else override
 
-    cfg = config if config is not None else load_config_readonly()
+    cfg = config if config is not None else load_config()
     terminal_cfg = cfg.get("terminal", {}) if isinstance(cfg, dict) else {}
     if not isinstance(terminal_cfg, dict):
         return target
-
-    # A caller-supplied config is its own source of explicit keys.  For the
-    # normal merged-config path, only keys present in raw config.yaml may
-    # override existing env values; keys inherited from DEFAULT_CONFIG are
-    # backfill-only.
-    explicit_keys = terminal_cfg.keys() if config is not None else raw_terminal_cfg.keys()
 
     for cfg_key, env_var in TERMINAL_CONFIG_ENV_MAP.items():
         if cfg_key not in terminal_cfg:
@@ -3275,7 +3284,7 @@ def apply_terminal_config_to_env(
                 continue
             if isinstance(value, str):
                 value = os.path.expanduser(value)
-        if (should_override and cfg_key in explicit_keys) or env_var not in target:
+        if should_override or env_var not in target:
             target[env_var] = _terminal_env_value(value)
     return target
 
@@ -3433,16 +3442,9 @@ _SECURITY_COMMENT = """
 # tokens, and passwords are masked in tool output, logs, and chat
 # responses before the model or user ever sees them. Set redact_secrets
 # to false to disable (e.g. when developing the redactor itself).
-# tirith pre-exec scanning is enabled by default when the tirith binary
-# is available. Configure via security.tirith_* keys or env vars
-# (TIRITH_ENABLED, TIRITH_BIN, TIRITH_TIMEOUT, TIRITH_FAIL_OPEN).
 #
 # security:
 #   redact_secrets: true
-#   tirith_enabled: true
-#   tirith_path: "tirith"
-#   tirith_timeout: 5
-#   tirith_fail_open: true
 """
 
 _FALLBACK_COMMENT = """
@@ -4069,21 +4071,6 @@ def save_anthropic_api_key(value: str, save_fn=None):
     writer("ANTHROPIC_TOKEN", "")
 
 
-def save_env_value_secure(key: str, value: str) -> Dict[str, Any]:
-    # Route through the unified credential lifecycle so a rotation via the
-    # secret-capture path also refreshes any config.yaml mirror of the old
-    # value and lifts a prior env-source suppression (#62269 fix family).
-    from hermes_cli.credential_lifecycle import save_provider_env_credential
-
-    save_provider_env_credential(key, value)
-    return {
-        "success": True,
-        "stored_as": key,
-        "validated": False,
-    }
-
-
-
 def reload_env() -> int:
     """Re-read ~/.hermes/.env into os.environ. Returns count of vars updated.
 
@@ -4107,60 +4094,61 @@ def reload_env() -> int:
 
 
 def get_env_value(key: str) -> Optional[str]:
-    """Get a value from ``os.environ`` or ``~/.hermes/.env``, scope-aware.
-
-    The ``os.environ`` read routes through ``agent.secret_scope.get_secret``
-    so that, under an active profile scope (multiplexed gateway turn), this
-    is scope-checked rather than leaking another profile's raw ``os.environ``
-    value. ``get_secret`` encodes the whole policy: global vars pass through;
-    scope is authoritative under multiplexing (miss -> None, no environ
-    fallthrough); when multiplexing is off it behaves exactly like the
-    legacy ``os.environ`` read. Its siblings ``get_env_value_prefer_dotenv``
-    and ``gateway.config._getenv`` already work this way — this was the last
-    scope-blind reader of the trio (#67027).
-    """
+    """Read a credential without escaping the active profile scope."""
     try:
-        from agent.secret_scope import (
-            UnscopedSecretError,
-            get_secret as _get_secret,
-        )
+        from agent.secret_scope import UnscopedSecretError, get_secret
     except Exception:
-        if key in os.environ:
-            return os.environ[key]
-        return load_env().get(key)
+        value = os.environ.get(key)
+    else:
+        try:
+            value = get_secret(key)
+        except UnscopedSecretError:
+            raise
+        except Exception:
+            value = os.environ.get(key)
+    if value is not None:
+        return value
 
-    try:
-        val = _get_secret(key)
-    except UnscopedSecretError:
-        raise
-    except Exception:
-        val = os.environ.get(key)
-    if val is not None:
-        return val
-
-    # Then check .env file
     env_vars = load_env()
     return env_vars.get(key)
 
 
-def get_env_value_prefer_dotenv(key: str) -> Optional[str]:
-    """Resolve a credential env value, preferring ``~/.hermes/.env`` over ``os.environ``.
+async def get_env_value_prefer_dotenv(key: str) -> Optional[str]:
+    """Async credential lookup for agent/provider execution paths.
 
-    Used for Hermes-managed credentials where a deliberate edit to ``.env``
-    must take precedence over a stale value inherited from the parent shell
-    (Codex CLI, test scripts, login profile exports). Without this, rotating
-    a key in ``.env`` mid-session leaves callers serving the stale shell
-    value and produces persistent 401s.
-
-    The ``os.environ`` fallback routes through ``secret_scope.get_secret`` so
-    that, under an active profile scope (multiplexed gateway turn), this read
-    is scope-checked rather than leaking another profile's raw ``os.environ``
-    value — matching the credential-pool seeding path's behaviour.
+    The dotenv file is read through ``aiofiles`` before falling back to the
+    profile-scoped process environment.
     """
-    env_vars = load_env()
-    val = env_vars.get(key)
-    if val:
-        return val
+    try:
+        import aiofiles
+
+        env_path = get_env_path()
+        env_vars: Dict[str, str] = {}
+        try:
+            async with aiofiles.open(
+                env_path, "r", encoding="utf-8-sig", errors="replace"
+            ) as handle:
+                raw_lines = await handle.readlines()
+        except FileNotFoundError:
+            raw_lines = []
+        for line in _sanitize_env_lines(raw_lines):
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#") or "=" not in stripped:
+                continue
+            if stripped.startswith("export "):
+                stripped = stripped[7:]
+            env_key, raw_value = stripped.split("=", 1)
+            env_key = env_key.strip()
+            if env_key:
+                env_vars[env_key] = _parse_env_value(raw_value)
+        value = env_vars.get(key)
+        if value:
+            return value
+    except Exception:
+        # A credential read should remain best-effort; the scoped environment
+        # fallback below preserves the same behavior as the sync helper.
+        pass
+
     try:
         from agent.secret_scope import (
             UnscopedSecretError,
@@ -4168,7 +4156,6 @@ def get_env_value_prefer_dotenv(key: str) -> Optional[str]:
         )
     except Exception:
         return os.environ.get(key)
-
     try:
         return _get_secret(key)
     except UnscopedSecretError:
@@ -4306,10 +4293,6 @@ def show_config():
     for env_key, name in keys:
         value = get_env_value(env_key)
         print(f"  {name:<14} {redact_key(value)}")
-    from hermes_cli.auth import get_anthropic_key
-    anthropic_value = get_anthropic_key()
-    print(f"  {'Anthropic':<14} {redact_key(anthropic_value)}")
-    
     # Model settings
     print()
     print(color("◆ Model", Colors.CYAN, Colors.BOLD))
@@ -4674,7 +4657,7 @@ _SCHEMA_DEFINED_DICT_KEYS = frozenset({
     # Platform configs — PlatformConfig dataclass + dynamic extras
     "discord", "telegram", "slack", "whatsapp", "signal", "mattermost",
     "matrix", "feishu", "wecom", "weixin", "bluebubbles", "qqbot", "yuanbao",
-    "email", "sms", "dingtalk",
+    "email", "sms",
     # MCP server template / dynamic auth dicts
     "sessions", "checkpoints",
 })
@@ -4818,481 +4801,6 @@ def _validate_config_key(key: str) -> tuple[bool, Optional[str]]:
     # Walked the entire user-supplied path without hitting an unknown
     # segment — it's known.
     return True, None
-
-
-def set_config_value(key: str, value: str, force: bool = False):
-    """Set a configuration value.
-
-    Args:
-        key: Dotted config path (e.g. ``terminal.backend``).
-        value: String value (auto-coerced to bool/int/float when matching).
-        force: When True, skip the unknown-key warning — useful for scripted
-            writes of keys the running version doesn't recognize yet — AND
-            authorize destructive replacement of a mapping section by a
-            scalar (e.g. ``--force model gpt-x`` replaces the whole ``model:``
-            mapping). Without --force, scalar writes over mapping sections are
-            refused (bare ``model`` is redirected to ``model.default``). The
-            CLI exposes this via ``hermes config set --force``.
-    """
-    if is_managed():
-        managed_error("set configuration values")
-        return
-    # Managed scope guard (D2): a key pinned by the managed layer cannot be set by
-    # the user — the next load would override it anyway. Hard-reject and name the
-    # source. Distinct from is_managed() above (the package-manager write-lock).
-    # Env-shaped keys (API keys / tokens) route to save_env_value below, which has
-    # its own managed-env-key guard; this catches the config.yaml keys.
-    from hermes_cli import managed_scope
-
-    if managed_scope.is_key_managed(key):
-        managed_dir = managed_scope.get_managed_dir()
-        src = (managed_dir / "config.yaml") if managed_dir else "the managed scope"
-        print(
-            f"Cannot set '{key}': it is managed by your administrator ({src}) "
-            f"and cannot be changed. Contact your administrator to modify it.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-    # Check if it's an API key (goes to .env)
-    if _is_env_config_key(key):
-        # Unified lifecycle: also rotates any config.yaml mirror of the old
-        # value so a stale higher-precedence copy can't win (#62269).
-        from hermes_cli.credential_lifecycle import save_provider_env_credential
-
-        save_provider_env_credential(key.upper(), value)
-        print(f"✓ Set {key} in {get_env_path()}")
-        return
-
-    # Unknown-key notice (#34067): the key is still written (arbitrary keys
-    # are supported — top-level scalars are bridged into os.environ for
-    # skills and external apps), but a plausible-but-wrong dotted path like
-    # ``gateway.discord.gateway_restart_notification`` previously reported
-    # bare success and left the user debugging behavior that never changed.
-    # Warn after the write so the user gets immediate feedback plus a
-    # "did you mean" hint, without blocking legitimate unknown keys.
-    is_known, suggestion = _validate_config_key(key)
-
-    # Otherwise it goes to config.yaml
-    # Read the raw user config (not merged with defaults) to avoid
-    # dumping all default values back to the file
-    config_path = get_config_path()
-    require_readable_config_before_write(config_path)
-    user_config = {}
-    if config_path.exists():
-        try:
-            with open(config_path, encoding="utf-8") as f:
-                user_config = fast_safe_load(f) or {}
-        except Exception as exc:
-            print(
-                f"✗ Cannot parse {config_path}: {exc}\n"
-                f"  The file contains a YAML syntax error. Fix the error\n"
-                f"  in your config file first, then retry.\n"
-                f"  (hermes config edit will open it in your editor.)",
-                file=sys.stderr,
-            )
-            sys.exit(1)
-    
-    # Handle nested keys (e.g., "tts.provider") including numeric list
-    # indices (e.g., "custom_providers.0.api_key").  Delegates to
-    # _set_nested which preserves list-typed nodes; before #17876 the
-    # inline navigation here silently overwrote lists with dicts.
-
-    # Preserve values for string-typed settings.  In particular, enum members
-    # such as approvals.mode="off" must not become YAML booleans.  Unknown keys
-    # retain the historical best-effort coercion behavior.
-    coerced_value: Any = value
-    if not isinstance(_default_value_for_key(key), str):
-        if value.lower() in {'true', 'yes', 'on'}:
-            coerced_value = True
-        elif value.lower() in {'false', 'no', 'off'}:
-            coerced_value = False
-        elif value.isdigit():
-            coerced_value = int(value)
-        elif value.replace('.', '', 1).isdigit():
-            coerced_value = float(value)
-
-    value = coerced_value
-    # Normalize a scalar ``model`` key before writing sub-keys so that
-    # ``hermes config set model.provider openai`` doesn't silently
-    # destroy the model id when ``model`` is a bare string shorthand
-    # (e.g. ``model: gpt-4o``).  Without this _set_nested replaces the
-    # scalar with an empty dict, dropping the model id permanently.
-    _model_key = key.strip().lower()
-    if _model_key.startswith("model."):
-        _model_val = user_config.get("model")
-        if isinstance(_model_val, str) and _model_val:
-            user_config["model"] = {"default": _model_val}
-    # Guard against #74995: a single-segment key that names an existing
-    # mapping would silently overwrite the entire section with a scalar
-    # (e.g. ``hermes config set model gpt-5.6-sol`` when model already
-    # contains default/provider/context_length).  Bare ``model`` is a
-    # documented shorthand — redirect to ``model.default`` and preserve
-    # siblings.  All other mapping sections are rejected unless --force.
-    if "." not in key:
-        _existing = user_config.get(key)
-        if isinstance(_existing, dict):
-            if key == "model":
-                if force:
-                    # --force: allow destructive section overwrite.
-                    print(
-                        f"⚠ Replacing entire 'model' section with a scalar "
-                        f"(discarding {len(_existing)} existing sub-key(s))"
-                    )
-                else:
-                    # Redirect bare-model shorthand to model.default while
-                    # keeping every sibling mapping key intact.
-                    key = "model.default"
-                    print(
-                        f"✓ Redirecting bare 'model' to 'model.default' "
-                        f"(preserving {len(_existing)} existing model sub-key(s))"
-                    )
-                    # value was already coerced above; proceed to _set_nested
-            elif not force:
-                _sub = [k for k in _existing if isinstance(k, str)]
-                print(
-                    f"✗ Cannot set '{key}' to a scalar — '{key}' is a "
-                    f"configuration section with {len(_sub)} sub-key(s).",
-                    file=sys.stderr,
-                )
-                if _sub:
-                    _sub_list = ", ".join(_sub[:8])
-                    print(f"  Sub-keys: {_sub_list}", file=sys.stderr)
-                    if len(_sub) > 8:
-                        print(
-                            f"  ... and {len(_sub) - 8} more",
-                            file=sys.stderr,
-                        )
-                print(
-                    "  Use a dotted path to set a specific leaf key:",
-                    file=sys.stderr,
-                )
-                print(
-                    f"    hermes config set {key}.<sub-key> <value>",
-                    file=sys.stderr,
-                )
-                print(
-                    "  Or use --force to replace the entire section:",
-                    file=sys.stderr,
-                )
-                print(
-                    f"    hermes config set --force {key} {value!r}",
-                    file=sys.stderr,
-                )
-                sys.exit(1)
-    _set_nested(user_config, key, value)
-    # Normalize the api_base → base_url alias at set-time too (issue #8919),
-    # so a fresh `hermes config set model.api_base ...` lands on the canonical
-    # key the runtime resolver actually reads, instead of being silently
-    # ignored. Mirrors the load-time migration in _normalize_root_model_keys.
-    _alias_norm = key.strip().lower()
-    if _alias_norm in ("model.api_base", "api_base"):
-        user_config = _normalize_root_model_keys(user_config)
-        key = "model.base_url"
-        print("  (note: 'api_base' is an alias — saved as model.base_url)")
-    # Write only user config back (not the full merged defaults)
-    ensure_hermes_home()
-    from utils import atomic_yaml_write
-    atomic_yaml_write(config_path, user_config, sort_keys=False)
-    
-    # Keep .env in sync for keys that terminal_tool reads directly from env vars.
-    # config.yaml is authoritative, but terminal_tool only reads TERMINAL_ENV etc.
-    env_var = terminal_config_env_var_for_key(key)
-    if env_var and key != "terminal.cwd":
-        save_env_value(env_var, _terminal_env_value(value))
-
-    # Setting display.skin is an explicit "apply NOW" — bump the skin file's
-    # mtime so the gateway watcher's (name, mtime) signature moves even when the
-    # name is unchanged (re-affirming the active skin after a surface missed the
-    # original activation). Built-ins have no file; a name switch already moves
-    # their signature.
-    if key == "display.skin" and isinstance(value, str) and value:
-        try:
-            skin_file = get_hermes_home() / "skins" / f"{value}.yaml"
-            if skin_file.exists():
-                skin_file.touch()
-        except Exception:
-            pass  # best-effort: the config write above already succeeded
-
-    # Mask the echoed value when the (possibly nested) key is credential-shaped
-    # — e.g. `hermes config set model.api_key cfut_...` routes to config.yaml
-    # (lowercase, so it misses the .env api_keys list above) and would otherwise
-    # print the raw secret to the terminal.
-    _leaf_key = key.rsplit(".", 1)[-1].lower()
-    if _leaf_key in _SECRET_CONFIG_KEYS and isinstance(value, str) and value:
-        from agent.redact import mask_secret
-        _display_value = mask_secret(value)
-    else:
-        _display_value = value
-    print(f"✓ Set {key} = {_display_value} in {config_path}")
-    warn_unpinned_cron_jobs_after_model_config_change(key, value, user_config)
-
-    # Post-write unknown-key notice (#34067): value IS saved, but tell the
-    # user the runtime may never read it and suggest the likely-intended path.
-    if not is_known and not force:
-        print(color(
-            f"⚠ '{key}' is not a recognized config key — it was saved anyway, "
-            "but Hermes may not read it.",
-            Colors.YELLOW,
-        ))
-        if suggestion:
-            print(color(f"  Did you mean: {suggestion}", Colors.YELLOW))
-        print(color(
-            "  (Custom top-level keys are supported and bridged to the "
-            "environment for skills/external tools. Use --force to skip "
-            "this notice.)",
-            Colors.DIM,
-        ))
-
-
-def get_config_value(key: str, *, as_json: bool = False):
-    """Print a resolved configuration value."""
-    if _is_env_config_key(key):
-        env_value = get_env_value(key.upper())
-        value = _MISSING if env_value is None else env_value
-    else:
-        value = _get_nested(load_config(), key)
-
-    if value is _MISSING:
-        print(f"Config key not set: {key}", file=sys.stderr)
-        sys.exit(1)
-
-    print(_format_config_get_value(value, as_json=as_json))
-
-
-def unset_config_value(key: str):
-    """Remove a user-set configuration or .env value."""
-    if is_managed():
-        managed_error("unset configuration values")
-        return
-    # Managed scope guard: a key pinned by the managed layer cannot be unset by
-    # the user — the next load would reinstate it anyway (mirrors set_config_value).
-    from hermes_cli import managed_scope
-
-    if managed_scope.is_key_managed(key):
-        managed_dir = managed_scope.get_managed_dir()
-        src = (managed_dir / "config.yaml") if managed_dir else "the managed scope"
-        print(
-            f"Cannot unset '{key}': it is managed by your administrator ({src}) "
-            f"and cannot be changed. Contact your administrator to modify it.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-
-    if _is_env_config_key(key):
-        # Unified lifecycle: prune env-seeded credential_pool entries and
-        # model-cache rows too, so `hermes config unset <KEY>` fully removes
-        # the provider instead of leaving it resurrectable (#51071 family).
-        from hermes_cli.credential_lifecycle import remove_provider_env_credential
-
-        if not remove_provider_env_credential(key.upper()).get("found"):
-            print(f"Config key not set: {key}", file=sys.stderr)
-            sys.exit(1)
-        print(f"✓ Unset {key} from {get_env_path()}")
-        return
-
-    config_path = get_config_path()
-    require_readable_config_before_write(config_path)
-    user_config = {}
-    if config_path.exists():
-        try:
-            with open(config_path, encoding="utf-8") as f:
-                user_config = fast_safe_load(f) or {}
-        except Exception as exc:
-            print(
-                f"✗ Cannot parse {config_path}: {exc}\n"
-                f"  The file contains a YAML syntax error. Fix the error\n"
-                f"  in your config file first, then retry.\n"
-                f"  (hermes config edit will open it in your editor.)",
-                file=sys.stderr,
-            )
-            sys.exit(1)
-
-    removed = _unset_nested(user_config, key)
-
-    # Keep .env in sync for keys that terminal_tool reads directly from env vars.
-    env_var = terminal_config_env_var_for_key(key)
-    if env_var and key != "terminal.cwd":
-        removed = remove_env_value(env_var) or removed
-
-    if not removed:
-        print(f"Config key not set: {key}", file=sys.stderr)
-        sys.exit(1)
-
-    ensure_hermes_home()
-    from utils import atomic_yaml_write
-    atomic_yaml_write(config_path, user_config, sort_keys=False)
-    print(f"✓ Unset {key} from {config_path}")
-
-
-# =============================================================================
-# Command handler
-# =============================================================================
-
-def config_command(args):
-    """Handle config subcommands."""
-    subcmd = getattr(args, 'config_command', None)
-    
-    if subcmd is None or subcmd == "show":
-        show_config()
-    
-    elif subcmd == "edit":
-        edit_config()
-    
-    elif subcmd == "get":
-        key = getattr(args, 'key', None)
-        if not key:
-            print("Usage: hermes config get <key> [--json]")
-            print()
-            print("Examples:")
-            print("  hermes config get model")
-            print("  hermes config get terminal.backend")
-            print("  hermes config get skills.config --json")
-            sys.exit(1)
-        get_config_value(key, as_json=getattr(args, 'json', False))
-
-    elif subcmd == "set":
-        key = getattr(args, 'key', None)
-        value = getattr(args, 'value', None)
-        force = bool(getattr(args, 'force', False))
-        if not key or value is None:
-            print("Usage: hermes config set [--force] <key> <value>")
-            print()
-            print("Examples:")
-            print("  hermes config set model anthropic/claude-sonnet-4")
-            print("  hermes config set terminal.backend docker")
-            print("  hermes config set OPENROUTER_API_KEY sk-or-...")
-            print()
-            print("  --force: skip the unknown-key notice for unrecognized keys,")
-            print("           and allow a scalar to replace a whole mapping section")
-            sys.exit(1)
-        set_config_value(key, value, force=force)
-
-    elif subcmd == "unset":
-        key = getattr(args, 'key', None)
-        if not key:
-            print("Usage: hermes config unset <key>")
-            print()
-            print("Examples:")
-            print("  hermes config unset model")
-            print("  hermes config unset terminal.backend")
-            print("  hermes config unset OPENROUTER_API_KEY")
-            sys.exit(1)
-        unset_config_value(key)
-    
-    elif subcmd == "path":
-        print(get_config_path())
-    
-    elif subcmd == "env-path":
-        print(get_env_path())
-    
-    elif subcmd == "migrate":
-        print()
-        print(color("🔄 Checking configuration for updates...", Colors.CYAN, Colors.BOLD))
-        print()
-        
-        # Check what's missing
-        missing_env = get_missing_env_vars(required_only=False)
-        missing_config = get_missing_config_fields()
-        current_ver, latest_ver = check_config_version()
-        
-        if not missing_env and not missing_config and current_ver >= latest_ver:
-            print(color("✓ Configuration is up to date!", Colors.GREEN))
-            print()
-            return
-        
-        # Show what needs to be updated
-        if current_ver < latest_ver:
-            print(f"  Config version: {current_ver} → {latest_ver}")
-        
-        if missing_config:
-            print(f"\n  {len(missing_config)} new config option(s) will be added with defaults")
-        
-        required_missing = [v for v in missing_env if v.get("is_required")]
-        optional_missing = [
-            v for v in missing_env
-            if not v.get("is_required") and not v.get("advanced")
-        ]
-        
-        if required_missing:
-            print(f"\n  ⚠️  {len(required_missing)} required API key(s) missing:")
-            for var in required_missing:
-                print(f"     • {var['name']}")
-        
-        if optional_missing:
-            print(f"\n  ℹ️  {len(optional_missing)} optional API key(s) not configured:")
-            for var in optional_missing:
-                tools = var.get("tools", [])
-                tools_str = f" (enables: {', '.join(tools[:2])})" if tools else ""
-                print(f"     • {var['name']}{tools_str}")
-        
-        print()
-        
-        # Run migration
-        results = migrate_config(interactive=True, quiet=False)
-        
-        print()
-        if results["env_added"] or results["config_added"]:
-            print(color("✓ Configuration updated!", Colors.GREEN))
-        
-        if results["warnings"]:
-            print()
-            for warning in results["warnings"]:
-                print(color(f"  ⚠️  {warning}", Colors.YELLOW))
-        
-        print()
-    
-    elif subcmd == "check":
-        # Non-interactive check for what's missing
-        print()
-        print(color("📋 Configuration Status", Colors.CYAN, Colors.BOLD))
-        print()
-        
-        current_ver, latest_ver = check_config_version()
-        if current_ver >= latest_ver:
-            print(f"  Config version: {current_ver} ✓")
-        else:
-            print(color(f"  Config version: {current_ver} → {latest_ver} (update available)", Colors.YELLOW))
-        
-        print()
-        print(color("  Required:", Colors.BOLD))
-        for var_name in REQUIRED_ENV_VARS:
-            if get_env_value(var_name):
-                print(f"    ✓ {var_name}")
-            else:
-                print(color(f"    ✗ {var_name} (missing)", Colors.RED))
-        
-        print()
-        print(color("  Optional:", Colors.BOLD))
-        for var_name, info in OPTIONAL_ENV_VARS.items():
-            if get_env_value(var_name):
-                print(f"    ✓ {var_name}")
-            else:
-                tools = info.get("tools", [])
-                tools_str = f" → {', '.join(tools[:2])}" if tools else ""
-                print(color(f"    ○ {var_name}{tools_str}", Colors.DIM))
-        
-        missing_config = get_missing_config_fields()
-        if missing_config:
-            print()
-            print(color(f"  {len(missing_config)} new config option(s) available", Colors.YELLOW))
-            print("    Run 'hermes config migrate' to add them")
-        
-        print()
-    
-    else:
-        print(f"Unknown config command: {subcmd}")
-        print()
-        print("Available commands:")
-        print("  hermes config           Show current configuration")
-        print("  hermes config edit      Open config in editor")
-        print("  hermes config get <key>          Print a resolved config value")
-        print("  hermes config set <key> <value>   Set a config value")
-        print("  hermes config unset <key>        Remove a config value")
-        print("  hermes config check     Check for missing/outdated config")
-        print("  hermes config migrate   Update config with new options")
-        print("  hermes config path      Show config file path")
-        print("  hermes config env-path  Show .env file path")
-        sys.exit(1)
 
 
 # ── Profile-driven env var injection ─────────────────────────────────────────

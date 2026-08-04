@@ -16,13 +16,15 @@ Invariants pinned here:
 
 from __future__ import annotations
 
+import pytest
+
 import sys
 import types
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 # Stub optional heavy imports so run_agent imports cleanly in isolation.
 sys.modules.setdefault("fire", types.SimpleNamespace(Fire=lambda *a, **k: None))
-sys.modules.setdefault("firecrawl", types.SimpleNamespace(Firecrawl=object))
 sys.modules.setdefault("fal_client", types.SimpleNamespace())
 
 
@@ -44,6 +46,7 @@ def _build_agent(tmp_path, monkeypatch):
     # Route through the non-streaming _interruptible_api_call path so the
     # monkeypatched fake responses are what the loop consumes.
     agent._disable_streaming = True
+    agent._deferred_provider_runtime = None
     return agent
 
 
@@ -81,17 +84,17 @@ def _truly_empty_response():
     )
 
 
-def test_exhausted_reasoning_only_delivers_labeled_excerpt(tmp_path, monkeypatch):
+@pytest.mark.asyncio
+async def test_exhausted_reasoning_only_delivers_labeled_excerpt(tmp_path, monkeypatch):
     """After the full ladder is exhausted on reasoning-only responses, the
     delivered text is the labeled excerpt — not a bare '(empty)' — while the
     transcript keeps its existing sentinel-scaffolding semantics."""
     agent = _build_agent(tmp_path, monkeypatch)
     monkeypatch.setattr(
-        agent, "_interruptible_api_call",
-        lambda api_kwargs: _reasoning_only_response(),
+        agent, "_execute_model_request", AsyncMock(return_value=_reasoning_only_response())
     )
 
-    result = agent.run_conversation("what is the answer?")
+    result = await agent.run_conversation("what is the answer?")
 
     final = result["final_response"]
     assert "(empty)" != final
@@ -109,17 +112,17 @@ def test_exhausted_reasoning_only_delivers_labeled_excerpt(tmp_path, monkeypatch
     )
 
 
-def test_exhausted_truly_empty_keeps_existing_behavior(tmp_path, monkeypatch):
+@pytest.mark.asyncio
+async def test_exhausted_truly_empty_keeps_existing_behavior(tmp_path, monkeypatch):
     """No reasoning anywhere → behavior unchanged from main: the '(empty)'
     terminal (possibly rewritten by the downstream turn-completion explainer)
     is delivered, and no reasoning excerpt appears."""
     agent = _build_agent(tmp_path, monkeypatch)
     monkeypatch.setattr(
-        agent, "_interruptible_api_call",
-        lambda api_kwargs: _truly_empty_response(),
+        agent, "_execute_model_request", AsyncMock(return_value=_truly_empty_response())
     )
 
-    result = agent.run_conversation("hello?")
+    result = await agent.run_conversation("hello?")
 
     final = result["final_response"]
     # Either the raw sentinel (explainer off) or the explainer's rewrite —
@@ -128,7 +131,8 @@ def test_exhausted_truly_empty_keeps_existing_behavior(tmp_path, monkeypatch):
     assert "only internal reasoning" not in final
 
 
-def test_reasoning_never_promoted_before_ladder_exhaustion(tmp_path, monkeypatch):
+@pytest.mark.asyncio
+async def test_reasoning_never_promoted_before_ladder_exhaustion(tmp_path, monkeypatch):
     """A reasoning-only response must first go through prefill continuation —
     if the model then produces real text, THAT is the answer, and no labeled
     reasoning excerpt appears."""
@@ -151,11 +155,10 @@ def test_reasoning_never_promoted_before_ladder_exhaustion(tmp_path, monkeypatch
         ),
     ]
     monkeypatch.setattr(
-        agent, "_interruptible_api_call",
-        lambda api_kwargs: responses.pop(0),
+        agent, "_execute_model_request", AsyncMock(side_effect=responses)
     )
 
-    result = agent.run_conversation("what is the answer?")
+    result = await agent.run_conversation("what is the answer?")
 
     assert result["final_response"] == "42."
     assert "only internal reasoning" not in result["final_response"]

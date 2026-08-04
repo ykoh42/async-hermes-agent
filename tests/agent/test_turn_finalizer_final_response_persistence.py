@@ -1,6 +1,8 @@
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
+
 from agent.turn_finalizer import finalize_turn
 
 
@@ -77,15 +79,9 @@ class FakeAgent:
     def clear_interrupt(self):
         pass
 
-    def _sync_external_memory_for_turn(self, **_kwargs):
-        pass
 
-
-
-
-
-
-def test_final_response_closes_tool_tail_before_persistence(monkeypatch):
+@pytest.mark.asyncio
+async def test_final_response_closes_tool_tail_before_persistence(monkeypatch):
     """A recovered/previewed final response must be durable in session history.
 
     Regression for turns where the caller receives a non-empty final_response,
@@ -107,7 +103,7 @@ def test_final_response_closes_tool_tail_before_persistence(monkeypatch):
         {"role": "tool", "tool_call_id": "call-1", "name": "terminal", "content": "ok"},
     ]
 
-    result = finalize_turn(
+    result = await finalize_turn(
         agent,
         final_response="Done.",
         api_call_count=2,
@@ -128,7 +124,8 @@ def test_final_response_closes_tool_tail_before_persistence(monkeypatch):
     assert agent.persisted_messages[-1] == {"role": "assistant", "content": "Done."}
 
 
-def test_final_response_fills_pure_tool_call_tail(monkeypatch):
+@pytest.mark.asyncio
+async def test_final_response_fills_pure_tool_call_tail(monkeypatch):
     """A tail assistant row that is a *pure tool-call turn* carries no answer.
 
     The role check alone ("tail is assistant ⇒ nothing to do") leaves the
@@ -151,7 +148,7 @@ def test_final_response_fills_pure_tool_call_tail(monkeypatch):
         },
     ]
 
-    result = finalize_turn(
+    result = await finalize_turn(
         agent,
         final_response="Here is your answer.",
         api_call_count=3,
@@ -176,50 +173,3 @@ def test_final_response_fills_pure_tool_call_tail(monkeypatch):
     assert persisted[-1]["content"] == "Here is your answer."
     assert persisted[-1]["tool_calls"]
     assert sum(1 for m in persisted if m.get("role") == "assistant") == 1
-
-
-
-
-
-
-def test_final_response_fill_invalidates_flush_scan_cursor():
-    """The fill's marker pop must invalidate the bounded flush-scan cursor.
-
-    The cursor (run_agent.py) skips the identity-matched prefix of its
-    previous snapshot assuming no live dict loses ``_db_persisted`` in place
-    — the fill is the one path that pops it. Without invalidation, the
-    turn-end flush skips the filled row as 'already stamped' and the
-    delivered answer never reaches state.db (the #43849 class resurfacing).
-    """
-    agent = FakeAgent()
-    agent._db_flush_scan_prefix = ["prior-snapshot"]
-    messages = [
-        {"role": "user", "content": "q"},
-        {
-            "role": "assistant",
-            "content": "",
-            "tool_calls": [
-                {"id": "t1", "type": "function",
-                 "function": {"name": "f", "arguments": "{}"}}
-            ],
-            "_db_persisted": True,
-        },
-    ]
-
-    finalize_turn(
-        agent,
-        final_response="Here is your answer.",
-        api_call_count=3,
-        interrupted=False,
-        failed=False,
-        messages=messages,
-        conversation_history=[],
-        effective_task_id="t",
-        turn_id="tid",
-        user_message="q",
-        original_user_message="q",
-        _should_review_memory=False,
-        _turn_exit_reason="text_response(final)",
-    )
-
-    assert agent._db_flush_scan_prefix is None

@@ -16,6 +16,7 @@ with real file I/O against a temp HERMES_HOME — no mocks on the write path.
 from __future__ import annotations
 
 import json
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -28,22 +29,16 @@ def _enable_traces(tmp_path, monkeypatch):
     hermes_home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
 
-    # save_moa_turn reads config via hermes_cli.config.load_config; stub it to
+    # save_moa_turn reads config via the native async loader; stub it to
     # return traces-on so the test doesn't depend on a real config file.
     import agent.moa_trace as moa_trace
 
-    monkeypatch.setattr(
-        moa_trace,
-        "load_config",
-        lambda: {"moa": {"save_traces": True}},
-        raising=False,
-    )
-    # load_config is imported lazily inside _traces_enabled_and_dir; patch the
-    # source module attribute it imports from as well.
     import hermes_cli.config as cfg
 
     monkeypatch.setattr(
-        cfg, "load_config", lambda: {"moa": {"save_traces": True}}, raising=False
+        cfg,
+        "load_config_readonly",
+        AsyncMock(return_value={"moa": {"save_traces": True}}),
     )
     return hermes_home / "moa-traces"
 
@@ -82,12 +77,13 @@ def _read_single_trace(trace_dir, session_id):
 
 
 
-def test_streamed_without_fallback_points_to_session_db(tmp_path, monkeypatch):
+@pytest.mark.asyncio
+async def test_streamed_without_fallback_points_to_session_db(tmp_path, monkeypatch):
     """Streaming turn with no resolvable text falls back to the state.db pointer."""
     trace_dir = _enable_traces(tmp_path, monkeypatch)
     mc = _make_completions_with_pending(streamed=True, inline_output=None)
 
-    mc.consume_and_save_trace("sess_nofb", aggregator_output_fallback=None)
+    await mc.consume_and_save_trace("sess_nofb", aggregator_output_fallback=None)
 
     rec = _read_single_trace(trace_dir, "sess_nofb")
     agg = rec["aggregator"]
@@ -96,17 +92,16 @@ def test_streamed_without_fallback_points_to_session_db(tmp_path, monkeypatch):
     assert agg["output_location"] == "assistant_message_in_session_db"
 
 
-def test_pending_trace_cleared_after_flush(tmp_path, monkeypatch):
+@pytest.mark.asyncio
+async def test_pending_trace_cleared_after_flush(tmp_path, monkeypatch):
     """A second flush is a no-op (pending cleared) — never double-writes."""
     trace_dir = _enable_traces(tmp_path, monkeypatch)
     mc = _make_completions_with_pending(streamed=True, inline_output=None)
 
-    mc.consume_and_save_trace("sess_once", aggregator_output_fallback="x")
+    await mc.consume_and_save_trace("sess_once", aggregator_output_fallback="x")
     # Second call: pending is None now, must not append a second line.
-    mc.consume_and_save_trace("sess_once", aggregator_output_fallback="y")
+    await mc.consume_and_save_trace("sess_once", aggregator_output_fallback="y")
 
     path = trace_dir / "sess_once.jsonl"
     lines = path.read_text().strip().split("\n")
     assert len(lines) == 1
-
-

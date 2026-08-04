@@ -111,7 +111,7 @@ class TestBackstopWrapper:
         tools = [
             "terminal", "read_file", "write_file", "search_files", "patch",
             "browser_navigate", "web_search", "web_extract", "delegate_task",
-            "execute_code", "skill_view", "vision_analyze", "memory",
+            "skill_view", "vision_analyze", "memory",
             "cronjob", "process", "totally_unknown_tool",
         ]
         keys = ["command", "path", "content", "pattern", "url", "query",
@@ -159,4 +159,3 @@ class TestDisplayPreviewTypeSafety:
         from agent.display import build_tool_preview
         result = build_tool_preview("process", {"action": None, "session_id": "abc"})
         assert isinstance(result, str)
-

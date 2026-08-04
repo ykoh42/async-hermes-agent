@@ -7,7 +7,9 @@ Reported: "switched from openrouter provider to anthropic api key via hermes
 model and the tui keeps trying openrouter".
 """
 
-from unittest.mock import MagicMock, patch
+import pytest
+
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from run_agent import AIAgent
 
@@ -33,18 +35,25 @@ def _make_agent(chain):
     agent._fallback_index = 0
     agent._fallback_chain = list(chain)
     agent._fallback_model = chain[0] if chain else None
+    agent._runtime_config_loaded = True
 
     return agent
 
 
-def _switch_to_anthropic(agent):
-    with (
-        patch("agent.anthropic_adapter.build_anthropic_client", return_value=MagicMock()),
-        patch("agent.anthropic_adapter.resolve_anthropic_token", return_value="sk-ant-xyz"),
-        patch("agent.anthropic_adapter._is_oauth_token", return_value=False),
-        patch("hermes_cli.timeouts.get_provider_request_timeout", return_value=None),
-    ):
-        agent.switch_model(
+async def _switch_to_anthropic(agent):
+    async def initialize_runtime():
+        pending = agent._deferred_provider_runtime
+        agent.provider = agent.requested_provider = pending["provider"]
+        agent.model = pending["model"]
+        agent.api_key = pending["api_key"]
+        agent.base_url = pending["base_url"]
+        agent.api_mode = pending["api_mode"]
+        agent._deferred_provider_runtime = None
+
+    agent._ensure_provider_runtime = AsyncMock(side_effect=initialize_runtime)
+    agent._persist_pending_billing_route = AsyncMock()
+    with patch("hermes_cli.config.load_config_readonly", new_callable=AsyncMock, return_value={}):
+        await agent.switch_model(
             new_model="claude-sonnet-4-5",
             new_provider="anthropic",
             api_key="sk-ant-xyz",
@@ -53,13 +62,14 @@ def _switch_to_anthropic(agent):
         )
 
 
-def test_switch_drops_old_primary_from_fallback_chain():
+@pytest.mark.asyncio
+async def test_switch_drops_old_primary_from_fallback_chain():
     agent = _make_agent([
         {"provider": "openrouter", "model": "x-ai/grok-4"},
         {"provider": "nous", "model": "hermes-4"},
     ])
 
-    _switch_to_anthropic(agent)
+    await _switch_to_anthropic(agent)
 
     providers = [entry["provider"] for entry in agent._fallback_chain]
 
@@ -69,10 +79,11 @@ def test_switch_drops_old_primary_from_fallback_chain():
     assert agent._fallback_model == {"provider": "nous", "model": "hermes-4"}
 
 
-def test_switch_with_empty_chain_stays_empty():
+@pytest.mark.asyncio
+async def test_switch_with_empty_chain_stays_empty():
     agent = _make_agent([])
 
-    _switch_to_anthropic(agent)
+    await _switch_to_anthropic(agent)
 
     assert agent._fallback_chain == []
     assert agent._fallback_model is None
@@ -80,12 +91,13 @@ def test_switch_with_empty_chain_stays_empty():
 
 
 
-def test_switch_within_same_provider_preserves_chain():
+@pytest.mark.asyncio
+async def test_switch_within_same_provider_preserves_chain():
     chain = [{"provider": "openrouter", "model": "x-ai/grok-4"}]
     agent = _make_agent(chain)
 
     with patch("hermes_cli.timeouts.get_provider_request_timeout", return_value=None):
-        agent.switch_model(
+        await agent.switch_model(
             new_model="openai/gpt-5",
             new_provider="openrouter",
             api_key="or-key",

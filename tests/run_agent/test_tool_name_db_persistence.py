@@ -3,7 +3,9 @@
 make_tool_result_message() sets tool_name on every tool-result dict at construction
 time. This test verifies that the value survives the flush path into the session DB.
 """
-from unittest.mock import MagicMock, patch
+
+import pytest
+from unittest.mock import patch
 
 from run_agent import AIAgent
 from agent.tool_dispatch_helpers import make_tool_result_message
@@ -25,21 +27,25 @@ def _make_agent(session_db):
         )
 
 
-def test_tool_name_persisted_to_session_db():
+@pytest.mark.asyncio
+async def test_tool_name_persisted_to_session_db(tmp_path):
     """tool_name set by make_tool_result_message must be passed through to
-    the batched flush so the column is populated on first write to the
-    session DB."""
-    session_db = MagicMock()
+    append_message so the column is populated on first flush to the session DB."""
+    from hermes_state import SessionDB
+
+    session_db = SessionDB(tmp_path / "state.db")
     agent = _make_agent(session_db)
+    try:
+        messages = [
+            {"role": "user", "content": "run a command"},
+            make_tool_result_message("terminal", "$ ls\nfile.txt", "c1"),
+        ]
+        await agent._flush_messages_to_session_db(messages)
 
-    messages = [
-        {"role": "user", "content": "run a command"},
-        make_tool_result_message("terminal", "$ ls\nfile.txt", "c1"),
-    ]
-    agent._flush_messages_to_session_db(messages)
-
-    assert session_db.append_messages_batch.call_count == 1
-    batch = session_db.append_messages_batch.call_args.kwargs["messages"]
-    tool_rows = [m for m in batch if m.get("role") == "tool"]
-    assert len(tool_rows) == 1
-    assert tool_rows[0]["tool_name"] == "terminal"
+        stored = await session_db.get_messages(agent.session_id)
+        tool_messages = [message for message in stored if message["role"] == "tool"]
+        assert len(tool_messages) == 1
+        assert tool_messages[0]["tool_name"] == "terminal"
+    finally:
+        await agent.close()
+        await session_db.close()

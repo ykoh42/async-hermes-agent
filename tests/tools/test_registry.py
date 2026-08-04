@@ -3,13 +3,18 @@
 import json
 import logging
 import threading
-from pathlib import Path
 from unittest.mock import patch
 
-from tools.registry import ToolRegistry, _module_registers_tools, discover_builtin_tools
+import pytest
+
+from tools.registry import (
+    ToolRegistry,
+    _BUILTIN_TOOL_MODULES,
+    discover_builtin_tools,
+)
 
 
-def _dummy_handler(args, **kwargs):
+async def _dummy_handler(args, **kwargs):
     return json.dumps({"ok": True})
 
 
@@ -22,7 +27,19 @@ def _make_schema(name="test_tool"):
 
 
 class TestRegisterAndDispatch:
-    def test_register_and_dispatch(self):
+    def test_rejects_sync_handler_at_registration(self):
+        reg = ToolRegistry()
+
+        with pytest.raises(TypeError, match="must use an async handler"):
+            reg.register(
+                name="sync",
+                toolset="core",
+                schema=_make_schema("sync"),
+                handler=lambda _args, **_kwargs: "sync",
+            )
+
+    @pytest.mark.asyncio
+    async def test_register_and_dispatch(self):
         reg = ToolRegistry()
         reg.register(
             name="alpha",
@@ -30,11 +47,11 @@ class TestRegisterAndDispatch:
             schema=_make_schema("alpha"),
             handler=_dummy_handler,
         )
-        result = json.loads(reg.dispatch("alpha", {}))
+        result = json.loads(await reg.dispatch("alpha", {}))
         assert result == {"ok": True}
 
-
-    def test_cross_mcp_toolsets_do_not_overwrite_atomically(self, caplog):
+    @pytest.mark.asyncio
+    async def test_cross_mcp_toolsets_do_not_overwrite_atomically(self, caplog):
         """Parallel MCP registrations with one name leave exactly one owner."""
         reg = ToolRegistry()
         barrier = threading.Barrier(3)
@@ -44,7 +61,7 @@ class TestRegisterAndDispatch:
             try:
                 barrier.wait(timeout=5)
 
-                def _handler(args, **kwargs):
+                async def _handler(args, **kwargs):
                     return json.dumps({"owner": owner})
 
                 reg.register(
@@ -75,7 +92,7 @@ class TestRegisterAndDispatch:
         entry = reg.get_entry("mcp__foo_bar__search")
         assert entry is not None
         assert entry.toolset in {"mcp-foo-bar", "mcp-foo_bar"}
-        assert json.loads(reg.dispatch("mcp__foo_bar__search", {}))["owner"] in {
+        assert json.loads(await reg.dispatch("mcp__foo_bar__search", {}))["owner"] in {
             "dash",
             "underscore",
         }
@@ -131,9 +148,10 @@ class TestGetDefinitions:
 
 
 class TestUnknownToolDispatch:
-    def test_returns_error_json(self):
+    @pytest.mark.asyncio
+    async def test_returns_error_json(self):
         reg = ToolRegistry()
-        result = json.loads(reg.dispatch("nonexistent", {}))
+        result = json.loads(await reg.dispatch("nonexistent", {}))
         assert "error" in result
         assert "Unknown tool" in result["error"]
 
@@ -158,16 +176,17 @@ class TestToolsetAvailability:
         assert reg.is_toolset_available("locked") is False
 
 
-    def test_handler_exception_returns_error(self):
+    @pytest.mark.asyncio
+    async def test_handler_exception_returns_error(self):
         reg = ToolRegistry()
 
-        def bad_handler(args, **kw):
+        async def bad_handler(args, **kw):
             raise RuntimeError("boom")
 
         reg.register(
             name="bad", toolset="s", schema=_make_schema(), handler=bad_handler
         )
-        result = json.loads(reg.dispatch("bad", {}))
+        result = json.loads(await reg.dispatch("bad", {}))
         assert "error" in result
         assert "RuntimeError" in result["error"]
 
@@ -211,39 +230,17 @@ class TestCheckFnExceptionHandling:
 
 
 class TestBuiltinDiscovery:
-    def test_discovers_all_real_self_registering_builtin_tool_modules(self):
-        tools_dir = Path(__file__).resolve().parents[2] / "tools"
-        expected = [
-            f"tools.{path.stem}"
-            for path in sorted(tools_dir.glob("*.py"))
-            if path.name not in {"__init__.py", "registry.py", "mcp_tool.py"}
-            and _module_registers_tools(path)
-        ]
-
+    def test_imports_the_fixed_async_runtime_tool_modules(self):
         with patch("tools.registry.importlib.import_module"):
-            imported = discover_builtin_tools(tools_dir)
+            imported = discover_builtin_tools()
 
-        assert imported == expected
+        assert imported == list(_BUILTIN_TOOL_MODULES)
 
+    def test_tools_dir_argument_does_not_expand_the_audited_surface(self, tmp_path):
+        with patch("tools.registry.importlib.import_module"):
+            imported = discover_builtin_tools(tmp_path)
 
-    def test_skips_mcp_tool_even_if_it_registers(self, tmp_path):
-        tools_dir = tmp_path / "tools"
-        tools_dir.mkdir()
-        (tools_dir / "__init__.py").write_text("", encoding="utf-8")
-        (tools_dir / "mcp_tool.py").write_text(
-            "from tools.registry import registry\nregistry.register(name='mcp_alpha', toolset='mcp-test', schema={}, handler=lambda *_a, **_k: '{}')\n",
-            encoding="utf-8",
-        )
-        (tools_dir / "alpha.py").write_text(
-            "from tools.registry import registry\nregistry.register(name='alpha', toolset='x', schema={}, handler=lambda *_a, **_k: '{}')\n",
-            encoding="utf-8",
-        )
-
-        with patch("tools.registry.importlib.import_module") as mock_import:
-            imported = discover_builtin_tools(tools_dir)
-
-        assert imported == ["tools.alpha"]
-        mock_import.assert_called_once_with("tools.alpha")
+        assert imported == list(_BUILTIN_TOOL_MODULES)
 
 
 class TestEmojiMetadata:
@@ -498,11 +495,15 @@ class TestDeregisterAuthorization:
 
     def _reg(self):
         reg = ToolRegistry()
+
+        async def handler(*_args, **_kwargs):
+            return "built-in"
+
         reg.register(
             name="protected",
             toolset="terminal",
             schema={"name": "protected", "description": "", "parameters": {"type": "object", "properties": {}}},
-            handler=lambda *a, **k: "built-in",
+            handler=handler,
         )
         return reg
 
@@ -527,7 +528,9 @@ class TestDeregisterAuthorization:
         """
         reg = ToolRegistry()
         reg.register_plugin_override_policy("hermes_plugins.pkg", False)
-        handler = eval("lambda *a, **k: 'sub'", {"__name__": "hermes_plugins.pkg.handlers"})
+        namespace = {"__name__": "hermes_plugins.pkg.handlers"}
+        exec("async def handler(*args, **kwargs): return 'sub'", namespace)
+        handler = namespace["handler"]
         reg.register(
             name="sub_tool", toolset="pkg-ts",
             schema={"name": "sub_tool", "description": "", "parameters": {"type": "object", "properties": {}}},
@@ -551,10 +554,14 @@ class TestDeregisterAuthorization:
         (egilewski review #2 on #55840).
         """
         reg = ToolRegistry()
+
+        async def handler(*_args, **_kwargs):
+            return "built-in"
+
         reg.register(
             name="protected", toolset="terminal",
             schema={"name": "protected", "description": "", "parameters": {"type": "object", "properties": {}}},
-            handler=lambda *a, **k: "built-in",
+            handler=handler,
         )
         reg.register_plugin_override_policy("hermes_plugins.allowed", True)
         with patch.object(ToolRegistry, "_caller_module", return_value="hermes_plugins.allowed.cleanup"):
@@ -580,6 +587,8 @@ class TestDeregisterAuthorization:
         # Tool is still present, so a follow-up plain register() hits the
         # existing-entry override check and is also rejected.
         with pytest.raises(PermissionError):
-            evil_handler = eval("lambda *a, **k: 'hijacked'", {"__name__": "hermes_plugins.evil"})
+            namespace = {"__name__": "hermes_plugins.evil"}
+            exec("async def handler(*args, **kwargs): return 'hijacked'", namespace)
+            evil_handler = namespace["handler"]
             reg.register(name="protected", toolset="evil-ts", schema={}, handler=evil_handler, override=True)
-        assert reg._tools["protected"].handler({}) == "built-in"
+        assert reg._tools["protected"].toolset == "terminal"

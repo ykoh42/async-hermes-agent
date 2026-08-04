@@ -7,6 +7,7 @@ sessions; plugins must obtain it from ``PluginContext.subagent_lifecycle``.
 
 from __future__ import annotations
 
+import asyncio
 import contextvars
 import dataclasses
 import enum
@@ -18,7 +19,6 @@ import secrets
 import threading
 import time
 from contextlib import contextmanager
-from concurrent.futures import Future, TimeoutError
 from typing import Any, Callable, Mapping, Optional
 
 from agent.interrupt_compat import request_hard_interrupt
@@ -141,7 +141,7 @@ class _Record:
     state: SubagentState
     updated_at: float
     agent: Any = None
-    future: Optional[Future] = None
+    future: Optional[asyncio.Task[None]] = None
     started_at: Optional[float] = None
     completed_at: Optional[float] = None
     result: Optional[SubagentResult] = None
@@ -157,12 +157,6 @@ class _Registry:
 
 
 _REGISTRY = _Registry()
-# Daemon worker pool: a wedged/abandoned child must never block interpreter
-# exit at atexit-join time (same rationale as _run_single_child's timeout
-# executor and the async-delegation registry pool).
-from tools.daemon_pool import DaemonThreadPoolExecutor as _DaemonExecutor
-
-_EXECUTOR = _DaemonExecutor(max_workers=8, thread_name_prefix="hermes-lifecycle")
 _SECRET = secrets.token_bytes(32)
 _ACTIVE_PARENT_AGENT: contextvars.ContextVar[Any] = contextvars.ContextVar(
     "hermes_subagent_lifecycle_parent", default=None
@@ -195,7 +189,7 @@ class SubagentLifecycleService:
     def __init__(self, parent_agent_resolver: Callable[[], Any]) -> None:
         self._parent_agent_resolver = parent_agent_resolver
 
-    def launch(self, request: SubagentLaunchRequest) -> SubagentHandle:
+    async def launch(self, request: SubagentLaunchRequest) -> SubagentHandle:
         parent = self._parent_agent_resolver()
         if parent is None:
             raise SubagentLifecycleError(
@@ -218,11 +212,11 @@ class SubagentLifecycleService:
         # Delegate construction remains internal so plugin code never imports
         # private delegation helpers or manipulates the active-child registry.
         from tools.delegate_tool import (
-            _build_child_preserving_parent_tools,
+            _build_child_agent,
             DEFAULT_MAX_ITERATIONS,
         )
 
-        child = _build_child_preserving_parent_tools(
+        child = await _build_child_agent(
             task_index=0,
             goal=request.goal,
             context=request.context,
@@ -256,7 +250,10 @@ class SubagentLifecycleService:
             _REGISTRY.records[subagent_id] = record
             if request.correlation_id:
                 _REGISTRY.correlations[correlation_key] = subagent_id
-        record.future = _EXECUTOR.submit(self._run, record, request.goal, parent)
+        record.future = asyncio.create_task(
+            self._run(record, request.goal, parent),
+            name=f"subagent-lifecycle-{subagent_id}",
+        )
         return handle
 
     def status(self, handle: SubagentHandle) -> SubagentStatus:
@@ -268,7 +265,7 @@ class SubagentLifecycleService:
         with _REGISTRY.lock:
             return SubagentStatus(record.handle, record.state, record.updated_at)
 
-    def wait(
+    async def wait(
         self, handle: SubagentHandle, *, timeout_seconds: Optional[float] = None
     ) -> SubagentTerminalState:
         record = self._record(handle)
@@ -279,7 +276,11 @@ class SubagentLifecycleService:
         future = record.future
         if future is not None:
             try:
-                future.result(timeout=timeout_seconds)
+                if timeout_seconds is None:
+                    await asyncio.shield(future)
+                else:
+                    async with asyncio.timeout(timeout_seconds):
+                        await asyncio.shield(future)
             except TimeoutError:
                 return SubagentTerminalState(record.handle, record.state, False, True)
             except Exception:
@@ -405,7 +406,7 @@ class SubagentLifecycleService:
                     None,
                 )
 
-    def _run(self, record: _Record, goal: str, parent: Any) -> None:
+    async def _run(self, record: _Record, goal: str, parent: Any) -> None:
         with _REGISTRY.lock:
             if record.state is not SubagentState.CANCEL_REQUESTED:
                 record.state = SubagentState.RUNNING
@@ -414,7 +415,7 @@ class SubagentLifecycleService:
         try:
             from tools.delegate_tool import _run_child_lifecycle
 
-            raw = _run_child_lifecycle(0, goal, record.agent, parent)
+            raw = await _run_child_lifecycle(0, goal, record.agent, parent)
             status = (
                 str(raw.get("status", "error")) if isinstance(raw, dict) else "error"
             )

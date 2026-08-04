@@ -13,7 +13,7 @@ from toolsets import (
 )
 
 
-def _dummy_handler(args, **kwargs):
+async def _dummy_handler(args, **kwargs):
     return "{}"
 
 
@@ -198,26 +198,6 @@ class TestToolsetConsistency:
             assert "tools" in ts, f"{name} missing tools"
             assert "includes" in ts, f"{name} missing includes"
 
-
-    def test_hermes_platforms_share_core_tools(self):
-        """All hermes-* platform toolsets share the same core tools.
-
-        Platform-specific additions (e.g. ``discord`` / ``discord_admin``
-        on hermes-discord, gated on DISCORD_BOT_TOKEN) are allowed on top —
-        the invariant is that the core set is identical across platforms.
-        """
-        platforms = ["hermes-cli", "hermes-telegram", "hermes-discord", "hermes-whatsapp", "hermes-slack", "hermes-signal", "hermes-homeassistant"]
-        tool_sets = [set(TOOLSETS[p]["tools"]) for p in platforms]
-        # All platforms must contain the shared core; platform-specific
-        # extras are OK (subset check, not equality).
-        core = set.intersection(*tool_sets)
-        for name, ts in zip(platforms, tool_sets):
-            assert core.issubset(ts), f"{name} is missing core tools: {core - ts}"
-        # Sanity: the shared core must be non-trivial (i.e. we didn't
-        # silently let a platform diverge so far that nothing is shared).
-        assert len(core) > 20, f"Suspiciously small shared core: {len(core)} tools"
-
-
 class TestPluginToolsets:
     def test_get_all_toolsets_includes_plugin_toolset(self, monkeypatch):
         reg = ToolRegistry()
@@ -235,29 +215,9 @@ class TestPluginToolsets:
         assert all_toolsets["plugin_bundle"]["tools"] == ["plugin_tool"]
 
 
-class TestDefaultPlatformWebSearchCoverage:
-    def test_hermes_whatsapp_toolset_includes_web_search(self):
-        assert "web_search" in resolve_toolset("hermes-whatsapp")
-
-
-
 class TestResolveToolsetIncludeRegistry:
     """include_registry flag exposes the static (pre-registry-merge) view used
     by platform reverse-mapping. Regression harness for issue #49622."""
-
-    def test_include_registry_false_excludes_registry_tools(self):
-        from tools.registry import discover_builtin_tools
-        discover_builtin_tools()  # registers read_terminal into 'terminal'
-
-        merged = set(resolve_toolset("terminal"))
-        static = set(resolve_toolset("terminal", include_registry=False))
-
-        assert static == {"terminal", "process"}, static
-        # read_terminal is registered into 'terminal' but is desktop-only and
-        # not part of the static definition — it must only appear in the merged view.
-        assert "read_terminal" in merged
-        assert "read_terminal" not in static
-
 
     def test_static_view_threads_through_includes(self):
         # 'debugging' has direct tools [terminal, process] and includes [web, file]

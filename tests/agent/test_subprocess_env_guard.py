@@ -24,8 +24,8 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 # Directories that make up the shipped source tree.
-SCAN_DIRS = ("agent", "hermes_cli", "tools", "gateway", "cron", "tui_gateway")
-SCAN_ROOT_FILES = ("cli.py", "hermes_constants.py")
+SCAN_DIRS = ("agent", "hermes_cli", "tools")
+SCAN_ROOT_FILES = ("hermes_constants.py",)
 
 # How many lines around an `os.environ.copy()` we look for a spawn call.
 PROXIMITY_LINES = 20

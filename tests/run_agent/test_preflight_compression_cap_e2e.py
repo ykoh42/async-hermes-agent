@@ -21,7 +21,9 @@ import contextlib
 import io
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, patch
+
+import pytest
 
 from hermes_state import SessionDB
 from run_agent import AIAgent
@@ -54,7 +56,7 @@ def _stop_response():
     return SimpleNamespace(choices=[choice], model="test/model", usage=None)
 
 
-def _make_agent(monkeypatch, tmp_path: Path, *, max_attempts) -> AIAgent:
+async def _make_agent(monkeypatch, tmp_path: Path, *, max_attempts):
     from hermes_cli import config as config_mod
 
     monkeypatch.setattr(
@@ -62,10 +64,12 @@ def _make_agent(monkeypatch, tmp_path: Path, *, max_attempts) -> AIAgent:
     )
 
     monkeypatch.setattr(
-        config_mod, "load_config_readonly", lambda: _config(max_attempts)
+        config_mod,
+        "load_config_readonly",
+        AsyncMock(return_value=_config(max_attempts)),
 
     )
-    db = SessionDB(db_path=tmp_path / "state.db")
+    db = SessionDB(tmp_path / "state.db")
     with (
         contextlib.redirect_stdout(io.StringIO()),
         patch("run_agent.get_tool_definitions", return_value=[]),
@@ -84,17 +88,18 @@ def _make_agent(monkeypatch, tmp_path: Path, *, max_attempts) -> AIAgent:
             session_db=db,
             session_id="preflight-cap-e2e",
         )
-    agent.client = MagicMock()
     agent._cached_system_prompt = "You are helpful."
     agent._use_prompt_caching = False
     agent._disable_streaming = True
     agent.tool_delay = 0
     agent.save_trajectories = False
-    return agent
+    await agent._ensure_provider_runtime()
+    return agent, db
 
 
-def test_preflight_runs_fourth_compaction_pass_at_cap_six(monkeypatch, tmp_path):
-    agent = _make_agent(monkeypatch, tmp_path, max_attempts=6)
+@pytest.mark.asyncio
+async def test_preflight_runs_fourth_compaction_pass_at_cap_six(monkeypatch, tmp_path):
+    agent, db = await _make_agent(monkeypatch, tmp_path, max_attempts=6)
     # Config-driven attach seam (agent_init) resolved the raised cap.
     assert agent.max_compression_attempts == 6
 
@@ -113,7 +118,7 @@ def test_preflight_runs_fourth_compaction_pass_at_cap_six(monkeypatch, tmp_path)
 
     compress_calls = []
 
-    def _fake_compress(messages, system_message, **_kwargs):
+    async def _fake_compress(messages, system_message, **_kwargs):
         compress_calls.append(len(messages))
         return messages, "compressed prompt"
 
@@ -123,19 +128,18 @@ def test_preflight_runs_fourth_compaction_pass_at_cap_six(monkeypatch, tmp_path)
         {"role": "user" if i % 2 == 0 else "assistant", "content": f"msg {i}"}
         for i in range(60)
     ]
-    agent.client.chat.completions.create.return_value = _stop_response()
-
     with (
         patch(
             "agent.turn_context.estimate_request_tokens_rough",
             side_effect=_shrinking_estimate,
         ),
         patch.object(agent, "_compress_context", side_effect=_fake_compress),
-        patch.object(agent, "_persist_session"),
-        patch.object(agent, "_save_trajectory"),
-        patch.object(agent, "_cleanup_task_resources"),
+        patch.object(agent, "_execute_model_request", AsyncMock(return_value=_stop_response())),
+        patch.object(agent, "_persist_session", AsyncMock()),
+        patch.object(agent, "_save_trajectory", AsyncMock()),
+        patch.object(agent, "_cleanup_task_resources", AsyncMock()),
     ):
-        result = agent.run_conversation("hello", conversation_history=history)
+        result = await agent.run_conversation("hello", conversation_history=history)
 
     assert result["completed"] is True
     # The old hardcoded range(3) made a 4th pass impossible; cap=6 must
@@ -145,5 +149,5 @@ def test_preflight_runs_fourth_compaction_pass_at_cap_six(monkeypatch, tmp_path)
         f"got {len(compress_calls)} passes"
     )
     assert len(compress_calls) == 6
-
-
+    await agent.close()
+    await db.close()

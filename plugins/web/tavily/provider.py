@@ -6,7 +6,7 @@ capabilities advertised:
 - ``supports_search()``  -> True (Tavily ``/search``)
 - ``supports_extract()`` -> True (Tavily ``/extract``)
 
-Both are sync — the underlying call is ``httpx.post(...)``.
+Both use the native async ``httpx.AsyncClient`` transport.
 
 Config keys this provider responds to::
 
@@ -32,7 +32,7 @@ from agent.web_search_provider import WebSearchProvider
 logger = logging.getLogger(__name__)
 
 
-def _tavily_request(endpoint: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+async def _tavily_request(endpoint: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     """POST to the Tavily API and return the parsed JSON response.
 
     Mirrors :func:`tools.web_tools._tavily_request`. Raises ``ValueError``
@@ -56,9 +56,10 @@ def _tavily_request(endpoint: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     url = f"{base_url}/{endpoint.lstrip('/')}"
     logger.info("Tavily %s request to %s", endpoint, url)
 
-    response = httpx.post(url, json=payload, timeout=60)
-    response.raise_for_status()
-    return response.json()
+    async with httpx.AsyncClient(timeout=60) as client:
+        response = await client.post(url, json=payload)
+        response.raise_for_status()
+        return response.json()
 
 
 def _normalize_tavily_search_results(response: Dict[str, Any]) -> Dict[str, Any]:
@@ -150,7 +151,7 @@ class TavilyWebSearchProvider(WebSearchProvider):
     def supports_extract(self) -> bool:
         return True
 
-    def search(self, query: str, limit: int = 5) -> Dict[str, Any]:
+    async def search(self, query: str, limit: int = 5) -> Dict[str, Any]:
         """Execute a Tavily search."""
         try:
             from tools.interrupt import is_interrupted
@@ -159,7 +160,7 @@ class TavilyWebSearchProvider(WebSearchProvider):
                 return {"success": False, "error": "Interrupted"}
 
             logger.info("Tavily search: '%s' (limit=%d)", query, limit)
-            raw = _tavily_request(
+            raw = await _tavily_request(
                 "search",
                 {
                     "query": query,
@@ -175,10 +176,10 @@ class TavilyWebSearchProvider(WebSearchProvider):
             logger.warning("Tavily search error: %s", exc)
             return {"success": False, "error": f"Tavily search failed: {exc}"}
 
-    def extract(self, urls: List[str], **kwargs: Any) -> List[Dict[str, Any]]:
+    async def extract(self, urls: List[str], **kwargs: Any) -> List[Dict[str, Any]]:
         """Extract content from one or more URLs via Tavily.
 
-        Sync — the underlying call is httpx.post(...). Returns the legacy
+        Uses native async HTTP and returns the legacy
         list-of-results shape; per-URL failures become items with ``error``.
         """
         try:
@@ -190,7 +191,7 @@ class TavilyWebSearchProvider(WebSearchProvider):
                 ]
 
             logger.info("Tavily extract: %d URL(s)", len(urls))
-            raw = _tavily_request(
+            raw = await _tavily_request(
                 "extract",
                 {
                     "urls": urls,

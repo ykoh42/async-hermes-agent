@@ -16,7 +16,7 @@ defensive mismatch guard in ``recover_with_credential_pool`` intact while
 making it impossible for a legitimate same-call switch to trip the guard.
 """
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -36,6 +36,7 @@ def _make_agent(current_provider, current_model, current_pool):
     """
     agent = MagicMock(name=f"Agent[{current_provider}]")
     agent.provider = current_provider
+    agent.requested_provider = current_provider
     agent.model = current_model
     agent.base_url = f"https://{current_provider}.example/v1"
     agent.api_key = f"{current_provider}-key"
@@ -61,9 +62,31 @@ def _make_agent(current_provider, current_model, current_pool):
     agent._fallback_chain = []
     agent._fallback_model = None
     agent._credential_pool = current_pool
+    agent._credential_pool_entry_id = None
+    agent.reasoning_config = None
+    agent._anthropic_client_source = None
     # Real-ish instance methods that switch_model calls
     agent._anthropic_prompt_cache_policy = MagicMock(return_value=(False, False))
     agent._ensure_lmstudio_runtime_loaded = MagicMock()
+    agent._persist_pending_billing_route = AsyncMock()
+
+    async def ensure_provider_runtime():
+        pending = agent._deferred_provider_runtime
+        agent.provider = pending["provider"]
+        agent.requested_provider = pending["provider"]
+        agent.model = pending["model"]
+        agent.base_url = pending["base_url"]
+        agent.api_key = pending["api_key"]
+        agent.api_mode = pending["api_mode"]
+        agent.client = MagicMock(name=f"Client[{agent.provider}]")
+        agent._client_kwargs = {
+            "api_key": agent.api_key,
+            "base_url": agent.base_url,
+        }
+        agent._deferred_provider_runtime = None
+        return True
+
+    agent._ensure_provider_runtime = ensure_provider_runtime
     return agent
 
 
@@ -81,7 +104,8 @@ def _make_pool(provider):
 class TestSwitchModelReloadsCredentialPool:
     """Issue #52727: switch_model must refresh _credential_pool on provider change."""
 
-    def test_switch_to_different_provider_reloads_pool(self):
+    @pytest.mark.asyncio
+    async def test_switch_to_different_provider_reloads_pool(self):
         """opencode-go -> groq must replace the agent's pool with a groq pool."""
         old_pool = _make_pool("opencode-go")
         new_pool = _make_pool("groq")
@@ -89,9 +113,9 @@ class TestSwitchModelReloadsCredentialPool:
 
         with patch(
             "agent.credential_pool.load_pool",
-            return_value=new_pool,
+            new=AsyncMock(return_value=new_pool),
         ) as load_pool_mock:
-            switch_model(
+            await switch_model(
                 agent,
                 new_model="llama-3.3-70b",
                 new_provider="groq",
@@ -110,15 +134,16 @@ class TestSwitchModelReloadsCredentialPool:
         # load_pool MUST have been called with the new provider.
         load_pool_mock.assert_called_once_with("groq")
 
-    def test_switch_to_same_provider_does_not_reload_pool(self):
+    @pytest.mark.asyncio
+    async def test_switch_to_same_provider_does_not_reload_pool(self):
         """Re-selecting the current provider must NOT churn the pool reference."""
         existing_pool = _make_pool("opencode-go")
         agent = _make_agent("opencode-go", "qwen-coder", existing_pool)
 
-        load_pool_mock = MagicMock(name="load_pool")
+        load_pool_mock = AsyncMock(name="load_pool")
 
-        with patch("agent.credential_pool.load_pool", load_pool_mock):
-            switch_model(
+        with patch("agent.credential_pool.load_pool", new=load_pool_mock):
+            await switch_model(
                 agent,
                 new_model="qwen-coder",
                 new_provider="opencode-go",  # SAME provider
@@ -131,13 +156,17 @@ class TestSwitchModelReloadsCredentialPool:
         assert agent._credential_pool is existing_pool
         load_pool_mock.assert_not_called()
 
-    def test_switch_creates_pool_when_agent_had_none(self):
+    @pytest.mark.asyncio
+    async def test_switch_creates_pool_when_agent_had_none(self):
         """An agent without a pool that switches providers must acquire one."""
         new_pool = _make_pool("groq")
         agent = _make_agent("opencode-go", "qwen-coder", None)
 
-        with patch("agent.credential_pool.load_pool", return_value=new_pool):
-            switch_model(
+        with patch(
+            "agent.credential_pool.load_pool",
+            new=AsyncMock(return_value=new_pool),
+        ):
+            await switch_model(
                 agent,
                 new_model="llama-3.3-70b",
                 new_provider="groq",
@@ -149,7 +178,8 @@ class TestSwitchModelReloadsCredentialPool:
         assert agent._credential_pool is new_pool
         assert agent._credential_pool.provider == "groq"
 
-    def test_recover_pool_mismatch_guard_no_longer_trips_after_switch(self):
+    @pytest.mark.asyncio
+    async def test_recover_pool_mismatch_guard_no_longer_trips_after_switch(self):
         """End-to-end: after a provider switch, recover_with_credential_pool
         must not skip rotation due to a provider mismatch.
 
@@ -163,11 +193,14 @@ class TestSwitchModelReloadsCredentialPool:
 
         old_pool = _make_pool("opencode-go")
         new_pool = _make_pool("groq")
-        new_pool.mark_exhausted_and_rotate.return_value = None
+        new_pool.mark_exhausted_and_rotate = AsyncMock(return_value=None)
         agent = _make_agent("opencode-go", "qwen-coder", old_pool)
 
-        with patch("agent.credential_pool.load_pool", return_value=new_pool):
-            switch_model(
+        with patch(
+            "agent.credential_pool.load_pool",
+            new=AsyncMock(return_value=new_pool),
+        ):
+            await switch_model(
                 agent,
                 new_model="llama-3.3-70b",
                 new_provider="groq",
@@ -178,7 +211,7 @@ class TestSwitchModelReloadsCredentialPool:
 
         # After the switch, the pool's provider matches the agent's provider.
         # A 429 on groq should now reach pool.mark_exhausted_and_rotate.
-        recover_with_credential_pool(
+        await recover_with_credential_pool(
             agent,
             status_code=429,
             has_retried_429=False,
@@ -191,7 +224,8 @@ class TestSwitchModelReloadsCredentialPool:
             "pool.current() was never called — mismatch guard short-circuited"
         )
 
-    def test_pool_reload_failure_does_not_block_switch(self):
+    @pytest.mark.asyncio
+    async def test_pool_reload_failure_does_not_block_switch(self):
         """If load_pool raises (e.g. corrupt auth.json), switch_model must
         still complete — the pool will simply be missing for this turn, and
         the next turn can re-attempt. Crashing the whole switch is worse
@@ -200,10 +234,10 @@ class TestSwitchModelReloadsCredentialPool:
 
         with patch(
             "agent.credential_pool.load_pool",
-            side_effect=RuntimeError("simulated corrupt auth.json"),
+            new=AsyncMock(side_effect=RuntimeError("simulated corrupt auth.json")),
         ):
             # Should NOT raise — pool reload failure is logged+swallowed.
-            switch_model(
+            await switch_model(
                 agent,
                 new_model="llama-3.3-70b",
                 new_provider="groq",

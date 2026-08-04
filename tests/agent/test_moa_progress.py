@@ -72,11 +72,12 @@ def _collect_emits(facade):
 
 
 
-def test_moa_phase_transitions_to_aggregator(moa_config, monkeypatch):
+@pytest.mark.asyncio
+async def test_moa_phase_transitions_to_aggregator(moa_config, monkeypatch):
     """A single ``moa.phase`` event with ``phase="aggregator"`` fires after the fan-out."""
     from agent.moa_loop import MoAChatCompletions
 
-    def fake_call_llm(**kwargs):
+    async def fake_call_llm(**kwargs):
         if kwargs.get("task") == "moa_reference":
             return _response("advice")
         return _response("acted")
@@ -86,7 +87,7 @@ def test_moa_phase_transitions_to_aggregator(moa_config, monkeypatch):
     facade = MoAChatCompletions("closed")
     captured = _collect_emits(facade)
 
-    facade.create(
+    await facade.create(
         model="closed",
         messages=[{"role": "user", "content": "plan the migration"}],
     )
@@ -106,11 +107,12 @@ def test_moa_phase_transitions_to_aggregator(moa_config, monkeypatch):
 
 
 
-def test_moa_progress_callback_none_safe(moa_config, monkeypatch):
+@pytest.mark.asyncio
+async def test_moa_progress_callback_none_safe(moa_config, monkeypatch):
     """A missing ``reference_callback`` does not break the fan-out or create()."""
     from agent.moa_loop import MoAChatCompletions
 
-    def fake_call_llm(**kwargs):
+    async def fake_call_llm(**kwargs):
         if kwargs.get("task") == "moa_reference":
             return _response("advice")
         return _response("acted")
@@ -120,7 +122,7 @@ def test_moa_progress_callback_none_safe(moa_config, monkeypatch):
     # No callback attached — the facade's _emit is a no-op in that case.
     facade = MoAChatCompletions("closed")
     assert facade.reference_callback is None
-    facade.create(
+    await facade.create(
         model="closed",
         messages=[{"role": "user", "content": "noop"}],
     )

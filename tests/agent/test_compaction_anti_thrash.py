@@ -46,7 +46,10 @@ def _compressor(threshold_tokens: int) -> ContextCompressor:
         provider="test",
     )
     cc.threshold_tokens = threshold_tokens  # pin; don't couple to window math
-    cc._generate_summary = lambda *a, **k: "Summary of earlier turns."
+    async def _generate_summary(*_args, **_kwargs):
+        return "Summary of earlier turns."
+
+    cc._generate_summary = _generate_summary
     return cc
 
 
@@ -58,7 +61,7 @@ def _messages(n: int, size: int = 1500) -> list:
     return msgs
 
 
-def _turn(cc, msgs, real_prompt_tokens):
+async def _turn(cc, msgs, real_prompt_tokens):
     """One agent turn as conversation_loop drives it.
 
     should_compress() gates on the real prompt count; if it fires, compress()
@@ -69,14 +72,15 @@ def _turn(cc, msgs, real_prompt_tokens):
     """
     if not cc.should_compress(real_prompt_tokens):
         return msgs, False
-    msgs = cc.compress(msgs, current_tokens=real_prompt_tokens)
+    msgs = await cc.compress(msgs, current_tokens=real_prompt_tokens)
     cc._verify_compaction_cleared_threshold = True
     cc.update_from_response({"prompt_tokens": real_prompt_tokens})
     return msgs, True
 
 
 class TestSavingsBasis:
-    def test_savings_does_not_depend_on_current_tokens(self):
+    @pytest.mark.asyncio
+    async def test_savings_does_not_depend_on_current_tokens(self):
         """Savings is a property of the messages, not of the caller's token count.
 
         Before the fix, passing the full-prompt count made an identical compaction
@@ -85,11 +89,11 @@ class TestSavingsBasis:
         msgs = _messages(14)
 
         a = _compressor(threshold_tokens=24_576)
-        a.compress([m.copy() for m in msgs], current_tokens=100_000)
+        await a.compress([m.copy() for m in msgs], current_tokens=100_000)
         with_full_prompt = a._last_compression_savings_pct
 
         b = _compressor(threshold_tokens=24_576)
-        b.compress([m.copy() for m in msgs], current_tokens=None)
+        await b.compress([m.copy() for m in msgs], current_tokens=None)
         messages_only = b._last_compression_savings_pct
 
         assert with_full_prompt == pytest.approx(messages_only, abs=0.01), (
@@ -98,15 +102,17 @@ class TestSavingsBasis:
             f"{messages_only:.1f}% without"
         )
 
-    def test_no_op_compaction_is_not_reported_as_huge_savings(self):
+    @pytest.mark.asyncio
+    async def test_no_op_compaction_is_not_reported_as_huge_savings(self):
         cc = _compressor(threshold_tokens=24_576)
         msgs = _messages(4, size=10)  # below the minimum compressible size
-        cc.compress(msgs, current_tokens=100_000)
+        await cc.compress(msgs, current_tokens=100_000)
         assert cc._last_compression_savings_pct < 50
 
 
 class TestFutilityGuard:
-    def test_stops_when_floor_alone_meets_threshold(self):
+    @pytest.mark.asyncio
+    async def test_stops_when_floor_alone_meets_threshold(self):
         """Incompressible floor >= threshold -> shrinking messages cannot help."""
         cc = _compressor(threshold_tokens=24_576)
         msgs = _messages(14)
@@ -116,7 +122,7 @@ class TestFutilityGuard:
 
         fired = 0
         for _ in range(6):
-            msgs, did = _turn(cc, msgs, real_prompt_tokens)
+            msgs, did = await _turn(cc, msgs, real_prompt_tokens)
             if did:
                 fired += 1
                 msgs.append({"role": "user", "content": "next " + "w" * 4000})
@@ -128,19 +134,21 @@ class TestFutilityGuard:
         assert fired <= 3, f"expected the loop to break early, compacted {fired}x"
 
 
-    def test_effective_compaction_still_resets_the_counter(self):
+    @pytest.mark.asyncio
+    async def test_effective_compaction_still_resets_the_counter(self):
         """A compaction that gets the prompt under the threshold is not thrashing."""
         cc = _compressor(threshold_tokens=750_000)
         msgs = _messages(120, size=2000)
         before = len(msgs)
-        out = cc.compress(msgs, current_tokens=None)
+        out = await cc.compress(msgs, current_tokens=None)
 
         assert len(out) < before, "a long transcript must still compact"
         assert cc._last_compression_savings_pct > 10
         assert cc._last_compression_made_progress is True
         assert cc._ineffective_compression_count == 0
 
-    def test_no_false_positive_under_tokenizer_skew(self):
+    @pytest.mark.asyncio
+    async def test_no_false_positive_under_tokenizer_skew(self):
         """The provider's real count exceeds the rough estimate; that is not a floor.
 
         An analytic `floor = real_prompt - rough_estimate` misreads tokenizer skew
@@ -155,7 +163,7 @@ class TestFutilityGuard:
 
         real_prompt = floor + int(skew * estimate_messages_tokens_rough(msgs))
         assert cc.should_compress(real_prompt)
-        msgs = cc.compress(msgs, current_tokens=real_prompt)
+        msgs = await cc.compress(msgs, current_tokens=real_prompt)
         real_after = floor + int(skew * estimate_messages_tokens_rough(msgs))
         cc._verify_compaction_cleared_threshold = True
         cc.update_from_response({"prompt_tokens": real_after})  # provider's real count
@@ -170,11 +178,12 @@ class TestFutilityGuard:
 
 
 
-    def test_model_switch_resets_and_persists_fallback_streak(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_model_switch_resets_fallback_streak(self, tmp_path):
         from hermes_state import SessionDB
 
         db = SessionDB(db_path=tmp_path / "state.db")
-        db.create_session("s1", source="cli")
+        await db.create_session("s1", source="cli")
         cc = _compressor(threshold_tokens=24_576)
         cc.bind_session_state(db, "s1")
         cc.record_completed_compaction(used_fallback=True)
@@ -182,13 +191,15 @@ class TestFutilityGuard:
         cc.update_model("next-model", 100_000)
 
         assert cc._fallback_compression_streak == 0
-        assert db.get_compression_fallback_streak("s1") == 0
+        assert await db.get_compression_fallback_streak("s1") == 0
+        await db.close()
 
 
 
 
 class TestMinimumMessagesBranch:
-    def test_too_few_messages_records_an_ineffective_pass(self):
+    @pytest.mark.asyncio
+    async def test_too_few_messages_records_an_ineffective_pass(self):
         """Returning the transcript unchanged must move the anti-thrash state.
 
         Otherwise should_compress() keeps saying True about a transcript that can
@@ -198,7 +209,7 @@ class TestMinimumMessagesBranch:
         msgs = _messages(3, size=10)
         before = cc._ineffective_compression_count
 
-        out = cc.compress(msgs, current_tokens=100_000)
+        out = await cc.compress(msgs, current_tokens=100_000)
 
         assert len(out) == len(msgs), "nothing should have been compressed"
         assert cc._last_compression_made_progress is False

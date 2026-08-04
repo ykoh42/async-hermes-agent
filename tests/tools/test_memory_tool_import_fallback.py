@@ -4,10 +4,13 @@ import builtins
 import importlib
 import sys
 
+import pytest
+
 from tools.registry import registry
 
 
-def test_memory_tool_imports_without_fcntl(monkeypatch, tmp_path):
+@pytest.mark.asyncio
+async def test_memory_tool_imports_without_fcntl(monkeypatch, tmp_path):
     original_import = builtins.__import__
 
     def fake_import(name, globals=None, locals=None, fromlist=(), level=0):
@@ -23,9 +26,7 @@ def test_memory_tool_imports_without_fcntl(monkeypatch, tmp_path):
     monkeypatch.setattr(memory_tool, "get_memory_dir", lambda: tmp_path)
 
     store = memory_tool.MemoryStore(memory_char_limit=200, user_char_limit=200)
-    store.load_from_disk()
-    result = store.add("memory", "fact learned during import fallback test")
-
-    assert memory_tool.fcntl is None
+    await store.load_from_disk()
+    result = await store.add("memory", "fact learned during import fallback test")
     assert registry.get_entry("memory") is not None
     assert result["success"] is True

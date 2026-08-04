@@ -13,8 +13,8 @@ Verifies:
 import json
 import os
 import sys
+import asyncio
 from pathlib import Path
-from unittest.mock import MagicMock, call, patch
 
 import pytest
 
@@ -37,7 +37,8 @@ class TestTrajectoryWriteDurability:
     the checkpoint claiming completion with no trajectory data on disk.
     """
 
-    def test_trajectory_entry_is_synced_to_disk(self, tmp_path, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_trajectory_entry_is_synced_to_disk(self, tmp_path, monkeypatch):
         """_process_batch_worker should flush+fsync the trajectory file."""
         prompt_result = {
             "success": True,
@@ -50,15 +51,16 @@ class TestTrajectoryWriteDurability:
             "toolsets_used": [],
         }
 
-        monkeypatch.setattr(
-            "batch_runner._process_single_prompt", lambda *a, **kw: prompt_result
-        )
+        async def process_prompt(*_args, **_kwargs):
+            return prompt_result
+
+        monkeypatch.setattr("batch_runner._process_single_prompt", process_prompt)
 
         # Intercept os.fsync to record calls
         fsync_calls = []
         monkeypatch.setattr("os.fsync", lambda fd: fsync_calls.append(fd))
 
-        _process_batch_worker(
+        await _process_batch_worker(
             (
                 1,
                 [(0, {"prompt": "hi"})],
@@ -92,45 +94,70 @@ class TestTrajectoryWriteDurability:
 def _make_runner(tmp_path, monkeypatch):
     """Build a minimal real BatchRunner against a 1-line tmp dataset."""
     dataset = tmp_path / "dataset.jsonl"
-    dataset.write_text(json.dumps({"prompt": "hi"}) + "\n", encoding="utf-8")
+    dataset.write_text(
+        json.dumps({"prompt": "first"}) + "\n"
+        + json.dumps({"prompt": "second"}) + "\n",
+        encoding="utf-8",
+    )
     # BatchRunner writes to Path("data")/run_name relative to cwd.
     monkeypatch.chdir(tmp_path)
     return BatchRunner(
         dataset_file=str(dataset),
         batch_size=1,
         run_name="pool-cleanup-test",
-        num_workers=1,
+        num_workers=2,
     )
 
 
-def _make_failing_pool(exc):
-    """Context-manager mock whose pool raises `exc` from imap_unordered."""
-    pool = MagicMock()
-    pool.imap_unordered.side_effect = exc
-    pool_cm = MagicMock()
-    pool_cm.__enter__ = MagicMock(return_value=pool)
-    pool_cm.__exit__ = MagicMock(return_value=False)
-    return pool, pool_cm
+class TestTaskCleanupOnInterruption:
+    """A failed or cancelled async batch must not leak sibling tasks."""
 
-
-class TestPoolCleanupOnInterruption:
-    """Drive the real BatchRunner.run() with a patched Pool and verify the
-    cleanup contract: terminate() + join() (join with NO timeout argument —
-    CPython's Pool.join signature is (self), so join(timeout=10) would
-    raise TypeError).
-    """
-
-    @pytest.mark.parametrize("exc_type", [KeyboardInterrupt, RuntimeError])
-    def test_run_terminates_and_joins_pool(self, tmp_path, monkeypatch, exc_type):
+    @pytest.mark.asyncio
+    async def test_run_cancels_and_awaits_siblings_on_worker_error(
+        self, tmp_path, monkeypatch
+    ):
         runner = _make_runner(tmp_path, monkeypatch)
-        pool, pool_cm = _make_failing_pool(exc_type("boom"))
+        both_started = asyncio.Event()
+        sibling_cancelled = asyncio.Event()
 
-        with patch.object(batch_runner, "Pool", return_value=pool_cm):
-            with pytest.raises(exc_type):
-                runner.run()
+        async def worker(args):
+            batch_num = args[0]
+            if batch_num == 0:
+                await both_started.wait()
+                raise RuntimeError("boom")
+            both_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                sibling_cancelled.set()
+                raise
 
-        pool.terminate.assert_called_once()
-        # join() must be called with no positional/keyword arguments.
-        assert pool.join.call_args_list == [call()], (
-            f"pool.join() called with unexpected args: {pool.join.call_args_list}"
-        )
+        monkeypatch.setattr(batch_runner, "_process_batch_worker", worker)
+        with pytest.raises(RuntimeError, match="boom"):
+            await runner.run()
+        assert sibling_cancelled.is_set()
+
+    @pytest.mark.asyncio
+    async def test_run_cancels_and_awaits_workers_when_caller_cancels(
+        self, tmp_path, monkeypatch
+    ):
+        runner = _make_runner(tmp_path, monkeypatch)
+        started = asyncio.Event()
+        cancelled = 0
+
+        async def worker(_args):
+            nonlocal cancelled
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled += 1
+                raise
+
+        monkeypatch.setattr(batch_runner, "_process_batch_worker", worker)
+        run_task = asyncio.create_task(runner.run())
+        await started.wait()
+        run_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await run_task
+        assert cancelled == 2

@@ -61,12 +61,12 @@ _JSON_BLOCK_RE = re.compile(r"\{[\s\S]*\}", re.MULTILINE)
 # ---------------------------------------------------------------------------
 
 
-def _load_xai_web_config() -> Dict[str, Any]:
-    """Read ``web.xai`` from config.yaml (returns {} on miss)."""
+async def _load_xai_web_config() -> Dict[str, Any]:
+    """Read ``web.xai`` from config.yaml without blocking the event loop."""
     try:
-        from hermes_cli.config import load_config
+        from hermes_cli.config import load_config_readonly
 
-        cfg = load_config()
+        cfg = await load_config_readonly()
         web_section = cfg.get("web") if isinstance(cfg, dict) else None
         xai_section = web_section.get("xai") if isinstance(web_section, dict) else None
         return xai_section if isinstance(xai_section, dict) else {}
@@ -129,7 +129,7 @@ class XAIWebSearchProvider(WebSearchProvider):
         """Cheap availability probe — env var OR auth-store has OAuth tokens.
 
         Delegates to :func:`tools.xai_http.has_xai_credentials`, which is
-        deliberately *not* the same as :func:`resolve_xai_http_credentials`:
+        deliberately does not await :func:`resolve_xai_http_credentials`:
         it never triggers OAuth token refresh or acquires the auth-store
         lock. The ABC contract requires this method to be safe to call on
         every ``hermes tools`` repaint and at tool-registration time.
@@ -145,7 +145,7 @@ class XAIWebSearchProvider(WebSearchProvider):
 
     # -- Search -----------------------------------------------------------
 
-    def search(self, query: str, limit: int = 5) -> Dict[str, Any]:
+    async def search(self, query: str, limit: int = 5) -> Dict[str, Any]:
         """Execute a Grok-backed web search.
 
         Returns ``{"success": True, "data": {"web": [{title, url, description, position}, ...]}}``
@@ -159,7 +159,7 @@ class XAIWebSearchProvider(WebSearchProvider):
         except Exception:  # noqa: BLE001 — interrupt module is best-effort
             pass
 
-        creds = resolve_xai_http_credentials()
+        creds = await resolve_xai_http_credentials()
         api_key = str(creds.get("api_key") or "").strip()
         base_url = str(creds.get("base_url") or "https://api.x.ai/v1").strip().rstrip("/")
         if not api_key:
@@ -181,7 +181,7 @@ class XAIWebSearchProvider(WebSearchProvider):
             limit = 5
         limit = max(1, min(limit, 100))
 
-        cfg = _load_xai_web_config()
+        cfg = await _load_xai_web_config()
         model = cfg.get("model") if isinstance(cfg.get("model"), str) else DEFAULT_MODEL
         model = model.strip() or DEFAULT_MODEL
 
@@ -252,53 +252,51 @@ class XAIWebSearchProvider(WebSearchProvider):
         # can't refresh those and an immediate retry would just burn quota.
         is_oauth_path = (creds.get("provider") == "xai-oauth")
         resp = None
-        for attempt in range(2):
-            try:
-                resp = httpx.post(
-                    f"{base_url}/responses",
-                    headers=headers,
-                    json=payload,
-                    timeout=timeout,
-                )
-                resp.raise_for_status()
-                break
-            except httpx.HTTPStatusError as exc:
-                status = exc.response.status_code if exc.response is not None else 0
-                if status == 401 and attempt == 0 and is_oauth_path:
-                    logger.info(
-                        "xAI web search got 401 on first attempt; forcing OAuth "
-                        "refresh and retrying once.",
-                    )
-                    try:
-                        refreshed = resolve_xai_http_credentials(
-                            force_refresh=True,
-                            api_key_hint=api_key,
-                        )
-                        refreshed_key = str(refreshed.get("api_key") or "").strip()
-                        if refreshed_key and refreshed_key != api_key:
-                            api_key = refreshed_key
-                            headers["Authorization"] = f"Bearer {api_key}"
-                            continue
-                        # Refresh returned the same (or empty) token — no point
-                        # in retrying. Fall through to the error return below.
-                    except Exception as refresh_exc:  # noqa: BLE001
-                        logger.warning(
-                            "xAI web search OAuth refresh after 401 failed: %s",
-                            refresh_exc,
-                        )
-                body = ""
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            for attempt in range(2):
                 try:
-                    body = exc.response.text[:300] if exc.response is not None else ""
-                except Exception:
+                    resp = await client.post(
+                        f"{base_url}/responses",
+                        headers=headers,
+                        json=payload,
+                    )
+                    resp.raise_for_status()
+                    break
+                except httpx.HTTPStatusError as exc:
+                    status = exc.response.status_code if exc.response is not None else 0
+                    if status == 401 and attempt == 0 and is_oauth_path:
+                        logger.info(
+                            "xAI web search got 401 on first attempt; forcing OAuth "
+                            "refresh and retrying once.",
+                        )
+                        try:
+                            refreshed = await resolve_xai_http_credentials(
+                                force_refresh=True,
+                                api_key_hint=api_key,
+                            )
+                            refreshed_key = str(refreshed.get("api_key") or "").strip()
+                            if refreshed_key and refreshed_key != api_key:
+                                api_key = refreshed_key
+                                headers["Authorization"] = f"Bearer {api_key}"
+                                continue
+                        except Exception as refresh_exc:  # noqa: BLE001
+                            logger.warning(
+                                "xAI web search OAuth refresh after 401 failed: %s",
+                                refresh_exc,
+                            )
                     body = ""
-                logger.warning("xAI web search HTTP %d: %s", status, body)
-                return {
-                    "success": False,
-                    "error": f"xAI web search returned HTTP {status}: {body}".rstrip(),
-                }
-            except httpx.RequestError as exc:
-                logger.warning("xAI web search request error: %s", exc)
-                return {"success": False, "error": f"Could not reach xAI: {exc}"}
+                    try:
+                        body = exc.response.text[:300] if exc.response is not None else ""
+                    except Exception:
+                        body = ""
+                    logger.warning("xAI web search HTTP %d: %s", status, body)
+                    return {
+                        "success": False,
+                        "error": f"xAI web search returned HTTP {status}: {body}".rstrip(),
+                    }
+                except httpx.RequestError as exc:
+                    logger.warning("xAI web search request error: %s", exc)
+                    return {"success": False, "error": f"Could not reach xAI: {exc}"}
 
         if resp is None:
             # Defensive — both attempts somehow exited the loop without resp.

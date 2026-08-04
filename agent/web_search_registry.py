@@ -96,20 +96,7 @@ def get_provider(name: str) -> Optional[WebSearchProvider]:
 
 
 def _read_config_key(*path: str) -> Optional[str]:
-    """Resolve a dotted config key from ``config.yaml``. Returns None on miss."""
-    try:
-        from hermes_cli.config import load_config_readonly
-
-        cfg = load_config_readonly()
-        cur = cfg
-        for segment in path:
-            if not isinstance(cur, dict):
-                return None
-            cur = cur.get(segment)
-        if isinstance(cur, str) and cur.strip():
-            return cur.strip()
-    except Exception as exc:
-        logger.debug("Could not read config %s: %s", ".".join(path), exc)
+    """Registry fallbacks are config-free; the async tool resolves overrides."""
     return None
 
 

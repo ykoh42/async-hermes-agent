@@ -46,11 +46,8 @@ from typing import List, Optional
 # fallback whenever no explicit ``session_id`` is passed.
 #
 # ContextVar (not a module global) so concurrent agents in one process —
-# gateway sessions, delegate_task subagents, batch runners — never see each
-# other's conversation id. Worker threads spawned via
-# ``tools.thread_context.propagate_context_to_thread`` (background review,
-# MoA fan-out, tool executor) inherit it through the copied Context; bare
-# threads (title generator) capture it explicitly at spawn time.
+# delegate_task subagents and batch runners — never see each other's
+# conversation id. Child asyncio tasks inherit the active context.
 _conversation_id: ContextVar[Optional[str]] = ContextVar(
     "nous_portal_conversation_id", default=None
 )

@@ -8,11 +8,11 @@ the pixels directly on its next turn.
 
 from __future__ import annotations
 
-import asyncio
 import base64
 import json
 from unittest.mock import patch
 
+import pytest
 
 from tools.vision_tools import (
     _build_native_vision_tool_result,
@@ -80,12 +80,11 @@ class TestBuildNativeVisionToolResult:
 
 
 class TestVisionAnalyzeNative:
-    def test_local_file_returns_multimodal_envelope(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_local_file_returns_multimodal_envelope(self, tmp_path):
         img = tmp_path / "test.png"
         img.write_bytes(_TINY_PNG)
-        result = asyncio.get_event_loop().run_until_complete(
-            _vision_analyze_native(str(img), "what is this?")
-        )
+        result = await _vision_analyze_native(str(img), "what is this?")
         assert isinstance(result, dict)
         assert result.get("_multimodal") is True
         parts = result["content"]
@@ -95,16 +94,16 @@ class TestVisionAnalyzeNative:
         assert url.startswith("data:image/")
 
 
-    def test_file_url_scheme_resolves(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_file_url_scheme_resolves(self, tmp_path):
         img = tmp_path / "t.png"
         img.write_bytes(_TINY_PNG)
-        result = asyncio.get_event_loop().run_until_complete(
-            _vision_analyze_native(f"file://{img}", "?")
-        )
+        result = await _vision_analyze_native(f"file://{img}", "?")
         assert isinstance(result, dict)
         assert result.get("_multimodal") is True
 
-    def test_oversized_image_resized_under_embed_cap(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_oversized_image_resized_under_embed_cap(self, tmp_path):
         """Regression for the wedged-session incident (May 2026).
 
         A vision tool-result image is baked into conversation history and
@@ -115,7 +114,6 @@ class TestVisionAnalyzeNative:
         embed cap (well under 5 MB) BEFORE embedding, not just at the 20 MB
         hard ceiling.  Skips if Pillow isn't available (resize is a no-op).
         """
-        pytest = __import__("pytest")
         try:
             from PIL import Image
         except ImportError:
@@ -128,9 +126,7 @@ class TestVisionAnalyzeNative:
         Image.effect_noise((2600, 2600), 80).convert("RGB").save(big, format="PNG")
         assert big.stat().st_size * 4 // 3 > 5 * 1024 * 1024, "test image not big enough"
 
-        result = asyncio.get_event_loop().run_until_complete(
-            _vision_analyze_native(str(big), "describe")
-        )
+        result = await _vision_analyze_native(str(big), "describe")
         assert isinstance(result, dict) and result.get("_multimodal") is True
         url = next(
             p["image_url"]["url"]
@@ -149,7 +145,8 @@ class TestVisionAnalyzeNative:
 class TestHandleVisionAnalyzeFastPath:
     """Verify the dispatcher chooses fast-path vs aux-LLM correctly."""
 
-    def test_vision_capable_main_model_uses_fast_path(self, tmp_path, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_vision_capable_main_model_uses_fast_path(self, tmp_path, monkeypatch):
         """Main model supports native vision → fast path returns multimodal."""
         img = tmp_path / "x.png"
         img.write_bytes(_TINY_PNG)
@@ -164,8 +161,9 @@ class TestHandleVisionAnalyzeFastPath:
                 "agent.image_routing.decide_image_input_mode",
                 return_value="native",
             ):
-                coro = _handle_vision_analyze({"image_url": str(img), "question": "?"})
-                result = asyncio.get_event_loop().run_until_complete(coro)
+                result = await _handle_vision_analyze(
+                    {"image_url": str(img), "question": "?"}
+                )
         finally:
             clear_runtime_main()
 
@@ -174,7 +172,8 @@ class TestHandleVisionAnalyzeFastPath:
         assert result.get("_multimodal") is True
 
 
-    def test_fast_path_disabled_for_unsupported_provider(self, tmp_path, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_fast_path_disabled_for_unsupported_provider(self, tmp_path, monkeypatch):
         """Even with vision-capable model, unknown provider → fall through."""
         img = tmp_path / "x.png"
         img.write_bytes(_TINY_PNG)
@@ -186,15 +185,17 @@ class TestHandleVisionAnalyzeFastPath:
         set_runtime_main("brand-new-provider", "anthropic/claude-opus-4.6")
         try:
             with patch("tools.vision_tools.vision_analyze_tool", side_effect=_aux_sentinel):
-                coro = _handle_vision_analyze({"image_url": str(img), "question": "?"})
-                result = asyncio.get_event_loop().run_until_complete(coro)
+                result = await _handle_vision_analyze(
+                    {"image_url": str(img), "question": "?"}
+                )
         finally:
             clear_runtime_main()
 
         assert not (isinstance(result, dict) and result.get("_multimodal") is True), \
             "Fast path fired for unknown provider; should have fallen through"
 
-    def test_supports_vision_override_bypasses_provider_allowlist(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_supports_vision_override_bypasses_provider_allowlist(self, tmp_path):
         """supports_vision=true enables the fast path on an unlisted provider."""
         img = tmp_path / "x.png"
         img.write_bytes(_TINY_PNG)
@@ -205,21 +206,26 @@ class TestHandleVisionAnalyzeFastPath:
         from agent.auxiliary_client import set_runtime_main, clear_runtime_main
         set_runtime_main("brand-new-provider", "llava-v1.6")
         try:
+            config_path = tmp_path / "config.yaml"
+            config_path.write_text(
+                "model:\n  supports_vision: true\n", encoding="utf-8"
+            )
             with patch(
-                "hermes_cli.config.load_config",
-                return_value={"model": {"supports_vision": True}},
+                "hermes_cli.config.get_config_path", return_value=config_path
             ), patch(
                 "tools.vision_tools.vision_analyze_tool", side_effect=_aux_sentinel,
             ) as mock_aux:
-                coro = _handle_vision_analyze({"image_url": str(img), "question": "?"})
-                result = asyncio.get_event_loop().run_until_complete(coro)
+                result = await _handle_vision_analyze(
+                    {"image_url": str(img), "question": "?"}
+                )
         finally:
             clear_runtime_main()
 
         assert isinstance(result, dict) and result.get("_multimodal") is True
         mock_aux.assert_not_called()
 
-    def test_text_mode_wins_over_supports_vision_override(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_text_mode_wins_over_supports_vision_override(self, tmp_path):
         """Explicit text routing blocks the fast path even with supports_vision."""
         img = tmp_path / "x.png"
         img.write_bytes(_TINY_PNG)
@@ -230,17 +236,20 @@ class TestHandleVisionAnalyzeFastPath:
         from agent.auxiliary_client import set_runtime_main, clear_runtime_main
         set_runtime_main("brand-new-provider", "llava-v1.6")
         try:
+            config_path = tmp_path / "config.yaml"
+            config_path.write_text(
+                "agent:\n  image_input_mode: text\n"
+                "model:\n  supports_vision: true\n",
+                encoding="utf-8",
+            )
             with patch(
-                "hermes_cli.config.load_config",
-                return_value={
-                    "agent": {"image_input_mode": "text"},
-                    "model": {"supports_vision": True},
-                },
+                "hermes_cli.config.get_config_path", return_value=config_path
             ), patch(
                 "tools.vision_tools.vision_analyze_tool", side_effect=_aux_sentinel,
             ) as mock_aux:
-                coro = _handle_vision_analyze({"image_url": str(img), "question": "?"})
-                result = asyncio.get_event_loop().run_until_complete(coro)
+                result = await _handle_vision_analyze(
+                    {"image_url": str(img), "question": "?"}
+                )
         finally:
             clear_runtime_main()
 

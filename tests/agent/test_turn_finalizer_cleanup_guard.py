@@ -59,18 +59,18 @@ class _StubAgent:
         self.session_cost_source = "stub"
 
     # --- fallible cleanup surfaces -------------------------------------
-    def _save_trajectory(self, *a, **k):
+    async def _save_trajectory(self, *a, **k):
         if "save_trajectory" in self._raise_in:
             raise RuntimeError("trajectory disk full")
 
-    def _cleanup_task_resources(self, *a, **k):
+    async def _cleanup_task_resources(self, *a, **k):
         if "cleanup_task_resources" in self._raise_in:
             raise RuntimeError("docker teardown EOF")
 
     def _drop_trailing_empty_response_scaffolding(self, *a, **k):
         pass
 
-    def _persist_session(self, *a, **k):
+    async def _persist_session(self, *a, **k):
         if "persist_session" in self._raise_in:
             raise RuntimeError("sqlite database is locked")
 
@@ -81,7 +81,7 @@ class _StubAgent:
     def _safe_print(self, *a, **k):
         pass
 
-    def _handle_max_iterations(self, messages, n):
+    async def _handle_max_iterations(self, messages, n):
         return "PARTIAL SUMMARY FROM MODEL"
 
     def _file_mutation_verifier_enabled(self):
@@ -96,11 +96,8 @@ class _StubAgent:
     def clear_interrupt(self):
         pass
 
-    def _sync_external_memory_for_turn(self, **k):
-        pass
 
-
-def _run(
+async def _run(
     agent,
     *,
     final_response=None,
@@ -118,7 +115,7 @@ def _run(
         },
         {"role": "tool", "tool_call_id": "c1", "content": "file contents"},
     ]
-    return finalize_turn(
+    return await finalize_turn(
         agent,
         final_response=final_response,
         api_call_count=api_call_count,
@@ -140,9 +137,10 @@ def _run(
 @pytest.mark.parametrize(
     "step", ["save_trajectory", "cleanup_task_resources", "persist_session"]
 )
-def test_single_cleanup_step_raises_does_not_skip_others(step):
+@pytest.mark.asyncio
+async def test_single_cleanup_step_raises_does_not_skip_others(step):
     agent = _StubAgent(raise_in=(step,))
-    result = _run(agent)
+    result = await _run(agent)
     # Response survives.
     assert result["final_response"] == "PARTIAL SUMMARY FROM MODEL"
     # Exactly the failing step is recorded; the others ran without error.
@@ -156,11 +154,10 @@ def test_single_cleanup_step_raises_does_not_skip_others(step):
     assert len(result["cleanup_errors"]) == 1
 
 
-def test_clean_turn_has_no_cleanup_errors_key():
+@pytest.mark.asyncio
+async def test_clean_turn_has_no_cleanup_errors_key():
     agent = _StubAgent(raise_in=())
-    result = _run(agent)
+    result = await _run(agent)
     assert result["final_response"] == "PARTIAL SUMMARY FROM MODEL"
     assert result["completed"] is False
     assert "cleanup_errors" not in result
-
-

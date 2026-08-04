@@ -37,7 +37,6 @@ import pytest
 # Stub optional deps the parent module imports at top level — keeps this
 # test file runnable in the same environment as the existing Codex tests.
 sys.modules.setdefault("fire", types.SimpleNamespace(Fire=lambda *a, **k: None))
-sys.modules.setdefault("firecrawl", types.SimpleNamespace(Firecrawl=object))
 sys.modules.setdefault("fal_client", types.SimpleNamespace())
 
 

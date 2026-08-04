@@ -33,6 +33,9 @@ import json
 import logging
 from typing import Any, Dict, List, Optional, Union
 
+import aiofiles
+import aiofiles.os
+
 # Sources that are excluded from session browsing/searching by default.
 # Third-party integrations tag their sessions with HERMES_SESSION_SOURCE=tool;
 # delegate subagent runs are tagged "subagent"; kanban dispatcher workers are
@@ -111,7 +114,7 @@ def _is_compaction_summary(content: str) -> bool:
     return any(stripped.startswith(p) for p in _COMPACTION_PREFIXES)
 
 
-def _resolve_to_parent(db, session_id: str) -> tuple[str, bool]:
+async def _resolve_to_parent(db, session_id: str) -> tuple[str, bool]:
     """Walk parent_session_id chain to the lineage root.
 
     Returns ``(root_id, has_compression_hop)`` where ``has_compression_hop`` is
@@ -131,7 +134,7 @@ def _resolve_to_parent(db, session_id: str) -> tuple[str, bool]:
     while cur and cur not in visited:
         visited.add(cur)
         try:
-            s = db.get_session(cur)
+            s = await db.get_session(cur)
             if not s:
                 break
             if s.get("end_reason") == "compression":
@@ -146,12 +149,12 @@ def _resolve_to_parent(db, session_id: str) -> tuple[str, bool]:
     return cur, has_compression
 
 
-def _resolve_lineage(db, session_id: str) -> str:
+async def _resolve_lineage(db, session_id: str) -> str:
     """Convenience: return only the lineage root (ignores compression hop)."""
-    return _resolve_to_parent(db, session_id)[0]
+    return (await _resolve_to_parent(db, session_id))[0]
 
 
-def _is_compression_ended(db, session_id: str) -> bool:
+async def _is_compression_ended(db, session_id: str) -> bool:
     """Return True if *session_id* itself ended with ``end_reason='compression'``.
 
     Unlike the ``has_compression_hop`` flag from :func:`_resolve_to_parent`
@@ -164,7 +167,7 @@ def _is_compression_ended(db, session_id: str) -> bool:
     if not session_id:
         return False
     try:
-        s = db.get_session(session_id)
+        s = await db.get_session(session_id)
         if not s:
             return False
         return s.get("end_reason") == "compression"
@@ -172,17 +175,15 @@ def _is_compression_ended(db, session_id: str) -> bool:
         return False
 
 
-def _get_message_storage_state(db, message_id) -> Optional[Dict[str, Any]]:
+async def _get_message_storage_state(db, message_id) -> Optional[Dict[str, Any]]:
     """Return the owning session and visibility flags for *message_id*."""
     if not message_id:
         return None
     try:
-        with db._lock:
-            cursor = db._conn.execute(
-                "SELECT session_id, active, compacted FROM messages WHERE id = ?",
-                (message_id,),
-            )
-            row = cursor.fetchone()
+        getter = getattr(db, "get_message_storage_state", None)
+        if not callable(getter):
+            return None
+        row = await getter(message_id)
     except Exception:
         logging.debug(
             "message storage-state lookup failed for %s", message_id, exc_info=True
@@ -191,7 +192,7 @@ def _get_message_storage_state(db, message_id) -> Optional[Dict[str, Any]]:
     return dict(row) if row is not None else None
 
 
-def _is_compacted_message(db, message_id) -> bool:
+async def _is_compacted_message(db, message_id) -> bool:
     """Return True if *message_id* is a compaction-archived row.
 
     Compaction archives are ``active=0, compacted=1`` — the content was
@@ -204,17 +205,17 @@ def _is_compacted_message(db, message_id) -> bool:
     Returns False on any error so the caller falls back to the safe default
     (skip the current session).
     """
-    state = _get_message_storage_state(db, message_id)
+    state = await _get_message_storage_state(db, message_id)
     return state is not None and state["active"] == 0 and state["compacted"] == 1
 
 
-def _annotate_rebuild_status(db, payload: Dict[str, Any]) -> None:
+async def _annotate_rebuild_status(db, payload: Dict[str, Any]) -> None:
     """Add a rebuild-progress note when the deferred FTS backfill (schema
     v23) is still running, so the agent can tell the user why older results
     may be incomplete/slower instead of treating a thin result set as
     ground truth. No-op (and never raises) when no rebuild is pending."""
     try:
-        status = db.fts_rebuild_status()
+        status = await db.fts_rebuild_status()
     except Exception:
         return
     if status is None:
@@ -295,7 +296,7 @@ def _shape_message(
     return {k: v for k, v in entry.items() if v is not None or k in ("content",)}
 
 
-def _resolve_profile_db(profile: str):
+async def _resolve_profile_db(profile: str):
     """Open another profile's ``state.db`` read-only, or None for the current one.
 
     The desktop's ``@session:<profile>/<id>`` links always carry the source
@@ -312,13 +313,16 @@ def _resolve_profile_db(profile: str):
 
     canon = profiles_mod.normalize_profile_name(profile)
     profiles_mod.validate_profile_name(canon)
-    if not profiles_mod.profile_exists(canon):
-        raise ValueError(f"profile '{canon}' does not exist")
+    if canon == "default":
+        profile_dir = profiles_mod.get_profile_dir(canon)
+    else:
+        profile_dir = profiles_mod.get_profile_dir(canon)
+        if not await aiofiles.os.path.isdir(profile_dir):
+            raise ValueError(f"profile '{canon}' does not exist")
+    return SessionDB(profile_dir / "state.db", read_only=True)
 
-    return SessionDB(db_path=profiles_mod.get_profile_dir(canon) / "state.db", read_only=True)
 
-
-def _session_link(session_id: str, profile: str = None) -> str:
+async def _session_link(session_id: str, profile: str = None) -> str:
     """The reference the agent writes to point the user at a session.
 
     Same value the desktop composer emits when a session is dragged into a
@@ -336,11 +340,10 @@ def _session_link(session_id: str, profile: str = None) -> str:
         except Exception:
             logging.debug("get_active_profile_name failed for session link", exc_info=True)
             name = ""
-
     return f"@session:{name}/{session_id}" if name else f"@session:{session_id}"
 
 
-def _locate_session_db(session_id: str):
+async def _locate_session_db(session_id: str):
     """Scan every profile's ``state.db`` (read-only) for a session id.
 
     Returns ``(db, profile_name)`` for the first profile that owns the id, or
@@ -359,32 +362,48 @@ def _locate_session_db(session_id: str):
 
     targets = [("default", profiles_mod.get_profile_dir("default"))]
     try:
-        targets += [(info.name, info.path) for info in profiles_mod.list_profiles()]
+        profiles_root = profiles_mod._get_profiles_root()
+        if await aiofiles.os.path.isdir(profiles_root):
+            iterator = await aiofiles.os.scandir(profiles_root)
+            try:
+                candidate_names = sorted(
+                    entry.name for entry in iterator if entry.name != "default"
+                )
+            finally:
+                iterator.close()
+            names = [
+                name
+                for name in candidate_names
+                if await aiofiles.os.path.isdir(profiles_root / name)
+            ]
+            targets.extend(
+                (name, profiles_mod.get_profile_dir(name)) for name in names
+            )
     except Exception:
-        logging.debug("list_profiles failed during session locate", exc_info=True)
+        logging.debug("async profile scan failed during session locate", exc_info=True)
 
     seen: set = set()
     for name, home in targets:
         db_path = Path(home) / "state.db"
         key = str(db_path)
-        if key in seen or not db_path.exists():
+        if key in seen or not await aiofiles.os.path.exists(db_path):
             continue
         seen.add(key)
         try:
-            pdb = SessionDB(db_path=db_path, read_only=True)
+            pdb = SessionDB(db_path, read_only=True)
         except Exception:
             continue
         try:
-            if pdb.get_session(session_id):
+            if await pdb.get_session(session_id):
                 return pdb, name
         except Exception:
             logging.debug("get_session probe failed for %s in %s", session_id, name, exc_info=True)
-        pdb.close()
+        await pdb.close()
 
     return None, None
 
 
-def _read_session(db, session_id: str, head: int = 20, tail: int = 10, link_profile: str = None) -> str:
+async def _read_session(db, session_id: str, head: int = 20, tail: int = 10, link_profile: str = None) -> str:
     """Read shape: dump a whole session by id (head + tail when large).
 
     Serves the linked-session case — the user dropped an @session reference and
@@ -393,7 +412,7 @@ def _read_session(db, session_id: str, head: int = 20, tail: int = 10, link_prof
     pointer to scroll the middle.
     """
     try:
-        meta = db.get_session(session_id) or {}
+        meta = await db.get_session(session_id) or {}
     except Exception as e:
         logging.debug("get_session failed for %s: %s", session_id, e, exc_info=True)
         meta = {}
@@ -401,7 +420,7 @@ def _read_session(db, session_id: str, head: int = 20, tail: int = 10, link_prof
         return tool_error(f"session_id not found: {session_id}", success=False)
 
     try:
-        rows = db.get_messages(session_id)
+        rows = await db.get_messages(session_id)
     except Exception as e:
         logging.error("get_messages failed for %s: %s", session_id, e, exc_info=True)
         return tool_error(f"failed to load session: {e}", success=False)
@@ -415,7 +434,7 @@ def _read_session(db, session_id: str, head: int = 20, tail: int = 10, link_prof
         "success": True,
         "mode": "read",
         "session_id": session_id,
-        "link": _session_link(session_id, link_profile),
+        "link": await _session_link(session_id, link_profile),
         "session_meta": {
             "when": _format_timestamp(meta.get("started_at")),
             "source": meta.get("source"),
@@ -434,16 +453,20 @@ def _read_session(db, session_id: str, head: int = 20, tail: int = 10, link_prof
     return json.dumps(response, ensure_ascii=False)
 
 
-def _list_recent_sessions(db, limit: int, current_session_id: str = None, link_profile: str = None) -> str:
+async def _list_recent_sessions(db, limit: int, current_session_id: str = None, link_profile: str = None) -> str:
     """Return metadata for the most recent sessions (no LLM calls, no FTS5)."""
     try:
-        sessions = db.list_sessions_rich(
+        sessions = await db.list_sessions_rich(
             limit=limit + 5,
             exclude_sources=list(_HIDDEN_SESSION_SOURCES),
             order_by_last_active=True,
         )  # fetch extra so we can skip current
 
-        current_root = _resolve_lineage(db, current_session_id) if current_session_id else None
+        current_root = (
+            await _resolve_lineage(db, current_session_id)
+            if current_session_id
+            else None
+        )
 
         results = []
         for s in sessions:
@@ -455,7 +478,7 @@ def _list_recent_sessions(db, limit: int, current_session_id: str = None, link_p
                 continue
             results.append({
                 "session_id": sid,
-                "link": _session_link(sid, link_profile),
+                "link": await _session_link(sid, link_profile),
                 "title": s.get("title") or None,
                 "source": s.get("source", ""),
                 "started_at": s.get("started_at", ""),
@@ -478,7 +501,7 @@ def _list_recent_sessions(db, limit: int, current_session_id: str = None, link_p
         return tool_error(f"Failed to list recent sessions: {e}", success=False)
 
 
-def _scroll(
+async def _scroll(
     db,
     session_id: str,
     around_message_id: int,
@@ -513,15 +536,15 @@ def _scroll(
     # longer in live context: in-place compacted rows, and rows owned by a
     # legacy session that ended via compression. Scroll must preserve that
     # distinction instead of rejecting the discovery result it just returned.
-    anchor_state = _get_message_storage_state(db, around_message_id)
+    anchor_state = await _get_message_storage_state(db, around_message_id)
     owning_session_id = (
         anchor_state.get("session_id") if anchor_state is not None else None
     )
 
     if current_session_id:
         anchor_session_id = owning_session_id or session_id
-        a_root = _resolve_lineage(db, anchor_session_id)
-        c_root = _resolve_lineage(db, current_session_id)
+        a_root = await _resolve_lineage(db, anchor_session_id)
+        c_root = await _resolve_lineage(db, current_session_id)
         if a_root and c_root and a_root == c_root:
             is_compacted_anchor = (
                 anchor_state is not None
@@ -535,7 +558,7 @@ def _scroll(
             )
             is_compression_history = (
                 not is_inactive_non_compacted_anchor
-                and _is_compression_ended(db, anchor_session_id)
+                and await _is_compression_ended(db, anchor_session_id)
             )
             if not (is_compacted_anchor or is_compression_history):
                 return tool_error(
@@ -545,7 +568,7 @@ def _scroll(
 
     # Session existence check
     try:
-        session_meta = db.get_session(session_id) or {}
+        session_meta = await db.get_session(session_id) or {}
     except Exception as e:
         logging.debug("get_session failed for %s: %s", session_id, e, exc_info=True)
         session_meta = {}
@@ -554,7 +577,7 @@ def _scroll(
 
     # Fetch the window
     try:
-        view = db.get_messages_around(session_id, around_message_id, window=window)
+        view = await db.get_messages_around(session_id, around_message_id, window=window)
     except Exception as e:
         logging.error("get_messages_around failed: %s", e, exc_info=True)
         return tool_error(f"failed to load messages: {e}", success=False)
@@ -568,11 +591,13 @@ def _scroll(
     if not messages:
         owning = owning_session_id
         if owning and owning != session_id:
-            a_root = _resolve_lineage(db, session_id)
-            o_root = _resolve_lineage(db, owning)
+            a_root = await _resolve_lineage(db, session_id)
+            o_root = await _resolve_lineage(db, owning)
             if a_root and o_root and a_root == o_root:
                 try:
-                    rebind_view = db.get_messages_around(owning, around_message_id, window=window)
+                    rebind_view = await db.get_messages_around(
+                        owning, around_message_id, window=window
+                    )
                     messages = rebind_view.get("window") or []
                     if messages:
                         view = rebind_view
@@ -581,7 +606,7 @@ def _scroll(
                             f"(child of {session_id}); rebound transparently"
                         )
                         try:
-                            session_meta = db.get_session(owning) or session_meta
+                            session_meta = await db.get_session(owning) or session_meta
                         except Exception:
                             pass
                         session_id = owning
@@ -620,7 +645,7 @@ def _normalize_title_query(query: str) -> str:
     return query.strip().strip("`'\"")
 
 
-def _title_match_result(
+async def _title_match_result(
     db,
     query: str,
     current_lineage_root: Optional[str],
@@ -631,19 +656,19 @@ def _title_match_result(
         return None
 
     try:
-        session_id = db.resolve_session_by_title(title_query)
+        session_id = await db.resolve_session_by_title(title_query)
     except Exception:
         logging.debug("resolve_session_by_title failed for %r", title_query, exc_info=True)
         return None
     if not session_id:
         return None
 
-    lineage_root = _resolve_lineage(db, session_id)
+    lineage_root = await _resolve_lineage(db, session_id)
     if current_lineage_root and lineage_root == current_lineage_root:
         return None
 
     try:
-        session_meta = db.get_session(lineage_root) or db.get_session(session_id) or {}
+        session_meta = await db.get_session(lineage_root) or await db.get_session(session_id) or {}
     except Exception:
         logging.debug("get_session failed for title match %s", session_id, exc_info=True)
         session_meta = {}
@@ -651,7 +676,7 @@ def _title_match_result(
         return None
 
     try:
-        messages = db.get_messages(session_id)
+        messages = await db.get_messages(session_id)
     except Exception:
         logging.debug("get_messages failed for title match %s", session_id, exc_info=True)
         messages = []
@@ -659,7 +684,7 @@ def _title_match_result(
     anchor_id = messages[0].get("id") if messages else None
     if anchor_id is not None:
         try:
-            view = db.get_anchored_view(session_id, anchor_id, window=5, bookend=3)
+            view = await db.get_anchored_view(session_id, anchor_id, window=5, bookend=3)
         except Exception:
             logging.debug("get_anchored_view failed for title match %s/%s", session_id, anchor_id, exc_info=True)
             view = {}
@@ -687,7 +712,7 @@ def _title_match_result(
     return entry
 
 
-def _discover(
+async def _discover(
     db,
     query: str,
     role_filter: Optional[List[str]],
@@ -698,11 +723,15 @@ def _discover(
 ) -> str:
     """Discovery shape: FTS5 + anchored window + bookends per hit. Single call."""
     role_list = role_filter if role_filter else ["user", "assistant"]
-    current_lineage_root = _resolve_lineage(db, current_session_id) if current_session_id else None
-    title_result = _title_match_result(db, query, current_lineage_root)
+    current_lineage_root = (
+        await _resolve_lineage(db, current_session_id)
+        if current_session_id
+        else None
+    )
+    title_result = await _title_match_result(db, query, current_lineage_root)
 
     try:
-        raw_results = db.search_messages(
+        raw_results = await db.search_messages(
             query=query,
             role_filter=role_list,
             exclude_sources=list(_HIDDEN_SESSION_SOURCES),
@@ -732,7 +761,7 @@ def _discover(
             "count": 0,
             "message": "No matching sessions found.",
         }
-        _annotate_rebuild_status(db, _empty_payload)
+        await _annotate_rebuild_status(db, _empty_payload)
         return json.dumps(_empty_payload, ensure_ascii=False)
 
     # Dedupe by lineage. Keep the raw owning session_id on the surviving
@@ -751,7 +780,7 @@ def _discover(
         if len(seen_sessions) >= limit:
             break
         raw_sid = r["session_id"]
-        resolved_sid, _ = _resolve_to_parent(db, raw_sid)
+        resolved_sid, _ = await _resolve_to_parent(db, raw_sid)
         # Skip the current session lineage — UNLESS the content has been
         # compression-summarised out of the live context (memory black hole
         # after compression). Two sub-cases:
@@ -767,8 +796,8 @@ def _discover(
         # current session, but the matched message row is an archived
         # (active=0, compacted=1) row. The live-context load filters active=1,
         # so that content is no longer in context — let it through.
-        is_compacted_hit = _is_compacted_message(db, r.get("id"))
-        is_ended_session = _is_compression_ended(db, raw_sid)
+        is_compacted_hit = await _is_compacted_message(db, r.get("id"))
+        is_ended_session = await _is_compression_ended(db, raw_sid)
         if current_lineage_root and resolved_sid == current_lineage_root:
             if not (is_ended_session or is_compacted_hit):
                 continue
@@ -791,13 +820,13 @@ def _discover(
         hit_sid = match_info.get("session_id") or lineage_root
         msg_id = match_info.get("id")
         try:
-            view = db.get_anchored_view(hit_sid, msg_id, window=5, bookend=3)
+            view = await db.get_anchored_view(hit_sid, msg_id, window=5, bookend=3)
         except Exception as e:
             logging.warning("get_anchored_view failed for %s/%s: %s", hit_sid, msg_id, e, exc_info=True)
             continue
 
         try:
-            session_meta = db.get_session(lineage_root) or {}
+            session_meta = await db.get_session(lineage_root) or {}
         except Exception:
             session_meta = {}
 
@@ -831,7 +860,7 @@ def _discover(
         results.append(entry)
 
     for entry in results:
-        entry["link"] = _session_link(entry["session_id"], link_profile)
+        entry["link"] = await _session_link(entry["session_id"], link_profile)
 
     _final_payload = {
         "success": True,
@@ -841,11 +870,11 @@ def _discover(
         "count": len(results),
         "sessions_searched": len(seen_sessions),
     }
-    _annotate_rebuild_status(db, _final_payload)
+    await _annotate_rebuild_status(db, _final_payload)
     return json.dumps(_final_payload, ensure_ascii=False)
 
 
-def session_search(
+async def session_search(
     query: str = "",
     role_filter: str = None,
     limit: int = 3,
@@ -871,103 +900,116 @@ def session_search(
     ``@session:<profile>/<id>`` link). Scroll wins over read/discovery when an
     anchor is set — the agent has asked for a specific slice.
     """
-    if db is None:
-        try:
-            from hermes_state import SessionDB
-            db = SessionDB()
-        except Exception:
-            logging.debug("SessionDB unavailable for session_search", exc_info=True)
-            from hermes_state import format_session_db_unavailable
-            return tool_error(format_session_db_unavailable(), success=False)
+    owned_databases = []
+    try:
+        if db is None:
+            try:
+                from hermes_state import SessionDB, _default_db_path
+                db = SessionDB(_default_db_path())
+                owned_databases.append(db)
+            except Exception as exc:
+                logging.debug("SessionDB construction failed for session_search", exc_info=True)
+                return tool_error(f"Session database not available: {exc}", success=False)
 
-    # Normalise a raw `@session:<profile>/<id>` link value passed as session_id.
-    # Session ids never contain "/", so a slash unambiguously means profile/id —
-    # always strip the prefix off the id, and adopt the embedded profile only
-    # when one wasn't passed explicitly. Handles every permutation the model
-    # might send (full value as id, with or without a separate profile=).
-    if isinstance(session_id, str) and "/" in session_id:
-        emb_profile, _, emb_id = session_id.partition("/")
-        if emb_id:
-            session_id = emb_id
-            if emb_profile and (profile is None or not str(profile).strip()):
-                profile = emb_profile
+        # Normalise a raw `@session:<profile>/<id>` link value passed as session_id.
+        # Session ids never contain "/", so a slash unambiguously means profile/id —
+        # always strip the prefix off the id, and adopt the embedded profile only
+        # when one wasn't passed explicitly. Handles every permutation the model
+        # might send (full value as id, with or without a separate profile=).
+        if isinstance(session_id, str) and "/" in session_id:
+            emb_profile, _, emb_id = session_id.partition("/")
+            if emb_id:
+                session_id = emb_id
+                if emb_profile and (profile is None or not str(profile).strip()):
+                    profile = emb_profile
 
-    # Cross-profile read: swap in the named profile's DB (read-only) for every
-    # shape below. The current-session-lineage guards no longer apply across
-    # profiles, but they key off ids that won't collide, so they stay inert.
-    if profile is not None and str(profile).strip():
-        try:
-            profile_db = _resolve_profile_db(profile)
-        except Exception as e:
-            return tool_error(f"profile '{profile}': {e}", success=False)
-        if profile_db is not None:
-            db = profile_db
-            current_session_id = None
+        # Cross-profile read: swap in the named profile's DB (read-only) for every
+        # shape below. The current-session-lineage guards no longer apply across
+        # profiles, but they key off ids that won't collide, so they stay inert.
+        if profile is not None and str(profile).strip():
+            try:
+                profile_db = await _resolve_profile_db(profile)
+            except Exception as e:
+                return tool_error(f"profile '{profile}': {e}", success=False)
+            if profile_db is not None:
+                owned_databases.append(profile_db)
+                db = profile_db
+                current_session_id = None
 
-    # Scroll shape takes precedence — explicit anchor beats any query.
-    if (isinstance(session_id, str) and session_id.strip()) and around_message_id is not None:
-        return _scroll(
-            db=db,
-            session_id=session_id,
-            around_message_id=around_message_id,
-            window=window,
-            current_session_id=current_session_id,
-        )
+        # Scroll shape takes precedence — explicit anchor beats any query.
+        if (isinstance(session_id, str) and session_id.strip()) and around_message_id is not None:
+            return await _scroll(
+                db=db,
+                session_id=session_id,
+                around_message_id=around_message_id,
+                window=window,
+                current_session_id=current_session_id,
+            )
 
-    # Read shape: a session_id with no anchor → dump the whole session.
-    if isinstance(session_id, str) and session_id.strip():
-        sid = session_id.strip()
-        result = _read_session(db, sid, link_profile=profile)
-        if json.loads(result).get("success"):
+        # Read shape: a session_id with no anchor → dump the whole session.
+        if isinstance(session_id, str) and session_id.strip():
+            sid = session_id.strip()
+            result = await _read_session(db, sid, link_profile=profile)
+            if json.loads(result).get("success"):
+                return result
+
+            # Miss in the target profile — the model may have dropped the owning
+            # profile from the link. Scan every profile and read it from wherever
+            # it lives, tagging the profile it was found in.
+            located, owner = await _locate_session_db(sid)
+            if located is not None:
+                try:
+                    found = json.loads(
+                        await _read_session(located, sid, link_profile=owner)
+                    )
+                finally:
+                    await located.close()
+                if found.get("success"):
+                    found["profile"] = owner
+                    return json.dumps(found, ensure_ascii=False)
             return result
 
-        # Miss in the target profile — the model may have dropped the owning
-        # profile from the link. Scan every profile and read it from wherever
-        # it lives, tagging the profile it was found in.
-        located, owner = _locate_session_db(sid)
-        if located is not None:
+        # Limit clamp [1, 10]
+        if not isinstance(limit, int):
             try:
-                found = json.loads(_read_session(located, sid, link_profile=owner))
-            finally:
-                located.close()
-            if found.get("success"):
-                found["profile"] = owner
-                return json.dumps(found, ensure_ascii=False)
-        return result
+                limit = int(limit)
+            except (TypeError, ValueError):
+                limit = 3
+        limit = max(1, min(limit, 10))
 
-    # Limit clamp [1, 10]
-    if not isinstance(limit, int):
-        try:
-            limit = int(limit)
-        except (TypeError, ValueError):
-            limit = 3
-    limit = max(1, min(limit, 10))
+        # Browse shape: no query → recent sessions.
+        if not query or not isinstance(query, str) or not query.strip():
+            return await _list_recent_sessions(
+                db, limit, current_session_id, link_profile=profile
+            )
 
-    # Browse shape: no query → recent sessions.
-    if not query or not isinstance(query, str) or not query.strip():
-        return _list_recent_sessions(db, limit, current_session_id, link_profile=profile)
+        # Parse role_filter
+        role_list: Optional[List[str]] = None
+        if isinstance(role_filter, str) and role_filter.strip():
+            role_list = [r.strip() for r in role_filter.split(",") if r.strip()]
 
-    # Parse role_filter
-    role_list: Optional[List[str]] = None
-    if isinstance(role_filter, str) and role_filter.strip():
-        role_list = [r.strip() for r in role_filter.split(",") if r.strip()]
+        # Normalise sort
+        sort_norm: Optional[str] = None
+        if isinstance(sort, str):
+            candidate = sort.strip().lower()
+            if candidate in ("newest", "oldest"):
+                sort_norm = candidate
 
-    # Normalise sort
-    sort_norm: Optional[str] = None
-    if isinstance(sort, str):
-        candidate = sort.strip().lower()
-        if candidate in ("newest", "oldest"):
-            sort_norm = candidate
-
-    return _discover(
-        db=db,
-        query=query.strip(),
-        role_filter=role_list,
-        limit=limit,
-        sort=sort_norm,
-        current_session_id=current_session_id,
-        link_profile=profile,
-    )
+        return await _discover(
+            db=db,
+            query=query.strip(),
+            role_filter=role_list,
+            limit=limit,
+            sort=sort_norm,
+            current_session_id=current_session_id,
+            link_profile=profile,
+        )
+    finally:
+        for owned_database in reversed(owned_databases):
+            try:
+                await owned_database.close()
+            except Exception:
+                logging.debug("Failed to close session-search database", exc_info=True)
 
 
 def check_session_search_requirements() -> bool:
@@ -1140,11 +1182,10 @@ SESSION_SEARCH_SCHEMA = {
 # --- Registry ---
 from tools.registry import registry, tool_error
 
-registry.register(
-    name="session_search",
-    toolset="session_search",
-    schema=SESSION_SEARCH_SCHEMA,
-    handler=lambda args, **kw: session_search(
+
+async def _session_search_handler(args: dict, **kw) -> str:
+    """Registry entry point for the native async session-search surface."""
+    return await session_search(
         query=args.get("query") or "",
         role_filter=args.get("role_filter"),
         limit=args.get("limit", 3),
@@ -1155,7 +1196,13 @@ registry.register(
         profile=args.get("profile"),
         db=kw.get("db"),
         current_session_id=kw.get("current_session_id"),
-    ),
+    )
+
+registry.register(
+    name="session_search",
+    toolset="session_search",
+    schema=SESSION_SEARCH_SCHEMA,
+    handler=_session_search_handler,
     check_fn=check_session_search_requirements,
     emoji="🔍",
 )

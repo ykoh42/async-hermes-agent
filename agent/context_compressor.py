@@ -19,23 +19,17 @@ Improvements over v2:
 import hashlib
 import json
 import logging
-import sqlite3
 import re
 import time
 import uuid
 from typing import Any, Dict, List, Optional
 
-from agent.auxiliary_client import (
-    AuxiliaryExplicitCancellation,
-    _is_connection_error,
-    aux_interrupt_protection,
-    call_llm,
-)
+from agent.auxiliary_client import call_llm, _is_connection_error, aux_interrupt_protection
 from agent.context_engine import ContextEngine, sanitize_memory_context
 from agent.error_classifier import FailoverReason, classify_api_error
 from agent.model_metadata import (
     MINIMUM_CONTEXT_LENGTH,
-    get_model_context_length,
+    get_static_context_length,
     estimate_messages_tokens_rough,
     estimate_tokens_rough,
 )
@@ -641,12 +635,6 @@ _ACTIVE_TASK_MAX_CHARS = 1400
 # high for small/light tails, but using all 20 as a hard floor here would bring
 # back the old large-tool-output case where nothing can be compacted.
 _MAX_TAIL_MESSAGE_FLOOR = 8
-
-# Pre-LLM feasibility skip (#60451): when the compressible middle is below
-# this fraction of threshold_tokens (and a prior real-usage ineffectiveness
-# strike exists), skip the LLM summary call — deterministic dropping alone
-# recovers the negligible savings such a summary could deliver.
-_FEASIBILITY_SKIP_MIDDLE_FRACTION = 0.10
 # Under context pressure (protected-tail tool bodies alone exceed the soft
 # tail budget), demote large completed tool/file outputs even inside the
 # protected region — but always keep this many trailing messages verbatim so
@@ -775,11 +763,6 @@ def _serialized_length_for_budget(value: Any) -> int:
 # Responses sessions in particular carry ``codex_reasoning_items`` blobs of
 # ``encrypted_content`` that can dominate the serialized session (a measured
 # 214-turn session held ~115K tokens / 27% of its payload there — #55572).
-#
-# ``reasoning_details`` is handled separately (see
-# ``_reasoning_details_text_chars``): its signed/base64 envelope is excluded
-# from the budget, mirroring the preflight estimator's exclusion in
-# ``model_metadata._estimate_message_tokens_without_images`` (#73298).
 _REPLAY_BUDGET_KEYS = (
     "reasoning",
     "reasoning_content",
@@ -789,35 +772,25 @@ _REPLAY_BUDGET_KEYS = (
 
 
 def _reasoning_details_text_chars(value: Any) -> int:
-    """Textual thinking chars inside a ``reasoning_details`` envelope.
-
-    ``reasoning_details`` carries provider thinking blocks: the actual
-    thinking TEXT plus opaque signed/base64 envelope blobs (Anthropic
-    ``signature``, redacted ``data``, encrypted payloads).  The envelope is
-    never billed at anything near chars/4 by the provider and — on every
-    transport except Codex Responses — is replayed for at most the newest
-    assistant turn, so charging it on every message inflated the tail-budget
-    walk and silently shrank the surviving tail (#73298, second site).
-
-    Count only the thinking text (the #51800 lesson: real reasoning text
-    MUST stay visible to the budget), skip everything else.
-    """
+    """Return the textual thinking size without provider envelope blobs."""
     if not value:
         return 0
     if isinstance(value, str):
         return len(value)
-    total = 0
     if isinstance(value, dict):
         value = [value]
-    if isinstance(value, list):
-        for part in value:
-            if isinstance(part, str):
-                total += len(part)
-            elif isinstance(part, dict):
-                for text_key in ("thinking", "text", "summary"):
-                    text = part.get(text_key)
-                    if isinstance(text, str):
-                        total += len(text)
+    if not isinstance(value, list):
+        return 0
+
+    total = 0
+    for part in value:
+        if isinstance(part, str):
+            total += len(part)
+        elif isinstance(part, dict):
+            for text_key in ("thinking", "text", "summary"):
+                text = part.get(text_key)
+                if isinstance(text, str):
+                    total += len(text)
     return total
 
 
@@ -852,12 +825,6 @@ def _estimate_msg_budget_tokens(msg: dict) -> int:
             tokens += estimate_tokens_rough(str(tc))
     for key in _REPLAY_BUDGET_KEYS:
         tokens += _serialized_length_for_budget(msg.get(key)) // _CHARS_PER_TOKEN
-    # reasoning_details: charge only the thinking TEXT, never the signed /
-    # base64 envelope (#73298 second site; mirrors the preflight estimator's
-    # exclusion in model_metadata).  When the same thinking text already rides
-    # in ``reasoning``/``reasoning_content`` (measured byte-identical on
-    # Anthropic-wire sessions), skip it here entirely so the prose is not
-    # charged twice on top of the envelope exclusion.
     if not (msg.get("reasoning") or msg.get("reasoning_content")):
         tokens += (
             _reasoning_details_text_chars(msg.get("reasoning_details"))
@@ -1230,13 +1197,6 @@ def _summarize_tool_result_unguarded(tool_name: str, tool_args: str, tool_conten
             goal = goal[:57] + "..."
         return f"[delegate_task] '{goal}' ({content_len:,} chars result)"
 
-    if tool_name == "execute_code":
-        code_str = _str_arg(args, "code")
-        code_preview = code_str[:60].replace("\n", " ")
-        if len(code_str) > 60:
-            code_preview += "..."
-        return f"[execute_code] `{code_preview}` ({line_count} lines output)"
-
     if tool_name == "skill_view":
         name = args.get("name", "?")
         if content_len > _SKILL_VIEW_PRUNE_MIN_CHARS:
@@ -1270,10 +1230,6 @@ def _summarize_tool_result_unguarded(tool_name: str, tool_args: str, tool_conten
 
     if tool_name == "text_to_speech":
         return f"[text_to_speech] generated audio ({content_len:,} chars)"
-
-    if tool_name == "cronjob":
-        action = args.get("action", "?")
-        return f"[cronjob] {action}"
 
     if tool_name == "process":
         action = args.get("action", "?")
@@ -1340,13 +1296,11 @@ class ContextCompressor(ContextEngine):
         self._consecutive_timeout_failures = 0
         self._last_summary_dropped_count = 0
         self._last_summary_fallback_used = False
-        self._last_feasibility_skip = False
         self._last_aux_model_failure_error = None
         self._last_aux_model_failure_model = None
         self._last_compression_savings_pct = 100.0
         self._ineffective_compression_count = 0
         self._anti_thrash_recovery_deadline = 0.0
-        self._prellm_skip_count = 0
         self._fallback_compression_streak = 0
         self._verify_compaction_cleared_threshold = False
         self._last_compression_made_progress = False
@@ -1398,7 +1352,6 @@ class ContextCompressor(ContextEngine):
             "protected_head_tokens": None,
             "protected_tail_tokens": None,
             "middle_window_tokens": None,
-            "prellm_skip_count": 0,
             "aux_prompt_tokens": None,
             "aux_output_reservation": None,
             "aux_provider": "",
@@ -1469,9 +1422,7 @@ class ContextCompressor(ContextEngine):
         """Emit the informative startup line once, on first resolution.
 
         Deferred out of ``__init__`` (#32221): the line reports resolved token
-        budgets, so emitting it there would force the synchronous
-        ``get_model_context_length()`` probe during construction. Reads via
-        the properties below are safe here because
+        budgets. Reads via the properties below are safe here because
         ``_resolved_context_length`` is already set.
         """
         if not getattr(self, "_log_init_summary", False):
@@ -1488,12 +1439,11 @@ class ContextCompressor(ContextEngine):
         )
 
     def _resolve_context_length(self) -> int:
-        """Resolve and cache the model's context length on first access."""
+        """Resolve and cache the model's static context length on first access."""
         if self._resolved_context_length is None:
-            self._resolved_context_length = get_model_context_length(
+            self._resolved_context_length = get_static_context_length(
                 self.model,
                 base_url=self.base_url,
-                api_key=self.api_key,
                 config_context_length=self._config_context_length,
                 provider=self.provider,
             )
@@ -1609,13 +1559,11 @@ class ContextCompressor(ContextEngine):
         self._consecutive_timeout_failures = 0
         self._last_summary_dropped_count = 0
         self._last_summary_fallback_used = False
-        self._last_feasibility_skip = False
         self._last_aux_model_failure_error = None
         self._last_aux_model_failure_model = None
         self._last_compression_savings_pct = 100.0
         self._ineffective_compression_count = 0
         self._anti_thrash_recovery_deadline = 0.0
-        self._prellm_skip_count = 0
         self._fallback_compression_streak = 0
         self._verify_compaction_cleared_threshold = False
         self._last_compression_made_progress = False
@@ -1633,7 +1581,14 @@ class ContextCompressor(ContextEngine):
         self._compression_telemetry_seed = None
 
     def bind_session_state(self, session_db: Any = None, session_id: str = "") -> None:
-        """Bind the current session row so durable cooldowns can round-trip."""
+        """Bind the current session identity without performing I/O.
+
+        The native async host hydrates durable guard state at the turn
+        prologue and persists it at the compression boundary.  This lifecycle
+        hook is intentionally synchronous because the context-engine ABC is
+        also used during object construction; it must therefore never call a
+        synchronous SessionDB method from an active async turn.
+        """
         self._session_db = session_db
         self._session_id = session_id or ""
         self._summary_failure_cooldown_until = 0.0
@@ -1642,51 +1597,17 @@ class ContextCompressor(ContextEngine):
         self._consecutive_timeout_failures = 0
         self._fallback_compression_streak = 0
         self._ineffective_compression_count = 0
-        self._prellm_skip_count = 0
         self._anti_thrash_recovery_deadline = 0.0
-        self.get_active_compression_failure_cooldown()
-        self._load_fallback_compression_streak()
-        self._load_ineffective_compression_count()
+        # Durable state is loaded by ``_hydrate_persisted_compression_guards``
+        # through SessionDB at the async turn boundary.
 
     def on_session_start(self, session_id: str, **kwargs) -> None:
         """Bind session-scoped compression state for a new or resumed session."""
         super().on_session_start(session_id, **kwargs)
         boundary_reason = kwargs.get("boundary_reason")
-        old_session_id = kwargs.get("old_session_id")
         session_db = kwargs.get("session_db", getattr(self, "_session_db", None))
         previous_fallback_streak = self._fallback_compression_streak
         previous_ineffective_count = self._ineffective_compression_count
-        if boundary_reason == "compression" and old_session_id:
-            getter = getattr(session_db, "get_compression_fallback_streak", None)
-            if callable(getter):
-                try:
-                    stored_streak = getter(old_session_id)
-                    if isinstance(stored_streak, (int, float, str)):
-                        previous_fallback_streak = max(0, int(stored_streak))
-                except (TypeError, ValueError, sqlite3.Error) as exc:
-                    logger.debug("compression parent fallback streak lookup failed: %s", exc)
-                except Exception as exc:
-                    logger.debug(
-                        "compression parent fallback streak lookup failed (non-sqlite): %s",
-                        exc,
-                    )
-            count_getter = getattr(
-                session_db, "get_compression_ineffective_count", None,
-            )
-            if callable(count_getter):
-                try:
-                    stored_count = count_getter(old_session_id)
-                    if isinstance(stored_count, (int, float, str)):
-                        previous_ineffective_count = max(0, int(stored_count))
-                except (TypeError, ValueError, sqlite3.Error) as exc:
-                    logger.debug(
-                        "compression parent ineffective count lookup failed: %s", exc,
-                    )
-                except Exception as exc:
-                    logger.debug(
-                        "compression parent ineffective count lookup failed (non-sqlite): %s",
-                        exc,
-                    )
         self.bind_session_state(session_db, session_id)
         if boundary_reason == "compression":
             # Rotation creates a fresh child row before this callback. Preserve
@@ -1703,36 +1624,12 @@ class ContextCompressor(ContextEngine):
                 self._persist_ineffective_compression_count()
 
     def _load_fallback_compression_streak(self) -> None:
-        session_db = getattr(self, "_session_db", None)
-        session_id = getattr(self, "_session_id", "")
-        getter = getattr(session_db, "get_compression_fallback_streak", None)
-        if not session_id or not callable(getter):
-            return
-        try:
-            stored_streak = getter(session_id)
-            self._fallback_compression_streak = max(
-                0,
-                int(stored_streak)
-                if isinstance(stored_streak, (int, float, str))
-                else 0,
-            )
-        except (TypeError, ValueError, sqlite3.Error) as exc:
-            logger.debug("compression fallback streak lookup failed: %s", exc)
-        except Exception as exc:
-            logger.debug("compression fallback streak lookup failed (non-sqlite): %s", exc)
+        """Compatibility no-op; async turn prologue owns DB hydration."""
+        return
 
     def _persist_fallback_compression_streak(self) -> None:
-        session_db = getattr(self, "_session_db", None)
-        session_id = getattr(self, "_session_id", "")
-        setter = getattr(session_db, "set_compression_fallback_streak", None)
-        if not session_id or not callable(setter):
-            return
-        try:
-            setter(session_id, self._fallback_compression_streak)
-        except sqlite3.Error as exc:
-            logger.debug("compression fallback streak persist failed: %s", exc)
-        except Exception as exc:
-            logger.debug("compression fallback streak persist failed (non-sqlite): %s", exc)
+        """Compatibility no-op; the async compression boundary persists it."""
+        return
 
     def _load_ineffective_compression_count(self) -> None:
         """Load the durable anti-thrash strike count for the bound session.
@@ -1745,36 +1642,12 @@ class ContextCompressor(ContextEngine):
         (#54923). The counter now round-trips through the session row like
         the failure cooldown and the fallback streak.
         """
-        session_db = getattr(self, "_session_db", None)
-        session_id = getattr(self, "_session_id", "")
-        getter = getattr(session_db, "get_compression_ineffective_count", None)
-        if not session_id or not callable(getter):
-            return
-        try:
-            stored_count = getter(session_id)
-            self._ineffective_compression_count = max(
-                0,
-                int(stored_count)
-                if isinstance(stored_count, (int, float, str))
-                else 0,
-            )
-        except (TypeError, ValueError, sqlite3.Error) as exc:
-            logger.debug("compression ineffective count lookup failed: %s", exc)
-        except Exception as exc:
-            logger.debug("compression ineffective count lookup failed (non-sqlite): %s", exc)
+        # The async turn prologue fills this value from SessionDB.
+        return
 
     def _persist_ineffective_compression_count(self) -> None:
-        session_db = getattr(self, "_session_db", None)
-        session_id = getattr(self, "_session_id", "")
-        setter = getattr(session_db, "set_compression_ineffective_count", None)
-        if not session_id or not callable(setter):
-            return
-        try:
-            setter(session_id, self._ineffective_compression_count)
-        except sqlite3.Error as exc:
-            logger.debug("compression ineffective count persist failed: %s", exc)
-        except Exception as exc:
-            logger.debug("compression ineffective count persist failed (non-sqlite): %s", exc)
+        """Compatibility no-op; the async compression boundary persists it."""
+        return
 
     def _record_ineffective_compression_verdict(self, count: int) -> None:
         """Set the anti-thrash strike counter, keeping the durable copy in sync.
@@ -1787,34 +1660,9 @@ class ContextCompressor(ContextEngine):
         self._ineffective_compression_count = count
         self._persist_ineffective_compression_count()
 
-    def record_completed_compaction(
-        self, *, used_fallback: bool = False, feasibility_skip: bool = False,
-    ) -> None:
-        """Record one completed boundary and its summary quality.
-
-        ``feasibility_skip=True`` marks a deliberate pre-LLM skip (#60451):
-        the boundary is streak-NEUTRAL for ``_fallback_compression_streak``
-        (neither incremented nor reset). It still arms the real-usage
-        effectiveness verdict (``_verify_compaction_cleared_threshold``) on
-        purpose — a skipped-summary drop that fails to clear the threshold is
-        exactly the incompressible-transcript case the ineffective-strike
-        breaker exists for, and its recovery probe bounds the block.
-        """
+    def record_completed_compaction(self, *, used_fallback: bool = False) -> None:
+        """Record one completed boundary and its summary quality."""
         self._verify_compaction_cleared_threshold = True
-        if feasibility_skip:
-            # A deliberate pre-LLM feasibility skip (#60451) is not a
-            # summary-quality verdict: it must neither extend a fallback
-            # streak (two skips would otherwise latch the >= 2 breaker and
-            # disable compression entirely — including the cheap deterministic
-            # dropping the skip exists to reach) nor reset one (a skip proves
-            # nothing about the summary model's health).
-            if not self.quiet_mode:
-                logger.info(
-                    "Compaction completed via pre-LLM feasibility skip; "
-                    "fallback_compression_streak unchanged (%d)",
-                    self._fallback_compression_streak,
-                )
-            return
         if used_fallback:
             self._fallback_compression_streak += 1
             if not self.quiet_mode:
@@ -1833,11 +1681,6 @@ class ContextCompressor(ContextEngine):
         refresh: bool = False,
     ) -> Optional[Dict[str, Any]]:
         """Return the live compression-failure cooldown for the bound session."""
-        if refresh:
-            # Transaction rollback must distinguish an authoritative empty row
-            # from a failed/unavailable durable read. The public return value
-            # cannot do so because it deliberately falls back to local state.
-            self._last_cooldown_refresh_was_authoritative = None
         now_mono = time.monotonic()
         local_state = None
         if self._summary_failure_cooldown_until > now_mono:
@@ -1851,58 +1694,10 @@ class ContextCompressor(ContextEngine):
             if not refresh:
                 return local_state
 
-        session_db = getattr(self, "_session_db", None)
-        session_id = getattr(self, "_session_id", "")
-        if not session_db or not session_id:
-            return local_state
-
-        getter = getattr(session_db, "get_compression_failure_cooldown", None)
-        if getter is None:
-            return local_state
-        try:
-            state = getter(session_id)
-        except sqlite3.Error as exc:
-            if refresh:
-                self._last_cooldown_refresh_was_authoritative = False
-            logger.debug("compression failure cooldown lookup failed: %s", exc)
-            return local_state
-        except Exception:
-            if refresh:
-                self._last_cooldown_refresh_was_authoritative = False
-            return local_state
-        if refresh:
-            self._last_cooldown_refresh_was_authoritative = True
-        if not state:
-            if refresh:
-                if local_state is not None and self._cooldown_persist_failed:
-                    # The live local cooldown never made it to the DB (persist
-                    # failed), so the empty row is not evidence that another
-                    # agent cleared it. Honouring the DB here would re-enable
-                    # auto-compress mid-cooldown and reopen the #11529 thrash
-                    # window. Keep the local timer authoritative until it
-                    # expires or a successful DB read supersedes it.
-                    return local_state
-                self._summary_failure_cooldown_until = 0.0
-                self._last_summary_error = None
-            return None
-
-        remaining_seconds = float(state.get("remaining_seconds") or 0.0)
-        if remaining_seconds <= 0:
-            if refresh:
-                if local_state is not None and self._cooldown_persist_failed:
-                    return local_state
-                self._summary_failure_cooldown_until = 0.0
-                self._last_summary_error = None
-            return None
-
-        self._summary_failure_cooldown_until = now_mono + remaining_seconds
-        self._last_summary_error = state.get("error")
-        self._cooldown_persist_failed = False
-        return {
-            "cooldown_until": float(state.get("cooldown_until") or 0.0),
-            "remaining_seconds": remaining_seconds,
-            "error": self._last_summary_error,
-        }
+        # Durable state is hydrated asynchronously before this method is
+        # reached.  Keeping this accessor memory-only makes all synchronous
+        # decision helpers safe to call from the event loop.
+        return local_state
 
     def _record_compression_failure_cooldown(
         self,
@@ -1913,81 +1708,17 @@ class ContextCompressor(ContextEngine):
         self._summary_failure_cooldown_until = time.monotonic() + cooldown_seconds
         self._last_summary_error = error
 
-        session_db = getattr(self, "_session_db", None)
-        session_id = getattr(self, "_session_id", "")
-        if not session_db or not session_id:
-            return
-
-        recorder = getattr(session_db, "record_compression_failure_cooldown", None)
-        if recorder is None:
-            self._cooldown_persist_failed = True
-            return
-        try:
-            recorder(session_id, cooldown_until, error)
-            self._cooldown_persist_failed = False
-        except sqlite3.Error as exc:
-            self._cooldown_persist_failed = True
-            logger.debug("compression failure cooldown persist failed: %s", exc)
-        except Exception as exc:
-            self._cooldown_persist_failed = True
-            logger.debug("compression failure cooldown persist failed (non-sqlite): %s", exc)
-
-    def record_timeout_failure(self, error: str) -> None:
-        """Record a consecutive timeout failure using the shared cooldown ladder.
-
-        Used by both the summary-LLM exception handler (inline at line ~3714)
-        and the host-level ``compress_context`` timeout wrapper in
-        ``run_compress_context_with_progress_timeout``. Avoids re-implementing
-        the ladder at each call site (#62452).
-        """
-        _TIMEOUT_COOLDOWN_LADDER = (60, 300, 900)
-        self._consecutive_timeout_failures = (
-            getattr(self, "_consecutive_timeout_failures", 0) + 1
-        )
-        cooldown = _TIMEOUT_COOLDOWN_LADDER[
-            min(self._consecutive_timeout_failures,
-                len(_TIMEOUT_COOLDOWN_LADDER)) - 1
-        ]
-        self._record_compression_failure_cooldown(float(cooldown), error)
+        # The async compression wrapper persists the complete guard snapshot in
+        # its ``finally`` block.  Never call a synchronous SessionDB method
+        # from this state transition.
 
     def _clear_compression_failure_cooldown(self) -> None:
-        # #76354 review F4: fence check BEFORE cooldown-clear. A late worker
-        # whose host already timed out (and recorded a timeout cooldown) must
-        # not undo that cooldown when its summary eventually succeeds. The
-        # hook is installed by compress_context for the duration of the
-        # fenced call; when it reports cancellation, keep the host's cooldown.
-        cancelled_check = getattr(self, "_compression_cancelled_check", None)
-        if callable(cancelled_check):
-            try:
-                if cancelled_check():
-                    logger.info(
-                        "Skipping compression cooldown clear: host already "
-                        "cancelled this compression attempt"
-                    )
-                    return
-            except Exception:
-                logger.debug(
-                    "compression cancellation check failed", exc_info=True
-                )
         self._summary_failure_cooldown_until = 0.0
         self._last_summary_error = None
         self._consecutive_timeout_failures = 0
         self._cooldown_persist_failed = False
 
-        session_db = getattr(self, "_session_db", None)
-        session_id = getattr(self, "_session_id", "")
-        if not session_db or not session_id:
-            return
-
-        clearer = getattr(session_db, "clear_compression_failure_cooldown", None)
-        if clearer is None:
-            return
-        try:
-            clearer(session_id)
-        except sqlite3.Error as exc:
-            logger.debug("compression failure cooldown clear failed: %s", exc)
-        except Exception as exc:
-            logger.debug("compression failure cooldown clear failed (non-sqlite): %s", exc)
+        # Durable clearing is performed by the async compression boundary.
 
     def update_model(
         self,
@@ -2071,7 +1802,6 @@ class ContextCompressor(ContextEngine):
         # trigger invalidates them. Keep the durable copy in sync so a
         # restart doesn't resurrect strikes this recalibration just voided.
         self._record_ineffective_compression_verdict(0)
-        self._prellm_skip_count = 0
         if runtime_changed:
             self._fallback_compression_streak = 0
             self._persist_fallback_compression_streak()
@@ -2304,10 +2034,6 @@ class ContextCompressor(ContextEngine):
         self._micro_compact_consecutive_failures: int = 0
         self._micro_compact_last_failure_cursor: int = -1
         self._micro_compact_defrag_threshold_tokens: int = 2000
-        # Set by _defrag_rolling_summary when it pops _DB_PERSISTED_MARKER
-        # from a live dict in place; consumed by finalize_turn to invalidate
-        # the agent's bounded flush-scan cursor (sibling of the #75170 site).
-        self._flush_scan_cursor_invalidated: bool = False
         self._micro_compact_passes: int = 0
         self._micro_compact_tokens_saved_total: int = 0
         # Cadence: run a pass every Nth completed turn. Each pass rewrites
@@ -2317,9 +2043,9 @@ class ContextCompressor(ContextEngine):
         self._micro_compact_every_n_turns: int = 1
         self._micro_compact_turns_since_pass: int = 0
 
-        # Defer context-length resolution to first access (#32221):
-        # get_model_context_length() can issue a synchronous /models HTTP
-        # probe, which must not block AIAgent construction. The small-context
+        # Defer context-length resolution to first access (#32221). The
+        # static resolver below performs no I/O, so it is also safe on the
+        # async conversation critical path. The small-context
         # threshold floor and the absolute threshold cap both need the
         # resolved window, so they are applied on first resolution (see
         # _resolve_context_length / the threshold_tokens property) instead
@@ -2335,11 +2061,9 @@ class ContextCompressor(ContextEngine):
         self._max_summary_tokens: int | None = None
         self.compression_count = 0
 
-        # The "initialized" log reports resolved token budgets, which would
-        # force the deferred get_model_context_length() probe to run inside
-        # __init__ and re-introduce the exact synchronous blocking this change
-        # removes (#32221). Emit it on first context-length resolution instead
-        # so construction stays non-blocking on every path (not just quiet).
+        # The "initialized" log reports resolved token budgets. Emit it on
+        # first context-length resolution so construction stays lightweight on
+        # every path (not just quiet).
         self._log_init_summary = not quiet_mode
         self._context_probed = False  # True after a step-down from context error
 
@@ -2369,9 +2093,6 @@ class ContextCompressor(ContextEngine):
         # restart with a persisted tripped counter (#69872) waits a full fresh
         # window before probing (#54923: restart must never disarm a guard).
         self._anti_thrash_recovery_deadline: float = 0.0
-        # Pre-LLM feasibility skips (#60451). Observability only; NEVER feeds
-        # the ineffectiveness strike latch or the fallback streak breaker.
-        self._prellm_skip_count: int = 0
         # Consecutive completed deterministic-fallback boundaries. Unlike the
         # real-usage effectiveness counter, ordinary fitting responses must not
         # reset this breaker; only a healthy completed summary does.
@@ -2393,7 +2114,6 @@ class ContextCompressor(ContextEngine):
         # (gateway hygiene, /compress) can surface a visible warning.
         self._last_summary_dropped_count: int = 0
         self._last_summary_fallback_used: bool = False
-        self._last_feasibility_skip: bool = False
         # When summary generation fails we now ABORT compression entirely
         # and return the original messages unchanged instead of dropping
         # the middle window with a static placeholder.  Callers inspect
@@ -2617,18 +2337,10 @@ class ContextCompressor(ContextEngine):
         counter has a timer — without a re-read the stale in-memory
         snapshot blocks forever.
         """
-        try:
-            self.get_active_compression_failure_cooldown(refresh=True)
-        except Exception as exc:
-            logger.debug("compression cooldown refresh failed: %s", exc)
-        try:
-            self._load_fallback_compression_streak()
-        except Exception as exc:
-            logger.debug("compression fallback-streak refresh failed: %s", exc)
-        try:
-            self._load_ineffective_compression_count()
-        except Exception as exc:
-            logger.debug("compression ineffective-count refresh failed: %s", exc)
+        # Refreshing durable state is an async operation owned by the host.
+        # This method remains as a compatibility hook but deliberately does no
+        # synchronous database work.
+        return
 
     def _automatic_compression_blocked(self) -> bool:
         """Return whether automatic compaction is in cooldown or tripped."""
@@ -3466,7 +3178,7 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         self.summary_model = ""  # empty = use main model
         self._clear_compression_failure_cooldown()  # no cooldown — retry immediately
 
-    def _generate_summary(
+    async def _generate_summary(
         self,
         turns_to_summarize: List[Dict[str, Any]],
         focus_topic: Optional[str] = None,
@@ -3791,10 +3503,12 @@ This compaction should PRIORITISE preserving all information related to the focu
             _aux_context = None
             try:
                 from agent.auxiliary_client import _resolve_task_provider_model
+                from hermes_cli.config import load_config_readonly
 
                 _resolved_provider, _resolved_model, _, _, _ = _resolve_task_provider_model(
                     "compression",
                     model=(self.summary_model or ""),
+                    config=await load_config_readonly(),
                 )
                 _aux_provider = _resolved_provider or ""
                 _aux_model = _resolved_model or _aux_model or self.model or ""
@@ -3810,7 +3524,7 @@ This compaction should PRIORITISE preserving all information related to the focu
             _aux_call_start = time.monotonic()
             try:
                 with aux_interrupt_protection():
-                    response = call_llm(**call_kwargs)
+                    response = await call_llm(**call_kwargs)
             finally:
                 self._record_aux_compression_call(
                     prompt_messages=call_kwargs["messages"],
@@ -3977,7 +3691,7 @@ This compaction should PRIORITISE preserving all information related to the focu
                 else:
                     _reason = "timed out"
                 self._fallback_to_main_for_compression(e, _reason)
-                return self._generate_summary(
+                return await self._generate_summary(
                     turns_to_summarize,
                     focus_topic=focus_topic,
                     memory_context=memory_context,
@@ -3998,7 +3712,7 @@ This compaction should PRIORITISE preserving all information related to the focu
                 and not getattr(self, "_summary_model_fallen_back", False)
             ):
                 self._fallback_to_main_for_compression(e, "failed")
-                return self._generate_summary(
+                return await self._generate_summary(
                     turns_to_summarize,
                     focus_topic=focus_topic,
                     memory_context=memory_context,
@@ -4382,12 +4096,9 @@ This compaction should PRIORITISE preserving all information related to the focu
         end: int,
     ) -> list[tuple[int, str]]:
         """Find handoff summaries inside a compression window."""
-        n = len(messages)
-        # Defensive: clamp bounds so a caller passing an out-of-range end
-        # (e.g. tail-cut returning len(messages)+1 when head_end >= n)
-        # cannot trigger IndexError.  (#75588)
-        start = max(0, min(start, n))
-        end = max(start, min(end, n))
+        message_count = len(messages)
+        start = max(0, min(start, message_count))
+        end = max(start, min(end, message_count))
         summaries: list[tuple[int, str]] = []
         for idx in range(start, end):
             content = messages[idx].get("content")
@@ -5157,7 +4868,10 @@ This compaction should PRIORITISE preserving all information related to the focu
         # exists to prevent.  Re-align FORWARD (never backward, which would give
         # the floor's message back) so a raised cut skips to the end of the
         # group and the whole call/result pair is summarised together.
-        return min(n, self._align_boundary_forward(messages, max(cut_idx, head_end + 1)))
+        return min(
+            n,
+            self._align_boundary_forward(messages, max(cut_idx, head_end + 1)),
+        )
 
     # ------------------------------------------------------------------
     # ContextEngine: manual /compress preflight
@@ -5364,7 +5078,7 @@ This compaction should PRIORITISE preserving all information related to the focu
             {"role": "user", "content": user_prompt},
         ]
 
-    def _micro_summarize_one(
+    async def _micro_summarize_one(
         self,
         exchange_text: str,
     ) -> Optional[str]:
@@ -5400,7 +5114,7 @@ This compaction should PRIORITISE preserving all information related to the focu
 
         try:
             with aux_interrupt_protection():
-                response = call_llm(**call_kwargs)
+                response = await call_llm(**call_kwargs)
         except Exception as exc:
             logger.info("micro-summarization call failed: %s", exc)
             return None
@@ -5426,7 +5140,7 @@ This compaction should PRIORITISE preserving all information related to the focu
         content_tokens = estimate_tokens_rough(self._micro_compact_rolling_summary)
         return content_tokens >= self._micro_compact_defrag_threshold_tokens
 
-    def _defrag_rolling_summary(
+    async def _defrag_rolling_summary(
         self,
         messages: List[Dict[str, Any]],
     ) -> bool:
@@ -5454,7 +5168,7 @@ This compaction should PRIORITISE preserving all information related to the focu
         # "merge these decisions into (no previous summary)" is exactly a
         # rewrite-compactly instruction for the accumulated text.
         self._micro_compact_rolling_summary = ""
-        fresh_summary = self._micro_summarize_one(old_summary)
+        fresh_summary = await self._micro_summarize_one(old_summary)
         if not fresh_summary:
             self._micro_compact_rolling_summary = old_summary
             return False
@@ -5474,15 +5188,6 @@ This compaction should PRIORITISE preserving all information related to the focu
                 # Content changed after a possible flush — clear the persisted
                 # stamp so the DB sync/flush rewrites the row.
                 entry.pop(_DB_PERSISTED_MARKER, None)
-                # Sibling of the finalize_turn pop site (#75170): this pop
-                # also strips the marker from a LIVE dict in place, so the
-                # bounded flush-scan cursor would identity-skip the rewritten
-                # marker and the defragged summary would never reach state.db.
-                # The compressor holds no agent reference, so raise a flag the
-                # finalizer consumes to invalidate agent._db_flush_scan_prefix.
-                # (The pop sites at module scope — fresh copies in
-                # strip-marker helpers — break identity and need no flag.)
-                self._flush_scan_cursor_invalidated = True
                 break
         logger.info(
             "Micro-compaction defrag: rolling summary re-summarized "
@@ -5490,9 +5195,11 @@ This compaction should PRIORITISE preserving all information related to the focu
         )
         return True
 
-    def _micro_compact(
+    async def _micro_compact(
         self,
         messages: List[Dict[str, Any]],
+        *,
+        session_db: Any = None,
     ) -> List[Dict[str, Any]]:
         """Run one round of micro-compaction on the conversation.
 
@@ -5505,9 +5212,9 @@ This compaction should PRIORITISE preserving all information related to the focu
         NOTE: the in-memory splice alone is not persisted — the subsequent
         ``_persist_session`` flush is append-only, so old DB rows stay
         ``active=1`` and a session resume double-loads both the summary and
-        the original exchanges.  This method therefore also calls
-        ``archive_and_compact`` on the session DB to soft-archive old rows
-        and insert the compacted set atomically.
+        the original exchanges. A caller can therefore supply its native
+        async session store, which atomically archives old rows and inserts
+        the compacted set.
         """
         if not self._micro_compact_enabled:
             return messages
@@ -5561,9 +5268,9 @@ This compaction should PRIORITISE preserving all information related to the focu
         # the transcript shape is unchanged and this pass does not also
         # absorb an exchange (one aux call per turn either way).
         if self._needs_defrag():
-            defragged = self._defrag_rolling_summary(messages)
+            defragged = await self._defrag_rolling_summary(messages)
             if defragged:
-                self._sync_micro_compact_to_db(messages)
+                await self._persist_micro_compaction(session_db, messages)
                 self._micro_compact_consecutive_failures = 0
                 self._micro_compact_last_failure_cursor = -1
             self._emit_micro_compaction_telemetry(
@@ -5583,7 +5290,7 @@ This compaction should PRIORITISE preserving all information related to the focu
         # Micro-summarize one exchange
         exchange_text = self._serialize_one_exchange(messages, exchange_start, exchange_end)
         _exchange_tokens = estimate_tokens_rough(exchange_text)
-        updated_summary = self._micro_summarize_one(exchange_text)
+        updated_summary = await self._micro_summarize_one(exchange_text)
         if updated_summary is None:
             # Track consecutive failures on the same cursor position so we
             # don't busy-loop on an unsummarizable exchange every turn.
@@ -5629,7 +5336,7 @@ This compaction should PRIORITISE preserving all information related to the focu
             messages, exchange_start, exchange_end, supersede=_cumulative,
         )
         self._micro_compact_cursor = self._cursor_after_splice(result, exchange_start + 1)
-        self._sync_micro_compact_to_db(result)
+        await self._persist_micro_compaction(session_db, result)
         self._emit_micro_compaction_telemetry(
             outcome="absorbed",
             messages_before=_messages_before,
@@ -5755,35 +5462,37 @@ This compaction should PRIORITISE preserving all information related to the focu
         except Exception as exc:
             logger.debug("failed to emit micro-compaction telemetry: %s", exc)
 
-    def _sync_micro_compact_to_db(
+    async def _persist_micro_compaction(
         self,
+        session_db: Any,
         compacted_messages: List[Dict[str, Any]],
     ) -> None:
         """Persist the micro-compacted message set to the session DB.
 
         Soft-archives every currently-active message row (``active = 0``)
         and inserts *compacted_messages* as fresh active rows — atomically,
-        via ``archive_and_compact``.  Then stamps ``_DB_PERSISTED_MARKER`` on
+        via the supplied native async ``archive_and_compact``. Then stamps
+        ``_DB_PERSISTED_MARKER`` on
         every dict so the upcoming append-only flush (``_persist_session`` →
         ``_flush_messages_to_session_db_unlocked``) skips them: they are
         already correctly stored.
 
         Without this, the in-memory-only splice leaves old exchange rows at
         ``active=1``, and a session resume double-loads both the summary and
-        the original messages — blowing past the model's context limit.
+        the original messages — blowing past the model's context limit. No
+        synchronous session-store fallback is used.
         """
-        session_db = getattr(self, "_session_db", None)
         session_id = getattr(self, "_session_id", "")
         if not session_db or not session_id:
             return
         try:
-            session_db.archive_and_compact(session_id, compacted_messages)
+            await session_db.archive_and_compact(session_id, compacted_messages)
             for msg in compacted_messages:
                 if isinstance(msg, dict):
                     msg[_DB_PERSISTED_MARKER] = True
         except Exception:
             logger.info(
-                "Micro-compaction DB sync failed — resume will double-load "
+                "Micro-compaction async DB persistence failed — resume will double-load "
                 "compacted messages until the next batch compression"
             )
 
@@ -5874,7 +5583,7 @@ This compaction should PRIORITISE preserving all information related to the focu
         # are accurate. Stripping them meant an archive_and_compact failure
         # left every previously-persisted message unstamped, and the next
         # append-only flush re-inserted them as duplicate active rows on top
-        # of the still-active originals. _sync_micro_compact_to_db re-stamps
+        # of the still-active originals. _persist_micro_compaction re-stamps
         # everything after a SUCCESSFUL archive; on failure the old stamps
         # keep the flush idempotent (only the new marker row is appended).
         return result
@@ -5931,7 +5640,7 @@ This compaction should PRIORITISE preserving all information related to the focu
             merged.append(msg)
         return merged
 
-    def compress(
+    async def compress(
         self,
         messages: List[Dict[str, Any]],
         current_tokens: Optional[int] = None,
@@ -5945,11 +5654,7 @@ This compaction should PRIORITISE preserving all information related to the focu
           1. Prune old tool results (cheap pre-pass, no LLM call)
           2. Protect head messages (system prompt + first exchange)
           3. Find tail boundary by token budget (~20K tokens of recent context)
-          4. Summarize middle turns with structured LLM prompt (skipped
-             pre-LLM when the middle is below
-             ``_FEASIBILITY_SKIP_MIDDLE_FRACTION`` of the threshold after a
-             prior real-usage ineffectiveness strike — the deterministic
-             fallback drop recovers the negligible savings instead)
+          4. Summarize middle turns with structured LLM prompt
           5. On re-compression, iteratively update the previous summary
 
         Blank platform-echo user rows trailing the latest actionable user
@@ -5969,9 +5674,7 @@ This compaction should PRIORITISE preserving all information related to the focu
                 everything else.  Inspired by Claude Code's ``/compact``.
             force: If True, clear any active summary-failure cooldown before
                 running so a manual ``/compress`` can retry immediately after
-                an auto-compression abort, and bypass the pre-LLM feasibility
-                skip so an explicit user request always exercises the full
-                summary path.  Auto-compress callers pass False.
+                an auto-compression abort.  Auto-compress callers pass False.
             memory_context: Optional provider-supplied context to preserve in
                 the summary prompt. Whitespace-only values are ignored.
         """
@@ -5979,7 +5682,6 @@ This compaction should PRIORITISE preserving all information related to the focu
         # after compress() returns to decide whether to surface a warning.
         self._last_summary_dropped_count = 0
         self._last_summary_fallback_used = False
-        self._last_feasibility_skip = False
         self._last_summary_error = None
         self._last_aux_model_failure_error = None
         self._last_aux_model_failure_model = None
@@ -6108,7 +5810,9 @@ This compaction should PRIORITISE preserving all information related to the focu
         # — take the narrow rescan, miss a beyond-window fossil, and discard the
         # rehydrated state as cross-session leakage (#57835).
         _previous_summary_before_scan = self._previous_summary
-        _summary_has_user_turn_before_scan = getattr(self, "_summary_has_user_turn", None)
+        _summary_has_user_turn_before_scan = getattr(
+            self, "_summary_has_user_turn", None
+        )
         # A persisted handoff summary can sit in the protected head after a
         # resume (commonly immediately after the system prompt). Search from
         # the first non-system message through the compression window. On the
@@ -6263,73 +5967,17 @@ This compaction should PRIORITISE preserving all information related to the focu
             )
 
         # Phase 3: Generate structured summary
-
-        # Pre-LLM feasibility check: if the middle section is too small to
-        # yield meaningful token savings, skip the expensive LLM summarization
-        # call and fall through to the deterministic message-dropping path
-        # (which is cheap and always applicable).  Without this guard a
-        # tool-heavy session where the protected tail already holds most of
-        # the tokens can burn 500+ seconds on a summary call that replaces a
-        # few lightweight messages, leaving the total token count essentially
-        # unchanged.
-        #
-        # Only fires after at least one prior real-usage ineffectiveness
-        # strike.  The check READS ``_ineffective_compression_count`` but
-        # never writes it: that strike counter is fed exclusively by real
-        # provider token counts (see the anti-thrashing verdict in
-        # _update_token_usage), and consumers latch at >= 2 to disable
-        # compression entirely.  Feasibility skips are tracked separately
-        # in ``_prellm_skip_count`` for observability.
-        #
-        # Skipped when ``force=True`` (manual /compress) so auth/error
-        # handling paths are always exercised on explicit user request.
-        feasibility_skip = False
-        if not force and self._ineffective_compression_count >= 1:
-            # _record_compression_regions already estimated this exact window
-            # into the telemetry dict above; reuse it so the log line and
-            # telemetry can never disagree. The regions helper no-ops when the
-            # telemetry attr isn't a dict, so fall back to a fresh estimate
-            # when the key is absent/None (0 is a legitimate value).
-            middle_tokens = telemetry.get("middle_window_tokens")
-            if middle_tokens is None:
-                middle_tokens = estimate_messages_tokens_rough(turns_to_summarize)
-            if middle_tokens < int(
-                self.threshold_tokens * _FEASIBILITY_SKIP_MIDDLE_FRACTION
-            ):
-                feasibility_skip = True
-                self._last_feasibility_skip = True
-                self._prellm_skip_count += 1
-                telemetry["prellm_skip_count"] = self._prellm_skip_count
-                if not self.quiet_mode:
-                    logger.warning(
-                        "Compression: middle section (%d tokens at indices "
-                        "%d-%d) is below %.0f%% of threshold (%d tokens) — "
-                        "skipping LLM summarization, proceeding with "
-                        "deterministic message dropping. prellm_skip_count=%d",
-                        middle_tokens, compress_start, compress_end,
-                        _FEASIBILITY_SKIP_MIDDLE_FRACTION * 100,
-                        self.threshold_tokens, self._prellm_skip_count,
-                    )
-
-        if feasibility_skip:
-            summary = None  # No LLM call; Phase 4 inserts the deterministic fallback
-        else:
-            # Deriving the auto focus topic scans recent user turns — only pay
-            # for it when a summary will actually be generated.
-            summary_focus_topic = focus_topic or self._derive_auto_focus_topic(messages)
-            try:
-                summary = self._generate_summary(
-                    turns_to_summarize,
-                    focus_topic=summary_focus_topic,
-                    memory_context=memory_context,
-                )
-            except AuxiliaryExplicitCancellation:
-                # Explicit cancellation is a true no-op. Restore state mutated by
-                # the resume/handoff self-heal scan before the exception escapes to
-                # the outer transaction, which restores the transcript and lease.
-                self._previous_summary = _previous_summary_before_scan
-                self._summary_has_user_turn = _summary_has_user_turn_before_scan
-                raise
+        summary_focus_topic = focus_topic or self._derive_auto_focus_topic(messages)
+        try:
+            summary = await self._generate_summary(
+                turns_to_summarize,
+                focus_topic=summary_focus_topic,
+                memory_context=memory_context,
+            )
+        except BaseException:
+            self._previous_summary = _previous_summary_before_scan
+            self._summary_has_user_turn = _summary_has_user_turn_before_scan
+            raise
 
         # If summary generation failed, behavior splits on
         # ``abort_on_summary_failure`` (config: compression.abort_on_summary_failure):
@@ -6351,7 +5999,7 @@ This compaction should PRIORITISE preserving all information related to the focu
         # of these cases, rotating into a child session with a placeholder
         # summary degrades the conversation for zero benefit. Preserve it
         # unchanged until access is restored or connectivity recovers.
-        if not summary and not feasibility_skip and (
+        if not summary and (
             self.abort_on_summary_failure
             or self._last_summary_auth_failure
             or self._last_summary_network_failure
@@ -6431,26 +6079,15 @@ This compaction should PRIORITISE preserving all information related to the focu
         # content-free "N messages were removed" marker.
         if not summary:
             if not self.quiet_mode:
-                if feasibility_skip:
-                    logger.info("Feasibility skip — inserting deterministic fallback context summary")
-                else:
-                    logger.warning("Summary generation failed — inserting deterministic fallback context summary")
+                logger.warning("Summary generation failed — inserting deterministic fallback context summary")
             n_dropped = compress_end - compress_start
             self._last_summary_dropped_count = n_dropped
             self._last_summary_fallback_used = True
             telemetry["fallback_used"] = True
-            if feasibility_skip:
-                # Deliberate optimization, not a summary failure — keep the
-                # telemetry class distinct so dashboards don't count skips
-                # as aux-model breakage.
-                telemetry["failure_class"] = telemetry.get("failure_class") or "feasibility_skip"
-            else:
-                telemetry["failure_class"] = telemetry.get("failure_class") or "summary_generation_failed"
+            telemetry["failure_class"] = telemetry.get("failure_class") or "summary_generation_failed"
             summary = self._build_static_fallback_summary(
                 turns_to_summarize,
-                # A stale error from an earlier real failure must not be
-                # embedded into a deliberate feasibility skip's fallback.
-                reason=None if feasibility_skip else self._last_summary_error,
+                reason=self._last_summary_error,
             )
 
         tail_messages: List[Dict[str, Any]] = []
@@ -6505,8 +6142,8 @@ This compaction should PRIORITISE preserving all information related to the focu
                 (
                     (idx, role)
                     for idx, role in (
-                        (idx, _template_visible_role(m))
-                        for idx, m in enumerate(tail_messages)
+                        (idx, _template_visible_role(message))
+                        for idx, message in enumerate(tail_messages)
                     )
                     if role is not None
                 ),
@@ -6537,17 +6174,6 @@ This compaction should PRIORITISE preserving all information related to the focu
         # If no user-role message survives in either the protected head or the
         # preserved tail, the summary MUST carry role="user" so the request
         # always has at least one user turn.
-        #
-        # A bare role check is not enough: the tail's sole surviving user
-        # turn can be image-only (a screenshot with no caption). The newest
-        # image-bearing user message is the ``_strip_historical_media``
-        # anchor and is kept byte-for-byte, so it never gains a text
-        # placeholder — its role is "user" but its text content is empty,
-        # which backends checking for actual query text still reject. Count
-        # only user messages with non-empty text as "surviving"; when the
-        # guard fires, the real (never fabricated) summary text lands in a
-        # role="user" slot, which is always non-empty (falls back to
-        # ``_build_static_fallback_summary`` above when generation fails).
         if not _force_user_leading:
             def _is_nonempty_user_turn(message: Dict[str, Any]) -> bool:
                 return message.get("role") == "user" and bool(
@@ -6613,27 +6239,12 @@ This compaction should PRIORITISE preserving all information related to the focu
                 ),
             })
 
-        # Default merge target: literal tail index 0. For an ordinary
-        # alternation collision the summary only has to stay *invisible* to
-        # the template, and a leading template-exempt row (bare tool-call
-        # assistant message, tool result) is the ideal carrier — it absorbs
-        # the summary without adding a visible turn, and it leaves the live
-        # tail user message intact as the model's actual prompt. Retargeting
-        # to the first template-visible row here would convert that live
-        # request into the summary carrier for no benefit.
-        #
-        # The forced repair path is the exception. There the merge is not
-        # about alternation but about guaranteeing at least one genuinely
-        # non-empty role="user" message (an image-only or otherwise
-        # text-empty surviving user row). An exempt carrier cannot satisfy
-        # that invariant, so the summary text must land on the
-        # template-visible row itself.
-        _merge_target_idx = 0
+        merge_target_idx = 0
         if _force_user_leading and first_tail_visible_idx is not None:
-            _merge_target_idx = first_tail_visible_idx
+            merge_target_idx = first_tail_visible_idx
         for tail_idx, msg in enumerate(tail_messages):
-            if _merge_summary_into_tail and tail_idx == _merge_target_idx:
-                # Merge the summary into the tail message that collided.
+            if _merge_summary_into_tail and tail_idx == merge_target_idx:
+                # Merge the summary into the first (post-strip) tail message.
                 old_content = msg.get("content", "")
                 if _force_user_leading and summary_role == "user":
                     # The summary must be part of the first user-visible

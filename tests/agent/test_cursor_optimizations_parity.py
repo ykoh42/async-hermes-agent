@@ -14,6 +14,8 @@ import statistics
 import sys
 import time
 
+import pytest
+
 sys.path.insert(0, ".")
 
 random.seed(1234)
@@ -137,26 +139,17 @@ def test_parity_token_memo():
         print(f"  n={n}: OK (equal across 3 iterations + compression + in-place edit + odd types)")
 
 
-def test_parity_persist_bounded_scan():
+@pytest.mark.asyncio
+async def test_parity_persist_bounded_scan(tmp_path):
     print("=== parity: _flush_messages_to_session_db bounded scan ===")
     import run_agent as ra
+    from hermes_state import SessionDB
 
-    class FakeDB:
-        def __init__(self):
-            self.rows = []
-        def append_message(self, **kw):
-            self.rows.append({k: copy.deepcopy(v) for k, v in kw.items()})
-        def append_messages_batch(self, session_id, messages, **kw):
-            for m in messages:
-                row = {k: copy.deepcopy(v) for k, v in m.items()}
-                row["session_id"] = session_id
-                self.rows.append(row)
-            return list(range(1, len(messages) + 1))
-
-    def make_agent(bounded):
+    async def make_agent(bounded, label):
         a = ra.AIAgent.__new__(ra.AIAgent)
         a.session_id = "s1"
-        a._session_db = FakeDB()
+        a._session_db = SessionDB(tmp_path / f"{label}.db")
+        await a._session_db.create_session("s1", source="test")
         a._session_db_created = True
         a._last_flushed_db_idx = 0
         a._flushed_db_message_ids = set()
@@ -167,16 +160,27 @@ def test_parity_persist_bounded_scan():
             a._db_flush_scan_prefix = None
         return a
 
+    async def persisted_messages(agent):
+        return [
+            {key: value for key, value in message.items() if key != "timestamp"}
+            for message in await agent._session_db.get_messages_as_conversation("s1")
+        ]
+
     for n in (50, 200, 500):
         base = build_history(n)
         la, lb = copy.deepcopy(base), copy.deepcopy(base)
-        A, B = make_agent(False), make_agent(True)
+        A, B = (
+            await make_agent(False, f"baseline-{n}"),
+            await make_agent(True, f"bounded-{n}"),
+        )
         for iteration in range(3):
             A._db_flush_scan_prefix = None  # baseline: always full scan
-            ra_ok = A._flush_messages_to_session_db_unlocked(la, None)
-            rb_ok = B._flush_messages_to_session_db_unlocked(lb, None)
+            ra_ok = await A._flush_messages_to_session_db_unlocked(la, None)
+            rb_ok = await B._flush_messages_to_session_db_unlocked(lb, None)
             assert ra_ok is True and rb_ok is True
-            assert A._session_db.rows == B._session_db.rows, f"rows diverge n={n} it={iteration}"
+            assert (
+                await persisted_messages(A) == await persisted_messages(B)
+            ), f"rows diverge n={n} it={iteration}"
             assert la == lb
             for lst in (la, lb):
                 lst.append({"role": "user", "content": f"turn {iteration} {UNI}"})
@@ -193,9 +197,14 @@ def test_parity_persist_bounded_scan():
                         m.pop(ra._DB_PERSISTED_MARKER, None)
                     lst[:] = head + [{"role": "user", "content": "SUMMARY"}] + tail
         A._db_flush_scan_prefix = None
-        A._flush_messages_to_session_db_unlocked(la, None)
-        B._flush_messages_to_session_db_unlocked(lb, None)
-        assert A._session_db.rows == B._session_db.rows and la == lb
+        await A._flush_messages_to_session_db_unlocked(la, None)
+        await B._flush_messages_to_session_db_unlocked(lb, None)
+        assert (
+            await persisted_messages(A) == await persisted_messages(B)
+            and la == lb
+        )
+        await A._session_db.close()
+        await B._session_db.close()
         print(f"  n={n}: OK (identical DB rows + marker stamps across 3 flushes + compression rewrite)")
 
 

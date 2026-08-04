@@ -129,17 +129,15 @@ class WebSearchProvider(abc.ABC):
     def supports_extract(self) -> bool:
         """Return True if this provider implements :meth:`extract`.
 
-        Both sync and async :meth:`extract` implementations are valid — the
-        dispatcher detects coroutine functions via
-        :func:`inspect.iscoroutinefunction` and awaits as needed. Sync
-        implementations that perform blocking I/O (HTTP, SDK calls) should
-        ideally wrap in :func:`asyncio.to_thread` at the call site; small
-        providers can keep their sync shape and let the dispatcher handle
-        threading.
+        Providers are expected to implement native async I/O.  The async
+        dispatcher deliberately does not wrap a synchronous provider in a
+        worker thread: doing so makes cancellation and resource ownership
+        opaque and reintroduces blocking compatibility behavior into the
+        agent loop.
         """
         return False
 
-    def search(self, query: str, limit: int = 5) -> Dict[str, Any]:
+    async def search(self, query: str, limit: int = 5) -> Dict[str, Any]:
         """Execute a web search.
 
         Override when :meth:`supports_search` returns True. The default
@@ -150,7 +148,7 @@ class WebSearchProvider(abc.ABC):
             f"{self.name} does not support search (override supports_search)"
         )
 
-    def extract(self, urls: List[str], **kwargs: Any) -> Any:
+    async def extract(self, urls: List[str], **kwargs: Any) -> Any:
         """Extract content from one or more URLs.
 
         Override when :meth:`supports_extract` returns True. The default
@@ -173,8 +171,8 @@ class WebSearchProvider(abc.ABC):
                 ...
             ]
 
-        Implementations MAY be ``async def`` — the dispatcher detects
-        coroutines via :func:`inspect.iscoroutinefunction` and awaits.
+        Implementations MUST be ``async def``.  A synchronous implementation
+        is a provider contract error and is rejected before network I/O.
 
         ``kwargs`` may carry forward-compat fields (``format``, ``include_raw``,
         ``max_chars``) — implementations should ignore unknown keys.

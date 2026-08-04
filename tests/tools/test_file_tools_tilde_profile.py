@@ -59,7 +59,7 @@ class TestResolvePathUsesProfileHome:
         process_home.mkdir()
 
         monkeypatch.setenv("HOME", str(process_home))
-        monkeypatch.setattr(terminal_tool, "_session_cwd", {})
+        monkeypatch.setattr(terminal_tool, "_session_cwds", {})
 
         with patch("hermes_constants.get_subprocess_home", return_value=str(profile_home)):
             resolved = ft._resolve_path_for_task("~/test_file.txt", task_id="test")
@@ -75,7 +75,7 @@ class TestResolvePathUsesProfileHome:
         process_home.mkdir()
 
         monkeypatch.setenv("HOME", str(process_home))
-        monkeypatch.setattr(terminal_tool, "_session_cwd", {})
+        monkeypatch.setattr(terminal_tool, "_session_cwds", {})
 
         with patch("hermes_constants.get_subprocess_home", return_value=str(profile_home)):
             # _resolve_base_dir uses the workspace root from config; if it contains ~,

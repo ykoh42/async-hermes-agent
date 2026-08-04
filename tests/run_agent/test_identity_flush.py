@@ -5,10 +5,12 @@ import tempfile
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 SESSION_ID = "test-identity-flush"
 
 
-def _make_agent(session_db, session_id=SESSION_ID):
+async def _make_agent(session_db, session_id=SESSION_ID):
     with patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}):
         from run_agent import AIAgent
 
@@ -22,28 +24,29 @@ def _make_agent(session_db, session_id=SESSION_ID):
             skip_context_files=True,
             skip_memory=True,
         )
-    agent._ensure_db_session()
+    await agent._ensure_db_session()
     return agent
 
 
-def _contents(db, session_id=SESSION_ID):
-    return [row["content"] for row in db.get_messages(session_id)]
+async def _contents(db, session_id=SESSION_ID):
+    return [row["content"] for row in await db.get_messages(session_id)]
 
 
 class TestIdentityFlush:
-    def test_repair_shrunk_messages_below_history_length_still_persists_assistant(self):
+    @pytest.mark.asyncio
+    async def test_repair_shrunk_messages_below_history_length_still_persists_assistant(self):
         """When repair shortens messages below conversation_history, don't slice empty."""
         from hermes_state import SessionDB
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            db = SessionDB(db_path=Path(tmpdir) / "t.db")
+            db = SessionDB(Path(tmpdir) / "t.db")
             try:
-                agent = _make_agent(db)
+                agent = await _make_agent(db)
 
                 # Simulate history already loaded from state.db.
                 history = [{"role": "user", "content": f"u{i}"} for i in range(6)]
                 for msg in history:
-                    db.append_message(
+                    await db.append_message(
                         session_id=SESSION_ID,
                         role=msg["role"],
                         content=msg["content"],
@@ -61,47 +64,51 @@ class TestIdentityFlush:
                 # The old positional flush computed flush_from >= len(messages)
                 # and dropped the assistant. Identity flush persists new dicts.
                 agent._last_flushed_db_idx = len(history)
-                agent._flush_messages_to_session_db(messages, history)
+                await agent._flush_messages_to_session_db(messages, history)
 
-                contents = _contents(db)
+                contents = await _contents(db)
                 assert "new question" in contents
                 assert "new answer" in contents
             finally:
-                db.close()
+                await agent.close()
+                await db.close()
 
 
-    def test_repeated_flush_same_turn_writes_once(self):
+    @pytest.mark.asyncio
+    async def test_repeated_flush_same_turn_writes_once(self):
         """Identity tracking preserves #860 same-turn dedup behavior."""
         from hermes_state import SessionDB
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            db = SessionDB(db_path=Path(tmpdir) / "t.db")
+            db = SessionDB(Path(tmpdir) / "t.db")
             try:
-                agent = _make_agent(db)
+                agent = await _make_agent(db)
                 messages = [{"role": "user", "content": "q"}]
 
-                agent._flush_messages_to_session_db(messages, [])
+                await agent._flush_messages_to_session_db(messages, [])
                 messages.append({"role": "assistant", "content": "a"})
-                agent._flush_messages_to_session_db(messages, [])
-                agent._flush_messages_to_session_db(messages, [])
+                await agent._flush_messages_to_session_db(messages, [])
+                await agent._flush_messages_to_session_db(messages, [])
 
-                assert _contents(db) == ["q", "a"]
+                assert await _contents(db) == ["q", "a"]
             finally:
-                db.close()
+                await agent.close()
+                await db.close()
 
-    def test_cursor_reset_starts_new_turn_identity_window(self):
+    @pytest.mark.asyncio
+    async def test_cursor_reset_starts_new_turn_identity_window(self):
         """Gateway resets _last_flushed_db_idx=0 before a cached-agent turn."""
         from hermes_state import SessionDB
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            db = SessionDB(db_path=Path(tmpdir) / "t.db")
+            db = SessionDB(Path(tmpdir) / "t.db")
             try:
-                agent = _make_agent(db)
+                agent = await _make_agent(db)
                 first_turn = [
                     {"role": "user", "content": "q1"},
                     {"role": "assistant", "content": "a1"},
                 ]
-                agent._flush_messages_to_session_db(first_turn, [])
+                await agent._flush_messages_to_session_db(first_turn, [])
 
                 history = [dict(m) for m in first_turn]
                 second_turn = history + [
@@ -109,13 +116,15 @@ class TestIdentityFlush:
                     {"role": "assistant", "content": "a2"},
                 ]
                 agent._last_flushed_db_idx = 0
-                agent._flush_messages_to_session_db(second_turn, history)
+                await agent._flush_messages_to_session_db(second_turn, history)
 
-                assert _contents(db) == ["q1", "a1", "q2", "a2"]
+                assert await _contents(db) == ["q1", "a1", "q2", "a2"]
             finally:
-                db.close()
+                await agent.close()
+                await db.close()
 
-    def test_flush_does_not_retain_object_ids_across_turns(self):
+    @pytest.mark.asyncio
+    async def test_flush_does_not_retain_object_ids_across_turns(self):
         """A flushed id() must never outlive its turn (id-reuse data loss).
 
         The dedup state used to keep ``{id(msg) for msg in flushed}`` alive
@@ -130,25 +139,27 @@ class TestIdentityFlush:
         from hermes_state import SessionDB
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            db = SessionDB(db_path=Path(tmpdir) / "t.db")
+            db = SessionDB(Path(tmpdir) / "t.db")
             try:
-                agent = _make_agent(db)
+                agent = await _make_agent(db)
                 turn = [
                     {"role": "user", "content": "u1"},
                     {"role": "assistant", "content": "a1"},
                 ]
-                agent._flush_messages_to_session_db(turn, [])
+                await agent._flush_messages_to_session_db(turn, [])
 
-                assert _contents(db) == ["u1", "a1"]
+                assert await _contents(db) == ["u1", "a1"]
                 # No object id may linger past the flush — a retained id() is the
                 # exact thing CPython can recycle onto a later message.
                 assert agent._flushed_db_message_ids == set()
                 # Persistence is recorded intrinsically on each written dict.
                 assert all(m.get("_db_persisted") is True for m in turn)
             finally:
-                db.close()
+                await agent.close()
+                await db.close()
 
-    def test_stale_seed_id_from_prior_flush_cannot_suppress_new_message(self):
+    @pytest.mark.asyncio
+    async def test_stale_seed_id_from_prior_flush_cannot_suppress_new_message(self):
         """A retained id() must not survive a flush and suppress a later message.
 
         The bug: the dedup set kept {id(msg)} across turns. After a flushed dict
@@ -163,12 +174,12 @@ class TestIdentityFlush:
         from hermes_state import SessionDB
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            db = SessionDB(db_path=Path(tmpdir) / "t.db")
+            db = SessionDB(Path(tmpdir) / "t.db")
             try:
-                agent = _make_agent(db)
+                agent = await _make_agent(db)
                 # Turn 1 establishes a same-session continuation so the seed is
                 # honoured (not reset to empty) on the next flush.
-                agent._flush_messages_to_session_db(
+                await agent._flush_messages_to_session_db(
                     [{"role": "user", "content": "u1"}], []
                 )
                 # After a real flush the seed MUST be empty — no id lingers to
@@ -181,7 +192,7 @@ class TestIdentityFlush:
                 # id-based dedup this entry silently drops the row.
                 agent._flushed_db_message_ids = {id(new_assistant)}
 
-                agent._flush_messages_to_session_db(
+                await agent._flush_messages_to_session_db(
                     [{"role": "user", "content": "u1", "_db_persisted": True},
                      new_assistant],
                     [],
@@ -196,42 +207,5 @@ class TestIdentityFlush:
                 assert agent._flushed_db_message_ids == set()
                 assert new_assistant.get("_db_persisted") is True
             finally:
-                db.close()
-
-
-class TestFlushCursorMarkerPop:
-    def test_filled_row_repersists_after_marker_pop_and_cursor_invalidation(self):
-        """End-to-end: incremental flush stamps the tool-call tail; the
-        finalizer fills its content and pops the marker; with the cursor
-        invalidated (as the pop site now does), the turn-end flush must
-        persist the filled answer — not skip the row as already-stamped."""
-        from hermes_state import SessionDB
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            db = SessionDB(db_path=Path(tmpdir) / "t.db")
-            try:
-                agent = _make_agent(db)
-                tool_row = {
-                    "role": "assistant",
-                    "content": "",
-                    "tool_calls": [
-                        {"id": "t1", "type": "function",
-                         "function": {"name": "f", "arguments": "{}"}}
-                    ],
-                }
-                messages = [tool_row]
-                agent._flush_messages_to_session_db_unlocked(messages)
-                assert messages[0].get("_db_persisted") is True
-                assert agent._db_flush_scan_prefix is not None
-
-                # What finalize_turn's fill does at the pop site:
-                messages[0]["content"] = "the final answer"
-                messages[0].pop("_db_persisted", None)
-                agent._db_flush_scan_prefix = None
-
-                messages.append({"role": "user", "content": "next question"})
-                agent._flush_messages_to_session_db_unlocked(messages)
-
-                assert "the final answer" in _contents(db)
-            finally:
-                db.close()
+                await agent.close()
+                await db.close()

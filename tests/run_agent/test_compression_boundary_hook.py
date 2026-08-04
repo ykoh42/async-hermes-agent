@@ -14,13 +14,32 @@ this from a real user-initiated /new.
 import os
 import tempfile
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+import pytest_asyncio
 
 from agent.conversation_compression import (
     finalize_context_engine_compression_notification,
 )
+from hermes_state import SessionDB
+
+
+_ASYNC_DBS = []
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def _close_async_dbs():
+    yield
+    for db in _ASYNC_DBS:
+        await db.close()
+    _ASYNC_DBS.clear()
+
+
+def _async_db(path: Path) -> SessionDB:
+    db = SessionDB(path)
+    _ASYNC_DBS.append(db)
+    return db
 
 class TestCompressionBoundaryHook:
     def _make_agent(self, session_db):
@@ -40,19 +59,18 @@ class TestCompressionBoundaryHook:
             agent.compression_in_place = False
             return agent
 
-    def test_on_session_start_called_with_compression_boundary(self):
-        from hermes_state import SessionDB
-
+    @pytest.mark.asyncio
+    async def test_on_session_start_called_with_compression_boundary(self):
         with tempfile.TemporaryDirectory() as tmpdir:
-            db = SessionDB(db_path=Path(tmpdir) / "test.db")
+            db = _async_db(Path(tmpdir) / "test.db")
             agent = self._make_agent(db)
 
             # Stub the context compressor: we only need to observe the hook.
             compressor = MagicMock()
-            compressor.compress.return_value = [
+            compressor.compress = AsyncMock(return_value=[
                 {"role": "user", "content": "[CONTEXT COMPACTION] summary"},
                 {"role": "user", "content": "tail question"},
-            ]
+            ])
             compressor.compression_count = 1
             compressor.last_prompt_tokens = 0
             compressor.last_completion_tokens = 0
@@ -70,7 +88,7 @@ class TestCompressionBoundaryHook:
                 {"role": "user", "content": f"m{i}"} for i in range(10)
             ]
 
-            agent._compress_context(messages, "sys", approx_tokens=10_000)
+            await agent._compress_context(messages, "sys", approx_tokens=10_000)
 
             # Session_id rotated
             assert agent.session_id != original_sid, \
@@ -97,18 +115,18 @@ class TestCompressionBoundaryHook:
             assert call.kwargs.get("old_session_id") == original_sid, \
                 f"Expected old_session_id={original_sid!r}, got {call.kwargs!r}"
             assert len(comp_calls) == 1
+            await agent.close()
 
-    def test_automatic_notification_follows_core_persistence(self):
-        from hermes_state import SessionDB
-
+    @pytest.mark.asyncio
+    async def test_automatic_notification_follows_core_persistence(self):
         events = []
         with tempfile.TemporaryDirectory() as tmpdir:
-            db = SessionDB(db_path=Path(tmpdir) / "test.db")
+            db = _async_db(Path(tmpdir) / "test.db")
             agent = self._make_agent(db)
             compressor = MagicMock()
-            compressor.compress.return_value = [
+            compressor.compress = AsyncMock(return_value=[
                 {"role": "user", "content": "summary"}
-            ]
+            ])
             compressor.compression_count = 1
             compressor.last_prompt_tokens = 0
             compressor.last_completion_tokens = 0
@@ -122,55 +140,59 @@ class TestCompressionBoundaryHook:
             agent.context_compressor = compressor
             original_publish = db.publish_compression_child
 
-            def _record_publish(*args, **kwargs):
-                result = original_publish(*args, **kwargs)
+            async def _record_publish(*args, **kwargs):
+                result = await original_publish(*args, **kwargs)
                 events.append("persist")
                 return result
 
             with patch.object(
                 db, "publish_compression_child", side_effect=_record_publish
             ):
-                agent._compress_context(
+                await agent._compress_context(
                     [{"role": "user", "content": "request"}],
                     "sys",
                     approx_tokens=100,
                 )
 
             assert events == ["persist", "compression"]
+            await agent.close()
 
-    def test_failure_before_persistence_does_not_notify(self):
-        from hermes_state import SessionDB
-
+    @pytest.mark.asyncio
+    async def test_failure_before_persistence_does_not_notify(self):
         with tempfile.TemporaryDirectory() as tmpdir:
-            db = SessionDB(db_path=Path(tmpdir) / "test.db")
+            db = _async_db(Path(tmpdir) / "test.db")
             agent = self._make_agent(db)
             compressor = MagicMock()
-            compressor.compress.side_effect = RuntimeError("synthetic compression failure")
+            compressor.compress = AsyncMock(
+                side_effect=RuntimeError("synthetic compression failure")
+            )
             agent.context_compressor = compressor
 
             with pytest.raises(RuntimeError, match="synthetic compression failure"):
-                agent._compress_context(
+                await agent._compress_context(
                     [{"role": "user", "content": "request"}],
                     "sys",
                     approx_tokens=100,
                 )
 
             compressor.on_session_start.assert_not_called()
+            await agent.close()
 
 
-    def test_no_progress_does_not_notify(self):
-        from hermes_state import SessionDB
-
+    @pytest.mark.asyncio
+    async def test_no_progress_does_not_notify(self):
         with tempfile.TemporaryDirectory() as tmpdir:
-            db = SessionDB(db_path=Path(tmpdir) / "test.db")
+            db = _async_db(Path(tmpdir) / "test.db")
             agent = self._make_agent(db)
             compressor = MagicMock()
-            compressor.compress.side_effect = lambda messages, **_kwargs: messages
+            compressor.compress = AsyncMock(
+                side_effect=lambda messages, **_kwargs: messages
+            )
             compressor._last_compress_aborted = False
             agent.context_compressor = compressor
             messages = [{"role": "user", "content": "request"}]
 
-            returned, _ = agent._compress_context(
+            returned, _ = await agent._compress_context(
                 messages,
                 "sys",
                 approx_tokens=100,
@@ -178,9 +200,11 @@ class TestCompressionBoundaryHook:
 
             assert returned is messages
             compressor.on_session_start.assert_not_called()
+            await agent.close()
 
 
-    def test_no_hook_when_no_session_db(self):
+    @pytest.mark.asyncio
+    async def test_no_hook_when_no_session_db(self):
         """Without session_db, session_id does not rotate and the hook is not fired."""
         from run_agent import AIAgent
         with patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}):
@@ -196,7 +220,9 @@ class TestCompressionBoundaryHook:
             )
 
         compressor = MagicMock()
-        compressor.compress.return_value = [{"role": "user", "content": "x"}]
+        compressor.compress = AsyncMock(
+            return_value=[{"role": "user", "content": "x"}]
+        )
         compressor.compression_count = 1
         compressor.last_prompt_tokens = 0
         compressor.last_completion_tokens = 0
@@ -204,7 +230,9 @@ class TestCompressionBoundaryHook:
         agent.context_compressor = compressor
 
         original_sid = agent.session_id
-        agent._compress_context([{"role": "user", "content": "m"}], "sys", approx_tokens=100)
+        await agent._compress_context(
+            [{"role": "user", "content": "m"}], "sys", approx_tokens=100
+        )
 
         # No DB => no rotation => no compression-boundary hook
         assert agent.session_id == original_sid
@@ -216,17 +244,19 @@ class TestCompressionBoundaryHook:
             f"No compression hook should fire without session_db rotation, "
             f"got {comp_calls!r}"
         )
+        await agent.close()
 
-    def test_hook_failure_does_not_break_compression(self):
+    @pytest.mark.asyncio
+    async def test_hook_failure_does_not_break_compression(self):
         """If the context engine raises from on_session_start, compression still completes."""
-        from hermes_state import SessionDB
-
         with tempfile.TemporaryDirectory() as tmpdir:
-            db = SessionDB(db_path=Path(tmpdir) / "test.db")
+            db = _async_db(Path(tmpdir) / "test.db")
             agent = self._make_agent(db)
 
             compressor = MagicMock()
-            compressor.compress.return_value = [{"role": "user", "content": "summary"}]
+            compressor.compress = AsyncMock(
+                return_value=[{"role": "user", "content": "summary"}]
+            )
             compressor.compression_count = 1
             compressor.last_prompt_tokens = 0
             compressor.last_completion_tokens = 0
@@ -244,11 +274,12 @@ class TestCompressionBoundaryHook:
             original_sid = agent.session_id
 
             # Must not raise
-            compressed, _prompt = agent._compress_context(
+            compressed, _prompt = await agent._compress_context(
                 [{"role": "user", "content": "m"}], "sys", approx_tokens=100
             )
             assert compressed
             assert agent.session_id != original_sid
+            await agent.close()
 
 
 class TestSessionCompressEvent:
@@ -274,10 +305,10 @@ class TestSessionCompressEvent:
 
     def _stub_compressor(self):
         compressor = MagicMock()
-        compressor.compress.return_value = [
+        compressor.compress = AsyncMock(return_value=[
             {"role": "user", "content": "[CONTEXT COMPACTION] summary"},
             {"role": "user", "content": "tail"},
-        ]
+        ])
         compressor.compression_count = 1
         compressor.last_prompt_tokens = 0
         compressor.last_completion_tokens = 0
@@ -285,19 +316,18 @@ class TestSessionCompressEvent:
         compressor._last_compress_aborted = False
         return compressor
 
-    def test_event_emitted_on_compression(self):
-        from hermes_state import SessionDB
-
+    @pytest.mark.asyncio
+    async def test_event_emitted_on_compression(self):
         events = []
         with tempfile.TemporaryDirectory() as tmpdir:
-            db = SessionDB(db_path=Path(tmpdir) / "test.db")
+            db = _async_db(Path(tmpdir) / "test.db")
             agent = self._make_agent(
                 db, event_callback=lambda et, ctx: events.append((et, ctx))
             )
             original_sid = agent.session_id
             agent.context_compressor = self._stub_compressor()
 
-            agent._compress_context(
+            await agent._compress_context(
                 [{"role": "user", "content": f"m{i}"} for i in range(10)],
                 "sys",
                 approx_tokens=10_000,
@@ -309,17 +339,17 @@ class TestSessionCompressEvent:
             assert ctx["session_id"] == agent.session_id
             assert ctx["old_session_id"] == original_sid
             assert ctx["compression_count"] == 1
+            await agent.close()
 
-    def test_no_callback_is_safe(self):
+    @pytest.mark.asyncio
+    async def test_no_callback_is_safe(self):
         """Compression must work when no event_callback is wired."""
-        from hermes_state import SessionDB
-
         with tempfile.TemporaryDirectory() as tmpdir:
-            db = SessionDB(db_path=Path(tmpdir) / "test.db")
+            db = _async_db(Path(tmpdir) / "test.db")
             agent = self._make_agent(db, event_callback=None)
             agent.context_compressor = self._stub_compressor()
-            compressed, _ = agent._compress_context(
+            compressed, _ = await agent._compress_context(
                 [{"role": "user", "content": "m"}], "sys", approx_tokens=100
             )
             assert compressed
-
+            await agent.close()

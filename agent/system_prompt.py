@@ -28,6 +28,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import asyncio
 from typing import Any, Dict, List, Optional
 
 from agent.prompt_builder import (
@@ -59,8 +60,8 @@ def _ra():
     """Lazy reference to the ``run_agent`` module.
 
     Helpers like ``load_soul_md``, ``build_environment_hints``,
-    ``build_context_files_prompt``, ``build_nous_subscription_prompt``,
-    ``build_skills_system_prompt`` and ``get_toolset_for_tool`` are
+    ``build_context_files_prompt``, ``build_skills_system_prompt`` and
+    ``get_toolset_for_tool`` are
     imported into ``run_agent``'s namespace.  Many tests
     ``patch("run_agent.load_soul_md", ...)``; if we imported them
     directly here those patches would not reach us.  Looking them up
@@ -149,7 +150,7 @@ def _tui_embedded_pane_clarifier(hint: str) -> str:
     return hint + _TUI_EMBEDDED_PANE_CLARIFIER
 
 
-def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) -> Dict[str, str]:
+async def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) -> Dict[str, str]:
     """Assemble the system prompt as three ordered cache tiers.
 
     Returns a dict with three keys:
@@ -171,6 +172,8 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # patch ``run_agent.get_toolset_for_tool`` and similar helpers, so
     # we resolve through ``_ra()`` to honor those patches.
     _r = _ra()
+    _context_cwd = await resolve_context_cwd()
+    _coding_config: Optional[dict] = None
 
     # Resolve the model's context window once so context-file caps can scale
     # to it (dynamic cap — see prompt_builder._dynamic_context_file_max_chars).
@@ -191,7 +194,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # cwd project instructions disabled.
     _soul_loaded = False
     if agent.load_soul_identity or not agent.skip_context_files:
-        _soul_content = _r.load_soul_md(_ctx_len)
+        _soul_content = await _r.load_soul_md(_ctx_len)
         if _soul_content:
             stable_parts.append(_soul_content)
             _soul_loaded = True
@@ -257,9 +260,6 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         from agent.prompt_builder import computer_use_guidance
         stable_parts.append(computer_use_guidance())
 
-    nous_subscription_prompt = _r.build_nous_subscription_prompt(agent.valid_tool_names)
-    if nous_subscription_prompt:
-        stable_parts.append(nous_subscription_prompt)
     # Tool-use enforcement: tells the model to actually call tools instead
     # of describing intended actions.  Controlled by config.yaml
     # agent.tool_use_enforcement:
@@ -313,12 +313,16 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         try:
             from agent.coding_context import coding_compact_skill_categories
 
-            _compact_cats = coding_compact_skill_categories(
-                platform=agent.platform, cwd=resolve_context_cwd()
+            if _coding_config is None:
+                from hermes_cli.config import load_config_readonly
+
+                _coding_config = await load_config_readonly()
+            _compact_cats = await coding_compact_skill_categories(
+                platform=agent.platform, cwd=_context_cwd, config=_coding_config
             )
         except Exception:
             _compact_cats = frozenset()
-        skills_prompt = _r.build_skills_system_prompt(
+        skills_prompt = await _r.build_skills_system_prompt(
             available_tools=agent.valid_tool_names,
             available_toolsets=avail_toolsets,
             compact_categories=_compact_cats or None,
@@ -345,7 +349,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # Environment hints (WSL, Termux, etc.) — tell the agent about the
     # execution environment so it can translate paths and adapt behavior.
     # Stable for the lifetime of the process.
-    _env_hints = _r.build_environment_hints()
+    _env_hints = await _r.build_environment_hints()
     if _env_hints:
         stable_parts.append(_env_hints)
 
@@ -360,9 +364,14 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         try:
             from agent.coding_context import coding_system_prompt_parts
 
-            coding_prefix_parts, coding_workspace_parts, coding_trailing_parts = coding_system_prompt_parts(
+            if _coding_config is None:
+                from hermes_cli.config import load_config_readonly
+
+                _coding_config = await load_config_readonly()
+            coding_prefix_parts, coding_workspace_parts, coding_trailing_parts = await coding_system_prompt_parts(
                 platform=agent.platform,
-                cwd=resolve_context_cwd(),
+                cwd=_context_cwd,
+                config=_coding_config,
                 model=agent.model,
             )
             stable_parts.extend(coding_prefix_parts)
@@ -378,23 +387,6 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     else:
         stable_parts.extend(coding_trailing_parts)
         post_workspace_parts = stable_parts
-
-    # Local Python toolchain probe — names python/pip/uv/PEP-668 state when
-    # something is non-default so the model can pick the right install
-    # strategy without discovering by failure.  Emits a single line; emits
-    # NOTHING when the environment is clean (no token cost).  Skipped
-    # entirely for remote terminal backends (the host's Python state is
-    # irrelevant when tools run inside docker/modal/ssh).  Gated by
-    # config.yaml ``agent.environment_probe`` (default True).
-    if getattr(agent, "_environment_probe", True):
-        try:
-            from tools.env_probe import get_environment_probe_line
-            _probe_line = get_environment_probe_line()
-            if _probe_line:
-                post_workspace_parts.append(_probe_line)
-        except Exception:
-            # Probe failure must never block prompt build.
-            pass
 
     # Active-profile hint — names the Hermes profile the agent is running
     # under so it doesn't conflate ~/.hermes/skills/ (default profile) with
@@ -453,7 +445,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     if platform_key == "telegram" and _default_hint:
         try:
             from hermes_cli.config import load_config_readonly
-            _cfg = load_config_readonly()
+            _cfg = await load_config_readonly()
             _tg_extra = ((_cfg.get("platforms") or {}).get("telegram") or {}).get("extra") or {}
             if _tg_extra.get("rich_messages"):
                 _default_hint = _default_hint.rstrip() + " " + TELEGRAM_RICH_MESSAGES_HINT
@@ -490,8 +482,8 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         # (developing Hermes). Every other surface (desktop chat panel,
         # gateway daemons) self-spawns into the install tree, where the
         # fallback would inject this repo's contributor AGENTS.md (#64590).
-        context_files_prompt = _r.build_context_files_prompt(
-            cwd=resolve_context_cwd(), skip_soul=_soul_loaded,
+        context_files_prompt = await _r.build_context_files_prompt(
+            cwd=_context_cwd, skip_soul=_soul_loaded,
             context_length=_ctx_len,
             allow_install_tree_fallback=agent.platform in ("cli", "tui"))
         if context_files_prompt:
@@ -510,15 +502,6 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             user_block = agent._memory_store.format_for_system_prompt("user")
             if user_block:
                 volatile_parts.append(user_block)
-
-    # External memory provider system prompt block (additive to built-in)
-    if agent._memory_manager:
-        try:
-            _ext_mem_block = agent._memory_manager.build_system_prompt()
-            if _ext_mem_block:
-                volatile_parts.append(_ext_mem_block)
-        except Exception:
-            pass
 
     from hermes_time import now as _hermes_now
     now = _hermes_now()
@@ -546,7 +529,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     }
 
 
-def build_system_prompt(agent: Any, system_message: Optional[str] = None) -> str:
+async def build_system_prompt(agent: Any, system_message: Optional[str] = None) -> str:
     """Assemble the full system prompt from all layers.
 
     Called once per session (cached on ``agent._cached_system_prompt``) and
@@ -561,19 +544,21 @@ def build_system_prompt(agent: Any, system_message: Optional[str] = None) -> str
     mid-session, which is the only way to keep upstream prompt caches
     warm across turns.
     """
-    parts = build_system_prompt_parts(agent, system_message=system_message)
+    parts = await build_system_prompt_parts(agent, system_message=system_message)
     joined = "\n\n".join(p for p in (parts["stable"], parts["context"], parts["volatile"]) if p)
     agent._cached_system_prompt_static = parts["stable"]
 
     # Surface context-file truncation warnings through the normal agent status
     # channel so gateway/CLI users see them in chat instead of only in logs.
+    emit_status = getattr(agent, "_emit_status", None)
     for warning in drain_truncation_warnings():
-        agent._emit_status(warning)
+        if callable(emit_status):
+            emit_status(warning)
 
     return joined
 
 
-def invalidate_system_prompt(agent: Any) -> None:
+async def invalidate_system_prompt(agent: Any) -> None:
     """Invalidate the cached system prompt, forcing a rebuild on the next turn.
 
     Called after context compression events. Also reloads memory from disk
@@ -582,10 +567,10 @@ def invalidate_system_prompt(agent: Any) -> None:
     agent._cached_system_prompt = None
     agent._cached_system_prompt_static = None
     if agent._memory_store:
-        agent._memory_store.load_from_disk()
+        await agent._memory_store.load_from_disk()
 
 
-def reconstruct_static_prefix(
+async def reconstruct_static_prefix(
     agent: Any,
     system_message: Optional[str] = None,
     *,
@@ -624,7 +609,8 @@ def reconstruct_static_prefix(
     if getattr(agent, "_static_rebuild_failed_for", None) == stored:
         return
     try:
-        static = build_system_prompt_parts(agent, system_message=system_message)["stable"]
+        parts = await build_system_prompt_parts(agent, system_message=system_message)
+        static = parts["stable"]
         if static and stored.startswith(static):
             agent._cached_system_prompt_static = static
             agent._static_rebuild_failed_for = None

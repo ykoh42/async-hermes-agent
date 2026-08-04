@@ -2,7 +2,7 @@
 compressor scan past messages, causing IndexError in _find_context_summaries()."""
 
 import pytest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from agent.context_compressor import ContextCompressor
 
@@ -10,7 +10,7 @@ from agent.context_compressor import ContextCompressor
 @pytest.fixture()
 def compressor():
     """Create a ContextCompressor with mocked dependencies."""
-    with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+    with patch("agent.context_compressor.get_static_context_length", return_value=100000):
         c = ContextCompressor(
             model="test/model",
             threshold_percent=0.85,
@@ -143,7 +143,10 @@ class TestCompressEndToEndShortToolSuffix:
             for i in range(7)
         ]
 
-    def test_compress_short_tool_suffix_no_crash_no_llm_unchanged(self, compressor):
+    @pytest.mark.asyncio
+    async def test_compress_short_tool_suffix_no_crash_no_llm_unchanged(
+        self, compressor
+    ):
         import copy
 
         c = compressor
@@ -163,11 +166,13 @@ class TestCompressEndToEndShortToolSuffix:
         assert c._find_tail_cut_by_tokens(messages, start) == n
 
         with patch.object(
-            c, "_generate_summary", return_value="SHOULD NOT BE CALLED"
+            c,
+            "_generate_summary",
+            new=AsyncMock(return_value="SHOULD NOT BE CALLED"),
         ) as gen:
             # Must not raise (pre-fix: IndexError scanning past the end of
             # the list with the unclamped compress_end).
-            out = c.compress(messages, current_tokens=90_000)
+            out = await c.compress(messages, current_tokens=90_000)
 
         assert gen.call_count == 0, (
             "compress() invoked the summary LLM even though there is no "

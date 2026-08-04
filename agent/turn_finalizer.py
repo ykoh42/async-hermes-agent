@@ -11,8 +11,8 @@ review trigger.
 Behavior-neutral: the body is moved unchanged. All ``agent.*`` side effects fire
 exactly as before; only the post-loop *locals* are passed in as keyword args, and
 the assembled ``result`` dict is returned to ``run_conversation`` which returns it
-to the caller. The function is synchronous with a single return — mirroring the
-region it replaces (no awaits, no early returns).
+to the caller. The finalizer is a coroutine so trajectory, resource, and session
+persistence stay on the caller's event loop.
 
 Module ``logger`` is imported lazily inside the body (``from
 agent.conversation_loop import logger``) so this module never imports
@@ -66,7 +66,7 @@ def _drop_verification_continuation_scaffolding(messages) -> None:
     ]
 
 
-def finalize_turn(
+async def finalize_turn(
     agent,
     *,
     final_response,
@@ -138,7 +138,7 @@ def finalize_turn(
                 f"\n⚠️  Iteration budget exhausted ({api_call_count}/{agent.max_iterations}) "
                 "— requesting summary..."
             )
-        final_response = agent._handle_max_iterations(messages, api_call_count)
+        final_response = await agent._handle_max_iterations(messages, api_call_count)
         iteration_limit_fallback = True
 
     if iteration_limit_fallback:
@@ -153,42 +153,16 @@ def finalize_turn(
         # consecutive-failure circuit breaker (#29747 gap 2).
         _kanban_task = os.environ.get("HERMES_KANBAN_TASK")
         if _kanban_task:
-            try:
-                from hermes_cli import kanban_db as _kb
-                _conn = _kb.connect()
-                try:
-                    _kb._record_task_failure(
-                        _conn,
-                        _kanban_task,
-                        error=(
-                            f"Iteration budget exhausted "
-                            f"({api_call_count}/{agent.max_iterations}) — "
-                            "task could not complete within the allowed "
-                            "iterations"
-                        ),
-                        outcome="timed_out",
-                        release_claim=True,
-                        end_run=True,
-                        event_payload_extra={
-                            "budget_used": api_call_count,
-                            "budget_max": agent.max_iterations,
-                        },
-                    )
-                    logger.info(
-                        "recorded budget-exhausted failure for task %s (%d/%d)",
-                        _kanban_task, api_call_count, agent.max_iterations,
-                    )
-                finally:
-                    try:
-                        _conn.close()
-                    except Exception:
-                        pass
-            except Exception:
-                logger.warning(
-                    "Failed to record budget-exhausted failure for task %s",
-                    _kanban_task,
-                    exc_info=True,
-                )
+            # Kanban's optional SQLite coordinator is a synchronous plugin
+            # boundary.  Calling it here would block the native turn on a
+            # database connection and violate the async waist.  The kanban
+            # worker owns its failure accounting; the core only reports the
+            # exhausted turn and keeps returning the model's partial result.
+            logger.warning(
+                "Skipping synchronous kanban failure accounting for task %s "
+                "in async-hermes-agent",
+                _kanban_task,
+            )
 
     # Determine if conversation completed successfully
     normal_text_response = str(_turn_exit_reason).startswith("text_response(")
@@ -247,14 +221,18 @@ def finalize_turn(
     # Save trajectory if enabled.  ``user_message`` may be a multimodal
     # list of parts; the trajectory format wants a plain string.
     try:
-        agent._save_trajectory(messages, _summarize_user_message_for_log(user_message), completed)
+        await agent._save_trajectory(
+            messages,
+            _summarize_user_message_for_log(user_message),
+            completed,
+        )
     except Exception as _save_err:
         _cleanup_errors.append(f"save_trajectory: {_save_err}")
         logger.error("finalize_turn: _save_trajectory failed: %s", _save_err, exc_info=True)
 
     # Clean up VM and browser for this task after conversation completes
     try:
-        agent._cleanup_task_resources(effective_task_id)
+        await agent._cleanup_task_resources(effective_task_id)
     except Exception as _cleanup_err:
         _cleanup_errors.append(f"cleanup_task_resources: {_cleanup_err}")
         logger.error("finalize_turn: _cleanup_task_resources failed: %s", _cleanup_err, exc_info=True)
@@ -339,12 +317,6 @@ def finalize_turn(
                 # otherwise ``/resume`` reloads ``content=""`` and the bug
                 # resurfaces cross-session.
                 _tail.pop("_db_persisted", None)
-                # The bounded flush-scan cursor (run_agent.py) skips the
-                # identity-matched prefix of its previous snapshot on the
-                # assumption that no live dict loses the marker in place —
-                # this pop is the one place that does. Invalidate it so the
-                # filled row is re-examined instead of skipped.
-                agent._db_flush_scan_prefix = None
 
         # The model has completed its request, so replace API-local
         # voice/model/skill guidance with the clean user input before writing the
@@ -383,19 +355,14 @@ def finalize_turn(
                     and not getattr(agent, "_persist_disabled", False)
                 ):
                     _before = len(messages)
-                    _compacted = _compressor._micro_compact(messages)
-                    # Micro-compaction defrag rewrites the newest MICRO
-                    # marker's content and pops _db_persisted from the live
-                    # dict in place — the sibling of the pop site above. The
-                    # compressor has no agent reference, so it raises a flag
-                    # for us to invalidate the bounded flush-scan cursor;
-                    # otherwise the rewritten marker row is identity-skipped
-                    # and the stale summary persists to state.db.
-                    if getattr(
-                        _compressor, "_flush_scan_cursor_invalidated", False
-                    ):
-                        _compressor._flush_scan_cursor_invalidated = False
-                        agent._db_flush_scan_prefix = None
+                    _session_db = (
+                        agent._session_db
+                        if getattr(agent, "_session_db", None) is not None
+                        else None
+                    )
+                    _compacted = await _compressor._micro_compact(
+                        messages, session_db=_session_db
+                    )
                     if isinstance(_compacted, list) and _compacted:
                         messages[:] = _compacted
                     _after = len(messages)
@@ -407,7 +374,7 @@ def finalize_turn(
             except Exception as _mc_err:
                 logger.info("Micro-compaction failed: %s", _mc_err)
 
-        agent._persist_session(messages, conversation_history)
+        await agent._persist_session(messages, conversation_history)
     except Exception as _persist_err:
         _cleanup_errors.append(f"persist_session: {_persist_err}")
         logger.error("finalize_turn: _persist_session failed: %s", _persist_err, exc_info=True)
@@ -474,7 +441,7 @@ def finalize_turn(
     if final_response and not interrupted:
         try:
             _failed = getattr(agent, "_turn_failed_file_mutations", None) or {}
-            if _failed and agent._file_mutation_verifier_enabled():
+            if _failed and await agent._file_mutation_verifier_enabled():
                 footer = agent._format_file_mutation_failure_footer(_failed)
                 if footer:
                     final_response = final_response.rstrip() + "\n\n" + footer
@@ -499,7 +466,7 @@ def finalize_turn(
     #     punctuation (e.g. "The").  A real short answer keeps its text.
     if not interrupted:
         try:
-            if agent._turn_completion_explainer_enabled():
+            if await agent._turn_completion_explainer_enabled():
                 _stripped = (final_response or "").strip()
                 _is_empty_terminal = _stripped == "" or _stripped == "(empty)"
                 # A short fragment that is not a normal text_response exit
@@ -547,7 +514,7 @@ def finalize_turn(
     if final_response and not interrupted:
         try:
             from hermes_cli.lifecycle import invoke_hook as _invoke_hook
-            _transform_results = _invoke_hook(
+            _transform_results = await _invoke_hook(
                 "transform_llm_output",
                 response_text=final_response,
                 session_id=agent.session_id or "",
@@ -569,7 +536,7 @@ def finalize_turn(
     if final_response and not interrupted:
         try:
             from hermes_cli.lifecycle import invoke_hook as _invoke_hook
-            _invoke_hook(
+            await _invoke_hook(
                 "post_llm_call",
                 session_id=agent.session_id,
                 task_id=effective_task_id,
@@ -665,13 +632,6 @@ def finalize_turn(
     }
     if agent._tool_guardrail_halt_decision is not None:
         result["guardrail"] = agent._tool_guardrail_halt_decision.to_metadata()
-    # Persistence failures already set failed=True + an explanation in
-    # final_response; also stamp `error` so gateway surfaces status="error"
-    # (and desktop can toast disk-full) instead of a quiet complete frame.
-    if failed and str(_turn_exit_reason) == "session_persistence_failed":
-        result["error"] = final_response or (
-            "session storage could not be written — free disk space and try again"
-        )
     # Surface any post-loop cleanup failures so the caller can distinguish a
     # clean turn from one whose trajectory/session/resource teardown raised
     # (the response is still returned either way — #8049).
@@ -695,47 +655,12 @@ def finalize_turn(
     # Clear stream callback so it doesn't leak into future calls
     agent._stream_callback = None
 
-    # Check skill trigger NOW — based on how many tool iterations THIS turn used.
-    _should_review_skills = False
-    if (agent._skill_nudge_interval > 0
-            and agent._iters_since_skill >= agent._skill_nudge_interval
-            and "skill_manage" in agent.valid_tool_names):
-        _should_review_skills = True
-        agent._iters_since_skill = 0
-
-    # External memory provider: sync the completed turn + queue next prefetch.
-    agent._sync_external_memory_for_turn(
-        original_user_message=original_user_message,
-        final_response=final_response,
-        interrupted=interrupted,
-        messages=messages,
-    )
-
-    # Background memory/skill review — runs AFTER the response is delivered
-    # so it never competes with the user's task for model attention.
-    if final_response and not interrupted and (_should_review_memory or _should_review_skills):
-        try:
-            agent._spawn_background_review(
-                messages_snapshot=list(messages),
-                review_memory=_should_review_memory,
-                review_skills=_should_review_skills,
-            )
-        except Exception:
-            pass  # Background review is best-effort
-
-    # Note: Memory provider on_session_end() + shutdown_all() are NOT
-    # called here — run_conversation() is called once per user message in
-    # multi-turn sessions. Shutting down after every turn would kill the
-    # provider before the second message. Actual session-end cleanup is
-    # handled by the CLI (atexit / /reset) and gateway (session expiry /
-    # _reset_session).
-
     # Plugin hook: on_session_end
     # Fired at the very end of every run_conversation call.
     # Plugins can use this for cleanup, flushing buffers, etc.
     try:
         from hermes_cli.lifecycle import invoke_hook as _invoke_hook
-        _invoke_hook(
+        await _invoke_hook(
             "on_session_end",
             session_id=agent.session_id,
             task_id=effective_task_id,

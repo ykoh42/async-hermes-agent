@@ -9,7 +9,9 @@ the operator set ``prompt_caching.cache_ttl: false``.
 from __future__ import annotations
 
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
+
+import pytest
 
 
 def _has_cache_control(obj) -> bool:
@@ -23,25 +25,27 @@ def _has_cache_control(obj) -> bool:
 
 
 class TestPromptCachingDisabledFromConfig:
-    def test_off_values(self):
+    @pytest.mark.asyncio
+    async def test_off_values(self):
         from agent.agent_runtime_helpers import prompt_caching_disabled_from_config
 
         for ttl in (False, None, "off", "false", "disabled", "no", "none", "OFF"):
             with patch(
                 "hermes_cli.config.load_config_readonly",
-                return_value={"prompt_caching": {"cache_ttl": ttl}},
+                new=AsyncMock(return_value={"prompt_caching": {"cache_ttl": ttl}}),
             ):
-                assert prompt_caching_disabled_from_config() is True, ttl
+                assert await prompt_caching_disabled_from_config() is True, ttl
 
-    def test_enabled_values(self):
+    @pytest.mark.asyncio
+    async def test_enabled_values(self):
         from agent.agent_runtime_helpers import prompt_caching_disabled_from_config
 
         for ttl in ("5m", "1h"):
             with patch(
                 "hermes_cli.config.load_config_readonly",
-                return_value={"prompt_caching": {"cache_ttl": ttl}},
+                new=AsyncMock(return_value={"prompt_caching": {"cache_ttl": ttl}}),
             ):
-                assert prompt_caching_disabled_from_config() is False, ttl
+                assert await prompt_caching_disabled_from_config() is False, ttl
 
     def test_shared_predicate_matches_agent_init_semantics(self):
         """agent_init and the stub paths must share one disable predicate.
@@ -58,7 +62,8 @@ class TestPromptCachingDisabledFromConfig:
 
 
 class TestPlanCacheSectionsHonorsDisable:
-    def test_explicit_cache_disabled_strips_markers(self):
+    @pytest.mark.asyncio
+    async def test_explicit_cache_disabled_strips_markers(self):
         from agent.agent_runtime_helpers import plan_cache_sections_for_destination
 
         messages = [
@@ -75,7 +80,7 @@ class TestPlanCacheSectionsHonorsDisable:
                 },
             }
         ]
-        out_msgs, out_tools = plan_cache_sections_for_destination(
+        out_msgs, out_tools = await plan_cache_sections_for_destination(
             messages,
             tools,
             provider="anthropic",
@@ -87,7 +92,8 @@ class TestPlanCacheSectionsHonorsDisable:
         assert not _has_cache_control(out_msgs)
         assert not _has_cache_control(out_tools)
 
-    def test_config_off_without_explicit_flag(self):
+    @pytest.mark.asyncio
+    async def test_config_off_without_explicit_flag(self):
         from agent.agent_runtime_helpers import plan_cache_sections_for_destination
 
         messages = [
@@ -96,9 +102,9 @@ class TestPlanCacheSectionsHonorsDisable:
         ]
         with patch(
             "hermes_cli.config.load_config_readonly",
-            return_value={"prompt_caching": {"cache_ttl": "off"}},
+            new=AsyncMock(return_value={"prompt_caching": {"cache_ttl": "off"}}),
         ):
-            out_msgs, out_tools = plan_cache_sections_for_destination(
+            out_msgs, out_tools = await plan_cache_sections_for_destination(
                 messages,
                 None,
                 provider="anthropic",
@@ -109,7 +115,8 @@ class TestPlanCacheSectionsHonorsDisable:
         assert not _has_cache_control(out_msgs)
         assert out_tools is None or not _has_cache_control(out_tools)
 
-    def test_enabled_still_adds_markers_on_native_anthropic(self):
+    @pytest.mark.asyncio
+    async def test_enabled_still_adds_markers_on_native_anthropic(self):
         from agent.agent_runtime_helpers import plan_cache_sections_for_destination
 
         messages = [
@@ -120,9 +127,9 @@ class TestPlanCacheSectionsHonorsDisable:
         ]
         with patch(
             "hermes_cli.config.load_config_readonly",
-            return_value={"prompt_caching": {"cache_ttl": "5m"}},
+            new=AsyncMock(return_value={"prompt_caching": {"cache_ttl": "5m"}}),
         ):
-            out_msgs, _ = plan_cache_sections_for_destination(
+            out_msgs, _ = await plan_cache_sections_for_destination(
                 messages,
                 None,
                 provider="anthropic",
@@ -138,7 +145,8 @@ class TestPlanCacheSectionsHonorsDisable:
 
 
 class TestMoASlotDecorationHonorsDisable:
-    def test_maybe_apply_skips_markers_when_disabled(self):
+    @pytest.mark.asyncio
+    async def test_maybe_apply_skips_markers_when_disabled(self):
         from agent.moa_loop import _maybe_apply_moa_cache_control
 
         messages = [
@@ -153,14 +161,15 @@ class TestMoASlotDecorationHonorsDisable:
             "base_url": "",
             "api_mode": "anthropic_messages",
         }
-        out = _maybe_apply_moa_cache_control(
+        out = await _maybe_apply_moa_cache_control(
             messages, runtime, cache_disabled=True
         )
         assert not _has_cache_control(out)
         # Inputs must not be mutated.
         assert not _has_cache_control(messages)
 
-    def test_maybe_apply_config_off(self):
+    @pytest.mark.asyncio
+    async def test_maybe_apply_config_off(self):
         from agent.moa_loop import _maybe_apply_moa_cache_control
 
         messages = [
@@ -177,9 +186,9 @@ class TestMoASlotDecorationHonorsDisable:
         }
         with patch(
             "hermes_cli.config.load_config_readonly",
-            return_value={"prompt_caching": {"cache_ttl": False}},
+            new=AsyncMock(return_value={"prompt_caching": {"cache_ttl": False}}),
         ):
-            out = _maybe_apply_moa_cache_control(messages, runtime)
+            out = await _maybe_apply_moa_cache_control(messages, runtime)
         assert not _has_cache_control(out)
 
 
@@ -188,7 +197,8 @@ class TestPreparedAggregatorNoAgentConfigOff:
     no ``_agent``. The planner must not raise and must honor config-off.
     """
 
-    def test_prepared_aggregator_without_agent_honors_config_off(self):
+    @pytest.mark.asyncio
+    async def test_prepared_aggregator_without_agent_honors_config_off(self):
         import copy
 
         from agent import moa_loop
@@ -198,28 +208,28 @@ class TestPreparedAggregatorNoAgentConfigOff:
             patch.object(
                 moa_loop,
                 "call_llm",
-                side_effect=lambda **kwargs: calls.append(kwargs) or SimpleNamespace(
+                new=AsyncMock(side_effect=lambda **kwargs: calls.append(kwargs) or SimpleNamespace(
                     choices=[SimpleNamespace(
                         message=SimpleNamespace(content="ok", tool_calls=[]),
                         finish_reason="stop",
                     )],
                     usage=None,
                     model="fake",
-                ),
+                )),
             ),
             patch.object(
                 moa_loop,
                 "_slot_runtime",
-                return_value={
+                new=AsyncMock(return_value={
                     "provider": "anthropic",
                     "model": "claude-sonnet-4-6",
                     "base_url": "https://api.anthropic.com",
                     "api_mode": "anthropic_messages",
-                },
+                }),
             ),
             patch(
                 "hermes_cli.config.load_config_readonly",
-                return_value={"prompt_caching": {"cache_ttl": "off"}},
+                new=AsyncMock(return_value={"prompt_caching": {"cache_ttl": "off"}}),
             ),
         ):
             completions = moa_loop.MoAChatCompletions.__new__(
@@ -261,7 +271,7 @@ class TestPreparedAggregatorNoAgentConfigOff:
             }]
             canonical_tools = copy.deepcopy(tools)
 
-            completions._call_prepared_aggregator(prepared, {"tools": tools})
+            await completions._call_prepared_aggregator(prepared, {"tools": tools})
 
         assert calls, "prepared aggregator must still call the LLM"
         assert not _has_cache_control(calls[0].get("tools") or []), (
@@ -273,24 +283,26 @@ class TestPreparedAggregatorNoAgentConfigOff:
 
 
 class TestBlankCachePolicyStubFactory:
-    def test_factory_sets_cache_disabled_from_config(self):
+    @pytest.mark.asyncio
+    async def test_factory_sets_cache_disabled_from_config(self):
         from agent.agent_runtime_helpers import blank_cache_policy_stub
 
         with patch(
             "hermes_cli.config.load_config_readonly",
-            return_value={"prompt_caching": {"cache_ttl": "off"}},
+            new=AsyncMock(return_value={"prompt_caching": {"cache_ttl": "off"}}),
         ):
-            stub = blank_cache_policy_stub()
+            stub = await blank_cache_policy_stub()
         assert stub._cache_disabled is True
 
-    def test_factory_honors_explicit_false(self):
+    @pytest.mark.asyncio
+    async def test_factory_honors_explicit_false(self):
         from agent.agent_runtime_helpers import blank_cache_policy_stub
 
         with patch(
             "hermes_cli.config.load_config_readonly",
-            return_value={"prompt_caching": {"cache_ttl": "off"}},
+            new=AsyncMock(return_value={"prompt_caching": {"cache_ttl": "off"}}),
         ):
-            stub = blank_cache_policy_stub(False)
+            stub = await blank_cache_policy_stub(False)
         assert stub._cache_disabled is False
 
 
@@ -299,7 +311,8 @@ class TestOneShotSynthesisAgentDisable:
     so the one-shot synthesis path cannot re-enable markers mid-session.
     """
 
-    def test_synthesis_untouched_when_agent_disables_cache(self):
+    @pytest.mark.asyncio
+    async def test_synthesis_untouched_when_agent_disables_cache(self):
         from agent import moa_loop
 
         calls = []
@@ -307,37 +320,37 @@ class TestOneShotSynthesisAgentDisable:
             patch.object(
                 moa_loop,
                 "call_llm",
-                side_effect=lambda **kwargs: calls.append(kwargs) or SimpleNamespace(
+                new=AsyncMock(side_effect=lambda **kwargs: calls.append(kwargs) or SimpleNamespace(
                     choices=[SimpleNamespace(
                         message=SimpleNamespace(content="synth", tool_calls=[]),
                         finish_reason="stop",
                     )],
                     usage=None,
                     model="fake",
-                ),
+                )),
             ),
             patch.object(
                 moa_loop,
                 "_run_references_parallel",
-                return_value=[("advisor-a", "advice from a", None)],
+                new=AsyncMock(return_value=[("advisor-a", "advice from a", None)]),
             ),
             patch.object(
                 moa_loop,
                 "_slot_runtime",
-                return_value={
+                new=AsyncMock(return_value={
                     "provider": "anthropic",
                     "model": "claude-opus-4.8",
                     "base_url": "",
                     "api_mode": "anthropic_messages",
-                },
+                }),
             ),
             # Config would enable caching; agent snapshot must win.
             patch(
                 "hermes_cli.config.load_config_readonly",
-                return_value={"prompt_caching": {"cache_ttl": "5m"}},
+                new=AsyncMock(return_value={"prompt_caching": {"cache_ttl": "5m"}}),
             ),
         ):
-            moa_loop.aggregate_moa_context(
+            await moa_loop.aggregate_moa_context(
                 user_prompt="what should I do next?",
                 api_messages=[{"role": "user", "content": "help me plan"}],
                 reference_models=[{"provider": "openrouter", "model": "openai/gpt-5.5"}],
@@ -354,7 +367,8 @@ class TestOneShotSynthesisAgentDisable:
 
 
 class TestAdvisorRuntimeDisable:
-    def test_maybe_apply_honors_runtime_cache_disabled_snapshot(self):
+    @pytest.mark.asyncio
+    async def test_maybe_apply_honors_runtime_cache_disabled_snapshot(self):
         from agent.moa_loop import _maybe_apply_moa_cache_control
 
         messages = [
@@ -365,9 +379,9 @@ class TestAdvisorRuntimeDisable:
         ]
         with patch(
             "hermes_cli.config.load_config_readonly",
-            return_value={"prompt_caching": {"cache_ttl": "5m"}},
+            new=AsyncMock(return_value={"prompt_caching": {"cache_ttl": "5m"}}),
         ):
-            out = _maybe_apply_moa_cache_control(
+            out = await _maybe_apply_moa_cache_control(
                 messages,
                 {
                     "provider": "anthropic",

@@ -47,7 +47,7 @@ LEGACY_SQL = """
 """
 
 
-def _make_stale_v22_db(tmp_path, usage_rows=(), sessions=("s1",)):
+async def _make_stale_v22_db(tmp_path, usage_rows=(), sessions=("s1",)):
     """Build a state.db in the stale-v22+ shape: current schema everywhere,
     but session_model_usage carrying the legacy 5-column PK with ``task``
     reconciler-appended OUTSIDE the key, and schema_version already at
@@ -56,8 +56,8 @@ def _make_stale_v22_db(tmp_path, usage_rows=(), sessions=("s1",)):
     # Born-current DB for everything else...
     db = SessionDB(db_path=db_path)
     for sid in sessions:
-        db.create_session(sid, "cli")
-    db.close()
+        await db.create_session(sid, "cli")
+    await db.close()
     # ...then regress session_model_usage to the legacy shape.
     conn = sqlite3.connect(db_path)
     conn.execute("DROP TABLE session_model_usage")
@@ -76,95 +76,104 @@ def _make_stale_v22_db(tmp_path, usage_rows=(), sessions=("s1",)):
     return db_path
 
 
-def _pk_cols(db):
-    rows = db._conn.execute(
+async def _pk_cols(db):
+    connection = await db._get_connection()
+    rows = await (await connection.execute(
         'PRAGMA table_info("session_model_usage")'
-    ).fetchall()
+    )).fetchall()
     return sorted(r["name"] for r in rows if r["pk"])
 
 
+@pytest.mark.asyncio
 class TestSessionModelUsagePkHeal:
-    def test_stale_v22_pk_rebuilt_and_accounting_restored(self, tmp_path):
+    async def test_stale_v22_pk_rebuilt_and_accounting_restored(self, tmp_path):
         """The broken-PK table is rebuilt on open even though schema_version
         is already current, and the usage upsert works again."""
-        db_path = _make_stale_v22_db(
+        db_path = await _make_stale_v22_db(
             tmp_path, usage_rows=[("s1", "m-old", 10, 20)]
         )
         db = SessionDB(db_path=db_path)
         try:
-            assert "task" in _pk_cols(db)
+            assert "task" in await _pk_cols(db)
+            connection = await db._get_connection()
             # Existing rows survive the rebuild (task backfilled to '').
-            row = db._conn.execute(
+            row = await (await connection.execute(
                 "SELECT task, input_tokens FROM session_model_usage "
                 "WHERE session_id='s1' AND model='m-old'"
-            ).fetchone()
+            )).fetchone()
             assert row is not None
             assert row["task"] == ""
             assert row["input_tokens"] == 10
             # The killed write path works again: the upsert used to abort
             # the whole transaction with an ON CONFLICT mismatch.
-            db.update_token_counts(
+            await db.update_token_counts(
                 "s1", input_tokens=5, output_tokens=7,
                 model="m-new", billing_provider="p", api_call_count=1,
             )
-            row = db._conn.execute(
+            row = await (await connection.execute(
                 "SELECT input_tokens FROM session_model_usage "
                 "WHERE session_id='s1' AND model='m-new'"
-            ).fetchone()
+            )).fetchone()
             assert row is not None and row["input_tokens"] == 5
         finally:
-            db.close()
+            await db.close()
 
-    def test_orphan_rows_survive_fk_enforcement(self, tmp_path):
+    async def test_orphan_rows_survive_fk_enforcement(self, tmp_path):
         """The rebuild copies rows inside an FK-off window: an orphaned
         usage row (session pruned while accounting was broken) must not
         abort the heal — OR IGNORE does NOT suppress FK violations."""
-        db_path = _make_stale_v22_db(
+        db_path = await _make_stale_v22_db(
             tmp_path,
             usage_rows=[("s1", "m1", 1, 1), ("ghost-session", "m1", 2, 2)],
         )
         db = SessionDB(db_path=db_path)
         try:
-            assert "task" in _pk_cols(db)
-            rows = db._conn.execute(
+            assert "task" in await _pk_cols(db)
+            connection = await db._get_connection()
+            rows = await (await connection.execute(
                 "SELECT session_id FROM session_model_usage ORDER BY session_id"
-            ).fetchall()
+            )).fetchall()
             assert [r["session_id"] for r in rows] == ["ghost-session", "s1"]
             # FK enforcement is restored after the heal window.
-            assert db._conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+            assert (await (await connection.execute(
+                "PRAGMA foreign_keys"
+            )).fetchone())[0] == 1
         finally:
-            db.close()
+            await db.close()
 
-    def test_healthy_db_is_a_noop(self, tmp_path):
+    async def test_healthy_db_is_a_noop(self, tmp_path):
         """A DB born with the composite PK is left untouched (idempotence)."""
         db = SessionDB(db_path=tmp_path / "state.db")
         try:
-            db.create_session("s1", "cli")
-            db.update_token_counts(
+            await db.create_session("s1", "cli")
+            await db.update_token_counts(
                 "s1", input_tokens=3, model="m", billing_provider="p",
                 api_call_count=1,
             )
-            assert "task" in _pk_cols(db)
+            assert "task" in await _pk_cols(db)
             # Re-running the heal directly is a no-op.
-            cur = db._conn.cursor()
-            db._heal_session_model_usage_pk(cur)
-            row = db._conn.execute(
+            connection = await db._get_connection()
+            await db._heal_session_model_usage_pk(connection)
+            row = await (await connection.execute(
                 "SELECT input_tokens FROM session_model_usage "
                 "WHERE session_id='s1'"
-            ).fetchone()
+            )).fetchone()
             assert row is not None and row["input_tokens"] == 3
         finally:
-            db.close()
+            await db.close()
 
-    def test_no_legacy_leftover_table(self, tmp_path):
+    async def test_no_legacy_leftover_table(self, tmp_path):
         """The rename-copy-drop leaves no *_legacy_pk residue behind."""
-        db_path = _make_stale_v22_db(tmp_path, usage_rows=[("s1", "m1", 1, 1)])
+        db_path = await _make_stale_v22_db(
+            tmp_path, usage_rows=[("s1", "m1", 1, 1)]
+        )
         db = SessionDB(db_path=db_path)
         try:
-            left = db._conn.execute(
+            connection = await db._get_connection()
+            left = await (await connection.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' "
                 "AND name='session_model_usage_legacy_pk'"
-            ).fetchone()
+            )).fetchone()
             assert left is None
         finally:
-            db.close()
+            await db.close()

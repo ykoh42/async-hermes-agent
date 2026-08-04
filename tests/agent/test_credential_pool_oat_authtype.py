@@ -2,6 +2,9 @@
 
 import json
 from pathlib import Path
+from unittest.mock import AsyncMock
+
+import pytest
 
 from agent.credential_pool import (
     AUTH_TYPE_API_KEY,
@@ -27,7 +30,8 @@ def test_anthropic_real_api_key_unchanged():
 
 
 
-def test_load_heals_legacy_row_and_exposes_it_to_resolver(tmp_path, monkeypatch):
+@pytest.mark.asyncio
+async def test_load_heals_legacy_row_and_exposes_it_to_resolver(tmp_path, monkeypatch):
     hermes_home = tmp_path / "hermes"
     hermes_home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
@@ -35,7 +39,7 @@ def test_load_heals_legacy_row_and_exposes_it_to_resolver(tmp_path, monkeypatch)
         monkeypatch.delenv(key, raising=False)
     monkeypatch.setattr(
         "agent.anthropic_adapter.read_claude_code_credentials",
-        lambda: None,
+        AsyncMock(return_value=None),
     )
     token = "sk-ant-oat-legacy-manual"
     auth_file = hermes_home / "auth.json"
@@ -56,10 +60,8 @@ def test_load_heals_legacy_row_and_exposes_it_to_resolver(tmp_path, monkeypatch)
     from agent.anthropic_adapter import resolve_anthropic_token
     from agent.credential_pool import load_pool
 
-    entry = load_pool("anthropic").entries()[0]
+    entry = (await load_pool("anthropic")).entries()[0]
     persisted = json.loads(auth_file.read_text())
     assert entry.auth_type == AUTH_TYPE_OAUTH
     assert persisted["credential_pool"]["anthropic"][0]["auth_type"] == AUTH_TYPE_OAUTH
-    assert resolve_anthropic_token() == token
-
-
+    assert await resolve_anthropic_token() == token

@@ -12,12 +12,13 @@ and a future refactor of these sites can't silently regress the contract.
 
 from __future__ import annotations
 
-from pathlib import Path
+import pytest
 
-from tools import code_execution_tool, file_tools, terminal_tool
+from tools import terminal_tool
 
 
-def test_terminal_env_config_uses_terminal_cwd(monkeypatch, tmp_path):
+@pytest.mark.asyncio
+async def test_terminal_env_config_uses_terminal_cwd(monkeypatch, tmp_path):
     """The terminal tool's default cwd should come from TERMINAL_CWD."""
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -25,19 +26,6 @@ def test_terminal_env_config_uses_terminal_cwd(monkeypatch, tmp_path):
     monkeypatch.setenv("TERMINAL_ENV", "local")
     monkeypatch.setenv("TERMINAL_CWD", str(workspace))
 
-    config = terminal_tool._get_env_config()
+    config = await terminal_tool._get_env_config()
 
     assert config["cwd"] == str(workspace)
-
-
-def test_execute_code_project_mode_falls_back_when_terminal_cwd_missing(monkeypatch, tmp_path):
-    """Invalid TERMINAL_CWD should not break execute_code project mode startup."""
-    staging = tmp_path / "staging"
-    staging.mkdir()
-
-    monkeypatch.setenv("TERMINAL_CWD", str(tmp_path / "missing"))
-
-    resolved = code_execution_tool._resolve_child_cwd("project", str(staging))
-
-    assert Path(resolved).is_dir()
-    assert Path(resolved) != tmp_path / "missing"

@@ -22,6 +22,7 @@ Env: TS_UE_MODEL, TS_BENCH_REPS, TS_UE_MODES (eager,bridge,listing),
 """
 from __future__ import annotations
 
+import asyncio
 import json, os, re, shutil, sys, time, traceback
 from pathlib import Path
 from typing import Any, Dict, List
@@ -187,7 +188,7 @@ SCENARIOS: List[Dict[str, Any]] = [
 ]
 
 
-def run_one(scenario, mode, rep, out_dir: Path):
+async def run_one(scenario, mode, rep, out_dir: Path):
     enabled = mode in ("bridge", "listing")
     model = os.environ.get("TS_UE_MODEL", "anthropic/claude-opus-4.8")
     lmax = int(os.environ.get("TS_UE_LISTING_MAX", "30000"))
@@ -228,7 +229,7 @@ def run_one(scenario, mode, rep, out_dir: Path):
                 pass
             return cu
         _cl.normalize_usage = _norm_spy
-        result = agent.run_conversation(
+        result = await agent.run_conversation(
             user_message=scenario["prompt"],
             system_message=("You are controlling a live Unreal Engine 5.8 editor. The editor is "
                             "already running and connected through your Unreal (mcp-unreal) tools — "
@@ -285,7 +286,7 @@ def run_one(scenario, mode, rep, out_dir: Path):
     return rec
 
 
-def main():
+async def main():
     out_dir = _THIS_DIR / "out_ue_hard"
     out_dir.mkdir(exist_ok=True)
     modes = [m for m in os.environ.get("TS_UE_MODES", "listing,bridge").split(",") if m]
@@ -293,7 +294,7 @@ def main():
     for scenario in SCENARIOS:
         for mode in modes:
             for rep in range(1, N_REPS + 1):
-                rec = run_one(scenario, mode, rep, out_dir)
+                rec = await run_one(scenario, mode, rep, out_dir)
                 print(f"{scenario['id']:22} {mode:8} rep{rep}: 1st={'Y' if rec['first_correct'] else 'n'} "
                       f"final={'Y' if rec['final_correct'] else 'n'} wrong={rec['wrong_calls']} "
                       f"ok={rec['success']} api={rec['api_calls']} in={rec['prompt_tokens_total']:>9,} "
@@ -305,4 +306,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

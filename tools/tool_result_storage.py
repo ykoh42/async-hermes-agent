@@ -11,7 +11,8 @@ Defense against context-window overflow operates at three levels:
    (registry.get_max_result_size), the full output is written INTO THE
    SANDBOX temp dir (for example /tmp/hermes-results/{tool_use_id}.txt on
    standard Linux, or $TMPDIR/hermes-results/{tool_use_id}.txt on Termux)
-   via env.execute(). The in-context content is replaced with a preview +
+   via the environment's native ``execute()`` coroutine. The in-context
+   content is replaced with a preview +
    file path reference. The model can read_file to access the full output
    on any backend.
 
@@ -23,11 +24,11 @@ Defense against context-window overflow operates at three levels:
 """
 
 import hashlib
+import inspect
 import logging
 import os
 import re
 import shlex
-import uuid
 
 from tools.budget_config import (
     DEFAULT_PREVIEW_SIZE_CHARS,
@@ -39,7 +40,6 @@ logger = logging.getLogger(__name__)
 PERSISTED_OUTPUT_TAG = "<persisted-output>"
 PERSISTED_OUTPUT_CLOSING_TAG = "</persisted-output>"
 STORAGE_DIR = "/tmp/hermes-results"
-HEREDOC_MARKER = "HERMES_PERSIST_EOF"
 _BUDGET_TOOL_NAME = "__budget_enforcement__"
 _UNSAFE_RESULT_FILENAME_CHARS = re.compile(r"[^A-Za-z0-9_.-]+")
 _MAX_RESULT_FILENAME_STEM = 120
@@ -90,15 +90,8 @@ def generate_preview(content: str, max_chars: int = DEFAULT_PREVIEW_SIZE_CHARS) 
     return truncated, True
 
 
-def _heredoc_marker(content: str) -> str:
-    """Return a heredoc delimiter that doesn't collide with content."""
-    if HEREDOC_MARKER not in content:
-        return HEREDOC_MARKER
-    return f"HERMES_PERSIST_{uuid.uuid4().hex[:8]}"
-
-
-def _write_to_sandbox(content: str, remote_path: str, env) -> bool:
-    """Write content into the sandbox via env.execute(). Returns True on success.
+async def _write_to_sandbox(content: str, remote_path: str, env) -> bool:
+    """Write content through a native async environment transport.
 
     Pushes ``content`` through stdin rather than embedding it in the command
     string. Linux's ``MAX_ARG_STRLEN`` caps any single argv element at 128 KB
@@ -112,7 +105,10 @@ def _write_to_sandbox(content: str, remote_path: str, env) -> bool:
     """
     storage_dir = os.path.dirname(remote_path)
     cmd = f"mkdir -p {shlex.quote(storage_dir)} && cat > {shlex.quote(remote_path)}"
-    result = env.execute(cmd, timeout=30, stdin_data=content)
+    execute = getattr(env, "execute", None)
+    if not callable(execute) or not inspect.iscoroutinefunction(execute):
+        return False
+    result = await execute(cmd, timeout=30, stdin_data=content)
     return result.get("returncode", 1) == 0
 
 
@@ -141,7 +137,7 @@ def _build_persisted_message(
     return msg
 
 
-def maybe_persist_tool_result(
+async def maybe_persist_tool_result(
     content: str,
     tool_name: str,
     tool_use_id: str,
@@ -151,8 +147,7 @@ def maybe_persist_tool_result(
 ) -> str:
     """Layer 2: persist oversized result into the sandbox, return preview + path.
 
-    Writes via env.execute() so the file is accessible from any backend
-    (local, Docker, SSH, Modal, Daytona). Falls back to inline truncation
+    Writes via the native async ``env.execute()`` contract. Falls back to inline truncation
     if write fails or no env is available.
 
     Args:
@@ -180,7 +175,7 @@ def maybe_persist_tool_result(
 
     if env is not None:
         try:
-            if _write_to_sandbox(content, remote_path, env):
+            if await _write_to_sandbox(content, remote_path, env):
                 logger.info(
                     "Persisted large tool result: %s (%s, %d chars -> %s)",
                     tool_name, tool_use_id, len(content), remote_path,
@@ -200,7 +195,7 @@ def maybe_persist_tool_result(
     )
 
 
-def enforce_turn_budget(
+async def enforce_turn_budget(
     tool_messages: list[dict],
     env=None,
     config: BudgetConfig = DEFAULT_BUDGET,
@@ -234,7 +229,7 @@ def enforce_turn_budget(
         content = msg["content"]
         tool_use_id = msg.get("tool_call_id", f"budget_{idx}")
 
-        replacement = maybe_persist_tool_result(
+        replacement = await maybe_persist_tool_result(
             content=content,
             tool_name=_BUDGET_TOOL_NAME,
             tool_use_id=tool_use_id,

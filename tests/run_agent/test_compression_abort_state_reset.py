@@ -21,6 +21,8 @@ import tempfile
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 
 def _make_agent(session_db):
     with patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}):
@@ -49,7 +51,7 @@ class _InPlaceSuccessCompressor:
     last_completion_tokens = 0
     awaiting_real_usage_after_compression = False
 
-    def compress(self, _messages, **_kwargs):
+    async def compress(self, _messages, **_kwargs):
         return [
             {"role": "user", "content": "[summary] earlier state"},
             {"role": "assistant", "content": "retained tail"},
@@ -62,7 +64,7 @@ class _BreakerBlockedCompressor(_InPlaceSuccessCompressor):
     def _automatic_compression_blocked(self):
         return True
 
-    def compress(self, messages, **_kwargs):  # pragma: no cover - must not run
+    async def compress(self, messages, **_kwargs):  # pragma: no cover - must not run
         raise AssertionError("compress() must not be reached when blocked")
 
 
@@ -71,18 +73,18 @@ class _NoProgressCompressor(_InPlaceSuccessCompressor):
 
     _last_compression_made_progress = False
 
-    def compress(self, messages, **_kwargs):
+    async def compress(self, messages, **_kwargs):
         return [dict(m) for m in messages]
 
 
 class TestAbortPathsResetPerAttemptState:
-    def _in_place_success(self, agent, messages):
+    async def _in_place_success(self, agent, messages):
         from agent.conversation_compression import (
             compress_context,
             conversation_history_after_compression,
         )
         agent.context_compressor = _InPlaceSuccessCompressor()
-        compacted, _ = compress_context(
+        compacted, _ = await compress_context(
             agent, messages, "system", approx_tokens=100_000
         )
         assert agent._last_compaction_in_place is True
@@ -91,7 +93,8 @@ class TestAbortPathsResetPerAttemptState:
             agent, compacted, None
         )
 
-    def test_breaker_blocked_skip_retains_previous_baseline(self):
+    @pytest.mark.asyncio
+    async def test_breaker_blocked_skip_retains_previous_baseline(self):
         """Pre-lock breaker skip after an in-place success must keep baseline."""
         from agent.conversation_compression import (
             compress_context,
@@ -100,22 +103,22 @@ class TestAbortPathsResetPerAttemptState:
         from hermes_state import SessionDB
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            db = SessionDB(db_path=Path(tmpdir) / "test.db")
+            db = SessionDB(Path(tmpdir) / "test.db")
             agent = _make_agent(db)
             agent.compression_in_place = True
             original = [
                 {"role": "user", "content": "old question"},
                 {"role": "assistant", "content": "old answer"},
             ]
-            agent._flush_messages_to_session_db(original, [])
-            compacted, history = self._in_place_success(agent, original)
+            await agent._flush_messages_to_session_db(original, [])
+            compacted, history = await self._in_place_success(agent, original)
 
             messages = compacted + [
                 {"role": "user", "content": "new request"},
                 {"role": "assistant", "content": "new answer"},
             ]
             agent.context_compressor = _BreakerBlockedCompressor()
-            returned, _ = compress_context(
+            returned, _ = await compress_context(
                 agent, messages, "system", approx_tokens=100_000
             )
             assert returned is messages
@@ -130,6 +133,6 @@ class TestAbortPathsResetPerAttemptState:
             # (would drop the new pair on restart), not None (would re-append
             # the compacted rows).
             assert new_history is history
-            db.close()
-
+            await agent.close()
+            await db.close()
 

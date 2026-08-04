@@ -4,7 +4,7 @@ import json
 import sys
 import time
 from types import SimpleNamespace
-from unittest.mock import patch, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -28,6 +28,12 @@ from agent.anthropic_adapter import (
 )
 from agent.transports import get_transport
 
+pytestmark = pytest.mark.asyncio
+
+
+async def _no_claude_code_credentials(*_args, **_kwargs):
+    return None
+
 
 # ---------------------------------------------------------------------------
 # Auth helpers
@@ -35,10 +41,10 @@ from agent.transports import get_transport
 
 
 class TestIsOAuthToken:
-    def test_setup_token(self):
+    async def test_setup_token(self):
         assert _is_oauth_token("sk-ant-oat01-abcdef1234567890") is True
 
-    def test_api_key(self):
+    async def test_api_key(self):
         assert _is_oauth_token("sk-ant-api03-abcdef1234567890") is False
 
 
@@ -48,10 +54,10 @@ class TestIsOAuthToken:
 class TestBuildAnthropicClient:
 
 
-    def test_api_key_uses_api_key(self):
+    async def test_api_key_uses_api_key(self):
         with patch("agent.anthropic_adapter._anthropic_sdk") as mock_sdk:
             build_anthropic_client("sk-ant-api03-something")
-            kwargs = mock_sdk.Anthropic.call_args[1]
+            kwargs = mock_sdk.AsyncAnthropic.call_args[1]
             assert kwargs["api_key"] == "sk-ant-api03-something"
             assert "auth_token" not in kwargs
             # API key auth should still get common betas
@@ -66,13 +72,13 @@ class TestBuildAnthropicClient:
 
 
 
-    def test_minimax_anthropic_endpoint_uses_bearer_auth_for_regular_api_keys(self):
+    async def test_minimax_anthropic_endpoint_uses_bearer_auth_for_regular_api_keys(self):
         with patch("agent.anthropic_adapter._anthropic_sdk") as mock_sdk:
             build_anthropic_client(
                 "minimax-secret-123",
                 base_url="https://api.minimax.io/anthropic",
             )
-            kwargs = mock_sdk.Anthropic.call_args[1]
+            kwargs = mock_sdk.AsyncAnthropic.call_args[1]
             assert kwargs["auth_token"] == "minimax-secret-123"
             assert "api_key" not in kwargs
             assert kwargs["default_headers"] == {
@@ -80,7 +86,7 @@ class TestBuildAnthropicClient:
             }
 
 
-    def test_azure_foundry_anthropic_endpoint_uses_bearer_auth(self):
+    async def test_azure_foundry_anthropic_endpoint_uses_bearer_auth(self):
         """Azure AI Foundry's /anthropic endpoint requires Authorization: Bearer.
 
         Regression test for #26970: without this, builds set api_key (x-api-key)
@@ -92,7 +98,7 @@ class TestBuildAnthropicClient:
                 "azure-foundry-secret-123",
                 base_url="https://my-resource.openai.azure.com/anthropic",
             )
-            kwargs = mock_sdk.Anthropic.call_args[1]
+            kwargs = mock_sdk.AsyncAnthropic.call_args[1]
             assert kwargs["auth_token"] == "azure-foundry-secret-123"
             assert "api_key" not in kwargs
             # Azure endpoints still get the api-version query param plumbing.
@@ -101,7 +107,7 @@ class TestBuildAnthropicClient:
             betas = kwargs["default_headers"]["anthropic-beta"]
             assert "context-1m-2025-08-07" in betas
 
-    def test_palantir_foundry_anthropic_endpoint_uses_bearer_auth(self):
+    async def test_palantir_foundry_anthropic_endpoint_uses_bearer_auth(self):
         """Palantir Foundry's LLM proxy requires Authorization: Bearer.
 
         Regression test for PR #36043: Palantir's
@@ -113,18 +119,18 @@ class TestBuildAnthropicClient:
                 "foundry-secret-123",
                 base_url="https://acme.palantirfoundry.com/api/v2/llm/proxy/anthropic",
             )
-            kwargs = mock_sdk.Anthropic.call_args[1]
+            kwargs = mock_sdk.AsyncAnthropic.call_args[1]
             assert kwargs["auth_token"] == "foundry-secret-123"
             assert "api_key" not in kwargs
 
 
-    def test_disables_sdk_retries_for_api_key(self):
+    async def test_disables_sdk_retries_for_api_key(self):
         """#26293: the SDK's default max_retries=2 ignores Retry-After and
         double-retries inside hermes's outer loop. We delegate retry entirely
         to the outer loop, so the client must be built with max_retries=0."""
         with patch("agent.anthropic_adapter._anthropic_sdk") as mock_sdk:
             build_anthropic_client("sk-ant-api03-something")
-            kwargs = mock_sdk.Anthropic.call_args[1]
+            kwargs = mock_sdk.AsyncAnthropic.call_args[1]
             assert kwargs["max_retries"] == 0
 
 
@@ -135,10 +141,10 @@ class TestReadClaudeCodeCredentials:
     def no_keychain(self, monkeypatch):
         monkeypatch.setattr(
             "agent.anthropic_adapter._read_claude_code_credentials_from_keychain",
-            lambda: None,
+            _no_claude_code_credentials,
         )
 
-    def test_reads_valid_credentials(self, tmp_path, monkeypatch):
+    async def test_reads_valid_credentials(self, tmp_path, monkeypatch):
         cred_file = tmp_path / ".claude" / ".credentials.json"
         cred_file.parent.mkdir(parents=True)
         cred_file.write_text(json.dumps({
@@ -149,18 +155,18 @@ class TestReadClaudeCodeCredentials:
             }
         }))
         monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
-        creds = read_claude_code_credentials()
+        creds = await read_claude_code_credentials()
         assert creds is not None
         assert creds["accessToken"] == "sk-ant-oat01-token"
         assert creds["refreshToken"] == "sk-ant-oat01-refresh"
         assert creds["source"] == "claude_code_credentials_file"
 
-    def test_ignores_primary_api_key_for_native_anthropic_resolution(self, tmp_path, monkeypatch):
+    async def test_ignores_primary_api_key_for_native_anthropic_resolution(self, tmp_path, monkeypatch):
         claude_json = tmp_path / ".claude.json"
         claude_json.write_text(json.dumps({"primaryApiKey": "sk-ant-api03-primary"}))
         monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
 
-        creds = read_claude_code_credentials()
+        creds = await read_claude_code_credentials()
         assert creds is None
 
 
@@ -168,47 +174,47 @@ class TestReadClaudeCodeCredentials:
 
 
 class TestIsClaudeCodeTokenValid:
-    def test_valid_token(self):
+    async def test_valid_token(self):
         creds = {"accessToken": "tok", "expiresAt": int(time.time() * 1000) + 3600_000}
         assert is_claude_code_token_valid(creds) is True
 
-    def test_expired_token(self):
+    async def test_expired_token(self):
         creds = {"accessToken": "tok", "expiresAt": int(time.time() * 1000) - 3600_000}
         assert is_claude_code_token_valid(creds) is False
 
-    def test_no_expiry_but_has_token(self):
+    async def test_no_expiry_but_has_token(self):
         creds = {"accessToken": "tok", "expiresAt": 0}
         assert is_claude_code_token_valid(creds) is True
 
 
 class TestResolveAnthropicToken:
-    def test_prefers_oauth_token_over_api_key(self, monkeypatch, tmp_path):
+    async def test_prefers_oauth_token_over_api_key(self, monkeypatch, tmp_path):
         monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-api03-mykey")
         monkeypatch.setenv("ANTHROPIC_TOKEN", "sk-ant-oat01-mytoken")
         monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
         monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
-        assert resolve_anthropic_token() == "sk-ant-oat01-mytoken"
+        assert await resolve_anthropic_token() == "sk-ant-oat01-mytoken"
 
-    def test_does_not_resolve_primary_api_key_as_native_anthropic_token(self, monkeypatch, tmp_path):
+    async def test_does_not_resolve_primary_api_key_as_native_anthropic_token(self, monkeypatch, tmp_path):
         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
         monkeypatch.delenv("ANTHROPIC_TOKEN", raising=False)
         monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
         (tmp_path / ".claude.json").write_text(json.dumps({"primaryApiKey": "sk-ant-api03-primary"}))
         monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
 
-        assert resolve_anthropic_token() is None
+        assert await resolve_anthropic_token() is None
 
-    def test_falls_back_to_api_key_when_no_oauth_sources_exist(self, monkeypatch, tmp_path):
+    async def test_falls_back_to_api_key_when_no_oauth_sources_exist(self, monkeypatch, tmp_path):
         monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-api03-mykey")
         monkeypatch.delenv("ANTHROPIC_TOKEN", raising=False)
         monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
         monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
-        assert resolve_anthropic_token() == "sk-ant-api03-mykey"
+        assert await resolve_anthropic_token() == "sk-ant-api03-mykey"
 
 
 
 
-    def test_falls_back_to_claude_code_credentials(self, monkeypatch, tmp_path):
+    async def test_falls_back_to_claude_code_credentials(self, monkeypatch, tmp_path):
         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
         monkeypatch.delenv("ANTHROPIC_TOKEN", raising=False)
         monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
@@ -222,9 +228,9 @@ class TestResolveAnthropicToken:
             }
         }))
         monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
-        assert resolve_anthropic_token() == "cc-auto-token"
+        assert await resolve_anthropic_token() == "cc-auto-token"
 
-    def test_falls_back_to_anthropic_credential_pool_oauth(self, monkeypatch, tmp_path):
+    async def test_falls_back_to_anthropic_credential_pool_oauth(self, monkeypatch, tmp_path):
         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
         monkeypatch.delenv("ANTHROPIC_TOKEN", raising=False)
         monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
@@ -232,20 +238,18 @@ class TestResolveAnthropicToken:
         # Isolate source #4 (credential_pool): ensure source #3 (Claude Code
         # creds, incl. the macOS keychain read which Path.home does not cover)
         # returns nothing, mirroring a Hermes-PKCE-only setup.
-        monkeypatch.setattr("agent.anthropic_adapter.read_claude_code_credentials", lambda: None)
+        monkeypatch.setattr("agent.anthropic_adapter.read_claude_code_credentials", _no_claude_code_credentials)
 
         pool_entry = SimpleNamespace(
             auth_type="oauth",
             access_token="pool-oauth-token",
         )
-        pool = SimpleNamespace(
-            _available_entries=lambda **_kwargs: ([pool_entry], []),
-        )
-        monkeypatch.setattr("agent.credential_pool.load_pool", lambda provider: pool)
+        pool = SimpleNamespace(entries = MagicMock(return_value=[pool_entry]))
+        monkeypatch.setattr("agent.credential_pool.load_pool", AsyncMock(return_value=pool))
 
-        assert resolve_anthropic_token() == "pool-oauth-token"
+        assert await resolve_anthropic_token() == "pool-oauth-token"
 
-    def test_prefers_anthropic_credential_pool_oauth_over_api_key(self, monkeypatch, tmp_path):
+    async def test_prefers_anthropic_credential_pool_oauth_over_api_key(self, monkeypatch, tmp_path):
         monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant...ykey")
         monkeypatch.delenv("ANTHROPIC_TOKEN", raising=False)
         monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
@@ -253,20 +257,18 @@ class TestResolveAnthropicToken:
         # Pool (source #4) must win over ANTHROPIC_API_KEY (source #5); also
         # isolate source #3 so a machine-local Claude Code creds / keychain
         # entry can't short-circuit before the pool.
-        monkeypatch.setattr("agent.anthropic_adapter.read_claude_code_credentials", lambda: None)
+        monkeypatch.setattr("agent.anthropic_adapter.read_claude_code_credentials", _no_claude_code_credentials)
 
         pool_entry = SimpleNamespace(
             auth_type="oauth",
             access_token="pool-oauth-token",
         )
-        pool = SimpleNamespace(
-            _available_entries=lambda **_kwargs: ([pool_entry], []),
-        )
-        monkeypatch.setattr("agent.credential_pool.load_pool", lambda provider: pool)
+        pool = SimpleNamespace(entries = MagicMock(return_value=[pool_entry]))
+        monkeypatch.setattr("agent.credential_pool.load_pool", AsyncMock(return_value=pool))
 
-        assert resolve_anthropic_token() == "pool-oauth-token"
+        assert await resolve_anthropic_token() == "pool-oauth-token"
 
-    def test_pool_entry_with_null_access_token_does_not_crash(self, monkeypatch, tmp_path):
+    async def test_pool_entry_with_null_access_token_does_not_crash(self, monkeypatch, tmp_path):
         """A persisted OAuth entry with access_token=None must not crash the
         resolver (None.strip() would escape the helper's try/excepts and take
         down the whole resolver incl. the ANTHROPIC_API_KEY fallback). It should
@@ -275,19 +277,17 @@ class TestResolveAnthropicToken:
         monkeypatch.delenv("ANTHROPIC_TOKEN", raising=False)
         monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
         monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
-        monkeypatch.setattr("agent.anthropic_adapter.read_claude_code_credentials", lambda: None)
+        monkeypatch.setattr("agent.anthropic_adapter.read_claude_code_credentials", _no_claude_code_credentials)
 
         broken_entry = SimpleNamespace(auth_type="oauth", access_token=None)
-        pool = SimpleNamespace(
-            _available_entries=lambda **_kwargs: ([broken_entry], []),
-        )
-        monkeypatch.setattr("agent.credential_pool.load_pool", lambda provider: pool)
+        pool = SimpleNamespace(entries = MagicMock(return_value=[broken_entry]))
+        monkeypatch.setattr("agent.credential_pool.load_pool", AsyncMock(return_value=pool))
 
         # Must fall through to source #5 (ANTHROPIC_API_KEY), not raise.
-        assert resolve_anthropic_token() == "sk-ant...ykey"
+        assert await resolve_anthropic_token() == "sk-ant...ykey"
 
-    def test_pool_api_key_only_entry_is_not_returned_as_token(self, monkeypatch, tmp_path):
-        """resolve_anthropic_token() returns an OAuth bearer token; a pool entry
+    async def test_pool_api_key_only_entry_is_not_returned_as_token(self, monkeypatch, tmp_path):
+        """await resolve_anthropic_token() returns an OAuth bearer token; a pool entry
         whose auth_type is api_key (not oauth) must NOT be returned from the pool
         path — those are consumed via the aux client's _pool_runtime_api_key
         lane, a different resolution concern."""
@@ -295,42 +295,33 @@ class TestResolveAnthropicToken:
         monkeypatch.delenv("ANTHROPIC_TOKEN", raising=False)
         monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
         monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
-        monkeypatch.setattr("agent.anthropic_adapter.read_claude_code_credentials", lambda: None)
+        monkeypatch.setattr("agent.anthropic_adapter.read_claude_code_credentials", _no_claude_code_credentials)
 
         api_key_entry = SimpleNamespace(auth_type="api_key", access_token="sk-pool-apikey")
-        pool = SimpleNamespace(
-            _available_entries=lambda **_kwargs: ([api_key_entry], []),
-        )
-        monkeypatch.setattr("agent.credential_pool.load_pool", lambda provider: pool)
+        pool = SimpleNamespace(entries = MagicMock(return_value=[api_key_entry]))
+        monkeypatch.setattr("agent.credential_pool.load_pool", AsyncMock(return_value=pool))
 
         # No OAuth entry and no other source → None (the api_key entry is ignored here).
-        assert resolve_anthropic_token() is None
+        assert await resolve_anthropic_token() is None
 
 
-    def test_pool_resolution_is_read_only(self, monkeypatch, tmp_path):
-        """The resolver must enumerate the pool read-only — clear_expired and
-        refresh must both be False so a bare resolve never writes auth.json or
-        triggers a network refresh from diagnostic call sites (#50108 MED)."""
+    async def test_pool_resolution_is_read_only(self, monkeypatch, tmp_path):
+        """The resolver must enumerate a read-only async pool snapshot."""
         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
         monkeypatch.delenv("ANTHROPIC_TOKEN", raising=False)
         monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
         monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
-        monkeypatch.setattr("agent.anthropic_adapter.read_claude_code_credentials", lambda: None)
+        monkeypatch.setattr("agent.anthropic_adapter.read_claude_code_credentials", _no_claude_code_credentials)
 
-        captured = {}
         pool_entry = SimpleNamespace(auth_type="oauth", access_token="pool-oauth-token")
+        entries = MagicMock(return_value=[pool_entry])
+        pool = SimpleNamespace(entries=entries)
+        monkeypatch.setattr("agent.credential_pool.load_pool", AsyncMock(return_value=pool))
 
-        def _available_entries(**kwargs):
-            captured.update(kwargs)
-            return ([pool_entry], [])
+        assert await resolve_anthropic_token() == "pool-oauth-token"
+        entries.assert_called_once_with()
 
-        pool = SimpleNamespace(_available_entries=_available_entries)
-        monkeypatch.setattr("agent.credential_pool.load_pool", lambda provider: pool)
-
-        assert resolve_anthropic_token() == "pool-oauth-token"
-        assert captured == {"clear_expired": False, "refresh": False}
-
-    def test_prefers_refreshable_claude_code_credentials_over_static_anthropic_token(self, monkeypatch, tmp_path):
+    async def test_prefers_refreshable_claude_code_credentials_over_static_anthropic_token(self, monkeypatch, tmp_path):
         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
         monkeypatch.setenv("ANTHROPIC_TOKEN", "sk-ant-oat01-static-token")
         monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
@@ -345,26 +336,26 @@ class TestResolveAnthropicToken:
         }))
         monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
 
-        assert resolve_anthropic_token() == "cc-auto-token"
+        assert await resolve_anthropic_token() == "cc-auto-token"
 
 
 
 class TestRefreshOauthToken:
-    def test_returns_none_without_refresh_token(self, tmp_path, monkeypatch):
+    async def test_returns_none_without_refresh_token(self, tmp_path, monkeypatch):
         monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
         # Neutralize live Claude Code sources (macOS Keychain + ~/.claude file)
         # so the adopt-already-refreshed branch can't short-circuit with a real
         # credential on a dev/CI machine that happens to have Claude Code creds.
         monkeypatch.setattr(
-            "agent.anthropic_adapter.read_claude_code_credentials", lambda: None
+            "agent.anthropic_adapter.read_claude_code_credentials", _no_claude_code_credentials
         )
         creds = {"accessToken": "expired", "refreshToken": "", "expiresAt": 0}
-        assert _refresh_oauth_token(creds) is None
+        assert await _refresh_oauth_token(creds) is None
 
-    def test_successful_refresh(self, tmp_path, monkeypatch):
+    async def test_successful_refresh(self, tmp_path, monkeypatch):
         monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
         monkeypatch.setattr(
-            "agent.anthropic_adapter.read_claude_code_credentials", lambda: None
+            "agent.anthropic_adapter.read_claude_code_credentials", _no_claude_code_credentials
         )
 
         creds = {
@@ -373,21 +364,17 @@ class TestRefreshOauthToken:
             "expiresAt": int(time.time() * 1000) - 3600_000,
         }
 
-        mock_response = json.dumps({
+        mock_response = {
             "access_token": "new-token-abc",
             "refresh_token": "new-refresh-456",
-            "expires_in": 7200,
-        }).encode()
+            "expires_at_ms": int(time.time() * 1000) + 7200_000,
+        }
 
-        with patch("urllib.request.urlopen") as mock_urlopen:
-            mock_ctx = MagicMock()
-            mock_ctx.__enter__ = MagicMock(return_value=MagicMock(
-                read=MagicMock(return_value=mock_response)
-            ))
-            mock_ctx.__exit__ = MagicMock(return_value=False)
-            mock_urlopen.return_value = mock_ctx
-
-            result = _refresh_oauth_token(creds)
+        with patch(
+            "agent.anthropic_adapter.refresh_anthropic_oauth_pure",
+            new=AsyncMock(return_value=mock_response),
+        ):
+            result = await _refresh_oauth_token(creds)
 
         assert result == "new-token-abc"
         # Verify credentials were written back
@@ -397,10 +384,10 @@ class TestRefreshOauthToken:
         assert written["claudeAiOauth"]["accessToken"] == "new-token-abc"
         assert written["claudeAiOauth"]["refreshToken"] == "new-refresh-456"
 
-    def test_failed_refresh_returns_none(self, tmp_path, monkeypatch):
+    async def test_failed_refresh_returns_none(self, tmp_path, monkeypatch):
         monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
         monkeypatch.setattr(
-            "agent.anthropic_adapter.read_claude_code_credentials", lambda: None
+            "agent.anthropic_adapter.read_claude_code_credentials", _no_claude_code_credentials
         )
         creds = {
             "accessToken": "old",
@@ -408,14 +395,17 @@ class TestRefreshOauthToken:
             "expiresAt": 0,
         }
 
-        with patch("urllib.request.urlopen", side_effect=Exception("network error")):
-            assert _refresh_oauth_token(creds) is None
+        with patch(
+            "agent.anthropic_adapter.refresh_anthropic_oauth_pure",
+            new=AsyncMock(side_effect=Exception("network error")),
+        ):
+            assert await _refresh_oauth_token(creds) is None
 
 
 class TestWriteClaudeCodeCredentials:
-    def test_writes_new_file(self, tmp_path, monkeypatch):
+    async def test_writes_new_file(self, tmp_path, monkeypatch):
         monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
-        _write_claude_code_credentials("tok", "ref", 12345)
+        await _write_claude_code_credentials("tok", "ref", 12345)
         cred_file = tmp_path / ".claude" / ".credentials.json"
         assert cred_file.exists()
         data = json.loads(cred_file.read_text())
@@ -423,19 +413,19 @@ class TestWriteClaudeCodeCredentials:
         assert data["claudeAiOauth"]["refreshToken"] == "ref"
         assert data["claudeAiOauth"]["expiresAt"] == 12345
 
-    def test_preserves_existing_fields(self, tmp_path, monkeypatch):
+    async def test_preserves_existing_fields(self, tmp_path, monkeypatch):
         monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
         cred_dir = tmp_path / ".claude"
         cred_dir.mkdir()
         cred_file = cred_dir / ".credentials.json"
         cred_file.write_text(json.dumps({"otherField": "keep-me"}))
-        _write_claude_code_credentials("new-tok", "new-ref", 99999)
+        await _write_claude_code_credentials("new-tok", "new-ref", 99999)
         data = json.loads(cred_file.read_text())
         assert data["otherField"] == "keep-me"
         assert data["claudeAiOauth"]["accessToken"] == "new-tok"
 
     @pytest.mark.skipif(sys.platform.startswith("win"), reason="POSIX mode bits not enforced on Windows")
-    def test_credentials_file_created_with_0o600(self, tmp_path, monkeypatch):
+    async def test_credentials_file_created_with_0o600(self, tmp_path, monkeypatch):
         """Refreshed Claude Code credentials must land on disk at 0o600.
 
         Regression for the TOCTOU race where ``write_text`` + ``replace``
@@ -445,7 +435,7 @@ class TestWriteClaudeCodeCredentials:
         """
         import stat as _stat
         monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
-        _write_claude_code_credentials("tok", "ref", 12345)
+        await _write_claude_code_credentials("tok", "ref", 12345)
 
         cred_file = tmp_path / ".claude" / ".credentials.json"
         assert cred_file.exists()
@@ -454,7 +444,7 @@ class TestWriteClaudeCodeCredentials:
 
 
 class TestResolveWithRefresh:
-    def test_auto_refresh_on_expired_creds(self, monkeypatch, tmp_path):
+    async def test_auto_refresh_on_expired_creds(self, monkeypatch, tmp_path):
         """When cred file has expired token + refresh token, auto-refresh is attempted."""
         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
         monkeypatch.delenv("ANTHROPIC_TOKEN", raising=False)
@@ -473,12 +463,15 @@ class TestResolveWithRefresh:
         monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
 
         # Mock refresh to succeed
-        with patch("agent.anthropic_adapter._refresh_oauth_token", return_value="refreshed-token"):
-            result = resolve_anthropic_token()
+        with patch(
+            "agent.anthropic_adapter._refresh_oauth_token",
+            new=AsyncMock(return_value="refreshed-token"),
+        ):
+            result = await resolve_anthropic_token()
 
         assert result == "refreshed-token"
 
-    def test_static_env_oauth_token_does_not_block_refreshable_claude_creds(self, monkeypatch, tmp_path):
+    async def test_static_env_oauth_token_does_not_block_refreshable_claude_creds(self, monkeypatch, tmp_path):
         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
         monkeypatch.setenv("ANTHROPIC_TOKEN", "sk-ant-oat01-expired-env-token")
         monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
@@ -494,15 +487,18 @@ class TestResolveWithRefresh:
         }))
         monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
 
-        with patch("agent.anthropic_adapter._refresh_oauth_token", return_value="refreshed-token"):
-            result = resolve_anthropic_token()
+        with patch(
+            "agent.anthropic_adapter._refresh_oauth_token",
+            new=AsyncMock(return_value="refreshed-token"),
+        ):
+            result = await resolve_anthropic_token()
 
         assert result == "refreshed-token"
 
 
 class TestRunOauthSetupToken:
 
-    def test_returns_token_from_credential_files(self, monkeypatch, tmp_path):
+    async def test_returns_token_from_credential_files(self, monkeypatch, tmp_path):
         """After subprocess completes, reads credentials from Claude Code files."""
         monkeypatch.setattr("shutil.which", lambda _: "/usr/bin/claude")
         monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
@@ -520,28 +516,34 @@ class TestRunOauthSetupToken:
         }))
         monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
 
-        with patch("subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(returncode=0)
-            token = run_oauth_setup_token()
+        process = SimpleNamespace(wait=AsyncMock(return_value=0))
+        with patch(
+            "agent.anthropic_adapter.asyncio.create_subprocess_exec",
+            new=AsyncMock(return_value=process),
+        ) as mock_exec:
+            token = await run_oauth_setup_token()
 
         assert token == "from-cred-file"
         # Don't assert exact call count — the contract is "credentials flow
         # through", not "exactly one subprocess call". xdist cross-test
         # pollution (other tests shimming subprocess via plugins) has flaked
         # assert_called_once() in CI.
-        assert mock_run.called
+        assert mock_exec.called
 
 
-    def test_returns_none_when_no_creds_found(self, monkeypatch, tmp_path):
+    async def test_returns_none_when_no_creds_found(self, monkeypatch, tmp_path):
         """Returns None when subprocess completes but no credentials are found."""
         monkeypatch.setattr("shutil.which", lambda _: "/usr/bin/claude")
         monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
         monkeypatch.delenv("ANTHROPIC_TOKEN", raising=False)
         monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
 
-        with patch("subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(returncode=0)
-            token = run_oauth_setup_token()
+        process = SimpleNamespace(wait=AsyncMock(return_value=0))
+        with patch(
+            "agent.anthropic_adapter.asyncio.create_subprocess_exec",
+            new=AsyncMock(return_value=process),
+        ):
+            token = await run_oauth_setup_token()
 
         assert token is None
 
@@ -553,13 +555,13 @@ class TestRunOauthSetupToken:
 
 
 class TestNormalizeModelName:
-    def test_strips_anthropic_prefix(self):
+    async def test_strips_anthropic_prefix(self):
         assert normalize_model_name("anthropic/claude-sonnet-4-20250514") == "claude-sonnet-4-20250514"
 
 
 
 
-    def test_preserve_dots_for_alibaba_dashscope(self):
+    async def test_preserve_dots_for_alibaba_dashscope(self):
         """Alibaba/DashScope use dots in model names (e.g. qwen3.5-plus). Fixes #1739."""
         assert normalize_model_name("qwen3.5-plus", preserve_dots=True) == "qwen3.5-plus"
         assert normalize_model_name("anthropic/qwen3.5-plus", preserve_dots=True) == "qwen3.5-plus"
@@ -572,7 +574,7 @@ class TestNormalizeModelName:
 
 
 class TestConvertTools:
-    def test_converts_openai_to_anthropic_format(self):
+    async def test_converts_openai_to_anthropic_format(self):
         tools = [
             {
                 "type": "function",
@@ -593,11 +595,11 @@ class TestConvertTools:
         assert result[0]["description"] == "Search the web"
         assert result[0]["input_schema"]["properties"]["query"]["type"] == "string"
 
-    def test_empty_tools(self):
+    async def test_empty_tools(self):
         assert convert_tools_to_anthropic([]) == []
         assert convert_tools_to_anthropic(None) == []
 
-    def test_strips_nullable_union_from_input_schema(self):
+    async def test_strips_nullable_union_from_input_schema(self):
         tools = [
             {
                 "type": "function",
@@ -643,7 +645,7 @@ class TestConvertMessages:
 
 
 
-    def test_strips_tool_use_when_result_not_immediately_adjacent(self):
+    async def test_strips_tool_use_when_result_not_immediately_adjacent(self):
         """A tool_use whose result appears LATER but not in the immediately
         following user message must be stripped (adjacency, #52145).
 
@@ -677,7 +679,7 @@ class TestConvertMessages:
                 )
 
 
-    def test_system_with_cache_control(self):
+    async def test_system_with_cache_control(self):
         messages = [
             {
                 "role": "system",
@@ -693,7 +695,7 @@ class TestConvertMessages:
         assert system[0]["cache_control"] == {"type": "ephemeral"}
 
 
-    def test_assistant_cache_control_blocks_are_preserved(self):
+    async def test_assistant_cache_control_blocks_are_preserved(self):
         messages = apply_anthropic_cache_control([
             {"role": "system", "content": "System prompt"},
             {"role": "assistant", "content": "Hello from assistant"},
@@ -707,7 +709,7 @@ class TestConvertMessages:
         assert assistant_blocks[0]["text"] == "Hello from assistant"
         assert assistant_blocks[0]["cache_control"] == {"type": "ephemeral"}
 
-    def test_assistant_tool_use_cache_control_is_preserved(self):
+    async def test_assistant_tool_use_cache_control_is_preserved(self):
         messages = apply_anthropic_cache_control([
             {"role": "system", "content": "System prompt"},
             {"role": "user", "content": "Run the tool"},
@@ -729,7 +731,7 @@ class TestConvertMessages:
         assert tool_use["id"] == "tc_1"
         assert tool_use["cache_control"] == {"type": "ephemeral"}
 
-    def test_ordered_replay_keeps_cache_control_from_nonempty_content(self):
+    async def test_ordered_replay_keeps_cache_control_from_nonempty_content(self):
         """An assistant turn that interleaves signed thinking with a tool_use
         AND has preamble text carries its cache_control INSIDE ``content``
         (apply_anthropic_cache_control marks the last content block, not the
@@ -777,7 +779,7 @@ class TestConvertMessages:
         # The signed thinking block must still lead the replayed message.
         assert assistant["content"][0]["type"] == "thinking"
 
-    def test_ordered_replay_tool_use_cache_control_is_preserved(self):
+    async def test_ordered_replay_tool_use_cache_control_is_preserved(self):
         messages = apply_anthropic_cache_control([
             {"role": "system", "content": "System prompt"},
             {"role": "user", "content": "Run the tool"},
@@ -821,7 +823,7 @@ class TestConvertMessages:
         assert tool_use["input"] == {"query": "redacted"}
         assert tool_use["cache_control"] == {"type": "ephemeral"}
 
-    def test_tool_cache_control_is_preserved_on_tool_result_block(self):
+    async def test_tool_cache_control_is_preserved_on_tool_result_block(self):
         messages = apply_anthropic_cache_control([
             {"role": "system", "content": "System prompt"},
             {
@@ -852,7 +854,7 @@ class TestConvertMessages:
 
 
 
-    def test_empty_user_message_string_gets_placeholder(self):
+    async def test_empty_user_message_string_gets_placeholder(self):
         """Empty user message strings should get '(empty message)' placeholder.
 
         Anthropic rejects requests with empty user message content.
@@ -868,7 +870,7 @@ class TestConvertMessages:
 
 
 
-    def test_leading_assistant_after_compaction_gets_user_turn_prepended(self):
+    async def test_leading_assistant_after_compaction_gets_user_turn_prepended(self):
         """The adapter backstops compactors that emit a leading assistant summary."""
         messages = [
             {"role": "system", "content": "You are helpful."},
@@ -880,7 +882,7 @@ class TestConvertMessages:
 
         assert system == "You are helpful."
         assert result[0]["role"] == "user"
-        assert result[0]["content"] == [{"type": "text", "text": "(empty)"}]
+        assert result[0]["content"] == [{"type": "text", "text": " "}]
         assert result[1]["role"] == "assistant"
         assert any(
             m["role"] == "assistant" and "Context compaction summary" in str(m["content"])
@@ -901,7 +903,7 @@ class TestBuildAnthropicKwargs:
 
 
 
-    def test_reasoning_config_maps_to_manual_thinking_for_pre_4_6_models(self):
+    async def test_reasoning_config_maps_to_manual_thinking_for_pre_4_6_models(self):
         kwargs = build_anthropic_kwargs(
             model="claude-sonnet-4-20250514",
             messages=[{"role": "user", "content": "think hard"}],
@@ -915,7 +917,7 @@ class TestBuildAnthropicKwargs:
         assert kwargs["max_tokens"] >= 16000 + 4096
         assert "output_config" not in kwargs
 
-    def test_reasoning_config_maps_to_adaptive_thinking_for_4_6_models(self):
+    async def test_reasoning_config_maps_to_adaptive_thinking_for_4_6_models(self):
         kwargs = build_anthropic_kwargs(
             model="claude-opus-4-6",
             messages=[{"role": "user", "content": "think hard"}],
@@ -936,7 +938,7 @@ class TestBuildAnthropicKwargs:
 
 
 
-    def test_supports_fast_mode_predicate(self):
+    async def test_supports_fast_mode_predicate(self):
         """Fast mode is Opus 4.6 only — Opus 4.7 and others must be excluded.
 
         For Opus 4.8 the fast variant is a separate model ID
@@ -955,7 +957,7 @@ class TestBuildAnthropicKwargs:
         assert _supports_fast_mode("claude-haiku-4-5") is False
         assert _supports_fast_mode("") is False
 
-    def test_fable_class_models_route_as_adaptive_thinking(self):
+    async def test_fable_class_models_route_as_adaptive_thinking(self):
         """Invariant: unknown/new Claude models default to the modern (4.7+)
         contract — adaptive thinking, xhigh-capable, sampling-params-forbidden —
         without any per-model code change. Named models (claude-fable-5) and
@@ -983,7 +985,7 @@ class TestBuildAnthropicKwargs:
 
 
 
-    def test_non_claude_anthropic_models_use_manual_path(self):
+    async def test_non_claude_anthropic_models_use_manual_path(self):
         """Non-Claude Anthropic-Messages models (minimax, qwen3, glm) must not
         be misclassified as adaptive by the default-to-modern rule. Kimi is
         the deliberate exception — see test_kimi_family_uses_adaptive_path."""
@@ -998,7 +1000,7 @@ class TestBuildAnthropicKwargs:
             assert _forbids_sampling_params(m) is False, m
 
 
-    def test_bare_k3_coding_plan_slug_is_kimi_family(self):
+    async def test_bare_k3_coding_plan_slug_is_kimi_family(self):
         """Kimi Coding Plan serves K3 as the bare slug ``k3`` — it must be
         classified as Kimi family (adaptive thinking) even on proxied
         endpoints where only the model name is available. Lookalike
@@ -1014,7 +1016,7 @@ class TestBuildAnthropicKwargs:
         for m in ("k30", "k3000-chat", "keras-3"):
             assert _model_name_is_kimi_family(m) is False, m
 
-    def test_fast_mode_omitted_for_unsupported_model(self):
+    async def test_fast_mode_omitted_for_unsupported_model(self):
         """fast_mode=True on Opus 4.7 must NOT inject speed=fast (API 400s)."""
         kwargs = build_anthropic_kwargs(
             model="claude-opus-4-7",
@@ -1048,7 +1050,7 @@ class TestBuildAnthropicKwargs:
 
 
 class TestGetAnthropicMaxOutput:
-    def test_opus_4_6(self):
+    async def test_opus_4_6(self):
         from agent.anthropic_adapter import _get_anthropic_max_output
         assert _get_anthropic_max_output("claude-opus-4-6") == 128_000
 
@@ -1070,19 +1072,19 @@ class TestToPlainData:
 
 
 
-    def test_deep_nesting_is_capped(self):
+    async def test_deep_nesting_is_capped(self):
         deep = "leaf"
         for _ in range(25):
             deep = {"nested": deep}
         result = _to_plain_data(deep)
         assert isinstance(result, dict)
 
-    def test_plain_values_pass_through(self):
+    async def test_plain_values_pass_through(self):
         assert _to_plain_data("hello") == "hello"
         assert _to_plain_data(42) == 42
         assert _to_plain_data(None) is None
 
-    def test_object_with_dunder_dict(self):
+    async def test_object_with_dunder_dict(self):
         obj = SimpleNamespace(type="thinking", thinking="reason", signature="sig")
         result = _to_plain_data(obj)
         assert result == {"type": "thinking", "thinking": "reason", "signature": "sig"}
@@ -1102,7 +1104,7 @@ class TestNormalizeResponse:
         return resp
 
 
-    def test_tool_use_response(self):
+    async def test_tool_use_response(self):
         blocks = [
             SimpleNamespace(type="text", text="Searching..."),
             SimpleNamespace(
@@ -1121,7 +1123,7 @@ class TestNormalizeResponse:
         assert nr.tool_calls[0].name == "search"
         assert json.loads(nr.tool_calls[0].arguments) == {"query": "test"}
 
-    def test_thinking_response(self):
+    async def test_thinking_response(self):
         blocks = [
             SimpleNamespace(type="thinking", thinking="Let me reason about this..."),
             SimpleNamespace(type="text", text="The answer is 42."),
@@ -1132,7 +1134,7 @@ class TestNormalizeResponse:
         assert nr.provider_data["reasoning_details"] == [{"type": "thinking", "thinking": "Let me reason about this..."}]
 
 
-    def test_stop_reason_mapping(self):
+    async def test_stop_reason_mapping(self):
         block = SimpleNamespace(type="text", text="x")
         nr1 = get_transport("anthropic_messages").normalize_response(
             self._make_response([block], "end_turn")
@@ -1156,7 +1158,7 @@ class TestNormalizeResponse:
 
 
 class TestRoleAlternation:
-    def test_merges_consecutive_user_messages(self):
+    async def test_merges_consecutive_user_messages(self):
         messages = [
             {"role": "user", "content": "Hello"},
             {"role": "user", "content": "World"},
@@ -1167,7 +1169,7 @@ class TestRoleAlternation:
         assert "Hello" in result[0]["content"]
         assert "World" in result[0]["content"]
 
-    def test_preserves_proper_alternation(self):
+    async def test_preserves_proper_alternation(self):
         messages = [
             {"role": "user", "content": "Hi"},
             {"role": "assistant", "content": "Hello!"},
@@ -1190,7 +1192,7 @@ class TestThinkingBlockSignatureManagement:
 
 
 
-    def test_redacted_thinking_with_data_preserved(self):
+    async def test_redacted_thinking_with_data_preserved(self):
         """Redacted thinking with 'data' field is kept on last turn."""
         messages = [
             {
@@ -1207,7 +1209,7 @@ class TestThinkingBlockSignatureManagement:
         assert len(redacted) == 1
         assert redacted[0]["data"] == "opaque_signature_data"
 
-    def test_redacted_thinking_without_data_dropped(self):
+    async def test_redacted_thinking_without_data_dropped(self):
         """Redacted thinking without 'data' is dropped — can't be validated."""
         messages = [
             {
@@ -1223,7 +1225,7 @@ class TestThinkingBlockSignatureManagement:
         blocks = result[0]["content"]
         assert not any(b.get("type") == "redacted_thinking" for b in blocks)
 
-    def test_cache_control_stripped_from_thinking_blocks(self):
+    async def test_cache_control_stripped_from_thinking_blocks(self):
         """cache_control markers are removed from thinking/redacted_thinking blocks."""
         messages = [
             {
@@ -1251,7 +1253,7 @@ class TestThinkingBlockSignatureManagement:
 
 
 
-    def test_multi_turn_conversation_preserves_only_last(self):
+    async def test_multi_turn_conversation_preserves_only_last(self):
         """Full multi-turn conversation: only last assistant keeps thinking."""
         messages = [
             {"role": "user", "content": "Question 1"},
@@ -1320,7 +1322,7 @@ class TestToolChoice:
         }
     ]
 
-    def test_auto_tool_choice(self):
+    async def test_auto_tool_choice(self):
         kwargs = build_anthropic_kwargs(
             model="claude-sonnet-4-20250514",
             messages=[{"role": "user", "content": "Hi"}],
@@ -1332,7 +1334,7 @@ class TestToolChoice:
         assert kwargs["tool_choice"] == {"type": "auto"}
 
 
-    def test_specific_tool_choice(self):
+    async def test_specific_tool_choice(self):
         kwargs = build_anthropic_kwargs(
             model="claude-sonnet-4-20250514",
             messages=[{"role": "user", "content": "Hi"}],
@@ -1359,18 +1361,18 @@ class TestResolvePositiveMaxTokens:
     """Unit tests for the positive-int resolver helper."""
 
 
-    def test_zero_returns_none(self):
+    async def test_zero_returns_none(self):
         assert _resolve_positive_anthropic_max_tokens(0) is None
 
 
 
 
 
-    def test_nan_returns_none(self):
+    async def test_nan_returns_none(self):
         assert _resolve_positive_anthropic_max_tokens(float("nan")) is None
 
 
-    def test_bool_true_returns_none(self):
+    async def test_bool_true_returns_none(self):
         # True is an int subclass but semantically never a real max_tokens value
         assert _resolve_positive_anthropic_max_tokens(True) is None
         assert _resolve_positive_anthropic_max_tokens(False) is None
@@ -1381,7 +1383,7 @@ class TestResolvePositiveMaxTokens:
 class TestResolveMessagesMaxTokens:
     """Integration tests for the full Messages resolver."""
 
-    def test_positive_requested_wins(self):
+    async def test_positive_requested_wins(self):
         assert _resolve_anthropic_messages_max_tokens(
             8192, "claude-opus-4-6"
         ) == 8192
@@ -1390,7 +1392,7 @@ class TestResolveMessagesMaxTokens:
 
 
 
-    def test_sub_one_float_falls_back(self):
+    async def test_sub_one_float_falls_back(self):
         # 0.5 floors to 0 -> not positive -> falls back to model ceiling
         result = _resolve_anthropic_messages_max_tokens(0.5, "claude-opus-4-6")
         assert result > 0
@@ -1420,7 +1422,7 @@ class TestConvertToolsToAnthropicDedup:
         }
 
 
-    def test_duplicate_tool_names_are_deduplicated(self):
+    async def test_duplicate_tool_names_are_deduplicated(self):
         """RED test — must fail until dedup guard is added."""
         tools = [
             self._make_openai_tool("lcm_grep"),
@@ -1437,7 +1439,7 @@ class TestConvertToolsToAnthropicDedup:
         assert len(result) == 3  # lcm_grep, lcm_describe, lcm_expand
 
 
-    def test_none_tools_returns_empty(self):
+    async def test_none_tools_returns_empty(self):
         assert convert_tools_to_anthropic(None) == []
 
 
@@ -1457,7 +1459,7 @@ class TestBlankTextBlockFiltering:
 
 
 
-    def test_normal_path_filters_none_text_block_without_crashing(self):
+    async def test_normal_path_filters_none_text_block_without_crashing(self):
         """Regression (review of #63228): text=None must not raise
         AttributeError. _convert_content_part_to_anthropic() can preserve
         None from an invalid upstream input text block -- a bare .strip()
@@ -1480,7 +1482,7 @@ class TestBlankTextBlockFiltering:
 
 
 
-    def test_normal_path_relocates_cache_control_from_dropped_block(self):
+    async def test_normal_path_relocates_cache_control_from_dropped_block(self):
         """Regression (review of #63228): prompt_caching.py's _apply_cache_marker
         sets cache_control directly on content[-1] for list content. If that
         last part is blank text, dropping it must relocate the marker to the
@@ -1508,7 +1510,7 @@ class TestBlankTextBlockFiltering:
         )
 
 
-    def test_replay_path_relocates_cache_control_from_dropped_block(self):
+    async def test_replay_path_relocates_cache_control_from_dropped_block(self):
         """Same cache_control-relocation guarantee on the ordered-replay path:
         a blank text block carrying cache_control (e.g. a stored, previously
         cache-marked turn where prompt_caching later becomes blank on replay)
@@ -1559,7 +1561,7 @@ class TestAllBlankFallbackAndNonStringText:
 
 
 
-    def test_sole_cache_marked_blank_block_relocates_marker_to_placeholder(self):
+    async def test_sole_cache_marked_blank_block_relocates_marker_to_placeholder(self):
         """A message whose ONLY content is a blank text block that also
         carries cache_control: the marker must not be silently dropped just
         because there's nothing else to relocate it onto -- it must land on
@@ -1575,7 +1577,7 @@ class TestAllBlankFallbackAndNonStringText:
         ], f"cache_control must relocate onto the (empty) placeholder: {blocks}"
 
 
-    def test_non_string_truthy_text_treated_as_invalid_not_crash(self):
+    async def test_non_string_truthy_text_treated_as_invalid_not_crash(self):
         """Regression: text=7 (a truthy int, not None) must not reach
         .strip() and raise AttributeError -- it must be treated the same as
         blank/invalid text and dropped."""
@@ -1595,7 +1597,7 @@ class TestAllBlankFallbackAndNonStringText:
         assert len(tool_blocks) == 1
 
 
-    def test_dict_valued_text_treated_as_invalid_not_crash(self):
+    async def test_dict_valued_text_treated_as_invalid_not_crash(self):
         """Another truthy non-string shape (dict) must also be safely dropped."""
         msg = {
             "role": "assistant",
@@ -1627,7 +1629,7 @@ class TestReplayAllBlankFallback:
         from agent.anthropic_adapter import _convert_assistant_message
         return _convert_assistant_message(message)
 
-    def test_sole_blank_marked_replay_block_keeps_marker_on_placeholder(self):
+    async def test_sole_blank_marked_replay_block_keeps_marker_on_placeholder(self):
         msg = {
             "role": "assistant",
             "content": "",
@@ -1640,7 +1642,7 @@ class TestReplayAllBlankFallback:
             {"type": "text", "text": "(empty)", "cache_control": {"type": "ephemeral"}}
         ], result["content"]
 
-    def test_thinking_plus_blank_marked_text_keeps_thinking_and_marker(self):
+    async def test_thinking_plus_blank_marked_text_keeps_thinking_and_marker(self):
         msg = {
             "role": "assistant",
             "content": "",
@@ -1656,7 +1658,7 @@ class TestReplayAllBlankFallback:
         assert len(marked) == 1 and marked[0]["type"] == "text"
         assert marked[0]["text"].strip(), "placeholder must be non-whitespace"
 
-    def test_thinking_plus_blank_unmarked_text_gets_schema_valid_placeholder(self):
+    async def test_thinking_plus_blank_unmarked_text_gets_schema_valid_placeholder(self):
         """Even without a cache marker, dropping the only text block from a
         thinking-only replay must leave schema-valid content."""
         msg = {
@@ -1670,190 +1672,3 @@ class TestReplayAllBlankFallback:
         result = self._convert(msg)
         texts = [b for b in result["content"] if b.get("type") == "text"]
         assert texts == [{"type": "text", "text": "(empty)"}]
-
-
-def _find_blank_text_blocks(messages):
-    """Recursively scan a converted Anthropic message list (including
-    nested tool_result content) for any text block whose text is empty or
-    whitespace-only. Returns a list of (message_index, role, location,
-    block_index) tuples for every violation found -- empty means the
-    payload is safe to send to Anthropic."""
-    violations = []
-    for m_idx, msg in enumerate(messages):
-        content = msg.get("content")
-        if not isinstance(content, list):
-            continue
-        for b_idx, blk in enumerate(content):
-            if not isinstance(blk, dict):
-                continue
-            if blk.get("type") == "text" and not (
-                isinstance(blk.get("text"), str) and blk["text"].strip()
-            ):
-                violations.append((m_idx, msg.get("role"), "content", b_idx))
-            if blk.get("type") == "tool_result" and isinstance(blk.get("content"), list):
-                for ib_idx, iblk in enumerate(blk["content"]):
-                    if (
-                        isinstance(iblk, dict)
-                        and iblk.get("type") == "text"
-                        and not (isinstance(iblk.get("text"), str) and iblk["text"].strip())
-                    ):
-                        violations.append((m_idx, msg.get("role"), "tool_result", ib_idx))
-    return violations
-
-
-class TestFinalPayloadHasNoBlankTextBlocks:
-    """End-to-end regression tests on the true final payload boundary:
-    ``convert_messages_to_anthropic`` -- the last transform before
-    ``build_anthropic_kwargs`` hands ``messages`` to the Anthropic SDK.
-
-    Covers the blank-content shapes enumerated for the "text content
-    blocks must contain non-whitespace text" HTTP 400 class, verifying the
-    final built payload never contains a blank text block while tool_use,
-    tool_result, and image content are preserved.
-    """
-
-    def test_user_message_empty_string_content(self):
-        messages = [{"role": "user", "content": ""}]
-        _, result = convert_messages_to_anthropic(messages)
-        assert _find_blank_text_blocks(result) == []
-        assert result[0]["content"] == "(empty message)"
-
-    def test_user_message_whitespace_only_string_content(self):
-        messages = [{"role": "user", "content": "   "}]
-        _, result = convert_messages_to_anthropic(messages)
-        assert _find_blank_text_blocks(result) == []
-        assert result[0]["content"] == "(empty message)"
-
-    def test_user_message_blank_list_content(self):
-        messages = [{"role": "user", "content": [{"type": "text", "text": ""}]}]
-        _, result = convert_messages_to_anthropic(messages)
-        assert _find_blank_text_blocks(result) == []
-        assert result[0]["content"] == [{"type": "text", "text": "(empty message)"}]
-
-    def test_user_message_mixed_blank_and_valid_text_blocks(self):
-        """A blank text block sitting alongside a non-blank one must be
-        dropped individually -- not left in place (the all-or-nothing bug)
-        and not used as an excuse to nuke the valid sibling block."""
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": "real question"},
-                    {"type": "text", "text": "   "},
-                ],
-            }
-        ]
-        _, result = convert_messages_to_anthropic(messages)
-        assert _find_blank_text_blocks(result) == []
-        assert result[0]["content"] == [{"type": "text", "text": "real question"}]
-
-    def test_mixed_blank_text_plus_valid_tool_block_preserved(self):
-        """Blank text next to a valid non-text block (tool_result) must
-        drop only the blank text and keep the tool block intact."""
-        messages = [
-            {"role": "user", "content": "call a tool"},
-            {
-                "role": "assistant",
-                "content": "",
-                "tool_calls": [
-                    {
-                        "id": "call_1",
-                        "function": {"name": "web_search", "arguments": '{"query": "x"}'},
-                    }
-                ],
-            },
-            {"role": "tool", "tool_call_id": "call_1", "content": "result text"},
-        ]
-        _, result = convert_messages_to_anthropic(messages)
-        assert _find_blank_text_blocks(result) == []
-        assistant_msg = next(m for m in result if m["role"] == "assistant")
-        tool_use_blocks = [b for b in assistant_msg["content"] if b.get("type") == "tool_use"]
-        assert len(tool_use_blocks) == 1
-        tool_result_msg = next(
-            m
-            for m in result
-            if m["role"] == "user"
-            and isinstance(m["content"], list)
-            and any(b.get("type") == "tool_result" for b in m["content"])
-        )
-        assert tool_result_msg is not None
-
-    def test_assistant_tool_call_message_with_blank_content(self):
-        """OpenAI-wire-shaped assistant turn: content is a blank string,
-        tool_calls carries the real payload. Must not surface a blank text
-        block, and the tool_use block must survive untouched."""
-        messages = [
-            {"role": "user", "content": "do it"},
-            {
-                "role": "assistant",
-                "content": "   ",
-                "tool_calls": [
-                    {
-                        "id": "call_2",
-                        "function": {"name": "web_search", "arguments": '{"query": "y"}'},
-                    }
-                ],
-            },
-            {"role": "tool", "tool_call_id": "call_2", "content": "ok"},
-        ]
-        _, result = convert_messages_to_anthropic(messages)
-        assert _find_blank_text_blocks(result) == []
-        assistant_msg = next(m for m in result if m["role"] == "assistant")
-        assert assistant_msg["content"] == [
-            {"type": "tool_use", "id": "call_2", "name": "web_search", "input": {"query": "y"}}
-        ]
-
-    def test_leading_synthesized_user_turn_is_non_blank(self):
-        """_ensure_leading_user_turn's synthesized filler must itself be
-        non-whitespace -- regression for the literal " " placeholder bug."""
-        messages = [
-            {"role": "system", "content": "sys"},
-            {"role": "assistant", "content": "[Context compaction summary] earlier work"},
-            {"role": "user", "content": "continue"},
-        ]
-        _, result = convert_messages_to_anthropic(messages)
-        assert _find_blank_text_blocks(result) == []
-        assert result[0]["content"] == [{"type": "text", "text": "(empty)"}]
-
-    def test_blank_text_nested_in_tool_result_content_is_dropped(self):
-        """A blank text part nested inside a tool_result's own multimodal
-        content list (e.g. alongside an image) must be scrubbed without
-        losing the image."""
-        messages = [
-            {"role": "user", "content": "screenshot please"},
-            {
-                "role": "assistant",
-                "content": "",
-                "tool_calls": [
-                    {
-                        "id": "call_3",
-                        "function": {"name": "screenshot", "arguments": "{}"},
-                    }
-                ],
-            },
-            {
-                "role": "tool",
-                "tool_call_id": "call_3",
-                "content": [
-                    {"type": "text", "text": "   "},
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": "data:image/png;base64,AAAA"},
-                    },
-                ],
-            },
-        ]
-        _, result = convert_messages_to_anthropic(messages)
-        assert _find_blank_text_blocks(result) == []
-        tool_result_msg = next(
-            m
-            for m in result
-            if m["role"] == "user"
-            and isinstance(m["content"], list)
-            and any(b.get("type") == "tool_result" for b in m["content"])
-        )
-        tool_result_block = next(
-            b for b in tool_result_msg["content"] if b.get("type") == "tool_result"
-        )
-        image_blocks = [b for b in tool_result_block["content"] if b.get("type") == "image"]
-        assert len(image_blocks) == 1

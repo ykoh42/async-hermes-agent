@@ -16,7 +16,6 @@ from agent.prompt_builder import (
     _find_git_root,
     _strip_yaml_frontmatter,
     build_skills_system_prompt,
-    build_nous_subscription_prompt,
     build_context_files_prompt,
     CONTEXT_FILE_MAX_CHARS,
     _dynamic_context_file_max_chars,
@@ -34,7 +33,6 @@ from agent.prompt_builder import (
     PLATFORM_HINTS,
     WSL_ENVIRONMENT_HINT,
 )
-from hermes_cli.nous_subscription import NousFeatureState, NousSubscriptionFeatures
 
 
 # =========================================================================
@@ -119,7 +117,7 @@ class TestTruncateContent:
         monkeypatch.setattr("hermes_cli.config.load_config", fake_load_config)
         monkeypatch.setattr("hermes_cli.config.load_config_readonly", fake_load_config)
 
-        _truncate_content("x" * 180, "warning.md")
+        _truncate_content("x" * 180, "warning.md", max_chars=120)
 
         warnings = drain_truncation_warnings()
         assert len(warnings) == 1
@@ -140,7 +138,7 @@ class TestTruncateContent:
         # Generate a warning in a fresh child context, then assert it did NOT
         # leak into the parent context's accumulator.
         def _child():
-            _truncate_content("x" * 180, "child.md")
+            _truncate_content("x" * 180, "child.md", max_chars=120)
             # Inside the child context, the warning is visible & drainable.
             assert any("child.md" in w for w in drain_truncation_warnings())
 
@@ -150,7 +148,7 @@ class TestTruncateContent:
         assert drain_truncation_warnings() == []
 
         # And a warning raised in the parent stays in the parent.
-        _truncate_content("y" * 180, "parent.md")
+        _truncate_content("y" * 180, "parent.md", max_chars=120)
         parent_warnings = drain_truncation_warnings()
         assert len(parent_warnings) == 1
         assert "parent.md" in parent_warnings[0]
@@ -177,17 +175,12 @@ class TestDynamicContextFileCap:
 
 
 
-    def test_explicit_config_beats_dynamic(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_explicit_config_beats_dynamic(self, monkeypatch, tmp_path):
         # An explicit value always wins, even when a big window is available.
-        monkeypatch.setattr(
-            "hermes_cli.config.load_config",
-            lambda: {"context_file_max_chars": 1_000},
-        )
-        monkeypatch.setattr(
-            "hermes_cli.config.load_config_readonly",
-            lambda: {"context_file_max_chars": 1_000},
-        )
-        assert _get_context_file_max_chars(200_000) == 1_000
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        (tmp_path / "config.yaml").write_text("context_file_max_chars: 1000\n")
+        assert await _get_context_file_max_chars(200_000) == 1_000
 
     def test_large_window_avoids_truncation_of_midsize_doc(self):
         # A 30K-char AGENTS.md is truncated at the flat default but survives
@@ -207,36 +200,39 @@ class TestDynamicContextFileCap:
 
 
 class TestParseSkillFile:
-    def test_reads_frontmatter_description(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_reads_frontmatter_description(self, tmp_path):
         skill_file = tmp_path / "SKILL.md"
         skill_file.write_text(
             "---\nname: test-skill\ndescription: A useful test skill\n---\n\nBody here"
         )
-        is_compat, frontmatter, desc = _parse_skill_file(skill_file)
+        is_compat, frontmatter, desc = await _parse_skill_file(skill_file)
         assert is_compat is True
         assert frontmatter.get("name") == "test-skill"
         assert desc == "A useful test skill"
 
 
-    def test_long_description_truncated(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_long_description_truncated(self, tmp_path):
         skill_file = tmp_path / "SKILL.md"
         long_desc = "A" * 100
         skill_file.write_text(f"---\ndescription: {long_desc}\n---\n")
-        _, _, desc = _parse_skill_file(skill_file)
+        _, _, desc = await _parse_skill_file(skill_file)
         assert len(desc) <= 60
         assert desc.endswith("...")
 
 
-    def test_logs_parse_failures_and_returns_defaults(self, tmp_path, monkeypatch, caplog):
+    @pytest.mark.asyncio
+    async def test_logs_parse_failures_and_returns_defaults(self, tmp_path, monkeypatch, caplog):
         skill_file = tmp_path / "SKILL.md"
         skill_file.write_text("---\nname: broken\n---\n")
 
         def boom(*args, **kwargs):
             raise OSError("read exploded")
 
-        monkeypatch.setattr(type(skill_file), "read_text", boom)
+        monkeypatch.setattr("aiofiles.open", boom)
         with caplog.at_level(logging.DEBUG, logger="agent.prompt_builder"):
-            is_compat, frontmatter, desc = _parse_skill_file(skill_file)
+            is_compat, frontmatter, desc = await _parse_skill_file(skill_file)
 
         assert is_compat is True
         assert frontmatter == {}
@@ -282,19 +278,21 @@ class TestBuildSkillsSystemPrompt:
 
 
 
-    def test_deduplicates_skills(self, monkeypatch, tmp_path):
+    @pytest.mark.asyncio
+    async def test_deduplicates_skills(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         cat_dir = tmp_path / "skills" / "tools"
         for subdir in ["search", "search"]:
             d = cat_dir / subdir
             d.mkdir(parents=True, exist_ok=True)
             (d / "SKILL.md").write_text("---\ndescription: Search stuff\n---\n")
-        result = build_skills_system_prompt()
+        result = await build_skills_system_prompt()
         # "search" should appear only once per category
         assert result.count("- search") == 1
 
 
-    def test_compact_categories_demote_nested_and_miss_cache_separately(
+    @pytest.mark.asyncio
+    async def test_compact_categories_demote_nested_and_miss_cache_separately(
         self, monkeypatch, tmp_path
     ):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
@@ -305,18 +303,19 @@ class TestBuildSkillsSystemPrompt:
         )
         # Nested category ("social-media/twitter") demoted via its parent:
         # name visible, description gone.
-        compact = build_skills_system_prompt(
+        compact = await build_skills_system_prompt(
             compact_categories=frozenset({"social-media"})
         )
         assert "thread-writer" in compact
         assert "Write threads" not in compact
         # Unfiltered call must not be served from the compacted cache entry.
-        full = build_skills_system_prompt()
+        full = await build_skills_system_prompt()
         assert "Write threads" in full
 
 
 
-    def test_excludes_disabled_skills(self, monkeypatch, tmp_path):
+    @pytest.mark.asyncio
+    async def test_excludes_disabled_skills(self, monkeypatch, tmp_path):
         """Skills in the user's disabled list should not appear in the system prompt."""
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         skills_dir = tmp_path / "skills" / "tools"
@@ -337,15 +336,16 @@ class TestBuildSkillsSystemPrompt:
         from unittest.mock import patch
 
         with patch(
-            "agent.prompt_builder.get_disabled_skill_names",
+            "agent.prompt_builder._get_disabled_skill_names",
             return_value={"old-tool"},
         ):
-            result = build_skills_system_prompt()
+            result = await build_skills_system_prompt()
 
         assert "web-search" in result
         assert "old-tool" not in result
 
-    def test_rebuilds_prompt_when_disabled_skills_change(self, monkeypatch, tmp_path):
+    @pytest.mark.asyncio
+    async def test_rebuilds_prompt_when_disabled_skills_change(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         skill_dir = tmp_path / "skills" / "tools" / "cached-skill"
         skill_dir.mkdir(parents=True)
@@ -353,78 +353,18 @@ class TestBuildSkillsSystemPrompt:
             "---\nname: cached-skill\ndescription: Cached skill\n---\n"
         )
 
-        first = build_skills_system_prompt()
+        first = await build_skills_system_prompt()
         assert "cached-skill" in first
 
         (tmp_path / "config.yaml").write_text(
             "skills:\n  disabled: [cached-skill]\n"
         )
 
-        second = build_skills_system_prompt()
+        second = await build_skills_system_prompt()
         assert "cached-skill" not in second
 
 
 
-
-
-class TestBuildNousSubscriptionPrompt:
-    def test_includes_active_subscription_features(self, monkeypatch):
-        monkeypatch.setattr("tools.tool_backend_helpers.managed_nous_tools_enabled", lambda: True)
-        monkeypatch.setattr(
-            "hermes_cli.nous_subscription.get_nous_subscription_features",
-            lambda config=None: NousSubscriptionFeatures(
-                subscribed=True,
-                nous_auth_present=True,
-                provider_is_nous=True,
-                features={
-                    "web": NousFeatureState("web", "Web tools", True, True, True, True, False, True, "firecrawl"),
-                    "image_gen": NousFeatureState("image_gen", "Image generation", True, True, True, True, False, True, "Nous Subscription"),
-                    "video_gen": NousFeatureState("video_gen", "Video generation", False, False, False, False, False, False, ""),
-                    "tts": NousFeatureState("tts", "OpenAI TTS", True, True, True, True, False, True, "OpenAI TTS"),
-                    "stt": NousFeatureState("stt", "Speech-to-text", True, True, True, True, False, True, "OpenAI Whisper"),
-                    "browser": NousFeatureState("browser", "Browser automation", True, True, True, True, False, True, "Browser Use"),
-                    "modal": NousFeatureState("modal", "Modal execution", False, True, False, False, False, True, "local"),
-                },
-            ),
-        )
-
-        prompt = build_nous_subscription_prompt({"web_search", "browser_navigate"})
-
-        assert "Browser Use" in prompt
-        assert "Modal execution is optional" in prompt
-        assert "do not ask the user for Firecrawl, FAL, OpenAI TTS, OpenAI Whisper, or Browser-Use API keys" in prompt
-
-    def test_non_subscriber_prompt_includes_relevant_upgrade_guidance(self, monkeypatch):
-        monkeypatch.setattr("tools.tool_backend_helpers.managed_nous_tools_enabled", lambda: True)
-        monkeypatch.setattr(
-            "hermes_cli.nous_subscription.get_nous_subscription_features",
-            lambda config=None: NousSubscriptionFeatures(
-                subscribed=False,
-                nous_auth_present=False,
-                provider_is_nous=False,
-                features={
-                    "web": NousFeatureState("web", "Web tools", True, False, False, False, False, True, ""),
-                    "image_gen": NousFeatureState("image_gen", "Image generation", True, False, False, False, False, True, ""),
-                    "video_gen": NousFeatureState("video_gen", "Video generation", False, False, False, False, False, False, ""),
-                    "tts": NousFeatureState("tts", "OpenAI TTS", True, False, False, False, False, True, ""),
-                    "stt": NousFeatureState("stt", "Speech-to-text", True, False, False, False, False, True, ""),
-                    "browser": NousFeatureState("browser", "Browser automation", True, False, False, False, False, True, ""),
-                    "modal": NousFeatureState("modal", "Modal execution", False, False, False, False, False, True, ""),
-                },
-            ),
-        )
-
-        prompt = build_nous_subscription_prompt({"image_generate"})
-
-        assert "suggest Nous subscription as one option" in prompt
-        assert "Do not mention subscription unless" in prompt
-
-    def test_feature_flag_off_returns_empty_prompt(self, monkeypatch):
-        monkeypatch.setattr("tools.tool_backend_helpers.managed_nous_tools_enabled", lambda: False)
-
-        prompt = build_nous_subscription_prompt({"web_search"})
-
-        assert prompt == ""
 
 
 # =========================================================================
@@ -433,23 +373,25 @@ class TestBuildNousSubscriptionPrompt:
 
 
 class TestBuildContextFilesPrompt:
-    def test_empty_dir_loads_seeded_global_soul(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_empty_dir_adds_no_context(self, tmp_path):
         from unittest.mock import patch
 
         fake_home = tmp_path / "fake_home"
         fake_home.mkdir()
         with patch("pathlib.Path.home", return_value=fake_home):
-            result = build_context_files_prompt(cwd=str(tmp_path))
-        assert "Project Context" in result
-        assert "Hermes Agent" in result
+            result = await build_context_files_prompt(cwd=str(tmp_path))
+        assert result == ""
 
-    def test_loads_agents_md(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_loads_agents_md(self, tmp_path):
         (tmp_path / "AGENTS.md").write_text("Use Ruff for linting.")
-        result = build_context_files_prompt(cwd=str(tmp_path))
+        result = await build_context_files_prompt(cwd=str(tmp_path))
         assert "Ruff for linting" in result
         assert "Project Context" in result
 
-    def test_skips_agents_md_in_install_tree_on_fallback(self, monkeypatch, tmp_path):
+    @pytest.mark.asyncio
+    async def test_skips_agents_md_in_install_tree_on_fallback(self, monkeypatch, tmp_path):
         # A backend that FALLS BACK into the install tree (cwd=None → getcwd,
         # the desktop default) must not load that tree's contributor AGENTS.md
         # as project context. The guard keys off the package root, so point it
@@ -459,7 +401,7 @@ class TestBuildContextFilesPrompt:
         monkeypatch.setattr(rt, "_PACKAGE_ROOT", tmp_path.resolve())
         (tmp_path / "AGENTS.md").write_text("Never give up on the right solution.")
         monkeypatch.chdir(tmp_path)
-        result = build_context_files_prompt(cwd=None, skip_soul=True)
+        result = await build_context_files_prompt(cwd=None, skip_soul=True)
         assert "Never give up" not in result
         assert result == ""
 
@@ -468,12 +410,13 @@ class TestBuildContextFilesPrompt:
 
 
 
-    def test_empty_soul_md_adds_nothing(self, tmp_path, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_empty_soul_md_adds_nothing(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes_home"))
         hermes_home = tmp_path / "hermes_home"
         hermes_home.mkdir()
         (hermes_home / "SOUL.md").write_text("\n\n", encoding="utf-8")
-        result = build_context_files_prompt(cwd=str(tmp_path))
+        result = await build_context_files_prompt(cwd=str(tmp_path))
         assert result == ""
 
 
@@ -491,9 +434,10 @@ class TestBuildContextFilesPrompt:
 
 
 
-    def test_loads_claude_md(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_loads_claude_md(self, tmp_path):
         (tmp_path / "CLAUDE.md").write_text("Use type hints everywhere.")
-        result = build_context_files_prompt(cwd=str(tmp_path))
+        result = await build_context_files_prompt(cwd=str(tmp_path))
         assert "type hints" in result
         assert "CLAUDE.md" in result
         assert "Project Context" in result
@@ -503,14 +447,15 @@ class TestBuildContextFilesPrompt:
         sys.platform == "darwin",
         reason="APFS default volume is case-insensitive; CLAUDE.md and claude.md alias the same path",
     )
-    def test_claude_md_uppercase_takes_priority(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_claude_md_uppercase_takes_priority(self, tmp_path):
         uppercase = tmp_path / "CLAUDE.md"
         lowercase = tmp_path / "claude.md"
         uppercase.write_text("From uppercase.")
         lowercase.write_text("From lowercase.")
         if uppercase.samefile(lowercase):
             pytest.skip("filesystem is case-insensitive")
-        result = build_context_files_prompt(cwd=str(tmp_path))
+        result = await build_context_files_prompt(cwd=str(tmp_path))
         assert "From uppercase" in result
         assert "From lowercase" not in result
 
@@ -524,22 +469,25 @@ class TestBuildContextFilesPrompt:
 
 
 class TestFindHermesMd:
-    def test_finds_in_cwd(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_finds_in_cwd(self, tmp_path):
         (tmp_path / ".hermes.md").write_text("rules")
-        assert _find_hermes_md(tmp_path) == tmp_path / ".hermes.md"
+        assert await _find_hermes_md(tmp_path) == tmp_path / ".hermes.md"
 
 
 
-    def test_walks_to_git_root(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_walks_to_git_root(self, tmp_path):
         (tmp_path / ".git").mkdir()
         (tmp_path / ".hermes.md").write_text("root rules")
         sub = tmp_path / "a" / "b"
         sub.mkdir(parents=True)
-        assert _find_hermes_md(sub) == tmp_path / ".hermes.md"
+        assert await _find_hermes_md(sub) == tmp_path / ".hermes.md"
 
 
 
-    def test_no_git_root_checks_cwd_only(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_no_git_root_checks_cwd_only(self, tmp_path):
         """Outside a git repo, only cwd is checked — parents are NOT walked.
 
         Walking parents with no git root to stop the loop would climb all
@@ -555,23 +503,26 @@ class TestFindHermesMd:
         cwd.mkdir()
         # No git root anywhere up the tree.
         with patch("agent.prompt_builder._find_git_root", return_value=None):
-            assert _find_hermes_md(cwd) is None
+            assert await _find_hermes_md(cwd) is None
 
 
 
 
 class TestFindGitRoot:
-    def test_finds_git_dir(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_finds_git_dir(self, tmp_path):
         (tmp_path / ".git").mkdir()
-        assert _find_git_root(tmp_path) == tmp_path
+        assert await _find_git_root(tmp_path) == tmp_path
 
-    def test_finds_from_subdirectory(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_finds_from_subdirectory(self, tmp_path):
         (tmp_path / ".git").mkdir()
         sub = tmp_path / "src" / "lib"
         sub.mkdir(parents=True)
-        assert _find_git_root(sub) == tmp_path
+        assert await _find_git_root(sub) == tmp_path
 
-    def test_returns_none_without_git(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_returns_none_without_git(self, tmp_path):
         # Create an isolated dir tree with no .git anywhere in it.
         # tmp_path itself might be under a git repo, so we test with
         # a directory that has its own .git higher up to verify the
@@ -580,7 +531,7 @@ class TestFindGitRoot:
         isolated.mkdir()
         # We can't fully guarantee no .git exists above tmp_path,
         # so just verify the function returns a Path or None.
-        result = _find_git_root(isolated)
+        result = await _find_git_root(isolated)
         # If result is not None, it must actually contain .git
         if result is not None:
             assert (result / ".git").exists()
@@ -604,18 +555,6 @@ class TestStripYamlFrontmatter:
 
 
 class TestPromptBuilderConstants:
-
-
-    def test_cli_and_tui_hints_flag_local_only_cron(self):
-        """#51568 — cron jobs from CLI/TUI sessions don't deliver back into
-        the session, so the agent must be told up front not to promise it."""
-        for key in ("cli", "tui"):
-            hint = PLATFORM_HINTS[key]
-            assert "LOCAL-ONLY" in hint
-            assert "deliver" in hint
-
-
-
     def test_api_server_hint_scopes_media_tag_guidance(self):
         """api_server MEDIA: interception is partial (#68402, corrected):
         _resolve_media_to_data_urls (gateway/platforms/api_server.py) inlines
@@ -677,32 +616,8 @@ class TestPromptBuilderConstants:
 # =========================================================================
 
 class TestEnvironmentHints:
-
-
-
-
-
-    def test_build_environment_hints_suppresses_host_on_docker_backend(self, monkeypatch):
-        """Docker/remote backends must hide host info — the agent can only touch the backend."""
-        import agent.prompt_builder as _pb
-        import sys
-        monkeypatch.setattr(_pb, "is_wsl", lambda: False)
-        monkeypatch.setattr(sys, "platform", "win32")
-        monkeypatch.setenv("TERMINAL_ENV", "docker")
-        # Force the probe to fail so we exercise the static fallback path
-        # deterministically (the live probe would try to spin up docker).
-        monkeypatch.setattr(_pb, "_probe_remote_backend", lambda _t: None)
-        _pb._clear_backend_probe_cache()
-        result = _pb.build_environment_hints()
-        # Host suppression: none of the local-backend lines should appear.
-        assert "Host: Windows" not in result
-        assert "User home directory:" not in result
-        assert "PowerShell" not in result
-        # Backend info must appear instead.
-        assert "Terminal backend: docker" in result
-        assert "inside" in result.lower()
-
-    def test_build_environment_hints_uses_terminal_cwd_over_launch_dir(self, monkeypatch, tmp_path):
+    @pytest.mark.asyncio
+    async def test_build_environment_hints_uses_terminal_cwd_over_launch_dir(self, monkeypatch, tmp_path):
         """THE BUG: gateway/cron set TERMINAL_CWD but the prompt emitted os.getcwd()
         (the daemon launch dir). Regression for #24882/#24969/#27383/#29265."""
         import agent.prompt_builder as _pb
@@ -712,85 +627,30 @@ class TestEnvironmentHints:
         configured.mkdir()
         monkeypatch.setenv("TERMINAL_CWD", str(configured))
         monkeypatch.chdir(tmp_path)
-        _pb._clear_backend_probe_cache()
-        assert f"Current working directory: {configured}" in _pb.build_environment_hints()
+        assert f"Current working directory: {configured}" in await _pb.build_environment_hints()
 
-    def test_build_environment_hints_falls_back_to_launch_dir(self, monkeypatch, tmp_path):
+    @pytest.mark.asyncio
+    async def test_build_environment_hints_falls_back_to_launch_dir(self, monkeypatch, tmp_path):
         """The #19242 local-CLI contract: no TERMINAL_CWD → the launch dir."""
         import agent.prompt_builder as _pb
         monkeypatch.setattr(_pb, "is_wsl", lambda: False)
         monkeypatch.delenv("TERMINAL_ENV", raising=False)
         monkeypatch.delenv("TERMINAL_CWD", raising=False)
         monkeypatch.chdir(tmp_path)
-        _pb._clear_backend_probe_cache()
-        assert f"Current working directory: {tmp_path}" in _pb.build_environment_hints()
+        assert f"Current working directory: {tmp_path}" in await _pb.build_environment_hints()
 
 
-    def test_probe_remote_backend_imports_real_factory(self, monkeypatch):
-        """Regression for #53667: the probe imported a nonexistent
-        ``get_environment`` from ``tools.environments`` and always died with
-        ``ImportError: cannot import name 'get_environment'`` (cosmetic — it
-        only dropped the live backend description to a static fallback). The
-        real factory is ``_create_environment`` in ``tools.terminal_tool``;
-        the probe must import and call THAT, returning a parsed line instead
-        of None."""
-        import agent.prompt_builder as _pb
-
-        monkeypatch.setenv("TERMINAL_ENV", "docker")
-        _pb._clear_backend_probe_cache()
-
-        class _FakeEnv:
-            def execute(self, cmd, timeout=None):
-                return {
-                    "returncode": 0,
-                    "output": (
-                        "os=Linux\nkernel=6.8.0\nhome=/root\n"
-                        "cwd=/workspace\nuser=root\n"
-                    ),
-                }
-
-        created = {}
-
-        def _fake_create_environment(*, env_type, **kwargs):
-            created["env_type"] = env_type
-            return _FakeEnv()
-
-        # Patch the REAL factory in tools.terminal_tool — the probe imports it
-        # locally, so the import itself must succeed (the bug was here).
-        import tools.terminal_tool as _tt
-        monkeypatch.setattr(_tt, "_create_environment", _fake_create_environment)
-
-        line = _pb._probe_remote_backend("docker")
-        assert created.get("env_type") == "docker"
-        assert line is not None
-        assert "Linux 6.8.0" in line
-        assert "root" in line
-
-
-    def test_environment_hint_from_env_var_is_appended(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_environment_hint_from_env_var_is_appended(self, monkeypatch):
         """HERMES_ENVIRONMENT_HINT lets an embedder describe the runtime env."""
         import agent.prompt_builder as _pb
         monkeypatch.setattr(_pb, "is_wsl", lambda: False)
         monkeypatch.delenv("TERMINAL_ENV", raising=False)
         monkeypatch.setenv("HERMES_ENVIRONMENT_HINT", "Running inside an OpenShell sandbox.")
-        _pb._clear_backend_probe_cache()
-        result = _pb.build_environment_hints()
+        result = await _pb.build_environment_hints()
         assert "Running inside an OpenShell sandbox." in result
         # The factual host block must still come first.
         assert result.index("Host:") < result.index("OpenShell")
-
-
-
-    def test_remote_backend_list_covers_known_sandboxes(self):
-        """Regression guard: if someone adds a remote backend, they must list it here."""
-        import agent.prompt_builder as _pb
-        for backend in ("docker", "singularity", "modal", "daytona", "ssh", "vercel_sandbox"):
-            assert backend in _pb._REMOTE_TERMINAL_BACKENDS, (
-                f"{backend!r} must be in _REMOTE_TERMINAL_BACKENDS so its host "
-                f"info is suppressed in the system prompt"
-            )
-
-
 # =========================================================================
 # Conditional skill activation
 # =========================================================================
@@ -829,14 +689,15 @@ class TestBuildSkillsSystemPromptConditional:
 
 
 
-    def test_requires_skill_hidden_when_toolset_missing(self, monkeypatch, tmp_path):
+    @pytest.mark.asyncio
+    async def test_requires_skill_hidden_when_toolset_missing(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         skill_dir = tmp_path / "skills" / "iot" / "openhue"
         skill_dir.mkdir(parents=True)
         (skill_dir / "SKILL.md").write_text(
             "---\nname: openhue\ndescription: Hue lights\nmetadata:\n  hermes:\n    requires_toolsets: [terminal]\n---\n"
         )
-        result = build_skills_system_prompt(
+        result = await build_skills_system_prompt(
             available_tools=set(),
             available_toolsets=set(),
         )
@@ -844,7 +705,8 @@ class TestBuildSkillsSystemPromptConditional:
 
 
 
-    def test_no_args_shows_all_skills(self, monkeypatch, tmp_path):
+    @pytest.mark.asyncio
+    async def test_no_args_shows_all_skills(self, monkeypatch, tmp_path):
         """Backward compat: calling with no args shows everything."""
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         skill_dir = tmp_path / "skills" / "search" / "duckduckgo"
@@ -852,7 +714,7 @@ class TestBuildSkillsSystemPromptConditional:
         (skill_dir / "SKILL.md").write_text(
             "---\nname: duckduckgo\ndescription: Free web search\nmetadata:\n  hermes:\n    fallback_for_toolsets: [web]\n---\n"
         )
-        result = build_skills_system_prompt()
+        result = await build_skills_system_prompt()
         assert "duckduckgo" in result
 
 
@@ -919,5 +781,3 @@ class TestParallelToolCallGuidance:
 # =========================================================================
 # Budget warning history stripping
 # =========================================================================
-
-

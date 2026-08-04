@@ -8,6 +8,8 @@ from unittest.mock import patch
 
 import pytest
 
+pytestmark = pytest.mark.asyncio
+
 from agent.file_safety import (
     _BLOCKED_PROJECT_ENV_BASENAMES,
     get_read_block_error,
@@ -31,10 +33,10 @@ class TestEnvFileReadBlocking:
         ".env.staging",
         ".envrc",
     ])
-    def test_blocked_env_basenames(self, basename):
+    async def test_blocked_env_basenames(self, basename):
         """All secret-bearing .env basenames are blocked regardless of directory."""
         path = f"/tmp/project/{basename}"
-        error = get_read_block_error(path)
+        error = await get_read_block_error(path)
         assert error is not None, f"{basename} should be blocked"
         assert "Access denied" in error
         assert "secret-bearing" in error.lower() or "environment file" in error.lower()
@@ -46,17 +48,17 @@ class TestEnvFileReadBlocking:
         ".ENV.PRODUCTION",
         ".ENVRC",
     ])
-    def test_blocked_env_basenames_case_insensitive(self, basename):
+    async def test_blocked_env_basenames_case_insensitive(self, basename):
         """Secret-bearing .env basenames are blocked regardless of case."""
-        error = get_read_block_error(f"/tmp/project/{basename}")
+        error = await get_read_block_error(f"/tmp/project/{basename}")
         assert error is not None, f"{basename} should be blocked"
         assert "Access denied" in error
         assert "environment file" in error.lower()
 
 
-    def test_allowed_env_example(self):
+    async def test_allowed_env_example(self):
         """"The .env.example file is explicitly allowed — it's documentation, not a secret."""
-        error = get_read_block_error("/tmp/project/.env.example")
+        error = await get_read_block_error("/tmp/project/.env.example")
         assert error is None
 
 
@@ -72,7 +74,7 @@ class TestEnvFileReadBlocking:
 class TestCacheFileReadBlocking:
     """Internal Hermes cache files must remain blocked."""
 
-    def test_hub_index_cache_blocked(self, tmp_path):
+    async def test_hub_index_cache_blocked(self, tmp_path):
         """Hub index-cache reads are blocked."""
         hermes_home = tmp_path / ".hermes"
         cache = hermes_home / "skills" / ".hub" / "index-cache" / "data.json"
@@ -80,11 +82,11 @@ class TestCacheFileReadBlocking:
         cache.write_text("{}")
 
         with patch("agent.file_safety._hermes_home_path", return_value=hermes_home):
-            error = get_read_block_error(str(cache))
+            error = await get_read_block_error(str(cache))
             assert error is not None
             assert "internal Hermes cache" in error
 
-    def test_hub_directory_blocked(self, tmp_path):
+    async def test_hub_directory_blocked(self, tmp_path):
         """Hub directory reads are blocked."""
         hermes_home = tmp_path / ".hermes"
         hub = hermes_home / "skills" / ".hub" / "metadata.json"
@@ -92,7 +94,7 @@ class TestCacheFileReadBlocking:
         hub.write_text("{}")
 
         with patch("agent.file_safety._hermes_home_path", return_value=hermes_home):
-            error = get_read_block_error(str(hub))
+            error = await get_read_block_error(str(hub))
             assert error is not None
 
 
@@ -104,21 +106,21 @@ class TestCacheFileReadBlocking:
 class TestCombinedGuards:
     """Both guards should work independently without interference."""
 
-    def test_env_guard_works_regardless_of_hermes_home(self, tmp_path):
+    async def test_env_guard_works_regardless_of_hermes_home(self, tmp_path):
         """The env basename guard does not depend on HERMES_HOME resolution."""
         hermes_home = tmp_path / ".hermes"
         hermes_home.mkdir()
 
         with patch("agent.file_safety._hermes_home_path", return_value=hermes_home):
             # Regular project .env should still be blocked
-            error = get_read_block_error("/workspace/.env")
+            error = await get_read_block_error("/workspace/.env")
             assert error is not None
 
             # .env.example should still be allowed
-            error = get_read_block_error("/workspace/.env.example")
+            error = await get_read_block_error("/workspace/.env.example")
             assert error is None
 
-    def test_cache_guard_still_works_with_env_guard(self, tmp_path):
+    async def test_cache_guard_still_works_with_env_guard(self, tmp_path):
         """Cache file blocking still works when env guard is active."""
         hermes_home = tmp_path / ".hermes"
         cache = hermes_home / "skills" / ".hub" / "index-cache" / "x"
@@ -126,6 +128,6 @@ class TestCombinedGuards:
         cache.write_text("")
 
         with patch("agent.file_safety._hermes_home_path", return_value=hermes_home):
-            error = get_read_block_error(str(cache))
+            error = await get_read_block_error(str(cache))
             assert error is not None
             assert "internal Hermes cache" in error

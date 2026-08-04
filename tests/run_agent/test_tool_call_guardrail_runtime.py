@@ -3,7 +3,9 @@
 import json
 import uuid
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
 
 from run_agent import AIAgent
 
@@ -57,6 +59,11 @@ def _make_agent(*tool_names: str, max_iterations: int = 10, config: dict | None 
     agent._use_prompt_caching = False
     agent.compression_enabled = False
     agent.save_trajectories = False
+    if config:
+        from agent.agent_init import _apply_runtime_config
+
+        _apply_runtime_config(agent, config)
+    agent._runtime_config_loaded = True
     return agent
 
 
@@ -86,7 +93,8 @@ def _hard_stop_config(**overrides) -> dict:
     return cfg
 
 
-def test_default_sequential_path_warns_repeated_exact_failure_without_blocking_execution():
+@pytest.mark.asyncio
+async def test_default_path_warns_repeated_exact_failure_without_blocking_execution():
     agent = _make_agent("web_search")
     args = {"query": "same"}
     _seed_exact_failures(agent, "web_search", args)
@@ -98,10 +106,20 @@ def test_default_sequential_path_warns_repeated_exact_failure_without_blocking_e
     msg = SimpleNamespace(content="", tool_calls=[tc])
     messages = []
 
-    with patch("run_agent.handle_function_call", return_value=json.dumps({"error": "boom"})) as mock_hfc:
-        agent._execute_tool_calls_sequential(msg, messages, "task-1")
+    with (
+        patch(
+            "model_tools.handle_function_call",
+            new_callable=AsyncMock,
+            return_value=json.dumps({"error": "boom"}),
+        ) as dispatch,
+        patch(
+            "tools.registry.registry.get_entry",
+            return_value=SimpleNamespace(is_async=True, max_result_size_chars=None),
+        ),
+    ):
+        await agent._execute_tool_calls(msg, messages, "task-1")
 
-    mock_hfc.assert_called_once()
+    dispatch.assert_awaited_once()
     assert len(starts) == 1
     assert any(event[0][0] == "tool.completed" for event in progress)
     assert len(messages) == 1
@@ -112,7 +130,8 @@ def test_default_sequential_path_warns_repeated_exact_failure_without_blocking_e
     assert agent._tool_guardrail_halt_decision is None
 
 
-def test_config_enabled_hard_stop_blocks_repeated_exact_failure_before_execution():
+@pytest.mark.asyncio
+async def test_config_enabled_hard_stop_blocks_repeated_exact_failure_before_execution():
     agent = _make_agent("web_search", config=_hard_stop_config())
     args = {"query": "same"}
     _seed_exact_failures(agent, "web_search", args)
@@ -124,10 +143,20 @@ def test_config_enabled_hard_stop_blocks_repeated_exact_failure_before_execution
     msg = SimpleNamespace(content="", tool_calls=[tc])
     messages = []
 
-    with patch("run_agent.handle_function_call", return_value="SHOULD_NOT_RUN") as mock_hfc:
-        agent._execute_tool_calls_sequential(msg, messages, "task-1")
+    with (
+        patch(
+            "model_tools.handle_function_call",
+            new_callable=AsyncMock,
+            return_value="SHOULD_NOT_RUN",
+        ) as dispatch,
+        patch(
+            "tools.registry.registry.get_entry",
+            return_value=SimpleNamespace(is_async=True, max_result_size_chars=None),
+        ),
+    ):
+        await agent._execute_tool_calls(msg, messages, "task-1")
 
-    mock_hfc.assert_not_called()
+    dispatch.assert_not_awaited()
     assert starts == []
     assert progress == []
     assert len(messages) == 1
@@ -136,7 +165,8 @@ def test_config_enabled_hard_stop_blocks_repeated_exact_failure_before_execution
     assert "repeated_exact_failure_block" in messages[0]["content"]
 
 
-def test_sequential_after_call_appends_guidance_to_tool_result_without_extra_messages():
+@pytest.mark.asyncio
+async def test_after_call_appends_guidance_to_tool_result_without_extra_messages():
     agent = _make_agent("web_search")
     args = {"query": "same"}
     _seed_exact_failures(agent, "web_search", args, count=1)
@@ -144,8 +174,18 @@ def test_sequential_after_call_appends_guidance_to_tool_result_without_extra_mes
     msg = SimpleNamespace(content="", tool_calls=[tc])
     messages = []
 
-    with patch("run_agent.handle_function_call", return_value=json.dumps({"error": "boom"})):
-        agent._execute_tool_calls_sequential(msg, messages, "task-1")
+    with (
+        patch(
+            "model_tools.handle_function_call",
+            new_callable=AsyncMock,
+            return_value=json.dumps({"error": "boom"}),
+        ),
+        patch(
+            "tools.registry.registry.get_entry",
+            return_value=SimpleNamespace(is_async=True, max_result_size_chars=None),
+        ),
+    ):
+        await agent._execute_tool_calls(msg, messages, "task-1")
 
     assert [m["role"] for m in messages] == ["tool"]
     assert messages[0]["tool_call_id"] == "c-warn"
@@ -153,7 +193,8 @@ def test_sequential_after_call_appends_guidance_to_tool_result_without_extra_mes
     assert "repeated_exact_failure_warning" in messages[0]["content"]
 
 
-def test_same_tool_failure_warning_tells_model_to_recover_with_tools():
+@pytest.mark.asyncio
+async def test_same_tool_failure_warning_tells_model_to_recover_with_tools():
     agent = _make_agent("terminal")
     guardrails = getattr(agent, "_tool_guardrails")
     guardrails.after_call(
@@ -172,8 +213,18 @@ def test_same_tool_failure_warning_tells_model_to_recover_with_tools():
     msg = SimpleNamespace(content="", tool_calls=[tc])
     messages = []
 
-    with patch("run_agent.handle_function_call", return_value=json.dumps({"exit_code": 1})):
-        agent._execute_tool_calls_sequential(msg, messages, "task-1")
+    with (
+        patch(
+            "model_tools.handle_function_call",
+            new_callable=AsyncMock,
+            return_value=json.dumps({"exit_code": 1}),
+        ),
+        patch(
+            "tools.registry.registry.get_entry",
+            return_value=SimpleNamespace(is_async=True, max_result_size_chars=None),
+        ),
+    ):
+        await agent._execute_tool_calls(msg, messages, "task-1")
 
     content = messages[0]["content"]
     assert "same_tool_failure_warning" in content
@@ -184,7 +235,8 @@ def test_same_tool_failure_warning_tells_model_to_recover_with_tools():
     assert "different tool" in content
 
 
-def test_config_enabled_hard_stop_concurrent_path_does_not_submit_blocked_calls_and_preserves_result_order():
+@pytest.mark.asyncio
+async def test_config_enabled_hard_stop_concurrent_path_does_not_submit_blocked_calls_and_preserves_result_order():
     agent = _make_agent("web_search", config=_hard_stop_config())
     blocked_args = {"query": "blocked"}
     allowed_args = {"query": "allowed"}
@@ -201,12 +253,18 @@ def test_config_enabled_hard_stop_concurrent_path_does_not_submit_blocked_calls_
     messages = []
     executed = []
 
-    def fake_handle(name, args, task_id, **kwargs):
+    async def fake_handle(name, args, task_id, **kwargs):
         executed.append((name, args, kwargs["tool_call_id"]))
         return json.dumps({"ok": args["query"]})
 
-    with patch("run_agent.handle_function_call", side_effect=fake_handle):
-        agent._execute_tool_calls_concurrent(msg, messages, "task-1")
+    with (
+        patch("model_tools.handle_function_call", side_effect=fake_handle),
+        patch(
+            "tools.registry.registry.get_entry",
+            return_value=SimpleNamespace(is_async=True, max_result_size_chars=None),
+        ),
+    ):
+        await agent._execute_tool_calls(msg, messages, "task-1")
 
     assert executed == [("web_search", allowed_args, "c-allow")]
     assert [m["tool_call_id"] for m in messages] == ["c-block", "c-allow"]
@@ -220,7 +278,10 @@ def test_config_enabled_hard_stop_concurrent_path_does_not_submit_blocked_calls_
     assert completed_events[0][1] == "web_search"
 
 
-def test_relay_rewrite_precedes_sequential_policy_approval_checkpoint_and_dispatch():
+@pytest.mark.asyncio
+async def test_request_middleware_rewrite_precedes_policy_and_dispatch():
+    from hermes_cli.middleware import RequestMiddlewareResult
+
     agent = _make_agent("write_file")
     original_args = {"path": "/original/path", "content": "old"}
     final_args = {"path": "/approved/path", "content": "new"}
@@ -230,8 +291,6 @@ def test_relay_rewrite_precedes_sequential_policy_approval_checkpoint_and_dispat
     observed = {
         "plugin": [],
         "guardrail": [],
-        "approval": [],
-        "checkpoint": [],
         "start": [],
         "dispatch": [],
     }
@@ -242,62 +301,55 @@ def test_relay_rewrite_precedes_sequential_policy_approval_checkpoint_and_dispat
         observed["guardrail"].append((name, dict(args)))
         return original_before_call(name, args)
 
-    def relay_execute(name, args, callback, **kwargs):
-        del name, args, kwargs
-        return callback(dict(final_args)), dict(final_args)
+    async def rewrite_request(name, args, **kwargs):
+        del name, kwargs
+        return RequestMiddlewareResult(
+            payload=dict(final_args),
+            original_payload=dict(args),
+            changed=True,
+            trace=[],
+        )
 
-    def observe_plugin(name, args, **kwargs):
+    async def observe_plugin(name, args, **kwargs):
         del kwargs
         observed["plugin"].append((name, dict(args)))
         return None
 
-    def observe_approval(name, args):
-        observed["approval"].append((name, dict(args)))
-        return None
-
-    def dispatch(name, args, task_id, **kwargs):
+    async def dispatch(name, args, task_id, **kwargs):
         del task_id, kwargs
         observed["dispatch"].append((name, dict(args)))
         return json.dumps({"ok": True})
 
-    agent._checkpoint_mgr = SimpleNamespace(
-        enabled=True,
-        get_working_dir_for_path=lambda path: path,
-        ensure_checkpoint=lambda path, reason: observed["checkpoint"].append(
-            (path, reason)
-        ),
-    )
     agent.tool_start_callback = lambda _call_id, name, args: observed["start"].append(
         (name, dict(args))
     )
 
     with (
-        patch("agent.relay_tools.execute", side_effect=relay_execute),
+        patch("hermes_cli.middleware.apply_tool_request_middleware", side_effect=rewrite_request),
         patch(
             "hermes_cli.plugins.resolve_pre_tool_block",
             side_effect=observe_plugin,
         ),
         patch.object(agent._tool_guardrails, "before_call", side_effect=observe_guardrail),
+        patch("model_tools.handle_function_call", side_effect=dispatch),
         patch(
-            "acp_adapter.edit_approval.maybe_require_edit_approval",
-            side_effect=observe_approval,
+            "tools.registry.registry.get_entry",
+            return_value=SimpleNamespace(is_async=True, max_result_size_chars=None),
         ),
-        patch("model_tools.registry.dispatch", side_effect=dispatch),
     ):
-        agent._execute_tool_calls_sequential(msg, messages, "task-1")
+        await agent._execute_tool_calls(msg, messages, "task-1")
 
     expected = [("write_file", final_args)]
     assert observed["plugin"] == expected
     assert observed["guardrail"] == expected
-    assert observed["approval"] == expected
     assert observed["start"] == expected
     assert observed["dispatch"] == expected
-    assert observed["checkpoint"] == [
-        ("/approved/path", "before write_file")
-    ]
 
 
-def test_relay_rewrite_is_guarded_before_dispatch_in_concurrent_path():
+@pytest.mark.asyncio
+async def test_request_middleware_rewrite_is_guarded_before_dispatch():
+    from hermes_cli.middleware import RequestMiddlewareResult
+
     agent = _make_agent("web_search", config=_hard_stop_config())
     original_args = {"query": "original"}
     blocked_args = {"query": "blocked"}
@@ -307,23 +359,37 @@ def test_relay_rewrite_is_guarded_before_dispatch_in_concurrent_path():
     messages = []
     starts = []
 
-    def relay_execute(name, args, callback, **kwargs):
+    async def rewrite_request(name, args, **kwargs):
         del name, args, kwargs
-        return callback(dict(blocked_args)), dict(blocked_args)
+        return RequestMiddlewareResult(
+            payload=dict(blocked_args),
+            original_payload=dict(original_args),
+            changed=True,
+            trace=[],
+        )
 
     agent.tool_start_callback = lambda *args: starts.append(args)
     with (
-        patch("agent.relay_tools.execute", side_effect=relay_execute),
-        patch("run_agent.handle_function_call", return_value="SHOULD_NOT_RUN") as dispatch,
+        patch("hermes_cli.middleware.apply_tool_request_middleware", side_effect=rewrite_request),
+        patch(
+            "model_tools.handle_function_call",
+            new_callable=AsyncMock,
+            return_value="SHOULD_NOT_RUN",
+        ) as dispatch,
+        patch(
+            "tools.registry.registry.get_entry",
+            return_value=SimpleNamespace(is_async=True, max_result_size_chars=None),
+        ),
     ):
-        agent._execute_tool_calls_concurrent(msg, messages, "task-1")
+        await agent._execute_tool_calls(msg, messages, "task-1")
 
-    dispatch.assert_not_called()
+    dispatch.assert_not_awaited()
     assert starts == []
     assert "repeated_exact_failure_block" in messages[0]["content"]
 
 
-def test_plugin_pre_tool_block_wins_without_counting_as_toolguard_block():
+@pytest.mark.asyncio
+async def test_plugin_pre_tool_block_wins_without_counting_as_toolguard_block():
     agent = _make_agent("web_search")
     args = {"query": "same"}
     tc = _mock_tool_call("web_search", json.dumps(args), "c-plugin")
@@ -331,17 +397,30 @@ def test_plugin_pre_tool_block_wins_without_counting_as_toolguard_block():
     messages = []
 
     with (
-        patch("hermes_cli.plugins.resolve_pre_tool_block", return_value="plugin policy"),
-        patch("run_agent.handle_function_call", return_value="SHOULD_NOT_RUN") as mock_hfc,
+        patch(
+            "hermes_cli.plugins.resolve_pre_tool_block",
+            new_callable=AsyncMock,
+            return_value="plugin policy",
+        ),
+        patch(
+            "model_tools.handle_function_call",
+            new_callable=AsyncMock,
+            return_value="SHOULD_NOT_RUN",
+        ) as dispatch,
+        patch(
+            "tools.registry.registry.get_entry",
+            return_value=SimpleNamespace(is_async=True, max_result_size_chars=None),
+        ),
     ):
-        agent._execute_tool_calls_sequential(msg, messages, "task-1")
+        await agent._execute_tool_calls(msg, messages, "task-1")
 
-    mock_hfc.assert_not_called()
+    dispatch.assert_not_awaited()
     assert "plugin policy" in messages[0]["content"]
     assert agent._tool_guardrails.before_call("web_search", args).action == "allow"
 
 
-def test_default_run_conversation_warns_without_guardrail_halt():
+@pytest.mark.asyncio
+async def test_default_run_conversation_warns_without_guardrail_halt():
     agent = _make_agent("web_search", max_iterations=10)
     same_args = {"query": "same"}
     responses = [
@@ -353,17 +432,28 @@ def test_default_run_conversation_warns_without_guardrail_halt():
         for i in range(1, 4)
     ]
     responses.append(_mock_response(content="done", finish_reason="stop", tool_calls=None))
-    agent.client.chat.completions.create.side_effect = responses
+    async def fake_model_request(*_args, **_kwargs):
+        return responses.pop(0)
 
     with (
-        patch("run_agent.handle_function_call", return_value=json.dumps({"error": "boom"})) as mock_hfc,
-        patch.object(agent, "_persist_session"),
-        patch.object(agent, "_save_trajectory"),
-        patch.object(agent, "_cleanup_task_resources"),
+        patch.object(agent, "_ensure_provider_runtime", new_callable=AsyncMock),
+        patch.object(agent, "_execute_model_request", side_effect=fake_model_request),
+        patch(
+            "model_tools.handle_function_call",
+            new_callable=AsyncMock,
+            return_value=json.dumps({"error": "boom"}),
+        ) as dispatch,
+        patch(
+            "tools.registry.registry.get_entry",
+            return_value=SimpleNamespace(is_async=True, max_result_size_chars=None),
+        ),
+        patch.object(agent, "_persist_session", new_callable=AsyncMock),
+        patch.object(agent, "_save_trajectory", new_callable=AsyncMock),
+        patch.object(agent, "_cleanup_task_resources", new_callable=AsyncMock),
     ):
-        result = agent.run_conversation("search repeatedly")
+        result = await agent.run_conversation("search repeatedly")
 
-    assert mock_hfc.call_count == 3
+    assert dispatch.await_count == 3
     assert result["turn_exit_reason"].startswith("text_response")
     assert "guardrail" not in result
     assert result["final_response"] == "done"
@@ -373,7 +463,8 @@ def test_default_run_conversation_warns_without_guardrail_halt():
 
 
 
-def test_guardrail_halt_emits_final_response_through_stream_delta_callback():
+@pytest.mark.asyncio
+async def test_guardrail_halt_emits_final_response_through_stream_delta_callback():
     """Regression for #30770: when the guardrail halts the loop, the
     synthesized halt message must be pushed through ``stream_delta_callback``
     so SSE/TUI clients see why the agent stopped instead of a silent stream
@@ -391,7 +482,8 @@ def test_guardrail_halt_emits_final_response_through_stream_delta_callback():
         )
         for i in range(1, 10)
     ]
-    agent.client.chat.completions.create.side_effect = responses
+    async def fake_model_request(*_args, **_kwargs):
+        return responses.pop(0)
 
     deltas: list = []
     agent.stream_delta_callback = lambda d: deltas.append(d)
@@ -402,12 +494,22 @@ def test_guardrail_halt_emits_final_response_through_stream_delta_callback():
     agent._disable_streaming = True
 
     with (
-        patch("run_agent.handle_function_call", return_value=json.dumps({"error": "boom"})),
-        patch.object(agent, "_persist_session"),
-        patch.object(agent, "_save_trajectory"),
-        patch.object(agent, "_cleanup_task_resources"),
+        patch.object(agent, "_ensure_provider_runtime", new_callable=AsyncMock),
+        patch.object(agent, "_execute_model_request", side_effect=fake_model_request),
+        patch(
+            "model_tools.handle_function_call",
+            new_callable=AsyncMock,
+            return_value=json.dumps({"error": "boom"}),
+        ),
+        patch(
+            "tools.registry.registry.get_entry",
+            return_value=SimpleNamespace(is_async=True, max_result_size_chars=None),
+        ),
+        patch.object(agent, "_persist_session", new_callable=AsyncMock),
+        patch.object(agent, "_save_trajectory", new_callable=AsyncMock),
+        patch.object(agent, "_cleanup_task_resources", new_callable=AsyncMock),
     ):
-        result = agent.run_conversation("search repeatedly")
+        result = await agent.run_conversation("search repeatedly")
 
     assert result["turn_exit_reason"] == "guardrail_halt"
     halt_text = result["final_response"]

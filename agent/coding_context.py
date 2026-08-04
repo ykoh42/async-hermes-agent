@@ -52,6 +52,7 @@ Activation (config ``agent.coding_context``):
 from __future__ import annotations
 
 import json
+import asyncio
 import logging
 import os
 import re
@@ -59,6 +60,9 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
+
+import aiofiles
+import aiofiles.os
 
 from hermes_cli._subprocess_compat import bounded_git_probe
 
@@ -107,35 +111,40 @@ _CODE_SCAN_SKIP_DIRS = frozenset({
 _CODE_SCAN_MAX_ENTRIES = 500
 
 
-def _has_code_files(root: Path) -> bool:
-    """Cheap, bounded check for source files in a repo's top two levels.
 
-    Lets a git repo of loose scripts (no manifest) still read as a code
-    workspace while a bare notes/writing repo does not. Scans the root and its
-    immediate subdirectories only, capped at ``_CODE_SCAN_MAX_ENTRIES`` stats —
-    a handful of readdirs at session start, not a full walk.
-    """
+
+async def _has_code_files(root: Path) -> bool:
+    """Bounded async source-file check for a git workspace."""
     seen = 0
     stack = [(root, True)]
     while stack:
         directory, is_root = stack.pop()
         try:
-            with os.scandir(directory) as entries:
-                for entry in entries:
-                    seen += 1
-                    if seen > _CODE_SCAN_MAX_ENTRIES:
-                        return False
-                    name = entry.name
-                    try:
-                        if entry.is_file():
-                            if os.path.splitext(name)[1].lower() in _CODE_EXTENSIONS:
-                                return True
-                        elif is_root and entry.is_dir() and name not in _CODE_SCAN_SKIP_DIRS and not name.startswith("."):
-                            stack.append((Path(entry.path), False))
-                    except OSError:
-                        continue
+            entries = await aiofiles.os.scandir(directory)
         except OSError:
             continue
+        try:
+            for entry in entries:
+                seen += 1
+                if seen > _CODE_SCAN_MAX_ENTRIES:
+                    return False
+                name = entry.name
+                path = Path(entry.path)
+                try:
+                    if await aiofiles.os.path.isfile(path):
+                        if os.path.splitext(name)[1].lower() in _CODE_EXTENSIONS:
+                            return True
+                    elif (
+                        is_root
+                        and name not in _CODE_SCAN_SKIP_DIRS
+                        and not name.startswith(".")
+                        and await aiofiles.os.path.isdir(path)
+                    ):
+                        stack.append((path, False))
+                except OSError:
+                    continue
+        finally:
+            entries.close()
     return False
 
 # Lockfile → package manager, checked in priority order.
@@ -333,15 +342,36 @@ def get_profile(name: str) -> ContextProfile:
 # ── Helpers ─────────────────────────────────────────────────────────────────
 
 
-def _coding_mode(config: Optional[dict[str, Any]]) -> str:
-    """Return the normalized ``agent.coding_context`` mode (auto/focus/on/off)."""
-    if config is None:
-        try:
-            from hermes_cli.config import load_config_readonly
+def _coding_instructions(config: Optional[dict[str, Any]]) -> str:
+    """Standing operator instructions for the coding posture (config).
 
-            config = load_config_readonly()
-        except Exception:
-            config = {}
+    ``agent.coding_instructions`` — a string or list of strings appended to the
+    coding brief as an extra stable system block, so a user can pin project-wide
+    coding-workflow rules (e.g. "for UI work don't run tsc/lint until I approve;
+    clean the diff before committing") without editing the shipped brief.
+    Cache-safe: resolved once per session into the stable system-prompt tier,
+    like the rest of the posture.
+    """
+    raw = ((config or {}).get("agent", {}) or {}).get("coding_instructions", "")
+    if isinstance(raw, (list, tuple)):
+        return "\n".join(str(item).strip() for item in raw if str(item).strip())
+    return str(raw or "").strip()
+
+
+async def _load_coding_config(config: Optional[dict[str, Any]]) -> dict[str, Any]:
+    if config is not None:
+        return config
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        loaded = await load_config_readonly()
+        return loaded if isinstance(loaded, dict) else {}
+    except Exception:
+        return {}
+
+
+def _coding_mode_from_config(config: Optional[dict[str, Any]]) -> str:
+    """Normalize the configured coding-context mode without I/O."""
     raw = ((config or {}).get("agent", {}) or {}).get("coding_context", "auto")
     mode = str(raw).strip().lower()
     if mode in {"focus", "strict", "lean"}:
@@ -353,46 +383,27 @@ def _coding_mode(config: Optional[dict[str, Any]]) -> str:
     return "auto"
 
 
-def _coding_instructions(config: Optional[dict[str, Any]]) -> str:
-    """Standing operator instructions for the coding posture (config).
-
-    ``agent.coding_instructions`` — a string or list of strings appended to the
-    coding brief as an extra stable system block, so a user can pin project-wide
-    coding-workflow rules (e.g. "for UI work don't run tsc/lint until I approve;
-    clean the diff before committing") without editing the shipped brief.
-    Cache-safe: resolved once per session into the stable system-prompt tier,
-    like the rest of the posture.
-    """
-    if config is None:
-        try:
-            from hermes_cli.config import load_config
-
-            config = load_config()
-        except Exception:
-            config = {}
+def _coding_instructions_from_config(config: Optional[dict[str, Any]]) -> str:
     raw = ((config or {}).get("agent", {}) or {}).get("coding_instructions", "")
     if isinstance(raw, (list, tuple)):
         return "\n".join(str(item).strip() for item in raw if str(item).strip())
     return str(raw or "").strip()
 
 
-def _resolve_cwd(cwd: Optional[str | Path]) -> Path:
+
+
+async def _resolve_cwd(cwd: Optional[str | Path]) -> Path:
+    """Resolve a session cwd without synchronous directory validation."""
     if cwd:
         return Path(cwd).expanduser()
     try:
         from agent.runtime_cwd import resolve_agent_cwd
 
-        return resolve_agent_cwd()
+        return await resolve_agent_cwd()
     except Exception:
         return Path(os.getcwd())
 
 
-def _git_root(cwd: Path) -> Optional[Path]:
-    current = cwd.resolve()
-    for parent in [current, *current.parents]:
-        if (parent / ".git").exists():
-            return parent
-    return None
 
 
 def _home() -> Optional[Path]:
@@ -402,22 +413,28 @@ def _home() -> Optional[Path]:
         return None
 
 
-def _marker_root(cwd: Path) -> Optional[Path]:
-    """Nearest ancestor that looks like a project root, or ``None``.
+async def _git_root(cwd: Path) -> Optional[Path]:
+    """Find a git root using awaitable metadata checks."""
+    current = cwd.absolute()
+    for parent in [current, *current.parents]:
+        try:
+            if await aiofiles.os.path.exists(parent / ".git"):
+                return parent
+        except OSError:
+            continue
+    return None
 
-    Walks up at most a few levels so a manifest in the workspace root counts
-    even when the user is in a subdirectory. ``$HOME`` itself is skipped — a
-    Makefile or AGENTS.md sitting in the home directory is global user config,
-    not a project-root signal.
-    """
-    current = cwd.resolve()
+
+
+
+
+
+async def _marker_root(cwd: Path) -> Optional[Path]:
+    """Find the nearest project marker without blocking metadata calls."""
+    current = cwd.absolute()
     home = _home()
-    # Shared world-writable temp roots are never project roots: a stray
-    # manifest in /tmp (left by any process) must not flip every session
-    # whose cwd lives under the temp dir into the coding posture. Same
-    # reasoning as the $HOME skip below.
     try:
-        temp_root = Path(tempfile.gettempdir()).resolve()
+        temp_root = Path(tempfile.gettempdir()).absolute()
     except Exception:
         temp_root = None
     for depth, parent in enumerate([current, *current.parents]):
@@ -426,44 +443,30 @@ def _marker_root(cwd: Path) -> Optional[Path]:
         if parent == home or (temp_root is not None and parent == temp_root):
             continue
         for marker in _PROJECT_MARKERS:
-            if (parent / marker).exists():
-                return parent
+            try:
+                if await aiofiles.os.path.exists(parent / marker):
+                    return parent
+            except OSError:
+                continue
     return None
 
 
-def _detect_profile_name(mode: str, platform: str, cwd_str: str) -> str:
-    """Resolve which profile applies.
 
-    ``auto``/``focus``: coding when the surface is interactive AND the cwd is a
-    code workspace (a git repo or a recognised project root). ``on``: always
-    coding. ``off``: always general.
 
-    A git repo rooted at ``$HOME`` (the dotfiles pattern) is NOT a workspace
-    signal — without the guard, every session anywhere under a dotfiles-managed
-    home directory would silently flip to the coding posture.
-
-    Detection is intentionally not memoized: it's a handful of ``stat`` calls,
-    and callers resolve the mode once per session anyway. Caching here would
-    risk a stale posture if a long-lived process (gateway/TUI) serves sessions
-    from different working directories.
-    """
+async def _detect_profile_name(mode: str, platform: str, cwd: Path) -> str:
+    """Resolve the context profile using awaitable filesystem probes."""
     if mode == "off":
         return GENERAL_PROFILE.name
     if mode == "on":
         return CODING_PROFILE.name
     if platform and platform.strip().lower() not in INTERACTIVE_CODING_PLATFORMS:
         return GENERAL_PROFILE.name
-    cwd = Path(cwd_str)
-    # A recognized project root (manifest / AGENTS.md / .cursorrules) is a code
-    # workspace on its own — cheap stat checks, no scan.
-    if _marker_root(cwd) is not None:
+    if await _marker_root(cwd) is not None:
         return CODING_PROFILE.name
-    git_root = _git_root(cwd)
+    git_root = await _git_root(cwd)
     if git_root is not None and git_root == _home():
-        git_root = None  # dotfiles repo at $HOME — not a code workspace
-    # A bare git repo only counts when it actually holds code, so `git init` on a
-    # notes/writing/research folder stays in the general posture.
-    if git_root is not None and _has_code_files(git_root):
+        git_root = None
+    if git_root is not None and await _has_code_files(git_root):
         return CODING_PROFILE.name
     return GENERAL_PROFILE.name
 
@@ -520,18 +523,9 @@ class RuntimeMode:
             return None
         return [self.profile.toolset, *_enabled_mcp_servers(config)]
 
-    def system_prompt_parts(self) -> tuple[list[str], list[str], list[str]]:
-        """Return prefix, workspace, and trailing posture blocks separately.
 
-        The operating brief carries a model-family edit-format nudge appended
-        to it (one cached string, not a separate block) so the model is steered
-        toward the `patch` mode it handles best — see ``_edit_format_line``.
-
-        The three lists preserve the historical flat prompt order: the brief,
-        the live workspace snapshot, then configured operator instructions.
-        Prompt assembly can therefore put a cache boundary before the snapshot
-        without changing the persisted system-prompt bytes.
-        """
+    async def system_prompt_parts(self) -> tuple[list[str], list[str], list[str]]:
+        """Build the prompt parts without synchronous git or file I/O."""
         if not self.is_coding:
             return [], [], []
         prefix: list[str] = []
@@ -543,22 +537,20 @@ class RuntimeMode:
             if edit_line:
                 brief = f"{brief}\n{edit_line}"
             prefix.append(brief)
-        workspace = build_coding_workspace_block(self.cwd)
+        workspace = await build_coding_workspace_block(self.cwd)
         if workspace:
             workspace_parts.append(workspace)
-        # Operator instructions ride their own block so the brief (block 0) stays
-        # byte-stable and cache-keyed independently of user config.
         if self.instructions:
             trailing.append(f"Operator instructions (from config):\n{self.instructions}")
         return prefix, workspace_parts, trailing
 
-    def system_blocks(self) -> list[str]:
+    async def system_blocks(self) -> list[str]:
         """Return posture blocks in their historical display order.
 
         ``system_prompt_parts`` is the cache-aware API. This compatibility
         helper retains the public flat list for callers outside prompt assembly.
         """
-        prefix, workspace, trailing = self.system_prompt_parts()
+        prefix, workspace, trailing = await self.system_prompt_parts()
         return [*prefix, *workspace, *trailing]
 
     def compact_skill_categories(self) -> frozenset[str]:
@@ -584,26 +576,22 @@ class RuntimeMode:
         return frozenset(self.profile.compact_skill_categories)
 
 
-def resolve_runtime_mode(
+
+
+
+async def resolve_runtime_mode(
     *,
     platform: Optional[str] = None,
     cwd: Optional[str | Path] = None,
     config: Optional[dict[str, Any]] = None,
     model: Optional[str] = None,
 ) -> RuntimeMode:
-    """Resolve the operating posture once. Cheap — a handful of ``stat`` calls.
-
-    This is the single entry point every domain should call. The returned
-    object is immutable and safe to cache for the session. Detection itself is
-    intentionally *not* memoized (see ``_detect_profile_name``) so a long-lived
-    process can't pin a stale posture; callers resolve once per session and
-    hold the result. ``model`` is recorded only to steer edit-format guidance;
-    it never affects detection.
-    """
-    resolved_cwd = _resolve_cwd(cwd)
-    mode = _coding_mode(config)
-    name = _detect_profile_name(
-        mode, (platform or "").strip().lower(), str(resolved_cwd)
+    """Resolve a runtime mode without blocking the active event loop."""
+    resolved_config = await _load_coding_config(config)
+    resolved_cwd = await _resolve_cwd(cwd)
+    mode = _coding_mode_from_config(resolved_config)
+    name = await _detect_profile_name(
+        mode, (platform or "").strip().lower(), resolved_cwd
     )
     return RuntimeMode(
         profile=get_profile(name),
@@ -611,24 +599,24 @@ def resolve_runtime_mode(
         cwd=resolved_cwd,
         config_mode=mode,
         model=model,
-        instructions=_coding_instructions(config),
+        instructions=_coding_instructions_from_config(resolved_config),
     )
 
 
-# ── Back-compat surface (thin wrappers over RuntimeMode) ────────────────────
+# ── Convenience surface (thin wrappers over RuntimeMode) ──────────────────
 
 
-def is_coding_context(
+async def is_coding_context(
     *,
     platform: Optional[str] = None,
     cwd: Optional[str | Path] = None,
     config: Optional[dict[str, Any]] = None,
 ) -> bool:
     """Whether Hermes should operate in its coding posture right now."""
-    return resolve_runtime_mode(platform=platform, cwd=cwd, config=config).is_coding
+    return (await resolve_runtime_mode(platform=platform, cwd=cwd, config=config)).is_coding
 
 
-def coding_selection(
+async def coding_selection(
     *,
     platform: Optional[str] = None,
     cwd: Optional[str | Path] = None,
@@ -639,12 +627,13 @@ def coding_selection(
     ``None`` unless the user opted into ``focus`` mode AND the posture is
     active — the default coding posture never overrides configured toolsets.
     """
-    return resolve_runtime_mode(
+    mode = await resolve_runtime_mode(
         platform=platform, cwd=cwd, config=config
-    ).toolset_selection(config)
+    )
+    return mode.toolset_selection(config)
 
 
-def coding_system_blocks(
+async def coding_system_blocks(
     *,
     platform: Optional[str] = None,
     cwd: Optional[str | Path] = None,
@@ -655,25 +644,15 @@ def coding_system_blocks(
 
     ``model`` steers the brief's edit-format nudge toward the model's family.
     """
-    return resolve_runtime_mode(
+    mode = await resolve_runtime_mode(
         platform=platform, cwd=cwd, config=config, model=model
-    ).system_blocks()
+    )
+    return await mode.system_blocks()
 
 
-def coding_system_prompt_parts(
-    *,
-    platform: Optional[str] = None,
-    cwd: Optional[str | Path] = None,
-    config: Optional[dict[str, Any]] = None,
-    model: Optional[str] = None,
-) -> tuple[list[str], list[str], list[str]]:
-    """Return coding prefix, workspace snapshot, and trailing guidance."""
-    return resolve_runtime_mode(
-        platform=platform, cwd=cwd, config=config, model=model
-    ).system_prompt_parts()
 
 
-def coding_compact_skill_categories(
+async def coding_compact_skill_categories(
     *,
     platform: Optional[str] = None,
     cwd: Optional[str | Path] = None,
@@ -687,9 +666,24 @@ def coding_compact_skill_categories(
     loadable via ``skill_view`` / ``skills_list``; only descriptions are
     dropped.
     """
-    return resolve_runtime_mode(
+    mode = await resolve_runtime_mode(
         platform=platform, cwd=cwd, config=config
-    ).compact_skill_categories()
+    )
+    return mode.compact_skill_categories()
+
+
+async def coding_system_prompt_parts(
+    *,
+    platform: Optional[str] = None,
+    cwd: Optional[str | Path] = None,
+    config: Optional[dict[str, Any]] = None,
+    model: Optional[str] = None,
+) -> tuple[list[str], list[str], list[str]]:
+    """Async prompt parts used by the agent's active system-prompt path."""
+    mode = await resolve_runtime_mode(
+        platform=platform, cwd=cwd, config=config, model=model
+    )
+    return await mode.system_prompt_parts()
 
 
 def _enabled_mcp_servers(config: Optional[dict[str, Any]]) -> list[str]:
@@ -716,15 +710,6 @@ def _enabled_mcp_servers(config: Optional[dict[str, Any]]) -> list[str]:
 # ── git/workspace probe ─────────────────────────────────────────────────────
 
 
-def _git(cwd: Path, *args: str) -> str:
-    """``git -C <cwd> <args>`` → stripped stdout, or ``""`` on any failure.
-
-    Uses the shared :func:`bounded_git_probe` so the post-kill cleanup is bounded
-    on Windows — a plain ``subprocess.run(timeout=...)`` here deadlocked the agent
-    turn inside ``build_coding_workspace_block`` when a killed git left a suspended
-    descendant holding the pipe handles (issue #66037).
-    """
-    return bounded_git_probe(["git", "-C", str(cwd), *args], timeout=_GIT_TIMEOUT)
 
 
 def _parse_status(porcelain: str) -> tuple[dict[str, str], dict[str, int]]:
@@ -752,14 +737,6 @@ def _parse_status(porcelain: str) -> tuple[dict[str, str], dict[str, int]]:
     return branch, counts
 
 
-def _read_small(path: Path) -> str:
-    """Read a small text file, or ``""`` — never raises, never reads huge files."""
-    try:
-        if not path.is_file() or path.stat().st_size > _MAX_FACT_FILE_BYTES:
-            return ""
-        return path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return ""
 
 
 @dataclass(frozen=True)
@@ -777,82 +754,25 @@ class ProjectFacts:
     context_files: list[str]
 
 
-def detect_project_facts(root: Path) -> ProjectFacts:
-    """Detect manifests, package manager(s), verify commands, and context files.
-
-    Cheap: stat calls plus reads of a couple of small files. The single source
-    of truth for both the prompt snapshot (:func:`_project_facts`) and the
-    gateway's ``project.facts`` — so the UI never re-sniffs verify commands.
-    """
-    manifests = [m for m in _PROJECT_MARKERS if m not in _CONTEXT_FILES and (root / m).is_file()]
-    package_managers = list(
-        dict.fromkeys(pm for lock, pm in (*_PY_LOCKFILES, *_JS_LOCKFILES) if (root / lock).is_file())
-    )
-
-    verify: list[str] = []
-    if (root / "scripts" / "run_tests.sh").is_file():
-        verify.append("scripts/run_tests.sh")
-    if (root / "package.json").is_file():
-        try:
-            scripts = json.loads(_read_small(root / "package.json") or "{}").get("scripts") or {}
-        except (json.JSONDecodeError, AttributeError):
-            scripts = {}
-        js_pm = next((pm for lock, pm in _JS_LOCKFILES if (root / lock).is_file()), "npm")
-        verify.extend(f"{js_pm} run {name}" for name in _VERIFY_TARGETS if name in scripts)
-    if (root / "pytest.ini").is_file() or "[tool.pytest" in _read_small(root / "pyproject.toml"):
-        verify.append("pytest")
-    makefile = _read_small(root / "Makefile")
-    if makefile:
-        verify.extend(
-            f"make {name}" for name in _VERIFY_TARGETS
-            if re.search(rf"^{re.escape(name)}\s*:", makefile, re.MULTILINE)
-        )
-
-    return ProjectFacts(
-        manifests=manifests,
-        package_managers=package_managers,
-        verify_commands=list(dict.fromkeys(verify))[:_MAX_VERIFY_COMMANDS],
-        context_files=[c for c in _CONTEXT_FILES if (root / c).is_file()],
-    )
 
 
-def _project_facts(root: Path) -> list[str]:
-    """Render :func:`detect_project_facts` as workspace-snapshot lines.
-
-    Hands the model its *verify loop* up front — which manifest, which package
-    manager, and the exact test/lint/build commands — instead of making it
-    rediscover them every session. Built once at prompt-build time; the string
-    output must stay byte-stable to preserve the prompt cache.
-    """
-    f = detect_project_facts(root)
-    facts: list[str] = []
-
-    if f.manifests:
-        line = f"- Project: {', '.join(f.manifests[:6])}"
-        if f.package_managers:
-            line += f" ({'/'.join(f.package_managers)})"
-        facts.append(line)
-    if f.verify_commands:
-        facts.append(f"- Verify: {'; '.join(f.verify_commands)}")
-    if f.context_files:
-        facts.append(f"- Context files: {', '.join(f.context_files)}")
-
-    return facts
 
 
-def project_facts_for(cwd: Optional[str | Path] = None) -> Optional[dict[str, Any]]:
+async def project_facts_for(
+    cwd: Optional[str | Path] = None,
+) -> Optional[dict[str, Any]]:
     """Structured project facts for ``cwd`` — ``None`` outside a workspace.
 
     Same detection the system-prompt snapshot uses (git root, else marker root),
     exposed for non-prompt consumers (the desktop verify UI) so they never
     re-derive "are we coding?" or duplicate the verify-command sniffing.
     """
-    resolved = _resolve_cwd(cwd)
-    root = _git_root(resolved) or _marker_root(resolved)
+    resolved = await _resolve_cwd(cwd)
+    root = await _git_root(resolved) or await _marker_root(resolved)
     if root is None:
         return None
 
-    f = detect_project_facts(root)
+    f = await detect_project_facts(root)
     return {
         "root": str(root),
         "manifests": f.manifests,
@@ -862,29 +782,160 @@ def project_facts_for(cwd: Optional[str | Path] = None) -> Optional[dict[str, An
     }
 
 
-def build_coding_workspace_block(cwd: Optional[str | Path] = None) -> str:
-    """Workspace snapshot for the system prompt (empty outside a workspace).
 
-    Git state (branch/status/commits) when the cwd is in a repo, plus detected
-    project facts (manifest, package manager, verify commands, context files)
-    — so marker-only (non-git) projects still get a snapshot.
-    """
-    resolved = _resolve_cwd(cwd)
-    git_root = _git_root(resolved)
-    root = git_root or _marker_root(resolved)
+
+# ── Agent prompt probes ────────────────────────────────────────────────────
+
+
+async def _git(cwd: Path, *args: str) -> str:
+    """Run a bounded git probe without occupying the event-loop thread."""
+    process = await asyncio.create_subprocess_exec(
+        "git",
+        "-C",
+        str(cwd),
+        *args,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    try:
+        stdout, _ = await asyncio.wait_for(process.communicate(), timeout=_GIT_TIMEOUT)
+    except asyncio.TimeoutError:
+        process.kill()
+        await process.communicate()
+        return ""
+    except asyncio.CancelledError:
+        process.kill()
+        await process.communicate()
+        raise
+    return stdout.decode("utf-8", errors="replace").strip()
+
+
+async def _is_file(path: Path) -> bool:
+    try:
+        return await aiofiles.os.path.isfile(path)
+    except OSError:
+        return False
+
+
+async def _read_small(path: Path) -> str:
+    """Read a bounded text file through aiofiles."""
+    try:
+        stat = await aiofiles.os.stat(path)
+        if stat.st_size > _MAX_FACT_FILE_BYTES:
+            return ""
+        async with aiofiles.open(path, "r", encoding="utf-8", errors="replace") as handle:
+            return await handle.read()
+    except (OSError, UnicodeError):
+        return ""
+
+
+async def detect_project_facts(root: Path) -> ProjectFacts:
+    """Async project-fact detection used by the active system prompt."""
+    marker_paths = [root / marker for marker in _PROJECT_MARKERS]
+    marker_exists = await asyncio.gather(*(_is_file(path) for path in marker_paths))
+    manifests = [
+        marker
+        for marker, exists in zip(_PROJECT_MARKERS, marker_exists)
+        if marker not in _CONTEXT_FILES and exists
+    ]
+
+    lock_paths = [root / lock for lock, _ in (*_PY_LOCKFILES, *_JS_LOCKFILES)]
+    lock_exists = await asyncio.gather(*(_is_file(path) for path in lock_paths))
+    all_lockfiles = (*_PY_LOCKFILES, *_JS_LOCKFILES)
+    package_managers = list(
+        dict.fromkeys(
+            pm for (lock, pm), exists in zip(all_lockfiles, lock_exists) if exists
+        )
+    )
+
+    run_tests_path = root / "scripts" / "run_tests.sh"
+    package_json_path = root / "package.json"
+    pytest_ini_path = root / "pytest.ini"
+    pyproject_path = root / "pyproject.toml"
+    makefile_path = root / "Makefile"
+    run_tests, package_json, pytest_ini, pyproject, makefile = await asyncio.gather(
+        _is_file(run_tests_path),
+        _is_file(package_json_path),
+        _is_file(pytest_ini_path),
+        _is_file(pyproject_path),
+        _is_file(makefile_path),
+    )
+    package_text = await _read_small(package_json_path) if package_json else ""
+    pyproject_text = await _read_small(pyproject_path) if pyproject else ""
+    makefile_text = await _read_small(makefile_path) if makefile else ""
+
+    verify: list[str] = []
+    if run_tests:
+        verify.append("scripts/run_tests.sh")
+    if package_json:
+        try:
+            scripts = json.loads(package_text or "{}").get("scripts") or {}
+        except (json.JSONDecodeError, AttributeError):
+            scripts = {}
+        js_pm = next(
+            (pm for (lock, pm), exists in zip(_JS_LOCKFILES, lock_exists[len(_PY_LOCKFILES):]) if exists),
+            "npm",
+        )
+        verify.extend(f"{js_pm} run {name}" for name in _VERIFY_TARGETS if name in scripts)
+    if pytest_ini or "[tool.pytest" in pyproject_text:
+        verify.append("pytest")
+    if makefile_text:
+        verify.extend(
+            f"make {name}"
+            for name in _VERIFY_TARGETS
+            if re.search(rf"^{re.escape(name)}\s*:", makefile_text, re.MULTILINE)
+        )
+
+    context_exists = await asyncio.gather(
+        *(_is_file(root / context_file) for context_file in _CONTEXT_FILES)
+    )
+    return ProjectFacts(
+        manifests=manifests,
+        package_managers=package_managers,
+        verify_commands=list(dict.fromkeys(verify))[:_MAX_VERIFY_COMMANDS],
+        context_files=[
+            context_file
+            for context_file, exists in zip(_CONTEXT_FILES, context_exists)
+            if exists
+        ],
+    )
+
+
+def _render_project_facts(facts: ProjectFacts) -> list[str]:
+    lines: list[str] = []
+    if facts.manifests:
+        line = f"- Project: {', '.join(facts.manifests[:6])}"
+        if facts.package_managers:
+            line += f" ({'/'.join(facts.package_managers)})"
+        lines.append(line)
+    if facts.verify_commands:
+        lines.append(f"- Verify: {'; '.join(facts.verify_commands)}")
+    if facts.context_files:
+        lines.append(f"- Context files: {', '.join(facts.context_files)}")
+    return lines
+
+
+async def build_coding_workspace_block(cwd: Optional[str | Path] = None) -> str:
+    """Async workspace snapshot preserving the synchronous output format."""
+    resolved = await _resolve_cwd(cwd)
+    git_root = await _git_root(resolved)
+    root = git_root or await _marker_root(resolved)
     if root is None:
         return ""
 
-    lines = ["Workspace (snapshot at session start — re-check with `git` before acting on it):"]
-    lines.append(f"- Root: {root}")
-
+    lines = [
+        "Workspace (snapshot at session start — re-check with `git` before acting on it):",
+        f"- Root: {root}",
+    ]
     if git_root is not None:
-        branch, counts = _parse_status(_git(root, "status", "--porcelain=2", "--branch"))
+        branch, counts = _parse_status(
+            await _git(root, "status", "--porcelain=2", "--branch")
+        )
         head = branch.get("head", "")
         if head and head != "(detached)":
             line = f"- Branch: {head}"
             if branch.get("upstream"):
-                line += f" \u2192 {branch['upstream']}"
+                line += f" → {branch['upstream']}"
                 ahead, behind = branch.get("ahead", "0"), branch.get("behind", "0")
                 if ahead != "0" or behind != "0":
                     line += f" (ahead {ahead}, behind {behind})"
@@ -892,25 +943,34 @@ def build_coding_workspace_block(cwd: Optional[str | Path] = None) -> str:
         elif head == "(detached)":
             lines.append("- Branch: (detached HEAD)")
 
-        # Linked worktree: the per-worktree git dir differs from the shared common dir.
-        # We surface the fact that it's a worktree (so the model knows branches/stashes
-        # are shared state) but deliberately do NOT expose the primary tree path —
-        # giving the model a second absolute path causes it to sometimes run commands
-        # in the wrong directory.
-        git_dir, common_dir = _git(root, "rev-parse", "--git-dir"), _git(root, "rev-parse", "--git-common-dir")
-        if git_dir and common_dir and Path(git_dir).resolve() != Path(common_dir).resolve():
+        git_dir, common_dir = await asyncio.gather(
+            _git(root, "rev-parse", "--git-dir"),
+            _git(root, "rev-parse", "--git-common-dir"),
+        )
+
+        def _git_path(value: str) -> Path:
+            path = Path(value)
+            return (root / path if not path.is_absolute() else path).absolute()
+
+        if git_dir and common_dir and _git_path(git_dir) != _git_path(common_dir):
             lines.append("- Worktree: linked (git state shared with primary tree)")
 
-        dirty = [f"{n} {label}" for label, n in (
-            ("staged", counts["staged"]), ("modified", counts["modified"]),
-            ("untracked", counts["untracked"]), ("conflicts", counts["conflicts"]),
-        ) if n]
+        dirty = [
+            f"{n} {label}"
+            for label, n in (
+                ("staged", counts["staged"]),
+                ("modified", counts["modified"]),
+                ("untracked", counts["untracked"]),
+                ("conflicts", counts["conflicts"]),
+            )
+            if n
+        ]
         lines.append(f"- Status: {', '.join(dirty) if dirty else 'clean'}")
 
-        recent = _git(root, "log", "-3", "--pretty=%h %s")
+        recent = await _git(root, "log", "-3", "--pretty=%h %s")
         if recent:
             lines.append("- Recent commits:")
-            lines.extend(f"    {c}" for c in recent.splitlines())
+            lines.extend(f"    {commit}" for commit in recent.splitlines())
 
-    lines.extend(_project_facts(root))
+    lines.extend(_render_project_facts(await detect_project_facts(root)))
     return "\n".join(lines)

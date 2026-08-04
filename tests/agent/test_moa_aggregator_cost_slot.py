@@ -49,12 +49,13 @@ moa:
     return home
 
 
-def test_create_populates_last_aggregator_slot(moa_config, monkeypatch):
+@pytest.mark.asyncio
+async def test_create_populates_last_aggregator_slot(moa_config, monkeypatch):
     """After a create() turn, last_aggregator_slot carries the REAL aggregator
     model/provider — not the virtual preset name."""
     from agent.moa_loop import MoAChatCompletions
 
-    def fake_call_llm(**kwargs):
+    async def fake_call_llm(**kwargs):
         return _response("acted" if kwargs.get("task") != "moa_reference" else "advice")
 
     monkeypatch.setattr("agent.moa_loop.call_llm", fake_call_llm)
@@ -63,7 +64,7 @@ def test_create_populates_last_aggregator_slot(moa_config, monkeypatch):
     # Slot is unset before any turn runs.
     assert facade.last_aggregator_slot is None
 
-    facade.create(
+    await facade.create(
         model="closed",
         messages=[{"role": "user", "content": "clean the db"}],
     )
@@ -76,12 +77,13 @@ def test_create_populates_last_aggregator_slot(moa_config, monkeypatch):
     assert slot["model"] != "closed"
 
 
-def test_client_exposes_last_aggregator_slot(moa_config, monkeypatch):
+@pytest.mark.asyncio
+async def test_client_exposes_last_aggregator_slot(moa_config, monkeypatch):
     """MoAClient delegates last_aggregator_slot to its completions facade so
     session accounting can read it without touching internals."""
     from agent.moa_loop import MoAClient
 
-    def fake_call_llm(**kwargs):
+    async def fake_call_llm(**kwargs):
         return _response("acted" if kwargs.get("task") != "moa_reference" else "advice")
 
     monkeypatch.setattr("agent.moa_loop.call_llm", fake_call_llm)
@@ -89,7 +91,7 @@ def test_client_exposes_last_aggregator_slot(moa_config, monkeypatch):
     client = MoAClient("closed")
     assert client.last_aggregator_slot is None
 
-    client.chat.completions.create(
+    await client.chat.completions.create(
         model="closed",
         messages=[{"role": "user", "content": "clean the db"}],
     )

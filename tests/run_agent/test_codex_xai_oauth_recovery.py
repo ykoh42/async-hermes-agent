@@ -31,7 +31,7 @@ Three distinct failure modes the user community hit during rollout:
 """
 
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -83,8 +83,6 @@ def test_codex_stream_wire_error_event_surfaces_stream_error_event(provider_mess
     provider's real message in the body."""
     from run_agent import _StreamErrorEvent
 
-    agent = _make_codex_agent()
-
     class _ErrorCreateStream:
         def __iter__(self_inner):
             yield SimpleNamespace(type="error", message=provider_message, code="forbidden")
@@ -92,11 +90,10 @@ def test_codex_stream_wire_error_event_surfaces_stream_error_event(provider_mess
         def close(self_inner):
             pass
 
-    mock_client = MagicMock()
-    mock_client.responses.create.return_value = _ErrorCreateStream()
+    from agent.codex_runtime import _consume_codex_event_stream
 
     with pytest.raises(_StreamErrorEvent) as excinfo:
-        agent._run_codex_stream({}, client=mock_client)
+        _consume_codex_event_stream(_ErrorCreateStream(), model="grok-4.3")
 
     assert provider_message in str(excinfo.value)
     assert excinfo.value.body["error"]["message"] == provider_message
@@ -121,8 +118,6 @@ def test_codex_stream_wire_error_event_nested_envelope_attr_style():
     """Details nested under ``error`` (SDK attr-object shape) are surfaced."""
     from run_agent import _StreamErrorEvent
 
-    agent = _make_codex_agent()
-
     class _ErrorCreateStream:
         def __iter__(self_inner):
             yield SimpleNamespace(
@@ -141,11 +136,10 @@ def test_codex_stream_wire_error_event_nested_envelope_attr_style():
         def close(self_inner):
             pass
 
-    mock_client = MagicMock()
-    mock_client.responses.create.return_value = _ErrorCreateStream()
+    from agent.codex_runtime import _consume_codex_event_stream
 
     with pytest.raises(_StreamErrorEvent) as excinfo:
-        agent._run_codex_stream({}, client=mock_client)
+        _consume_codex_event_stream(_ErrorCreateStream(), model="grok-4.3")
 
     assert "Slow down" in str(excinfo.value)
     assert excinfo.value.code == "rate_limit_exceeded"
@@ -380,7 +374,8 @@ def test_is_entitlement_failure_false_for_status_other_than_401_403():
 
 
 
-def test_recover_with_credential_pool_skips_refresh_on_entitlement_403():
+@pytest.mark.asyncio
+async def test_recover_with_credential_pool_skips_refresh_on_entitlement_403():
     """The recovery path must NOT call pool.try_refresh_current() on entitlement 403.
 
     Before the fix, an unsubscribed xAI OAuth account would burn the agent
@@ -396,14 +391,16 @@ def test_recover_with_credential_pool_skips_refresh_on_entitlement_403():
     refresh_calls = {"n": 0}
 
     class _FakePool:
-        def try_refresh_matching(self, api_key_hint=None):
+        provider = "xai-oauth"
+
+        async def try_refresh_matching(self, api_key_hint=None):
             refresh_calls["n"] += 1
             return MagicMock(id="should_not_be_called")
 
-        def mark_exhausted_and_rotate(self, **_kwargs):
+        async def mark_exhausted_and_rotate(self, **_kwargs):
             return None
 
-        def has_available(self):
+        async def has_available(self):
             return False
 
     agent._credential_pool = _FakePool()
@@ -414,7 +411,7 @@ def test_recover_with_credential_pool_skips_refresh_on_entitlement_403():
                    "active Grok subscription. Manage at https://grok.com",
     }
 
-    recovered, _retried_429 = agent._recover_with_credential_pool(
+    recovered, _retried_429 = await agent._recover_with_credential_pool(
         status_code=403,
         has_retried_429=False,
         classified_reason=FailoverReason.auth,
@@ -425,7 +422,8 @@ def test_recover_with_credential_pool_skips_refresh_on_entitlement_403():
     assert refresh_calls["n"] == 0, "try_refresh_current must NOT be called on entitlement 403"
 
 
-def test_recover_with_credential_pool_rotates_on_xai_spending_limit_403():
+@pytest.mark.asyncio
+async def test_recover_with_credential_pool_rotates_on_xai_spending_limit_403():
     """xAI's explicit spending-limit 403 must rotate, not hit the entitlement guard."""
     from agent.error_classifier import FailoverReason, classify_api_error
 
@@ -446,11 +444,11 @@ def test_recover_with_credential_pool_rotates_on_xai_spending_limit_403():
     class _FakePool:
         provider = "xai-oauth"
 
-        def try_refresh_matching(self, api_key_hint=None):
+        async def try_refresh_matching(self, api_key_hint=None):
             refresh_calls["n"] += 1
             return MagicMock(id="should_not_be_called")
 
-        def mark_exhausted_and_rotate(
+        async def mark_exhausted_and_rotate(
             self,
             *,
             status_code,
@@ -472,9 +470,9 @@ def test_recover_with_credential_pool_rotates_on_xai_spending_limit_403():
     classified = classify_api_error(error, provider="xai-oauth", model="grok-4.5")
     error_context = agent._extract_api_error_context(error)
     setattr(agent, "_credential_pool", _FakePool())
-    agent._swap_credential = MagicMock()
+    agent._swap_credential = AsyncMock()
 
-    recovered, retried_429 = agent._recover_with_credential_pool(
+    recovered, retried_429 = await agent._recover_with_credential_pool(
         status_code=error.status_code,
         has_retried_429=False,
         classified_reason=classified.reason,
@@ -485,7 +483,7 @@ def test_recover_with_credential_pool_rotates_on_xai_spending_limit_403():
     assert recovered is True
     assert retried_429 is False
     assert refresh_calls["n"] == 0
-    agent._swap_credential.assert_called_once_with(next_entry)
+    agent._swap_credential.assert_awaited_once_with(next_entry)
 
 
 

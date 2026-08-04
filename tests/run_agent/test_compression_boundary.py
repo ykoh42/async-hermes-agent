@@ -6,6 +6,8 @@ so that parallel tool calls are never split during compression.
 
 from unittest.mock import patch
 
+import pytest
+
 from agent.context_compressor import ContextCompressor
 
 
@@ -37,7 +39,7 @@ def _make_compressor(**kwargs) -> ContextCompressor:
         quiet_mode=True,
     )
     defaults.update(kwargs)
-    with patch("agent.context_compressor.get_model_context_length", return_value=8000):
+    with patch("agent.context_compressor.get_static_context_length", return_value=8000):
         return ContextCompressor(**defaults)
 
 
@@ -90,7 +92,8 @@ class TestAlignBoundaryBackward:
 class TestCompressionToolResultPreservation:
     """Verify that compress() never silently drops tool results."""
 
-    def test_parallel_tool_results_not_lost(self):
+    @pytest.mark.asyncio
+    async def test_parallel_tool_results_not_lost(self):
         """The exact scenario that triggered silent data loss before the fix."""
         comp = _make_compressor(protect_first_n=3, protect_last_n=4)
 
@@ -115,7 +118,7 @@ class TestCompressionToolResultPreservation:
 
         fake_summary = "[Summary of earlier conversation]"
         with patch.object(comp, "_generate_summary", return_value=fake_summary):
-            result = comp.compress(messages, current_tokens=7000)
+            result = await comp.compress(messages, current_tokens=7000)
 
         # After compression, no tool results should be orphaned/lost.
         # All tool results in the result must have a matching assistant tool_call.

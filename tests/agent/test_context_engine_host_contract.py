@@ -28,6 +28,8 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
+import pytest
+
 from agent.context_compressor import ContextCompressor
 from hermes_state import SessionDB
 from run_agent import AIAgent
@@ -83,16 +85,23 @@ def test_transition_skips_optional_hooks_when_engine_lacks_them():
 
 
 
-def test_reset_session_state_rebinds_builtin_compressor_after_session_switch(tmp_path, monkeypatch):
-    """Reset-only session switches must rebind durable cooldown state to the new session."""
+@pytest.mark.asyncio
+async def test_reset_session_state_rebinds_builtin_compressor_after_session_switch(tmp_path, monkeypatch):
+    """Reset-only session switches must rebind local compression state.
+
+    Native turn persistence goes through ``conversation_compression`` and the
+    async session adapter.  ``reset_session_state`` itself only changes the
+    compressor's active session identity; it must not issue a legacy
+    synchronous SQLite write.
+    """
     db = SessionDB(db_path=tmp_path / "state.db")
-    db.create_session("old-sid", source="cli")
-    db.create_session("new-sid", source="cli")
-    db.record_compression_failure_cooldown("old-sid", 4_000_000_000.0, "old-timeout")
-    db.set_compression_fallback_streak("old-sid", 2)
+    await db.create_session("old-sid", source="cli")
+    await db.create_session("new-sid", source="cli")
+    await db.record_compression_failure_cooldown("old-sid", 4_000_000_000.0, "old-timeout")
+    await db.set_compression_fallback_streak("old-sid", 2)
 
     monkeypatch.setattr(
-        "agent.context_compressor.get_model_context_length",
+        "agent.context_compressor.get_static_context_length",
         lambda *_a, **_k: 100_000,
     )
     compressor = ContextCompressor(
@@ -102,7 +111,7 @@ def test_reset_session_state_rebinds_builtin_compressor_after_session_switch(tmp
         protect_last_n=2,
         quiet_mode=True,
     )
-    compressor.bind_session_state(db, "old-sid")
+    compressor.bind_session_state(None, "old-sid")
 
     agent = _bare_agent()
     agent._session_db = db
@@ -114,13 +123,15 @@ def test_reset_session_state_rebinds_builtin_compressor_after_session_switch(tmp
     assert compressor._session_id == "new-sid"
     assert compressor.get_active_compression_failure_cooldown() is None
     assert compressor._fallback_compression_streak == 0
-    assert db.get_compression_failure_cooldown("old-sid") is not None
-    assert db.get_compression_fallback_streak("old-sid") == 2
+    assert await db.get_compression_failure_cooldown("old-sid") is not None
+    assert await db.get_compression_fallback_streak("old-sid") == 2
 
     compressor._record_compression_failure_cooldown(30.0, "new-timeout")
 
-    assert db.get_compression_failure_cooldown("new-sid") is not None
-    assert db.get_compression_failure_cooldown("old-sid")["error"] == "old-timeout"
+    assert compressor.get_active_compression_failure_cooldown() is not None
+    assert await db.get_compression_failure_cooldown("new-sid") is None
+    assert (await db.get_compression_failure_cooldown("old-sid"))["error"] == "old-timeout"
+    await db.close()
 
 
 def test_update_from_response_forwards_canonical_cache_buckets():
@@ -158,36 +169,3 @@ def test_update_from_response_forwards_canonical_cache_buckets():
     assert usage_dict["reasoning_tokens"] == 50
     assert usage_dict["input_tokens"] == 1000
     assert usage_dict["output_tokens"] == 500
-
-
-
-
-
-
-def test_engine_collector_forwards_register_command_to_plugin_manager():
-    """A plugin context engine can register a slash command via ``ctx.register_command``."""
-    from plugins.context_engine import _EngineCollector
-    from hermes_cli.plugins import get_plugin_manager
-
-    handler = lambda raw_args: f"echo: {raw_args}"
-
-    collector = _EngineCollector(engine_name="my-lcm")
-    collector.register_command(
-        "my-lcm-test-cmd",
-        handler,
-        description="test command from a context engine",
-        args_hint="<msg>",
-    )
-
-    manager = get_plugin_manager()
-    try:
-        assert "my-lcm-test-cmd" in manager._plugin_commands
-        entry = manager._plugin_commands["my-lcm-test-cmd"]
-        assert entry["handler"] is handler
-        assert entry["args_hint"] == "<msg>"
-        assert entry["plugin"] == "context-engine:my-lcm"
-    finally:
-        # Clean up so we don't leak the registration across tests.
-        manager._plugin_commands.pop("my-lcm-test-cmd", None)
-
-

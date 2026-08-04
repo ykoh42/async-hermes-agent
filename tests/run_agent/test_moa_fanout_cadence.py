@@ -10,6 +10,8 @@ same cache-reuse mechanism the user_turn fanout uses.
 
 from types import SimpleNamespace
 
+import pytest
+
 
 def _response(content="done", *, tool_calls=None):
     message = SimpleNamespace(content=content, tool_calls=tool_calls or [])
@@ -38,7 +40,7 @@ moa:
 
 
 def _install_fake_llm(monkeypatch, ref_runs):
-    def fake_call_llm(**kwargs):
+    async def fake_call_llm(**kwargs):
         if kwargs["task"] == "moa_reference":
             ref_runs.append(kwargs["model"])
             return _response(f"advice #{len(ref_runs)}")
@@ -66,7 +68,8 @@ def _iteration_messages(base, iterations):
         yield list(msgs)
 
 
-def test_every_n_cadence_runs_references_every_nth_iteration(monkeypatch, tmp_path):
+@pytest.mark.asyncio
+async def test_every_n_cadence_runs_references_every_nth_iteration(monkeypatch, tmp_path):
     """With every_n:3, references run on iterations 1 and 4 of a 6-iteration
     tool loop (1 on-cadence, then every 3rd), not on all 6."""
     home = tmp_path / ".hermes"
@@ -82,7 +85,7 @@ def test_every_n_cadence_runs_references_every_nth_iteration(monkeypatch, tmp_pa
     facade = MoAChatCompletions("review", reference_callback=lambda ev, **kw: events.append(ev))
     base = [{"role": "user", "content": "do the thing"}]
     for msgs in _iteration_messages(base, 6):
-        facade.create(messages=msgs, tools=[{"type": "function"}])
+        await facade.create(messages=msgs, tools=[{"type": "function"}])
 
     # 1 reference model × iterations {1, 4} on-cadence = 2 advisor runs.
     assert len(ref_runs) == 2
@@ -91,7 +94,8 @@ def test_every_n_cadence_runs_references_every_nth_iteration(monkeypatch, tmp_pa
     assert events.count("moa.aggregating") == 2
 
 
-def test_every_n_off_cadence_iterations_reuse_cached_guidance(monkeypatch, tmp_path):
+@pytest.mark.asyncio
+async def test_every_n_off_cadence_iterations_reuse_cached_guidance(monkeypatch, tmp_path):
     """Off-cadence iterations must still give the aggregator the last
     on-cadence advisor guidance (cache reuse), not run advisor-less."""
     home = tmp_path / ".hermes"
@@ -105,10 +109,11 @@ def test_every_n_off_cadence_iterations_reuse_cached_guidance(monkeypatch, tmp_p
 
     facade = MoAChatCompletions("review")
     base = [{"role": "user", "content": "task"}]
-    prepared = [
-        facade.create(messages=msgs, tools=[], _moa_prepare_only=True)
-        for msgs in _iteration_messages(base, 3)
-    ]
+    prepared = []
+    for msgs in _iteration_messages(base, 3):
+        prepared.append(
+            await facade.create(messages=msgs, tools=[], _moa_prepare_only=True)
+        )
 
     # Iteration 1 ran the references; iterations 2-3 are off-cadence.
     assert len(ref_runs) == 1
@@ -126,7 +131,8 @@ def test_every_n_off_cadence_iterations_reuse_cached_guidance(monkeypatch, tmp_p
 
 
 
-def test_per_iteration_default_unchanged_by_cadence_state(monkeypatch, tmp_path):
+@pytest.mark.asyncio
+async def test_per_iteration_default_unchanged_by_cadence_state(monkeypatch, tmp_path):
     """Default fanout still re-runs references on every state change."""
     home = tmp_path / ".hermes"
     _cadence_config(home, "per_iteration")
@@ -140,6 +146,6 @@ def test_per_iteration_default_unchanged_by_cadence_state(monkeypatch, tmp_path)
     facade = MoAChatCompletions("review")
     base = [{"role": "user", "content": "task"}]
     for msgs in _iteration_messages(base, 3):
-        facade.create(messages=msgs, tools=[])
+        await facade.create(messages=msgs, tools=[])
 
     assert len(ref_runs) == 3

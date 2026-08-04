@@ -15,9 +15,11 @@ Features:
 
 Usage:
     from run_agent import AIAgent
-    
+
     agent = AIAgent(base_url="http://localhost:30000/v1", model="claude-opus-4-20250514")
-    response = agent.run_conversation("Tell me about the latest Python updates")
+    response = await agent.run_conversation(
+        "Tell me about the latest Python updates"
+    )
 """
 
 # IMPORTANT: hermes_bootstrap must be the very first import — UTF-8 stdio
@@ -32,33 +34,26 @@ except ModuleNotFoundError:
     pass
 
 import asyncio
-import base64
 import copy
 import hashlib
+import inspect
 import json
 import logging
 logger = logging.getLogger(__name__)
 import os
 import re
 import sys
-import tempfile
 import time
-import threading
 import uuid
 import warnings
 from typing import List, Dict, Any, Optional, Callable
-# NOTE: `from openai import OpenAI` is deliberately NOT at module top — the
+# NOTE: `from openai import AsyncOpenAI` is deliberately NOT at module top — the
 # SDK pulls ~240 ms of imports. We expose `OpenAI` as a thin proxy object
 # that imports the SDK on first call/isinstance check. This preserves:
-#   (a) the single in-module `OpenAI(**client_kwargs)` call site at
-#       _create_openai_client, and
-#   (b) `patch("run_agent.OpenAI", ...)` test patterns used by ~28 test files.
+#   (a) the stable `OpenAI(**client_kwargs)` factory name while constructing a
+#       native async client, and
+#   (b) `patch("run_agent.OpenAI", ...)` integration seams.
 #
-# NOTE: `fire` is ONLY used in the `__main__` block below (for running
-# run_agent.py directly as a CLI) — it is NOT needed for library usage.
-# It is imported there, not here, so that importing run_agent from a
-# daemon thread (e.g. curator's forked review agent) never fails with
-# ModuleNotFoundError on broken/partial installs where `fire` isn't present.
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -105,7 +100,7 @@ def _session_source_for_agent(platform: Optional[str]) -> str:
 
 # OpenAI lazy proxy + safe stdio + proxy URL helpers — see agent/process_bootstrap.py.
 # `OpenAI` is re-exported here so `patch("run_agent.OpenAI", ...)` in tests works.
-# The other `# noqa: F401` re-exports below cover names accessed via
+# The other F401 re-exports below cover names accessed via
 # `mock.patch("run_agent.<X>")`, `from run_agent import <X>` in production
 # siblings, or the `_ra().<X>` indirection in agent/system_prompt.py — none
 # of which ruff's in-module usage scan can see.
@@ -115,44 +110,35 @@ from agent.process_bootstrap import (
     _get_proxy_for_base_url,
 )
 from agent.iteration_budget import IterationBudget
-from agent.interrupt_compat import request_hard_interrupt
 
 
-from hermes_cli.env_loader import load_hermes_dotenv
 from hermes_cli.timeouts import (
     get_provider_request_timeout,
     get_provider_stale_timeout,
 )
 
 _hermes_home = get_hermes_home()
-_project_env = Path(__file__).parent / '.env'
-_loaded_env_paths = load_hermes_dotenv(hermes_home=_hermes_home, project_env=_project_env)
-if _loaded_env_paths:
-    for _env_path in _loaded_env_paths:
-        logger.info("Loaded environment variables from %s", _env_path)
-else:
-    logger.info("No .env file found. Using system environment variables.")
-
+_project_env = Path(__file__).parent / ".env"
 
 # Import our tool system
 from model_tools import (
     get_tool_definitions,  # noqa: F401  # re-exported for tests that mock.patch("run_agent.get_tool_definitions")
     get_toolset_for_tool,
-    handle_function_call,  # noqa: F401  # re-exported for tests that mock.patch("run_agent.handle_function_call")
     check_toolset_requirements,  # noqa: F401  # re-exported for tests that mock.patch("run_agent.check_toolset_requirements")
 )
-from tools.terminal_tool import cleanup_vm, get_active_env
-from tools.interrupt import set_interrupt as _set_interrupt
-from tools.browser_tool import cleanup_browser
+from tools.terminal_tool import cleanup_vm
+from tools.interrupt import (
+    bind_interrupt_event as _bind_interrupt_event,
+    reset_interrupt_event as _reset_interrupt_event,
+    set_interrupt as _set_interrupt,
+)
 
 
 # Agent internals extracted to agent/ package for modularity
 from agent.memory_manager import sanitize_context
-from agent.memory_provider import is_trivial_prompt
 from agent.error_classifier import FailoverReason
 from agent.redact import redact_sensitive_text
 from agent.message_content import flatten_message_text
-from agent.session_activity import ActivityProvenance
 from agent.model_metadata import (
     estimate_request_tokens_rough,  # noqa: F401  # re-exported for tests that mock.patch("run_agent.estimate_request_tokens_rough")
     is_local_endpoint,
@@ -169,7 +155,6 @@ from agent.prompt_builder import (  # noqa: F401  # re-exported via _ra() / mock
     build_skills_system_prompt,
     build_context_files_prompt,
     build_environment_hints,
-    build_nous_subscription_prompt,
     load_soul_md,
 )
 from agent.process_bootstrap import _get_proxy_from_env  # noqa: F401
@@ -192,7 +177,6 @@ from agent.codex_responses_adapter import (
     _derive_responses_function_call_id as _codex_derive_responses_function_call_id,
     _deterministic_call_id as _codex_deterministic_call_id,
     _split_responses_tool_id as _codex_split_responses_tool_id,
-    _summarize_user_message_for_log,  # also used by _sync_external_memory_for_turn (memory boundary)
 )
 from agent.tool_guardrails import (
     ToolGuardrailDecision,
@@ -220,7 +204,7 @@ from agent.tool_dispatch_helpers import (
     _extract_error_preview,
     _trajectory_normalize_msg,  # noqa: F401  # re-exported for tests that `from run_agent import _trajectory_normalize_msg`
 )
-from utils import atomic_json_write, base_url_host_matches, base_url_hostname, env_float, is_truthy_value, model_forces_max_completion_tokens
+from utils import base_url_host_matches, base_url_hostname, env_float, is_truthy_value, model_forces_max_completion_tokens
 
 
 # Internal flags that mark a message as ephemeral empty-response/prefill
@@ -278,12 +262,6 @@ _MAX_TOOL_WORKERS = 8
 # this never reaches a strict OpenAI-compatible gateway.
 _DB_PERSISTED_MARKER = "_db_persisted"
 
-
-# Guard so the OpenRouter metadata pre-warm thread is only spawned once per
-# process, not once per AIAgent instantiation.  Without this, long-running
-# gateway processes leak one OS thread per incoming message and eventually
-# exhaust the system thread limit (RuntimeError: can't start new thread).
-_openrouter_prewarm_done = threading.Event()
 
 # =========================================================================
 # Large tool result handler — save oversized output to temp file
@@ -477,7 +455,6 @@ class AIAgent:
         notice_callback: callable = None,
         notice_clear_callback: callable = None,
         event_callback: Optional[Callable[[str, dict], None]] = None,
-        reaction_callback: Optional[Callable[[str], None]] = None,
         max_tokens: int = None,
         reasoning_config: Dict[str, Any] = None,
         service_tier: str = None,
@@ -561,7 +538,6 @@ class AIAgent:
             notice_callback=notice_callback,
             notice_clear_callback=notice_clear_callback,
             event_callback=event_callback,
-            reaction_callback=reaction_callback,
             max_tokens=max_tokens,
             reasoning_config=reasoning_config,
             service_tier=service_tier,
@@ -591,32 +567,40 @@ class AIAgent:
             pass_session_id=pass_session_id,
         )
 
-    def _get_session_db_for_recall(self):
-        """Return a SessionDB for recall, lazily creating it if an entrypoint forgot.
+    def _get_turn_lock(self) -> asyncio.Lock:
+        """Return the lazily-created lock that serializes one agent's turns."""
+        lock = getattr(self, "_turn_lock", None)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._turn_lock = lock
+        return lock
 
-        Most frontends pass ``session_db`` into ``AIAgent`` explicitly, but recall
-        is important enough that a missing constructor argument should degrade by
-        opening the default state DB instead of making the advertised
-        ``session_search`` tool unusable.
-        """
-        # Persistence-isolated forks (background review) must not lazily open the
-        # canonical state DB: doing so would re-arm _flush_messages_to_session_db
-        # to write the fork's harness turn into the user's real session. Recall
-        # degrades to None for them (they don't use session_search anyway).
-        if getattr(self, "_persist_disabled", False):
-            return None
-        if self._session_db is not None:
-            return self._session_db
-        try:
-            from hermes_state import SessionDB
+    def _get_close_lock(self) -> asyncio.Lock:
+        """Return the lazily-created lock that makes ``close()`` idempotent."""
+        lock = getattr(self, "_close_lock", None)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._close_lock = lock
+        return lock
 
-            self._session_db = SessionDB()
-            return self._session_db
-        except Exception:
-            logger.debug("SessionDB unavailable for recall", exc_info=True)
-            return None
+    def _get_session_persist_lock(self) -> asyncio.Lock:
+        """Return the per-agent async lock for transcript mutations."""
+        lock = getattr(self, "_session_persist_lock", None)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._session_persist_lock = lock
+        return lock
 
-    def _ensure_db_session(self) -> None:
+    async def __aenter__(self):
+        """Support ``async with AIAgent(...)`` without a separate start API."""
+        await self._ensure_provider_runtime()
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> bool:
+        await self.close()
+        return False
+
+    async def _ensure_db_session(self) -> None:
         """Create session DB row on first use. Disables _session_db on failure."""
         if getattr(self, "_persist_disabled", False):
             return
@@ -631,24 +615,14 @@ class AIAgent:
                     _profile_for_session = None
             except Exception:
                 _profile_for_session = None
-            # Carry the live YOLO bypass into the creation-time model_config so
-            # a session whose /yolo was toggled BEFORE the row existed (the row
-            # is created lazily on the first turn) still persists the flag for
-            # `hermes --resume`. set_session_yolo() no-ops on a missing row, so
-            # this is the only chance to record a pre-first-turn toggle.
-            _init_model_config = self._session_init_model_config
-            try:
-                from tools.approval import is_session_yolo_enabled
-                if is_session_yolo_enabled(self.session_id):
-                    _init_model_config = dict(_init_model_config or {})
-                    _init_model_config["yolo_mode"] = True
-            except Exception:
-                pass
-            self._session_db.create_session(
+            session_db = self._session_db
+            if session_db is None:
+                return
+            await session_db.create_session(
                 session_id=self.session_id,
                 source=source,
                 model=self.model,
-                model_config=_init_model_config,
+                model_config=self._session_init_model_config,
                 system_prompt=self._cached_system_prompt,
                 user_id=None,
                 parent_session_id=self._parent_session_id,
@@ -662,6 +636,30 @@ class AIAgent:
             logger.warning(
                 "Session DB creation failed (will retry next turn): %s", e
             )
+
+    async def _persist_pending_billing_route(self) -> None:
+        """Persist the active model route after an async model switch."""
+        pending = getattr(self, "_pending_billing_route", None)
+        if (
+            not pending
+            or not getattr(self, "_session_db", None)
+            or getattr(self, "_persist_disabled", False)
+        ):
+            return
+        try:
+            session_db = self._session_db
+            if session_db is None:
+                return
+            await session_db.update_session_billing_route(
+                self.session_id,
+                provider=pending["provider"],
+                base_url=pending["base_url"],
+                billing_mode=pending["billing_mode"],
+            )
+        except Exception:
+            logger.warning("Failed to persist billing route after model switch", exc_info=True)
+            return
+        self._pending_billing_route = None
 
     def _transition_context_engine_session(
         self,
@@ -802,7 +800,7 @@ class AIAgent:
             and target_session_id != bound_session_id
         ):
             try:
-                engine.bind_session_state(getattr(self, "_session_db", None), target_session_id)
+                engine.bind_session_state(None, target_session_id)
             except Exception as exc:
                 logger.debug("context engine bind_session_state during reset: %s", exc)
 
@@ -848,29 +846,23 @@ class AIAgent:
         self,
         config_context_length: Optional[int] = None,
     ) -> Any:
-        """Preload LM Studio unless configured to rely on JIT loading."""
+        """Reject the legacy blocking LM Studio preloader on the async path."""
         if (self.provider or "").strip().lower() != "lmstudio":
             return None
         if (getattr(self, "lmstudio_load_mode", "explicit") or "explicit").strip().lower() == "jit":
-            logger.debug("LM Studio explicit preload skipped: lmstudio_load_mode=jit")
             return None
+        from agent.agent_runtime_helpers import AsyncCapabilityError
 
-        from hermes_cli.models import ensure_lmstudio_model_loaded
-
-        if config_context_length is None:
-            config_context_length = getattr(self, "_config_context_length", None)
-        return ensure_lmstudio_model_loaded(
-            self.model,
-            self.base_url,
-            getattr(self, "api_key", ""),
-            config_context_length,
-            return_load_result=True,
+        raise AsyncCapabilityError(
+            "LM Studio explicit model loading uses a blocking management API and "
+            "is disabled in async-hermes-agent. Set model.lmstudio_load_mode to "
+            "'jit' or add a native async LM Studio loader."
         )
 
-    def switch_model(self, new_model, new_provider, api_key='', base_url='', api_mode=''):
+    async def switch_model(self, new_model, new_provider, api_key='', base_url='', api_mode=''):
         """Forwarder — see ``agent.agent_runtime_helpers.switch_model``."""
         from agent.agent_runtime_helpers import switch_model
-        return switch_model(self, new_model, new_provider, api_key, base_url, api_mode)
+        return await switch_model(self, new_model, new_provider, api_key, base_url, api_mode)
 
     def _safe_print(self, *args, **kwargs):
         """Print that silently handles broken pipes / closed stdout.
@@ -1013,12 +1005,6 @@ class AIAgent:
             from agent.conversation_compression import (
                 CONTEXT_OVERFLOW_BLOCKED_WARNING_TEMPLATE,
             )
-            # cooldown + anti-thrash (ineffective) are both "compression blocked".
-            if _warn_kind in ("cooldown", "ineffective"):
-                self._touch_activity(
-                    f"compression blocked ({reason})",
-                    provenance=ActivityProvenance.AGENT_COMPRESSION_COOLDOWN,
-                )
             self._emit_warning(
                 CONTEXT_OVERFLOW_BLOCKED_WARNING_TEMPLATE.format(
                     tokens=preflight_tokens,
@@ -1314,10 +1300,10 @@ class AIAgent:
             "auth_mode": getattr(self, "auth_mode", "") or "",
         }
 
-    def _check_compression_model_feasibility(self) -> None:
+    async def _check_compression_model_feasibility(self) -> None:
         """Forwarder — see ``agent.conversation_compression.check_compression_model_feasibility``."""
         from agent.conversation_compression import check_compression_model_feasibility
-        check_compression_model_feasibility(self)
+        await check_compression_model_feasibility(self)
 
     def _replay_compression_warning(self) -> None:
         """Forwarder — see ``agent.conversation_compression.replay_compression_warning``."""
@@ -1377,7 +1363,7 @@ class AIAgent:
         passed as a per-call ``timeout=`` kwarg, overriding the client-level
         timeout the AIAgent.__init__ path configured.
         """
-        cfg = get_provider_request_timeout(self.provider, self.model)
+        cfg = getattr(self, "_provider_request_timeout", None)
         if cfg is not None:
             return cfg
         return env_float("HERMES_API_TIMEOUT", 1800.0)
@@ -1400,7 +1386,7 @@ class AIAgent:
         explicitly configured a stale timeout, such as auto-disabling the
         detector for local endpoints.
         """
-        cfg = get_provider_stale_timeout(self.provider, self.model)
+        cfg = getattr(self, "_provider_stale_timeout", None)
         if cfg is not None:
             return cfg, False
 
@@ -1508,28 +1494,14 @@ class AIAgent:
         )
 
     def _is_copilot_provider(self) -> bool:
-        """True when the active provider is GitHub Copilot, however spelled.
-
-        ``self.provider`` is not always the normalized slug: ``/model`` and
-        profile configs can leave the alias ``github-copilot`` (or ``github``)
-        in place — a single session log can show both ``provider=copilot`` and
-        ``provider=github-copilot`` for the same account. A bare
-        ``provider == "copilot"`` gate silently skips credential recovery for
-        the alias spellings, so this is the single owner of the check; the
-        Copilot base URL is accepted as a fallback signal.
-        """
-        if (self.provider or "").strip().lower() in {"copilot", "github-copilot", "github"}:
+        """Return whether the active route is GitHub Copilot under any alias."""
+        if (self.provider or "").strip().lower() in {
+            "copilot",
+            "github-copilot",
+            "github",
+        }:
             return True
         return self._is_copilot_url()
-
-    def _is_codex_backend(self) -> bool:
-        """Return True for the ChatGPT OAuth Codex Responses backend."""
-        return (
-            getattr(self, "api_mode", None) == "codex_responses"
-            and getattr(self, "_base_url_hostname", "") == "chatgpt.com"
-            and "/backend-api/codex"
-            in (getattr(self, "_base_url_lower", "") or "")
-        )
 
     def _anthropic_prompt_cache_policy(
         self,
@@ -1542,24 +1514,6 @@ class AIAgent:
         """Forwarder — see ``agent.agent_runtime_helpers.anthropic_prompt_cache_policy``."""
         from agent.agent_runtime_helpers import anthropic_prompt_cache_policy
         return anthropic_prompt_cache_policy(self, provider=provider, base_url=base_url, api_mode=api_mode, model=model)
-
-    def _direct_native_anthropic_tool_cache_capability(
-        self,
-        *,
-        provider: Optional[str] = None,
-        base_url: Optional[str] = None,
-        api_mode: Optional[str] = None,
-        model: Optional[str] = None,
-    ) -> bool:
-        """Forwarder for the request-local native Anthropic tool capability."""
-        from agent.agent_runtime_helpers import _direct_native_anthropic_tool_cache_capability
-        return _direct_native_anthropic_tool_cache_capability(
-            self,
-            provider=provider,
-            base_url=base_url,
-            api_mode=api_mode,
-            model=model,
-        )
 
     @staticmethod
     def _model_requires_responses_api(model: str) -> bool:
@@ -1761,62 +1715,10 @@ class AIAgent:
         from agent.agent_runtime_helpers import extract_reasoning
         return extract_reasoning(self, assistant_message)
 
-    def _cleanup_task_resources(self, task_id: str) -> None:
+    async def _cleanup_task_resources(self, task_id: str) -> None:
         """Forwarder — see ``agent.chat_completion_helpers.cleanup_task_resources``."""
         from agent.chat_completion_helpers import cleanup_task_resources
-        return cleanup_task_resources(self, task_id)
-
-    # ------------------------------------------------------------------
-    # Background memory/skill review — prompts live in agent.background_review
-    # ------------------------------------------------------------------
-    from agent.background_review import (
-        _MEMORY_REVIEW_PROMPT,
-        _SKILL_REVIEW_PROMPT,
-        _COMBINED_REVIEW_PROMPT,
-    )
-
-    @staticmethod
-    def _summarize_background_review_actions(
-        review_messages: List[Dict],
-        prior_snapshot: List[Dict],
-        notification_mode: str = "on",
-    ) -> List[str]:
-        """Forwarder — see ``agent.background_review.summarize_background_review_actions``."""
-        from agent.background_review import summarize_background_review_actions
-        return summarize_background_review_actions(
-            review_messages,
-            prior_snapshot,
-            notification_mode=notification_mode,
-        )
-
-    def _spawn_background_review(
-        self,
-        messages_snapshot: List[Dict],
-        review_memory: bool = False,
-        review_skills: bool = False,
-    ) -> None:
-        """Spawn the background memory/skill review thread.
-
-        Thin wrapper — the heavy lifting lives in
-        ``agent.background_review.spawn_background_review_thread`` which
-        returns the thread target.  ``threading.Thread`` is constructed
-        here so existing tests that patch ``run_agent.threading.Thread``
-        keep working.
-        """
-        from agent.background_review import spawn_background_review_thread
-        from tools.thread_context import propagate_context_to_thread
-        target, _prompt = spawn_background_review_thread(
-            self,
-            messages_snapshot,
-            review_memory=review_memory,
-            review_skills=review_skills,
-        )
-        # Carry the active profile into the review thread so MEMORY.md / skill
-        # review writes land in the right profile (#54937).
-        t = threading.Thread(
-            target=propagate_context_to_thread(target), daemon=True, name="bg-review"
-        )
-        t.start()
+        await cleanup_task_resources(self, task_id)
 
     def _build_memory_write_metadata(
         self,
@@ -1826,15 +1728,24 @@ class AIAgent:
         task_id: Optional[str] = None,
         tool_call_id: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Forwarder — see ``agent.background_review.build_memory_write_metadata``."""
-        from agent.background_review import build_memory_write_metadata
-        return build_memory_write_metadata(
-            self,
-            write_origin=write_origin,
-            execution_context=execution_context,
-            task_id=task_id,
-            tool_call_id=tool_call_id,
-        )
+        """Build provenance metadata for external memory-provider mirrors."""
+        metadata: Dict[str, Any] = {
+            "write_origin": write_origin or getattr(
+                self, "_memory_write_origin", "assistant_tool"
+            ),
+            "execution_context": execution_context or getattr(
+                self, "_memory_write_context", "foreground"
+            ),
+            "session_id": self.session_id or "",
+            "parent_session_id": self._parent_session_id or "",
+            "platform": self.platform or os.environ.get("HERMES_SESSION_SOURCE", "cli"),
+            "tool_name": "memory",
+        }
+        if task_id:
+            metadata["task_id"] = task_id
+        if tool_call_id:
+            metadata["tool_call_id"] = tool_call_id
+        return {key: value for key, value in metadata.items() if value not in {None, ""}}
 
     def _apply_persist_user_message_override(self, messages: List[Dict]) -> None:
         """Rewrite the current-turn user message before persistence/return.
@@ -1882,7 +1793,7 @@ class AIAgent:
                 if timestamp is not None:
                     msg["timestamp"] = timestamp
 
-    def _persist_session(self, messages: List[Dict], conversation_history: List[Dict] = None):
+    async def _persist_session(self, messages: List[Dict], conversation_history: List[Dict] = None):
         """Save session state to both JSON log and SQLite on any exit path.
 
         Ensures conversations are never lost, even on errors or early returns.
@@ -1896,31 +1807,37 @@ class AIAgent:
         """
         # Scaffolding removal mutates the live list (desired — ephemeral
         # retry/failure sentinels must not survive into the real transcript).
-        # Close and turn-start persistence can run on separate CLI threads; the
-        # marker test-and-append below must be one critical section or both can
-        # observe the same unmarked dict and write duplicate durable rows.
+        # Close and turn-start persistence can run from separate tasks; the
+        # async persistence lock keeps marker checks and durable appends in one
+        # critical section.
         from agent.agent_runtime_helpers import note_turn_persisted
 
-        persist_lock = getattr(self, "_session_persist_lock", None)
-
-        def _persist_and_drain() -> None:
+        async with self._get_session_persist_lock():
             self._drop_trailing_empty_response_scaffolding(messages)
             self._session_messages = messages
-            self._save_session_log(messages)
-            self._flush_messages_to_session_db(messages, conversation_history)
+            await self._save_session_log(messages)
+            # We already own the per-agent persistence lock. Re-entering the
+            # public flush wrapper would await the same non-reentrant
+            # ``asyncio.Lock`` forever; call the lock-free implementation
+            # directly so log + transcript + token accounting remain one
+            # serialized persistence transaction.
+            await self._flush_messages_to_session_db_unlocked(
+                messages, conversation_history
+            )
             # Drain async token-accounting deltas at every persist point (turn
             # finalize + error exits) so a crash after this line loses at most
             # the in-flight API call's delta. Cheap no-op when nothing queued.
             if self._session_db is not None:
-                self._session_db.flush_token_counts()
+                # Keep persistence duck-typed for lightweight session-store
+                # adapters used by the batch/training harness.  The built-in
+                # SessionDB implements this drain, while an adapter that only
+                # supports message writes should not make an otherwise
+                # durable turn fail on exit.
+                session_db = self._session_db
+                flush_token_counts = getattr(session_db, "flush_token_counts", None)
+                if callable(flush_token_counts):
+                    await flush_token_counts()
             note_turn_persisted(self)
-
-        if persist_lock is None:
-            _persist_and_drain()
-            return
-
-        with persist_lock:
-            _persist_and_drain()
 
     def _drop_trailing_empty_response_scaffolding(self, messages: List[Dict]) -> None:
         """Remove private empty-response retry/failure scaffolding from transcript tails.
@@ -1980,19 +1897,18 @@ class AIAgent:
         from agent.agent_runtime_helpers import repair_message_sequence
         return repair_message_sequence(self, messages)
 
-    def _flush_messages_to_session_db(
+    async def _flush_messages_to_session_db(
         self,
         messages: List[Dict],
         conversation_history: Optional[List[Dict]] = None,
     ):
         """Serialize direct and turn-boundary session flushes per agent."""
-        persist_lock = getattr(self, "_session_persist_lock", None)
-        if persist_lock is None:
-            return self._flush_messages_to_session_db_unlocked(messages, conversation_history)
-        with persist_lock:
-            return self._flush_messages_to_session_db_unlocked(messages, conversation_history)
+        async with self._get_session_persist_lock():
+            return await self._flush_messages_to_session_db_unlocked(
+                messages, conversation_history
+            )
 
-    def _flush_messages_to_session_db_unlocked(
+    async def _flush_messages_to_session_db_unlocked(
         self,
         messages: List[Dict],
         conversation_history: Optional[List[Dict]] = None,
@@ -2039,7 +1955,7 @@ class AIAgent:
         try:
             # Retry row creation if the earlier attempt failed transiently.
             if not self._session_db_created:
-                self._ensure_db_session()
+                await self._ensure_db_session()
             # Positional flushing used to slice at
             # max(len(conversation_history), _last_flushed_db_idx). That
             # assumes the live `messages` list is the original history plus a
@@ -2096,10 +2012,6 @@ class AIAgent:
                 ):
                     _scan_start += 1
 
-            # Collect this flush's new rows and write them in ONE transaction
-            # at the end of the scan (see append_messages_batch).
-            _batch_rows: List[Dict[str, Any]] = []
-            _batch_msgs: List[Dict] = []
             for _msg_idx in range(_scan_start, len(messages)):
                 msg = messages[_msg_idx]
                 if not isinstance(msg, dict):
@@ -2218,48 +2130,36 @@ class AIAgent:
                     ]
                 elif isinstance(msg.get("tool_calls"), list):
                     tool_calls_data = msg["tool_calls"]
-                _batch_rows.append({
-                    "role": role,
-                    "content": content,
-                    "tool_name": msg.get("tool_name"),
-                    "tool_calls": tool_calls_data,
-                    "tool_call_id": msg.get("tool_call_id"),
-                    "finish_reason": msg.get("finish_reason"),
-                    # Reasoning/codex fields are role-gated (assistant-only)
-                    # inside _insert_message_rows — pass through untouched.
-                    "reasoning": msg.get("reasoning"),
-                    "reasoning_content": msg.get("reasoning_content"),
-                    "reasoning_details": msg.get("reasoning_details"),
-                    "codex_reasoning_items": msg.get("codex_reasoning_items"),
-                    "codex_message_items": msg.get("codex_message_items"),
-                    "timestamp": _row_timestamp,
-                    "api_content": _row_api_content,
-                    "display_kind": (
+                session_db = self._session_db
+                if session_db is None:
+                    return None
+                await session_db.append_message(
+                    session_id=self.session_id,
+                    role=role,
+                    content=content,
+                    tool_name=msg.get("tool_name"),
+                    tool_calls=tool_calls_data,
+                    tool_call_id=msg.get("tool_call_id"),
+                    finish_reason=msg.get("finish_reason"),
+                    reasoning=msg.get("reasoning") if role == "assistant" else None,
+                    reasoning_content=msg.get("reasoning_content") if role == "assistant" else None,
+                    reasoning_details=msg.get("reasoning_details") if role == "assistant" else None,
+                    codex_reasoning_items=msg.get("codex_reasoning_items") if role == "assistant" else None,
+                    codex_message_items=msg.get("codex_message_items") if role == "assistant" else None,
+                    timestamp=_row_timestamp,
+                    api_content=_row_api_content,
+                    display_kind=(
                         "hidden"
                         if msg.get(COMPRESSED_SUMMARY_METADATA_KEY)
                         and not msg.get("_compressed_summary_has_user_turn")
                         else msg.get("display_kind")
                     ),
-                    "display_metadata": msg.get("display_metadata"),
-                })
-                _batch_msgs.append(msg)
-            # One transaction for the whole turn's new rows (typically 3-8
-            # messages): one BEGIN IMMEDIATE / commit — and, off WAL, one
-            # fsync — instead of one per row. All-or-nothing pairs exactly
-            # with the marker stamping below: on failure NO rows landed and
-            # NO markers were stamped, so the next flush re-scans and
-            # re-writes the whole tail (same recovery contract as before,
-            # minus the partial-prefix case that could double-pay counters).
-            if _batch_rows:
-                self._session_db.append_messages_batch(
-                    session_id=self.session_id,
-                    messages=_batch_rows,
+                    display_metadata=msg.get("display_metadata"),
                     compression_lock_holder=getattr(
                         self, "_active_compression_lock_holder", None
                     ),
                 )
-                for _written in _batch_msgs:
-                    _written[_DB_PERSISTED_MARKER] = True
+                msg[_DB_PERSISTED_MARKER] = True
             # The intrinsic markers are now the sole source of truth. Reset the
             # one-shot seed so no id() outlives this flush to alias a message
             # allocated next turn at a recycled address.
@@ -2317,7 +2217,7 @@ class AIAgent:
         from agent.agent_runtime_helpers import convert_to_trajectory_format
         return convert_to_trajectory_format(self, messages, user_query, completed)
 
-    def _save_trajectory(self, messages: List[Dict[str, Any]], user_query: str, completed: bool):
+    async def _save_trajectory(self, messages: List[Dict[str, Any]], user_query: str, completed: bool):
         """
         Save conversation trajectory to JSONL file.
         
@@ -2330,7 +2230,7 @@ class AIAgent:
             return
         
         trajectory = self._convert_to_trajectory_format(messages, user_query, completed)
-        _save_trajectory_to_file(trajectory, self.model, completed)
+        await _save_trajectory_to_file(trajectory, self.model, completed)
 
     @staticmethod
     def _is_entitlement_failure(
@@ -2817,7 +2717,7 @@ class AIAgent:
             }
         )
 
-    def _invoke_api_request_error_hook(
+    async def _invoke_api_request_error_hook(
         self,
         *,
         task_id: str,
@@ -2843,7 +2743,7 @@ class AIAgent:
             if not _lifecycle.has_hook("api_request_error"):
                 return
             ended_at = time.time()
-            _lifecycle.invoke_hook(
+            await _lifecycle.invoke_hook(
                 "api_request_error",
                 task_id=task_id,
                 turn_id=turn_id,
@@ -2872,7 +2772,7 @@ class AIAgent:
         except Exception:
             pass
 
-    def _dump_api_request_debug(
+    async def _dump_api_request_debug(
         self,
         api_kwargs: Dict[str, Any],
         *,
@@ -2881,7 +2781,9 @@ class AIAgent:
     ) -> Optional[Path]:
         """Forwarder — see ``agent.agent_runtime_helpers.dump_api_request_debug``."""
         from agent.agent_runtime_helpers import dump_api_request_debug
-        return dump_api_request_debug(self, api_kwargs, reason=reason, error=error)
+        return await dump_api_request_debug(
+            self, api_kwargs, reason=reason, error=error
+        )
 
     @staticmethod
     def _clean_session_content(content: str) -> str:
@@ -2923,7 +2825,7 @@ class AIAgent:
             return redacted
         return content
 
-    def _save_session_log(self, messages: List[Dict[str, Any]] = None):
+    async def _save_session_log(self, messages: List[Dict[str, Any]] = None):
         """Optional per-session JSON snapshot writer.
 
         Gated by ``sessions.write_json_snapshots`` (default False).  state.db
@@ -2944,6 +2846,9 @@ class AIAgent:
         if not messages:
             return
 
+        import aiofiles
+        import aiofiles.os
+
         # Re-derive the target path each call so /branch and /compress
         # session-id changes land in the right file without any re-point
         # bookkeeping at the call sites.  Sanitize the session ID into a
@@ -2957,6 +2862,7 @@ class AIAgent:
             return
 
         try:
+            await aiofiles.os.makedirs(self.logs_dir, exist_ok=True)
             cleaned = []
             for msg in messages:
                 # Mirror the SQLite flush: ephemeral recovery scaffolding is
@@ -2979,18 +2885,20 @@ class AIAgent:
             # Guard: never overwrite a larger session log with fewer messages.
             # Protects against data loss when a resumed agent starts with
             # partial history and would otherwise clobber the full JSON log.
-            if log_file.exists():
-                try:
-                    existing = json.loads(log_file.read_text(encoding="utf-8"))
-                    existing_count = existing.get("message_count", len(existing.get("messages", [])))
-                    if existing_count > len(cleaned):
-                        logging.debug(
-                            "Skipping session log overwrite: existing has %d messages, current has %d",
-                            existing_count, len(cleaned),
-                        )
-                        return
-                except Exception:
-                    pass  # corrupted existing file — allow the overwrite
+            try:
+                async with aiofiles.open(log_file, encoding="utf-8") as existing_file:
+                    existing = json.loads(await existing_file.read())
+                existing_count = existing.get("message_count", len(existing.get("messages", [])))
+                if existing_count > len(cleaned):
+                    logging.debug(
+                        "Skipping session log overwrite: existing has %d messages, current has %d",
+                        existing_count, len(cleaned),
+                    )
+                    return
+            except FileNotFoundError:
+                pass
+            except Exception:
+                pass  # corrupted existing file — allow the overwrite
 
             entry = {
                 "session_id": self.session_id,
@@ -3005,24 +2913,27 @@ class AIAgent:
                 "messages": cleaned,
             }
 
-            atomic_json_write(
-                log_file,
-                entry,
-                indent=2,
-                default=str,
-            )
+            temporary_file = log_file.with_name(f".{log_file.name}.tmp")
+            async with aiofiles.open(temporary_file, "w", encoding="utf-8") as output:
+                await output.write(json.dumps(entry, indent=2, default=str))
+            await aiofiles.os.replace(temporary_file, log_file)
 
         except Exception as e:
             if self.verbose_logging:
                 logging.warning(f"Failed to save session log: {e}")
 
 
-    def interrupt(self, message: Optional[str] = None, *, hard_cancel: bool = False) -> None:
+    def interrupt(
+        self,
+        message: Optional[str] = None,
+        *,
+        hard_cancel: bool = False,
+    ) -> None:
         """
         Request the agent to interrupt its current tool-calling loop.
         
-        Call this from another thread (e.g., input handler, message receiver)
-        to gracefully stop the agent and process a new message.
+        Call this from another task on the same event loop to gracefully stop
+        the agent and process a new message.
         
         Also signals long-running tool executions (e.g. terminal commands)
         to terminate early, so the agent can respond immediately.
@@ -3030,120 +2941,39 @@ class AIAgent:
         Args:
             message: Optional new message that triggered the interrupt.
                      If provided, the agent will include this in its response context.
-            hard_cancel: Mark this as an explicit stop rather than a redirect or
-                         incoming-message interrupt. Compression may honor this
-                         atomic signal even while ordinary interrupts are masked.
         
-        Example (CLI):
-            # In a separate input thread:
-            if user_typed_something:
-                agent.interrupt(user_input)
-        
-        Example (Messaging):
-            # When new message arrives for active session:
+        Example (async service):
+            # When new input arrives for an active session:
             if session_has_running_agent:
                 running_agent.interrupt(new_message.text)
         """
-        # A hard stop and redirect share one lock so /stop cannot race with an
-        # accepted correction and accidentally turn itself into a retry.
-        def _admit_hard_cancel() -> None:
-            event = getattr(self, "_hard_interrupt_requested", None)
-            if event is None:
-                return
-            fence = vars(self).get("_active_compression_commit_fence")
-            cancel_before_commit = getattr(
-                type(fence), "cancel_before_commit", None
-            )
-            if callable(cancel_before_commit):
-                try:
-                    # This sets the Event while holding the same lock used by
-                    # begin_commit(). If commit already won, it waits for that
-                    # tracked mutation to finish before publishing the stop.
-                    cancel_before_commit(fence, event)
-                    return
-                except Exception:
-                    logger.debug(
-                        "Compression hard-cancel fence admission failed",
-                        exc_info=True,
-                    )
-            event.set()
+        # These mutations contain no await boundary, so they are atomic with
+        # respect to other tasks on the owning event loop.
+        self._interrupt_requested = True
+        self._interrupt_message = message
+        self._pending_redirect = None
+        if hard_cancel:
+            self._hard_interrupt_requested.set()
 
-        _redirect_lock = getattr(self, "_pending_redirect_lock", None)
-        if _redirect_lock is not None:
-            with _redirect_lock:
-                self._interrupt_requested = True
-                self._interrupt_message = message
-                if hard_cancel:
-                    _admit_hard_cancel()
-                self._pending_redirect = None
-        else:
-            self._interrupt_requested = True
-            self._interrupt_message = message
-            if hard_cancel:
-                _admit_hard_cancel()
-            self._pending_redirect = None
-
-        # Codex app-server owns its model/tool loop and watches a private
-        # interrupt event rather than Hermes' per-thread flag.
-        if getattr(self, "api_mode", None) == "codex_app_server":
-            _codex_session = getattr(self, "_codex_session", None)
-            _request_interrupt = getattr(_codex_session, "request_interrupt", None)
-            if callable(_request_interrupt):
-                try:
-                    _request_interrupt()
-                except Exception:
-                    logger.debug(
-                        "Failed to interrupt Codex app-server turn",
-                        exc_info=True,
-                    )
-
-        # A cron turn performs its API request on the conversation thread to
-        # avoid the nested interrupt-worker deadlock.  Unlike the normal worker
-        # path, its client is registered here so this cross-thread interrupt can
-        # still shut down the active sockets promptly.
+        # The active native client registers an abort callback so a sibling
+        # service task can shut down the in-flight request promptly.
         _abort_active_request = getattr(self, "_active_request_abort", None)
         if callable(_abort_active_request):
             try:
                 _abort_active_request("interrupt_abort")
             except Exception:
                 logger.debug("Failed to abort active inline request", exc_info=True)
-        # Signal all tools to abort any in-flight operations immediately.
-        # Scope the interrupt to this agent's execution thread so other
-        # agents running in the same process (gateway) are not affected.
-        if self._execution_thread_id is not None:
-            _set_interrupt(True, self._execution_thread_id)
-            self._interrupt_thread_signal_pending = False
-        else:
-            # The interrupt arrived before run_conversation() finished
-            # binding the agent to its execution thread. Defer the tool-level
-            # interrupt signal until startup completes instead of targeting
-            # the caller thread by mistake.
-            self._interrupt_thread_signal_pending = True
-        # Fan out to concurrent-tool worker threads.  Those workers run tools
-        # on their own tids (ThreadPoolExecutor workers), so `is_interrupted()`
-        # inside a tool only sees an interrupt when their specific tid is in
-        # the `_interrupted_threads` set.  Without this propagation, an
-        # already-running concurrent tool (e.g. a terminal command hung on
-        # network I/O) never notices the interrupt and has to run to its own
-        # timeout.  See `_run_tool` for the matching entry/exit bookkeeping.
-        # `getattr` fallback covers test stubs that build AIAgent via
-        # object.__new__ and skip __init__.
-        _tracker = getattr(self, "_tool_worker_threads", None)
-        _tracker_lock = getattr(self, "_tool_worker_threads_lock", None)
-        if _tracker is not None and _tracker_lock is not None:
-            with _tracker_lock:
-                _worker_tids = list(_tracker)
-            for _wtid in _worker_tids:
-                try:
-                    _set_interrupt(True, _wtid)
-                except Exception:
-                    pass
+        # Tool tasks inherit this event through the conversation ContextVar.
+        # The event exists before a turn starts, so pre-start interrupts are
+        # preserved without a deferred thread-id handoff.
+        _set_interrupt(True, self._interrupt_event)
         # Propagate interrupt to any running child agents (subagent delegation)
-        with self._active_children_lock:
-            children_copy = list(self._active_children)
+        children_copy = list(self._active_children)
         for child in children_copy:
             try:
                 if hard_cancel:
+                    from agent.interrupt_compat import request_hard_interrupt
+
                     request_hard_interrupt(child, message)
                 else:
                     child.interrupt(message)
@@ -3153,69 +2983,31 @@ class AIAgent:
             print("\n⚡ Interrupt requested" + (f": '{message[:40]}...'" if message and len(message) > 40 else f": '{message}'" if message else ""))
 
     def hard_interrupt(self, message: Optional[str] = None) -> None:
-        """Request an explicit stop while preserving ``interrupt()`` ABI.
-
-        Frontends can feature-detect this method and fall back to the legacy
-        ``interrupt()`` signature for synthetic or third-party agents.
-        """
-        # Deliberately bypass dynamic dispatch: subclasses written against the
-        # legacy interrupt(message=None) ABI may override interrupt without the
-        # newer keyword-only hard_cancel argument.
+        """Request an explicit stop while preserving the interrupt ABI."""
         AIAgent.interrupt(self, message, hard_cancel=True)
 
     def clear_interrupt(self, *, preserve_redirect: bool = False) -> bool:
-        """Clear the interrupt request and per-thread tool signal.
+        """Clear the interrupt request and task-local tool signal.
 
         ``preserve_redirect`` is used only by the conversation loop after it
         intentionally cancels a model request to rebuild that same logical
         turn. Public hard-stop paths keep the default and clear everything.
         """
-        _redirect_lock = getattr(self, "_pending_redirect_lock", None)
-        if _redirect_lock is not None:
-            with _redirect_lock:
-                if preserve_redirect and not self._pending_redirect:
-                    return False
-                self._interrupt_requested = False
-                self._interrupt_message = None
-                getattr(self, "_hard_interrupt_requested", threading.Event()).clear()
-                if not preserve_redirect:
-                    self._pending_redirect = None
-        else:
-            if preserve_redirect and not getattr(self, "_pending_redirect", None):
-                return False
-            self._interrupt_requested = False
-            self._interrupt_message = None
-            getattr(self, "_hard_interrupt_requested", threading.Event()).clear()
-            if not preserve_redirect:
-                self._pending_redirect = None
-        self._interrupt_thread_signal_pending = False
-        if self._execution_thread_id is not None:
-            _set_interrupt(False, self._execution_thread_id)
-        # Also clear any concurrent-tool worker thread bits.  Tracked
-        # workers normally clear their own bit on exit, but an explicit
-        # clear here guarantees no stale interrupt can survive a turn
-        # boundary and fire on a subsequent, unrelated tool call that
-        # happens to get scheduled onto the same recycled worker tid.
-        # `getattr` fallback covers test stubs that build AIAgent via
-        # object.__new__ and skip __init__.
-        _tracker = getattr(self, "_tool_worker_threads", None)
-        _tracker_lock = getattr(self, "_tool_worker_threads_lock", None)
-        if _tracker is not None and _tracker_lock is not None:
-            with _tracker_lock:
-                _worker_tids = list(_tracker)
-            for _wtid in _worker_tids:
-                try:
-                    _set_interrupt(False, _wtid)
-                except Exception:
-                    pass
+        if preserve_redirect and not getattr(self, "_pending_redirect", None):
+            return False
+        self._interrupt_requested = False
+        self._interrupt_message = None
+        hard_interrupt = getattr(self, "_hard_interrupt_requested", None)
+        if hard_interrupt is not None:
+            hard_interrupt.clear()
+        if not preserve_redirect:
+            self._pending_redirect = None
+        _set_interrupt(False, self._interrupt_event)
         # A hard interrupt supersedes any pending /steer — the steer was
         # meant for the agent's next tool-call iteration, which will no
         # longer happen. Drop it instead of surprising the user with a
         # late injection on the post-interrupt turn.
-        _steer_lock = getattr(self, "_pending_steer_lock", None)
-        if _steer_lock is not None:
-            with _steer_lock:
-                self._pending_steer = None
+        self._pending_steer = None
         return True
 
     def steer(self, text: str) -> bool:
@@ -3227,8 +3019,8 @@ class AIAgent:
         result's content once the current tool batch finishes. The model
         sees the steer as part of the tool output on its next iteration.
 
-        Thread-safe: callable from gateway/CLI/TUI threads. Multiple calls
-        before the drain point concatenate with newlines.
+        Task-safe on the owning event loop. Multiple calls before the drain
+        point concatenate with newlines.
 
         Args:
             text: The user text to inject. Empty strings are ignored.
@@ -3239,19 +3031,8 @@ class AIAgent:
         if not text or not text.strip():
             return False
         cleaned = text.strip()
-        _lock = getattr(self, "_pending_steer_lock", None)
-        if _lock is None:
-            # Test stubs that built AIAgent via object.__new__ skip __init__.
-            # Fall back to direct attribute set; no concurrent callers expected
-            # in those stubs.
-            existing = getattr(self, "_pending_steer", None)
-            self._pending_steer = (existing + "\n" + cleaned) if existing else cleaned
-            return True
-        with _lock:
-            if self._pending_steer:
-                self._pending_steer = self._pending_steer + "\n" + cleaned
-            else:
-                self._pending_steer = cleaned
+        existing = getattr(self, "_pending_steer", None)
+        self._pending_steer = (existing + "\n" + cleaned) if existing else cleaned
         return True
 
     def redirect(self, text: str) -> bool:
@@ -3262,34 +3043,12 @@ class AIAgent:
         the displayed partial reasoning as plain assistant context, appends the
         correction as a real user message, and retries. During tool execution
         it degrades to ``steer()`` so the tool can finish at a safe boundary.
-        Codex app-server has a native ``turn/steer`` operation and uses it
-        directly instead of cancelling.
-
         Returns ``False`` when there is no live turn or the text is empty, so
         surfaces can fall back to their existing next-turn queue.
         """
         if not text or not text.strip():
             return False
         cleaned = text.strip()
-
-        # Codex owns its internal reasoning/tool loop, so use its first-class
-        # active-turn steering protocol rather than interrupting the subprocess.
-        if getattr(self, "api_mode", None) == "codex_app_server":
-            _codex_session = getattr(self, "_codex_session", None)
-            _native_steer = getattr(_codex_session, "request_steer", None)
-            if callable(_native_steer):
-                _redirect_lock = getattr(self, "_pending_redirect_lock", None)
-                if _redirect_lock is not None:
-                    with _redirect_lock:
-                        if self._interrupt_requested:
-                            return False
-                elif self._interrupt_requested:
-                    return False
-                try:
-                    return bool(_native_steer(cleaned))
-                except Exception:
-                    logger.debug("Codex app-server turn/steer failed", exc_info=True)
-                    return False
 
         # Never kill a tool merely to deliver conversational guidance. The
         # existing steer drain puts it on the final tool result before the next
@@ -3298,46 +3057,22 @@ class AIAgent:
             return self.steer(cleaned)
 
         _model_active = getattr(self, "_model_request_active", None)
-        _redirect_lock = getattr(self, "_pending_redirect_lock", None)
-        if _redirect_lock is None:
-            if _model_active is None or not _model_active.is_set():
-                return False
-            existing = getattr(self, "_pending_redirect", None)
-            if self._interrupt_requested and not existing:
-                return False
-            self._pending_redirect = (
-                f"{existing}\n\n[Additional user correction]\n{cleaned}"
-                if existing
-                else cleaned
-            )
-            self._interrupt_requested = True
-            self._interrupt_message = None
-        else:
-            with _redirect_lock:
-                if _model_active is None or not _model_active.is_set():
-                    # The response completed before we acquired the state lock.
-                    # Reject so the surface queues a new turn.
-                    return False
-                if self._interrupt_requested and not self._pending_redirect:
-                    return False
-                if self._pending_redirect:
-                    self._pending_redirect = (
-                        f"{self._pending_redirect}\n\n"
-                        f"[Additional user correction]\n{cleaned}"
-                    )
-                else:
-                    self._pending_redirect = cleaned
-                self._interrupt_requested = True
-                self._interrupt_message = None
+        if _model_active is None or not _model_active.is_set():
+            return False
+        existing = getattr(self, "_pending_redirect", None)
+        if self._interrupt_requested and not existing:
+            return False
+        self._pending_redirect = (
+            f"{existing}\n\n[Additional user correction]\n{cleaned}"
+            if existing
+            else cleaned
+        )
+        self._interrupt_requested = True
+        self._interrupt_message = None
 
         # Interrupt only the model request. Do not fan out to tool workers or
         # child agents as interrupt() does.
-        _execution_thread_id = getattr(self, "_execution_thread_id", None)
-        if _execution_thread_id is not None:
-            _set_interrupt(True, _execution_thread_id)
-            self._interrupt_thread_signal_pending = False
-        else:
-            self._interrupt_thread_signal_pending = True
+        _set_interrupt(True, self._interrupt_event)
         _abort_active_request = getattr(self, "_active_request_abort", None)
         if callable(_abort_active_request):
             try:
@@ -3348,38 +3083,22 @@ class AIAgent:
 
     def _has_pending_redirect(self) -> bool:
         """Return whether an active-turn redirect is waiting to be applied."""
-        _redirect_lock = getattr(self, "_pending_redirect_lock", None)
-        if _redirect_lock is None:
-            return bool(getattr(self, "_pending_redirect", None))
-        with _redirect_lock:
-            return bool(self._pending_redirect)
+        return bool(getattr(self, "_pending_redirect", None))
 
     def _drain_pending_redirect(self) -> Optional[str]:
         """Return and clear pending active-turn correction text."""
-        _redirect_lock = getattr(self, "_pending_redirect_lock", None)
-        if _redirect_lock is None:
-            text = getattr(self, "_pending_redirect", None)
-            self._pending_redirect = None
-            return text
-        with _redirect_lock:
-            text = self._pending_redirect
-            self._pending_redirect = None
+        text = getattr(self, "_pending_redirect", None)
+        self._pending_redirect = None
         return text
 
     def _drain_pending_steer(self) -> Optional[str]:
         """Return the pending steer text (if any) and clear the slot.
 
-        Safe to call from the agent execution thread after appending tool
-        results. Returns None when no steer is pending.
+        Safe to call from the owning event loop after appending tool results.
+        Returns None when no steer is pending.
         """
-        _lock = getattr(self, "_pending_steer_lock", None)
-        if _lock is None:
-            text = getattr(self, "_pending_steer", None)
-            self._pending_steer = None
-            return text
-        with _lock:
-            text = self._pending_steer
-            self._pending_steer = None
+        text = getattr(self, "_pending_steer", None)
+        self._pending_steer = None
         return text
 
     def _record_file_mutation_result(
@@ -3425,7 +3144,7 @@ class AIAgent:
             for path in targets:
                 state.pop(path, None)
 
-    def _file_mutation_verifier_enabled(self) -> bool:
+    async def _file_mutation_verifier_enabled(self) -> bool:
         """Check whether the per-turn file-mutation verifier footer is on.
 
         Config path: ``display.file_mutation_verifier`` (bool, default True).
@@ -3441,8 +3160,8 @@ class AIAgent:
             # Read from the persisted config.yaml so gateway and CLI share
             # the same setting.  Import lazily to avoid a startup-time cycle.
             try:
-                from hermes_cli.config import load_config as _load_config
-                _cfg = _load_config() or {}
+                from hermes_cli.config import load_config_readonly
+                _cfg = await load_config_readonly()
             except Exception:
                 _cfg = {}
             _display = _cfg.get("display") if isinstance(_cfg, dict) else None
@@ -3522,7 +3241,7 @@ class AIAgent:
         # double-wrapped).
         return cls._neutralize_footer_paths("\n".join(lines))
 
-    def _turn_completion_explainer_enabled(self) -> bool:
+    async def _turn_completion_explainer_enabled(self) -> bool:
         """Check whether the end-of-turn completion explainer footer is on.
 
         Config path: ``display.turn_completion_explainer`` (bool, default
@@ -3538,8 +3257,8 @@ class AIAgent:
             # Read from the persisted config.yaml so gateway and CLI share
             # the same setting.  Import lazily to avoid a startup-time cycle.
             try:
-                from hermes_cli.config import load_config as _load_config
-                _cfg = _load_config() or {}
+                from hermes_cli.config import load_config_readonly
+                _cfg = await load_config_readonly()
             except Exception:
                 _cfg = {}
             _display = _cfg.get("display") if isinstance(_cfg, dict) else None
@@ -3643,8 +3362,8 @@ class AIAgent:
                 prefix
                 + "the turn was stopped because session storage could not be "
                 "written (the transcript would have been lost on restart). "
-                "This is often a full disk — free some space (or fix state.db "
-                "permissions), then send your message again."
+                "Check disk space / permissions for the state DB, then send "
+                "your message again."
             )
         # Unknown/diagnostic-only reasons (e.g. "unknown", guardrail_halt
         # which already surfaces its own message) — don't second-guess.
@@ -3655,130 +3374,27 @@ class AIAgent:
         from agent.agent_runtime_helpers import apply_pending_steer_to_tool_results
         return apply_pending_steer_to_tool_results(self, messages, num_tool_msgs)
 
-    def _touch_activity(
-        self,
-        desc: str,
-        *,
-        provenance: Optional[ActivityProvenance] = None,
-        force_persist: bool = False,
-    ) -> None:
-        """Update the last-activity timestamp and description (thread-safe).
+    def _touch_activity(self, desc: str) -> None:
+        """Update the last-activity timestamp and description.
 
         Also bridges to the kanban board's heartbeat fields when this
         process is a dispatcher-spawned worker (HERMES_KANBAN_TASK set),
         so the dispatcher watchdog doesn't reclaim an actively-running
         worker as stale (#31752). Bridge is rate-limited (60s) and
         best-effort — it never raises into the agent loop.
-
-        Separately, rate-limits a durable SessionDB activity projection
-        (``last_activity_at`` + bounded description/provenance) so
-        CLI/Gateway consumers share one observation source (#72016 / #72039).
-
-        ``provenance`` defaults to ``unknown`` (the ordinary agent activity
-        clock). Named values are for special writers (e.g. compression);
-        ordinary call sites should leave the default.
-
-        ``force_persist`` bypasses the 60s SessionDB rate limit so a
-        terminal stamp (e.g. compression completed) is not dropped.
         """
-        from agent.session_activity import (
-            bound_activity_description,
-            normalize_activity_provenance,
-            reset_session_activity_persist_window,
-        )
-
         self._last_activity_ts = time.time()
-        self._last_activity_desc = bound_activity_description(desc)
-        self._last_activity_provenance = normalize_activity_provenance(provenance)
+        self._last_activity_desc = desc
         if os.environ.get("HERMES_KANBAN_TASK"):
             try:
-                from tools.kanban_tools import (
-                    heartbeat_current_worker_from_env,
-                    inject_new_comments_from_env,
-                )
+                from tools.kanban_tools import heartbeat_current_worker_from_env
                 heartbeat_current_worker_from_env()
-                # Fold any new operator notes into the running turn (OUT-OF-BAND
-                # steer) so the user can talk to a live task without a restart.
-                inject_new_comments_from_env(self)
             except Exception:
                 # Never let the bridge break the agent loop.  The function
                 # already swallows exceptions internally; this outer guard
                 # covers import-time failures (kanban_tools unavailable,
                 # etc.) on niche deployment surfaces.
                 pass
-        if force_persist:
-            reset_session_activity_persist_window(self)
-        self._persist_session_activity_if_due()
-
-    def _persist_session_activity_if_due(self) -> None:
-        """Best-effort durable activity heartbeat for SessionDB consumers.
-
-        Cadence is pinned by SESSION_ACTIVITY_HEARTBEAT_MIN_INTERVAL_SECONDS
-        (>=30s per session, config-independent — see agent/session_activity.py).
-        The write rides the standard SessionDB ``_execute_write`` patience
-        path via ``touch_session_activity``. Fail-open: a failed heartbeat
-        write must NEVER raise into the agent loop (swallow + debug-log).
-        """
-        session_id = getattr(self, "session_id", None)
-        session_db = getattr(self, "_session_db", None)
-        if not session_id or session_db is None:
-            return
-        touch = getattr(session_db, "touch_session_activity", None)
-        if not callable(touch):
-            return
-        from agent.session_activity import (
-            SESSION_ACTIVITY_HEARTBEAT_MIN_INTERVAL_SECONDS,
-            normalize_activity_provenance,
-        )
-
-        now_mono = time.monotonic()
-        last_mono = getattr(self, "_session_activity_last_persist_mono", 0.0)
-        if (now_mono - last_mono) < SESSION_ACTIVITY_HEARTBEAT_MIN_INTERVAL_SECONDS:
-            return
-        self._session_activity_last_persist_mono = now_mono
-        try:
-            touch(
-                session_id,
-                getattr(self, "_last_activity_ts", None),
-                description=getattr(self, "_last_activity_desc", None),
-                provenance=normalize_activity_provenance(
-                    getattr(self, "_last_activity_provenance", None)
-                ),
-            )
-        except Exception:
-            # Never let durable heartbeat I/O break the agent loop. The
-            # heartbeat is an observation-only projection; the next due
-            # window retries naturally.
-            logger.debug(
-                "session activity heartbeat write failed (ignored)",
-                exc_info=True,
-            )
-
-    def _reset_activity_labels_after_turn(self) -> None:
-        """Drop mid-turn activity labels once the turn is no longer running.
-
-        Keeps ``_last_activity_ts`` so idle/watchdog clocks stay continuous
-        across interrupt-recursive turns (#15654) and between turns. Clears
-        description + provenance so idle cached agents / SessionDB listings
-        do not keep advertising the last mid-turn stamp (e.g. compression
-        or tool execution) after the turn ended (#72039).
-        """
-        from agent.session_activity import ActivityProvenance
-
-        self._last_activity_desc = ""
-        self._last_activity_provenance = ActivityProvenance.UNKNOWN
-        session_id = getattr(self, "session_id", None)
-        session_db = getattr(self, "_session_db", None)
-        if not session_id or session_db is None:
-            return
-        clear = getattr(session_db, "clear_session_activity_labels", None)
-        if not callable(clear):
-            return
-        try:
-            clear(session_id)
-        except Exception:
-            # Never let durable cleanup I/O break turn teardown.
-            pass
 
     def _capture_rate_limits(self, http_response: Any) -> None:
         """Parse x-ratelimit-* headers from an HTTP response and cache the state.
@@ -3946,17 +3562,10 @@ class AIAgent:
         cached = getattr(self, "_credits_notices_enabled_cache", None)
         if cached is not None:
             return cached
-        enabled = True
-        try:
-            from hermes_cli.config import load_config as _load_config
-            _cfg = _load_config() or {}
-            _display = _cfg.get("display") if isinstance(_cfg, dict) else None
-            if isinstance(_display, dict) and "credits_notices" in _display:
-                enabled = bool(_display.get("credits_notices"))
-        except Exception:
-            enabled = True
-        self._credits_notices_enabled_cache = enabled
-        return enabled
+        # The async turn prologue populates this snapshot before any response
+        # callback can run. A callback may also fire while a legacy client is
+        # being constructed, so fail open rather than reading config here.
+        return True
 
     def get_credits_state(self):
         """Return the last captured CreditsState, or None."""
@@ -3993,51 +3602,24 @@ class AIAgent:
     def get_activity_summary(self) -> dict:
         """Return a snapshot of the agent's current activity for diagnostics.
 
-        Exposes the shared activity observation contract
-        (``last_activity_at`` / ``last_activity_description`` /
-        ``last_activity_provenance``) plus short aliases
-        (``last_activity_ts`` / ``last_activity_desc`` / …) for existing
-        gateway and delegate readers.
+        Called by the gateway timeout handler to report what the agent was doing
+        when it was killed, and by the periodic "still working" notifications.
         """
-        from agent.session_activity import (
-            ActivityProvenance,
-            build_activity_snapshot,
-        )
-
-        provenance = getattr(self, "_last_activity_provenance", None)
-        if provenance is None:
-            provenance = ActivityProvenance.UNKNOWN
-        return build_activity_snapshot(
-            last_activity_at=getattr(self, "_last_activity_ts", None),
-            last_activity_description=getattr(self, "_last_activity_desc", None) or "",
-            last_activity_provenance=provenance,
-            extra={
+        elapsed = time.time() - self._last_activity_ts
+        return {
+            "last_activity_ts": self._last_activity_ts,
+            "last_activity_desc": self._last_activity_desc,
+            "seconds_since_activity": round(elapsed, 1),
             "current_tool": self._current_tool,
             "api_call_count": self._api_call_count,
             "max_iterations": self.max_iterations,
             "budget_used": self.iteration_budget.used,
             "budget_max": self.iteration_budget.max_total,
-            },
-        )
+        }
 
-    def shutdown_memory_provider(self, messages: list = None) -> None:
-        """Shut down the memory provider and context engine — call at actual session boundaries.
-
-        This calls on_session_end() then shutdown_all() on the memory
-        manager, and on_session_end() on the context engine.
-        NOT called per-turn — only at CLI exit, /reset, gateway
-        session expiry, etc.
-        """
-        if self._memory_manager:
-            try:
-                self._memory_manager.on_session_end(messages or [])
-            except Exception as e:
-                logger.warning("Memory provider on_session_end failed during shutdown: %s", e, exc_info=True)
-            try:
-                self._memory_manager.shutdown_all()
-            except Exception:
-                pass
-        # Notify context engine of session end (flush DAG, close DBs, etc.)
+    async def shutdown_memory_provider(self, messages: list = None) -> None:
+        """Finish native context state at a real session boundary."""
+        # Notify the built-in context engine of the session boundary.
         if hasattr(self, "context_compressor") and self.context_compressor:
             try:
                 self.context_compressor.on_session_end(
@@ -4047,16 +3629,8 @@ class AIAgent:
             except Exception:
                 pass
 
-    def commit_memory_session(self, messages: list = None) -> None:
-        """Trigger end-of-session extraction without tearing providers down.
-        Called when session_id rotates (e.g. /new, context compression);
-        providers keep their state and continue running under the old
-        session_id — they just flush pending extraction now."""
-        if self._memory_manager:
-            try:
-                self._memory_manager.on_session_end(messages or [])
-            except Exception:
-                pass
+    async def commit_memory_session(self, messages: list = None) -> None:
+        """Commit built-in context-engine state at a compression boundary."""
         # Notify context engine of session end too — same lifecycle moment as
         # the memory manager's on_session_end. Without this, engines that
         # accumulate per-session state (DAGs, summaries) leak that state from
@@ -4072,134 +3646,29 @@ class AIAgent:
             except Exception:
                 pass
 
-    def _sync_external_memory_for_turn(
-        self,
-        *,
-        original_user_message: Any,
-        final_response: Any,
-        interrupted: bool,
-        messages: list | None = None,
-    ) -> None:
-        """Mirror a completed turn into external memory providers.
-
-        Called at the end of ``run_conversation`` with the cleaned user
-        message (``original_user_message``) and the finalised assistant
-        response.  The external memory backend gets both ``sync_all`` (to
-        persist the exchange) and ``queue_prefetch_all`` (to start
-        warming context for the next turn) in one shot.
-
-        Uses ``original_user_message`` rather than ``user_message``
-        because the latter may carry injected skill content that bloats
-        or breaks provider queries.
-
-        Interrupted turns are skipped entirely (#15218).  A partial
-        assistant output, an aborted tool chain, or a mid-stream reset
-        is not durable conversational truth — mirroring it into an
-        external memory backend pollutes future recall with state the
-        user never saw completed.  The prefetch is gated on the same
-        flag: the user's next message is almost certainly a retry of
-        the same intent, and a prefetch keyed on the interrupted turn
-        would fire against stale context.
-
-        Normal completed turns still sync as before.  The whole body is
-        wrapped in ``try/except Exception`` because external memory
-        providers are strictly best-effort — a misconfigured or offline
-        backend must not block the user from seeing their response.
-        """
-        if interrupted:
-            return
-        if not (self._memory_manager and final_response and original_user_message):
-            return
-        # Multimodal turns carry content as a list of typed parts; providers
-        # expect plain strings, so flatten to text first (newline-joined for
-        # memory, vs the default space-join used for log/trajectory previews).
-        user_text = _summarize_user_message_for_log(original_user_message, sep="\n")
-        response_text = _summarize_user_message_for_log(final_response, sep="\n")
-        if not (user_text and response_text):
-            return
-        try:
-            sync_kwargs = {"session_id": self.session_id or ""}
-            if messages is not None:
-                sync_kwargs["messages"] = messages
-            self._memory_manager.sync_all(
-                user_text,
-                response_text,
-                **sync_kwargs,
-            )
-            # Sibling of the build_turn_context() prefetch gate: warming the
-            # next turn's recall with a trivial prompt ("hi", "thanks") keys
-            # provider searches on zero-signal text — skip it. The sync above
-            # still runs so the turn itself is persisted.
-            if not is_trivial_prompt(user_text):
-                self._memory_manager.queue_prefetch_all(
-                    user_text,
-                    session_id=self.session_id or "",
-                )
-        except Exception:
-            pass
-
-    def release_clients(self) -> None:
-        """Release LLM client resources WITHOUT tearing down session tool state.
-
-        Used by the gateway when evicting this agent from _agent_cache for
-        memory-management reasons (LRU cap or idle TTL) — the session may
-        resume at any time with a freshly-built AIAgent that reuses the
-        same task_id / session_id, so we must NOT kill:
-          - process_registry entries for task_id (user's bg shells)
-          - terminal sandbox for task_id (cwd, env, shell state)
-          - browser daemon for task_id (open tabs, cookies)
-          - computer-use backend for task_id (native target and browser refs)
-          - memory provider (has its own lifecycle; keeps running)
-
-        We DO close:
-          - OpenAI/httpx client pool (big chunk of held memory + sockets;
-            the rebuilt agent gets a fresh client anyway)
-          - Active child subagents (per-turn artefacts; safe to drop)
-
-        Safe to call multiple times.  Distinct from close() — which is the
-        hard teardown for actual session boundaries (/new, /reset, session
-        expiry).
-        """
-        # Close active child agents (per-turn; no cross-turn persistence).
-        try:
-            with self._active_children_lock:
-                children = list(self._active_children)
-                self._active_children.clear()
-            for child in children:
-                try:
-                    child.release_clients()
-                except Exception:
-                    # Fall back to full close on children; they're per-turn.
-                    try:
-                        child.close()
-                    except Exception:
-                        pass
-        except Exception:
-            pass
-
-        # Retire the OpenAI/httpx client to release sockets immediately.
-        # #70773: eviction runs on the gateway's memory-manager thread — a
-        # cross-thread hard close of the shared client can release TLS FDs
-        # under a still-unwinding worker (FD-recycle → SQLite corruption).
-        # Retirement shuts the pooled sockets down (the memory/socket win we
-        # want here) and lets GC release the FDs once no thread holds them.
-        try:
-            client = getattr(self, "client", None)
-            if client is not None:
-                self._retire_shared_openai_client(client, reason="cache_evict")
-                self.client = None
-        except Exception:
-            pass
-
-        # Also drop the cached per-request wire client (reused across
-        # sequential LLM calls) — same socket/memory rationale as above.
-        try:
-            self._close_cached_request_openai_client(reason="cache_evict")
-        except Exception:
-            pass
-
-    def close(self) -> None:
+    async def close(self) -> None:
         """Release all resources held by this agent instance.
+
+        The lock is held across the complete cleanup coroutine.  Keeping the
+        acquire/release boundary here (rather than around individual steps)
+        guarantees cancellation can never strand an agent in a permanently
+        locked closing state.
+        """
+        close_lock = self._get_close_lock()
+        await close_lock.acquire()
+        try:
+            await self._close_unlocked()
+        except asyncio.CancelledError:
+            # Teardown may have completed only partially.  Allow a later
+            # close attempt to finish the remaining resources instead of
+            # treating the cancelled attempt as a successful idempotent close.
+            self._closed = False
+            raise
+        finally:
+            close_lock.release()
+
+    async def _close_unlocked(self) -> None:
+        """Perform resource teardown while the close lock is held.
 
         Cleans up subprocess resources that would otherwise become orphans:
         - Background processes tracked in ProcessRegistry
@@ -4212,67 +3681,106 @@ class AIAgent:
         Safe to call multiple times (idempotent).  Each cleanup step is
         independently guarded so a failure in one does not prevent the rest.
         """
-        task_id = getattr(self, "session_id", None) or ""
+        if getattr(self, "_closed", False):
+            return
 
-        # 1. Kill background processes for this task
+        # A caller may close an agent from a request-scope task while its turn
+        # is still awaiting a provider or tool.  Cancel that task first and
+        # wait for its finalizer, so the native clients, terminal children,
+        # and session writes are not torn down underneath active work.
+        active_turn = getattr(self, "_active_turn_task", None)
+        current_task = asyncio.current_task()
+        if (
+            active_turn is not None
+            and active_turn is not current_task
+            and not active_turn.done()
+        ):
+            active_turn.cancel()
+            try:
+                await active_turn
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.debug("Active turn failed while closing agent", exc_info=True)
+
+        self._closed = True
+
+        task_ids = set(getattr(self, "_task_ids", set()) or ())
+        current_task_id = getattr(self, "_current_task_id", None)
+        if current_task_id:
+            task_ids.add(current_task_id)
+        session_id = getattr(self, "session_id", None)
+        if session_id:
+            task_ids.add(session_id)
+
+        # 1. Terminate/reap native background terminal commands and release
+        # their local environment bookkeeping on this event loop.  The legacy
+        # ProcessRegistry is synchronous and is not used by the async runtime.
         try:
-            from tools.process_registry import process_registry
-            process_registry.kill_all(task_id=task_id)
+            for task_id in task_ids or {"default"}:
+                await cleanup_vm(task_id)
+            task_ids.clear()
+            self._task_ids = set()
         except Exception:
             pass
 
-        # 2. Clean terminal sandbox environments
+        # 2. Close active child agents
         try:
-            cleanup_vm(task_id)
-        except Exception:
-            pass
-
-        # 3. Clean browser daemon sessions
-        try:
-            cleanup_browser(task_id)
-        except Exception:
-            pass
-
-        # 4. Release the session-owned computer-use backend.  This ends the
-        # exact cua-driver session, drops typed-browser refs/grants, and stops
-        # a private embedded daemon when Hermes YOLO selected unrestricted
-        # mode.  The import is lazy so sessions without computer_use retain
-        # the narrow core footprint.
-        try:
-            from tools.computer_use import release_computer_use_session
-
-            release_computer_use_session(task_id)
-        except Exception:
-            pass
-
-        # 5. Close active child agents
-        try:
-            with self._active_children_lock:
-                children = list(self._active_children)
-                self._active_children.clear()
+            children = list(self._active_children)
+            self._active_children.clear()
             for child in children:
                 try:
-                    child.close()
+                    close_child = getattr(child, "close", None)
+                    if callable(close_child):
+                        await close_child()
                 except Exception:
                     pass
         except Exception:
             pass
 
-        # 6. Close the OpenAI/httpx client
-        try:
-            client = getattr(self, "client", None)
-            if client is not None:
-                self._close_openai_client(client, reason="agent_close", shared=True)
-                self.client = None
-        except Exception:
-            pass
+        # Native clients are owned by the agent and closed on the event loop
+        # that consumed them. ``client`` covers OpenAI-compatible, Codex,
+        # Gemini, and MoA transports; Anthropic keeps its provider-specific
+        # slot because it does not expose the OpenAI-shaped interface.
+        closed_client_ids: set[int] = set()
+        for attribute in ("client", "_anthropic_client"):
+            client = getattr(self, attribute, None)
+            if client is None:
+                continue
+            if id(client) in closed_client_ids:
+                setattr(self, attribute, None)
+                continue
+            closed_client_ids.add(id(client))
+            try:
+                close_client = getattr(client, "aclose", None) or getattr(client, "close", None)
+                if callable(close_client) and inspect.iscoroutinefunction(
+                    inspect.unwrap(close_client)
+                ):
+                    await close_client()
+                elif callable(close_client):
+                    logger.error(
+                        "Native async client %s exposes only a synchronous close()",
+                        attribute,
+                    )
+            except Exception:
+                logger.debug("Client close failed for %s", attribute, exc_info=True)
+            finally:
+                setattr(self, attribute, None)
+        self._anthropic_client_source = None
 
-        # 6b. Close the cached per-request wire client (reused across
-        # sequential LLM calls; see _create_request_openai_client).
-        try:
-            self._close_cached_request_openai_client(reason="agent_close")
-        except Exception:
-            pass
+        # MCP transports are shared by agents on this async runtime. Release
+        # this instance's lease and close them only after the final consumer.
+        if getattr(self, "_mcp_lifecycle_retained", False):
+            try:
+                from tools.mcp_tool import release_mcp_lifecycle
+
+                await release_mcp_lifecycle(self)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.debug("MCP lifecycle release failed", exc_info=True)
+            else:
+                self._mcp_lifecycle_retained = False
 
         # 7. Free conversation history.  Mirrors _release_evicted_agent_soft's
         # soft-eviction clear — close() is the hard teardown for true session
@@ -4285,15 +3793,6 @@ class AIAgent:
         except Exception:
             pass
 
-        # The references above are now gone; on Linux/glibc, return their free
-        # heap pages immediately instead of retaining the process RSS high-water
-        # mark until exit.  This helper is a safe no-op on other allocators.
-        try:
-            from hermes_cli.mem_trim import trim_memory
-            trim_memory(force=True, reason="agent close")
-        except Exception:
-            pass
-
         # 8. Finalize the owned SQLite session row unless this agent is only a
         # temporary helper that deliberately handed session ownership forward
         # (manual compression helpers that rotate to a continuation session_id,
@@ -4303,12 +3802,19 @@ class AIAgent:
         # 'cron_complete' / 'cli_close' reason set by an earlier terminal path.
         try:
             if getattr(self, "_end_session_on_close", True):
-                session_db = getattr(self, "_session_db", None)
+                session_db = self._session_db
                 session_id = getattr(self, "session_id", None)
                 if session_db and session_id:
-                    session_db.end_session(session_id, "agent_close")
+                    await session_db.end_session(session_id, "agent_close")
         except Exception:
             pass
+        try:
+            session_db = getattr(self, "_session_db", None)
+            if session_db is not None:
+                await session_db.close()
+                self._session_db = None
+        except Exception:
+            logger.debug("Async session DB close failed", exc_info=True)
 
     def _hydrate_todo_store(self, history: List[Dict[str, Any]]) -> None:
         """
@@ -4426,15 +3932,15 @@ class AIAgent:
 
 
 
-    def _build_system_prompt_parts(self, system_message: str = None) -> Dict[str, str]:
+    async def _build_system_prompt_parts(self, system_message: str = None) -> Dict[str, str]:
         """Forwarder — see ``agent.system_prompt.build_system_prompt_parts``."""
         from agent.system_prompt import build_system_prompt_parts
-        return build_system_prompt_parts(self, system_message=system_message)
+        return await build_system_prompt_parts(self, system_message=system_message)
 
-    def _build_system_prompt(self, system_message: str = None) -> str:
+    async def _build_system_prompt(self, system_message: str = None) -> str:
         """Forwarder — see ``agent.system_prompt.build_system_prompt``."""
         from agent.system_prompt import build_system_prompt
-        return build_system_prompt(self, system_message=system_message)
+        return await build_system_prompt(self, system_message=system_message)
 
     @staticmethod
     def _get_tool_call_id_static(tc) -> str:
@@ -4617,10 +4123,10 @@ class AIAgent:
         from agent.agent_runtime_helpers import repair_tool_call
         return repair_tool_call(self, tool_name)
 
-    def _invalidate_system_prompt(self):
+    async def _invalidate_system_prompt(self):
         """Forwarder — see ``agent.system_prompt.invalidate_system_prompt``."""
         from agent.system_prompt import invalidate_system_prompt
-        invalidate_system_prompt(self)
+        await invalidate_system_prompt(self)
 
     @staticmethod
     def _deterministic_call_id(fn_name: str, arguments: str, index: int = 0) -> str:
@@ -4645,951 +4151,22 @@ class AIAgent:
         """Build a valid Responses `function_call.id` (must start with `fc_`)."""
         return _codex_derive_responses_function_call_id(call_id, response_item_id)
 
-    def _thread_identity(self) -> str:
-        thread = threading.current_thread()
-        return f"{thread.name}:{thread.ident}"
+    @staticmethod
+    def _task_identity() -> str:
+        try:
+            task = asyncio.current_task()
+        except RuntimeError:
+            task = None
+        return f"{task.get_name()}:{id(task):x}" if task is not None else "no-task"
 
     def _client_log_context(self) -> str:
         provider = getattr(self, "provider", "unknown")
         base_url = getattr(self, "base_url", "unknown")
         model = getattr(self, "model", "unknown")
         return (
-            f"thread={self._thread_identity()} provider={provider} "
+            f"task={self._task_identity()} provider={provider} "
             f"base_url={base_url} model={model}"
         )
-
-    def _openai_client_lock(self) -> threading.RLock:
-        lock = getattr(self, "_client_lock", None)
-        if lock is None:
-            lock = threading.RLock()
-            self._client_lock = lock
-        return lock
-
-    @staticmethod
-    def _is_openai_client_closed(client: Any) -> bool:
-        """Check if an OpenAI client is closed.
-
-        Handles both property and method forms of is_closed:
-        - httpx.Client.is_closed is a bool property
-        - openai.OpenAI.is_closed is a method returning bool
-
-        Prior bug: getattr(client, "is_closed", False) returned the bound method,
-        which is always truthy, causing unnecessary client recreation on every call.
-        """
-        from unittest.mock import Mock
-
-        if isinstance(client, Mock):
-            return False
-
-        is_closed_attr = getattr(client, "is_closed", None)
-        if is_closed_attr is not None:
-            # Handle method (openai SDK) vs property (httpx)
-            if callable(is_closed_attr):
-                if is_closed_attr():
-                    return True
-            elif bool(is_closed_attr):
-                return True
-
-        http_client = getattr(client, "_client", None)
-        if http_client is not None:
-            return bool(getattr(http_client, "is_closed", False))
-        return False
-
-    @staticmethod
-    def _build_keepalive_http_client(base_url: str = "", *, verify: Any = True) -> Any:
-        """Build an httpx.Client with proactive idle-connection reaping.
-
-        Previously this method injected a custom ``httpx.HTTPTransport``
-        with ``socket_options`` (``SO_KEEPALIVE``, ``TCP_KEEPIDLE``, …) to
-        prevent CLOSE-WAIT accumulation on long-lived connections (#10324).
-
-        That approach broke streaming for providers behind reverse proxies
-        (OpenResty, Cloudflare, etc.) because the custom socket options
-        conflict with the proxy's chunked-transfer handling (#54049,
-        #12952).  It also stripped ``TCP_NODELAY``, stalling TLS handshakes
-        and SSE encoding.
-
-        The fix moves connection lifecycle management from the socket layer
-        to the HTTP pool layer: ``keepalive_expiry=20.0`` tells httpx to
-        close idle pooled connections *before* a reverse proxy's typical
-        30–60 s timeout drops them, preventing CLOSE-WAIT accumulation
-        without modifying socket options.  The default httpx transport
-        preserves OS TCP defaults (including ``TCP_NODELAY``).
-
-        ``verify`` carries per-provider ``ssl_ca_cert`` / ``ssl_verify`` and
-        ``HERMES_CA_BUNDLE`` settings.  It is passed on the client AND on
-        the plain no-proxy mounts (a mounted transport owns the SSL context
-        for its scheme).
-        """
-        try:
-            import httpx as _httpx
-
-            # Explicitly read proxy settings so requests route through
-            # HTTP_PROXY / HTTPS_PROXY / NO_PROXY correctly.
-            _proxy = _get_proxy_for_base_url(base_url)
-
-            # Proactive pool reaping: close idle connections at 20 s,
-            # before reverse proxies (30–60 s typical) send FIN and
-            # cause CLOSE-WAIT accumulation.
-            _limits = _httpx.Limits(
-                max_keepalive_connections=20,
-                max_connections=100,
-                keepalive_expiry=20.0,
-            )
-
-            # Timeouts: generous read=None for SSE streaming endpoints.
-            _timeout = _httpx.Timeout(
-                connect=15.0,
-                read=None,
-                write=15.0,
-                pool=10.0,
-            )
-
-            # When _proxy is None (NO_PROXY bypass or no proxy configured),
-            # mount plain transports to prevent httpx from reading env proxy
-            # vars and creating an HTTPProxy mount that would bypass our
-            # NO_PROXY resolution.
-            _mounts = {}
-            if _proxy is None:
-                _mounts = {
-                    "http://": _httpx.HTTPTransport(verify=verify),
-                    "https://": _httpx.HTTPTransport(verify=verify),
-                }
-            return _httpx.Client(
-                limits=_limits,
-                timeout=_timeout,
-                proxy=_proxy,
-                mounts=_mounts or None,
-                verify=verify,
-            )
-        except Exception:
-            return None
-
-    def _create_openai_client(self, client_kwargs: dict, *, reason: str, shared: bool) -> Any:
-        """Forwarder — see ``agent.agent_runtime_helpers.create_openai_client``."""
-        from agent.agent_runtime_helpers import create_openai_client
-        return create_openai_client(self, client_kwargs, reason=reason, shared=shared)
-
-    @staticmethod
-    def _force_close_tcp_sockets(client: Any) -> int:
-        """Forwarder — see ``agent.agent_runtime_helpers.force_close_tcp_sockets``."""
-        from agent.agent_runtime_helpers import force_close_tcp_sockets
-        return force_close_tcp_sockets(client)
-
-    def _close_openai_client(self, client: Any, *, reason: str, shared: bool) -> None:
-        if client is None:
-            return
-        # Force-close TCP sockets first to prevent CLOSE-WAIT accumulation,
-        # then do the graceful SDK-level close.
-        force_closed = self._force_close_tcp_sockets(client)
-        try:
-            client.close()
-            logger.info(
-                "OpenAI client closed (%s, shared=%s, tcp_force_closed=%d) %s",
-                reason,
-                shared,
-                force_closed,
-                self._client_log_context(),
-            )
-        except Exception as exc:
-            logger.debug(
-                "OpenAI client close failed (%s, shared=%s) %s error=%s",
-                reason,
-                shared,
-                self._client_log_context(),
-                exc,
-            )
-
-    def _retire_shared_openai_client(self, client: Any, *, reason: str) -> None:
-        """Ownership-safe retirement of a replaced shared OpenAI client.
-
-        #70773 / #67142 / #29507: ``client.close()`` releases the pool's raw
-        FDs from the *calling* thread. The shared primary client has no single
-        owning thread — worker threads from stale-killed attempts may still be
-        unwinding their SSL BIOs, and the codex-direct / MoA paths stream on
-        the shared client itself. If we release an FD while another thread's
-        SSL layer still caches the raw integer fd, the kernel can recycle it
-        into an unrelated ``open()`` (e.g. ``kanban.db``) and the unwinding
-        TLS flush then writes an application-data record into that file — the
-        SQLite-header corruption documented in #29507/#70773.
-
-        Only an owner may release FDs, and a replaced shared client has none.
-        So nobody calls ``close()``: we ``shutdown()`` the pooled sockets
-        (FD-safe from any thread; unblocks in-flight readers with EOF/EPIPE)
-        and defer the actual FD release to garbage collection. Refcounting
-        guarantees the underlying sockets are only collected once every
-        thread that borrowed the client has unwound — GC *is* the ownership
-        handshake. In the common case (no borrower) the refcount hits zero on
-        this line and the FDs are released immediately anyway.
-        """
-        if client is None:
-            return
-        try:
-            shutdown_count = self._force_close_tcp_sockets(client)
-            logger.info(
-                "Shared OpenAI client retired (%s, tcp_shutdown=%d, "
-                "fd_release=deferred_to_gc) %s",
-                reason,
-                shutdown_count,
-                self._client_log_context(),
-            )
-        except Exception as exc:
-            logger.debug(
-                "Shared OpenAI client retire failed (%s) %s error=%s",
-                reason,
-                self._client_log_context(),
-                exc,
-            )
-
-    def _replace_primary_openai_client(self, *, reason: str) -> bool:
-        with self._openai_client_lock():
-            old_client = getattr(self, "client", None)
-            try:
-                new_client = self._create_openai_client(self._client_kwargs, reason=reason, shared=True)
-            except Exception as exc:
-                logger.warning(
-                    "Failed to rebuild shared OpenAI client (%s) %s error=%s",
-                    reason,
-                    self._client_log_context(),
-                    exc,
-                )
-                return False
-            self.client = new_client
-        # #70773: never hard-close the replaced shared client from here — the
-        # caller may not be the thread whose request is still unwinding on the
-        # old pool (credential rotation and dead-connection cleanup run on the
-        # turn thread while stale-killed workers unwind; the codex-direct path
-        # streams on the shared client itself). Retire it instead: sockets are
-        # shut down (FD-safe), FD release deferred to GC.
-        self._retire_shared_openai_client(old_client, reason=f"replace:{reason}")
-        return True
-
-    def _ensure_primary_openai_client(self, *, reason: str) -> Any:
-        with self._openai_client_lock():
-            client = getattr(self, "client", None)
-            if client is not None and not self._is_openai_client_closed(client):
-                return client
-            old_client = client
-            try:
-                new_client = self._create_openai_client(
-                    self._client_kwargs, reason=reason, shared=True
-                )
-            except Exception as exc:
-                logger.warning(
-                    "Failed to recreate closed OpenAI client (%s) %s error=%s",
-                    reason,
-                    self._client_log_context(),
-                    exc,
-                )
-                raise RuntimeError("Failed to recreate closed OpenAI client") from exc
-            self.client = new_client
-
-        logger.warning(
-            "Detected closed shared OpenAI client; recreated before use (%s) %s",
-            reason,
-            self._client_log_context(),
-        )
-        self._close_openai_client(old_client, reason=f"replace:{reason}", shared=True)
-        return new_client
-
-    def _cleanup_dead_connections(self) -> bool:
-        """Forwarder — see ``agent.agent_runtime_helpers.cleanup_dead_connections``."""
-        from agent.agent_runtime_helpers import cleanup_dead_connections
-        return cleanup_dead_connections(self)
-
-    @staticmethod
-    def _api_kwargs_have_image_parts(api_kwargs: dict) -> bool:
-        """Return True when the outbound request still contains native image parts."""
-        if not isinstance(api_kwargs, dict):
-            return False
-        candidates = []
-        messages = api_kwargs.get("messages")
-        if isinstance(messages, list):
-            candidates.extend(messages)
-        # Responses API payloads use `input`; after conversion, image parts can
-        # still be present there instead of in `messages`.
-        response_input = api_kwargs.get("input")
-        if isinstance(response_input, list):
-            candidates.extend(response_input)
-
-        def _contains_image(value: Any) -> bool:
-            if isinstance(value, dict):
-                ptype = value.get("type")
-                if ptype in {"image_url", "input_image"}:
-                    return True
-                return any(_contains_image(v) for v in value.values())
-            if isinstance(value, list):
-                return any(_contains_image(v) for v in value)
-            return False
-
-        return any(_contains_image(item) for item in candidates)
-
-    def _copilot_headers_for_request(self, *, is_vision: bool) -> dict:
-        from hermes_cli.copilot_auth import copilot_request_headers
-
-        return copilot_request_headers(is_agent_turn=True, is_vision=is_vision)
-
-    # Close reasons the request workers' own ``finally`` unwind reports for
-    # a request that produced a response — the only closes that both come
-    # from the thread that owns the pool's FDs AND attest a healthy pool.
-    # Only these may keep the wire client for the next call, and poisoning
-    # still wins: a cross-thread abort (#29507) marks the slot so even a
-    # worker-finally close discards it. Every other reason (error cleanups,
-    # stale/interrupt kills, retry cleanups) gets a real close, so a retry
-    # after a request error always builds a fresh pool.
-    _REQUEST_CLIENT_REUSE_REASONS = frozenset({
-        "request_complete",
-        "stream_request_complete",
-    })
-
-    def _request_client_cache_ref(self) -> dict:
-        # Lazy init — tests build agents via AIAgent.__new__ without __init__.
-        cache = getattr(self, "_request_client_cache", None)
-        if cache is None:
-            cache = {"client": None, "kwargs": None, "poisoned": False, "in_use": False}
-            self._request_client_cache = cache
-        return cache
-
-    def _create_request_openai_client(self, *, reason: str, api_kwargs: Optional[dict] = None) -> Any:
-        from unittest.mock import Mock
-
-        primary_client = self._ensure_primary_openai_client(reason=reason)
-        if self.provider == "moa":
-            return primary_client
-        if isinstance(primary_client, Mock):
-            return primary_client
-        with self._openai_client_lock():
-            request_kwargs = dict(self._client_kwargs)
-        # Per-request OpenAI-wire clients (used by both the non-streaming
-        # chat-completions path and the streaming chat-completions path
-        # in `_interruptible_api_call`) should not run the SDK's built-in
-        # retry loop: the agent's outer loop owns retries with credential
-        # rotation, provider fallback, and backoff that the SDK can't
-        # see. Leaving SDK retries on (default 2) compounds with our outer
-        # retries and lets a single hung provider request stretch to ~3x
-        # the per-call timeout before our stale detector reports it.
-        # Shared/primary clients and Anthropic / Bedrock paths are
-        # unaffected (they don't go through here).
-        request_kwargs["max_retries"] = 0
-        if (
-            base_url_host_matches(str(request_kwargs.get("base_url", "")), "githubcopilot.com")
-            and self._api_kwargs_have_image_parts(api_kwargs or {})
-        ):
-            request_kwargs["default_headers"] = self._copilot_headers_for_request(is_vision=True)
-        # Reuse the cached wire client while the effective kwargs are
-        # unchanged: constructing openai.OpenAI + its httpx pool costs
-        # ~19-35ms per LLM call (fresh TCP+TLS handshake), ~5x per turn.
-        # The cache is a single checked-out slot: `in_use` prevents two
-        # concurrent calls from sharing one pool's close/abort lifecycle
-        # (a second concurrent call gets a fresh untracked client with
-        # the old build-per-request behavior).
-        stale = None
-        with self._openai_client_lock():
-            cache = self._request_client_cache_ref()
-            cached = cache["client"]
-            if cached is not None and not cache["in_use"]:
-                if (
-                    not cache["poisoned"]
-                    and cache["kwargs"] == request_kwargs
-                    and not self._is_openai_client_closed(cached)
-                ):
-                    cache["in_use"] = True
-                    return cached
-                # kwargs changed (credential rotation, provider failover),
-                # poisoned by a cross-thread abort (#29507), or externally
-                # closed — never reuse; discard and rebuild below.
-                stale = cached
-                cache["client"] = None
-                cache["kwargs"] = None
-                cache["poisoned"] = False
-        if stale is not None:
-            # Safe to close from this thread: in_use was False, so no
-            # worker thread owns the pool's FDs (#29507 concerns clients
-            # with an in-flight request on another thread).
-            self._close_openai_client(stale, reason=f"reuse_evict:{reason}", shared=False)
-        client = self._create_openai_client(request_kwargs, reason=reason, shared=False)
-        with self._openai_client_lock():
-            cache = self._request_client_cache_ref()
-            if cache["client"] is None:
-                cache["client"] = client
-                # Snapshot nested dicts (default_headers): rotation sites
-                # assign fresh inner dicts today, but an aliased inner
-                # object would compare equal even after in-place mutation.
-                cache["kwargs"] = {
-                    k: dict(v) if isinstance(v, dict) else v
-                    for k, v in request_kwargs.items()
-                }
-                cache["poisoned"] = False
-                cache["in_use"] = True
-            # else: a concurrent call holds the slot — hand this client
-            # out untracked; _close_request_openai_client fully closes
-            # untracked clients, preserving the per-request lifecycle.
-        return client
-
-    def _close_request_openai_client(self, client: Any, *, reason: str) -> None:
-        with self._openai_client_lock():
-            cache = self._request_client_cache_ref()
-            if cache["client"] is client:
-                if reason in self._REQUEST_CLIENT_REUSE_REASONS and not cache["poisoned"]:
-                    # Clean finish on the owning thread — keep the wire client
-                    # (and its warm httpx pool) for the next sequential call.
-                    cache["in_use"] = False
-                    return
-                # Failure / kill / abort outcome: drop the slot and fall
-                # through to a real close. This runs on the owning worker
-                # thread, which is where the FD release belongs (#29507).
-                cache["client"] = None
-                cache["kwargs"] = None
-                cache["poisoned"] = False
-                cache["in_use"] = False
-        self._close_openai_client(client, reason=reason, shared=False)
-
-    def _close_cached_request_openai_client(self, *, reason: str) -> None:
-        """Teardown hook: really close the cached per-request wire client."""
-        with self._openai_client_lock():
-            cache = getattr(self, "_request_client_cache", None)
-            client = cache["client"] if cache else None
-            in_use = bool(cache["in_use"]) if cache else False
-            if cache is not None:
-                cache["client"] = None
-                cache["kwargs"] = None
-                cache["poisoned"] = False
-                cache["in_use"] = False
-        if client is None:
-            return
-        if in_use:
-            # A worker thread has this client checked out for an in-flight
-            # request (workers can outlive turns — see interruptible_api_call).
-            # client.close() here would release its FDs from a stranger thread,
-            # the #29507 race teardown must not reintroduce. Abort the sockets
-            # instead; the slot is already cleared, so the worker's own finally
-            # sees an untracked client and does the real close on its thread.
-            self._abort_request_openai_client(client, reason=f"{reason}_in_flight")
-            return
-        self._close_openai_client(client, reason=reason, shared=False)
-
-    def _abort_request_openai_client(self, client: Any, *, reason: str) -> None:
-        """Cross-thread abort: shut sockets down without releasing FDs.
-
-        Companion to :meth:`_close_request_openai_client` for stranger-thread
-        callers (interrupt-check loop, stale-call detector). Calling
-        ``client.close()`` from a thread that does not own the active httpx
-        connection raced the still-live SSL BIO and corrupted unrelated file
-        descriptors when the kernel recycled the just-freed TCP FD (#29507).
-
-        Here we only ``shutdown(SHUT_RDWR)`` the pool's sockets. That unblocks
-        the owning worker thread's pending ``recv``/``send`` with an EOF or
-        ``EPIPE`` so it can unwind and close ``client`` from its own context
-        — which is where the FD release belongs.
-        """
-        if client is None:
-            return
-        # A pool whose sockets were shut down from a stranger thread must
-        # never be reused: poison the cache slot so the owner-thread close
-        # discards it and the next create builds a fresh client.
-        with self._openai_client_lock():
-            cache = self._request_client_cache_ref()
-            if cache["client"] is client:
-                cache["poisoned"] = True
-        try:
-            shutdown_count = self._force_close_tcp_sockets(client)
-            # tcp_force_closed=0 means the stranger-thread abort found no
-            # sockets to shut down — the worker stays blocked in recv and the
-            # provider keeps the slot (#72975). Surface that as WARNING so it
-            # cannot be mistaken for a successful abort in the logs.
-            _log = logger.warning if shutdown_count == 0 else logger.info
-            _log(
-                "OpenAI client aborted (%s, shared=False, tcp_force_closed=%d, "
-                "deferred_close=stranger_thread) %s%s",
-                reason,
-                shutdown_count,
-                self._client_log_context(),
-                (
-                    " — no sockets found; in-flight request may keep running "
-                    "until the provider finishes"
-                    if shutdown_count == 0
-                    else ""
-                ),
-            )
-        except Exception as exc:
-            logger.debug(
-                "OpenAI client abort failed (%s, shared=False) %s error=%s",
-                reason,
-                self._client_log_context(),
-                exc,
-            )
-
-    def _create_request_anthropic_client(self, *, reason: str) -> Any:
-        """Build a request-local Anthropic client for one in-flight call.
-
-        The shared ``_anthropic_client`` stays the long-lived primary, but the
-        stale/interrupt watchdog runs on the poll thread and must never call
-        ``close()`` on the client whose TLS socket a worker thread is still
-        reading: releasing that FD from a stranger thread lets the kernel
-        recycle it under a still-live SSL BIO, which then writes a TLS record
-        into an unrelated SQLite header (#29507 / #67142). A per-request client
-        lets the stranger thread ``shutdown()`` the socket while the owning
-        worker performs the SDK-level close from its own context — the same
-        ownership contract the OpenAI-wire path already uses.
-
-        Mirrors ``_rebuild_anthropic_client`` construction (direct + Bedrock,
-        1M-beta drop) but returns a fresh client instead of swapping the shared
-        one.
-        """
-        if self.api_mode == "anthropic_messages":
-            self._try_refresh_anthropic_client_credentials()
-        _drop_1m = bool(getattr(self, "_oauth_1m_beta_disabled", False))
-        if getattr(self, "provider", None) == "bedrock":
-            from agent.anthropic_adapter import build_anthropic_bedrock_client
-            region = getattr(self, "_bedrock_region", "us-east-1") or "us-east-1"
-            client = build_anthropic_bedrock_client(region)
-        else:
-            from agent.anthropic_adapter import build_anthropic_client
-            client = build_anthropic_client(
-                self._anthropic_api_key,
-                getattr(self, "_anthropic_base_url", None),
-                timeout=get_provider_request_timeout(self.provider, self.model),
-                drop_context_1m_beta=_drop_1m,
-            )
-        logger.debug(
-            "Anthropic request client created (%s, shared=False) provider=%s model=%s",
-            reason,
-            getattr(self, "provider", None),
-            getattr(self, "model", None),
-        )
-        return client
-
-    def _close_request_anthropic_client(self, client: Any, *, reason: str) -> None:
-        """Owner-thread full close of a request-local Anthropic client.
-
-        Force-closes the pool's TCP sockets first (CLOSE-WAIT hygiene, parity
-        with ``_close_openai_client``), then does the graceful SDK close. Safe
-        because the caller owns the connection.
-        """
-        if client is None:
-            return
-        try:
-            self._force_close_tcp_sockets(client)
-            client.close()
-            logger.info(
-                "Anthropic client closed (%s, shared=False) provider=%s model=%s",
-                reason,
-                getattr(self, "provider", None),
-                getattr(self, "model", None),
-            )
-        except Exception as exc:
-            logger.debug(
-                "Anthropic client close failed (%s, shared=False) provider=%s model=%s error=%s",
-                reason,
-                getattr(self, "provider", None),
-                getattr(self, "model", None),
-                exc,
-            )
-
-    def _abort_request_anthropic_client(self, client: Any, *, reason: str) -> None:
-        """Cross-thread abort for request-local Anthropic clients.
-
-        Stranger threads (the interrupt-check / stale-stream detector loop)
-        must not call the SDK ``close()`` — that races the owning worker's live
-        SSL BIO and can recycle a TLS FD into a SQLite header (#29507 /
-        #67142). Only ``shutdown(SHUT_RDWR)`` the pool's sockets so the worker
-        unblocks and releases the FD from its own thread.
-        """
-        if client is None:
-            return
-        try:
-            shutdown_count = self._force_close_tcp_sockets(client)
-            # Same visibility contract as the OpenAI abort path (#72975):
-            # zero sockets shut down means the abort did not unblock the
-            # worker — log WARNING, not a success-shaped INFO.
-            _log = logger.warning if shutdown_count == 0 else logger.info
-            _log(
-                "Anthropic client aborted (%s, shared=False, tcp_force_closed=%d, "
-                "deferred_close=stranger_thread) provider=%s model=%s%s",
-                reason,
-                shutdown_count,
-                getattr(self, "provider", None),
-                getattr(self, "model", None),
-                (
-                    " — no sockets found; in-flight request may keep running "
-                    "until the provider finishes"
-                    if shutdown_count == 0
-                    else ""
-                ),
-            )
-        except Exception as exc:
-            logger.debug(
-                "Anthropic client abort failed (%s, shared=False) provider=%s model=%s error=%s",
-                reason,
-                getattr(self, "provider", None),
-                getattr(self, "model", None),
-                exc,
-            )
-
-    def _run_codex_stream(self, api_kwargs: dict, client: Any = None, on_first_delta: callable = None):
-        """Forwarder — see ``agent.codex_runtime.run_codex_stream``."""
-        from agent.codex_runtime import run_codex_stream
-        return run_codex_stream(self, api_kwargs, client, on_first_delta)
-
-    def _run_codex_create_stream_fallback(self, api_kwargs: dict, client: Any = None):
-        """Forwarder — see ``agent.codex_runtime.run_codex_create_stream_fallback``."""
-        from agent.codex_runtime import run_codex_create_stream_fallback
-        return run_codex_create_stream_fallback(self, api_kwargs, client)
-
-    def _try_refresh_codex_client_credentials(self, *, force: bool = True) -> bool:
-        if self.api_mode != "codex_responses" or self.provider not in {"openai-codex", "xai-oauth"}:
-            return False
-
-        # Guard against silent account swap.
-        #
-        # When an agent is using a non-singleton credential — e.g. a manual
-        # pool entry (``hermes auth add xai-oauth``) whose tokens belong to
-        # a different account than the device_code singleton, or an agent
-        # constructed with an explicit ``api_key=`` arg — force-refreshing
-        # the singleton here and adopting its tokens silently re-routes the
-        # rest of the conversation onto the singleton's account.  The
-        # credential pool's reactive recovery (``_recover_with_credential_pool``)
-        # is the right channel for that case; this path is the
-        # singleton-only fallback used when the pool can't recover, and
-        # MUST only fire when the agent really is on singleton tokens.
-        try:
-            if self.provider == "openai-codex":
-                from hermes_cli.auth import resolve_codex_runtime_credentials
-
-                singleton_now = resolve_codex_runtime_credentials(
-                    refresh_if_expiring=False,
-                )
-            else:
-                from hermes_cli.auth import resolve_xai_oauth_runtime_credentials
-
-                singleton_now = resolve_xai_oauth_runtime_credentials(
-                    refresh_if_expiring=False,
-                )
-        except Exception as exc:
-            logger.debug("%s singleton read failed: %s", self.provider, exc)
-            return False
-
-        singleton_key = str(singleton_now.get("api_key") or "").strip()
-        active_key = str(self.api_key or "").strip()
-        if singleton_key and active_key and singleton_key != active_key:
-            logger.debug(
-                "%s singleton tokens differ from the active api_key; "
-                "skipping singleton force-refresh to avoid silent account swap. "
-                "Reactive credential rotation should go through the pool.",
-                self.provider,
-            )
-            return False
-
-        try:
-            if self.provider == "openai-codex":
-                from hermes_cli.auth import resolve_codex_runtime_credentials
-
-                old_key = str(self.api_key or "").strip()
-                creds = resolve_codex_runtime_credentials(force_refresh=force)
-            else:
-                from hermes_cli.auth import resolve_xai_oauth_runtime_credentials
-
-                old_key = str(self.api_key or "").strip()
-                creds = resolve_xai_oauth_runtime_credentials(force_refresh=force)
-        except Exception as exc:
-            logger.debug("%s credential refresh failed: %s", self.provider, exc)
-            return False
-
-        api_key = creds.get("api_key")
-        base_url = creds.get("base_url")
-        if not isinstance(api_key, str) or not api_key.strip():
-            return False
-        if not isinstance(base_url, str) or not base_url.strip():
-            return False
-
-        # Defect 2 fix: return False when no NEW token was actually minted.
-        # resolve_codex_runtime_credentials returns the same stale token
-        # when the underlying refresh fails (failure is debug-only).
-        # Comparing the access token (api_key) before/after detects this.
-        new_key = api_key.strip()
-        if old_key and new_key == old_key:
-            logger.debug(
-                "%s credential refresh returned the same token; "
-                "refresh likely failed silently",
-                self.provider,
-            )
-            return False
-
-        self.api_key = api_key.strip()
-        self.base_url = base_url.strip().rstrip("/")
-        self._client_kwargs["api_key"] = self.api_key
-        self._client_kwargs["base_url"] = self.base_url
-
-        if not self._replace_primary_openai_client(reason=f"{self.provider}_credential_refresh"):
-            return False
-
-        return True
-
-    def _try_refresh_nous_client_credentials(
-        self,
-        *,
-        force: bool = True,
-    ) -> bool:
-        if self.provider != "nous":
-            return False
-        # Portal serves anthropic/* on the native Messages route, so a session
-        # can be holding either client kind when its short-lived invoke JWT
-        # expires. Both need the refresh or the turn dies on a 401.
-        if self.api_mode not in ("chat_completions", "anthropic_messages"):
-            return False
-
-        try:
-            from hermes_cli.auth import resolve_nous_runtime_credentials
-
-            creds = resolve_nous_runtime_credentials(
-                timeout_seconds=env_float("HERMES_NOUS_TIMEOUT_SECONDS", 15),
-                force_refresh=force,
-            )
-        except Exception as exc:
-            logger.debug("Nous credential refresh failed: %s", exc)
-            return False
-
-        api_key = creds.get("api_key")
-        base_url = creds.get("base_url")
-        if not isinstance(api_key, str) or not api_key.strip():
-            return False
-        if not isinstance(base_url, str) or not base_url.strip():
-            return False
-
-        self.api_key = api_key.strip()
-        self.base_url = base_url.strip().rstrip("/")
-
-        if self.api_mode == "anthropic_messages":
-            self._anthropic_api_key = self.api_key
-            self._anthropic_base_url = self.base_url
-            self._rebuild_anthropic_client()
-            return True
-
-        self._client_kwargs["api_key"] = self.api_key
-        self._client_kwargs["base_url"] = self.base_url
-        # Nous requests should not inherit OpenRouter-only attribution headers.
-        self._client_kwargs.pop("default_headers", None)
-
-        if not self._replace_primary_openai_client(reason="nous_credential_refresh"):
-            return False
-
-        return True
-
-    def _try_refresh_vertex_client_credentials(self) -> bool:
-        """Re-mint the Vertex OAuth2 access token and rebuild the OpenAI client.
-
-        Vertex tokens live ~1 hour. On a long-lived agent (gateway session) a
-        cached client's bearer token will expire mid-session, producing a 401.
-        This re-resolves credentials via the adapter (which refreshes the
-        underlying google-auth Credentials object when near expiry), swaps the
-        new token into the client kwargs, and rebuilds the primary OpenAI
-        client. Returns True when a usable token+base_url were obtained.
-        """
-        if self.api_mode != "chat_completions" or self.provider != "vertex":
-            return False
-
-        try:
-            from agent.vertex_adapter import get_vertex_config
-
-            token, base_url = get_vertex_config()
-        except Exception as exc:
-            logger.debug("Vertex credential refresh failed: %s", exc)
-            return False
-
-        if not isinstance(token, str) or not token.strip():
-            return False
-        if not isinstance(base_url, str) or not base_url.strip():
-            return False
-
-        self.api_key = token.strip()
-        self.base_url = base_url.strip().rstrip("/")
-        self._client_kwargs["api_key"] = self.api_key
-        self._client_kwargs["base_url"] = self.base_url
-
-        if not self._replace_primary_openai_client(reason="vertex_credential_refresh"):
-            return False
-
-        logger.info("Vertex AI OAuth token refreshed")
-        return True
-
-    def _try_refresh_copilot_client_credentials(self) -> bool:
-        """Refresh Copilot credentials and rebuild the shared OpenAI client.
-
-        The raw GitHub OAuth token (`gh auth token`) is usually stable, but the
-        short-TTL *exchanged* IDE token minted from it is what Copilot actually
-        authenticates — and it expires mid-session. A heavy/long turn whose
-        request straddles that expiry gets a clean `401 IDE token expired:
-        unauthorized: token expired`. Simply re-resolving the (unchanged) raw
-        token and rebuilding the client leaves the SAME expired IDE token on the
-        wire, so the retry 401s again and the turn aborts as non-retryable —
-        only a gateway restart helped, because a cold process re-runs the
-        exchange. Fix: force a fresh exchange (evict the cached exchanged JWT,
-        then mint a new one) so the retry carries a valid IDE token. Mirrors the
-        400 stale-credential recovery; the caller enforces the single-shot guard.
-        """
-        if not self._is_copilot_provider():
-            return False
-
-        try:
-            from hermes_cli.copilot_auth import (
-                resolve_copilot_token,
-                get_copilot_api_token,
-                evict_cached_exchanged_token,
-            )
-
-            new_token, token_source = resolve_copilot_token()
-        except Exception as exc:
-            logger.debug("Copilot credential refresh failed: %s", exc)
-            return False
-
-        if not isinstance(new_token, str) or not new_token.strip():
-            return False
-
-        new_token = new_token.strip()
-
-        # Force a fresh IDE-token exchange: the cached exchanged JWT is the thing
-        # that expired ("401 IDE token expired"), so evict it and re-mint before
-        # rebuilding the client. Fall back to the resolved (raw) token only if the
-        # exchange itself is unavailable (network blip) — a client rebuild on the
-        # raw token still clears stale client state and may recover on enterprise
-        # seats where headers matter.
-        try:
-            evict_cached_exchanged_token(new_token)
-            api_token, enterprise_base_url = get_copilot_api_token(new_token)
-            if isinstance(api_token, str) and api_token.strip():
-                new_token = api_token.strip()
-                if enterprise_base_url:
-                    self.base_url = enterprise_base_url.rstrip("/")
-        except Exception as exc:
-            logger.debug("Copilot 401 re-exchange failed, using resolved token: %s", exc)
-
-        self.api_key = new_token
-        self._client_kwargs["api_key"] = self.api_key
-        self._client_kwargs["base_url"] = self.base_url
-        self._apply_client_headers_for_base_url(str(self.base_url or ""))
-
-        if not self._replace_primary_openai_client(reason="copilot_credential_refresh"):
-            return False
-
-        logger.info("Copilot credentials refreshed from %s", token_source)
-        return True
-
-    def _try_recover_stale_copilot_credential(self) -> bool:
-        """Force a fresh Copilot token exchange + client rebuild after a 400.
-
-        Copilot surfaces a stale/degraded credential as a
-        ``400 model_not_available_for_integrator`` /
-        ``model_not_supported`` — NOT a clean 401 — so the normal 401 refresh
-        path never fires. The most common trigger is a raw ``ghu_`` OAuth token
-        that got seeded (and cached) when the startup token exchange degraded:
-        the raw token routes the request to the restricted
-        ``copilot-language-server`` integrator whose allowlist omits
-        enterprise-only models (e.g. ``claude-opus-4.8``).
-
-        Recovery = evict the poisoned cache entry, force a fresh exchange to
-        mint the real ~437-char API token, re-apply the Copilot headers, and
-        rebuild the shared client. Single-shot (guarded by the caller) so a
-        genuinely unavailable model can't loop.
-        """
-        if not self._is_copilot_provider():
-            return False
-
-        try:
-            from hermes_cli.copilot_auth import (
-                resolve_copilot_token,
-                get_copilot_api_token,
-                evict_cached_exchanged_token,
-            )
-
-            raw_token, token_source = resolve_copilot_token()
-            if not isinstance(raw_token, str) or not raw_token.strip():
-                return False
-            raw_token = raw_token.strip()
-
-            # Drop any cached (possibly degraded/raw) exchanged token so the
-            # next exchange hits the network and mints a fresh one.
-            evict_cached_exchanged_token(raw_token)
-
-            api_token, enterprise_base_url = get_copilot_api_token(raw_token)
-        except Exception as exc:
-            logger.debug("Copilot stale-credential recovery failed: %s", exc)
-            return False
-
-        if not isinstance(api_token, str) or not api_token.strip():
-            return False
-
-        # If the exchange STILL degraded to the raw token, a rebuild won't help
-        # — don't burn the single-shot retry on an identical request.
-        if api_token == raw_token and not enterprise_base_url:
-            logger.warning(
-                "Copilot stale-credential recovery: exchange still degraded to "
-                "raw token; skipping retry (network/exchange endpoint unavailable)."
-            )
-            return False
-
-        self.api_key = api_token.strip()
-        if enterprise_base_url:
-            self.base_url = enterprise_base_url.rstrip("/")
-        self._client_kwargs["api_key"] = self.api_key
-        self._client_kwargs["base_url"] = self.base_url
-        self._apply_client_headers_for_base_url(str(self.base_url or ""))
-
-        if not self._replace_primary_openai_client(reason="copilot_stale_credential_recovery"):
-            return False
-
-        logger.info("Copilot credentials re-exchanged after stale-credential 400 (source=%s)", token_source)
-        return True
-
-    def _try_refresh_anthropic_client_credentials(self) -> bool:
-        if self.api_mode != "anthropic_messages" or not hasattr(self, "_anthropic_api_key"):
-            return False
-        # Only refresh credentials for the native Anthropic provider.
-        # Other anthropic_messages providers (MiniMax, Alibaba, etc.) use their own keys.
-        if self.provider != "anthropic":
-            return False
-        # Azure endpoints use static API keys — OAuth token rotation doesn't apply.
-        # Refreshing would pick up ~/.claude/.credentials.json OAuth token and break auth.
-        _base = getattr(self, "_anthropic_base_url", "") or ""
-        if "azure.com" in _base:
-            return False
-
-        try:
-            from agent.anthropic_adapter import resolve_anthropic_token, build_anthropic_client
-
-            new_token = resolve_anthropic_token()
-        except Exception as exc:
-            logger.debug("Anthropic credential refresh failed: %s", exc)
-            return False
-
-        if not isinstance(new_token, str) or not new_token.strip():
-            return False
-        new_token = new_token.strip()
-        if new_token == self._anthropic_api_key:
-            return False
-
-        try:
-            self._anthropic_client.close()
-        except Exception:
-            pass
-
-        try:
-            self._anthropic_client = build_anthropic_client(
-                new_token,
-                getattr(self, "_anthropic_base_url", None),
-                timeout=get_provider_request_timeout(self.provider, self.model),
-            )
-        except Exception as exc:
-            logger.warning("Failed to rebuild Anthropic client after credential refresh: %s", exc)
-            return False
-
-        self._anthropic_api_key = new_token
-        # Update OAuth flag — token type may have changed (API key ↔ OAuth).
-        # Only treat as OAuth on native Anthropic; third-party endpoints using
-        # the Anthropic protocol must not trip OAuth paths (#1739 & third-party
-        # identity-injection guard).
-        from agent.anthropic_adapter import _is_oauth_token
-        self._is_anthropic_oauth = _is_oauth_token(new_token) if self.provider == "anthropic" else False
-        return True
 
     def _apply_client_headers_for_base_url(
         self,
@@ -5665,7 +4242,11 @@ class AIAgent:
             except Exception:
                 logger.debug("custom-provider extra_headers skipped", exc_info=True)
 
-    def _apply_user_default_headers(self) -> None:
+    def _apply_user_default_headers(
+        self,
+        *,
+        config: Optional[Dict[str, Any]] = None,
+    ) -> None:
         """Merge user-configured request headers onto the OpenAI client.
 
         Reads ``model.default_headers`` from config.yaml and merges it onto
@@ -5691,69 +4272,56 @@ class AIAgent:
         from agent.auxiliary_client import (
             _apply_user_default_headers as _merge_user_headers,
         )
-        merged = _merge_user_headers(self._client_kwargs.get("default_headers"))
+        merged = _merge_user_headers(
+            self._client_kwargs.get("default_headers"),
+            config=config,
+        )
         if merged:
             self._client_kwargs["default_headers"] = merged
 
-    def _swap_credential(self, entry) -> None:
-        runtime_key = getattr(entry, "runtime_api_key", None) or getattr(entry, "access_token", "")
-        runtime_base = getattr(entry, "runtime_base_url", None) or getattr(entry, "base_url", None) or self.base_url
+    async def _swap_credential(self, entry) -> None:
+        """Install a selected pool credential through the native async path.
+
+        Credential rotation happens in the retry loop, so it must not rebuild
+        a synchronous SDK client, reload config, or perform OAuth/file I/O.
+        The deferred-runtime initializer owns the async transport lifecycle
+        and closes the previous client before exposing the replacement.
+        """
+        runtime_key = (
+            getattr(entry, "runtime_api_key", None)
+            or getattr(entry, "access_token", "")
+        )
+        runtime_base = (
+            getattr(entry, "runtime_base_url", None)
+            or getattr(entry, "base_url", None)
+            or self.base_url
+        )
+        if not runtime_key or not runtime_base:
+            from agent.agent_runtime_helpers import AsyncCapabilityError
+
+            raise AsyncCapabilityError(
+                "The selected credential has no native async API key and base URL."
+            )
+
         self._credential_pool_entry_id = getattr(entry, "id", None)
-        from hermes_cli.route_identity import normalize_route_base_url
+        self._deferred_provider_runtime = {
+            "provider": self.provider,
+            "model": self.model,
+            "api_key": runtime_key,
+            "base_url": runtime_base,
+            # Rotation replaces credentials, not the already selected wire
+            # protocol (a custom Anthropic account can explicitly use an
+            # OpenAI-compatible relay, for example).
+            "api_mode": self.api_mode,
+            "request_timeout": getattr(self, "_provider_request_timeout", None),
+            "stale_timeout": getattr(self, "_provider_stale_timeout", None),
+            # Pool selection must not replace the user-selected primary
+            # snapshot while a fallback is temporarily active.
+            "update_primary": False,
+        }
+        await self._ensure_provider_runtime()
 
-        route_changed = normalize_route_base_url(self.base_url) != normalize_route_base_url(
-            runtime_base
-        )
-
-        if self.api_mode == "anthropic_messages":
-            from agent.anthropic_adapter import build_anthropic_client, _is_oauth_token
-
-            try:
-                self._anthropic_client.close()
-            except Exception:
-                pass
-
-            self._anthropic_api_key = runtime_key
-            self._anthropic_base_url = runtime_base.rstrip("/") if isinstance(runtime_base, str) else runtime_base
-            self._anthropic_client = build_anthropic_client(
-                runtime_key, self._anthropic_base_url,
-                timeout=get_provider_request_timeout(self.provider, self.model),
-            )
-            self._is_anthropic_oauth = _is_oauth_token(runtime_key) if self.provider == "anthropic" else False
-            self.api_key = runtime_key
-            self.base_url = runtime_base.rstrip("/") if isinstance(runtime_base, str) else runtime_base
-            return
-
-        self.api_key = runtime_key
-        self.base_url = runtime_base.rstrip("/") if isinstance(runtime_base, str) else runtime_base
-        self._client_kwargs["api_key"] = self.api_key
-        self._client_kwargs["base_url"] = self.base_url
-        self._client_kwargs.pop("ssl_verify", None)
-        self._client_kwargs.pop("ssl_ca_cert", None)
-        try:
-            from hermes_cli.config import (
-                apply_custom_provider_tls_to_client_kwargs,
-                get_compatible_custom_providers,
-                load_config_readonly,
-            )
-
-            apply_custom_provider_tls_to_client_kwargs(
-                self._client_kwargs,
-                str(self.base_url or ""),
-                get_compatible_custom_providers(load_config_readonly()),
-            )
-        except Exception:
-            logger.debug(
-                "custom-provider TLS resolution skipped on credential rotation",
-                exc_info=True,
-            )
-        self._apply_client_headers_for_base_url(
-            self.base_url,
-            apply_user_headers=not route_changed,
-        )
-        self._replace_primary_openai_client(reason="credential_rotation")
-
-    def _recover_with_credential_pool(
+    async def _recover_with_credential_pool(
         self,
         *,
         status_code: Optional[int],
@@ -5763,66 +4331,147 @@ class AIAgent:
     ) -> tuple[bool, bool]:
         """Forwarder — see ``agent.agent_runtime_helpers.recover_with_credential_pool``."""
         from agent.agent_runtime_helpers import recover_with_credential_pool
-        return recover_with_credential_pool(self, status_code=status_code, has_retried_429=has_retried_429, classified_reason=classified_reason, error_context=error_context)
+        return await recover_with_credential_pool(
+            self,
+            status_code=status_code,
+            has_retried_429=has_retried_429,
+            classified_reason=classified_reason,
+            error_context=error_context,
+        )
 
-    def _credential_pool_may_recover_rate_limit(self) -> bool:
+    async def _credential_pool_may_recover_rate_limit(self) -> bool:
         """Whether a rate-limit retry should wait for same-provider credentials."""
         pool = self._credential_pool
         if pool is None:
             return False
-        return pool.has_available()
+        return await pool.has_available()
 
-    def _anthropic_messages_create(self, api_kwargs: dict, *, client: Any = None):
-        # When a request-local client is supplied it was already credential-
-        # refreshed in ``_create_request_anthropic_client``; only the shared
-        # fallback path refreshes here.
-        if client is None and self.api_mode == "anthropic_messages":
-            self._try_refresh_anthropic_client_credentials()
-        # Defensive: strip Responses-only kwargs that can leak in under an
-        # api_mode-flip race (the Anthropic SDK raises a non-retryable
-        # TypeError on them). See #31673.
-        from agent.anthropic_adapter import create_anthropic_message
-        return create_anthropic_message(
-            client or self._anthropic_client,
-            api_kwargs,
-            log_prefix=getattr(self, "log_prefix", ""),
-            prefer_stream=not bool(getattr(self, "_disable_streaming", False)),
-            # Rate-limit + credits state live in response headers, which the
-            # parsed Message drops. No-ops on providers that don't send the
-            # matching header families (x-ratelimit-* / x-nous-credits-*).
-            on_response=self._capture_anthropic_response_headers,
-        )
+    async def _execute_model_request(
+        self,
+        api_kwargs: dict,
+        *,
+        use_streaming: bool = False,
+        on_first_delta: Optional[Callable[[], None]] = None,
+    ):
+        """Execute one model request without blocking the event loop.
 
-    def _rebuild_anthropic_client(self) -> None:
-        """Rebuild the Anthropic client after an interrupt or stale call.
-
-        Handles both direct Anthropic and Bedrock-hosted Anthropic models
-        correctly — rebuilding with the Bedrock SDK when provider is bedrock,
-        rather than always falling back to build_anthropic_client() which
-        requires a direct Anthropic API key.
-
-        Honors ``self._oauth_1m_beta_disabled`` (set by the reactive recovery
-        path when an OAuth subscription rejects the 1M-context beta) so the
-        rebuilt client carries the reduced beta set.
+        The async repository owns a native async client per agent runtime.
+        OpenAI-compatible and Codex Responses providers use ``AsyncOpenAI``;
+        Anthropic Messages uses its native async SDK. Providers without a
+        native transport fail before the request rather than using a worker.
         """
-        _drop_1m = bool(getattr(self, "_oauth_1m_beta_disabled", False))
-        if getattr(self, "provider", None) == "bedrock":
-            from agent.anthropic_adapter import build_anthropic_bedrock_client
-            region = getattr(self, "_bedrock_region", "us-east-1") or "us-east-1"
-            self._anthropic_client = build_anthropic_bedrock_client(region)
-        else:
-            from agent.anthropic_adapter import build_anthropic_client
-            self._anthropic_client = build_anthropic_client(
-                self._anthropic_api_key,
-                getattr(self, "_anthropic_base_url", None),
-                timeout=get_provider_request_timeout(self.provider, self.model),
-                drop_context_1m_beta=_drop_1m,
+        if self.api_mode == "codex_responses":
+            if use_streaming:
+                from agent.codex_runtime import run_codex_stream
+
+                return await run_codex_stream(
+                    self,
+                    api_kwargs,
+                    client=self.client,
+                    on_first_delta=on_first_delta,
+                )
+
+            request = dict(api_kwargs)
+            request.pop("stream", None)
+            return await self.client.responses.create(**request)
+
+        if self.api_mode == "anthropic_messages":
+            # Anthropic ships a native async SDK.  Use it directly for static
+            # credentials instead of routing the Messages call through the
+            # synchronous interrupt worker.  Callable Entra credentials still
+            # use the compatibility path until an AsyncClient-aware bearer
+            # hook is available (the token provider itself is synchronous).
+            anthropic_key = getattr(self, "_anthropic_api_key", None)
+            if not callable(anthropic_key):
+                from agent.anthropic_adapter import (
+                    build_anthropic_client,
+                    create_anthropic_message,
+                )
+
+                client_source = (
+                    anthropic_key,
+                    getattr(self, "_anthropic_base_url", None),
+                    bool(getattr(self, "_oauth_1m_beta_disabled", False)),
+                )
+                if getattr(self, "_anthropic_client_source", None) != client_source:
+                    self._anthropic_client = build_anthropic_client(
+                        anthropic_key,
+                        getattr(self, "_anthropic_base_url", None),
+                        timeout=getattr(self, "_provider_request_timeout", None),
+                        drop_context_1m_beta=client_source[2],
+                    )
+                    self._anthropic_client_source = client_source
+
+                first_event = True
+
+                def _on_anthropic_event(_event: Any) -> None:
+                    nonlocal first_event
+                    if first_event:
+                        first_event = False
+                        if on_first_delta is not None:
+                            on_first_delta()
+
+                return await create_anthropic_message(
+                    self._anthropic_client,
+                    api_kwargs,
+                    log_prefix=getattr(self, "log_prefix", ""),
+                    prefer_stream=use_streaming,
+                    on_stream_event=_on_anthropic_event if use_streaming else None,
+                    on_response=self._capture_anthropic_response_headers,
+                )
+
+        if self.api_mode != "chat_completions":
+            raise RuntimeError(
+                f"api_mode={self.api_mode!r} has no native async transport. "
+                "Use chat_completions, anthropic_messages, or codex_responses, "
+                "or add a native async provider implementation."
             )
 
-    def _interruptible_api_call(self, api_kwargs: dict):
-        """Forwarder — see ``agent.chat_completion_helpers.interruptible_api_call``."""
-        from agent.chat_completion_helpers import interruptible_api_call
-        return interruptible_api_call(self, api_kwargs)
+        create_completion = self.client.chat.completions.create
+        if not inspect.iscoroutinefunction(inspect.unwrap(create_completion)):
+            raise RuntimeError(
+                f"provider={self.provider!r} resolves to a synchronous adapter. "
+                "The async-first core does not run providers in a thread; add "
+                "a native async adapter before enabling this provider."
+            )
+
+        request = dict(api_kwargs)
+        if use_streaming:
+            request["stream"] = True
+            request.setdefault("stream_options", {"include_usage": True})
+
+        result = await create_completion(**request)
+
+        if not use_streaming or hasattr(result, "choices"):
+            return result
+
+        from agent.auxiliary_client import _ChatStreamAccumulator
+
+        accumulator = _ChatStreamAccumulator(
+            model=str(request.get("model") or self.model or "")
+        )
+        first_delta = True
+        async for chunk in result:
+            if first_delta:
+                first_delta = False
+                if on_first_delta is not None:
+                    on_first_delta()
+            # Preserve the existing streaming display contract while the
+            # accumulator reconstructs tool calls/reasoning for the loop.
+            try:
+                choices = getattr(chunk, "choices", None) or []
+                delta = getattr(choices[0], "delta", None) if choices else None
+                text = getattr(delta, "content", None) if delta is not None else None
+                if isinstance(text, str) and text:
+                    self._fire_stream_delta(text)
+            except Exception:
+                pass
+            accumulator.feed(chunk)
+
+        close = getattr(result, "aclose", None) or getattr(result, "close", None)
+        if inspect.iscoroutinefunction(close):
+            await close()
+        return accumulator.finish()
 
     # ── Unified streaming API call ─────────────────────────────────────────
 
@@ -5869,12 +4518,6 @@ class AIAgent:
 
     def _record_streamed_assistant_text(self, text: str) -> None:
         """Accumulate visible assistant text emitted through stream callbacks."""
-        # Single-writer guard (#65991): a superseded stream must not pollute the
-        # turn's accumulated text (which also feeds the interim-visible-text
-        # de-dup comparison), even when a caller reaches this directly (the
-        # tool-suppressed content path) rather than through _fire_stream_delta.
-        if self._stream_writer_superseded():
-            return
         if isinstance(text, str) and text:
             self._current_streamed_assistant_text = (
                 getattr(self, "_current_streamed_assistant_text", "") + text
@@ -6060,88 +4703,8 @@ class AIAgent:
         except Exception:
             logger.debug("interim_assistant_callback error", exc_info=True)
 
-    def _ensure_stream_writer_state(self) -> None:
-        """Lazily create the single-writer guard fields (#65991).
-
-        The fields are normally set in ``agent_init``, but agents constructed
-        via ``AIAgent.__new__`` (test doubles, legacy/partially-initialized
-        instances) skip that path. Claiming/checking the writer must not crash
-        those agents, so initialize the fields on first use.
-        """
-        if getattr(self, "_stream_writer_lock", None) is None:
-            self._stream_writer_lock = threading.Lock()
-        if not hasattr(self, "_stream_writer_token"):
-            self._stream_writer_token = 0
-        if getattr(self, "_stream_writer_tls", None) is None:
-            self._stream_writer_tls = threading.local()
-        if not hasattr(self, "_stream_writer_dropped"):
-            self._stream_writer_dropped = 0
-
-    def _claim_stream_writer(self) -> int:
-        """Claim exclusive ownership of the streaming delta sink for the calling
-        stream attempt and return its monotonic writer token (#65991).
-
-        Every streaming attempt (each provider path, each retry) calls this
-        right before it begins consuming its stream. Claiming bumps the shared
-        token, so any earlier attempt still alive on another thread is
-        immediately superseded: its cached token no longer matches and the sink
-        fences its late chunks out. The token is stored per-thread, so a thread
-        that never claimed (a non-streaming caller) is never treated as a
-        writer and can never be fenced.
-        """
-        self._ensure_stream_writer_state()
-        with self._stream_writer_lock:
-            self._stream_writer_token += 1
-            token = self._stream_writer_token
-        self._stream_writer_tls.token = token
-        return token
-
-    def _stream_writer_is_current(self, token: int) -> bool:
-        """True when ``token`` (from a prior _claim_stream_writer) is still the
-        active writer — i.e. no newer stream attempt has claimed the sink since
-        (#65991). Lets a stream loop bail out the instant it is superseded."""
-        return token == getattr(self, "_stream_writer_token", token)
-
-    def _stream_writer_superseded(self) -> bool:
-        """True when the calling thread claimed the delta sink but a newer
-        stream attempt has since claimed it — i.e. this thread is a stale
-        writer whose chunks must be dropped (#65991).
-
-        A thread that never claimed (``token is None``) is not a writer and is
-        never reported as superseded, so non-streaming delta callers are
-        unaffected.
-        """
-        tls = getattr(self, "_stream_writer_tls", None)
-        token = getattr(tls, "token", None) if tls is not None else None
-        if token is None:
-            return False
-        return token != getattr(self, "_stream_writer_token", token)
-
-    def _note_dropped_stream_writer(self, where: str) -> None:
-        """Record + log that a superseded stream's delta was discarded."""
-        try:
-            self._stream_writer_dropped = int(getattr(self, "_stream_writer_dropped", 0)) + 1
-        except Exception:
-            self._stream_writer_dropped = 1
-        # Log sparsely (first drop, then powers of two) so a chatty superseded
-        # stream can't flood the log, but a real provider problem is still
-        # visible. A silent discard would hide genuine failures.
-        _n = self._stream_writer_dropped
-        if _n == 1 or (_n & (_n - 1)) == 0:
-            logger.warning(
-                "Dropped delta from a superseded stream writer at %s "
-                "(discarded=%d this turn) — a stale stream tried to write into "
-                "the turn after a retry superseded it.",
-                where, _n,
-            )
-
     def _fire_stream_delta(self, text: str) -> None:
         """Fire all registered stream delta callbacks (display + TTS)."""
-        # Single-writer guard (#65991): a superseded stream must not interleave
-        # its tokens into the turn alongside the retry that replaced it.
-        if self._stream_writer_superseded():
-            self._note_dropped_stream_writer("_fire_stream_delta")
-            return
         # If a tool iteration set the break flag, prepend a single paragraph
         # break before the first real text delta.  This prevents the original
         # problem (text concatenation across tool boundaries) without stacking
@@ -6195,11 +4758,6 @@ class AIAgent:
 
     def _fire_reasoning_delta(self, text: str) -> None:
         """Fire reasoning callback if registered."""
-        # Single-writer guard (#65991): fence out a superseded stream's
-        # reasoning deltas the same way as content deltas.
-        if self._stream_writer_superseded():
-            self._note_dropped_stream_writer("_fire_reasoning_delta")
-            return
         cb = self.reasoning_callback
         if cb is not None:
             try:
@@ -6229,17 +4787,10 @@ class AIAgent:
             or getattr(self, "_stream_callback", None) is not None
         )
 
-    def _interruptible_streaming_api_call(
-        self, api_kwargs: dict, *, on_first_delta: callable = None
-    ):
-        """Forwarder — see ``agent.chat_completion_helpers.interruptible_streaming_api_call``."""
-        from agent.chat_completion_helpers import interruptible_streaming_api_call
-        return interruptible_streaming_api_call(self, api_kwargs, on_first_delta=on_first_delta)
-
-    def _try_activate_fallback(self, reason: "FailoverReason | None" = None) -> bool:
+    async def _try_activate_fallback(self, reason: "FailoverReason | None" = None) -> bool:
         """Forwarder — see ``agent.chat_completion_helpers.try_activate_fallback``."""
         from agent.chat_completion_helpers import try_activate_fallback
-        return try_activate_fallback(self, reason)
+        return await try_activate_fallback(self, reason)
 
     def _has_pending_fallback(self) -> bool:
         """Whether a fallback provider is actually available to switch to.
@@ -6255,17 +4806,44 @@ class AIAgent:
 
     # ── Per-turn primary restoration ─────────────────────────────────────
 
-    def _restore_primary_runtime(self) -> bool:
+    async def _ensure_provider_runtime(self) -> bool:
+        """Resolve a deferred provider through the native async auth boundary."""
+        from agent.agent_init import initialize_deferred_runtime
+        from agent.agent_runtime_helpers import AsyncCapabilityError
+
+        initialization_error: AsyncCapabilityError | None = None
+        allow_startup_fallback = False
+        try:
+            return await initialize_deferred_runtime(self)
+        except AsyncCapabilityError as exc:
+            initialization_error = exc
+            pending = getattr(self, "_deferred_provider_runtime", None) or {}
+            allow_startup_fallback = bool(pending.get("update_primary", True))
+
+        # Release initialize_deferred_runtime's provider lock before entering
+        # the fallback lifecycle: fallback resolution calls this method again
+        # with update_primary=False for the selected candidate.
+        if allow_startup_fallback and self._has_pending_fallback():
+            if await self._try_activate_fallback():
+                return True
+        raise initialization_error
+
+    async def _restore_primary_runtime(self) -> bool:
         """Forwarder — see ``agent.agent_runtime_helpers.restore_primary_runtime``."""
         from agent.agent_runtime_helpers import restore_primary_runtime
-        return restore_primary_runtime(self)
+        return await restore_primary_runtime(self)
 
-    def _try_recover_primary_transport(
+    async def _try_recover_primary_transport(
         self, api_error: Exception, *, retry_count: int, max_retries: int,
     ) -> bool:
         """Forwarder — see ``agent.agent_runtime_helpers.try_recover_primary_transport``."""
         from agent.agent_runtime_helpers import try_recover_primary_transport
-        return try_recover_primary_transport(self, api_error, retry_count=retry_count, max_retries=max_retries)
+        return await try_recover_primary_transport(
+            self,
+            api_error,
+            retry_count=retry_count,
+            max_retries=max_retries,
+        )
 
     @staticmethod
     def _content_has_image_parts(content: Any) -> bool:
@@ -6276,98 +4854,22 @@ class AIAgent:
                 return True
         return False
 
-    # 20 MB base64 ≈ 15 MB decoded image — generous but prevents OOM from an
-    # oversized data: URL (a 100 MB+ payload creates ~275 MB of memory pressure,
-    # and gateway users sharing the same process can trivially OOM it).
-    _MAX_DATA_URL_BASE64_BYTES = 20 * 1024 * 1024
-
-    @staticmethod
-    def _materialize_data_url_for_vision(image_url: str) -> tuple[str, Optional[Path]]:
-        header, _, data = str(image_url or "").partition(",")
-        if len(data) > AIAgent._MAX_DATA_URL_BASE64_BYTES:
-            logger.warning(
-                "data-URL payload too large (%d bytes), skipping", len(data)
-            )
-            return "", None
-        mime = "image/jpeg"
-        if header.startswith("data:"):
-            mime_part = header[len("data:"):].split(";", 1)[0].strip()
-            if mime_part.startswith("image/"):
-                mime = mime_part
-        suffix = {
-            "image/png": ".png",
-            "image/gif": ".gif",
-            "image/webp": ".webp",
-            "image/jpeg": ".jpg",
-            "image/jpg": ".jpg",
-        }.get(mime, ".jpg")
-        tmp = tempfile.NamedTemporaryFile(prefix="anthropic_image_", suffix=suffix, delete=False)
-        try:
-            with tmp:
-                tmp.write(base64.b64decode(data))
-        except Exception:
-            # delete=False means a corrupt/unsupported data URL would otherwise
-            # leak a zero-byte temp file on every failed materialization.
-            try:
-                os.unlink(tmp.name)
-            except OSError:
-                pass
-            raise
-        path = Path(tmp.name)
-        return str(path), path
-
     def _describe_image_for_anthropic_fallback(self, image_url: str, role: str) -> str:
-        cache_key = hashlib.sha256(str(image_url or "").encode("utf-8")).hexdigest()
-        cached = self._anthropic_image_fallback_cache.get(cache_key)
-        if cached:
-            return cached
-
         role_label = {
             "assistant": "assistant",
             "tool": "tool result",
         }.get(role, "user")
-        analysis_prompt = (
-            "Describe everything visible in this image in thorough detail. "
-            "Include any text, code, UI, data, objects, people, layout, colors, "
-            "and any other notable visual information."
+        # The old non-vision fallback synchronously ran a vision tool through
+        # a nested event loop while preparing a model request. Vision is outside
+        # this fork's native tool waist, so retain a truthful prompt-side note
+        # instead of nesting an event loop or blocking the agent turn.
+        return (
+            f"[The {role_label} attached an image, but the active model does not "
+            "support image input and native vision fallback is unavailable in "
+            "async-hermes-agent.]"
         )
 
-        vision_source = str(image_url or "")
-        cleanup_path: Optional[Path] = None
-        if vision_source.startswith("data:"):
-            vision_source, cleanup_path = self._materialize_data_url_for_vision(vision_source)
-
-        description = ""
-        try:
-            from tools.vision_tools import vision_analyze_tool
-
-            result_json = asyncio.run(
-                vision_analyze_tool(image_url=vision_source, user_prompt=analysis_prompt)
-            )
-            result = json.loads(result_json) if isinstance(result_json, str) else {}
-            description = (result.get("analysis") or "").strip()
-        except Exception as e:
-            description = f"Image analysis failed: {e}"
-        finally:
-            if cleanup_path and cleanup_path.exists():
-                try:
-                    cleanup_path.unlink()
-                except OSError:
-                    pass
-
-        if not description:
-            description = "Image analysis failed."
-
-        note = f"[The {role_label} attached an image. Here's what it contains:\n{description}]"
-        if vision_source and not str(image_url or "").startswith("data:"):
-            note += (
-                f"\n[If you need a closer look, use vision_analyze with image_url: {vision_source}]"
-            )
-
-        self._anthropic_image_fallback_cache[cache_key] = note
-        return note
-
-    def _model_supports_vision(self) -> bool:
+    async def _model_supports_vision(self) -> bool:
         """Return True if the active provider+model reports native vision.
 
         Used to decide whether to strip image content parts from API-bound
@@ -6382,12 +4884,21 @@ class AIAgent:
         misclassified as non-vision and have their images stripped.
         """
         try:
-            from hermes_cli.config import load_config
+            from hermes_cli.config import get_config_path
+            import aiofiles
+            from utils import fast_safe_load
             from agent.image_routing import _lookup_supports_vision
-            cfg = load_config()
+            config_path = get_config_path()
+            try:
+                async with aiofiles.open(config_path, encoding="utf-8") as config_file:
+                    cfg = fast_safe_load(await config_file.read()) or {}
+            except FileNotFoundError:
+                cfg = {}
+            if not isinstance(cfg, dict):
+                cfg = {}
             provider = (getattr(self, "provider", "") or "").strip()
             model = (getattr(self, "model", "") or "").strip()
-            return _lookup_supports_vision(provider, model, cfg) is True
+            return await _lookup_supports_vision(provider, model, cfg) is True
         except Exception:
             return False
 
@@ -6470,7 +4981,7 @@ class AIAgent:
             cache[mode] = t
         return t
 
-    def _prepare_anthropic_messages_for_api(self, api_messages: list) -> list:
+    async def _prepare_anthropic_messages_for_api(self, api_messages: list) -> list:
         # Fast exit when no message carries image content at all.
         if not any(
             isinstance(msg, dict) and self._content_has_image_parts(msg.get("content"))
@@ -6483,7 +4994,7 @@ class AIAgent:
         # native Anthropic ``{"type": "image", "source": ...}`` blocks. When
         # the active model supports vision we let the adapter do its job and
         # skip this legacy text-fallback preprocessor entirely.
-        if self._model_supports_vision():
+        if await self._model_supports_vision():
             return api_messages
 
         # Non-vision Anthropic model (rare today, but keep the fallback for
@@ -6498,7 +5009,7 @@ class AIAgent:
             )
         return transformed
 
-    def _prepare_messages_for_non_vision_model(self, api_messages: list) -> list:
+    async def _prepare_messages_for_non_vision_model(self, api_messages: list) -> list:
         """Strip native image parts when the active model lacks vision.
 
         Runs on the chat.completions / codex_responses paths. Vision-capable
@@ -6513,7 +5024,7 @@ class AIAgent:
         ):
             return api_messages
 
-        if self._model_supports_vision():
+        if await self._model_supports_vision():
             return api_messages
 
         transformed = copy.deepcopy(api_messages)
@@ -6530,7 +5041,7 @@ class AIAgent:
             )
         return transformed
 
-    def _tool_result_content_for_active_model(self, tool_name: str, result: Any) -> Any:
+    async def _tool_result_content_for_active_model(self, tool_name: str, result: Any) -> Any:
         """Return the tool message content that is safe for the active model.
 
         Multimodal tool results normally unwrap to OpenAI-style content parts so
@@ -6546,7 +5057,7 @@ class AIAgent:
         if not self._content_has_image_parts(content):
             return content
 
-        if self._model_supports_vision():
+        if await self._model_supports_vision():
             # Vision-capable on paper — but if the provider rejects list-type
             # tool content (e.g. Xiaomi MiMo's 400 "text is not set"), or if
             # we've already learned this lesson in-session, short-circuit to
@@ -6593,7 +5104,7 @@ class AIAgent:
         )
         return summary
 
-    def _try_shrink_image_parts_in_messages(
+    async def _try_shrink_image_parts_in_messages(
         self,
         api_messages: list,
         *,
@@ -6601,7 +5112,7 @@ class AIAgent:
     ) -> bool:
         """Forwarder — see ``agent.conversation_compression.try_shrink_image_parts_in_messages``."""
         from agent.conversation_compression import try_shrink_image_parts_in_messages
-        return try_shrink_image_parts_in_messages(
+        return await try_shrink_image_parts_in_messages(
             api_messages,
             max_dimension=max_dimension,
         )
@@ -6793,12 +5304,40 @@ class AIAgent:
                     content[-1]["cache_control"] = {"type": "ephemeral"}
                 break
 
-    def _build_api_kwargs(self, api_messages: list, tools_for_api: Optional[list] = None) -> dict:
+    async def _build_api_kwargs(
+        self,
+        api_messages: list,
+        tools_for_api: Optional[list] = None,
+    ) -> dict:
         """Forwarder — see ``agent.chat_completion_helpers.build_api_kwargs``."""
         from agent.chat_completion_helpers import build_api_kwargs
-        return build_api_kwargs(self, api_messages, tools_for_api=tools_for_api)
+        return await build_api_kwargs(
+            self,
+            api_messages,
+            tools_for_api=tools_for_api,
+        )
 
-    def _supports_reasoning_extra_body(self) -> bool:
+    def _direct_native_anthropic_tool_cache_capability(
+        self,
+        *,
+        provider: Optional[str] = None,
+        base_url: Optional[str] = None,
+        api_mode: Optional[str] = None,
+        model: Optional[str] = None,
+    ) -> bool:
+        from agent.agent_runtime_helpers import (
+            _direct_native_anthropic_tool_cache_capability,
+        )
+
+        return _direct_native_anthropic_tool_cache_capability(
+            self,
+            provider=provider,
+            base_url=base_url,
+            api_mode=api_mode,
+            model=model,
+        )
+
+    async def _supports_reasoning_extra_body(self) -> bool:
         """Return True when reasoning extra_body is safe to send for this route/model.
 
         OpenRouter forwards unknown extra_body fields to upstream providers.
@@ -6820,7 +5359,7 @@ class AIAgent:
             except Exception:
                 return False
         if (self.provider or "").strip().lower() == "lmstudio":
-            opts = self._lmstudio_reasoning_options_cached()
+            opts = await self._lmstudio_reasoning_options_cached()
             # "off-only" (or absent) means no real reasoning capability.
             return any(opt and opt != "off" for opt in opts)
         # Ollama Cloud (and any Ollama-compatible server): the native
@@ -6828,7 +5367,7 @@ class AIAgent:
         # only for models that declare the "thinking" capability. deepseek-v4
         # has it; gemma3 / qwen3-coder don't. Cached per (model, base_url).
         if base_url_host_matches(self._base_url_lower, "ollama.com"):
-            return self._ollama_supports_thinking_cached()
+            return await self._ollama_supports_thinking_cached()
         if "openrouter" not in self._base_url_lower:
             return False
         if "api.mistral.ai" in self._base_url_lower:
@@ -6848,7 +5387,7 @@ class AIAgent:
         )
         return any(model.startswith(prefix) for prefix in reasoning_model_prefixes)
 
-    def _lmstudio_reasoning_options_cached(self) -> list[str]:
+    async def _lmstudio_reasoning_options_cached(self) -> list[str]:
         """Probe LM Studio's published reasoning ``allowed_options`` once per
         (model, base_url). The list (e.g. ``["off","on"]`` or
         ``["off","minimal","low"]``) is needed both for the supports-reasoning
@@ -6874,7 +5413,7 @@ class AIAgent:
                 return opts
         try:
             from hermes_cli.models import lmstudio_model_reasoning_options
-            opts = lmstudio_model_reasoning_options(
+            opts = await lmstudio_model_reasoning_options(
                 self.model, self.base_url, getattr(self, "api_key", ""),
             )
         except Exception:
@@ -6882,7 +5421,7 @@ class AIAgent:
         cache[key] = (opts, _time.monotonic())
         return opts
 
-    def _ollama_supports_thinking_cached(self) -> bool:
+    async def _ollama_supports_thinking_cached(self) -> bool:
         """Probe Ollama's ``/api/show`` capabilities once per (model, base_url).
 
         Returns True only when the model declares the ``thinking`` capability.
@@ -6905,7 +5444,7 @@ class AIAgent:
                 return bool(supported)
         try:
             from hermes_cli.models import ollama_model_supports_thinking
-            supported = ollama_model_supports_thinking(
+            supported = await ollama_model_supports_thinking(
                 self.model, self.base_url, getattr(self, "api_key", "")
             )
         except Exception:
@@ -6913,7 +5452,7 @@ class AIAgent:
         cache[key] = (supported, _time.monotonic())
         return bool(supported)
 
-    def _resolve_lmstudio_summary_reasoning_effort(self) -> Optional[str]:
+    async def _resolve_lmstudio_summary_reasoning_effort(self) -> Optional[str]:
         """Resolve a safe top-level ``reasoning_effort`` for LM Studio.
 
         The iteration-limit summary path calls ``chat.completions.create()``
@@ -6923,7 +5462,7 @@ class AIAgent:
         from agent.lmstudio_reasoning import resolve_lmstudio_effort
         return resolve_lmstudio_effort(
             self.reasoning_config,
-            self._lmstudio_reasoning_options_cached(),
+            await self._lmstudio_reasoning_options_cached(),
         )
 
     def _github_models_reasoning_extra_body(self) -> dict | None:
@@ -7112,7 +5651,7 @@ class AIAgent:
         """
         return self.api_mode != "codex_responses"
 
-    def _compress_context(
+    async def _compress_context(
         self,
         messages: list,
         system_message: str,
@@ -7132,7 +5671,6 @@ class AIAgent:
         ``force=False``.
         """
         from agent.conversation_compression import (
-            CompressionCommitFence,
             compress_context,
             resolve_context_compression_timeouts,
             run_compress_context_with_progress_timeout,
@@ -7158,198 +5696,53 @@ class AIAgent:
         # it buys is the turns AFTER compaction reading the cache it wrote.
         token = None
         if get_conversation_context() is None:
-            root = self._conversation_root_id()
+            root = await self._conversation_root_id()
             if root:
                 token = set_conversation_context(root)
-        # Every AIAgent compression has a fence, including ordinary in-turn and
-        # manual paths. hard_interrupt() uses this exact instance to serialize
-        # cancel admission against begin_commit().
-        active_fence = commit_fence or CompressionCommitFence()
-        # A single agent can receive overlapping automatic/manual entrypoints.
-        # Serialize fence publication so a waiter cannot replace the fence of
-        # the attempt currently generating/committing a summary.
-        fence_registration_lock = vars(self).setdefault(
-            "_compression_commit_fence_lock", threading.RLock()
-        )
-        with fence_registration_lock:
-            missing_fence = object()
-            previous_fence = vars(self).get(
-                "_active_compression_commit_fence", missing_fence
-            )
-            self._active_compression_commit_fence = active_fence
         try:
-            def _run(fence=None, target_messages=None):
-                return compress_context(
+            async def _compress(fence):
+                return await compress_context(
                     self,
-                    target_messages if target_messages is not None else messages,
+                    messages,
                     system_message,
-                    approx_tokens=approx_tokens, task_id=task_id,
+                    approx_tokens=approx_tokens,
+                    task_id=task_id,
                     focus_topic=focus_topic,
                     force=force,
-                    defer_context_engine_notification=(
-                        defer_context_engine_notification
-                    ),
+                    defer_context_engine_notification=defer_context_engine_notification,
                     commit_fence=fence,
                 )
 
-            # Callers that already own a progress-aware wait (gateway session
-            # hygiene) pass commit_fence and must not be double-wrapped.
             if commit_fence is not None:
-                return _run(active_fence)
+                return await _compress(commit_fence)
 
-            idle_timeout, total_ceiling = resolve_context_compression_timeouts()
-            if idle_timeout <= 0:
-                return _run(active_fence)
+            from hermes_cli.config import load_config_readonly
 
-            def _snapshot_worker(fence=None):
-                # #76354 review F3: the pooled worker must NEVER share the
-                # caller's live transcript. Plugin/legacy context engines are
-                # allowed to mutate their input list in place; after a host
-                # timeout the worker stays alive, so a shared list would let
-                # a late engine rewrite the live conversation (roles,
-                # ordering, persisted content) behind the caller's back.
-                # Deep-snapshot here, on the worker thread, so the caller's
-                # list object is never touched by pooled code. Results are
-                # published to caller-visible state only via the returned
-                # value of an ADMITTED commit (the host discards results on
-                # timeout/cancel); durable SessionDB mutation is already
-                # gated behind the commit fence inside compress_context.
-                snapshot = copy.deepcopy(messages)
-                result_msgs, result_prompt = _run(
-                    fence, target_messages=snapshot
-                )
-                if result_msgs is snapshot:
-                    # No-op/abort path returned the snapshot unchanged: hand
-                    # back the caller's ORIGINAL list so identity-based
-                    # semantics (len/identity no-op detection, flush dedup
-                    # by id()) keep working.
-                    return messages, result_prompt
-                return result_msgs, result_prompt
-
-            # Resolve the fallback prompt lazily on timeout only. Eager
-            # rebuild here would raise before compress_context runs whenever
-            # _cached_system_prompt is unset and _build_system_prompt fails
-            # (lock-refresher / noop-exception tests rely on that path).
-            def _fallback_prompt():
-                cached = getattr(self, "_cached_system_prompt", None)
-                if cached:
-                    return cached
-                try:
-                    return self._build_system_prompt(system_message)
-                except Exception:
-                    logger.debug(
-                        "compress_context timeout fallback prompt rebuild "
-                        "failed; using raw system_message",
-                        exc_info=True,
-                    )
-                    return system_message or ""
-
-            def _on_timeout(idle, waited, since_progress):
-                logger.warning(
-                    "Context compression made no progress for %.1fs "
-                    "(total wait %.1fs, ceiling %.1fs); continuing without "
-                    "compression",
-                    since_progress,
-                    waited,
-                    total_ceiling,
-                )
-                touch = getattr(self, "_touch_activity", None)
-                if callable(touch):
-                    try:
-                        touch(
-                            "context compression timed out",
-                            provenance=ActivityProvenance.AGENT_COMPRESSION_TIMEOUT,
-                        )
-                    except Exception:
-                        logger.debug(
-                            "compress_context timeout activity touch failed",
-                            exc_info=True,
-                        )
-                # Same timeout cooldown ladder as summary-LLM timeouts
-                # (#62452): avoid re-burning the full idle budget every turn.
-                compressor = getattr(self, "context_compressor", None)
-                if compressor is not None:
-                    record = getattr(compressor, "record_timeout_failure", None)
-                    if callable(record):
-                        try:
-                            record(
-                                "host compress_context timeout "
-                                "(no summary progress)"
-                            )
-                        except Exception:
-                            logger.debug(
-                                "failed to record compress_context timeout "
-                                "cooldown",
-                                exc_info=True,
-                            )
-                emit = getattr(self, "_emit_warning", None)
-                if callable(emit):
-                    emit(
-                        "⚠ Context compression timed out "
-                        f"after {idle:.1f}s with no output from the summary "
-                        "model. No messages were dropped — continuing without "
-                        "compression. Run /compress to retry, /new for a clean "
-                        "session, or check auxiliary.compression."
-                    )
-
-            def _on_commit_overrun(waited, ceiling):
-                # Commit-phase ceiling breach: the SessionDB mutation is in
-                # flight and must complete (abandoning it mid-commit would
-                # diverge live messages from durable session state), so this
-                # only surfaces the overrun — it never cancels the commit.
-                emit = getattr(self, "_emit_warning", None)
-                if callable(emit):
-                    emit(
-                        "⚠ Context compression commit is taking unusually "
-                        f"long ({waited:.0f}s, ceiling {ceiling:.0f}s). "
-                        "Waiting for it to finish safely — if this persists, "
-                        "check SessionDB health (disk / lock contention)."
-                    )
-
-            result = run_compress_context_with_progress_timeout(
-                worker=_snapshot_worker,
-                messages=messages,
-                system_prompt_fallback=_fallback_prompt,
-                idle_timeout_seconds=idle_timeout,
-                total_ceiling_seconds=total_ceiling,
-                on_timeout=_on_timeout,
-                on_commit_overrun=_on_commit_overrun,
-                fence=active_fence,
-                telemetry_agent=self,
+            config = await load_config_readonly()
+            compression_config = (
+                config.get("compression", {}) if isinstance(config, dict) else {}
             )
-            # compress_context ran on a daemon pool worker thread; the session
-            # id rotation updated hermes_logging._session_context (a
-            # threading.local) on the WORKER thread, not this one. Propagate
-            # the current session_id back so subsequent log lines on this
-            # thread carry the rotated id (#34089).
+            idle_timeout, total_ceiling = resolve_context_compression_timeouts(
+                compression_config
+            )
             try:
-                from hermes_logging import set_session_context
-                set_session_context(self.session_id)
-            except Exception:
-                pass
-            # #76354 review F5: the worker thread also rebound the session
-            # ContextVar inside its own (copied) context, which the caller
-            # never sees — and get_session_env() prefers an already-bound
-            # ContextVar over os.environ. Rebind in the CALLER's context so
-            # post-compression tools/subprocesses on this thread resolve
-            # HERMES_SESSION_ID to the child id after an out-of-place
-            # rotation (idempotent when no rotation happened).
-            try:
-                from gateway.session_context import set_current_session_id
-                if self.session_id:
-                    set_current_session_id(self.session_id)
-            except Exception:
-                logger.debug(
-                    "post-compression session ContextVar rebind failed",
-                    exc_info=True,
+                return await run_compress_context_with_progress_timeout(
+                    worker=_compress,
+                    messages=messages,
+                    system_prompt_fallback=system_message,
+                    idle_timeout_seconds=idle_timeout,
+                    total_ceiling_seconds=total_ceiling,
+                    hard_cancel_event=getattr(
+                        self, "_hard_interrupt_requested", None
+                    ),
                 )
-            return result
+            except BaseException as exc:
+                from agent.auxiliary_client import AuxiliaryExplicitCancellation
+
+                if isinstance(exc, AuxiliaryExplicitCancellation):
+                    return messages, system_message
+                raise
         finally:
-            with fence_registration_lock:
-                if previous_fence is missing_fence:
-                    vars(self).pop("_active_compression_commit_fence", None)
-                else:
-                    self._active_compression_commit_fence = previous_fence
             # Restore whatever the caller had, so a compaction never leaks its
             # tag into the surrounding scope.
             if token is not None:
@@ -7393,102 +5786,6 @@ class AIAgent:
         self._set_tool_guardrail_halt(decision)
         return toolguard_synthetic_result(decision)
 
-    def _execute_tool_calls(self, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0) -> None:
-        """Execute tool calls from the assistant message and append results to messages.
-
-        The segment planner splits the batch into maximal contiguous runs of
-        parallel-safe calls (read-only tools, non-overlapping file targets,
-        opted-in MCP tools) separated by sequential barriers (interactive,
-        unsafe, or unrecognized tools). Homogeneous batches keep their
-        original single-path dispatch; mixed batches execute segment by
-        segment in emission order so safe subsets still run concurrently
-        while side-effect ordering is preserved.
-        """
-        tool_calls = assistant_message.tool_calls
-
-        # Allow _vprint during tool execution even with stream consumers
-        self._executing_tools = True
-        try:
-            if len(tool_calls) <= 1:
-                return self._execute_tool_calls_sequential(
-                    assistant_message, messages, effective_task_id, api_call_count
-                )
-
-            from agent.tool_dispatch_helpers import _plan_tool_batch_segments
-            _active_env = get_active_env(effective_task_id)
-            _exec_cwd = Path(_active_env.cwd) if _active_env is not None and _active_env.cwd else None
-            segments = _plan_tool_batch_segments(tool_calls, execution_cwd=_exec_cwd)
-
-            if len(segments) == 1:
-                kind = segments[0][0]
-                if kind == "parallel":
-                    return self._execute_tool_calls_concurrent(
-                        assistant_message, messages, effective_task_id, api_call_count
-                    )
-                return self._execute_tool_calls_sequential(
-                    assistant_message, messages, effective_task_id, api_call_count
-                )
-
-            from agent.tool_executor import execute_tool_calls_segmented
-            return execute_tool_calls_segmented(
-                self, assistant_message, messages, effective_task_id, api_call_count,
-                segments=segments,
-            )
-        finally:
-            self._executing_tools = False
-
-    def _dispatch_delegate_task(self, function_args: dict) -> str:
-        """Single call site for delegate_task dispatch.
-
-        New DELEGATE_TASK_SCHEMA fields only need to be added here to reach all
-        invocation paths (concurrent, sequential, inline).
-        """
-        from tools.delegate_tool import (
-            _strip_model_hidden_task_fields,
-            delegate_task as _delegate_task,
-        )
-        # Delegations from the top-level MODEL always run in the background —
-        # the model does not get to choose. delegate_task returns immediately
-        # with a handle (one per task) and each subagent's result re-enters the
-        # conversation as a new message when it finishes. This applies to BOTH
-        # a single task and a fan-out batch (each task becomes its own
-        # independent background subagent). The one exception:
-        #   - A delegation from an ORCHESTRATOR SUBAGENT (depth > 0) stays
-        #     synchronous: the orchestrator needs its workers' results within
-        #     its own turn to compose a summary, and a subagent doesn't own the
-        #     gateway session the async result would route back to.
-        # The schema-level `background` param is intentionally ignored here.
-        _is_subagent = getattr(self, "_delegate_depth", 0) > 0
-        return _delegate_task(
-            goal=function_args.get("goal"),
-            context=function_args.get("context"),
-            tasks=_strip_model_hidden_task_fields(function_args.get("tasks")),
-            max_iterations=function_args.get("max_iterations"),
-            role=function_args.get("role"),
-            background=(not _is_subagent),
-            parent_agent=self,
-        )
-
-    def _invoke_tool(self, function_name: str, function_args: dict, effective_task_id: str,
-                     tool_call_id: Optional[str] = None, messages: list = None,
-                     pre_tool_block_checked: bool = False,
-                     skip_tool_request_middleware: bool = False,
-                     tool_request_middleware_trace: Optional[list[dict[str, Any]]] = None,
-                     skip_tool_execution_middleware: bool = False) -> str:
-        """Forwarder — see ``agent.agent_runtime_helpers.invoke_tool``."""
-        from agent.agent_runtime_helpers import invoke_tool
-        return invoke_tool(
-            self,
-            function_name,
-            function_args,
-            effective_task_id,
-            tool_call_id,
-            messages,
-            pre_tool_block_checked,
-            skip_tool_request_middleware,
-            tool_request_middleware_trace,
-            skip_tool_execution_middleware,
-        )
 
     @staticmethod
     def _wrap_verbose(label: str, text: str, indent: str = "     ") -> str:
@@ -7515,22 +5812,26 @@ class AIAgent:
         body = ("\n" + indent).join(out_lines)
         return f"{indent}{label}{body}"
 
-    def _execute_tool_calls_concurrent(self, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0) -> None:
-        """Forwarder — see ``agent.tool_executor.execute_tool_calls_concurrent``."""
-        from agent.tool_executor import execute_tool_calls_concurrent
-        return execute_tool_calls_concurrent(self, assistant_message, messages, effective_task_id, api_call_count)
+    async def _execute_tool_calls(
+        self,
+        assistant_message,
+        messages: list,
+        effective_task_id: str,
+        api_call_count: int = 0,
+    ) -> None:
+        """Execute the model tool batch through native async handlers."""
+        from agent.tool_executor import execute_tool_calls_segmented
 
-    def _execute_tool_calls_sequential(self, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0) -> None:
-        """Forwarder — see ``agent.tool_executor.execute_tool_calls_sequential``."""
-        from agent.tool_executor import execute_tool_calls_sequential
-        return execute_tool_calls_sequential(self, assistant_message, messages, effective_task_id, api_call_count)
+        return await execute_tool_calls_segmented(
+            self, assistant_message, messages, effective_task_id, api_call_count
+        )
 
-    def _handle_max_iterations(self, messages: list, api_call_count: int) -> str:
+    async def _handle_max_iterations(self, messages: list, api_call_count: int) -> str:
         """Forwarder — see ``agent.chat_completion_helpers.handle_max_iterations``."""
         from agent.chat_completion_helpers import handle_max_iterations
-        return handle_max_iterations(self, messages, api_call_count)
+        return await handle_max_iterations(self, messages, api_call_count)
 
-    def _conversation_root_id(self) -> Optional[str]:
+    async def _conversation_root_id(self) -> Optional[str]:
         """Resolve the stable conversation id for Portal usage attribution.
 
         Returns the session-lineage ROOT id rather than the current segment
@@ -7549,17 +5850,17 @@ class AIAgent:
         # Subagents may not have a DB row yet on their first turn; walking
         # from the parent id still lands on the right root.
         start = getattr(self, "_parent_session_id", None) or sid
-        db = getattr(self, "_session_db", None)
-        if db is not None:
+        if getattr(self, "_session_db", None) is not None:
             try:
-                root = db.get_conversation_root(start)
+                db = self._session_db
+                root = await db.get_conversation_root(start) if db is not None else None
                 if root:
                     return root
             except Exception:
                 logger.debug("Conversation root lineage walk failed", exc_info=True)
         return start
 
-    def run_conversation(
+    async def run_conversation(
         self,
         user_message: Any,
         system_message: str = None,
@@ -7577,70 +5878,35 @@ class AIAgent:
             reset_accounting_context,
             set_accounting_context,
         )
-        from agent import relay_runtime
         from agent.conversation_loop import run_conversation
         from agent.portal_tags import (
             reset_conversation_context,
             set_conversation_context,
         )
-        from hermes_cli.observability.relay_shared_metrics import (
-            finish_task_run,
-            start_task_run,
-        )
         from agent.subagent_lifecycle import bind_subagent_parent
+        turn_lock = self._get_turn_lock()
+        await turn_lock.acquire()
+        self._active_turn_task = asyncio.current_task()
         effective_task_id = task_id or str(uuid.uuid4())
         session_id = str(getattr(self, "session_id", None) or "")
-        task_context = {
-            "session_id": session_id,
-            "task_id": effective_task_id,
-            "platform": getattr(self, "platform", None) or "",
-        }
-        relay_turn_id = (
-            f"{session_id or 'session'}:{effective_task_id}:{uuid.uuid4().hex[:8]}"
-        )
-        self._relay_pending_turn_id = relay_turn_id
-        relay_parent_session_id = (
-            str(getattr(self, "_parent_session_id", None) or "")
-            if task_context["platform"] == "subagent"
-            else ""
-        )
-        relay_lease = None
-        relay_turn = None
         token = None
         acct_token = None
-        task_started = False
-        task_finished = False
-        relay_outcome = "failed"
+        interrupt_token = _bind_interrupt_event(self._interrupt_event)
         try:
-            relay_lease = relay_runtime.SESSION_COORDINATOR.acquire_conversation(
-                profile_key=relay_runtime.current_profile_key(),
-                session_id=task_context["session_id"],
-                platform=task_context["platform"],
-                parent_session_id=relay_parent_session_id,
-                model=str(getattr(self, "model", None) or ""),
-            )
-            relay_turn = relay_runtime.SESSION_COORDINATOR.begin_turn(
-                relay_lease,
-                turn_id=relay_turn_id,
-                task_id=effective_task_id,
-            )
-            start_task_run(
-                **task_context,
-                parent_session_id=getattr(self, "_parent_session_id", None) or "",
-            )
-            task_started = True
             # Publish the conversation id for ambient Nous Portal tagging. Every
             # LLM call made inside this turn — main loop, compression, vision,
             # web_extract, session_search, MoA slots, background-review forks
-            # (which copy this Context into their thread) — inherits the
+            # (which inherit this Context in child tasks) — inherits the
             # ``conversation=<root>`` tag with zero per-call-site plumbing.
-            token = set_conversation_context(self._conversation_root_id())
+            token = set_conversation_context(await self._conversation_root_id())
             # Publish the session accounting handles the same way so auxiliary
             # calls record their token usage into session_model_usage (task
             # dimension) — the fix for aux spend being invisible in analytics
             # (issue #23270).
             acct_token = set_accounting_context(
-                getattr(self, "_session_db", None),
+                self._session_db
+                if getattr(self, "_session_db", None) is not None
+                else None,
                 getattr(self, "session_id", None),
             )
             from agent.auxiliary_client import scoped_runtime_main
@@ -7648,9 +5914,9 @@ class AIAgent:
             # The outer token restores the caller's Context even though turn setup
             # replaces the value with the live runtime after fallback restoration.
             # Keep the scope local instead of storing ContextVar tokens on the agent,
-            # which may be observed from another thread.
+            # which may be observed from another task.
             with bind_subagent_parent(self), scoped_runtime_main({}):
-                result = run_conversation(
+                return await run_conversation(
                     self,
                     user_message,
                     system_message,
@@ -7663,64 +5929,17 @@ class AIAgent:
                     persist_user_display_metadata=persist_user_display_metadata,
                     moa_config=moa_config,
                 )
-            terminal = result if isinstance(result, dict) else {}
-            if terminal.get("interrupted") is True:
-                relay_outcome = "cancelled"
-            elif terminal.get("failed") is True:
-                relay_outcome = "failed"
-            else:
-                relay_outcome = "success"
-            relay_runtime.SESSION_COORDINATOR.finish_logical_calls(
-                relay_turn,
-                outcome=relay_outcome,
-            )
-            task_finished = True
-            finish_task_run(**task_context, result=result)
-            return result
-        except BaseException as exc:
-            if isinstance(exc, (KeyboardInterrupt, InterruptedError)) or (
-                type(exc).__name__ == "CancelledError"
-            ):
-                relay_outcome = "cancelled"
-            elif isinstance(exc, TimeoutError):
-                relay_outcome = "timed_out"
-            if relay_turn is not None:
-                relay_runtime.SESSION_COORDINATOR.finish_logical_calls(
-                    relay_turn,
-                    outcome=relay_outcome,
-                )
-            if task_started and not task_finished:
-                task_finished = True
-                finish_task_run(**task_context, error=exc)
-            raise
         finally:
-            try:
-                if relay_turn is not None:
-                    relay_runtime.SESSION_COORDINATOR.end_turn(
-                        relay_turn,
-                        outcome=relay_outcome,
-                    )
-            finally:
-                try:
-                    if relay_lease is not None:
-                        relay_runtime.SESSION_COORDINATOR.release_conversation(
-                            relay_lease
-                        )
-                finally:
-                    # Always clear mid-turn labels when the turn exits — including
-                    # interrupted early returns that skip finalize_turn. Keep ts.
-                    try:
-                        self._reset_activity_labels_after_turn()
-                    except Exception:
-                        pass
-                    if getattr(self, "_relay_pending_turn_id", None) == relay_turn_id:
-                        self._relay_pending_turn_id = None
-                    if acct_token is not None:
-                        reset_accounting_context(acct_token)
-                    if token is not None:
-                        reset_conversation_context(token)
+            _reset_interrupt_event(interrupt_token)
+            if acct_token is not None:
+                reset_accounting_context(acct_token)
+            if token is not None:
+                reset_conversation_context(token)
+            if getattr(self, "_active_turn_task", None) is asyncio.current_task():
+                self._active_turn_task = None
+            turn_lock.release()
 
-    def chat(self, message: str, stream_callback: Optional[callable] = None) -> str:
+    async def chat(self, message: str, stream_callback: Optional[callable] = None) -> str:
         """
         Simple chat interface that returns just the final response.
 
@@ -7731,23 +5950,11 @@ class AIAgent:
         Returns:
             str: Final assistant response
         """
-        result = self.run_conversation(message, stream_callback=stream_callback)
+        result = await self.run_conversation(message, stream_callback=stream_callback)
         return result["final_response"]
 
-    def _run_codex_app_server_turn(
-        self,
-        *,
-        user_message: str,
-        original_user_message: Any,
-        messages: List[Dict[str, Any]],
-        effective_task_id: str,
-        should_review_memory: bool = False,
-    ) -> Dict[str, Any]:
-        """Forwarder — see ``agent.codex_runtime.run_codex_app_server_turn``."""
-        from agent.codex_runtime import run_codex_app_server_turn
-        return run_codex_app_server_turn(self, user_message=user_message, original_user_message=original_user_message, messages=messages, effective_task_id=effective_task_id, should_review_memory=should_review_memory)
 
-def main(
+async def main(
     query: str = None,
     model: str = "",
     api_key: str = None,
@@ -7915,52 +6122,50 @@ def main(
     print(f"\n📝 User Query: {user_query}")
     print("\n" + "=" * 50)
     
-    # Run conversation
-    result = agent.run_conversation(user_query)
-    
-    print("\n" + "=" * 50)
-    print("📋 CONVERSATION SUMMARY")
-    print("=" * 50)
-    print(f"✅ Completed: {result['completed']}")
-    print(f"📞 API Calls: {result['api_calls']}")
-    print(f"💬 Messages: {len(result['messages'])}")
-    
-    if result['final_response']:
-        print("\n🎯 FINAL RESPONSE:")
-        print("-" * 30)
-        print(result['final_response'])
-    
-    # Save sample trajectory to UUID-named file if requested
-    if save_sample:
-        sample_id = str(uuid.uuid4())[:8]
-        sample_filename = f"sample_{sample_id}.json"
-        
-        # Convert messages to trajectory format (same as batch_runner)
-        trajectory = agent._convert_to_trajectory_format(
-            result['messages'], 
-            user_query, 
-            result['completed']
-        )
-        
-        entry = {
-            "conversations": trajectory,
-            "timestamp": datetime.now().isoformat(),
-            "model": model,
-            "completed": result['completed'],
-            "query": user_query
-        }
-        
-        try:
-            with open(sample_filename, "w", encoding="utf-8") as f:
-                # Pretty-print JSON with indent for readability
-                f.write(json.dumps(entry, ensure_ascii=False, indent=2))
-            print(f"\n💾 Sample trajectory saved to: {sample_filename}")
-        except Exception as e:
-            print(f"\n⚠️ Failed to save sample: {e}")
-    
-    print("\n👋 Agent execution completed!")
+    try:
+        result = await agent.run_conversation(user_query)
 
+        print("\n" + "=" * 50)
+        print("📋 CONVERSATION SUMMARY")
+        print("=" * 50)
+        print(f"✅ Completed: {result['completed']}")
+        print(f"📞 API Calls: {result['api_calls']}")
+        print(f"💬 Messages: {len(result['messages'])}")
 
-if __name__ == "__main__":
-    import fire
-    fire.Fire(main)
+        if result['final_response']:
+            print("\n🎯 FINAL RESPONSE:")
+            print("-" * 30)
+            print(result['final_response'])
+
+        if save_sample:
+            sample_id = str(uuid.uuid4())[:8]
+            sample_filename = f"sample_{sample_id}.json"
+            trajectory = agent._convert_to_trajectory_format(
+                result['messages'],
+                user_query,
+                result['completed'],
+            )
+            entry = {
+                "conversations": trajectory,
+                "timestamp": datetime.now().isoformat(),
+                "model": model,
+                "completed": result['completed'],
+                "query": user_query,
+            }
+
+            try:
+                import aiofiles
+
+                async with aiofiles.open(
+                    sample_filename, "w", encoding="utf-8"
+                ) as output:
+                    await output.write(
+                        json.dumps(entry, ensure_ascii=False, indent=2)
+                    )
+                print(f"\n💾 Sample trajectory saved to: {sample_filename}")
+            except Exception as e:
+                print(f"\n⚠️ Failed to save sample: {e}")
+
+        print("\n👋 Agent execution completed!")
+    finally:
+        await agent.close()

@@ -17,6 +17,8 @@ resolved through :func:`_ra` so those patches keep working.
 from __future__ import annotations
 
 import json
+import asyncio
+import inspect
 import logging
 import os
 import random
@@ -26,6 +28,7 @@ import time
 from typing import Any, Dict, List, Optional
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
+from agent.agent_runtime_helpers import AsyncCapabilityError
 from agent.conversation_compression import (
     COMPRESSION_RETRY_CONTEXT_REDUCED_STATUS_TEMPLATE,
     COMPRESSION_RETRY_MESSAGES_STATUS_TEMPLATE,
@@ -36,7 +39,6 @@ from agent.conversation_compression import (
     conversation_history_after_compression,
 )
 from agent.context_engine import automatic_compaction_status_message
-from agent.display import KawaiiSpinner
 from agent.error_classifier import FailoverReason, classify_api_error
 from agent.turn_context import (
     _compression_warrants_another_preflight_pass,
@@ -81,7 +83,10 @@ from agent.retry_utils import (
     zai_coding_overload_retry_ceiling,
 )
 from agent.trajectory import has_incomplete_scratchpad
-from agent.usage_pricing import estimate_usage_cost, normalize_usage
+from agent.usage_pricing import (
+    estimate_usage_cost,
+    normalize_usage,
+)
 from hermes_constants import PARTIAL_STREAM_STUB_ID
 from hermes_logging import set_session_context
 from tools.skill_provenance import set_current_write_origin
@@ -196,13 +201,7 @@ def _apply_active_turn_redirect(agent: Any, messages: List[Dict[str, Any]], text
 
 
 def _is_copilot_provider(agent: Any) -> bool:
-    """Delegate to ``AIAgent._is_copilot_provider`` (single owner of the check).
-
-    ``agent.provider`` is not always the normalized ``copilot`` slug —
-    ``/model`` and profile configs can leave the alias ``github-copilot`` (or
-    ``github``) in place, and a bare ``provider == "copilot"`` gate silently
-    skips credential recovery for those spellings.
-    """
+    """Use the agent's canonical Copilot alias check with a safe fallback."""
     try:
         return bool(agent._is_copilot_provider())
     except Exception:
@@ -211,36 +210,6 @@ def _is_copilot_provider(agent: Any) -> bool:
             "github-copilot",
             "github",
         }
-
-
-def _is_stale_copilot_credential_error(status_code: Optional[int], error_message: str) -> bool:
-    """Detect a Copilot 400 that is really a STALE / DEGRADED credential.
-
-    Copilot surfaces a stale or degraded credential as an HTTP 400 rather than a
-    clean 401. Two body markers indicate this class:
-
-    - ``model_not_available_for_integrator`` — the request reached the
-      restricted ``copilot-language-server`` integrator (the server's fallback
-      when it receives a raw OAuth token instead of an exchanged API token),
-      whose model allowlist omits enterprise-only models.
-    - ``model_not_supported`` / "the requested model is not supported" — the
-      cached bearer's Copilot entitlement rotated out from under a long-lived
-      process.
-
-    Matched narrowly (status 400 AND a specific marker) so a genuinely wrong
-    model name — a real 400 — never triggers the single-shot re-exchange. The
-    caller enforces copilot-provider scoping and the single-shot guard.
-    """
-    lowered = (error_message or "").lower()
-    is_400 = status_code == 400 or "error code: 400" in lowered
-    if not is_400:
-        return False
-    return (
-        "model_not_available_for_integrator" in lowered
-        or "not available for integrator" in lowered
-        or "model_not_supported" in lowered
-        or "the requested model is not supported" in lowered
-    )
 
 
 def _image_error_max_dimension(error: Exception) -> Optional[int]:
@@ -325,25 +294,12 @@ def _ra():
     return run_agent
 
 
-def _nous_entitlement_message(capability: str) -> str:
-    try:
-        from hermes_cli.nous_account import (
-            format_nous_portal_entitlement_message,
-            get_nous_portal_account_info,
-        )
-
-        account_info = get_nous_portal_account_info(force_fresh=True)
-        message = format_nous_portal_entitlement_message(
-            account_info,
-            capability=capability,
-        )
-        return message or ""
-    except Exception:
-        return ""
+async def _nous_entitlement_message(capability: str) -> str:
+    return ""
 
 
-def _print_nous_entitlement_guidance(agent, capability: str) -> bool:
-    message = _nous_entitlement_message(capability)
+async def _print_nous_entitlement_guidance(agent, capability: str) -> bool:
+    message = await _nous_entitlement_message(capability)
     if not message:
         return False
     for line in message.splitlines():
@@ -361,7 +317,7 @@ def _is_nous_inference_route(provider: str, base_url: str) -> bool:
     )
 
 
-def _billing_or_entitlement_message(
+async def _billing_or_entitlement_message(
     *,
     capability: str,
     provider: str,
@@ -369,7 +325,7 @@ def _billing_or_entitlement_message(
     model: str,
 ) -> str:
     if _is_nous_inference_route(provider, base_url):
-        return _nous_entitlement_message(capability)
+        return await _nous_entitlement_message(capability)
 
     provider_label = (provider or "").strip() or "the selected provider"
     model_label = (model or "").strip() or "the selected model"
@@ -431,7 +387,7 @@ def _billing_block_dict(provider, base_url, model, message="") -> Optional[dict]
         return None
 
 
-def _print_billing_or_entitlement_guidance(
+async def _print_billing_or_entitlement_guidance(
     agent,
     *,
     capability: str,
@@ -439,7 +395,7 @@ def _print_billing_or_entitlement_guidance(
     base_url: str,
     model: str,
 ) -> bool:
-    message = _billing_or_entitlement_message(
+    message = await _billing_or_entitlement_message(
         capability=capability,
         provider=provider,
         base_url=base_url,
@@ -452,22 +408,7 @@ def _print_billing_or_entitlement_guidance(
     return True
 
 
-def _try_refresh_nous_paid_entitlement_credentials(agent) -> bool:
-    """Refresh Nous runtime credentials after a fresh paid-entitlement check."""
-    try:
-        from hermes_cli.nous_account import get_nous_portal_account_info
-
-        account_info = get_nous_portal_account_info(force_fresh=True)
-        if account_info.paid_service_access is not True:
-            return False
-        return agent._try_refresh_nous_client_credentials(
-            force=True,
-        )
-    except Exception:
-        return False
-
-
-def _restore_or_build_system_prompt(agent, system_message, conversation_history):
+async def _restore_or_build_system_prompt(agent, system_message, conversation_history):
     """Restore the cached system prompt from the session DB or build it fresh.
 
     Mutates ``agent._cached_system_prompt`` and persists a freshly-built
@@ -498,7 +439,12 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
     stored_state = "missing"
     if conversation_history and agent._session_db:
         try:
-            session_row = agent._session_db.get_session(agent.session_id)
+            session_db = agent._session_db
+            session_row = (
+                await session_db.get_session(agent.session_id)
+                if session_db is not None
+                else None
+            )
             if session_row is not None:
                 raw_prompt = session_row.get("system_prompt")
                 if raw_prompt is None:
@@ -516,7 +462,7 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
                 agent.session_id, exc,
             )
 
-    if stored_prompt and _stored_prompt_matches_runtime(agent, stored_prompt):
+    if stored_prompt and await _stored_prompt_matches_runtime(agent, stored_prompt):
         # Continuing session — reuse the exact system prompt from the
         # previous turn so the Anthropic cache prefix matches.
         agent._cached_system_prompt = stored_prompt
@@ -533,7 +479,7 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
         # fails open to the legacy cache layout.
         from agent.system_prompt import reconstruct_static_prefix
 
-        reconstruct_static_prefix(agent, system_message=system_message)
+        await reconstruct_static_prefix(agent, system_message=system_message)
         return
     if stored_prompt:
         stored_state = "stale_runtime"
@@ -560,14 +506,14 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
 
     # First turn of a new session (or recovering from a broken stored
     # prompt) — build from scratch.
-    agent._cached_system_prompt = agent._build_system_prompt(system_message)
+    agent._cached_system_prompt = await agent._build_system_prompt(system_message)
 
     # Plugin hook: on_session_start — fired once when a brand-new
     # session is created (not on continuation).  Plugins can use this
     # to initialise session-scoped state (e.g. warm a memory cache).
     try:
         from hermes_cli.lifecycle import invoke_hook as _invoke_hook
-        _invoke_hook(
+        await _invoke_hook(
             "on_session_start",
             session_id=agent.session_id,
             model=agent.model,
@@ -585,7 +531,7 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
     try:
         from agent.credits_tracker import seed_credits_at_session_start
 
-        seed_credits_at_session_start(agent)
+        await seed_credits_at_session_start(agent)
     except Exception:
         logger.debug("cold-start credits seed failed (fail-open)", exc_info=True)
 
@@ -595,7 +541,12 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
     # subsequent turn).
     if agent._session_db:
         try:
-            agent._session_db.update_system_prompt(agent.session_id, agent._cached_system_prompt)
+            session_db = agent._session_db
+            if session_db is not None:
+                await session_db.update_system_prompt(
+                    agent.session_id,
+                    agent._cached_system_prompt,
+                )
         except Exception as exc:
             logger.warning(
                 "Session DB update_system_prompt failed for session %s: "
@@ -605,7 +556,7 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
             )
 
 
-def _stored_prompt_matches_runtime(agent, prompt: str) -> bool:
+async def _stored_prompt_matches_runtime(agent, prompt: str) -> bool:
     """Return False when the persisted runtime-identity lines are stale."""
 
     def line_value(label: str) -> str:
@@ -667,7 +618,7 @@ def _stored_prompt_matches_runtime(agent, prompt: str) -> bool:
     # rejected (they would always differ from the launch dir's os.getcwd()).
     stored_cwd = host_info_value("Current working directory")
     if stored_cwd:
-        if stored_cwd != str(resolve_agent_cwd()):
+        if stored_cwd != str(await resolve_agent_cwd()):
             return False
 
     # Detect runtime-surface drift: the stored prompt records which platform it
@@ -738,42 +689,24 @@ _CONTENT_POLICY_RECOVERY_HINT = (
 )
 
 
-# Memo for the send-path tool-call argument canonicalization inside
-# run_conversation().  That pass re-canonicalizes the arguments string of
-# EVERY historical tool call on EVERY API-call iteration (quadratic in
-# session tool-call count), and the api_messages copies share the exact
-# argument string objects with the persisted history, so the same strings
-# come through unchanged iteration after iteration.
-#
-# Soundness: canonicalization is a pure, deterministic function of the
-# input string (fixed separators, sort_keys=True), so a value-keyed memo
-# is exact — equal inputs always produce the canonical form computed the
-# first time.  Malformed strings raise out of json.loads BEFORE anything
-# is stored, so the repair fallback below is never memoized and reruns on
-# every occurrence, exactly as before.  Bounded FIFO eviction mirrors the
-# _MSG_TOKENS_CACHE idiom in agent/model_metadata.py.
+# Tool-call arguments are canonicalized on every model request. A bounded
+# value-keyed memo avoids repeatedly parsing the unchanged historical calls.
 _CANON_ARGS_CACHE: Dict[str, str] = {}
 _CANON_ARGS_CACHE_MAX = 4096
-# Count bound alone doesn't bound MEMORY: write_file/patch argument strings
-# run 100KB+, so 4096 entries could pin ~800MB in a long-lived gateway
-# process. The byte budget keeps the memo effective for the common case
-# (args ~0.5-2KB) while bounding the worst case.
 _CANON_ARGS_CACHE_MAX_BYTES = 32 * 1024 * 1024
 _canon_args_cache_bytes = 0
 
 
 def _canonicalize_tool_call_arguments(arg_str: str) -> str:
-    """Return the canonical wire form of a tool-call arguments JSON string.
-
-    Raises whatever ``json.loads`` raises on malformed input; the caller
-    falls back to ``_repair_tool_call_arguments``, exactly as before.
-    """
+    """Return the stable wire representation of a tool-call JSON payload."""
     global _canon_args_cache_bytes
+
     cached = _CANON_ARGS_CACHE.get(arg_str)
     if cached is not None:
         return cached
+
     canonical = json.dumps(
-        json.loads(arg_str), separators=(",", ":"), sort_keys=True,
+        json.loads(arg_str), separators=(",", ":"), sort_keys=True
     )
     _CANON_ARGS_CACHE[arg_str] = canonical
     _canon_args_cache_bytes += len(arg_str) + len(canonical)
@@ -783,45 +716,42 @@ def _canonicalize_tool_call_arguments(arg_str: str) -> str:
     ):
         try:
             evicted_key = next(iter(_CANON_ARGS_CACHE))
-            evicted_val = _CANON_ARGS_CACHE.pop(evicted_key)
-            _canon_args_cache_bytes -= len(evicted_key) + len(evicted_val)
+            evicted_value = _CANON_ARGS_CACHE.pop(evicted_key)
+            _canon_args_cache_bytes -= len(evicted_key) + len(evicted_value)
         except (StopIteration, KeyError, RuntimeError):
             break
     return canonical
 
 
 def _canonicalize_api_tool_calls(api_messages) -> None:
-    """Canonicalize tool-call argument JSON on the send-path message copy.
-
-    Rewrites each message's ``tool_calls`` in place (copy-on-write for the
-    tool-call dicts it canonicalizes; the persisted history is untouched).
-    The pass still traverses every message and tool call each iteration;
-    the memo above bounds the JSON parse/serialize work to one round-trip
-    per UNIQUE argument string instead of one per string per iteration —
-    the quadratic part of the cost. The remaining traversal is pointer
-    chasing and dict copies, cheap next to a json.loads + json.dumps.
-    """
-    for am in api_messages:
-        tcs = am.get("tool_calls")
-        if not tcs:
+    """Canonicalize copied API messages without mutating persisted history."""
+    for message in api_messages:
+        tool_calls = message.get("tool_calls")
+        if not tool_calls:
             continue
-        new_tcs = []
-        for tc in tcs:
-            if isinstance(tc, dict) and "function" in tc:
+
+        normalized_calls = []
+        for tool_call in tool_calls:
+            if isinstance(tool_call, dict) and "function" in tool_call:
                 try:
-                    tc = {**tc, "function": {
-                        **tc["function"],
-                        "arguments": _canonicalize_tool_call_arguments(
-                            tc["function"]["arguments"]
-                        ),
-                    }}
+                    tool_call = {
+                        **tool_call,
+                        "function": {
+                            **tool_call["function"],
+                            "arguments": _canonicalize_tool_call_arguments(
+                                tool_call["function"]["arguments"]
+                            ),
+                        },
+                    }
                 except Exception:
-                    tc["function"]["arguments"] = _repair_tool_call_arguments(
-                        tc["function"]["arguments"],
-                        tc["function"].get("name", "?"),
+                    tool_call["function"]["arguments"] = (
+                        _repair_tool_call_arguments(
+                            tool_call["function"]["arguments"],
+                            tool_call["function"].get("name", "?"),
+                        )
                     )
-            new_tcs.append(tc)
-        am["tool_calls"] = new_tcs
+            normalized_calls.append(tool_call)
+        message["tool_calls"] = normalized_calls
 
 
 def _invalid_tool_name_error_content(name: str, valid_tool_names) -> str:
@@ -988,7 +918,7 @@ def _sync_failover_system_message(agent, api_messages, active_system_prompt):
     return sp
 
 
-def _ensure_cached_system_prompt_static(agent, system_message=None) -> None:
+async def _ensure_cached_system_prompt_static(agent, system_message=None) -> None:
     """Rebuild ``_cached_system_prompt_static`` when caching becomes active.
 
     Sessions restored under a cache-off primary skip the static-prefix rebuild
@@ -1002,7 +932,7 @@ def _ensure_cached_system_prompt_static(agent, system_message=None) -> None:
     """
     from agent.system_prompt import reconstruct_static_prefix
 
-    reconstruct_static_prefix(
+    await reconstruct_static_prefix(
         agent, system_message=system_message, log_label="failover redecoration"
     )
 
@@ -1022,14 +952,14 @@ def _peel_moa_guidance(
     return peel_reference_guidance(messages, guidance)
 
 
-def _redecorate_prompt_cache_for_provider(
+async def _redecorate_prompt_cache_for_provider(
     agent,
     api_messages: List[Dict[str, Any]],
     *,
     system_message=None,
     moa_prepared: Optional[Dict[str, Any]] = None,
     tools_for_api: Optional[List[Dict[str, Any]]] = None,
-) -> tuple[List[Dict[str, Any]], Optional[Dict[str, Any]]] | tuple[List[Dict[str, Any]], Optional[Dict[str, Any]], List[Dict[str, Any]]]:
+):
     """Strip and re-apply cache_control for the *current* provider policy.
 
     Decoration runs once per call block before the retry loop for the primary
@@ -1039,9 +969,10 @@ def _redecorate_prompt_cache_for_provider(
     by reshaping at the top of each retry attempt.
 
     The source list is the mutated in-flight request (image shrink / ASCII /
-    reasoning_details recoveries already applied), never a pristine
-    pre-decoration snapshot. MoA guidance is peeled and rebased without
-    decoration; the acting aggregator plans its resolved destination later.
+    reasoning_details recoveries already applied) — never a pristine
+    pre-decoration snapshot. MoA guidance is peeled, the base is redecorated,
+    then ``rebase_prepared_request`` re-attaches guidance outside the cached
+    span.
     """
     messages: List[Dict[str, Any]] = [
         dict(m) if isinstance(m, dict) else m for m in (api_messages or [])
@@ -1057,8 +988,6 @@ def _redecorate_prompt_cache_for_provider(
     )
 
     if prepared is not None and getattr(agent, "provider", None) == "moa":
-        # Prepared MoA state is canonical: the synchronous acting-aggregator
-        # sender owns its destination-local cache plan after it resolves the slot.
         completions = getattr(getattr(agent.client, "chat", None), "completions", None)
         rebase = getattr(completions, "rebase_prepared_request", None)
         if callable(rebase):
@@ -1072,20 +1001,17 @@ def _redecorate_prompt_cache_for_provider(
     # flags are unconditionally initialized on AIAgent, and a getattr
     # default here would mask a real init bug as silent cache-off.
     if agent._use_prompt_caching:
-        _ensure_cached_system_prompt_static(agent, system_message=system_message)
+        await _ensure_cached_system_prompt_static(agent, system_message=system_message)
         static = getattr(agent, "_cached_system_prompt_static", None)
-        direct_tool_cache = getattr(
-            agent,
-            "_direct_native_anthropic_tool_cache_capability",
-            lambda: False,
-        )()
         plan = build_prompt_cache_plan(
             messages,
             planned_tools,
             cache_ttl=agent._cache_ttl,
             native_anthropic=agent._use_native_cache_layout,
             static_system_prefix=static if isinstance(static, str) else None,
-            direct_native_tool_cache=direct_tool_cache,
+            direct_native_tool_cache=(
+                agent._direct_native_anthropic_tool_cache_capability()
+            ),
         )
         messages = plan.messages
         planned_tools = plan.tools
@@ -1225,7 +1151,7 @@ def _notify_context_engine_turn_complete(
         )
 
 
-def run_conversation(
+async def run_conversation(
     agent,
     user_message: Any,
     system_message: str = None,
@@ -1294,7 +1220,7 @@ def run_conversation(
     # ``build_turn_context``.  It mutates ``agent`` exactly as the inline code
     # did and returns the locals the loop below reads back.  See
     # ``agent/turn_context.py``.
-    _ctx = build_turn_context(
+    _ctx = await build_turn_context(
         agent,
         user_message,
         system_message,
@@ -1385,20 +1311,6 @@ def run_conversation(
     # stale prior turn's usage.
     agent._last_turn_usage = None
 
-    # Optional opt-in runtime: if api_mode == codex_app_server, hand the
-    # turn to the codex app-server subprocess (terminal/file ops/patching
-    # all run inside Codex). Default Hermes path is bypassed entirely.
-    # See agent/transports/codex_app_server_session.py for the adapter
-    # and references/codex-app-server-runtime.md for the rationale.
-    if agent.api_mode == "codex_app_server":
-        return agent._run_codex_app_server_turn(
-            user_message=user_message,
-            original_user_message=original_user_message,
-            messages=messages,
-            effective_task_id=effective_task_id,
-            should_review_memory=_should_review_memory,
-        )
-
     while (api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0) or agent._budget_grace_call:
         _redirect_text = agent._drain_pending_redirect()
         if _redirect_text:
@@ -1408,10 +1320,7 @@ def run_conversation(
                     f"{original_user_message}\n\n"
                     f"User correction during the turn: {_redirect_text}"
                 )
-            agent._persist_session(messages, conversation_history)
-
-        # Reset per-turn checkpoint dedup so each iteration can take one snapshot
-        agent._checkpoint_mgr.new_turn()
+            await agent._persist_session(messages, conversation_history)
 
         # Check for interrupt request (e.g., user sent new message)
         if agent._interrupt_requested:
@@ -1464,12 +1373,6 @@ def run_conversation(
             except Exception as _step_err:
                 logger.debug("step_callback error (iteration %s): %s", api_call_count, _step_err)
 
-        # Track tool-calling iterations for skill nudge.
-        # Counter resets whenever skill_manage is actually used.
-        if (agent._skill_nudge_interval > 0
-                and "skill_manage" in agent.valid_tool_names):
-            agent._iters_since_skill += 1
-        
         # ── Pre-API-call /steer drain ──────────────────────────────────
         # If a /steer arrived during the previous API call (while the model
         # was thinking), drain it now — before we build api_messages — so
@@ -1510,16 +1413,12 @@ def run_conversation(
             if not _injected:
                 # No tool message to inject into — put it back so
                 # the post-tool-execution drain picks it up later.
-                _lock = getattr(agent, "_pending_steer_lock", None)
-                if _lock is not None:
-                    with _lock:
-                        if agent._pending_steer:
-                            agent._pending_steer = agent._pending_steer + "\n" + _pre_api_steer
-                        else:
-                            agent._pending_steer = _pre_api_steer
-                else:
-                    existing = getattr(agent, "_pending_steer", None)
-                    agent._pending_steer = (existing + "\n" + _pre_api_steer) if existing else _pre_api_steer
+                existing = getattr(agent, "_pending_steer", None)
+                agent._pending_steer = (
+                    existing + "\n" + _pre_api_steer
+                    if existing
+                    else _pre_api_steer
+                )
 
         # Prepare messages for API call
         # If we have an ephemeral system prompt, prepend it to the messages
@@ -1588,12 +1487,6 @@ def run_conversation(
             # event row enters the live history.
             api_msg.pop("display_kind", None)
             api_msg.pop("display_metadata", None)
-
-            # Durable row identity stamped by _rows_to_conversation so the
-            # desktop can address a specific persisted message (reactions).
-            # Bookkeeping, never a provider field — only the chat-completions
-            # transport strips underscore keys, so drop it centrally here.
-            api_msg.pop("_row_id", None)
 
             # Inject ephemeral context into the current turn's user message.
             # Sources: memory manager prefetch + plugin pre_llm_call hooks
@@ -1704,7 +1597,7 @@ def run_conversation(
                 from agent.message_content import flatten_message_text as _flatten_mt
                 from agent.moa_loop import _preset_temperature, aggregate_moa_context
 
-                _moa_context = aggregate_moa_context(
+                _moa_context = await aggregate_moa_context(
                     user_prompt=(
                         original_user_message
                         if isinstance(original_user_message, str)
@@ -1822,8 +1715,12 @@ def run_conversation(
         # regardless of ordering (a single-space pad here previously had to
         # be sequenced after normalization to survive, forking the concept).
 
-        # Build the request-local cache sections only after every transcript
-        # mutation. The canonical tool registry stays undecorated.
+        # Apply Anthropic prompt caching for Claude models on native
+        # Anthropic, OpenRouter, and third-party Anthropic-compatible
+        # gateways. Auto-detected: if ``_use_prompt_caching`` is set, inject
+        # cache_control breakpoints for the static system prefix, full system
+        # prompt, and last two messages (or the legacy system-and-3 layout
+        # when no static prefix is available).
         #
         # Runs LAST, after every message mutation above. Marking earlier
         # defeats the prefix stability the mutations exist to create:
@@ -1841,7 +1738,7 @@ def run_conversation(
         tools_for_api = agent.tools
         if agent._use_prompt_caching and agent.provider != "moa":
             _static_system_prefix = getattr(agent, "_cached_system_prompt_static", None)
-            _initial_cache_plan = build_prompt_cache_plan(
+            initial_cache_plan = build_prompt_cache_plan(
                 api_messages,
                 tools_for_api,
                 cache_ttl=agent._cache_ttl,
@@ -1851,10 +1748,12 @@ def run_conversation(
                     if isinstance(_static_system_prefix, str)
                     else None
                 ),
-                direct_native_tool_cache=agent._direct_native_anthropic_tool_cache_capability(),
+                direct_native_tool_cache=(
+                    agent._direct_native_anthropic_tool_cache_capability()
+                ),
             )
-            api_messages = _initial_cache_plan.messages
-            tools_for_api = _initial_cache_plan.tools
+            api_messages = initial_cache_plan.messages
+            tools_for_api = initial_cache_plan.tools
 
         # Build a persistent-MoA request before measuring compression pressure.
         # MoA reference output is injected into the aggregator prompt, but it
@@ -1875,7 +1774,7 @@ def run_conversation(
             if _moa_prepared_request is None:
                 _prepare_moa_request = getattr(_moa_completions, "prepare", None)
                 if callable(_prepare_moa_request):
-                    _moa_prepared_request = _prepare_moa_request(api_messages)
+                    _moa_prepared_request = await _prepare_moa_request(api_messages)
             if _moa_prepared_request is not None:
                 api_messages = _moa_prepared_request["messages"]
 
@@ -1925,9 +1824,28 @@ def run_conversation(
         # LLM cooldown + anti-thrash guards (#11529). compression_attempts is a
         # hard per-turn backstop shared with the overflow error handlers.
         _compressor = agent.context_compressor
-        _preflight_threshold = int(
-            getattr(_compressor, "threshold_tokens", 0) or 0
-        )
+        if agent.compression_enabled:
+            _preflight_threshold = int(
+                getattr(_compressor, "threshold_tokens", 0) or 0
+            )
+            _defer_preflight = getattr(
+                _compressor,
+                "should_defer_preflight_to_real_usage",
+                lambda _tokens: False,
+            )
+            _compression_cooldown = getattr(
+                _compressor,
+                "get_active_compression_failure_cooldown",
+                lambda: None,
+            )()
+        else:
+            # Resolving ContextCompressor.threshold_tokens can live-probe a
+            # provider's /models endpoint. A disabled compressor must be a
+            # true no-op in an async turn, not an accidental sync probe just
+            # to calculate a branch that cannot run.
+            _preflight_threshold = 0
+            _defer_preflight = lambda _tokens: False
+            _compression_cooldown = None
         # A previous mid-turn preflight pass deliberately continued the loop so
         # API-only context and all sanitization could be rebuilt. Compare that
         # fully assembled request with the fully assembled request that caused
@@ -1937,6 +1855,8 @@ def run_conversation(
         _previous_preflight_pressure = _last_preflight_pressure
         _last_preflight_pressure = None
         if (
+            agent.compression_enabled
+            and
             _previous_preflight_pressure is not None
             and request_pressure_tokens >= _preflight_threshold
             and not _compression_warrants_another_preflight_pass(
@@ -1956,12 +1876,6 @@ def run_conversation(
                 f"{_previous_preflight_pressure:,}",
                 f"{request_pressure_tokens:,}",
             )
-        _defer_preflight = getattr(
-            _compressor, "should_defer_preflight_to_real_usage", lambda _t: False
-        )
-        _compression_cooldown = getattr(
-            _compressor, "get_active_compression_failure_cooldown", lambda: None
-        )()
         if (
             agent.compression_enabled
             and len(messages) > 1
@@ -2014,7 +1928,7 @@ def run_conversation(
                 agent._emit_status(_pre_api_status)
             _last_preflight_pressure = request_pressure_tokens
             _pre_api_input = messages
-            messages, active_system_prompt = agent._compress_context(
+            messages, active_system_prompt = await agent._compress_context(
                 messages,
                 system_message,
                 approx_tokens=request_pressure_tokens,
@@ -2086,27 +2000,12 @@ def run_conversation(
                     int(getattr(_compressor, "threshold_tokens", 0) or 0),
                 )
         
-        # Thinking spinner for quiet mode (animated during API call)
-        thinking_spinner = None
-        
         if not agent.quiet_mode:
             agent._vprint(f"\n{agent.log_prefix}🔄 Making API call #{api_call_count}/{agent.max_iterations}...")
             agent._vprint(f"{agent.log_prefix}   📊 Request size: {len(api_messages)} messages, ~{approx_tokens:,} tokens (~{total_chars:,} chars)")
             agent._vprint(f"{agent.log_prefix}   🔧 Available tools: {len(agent.tools) if agent.tools else 0}")
-        else:
-            # Animated thinking spinner in quiet mode
-            face = random.choice(KawaiiSpinner.get_thinking_faces())
-            verb = random.choice(KawaiiSpinner.get_thinking_verbs())
-            if agent.thinking_callback:
-                # CLI TUI mode: use prompt_toolkit widget instead of raw spinner
-                # (works in both streaming and non-streaming modes)
-                agent.thinking_callback(f"{face} {verb}...")
-            elif not agent._has_stream_consumers() and agent._should_start_quiet_spinner():
-                # Raw KawaiiSpinner only when no streaming consumers and the
-                # spinner output has a safe sink.
-                spinner_type = random.choice(['brain', 'sparkle', 'pulse', 'moon', 'star'])
-                thinking_spinner = KawaiiSpinner(f"{face} {verb}...", spinner_type=spinner_type, print_fn=agent._print_fn)
-                thinking_spinner.start()
+        elif agent.thinking_callback:
+            agent.thinking_callback("Thinking...")
         
         # Log request details if verbose
         if agent.verbose_logging:
@@ -2137,7 +2036,7 @@ def run_conversation(
                         nous_rate_limit_remaining,
                         format_remaining as _fmt_nous_remaining,
                     )
-                    _nous_remaining = nous_rate_limit_remaining()
+                    _nous_remaining = await nous_rate_limit_remaining()
                     if _nous_remaining is not None and _nous_remaining > 0:
                         _nous_msg = (
                             f"Nous Portal rate limit active — "
@@ -2147,7 +2046,7 @@ def run_conversation(
                             f"⏳ {_nous_msg} Trying fallback..."
                         )
                         agent._buffer_status(f"⏳ {_nous_msg}")
-                        if agent._try_activate_fallback():
+                        if await agent._try_activate_fallback():
                             active_system_prompt = _sync_failover_system_message(
                                 agent, api_messages, active_system_prompt)
                             retry_count = 0
@@ -2157,7 +2056,7 @@ def run_conversation(
                         # No fallback available — surface buffered context
                         # so user sees the rate-limit message that led here.
                         agent._flush_status_buffer()
-                        agent._persist_session(messages, conversation_history)
+                        await agent._persist_session(messages, conversation_history)
                         return {
                             "final_response": (
                                 f"⏳ {_nous_msg}\n\n"
@@ -2191,7 +2090,7 @@ def run_conversation(
                 # still carries the primary's breakpoints (or none). Strip and
                 # re-render for the current provider before building kwargs.
                 api_messages, _moa_prepared_request, tools_for_api = (
-                    _redecorate_prompt_cache_for_provider(
+                    await _redecorate_prompt_cache_for_provider(
                         agent,
                         api_messages,
                         system_message=system_message,
@@ -2199,13 +2098,10 @@ def run_conversation(
                         tools_for_api=tools_for_api,
                     )
                 )
-                if tools_for_api == agent.tools:
-                    api_kwargs = agent._build_api_kwargs(api_messages)
-                else:
-                    api_kwargs = agent._build_api_kwargs(
-                        api_messages,
-                        tools_for_api=tools_for_api,
-                    )
+                api_kwargs = await agent._build_api_kwargs(
+                    api_messages,
+                    tools_for_api=tools_for_api,
+                )
                 if agent._force_ascii_payload:
                     _sanitize_structure_non_ascii(api_kwargs)
                 if agent.api_mode == "codex_responses":
@@ -2213,7 +2109,6 @@ def run_conversation(
                         api_kwargs,
                         allow_stream=False,
                         is_github_responses=agent._is_copilot_url(),
-                        sanitize_harmony_tokens=agent._is_codex_backend(),
                     )
                 # Copilot x-initiator: the first API call of a user turn is
                 # marked "user" so Copilot bills a premium request; tool-loop
@@ -2226,7 +2121,7 @@ def run_conversation(
                 try:
                     from hermes_cli.middleware import apply_llm_request_middleware
 
-                    _llm_request_mw = apply_llm_request_middleware(
+                    _llm_request_mw = await apply_llm_request_middleware(
                         api_kwargs,
                         task_id=effective_task_id,
                         turn_id=turn_id,
@@ -2274,7 +2169,7 @@ def run_conversation(
                         # provider client.  New consumers should read the
                         # sanitised view from ``request["body"]["messages"]``.
                         _request_payload = agent._api_request_payload_for_hook(api_kwargs)
-                        _invoke_hook(
+                        await _invoke_hook(
                             "pre_api_request",
                             task_id=effective_task_id,
                             turn_id=turn_id,
@@ -2305,7 +2200,7 @@ def run_conversation(
                     pass
 
                 if env_var_enabled("HERMES_DUMP_REQUESTS"):
-                    agent._dump_api_request_debug(api_kwargs, reason="preflight")
+                    await agent._dump_api_request_debug(api_kwargs, reason="preflight")
 
                 # This object is private to the in-process MoA facade.  Add it
                 # only after middleware, hooks, and debug dumps so none of them
@@ -2324,11 +2219,7 @@ def run_conversation(
                 # consumers are registered, and falls back to non-
                 # streaming automatically if the provider doesn't
                 # support it.
-                def _stop_spinner():
-                    nonlocal thinking_spinner
-                    if thinking_spinner:
-                        thinking_spinner.stop("")
-                        thinking_spinner = None
+                def _stop_thinking():
                     if agent.thinking_callback:
                         agent.thinking_callback("")
 
@@ -2338,27 +2229,6 @@ def run_conversation(
                 # session instead of re-failing every retry.
                 if getattr(agent, "_disable_streaming", False):
                     _use_streaming = False
-                # CopilotACPClient communicates via subprocess stdio and
-                # returns a plain SimpleNamespace — not an iterable
-                # stream.  Mirror the ACP exclusion used for Responses
-                # API upgrade (lines ~1083-1085).
-                elif (
-                    agent.provider in {"copilot-acp"}
-                    or str(agent.base_url or "").lower().startswith("acp://copilot")
-                    or str(agent.base_url or "").lower().startswith("acp+tcp://")
-                ):
-                    _use_streaming = False
-                # MoA streams only when a display/TTS consumer is present to
-                # receive the deltas. MoAChatCompletions.create() honors
-                # stream=True (runs the references, then returns the aggregator's
-                # raw token stream) and is reached here because, for provider
-                # "moa", _create_request_openai_client returns the MoA facade
-                # itself. Without consumers (quiet mode, subagents, health-check
-                # probes) we keep the complete-response path: the facade returns a
-                # whole response when stream is not requested, preserving the
-                # prior behavior for those callers.
-                elif agent.provider == "moa" and not agent._has_stream_consumers():
-                    _use_streaming = False
                 elif not agent._has_stream_consumers():
                     # No display/TTS consumer. Still prefer streaming for
                     # health checking, but skip for Mock clients in tests
@@ -2367,54 +2237,32 @@ def run_conversation(
                     if isinstance(getattr(agent, "client", None), Mock):
                         _use_streaming = False
 
-                def _perform_api_call(next_api_kwargs):
+                async def _perform_api_call(next_api_kwargs):
                     if agent.api_mode == "codex_responses":
                         next_api_kwargs = agent._get_transport().preflight_kwargs(
                             next_api_kwargs,
                             allow_stream=False,
                             is_github_responses=agent._is_copilot_url(),
-                            sanitize_harmony_tokens=agent._is_codex_backend(),
                         )
-                    if _use_streaming:
-                        return agent._interruptible_streaming_api_call(
-                            next_api_kwargs, on_first_delta=_stop_spinner
-                        )
-                    from agent import relay_llm
-
-                    return relay_llm.execute(
+                    return await agent._execute_model_request(
                         next_api_kwargs,
-                        agent._interruptible_api_call,
-                        session_id=str(agent.session_id or ""),
-                        name=str(agent.provider or "provider"),
-                        model_name=str(agent.model or ""),
-                        metadata={
-                            "api_mode": agent.api_mode,
-                            "api_request_id": api_request_id,
-                            "call_role": (
-                                "delegated"
-                                if getattr(agent, "is_subagent", False)
-                                else "fallback"
-                                if int(getattr(agent, "_fallback_index", 0) or 0) > 0
-                                else "primary"
-                            ),
-                            "retry_count": retry_count,
-                        },
-                        defer_logical_completion=True,
+                        use_streaming=_use_streaming,
+                        on_first_delta=_stop_thinking,
                     )
 
-                from hermes_cli.middleware import run_llm_execution_middleware
-
                 _model_request_active = getattr(agent, "_model_request_active", None)
-                _redirect_lock = getattr(agent, "_pending_redirect_lock", None)
-                if _redirect_lock is not None:
-                    with _redirect_lock:
-                        if _model_request_active is not None:
-                            _model_request_active.set()
-                elif _model_request_active is not None:
+                if _model_request_active is not None:
                     _model_request_active.set()
                 _redirect_crossed_response = False
                 try:
-                    response = run_llm_execution_middleware(
+                    # Preserve the execution-middleware contract on the async
+                    # path. The chain and provider terminal call are native
+                    # awaitables.
+                    from hermes_cli.middleware import (
+                        run_llm_execution_middleware,
+                    )
+
+                    response = await run_llm_execution_middleware(
                         api_kwargs,
                         _perform_api_call,
                         original_request=_original_api_kwargs,
@@ -2428,28 +2276,15 @@ def run_conversation(
                         base_url=agent.base_url,
                         api_mode=agent.api_mode,
                         api_call_count=api_call_count,
-                        middleware_trace=list(_llm_middleware_trace),
                     )
                 finally:
-                    if _redirect_lock is not None:
-                        with _redirect_lock:
-                            if _model_request_active is not None:
-                                _model_request_active.clear()
-                            _redirect_crossed_response = bool(
-                                agent._pending_redirect
-                            )
-                    else:
-                        if _model_request_active is not None:
-                            _model_request_active.clear()
-                        _redirect_crossed_response = agent._has_pending_redirect()
+                    if _model_request_active is not None:
+                        _model_request_active.clear()
+                    _redirect_crossed_response = agent._has_pending_redirect()
                 if _redirect_crossed_response:
-                    # The response and redirect can cross on different threads:
-                    # redirect() observed the request as active just before this
-                    # call returned. Discard that now-stale response and rebuild
-                    # from the correction rather than silently losing it.
-                    if thinking_spinner:
-                        thinking_spinner.stop("")
-                        thinking_spinner = None
+                    # redirect() observed the request as active while the
+                    # provider await was suspended. Discard that now-stale
+                    # response and rebuild from the correction.
                     if agent.thinking_callback:
                         agent.thinking_callback("")
                     if agent.clear_interrupt(preserve_redirect=True):
@@ -2462,9 +2297,6 @@ def run_conversation(
                 
                 # Stop thinking spinner silently -- the response box or tool
                 # execution messages that follow are more informative.
-                if thinking_spinner:
-                    thinking_spinner.stop("")
-                    thinking_spinner = None
                 if agent.thinking_callback:
                     agent.thinking_callback("")
                 
@@ -2557,7 +2389,7 @@ def run_conversation(
                             error_details.append("response.choices is empty")
 
                 if response_invalid:
-                    agent._invoke_api_request_error_hook(
+                    await agent._invoke_api_request_error_hook(
                         task_id=effective_task_id,
                         turn_id=turn_id,
                         api_request_id=api_request_id,
@@ -2574,9 +2406,6 @@ def run_conversation(
                     )
                     # Stop spinner silently — retry status is now buffered
                     # and only surfaced if every retry+fallback exhausts.
-                    if thinking_spinner:
-                        thinking_spinner.stop("")
-                        thinking_spinner = None
                     if agent.thinking_callback:
                         agent.thinking_callback("")
                     
@@ -2589,7 +2418,7 @@ def run_conversation(
                     # rather than retrying with extended backoff.
                     if agent._fallback_index < len(agent._fallback_chain):
                         agent._buffer_status("⚠️ Empty/malformed response — switching to fallback...")
-                    if agent._try_activate_fallback():
+                    if await agent._try_activate_fallback():
                         active_system_prompt = _sync_failover_system_message(
                             agent, api_messages, active_system_prompt)
                         retry_count = 0
@@ -2662,7 +2491,7 @@ def run_conversation(
                         # Try fallback before giving up
                         if agent._has_pending_fallback():
                             agent._buffer_status(f"⚠️ Max retries ({max_retries}) for invalid responses — trying fallback...")
-                        if agent._try_activate_fallback():
+                        if await agent._try_activate_fallback():
                             active_system_prompt = _sync_failover_system_message(
                                 agent, api_messages, active_system_prompt)
                             retry_count = 0
@@ -2672,8 +2501,8 @@ def run_conversation(
                         # Terminal — flush buffered retry trace so user sees what happened.
                         agent._flush_status_buffer()
                         agent._emit_status(f"❌ Max retries ({max_retries}) exceeded for invalid responses. Giving up.")
-                        logger.error("%sInvalid API response after %d retries.", agent.log_prefix, max_retries)
-                        agent._persist_session(messages, conversation_history)
+                        logger.error(f"{agent.log_prefix}Invalid API response after {max_retries} retries.")
+                        await agent._persist_session(messages, conversation_history)
                         _final_response = f"Invalid API response after {max_retries} retries: {_failure_hint}"
                         return {
                             "final_response": _final_response,
@@ -2687,7 +2516,7 @@ def run_conversation(
                     # Backoff before retry — jittered exponential: 5s base, 120s cap
                     wait_time = jittered_backoff(retry_count, base_delay=5.0, max_delay=120.0)
                     agent._buffer_vprint(f"⏳ Retrying in {wait_time:.1f}s ({_failure_hint})...")
-                    logger.warning("Invalid API response (retry %d/%d): %s | Provider: %s", retry_count, max_retries, ', '.join(error_details), provider_name)
+                    logger.warning(f"Invalid API response (retry {retry_count}/{max_retries}): {', '.join(error_details)} | Provider: {provider_name}")
                     
                     # Sleep in small increments to stay responsive to interrupts
                     sleep_end = time.time() + wait_time
@@ -2708,7 +2537,7 @@ def run_conversation(
                             agent._vprint(f"{agent.log_prefix}⚡ Interrupt detected during retry wait, aborting.", force=True)
                             _interrupt_text = f"Operation interrupted during retry ({_failure_hint}, attempt {retry_count}/{max_retries})."
                             close_interrupted_tool_sequence(messages, _interrupt_text)
-                            agent._persist_session(messages, conversation_history)
+                            await agent._persist_session(messages, conversation_history)
                             agent.clear_interrupt()
                             return {
                                 "final_response": _interrupt_text,
@@ -2717,7 +2546,7 @@ def run_conversation(
                                 "completed": False,
                                 "interrupted": True,
                             }
-                        time.sleep(0.2)
+                        await asyncio.sleep(0.2)
                         # Touch activity every ~30s so the gateway's inactivity
                         # monitor knows we're alive during backoff waits.
                         _backoff_touch_counter += 1
@@ -2810,7 +2639,7 @@ def run_conversation(
                     if not _refusal_text:
                         _refusal_text = (agent._extract_reasoning(_refusal_result) or "").strip()
 
-                    agent._invoke_api_request_error_hook(
+                    await agent._invoke_api_request_error_hook(
                         task_id=effective_task_id,
                         turn_id=turn_id,
                         api_request_id=api_request_id,
@@ -2826,9 +2655,6 @@ def run_conversation(
                         reason=FailoverReason.content_policy_blocked.value,
                     )
 
-                    if thinking_spinner:
-                        thinking_spinner.stop("")
-                        thinking_spinner = None
                     if agent.thinking_callback:
                         agent.thinking_callback("")
 
@@ -2839,7 +2665,7 @@ def run_conversation(
                         agent._buffer_status(
                             "⚠️ Model declined to respond (safety refusal) — trying fallback..."
                         )
-                    if agent._try_activate_fallback():
+                    if await agent._try_activate_fallback():
                         active_system_prompt = _sync_failover_system_message(
                             agent, api_messages, active_system_prompt)
                         retry_count = 0
@@ -2875,8 +2701,8 @@ def run_conversation(
                         f"{_CONTENT_POLICY_RECOVERY_HINT}"
                     )
 
-                    agent._cleanup_task_resources(effective_task_id)
-                    agent._persist_session(messages, conversation_history)
+                    await agent._cleanup_task_resources(effective_task_id)
+                    await agent._persist_session(messages, conversation_history)
                     return _content_policy_blocked_result(
                         messages,
                         api_call_count,
@@ -2968,8 +2794,8 @@ def run_conversation(
                             "→ Lower reasoning effort: `/thinkon low` or `/thinkon minimal`\n"
                             "→ Or switch to a larger/non-reasoning model with `/model`"
                         )
-                        agent._cleanup_task_resources(effective_task_id)
-                        agent._persist_session(messages, conversation_history)
+                        await agent._cleanup_task_resources(effective_task_id)
+                        await agent._persist_session(messages, conversation_history)
                         return {
                             "final_response": _exhaust_response,
                             "messages": messages,
@@ -3008,7 +2834,7 @@ def run_conversation(
                             agent._emit_status(
                                 "Content filter terminated stream; switching to fallback..."
                             )
-                            if agent._try_activate_fallback():
+                            if await agent._try_activate_fallback():
                                 # Roll the partial content (if any was already
                                 # appended in a prior continuation pass) back to
                                 # the last clean turn so the fallback provider
@@ -3096,8 +2922,8 @@ def run_conversation(
                                 break
 
                             partial_response = agent._strip_think_blocks("".join(truncated_response_parts)).strip()
-                            agent._cleanup_task_resources(effective_task_id)
-                            agent._persist_session(messages, conversation_history)
+                            await agent._cleanup_task_resources(effective_task_id)
+                            await agent._persist_session(messages, conversation_history)
                             return {
                                 "final_response": partial_response or None,
                                 "messages": messages,
@@ -3156,7 +2982,7 @@ def run_conversation(
                                     f"{agent.log_prefix}⚠️  Truncated tool call response detected again — refusing to execute incomplete tool arguments.",
                                     force=True,
                                 )
-                            agent._cleanup_task_resources(effective_task_id)
+                            await agent._cleanup_task_resources(effective_task_id)
                             _final_response = (
                                 "Stream repeatedly dropped mid tool-call (network); "
                                 "the tool was not executed"
@@ -3167,7 +2993,7 @@ def run_conversation(
                             # errors) can leave a tool-result tail; this path
                             # never reaches finalize_turn (#48879 class).
                             close_interrupted_tool_sequence(messages, _final_response)
-                            agent._persist_session(messages, conversation_history)
+                            await agent._persist_session(messages, conversation_history)
                             return {
                                 "final_response": _final_response,
                                 "messages": messages,
@@ -3182,8 +3008,8 @@ def run_conversation(
                         agent._vprint(f"{agent.log_prefix}   ⏪ Rolling back to last complete assistant turn")
                         rolled_back_messages = agent._get_messages_up_to_last_assistant(messages)
 
-                        agent._cleanup_task_resources(effective_task_id)
-                        agent._persist_session(messages, conversation_history)
+                        await agent._cleanup_task_resources(effective_task_id)
+                        await agent._persist_session(messages, conversation_history)
 
                         return {
                             "final_response": "Response truncated due to output length limit",
@@ -3197,7 +3023,7 @@ def run_conversation(
                         # First message was truncated - mark as failed
                         agent._flush_status_buffer()
                         agent._vprint(f"{agent.log_prefix}❌ First response truncated - cannot recover", force=True)
-                        agent._persist_session(messages, conversation_history)
+                        await agent._persist_session(messages, conversation_history)
                         return {
                             "final_response": "First response truncated due to output length limit",
                             "messages": messages,
@@ -3225,7 +3051,11 @@ def run_conversation(
                     # usage, so without this the entire advisor spend — usually
                     # the bulk of a MoA turn — is invisible in token counts.
                     _moa_ref_cost = None
-                    _moa_client = getattr(agent, "client", None)
+                    _moa_client = (
+                        getattr(agent, "client", None)
+                        if agent.provider == "moa"
+                        else None
+                    )
                     if _moa_client is not None and hasattr(_moa_client, "consume_reference_usage"):
                         try:
                             _ref_usage, _moa_ref_cost = _moa_client.consume_reference_usage()
@@ -3246,7 +3076,7 @@ def run_conversation(
                             _agg_streamed_text = (
                                 getattr(agent, "_current_streamed_assistant_text", "") or ""
                             )
-                            _moa_client.consume_and_save_trace(
+                            await _moa_client.consume_and_save_trace(
                                 agent.session_id,
                                 aggregator_output_fallback=_agg_streamed_text or None,
                             )
@@ -3297,7 +3127,9 @@ def run_conversation(
                     if getattr(agent.context_compressor, "_context_probed", False):
                         ctx = agent.context_compressor.context_length
                         if getattr(agent.context_compressor, "_context_probe_persistable", False):
-                            save_context_length(agent.model, agent.base_url, ctx)
+                            await save_context_length(
+                                agent.model, agent.base_url, ctx
+                            )
                             agent._safe_print(f"{agent.log_prefix}💾 Cached context length: {ctx:,} tokens for {agent.model}")
                         agent.context_compressor._context_probed = False
                         agent.context_compressor._context_probe_persistable = False
@@ -3339,7 +3171,7 @@ def run_conversation(
                         _agg_cost_model = _agg_slot["model"]
                         _agg_cost_provider = _agg_slot.get("provider") or agent.provider
                         _agg_cost_base_url = _agg_slot.get("base_url") or agent.base_url
-                    cost_result = estimate_usage_cost(
+                    cost_result = await estimate_usage_cost(
                         _agg_cost_model,
                         aggregator_usage,
                         provider=_agg_cost_provider,
@@ -3374,7 +3206,7 @@ def run_conversation(
                             # not silently lost (UPDATE on a non-existent row
                             # affects 0 rows without error).
                             if not agent._session_db_created:
-                                agent._ensure_db_session()
+                                await agent._ensure_db_session()
                             # Per-call cost delta = aggregator cost + MoA
                             # advisor cost (each priced at its own rate). Folded
                             # here so state.db's estimated_cost_usd includes the
@@ -3387,12 +3219,10 @@ def run_conversation(
                                     _cost_delta = (_cost_delta or 0.0) + float(_moa_ref_cost)
                                 except (TypeError, ValueError):  # pragma: no cover
                                     pass
-                            # Enqueued, not written: the background writer
-                            # applies the delta off the turn thread (a cold
-                            # state.db UPDATE here stalled the tool loop for
-                            # up to hundreds of ms per API call). Drained at
-                            # turn finalize via _persist_session.
-                            agent._session_db.queue_token_counts(
+                            session_db = agent._session_db
+                            if session_db is None:
+                                raise RuntimeError("Async session DB is unavailable")
+                            await session_db.update_token_counts(
                                 agent.session_id,
                                 input_tokens=canonical_usage.input_tokens,
                                 output_tokens=canonical_usage.output_tokens,
@@ -3455,22 +3285,13 @@ def run_conversation(
                 if agent.provider == "nous":
                     try:
                         from agent.nous_rate_guard import clear_nous_rate_limit
-                        clear_nous_rate_limit()
+                        await clear_nous_rate_limit()
                     except Exception:
                         pass
-                from agent import relay_llm
-
-                relay_llm.complete_logical_call(
-                    api_request_id,
-                    outcome="success",
-                )
                 agent._touch_activity(f"API call #{api_call_count} completed")
                 break  # Success, exit retry loop
 
             except InterruptedError:
-                if thinking_spinner:
-                    thinking_spinner.stop("")
-                    thinking_spinner = None
                 if agent.thinking_callback:
                     agent.thinking_callback("")
                 if agent._has_pending_redirect():
@@ -3498,15 +3319,12 @@ def run_conversation(
                     final_response = _partial
                 else:
                     final_response = f"{INTERRUPT_WAITING_FOR_MODEL_PREFIX}{api_elapsed:.1f}s elapsed)."
-                agent._persist_session(messages, conversation_history)
+                await agent._persist_session(messages, conversation_history)
                 break
 
             except Exception as api_error:
                 # Stop spinner silently — retry status is buffered and
                 # only flushed when every retry+fallback is exhausted.
-                if thinking_spinner:
-                    thinking_spinner.stop("")
-                    thinking_spinner = None
                 if agent.thinking_callback:
                     agent.thinking_callback("")
 
@@ -3812,7 +3630,7 @@ def run_conversation(
                     classified.retryable, classified.should_compress,
                     classified.should_rotate_credential, classified.should_fallback,
                 )
-                agent._invoke_api_request_error_hook(
+                await agent._invoke_api_request_error_hook(
                     task_id=effective_task_id,
                     turn_id=turn_id,
                     api_request_id=api_request_id,
@@ -3837,22 +3655,34 @@ def run_conversation(
                     and not _retry.nous_paid_entitlement_refresh_attempted
                 ):
                     _retry.nous_paid_entitlement_refresh_attempted = True
-                    if _try_refresh_nous_paid_entitlement_credentials(agent):
-                        agent._vprint(
-                            f"{agent.log_prefix}🔐 Nous paid access verified — "
-                            "refreshed runtime credentials and retrying request...",
-                            force=True,
-                        )
-                        continue
+                    raise AsyncCapabilityError(
+                        "Nous paid-entitlement credential renewal has no native async "
+                        "implementation. Refresh credentials before starting the async agent."
+                    )
 
-                recovered_with_pool, _retry.has_retried_429 = agent._recover_with_credential_pool(
-                    status_code=status_code,
-                    has_retried_429=_retry.has_retried_429,
-                    classified_reason=classified.reason,
-                    error_context=error_context,
-                )
-                if recovered_with_pool:
-                    continue
+                # API-key pool rotation is native async: it mutates the pool
+                # under its task lock and persists via aiofiles. OAuth refresh
+                # still fails explicitly inside that path until its provider
+                # transport has been converted; it is never sent through a
+                # worker thread.
+                if (
+                    getattr(agent, "_credential_pool", None) is not None
+                    and classified.reason
+                    in {
+                        FailoverReason.billing,
+                        FailoverReason.rate_limit,
+                        FailoverReason.auth,
+                    }
+                ):
+                    recovered_with_pool, _retry.has_retried_429 = await agent._recover_with_credential_pool(
+                        status_code=classified.status_code,
+                        has_retried_429=_retry.has_retried_429,
+                        classified_reason=classified.reason,
+                        error_context=classified.error_context,
+                    )
+                    if recovered_with_pool:
+                        retry_count = 0
+                        continue
 
                 # Image-too-large recovery: shrink oversized native image
                 # parts in-place and retry once.  Triggered by Anthropic's
@@ -3866,7 +3696,7 @@ def run_conversation(
                 ):
                     _retry.image_shrink_retry_attempted = True
                     image_max_dimension = _image_error_max_dimension(api_error) or 8000
-                    if agent._try_shrink_image_parts_in_messages(
+                    if await agent._try_shrink_image_parts_in_messages(
                         api_messages,
                         max_dimension=image_max_dimension,
                     ):
@@ -3925,11 +3755,26 @@ def run_conversation(
                     _retry.oauth_1m_beta_retry_attempted = True
                     if not getattr(agent, "_oauth_1m_beta_disabled", False):
                         agent._oauth_1m_beta_disabled = True
-                        try:
-                            agent._anthropic_client.close()
-                        except Exception:
-                            pass
-                        agent._rebuild_anthropic_client()
+                        # Discarding the source marker makes
+                        # _execute_model_request() construct the replacement
+                        # with the reduced beta set on the next iteration.
+                        anthropic_client = getattr(agent, "_anthropic_client", None)
+                        if anthropic_client is not None:
+                            try:
+                                close = getattr(anthropic_client, "aclose", None) or getattr(
+                                    anthropic_client, "close", None
+                                )
+                                if callable(close) and inspect.iscoroutinefunction(
+                                    inspect.unwrap(close)
+                                ):
+                                    await close()
+                            except Exception:
+                                logger.debug(
+                                    "Async Anthropic client close failed during 1M beta recovery",
+                                    exc_info=True,
+                                )
+                        agent._anthropic_client = None
+                        agent._anthropic_client_source = None
                         agent._vprint(
                             f"{agent.log_prefix}🔕 OAuth subscription doesn't support "
                             f"the 1M-context beta — disabled for this session and retrying...",
@@ -3944,10 +3789,10 @@ def run_conversation(
                     and not _retry.codex_auth_retry_attempted
                 ):
                     _retry.codex_auth_retry_attempted = True
-                    if agent._try_refresh_codex_client_credentials(force=True):
-                        _label = "xAI OAuth" if agent.provider == "xai-oauth" else "Codex"
-                        agent._buffer_vprint(f"🔐 {_label} auth refreshed after 401. Retrying request...")
-                        continue
+                    raise AsyncCapabilityError(
+                        f"{agent.provider} OAuth renewal has no native async implementation. "
+                        "Refresh credentials before starting the async agent."
+                    )
                 if (
                     agent.api_mode == "chat_completions"
                     and agent.provider == "vertex"
@@ -3955,9 +3800,10 @@ def run_conversation(
                     and not _retry.vertex_auth_retry_attempted
                 ):
                     _retry.vertex_auth_retry_attempted = True
-                    if agent._try_refresh_vertex_client_credentials():
-                        agent._buffer_vprint("🔐 Vertex AI token refreshed after 401. Retrying request...")
-                        continue
+                    raise AsyncCapabilityError(
+                        "Vertex OAuth renewal has no native async implementation. "
+                        "Refresh credentials before starting the async agent."
+                    )
                 if (
                     agent.api_mode in ("chat_completions", "anthropic_messages")
                     and agent.provider == "nous"
@@ -3965,40 +3811,20 @@ def run_conversation(
                     and not _retry.nous_auth_retry_attempted
                 ):
                     _retry.nous_auth_retry_attempted = True
-                    if agent._try_refresh_nous_client_credentials(force=True):
-                        print(f"{agent.log_prefix}🔐 Nous agent key refreshed after 401. Retrying request...")
-                        continue
-                    # Credential refresh didn't help — show diagnostic info.
-                    # Most common causes: Portal OAuth expired/revoked,
-                    # account out of credits, or agent key blocked.
-                    from hermes_constants import display_hermes_home as _dhh_fn
-                    _dhh = _dhh_fn()
-                    _body_text = ""
-                    try:
-                        _body = getattr(api_error, "body", None) or getattr(api_error, "response", None)
-                        if _body is not None:
-                            _body_text = str(_body)[:200]
-                    except Exception:
-                        pass
-                    print(f"{agent.log_prefix}🔐 Nous 401 — Portal authentication failed.")
-                    if _body_text:
-                        print(f"{agent.log_prefix}   Response: {_body_text}")
-                    if not _print_nous_entitlement_guidance(agent, "Nous model access"):
-                        print(f"{agent.log_prefix}   Most likely: Portal OAuth expired, account out of credits, or agent key revoked.")
-                    print(f"{agent.log_prefix}   Troubleshooting:")
-                    print(f"{agent.log_prefix}     • Re-authenticate: hermes auth add nous")
-                    print(f"{agent.log_prefix}     • Check credits / billing: https://portal.nousresearch.com")
-                    print(f"{agent.log_prefix}     • Verify stored credentials: {_dhh}/auth.json")
-                    print(f"{agent.log_prefix}     • Switch providers temporarily: /model <model> --provider openrouter")
+                    raise AsyncCapabilityError(
+                        "Nous credential renewal has no native async implementation. "
+                        "Refresh credentials before starting the async agent."
+                    )
                 if (
                     _is_copilot_provider(agent)
                     and status_code == 401
                     and not _retry.copilot_auth_retry_attempted
                 ):
                     _retry.copilot_auth_retry_attempted = True
-                    if agent._try_refresh_copilot_client_credentials():
-                        agent._buffer_vprint("🔐 Copilot credentials refreshed after 401. Retrying request...")
-                        continue
+                    raise AsyncCapabilityError(
+                        "Copilot credential renewal has no native async implementation. "
+                        "Refresh credentials before starting the async agent."
+                    )
                 if (
                     agent.api_mode == "anthropic_messages"
                     and status_code == 401
@@ -4007,26 +3833,17 @@ def run_conversation(
                 ):
                     _retry.anthropic_auth_retry_attempted = True
                     from agent.anthropic_adapter import _is_oauth_token
-                    from agent.azure_identity_adapter import is_token_provider
-                    if agent._try_refresh_anthropic_client_credentials():
-                        print(f"{agent.log_prefix}🔐 Anthropic credentials refreshed after 401. Retrying request...")
-                        continue
+                    if getattr(agent, "_is_anthropic_oauth", False):
+                        raise AsyncCapabilityError(
+                            "Anthropic OAuth renewal has no native async implementation. "
+                            "Refresh credentials before starting the async agent."
+                        )
                     # Credential refresh didn't help — show diagnostic info
                     key = agent._anthropic_api_key
                     print(f"{agent.log_prefix}🔐 Anthropic 401 — authentication failed.")
-                    if is_token_provider(key):
-                        # Azure Foundry Entra ID — the bearer token is
-                        # minted per-request by an httpx event hook on a
-                        # custom http_client passed to the SDK. The 401
-                        # means Azure rejected the JWT (RBAC role missing,
-                        # az login expired, IMDS unreachable, etc.).
-                        print(f"{agent.log_prefix}   Auth method: Microsoft Entra ID (httpx event hook)")
-                        print(f"{agent.log_prefix}   Run `hermes doctor` for credential-chain diagnostics, or")
-                        print(f"{agent.log_prefix}   `az login` if your developer session expired.")
-                    else:
-                        auth_method = "Bearer (OAuth/setup-token)" if _is_oauth_token(key) else "x-api-key (API key)"
-                        print(f"{agent.log_prefix}   Auth method: {auth_method}")
-                        print(f"{agent.log_prefix}   Token prefix: {key[:12]}..." if isinstance(key, str) and len(key) > 12 else f"{agent.log_prefix}   Token: (empty or short)")
+                    auth_method = "Bearer (OAuth/setup-token)" if _is_oauth_token(key) else "x-api-key (API key)"
+                    print(f"{agent.log_prefix}   Auth method: {auth_method}")
+                    print(f"{agent.log_prefix}   Token prefix: {key[:12]}..." if isinstance(key, str) and len(key) > 12 else f"{agent.log_prefix}   Token: (empty or short)")
                     print(f"{agent.log_prefix}   Troubleshooting:")
                     from hermes_constants import display_hermes_home as _dhh_fn
                     _dhh = _dhh_fn()
@@ -4240,7 +4057,7 @@ def run_conversation(
                     agent._vprint(f"{agent.log_prefix}⚡ Interrupt detected during error handling, aborting retries.", force=True)
                     _interrupt_text = f"Operation interrupted: handling API error ({error_type}: {agent._clean_error_message(str(api_error))})."
                     close_interrupted_tool_sequence(messages, _interrupt_text)
-                    agent._persist_session(messages, conversation_history)
+                    await agent._persist_session(messages, conversation_history)
                     agent.clear_interrupt()
                     return {
                         "final_response": _interrupt_text,
@@ -4305,7 +4122,7 @@ def run_conversation(
                         f"{agent.log_prefix}Context overflow ({classified.reason.value}) with "
                         f"auto-compaction disabled — not compressing."
                     )
-                    agent._persist_session(messages, conversation_history)
+                    await agent._persist_session(messages, conversation_history)
                     _final_response = (
                         "Context overflow and auto-compaction is disabled "
                         "(compression.enabled: false). Run /compress to compact manually, "
@@ -4360,11 +4177,11 @@ def run_conversation(
                     compression_attempts += 1
                     if compression_attempts <= max_compression_attempts:
                         original_len = len(messages)
-                        # Option A (LCM issue 441): overhead-aware request size so recovery arms on
-                        # the true request (msgs + tools + system), not the tool-blind message count.
-                        messages, active_system_prompt = agent._compress_context(
+                        messages, active_system_prompt = await agent._compress_context(
                             messages, system_message,
-                            approx_tokens=estimate_request_tokens_rough(api_messages, tools=agent.tools or None),
+                            approx_tokens=estimate_request_tokens_rough(
+                                api_messages, tools=agent.tools or None
+                            ),
                             task_id=effective_task_id,
                         )
                         conversation_history = conversation_history_after_compression(
@@ -4376,7 +4193,7 @@ def run_conversation(
                                     new_ctx=_reduced_ctx, old_ctx=old_ctx
                                 )
                             )
-                            time.sleep(2)
+                            await asyncio.sleep(2)
                             _retry.restart_with_compressed_messages = True
                             break
                     # Fall through to normal error handling if compression
@@ -4424,10 +4241,9 @@ def run_conversation(
                     # different model regardless of pool state.
                     _is_upstream = classified.reason == FailoverReason.upstream_rate_limit
                     pool_may_recover = (
-                        False if _is_upstream
-                        else _ra()._pool_may_recover_from_rate_limit(
-                            agent._credential_pool,
-                        )
+                        False
+                        if _is_upstream
+                        else await agent._credential_pool_may_recover_rate_limit()
                     )
                     if not pool_may_recover:
                         if _is_upstream:
@@ -4448,7 +4264,7 @@ def run_conversation(
                             )
                         else:
                             agent._buffer_status("⚠️ Rate limited — switching to fallback provider...")
-                        if agent._try_activate_fallback(reason=classified.reason):
+                        if await agent._try_activate_fallback(reason=classified.reason):
                             active_system_prompt = _sync_failover_system_message(
                                 agent, api_messages, active_system_prompt)
                             retry_count = 0
@@ -4481,7 +4297,7 @@ def run_conversation(
                         "🔐 Authentication failed and could not be refreshed — "
                         "switching to fallback provider..."
                     )
-                    if agent._try_activate_fallback(reason=classified.reason):
+                    if await agent._try_activate_fallback(reason=classified.reason):
                         active_system_prompt = _sync_failover_system_message(
                             agent, api_messages, active_system_prompt)
                         retry_count = 0
@@ -4531,7 +4347,7 @@ def run_conversation(
                             last_known_state=agent._rate_limit_state,
                         )
                         if _genuine_nous_rate_limit:
-                            record_nous_rate_limit(
+                            await record_nous_rate_limit(
                                 headers=_err_hdrs,
                                 error_context=error_context,
                             )
@@ -4601,8 +4417,8 @@ def run_conversation(
                         agent._flush_status_buffer()
                         agent._vprint(f"{agent.log_prefix}❌ Max compression attempts ({max_compression_attempts}) reached for payload-too-large error.", force=True)
                         agent._vprint(f"{agent.log_prefix}   💡 Try /new to start a fresh conversation, or /compress to retry compression.", force=True)
-                        logger.error("%s413 compression failed after %d attempts.", agent.log_prefix, max_compression_attempts)
-                        agent._persist_session(messages, conversation_history)
+                        logger.error(f"{agent.log_prefix}413 compression failed after {max_compression_attempts} attempts.")
+                        await agent._persist_session(messages, conversation_history)
                         _final_response = f"Request payload too large: max compression attempts ({max_compression_attempts}) reached."
                         return {
                             "final_response": _final_response,
@@ -4619,11 +4435,12 @@ def run_conversation(
                     original_len = len(messages)
                     original_tokens = estimate_messages_tokens_rough(messages)
                     _overflow_input = messages
-                    # Option A (LCM issue 441): overhead-aware request size so recovery arms on the
-                    # true request (msgs + tools + system), not the tool-blind message count.
-                    messages, active_system_prompt = agent._compress_context(
-                        messages, system_message,
-                        approx_tokens=estimate_request_tokens_rough(api_messages, tools=agent.tools or None),
+                    messages, active_system_prompt = await agent._compress_context(
+                        messages,
+                        system_message,
+                        approx_tokens=estimate_request_tokens_rough(
+                            api_messages, tools=agent.tools or None
+                        ),
                         task_id=effective_task_id,
                     )
                     if messages is _overflow_input and compression_skipped_due_to_lock(agent):
@@ -4634,7 +4451,7 @@ def run_conversation(
                         # attempt and end the turn softly so the gateway does
                         # NOT auto-reset the session (#9893/#35809).
                         compression_attempts -= 1
-                        agent._persist_session(messages, conversation_history)
+                        await agent._persist_session(messages, conversation_history)
                         return _compression_deferred_result(
                             agent, messages, api_call_count
                         )
@@ -4654,7 +4471,7 @@ def run_conversation(
                             agent._buffer_status(COMPRESSION_RETRY_MESSAGES_STATUS_TEMPLATE.format(before=original_len, after=len(messages)))
                         else:
                             agent._buffer_status(COMPRESSION_RETRY_TOKENS_STATUS_TEMPLATE.format(before=original_tokens, after=new_tokens))
-                        time.sleep(2)  # Brief pause between compression retries
+                        await asyncio.sleep(2)  # Brief pause between compression retries
                         _retry.restart_with_compressed_messages = True
                         break
                     else:
@@ -4673,8 +4490,8 @@ def run_conversation(
                         agent._flush_status_buffer()
                         agent._vprint(f"{agent.log_prefix}❌ Payload too large and cannot compress further.", force=True)
                         agent._vprint(f"{agent.log_prefix}   💡 Try /new to start a fresh conversation, or /compress to retry compression.", force=True)
-                        logger.error("%s413 payload too large. Cannot compress further.", agent.log_prefix)
-                        agent._persist_session(messages, conversation_history)
+                        logger.error(f"{agent.log_prefix}413 payload too large. Cannot compress further.")
+                        await agent._persist_session(messages, conversation_history)
                         _final_response = "Request payload too large (413). Cannot compress further."
                         return {
                             "final_response": _final_response,
@@ -4746,8 +4563,8 @@ def run_conversation(
                             agent._flush_status_buffer()
                             agent._vprint(f"{agent.log_prefix}❌ Max compression attempts ({max_compression_attempts}) reached.", force=True)
                             agent._vprint(f"{agent.log_prefix}   💡 Try /new to start a fresh conversation, or /compress to retry compression.", force=True)
-                            logger.error("%sContext compression failed after %d attempts.", agent.log_prefix, max_compression_attempts)
-                            agent._persist_session(messages, conversation_history)
+                            logger.error(f"{agent.log_prefix}Context compression failed after {max_compression_attempts} attempts.")
+                            await agent._persist_session(messages, conversation_history)
                             _final_response = f"Context length exceeded: max compression attempts ({max_compression_attempts}) reached."
                             return {
                                 "final_response": _final_response,
@@ -4788,7 +4605,7 @@ def run_conversation(
                             f"{agent.log_prefix}Output-cap error not routed into compression "
                             f"(max_tokens over provider cap): {error_msg[:200]}"
                         )
-                        agent._persist_session(messages, conversation_history)
+                        await agent._persist_session(messages, conversation_history)
                         _final_response = (
                             "max_tokens exceeds the provider's output cap for this model. "
                             "Lower model.max_tokens in config.yaml."
@@ -4835,13 +4652,6 @@ def run_conversation(
                             provider=agent.provider,
                             api_mode=agent.api_mode,
                         )
-                        # Persist an explicit provider-reported limit before
-                        # compression/retry. The next request can be rate
-                        # limited, omit usage, or the process can restart; none
-                        # of those should discard metadata the provider already
-                        # confirmed. Keep the probe flags as a best-effort
-                        # post-success retry if this write cannot complete.
-                        save_context_length(agent.model, agent.base_url, new_ctx)
                         # Context probing flags — only set on built-in
                         # compressor (plugin engines manage their own).  This
                         # value came from the provider, so it is safe to cache.
@@ -4865,8 +4675,8 @@ def run_conversation(
                         agent._flush_status_buffer()
                         agent._vprint(f"{agent.log_prefix}❌ Max compression attempts ({max_compression_attempts}) reached.", force=True)
                         agent._vprint(f"{agent.log_prefix}   💡 Try /new to start a fresh conversation, or /compress to retry compression.", force=True)
-                        logger.error("%sContext compression failed after %d attempts.", agent.log_prefix, max_compression_attempts)
-                        agent._persist_session(messages, conversation_history)
+                        logger.error(f"{agent.log_prefix}Context compression failed after {max_compression_attempts} attempts.")
+                        await agent._persist_session(messages, conversation_history)
                         _final_response = f"Context length exceeded: max compression attempts ({max_compression_attempts}) reached."
                         return {
                             "final_response": _final_response,
@@ -4883,13 +4693,12 @@ def run_conversation(
                     original_len = len(messages)
                     original_tokens = estimate_messages_tokens_rough(messages)
                     _overflow_input = messages
-                    # Option A (LCM issue 441): pass the OVERHEAD-AWARE request size (msgs + tool
-                    # schemas + system), not the tool-blind message count, so LCM forced-overflow
-                    # recovery arms on the TRUE request that overflowed. See hermes-lcm engine
-                    # _should_force_overflow_recovery. (approx_tokens stays for the status display.)
-                    messages, active_system_prompt = agent._compress_context(
-                        messages, system_message,
-                        approx_tokens=estimate_request_tokens_rough(api_messages, tools=agent.tools or None),
+                    messages, active_system_prompt = await agent._compress_context(
+                        messages,
+                        system_message,
+                        approx_tokens=estimate_request_tokens_rough(
+                            api_messages, tools=agent.tools or None
+                        ),
                         task_id=effective_task_id,
                     )
                     if messages is _overflow_input and compression_skipped_due_to_lock(agent):
@@ -4900,7 +4709,7 @@ def run_conversation(
                         # attempt and end the turn softly so the gateway does
                         # NOT auto-reset the session (#9893/#35809).
                         compression_attempts -= 1
-                        agent._persist_session(messages, conversation_history)
+                        await agent._persist_session(messages, conversation_history)
                         return _compression_deferred_result(
                             agent, messages, api_call_count
                         )
@@ -4920,7 +4729,7 @@ def run_conversation(
                             agent._buffer_status(COMPRESSION_RETRY_MESSAGES_STATUS_TEMPLATE.format(before=original_len, after=len(messages)))
                         elif new_tokens > 0 and new_tokens < original_tokens * 0.95:
                             agent._buffer_status(COMPRESSION_RETRY_TOKENS_STATUS_TEMPLATE.format(before=original_tokens, after=new_tokens))
-                        time.sleep(2)  # Brief pause between compression retries
+                        await asyncio.sleep(2)  # Brief pause between compression retries
                         _retry.restart_with_compressed_messages = True
                         break
                     else:
@@ -4928,8 +4737,8 @@ def run_conversation(
                         agent._flush_status_buffer()
                         agent._vprint(f"{agent.log_prefix}❌ Context length exceeded and cannot compress further.", force=True)
                         agent._vprint(f"{agent.log_prefix}   💡 The conversation has accumulated too much content. Try /new to start fresh, or /compress to manually trigger compression.", force=True)
-                        logger.error("%sContext length exceeded: %s tokens. Cannot compress further.", agent.log_prefix, f"{new_tokens:,}")
-                        agent._persist_session(messages, conversation_history)
+                        logger.error(f"{agent.log_prefix}Context length exceeded: {new_tokens:,} tokens. Cannot compress further.")
+                        await agent._persist_session(messages, conversation_history)
                         _final_response = f"Context length exceeded ({new_tokens:,} tokens). Cannot compress further."
                         return {
                             "final_response": _final_response,
@@ -5014,32 +4823,6 @@ def run_conversation(
                 ) and not is_context_length_error
 
                 if is_client_error:
-                    # Copilot self-heal BEFORE fallback: a stale/degraded
-                    # credential surfaces as a 400
-                    # ``model_not_available_for_integrator`` /
-                    # ``model_not_supported`` (not a clean 401), so the 401
-                    # refresh path above never fired. Force a fresh token
-                    # exchange + client rebuild and retry once on the SAME
-                    # provider — a fresh 437-char API token routes to the
-                    # correct integrator and the model becomes available again.
-                    # Single-shot guard prevents looping on a genuinely
-                    # unavailable model. Copilot-scoped so other providers'
-                    # real 400s are untouched.
-                    if (
-                        _is_copilot_provider(agent)
-                        and not _retry.copilot_stale_cred_retry_attempted
-                        and _is_stale_copilot_credential_error(
-                            status_code, str(getattr(api_error, "message", "") or api_error)
-                        )
-                    ):
-                        _retry.copilot_stale_cred_retry_attempted = True
-                        if agent._try_recover_stale_copilot_credential():
-                            agent._buffer_vprint(
-                                "🔐 Copilot credential re-exchanged after "
-                                "model_not_available 400. Retrying request..."
-                            )
-                            retry_count = 0
-                            continue
                     # Try fallback before aborting — a different provider may
                     # not have the same issue (rate limit, auth, etc.). Only
                     # announce the attempt when a fallback chain actually
@@ -5053,7 +4836,7 @@ def run_conversation(
                             agent._buffer_status("⚠️ TLS certificate verification failed — trying fallback...")
                         else:
                             agent._buffer_status(f"⚠️ Non-retryable error (HTTP {status_code}) — trying fallback...")
-                    if agent._try_activate_fallback():
+                    if await agent._try_activate_fallback():
                         active_system_prompt = _sync_failover_system_message(
                             agent, api_messages, active_system_prompt)
                         retry_count = 0
@@ -5061,7 +4844,7 @@ def run_conversation(
                         _retry.primary_recovery_attempted = False
                         continue
                     if api_kwargs is not None:
-                        agent._dump_api_request_debug(
+                        await agent._dump_api_request_debug(
                             api_kwargs, reason="non_retryable_client_error", error=api_error,
                         )
                     # Terminal — flush buffered context so the user sees
@@ -5094,7 +4877,7 @@ def run_conversation(
                     agent._vprint(f"{agent.log_prefix}   🌐 Endpoint: {_base}", force=True)
                     # Actionable guidance for common auth errors
                     if classified.is_auth or classified.reason == FailoverReason.billing:
-                        if classified.reason == FailoverReason.billing and _print_billing_or_entitlement_guidance(
+                        if classified.reason == FailoverReason.billing and await _print_billing_or_entitlement_guidance(
                             agent,
                             capability="model access",
                             provider=_provider,
@@ -5102,7 +4885,7 @@ def run_conversation(
                             model=_model,
                         ):
                             pass
-                        elif _provider == "nous" and _print_nous_entitlement_guidance(
+                        elif _provider == "nous" and await _print_nous_entitlement_guidance(
                             agent,
                             "Nous model access",
                         ):
@@ -5194,7 +4977,7 @@ def run_conversation(
                             f"{agent.log_prefix}        for localhost, or add the server's cert to your trust store.",
                             force=True,
                         )
-                    logger.error("%sNon-retryable client error: %s", agent.log_prefix, api_error)
+                    logger.error(f"{agent.log_prefix}Non-retryable client error: {api_error}")
                     # Skip session persistence when the error is likely
                     # context-overflow related (status 400 + large session).
                     # Persisting the failed user message would make the
@@ -5207,7 +4990,7 @@ def run_conversation(
                             force=True,
                         )
                     else:
-                        agent._persist_session(messages, conversation_history)
+                        await agent._persist_session(messages, conversation_history)
                     if classified.reason == FailoverReason.content_policy_blocked:
                         _policy_response = (
                             "⚠️  The model provider's safety filter blocked this request "
@@ -5226,7 +5009,7 @@ def run_conversation(
                     # the max-retries path so every surface (CLI, TUI, desktop)
                     # renders one consistent billing signal.
                     if classified.reason == FailoverReason.billing:
-                        _ce_guidance = _billing_or_entitlement_message(
+                        _ce_guidance = await _billing_or_entitlement_message(
                             capability="model access",
                             provider=_provider,
                             base_url=str(_base),
@@ -5260,7 +5043,7 @@ def run_conversation(
                     # client once for transient transport errors (stale
                     # connection pool, TCP reset).  Only attempted once
                     # per API call block.
-                    if not _retry.primary_recovery_attempted and agent._try_recover_primary_transport(
+                    if not _retry.primary_recovery_attempted and await agent._try_recover_primary_transport(
                         api_error, retry_count=retry_count, max_retries=max_retries,
                     ):
                         _retry.primary_recovery_attempted = True
@@ -5276,7 +5059,7 @@ def run_conversation(
                     # Try fallback before giving up entirely
                     if agent._has_pending_fallback():
                         agent._buffer_status(f"⚠️ Max retries ({max_retries}) exhausted — trying fallback...")
-                    if agent._try_activate_fallback():
+                    if await agent._try_activate_fallback():
                         active_system_prompt = _sync_failover_system_message(
                             agent, api_messages, active_system_prompt)
                         retry_count = 0
@@ -5289,13 +5072,13 @@ def run_conversation(
                     _billing_guidance = ""
                     if classified.reason == FailoverReason.billing:
                         agent._emit_status(f"❌ Billing or credits exhausted — {_final_summary}")
-                        _billing_guidance = _billing_or_entitlement_message(
+                        _billing_guidance = await _billing_or_entitlement_message(
                             capability="model access",
                             provider=_provider,
                             base_url=str(_base),
                             model=_model,
                         )
-                        _print_billing_or_entitlement_guidance(
+                        await _print_billing_or_entitlement_guidance(
                             agent,
                             capability="model access",
                             provider=_provider,
@@ -5331,7 +5114,7 @@ def run_conversation(
                         )
                         agent._vprint(
                             f"{agent.log_prefix}      Try asking the model "
-                            f"to use execute_code with Python's open() for "
+                            f"to use terminal with a small Python script for "
                             f"large files, or to write the file in smaller "
                             f"sections.",
                             force=True,
@@ -5402,10 +5185,10 @@ def run_conversation(
                         _provider, _model, len(api_messages), f"{approx_tokens:,}",
                     )
                     if api_kwargs is not None:
-                        agent._dump_api_request_debug(
+                        await agent._dump_api_request_debug(
                             api_kwargs, reason="max_retries_exhausted", error=api_error,
                         )
-                    agent._persist_session(messages, conversation_history)
+                    await agent._persist_session(messages, conversation_history)
                     _billing_block = None
                     if classified.reason == FailoverReason.billing:
                         _final_response = f"Billing or credits exhausted: {_final_summary}"
@@ -5437,7 +5220,7 @@ def run_conversation(
                             "dropping — this often happens when generating "
                             "very large tool call responses (e.g. write_file "
                             "with long content). Try asking me to use "
-                            "execute_code with Python's open() for large "
+                            "terminal with a small Python script for large "
                             "files, or to write in smaller sections."
                         )
                     return {
@@ -5525,7 +5308,7 @@ def run_conversation(
                         agent._vprint(f"{agent.log_prefix}⚡ Interrupt detected during retry wait, aborting.", force=True)
                         _interrupt_text = f"Operation interrupted: retrying API call after error (retry {retry_count}/{max_retries})."
                         close_interrupted_tool_sequence(messages, _interrupt_text)
-                        agent._persist_session(messages, conversation_history)
+                        await agent._persist_session(messages, conversation_history)
                         agent.clear_interrupt()
                         return {
                             "final_response": _interrupt_text,
@@ -5534,7 +5317,7 @@ def run_conversation(
                             "completed": False,
                             "interrupted": True,
                         }
-                    time.sleep(0.2)  # Check interrupt every 200ms
+                    await asyncio.sleep(0.2)  # Check interrupt every 200ms
                     # Touch activity every ~30s so the gateway's inactivity
                     # monitor knows we're alive during backoff waits.
                     _backoff_touch_counter += 1
@@ -5617,7 +5400,7 @@ def run_conversation(
         if response is None:
             _turn_exit_reason = "all_retries_exhausted_no_response"
             print(f"{agent.log_prefix}❌ All API retries exhausted with no successful response.")
-            agent._persist_session(messages, conversation_history)
+            await agent._persist_session(messages, conversation_history)
             break
 
         try:
@@ -5661,7 +5444,7 @@ def run_conversation(
                     )
                     _assistant_text = assistant_message.content or ""
                     _api_ended_at = api_start_time + api_duration
-                    _invoke_hook(
+                    await _invoke_hook(
                         "post_api_request",
                         task_id=effective_task_id,
                         turn_id=turn_id,
@@ -5739,8 +5522,8 @@ def run_conversation(
                     agent._incomplete_scratchpad_retries = 0
                     
                     rolled_back_messages = agent._get_messages_up_to_last_assistant(messages)
-                    agent._cleanup_task_resources(effective_task_id)
-                    agent._persist_session(messages, conversation_history)
+                    await agent._cleanup_task_resources(effective_task_id)
+                    await agent._persist_session(messages, conversation_history)
                     
                     return {
                         "final_response": "Incomplete REASONING_SCRATCHPAD after 2 retries",
@@ -5870,7 +5653,7 @@ def run_conversation(
                     continue
 
                 agent._codex_incomplete_retries = 0
-                agent._persist_session(messages, conversation_history)
+                await agent._persist_session(messages, conversation_history)
                 return {
                     "final_response": "Codex response remained incomplete after 3 continuation attempts",
                     "messages": messages,
@@ -5959,7 +5742,7 @@ def run_conversation(
                         # interrupt aborts (#48879 / #52592) so the next user
                         # turn is not tool→user for strict providers.
                         close_interrupted_tool_sequence(messages, _final_response)
-                        agent._persist_session(messages, conversation_history)
+                        await agent._persist_session(messages, conversation_history)
                         return {
                             "final_response": _final_response,
                             "messages": messages,
@@ -6038,12 +5821,12 @@ def run_conversation(
                             force=True,
                         )
                         agent._invalid_json_retries = 0
-                        agent._cleanup_task_resources(effective_task_id)
+                        await agent._cleanup_task_resources(effective_task_id)
                         _final_response = "Response truncated due to output length limit"
                         # Same tool-tail close as interrupt / invalid-tool
                         # exhaustion — this path never reaches finalize_turn.
                         close_interrupted_tool_sequence(messages, _final_response)
-                        agent._persist_session(messages, conversation_history)
+                        await agent._persist_session(messages, conversation_history)
                         return {
                             "final_response": _final_response,
                             "messages": messages,
@@ -6236,7 +6019,7 @@ def run_conversation(
                     # side effects run. If a destructive tool restarts or
                     # terminates Hermes mid-turn, resume logic still sees the
                     # exact tool-call block that already executed.
-                    _tool_turn_persisted = agent._flush_messages_to_session_db(
+                    _tool_turn_persisted = await agent._flush_messages_to_session_db(
                         messages, conversation_history
                     )
                 except Exception as exc:
@@ -6276,7 +6059,12 @@ def run_conversation(
                     except Exception:
                         pass
 
-                agent._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
+                # Tool execution is independent of UI streaming. Batch and
+                # quiet agents deliberately have no stream callback, but they
+                # must still emit the model → tool → observation trajectory.
+                await agent._execute_tool_calls(
+                    assistant_message, messages, effective_task_id, api_call_count
+                )
 
                 if getattr(agent, "_incremental_persistence_failed", False):
                     # A tool result could not be made canonical. Do not send
@@ -6323,13 +6111,6 @@ def run_conversation(
                 # arrives.
                 agent._stream_needs_break = True
 
-                # Refund the iteration if the ONLY tool(s) called were
-                # execute_code (programmatic tool calling).  These are
-                # cheap RPC-style calls that shouldn't eat the budget.
-                _tc_names = {tc.function.name for tc in assistant_message.tool_calls}
-                if _tc_names == {"execute_code"}:
-                    agent.iteration_budget.refund()
-                
                 # Use real token counts from the API response to decide
                 # compression.  prompt_tokens + completion_tokens is the
                 # actual context size the provider reported plus the
@@ -6383,12 +6164,9 @@ def run_conversation(
                         _clear_warn()
                     agent._safe_print("  ⟳ compacting context…")
                     _post_tool_input = messages
-                    # Route the overhead-aware _real_tokens (computed above) into compression, not
-                    # the bare last_prompt_tokens — which is 0 in the no-usage fallback, hiding the
-                    # true request size from the engine's overflow guard (upstream PR #77169 review).
-                    messages, active_system_prompt = agent._compress_context(
+                    messages, active_system_prompt = await agent._compress_context(
                         messages, system_message,
-                        approx_tokens=_real_tokens,
+                        approx_tokens=agent.context_compressor.last_prompt_tokens,
                         task_id=effective_task_id,
                     )
                     if (
@@ -6675,47 +6453,15 @@ def run_conversation(
                     )
                     if _truly_empty and (not _has_structured or _prefill_exhausted) and agent._empty_content_retries < 3:
                         agent._empty_content_retries += 1
-                        wait_time = jittered_backoff(
-                            agent._empty_content_retries,
-                            base_delay=5.0,
-                            max_delay=60.0,
-                        )
                         logger.warning(
                             "Empty response (no content or reasoning) — "
-                            "retry %d/3 in %.1fs (model=%s)",
-                            agent._empty_content_retries, wait_time, agent.model,
+                            "retry %d/3 (model=%s)",
+                            agent._empty_content_retries, agent.model,
                         )
                         agent._buffer_status(
                             f"⚠️ Empty response from model — retrying "
-                            f"({agent._empty_content_retries}/3) in {wait_time:.0f}s"
+                            f"({agent._empty_content_retries}/3)"
                         )
-                        # Sleep in small increments to stay responsive to interrupts
-                        sleep_end = time.time() + wait_time
-                        _backoff_touch_counter = 0
-                        while time.time() < sleep_end:
-                            if agent._interrupt_requested:
-                                agent._vprint(f"{agent.log_prefix}⚡ Interrupt detected during empty-response retry wait, aborting.", force=True)
-                                _interrupt_text = (
-                                    f"Operation interrupted: retrying empty response from model "
-                                    f"(retry {agent._empty_content_retries}/3)."
-                                )
-                                close_interrupted_tool_sequence(messages, _interrupt_text)
-                                agent._persist_session(messages, conversation_history)
-                                agent.clear_interrupt()
-                                return {
-                                    "final_response": _interrupt_text,
-                                    "messages": messages,
-                                    "api_calls": api_call_count,
-                                    "completed": False,
-                                    "interrupted": True,
-                                }
-                            time.sleep(0.2)
-                            _backoff_touch_counter += 1
-                            if _backoff_touch_counter % 150 == 0:  # 150 × 0.2s = 30s
-                                agent._touch_activity(
-                                    f"empty response retry backoff ({agent._empty_content_retries}/3), "
-                                    f"{int(sleep_end - time.time())}s remaining"
-                                )
                         continue
 
                     # ── Exhausted retries — try fallback provider ──
@@ -6735,7 +6481,7 @@ def run_conversation(
                             "⚠️ Model returning empty responses — "
                             "switching to fallback provider..."
                         )
-                        if agent._try_activate_fallback():
+                        if await agent._try_activate_fallback():
                             active_system_prompt = _sync_failover_system_message(
                                 agent, api_messages, active_system_prompt)
                             agent._empty_content_retries = 0
@@ -6950,177 +6696,6 @@ def run_conversation(
                 ):
                     messages.pop()
 
-                try:
-                    from agent.verification_stop import (
-                        build_verify_on_stop_nudge,
-                        verify_on_stop_enabled,
-                    )
-
-                    if verify_on_stop_enabled():
-                        _verify_nudge = build_verify_on_stop_nudge(
-                            session_id=getattr(agent, "session_id", None),
-                            changed_paths=getattr(agent, "_turn_file_mutation_paths", set()),
-                            attempts=getattr(agent, "_verification_stop_nudges", 0),
-                        )
-                    else:
-                        _verify_nudge = None
-                except Exception:
-                    logger.debug("verification stop-loop check failed", exc_info=True)
-                    _verify_nudge = None
-
-                if _verify_nudge:
-                    agent._verification_stop_nudges = (
-                        getattr(agent, "_verification_stop_nudges", 0) + 1
-                    )
-                    final_msg["finish_reason"] = "verification_required"
-                    # The assistant response is real content — persist it and
-                    # emit to the UI as an interim message so the user sees the
-                    # attempted final answer before the verification loop runs.
-                    # Only the nudge is flagged synthetic so it gets stripped
-                    # from the durable transcript (#65919 §7).
-                    agent._emit_interim_assistant_message(final_msg)
-                    messages.append(final_msg)
-                    try:
-                        agent._flush_messages_to_session_db(messages, conversation_history)
-                    except Exception:
-                        logger.debug("verify-on-stop interim flush failed", exc_info=True)
-                    messages.append({
-                        "role": "user",
-                        "content": _verify_nudge,
-                        "_verification_stop_synthetic": True,
-                    })
-                    agent._session_messages = messages
-                    # Run the verification-stop loop silently — the nudge is an
-                    # internal turn that should not add noise to the user's
-                    # terminal. Keep a debug breadcrumb in agent.log for tracing.
-                    logger.debug("verification stop-loop nudge issued (attempt %d)",
-                                 agent._verification_stop_nudges)
-                    # Keep the attempted answer only as an explicit fallback for
-                    # continuation-budget exhaustion.  ``final_response`` itself
-                    # must be cleared so the finalizer can distinguish this gate
-                    # from unrelated error/recovery exits. (#61631)
-                    # Track whether this candidate was already streamed so the
-                    # finalizer can mark the turn previewed only if the
-                    # candidate is actually reused as the final response.
-                    _pending_verification_response = final_response
-                    _pending_verification_response_previewed = (
-                        agent._interim_content_was_streamed(final_response or "")
-                    )
-                    final_response = None
-                    continue
-
-                # User verification-loop gate: when the agent edited code this
-                # turn, let a registered `pre_verify` hook (plugin/shell) keep it
-                # going one more turn. The shipped guidance is folded into the
-                # evidence-based verify-on-stop nudge above, so this path has no
-                # default continuation cost.
-                _verify_nudge2 = None
-                _edited = sorted(getattr(agent, "_turn_file_mutation_paths", set()) or [])
-                _attempt = getattr(agent, "_pre_verify_nudges", 0)
-                try:
-                    from agent.verify_hooks import max_verify_nudges
-                    from hermes_cli.lifecycle import has_hook
-                    from hermes_cli.plugins import get_pre_verify_continue_message
-
-                    if _edited and has_hook("pre_verify") and _attempt < max_verify_nudges():
-                        # Posture is fixed for the session — resolve once + cache.
-                        coding = getattr(agent, "_resolved_is_coding", None)
-                        if coding is None:
-                            from agent.coding_context import is_coding_context
-                            coding = bool(is_coding_context(platform=getattr(agent, "platform", "") or ""))
-                            agent._resolved_is_coding = coding
-                        _verify_nudge2 = get_pre_verify_continue_message(
-                            session_id=getattr(agent, "session_id", None) or "",
-                            platform=getattr(agent, "platform", "") or "",
-                            model=getattr(agent, "model", "") or "",
-                            coding=coding,
-                            attempt=_attempt,
-                            final_response=final_response,
-                            changed_paths=_edited,
-                        )
-                except Exception:
-                    logger.debug("pre_verify hook check failed", exc_info=True)
-                    _verify_nudge2 = None
-
-                if _verify_nudge2:
-                    agent._pre_verify_nudges = _attempt + 1
-                    final_msg["finish_reason"] = "verify_hook_continue"
-                    # The assistant response is real content — persist it and
-                    # emit to the UI as an interim message so the user sees the
-                    # attempted final answer before the pre_verify loop runs.
-                    # Only the nudge is flagged synthetic so it gets stripped
-                    # from the durable transcript (#65919 §7).
-                    agent._emit_interim_assistant_message(final_msg)
-                    messages.append(final_msg)
-                    try:
-                        agent._flush_messages_to_session_db(messages, conversation_history)
-                    except Exception:
-                        logger.debug("pre_verify interim flush failed", exc_info=True)
-                    messages.append({
-                        "role": "user",
-                        "content": _verify_nudge2,
-                        "_pre_verify_synthetic": True,
-                    })
-                    agent._session_messages = messages
-                    logger.debug("pre_verify nudge issued (attempt %d)",
-                                 agent._pre_verify_nudges)
-                    _pending_verification_response = final_response
-                    _pending_verification_response_previewed = (
-                        agent._interim_content_was_streamed(final_response or "")
-                    )
-                    final_response = None
-                    continue
-
-                # ── Kanban worker terminal-tool stop guard ─────────────
-                # Workers must end with kanban_complete / kanban_block.
-                # Models sometimes narrate the next step ("Let me write the
-                # report") and stop with finish_reason=stop — a clean exit
-                # that the dispatcher records as protocol_violation. Nudge
-                # once or twice before allowing that exit.
-                try:
-                    from agent.kanban_stop import build_kanban_stop_nudge
-
-                    _kanban_nudge = build_kanban_stop_nudge(
-                        messages=messages,
-                        attempts=getattr(agent, "_kanban_stop_nudges", 0),
-                    )
-                except Exception:
-                    logger.debug("kanban stop-loop check failed", exc_info=True)
-                    _kanban_nudge = None
-
-                if _kanban_nudge:
-                    agent._kanban_stop_nudges = (
-                        getattr(agent, "_kanban_stop_nudges", 0) + 1
-                    )
-                    final_msg["finish_reason"] = "kanban_terminal_required"
-                    final_msg["_kanban_stop_synthetic"] = True
-                    messages.append(final_msg)
-                    messages.append({
-                        "role": "user",
-                        "content": _kanban_nudge,
-                        "_kanban_stop_synthetic": True,
-                    })
-                    agent._session_messages = messages
-                    logger.info(
-                        "kanban stop-loop nudge issued (attempt %d) task=%s",
-                        agent._kanban_stop_nudges,
-                        os.environ.get("HERMES_KANBAN_TASK", ""),
-                    )
-                    agent._emit_status(
-                        "⚠️ Kanban worker tried to exit without "
-                        "kanban_complete/kanban_block — nudging to finish"
-                    )
-                    # Same finalizer contract as verify-on-stop: clear
-                    # final_response while continuing so a later budget
-                    # exhaustion path does not treat the narrated stop as
-                    # a completed answer.
-                    _pending_verification_response = final_response
-                    _pending_verification_response_previewed = (
-                        agent._interim_content_was_streamed(final_response or "")
-                    )
-                    final_response = None
-                    continue
-
                 messages.append(final_msg)
                 
                 _turn_exit_reason = f"text_response(finish_reason={finish_reason})"
@@ -7128,6 +6703,49 @@ def run_conversation(
                     agent._safe_print(f"🎉 Conversation completed after {api_call_count} OpenAI-compatible API call(s)")
                 break
             
+        except asyncio.CancelledError:
+            # External request cancellation is a normal lifecycle event for
+            # an async service.  Persist the partial transcript/trajectory
+            # through the same finalizer used by completed turns, then
+            # re-raise so the caller still observes cancellation.  The
+            # finalizer task is shielded so a second cancellation cannot leave
+            # an unmatched tool call or half-written session row behind.
+            interrupted = True
+            _turn_exit_reason = "cancelled"
+            agent._session_messages = messages
+            from agent.turn_finalizer import finalize_turn
+
+            finalizer_task = asyncio.create_task(
+                finalize_turn(
+                    agent,
+                    final_response=final_response,
+                    api_call_count=api_call_count,
+                    interrupted=True,
+                    failed=failed,
+                    messages=messages,
+                    conversation_history=conversation_history,
+                    effective_task_id=effective_task_id,
+                    turn_id=turn_id,
+                    user_message=user_message,
+                    original_user_message=original_user_message,
+                    _should_review_memory=_should_review_memory,
+                    _turn_exit_reason=_turn_exit_reason,
+                    _pending_verification_response=_pending_verification_response,
+                    _pending_verification_response_previewed=(
+                        _pending_verification_response_previewed
+                    ),
+                )
+            )
+            try:
+                await asyncio.shield(finalizer_task)
+            except asyncio.CancelledError:
+                await asyncio.shield(finalizer_task)
+            except Exception:
+                logger.error(
+                    "Cancelled turn finalization failed",
+                    exc_info=True,
+                )
+            raise
         except Exception as e:
             # Phase-aware error classification. The huge outer try/except spans
             # both the actual API request and all local post-processing of the
@@ -7227,7 +6845,7 @@ def run_conversation(
     # (god-file decomposition Phase 1 step 4). Behavior-neutral: the assembled
     # result dict is returned exactly as before.
     from agent.turn_finalizer import finalize_turn
-    return finalize_turn(
+    return await finalize_turn(
         agent,
         final_response=final_response,
         api_call_count=api_call_count,

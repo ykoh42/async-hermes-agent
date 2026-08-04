@@ -28,7 +28,7 @@ CANONICAL = f"custom:{PROVIDER_KEY}"
 
 
 @pytest.fixture
-def keyed_provider_config(monkeypatch):
+def keyed_provider_config():
     """A ``providers:`` entry whose display name differs from its config key."""
     config = {
         "providers": {
@@ -41,26 +41,29 @@ def keyed_provider_config(monkeypatch):
             }
         }
     }
-    monkeypatch.setattr(rp, "load_config", lambda *a, **k: config)
-    monkeypatch.setattr("hermes_cli.config.load_config", lambda *a, **k: config)
-    monkeypatch.setattr(rp, "_get_model_config", lambda: {})
     return config
 
 
 def test_display_name_heals_to_the_config_key_identity(keyed_provider_config):
     """The regression: the display-name spelling must not mint a second identity."""
-    assert rp.canonical_custom_identity(config_provider=DISPLAY_NAME) == CANONICAL
+    assert rp.canonical_custom_identity(
+        config_provider=DISPLAY_NAME,
+        config=keyed_provider_config,
+    ) == CANONICAL
 
 
-def test_config_model_provider_display_name_heals_too(keyed_provider_config, monkeypatch):
+def test_config_model_provider_display_name_heals_too(keyed_provider_config):
     """Same path reached through ``config.model.provider`` rather than an argument."""
-    monkeypatch.setattr(rp, "_get_model_config", lambda: {"provider": DISPLAY_NAME})
-    assert rp.canonical_custom_identity() == CANONICAL
+    keyed_provider_config["model"] = {"provider": DISPLAY_NAME}
+    assert rp.canonical_custom_identity(config=keyed_provider_config) == CANONICAL
 
 
 def test_config_key_spelling_still_resolves(keyed_provider_config):
     """The spelling that already worked keeps working."""
-    assert rp.canonical_custom_identity(config_provider=PROVIDER_KEY) == CANONICAL
+    assert rp.canonical_custom_identity(
+        config_provider=PROVIDER_KEY,
+        config=keyed_provider_config,
+    ) == CANONICAL
 
 
 def test_all_recovery_sources_agree_on_one_identity(keyed_provider_config):
@@ -69,19 +72,28 @@ def test_all_recovery_sources_agree_on_one_identity(keyed_provider_config):
     Three sources feeding the same session-identity slot is only safe while
     they agree; a divergent one silently splits an endpoint in two.
     """
-    by_url = rp.canonical_custom_identity(base_url=BASE_URL)
-    by_model = rp.canonical_custom_identity(model=MODEL)
-    by_config = rp.canonical_custom_identity(config_provider=DISPLAY_NAME)
+    by_url = rp.canonical_custom_identity(
+        base_url=BASE_URL, config=keyed_provider_config
+    )
+    by_model = rp.canonical_custom_identity(
+        model=MODEL, config=keyed_provider_config
+    )
+    by_config = rp.canonical_custom_identity(
+        config_provider=DISPLAY_NAME, config=keyed_provider_config
+    )
 
     assert {by_url, by_model, by_config} == {CANONICAL}
 
 
 def test_unconfigured_candidate_still_returns_none(keyed_provider_config):
     """Fail-closed contract: never invent an identity resolution can't honour."""
-    assert rp.canonical_custom_identity(config_provider="not-a-configured-entry") is None
+    assert rp.canonical_custom_identity(
+        config_provider="not-a-configured-entry",
+        config=keyed_provider_config,
+    ) is None
 
 
-def test_legacy_unkeyed_entry_keeps_its_name_identity(monkeypatch):
+def test_legacy_unkeyed_entry_keeps_its_name_identity():
     """``custom_providers:`` entries have no key, so the name stays the identity."""
     config = {
         "custom_providers": [
@@ -93,8 +105,7 @@ def test_legacy_unkeyed_entry_keeps_its_name_identity(monkeypatch):
             }
         ]
     }
-    monkeypatch.setattr(rp, "load_config", lambda *a, **k: config)
-    monkeypatch.setattr("hermes_cli.config.load_config", lambda *a, **k: config)
-    monkeypatch.setattr(rp, "_get_model_config", lambda: {})
-
-    assert rp.canonical_custom_identity(config_provider="Legacy Endpoint") == "custom:legacy-endpoint"
+    assert rp.canonical_custom_identity(
+        config_provider="Legacy Endpoint",
+        config=config,
+    ) == "custom:legacy-endpoint"

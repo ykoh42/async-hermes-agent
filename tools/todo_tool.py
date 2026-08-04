@@ -201,13 +201,13 @@ class TodoStore:
         return [todos[i] for i in sorted(last_index.values())]
 
 
-def todo_tool(
+async def todo_tool(
     todos: Optional[List[Dict[str, Any]]] = None,
     merge: bool = False,
     store: Optional[TodoStore] = None,
 ) -> str:
     """
-    Single entry point for the todo tool. Reads or writes depending on params.
+    Read or update the per-agent todo store.
 
     Args:
         todos: if provided, write these items. If None, read current list.
@@ -324,12 +324,21 @@ TODO_SCHEMA = {
 # --- Registry ---
 from tools.registry import registry, tool_error
 
+
+async def _handle_todo(args: Dict[str, Any], **context: Any) -> str:
+    """Adapt the registry's raw argument dictionary to ``todo_tool``."""
+    return await todo_tool(
+        todos=args.get("todos"),
+        merge=args.get("merge", False),
+        store=context.get("store"),
+    )
+
+
 registry.register(
     name="todo",
     toolset="todo",
     schema=TODO_SCHEMA,
-    handler=lambda args, **kw: todo_tool(
-        todos=args.get("todos"), merge=args.get("merge", False), store=kw.get("store")),
+    handler=_handle_todo,
     check_fn=check_todo_requirements,
     emoji="📋",
 )

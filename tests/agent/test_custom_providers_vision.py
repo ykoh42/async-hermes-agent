@@ -65,7 +65,8 @@ class TestDecideImageInputMode:
 
 
 
-    def test_providers_dict_takes_precedence(self):
+    @pytest.mark.asyncio
+    async def test_providers_dict_takes_precedence(self):
         """providers.<name>.models takes precedence over custom_providers."""
         from agent.image_routing import decide_image_input_mode
         cfg = {
@@ -85,11 +86,12 @@ class TestDecideImageInputMode:
                 }
             ]
         }
-        result = decide_image_input_mode("my-provider", "my-model", cfg)
+        result = await decide_image_input_mode("my-provider", "my-model", cfg)
         assert result == "text"
 
 
-    def test_cli_named_provider_explicit_false_is_not_shadowed_by_default(self):
+    @pytest.mark.asyncio
+    async def test_cli_named_provider_explicit_false_is_not_shadowed_by_default(self):
         """A selected false override wins even when the configured default is true."""
         from agent.image_routing import decide_image_input_mode
 
@@ -106,14 +108,15 @@ class TestDecideImageInputMode:
                 },
             ],
         }
-        assert decide_image_input_mode(
+        assert await decide_image_input_mode(
             "custom",
             "shared-model",
             cfg,
             requested_provider="text-only-provider",
         ) == "text"
 
-    def test_runtime_provider_identity_does_not_leak_to_another_model(self):
+    @pytest.mark.asyncio
+    async def test_runtime_provider_identity_does_not_leak_to_another_model(self):
         """Context identity is only evidence for its exact runtime provider/model."""
         from agent.auxiliary_client import clear_runtime_main, set_runtime_main
         from agent.image_routing import decide_image_input_mode
@@ -136,6 +139,6 @@ class TestDecideImageInputMode:
                 "selected-model",
                 requested_provider="my-vision-provider",
             )
-            assert decide_image_input_mode("custom", "other-model", cfg) == "text"
+            assert await decide_image_input_mode("custom", "other-model", cfg) == "text"
         finally:
             clear_runtime_main()

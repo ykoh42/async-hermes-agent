@@ -1,5 +1,9 @@
 from types import SimpleNamespace
 
+import pytest
+
+pytestmark = pytest.mark.asyncio
+
 from agent.usage_pricing import (
     CanonicalUsage,
     estimate_usage_cost,
@@ -15,7 +19,7 @@ from agent.usage_pricing import (
 
 
 
-def test_normalize_usage_reads_deepseek_native_cache_hit_tokens():
+async def test_normalize_usage_reads_deepseek_native_cache_hit_tokens():
     """DeepSeek's native API (api.deepseek.com) reports context-cache hits as
     top-level prompt_cache_hit_tokens / prompt_cache_miss_tokens (with
     prompt_tokens = hit + miss), not OpenAI's nested
@@ -39,7 +43,7 @@ def test_normalize_usage_reads_deepseek_native_cache_hit_tokens():
 
 
 
-def test_normalize_usage_openai_reads_top_level_anthropic_cache_fields():
+async def test_normalize_usage_openai_reads_top_level_anthropic_cache_fields():
     """Some OpenAI-compatible proxies (OpenRouter, Vercel AI Gateway, Cline) expose
     Anthropic-style cache token counts at the top level of the usage object when
     routing Claude models, instead of nesting them in prompt_tokens_details.
@@ -82,7 +86,7 @@ def test_normalize_usage_openai_reads_top_level_anthropic_cache_fields():
 
 
 
-def test_deepseek_v4_pro_pricing_entry_exists():
+async def test_deepseek_v4_pro_pricing_entry_exists():
     """Regression test: deepseek-v4-pro must have a pricing entry.
 
     Before this fix, deepseek-v4-pro sessions showed as unknown cost
@@ -90,7 +94,7 @@ def test_deepseek_v4_pro_pricing_entry_exists():
     entry for that model.  See #24218.  Rates track the 2026-07 price cut
     ($1.74/$3.48 → $0.435/$0.87).
     """
-    entry = get_pricing_entry(
+    entry = await get_pricing_entry(
         "deepseek-v4-pro",
         provider="deepseek",
     )
@@ -105,15 +109,15 @@ def test_deepseek_v4_pro_pricing_entry_exists():
 
 
 
-def test_deepseek_deprecated_aliases_price_as_v4_flash():
+async def test_deepseek_deprecated_aliases_price_as_v4_flash():
     """Invariant: deepseek-chat / deepseek-reasoner are deprecated aliases for
     deepseek-v4-flash's non-thinking / thinking modes (deprecation 2026-07-24)
     — they must bill at identical rates to the flash entry, or sessions on the
     legacy names over/under-report cost."""
-    flash = get_pricing_entry("deepseek-v4-flash", provider="deepseek")
+    flash = await get_pricing_entry("deepseek-v4-flash", provider="deepseek")
     assert flash is not None
     for alias in ("deepseek-chat", "deepseek-reasoner"):
-        entry = get_pricing_entry(alias, provider="deepseek")
+        entry = await get_pricing_entry(alias, provider="deepseek")
         assert entry is not None, alias
         assert entry.input_cost_per_million == flash.input_cost_per_million, alias
         assert entry.output_cost_per_million == flash.output_cost_per_million, alias
@@ -124,7 +128,7 @@ def test_deepseek_deprecated_aliases_price_as_v4_flash():
 
 
 
-def test_bedrock_claude_rows_all_carry_cache_pricing():
+async def test_bedrock_claude_rows_all_carry_cache_pricing():
     """Invariant: every Bedrock Claude pricing row must carry cache-read AND
     cache-write rates, otherwise a cached session prices as ``unknown``.
 
@@ -150,7 +154,7 @@ def test_bedrock_claude_rows_all_carry_cache_pricing():
         assert entry.cache_write_cost_per_million > entry.input_cost_per_million, key
 
 
-def test_bedrock_current_gen_claude_rows_resolve():
+async def test_bedrock_current_gen_claude_rows_resolve():
     """Current-gen Claude models (Opus 4.8/4.7, Sonnet 5) must have Bedrock
     pricing rows so cached sessions report a dollar cost, not ``unknown``.
     Assert each resolves via the bare id and a cross-region inference profile
@@ -168,7 +172,7 @@ def test_bedrock_current_gen_claude_rows_resolve():
         "anthropic.claude-opus-4-7",
         "anthropic.claude-sonnet-5",
     ):
-        ref = get_pricing_entry(bare, provider="bedrock", base_url=url)
+        ref = await get_pricing_entry(bare, provider="bedrock", base_url=url)
         assert ref is not None, bare
         assert ref.input_cost_per_million is not None, bare
         assert ref.output_cost_per_million is not None, bare
@@ -181,7 +185,7 @@ def test_bedrock_current_gen_claude_rows_resolve():
         assert ref.cache_write_cost_per_million is not None, bare
         # Cross-region inference profiles resolve to the same entry.
         for mid in (f"us.{bare}", f"global.{bare}"):
-            entry = get_pricing_entry(mid, provider="bedrock", base_url=url)
+            entry = await get_pricing_entry(mid, provider="bedrock", base_url=url)
             assert entry is not None, mid
             assert entry.input_cost_per_million == ref.input_cost_per_million, mid
             assert entry.output_cost_per_million == ref.output_cost_per_million, mid
@@ -189,20 +193,20 @@ def test_bedrock_current_gen_claude_rows_resolve():
 
 
 
-def test_bedrock_versioned_inference_profile_resolves_to_bare_pricing():
+async def test_bedrock_versioned_inference_profile_resolves_to_bare_pricing():
     """Bedrock profile IDs may include the provider's dated version suffix.
 
     The pricing table intentionally uses shorter model-family IDs, so the
     lookup needs a longest-prefix fallback after stripping the region scope.
     """
-    bare = get_pricing_entry("anthropic.claude-sonnet-4-6", provider="bedrock")
+    bare = await get_pricing_entry("anthropic.claude-sonnet-4-6", provider="bedrock")
     assert bare is not None
 
     for model in (
         "us.anthropic.claude-sonnet-4-6-20250514-v1:0",
         "global.anthropic.claude-sonnet-4-6-20250514-v1:0",
     ):
-        scoped = get_pricing_entry(model, provider="bedrock")
+        scoped = await get_pricing_entry(model, provider="bedrock")
         assert scoped is not None, model
         assert scoped.input_cost_per_million == bare.input_cost_per_million
         assert scoped.output_cost_per_million == bare.output_cost_per_million
@@ -214,7 +218,8 @@ def test_bedrock_versioned_inference_profile_resolves_to_bare_pricing():
 
 
 
-def test_bedrock_claude_cached_session_estimates_cost_not_unknown():
+@pytest.mark.asyncio
+async def test_bedrock_claude_cached_session_estimates_cost_not_unknown():
     """A Bedrock Claude session with cache hits must produce a dollar estimate,
     not ``unknown`` — the user-visible symptom in #50295.
     """
@@ -229,7 +234,7 @@ def test_bedrock_claude_cached_session_estimates_cost_not_unknown():
     assert canonical.cache_read_tokens == 1369379
     assert canonical.cache_write_tokens == 42135
 
-    result = estimate_usage_cost(
+    result = await estimate_usage_cost(
         "us.anthropic.claude-opus-4-6",
         canonical,
         provider="bedrock",
@@ -244,16 +249,16 @@ def test_bedrock_claude_cached_session_estimates_cost_not_unknown():
 
 
 
-def test_fireworks_router_fast_tier_prices_distinctly():
+async def test_fireworks_router_fast_tier_prices_distinctly():
     """Fast serving tiers live under accounts/fireworks/routers/<name>-fast and
     bill at higher rates than the standard model — the routing layer's
     rsplit("/", 1) must land on the distinct fast-tier entry."""
-    standard = get_pricing_entry(
+    standard = await get_pricing_entry(
         "accounts/fireworks/models/kimi-k2p6",
         provider="fireworks",
         base_url="https://api.fireworks.ai/inference/v1",
     )
-    fast = get_pricing_entry(
+    fast = await get_pricing_entry(
         "accounts/fireworks/routers/kimi-k2p6-fast",
         provider="fireworks",
         base_url="https://api.fireworks.ai/inference/v1",
@@ -273,7 +278,7 @@ def test_fireworks_router_fast_tier_prices_distinctly():
 
 
 
-def test_google_and_vertex_routes_share_official_pricing_snapshot():
+async def test_google_and_vertex_routes_share_official_pricing_snapshot():
     """Direct Gemini, Vertex, and Vertex's OpenAI-compatible hostname must
     all normalize to the Google official-pricing route.
     """
@@ -291,19 +296,22 @@ def test_google_and_vertex_routes_share_official_pricing_snapshot():
     assert all(route.billing_mode == "official_docs_snapshot" for route in routes)
 
 
-def test_vertex_default_model_estimates_cached_usage(monkeypatch):
+@pytest.mark.asyncio
+async def test_vertex_default_model_estimates_cached_usage(monkeypatch):
     """The bundled Vertex profile's default auxiliary model must fall back to
     Google snapshot pricing when the OpenAI-compatible endpoint has no model
     metadata, including for cache-read accounting.
     """
     from providers import get_provider_profile
 
+    async def _empty_metadata(*_args, **_kwargs):
+        return {}
+
     monkeypatch.setattr(
-        "agent.usage_pricing.fetch_endpoint_model_metadata",
-        lambda *_args, **_kwargs: {},
+        "agent.usage_pricing.fetch_endpoint_model_metadata", _empty_metadata
     )
     vertex = get_provider_profile("vertex")
-    result = estimate_usage_cost(
+    result = await estimate_usage_cost(
         vertex.default_aux_model,
         CanonicalUsage(input_tokens=100, output_tokens=100, cache_read_tokens=100),
         provider=vertex.name,

@@ -43,11 +43,12 @@ class TestArceeProviderRegistry:
 
 class TestArceeAliases:
     @pytest.mark.parametrize("alias", ["arcee", "arcee-ai", "arceeai"])
-    def test_alias_resolves(self, alias, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_alias_resolves(self, alias, monkeypatch):
         for key in _OTHER_PROVIDER_KEYS + ("OPENROUTER_API_KEY",):
             monkeypatch.delenv(key, raising=False)
         monkeypatch.setenv("ARCEEAI_API_KEY", "arc-test-12345")
-        assert resolve_provider(alias) == "arcee"
+        assert await resolve_provider(alias) == "arcee"
 
     def test_normalize_provider_models_py(self):
         from hermes_cli.models import normalize_provider
@@ -61,23 +62,26 @@ class TestArceeAliases:
 
 
 class TestArceeCredentials:
-    def test_status_configured(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_status_configured(self, monkeypatch):
         monkeypatch.setenv("ARCEEAI_API_KEY", "arc-test")
-        status = get_api_key_provider_status("arcee")
+        status = await get_api_key_provider_status("arcee")
         assert status["configured"]
 
 
-    def test_openrouter_key_does_not_make_arcee_configured(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_openrouter_key_does_not_make_arcee_configured(self, monkeypatch):
         """OpenRouter users should NOT see arcee as configured."""
         monkeypatch.delenv("ARCEEAI_API_KEY", raising=False)
         monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
-        status = get_api_key_provider_status("arcee")
+        status = await get_api_key_provider_status("arcee")
         assert not status["configured"]
 
-    def test_resolve_credentials(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_resolve_credentials(self, monkeypatch):
         monkeypatch.setenv("ARCEEAI_API_KEY", "arc-direct-key")
         monkeypatch.delenv("ARCEE_BASE_URL", raising=False)
-        creds = resolve_api_key_provider_credentials("arcee")
+        creds = await resolve_api_key_provider_credentials("arcee")
         assert creds["api_key"] == "arc-direct-key"
         assert creds["base_url"] == "https://api.arcee.ai/api/v1"
 
@@ -156,5 +160,4 @@ class TestArceeProvidersModule:
 # =============================================================================
 # Auxiliary client — main-model-first design
 # =============================================================================
-
 

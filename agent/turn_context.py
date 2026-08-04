@@ -14,7 +14,7 @@ captures those produced values; ``build_turn_context`` performs the setup work a
 returns one. ``run_conversation`` is left to unpack the context and run the loop,
 shrinking the orchestrator by the full prologue.
 
-The builder still mutates ``agent`` heavily (counters, thread id, cached prompt,
+The builder still mutates ``agent`` heavily (counters, turn state, cached prompt,
 session DB) exactly as the inline code did — those side effects are the point. The
 ``TurnContext`` it returns carries only the *locals* the loop reads back.
 
@@ -24,8 +24,8 @@ move-and-name refactor with no semantic change.
 
 from __future__ import annotations
 
+import asyncio
 import logging
-import threading
 import time
 import uuid
 from dataclasses import dataclass
@@ -36,12 +36,12 @@ from agent.conversation_compression import (
     PREFLIGHT_COMPRESSION_STATUS_TEMPLATE,
     compression_skipped_due_to_lock,
     conversation_history_after_compression,
+    _hydrate_persisted_compression_guards,
     recover_rotated_compression_session,
 )
 from agent.context_engine import automatic_compaction_status_message
 from agent.iteration_budget import IterationBudget
 from agent.memory_manager import build_memory_context_block
-from agent.memory_provider import is_trivial_prompt
 from agent.model_metadata import (
     estimate_messages_tokens_rough,
     estimate_request_tokens_rough,
@@ -327,7 +327,7 @@ class TurnContext:
     preflight_compression_blocked: bool = False
 
 
-def build_turn_context(
+async def build_turn_context(
     agent,
     user_message: Any,
     system_message: Optional[str],
@@ -360,7 +360,7 @@ def build_turn_context(
     # Recover a session rotated by another path before binding log/turn ids or
     # copying client-supplied history. Everything in this turn must consistently
     # belong to the canonical child, including observability metadata.
-    recovered_history = recover_rotated_compression_session(agent)
+    recovered_history = await recover_rotated_compression_session(agent)
     if recovered_history is not None:
         conversation_history = recovered_history
 
@@ -372,14 +372,21 @@ def build_turn_context(
     # null; rebuilding from scratch" warning and a needless first-turn prefix
     # cache miss. (Issue #45499.)
 
-    # Tag log records on this thread with the session ID for ``hermes logs``.
+    # Tag log records in this context with the session ID for ``hermes logs``.
     set_session_context(agent.session_id)
 
-    # Bind the skill write-origin ContextVar for this thread.
+    # Bind the skill write-origin ContextVar for this task.
     set_current_write_origin(getattr(agent, "_memory_write_origin", "assistant_tool"))
 
+    # Resolve credentials lazily.  The constructor deliberately keeps auth
+    # discovery state-only so auth.json/OAuth I/O cannot block application
+    # startup or the event loop.
+    ensure_provider_runtime = getattr(agent, "_ensure_provider_runtime", None)
+    if ensure_provider_runtime is not None:
+        await ensure_provider_runtime()
+
     # Restore the primary runtime if the previous turn activated fallback.
-    agent._restore_primary_runtime()
+    await agent._restore_primary_runtime()
 
     # Tell auxiliary_client what the live main provider/model are for this turn
     # after primary restoration has settled the runtime.
@@ -397,7 +404,7 @@ def build_turn_context(
     except Exception:
         pass
 
-    # Between-turns MCP refresh: an MCP server that finished connecting since
+    # Between-turns MCP discovery/refresh: a server that finished connecting since
     # the previous turn (slow HTTP/OAuth servers routinely take 2-6s on a cold
     # connect, missing the bounded startup wait) lands in THIS turn's tool
     # snapshot.  This is cache-safe by construction: it runs in the per-turn
@@ -409,19 +416,27 @@ def build_turn_context(
     # name and leaves the snapshot untouched on no-change).
     try:
         if not getattr(agent, "_skip_mcp_refresh", False):
-            # Import-cost gate: ``tools.mcp_tool`` pulls in the whole ``mcp``
-            # package (~0.4s measured) even when the user has zero MCP servers
-            # configured.  MCP tools can only be registered by code that has
-            # already imported ``tools.mcp_tool`` (discovery, /reload-mcp,
-            # late-binding refresh) — so if it isn't in sys.modules yet, there
-            # is nothing to refresh and the import can be skipped outright.
-            # This keeps the no-MCP first turn off the heavy import path
-            # without changing behavior for MCP users.
-            import sys as _sys
-            if "tools.mcp_tool" in _sys.modules:
-                from tools.mcp_tool import has_registered_mcp_tools, refresh_agent_mcp_tools
-                if has_registered_mcp_tools():
-                    refresh_agent_mcp_tools(agent, quiet_mode=True)
+            # The first discovery is intentionally lazy: ``AIAgent.__init__``
+            # must not open an MCP transport or synchronously wait on a remote
+            # server.  Subsequent turns only refresh the in-memory snapshot.
+            from tools.mcp_tool import (
+                discover_mcp_tools,
+                has_registered_mcp_tools,
+                refresh_agent_mcp_tools,
+                retain_mcp_lifecycle,
+            )
+
+            if not getattr(agent, "_mcp_discovery_started", False):
+                agent._mcp_discovery_started = True
+                await retain_mcp_lifecycle(agent)
+                agent._mcp_lifecycle_retained = True
+                await discover_mcp_tools()
+            if (
+                not getattr(agent, "_tool_snapshot_initialized", False)
+                or has_registered_mcp_tools()
+            ):
+                await refresh_agent_mcp_tools(agent, quiet_mode=True)
+                agent._tool_snapshot_initialized = True
     except Exception:
         logger.debug("between-turns MCP tool refresh skipped", exc_info=True)
 
@@ -431,7 +446,7 @@ def build_turn_context(
     if isinstance(persist_user_message, str):
         persist_user_message = sanitize_surrogates(persist_user_message)
 
-    # Store stream callback for _interruptible_api_call to pick up.
+    # Store the stream callback for the native model transport.
     agent._stream_callback = stream_callback
     agent._persist_user_message_idx = None
     agent._persist_user_message_override = persist_user_message
@@ -439,12 +454,14 @@ def build_turn_context(
     # Generate unique task_id if not provided to isolate VMs between tasks.
     effective_task_id = task_id or str(uuid.uuid4())
     agent._current_task_id = effective_task_id
-    turn_id = str(getattr(agent, "_relay_pending_turn_id", "") or "")
-    if not turn_id:
-        turn_id = (
-            f"{agent.session_id or 'session'}:{effective_task_id}:{uuid.uuid4().hex[:8]}"
-        )
-    agent._relay_pending_turn_id = None
+    task_ids = getattr(agent, "_task_ids", None)
+    if task_ids is None:
+        task_ids = set()
+        agent._task_ids = task_ids
+    task_ids.add(effective_task_id)
+    turn_id = (
+        f"{agent.session_id or 'session'}:{effective_task_id}:{uuid.uuid4().hex[:8]}"
+    )
     agent._current_turn_id = turn_id
     agent._current_api_request_id = ""
     # Tripwire: warn (with both turn ids) when this turn starts before the
@@ -470,25 +487,25 @@ def build_turn_context(
     _reset_consol = getattr(agent._memory_store, "reset_consolidation_failures", None)
     if callable(_reset_consol):
         _reset_consol()
+    if agent._memory_store is not None and not getattr(agent, "_memory_loaded", False):
+        load_memory = getattr(agent._memory_store, "load_from_disk", None)
+        if not callable(load_memory):
+            raise RuntimeError(
+                "Async AIAgent requires a memory store with async load_from_disk()."
+            )
+        await load_memory()
+        agent._memory_loaded = True
     agent._vision_supported = True
 
-    # Pre-turn connection health check: clean up dead TCP connections.
-    if agent.api_mode != "anthropic_messages":
-        try:
-            if agent._cleanup_dead_connections():
-                agent._emit_status(
-                    "🔌 Detected stale connections from a previous provider "
-                    "issue — cleaned up automatically. Proceeding with fresh "
-                    "connection."
-                )
-        except Exception:
-            pass
+    # Native HTTP clients own their connection health asynchronously.  The
+    # former raw-socket probe traversed the synchronous client's pool from the
+    # event loop, so it is intentionally absent from the async turn path.
     # Replay compression warning through status_callback for gateway platforms.
     if agent._compression_warning:
         agent._replay_compression_warning()
         agent._compression_warning = None  # send once
 
-    # NOTE: _turns_since_memory and _iters_since_skill are NOT reset here.
+    # NOTE: _turns_since_memory is intentionally not reset here.
     agent.iteration_budget = IterationBudget(agent.max_iterations)
 
     # Log conversation turn start for debugging/observability.
@@ -590,20 +607,6 @@ def build_turn_context(
             should_review_memory = True
             agent._turns_since_memory = 0
 
-    # Cosmetic side-signal: detect an affection "reaction" (ily / <3 / good bot)
-    # and notify the host so it can play hearts. Token-free, never touches the
-    # conversation, and never fatal — a purely optional UI beat.
-    reaction_callback = getattr(agent, "reaction_callback", None)
-    if reaction_callback is not None:
-        try:
-            from agent.reactions import detect_reaction
-
-            kind = detect_reaction(original_user_message)
-            if kind:
-                reaction_callback(kind)
-        except Exception:
-            pass
-
     if not agent.quiet_mode:
         _print_preview = summarize_user_message_for_log(user_message)
         agent._safe_print(
@@ -613,7 +616,11 @@ def build_turn_context(
 
     # ── System prompt (cached per session for prefix caching) ──
     if agent._cached_system_prompt is None:
-        restore_or_build_system_prompt(agent, system_message, conversation_history)
+        await restore_or_build_system_prompt(
+            agent,
+            system_message,
+            conversation_history,
+        )
 
     active_system_prompt = agent._cached_system_prompt
 
@@ -628,13 +635,17 @@ def build_turn_context(
     # LATER (after memory prefetch / pre_llm_call), so the row is written
     # once with its final api_content — both steps take the same per-agent
     # persist lock as CLI close persistence.
-    persist_lock = getattr(agent, "_session_persist_lock", None)
+    persist_lock = agent._get_session_persist_lock()
     try:
-        if persist_lock is None:
-            agent._ensure_db_session()
-        else:
-            with persist_lock:
-                agent._ensure_db_session()
+        async with persist_lock:
+            await agent._ensure_db_session()
+            await agent._persist_pending_billing_route()
+            if getattr(agent, "_session_db", None) is not None:
+                await _hydrate_persisted_compression_guards(
+                    agent.context_compressor,
+                    agent._session_db,
+                    agent.session_id,
+                )
     except Exception:
         logger.warning(
             "Turn-start session row creation failed for session=%s",
@@ -707,7 +718,7 @@ def build_turn_context(
                 if _idle_status:
                     agent._emit_status(_idle_status)
                 _idle_input = messages
-                messages, active_system_prompt = agent._compress_context(
+                messages, active_system_prompt = await agent._compress_context(
                     messages, system_message, approx_tokens=_idle_tokens,
                     task_id=effective_task_id,
                 )
@@ -770,21 +781,6 @@ def build_turn_context(
             lambda _tokens: False,
         )
         _preflight_deferred = _defer_preflight(_preflight_tokens)
-        # Codex app-server threads are compacted by the codex agent itself;
-        # Hermes only initiates compaction in "hermes" mode (#36801).
-        _codex_native_auto = (
-            getattr(agent, "api_mode", None) == "codex_app_server"
-            and str(
-                getattr(
-                    agent,
-                    "codex_app_server_auto_compaction",
-                    "native",
-                )
-                or "native"
-            ).lower()
-            in {"native", "off"}
-        )
-
         if not _preflight_deferred:
             _last = _compressor.last_prompt_tokens
             # Do NOT overwrite the -1 sentinel (#36718).
@@ -819,12 +815,6 @@ def build_turn_context(
                 # summary-LLM cooldown — surface a warning (see block below).
                 _cooldown_secs = _compression_cooldown.get("remaining_seconds", 0.0)
                 _compress_block_reason = f"cooldown:{_cooldown_secs:.0f}"
-        elif _codex_native_auto:
-            logger.info(
-                "Skipping Hermes preflight compression for codex app-server "
-                "(mode=%s); Hermes will not start thread compaction here.",
-                getattr(agent, "codex_app_server_auto_compaction", "native"),
-            )
         else:
             _should_compress_now = _compressor.should_compress(_preflight_tokens)
             if not _should_compress_now:
@@ -881,7 +871,7 @@ def build_turn_context(
                 _orig_len = len(messages)
                 _orig_tokens = _preflight_tokens
                 _preflight_input = messages
-                messages, active_system_prompt = agent._compress_context(
+                messages, active_system_prompt = await agent._compress_context(
                     messages, system_message, approx_tokens=_preflight_tokens,
                     task_id=effective_task_id,
                 )
@@ -961,10 +951,10 @@ def build_turn_context(
             if callable(_clear_warn):
                 _clear_warn()
             # Engine maintenance only when NO skip-branch fired: a failure
-            # cooldown, deferred estimate, or codex-native route must keep
-            # the engine hook un-consulted (#20316 contract — the cooldown
+            # cooldown or deferred estimate must keep the engine hook
+            # un-consulted (#20316 contract — the cooldown
             # exists precisely because compression recently failed).
-            if _compression_cooldown or _preflight_deferred or _codex_native_auto:
+            if _compression_cooldown or _preflight_deferred:
                 _engine_preflight = None
             else:
                 _engine_preflight = getattr(
@@ -972,7 +962,7 @@ def build_turn_context(
                 )
             # ── Engine-driven sub-threshold preflight maintenance (#20316) ──
             # None of the threshold-path branches fired (not deferred, no
-            # failure cooldown, not codex-native, and should_compress() said
+            # failure cooldown, and should_compress() said
             # the request is under pressure). Context engines that override
             # ``should_compress_preflight()`` (e.g. LCM-style incremental
             # leaf-chunk compaction) can still request deferred maintenance
@@ -1014,7 +1004,7 @@ def build_turn_context(
                     f"{getattr(_compressor, 'threshold_tokens', 0):,}",
                 )
                 _engine_input = messages
-                messages, active_system_prompt = agent._compress_context(
+                messages, active_system_prompt = await agent._compress_context(
                     messages, system_message, approx_tokens=_preflight_tokens,
                     task_id=effective_task_id,
                 )
@@ -1048,59 +1038,41 @@ def build_turn_context(
         )
         agent._persist_user_message_idx = current_turn_user_idx
 
-    # Plugin hook: pre_llm_call (context injected into user message, not system prompt).
     plugin_user_context = ""
+
+    # Plugins may contribute request-only context for this turn. Keep it on
+    # the current user message rather than the system prompt: the latter is a
+    # stable, cached prefix for the lifetime of the conversation.
+    #
+    # The async lifecycle dispatcher rejects synchronous callbacks instead of
+    # running them in a worker. Do not hide that capability error here; users
+    # must either migrate the plugin hook or disable it.
     try:
-        from hermes_cli.lifecycle import invoke_hook as _invoke_hook
-        _pre_results = _invoke_hook(
+        from hermes_cli.lifecycle import invoke_hook
+        from hermes_cli.plugins import AsyncPluginCapabilityError
+
+        pre_llm_results = await invoke_hook(
             "pre_llm_call",
             session_id=agent.session_id,
-            task_id=effective_task_id,
-            turn_id=turn_id,
             user_message=original_user_message,
             conversation_history=list(messages),
-            is_first_turn=(not bool(conversation_history)),
+            is_first_turn=not bool(conversation_history),
             model=agent.model,
             platform=getattr(agent, "platform", None) or "",
-            parent_session_id=getattr(agent, "_parent_session_id", None) or "",
-            sender_id=getattr(agent, "_user_id", None) or "",
         )
-        _ctx_parts: list[str] = []
-        # Spill oversized per-hook context to disk so a runaway plugin
-        # can't inflate every subsequent turn's prompt. Ported from
-        # openai/codex PR #21069 ("Spill large hook outputs from context").
-        try:
-            from tools.hook_output_spill import (
-                get_spill_config as _spill_cfg,
-                spill_if_oversized as _spill_if_oversized,
-            )
-            _spill_config_cached = _spill_cfg()
-        except Exception:
-            _spill_if_oversized = None  # type: ignore[assignment]
-            _spill_config_cached = None
-        for r in _pre_results:
-            _piece: str = ""
-            if isinstance(r, dict) and r.get("context"):
-                _piece = str(r["context"])
-            elif isinstance(r, str) and r.strip():
-                _piece = r
-            else:
-                continue
-            if _spill_if_oversized is not None:
-                try:
-                    _piece = _spill_if_oversized(
-                        _piece,
-                        session_id=agent.session_id,
-                        source="plugin hook",
-                        config=_spill_config_cached,
-                    )
-                except Exception as _spill_exc:
-                    logger.warning("hook context spill failed: %s", _spill_exc)
-            _ctx_parts.append(_piece)
-        if _ctx_parts:
-            plugin_user_context = "\n\n".join(_ctx_parts)
+    except AsyncPluginCapabilityError:
+        raise
     except Exception as exc:
         logger.warning("pre_llm_call hook failed: %s", exc)
+    else:
+        context_parts = []
+        for result in pre_llm_results:
+            if isinstance(result, dict) and result.get("context"):
+                context_parts.append(str(result["context"]))
+            elif isinstance(result, str) and result.strip():
+                context_parts.append(result)
+        if context_parts:
+            plugin_user_context = "\n\n".join(context_parts)
 
     # Gateway must-deliver notes (auto-reset note, first-contact intro,
     # voice-channel change) ride the same user-message injection channel as
@@ -1131,39 +1103,21 @@ def build_turn_context(
     agent._verification_stop_nudges = 0
     agent._pre_verify_nudges = 0
 
-    # Record the execution thread so interrupt()/clear_interrupt() can scope
-    # the tool-level interrupt signal to THIS agent's thread only.
-    agent._execution_thread_id = threading.current_thread().ident
-
-    # Clear stale per-thread interrupt state, preserving a pending interrupt.
-    ra()._set_interrupt(False, agent._execution_thread_id)
+    # Clear stale task-local tool state while preserving a pre-start interrupt.
+    interrupt_event = getattr(agent, "_interrupt_event", None)
+    if interrupt_event is None:
+        interrupt_event = asyncio.Event()
+        agent._interrupt_event = interrupt_event
+    ra()._set_interrupt(False, interrupt_event)
     if agent._interrupt_requested:
-        ra()._set_interrupt(True, agent._execution_thread_id)
-        agent._interrupt_thread_signal_pending = False
+        ra()._set_interrupt(True, interrupt_event)
     else:
         agent._interrupt_message = None
-        agent._interrupt_thread_signal_pending = False
 
-    # Notify memory providers of the new turn (BEFORE prefetch_all).
-    if agent._memory_manager:
-        try:
-            _turn_msg = original_user_message if isinstance(original_user_message, str) else ""
-            agent._memory_manager.on_turn_start(agent._user_turn_count, _turn_msg)
-        except Exception:
-            pass
-
-    # External memory provider: prefetch once before the tool loop.
-    #
-    # Skip prefetch on trivial prompts (greetings, acknowledgements) to
-    # prevent memory-context injection on turns that carry no semantic signal.
+    # No external-memory prefetch is composed into the prompt in this
+    # distribution. Built-in persisted memory is already part of the stable
+    # system prompt and remains available to the model through the memory tool.
     ext_prefetch_cache = ""
-    if agent._memory_manager:
-        try:
-            _query = original_user_message if isinstance(original_user_message, str) else ""
-            if not is_trivial_prompt(_query):
-                ext_prefetch_cache = agent._memory_manager.prefetch_all(_query) or ""
-        except Exception:
-            pass
 
     # ── api_content sidecar: persist what you send ──
     # The prefetch/plugin context above is injected into the API copy of this
@@ -1175,16 +1129,13 @@ def build_turn_context(
     # content, so the crash persist below writes both in the same row and
     # replay can reproduce the sent prefix byte-for-byte. Guarded by the
     # same predicate the api_messages build uses, so the stamped bytes are
-    # exactly the bytes the loop sends. codex_app_server turns bypass the
-    # api_messages build entirely (the codex thread gets the plain user
-    # message), so stamping there would persist bytes that were never sent.
-    # MoA turns append per-call aggregated reference context to the same API
+    # exactly the bytes the loop sends. MoA turns append per-call aggregated
+    # reference context to the same API
     # copy AFTER this composition, so the stamped bytes would never match the
     # wire either — skip the stamp rather than persist provably wrong "exact
     # sent bytes" (MoA keeps its pre-sidecar cache behavior).
     if (
         not moa_active
-        and getattr(agent, "api_mode", None) != "codex_app_server"
         and 0 <= current_turn_user_idx < len(messages)
         and messages[current_turn_user_idx].get("role") == "user"
     ):
@@ -1205,10 +1156,9 @@ def build_turn_context(
             if _preflight_compressed and bool(
                 getattr(agent, "_last_compaction_in_place", False)
             ):
-                _db = getattr(agent, "_session_db", None)
-                if _db is not None:
+                if getattr(agent, "_session_db", None) is not None:
                     try:
-                        _db.set_latest_user_api_content(
+                        await agent._session_db.set_latest_user_api_content(
                             agent.session_id,
                             _turn_user_msg.get("content"),
                             _api_content,
@@ -1225,19 +1175,12 @@ def build_turn_context(
     # call. Runs after preflight compression (which rewrites history anyway)
     # and after prefetch/pre_llm_call, so the user row is written once with
     # its final api_content instead of being re-written mid-turn.
-    # Keep row creation and the marker-based append in the same per-agent
-    # critical section as CLI close persistence, and retry the row create if
-    # the pre-compression attempt above failed transiently.
-    def _ensure_and_persist() -> None:
-        agent._ensure_db_session()
-        agent._persist_session(messages, conversation_history)
-
     try:
-        if persist_lock is None:
-            _ensure_and_persist()
-        else:
-            with persist_lock:
-                _ensure_and_persist()
+        # Retry row creation immediately before the crash-safe flush if the
+        # earlier turn-start attempt failed transiently.  ``_persist_session``
+        # owns the transcript lock, so do not acquire it here as well.
+        await agent._ensure_db_session()
+        await agent._persist_session(messages, conversation_history)
     except Exception:
         logger.warning(
             "Early turn-start session persistence failed for session=%s",

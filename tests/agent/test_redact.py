@@ -625,7 +625,7 @@ class TestDbConnstrCodeOutput:
     """Regression tests for issue #33801 — _DB_CONNSTR_RE corrupting code output.
 
     Two distinct flaws, both confined to displayed tool OUTPUT (read_file /
-    terminal / execute_code), never the on-disk content:
+    terminal), never the on-disk content:
 
     1. The password group ``[^@]+`` was greedy across newlines, so on a
        multi-line block it scanned past the DSN line to the next stray ``@``
@@ -829,5 +829,4 @@ class TestKeywordWordBoundary:
         text = "secrets: hunter2hunter2hunter2hh"
         result = redact_sensitive_text(text)
         assert "hunter2hunter2hunter2hh" not in result
-
 

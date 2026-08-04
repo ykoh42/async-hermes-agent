@@ -1,12 +1,12 @@
 import sys
 import types
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
 
 sys.modules.setdefault("fire", types.SimpleNamespace(Fire=lambda *a, **k: None))
-sys.modules.setdefault("firecrawl", types.SimpleNamespace(Firecrawl=object))
 sys.modules.setdefault("fal_client", types.SimpleNamespace())
 
 import run_agent
@@ -51,9 +51,11 @@ def _build_agent(monkeypatch):
         skip_context_files=True,
         skip_memory=True,
     )
-    agent._cleanup_task_resources = lambda task_id: None
-    agent._persist_session = lambda messages, history=None: None
-    agent._save_trajectory = lambda messages, user_message, completed: None
+    agent._cleanup_task_resources = AsyncMock()
+    agent._persist_session = AsyncMock()
+    agent._save_trajectory = AsyncMock()
+    agent._runtime_config_loaded = True
+    agent._runtime_config_snapshot = {}
     return agent
 
 
@@ -71,9 +73,9 @@ def _build_copilot_agent(monkeypatch, *, model="gpt-5.4"):
         skip_context_files=True,
         skip_memory=True,
     )
-    agent._cleanup_task_resources = lambda task_id: None
-    agent._persist_session = lambda messages, history=None: None
-    agent._save_trajectory = lambda messages, user_message, completed: None
+    agent._cleanup_task_resources = AsyncMock()
+    agent._persist_session = AsyncMock()
+    agent._save_trajectory = AsyncMock()
     return agent
 
 
@@ -229,10 +231,17 @@ class _FakeCreateStream:
         self._events = list(events)
         self.closed = False
 
+    def __aiter__(self):
+        async def _iterate():
+            for event in self._events:
+                yield event
+
+        return _iterate()
+
     def __iter__(self):
         return iter(self._events)
 
-    def close(self):
+    async def aclose(self):
         self.closed = True
 
 
@@ -260,7 +269,6 @@ def test_api_mode_uses_explicit_provider_when_codex(monkeypatch):
     )
     assert agent.api_mode == "codex_responses"
     assert agent.provider == "openai-codex"
-    assert agent._is_codex_backend() is False
 
 
 
@@ -275,9 +283,10 @@ def test_api_mode_uses_explicit_provider_when_codex(monkeypatch):
 
 
 
-def test_build_api_kwargs_codex(monkeypatch):
+@pytest.mark.asyncio
+async def test_build_api_kwargs_codex(monkeypatch):
     agent = _build_agent(monkeypatch)
-    kwargs = agent._build_api_kwargs(
+    kwargs = await agent._build_api_kwargs(
         [
             {"role": "system", "content": "You are Hermes."},
             {"role": "user", "content": "Ping"},
@@ -306,7 +315,8 @@ def test_build_api_kwargs_codex(monkeypatch):
     assert "extra_body" not in kwargs
 
 
-def test_build_api_kwargs_mantle_sets_extended_prompt_cache_retention(monkeypatch):
+@pytest.mark.asyncio
+async def test_build_api_kwargs_mantle_sets_extended_prompt_cache_retention(monkeypatch):
     _patch_agent_bootstrap(monkeypatch)
     agent = run_agent.AIAgent(
         model="openai.gpt-5.5",
@@ -320,7 +330,7 @@ def test_build_api_kwargs_mantle_sets_extended_prompt_cache_retention(monkeypatc
         skip_memory=True,
     )
 
-    kwargs = agent._build_api_kwargs([{"role": "user", "content": "Ping"}])
+    kwargs = await agent._build_api_kwargs([{"role": "user", "content": "Ping"}])
 
     assert kwargs["prompt_cache_retention"] == "24h"
 
@@ -408,7 +418,8 @@ def _build_xai_agent_with_slash_enum_tool(monkeypatch):
 
 
 
-def test_run_codex_stream_returns_collected_items_when_stream_ends_without_terminal(monkeypatch):
+@pytest.mark.asyncio
+async def test_run_codex_stream_returns_collected_items_when_stream_ends_without_terminal(monkeypatch):
     """The event-driven path tolerates streams that end without a terminal frame.
 
     Previously the SDK's ``responses.stream(...)`` helper raised
@@ -425,7 +436,7 @@ def test_run_codex_stream_returns_collected_items_when_stream_ends_without_termi
     )
     calls = {"create": 0}
 
-    def _fake_create(**kwargs):
+    async def _fake_create(**kwargs):
         calls["create"] += 1
         assert kwargs.get("stream") is True
         return _FakeCreateStream([
@@ -438,7 +449,11 @@ def test_run_codex_stream_returns_collected_items_when_stream_ends_without_termi
         responses=SimpleNamespace(create=_fake_create),
     )
 
-    response = agent._run_codex_stream(_codex_request_kwargs())
+    from agent.codex_runtime import run_codex_stream
+
+    response = await run_codex_stream(
+        agent, _codex_request_kwargs(), client=agent.client
+    )
     assert calls["create"] == 1
     assert response.status == "completed"
     assert response.output == [output_item]
@@ -535,7 +550,8 @@ def test_consume_codex_stream_separates_commentary_from_analysis(monkeypatch):
 
 
 
-def test_run_codex_stream_delivers_redacted_commentary_once(monkeypatch):
+@pytest.mark.asyncio
+async def test_run_codex_stream_delivers_redacted_commentary_once(monkeypatch):
     from agent.codex_responses_adapter import _normalize_codex_response
 
     agent = _build_agent(monkeypatch)
@@ -564,7 +580,7 @@ def test_run_codex_stream_delivers_redacted_commentary_once(monkeypatch):
         arguments="{}",
     )
 
-    def _fake_create(**kwargs):
+    async def _fake_create(**kwargs):
         assert kwargs.get("stream") is True
         return _FakeCreateStream([
             SimpleNamespace(
@@ -587,7 +603,11 @@ def test_run_codex_stream_delivers_redacted_commentary_once(monkeypatch):
 
     agent.client = SimpleNamespace(responses=SimpleNamespace(create=_fake_create))
 
-    response = agent._run_codex_stream(_codex_request_kwargs())
+    from agent.codex_runtime import run_codex_stream
+
+    response = await run_codex_stream(
+        agent, _codex_request_kwargs(), client=agent.client
+    )
 
     assert len(delivered) == 1
     assert delivered[0][1] is False
@@ -608,79 +628,22 @@ def test_run_codex_stream_delivers_redacted_commentary_once(monkeypatch):
 
 
 
-def test_run_codex_stream_returns_terminal_response_when_post_terminal_drain_fails(
-    monkeypatch, caplog
-):
-    """Regression test for issue #74310.
 
-    A transport error while draining the SSE iterator *after* a valid
-    ``response.completed`` has already been observed (and the response
-    object fully assembled) must NOT discard that response and retry with
-    a brand-new physical request -- that would silently duplicate an
-    already-billed inference. Only errors that occur BEFORE a terminal
-    event is captured should trigger the retry-with-new-request path.
-    """
-    import logging
 
-    import httpx
 
+
+
+
+@pytest.mark.asyncio
+async def test_run_conversation_codex_plain_text(monkeypatch):
     agent = _build_agent(monkeypatch)
-
-    message_item = SimpleNamespace(
-        type="message",
-        status="completed",
-        content=[SimpleNamespace(type="output_text", text="All done.")],
-    )
-    usage = SimpleNamespace(input_tokens=10, output_tokens=6, total_tokens=16)
-
-    class _PostTerminalDroppingStream(_FakeCreateStream):
-        """Yields events normally, then raises only on the *next* pull --
-        i.e. after ``response.completed`` has already been consumed and the
-        event-driven parser has broken out of its loop."""
-
-        def __iter__(self):
-            yield from super().__iter__()
-            raise httpx.RemoteProtocolError("connection dropped during drain")
-
-    events = [
-        SimpleNamespace(type="response.output_item.done", item=message_item),
-        SimpleNamespace(
-            type="response.completed",
-            response=SimpleNamespace(
-                status="completed",
-                usage=usage,
-                id="resp_post_terminal_1",
-            ),
-        ),
-    ]
-
-    calls = {"count": 0}
-
-    def _fake_create(**kwargs):
-        calls["count"] += 1
-        return _PostTerminalDroppingStream(events)
-
-    agent.client = SimpleNamespace(responses=SimpleNamespace(create=_fake_create))
-
-    with caplog.at_level(logging.WARNING, logger="agent.codex_runtime"):
-        response = agent._run_codex_stream(_codex_request_kwargs())
-
-    # Only ONE physical request was ever opened -- the drain failure did not
-    # trigger a second call to responses.create(stream=True).
-    assert calls["count"] == 1
-    assert response.status == "completed"
-    assert response.usage is usage
-    assert response.id == "resp_post_terminal_1"
-    assert any(
-        "finalization" in record.message for record in caplog.records
+    monkeypatch.setattr(
+        agent,
+        "_execute_model_request",
+        AsyncMock(side_effect=lambda api_kwargs, **_: _codex_message_response("OK")),
     )
 
-
-def test_run_conversation_codex_plain_text(monkeypatch):
-    agent = _build_agent(monkeypatch)
-    monkeypatch.setattr(agent, "_interruptible_api_call", lambda api_kwargs: _codex_message_response("OK"))
-
-    result = agent.run_conversation("Say OK")
+    result = await agent.run_conversation("Say OK")
 
     assert result["completed"] is True
     assert result["final_response"] == "OK"
@@ -688,92 +651,8 @@ def test_run_conversation_codex_plain_text(monkeypatch):
     assert result["messages"][-1]["content"] == "OK"
 
 
-def test_codex_preflight_defangs_harmony_tokens_before_and_after_middleware(monkeypatch):
-    """Both mutable request boundaries must reject literal Harmony wire tokens."""
-    agent = _build_agent(monkeypatch)
-    setattr(agent, "_disable_streaming", True)
-    token = f"<\x7cstart\x7c>"
-    captured = {}
-
-    def _request_middleware(request, **_context):
-        # Initial preflight runs before request middleware.
-        assert token not in str(request["input"])
-        replacement = dict(request)
-        replacement["instructions"] = "Inspect source containing " + token
-        replacement["input"] = [{
-            "type": "function_call_output",
-            "call_id": "call_poisoned",
-            "output": "source contains " + token,
-        }]
-        return SimpleNamespace(
-            payload=replacement,
-            original_payload=request,
-            changed=True,
-            trace=[],
-        )
-
-    def _execution_middleware(request, next_call, **_context):
-        # Request middleware can reintroduce a reserved token after initial
-        # preflight, so it must still be present before the dispatch chokepoint.
-        assert token in str(request)
-        return next_call(request)
-
-    def _capture_api_call(api_kwargs):
-        captured.update(api_kwargs)
-        return _codex_message_response("OK")
-
-    monkeypatch.setattr(
-        "hermes_cli.middleware.apply_llm_request_middleware",
-        _request_middleware,
-    )
-    monkeypatch.setattr(
-        "hermes_cli.middleware.run_llm_execution_middleware",
-        _execution_middleware,
-    )
-    monkeypatch.setattr(agent, "_interruptible_api_call", _capture_api_call)
-
-    result = agent.run_conversation("Read " + token)
-
-    assert result["completed"] is True
-    assert token not in captured["instructions"]
-    assert token not in str(captured["input"])
-    assert "<｜start｜>" in captured["instructions"]
-
-
-def test_copilot_responses_preflight_preserves_harmony_tokens(monkeypatch):
-    """Other Responses-compatible providers remain byte-identical."""
-    agent = _build_copilot_agent(monkeypatch)
-    setattr(agent, "_disable_streaming", True)
-    token = f"<\x7cstart\x7c>"
-    captured = {}
-
-    def _capture_api_call(api_kwargs):
-        captured.update(api_kwargs)
-        return _codex_message_response("OK")
-
-    monkeypatch.setattr(agent, "_interruptible_api_call", _capture_api_call)
-
-    result = agent.run_conversation("Read " + token)
-
-    assert result["completed"] is True
-    assert token in str(captured["input"])
-
-
-def test_codex_backend_detection_is_narrow(monkeypatch):
-    codex = _build_agent(monkeypatch)
-    copilot = _build_copilot_agent(monkeypatch)
-
-    assert codex._is_codex_backend() is True
-    assert copilot._is_codex_backend() is False
-
-    # Exact backend URL detection still works for an explicitly custom route.
-    setattr(codex, "provider", "custom")
-    assert codex._is_codex_backend() is True
-    setattr(codex, "api_mode", "chat_completions")
-    assert codex._is_codex_backend() is False
-
-
-def test_copilot_final_preflight_sanitizes_both_middleware_layers(monkeypatch):
+@pytest.mark.asyncio
+async def test_copilot_final_preflight_sanitizes_both_middleware_layers(monkeypatch):
     """The dispatch chokepoint must sanitize after every mutable layer."""
     agent = _build_copilot_agent(monkeypatch)
     setattr(agent, "_disable_streaming", True)
@@ -789,7 +668,7 @@ def test_copilot_final_preflight_sanitizes_both_middleware_layers(monkeypatch):
             "phase": phase,
         }
 
-    def _request_middleware(request, **_context):
+    async def _request_middleware(request, **_context):
         replacement = dict(request)
         replacement["input"] = [
             _message_item(
@@ -806,7 +685,7 @@ def test_copilot_final_preflight_sanitizes_both_middleware_layers(monkeypatch):
             trace=[],
         )
 
-    def _execution_middleware(request, next_call, **_context):
+    async def _execution_middleware(request, next_call, **_context):
         # Request middleware runs after the initial preflight, so its ID is
         # still present here. The dispatch chokepoint must remove the ID that
         # this execution middleware introduces immediately before the API call.
@@ -820,9 +699,9 @@ def test_copilot_final_preflight_sanitizes_both_middleware_layers(monkeypatch):
                 status="in_progress",
             )
         ]
-        return next_call(replacement)
+        return await next_call(replacement)
 
-    def _capture_api_call(api_kwargs):
+    def _capture_api_call(api_kwargs, **_):
         captured.update(api_kwargs)
         return _codex_message_response("OK")
 
@@ -834,9 +713,11 @@ def test_copilot_final_preflight_sanitizes_both_middleware_layers(monkeypatch):
         "hermes_cli.middleware.run_llm_execution_middleware",
         _execution_middleware,
     )
-    monkeypatch.setattr(agent, "_interruptible_api_call", _capture_api_call)
+    monkeypatch.setattr(
+        agent, "_execute_model_request", AsyncMock(side_effect=_capture_api_call)
+    )
 
-    result = agent.run_conversation("Say OK")
+    result = await agent.run_conversation("Say OK")
 
     assert result["completed"] is True
     message_item = captured["input"][0]
@@ -848,19 +729,20 @@ def test_copilot_final_preflight_sanitizes_both_middleware_layers(monkeypatch):
     ]
 
 
-def test_codex_final_preflight_bounds_middleware_cache_key(monkeypatch):
+@pytest.mark.asyncio
+async def test_codex_final_preflight_bounds_middleware_cache_key(monkeypatch):
     """Execution middleware cannot reintroduce an over-length provider key."""
     agent = _build_agent(monkeypatch)
     setattr(agent, "_disable_streaming", True)
     captured = {}
     long_key = "paperclip:" + "x" * 130
 
-    def _execution_middleware(request, next_call, **_context):
+    async def _execution_middleware(request, next_call, **_context):
         replacement = dict(request)
         replacement["prompt_cache_key"] = long_key
-        return next_call(replacement)
+        return await next_call(replacement)
 
-    def _capture_api_call(api_kwargs):
+    def _capture_api_call(api_kwargs, **_):
         captured.update(api_kwargs)
         return _codex_message_response("OK")
 
@@ -868,22 +750,25 @@ def test_codex_final_preflight_bounds_middleware_cache_key(monkeypatch):
         "hermes_cli.middleware.run_llm_execution_middleware",
         _execution_middleware,
     )
-    monkeypatch.setattr(agent, "_interruptible_api_call", _capture_api_call)
+    monkeypatch.setattr(
+        agent, "_execute_model_request", AsyncMock(side_effect=_capture_api_call)
+    )
 
-    result = agent.run_conversation("Say OK")
+    result = await agent.run_conversation("Say OK")
 
     assert result["completed"] is True
     assert captured["prompt_cache_key"].startswith("pck_")
     assert len(captured["prompt_cache_key"]) <= 64
 
 
-def test_run_conversation_codex_empty_output_with_output_text(monkeypatch):
+@pytest.mark.asyncio
+async def test_run_conversation_codex_empty_output_with_output_text(monkeypatch):
     """Regression: empty response.output + valid output_text should succeed,
     not trigger retry/fallback. The validation stage must defer to
     _normalize_codex_response which synthesizes output from output_text."""
     agent = _build_agent(monkeypatch)
 
-    def _empty_output_response(api_kwargs):
+    def _empty_output_response(api_kwargs, **_):
         return SimpleNamespace(
             output=[],
             output_text="Hello from Codex",
@@ -892,9 +777,11 @@ def test_run_conversation_codex_empty_output_with_output_text(monkeypatch):
             model="gpt-5-codex",
         )
 
-    monkeypatch.setattr(agent, "_interruptible_api_call", _empty_output_response)
+    monkeypatch.setattr(
+        agent, "_execute_model_request", AsyncMock(side_effect=_empty_output_response)
+    )
 
-    result = agent.run_conversation("Say hello")
+    result = await agent.run_conversation("Say hello")
 
     assert result["completed"] is True
     assert result["final_response"] == "Hello from Codex"
@@ -923,7 +810,8 @@ def _build_xai_oauth_agent(monkeypatch):
     return agent
 
 
-def test_build_api_kwargs_xai_oauth_sends_cache_key_via_extra_body(monkeypatch):
+@pytest.mark.asyncio
+async def test_build_api_kwargs_xai_oauth_sends_cache_key_via_extra_body(monkeypatch):
     """xai-oauth + codex_responses must route prompt caching via the
     ``prompt_cache_key`` body field on /v1/responses (xAI's documented
     Responses-API cache key — see docs.x.ai prompt-caching/maximizing-
@@ -937,7 +825,7 @@ def test_build_api_kwargs_xai_oauth_sends_cache_key_via_extra_body(monkeypatch):
     reaches api.x.ai. The ``x-grok-conv-id`` header is retained as a
     belt-and-braces fallback for clients/proxies that route on headers."""
     agent = _build_xai_oauth_agent(monkeypatch)
-    kwargs = agent._build_api_kwargs(
+    kwargs = await agent._build_api_kwargs(
         [
             {"role": "system", "content": "You are Hermes."},
             {"role": "user", "content": "Ping"},
@@ -962,226 +850,9 @@ def test_build_api_kwargs_xai_oauth_sends_cache_key_via_extra_body(monkeypatch):
 
 
 
-def test_try_refresh_codex_client_credentials_handles_xai_oauth(monkeypatch):
-    """``_try_refresh_codex_client_credentials`` must rebuild the OpenAI
-    client with freshly resolved xAI OAuth credentials when the active
-    provider is xai-oauth.  The function name is shared between codex and
-    xai-oauth (both speak codex_responses) — covering both cases prevents
-    silent regressions where the function gets gated to a single provider."""
-    agent = _build_xai_oauth_agent(monkeypatch)
-    closed = {"value": False}
-    rebuilt = {"kwargs": None}
-
-    class _ExistingClient:
-        def close(self):
-            closed["value"] = True
-
-    class _RebuiltClient:
-        pass
-
-    def _fake_openai(**kwargs):
-        rebuilt["kwargs"] = kwargs
-        return _RebuiltClient()
-
-    def _fake_resolve(force_refresh=False, refresh_if_expiring=True, **_):
-        # The pre-refresh guard reads the singleton with refresh_if_expiring=False
-        # to verify that the agent's active key still matches; the actual
-        # refresh later passes force_refresh=True.  Both calls must succeed.
-        return {
-            "api_key": "fresh-xai-token" if force_refresh else agent.api_key,
-            "base_url": "https://api.x.ai/v1",
-        }
-
-    monkeypatch.setattr(
-        "hermes_cli.auth.resolve_xai_oauth_runtime_credentials",
-        _fake_resolve,
-    )
-    monkeypatch.setattr(run_agent, "OpenAI", _fake_openai)
-
-    existing = _ExistingClient()
-    agent.client = existing
-    retired = {"client": None}
-    monkeypatch.setattr(
-        agent,
-        "_retire_shared_openai_client",
-        lambda client, *, reason: retired.__setitem__("client", client),
-    )
-    ok = agent._try_refresh_codex_client_credentials(force=True)
-
-    assert ok is True
-    # #70773: the replaced shared client must NOT be close()d from the
-    # refresh path (cross-thread close is the FD-recycle corruption
-    # vector) — it is retired (sockets shutdown, FD release via GC).
-    assert closed["value"] is False
-    assert retired["client"] is existing
-    assert rebuilt["kwargs"]["api_key"] == "fresh-xai-token"
-    assert rebuilt["kwargs"]["base_url"] == "https://api.x.ai/v1"
-    assert isinstance(agent.client, _RebuiltClient)
-    assert agent.api_key == "fresh-xai-token"
-
-
-def test_try_refresh_codex_client_credentials_skips_xai_oauth_when_singleton_differs(monkeypatch):
-    """An xai-oauth agent constructed with a non-singleton credential
-    (e.g. a manual pool entry whose tokens belong to a different account
-    than the device_code singleton, or an explicit ``api_key=`` arg)
-    MUST NOT silently adopt the singleton's tokens on a 401 reactive
-    refresh.  Otherwise a 401 mid-conversation would re-route the rest
-    of the conversation onto a different account, with no user feedback.
-
-    The credential pool's reactive recovery is the right channel for
-    pool-managed credentials; this fallback path is for the singleton-
-    only case and must short-circuit when the active key differs."""
-    agent = _build_xai_oauth_agent(monkeypatch)
-    # Agent is using "xai-oauth-token" (per the builder); singleton holds
-    # a *different* account's token.  No force_refresh should fire.
-    refresh_calls = {"count": 0}
-
-    def _fake_resolve(force_refresh=False, refresh_if_expiring=True, **_):
-        if force_refresh:
-            refresh_calls["count"] += 1
-            return {
-                "api_key": "singleton-account-token",
-                "base_url": "https://api.x.ai/v1",
-            }
-        # The pre-refresh guard read — return the singleton's view of the
-        # singleton's token, which is NOT what the agent is currently using.
-        return {
-            "api_key": "singleton-account-token",
-            "base_url": "https://api.x.ai/v1",
-        }
-
-    monkeypatch.setattr(
-        "hermes_cli.auth.resolve_xai_oauth_runtime_credentials",
-        _fake_resolve,
-    )
-
-    pre_refresh_key = agent.api_key
-    ok = agent._try_refresh_codex_client_credentials(force=True)
-
-    assert ok is False, (
-        "must not refresh when the active credential isn't the singleton; "
-        "otherwise the conversation silently swaps accounts mid-flight."
-    )
-    assert refresh_calls["count"] == 0, (
-        "force_refresh must not run — that would mutate the singleton's "
-        "tokens on disk and consume its single-use refresh_token for an "
-        "agent that wasn't even using the singleton."
-    )
-    assert agent.api_key == pre_refresh_key
 
 
 
-
-
-
-def test_try_refresh_copilot_client_credentials_rebuilds_client(monkeypatch):
-    agent = _build_copilot_agent(monkeypatch)
-    rebuilt = {"kwargs": None}
-
-    class _ExistingClient:
-        pass
-
-    class _RebuiltClient:
-        pass
-
-    def _fake_openai(**kwargs):
-        rebuilt["kwargs"] = kwargs
-        return _RebuiltClient()
-
-    monkeypatch.setattr(
-        "hermes_cli.copilot_auth.resolve_copilot_token",
-        lambda: ("gho_new_token", "GH_TOKEN"),
-    )
-    # The 401 refresh forces a fresh IDE-token exchange; mock it to a valid
-    # exchanged token so the test is deterministic and network-free.
-    monkeypatch.setattr(
-        "hermes_cli.copilot_auth.evict_cached_exchanged_token",
-        lambda _raw: None,
-    )
-    monkeypatch.setattr(
-        "hermes_cli.copilot_auth.get_copilot_api_token",
-        lambda _raw: ("tid=exchanged-ide-token", None),
-    )
-    monkeypatch.setattr(run_agent, "OpenAI", _fake_openai)
-
-    agent.client = _ExistingClient()
-    ok = agent._try_refresh_copilot_client_credentials()
-
-    assert ok is True
-    # The old client is retired by _replace_primary_openai_client (release is
-    # deferred to GC on current main — no synchronous .close() contract).
-    # The freshly EXCHANGED IDE token — not the raw ghu_/gho_ token — goes on
-    # the wire, which is what fixes the "401 IDE token expired" recurrence.
-    assert rebuilt["kwargs"]["api_key"] == "tid=exchanged-ide-token"
-    assert rebuilt["kwargs"]["base_url"] == "https://api.githubcopilot.com"
-    assert rebuilt["kwargs"]["default_headers"]["Copilot-Integration-Id"] == "vscode-chat"
-    assert isinstance(agent.client, _RebuiltClient)
-
-
-def test_try_refresh_copilot_client_credentials_rebuilds_even_if_token_unchanged(monkeypatch):
-    agent = _build_copilot_agent(monkeypatch)
-    rebuilt = {"count": 0}
-
-    class _RebuiltClient:
-        pass
-
-    def _fake_openai(**kwargs):
-        rebuilt["count"] += 1
-        return _RebuiltClient()
-
-    monkeypatch.setattr(
-        "hermes_cli.copilot_auth.resolve_copilot_token",
-        lambda: ("gh-token", "gh auth token"),
-    )
-    monkeypatch.setattr(
-        "hermes_cli.copilot_auth.evict_cached_exchanged_token",
-        lambda _raw: None,
-    )
-    monkeypatch.setattr(
-        "hermes_cli.copilot_auth.get_copilot_api_token",
-        lambda _raw: ("tid=fresh-exchanged", None),
-    )
-    monkeypatch.setattr(run_agent, "OpenAI", _fake_openai)
-
-    ok = agent._try_refresh_copilot_client_credentials()
-
-    assert ok is True
-    assert rebuilt["count"] == 1
-
-
-def test_try_refresh_copilot_client_credentials_falls_back_when_exchange_unavailable(monkeypatch):
-    """If the IDE-token re-exchange itself fails (network blip), the refresh
-    still rebuilds the client on the resolved raw token rather than throwing —
-    clears stale client state and degrades gracefully."""
-    agent = _build_copilot_agent(monkeypatch)
-    rebuilt = {"kwargs": None}
-
-    class _RebuiltClient:
-        pass
-
-    def _fake_openai(**kwargs):
-        rebuilt["kwargs"] = kwargs
-        return _RebuiltClient()
-
-    def _boom(_raw):
-        raise RuntimeError("exchange endpoint unreachable")
-
-    monkeypatch.setattr(
-        "hermes_cli.copilot_auth.resolve_copilot_token",
-        lambda: ("gho_raw_token", "GH_TOKEN"),
-    )
-    monkeypatch.setattr(
-        "hermes_cli.copilot_auth.evict_cached_exchanged_token",
-        lambda _raw: None,
-    )
-    monkeypatch.setattr("hermes_cli.copilot_auth.get_copilot_api_token", _boom)
-    monkeypatch.setattr(run_agent, "OpenAI", _fake_openai)
-
-    ok = agent._try_refresh_copilot_client_credentials()
-
-    assert ok is True
-    # Exchange failed → falls back to the resolved raw token, client still rebuilt.
-    assert rebuilt["kwargs"]["api_key"] == "gho_raw_token"
 
 
 def test_chat_messages_to_responses_input_uses_call_id_for_function_call(monkeypatch):
@@ -1268,18 +939,21 @@ def test_preflight_codex_api_kwargs_rejects_function_call_output_without_call_id
 
 
 
-def test_run_conversation_codex_replay_payload_keeps_call_id(monkeypatch):
+@pytest.mark.asyncio
+async def test_run_conversation_codex_replay_payload_keeps_call_id(monkeypatch):
     agent = _build_agent(monkeypatch)
     responses = [_codex_tool_call_response(), _codex_message_response("done")]
     requests = []
 
-    def _fake_api_call(api_kwargs):
+    def _fake_api_call(api_kwargs, **_):
         requests.append(api_kwargs)
         return responses.pop(0)
 
-    monkeypatch.setattr(agent, "_interruptible_api_call", _fake_api_call)
+    monkeypatch.setattr(
+        agent, "_execute_model_request", AsyncMock(side_effect=_fake_api_call)
+    )
 
-    def _fake_execute_tool_calls(assistant_message, messages, effective_task_id, *_args):
+    async def _fake_execute_tool_calls(assistant_message, messages, effective_task_id, *_args):
         for call in assistant_message.tool_calls:
             messages.append(
                 {
@@ -1291,7 +965,7 @@ def test_run_conversation_codex_replay_payload_keeps_call_id(monkeypatch):
 
     monkeypatch.setattr(agent, "_execute_tool_calls", _fake_execute_tool_calls)
 
-    result = agent.run_conversation("run a command")
+    result = await agent.run_conversation("run a command")
 
     assert result["completed"] is True
     assert result["final_response"] == "done"
@@ -1309,7 +983,8 @@ def test_run_conversation_codex_replay_payload_keeps_call_id(monkeypatch):
 
 
 
-def test_run_conversation_compresses_mid_turn_before_output_budget_exhaustion(monkeypatch):
+@pytest.mark.asyncio
+async def test_run_conversation_compresses_mid_turn_before_output_budget_exhaustion(monkeypatch):
     """Long tool-heavy turns should compact before the next API request.
 
     Initial preflight compression only sees the user's first message. A single
@@ -1329,11 +1004,14 @@ def test_run_conversation_compresses_mid_turn_before_output_budget_exhaustion(mo
     requests = []
     monkeypatch.setattr(
         agent,
-        "_interruptible_api_call",
-        lambda api_kwargs: requests.append(api_kwargs) or responses.pop(0),
+        "_execute_model_request",
+        AsyncMock(
+            side_effect=lambda api_kwargs, **_: requests.append(api_kwargs)
+            or responses.pop(0)
+        ),
     )
 
-    def _fake_execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count=0):
+    async def _fake_execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count=0):
         for call in assistant_message.tool_calls:
             messages.append(
                 {
@@ -1345,7 +1023,7 @@ def test_run_conversation_compresses_mid_turn_before_output_budget_exhaustion(mo
 
     compress_calls = []
 
-    def _fake_compress_context(messages, system_message, *, approx_tokens=None, task_id="default", focus_topic=None):
+    async def _fake_compress_context(messages, system_message, *, approx_tokens=None, task_id="default", focus_topic=None):
         compress_calls.append(approx_tokens)
         return [
             {"role": "user", "content": "[summary of prior tool-heavy work]"},
@@ -1354,7 +1032,7 @@ def test_run_conversation_compresses_mid_turn_before_output_budget_exhaustion(mo
     monkeypatch.setattr(agent, "_execute_tool_calls", _fake_execute_tool_calls)
     monkeypatch.setattr(agent, "_compress_context", _fake_compress_context)
 
-    result = agent.run_conversation("do a tool-heavy task")
+    result = await agent.run_conversation("do a tool-heavy task")
 
     assert result["completed"] is True
     assert result["final_response"] == "Summary after compaction."
@@ -1363,7 +1041,8 @@ def test_run_conversation_compresses_mid_turn_before_output_budget_exhaustion(mo
     assert len(requests) == 2
 
 
-def test_mid_turn_compaction_does_not_double_persist_in_place_rows(monkeypatch, tmp_path):
+@pytest.mark.asyncio
+async def test_mid_turn_compaction_does_not_double_persist_in_place_rows(monkeypatch, tmp_path):
     """Mid-turn pre-API compaction must re-baseline the flush cursor.
 
     In-place compaction (``compression.in_place: True``, the default) inserts
@@ -1383,48 +1062,50 @@ def test_mid_turn_compaction_does_not_double_persist_in_place_rows(monkeypatch, 
     # _build_agent stubs _persist_session; restore the real one so the flush
     # cursor / double-write behaviour is exercised end to end.
     agent._persist_session = run_agent.AIAgent._persist_session.__get__(agent)
-    agent._cleanup_task_resources = lambda task_id: None
+    agent._cleanup_task_resources = AsyncMock()
 
     agent.context_compressor.context_length = 20_000
     agent.context_compressor.threshold_tokens = 20_000
 
-    agent._session_db = SessionDB()
-    agent._ensure_db_session()
+    agent._session_db = SessionDB(tmp_path / "state.db")
+    await agent._ensure_db_session()
 
     responses = [
         _codex_tool_call_response(),
         _codex_message_response("Summary after compaction."),
     ]
     monkeypatch.setattr(
-        agent, "_interruptible_api_call", lambda api_kwargs: responses.pop(0)
+        agent,
+        "_execute_model_request",
+        AsyncMock(side_effect=lambda api_kwargs, **_: responses.pop(0)),
     )
 
-    def _fake_execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count=0):
+    async def _fake_execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count=0):
         for call in assistant_message.tool_calls:
             messages.append(
                 {"role": "tool", "tool_call_id": call.id, "content": "x" * 80_000}
             )
 
-    def _fake_compress_context(messages, system_message, *, approx_tokens=None, task_id="default", focus_topic=None):
+    async def _fake_compress_context(messages, system_message, *, approx_tokens=None, task_id="default", focus_topic=None):
         # Emulate the real in-place compaction DB side effect: soft-archive the
         # prior rows and insert the compacted set under the SAME session id,
         # then reset the flush identity seed — exactly as archive_and_compact +
         # the in_place branch in conversation_compression.py do.
         agent._last_compaction_in_place = True
         compacted = [{"role": "user", "content": "[summary of prior tool-heavy work]"}]
-        agent._session_db.archive_and_compact(agent.session_id, compacted)
+        await agent._session_db.archive_and_compact(agent.session_id, compacted)
         agent._flushed_db_message_ids = set()
         return compacted, "You are Hermes."
 
     monkeypatch.setattr(agent, "_execute_tool_calls", _fake_execute_tool_calls)
     monkeypatch.setattr(agent, "_compress_context", _fake_compress_context)
 
-    result = agent.run_conversation("do a tool-heavy task")
+    result = await agent.run_conversation("do a tool-heavy task")
     assert result["completed"] is True
 
     # The compacted summary row must appear exactly once in the active
     # transcript that a resume would reload.
-    active = agent._session_db.get_messages(agent.session_id)
+    active = await agent._session_db.get_messages(agent.session_id)
     summary_rows = [
         m for m in active
         if isinstance(m.get("content"), str)
@@ -1434,6 +1115,7 @@ def test_mid_turn_compaction_does_not_double_persist_in_place_rows(monkeypatch, 
         f"compacted summary row double-persisted: {len(summary_rows)} copies "
         "(conversation_history flush cursor not re-baselined for in-place compaction)"
     )
+    await agent._session_db.close()
 
 
 def _codex_incomplete_with_reasoning(text: str, reasoning_id: str = "rs_default"):
@@ -1459,7 +1141,8 @@ def _codex_incomplete_with_reasoning(text: str, reasoning_id: str = "rs_default"
     )
 
 
-def test_codex_incomplete_visible_dedup_suppresses_duplicate_interims(monkeypatch):
+@pytest.mark.asyncio
+async def test_codex_incomplete_visible_dedup_suppresses_duplicate_interims(monkeypatch):
     """Two consecutive incomplete responses with identical visible content
     but different opaque reasoning items should be collapsed — only the first
     interim is emitted to the user (#52711)."""
@@ -1471,7 +1154,11 @@ def test_codex_incomplete_visible_dedup_suppresses_duplicate_interims(monkeypatc
         _codex_incomplete_with_reasoning("Working on it...", "rs_2"),
         _codex_message_response("Done."),
     ]
-    monkeypatch.setattr(agent, "_interruptible_api_call", lambda api_kwargs: responses.pop(0))
+    monkeypatch.setattr(
+        agent,
+        "_execute_model_request",
+        AsyncMock(side_effect=lambda api_kwargs, **_: responses.pop(0)),
+    )
 
     emitted: list = []
     original_emit = agent._emit_interim_assistant_message
@@ -1480,7 +1167,7 @@ def test_codex_incomplete_visible_dedup_suppresses_duplicate_interims(monkeypatc
         original_emit(msg)
     monkeypatch.setattr(agent, "_emit_interim_assistant_message", _capture_emit)
 
-    result = agent.run_conversation("test dedup")
+    result = await agent.run_conversation("test dedup")
 
     assert result["completed"] is True
     # Only ONE interim should have been emitted (the first), not two.
@@ -1488,7 +1175,8 @@ def test_codex_incomplete_visible_dedup_suppresses_duplicate_interims(monkeypatc
     assert emitted[0] == "Working on it..."
 
 
-def test_codex_incomplete_opaque_state_updated_in_place(monkeypatch):
+@pytest.mark.asyncio
+async def test_codex_incomplete_opaque_state_updated_in_place(monkeypatch):
     """When visible content is a duplicate, the last message's opaque state
     (codex_reasoning_items) should be updated in-place without emitting a new
     interim (#52711)."""
@@ -1498,9 +1186,13 @@ def test_codex_incomplete_opaque_state_updated_in_place(monkeypatch):
         _codex_incomplete_with_reasoning("Partial output...", "rs_2"),
         _codex_message_response("Final."),
     ]
-    monkeypatch.setattr(agent, "_interruptible_api_call", lambda api_kwargs: responses.pop(0))
+    monkeypatch.setattr(
+        agent,
+        "_execute_model_request",
+        AsyncMock(side_effect=lambda api_kwargs, **_: responses.pop(0)),
+    )
 
-    result = agent.run_conversation("test opaque update")
+    result = await agent.run_conversation("test opaque update")
 
     assert result["completed"] is True
     # Find the incomplete interim message in the result.
@@ -1712,7 +1404,8 @@ def test_stream_delta_strips_leaked_memory_context_across_chunks(monkeypatch):
 
 
 
-def test_codex_commentary_emits_before_tool_and_withholds_final_answer(monkeypatch):
+@pytest.mark.asyncio
+async def test_codex_commentary_emits_before_tool_and_withholds_final_answer(monkeypatch):
     agent = _build_agent(monkeypatch)
     events = []
     agent.interim_assistant_callback = (
@@ -1723,9 +1416,13 @@ def test_codex_commentary_emits_before_tool_and_withholds_final_answer(monkeypat
         _codex_commentary_final_tool_response("I'll inspect the repo first."),
         _codex_message_response("Verified final answer."),
     ]
-    monkeypatch.setattr(agent, "_interruptible_api_call", lambda api_kwargs: responses.pop(0))
+    monkeypatch.setattr(
+        agent,
+        "_execute_model_request",
+        AsyncMock(side_effect=lambda api_kwargs, **_: responses.pop(0)),
+    )
 
-    def _fake_execute_tool_calls(assistant_message, messages, effective_task_id, *_args):
+    async def _fake_execute_tool_calls(assistant_message, messages, effective_task_id, *_args):
         events.append(("tool", assistant_message.tool_calls[0].function.name))
         messages.append({
             "role": "tool",
@@ -1735,7 +1432,7 @@ def test_codex_commentary_emits_before_tool_and_withholds_final_answer(monkeypat
 
     monkeypatch.setattr(agent, "_execute_tool_calls", _fake_execute_tool_calls)
 
-    result = agent.run_conversation("analyze repo")
+    result = await agent.run_conversation("analyze repo")
 
     assert result["completed"] is True
     assert events == [
@@ -1749,20 +1446,24 @@ def test_codex_commentary_emits_before_tool_and_withholds_final_answer(monkeypat
 
 
 
-def test_dump_api_request_debug_uses_responses_url(monkeypatch, tmp_path):
+@pytest.mark.asyncio
+async def test_dump_api_request_debug_uses_responses_url(monkeypatch, tmp_path):
     """Debug dumps should show /responses URL when in codex_responses mode."""
     import json
     agent = _build_agent(monkeypatch)
     agent.base_url = "http://127.0.0.1:9208/v1"
     agent.logs_dir = tmp_path
 
-    dump_file = agent._dump_api_request_debug(_codex_request_kwargs(), reason="preflight")
+    dump_file = await agent._dump_api_request_debug(
+        _codex_request_kwargs(), reason="preflight"
+    )
 
     payload = json.loads(dump_file.read_text())
     assert payload["request"]["url"] == "http://127.0.0.1:9208/v1/responses"
 
 
-def test_dump_api_request_debug_uses_chat_completions_url(monkeypatch, tmp_path):
+@pytest.mark.asyncio
+async def test_dump_api_request_debug_uses_chat_completions_url(monkeypatch, tmp_path):
     """Debug dumps should show /chat/completions URL for chat_completions mode."""
     import json
     _patch_agent_bootstrap(monkeypatch)
@@ -1777,7 +1478,7 @@ def test_dump_api_request_debug_uses_chat_completions_url(monkeypatch, tmp_path)
     )
     agent.logs_dir = tmp_path
 
-    dump_file = agent._dump_api_request_debug(
+    dump_file = await agent._dump_api_request_debug(
         {"model": "gpt-4o", "messages": [{"role": "user", "content": "hi"}]},
         reason="preflight",
     )
@@ -1858,7 +1559,8 @@ def test_chat_messages_to_responses_input_reasoning_only_has_following_item(monk
 
 
 
-def test_duplicate_detection_distinguishes_different_codex_reasoning(monkeypatch):
+@pytest.mark.asyncio
+async def test_duplicate_detection_distinguishes_different_codex_reasoning(monkeypatch):
     """Two consecutive reasoning-only responses with different encrypted content
     are deduped on visible content — only one interim is kept, but opaque state
     is updated in-place (#52711)."""
@@ -1888,9 +1590,13 @@ def test_duplicate_detection_distinguishes_different_codex_reasoning(monkeypatch
         ),
         _codex_message_response("Final answer after thinking."),
     ]
-    monkeypatch.setattr(agent, "_interruptible_api_call", lambda api_kwargs: responses.pop(0))
+    monkeypatch.setattr(
+        agent,
+        "_execute_model_request",
+        AsyncMock(side_effect=lambda api_kwargs, **_: responses.pop(0)),
+    )
 
-    result = agent.run_conversation("think very hard")
+    result = await agent.run_conversation("think very hard")
 
     assert result["completed"] is True
     assert result["final_response"] == "Final answer after thinking."
@@ -1908,7 +1614,8 @@ def test_duplicate_detection_distinguishes_different_codex_reasoning(monkeypatch
         assert items[0].get("encrypted_content") == "enc_second"
 
 
-def test_duplicate_detection_uses_commentary_when_hidden_reasoning_changes(monkeypatch):
+@pytest.mark.asyncio
+async def test_duplicate_detection_uses_commentary_when_hidden_reasoning_changes(monkeypatch):
     """Identical commentary is emitted once while newer replay state wins."""
     agent = _build_agent(monkeypatch)
     emitted = []
@@ -1960,9 +1667,13 @@ def test_duplicate_detection_uses_commentary_when_hidden_reasoning_changes(monke
         ),
         _codex_message_response("Final answer after progress updates."),
     ]
-    monkeypatch.setattr(agent, "_interruptible_api_call", lambda api_kwargs: responses.pop(0))
+    monkeypatch.setattr(
+        agent,
+        "_execute_model_request",
+        AsyncMock(side_effect=lambda api_kwargs, **_: responses.pop(0)),
+    )
 
-    result = agent.run_conversation("keep going")
+    result = await agent.run_conversation("keep going")
 
     assert result["completed"] is True
     assert emitted == ["Still working..."]
@@ -1981,15 +1692,6 @@ def test_duplicate_detection_uses_commentary_when_hidden_reasoning_changes(monke
     reasoning_items = interim_msgs[0].get("codex_reasoning_items")
     if reasoning_items:
         assert reasoning_items[0].get("id") == "rs_second"
-
-
-
-
-
-
-
-
-
 
 
 

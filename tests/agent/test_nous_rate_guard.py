@@ -20,11 +20,12 @@ def rate_guard_env(tmp_path, monkeypatch):
 class TestRecordNousRateLimit:
     """Test recording rate limit state."""
 
-    def test_records_with_header_reset(self, rate_guard_env):
+    @pytest.mark.asyncio
+    async def test_records_with_header_reset(self, rate_guard_env):
         from agent.nous_rate_guard import record_nous_rate_limit, _state_path
 
         headers = {"x-ratelimit-reset-requests-1h": "1800"}
-        record_nous_rate_limit(headers=headers)
+        await record_nous_rate_limit(headers=headers)
 
         path = _state_path()
         assert os.path.exists(path)
@@ -36,11 +37,12 @@ class TestRecordNousRateLimit:
 
 
 
-    def test_falls_back_to_error_context_reset_at(self, rate_guard_env):
+    @pytest.mark.asyncio
+    async def test_falls_back_to_error_context_reset_at(self, rate_guard_env):
         from agent.nous_rate_guard import record_nous_rate_limit, _state_path
 
         future_reset = time.time() + 900
-        record_nous_rate_limit(
+        await record_nous_rate_limit(
             headers=None,
             error_context={"reset_at": future_reset},
         )
@@ -50,10 +52,11 @@ class TestRecordNousRateLimit:
         assert state["reset_at"] == pytest.approx(future_reset, abs=1)
 
 
-    def test_custom_default_cooldown(self, rate_guard_env):
+    @pytest.mark.asyncio
+    async def test_custom_default_cooldown(self, rate_guard_env):
         from agent.nous_rate_guard import record_nous_rate_limit, _state_path
 
-        record_nous_rate_limit(headers=None, default_cooldown=120.0)
+        await record_nous_rate_limit(headers=None, default_cooldown=120.0)
 
         with open(_state_path()) as f:
             state = json.load(f)
@@ -65,15 +68,17 @@ class TestNousRateLimitRemaining:
     """Test checking remaining rate limit time."""
 
 
-    def test_returns_remaining_seconds_when_active(self, rate_guard_env):
+    @pytest.mark.asyncio
+    async def test_returns_remaining_seconds_when_active(self, rate_guard_env):
         from agent.nous_rate_guard import record_nous_rate_limit, nous_rate_limit_remaining
 
-        record_nous_rate_limit(headers={"x-ratelimit-reset-requests-1h": "600"})
-        remaining = nous_rate_limit_remaining()
+        await record_nous_rate_limit(headers={"x-ratelimit-reset-requests-1h": "600"})
+        remaining = await nous_rate_limit_remaining()
         assert remaining is not None
         assert 595 < remaining <= 605  # ~600 seconds, allowing for test execution time
 
-    def test_returns_none_when_expired(self, rate_guard_env):
+    @pytest.mark.asyncio
+    async def test_returns_none_when_expired(self, rate_guard_env):
         from agent.nous_rate_guard import nous_rate_limit_remaining, _state_path
 
         # Write an already-expired state
@@ -82,7 +87,7 @@ class TestNousRateLimitRemaining:
         with open(_state_path(), "w") as f:
             json.dump({"reset_at": time.time() - 10, "recorded_at": time.time() - 100}, f)
 
-        assert nous_rate_limit_remaining() is None
+        assert await nous_rate_limit_remaining() is None
         # File should be cleaned up
         assert not os.path.exists(_state_path())
 
@@ -91,7 +96,8 @@ class TestNousRateLimitRemaining:
 class TestClearNousRateLimit:
     """Test clearing rate limit state."""
 
-    def test_clears_existing_file(self, rate_guard_env):
+    @pytest.mark.asyncio
+    async def test_clears_existing_file(self, rate_guard_env):
         from agent.nous_rate_guard import (
             record_nous_rate_limit,
             clear_nous_rate_limit,
@@ -99,18 +105,19 @@ class TestClearNousRateLimit:
             _state_path,
         )
 
-        record_nous_rate_limit(headers={"retry-after": "600"})
-        assert nous_rate_limit_remaining() is not None
+        await record_nous_rate_limit(headers={"retry-after": "600"})
+        assert await nous_rate_limit_remaining() is not None
 
-        clear_nous_rate_limit()
-        assert nous_rate_limit_remaining() is None
+        await clear_nous_rate_limit()
+        assert await nous_rate_limit_remaining() is None
         assert not os.path.exists(_state_path())
 
-    def test_clear_when_no_file(self, rate_guard_env):
+    @pytest.mark.asyncio
+    async def test_clear_when_no_file(self, rate_guard_env):
         from agent.nous_rate_guard import clear_nous_rate_limit
 
         # Should not raise
-        clear_nous_rate_limit()
+        await clear_nous_rate_limit()
 
 
 class TestFormatRemaining:
@@ -151,31 +158,40 @@ class TestParseResetSeconds:
 class TestAuxiliaryClientIntegration:
     """Test that the auxiliary client respects the rate guard."""
 
-    def test_try_nous_skips_when_rate_limited(self, rate_guard_env, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_try_nous_skips_when_rate_limited(self, rate_guard_env, monkeypatch):
         from agent.nous_rate_guard import record_nous_rate_limit
 
         # Record a rate limit
-        record_nous_rate_limit(headers={"retry-after": "600"})
+        await record_nous_rate_limit(headers={"retry-after": "600"})
 
         # Mock _read_nous_auth to return valid creds (would normally succeed)
         import agent.auxiliary_client as aux
-        monkeypatch.setattr(aux, "_read_nous_auth", lambda: {
-            "access_token": "test-token",
-            "inference_base_url": "https://api.nous.test/v1",
-        })
+        async def read_nous_auth():
+            return {
+                "access_token": "test-token",
+                "inference_base_url": "https://api.nous.test/v1",
+            }
 
-        result = aux._try_nous()
+        monkeypatch.setattr(aux, "_read_nous_auth", read_nous_auth)
+
+        result = await aux._try_nous()
         assert result == (None, None)
 
-    def test_try_nous_works_when_not_rate_limited(self, rate_guard_env, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_try_nous_works_when_not_rate_limited(self, rate_guard_env, monkeypatch):
         import agent.auxiliary_client as aux
+        from agent.agent_runtime_helpers import AsyncCapabilityError
 
         # No rate limit recorded — _try_nous should proceed normally
         # (will return None because no real creds, but won't be blocked
         # by the rate guard)
-        monkeypatch.setattr(aux, "_read_nous_auth", lambda: None)
-        result = aux._try_nous()
-        assert result == (None, None)
+        async def read_nous_auth():
+            return None
+
+        monkeypatch.setattr(aux, "_read_nous_auth", read_nous_auth)
+        with pytest.raises(AsyncCapabilityError, match="Nous Portal OAuth refresh"):
+            await aux._try_nous()
 
 
 class TestIsGenuineNousRateLimit:
@@ -248,9 +264,8 @@ class TestRateGuardStateEncoding:
     built to prevent.
     """
 
-    def test_read_uses_utf8_under_non_utf8_locale(self, rate_guard_env, monkeypatch):
-        import builtins
-
+    @pytest.mark.asyncio
+    async def test_read_uses_utf8_under_non_utf8_locale(self, rate_guard_env):
         from agent.nous_rate_guard import nous_rate_limit_remaining, _state_path
 
         path = _state_path()
@@ -265,20 +280,5 @@ class TestRateGuardStateEncoding:
                 % (int(time.time()) + 3600)
             )
 
-        real_open = builtins.open
-
-        def guarded_open(file, mode="r", *args, **kwargs):
-            try:
-                is_target = str(file) == str(path)
-            except Exception:
-                is_target = False
-            if is_target and "b" not in mode and kwargs.get("encoding") != "utf-8":
-                raise UnicodeDecodeError(
-                    "gbk", b"\x94", 0, 1, "illegal multibyte sequence"
-                )
-            return real_open(file, mode, *args, **kwargs)
-
-        monkeypatch.setattr(builtins, "open", guarded_open)
-
-        remaining = nous_rate_limit_remaining()
+        remaining = await nous_rate_limit_remaining()
         assert remaining is not None and remaining > 0

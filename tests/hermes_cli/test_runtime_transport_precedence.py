@@ -79,14 +79,15 @@ class TestFallbackApiMode:
 class TestExplicitRuntimeIntegration:
     """The explicit-runtime path resolves regional OpenAI to codex_responses."""
 
-    def test_explicit_openai_api_regional_host(self):
+    @pytest.mark.asyncio
+    async def test_explicit_openai_api_regional_host(self):
         from hermes_cli.runtime_provider import _resolve_explicit_runtime
 
         with mock_patch(
             "hermes_cli.runtime_provider._get_model_config",
             return_value={"provider": "openai-api", "default": "gpt-5.6-terra"},
         ):
-            result = _resolve_explicit_runtime(
+            result = await _resolve_explicit_runtime(
                 provider="openai-api",
                 requested_provider="openai-api",
                 explicit_api_key="sk-test",

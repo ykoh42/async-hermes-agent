@@ -11,7 +11,7 @@ exhausting remaining entries and falling through to cross-provider fallback.
 import json
 import logging
 import time
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -109,10 +109,27 @@ class TestRestorePrimaryPoolReselect:
         agent._apply_client_headers_for_base_url = MagicMock()
         agent._replace_primary_openai_client = MagicMock(return_value=True)
 
+        async def _ensure_provider_runtime():
+            pending = agent._deferred_provider_runtime
+            agent.api_key = pending["api_key"]
+            agent.base_url = pending["base_url"]
+            agent._client_kwargs = {
+                "api_key": agent.api_key,
+                "base_url": agent.base_url,
+            }
+            agent.client = MagicMock()
+            agent._deferred_provider_runtime = None
+            return True
+
+        agent._ensure_provider_runtime = AsyncMock(
+            side_effect=_ensure_provider_runtime,
+        )
+
         return agent
 
 
-    def test_restore_uses_freshest_available_entry(self):
+    @pytest.mark.asyncio
+    async def test_restore_uses_freshest_available_entry(self):
         """When multiple entries are available, restore should select the pool's best pick."""
         entries = [
             _make_entry("entry-1", "key-1", priority=0,
@@ -123,7 +140,7 @@ class TestRestorePrimaryPoolReselect:
         pool = _build_mock_pool(entries)
 
         agent = self._make_agent(pool)
-        result = agent._restore_primary_runtime()
+        result = await agent._restore_primary_runtime()
 
         assert result is True
         # entry-1 is exhausted, so pool should select entry-2
@@ -132,24 +149,24 @@ class TestRestorePrimaryPoolReselect:
 
 
 
-    def test_restore_rebuilds_client_after_reselect(self):
-        """After re-selecting from pool, client should be rebuilt with new key."""
+    @pytest.mark.asyncio
+    async def test_restore_rebuilds_client_after_reselect(self):
+        """After re-selecting from pool, native runtime receives the new key."""
         entries = [
             _make_entry("entry-1", "key-1", priority=0),
         ]
         pool = _build_mock_pool(entries)
 
         agent = self._make_agent(pool)
-        result = agent._restore_primary_runtime()
+        result = await agent._restore_primary_runtime()
 
         assert result is True
-        # _swap_credential rebuilds the live OpenAI client with the fresh key.
-        agent._replace_primary_openai_client.assert_called_once_with(
-            reason="credential_rotation",
-        )
+        agent._ensure_provider_runtime.assert_awaited()
+        agent._replace_primary_openai_client.assert_not_called()
 
 
-    def test_restore_updates_base_url_from_pool_entry(self):
+    @pytest.mark.asyncio
+    async def test_restore_updates_base_url_from_pool_entry(self):
         """If pool entry has a different base_url, restore should update it."""
         entries = [
             {
@@ -160,7 +177,7 @@ class TestRestorePrimaryPoolReselect:
         pool = _build_mock_pool(entries)
 
         agent = self._make_agent(pool)
-        result = agent._restore_primary_runtime()
+        result = await agent._restore_primary_runtime()
 
         assert result is True
         assert "custom-endpoint.example.com" in agent.base_url

@@ -27,7 +27,7 @@ in the protected head or preserved tail, the summary MUST carry
 
 from __future__ import annotations
 
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -37,7 +37,7 @@ def compressor():
     from agent.context_compressor import ContextCompressor
 
     with patch(
-        "agent.context_compressor.get_model_context_length",
+        "agent.context_compressor.get_static_context_length",
         return_value=100_000,
     ):
         c = ContextCompressor(
@@ -78,7 +78,8 @@ def _role_hist(messages: list[dict]) -> dict[str, int]:
 
 
 class TestCompressAlwaysKeepsAUserTurn:
-    def test_kanban_worker_recompaction_keeps_user_turn(self, compressor):
+    @pytest.mark.asyncio
+    async def test_kanban_worker_recompaction_keeps_user_turn(self, compressor):
         """The exact #58753 shape: no system prompt in the list, a
         re-compaction (``protect_first_n`` decayed to 0), and the only
         user turn old enough to fall into the compressed middle. Before
@@ -95,8 +96,8 @@ class TestCompressAlwaysKeepsAUserTurn:
         messages += _tool_turns(0, 12)
 
         mocked = f"{SUMMARY_PREFIX}\nrolled-up summary of the tool work"
-        with patch.object(c, "_generate_summary", return_value=mocked):
-            out = c.compress(messages, current_tokens=90_000)
+        with patch.object(c, "_generate_summary", new=AsyncMock(return_value=mocked)):
+            out = await c.compress(messages, current_tokens=90_000)
 
         hist = _role_hist(out)
         assert hist.get("user", 0) >= 1, (
@@ -106,7 +107,8 @@ class TestCompressAlwaysKeepsAUserTurn:
         )
 
 
-    def test_no_consecutive_user_roles_introduced(self, compressor):
+    @pytest.mark.asyncio
+    async def test_no_consecutive_user_roles_introduced(self, compressor):
         """Forcing the summary to role=user must not create two
         consecutive user-role messages (strict alternation invariant).
         When a user survives in the tail we do NOT force, so the pinned
@@ -119,15 +121,16 @@ class TestCompressAlwaysKeepsAUserTurn:
         messages += _tool_turns(0, 12)
 
         mocked = f"{SUMMARY_PREFIX}\nsummary body"
-        with patch.object(c, "_generate_summary", return_value=mocked):
-            out = c.compress(messages, current_tokens=90_000)
+        with patch.object(c, "_generate_summary", new=AsyncMock(return_value=mocked)):
+            out = await c.compress(messages, current_tokens=90_000)
 
         for prev, cur in zip(out, out[1:]):
             assert not (
                 prev.get("role") == "user" and cur.get("role") == "user"
             ), "compression introduced consecutive user-role messages"
 
-    def test_preserved_tail_user_is_not_overridden(self, compressor):
+    @pytest.mark.asyncio
+    async def test_preserved_tail_user_is_not_overridden(self, compressor):
         """When a genuine user message survives in the tail, the guard
         must NOT fire (the summary keeps its alternation-driven role) —
         the request already has a user turn."""
@@ -145,8 +148,8 @@ class TestCompressAlwaysKeepsAUserTurn:
         ]
 
         mocked = f"{SUMMARY_PREFIX}\nsummary body"
-        with patch.object(c, "_generate_summary", return_value=mocked):
-            out = c.compress(messages, current_tokens=90_000)
+        with patch.object(c, "_generate_summary", new=AsyncMock(return_value=mocked)):
+            out = await c.compress(messages, current_tokens=90_000)
 
         hist = _role_hist(out)
         assert hist.get("user", 0) >= 1
@@ -181,7 +184,10 @@ class TestCompressKeepsANonEmptyUserTurn:
     turns, which is what backends actually reject on.
     """
 
-    def test_image_only_tail_user_turn_still_yields_non_empty_text(self, compressor):
+    @pytest.mark.asyncio
+    async def test_image_only_tail_user_turn_still_yields_non_empty_text(
+        self, compressor
+    ):
         from agent.context_compressor import SUMMARY_PREFIX
 
         c = compressor
@@ -199,8 +205,8 @@ class TestCompressKeepsANonEmptyUserTurn:
         }]
 
         mocked = f"{SUMMARY_PREFIX}\nrolled-up summary of the tool work"
-        with patch.object(c, "_generate_summary", return_value=mocked):
-            out = c.compress(messages, current_tokens=90_000)
+        with patch.object(c, "_generate_summary", new=AsyncMock(return_value=mocked)):
+            out = await c.compress(messages, current_tokens=90_000)
 
         hist = _role_hist(out)
         assert hist.get("user", 0) >= 1
@@ -212,7 +218,10 @@ class TestCompressKeepsANonEmptyUserTurn:
             f"messages'. Output: {out}"
         )
 
-    def test_image_only_protected_head_still_yields_non_empty_text(self, compressor):
+    @pytest.mark.asyncio
+    async def test_image_only_protected_head_still_yields_non_empty_text(
+        self, compressor
+    ):
         """Isolates the ``_user_survives`` text check from the merge-target
         fix below: here ``compress_start != 0`` and there's no system
         message, so neither existing force condition
@@ -236,15 +245,18 @@ class TestCompressKeepsANonEmptyUserTurn:
         messages += _tool_turns(0, 12)
 
         mocked = f"{SUMMARY_PREFIX}\nrolled-up summary of the tool work"
-        with patch.object(c, "_generate_summary", return_value=mocked):
-            out = c.compress(messages, current_tokens=90_000)
+        with patch.object(c, "_generate_summary", new=AsyncMock(return_value=mocked)):
+            out = await c.compress(messages, current_tokens=90_000)
 
         assert _has_nonempty_user_text(out), (
             "REGRESSION: an image-only protected-head user turn satisfied "
             f"the role-only zero-user-turn guard. Output: {out}"
         )
 
-    def test_merge_targets_the_colliding_tail_message_not_index_zero(self, compressor):
+    @pytest.mark.asyncio
+    async def test_merge_targets_the_colliding_tail_message_not_index_zero(
+        self, compressor
+    ):
         """Template-exempt rows (bare tool-call assistant / tool messages)
         ahead of the colliding tail user message must not divert the merge:
         merging into literal tail index 0 would attach the summary to an
@@ -266,8 +278,8 @@ class TestCompressKeepsANonEmptyUserTurn:
         }]
 
         mocked = f"{SUMMARY_PREFIX}\nrolled-up summary of the tool work"
-        with patch.object(c, "_generate_summary", return_value=mocked):
-            out = c.compress(messages, current_tokens=90_000)
+        with patch.object(c, "_generate_summary", new=AsyncMock(return_value=mocked)):
+            out = await c.compress(messages, current_tokens=90_000)
 
         assert _has_nonempty_user_text(out), (
             "REGRESSION: the summary merged into tail index 0 (a "

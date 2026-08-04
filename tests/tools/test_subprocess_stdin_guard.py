@@ -35,25 +35,6 @@ def test_all_tui_subprocess_calls_have_stdin():
     )
 
 
-def test_oauth_setup_token_keeps_inherited_stdin():
-    """The interactive 'claude setup-token' login must NOT be muzzled.
-
-    Forcing stdin=subprocess.DEVNULL here would feed the OAuth prompt EOF and
-    break interactive token setup. A blanket DEVNULL sweep over TUI-context
-    subprocess calls must leave this one inheriting stdin. Regression guard for
-    the over-application caught while salvaging the stdin-EOF fix.
-    """
-    src = (REPO_ROOT / "agent" / "anthropic_adapter.py").read_text()
-    assert 'subprocess.run([claude_path, "setup-token"])' in src, (
-        "interactive setup-token call changed shape; re-verify it still "
-        "inherits stdin (no stdin=subprocess.DEVNULL)"
-    )
-    assert 'subprocess.run([claude_path, "setup-token"], stdin' not in src, (
-        "setup-token must inherit stdin so the user can complete the OAuth "
-        "login prompt; do not add stdin=subprocess.DEVNULL"
-    )
-
-
 def test_inline_noqa_marker_exempts_a_call():
     """The guard honors an inline 'noqa: subprocess-stdin' exemption marker."""
     guard = _load_guard()
@@ -67,4 +48,3 @@ def test_inline_noqa_marker_exempts_a_call():
         "x.py",
     )
     assert exempt == [], "inline marker should exempt the call"
-

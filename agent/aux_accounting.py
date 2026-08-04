@@ -14,8 +14,6 @@ ContextVar semantics give us the right isolation for free:
 
 * concurrent agents in one process (gateway sessions, delegate subagents)
   never see each other's accounting context;
-* worker threads spawned via ``tools.thread_context.propagate_context_to_thread``
-  (MoA fan-out, background review) inherit the parent turn's context;
 * asyncio tasks inherit the context of the code that created them.
 
 MoA reference/aggregator slots are explicitly EXCLUDED from recording:
@@ -68,7 +66,7 @@ def get_accounting_context() -> Optional[tuple]:
     return _accounting.get()
 
 
-def record_aux_usage(
+async def record_aux_usage(
     response: Any,
     task: Optional[str],
     *,
@@ -113,7 +111,7 @@ def record_aux_usage(
         model = str(getattr(response, "model", "") or "") or "unknown"
         estimated_cost = None
         try:
-            cost = estimate_usage_cost(
+            cost = await estimate_usage_cost(
                 model, usage, provider=provider, base_url=base_url
             )
             if cost.amount_usd is not None:
@@ -121,7 +119,12 @@ def record_aux_usage(
         except Exception:
             logger.debug("Aux usage cost estimation failed", exc_info=True)
 
-        session_db.record_auxiliary_usage(
+        record_usage = getattr(session_db, "record_auxiliary_usage", None)
+        if not callable(record_usage):
+            raise RuntimeError(
+                "Async auxiliary accounting requires SessionDB."
+            )
+        await record_usage(
             session_id,
             task,
             model=model,

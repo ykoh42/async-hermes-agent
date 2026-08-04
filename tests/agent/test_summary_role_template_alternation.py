@@ -35,7 +35,7 @@ shapes (summary-user followed only by exempt messages) are alternation-safe.
 
 from __future__ import annotations
 
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -51,7 +51,7 @@ def compressor():
     from agent.context_compressor import ContextCompressor
 
     with patch(
-        "agent.context_compressor.get_model_context_length",
+        "agent.context_compressor.get_static_context_length",
         return_value=100_000,
     ):
         c = ContextCompressor(
@@ -130,8 +130,9 @@ class TestTemplateVisibleRoleHelper:
         assert _template_visible_role("not a message") is None
 
 
+@pytest.mark.asyncio
 class TestSummaryRoleAlternatesAgainstVisibleNeighbours:
-    def test_captured_devstral_shape_emits_assistant_summary(self, compressor):
+    async def test_captured_devstral_shape_emits_assistant_summary(self, compressor):
         """The byte-captured poisoning shape: protected head ends
         ``[user, assistant(tool_calls), tool]``, tail is all tool flow.
         The literal previous role is ``tool`` (which used to pin the
@@ -142,8 +143,8 @@ class TestSummaryRoleAlternatesAgainstVisibleNeighbours:
         messages += _tool_turns(0, 30)
 
         mocked = f"{SUMMARY_PREFIX}\nrolled-up summary of the tool work"
-        with patch.object(c, "_generate_summary", return_value=mocked):
-            out = c.compress(messages, current_tokens=90_000)
+        with patch.object(c, "_generate_summary", new=AsyncMock(return_value=mocked)):
+            out = await c.compress(messages, current_tokens=90_000)
 
         rows = _summary_rows(out)
         assert len(rows) == 1
@@ -155,14 +156,14 @@ class TestSummaryRoleAlternatesAgainstVisibleNeighbours:
             f"poisoned permanently. Got role={rows[0].get('role')!r}."
         )
 
-    def test_captured_shape_passes_mistral_alternation(self, compressor):
+    async def test_captured_shape_passes_mistral_alternation(self, compressor):
         c = compressor
         messages = [{"role": "user", "content": "run a full systems diagnostic"}]
         messages += _tool_turns(0, 30)
 
         mocked = f"{SUMMARY_PREFIX}\nrolled-up summary of the tool work"
-        with patch.object(c, "_generate_summary", return_value=mocked):
-            out = c.compress(messages, current_tokens=90_000)
+        with patch.object(c, "_generate_summary", new=AsyncMock(return_value=mocked)):
+            out = await c.compress(messages, current_tokens=90_000)
 
         assert _mistral_alternation_ok(out), (
             "Compressed transcript fails the Mistral template alternation "
@@ -170,7 +171,7 @@ class TestSummaryRoleAlternatesAgainstVisibleNeighbours:
             f"{[_template_visible_role(m) for m in out if _template_visible_role(m)]}"
         )
 
-    def test_visible_head_assistant_visible_tail_user_merges(self, compressor):
+    async def test_visible_head_assistant_visible_tail_user_merges(self, compressor):
         """When the visible head ends ``assistant`` and the visible tail
         opens ``user``, NO standalone role can satisfy alternation (user
         collides with the tail, assistant with the head -- and the
@@ -193,8 +194,8 @@ class TestSummaryRoleAlternatesAgainstVisibleNeighbours:
         ]
 
         mocked = f"{SUMMARY_PREFIX}\nsummary body"
-        with patch.object(c, "_generate_summary", return_value=mocked):
-            out = c.compress(messages, current_tokens=90_000)
+        with patch.object(c, "_generate_summary", new=AsyncMock(return_value=mocked)):
+            out = await c.compress(messages, current_tokens=90_000)
 
         rows = _summary_rows(out)
         assert len(rows) == 1
@@ -204,8 +205,9 @@ class TestSummaryRoleAlternatesAgainstVisibleNeighbours:
         assert _mistral_alternation_ok(out)
 
 
+@pytest.mark.asyncio
 class TestForcedUserGuardsStillWin:
-    def test_zero_user_guard_still_forces_user(self, compressor):
+    async def test_zero_user_guard_still_forces_user(self, compressor):
         """#58753: when no genuine user turn survives, the summary must
         still be pinned to role=user (and that shape is alternation-safe
         because everything after it is template-exempt)."""
@@ -215,15 +217,15 @@ class TestForcedUserGuardsStillWin:
         messages += _tool_turns(0, 12)
 
         mocked = f"{SUMMARY_PREFIX}\nsummary body"
-        with patch.object(c, "_generate_summary", return_value=mocked):
-            out = c.compress(messages, current_tokens=90_000)
+        with patch.object(c, "_generate_summary", new=AsyncMock(return_value=mocked)):
+            out = await c.compress(messages, current_tokens=90_000)
 
         rows = _summary_rows(out)
         assert len(rows) == 1
         assert rows[0].get("role") == "user"
         assert _mistral_alternation_ok(out)
 
-    def test_no_literal_consecutive_user_roles(self, compressor):
+    async def test_no_literal_consecutive_user_roles(self, compressor):
         """The pre-existing literal invariant still holds alongside the
         template-visible one."""
         c = compressor
@@ -231,8 +233,8 @@ class TestForcedUserGuardsStillWin:
         messages += _tool_turns(0, 30)
 
         mocked = f"{SUMMARY_PREFIX}\nsummary body"
-        with patch.object(c, "_generate_summary", return_value=mocked):
-            out = c.compress(messages, current_tokens=90_000)
+        with patch.object(c, "_generate_summary", new=AsyncMock(return_value=mocked)):
+            out = await c.compress(messages, current_tokens=90_000)
 
         for prev, cur in zip(out, out[1:]):
             assert not (

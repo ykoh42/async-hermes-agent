@@ -1,7 +1,8 @@
 """Tests for Bug #12905 fixes in agent/anthropic_adapter.py — macOS Keychain support."""
 
 import json
-from unittest.mock import patch, MagicMock
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -14,7 +15,14 @@ from agent.anthropic_adapter import (
 
 # This module exercises the reader itself with explicit platform and subprocess
 # mocks, so it opts out of the suite-wide guard without touching a real Keychain.
-pytestmark = pytest.mark.allow_macos_keychain
+pytestmark = [pytest.mark.allow_macos_keychain, pytest.mark.asyncio]
+
+
+def _security_process(returncode: int, stdout: str = "") -> SimpleNamespace:
+    return SimpleNamespace(
+        returncode=returncode,
+        communicate=AsyncMock(return_value=(stdout.encode(), b"")),
+    )
 
 
 class TestReadClaudeCodeCredentialsFromKeychain:
@@ -22,19 +30,19 @@ class TestReadClaudeCodeCredentialsFromKeychain:
 
 
 
-    def test_returns_none_when_security_command_not_found(self):
+    async def test_returns_none_when_security_command_not_found(self):
         """OSError from missing security binary must be handled gracefully."""
         with patch("agent.anthropic_adapter.platform.system", return_value="Darwin"), \
-             patch("agent.anthropic_adapter.subprocess.run",
-                   side_effect=OSError("security not found")):
-            assert _read_claude_code_credentials_from_keychain() is None
+             patch("agent.anthropic_adapter.asyncio.create_subprocess_exec",
+                   new=AsyncMock(side_effect=OSError("security not found"))):
+            assert await _read_claude_code_credentials_from_keychain() is None
 
-    def test_returns_none_on_nonzero_exit_code(self):
+    async def test_returns_none_on_nonzero_exit_code(self):
         """security returns non-zero when the Keychain entry doesn't exist."""
         with patch("agent.anthropic_adapter.platform.system", return_value="Darwin"), \
-             patch("agent.anthropic_adapter.subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(returncode=1, stdout="", stderr="")
-            assert _read_claude_code_credentials_from_keychain() is None
+             patch("agent.anthropic_adapter.asyncio.create_subprocess_exec",
+                   new=AsyncMock(return_value=_security_process(1))):
+            assert await _read_claude_code_credentials_from_keychain() is None
 
 
 
@@ -45,7 +53,7 @@ class TestReadClaudeCodeCredentialsFromKeychain:
 class TestReadClaudeCodeCredentialsPriority:
     """Bug 4: Keychain must be checked before the JSON file."""
 
-    def test_keychain_takes_priority_over_json_file(self, tmp_path, monkeypatch):
+    async def test_keychain_takes_priority_over_json_file(self, tmp_path, monkeypatch):
         """When both Keychain and JSON file have credentials, Keychain wins."""
         # Set up JSON file with "older" token
         json_cred_file = tmp_path / ".claude" / ".credentials.json"
@@ -61,26 +69,22 @@ class TestReadClaudeCodeCredentialsPriority:
 
         # Mock Keychain to return a "newer" token
         with patch("agent.anthropic_adapter.platform.system", return_value="Darwin"), \
-             patch("agent.anthropic_adapter.subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(
-                returncode=0,
-                stdout=json.dumps({
+             patch("agent.anthropic_adapter.asyncio.create_subprocess_exec",
+                   new=AsyncMock(return_value=_security_process(0, json.dumps({
                     "claudeAiOauth": {
                         "accessToken": "keychain-token",
                         "refreshToken": "keychain-refresh",
                         "expiresAt": 9999999999999,
                     }
-                }),
-                stderr="",
-            )
-            creds = read_claude_code_credentials()
+                })))):
+            creds = await read_claude_code_credentials()
 
         # Keychain token should be returned, not JSON file token
         assert creds is not None
         assert creds["accessToken"] == "keychain-token"
         assert creds["source"] == "macos_keychain"
 
-    def test_falls_back_to_json_when_keychain_returns_none(self, tmp_path, monkeypatch):
+    async def test_falls_back_to_json_when_keychain_returns_none(self, tmp_path, monkeypatch):
         """When Keychain has no entry, JSON file is used as fallback."""
         json_cred_file = tmp_path / ".claude" / ".credentials.json"
         json_cred_file.parent.mkdir(parents=True)
@@ -94,23 +98,22 @@ class TestReadClaudeCodeCredentialsPriority:
         monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
 
         with patch("agent.anthropic_adapter.platform.system", return_value="Darwin"), \
-             patch("agent.anthropic_adapter.subprocess.run") as mock_run:
-            # Simulate Keychain entry not found
-            mock_run.return_value = MagicMock(returncode=1, stdout="", stderr="")
-            creds = read_claude_code_credentials()
+             patch("agent.anthropic_adapter.asyncio.create_subprocess_exec",
+                   new=AsyncMock(return_value=_security_process(1))):
+            creds = await read_claude_code_credentials()
 
         assert creds is not None
         assert creds["accessToken"] == "json-fallback-token"
         assert creds["source"] == "claude_code_credentials_file"
 
-    def test_returns_none_when_neither_keychain_nor_json_has_creds(self, tmp_path, monkeypatch):
+    async def test_returns_none_when_neither_keychain_nor_json_has_creds(self, tmp_path, monkeypatch):
         """No credentials anywhere — must return None cleanly."""
         monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
 
         with patch("agent.anthropic_adapter.platform.system", return_value="Darwin"), \
-             patch("agent.anthropic_adapter.subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(returncode=1, stdout="", stderr="")
-            creds = read_claude_code_credentials()
+             patch("agent.anthropic_adapter.asyncio.create_subprocess_exec",
+                   new=AsyncMock(return_value=_security_process(1))):
+            creds = await read_claude_code_credentials()
 
         assert creds is None
 
@@ -142,19 +145,15 @@ class TestReadClaudeCodeCredentialsDesync:
         monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
 
     def _keychain_payload(self, *, access_token, expires_at, refresh_token="kc-refresh"):
-        return MagicMock(
-            returncode=0,
-            stdout=json.dumps({
+        return _security_process(0, json.dumps({
                 "claudeAiOauth": {
                     "accessToken": access_token,
                     "refreshToken": refresh_token,
                     "expiresAt": expires_at,
                 }
-            }),
-            stderr="",
-        )
+            }))
 
-    def test_keychain_expired_file_fresh_returns_file(self, tmp_path, monkeypatch):
+    async def test_keychain_expired_file_fresh_returns_file(self, tmp_path, monkeypatch):
         """Regression: when the Keychain holds an expired token but the JSON
         file has a valid one, callers must receive the valid file token rather
         than None. (Pre-fix behavior returned the expired Keychain token, and
@@ -163,11 +162,11 @@ class TestReadClaudeCodeCredentialsDesync:
         """
         self._setup(tmp_path, monkeypatch, file_expires_at=self._FRESH, file_token="fresh-file-token")
         with patch("agent.anthropic_adapter.platform.system", return_value="Darwin"), \
-             patch("agent.anthropic_adapter.subprocess.run") as mock_run:
-            mock_run.return_value = self._keychain_payload(
-                access_token="stale-keychain-token", expires_at=self._EXPIRED,
-            )
-            creds = read_claude_code_credentials()
+             patch("agent.anthropic_adapter.asyncio.create_subprocess_exec",
+                   new=AsyncMock(return_value=self._keychain_payload(
+                       access_token="stale-keychain-token", expires_at=self._EXPIRED,
+                   ))):
+            creds = await read_claude_code_credentials()
 
         assert creds is not None
         assert creds["accessToken"] == "fresh-file-token"
@@ -175,18 +174,18 @@ class TestReadClaudeCodeCredentialsDesync:
 
 
 
-    def test_both_expired_prefers_later_expiry(self, tmp_path, monkeypatch):
+    async def test_both_expired_prefers_later_expiry(self, tmp_path, monkeypatch):
         """When both are expired, return the one with the later ``expiresAt``;
         its ``refresh_token`` is the most recently issued and most likely to
         succeed at the OAuth refresh endpoint.
         """
         self._setup(tmp_path, monkeypatch, file_expires_at=self._EXPIRED + 5, file_token="newer-expired-file")
         with patch("agent.anthropic_adapter.platform.system", return_value="Darwin"), \
-             patch("agent.anthropic_adapter.subprocess.run") as mock_run:
-            mock_run.return_value = self._keychain_payload(
-                access_token="older-expired-keychain", expires_at=self._EXPIRED,
-            )
-            creds = read_claude_code_credentials()
+             patch("agent.anthropic_adapter.asyncio.create_subprocess_exec",
+                   new=AsyncMock(return_value=self._keychain_payload(
+                       access_token="older-expired-keychain", expires_at=self._EXPIRED,
+                   ))):
+            creds = await read_claude_code_credentials()
 
         assert creds is not None
         assert creds["accessToken"] == "newer-expired-file"
@@ -200,7 +199,7 @@ class TestRefreshOAuthTokenAdoptsFreshCredential:
 
     _FRESH = 9_999_999_999_999
 
-    def test_adopts_already_refreshed_token_without_posting(self, monkeypatch):
+    async def test_adopts_already_refreshed_token_without_posting(self, monkeypatch):
         """When a live source already holds a valid token, return it and skip
         the network refresh entirely.
         """
@@ -211,10 +210,10 @@ class TestRefreshOAuthTokenAdoptsFreshCredential:
         }
         monkeypatch.setattr(
             "agent.anthropic_adapter.read_claude_code_credentials",
-            lambda: fresh,
+            AsyncMock(return_value=fresh),
         )
 
-        def _should_not_be_called(*args, **kwargs):  # pragma: no cover - guard
+        async def _should_not_be_called(*args, **kwargs):  # pragma: no cover - guard
             raise AssertionError("refresh_anthropic_oauth_pure must not be called")
 
         monkeypatch.setattr(
@@ -224,21 +223,21 @@ class TestRefreshOAuthTokenAdoptsFreshCredential:
 
         # Stale creds passed in by the caller — should be ignored in favor
         # of the live, already-refreshed token.
-        result = _refresh_oauth_token({"refreshToken": "stale", "expiresAt": 1})
+        result = await _refresh_oauth_token({"refreshToken": "stale", "expiresAt": 1})
         assert result == "already-refreshed-token"
 
-    def test_falls_back_to_network_refresh_when_no_fresh_credential(self, monkeypatch):
+    async def test_falls_back_to_network_refresh_when_no_fresh_credential(self, monkeypatch):
         """When no live source has a valid token, fall back to refreshing
         ourselves using the freshest available refresh token.
         """
         # Live read returns an expired credential carrying a refresh token.
         monkeypatch.setattr(
             "agent.anthropic_adapter.read_claude_code_credentials",
-            lambda: {"accessToken": "expired", "refreshToken": "live-refresh", "expiresAt": 1},
+            AsyncMock(return_value={"accessToken": "expired", "refreshToken": "live-refresh", "expiresAt": 1}),
         )
         captured = {}
 
-        def _fake_refresh(refresh_token, **kwargs):
+        async def _fake_refresh(refresh_token, **kwargs):
             captured["refresh_token"] = refresh_token
             return {
                 "access_token": "newly-minted",
@@ -250,12 +249,10 @@ class TestRefreshOAuthTokenAdoptsFreshCredential:
             "agent.anthropic_adapter.refresh_anthropic_oauth_pure", _fake_refresh
         )
         monkeypatch.setattr(
-            "agent.anthropic_adapter._write_claude_code_credentials",
-            lambda *a, **k: None,
+            "agent.anthropic_adapter._write_claude_code_credentials", AsyncMock(),
         )
 
-        result = _refresh_oauth_token({"refreshToken": "caller-refresh", "expiresAt": 1})
+        result = await _refresh_oauth_token({"refreshToken": "caller-refresh", "expiresAt": 1})
         assert result == "newly-minted"
         # Prefers the live source's refresh token over the caller's stale copy.
         assert captured["refresh_token"] == "live-refresh"
-

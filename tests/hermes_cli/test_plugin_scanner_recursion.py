@@ -1,9 +1,8 @@
-"""Tests for PR1 pluggable image gen: scanner recursion, kinds, path keys.
+"""Tests for plugin scanner recursion, kinds, and path-derived keys.
 
-Covers ``_scan_directory`` recursion into category namespaces
-(``plugins/image_gen/openai/``), ``kind`` parsing, path-derived registry
-keys, and the new gate logic (bundled backends auto-load; user backends
-still opt-in; exclusive kind skipped; unknown kinds → standalone warning).
+Covers ``_scan_directory`` recursion into category namespaces, ``kind``
+parsing, path-derived registry keys, and the gate logic (user backends still
+opt in; exclusive kind skipped; unknown kinds → standalone warning).
 """
 
 from __future__ import annotations
@@ -30,7 +29,7 @@ def _write_plugin(
     """Create a plugin dir at ``root/<segments...>/`` with plugin.yaml + __init__.py.
 
     ``segments`` lets tests build both flat (``["my-plugin"]``) and
-    category-namespaced (``["image_gen", "openai"]``) layouts.
+    category-namespaced (``["category", "name"]``) layouts.
     """
     plugin_dir = root
     for seg in segments:
@@ -72,22 +71,22 @@ def _enable(hermes_home: Path, name: str) -> None:
 
 class TestCategoryNamespaceRecursion:
     def test_category_namespace_discovered(self, tmp_path, monkeypatch):
-        """``<root>/image_gen/openai/plugin.yaml`` is discovered with key
-        ``image_gen/openai`` when the ``image_gen`` parent has no manifest."""
+        """A nested ``<root>/category/name/plugin.yaml`` is discovered with
+        a path-derived key when the category parent has no manifest."""
         import os
         hermes_home = Path(os.environ["HERMES_HOME"])  # set by hermetic conftest fixture
         user_plugins = hermes_home / "plugins"
 
-        _write_plugin(user_plugins, ["image_gen", "openai"])
-        _enable(hermes_home, "image_gen/openai")
+        _write_plugin(user_plugins, ["category", "name"])
+        _enable(hermes_home, "category/name")
 
         mgr = PluginManager()
         mgr.discover_and_load()
 
-        assert "image_gen/openai" in mgr._plugins
-        loaded = mgr._plugins["image_gen/openai"]
-        assert loaded.manifest.key == "image_gen/openai"
-        assert loaded.manifest.name == "openai"
+        assert "category/name" in mgr._plugins
+        loaded = mgr._plugins["category/name"]
+        assert loaded.manifest.key == "category/name"
+        assert loaded.manifest.name == "name"
         assert loaded.enabled is True
 
 
@@ -180,7 +179,7 @@ class TestBackendGate:
 
         _write_plugin(
             user_plugins,
-            ["image_gen", "fancy"],
+            ["category", "fancy"],
             manifest_extra={"kind": "backend"},
         )
         # Do NOT opt in.
@@ -188,7 +187,7 @@ class TestBackendGate:
         mgr = PluginManager()
         mgr.discover_and_load()
 
-        loaded = mgr._plugins["image_gen/fancy"]
+        loaded = mgr._plugins["category/fancy"]
         assert loaded.enabled is False
         assert "not enabled" in (loaded.error or "")
 
@@ -211,92 +210,3 @@ class TestBackendGate:
         loaded = mgr._plugins["some-backend"]
         assert loaded.enabled is False
         assert "exclusive" in (loaded.error or "")
-
-
-# ── Bundled backend auto-load (integration with real bundled plugin) ────────
-
-
-class TestBundledBackendAutoLoad:
-    def test_bundled_image_gen_openai_autoloads(self, tmp_path, monkeypatch):
-        """The bundled ``plugins/image_gen/openai/`` plugin loads without
-        any opt-in — it's ``kind: backend`` and shipped in-repo."""
-        import os
-        hermes_home = Path(os.environ["HERMES_HOME"])  # set by hermetic conftest fixture
-
-        mgr = PluginManager()
-        mgr.discover_and_load()
-
-        assert "image_gen/openai" in mgr._plugins
-        loaded = mgr._plugins["image_gen/openai"]
-        assert loaded.manifest.source == "bundled"
-        assert loaded.manifest.kind == "backend"
-        assert loaded.enabled is True, f"error: {loaded.error}"
-
-
-# ── PluginContext.register_image_gen_provider ───────────────────────────────
-
-
-class TestRegisterImageGenProvider:
-    def test_accepts_valid_provider(self, tmp_path, monkeypatch):
-        from agent import image_gen_registry
-        from agent.image_gen_provider import ImageGenProvider
-
-        image_gen_registry._reset_for_tests()
-
-        class FakeProvider(ImageGenProvider):
-            @property
-            def name(self) -> str:
-                return "fake-test"
-
-            def generate(self, prompt, aspect_ratio="landscape", **kw):
-                return {"success": True, "image": "test://fake"}
-
-        import os
-        hermes_home = Path(os.environ["HERMES_HOME"])  # set by hermetic conftest fixture
-        plugin_dir = _write_plugin(
-            hermes_home / "plugins",
-            ["my-img-plugin"],
-            register_body=(
-                "from agent.image_gen_provider import ImageGenProvider\n"
-                "    class P(ImageGenProvider):\n"
-                "        @property\n"
-                "        def name(self): return 'fake-ctx'\n"
-                "        def generate(self, prompt, aspect_ratio='landscape', **kw):\n"
-                "            return {'success': True, 'image': 'x://y'}\n"
-                "    ctx.register_image_gen_provider(P())"
-            ),
-        )
-        _enable(hermes_home, "my-img-plugin")
-
-        mgr = PluginManager()
-        mgr.discover_and_load()
-
-        assert mgr._plugins["my-img-plugin"].enabled is True
-        assert image_gen_registry.get_provider("fake-ctx") is not None
-
-        image_gen_registry._reset_for_tests()
-
-    def test_rejects_non_provider(self, tmp_path, monkeypatch, caplog):
-        from agent import image_gen_registry
-
-        image_gen_registry._reset_for_tests()
-
-        import os
-        hermes_home = Path(os.environ["HERMES_HOME"])  # set by hermetic conftest fixture
-        _write_plugin(
-            hermes_home / "plugins",
-            ["bad-img-plugin"],
-            register_body="ctx.register_image_gen_provider('not a provider')",
-        )
-        _enable(hermes_home, "bad-img-plugin")
-
-        with caplog.at_level("WARNING"):
-            mgr = PluginManager()
-            mgr.discover_and_load()
-
-        # Plugin loaded (register returned normally) but nothing was
-        # registered in the provider registry.
-        assert mgr._plugins["bad-img-plugin"].enabled is True
-        assert image_gen_registry.get_provider("not a provider") is None
-
-        image_gen_registry._reset_for_tests()
