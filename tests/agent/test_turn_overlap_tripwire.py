@@ -21,11 +21,9 @@ class _FakeAgent:
 @pytest.fixture(autouse=True)
 def _clear_inflight_registry():
     """Isolate the module-level session registry between tests."""
-    with _helpers._INFLIGHT_TURNS_LOCK:
-        _helpers._INFLIGHT_TURNS_BY_SESSION.clear()
+    _helpers._INFLIGHT_TURNS_BY_SESSION.clear()
     yield
-    with _helpers._INFLIGHT_TURNS_LOCK:
-        _helpers._INFLIGHT_TURNS_BY_SESSION.clear()
+    _helpers._INFLIGHT_TURNS_BY_SESSION.clear()
 
 
 def test_clean_serial_turns_no_warning(caplog):
@@ -93,5 +91,4 @@ def test_persist_disabled_fork_neither_registers_nor_warns(caplog):
         note_turn_start(fork, "s1:tr:gggg")
         assert note_turn_start(parent, "s1:t2:bbbb") is None
     assert not caplog.records
-
 

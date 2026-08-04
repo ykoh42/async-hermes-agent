@@ -148,6 +148,7 @@ async def test_agent_turn_binds_and_clears_lifecycle_parent(monkeypatch):
     from run_agent import AIAgent
 
     agent = AIAgent.__new__(AIAgent)
+    agent._interrupt_event = asyncio.Event()
     observed = []
 
     async def run_conversation(parent, *_args, **_kwargs):

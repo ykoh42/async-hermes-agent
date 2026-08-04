@@ -25,7 +25,6 @@ import logging
 import os
 import re
 import sys
-import threading
 import time
 import uuid
 from datetime import datetime
@@ -1180,9 +1179,8 @@ def init_agent(
     # Interrupt mechanism for breaking out of tool loops
     agent._interrupt_requested = False
     agent._interrupt_message = None  # Optional message that triggered interrupt
-    agent._execution_thread_id: int | None = None  # Set at run_conversation() start
-    agent._interrupt_thread_signal_pending = False
-    agent._model_request_active = threading.Event()
+    agent._interrupt_event = asyncio.Event()
+    agent._model_request_active = asyncio.Event()
     agent._supports_active_turn_redirect = True
 
     # /steer mechanism — inject a user note into the next tool result
@@ -1193,19 +1191,16 @@ def init_agent(
     # iteration. Message-role alternation is preserved (we modify an
     # existing tool message rather than inserting a new user turn).
     agent._pending_steer: Optional[str] = None
-    agent._pending_steer_lock = threading.Lock()
 
     # Active-turn redirect mechanism. A regular follow-up sent while the model
     # is generating is different from a hard /stop: preserve the valid turn
     # prefix, cancel only the in-flight model request, and rebuild its tail with
     # the correction. The loop drains this slot at a role-safe boundary.
     agent._pending_redirect: Optional[str] = None
-    agent._pending_redirect_lock = threading.Lock()
 
     # Subagent delegation state
     agent._delegate_depth = 0        # 0 = top-level agent, incremented for children
     agent._active_children = []      # Running child AIAgents (for interrupt propagation)
-    agent._active_children_lock = threading.Lock()
     # Async-first runtime ownership. The lock binds to the event loop on first
     # use, keeping construction itself synchronous and side-effect free.
     agent._turn_lock = None
@@ -2460,136 +2455,32 @@ def init_agent(
 
 
 
-    # Select context engine: config-driven (like memory providers).
-    # 1. Check config.yaml context.engine setting
-    # 2. Check plugins/context_engine/<name>/ directory (repo-shipped)
-    # 3. Check general plugin system (user-installed plugins)
-    # 4. Fall back to built-in ContextCompressor
-    _selected_engine = None
-    _copy_failed = False
-    _engine_name = "compressor"  # default
-    try:
-        _ctx_cfg = _agent_cfg.get("context", {}) if isinstance(_agent_cfg, dict) else {}
-        _engine_name = _ctx_cfg.get("engine", "compressor") or "compressor"
-    except Exception:
-        pass
+    # This distribution only admits the built-in ContextCompressor. The real
+    # user configuration is loaded at the first await boundary, where a
+    # configured external engine is rejected before the provider starts.
 
-    # This distribution only admits the built-in ContextCompressor on the
-    # native async turn path.  Third-party context engines use the historical
-    # synchronous hook contract (selection, lifecycle, and optional tools),
-    # so loading one here would both perform plugin I/O in ``__init__`` and
-    # give it a chance to block a later turn.  Remember the requested engine
-    # and reject it at the async runtime boundary instead.
-    agent._async_unsupported_context_engine = None
-    if _engine_name != "compressor":
-        agent._async_unsupported_context_engine = str(_engine_name)
-        _engine_name = "compressor"
-
-    if _engine_name != "compressor":
-        # Try loading from plugins/context_engine/<name>/
-        try:
-            from plugins.context_engine import load_context_engine
-            _selected_engine = load_context_engine(_engine_name)
-        except Exception as _ce_load_err:
-            _ra().logger.debug("Context engine load from plugins/context_engine/: %s", _ce_load_err)
-
-        # Try general plugin system as fallback
-        if _selected_engine is None:
-            _candidate = None
-            try:
-                from hermes_cli.plugins import get_plugin_context_engine
-                _candidate = get_plugin_context_engine()
-            except Exception:
-                _candidate = None
-            if _candidate is not None and _candidate.name == _engine_name:
-                # Deep-copy the shared plugin singleton so a child agent's
-                # update_model() can't mutate the parent's compressor (#42449).
-                # Copy can fail for engines holding uncopyable state (locks, DB
-                # connections, clients); in that case fall back to the built-in
-                # compressor with an ACCURATE message rather than silently
-                # mislabelling it "not found".
-                import copy
-                try:
-                    _selected_engine = copy.deepcopy(_candidate)
-                except Exception as _copy_err:
-                    _copy_failed = True
-                    _ra().logger.warning(
-                        "Context engine '%s' could not be safely copied for this "
-                        "agent (%s) — falling back to built-in compressor. Plugin "
-                        "engines that hold uncopyable state (locks, DB connections) "
-                        "should implement __deepcopy__ to copy only mutable budget "
-                        "state.",
-                        _engine_name, _copy_err,
-                    )
-                    _selected_engine = None
-
-        if _selected_engine is None and not _copy_failed:
-            _ra().logger.warning(
-                "Context engine '%s' not found — falling back to built-in compressor",
-                _engine_name,
-            )
-    # else: config says "compressor" — use built-in, don't auto-activate plugins
-
-    if _selected_engine is not None:
-        agent.context_compressor = _selected_engine
-        # External engines own compaction policy: the host compression
-        # threshold (including the Codex gpt-5.5 autoraise above) only
-        # configures the built-in ContextCompressor and never reaches the
-        # plugin, so the autoraise notice would announce a change that does
-        # not apply. Drop it. (#44439)
-        agent._compression_threshold_autoraised = None
-        # Plugin engines receive the same no-I/O initial bound as the built-in
-        # compressor. Native provider metadata can refine it after a response.
-        _plugin_ctx_len = get_static_context_length(
-            agent.model,
-            base_url=agent.base_url,
-            config_context_length=_effective_context_length,
-            provider=agent.provider,
-            custom_providers=_custom_providers,
-        )
-        # Per-model threshold overrides are part of the explicit
-        # context-engine contract: assign them BEFORE the initial
-        # update_model() call so the first resolution (which derives
-        # threshold_percent/threshold_tokens for the initial model) already
-        # sees the overrides. Assigning after update_model() left the initial
-        # model on the engine's global threshold until the first /model
-        # switch. Engines that override update_model() own their own policy
-        # and may ignore the attribute.
-        if compression_model_thresholds:
-            agent.context_compressor.model_thresholds = compression_model_thresholds
-        agent.context_compressor.update_model(
-            model=agent.model,
-            context_length=_plugin_ctx_len,
-            base_url=agent.base_url,
-            api_key=getattr(agent, "api_key", ""),
-            provider=agent.provider,
-            api_mode=agent.api_mode,
-        )
-        if not agent.quiet_mode:
-            _ra().logger.info("Using context engine: %s", _selected_engine.name)
-    else:
-        agent.context_compressor = ContextCompressor(
-            model=agent.model,
-            threshold_percent=compression_threshold,
-            protect_first_n=compression_protect_first,
-            protect_last_n=compression_protect_last,
-            summary_target_ratio=compression_target_ratio,
-            summary_model_override=None,
-            quiet_mode=agent.quiet_mode,
-            base_url=agent.base_url,
-            api_key=getattr(agent, "api_key", ""),
-            config_context_length=_effective_context_length,
-            provider=agent.provider,
-            api_mode=agent.api_mode,
-            abort_on_summary_failure=compression_abort_on_summary_failure,
-            max_tokens=agent.max_tokens,
-            model_thresholds=compression_model_thresholds,
-            threshold_tokens_cap=compression_threshold_tokens,
-            proactive_prune_tokens=compression_proactive_prune_tokens,
-            proactive_prune_min_result_chars=compression_proactive_prune_min_chars,
-            proactive_prune_min_reclaim_tokens=compression_proactive_prune_min_reclaim,
-            min_tail_user_messages=compression_min_tail_users,
-        )
+    agent.context_compressor = ContextCompressor(
+        model=agent.model,
+        threshold_percent=compression_threshold,
+        protect_first_n=compression_protect_first,
+        protect_last_n=compression_protect_last,
+        summary_target_ratio=compression_target_ratio,
+        summary_model_override=None,
+        quiet_mode=agent.quiet_mode,
+        base_url=agent.base_url,
+        api_key=getattr(agent, "api_key", ""),
+        config_context_length=_effective_context_length,
+        provider=agent.provider,
+        api_mode=agent.api_mode,
+        abort_on_summary_failure=compression_abort_on_summary_failure,
+        max_tokens=agent.max_tokens,
+        model_thresholds=compression_model_thresholds,
+        threshold_tokens_cap=compression_threshold_tokens,
+        proactive_prune_tokens=compression_proactive_prune_tokens,
+        proactive_prune_min_result_chars=compression_proactive_prune_min_chars,
+        proactive_prune_min_reclaim_tokens=compression_proactive_prune_min_reclaim,
+        min_tail_user_messages=compression_min_tail_users,
+    )
     _bind_session_state = getattr(agent.context_compressor, "bind_session_state", None)
     if callable(_bind_session_state):
         try:
@@ -2921,16 +2812,6 @@ async def initialize_deferred_runtime(agent: Any) -> bool:
         from hermes_cli.auth import PROVIDER_REGISTRY
         from hermes_constants import OPENROUTER_BASE_URL
 
-        unsupported_context_engine = getattr(
-            agent, "_async_unsupported_context_engine", None
-        )
-        if unsupported_context_engine:
-            raise AsyncCapabilityError(
-                "Context engine "
-                f"{unsupported_context_engine!r} has no native async lifecycle "
-                "contract and is disabled in async-hermes-agent. Use the built-in "
-                "'compressor' engine or provide a native async implementation."
-            )
         if getattr(agent, "_runtime_config_loaded", False):
             config_snapshot = getattr(agent, "_runtime_config_snapshot", {})
             if not isinstance(config_snapshot, dict):
@@ -2958,6 +2839,19 @@ async def initialize_deferred_runtime(agent: Any) -> bool:
                         ),
                     )
                     await _record_codex_gpt55_autoraise_notice(autoraise)
+        context_config = config_snapshot.get("context", {})
+        configured_context_engine = (
+            str(context_config.get("engine") or "compressor").strip()
+            if isinstance(context_config, dict)
+            else "compressor"
+        )
+        if configured_context_engine != "compressor":
+            raise AsyncCapabilityError(
+                "Context engine "
+                f"{configured_context_engine!r} has no native async lifecycle "
+                "contract and is disabled in async-hermes-agent. Use the built-in "
+                "'compressor' engine or provide a native async implementation."
+            )
         secrets_config = config_snapshot.get("secrets", {})
         if isinstance(secrets_config, dict) and any(
             isinstance(value, dict) and value.get("enabled")

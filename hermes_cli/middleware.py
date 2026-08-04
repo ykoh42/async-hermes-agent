@@ -200,11 +200,9 @@ async def run_tool_execution_middleware(
 ) -> Any:
     """Run a tool through coroutine-native execution middleware.
 
-    Async Hermes never hides a tool call in a worker thread.  Middleware that
+    Async Hermes never hides a tool call in a worker thread. Middleware that
     wraps a tool call therefore has the same requirement: it must await its
-    ``next_call`` continuation and return an awaitable itself.  The legacy
-    synchronous chain remains private for code paths not exposed by this
-    package's async agent API.
+    ``next_call`` continuation and return an awaitable itself.
     """
     callbacks = _get_middleware_callbacks(TOOL_EXECUTION_MIDDLEWARE)
     if not callbacks:

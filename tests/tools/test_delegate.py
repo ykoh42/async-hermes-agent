@@ -12,7 +12,6 @@ Run with:  python -m pytest tests/test_delegate.py -v
 import asyncio
 import json
 import os
-import threading
 import time
 import types
 import unittest
@@ -52,7 +51,6 @@ def _make_mock_parent(depth=0):
     parent._credential_pool = None
     parent._delegate_depth = depth
     parent._active_children = []
-    parent._active_children_lock = threading.Lock()
     parent._print_fn = None
     parent.tool_progress_callback = None
     parent.thinking_callback = None
@@ -1345,7 +1343,6 @@ class TestOrchestratorEndToEnd(unittest.IsolatedAsyncioTestCase):
                 m._delegate_depth = 1
                 m._delegate_role = "orchestrator"
                 m._active_children = []
-                m._active_children_lock = threading.Lock()
                 m._session_db = None
                 m.platform = "cli"
                 m.enabled_toolsets = ["terminal", "file", "delegation"]

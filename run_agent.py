@@ -44,7 +44,6 @@ import os
 import re
 import sys
 import time
-import threading
 import uuid
 import warnings
 from typing import List, Dict, Any, Optional, Callable
@@ -128,7 +127,11 @@ from model_tools import (
     check_toolset_requirements,  # noqa: F401  # re-exported for tests that mock.patch("run_agent.check_toolset_requirements")
 )
 from tools.terminal_tool import cleanup_vm
-from tools.interrupt import set_interrupt as _set_interrupt
+from tools.interrupt import (
+    bind_interrupt_event as _bind_interrupt_event,
+    reset_interrupt_event as _reset_interrupt_event,
+    set_interrupt as _set_interrupt,
+)
 
 
 # Agent internals extracted to agent/ package for modularity
@@ -1794,9 +1797,9 @@ class AIAgent:
         """
         # Scaffolding removal mutates the live list (desired — ephemeral
         # retry/failure sentinels must not survive into the real transcript).
-        # Close and turn-start persistence can run on separate CLI threads; the
-        # marker test-and-append below must be one critical section or both can
-        # observe the same unmarked dict and write duplicate durable rows.
+        # Close and turn-start persistence can run from separate tasks; the
+        # async persistence lock keeps marker checks and durable appends in one
+        # critical section.
         from agent.agent_runtime_helpers import note_turn_persisted
 
         async with self._get_session_persist_lock():
@@ -2914,8 +2917,8 @@ class AIAgent:
         """
         Request the agent to interrupt its current tool-calling loop.
         
-        Call this from another thread (e.g., input handler, message receiver)
-        to gracefully stop the agent and process a new message.
+        Call this from another task on the same event loop to gracefully stop
+        the agent and process a new message.
         
         Also signals long-running tool executions (e.g. terminal commands)
         to terminate early, so the agent can respond immediately.
@@ -2924,54 +2927,31 @@ class AIAgent:
             message: Optional new message that triggered the interrupt.
                      If provided, the agent will include this in its response context.
         
-        Example (CLI):
-            # In a separate input thread:
-            if user_typed_something:
-                agent.interrupt(user_input)
-        
-        Example (Messaging):
-            # When new message arrives for active session:
+        Example (async service):
+            # When new input arrives for an active session:
             if session_has_running_agent:
                 running_agent.interrupt(new_message.text)
         """
-        # A hard stop and redirect share one lock so /stop cannot race with an
-        # accepted correction and accidentally turn itself into a retry.
-        _redirect_lock = getattr(self, "_pending_redirect_lock", None)
-        if _redirect_lock is not None:
-            with _redirect_lock:
-                self._interrupt_requested = True
-                self._interrupt_message = message
-                self._pending_redirect = None
-        else:
-            self._interrupt_requested = True
-            self._interrupt_message = message
-            self._pending_redirect = None
+        # These mutations contain no await boundary, so they are atomic with
+        # respect to other tasks on the owning event loop.
+        self._interrupt_requested = True
+        self._interrupt_message = message
+        self._pending_redirect = None
 
-        # A cron turn performs its API request on the conversation thread to
-        # avoid the nested interrupt-worker deadlock.  Unlike the normal worker
-        # path, its client is registered here so this cross-thread interrupt can
-        # still shut down the active sockets promptly.
+        # The active native client registers an abort callback so a sibling
+        # service task can shut down the in-flight request promptly.
         _abort_active_request = getattr(self, "_active_request_abort", None)
         if callable(_abort_active_request):
             try:
                 _abort_active_request("interrupt_abort")
             except Exception:
                 logger.debug("Failed to abort active inline request", exc_info=True)
-        # Signal all tools to abort any in-flight operations immediately.
-        # Scope the interrupt to this agent's execution thread so other
-        # agents running in the same process (gateway) are not affected.
-        if self._execution_thread_id is not None:
-            _set_interrupt(True, self._execution_thread_id)
-            self._interrupt_thread_signal_pending = False
-        else:
-            # The interrupt arrived before run_conversation() finished
-            # binding the agent to its execution thread. Defer the tool-level
-            # interrupt signal until startup completes instead of targeting
-            # the caller thread by mistake.
-            self._interrupt_thread_signal_pending = True
+        # Tool tasks inherit this event through the conversation ContextVar.
+        # The event exists before a turn starts, so pre-start interrupts are
+        # preserved without a deferred thread-id handoff.
+        _set_interrupt(True, self._interrupt_event)
         # Propagate interrupt to any running child agents (subagent delegation)
-        with self._active_children_lock:
-            children_copy = list(self._active_children)
+        children_copy = list(self._active_children)
         for child in children_copy:
             try:
                 child.interrupt(message)
@@ -2981,39 +2961,24 @@ class AIAgent:
             print("\n⚡ Interrupt requested" + (f": '{message[:40]}...'" if message and len(message) > 40 else f": '{message}'" if message else ""))
 
     def clear_interrupt(self, *, preserve_redirect: bool = False) -> bool:
-        """Clear the interrupt request and per-thread tool signal.
+        """Clear the interrupt request and task-local tool signal.
 
         ``preserve_redirect`` is used only by the conversation loop after it
         intentionally cancels a model request to rebuild that same logical
         turn. Public hard-stop paths keep the default and clear everything.
         """
-        _redirect_lock = getattr(self, "_pending_redirect_lock", None)
-        if _redirect_lock is not None:
-            with _redirect_lock:
-                if preserve_redirect and not self._pending_redirect:
-                    return False
-                self._interrupt_requested = False
-                self._interrupt_message = None
-                if not preserve_redirect:
-                    self._pending_redirect = None
-        else:
-            if preserve_redirect and not getattr(self, "_pending_redirect", None):
-                return False
-            self._interrupt_requested = False
-            self._interrupt_message = None
-            if not preserve_redirect:
-                self._pending_redirect = None
-        self._interrupt_thread_signal_pending = False
-        if self._execution_thread_id is not None:
-            _set_interrupt(False, self._execution_thread_id)
+        if preserve_redirect and not getattr(self, "_pending_redirect", None):
+            return False
+        self._interrupt_requested = False
+        self._interrupt_message = None
+        if not preserve_redirect:
+            self._pending_redirect = None
+        _set_interrupt(False, self._interrupt_event)
         # A hard interrupt supersedes any pending /steer — the steer was
         # meant for the agent's next tool-call iteration, which will no
         # longer happen. Drop it instead of surprising the user with a
         # late injection on the post-interrupt turn.
-        _steer_lock = getattr(self, "_pending_steer_lock", None)
-        if _steer_lock is not None:
-            with _steer_lock:
-                self._pending_steer = None
+        self._pending_steer = None
         return True
 
     def steer(self, text: str) -> bool:
@@ -3025,8 +2990,8 @@ class AIAgent:
         result's content once the current tool batch finishes. The model
         sees the steer as part of the tool output on its next iteration.
 
-        Thread-safe: callable from gateway/CLI/TUI threads. Multiple calls
-        before the drain point concatenate with newlines.
+        Task-safe on the owning event loop. Multiple calls before the drain
+        point concatenate with newlines.
 
         Args:
             text: The user text to inject. Empty strings are ignored.
@@ -3037,19 +3002,8 @@ class AIAgent:
         if not text or not text.strip():
             return False
         cleaned = text.strip()
-        _lock = getattr(self, "_pending_steer_lock", None)
-        if _lock is None:
-            # Test stubs that built AIAgent via object.__new__ skip __init__.
-            # Fall back to direct attribute set; no concurrent callers expected
-            # in those stubs.
-            existing = getattr(self, "_pending_steer", None)
-            self._pending_steer = (existing + "\n" + cleaned) if existing else cleaned
-            return True
-        with _lock:
-            if self._pending_steer:
-                self._pending_steer = self._pending_steer + "\n" + cleaned
-            else:
-                self._pending_steer = cleaned
+        existing = getattr(self, "_pending_steer", None)
+        self._pending_steer = (existing + "\n" + cleaned) if existing else cleaned
         return True
 
     def redirect(self, text: str) -> bool:
@@ -3074,46 +3028,22 @@ class AIAgent:
             return self.steer(cleaned)
 
         _model_active = getattr(self, "_model_request_active", None)
-        _redirect_lock = getattr(self, "_pending_redirect_lock", None)
-        if _redirect_lock is None:
-            if _model_active is None or not _model_active.is_set():
-                return False
-            existing = getattr(self, "_pending_redirect", None)
-            if self._interrupt_requested and not existing:
-                return False
-            self._pending_redirect = (
-                f"{existing}\n\n[Additional user correction]\n{cleaned}"
-                if existing
-                else cleaned
-            )
-            self._interrupt_requested = True
-            self._interrupt_message = None
-        else:
-            with _redirect_lock:
-                if _model_active is None or not _model_active.is_set():
-                    # The response completed before we acquired the state lock.
-                    # Reject so the surface queues a new turn.
-                    return False
-                if self._interrupt_requested and not self._pending_redirect:
-                    return False
-                if self._pending_redirect:
-                    self._pending_redirect = (
-                        f"{self._pending_redirect}\n\n"
-                        f"[Additional user correction]\n{cleaned}"
-                    )
-                else:
-                    self._pending_redirect = cleaned
-                self._interrupt_requested = True
-                self._interrupt_message = None
+        if _model_active is None or not _model_active.is_set():
+            return False
+        existing = getattr(self, "_pending_redirect", None)
+        if self._interrupt_requested and not existing:
+            return False
+        self._pending_redirect = (
+            f"{existing}\n\n[Additional user correction]\n{cleaned}"
+            if existing
+            else cleaned
+        )
+        self._interrupt_requested = True
+        self._interrupt_message = None
 
         # Interrupt only the model request. Do not fan out to tool workers or
         # child agents as interrupt() does.
-        _execution_thread_id = getattr(self, "_execution_thread_id", None)
-        if _execution_thread_id is not None:
-            _set_interrupt(True, _execution_thread_id)
-            self._interrupt_thread_signal_pending = False
-        else:
-            self._interrupt_thread_signal_pending = True
+        _set_interrupt(True, self._interrupt_event)
         _abort_active_request = getattr(self, "_active_request_abort", None)
         if callable(_abort_active_request):
             try:
@@ -3124,38 +3054,22 @@ class AIAgent:
 
     def _has_pending_redirect(self) -> bool:
         """Return whether an active-turn redirect is waiting to be applied."""
-        _redirect_lock = getattr(self, "_pending_redirect_lock", None)
-        if _redirect_lock is None:
-            return bool(getattr(self, "_pending_redirect", None))
-        with _redirect_lock:
-            return bool(self._pending_redirect)
+        return bool(getattr(self, "_pending_redirect", None))
 
     def _drain_pending_redirect(self) -> Optional[str]:
         """Return and clear pending active-turn correction text."""
-        _redirect_lock = getattr(self, "_pending_redirect_lock", None)
-        if _redirect_lock is None:
-            text = getattr(self, "_pending_redirect", None)
-            self._pending_redirect = None
-            return text
-        with _redirect_lock:
-            text = self._pending_redirect
-            self._pending_redirect = None
+        text = getattr(self, "_pending_redirect", None)
+        self._pending_redirect = None
         return text
 
     def _drain_pending_steer(self) -> Optional[str]:
         """Return the pending steer text (if any) and clear the slot.
 
-        Safe to call from the agent execution thread after appending tool
-        results. Returns None when no steer is pending.
+        Safe to call from the owning event loop after appending tool results.
+        Returns None when no steer is pending.
         """
-        _lock = getattr(self, "_pending_steer_lock", None)
-        if _lock is None:
-            text = getattr(self, "_pending_steer", None)
-            self._pending_steer = None
-            return text
-        with _lock:
-            text = self._pending_steer
-            self._pending_steer = None
+        text = getattr(self, "_pending_steer", None)
+        self._pending_steer = None
         return text
 
     def _record_file_mutation_result(
@@ -3432,7 +3346,7 @@ class AIAgent:
         return apply_pending_steer_to_tool_results(self, messages, num_tool_msgs)
 
     def _touch_activity(self, desc: str) -> None:
-        """Update the last-activity timestamp and description (thread-safe).
+        """Update the last-activity timestamp and description.
 
         Also bridges to the kanban board's heartbeat fields when this
         process is a dispatcher-spawned worker (HERMES_KANBAN_TASK set),
@@ -3783,9 +3697,8 @@ class AIAgent:
 
         # 2. Close active child agents
         try:
-            with self._active_children_lock:
-                children = list(self._active_children)
-                self._active_children.clear()
+            children = list(self._active_children)
+            self._active_children.clear()
             for child in children:
                 try:
                     close_child = getattr(child, "close", None)
@@ -4193,16 +4106,20 @@ class AIAgent:
         """Build a valid Responses `function_call.id` (must start with `fc_`)."""
         return _codex_derive_responses_function_call_id(call_id, response_item_id)
 
-    def _thread_identity(self) -> str:
-        thread = threading.current_thread()
-        return f"{thread.name}:{thread.ident}"
+    @staticmethod
+    def _task_identity() -> str:
+        try:
+            task = asyncio.current_task()
+        except RuntimeError:
+            task = None
+        return f"{task.get_name()}:{id(task):x}" if task is not None else "no-task"
 
     def _client_log_context(self) -> str:
         provider = getattr(self, "provider", "unknown")
         base_url = getattr(self, "base_url", "unknown")
         model = getattr(self, "model", "unknown")
         return (
-            f"thread={self._thread_identity()} provider={provider} "
+            f"task={self._task_identity()} provider={provider} "
             f"base_url={base_url} model={model}"
         )
 
@@ -5874,11 +5791,12 @@ class AIAgent:
         session_id = str(getattr(self, "session_id", None) or "")
         token = None
         acct_token = None
+        interrupt_token = _bind_interrupt_event(self._interrupt_event)
         try:
             # Publish the conversation id for ambient Nous Portal tagging. Every
             # LLM call made inside this turn — main loop, compression, vision,
             # web_extract, session_search, MoA slots, background-review forks
-            # (which copy this Context into their thread) — inherits the
+            # (which inherit this Context in child tasks) — inherits the
             # ``conversation=<root>`` tag with zero per-call-site plumbing.
             token = set_conversation_context(await self._conversation_root_id())
             # Publish the session accounting handles the same way so auxiliary
@@ -5896,7 +5814,7 @@ class AIAgent:
             # The outer token restores the caller's Context even though turn setup
             # replaces the value with the live runtime after fallback restoration.
             # Keep the scope local instead of storing ContextVar tokens on the agent,
-            # which may be observed from another thread.
+            # which may be observed from another task.
             with bind_subagent_parent(self), scoped_runtime_main({}):
                 return await run_conversation(
                     self,
@@ -5912,6 +5830,7 @@ class AIAgent:
                     moa_config=moa_config,
                 )
         finally:
+            _reset_interrupt_event(interrupt_token)
             if acct_token is not None:
                 reset_accounting_context(acct_token)
             if token is not None:

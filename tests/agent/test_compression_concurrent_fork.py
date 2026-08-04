@@ -30,7 +30,6 @@ from __future__ import annotations
 
 import asyncio
 import os
-import threading
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -312,7 +311,7 @@ async def test_fence_cancelled_compression_leaves_lock_reacquirable(tmp_path: Pa
         )
     )
     await asyncio.wait_for(summary_started.wait(), timeout=2)
-    assert fence.cancel_before_commit() is True
+    assert await fence.cancel_before_commit() is True
     release_summary.set()
     result = await asyncio.wait_for(task, timeout=5)
 
@@ -338,32 +337,31 @@ async def test_fence_cancelled_compression_leaves_lock_reacquirable(tmp_path: Pa
     assert await db.get_compression_lock_holder(session_id) is None
 
 
-def test_commit_fence_waits_for_an_active_commit() -> None:
+@pytest.mark.asyncio
+async def test_commit_fence_waits_for_an_active_commit() -> None:
     """A timeout that loses the fence race cannot overlap the live turn."""
     from agent.conversation_compression import CompressionCommitFence
 
     fence = CompressionCommitFence()
-    assert fence.begin_commit() is True
-    assert fence.try_cancel_before_commit() is None
-    cancel_started = threading.Event()
-    cancel_finished = threading.Event()
-    result = {}
+    assert await fence.begin_commit() is True
+    cancel_started = asyncio.Event()
+    cancel_finished = asyncio.Event()
+    result: dict[str, bool] = {}
 
-    def _cancel() -> None:
+    async def _cancel() -> None:
         cancel_started.set()
-        result["cancelled"] = fence.cancel_before_commit()
+        result["cancelled"] = await fence.cancel_before_commit()
         cancel_finished.set()
 
-    waiter = threading.Thread(target=_cancel, name="hygiene-timeout-fence")
-    waiter.start()
+    waiter = asyncio.create_task(_cancel())
     try:
-        assert cancel_started.wait(timeout=2)
+        await asyncio.wait_for(cancel_started.wait(), timeout=2)
+        await asyncio.sleep(0)
         assert not cancel_finished.is_set()
     finally:
         fence.finish_commit()
-    waiter.join(timeout=2)
+    await asyncio.wait_for(waiter, timeout=2)
 
-    assert not waiter.is_alive()
     assert result["cancelled"] is False
 
 

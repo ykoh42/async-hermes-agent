@@ -363,14 +363,18 @@ async def test_deferred_runtime_rejects_sync_only_context_engine_early():
         state = {
             "_deferred_provider_runtime": {"provider": "openrouter", "model": "test"},
             "_async_provider_init_lock": None,
-            "_async_unsupported_context_engine": None,
+            "_dotenv_loaded": True,
+            "_runtime_config_loaded": True,
+            "_runtime_config_snapshot": {"context": {"engine": "compressor"}},
         }
         state.update(attributes)
         agent = SimpleNamespace(**state)
         with pytest.raises(AsyncCapabilityError):
             await initialize_deferred_runtime(agent)
 
-    await assert_rejected(_async_unsupported_context_engine="third-party")
+    await assert_rejected(
+        _runtime_config_snapshot={"context": {"engine": "third-party"}}
+    )
 
 
 

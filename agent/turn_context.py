@@ -14,7 +14,7 @@ captures those produced values; ``build_turn_context`` performs the setup work a
 returns one. ``run_conversation`` is left to unpack the context and run the loop,
 shrinking the orchestrator by the full prologue.
 
-The builder still mutates ``agent`` heavily (counters, thread id, cached prompt,
+The builder still mutates ``agent`` heavily (counters, turn state, cached prompt,
 session DB) exactly as the inline code did — those side effects are the point. The
 ``TurnContext`` it returns carries only the *locals* the loop reads back.
 
@@ -24,8 +24,8 @@ move-and-name refactor with no semantic change.
 
 from __future__ import annotations
 
+import asyncio
 import logging
-import threading
 import time
 import uuid
 from dataclasses import dataclass
@@ -372,10 +372,10 @@ async def build_turn_context(
     # null; rebuilding from scratch" warning and a needless first-turn prefix
     # cache miss. (Issue #45499.)
 
-    # Tag log records on this thread with the session ID for ``hermes logs``.
+    # Tag log records in this context with the session ID for ``hermes logs``.
     set_session_context(agent.session_id)
 
-    # Bind the skill write-origin ContextVar for this thread.
+    # Bind the skill write-origin ContextVar for this task.
     set_current_write_origin(getattr(agent, "_memory_write_origin", "assistant_tool"))
 
     # Resolve credentials lazily.  The constructor deliberately keeps auth
@@ -1100,18 +1100,16 @@ async def build_turn_context(
     agent._verification_stop_nudges = 0
     agent._pre_verify_nudges = 0
 
-    # Record the execution thread so interrupt()/clear_interrupt() can scope
-    # the tool-level interrupt signal to THIS agent's thread only.
-    agent._execution_thread_id = threading.current_thread().ident
-
-    # Clear stale per-thread interrupt state, preserving a pending interrupt.
-    ra()._set_interrupt(False, agent._execution_thread_id)
+    # Clear stale task-local tool state while preserving a pre-start interrupt.
+    interrupt_event = getattr(agent, "_interrupt_event", None)
+    if interrupt_event is None:
+        interrupt_event = asyncio.Event()
+        agent._interrupt_event = interrupt_event
+    ra()._set_interrupt(False, interrupt_event)
     if agent._interrupt_requested:
-        ra()._set_interrupt(True, agent._execution_thread_id)
-        agent._interrupt_thread_signal_pending = False
+        ra()._set_interrupt(True, interrupt_event)
     else:
         agent._interrupt_message = None
-        agent._interrupt_thread_signal_pending = False
 
     # No external-memory prefetch is composed into the prompt in this
     # distribution. Built-in persisted memory is already part of the stable

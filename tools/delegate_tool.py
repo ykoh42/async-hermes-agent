@@ -29,7 +29,6 @@ _delegation_config_snapshot: contextvars.ContextVar[dict] = contextvars.ContextV
     default={},
 )
 import os
-import threading
 import time
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlsplit, urlunsplit
@@ -142,10 +141,8 @@ _MIN_SPAWN_DEPTH = 1
 # process, including nested orchestrator -> worker chains.
 # ---------------------------------------------------------------------------
 
-_spawn_pause_lock = threading.Lock()
 _spawn_paused: bool = False
 
-_active_subagents_lock = threading.Lock()
 # subagent_id -> mutable record tracking the live child agent.  Stays only
 # for the lifetime of the run; _run_single_child is the owner.
 _active_subagents: Dict[str, Dict[str, Any]] = {}
@@ -158,27 +155,23 @@ def set_spawn_paused(paused: bool) -> bool:
     with a "spawning paused" error until unblocked.  Returns the new state.
     """
     global _spawn_paused
-    with _spawn_pause_lock:
-        _spawn_paused = bool(paused)
-        return _spawn_paused
+    _spawn_paused = bool(paused)
+    return _spawn_paused
 
 
 def is_spawn_paused() -> bool:
-    with _spawn_pause_lock:
-        return _spawn_paused
+    return _spawn_paused
 
 
 def _register_subagent(record: Dict[str, Any]) -> None:
     sid = record.get("subagent_id")
     if not sid:
         return
-    with _active_subagents_lock:
-        _active_subagents[sid] = record
+    _active_subagents[sid] = record
 
 
 def _unregister_subagent(subagent_id: str) -> None:
-    with _active_subagents_lock:
-        _active_subagents.pop(subagent_id, None)
+    _active_subagents.pop(subagent_id, None)
 
 
 def interrupt_subagent(subagent_id: str) -> bool:
@@ -188,8 +181,7 @@ def interrupt_subagent(subagent_id: str) -> bool:
     grandchildren via AIAgent.interrupt(). Returns True if a matching
     subagent was found.
     """
-    with _active_subagents_lock:
-        record = _active_subagents.get(subagent_id)
+    record = _active_subagents.get(subagent_id)
     if not record:
         return False
     agent = record.get("agent")
@@ -207,13 +199,13 @@ def list_active_subagents() -> List[Dict[str, Any]]:
     """Snapshot of the currently running subagent tree.
 
     Each record: {subagent_id, parent_id, depth, goal, model, started_at,
-    tool_count, status}.  Safe to call from any thread — returns a copy.
+    tool_count, status}. Safe to call from another event-loop task because the
+    snapshot contains no await boundary.
     """
-    with _active_subagents_lock:
-        return [
-            {k: v for k, v in r.items() if k != "agent"}
-            for r in _active_subagents.values()
-        ]
+    return [
+        {k: v for k, v in r.items() if k != "agent"}
+        for r in _active_subagents.values()
+    ]
 
 
 def _extract_output_tail(
@@ -1080,11 +1072,10 @@ def _build_child_progress_callback(
         # TASK_TOOL_STARTED — display and batch for parent relay
         _tool_count[0] += 1
         if subagent_id is not None:
-            with _active_subagents_lock:
-                rec = _active_subagents.get(subagent_id)
-                if rec is not None:
-                    rec["tool_count"] = _tool_count[0]
-                    rec["last_tool"] = tool_name or ""
+            rec = _active_subagents.get(subagent_id)
+            if rec is not None:
+                rec["tool_count"] = _tool_count[0]
+                rec["last_tool"] = tool_name or ""
         if spinner:
             short = (
                 (preview[:35] + "...")
@@ -1545,12 +1536,7 @@ async def _build_child_agent(
 
     # Register child for interrupt propagation
     if hasattr(parent_agent, "_active_children"):
-        lock = getattr(parent_agent, "_active_children_lock", None)
-        if lock:
-            with lock:
-                parent_agent._active_children.append(child)
-        else:
-            parent_agent._active_children.append(child)
+        parent_agent._active_children.append(child)
 
     # Announce the spawn immediately — the child may sit in a queue
     # for seconds if max_concurrent_children is saturated, so the TUI
@@ -2301,12 +2287,7 @@ async def _run_single_child(
         # Unregister child from interrupt propagation
         if hasattr(parent_agent, "_active_children"):
             try:
-                lock = getattr(parent_agent, "_active_children_lock", None)
-                if lock:
-                    with lock:
-                        parent_agent._active_children.remove(child)
-                else:
-                    parent_agent._active_children.remove(child)
+                parent_agent._active_children.remove(child)
             except (ValueError, UnboundLocalError) as e:
                 logger.debug("Could not remove child from active_children: %s", e)
 

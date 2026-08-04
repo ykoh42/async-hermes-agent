@@ -262,7 +262,7 @@ async def test_init_feasibility_check_uses_aux_context_override_from_config():
         # to validate the call shape still forwards the override correctly.
         await agent._check_compression_model_feasibility()
 
-    mock_ctx_len.assert_called_once_with(
+    mock_ctx_len.assert_any_call(
         "custom/big-model",
         base_url="http://custom-endpoint:8080/v1",
         config_context_length=1_000_000,

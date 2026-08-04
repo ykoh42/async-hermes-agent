@@ -3,7 +3,7 @@
 Three concerns, all tied to ``AIAgent`` boot-time / runtime IO setup:
 
 1. **Lazy OpenAI SDK import** — ``_load_openai_cls`` + ``_OpenAIProxy``
-   defer the 240ms-ish ``from openai import OpenAI`` cost until first use,
+   defer the 240ms-ish ``from openai import AsyncOpenAI`` cost until first use,
    while preserving ``isinstance(client, OpenAI)`` checks and
    ``patch("run_agent.OpenAI", ...)`` test patterns.
 
@@ -70,8 +70,7 @@ class _SafeWriter:
     run_conversation() — especially via double-fault when an except handler
     also tries to print.
 
-    Additionally, when subagents run in ThreadPoolExecutor threads, the shared
-    stdout handle can close between thread teardown and cleanup, raising
+    The shared stdout handle can also close during process teardown, raising
     ``ValueError: I/O operation on closed file`` instead of OSError.
 
     This wrapper delegates all writes to the underlying stream and silently

@@ -1,113 +1,58 @@
-"""Per-thread interrupt signaling for all tools.
+"""Task-local interrupt signaling for the native async tool runtime.
 
-Provides thread-scoped interrupt tracking so that interrupting one agent
-session does not kill tools running in other sessions.  This is critical
-in the gateway where multiple agents run concurrently in the same process.
-
-The agent stores its execution thread ID at the start of run_conversation()
-and passes it to set_interrupt()/clear_interrupt().  Tools call
-is_interrupted() which checks the CURRENT thread — no argument needed.
-
-Usage in tools:
-    from tools.interrupt import is_interrupted
-    if is_interrupted():
-        return {"output": "[interrupted]", "returncode": 130}
+Each ``AIAgent`` owns one :class:`asyncio.Event`. ``run_conversation`` binds
+that event to the current context, and tool tasks inherit the same reference
+through normal ``contextvars`` propagation. This isolates concurrent agents
+that share one event-loop thread without a thread-local compatibility layer.
 """
 
-import logging
-import os
-import threading
+from __future__ import annotations
 
-logger = logging.getLogger(__name__)
-
-# Opt-in debug tracing — pairs with HERMES_DEBUG_INTERRUPT in
-# tools/environments/base.py.  Enables per-call logging of set/check so the
-# caller thread, target thread, and current state are visible when
-# diagnosing "interrupt signaled but tool never saw it" reports.
-_DEBUG_INTERRUPT = bool(os.getenv("HERMES_DEBUG_INTERRUPT"))
-
-if _DEBUG_INTERRUPT:
-    # AIAgent's quiet_mode path forces `tools` logger to ERROR on CLI startup.
-    # Force our own logger back to INFO so the trace is visible in agent.log.
-    logger.setLevel(logging.INFO)
-
-# Set of thread idents that have been interrupted.
-_interrupted_threads: set[int] = set()
-_lock = threading.Lock()
+import asyncio
+import contextvars
 
 
-def set_interrupt(active: bool, thread_id: int | None = None) -> None:
-    """Set or clear interrupt for a specific thread.
+_current_interrupt_event: contextvars.ContextVar[asyncio.Event | None] = (
+    contextvars.ContextVar("hermes_interrupt_event", default=None)
+)
 
-    Args:
-        active: True to signal interrupt, False to clear it.
-        thread_id: Target thread ident.  When None, targets the
-                   current thread (backward compat for CLI/tests).
+
+def bind_interrupt_event(
+    event: asyncio.Event,
+) -> contextvars.Token[asyncio.Event | None]:
+    """Bind an agent-owned interrupt event to the current async context."""
+    return _current_interrupt_event.set(event)
+
+
+def reset_interrupt_event(
+    token: contextvars.Token[asyncio.Event | None],
+) -> None:
+    """Restore the interrupt binding that preceded a conversation turn."""
+    _current_interrupt_event.reset(token)
+
+
+def set_interrupt(
+    active: bool,
+    event: asyncio.Event | None = None,
+) -> asyncio.Event:
+    """Set or clear an interrupt event without blocking the event loop.
+
+    ``event`` is supplied by cross-task agent controls such as
+    :meth:`AIAgent.interrupt`. Tool code normally omits it and operates on the
+    event bound to its inherited task context.
     """
-    tid = thread_id if thread_id is not None else threading.current_thread().ident
-    with _lock:
-        if active:
-            _interrupted_threads.add(tid)
-        else:
-            _interrupted_threads.discard(tid)
-        _snapshot = set(_interrupted_threads) if _DEBUG_INTERRUPT else None
-    if _DEBUG_INTERRUPT:
-        logger.info(
-            "[interrupt-debug] set_interrupt(active=%s, target_tid=%s) "
-            "called_from_tid=%s current_set=%s",
-            active, tid, threading.current_thread().ident, _snapshot,
-        )
+    target = event or _current_interrupt_event.get()
+    if target is None:
+        target = asyncio.Event()
+        _current_interrupt_event.set(target)
+    if active:
+        target.set()
+    else:
+        target.clear()
+    return target
 
 
 def is_interrupted() -> bool:
-    """Check if an interrupt has been requested for the current thread.
-
-    Safe to call from any thread — each thread only sees its own
-    interrupt state.
-    """
-    tid = threading.current_thread().ident
-    with _lock:
-        return tid in _interrupted_threads
-
-
-def clear_current_thread_interrupt() -> None:
-    """Clear any interrupt bit on the CURRENT thread.
-
-    Gives a user-approved command a clean interrupt slate immediately before
-    it spawns its child process, so a stale bit that landed on this thread
-    during the blocking approval-wait cannot SIGINT the just-approved run
-    (exit 130 + "[Command interrupted]").  Single-thread ordering on this tid
-    keeps the DO-NOT-BREAK invariant intact: a *genuine* interrupt arriving
-    after this call re-sets the bit on the same thread and is still observed by
-    the executor's poll loop.  Call this directly, never via the
-    _interrupt_event proxy (its .clear() binds to whatever thread runs it).
-    """
-    set_interrupt(False)  # thread_id=None -> current thread (see set_interrupt)
-
-
-# ---------------------------------------------------------------------------
-# Backward-compatible _interrupt_event proxy
-# ---------------------------------------------------------------------------
-# Some legacy call sites (process_registry, tests)
-# import _interrupt_event directly and call .is_set() / .set() / .clear().
-# This shim maps those calls to the per-thread functions above so existing
-# code keeps working while the underlying mechanism is thread-scoped.
-
-class _ThreadAwareEventProxy:
-    """Drop-in proxy that maps threading.Event methods to per-thread state."""
-
-    def is_set(self) -> bool:
-        return is_interrupted()
-
-    def set(self) -> None:  # noqa: A003
-        set_interrupt(True)
-
-    def clear(self) -> None:
-        set_interrupt(False)
-
-    def wait(self, timeout: float | None = None) -> bool:
-        """Not truly supported — returns current state immediately."""
-        return self.is_set()
-
-
-_interrupt_event = _ThreadAwareEventProxy()
+    """Return whether the current agent task has been interrupted."""
+    event = _current_interrupt_event.get()
+    return bool(event and event.is_set())

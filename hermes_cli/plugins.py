@@ -1805,29 +1805,6 @@ class PluginManager:
         """Return True when at least one callback is registered for middleware."""
         return bool(self._middleware.get(kind))
 
-    def invoke_middleware(self, kind: str, **kwargs: Any) -> List[Any]:
-        """Call registered middleware callbacks for *kind*.
-
-        Each callback is isolated so one plugin cannot break the base runtime
-        path. Middleware that wants to change behavior must return the shape
-        documented by the caller-specific contract.
-        """
-        callbacks = self._middleware.get(kind, [])
-        results: List[Any] = []
-        for cb in callbacks:
-            try:
-                ret = cb(**kwargs)
-                if ret is not None:
-                    results.append(ret)
-            except Exception as exc:
-                logger.warning(
-                    "Middleware '%s' callback %s raised: %s",
-                    kind,
-                    getattr(cb, "__name__", repr(cb)),
-                    exc,
-                )
-        return results
-
     # -----------------------------------------------------------------------
     # Slack action handler accessor
     # -----------------------------------------------------------------------
@@ -1924,14 +1901,6 @@ class AsyncPluginCapabilityError(RuntimeError):
 async def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
     """Await native lifecycle hooks without a sync compatibility bridge."""
     return await get_plugin_manager().invoke_hook(hook_name, **kwargs)
-
-
-def invoke_middleware(kind: str, **kwargs: Any) -> List[Any]:
-    """Invoke registered middleware callbacks.
-
-    Returns a list of non-``None`` return values from middleware callbacks.
-    """
-    return get_plugin_manager().invoke_middleware(kind, **kwargs)
 
 
 def has_middleware(kind: str) -> bool:

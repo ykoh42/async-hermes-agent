@@ -1329,16 +1329,12 @@ async def run_conversation(
             if not _injected:
                 # No tool message to inject into — put it back so
                 # the post-tool-execution drain picks it up later.
-                _lock = getattr(agent, "_pending_steer_lock", None)
-                if _lock is not None:
-                    with _lock:
-                        if agent._pending_steer:
-                            agent._pending_steer = agent._pending_steer + "\n" + _pre_api_steer
-                        else:
-                            agent._pending_steer = _pre_api_steer
-                else:
-                    existing = getattr(agent, "_pending_steer", None)
-                    agent._pending_steer = (existing + "\n" + _pre_api_steer) if existing else _pre_api_steer
+                existing = getattr(agent, "_pending_steer", None)
+                agent._pending_steer = (
+                    existing + "\n" + _pre_api_steer
+                    if existing
+                    else _pre_api_steer
+                )
 
         # Prepare messages for API call
         # If we have an ephemeral system prompt, prepend it to the messages
@@ -2188,12 +2184,7 @@ async def run_conversation(
                     )
 
                 _model_request_active = getattr(agent, "_model_request_active", None)
-                _redirect_lock = getattr(agent, "_pending_redirect_lock", None)
-                if _redirect_lock is not None:
-                    with _redirect_lock:
-                        if _model_request_active is not None:
-                            _model_request_active.set()
-                elif _model_request_active is not None:
+                if _model_request_active is not None:
                     _model_request_active.set()
                 _redirect_crossed_response = False
                 try:
@@ -2220,22 +2211,13 @@ async def run_conversation(
                         api_call_count=api_call_count,
                     )
                 finally:
-                    if _redirect_lock is not None:
-                        with _redirect_lock:
-                            if _model_request_active is not None:
-                                _model_request_active.clear()
-                            _redirect_crossed_response = bool(
-                                agent._pending_redirect
-                            )
-                    else:
-                        if _model_request_active is not None:
-                            _model_request_active.clear()
-                        _redirect_crossed_response = agent._has_pending_redirect()
+                    if _model_request_active is not None:
+                        _model_request_active.clear()
+                    _redirect_crossed_response = agent._has_pending_redirect()
                 if _redirect_crossed_response:
-                    # The response and redirect can cross on different threads:
-                    # redirect() observed the request as active just before this
-                    # call returned. Discard that now-stale response and rebuild
-                    # from the correction rather than silently losing it.
+                    # redirect() observed the request as active while the
+                    # provider await was suspended. Discard that now-stale
+                    # response and rebuild from the correction.
                     if agent.thinking_callback:
                         agent.thinking_callback("")
                     if agent.clear_interrupt(preserve_redirect=True):

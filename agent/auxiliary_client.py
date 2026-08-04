@@ -52,7 +52,6 @@ import json
 import logging
 import os
 import re
-import threading
 import time
 import uuid
 from pathlib import Path  # noqa: F401 — used by test mocks
@@ -192,7 +191,7 @@ def _create_openai_client(
 # (e.g. an incoming user message while the agent is busy). Context
 # compression is the prime case: if the summary LLM call is interrupted
 # part-way, compression falls back to a static "summary unavailable" marker
-# and the real handoff is lost (#23975). A thread-local flag lets such a
+# and the real handoff is lost (#23975). A task-local flag lets such a
 # task mark its in-flight LLM call as interrupt-protected; the Codex
 # Responses stream's cancellation check honors it. TIMEOUTS still fire
 # (a hung call must die), and all OTHER aux tasks (vision, web_extract,
@@ -209,7 +208,7 @@ def _aux_interrupt_protected() -> bool:
 
 @contextlib.contextmanager
 def aux_interrupt_protection(active: bool = True):
-    """Mark the current thread's auxiliary LLM call as interrupt-protected.
+    """Mark the current task's auxiliary LLM call as interrupt-protected.
 
     Used by atomic aux tasks (compression) so a mid-flight gateway interrupt
     doesn't abort the call and trigger a degraded fallback. Re-entrant-safe:
@@ -227,12 +226,11 @@ def aux_interrupt_protection(active: bool = True):
 # wall-clock deadlines in their hosts (gateway session hygiene). A fixed
 # deadline punishes SLOW summary models exactly as hard as HUNG ones: a
 # reasoning model happily streaming a large summary is killed mid-generation.
-# This thread-local hook lets the host observe liveness instead: the wire
+# This task-local hook lets the host observe liveness instead: the wire
 # consumers below tick it on every streamed token/SSE event, and the host
 # extends its deadline while tokens are moving (see gateway/run.py session
-# hygiene + CompressionCommitFence.touch_progress). Thread-local matches the
-# call topology — the aux call and its stream consumption run synchronously
-# on the thread that installed the hook.
+# hygiene + CompressionCommitFence.touch_progress). Context-local state follows
+# the auxiliary call and its stream-consumer child tasks.
 _aux_progress: contextvars.ContextVar[Optional[Callable[[], Any]]] = contextvars.ContextVar(
     "hermes_aux_progress_hook",
     default=None,
@@ -256,7 +254,7 @@ def _aux_progress_active() -> bool:
 
 @contextlib.contextmanager
 def aux_progress_hook(hook):
-    """Install *hook* as the current thread's aux forward-progress callback.
+    """Install *hook* as the current task's aux forward-progress callback.
 
     ``hook=None`` is a no-op passthrough so callers can wire it
     unconditionally. Re-entrant-safe: restores the previous hook on exit.
@@ -2269,51 +2267,13 @@ async def _read_main_api_key_if_same_host(
     return main_key
 
 
-# Compatibility mirrors for older readers/tests. The authoritative value is
-# the ContextVar below: gateway sessions can overlap in one process, so a
-# process-global tuple is not safe as routing or cache-key input.
-_RUNTIME_MAIN_PROVIDER: str = ""
-_RUNTIME_MAIN_MODEL: str = ""
-_RUNTIME_MAIN_BASE_URL: str = ""
-_RUNTIME_MAIN_API_KEY: Any = ""
-_RUNTIME_MAIN_API_MODE: str = ""
-_RUNTIME_MAIN_AUTH_MODE: str = ""
 _RUNTIME_MAIN_CONTEXT: contextvars.ContextVar[Optional[Dict[str, Any]]] = (
     contextvars.ContextVar("auxiliary_runtime_main", default=None)
 )
 
-_RUNTIME_MAIN_COMPAT_SNAPSHOT: Tuple[Any, ...] = ("", "", "", "", "", "")
-_RUNTIME_MAIN_COMPAT_LOCK = threading.Lock()
-
-
-def _compat_runtime_main() -> Optional[Dict[str, Any]]:
-    """Expose deliberately patched legacy globals in a single main context.
-
-    ``set_runtime_main`` mirrors values into the old module attributes for
-    introspection, but those mirrors must never become runtime inputs. A direct
-    patch is recognized only when it differs from the mirrored snapshot and
-    only on the main thread, keeping concurrent session workers isolated.
-    """
-    if threading.current_thread() is not threading.main_thread():
-        return None
-    values = (
-        _RUNTIME_MAIN_PROVIDER,
-        _RUNTIME_MAIN_MODEL,
-        _RUNTIME_MAIN_BASE_URL,
-        _RUNTIME_MAIN_API_KEY,
-        _RUNTIME_MAIN_API_MODE,
-        _RUNTIME_MAIN_AUTH_MODE,
-    )
-    if values == _RUNTIME_MAIN_COMPAT_SNAPSHOT:
-        return None
-    return dict(zip(_MAIN_RUNTIME_FIELDS, values))
-
-
 def _runtime_main_value(field: str) -> Any:
-    """Read one runtime field through context-local/controlled legacy state."""
+    """Read one runtime field from the current async context."""
     runtime = _RUNTIME_MAIN_CONTEXT.get()
-    if runtime is None:
-        runtime = _compat_runtime_main()
     if isinstance(runtime, dict):
         value = runtime.get(field)
         if value:
@@ -2333,12 +2293,9 @@ def set_runtime_main(
 ) -> contextvars.Token:
     """Record the current context's live main runtime for auxiliary routing.
 
-    Context-local state prevents concurrent gateway sessions from overwriting
-    one another while retaining compatibility mirrors for legacy readers.
+    Context-local state prevents concurrent agent tasks from overwriting one
+    another.
     """
-    global _RUNTIME_MAIN_PROVIDER, _RUNTIME_MAIN_MODEL
-    global _RUNTIME_MAIN_BASE_URL, _RUNTIME_MAIN_API_KEY, _RUNTIME_MAIN_API_MODE
-    global _RUNTIME_MAIN_AUTH_MODE, _RUNTIME_MAIN_COMPAT_SNAPSHOT
     runtime = {
         "provider": (provider or "").strip().lower(),
         "requested_provider": (requested_provider or "").strip().lower(),
@@ -2352,22 +2309,7 @@ def set_runtime_main(
         "api_mode": (api_mode or "").strip(),
         "auth_mode": (auth_mode or "").strip().lower(),
     }
-    # Publish authoritative context before updating locked compatibility
-    # mirrors; concurrent sessions never read those mirrors at runtime.
-    token = _RUNTIME_MAIN_CONTEXT.set(runtime)
-    with _RUNTIME_MAIN_COMPAT_LOCK:
-        (
-            _RUNTIME_MAIN_PROVIDER,
-            _RUNTIME_MAIN_MODEL,
-            _RUNTIME_MAIN_BASE_URL,
-            _RUNTIME_MAIN_API_KEY,
-            _RUNTIME_MAIN_API_MODE,
-            _RUNTIME_MAIN_AUTH_MODE,
-        ) = (runtime[field] for field in _MAIN_RUNTIME_FIELDS)
-        _RUNTIME_MAIN_COMPAT_SNAPSHOT = tuple(
-            runtime[field] for field in _MAIN_RUNTIME_FIELDS
-        )
-    return token
+    return _RUNTIME_MAIN_CONTEXT.set(runtime)
 
 
 def reset_runtime_main(token: contextvars.Token) -> None:
@@ -2377,14 +2319,14 @@ def reset_runtime_main(token: contextvars.Token) -> None:
     try:
         _RUNTIME_MAIN_CONTEXT.reset(token)
     except (RuntimeError, ValueError):
-        # A token cannot be reset from another copied Context. Background
-        # workers inherit values, not ownership of the parent's token.
+        # A token cannot be reset from another copied Context. Child tasks
+        # inherit values, not ownership of the parent's token.
         pass
 
 
 @contextlib.contextmanager
 def scoped_runtime_main(main_runtime: Optional[Dict[str, Any]]):
-    """Temporarily bind an explicit runtime without touching legacy mirrors."""
+    """Temporarily bind an explicit runtime to the current async context."""
     runtime = _normalize_main_runtime(main_runtime)
     token = _RUNTIME_MAIN_CONTEXT.set(runtime or None)
     try:
@@ -2395,18 +2337,7 @@ def scoped_runtime_main(main_runtime: Optional[Dict[str, Any]]):
 
 def clear_runtime_main() -> None:
     """Clear the runtime override in the current context."""
-    global _RUNTIME_MAIN_PROVIDER, _RUNTIME_MAIN_MODEL
-    global _RUNTIME_MAIN_BASE_URL, _RUNTIME_MAIN_API_KEY, _RUNTIME_MAIN_API_MODE
-    global _RUNTIME_MAIN_AUTH_MODE, _RUNTIME_MAIN_COMPAT_SNAPSHOT
     _RUNTIME_MAIN_CONTEXT.set(None)
-    with _RUNTIME_MAIN_COMPAT_LOCK:
-        _RUNTIME_MAIN_PROVIDER = ""
-        _RUNTIME_MAIN_MODEL = ""
-        _RUNTIME_MAIN_BASE_URL = ""
-        _RUNTIME_MAIN_API_KEY = ""
-        _RUNTIME_MAIN_API_MODE = ""
-        _RUNTIME_MAIN_AUTH_MODE = ""
-        _RUNTIME_MAIN_COMPAT_SNAPSHOT = ("", "", "", "", "", "")
 
 
 def _resolve_custom_runtime(
@@ -2873,13 +2804,9 @@ def _normalize_main_runtime(main_runtime: Optional[Dict[str, Any]]) -> Dict[str,
     for ``api_key`` and calls it before every request.
     """
     if main_runtime is None:
-        # Context-local state is inherited by tool worker wrappers while
-        # remaining isolated across concurrent gateway sessions. Never fall
-        # back to compatibility mirrors here: another session may have written
-        # them most recently, which would leak its endpoint/key into this call.
+        # Context-local state is inherited by child tasks while remaining
+        # isolated across concurrent agent sessions.
         main_runtime = _RUNTIME_MAIN_CONTEXT.get()
-        if main_runtime is None:
-            main_runtime = _compat_runtime_main()
     if not isinstance(main_runtime, dict):
         return {}
     normalized: Dict[str, Any] = {}

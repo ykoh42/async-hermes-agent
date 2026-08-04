@@ -12,7 +12,6 @@ import hashlib
 import asyncio
 import logging
 import re
-import threading
 from typing import Any
 
 from agent.auxiliary_client import call_llm
@@ -758,15 +757,13 @@ async def _run_references_parallel(
     progress_callback: Any = None,
     reference_timeout: float | None = None,
     agent: Any = None,
-    late_accounting_sink: Any = None,
 ) -> list[tuple[str, str, Any]]:
     """Fan out reference calls without blocking the event loop.
 
     Results retain configured-slot order. An internal Hermes interrupt cancels
     unfinished requests, waits for their cancellation, and returns the same
-    labelled interruption note that the former thread-pool path produced.
-    ``late_accounting_sink`` is retained in the private signature for callers
-    during the migration, but native tasks are cancelled rather than detached.
+    labelled interruption note. Native tasks are cancelled and joined rather
+    than detached.
     """
     from agent.usage_pricing import CanonicalUsage
 
@@ -1396,10 +1393,6 @@ class MoAChatCompletions:
 
         self._pending_reference_usage: Any = CanonicalUsage()
         self._pending_reference_cost: Any = None
-        # Guards pending usage/cost against concurrent late-accounting
-        # callbacks (see _record_late_reference_accounting), which fire on
-        # executor worker threads after an interrupted fan-out returns.
-        self._accounting_lock = threading.Lock()
         # Resolved aggregator slot ({provider, model, ...}) from the most recent
         # create(); read by session cost accounting to price the aggregator's
         # acting turn at its real model instead of the virtual preset name.
@@ -1432,41 +1425,11 @@ class MoAChatCompletions:
         """
         from agent.usage_pricing import CanonicalUsage
 
-        with self._accounting_lock:
-            usage = self._pending_reference_usage or CanonicalUsage()
-            cost = self._pending_reference_cost
-            self._pending_reference_usage = CanonicalUsage()
-            self._pending_reference_cost = None
+        usage = self._pending_reference_usage or CanonicalUsage()
+        cost = self._pending_reference_cost
+        self._pending_reference_usage = CanonicalUsage()
+        self._pending_reference_cost = None
         return usage, cost
-
-    def _record_late_reference_accounting(self, label: str, accounting: Any) -> None:
-        """Fold a late-completing interrupted reference's real spend in.
-
-        When a user interrupt aborts the fan-out wait, references already in
-        flight keep running (they cannot be force-killed) and DO bill when
-        they complete. Their placeholder results carry zeroed accounting, so
-        without this hook that spend would vanish from session accounting.
-        The fan-out registers this as a done-callback on abandoned futures;
-        it folds the eventual real usage/cost into the pending totals, where
-        the next ``consume_reference_usage`` pick-up records it. Thread-safe:
-        done-callbacks fire on executor worker threads.
-        """
-        from agent.usage_pricing import CanonicalUsage
-
-        if not isinstance(accounting, _RefAccounting):
-            return
-        with self._accounting_lock:
-            if isinstance(accounting.usage, CanonicalUsage):
-                self._pending_reference_usage = (
-                    self._pending_reference_usage or CanonicalUsage()
-                ) + accounting.usage
-            if accounting.cost_usd is not None:
-                self._pending_reference_cost = (
-                    self._pending_reference_cost or 0
-                ) + accounting.cost_usd
-        logger.debug(
-            "MoA: recorded late accounting for interrupted reference %s", label
-        )
 
     async def consume_and_save_trace(
         self, session_id: Any = None, aggregator_output_fallback: Any = None
@@ -1815,10 +1778,8 @@ class MoAChatCompletions:
             # this create() is a repeat tool-iteration reusing the cached
             # advice. Charging their tokens/cost again here would multiply
             # advisor spend by the tool-iteration count, so nothing new is
-            # deposited — but do NOT zero the pending totals: a
-            # late-completing interrupted reference may have deposited its
-            # real spend since the last consume(), and that must survive
-            # until the next consume_reference_usage() pick-up.
+            # deposited. Any totals awaiting their single consumption remain
+            # untouched.
             # Likewise no trace on a cache HIT — the full turn was already
             # traced on the MISS that ran the references. A repeat iteration is
             # not a new MoA turn.
@@ -1845,7 +1806,6 @@ class MoAChatCompletions:
                 progress_callback=_progress,
                 reference_timeout=reference_timeout,
                 agent=self._agent,
-                late_accounting_sink=self._record_late_reference_accounting,
             )
             interrupted_any = any(
                 text == _INTERRUPTED_REFERENCE_NOTE
@@ -1878,17 +1838,13 @@ class MoAChatCompletions:
                         _ref_usage = _ref_usage + _acct.usage
                     if _acct.cost_usd is not None:
                         _ref_cost = (_ref_cost or 0) + _acct.cost_usd
-            with self._accounting_lock:
-                # Fold (don't overwrite): a late-completing interrupted
-                # reference from a PREVIOUS turn may have deposited its real
-                # spend here between consume() calls — keep it.
-                self._pending_reference_usage = (
-                    self._pending_reference_usage or CanonicalUsage()
-                ) + _ref_usage
-                if _ref_cost is not None:
-                    self._pending_reference_cost = (
-                        self._pending_reference_cost or 0
-                    ) + _ref_cost
+            self._pending_reference_usage = (
+                self._pending_reference_usage or CanonicalUsage()
+            ) + _ref_usage
+            if _ref_cost is not None:
+                self._pending_reference_cost = (
+                    self._pending_reference_cost or 0
+                ) + _ref_cost
             # Stash the full reference fan-out for trace persistence. The
             # aggregator input/label are filled in below once agg_messages is
             # built; the aggregator OUTPUT is stitched in by the caller

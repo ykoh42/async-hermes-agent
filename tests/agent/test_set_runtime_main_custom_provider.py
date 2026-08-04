@@ -7,14 +7,14 @@ import pytest
 from unittest.mock import AsyncMock, patch, MagicMock
 
 
-def _get_globals(mod):
-    """Read runtime globals without triggering redaction."""
+def _get_runtime(mod):
+    """Read the current task-local runtime without triggering redaction."""
     return {
-        "provider": mod._RUNTIME_MAIN_PROVIDER,
-        "model": mod._RUNTIME_MAIN_MODEL,
-        "base_url": mod._RUNTIME_MAIN_BASE_URL,
-        "cred": mod._RUNTIME_MAIN_API_KEY,  # renamed to avoid redaction
-        "api_mode": mod._RUNTIME_MAIN_API_MODE,
+        "provider": mod._runtime_main_value("provider"),
+        "model": mod._runtime_main_value("model"),
+        "base_url": mod._runtime_main_value("base_url"),
+        "cred": mod._runtime_main_value("api_key"),  # renamed to avoid redaction
+        "api_mode": mod._runtime_main_value("api_mode"),
     }
 
 
@@ -22,8 +22,8 @@ class TestSetRuntimeMainCustomProvider:
     """set_runtime_main must propagate base_url/api_key/api_mode for custom providers."""
 
 
-    def test_clear_resets_all_globals(self):
-        """clear_runtime_main resets all five globals to empty."""
+    def test_clear_resets_task_local_runtime(self):
+        """clear_runtime_main resets all task-local runtime fields."""
         import agent.auxiliary_client as mod
 
         mod.set_runtime_main(
@@ -33,13 +33,13 @@ class TestSetRuntimeMainCustomProvider:
             api_mode="chat_completions",
         )
         mod.clear_runtime_main()
-        g = _get_globals(mod)
+        g = _get_runtime(mod)
         for v in g.values():
             assert v == "", f"Expected empty, got {v!r}"
 
     @pytest.mark.asyncio
-    async def test_resolve_auto_uses_globals_for_custom_provider(self):
-        """_resolve_auto reads base_url/api_key from globals when main_runtime is None."""
+    async def test_resolve_auto_uses_context_for_custom_provider(self):
+        """_resolve_auto reads the bound runtime when main_runtime is None."""
         import agent.auxiliary_client as mod
 
         mod.clear_runtime_main()

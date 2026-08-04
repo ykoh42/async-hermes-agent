@@ -27,7 +27,6 @@ import inspect
 import json
 import logging
 import re
-import threading
 import time
 import uuid
 from datetime import datetime
@@ -420,7 +419,6 @@ def sanitize_tool_call_arguments(
 # named warning.  Process-local by design — same visibility scope as the
 # per-agent marker it extends.
 _INFLIGHT_TURNS_BY_SESSION: Dict[str, Tuple[str, float]] = {}
-_INFLIGHT_TURNS_LOCK = threading.Lock()
 
 
 def note_turn_start(agent, turn_id: str):
@@ -467,9 +465,8 @@ def note_turn_start(agent, turn_id: str):
     session_id = getattr(agent, "session_id", None)
     if session_id and not getattr(agent, "_persist_disabled", False):
         now = time.time()
-        with _INFLIGHT_TURNS_LOCK:
-            entry = _INFLIGHT_TURNS_BY_SESSION.get(session_id)
-            _INFLIGHT_TURNS_BY_SESSION[session_id] = (turn_id, now)
+        entry = _INFLIGHT_TURNS_BY_SESSION.get(session_id)
+        _INFLIGHT_TURNS_BY_SESSION[session_id] = (turn_id, now)
         # Stamp the session id this turn registered under: compression can
         # rotate agent.session_id mid-turn, and the persist-time clear must
         # pop the slot the turn actually holds, not the rotated id.
@@ -506,8 +503,7 @@ def note_turn_persisted(agent):
             agent, "session_id", None
         )
         if session_id:
-            with _INFLIGHT_TURNS_LOCK:
-                _INFLIGHT_TURNS_BY_SESSION.pop(session_id, None)
+            _INFLIGHT_TURNS_BY_SESSION.pop(session_id, None)
     agent._inflight_turn_session_id = None
 
 
@@ -3052,16 +3048,10 @@ def apply_pending_steer_to_tool_results(agent, messages: list, num_tool_msgs: in
         # No tool result in this batch (e.g. all skipped by interrupt);
         # put the steer back so the caller's fallback path can deliver
         # it as a normal next-turn user message.
-        _lock = getattr(agent, "_pending_steer_lock", None)
-        if _lock is not None:
-            with _lock:
-                if agent._pending_steer:
-                    agent._pending_steer = agent._pending_steer + "\n" + steer_text
-                else:
-                    agent._pending_steer = steer_text
-        else:
-            existing = getattr(agent, "_pending_steer", None)
-            agent._pending_steer = (existing + "\n" + steer_text) if existing else steer_text
+        existing = getattr(agent, "_pending_steer", None)
+        agent._pending_steer = (
+            existing + "\n" + steer_text if existing else steer_text
+        )
         return
     marker = format_steer_marker(steer_text)
     existing_content = messages[target_idx].get("content", "")

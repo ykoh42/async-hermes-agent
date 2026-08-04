@@ -1021,8 +1021,7 @@ moa:
 async def test_facade_does_not_cache_interrupted_reference_results(monkeypatch, tmp_path):
     """An interrupted fan-out is a partial snapshot — caching it would replay
     placeholder notes on every later iteration of the turn. The facade must
-    leave the cache empty so the next create() re-runs the references, and
-    a late-completing reference's real spend must land in pending usage."""
+    leave the cache empty so the next create() re-runs the references."""
     from agent import moa_loop
     from agent.usage_pricing import CanonicalUsage
 
@@ -1053,7 +1052,11 @@ moa:
         )
     ]
 
+    fanout_calls = 0
+
     async def fake_fanout(*args, **kwargs):
+        nonlocal fanout_calls
+        fanout_calls += 1
         return list(interrupted_outputs)
 
     monkeypatch.setattr(moa_loop, "_run_references_parallel", fake_fanout)
@@ -1074,18 +1077,14 @@ moa:
     assert facade._ref_cache_key is None
     assert facade._ref_cache_outputs == []
 
-    # A late completion depositing real spend is picked up by consume().
-    facade._record_late_reference_accounting(
-        "openrouter:advisor",
-        moa_loop._RefAccounting(CanonicalUsage(input_tokens=33), 0.42),
-    )
+    # Native tasks are cancelled and joined, so no detached completion can
+    # deposit usage after the turn returns.
     usage, cost = facade.consume_reference_usage()
-    assert usage.input_tokens == 33
-    assert cost == pytest.approx(0.42)
-    # And consume() drained it — no double count.
-    usage2, cost2 = facade.consume_reference_usage()
-    assert usage2.input_tokens == 0
-    assert cost2 is None
+    assert usage.input_tokens == 0
+    assert cost is None
+
+    await facade.create(messages=[{"role": "user", "content": "go"}], tools=[])
+    assert fanout_calls == 2
 
 
 class _CountingCtxLen:

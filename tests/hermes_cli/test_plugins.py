@@ -93,16 +93,19 @@ class TestPluginDiscovery:
     """Tests for plugin discovery from directories and entry points."""
 
 
-    def test_plugin_can_register_and_invoke_middleware(self, tmp_path, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_plugin_can_register_and_invoke_middleware(self, tmp_path, monkeypatch):
         plugins_dir = tmp_path / "hermes_test" / "plugins"
         _make_plugin_dir(
             plugins_dir,
             "mw_plugin",
             register_body=(
-                "ctx.register_middleware('llm_request', "
-                "lambda **kw: {'request': {**kw['request'], 'mw': True}})\n"
-                "ctx.register_middleware('tool_request', "
-                "lambda **kw: {'args': {**kw['args'], 'mw': True}})"
+                "async def llm_request(**kw):\n"
+                "    return {'request': {**kw['request'], 'mw': True}}\n"
+                "async def tool_request(**kw):\n"
+                "    return {'args': {**kw['args'], 'mw': True}}\n"
+                "ctx.register_middleware('llm_request', llm_request)\n"
+                "ctx.register_middleware('tool_request', tool_request)"
             ),
         )
         monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes_test"))
@@ -113,12 +116,13 @@ class TestPluginDiscovery:
         assert "llm_request" in VALID_MIDDLEWARE
         assert "tool_request" in VALID_MIDDLEWARE
         assert set(mgr._plugins["mw_plugin"].middleware_registered) == {"llm_request", "tool_request"}
-        assert mgr.invoke_middleware("llm_request", request={"messages": []}) == [
-            {"request": {"messages": [], "mw": True}}
-        ]
-        assert mgr.invoke_middleware("tool_request", args={"path": "README.md"}) == [
-            {"args": {"path": "README.md", "mw": True}}
-        ]
+        monkeypatch.setattr("hermes_cli.plugins._plugin_manager", mgr)
+        llm_result = await apply_llm_request_middleware({"messages": []})
+        tool_result = await apply_tool_request_middleware(
+            "read_file", {"path": "README.md"}
+        )
+        assert llm_result.payload == {"messages": [], "mw": True}
+        assert tool_result.payload == {"path": "README.md", "mw": True}
         assert mgr.has_middleware("llm_request") is True
 
 

@@ -37,7 +37,6 @@ import math
 import os
 import time
 import uuid
-import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -219,10 +218,10 @@ class CompressionCommitFence:
     """
 
     def __init__(self) -> None:
-        self._lock = threading.Lock()
+        self._lock = asyncio.Lock()
         self._cancelled = False
         self._commit_started = False
-        # Forward-progress telemetry: the compression worker touches this
+        # Forward-progress telemetry: the compression task touches this
         # whenever the streamed summary call produces a token (see
         # ContextCompressor._call_summary_llm). Waiters use it to distinguish
         # a SLOW-but-alive summary model from a HUNG one, so slow models are
@@ -232,9 +231,7 @@ class CompressionCommitFence:
     def touch_progress(self) -> None:
         """Record forward progress (e.g. a streamed summary token arriving).
 
-        Called from the compression worker thread; read by async waiters via
-        :meth:`seconds_since_progress`. A bare float store is atomic in
-        CPython, so no lock is needed.
+        Called and read on the owning event loop, with no await boundary.
         """
         self._last_progress = time.monotonic()
 
@@ -242,38 +239,22 @@ class CompressionCommitFence:
         """Seconds since the worker last reported forward progress."""
         return max(0.0, time.monotonic() - self._last_progress)
 
-    def cancel_before_commit(self) -> bool:
+    async def cancel_before_commit(self) -> bool:
         """Cancel a pending commit, or wait for an active commit to finish.
 
         Returns ``True`` when cancellation won before the commit boundary.
         Returns ``False`` when the worker had already entered the boundary; in
         that case acquiring this lock waits until all session mutation finishes.
         """
-        with self._lock:
+        async with self._lock:
             if self._commit_started:
                 return False
             self._cancelled = True
             return True
 
-    def try_cancel_before_commit(self) -> Optional[bool]:
-        """Non-blocking form of :meth:`cancel_before_commit`.
-
-        Returns ``None`` while an active commit owns the fence, allowing an
-        async caller to yield instead of blocking its event loop.
-        """
-        if not self._lock.acquire(blocking=False):
-            return None
-        try:
-            if self._commit_started:
-                return False
-            self._cancelled = True
-            return True
-        finally:
-            self._lock.release()
-
-    def begin_commit(self) -> bool:
+    async def begin_commit(self) -> bool:
         """Enter the commit boundary unless cancellation already won."""
-        self._lock.acquire()
+        await self._lock.acquire()
         if self._cancelled:
             self._lock.release()
             return False
@@ -527,20 +508,19 @@ async def recover_rotated_compression_session(
 
 
 def _compression_lock_holder(agent: Any) -> str:
-    """Build a unique holder id for the lock: pid:tid:agent-instance:uuid.
+    """Build a unique holder id for the lock: pid:task:agent-instance:uuid.
 
-    The pid+tid prefix lets ops tell crashed/abandoned holders apart from
+    The pid+task prefix lets ops tell crashed/abandoned holders apart from
     live ones (expiry-based recovery uses the timestamp, but ``holder``
     is what shows up in diagnostics + log lines). The agent instance id
-    and a per-acquire uuid disambiguate two co-resident agents on the
-    same thread (background_review forks run on a worker thread, but
-    on machines where compression itself dispatches to a thread pool
-    we want each acquire to be unique).
+    and a per-acquire uuid disambiguate co-resident agents and concurrent
+    tasks on the same event loop.
     """
-    import threading
+    task = asyncio.current_task()
+    task_name = task.get_name() if task is not None else "no-task"
     return (
         f"pid={os.getpid()}"
-        f":tid={threading.get_ident()}"
+        f":task={task_name}"
         f":agent={id(agent):x}"
         f":nonce={uuid.uuid4().hex[:8]}"
     )
@@ -1217,9 +1197,9 @@ async def compress_context(
             callers use the default ``False``.
         defer_context_engine_notification: Delay the existing context-engine
             hook until a manual host commits its outer history transaction.
-        commit_fence: Optional cooperative fence for executor callers that
-            may time out. It prevents a late worker from mutating session state
-            after its caller has moved on.
+        commit_fence: Optional cooperative async fence for callers that may
+            time out. It prevents cancellation from crossing an active durable
+            commit boundary.
 
     Returns:
         ``(compressed_messages, new_system_prompt)`` tuple.  When
@@ -1654,8 +1634,8 @@ async def compress_context(
         # ``commit_fence.seconds_since_progress()`` to extend their deadline
         # while tokens are moving — so a SLOW summary model is only killed
         # when it is actually silent, not merely thorough. The hook is
-        # thread-local and the compress call is synchronous on this thread,
-        # so it cannot leak into unrelated auxiliary calls.
+        # task-local and inherited only by child tasks, so it cannot leak into
+        # unrelated auxiliary calls.
         #
         # Fenceless callers (CLI /compress, in-loop auto-compress) install a
         # no-op hook: nobody polls their progress, but an ACTIVE hook is what
@@ -1781,7 +1761,7 @@ async def compress_context(
             return messages, _existing_sp
 
         if commit_fence is not None:
-            _commit_fence_entered = commit_fence.begin_commit()
+            _commit_fence_entered = await commit_fence.begin_commit()
             if not _commit_fence_entered:
                 logger.info(
                     "Compression commit cancelled before session mutation "

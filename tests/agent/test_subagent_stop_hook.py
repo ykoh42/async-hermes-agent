@@ -2,7 +2,7 @@
 
 Covers wire-up from tools.delegate_tool.delegate_task:
   * fires once per child in both single-task and batch modes
-  * runs on the parent thread (no re-entrancy for hook authors)
+  * runs in the parent task (no detached hook work)
   * carries child_role when the agent exposes _delegate_role
   * carries child_role=None when _delegate_role is not set (pre-M3)
   * exposes a detached, metadata-only tool_call_history
@@ -11,7 +11,7 @@ Covers wire-up from tools.delegate_tool.delegate_task:
 from __future__ import annotations
 
 import json
-import threading
+import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -38,7 +38,6 @@ def _make_parent(depth: int = 0, session_id: str = "parent-1"):
     parent._session_db = None
     parent._delegate_depth = depth
     parent._active_children = []
-    parent._active_children_lock = threading.Lock()
     parent._print_fn = None
     parent.tool_progress_callback = None
     parent.thinking_callback = None
@@ -76,7 +75,7 @@ def _register_capturing_hook():
     captured = []
 
     async def _cb(**kwargs):
-        kwargs["_thread"] = threading.current_thread()
+        kwargs["_task"] = asyncio.current_task()
         captured.append(kwargs)
 
     mgr = plugins.get_plugin_manager()
@@ -111,9 +110,9 @@ class TestSingleTask:
         assert payload["child_summary"] == "Done!"
         assert payload["duration_ms"] == 5000
 
-    async def test_fires_on_parent_thread(self):
+    async def test_fires_in_parent_task(self):
         captured = _register_capturing_hook()
-        main_thread = threading.current_thread()
+        parent_task = asyncio.current_task()
 
         with patch(
             "tools.delegate_tool._run_single_child", new_callable=AsyncMock
@@ -125,7 +124,7 @@ class TestSingleTask:
             }
             await delegate_task(goal="go", parent_agent=_make_parent())
 
-        assert captured[0]["_thread"] is main_thread
+        assert captured[0]["_task"] is parent_task
 
     async def test_payload_includes_parent_session_id(self):
         captured = _register_capturing_hook()
@@ -178,9 +177,9 @@ class TestBatchMode:
         roles = sorted(c["child_role"] for c in captured)
         assert roles == ["role-a", "role-b", "role-c"]
 
-    async def test_all_fires_on_parent_thread(self):
+    async def test_all_fire_in_parent_task(self):
         captured = _register_capturing_hook()
-        main_thread = threading.current_thread()
+        parent_task = asyncio.current_task()
 
         with patch(
             "tools.delegate_tool._run_single_child", new_callable=AsyncMock
@@ -199,7 +198,7 @@ class TestBatchMode:
             )
 
         for payload in captured:
-            assert payload["_thread"] is main_thread
+            assert payload["_task"] is parent_task
 
 
 # ── payload shape ─────────────────────────────────────────────────────────
