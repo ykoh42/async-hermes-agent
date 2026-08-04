@@ -2298,6 +2298,20 @@ async def invoke_tool(
             f"Tool '{function_name}' has no native async handler. "
             "The async agent does not execute sync tools on a worker thread."
         )
+    handler_context = {}
+    if function_name == "memory":
+        handler_context["store"] = getattr(agent, "_memory_store", None)
+    elif function_name == "todo":
+        handler_context["store"] = getattr(agent, "_todo_store", None)
+    elif function_name == "session_search":
+        handler_context["db"] = getattr(agent, "_session_db", None)
+        handler_context["current_session_id"] = getattr(agent, "session_id", None)
+    elif function_name == "clarify":
+        handler_context["callback"] = getattr(agent, "clarify_callback", None)
+    elif function_name == "read_terminal":
+        handler_context["callback"] = getattr(
+            agent, "read_terminal_callback", None
+        )
     result = await handle_function_call(
         function_name,
         function_args,
@@ -2305,6 +2319,7 @@ async def invoke_tool(
         session_id=getattr(agent, "session_id", "") or "",
         user_task=getattr(agent, "_current_user_task", None),
         enabled_tools=list(getattr(agent, "valid_tool_names", None) or []) or None,
+        **handler_context,
     )
     return result if isinstance(result, str) else json.dumps(result, ensure_ascii=False)
 

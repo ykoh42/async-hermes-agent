@@ -371,11 +371,6 @@ def _resolve_active_context_length() -> int:
 # handle_function_call  (the main dispatcher)
 # =============================================================================
 
-# Tools whose execution is intercepted by the agent loop (run_agent.py)
-# because they need agent-level state (TodoStore, MemoryStore, etc.).
-# The registry still holds their schemas; dispatch just returns a stub error
-# so if something slips through, the LLM sees a sensible message.
-_AGENT_LOOP_TOOLS = {"todo", "memory", "session_search"}
 _READ_SEARCH_TOOLS = {"read_file", "search_files"}
 
 
@@ -853,9 +848,6 @@ async def handle_function_call(
         if isinstance(request_result.original_payload, dict):
             original_args = request_result.original_payload
         middleware_trace = list(request_result.trace)
-
-    if function_name in _AGENT_LOOP_TOOLS:
-        return tool_error(f"{function_name} must be handled by the agent loop")
 
     if not skip_pre_tool_call_hook:
         from hermes_cli.plugins import resolve_pre_tool_block

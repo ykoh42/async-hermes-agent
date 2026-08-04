@@ -1499,6 +1499,25 @@ async def test_close_is_awaitable_and_idempotent():
 
 
 @pytest.mark.asyncio
+async def test_close_releases_retained_mcp_lifecycle(monkeypatch):
+    from tools import mcp_tool
+
+    agent = AIAgent.__new__(AIAgent)
+    agent._mcp_lifecycle_retained = True
+    released = []
+
+    async def release(owner):
+        released.append(owner)
+
+    monkeypatch.setattr(mcp_tool, "release_mcp_lifecycle", release)
+
+    await agent.close()
+
+    assert released == [agent]
+    assert agent._mcp_lifecycle_retained is False
+
+
+@pytest.mark.asyncio
 async def test_close_awaits_the_native_primary_client():
     """The async lifecycle closes the primary transport directly."""
     agent = AIAgent.__new__(AIAgent)

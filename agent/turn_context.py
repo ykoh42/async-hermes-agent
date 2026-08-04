@@ -423,10 +423,13 @@ async def build_turn_context(
                 discover_mcp_tools,
                 has_registered_mcp_tools,
                 refresh_agent_mcp_tools,
+                retain_mcp_lifecycle,
             )
 
             if not getattr(agent, "_mcp_discovery_started", False):
                 agent._mcp_discovery_started = True
+                await retain_mcp_lifecycle(agent)
+                agent._mcp_lifecycle_retained = True
                 await discover_mcp_tools()
             if (
                 not getattr(agent, "_tool_snapshot_initialized", False)

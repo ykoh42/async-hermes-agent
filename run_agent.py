@@ -3739,6 +3739,20 @@ class AIAgent:
                 setattr(self, attribute, None)
         self._anthropic_client_source = None
 
+        # MCP transports are shared by agents on this async runtime. Release
+        # this instance's lease and close them only after the final consumer.
+        if getattr(self, "_mcp_lifecycle_retained", False):
+            try:
+                from tools.mcp_tool import release_mcp_lifecycle
+
+                await release_mcp_lifecycle(self)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.debug("MCP lifecycle release failed", exc_info=True)
+            else:
+                self._mcp_lifecycle_retained = False
+
         # 7. Free conversation history.  Mirrors _release_evicted_agent_soft's
         # soft-eviction clear — close() is the hard teardown for true session
         # boundaries (/new, /reset, session expiry), so the message list won't

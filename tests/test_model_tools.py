@@ -9,10 +9,10 @@ from model_tools import (
     handle_function_call,
     get_all_tool_names,
     get_toolset_for_tool,
-    _AGENT_LOOP_TOOLS,
     _LEGACY_TOOLSET_MAP,
     TOOL_TO_TOOLSET_MAP,
 )
+from tools.todo_tool import TodoStore
 
 
 # =========================================================================
@@ -21,11 +21,32 @@ from model_tools import (
 
 class TestHandleFunctionCall:
     @pytest.mark.asyncio
-    async def test_agent_loop_tool_returns_error(self):
-        for tool_name in _AGENT_LOOP_TOOLS:
-            result = json.loads(await handle_function_call(tool_name, {}))
-            assert "error" in result
-            assert "agent loop" in result["error"].lower()
+    async def test_stateful_tool_dispatches_with_agent_context(self):
+        store = TodoStore()
+        result = json.loads(
+            await handle_function_call(
+                "todo",
+                {
+                    "todos": [
+                        {
+                            "id": "live-check",
+                            "content": "Native async dispatch",
+                            "status": "completed",
+                        }
+                    ]
+                },
+                store=store,
+            )
+        )
+
+        assert result["todos"] == [
+            {
+                "id": "live-check",
+                "content": "Native async dispatch",
+                "status": "completed",
+            }
+        ]
+        assert result["summary"]["completed"] == 1
 
     @pytest.mark.asyncio
     async def test_unknown_tool_returns_error(self):
@@ -120,22 +141,6 @@ class TestHandleFunctionCall:
         post_call = next(call for call in hook_calls if call[0] == "post_tool_call")
         assert pre_call[1]["middleware_trace"] == expected_trace
         assert post_call[1]["middleware_trace"] == expected_trace
-
-
-# =========================================================================
-# Agent loop tools
-# =========================================================================
-
-class TestAgentLoopTools:
-    def test_expected_tools_in_set(self):
-        assert "todo" in _AGENT_LOOP_TOOLS
-        assert "memory" in _AGENT_LOOP_TOOLS
-        assert "session_search" in _AGENT_LOOP_TOOLS
-        assert "delegate_task" not in _AGENT_LOOP_TOOLS
-
-    def test_no_regular_tools_in_set(self):
-        assert "web_search" not in _AGENT_LOOP_TOOLS
-        assert "terminal" not in _AGENT_LOOP_TOOLS
 
 
 # =========================================================================

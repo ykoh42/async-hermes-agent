@@ -48,3 +48,34 @@ async def test_mcp_tool_uses_async_cross_loop_bridge(monkeypatch):
     result = await handler({"value": "hello"})
 
     assert result == '{"result": "ok:hello"}'
+
+
+@pytest.mark.asyncio
+async def test_mcp_lifecycle_stops_after_last_agent_releases(monkeypatch):
+    class Owner:
+        pass
+
+    first = Owner()
+    second = Owner()
+    shutdown_calls = 0
+
+    async def shutdown():
+        nonlocal shutdown_calls
+        shutdown_calls += 1
+
+    monkeypatch.setattr(mcp_tool, "shutdown_mcp_servers", shutdown)
+    mcp_tool._mcp_lifecycle_consumers.clear()
+    try:
+        await mcp_tool.retain_mcp_lifecycle(first)
+        await mcp_tool.retain_mcp_lifecycle(second)
+
+        await mcp_tool.release_mcp_lifecycle(first)
+        assert shutdown_calls == 0
+
+        await mcp_tool.release_mcp_lifecycle(second)
+        assert shutdown_calls == 1
+
+        await mcp_tool.release_mcp_lifecycle(second)
+        assert shutdown_calls == 1
+    finally:
+        mcp_tool._mcp_lifecycle_consumers.clear()

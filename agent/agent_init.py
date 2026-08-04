@@ -1641,6 +1641,7 @@ def init_agent(
     # construction state-only; ``build_turn_context`` performs the native
     # async discovery before the first tool snapshot is sent to the model.
     agent._mcp_discovery_started = False
+    agent._mcp_lifecycle_retained = False
 
     # Build a static schema snapshot without running availability probes or
     # reading configuration. MCP transport discovery remains deferred.

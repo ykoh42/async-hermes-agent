@@ -97,6 +97,7 @@ import shutil
 import sys
 import threading
 import time
+import weakref
 from types import SimpleNamespace
 from typing import Callable
 from datetime import datetime
@@ -3462,6 +3463,8 @@ class MCPServerTask:
 _servers: Dict[str, MCPServerTask] = {}
 _server_connecting: set[str] = set()
 _server_connect_errors: Dict[str, str] = {}
+_mcp_lifecycle_consumers: weakref.WeakSet[object] = weakref.WeakSet()
+_mcp_lifecycle_lock = asyncio.Lock()
 # Discovery installs a task-local claim before calling ``_connect_server`` so
 # it can retain a recoverable parked task without making standalone probe calls
 # publish failed servers into module-global ownership.
@@ -6092,6 +6095,22 @@ async def shutdown_mcp_servers() -> None:
             _parallel_safe_servers.clear()
             _mcp_tool_server_names.clear()
         await _kill_orphaned_mcp_children(include_active=True)
+
+
+async def retain_mcp_lifecycle(owner: object) -> None:
+    """Keep shared MCP transports alive while an agent can use them."""
+    async with _mcp_lifecycle_lock:
+        _mcp_lifecycle_consumers.add(owner)
+
+
+async def release_mcp_lifecycle(owner: object) -> None:
+    """Release an agent's MCP lease and stop transports after the last user."""
+    async with _mcp_lifecycle_lock:
+        if owner not in _mcp_lifecycle_consumers:
+            return
+        _mcp_lifecycle_consumers.remove(owner)
+        if not _mcp_lifecycle_consumers:
+            await shutdown_mcp_servers()
 
 
 
