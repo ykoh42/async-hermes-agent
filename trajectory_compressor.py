@@ -383,46 +383,44 @@ class TrajectoryCompressor:
             self._llm_provider = provider
             self._use_call_llm = True
             self.client = None
-            self.async_client = None
         else:
-            # Custom endpoint — retain only async client construction metadata.
+            # Custom endpoint — retain only lazy client construction metadata.
             self._use_call_llm = False
             api_key = os.getenv(self.config.api_key_env)
             if not api_key:
                 raise RuntimeError(
                     f"Missing API key. Set {self.config.api_key_env} "
                     f"environment variable.")
-            self.client = None
-            # AsyncOpenAI is created lazily in _get_async_client() so it
+            # AsyncOpenAI is created lazily in _get_client() so it
             # binds to the current event loop — avoids "Event loop is closed"
             # when process_directory() is called multiple times (each call
             # creates a new loop via asyncio.run()).
-            self.async_client = None
-            self._async_client_api_key = api_key
+            self.client = None
+            self._client_api_key = api_key
 
         print(f"✅ Initialized summarizer client: {self.config.summarization_model}")
         print(f"   Max concurrent requests: {self.config.max_concurrent_requests}")
 
-    def _get_async_client(self):
+    def _get_client(self):
         """Return an AsyncOpenAI client bound to the current event loop.
 
         Created lazily and reused for this compressor lifecycle.
         """
-        if self.async_client is not None:
-            return self.async_client
+        if self.client is not None:
+            return self.client
         from openai import AsyncOpenAI
         from agent.auxiliary_client import _to_openai_base_url
 
-        self.async_client = AsyncOpenAI(
-            api_key=self._async_client_api_key,
+        self.client = AsyncOpenAI(
+            api_key=self._client_api_key,
             base_url=_to_openai_base_url(self.config.base_url),
         )
-        return self.async_client
+        return self.client
 
     async def close(self) -> None:
         """Close the owned summarization transport, if one was created."""
-        client = self.async_client
-        self.async_client = None
+        client = self.client
+        self.client = None
         if client is not None:
             await client.close()
 
@@ -605,7 +603,7 @@ class TrajectoryCompressor:
     
     async def _generate_summary(self, content: str, metrics: TrajectoryMetrics) -> str:
         """
-        Generate a summary of the compressed turns using OpenRouter (async version).
+        Generate a summary of the compressed turns.
         
         Args:
             content: The content to summarize
@@ -657,7 +655,7 @@ Write only the summary, starting with "[CONTEXT SUMMARY]:" prefix."""
                     }
                     if summary_temperature is not None:
                         _create_kwargs["temperature"] = summary_temperature
-                    response = await self._get_async_client().chat.completions.create(**_create_kwargs)
+                    response = await self._get_client().chat.completions.create(**_create_kwargs)
                 
                 summary = self._coerce_summary_content(response.choices[0].message.content)
                 return self._ensure_summary_prefix(summary)
@@ -677,9 +675,7 @@ Write only the summary, starting with "[CONTEXT SUMMARY]:" prefix."""
         trajectory: List[Dict[str, str]]
     ) -> Tuple[List[Dict[str, str]], TrajectoryMetrics]:
         """
-        Compress a single trajectory to fit within target token budget (async version).
-        
-        Same algorithm as compress_trajectory but uses async API calls for summarization.
+        Compress a single trajectory to fit within the target token budget.
         """
         metrics = TrajectoryMetrics()
         metrics.original_turns = len(trajectory)
@@ -800,7 +796,7 @@ Write only the summary, starting with "[CONTEXT SUMMARY]:" prefix."""
     
     async def process_entry(self, entry: Dict[str, Any]) -> Tuple[Dict[str, Any], TrajectoryMetrics]:
         """
-        Process a single JSONL entry (async version).
+        Process a single JSONL entry.
         """
         if "conversations" not in entry:
             metrics = TrajectoryMetrics()

@@ -6,7 +6,7 @@ creates and closes a fresh event loop — the client's internal httpx
 transport remains bound to the now-closed loop. A second call to
 process_directory() would fail with "Event loop is closed".
 
-The fix creates the AsyncOpenAI client lazily via _get_async_client() so
+The fix creates the AsyncOpenAI client lazily via _get_client() so
 each asyncio.run() gets a client bound to the current loop.
 """
 
@@ -17,10 +17,10 @@ import pytest
 
 
 class TestAsyncClientLazyCreation:
-    """trajectory_compressor.py — _get_async_client()"""
+    """trajectory_compressor.py — lazy native-async client ownership."""
 
-    def test_async_client_none_after_init(self):
-        """async_client should be None after __init__ (not eagerly created)."""
+    def test_client_none_after_init(self):
+        """client should be None after __init__ (not eagerly created)."""
         from trajectory_compressor import TrajectoryCompressor
 
         comp = TrajectoryCompressor.__new__(TrajectoryCompressor)
@@ -28,40 +28,40 @@ class TestAsyncClientLazyCreation:
         comp.config.base_url = "https://api.example.com/v1"
         comp.config.api_key_env = "TEST_API_KEY"
         comp._use_call_llm = False
-        comp.async_client = None
-        comp._async_client_api_key = "test-key"
+        comp.client = None
+        comp._client_api_key = "test-key"
 
-        assert comp.async_client is None
+        assert comp.client is None
 
-    def test_get_async_client_creates_new_client(self):
-        """_get_async_client() should create a fresh AsyncOpenAI instance."""
+    def test_get_client_creates_new_client(self):
+        """_get_client() should create a fresh AsyncOpenAI instance."""
         from trajectory_compressor import TrajectoryCompressor
 
         comp = TrajectoryCompressor.__new__(TrajectoryCompressor)
         comp.config = MagicMock()
         comp.config.base_url = "https://api.example.com/v1"
-        comp._async_client_api_key = "test-key"
-        comp.async_client = None
+        comp._client_api_key = "test-key"
+        comp.client = None
 
         mock_async_openai = MagicMock()
         with patch("openai.AsyncOpenAI", mock_async_openai):
-            client = comp._get_async_client()
+            client = comp._get_client()
 
         mock_async_openai.assert_called_once_with(
             api_key="test-key",
             base_url="https://api.example.com/v1",
         )
-        assert comp.async_client is not None
+        assert comp.client is not None
 
-    def test_get_async_client_reuses_owned_client(self):
+    def test_get_client_reuses_owned_client(self):
         """One compressor lifecycle reuses one event-loop-bound client."""
         from trajectory_compressor import TrajectoryCompressor
 
         comp = TrajectoryCompressor.__new__(TrajectoryCompressor)
         comp.config = MagicMock()
         comp.config.base_url = "https://api.example.com/v1"
-        comp._async_client_api_key = "test-key"
-        comp.async_client = None
+        comp._client_api_key = "test-key"
+        comp.client = None
 
         call_count = 0
         instances = []
@@ -74,8 +74,8 @@ class TestAsyncClientLazyCreation:
             return instance
 
         with patch("openai.AsyncOpenAI", side_effect=mock_constructor):
-            client1 = comp._get_async_client()
-            client2 = comp._get_async_client()
+            client1 = comp._get_client()
+            client2 = comp._get_client()
 
         assert call_count == 1
         assert client1 is client2 is instances[0]
@@ -86,12 +86,12 @@ class TestAsyncClientLazyCreation:
 
         comp = TrajectoryCompressor.__new__(TrajectoryCompressor)
         client = MagicMock(close=AsyncMock())
-        comp.async_client = client
+        comp.client = client
 
         await comp.close()
 
         client.close.assert_awaited_once_with()
-        assert comp.async_client is None
+        assert comp.client is None
 
 
 class TestSourceLineVerification:
@@ -107,23 +107,21 @@ class TestSourceLineVerification:
     def test_no_eager_async_openai_in_init(self):
         """__init__ should NOT create AsyncOpenAI eagerly."""
         src = self._read_file()
-        # The old pattern: self.async_client = AsyncOpenAI(...) in _init_summarizer
-        # should not exist — only self.async_client = None
+        # AsyncOpenAI construction must remain inside the lazy accessor.
         lines = src.split("\n")
         for i, line in enumerate(lines, 1):
-            if "self.async_client = AsyncOpenAI(" in line and "_get_async_client" not in lines[max(0,i-3):i+1]:
-                # Allow it inside _get_async_client method
-                # Check if we're inside _get_async_client by looking at context
+            if "self.client = AsyncOpenAI(" in line and "_get_client" not in lines[max(0,i-3):i+1]:
+                # Check if we're inside _get_client by looking at context
                 context = "\n".join(lines[max(0,i-20):i+1])
-                if "_get_async_client" not in context:
+                if "_get_client" not in context:
                     pytest.fail(
-                        f"Line {i}: AsyncOpenAI created eagerly outside _get_async_client()"
+                        f"Line {i}: AsyncOpenAI created eagerly outside _get_client()"
                     )
 
-    def test_get_async_client_method_exists(self):
-        """_get_async_client method should exist."""
+    def test_get_client_method_exists(self):
+        """The lazy client accessor should exist."""
         src = self._read_file()
-        assert "def _get_async_client(self)" in src
+        assert "def _get_client(self)" in src
 
 
 @pytest.mark.asyncio
@@ -142,10 +140,10 @@ async def test_generate_summary_async_kimi_omits_temperature():
     compressor.logger = MagicMock()
     compressor._use_call_llm = False
     async_client = MagicMock()
-    async_client.chat.completions.create = MagicMock(return_value=SimpleNamespace(
+    async_client.chat.completions.create = AsyncMock(return_value=SimpleNamespace(
         choices=[SimpleNamespace(message=SimpleNamespace(content="[CONTEXT SUMMARY]: summary"))]
     ))
-    compressor._get_async_client = MagicMock(return_value=async_client)
+    compressor._get_client = MagicMock(return_value=async_client)
 
     metrics = TrajectoryMetrics()
     result = await compressor._generate_summary("tool output", metrics)
@@ -171,10 +169,10 @@ async def test_generate_summary_async_public_moonshot_kimi_k2_5_omits_temperatur
     compressor.logger = MagicMock()
     compressor._use_call_llm = False
     async_client = MagicMock()
-    async_client.chat.completions.create = MagicMock(return_value=SimpleNamespace(
+    async_client.chat.completions.create = AsyncMock(return_value=SimpleNamespace(
         choices=[SimpleNamespace(message=SimpleNamespace(content="[CONTEXT SUMMARY]: summary"))]
     ))
-    compressor._get_async_client = MagicMock(return_value=async_client)
+    compressor._get_client = MagicMock(return_value=async_client)
 
     metrics = TrajectoryMetrics()
     result = await compressor._generate_summary("tool output", metrics)
@@ -200,10 +198,10 @@ async def test_generate_summary_async_public_moonshot_cn_kimi_k2_5_omits_tempera
     compressor.logger = MagicMock()
     compressor._use_call_llm = False
     async_client = MagicMock()
-    async_client.chat.completions.create = MagicMock(return_value=SimpleNamespace(
+    async_client.chat.completions.create = AsyncMock(return_value=SimpleNamespace(
         choices=[SimpleNamespace(message=SimpleNamespace(content="[CONTEXT SUMMARY]: summary"))]
     ))
-    compressor._get_async_client = MagicMock(return_value=async_client)
+    compressor._get_client = MagicMock(return_value=async_client)
 
     metrics = TrajectoryMetrics()
     result = await compressor._generate_summary("tool output", metrics)
