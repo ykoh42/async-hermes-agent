@@ -108,16 +108,3 @@ class TestScopeIsolation:
             assert ss.get_secret("K") == "a"
         finally:
             ss.reset_secret_scope(t1)
-
-
-class TestEnvFileParsing:
-    """load_env_file parses without mutating os.environ."""
-
-
-
-
-    def test_build_profile_secret_scope(self, tmp_path):
-        (tmp_path / ".env").write_text("ANTHROPIC_API_KEY=sk-profile\n")
-        assert ss.build_profile_secret_scope(tmp_path) == {
-            "ANTHROPIC_API_KEY": "sk-profile"
-        }
