@@ -11,7 +11,7 @@ Defense against context-window overflow operates at three levels:
    (registry.get_max_result_size), the full output is written INTO THE
    SANDBOX temp dir (for example /tmp/hermes-results/{tool_use_id}.txt on
    standard Linux, or $TMPDIR/hermes-results/{tool_use_id}.txt on Termux)
-   via the environment's native ``execute_async()`` method. The in-context
+   via the environment's native ``execute()`` coroutine. The in-context
    content is replaced with a preview +
    file path reference. The model can read_file to access the full output
    on any backend.
@@ -24,11 +24,11 @@ Defense against context-window overflow operates at three levels:
 """
 
 import hashlib
+import inspect
 import logging
 import os
 import re
 import shlex
-import uuid
 
 from tools.budget_config import (
     DEFAULT_PREVIEW_SIZE_CHARS,
@@ -40,7 +40,6 @@ logger = logging.getLogger(__name__)
 PERSISTED_OUTPUT_TAG = "<persisted-output>"
 PERSISTED_OUTPUT_CLOSING_TAG = "</persisted-output>"
 STORAGE_DIR = "/tmp/hermes-results"
-HEREDOC_MARKER = "HERMES_PERSIST_EOF"
 _BUDGET_TOOL_NAME = "__budget_enforcement__"
 _UNSAFE_RESULT_FILENAME_CHARS = re.compile(r"[^A-Za-z0-9_.-]+")
 _MAX_RESULT_FILENAME_STEM = 120
@@ -91,13 +90,6 @@ def generate_preview(content: str, max_chars: int = DEFAULT_PREVIEW_SIZE_CHARS) 
     return truncated, True
 
 
-def _heredoc_marker(content: str) -> str:
-    """Return a heredoc delimiter that doesn't collide with content."""
-    if HEREDOC_MARKER not in content:
-        return HEREDOC_MARKER
-    return f"HERMES_PERSIST_{uuid.uuid4().hex[:8]}"
-
-
 async def _write_to_sandbox(content: str, remote_path: str, env) -> bool:
     """Write content through a native async environment transport.
 
@@ -113,10 +105,10 @@ async def _write_to_sandbox(content: str, remote_path: str, env) -> bool:
     """
     storage_dir = os.path.dirname(remote_path)
     cmd = f"mkdir -p {shlex.quote(storage_dir)} && cat > {shlex.quote(remote_path)}"
-    execute_async = getattr(env, "execute_async", None)
-    if not callable(execute_async):
+    execute = getattr(env, "execute", None)
+    if not callable(execute) or not inspect.iscoroutinefunction(execute):
         return False
-    result = await execute_async(cmd, timeout=30, stdin_data=content)
+    result = await execute(cmd, timeout=30, stdin_data=content)
     return result.get("returncode", 1) == 0
 
 
@@ -155,8 +147,7 @@ async def maybe_persist_tool_result(
 ) -> str:
     """Layer 2: persist oversized result into the sandbox, return preview + path.
 
-    Writes via env.execute() so the file is accessible from any backend
-    (local, Docker, SSH, Modal, Daytona). Falls back to inline truncation
+    Writes via the native async ``env.execute()`` contract. Falls back to inline truncation
     if write fails or no env is available.
 
     Args:

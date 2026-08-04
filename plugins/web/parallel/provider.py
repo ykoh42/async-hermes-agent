@@ -1,15 +1,7 @@
 """Parallel.ai web search + content extraction — plugin form.
 
-Subclasses :class:`agent.web_search_provider.WebSearchProvider`. Uses two
-distinct Parallel SDK clients:
-
-- ``Parallel`` (sync)        — for :meth:`search`
-- ``AsyncParallel`` (async)  — for :meth:`extract`
-
-This is the first plugin to exercise the **async-extract** code path in
-the ABC: :meth:`extract` is declared ``async def``, and the dispatcher
-in :func:`tools.web_tools.web_extract_tool` detects coroutines via
-:func:`inspect.iscoroutinefunction` and awaits.
+Subclasses :class:`agent.web_search_provider.WebSearchProvider` and uses the
+native ``AsyncParallel`` SDK client for both search and extraction.
 
 Config keys this provider responds to::
 
@@ -36,55 +28,11 @@ from agent.web_search_provider import WebSearchProvider
 
 logger = logging.getLogger(__name__)
 
-# Module-level note: the canonical cache slots ``_parallel_client`` and
-# ``_async_parallel_client`` live on :mod:`tools.web_tools` so tests that do
-# ``tools.web_tools._parallel_client = None`` between cases see fresh state.
-# The plugin reads/writes through that public module (see
-# :func:`_get_sync_client` / :func:`_get_async_client`).
-
-
-def _get_sync_client() -> Any:
-    """Lazy-load + cache the sync Parallel client.
-
-    Cache lives on :mod:`tools.web_tools` (as ``_parallel_client``) so unit
-    tests that reset that name between cases keep working.
-    """
+def _get_parallel_client() -> Any:
+    """Lazy-load and cache the native async Parallel client."""
     import tools.web_tools as _wt
 
     cached = getattr(_wt, "_parallel_client", None)
-    if cached is not None:
-        return cached
-
-    from agent.web_search_provider import get_provider_env
-
-    api_key = get_provider_env("PARALLEL_API_KEY")
-    if not api_key:
-        raise ValueError(
-            "PARALLEL_API_KEY environment variable not set. "
-            "Get your API key at https://parallel.ai"
-        )
-
-    try:
-        from parallel import Parallel  # noqa: WPS433 — deliberately lazy
-    except ImportError as exc:
-        raise ImportError(
-            "The optional Parallel SDK is not installed. "
-            "Install async-hermes-agent[parallel-web]."
-        ) from exc
-
-    client = Parallel(api_key=api_key)
-    _wt._parallel_client = client
-    return client
-
-
-def _get_async_client() -> Any:
-    """Lazy-load + cache the async Parallel client.
-
-    Cache lives on :mod:`tools.web_tools` (as ``_async_parallel_client``).
-    """
-    import tools.web_tools as _wt
-
-    cached = getattr(_wt, "_async_parallel_client", None)
     if cached is not None:
         return cached
 
@@ -106,26 +54,15 @@ def _get_async_client() -> Any:
         ) from exc
 
     client = AsyncParallel(api_key=api_key)
-    _wt._async_parallel_client = client
+    _wt._parallel_client = client
     return client
 
 
 def _reset_clients_for_tests() -> None:
-    """Drop both cached clients so tests can re-instantiate cleanly.
-
-    Clears the canonical slots on :mod:`tools.web_tools` (where
-    :func:`_get_sync_client` / :func:`_get_async_client` read/write them).
-    """
+    """Drop the cached client so tests can re-instantiate cleanly."""
     import tools.web_tools as _wt
 
     _wt._parallel_client = None
-    _wt._async_parallel_client = None
-
-
-# Backward-compatible aliases for the names that lived in tools.web_tools
-# before the migration (matches existing tests + external callers).
-_get_parallel_client = _get_sync_client
-_get_async_parallel_client = _get_async_client
 
 
 def _resolve_search_mode() -> str:
@@ -176,7 +113,7 @@ class ParallelWebSearchProvider(WebSearchProvider):
             logger.info(
                 "Parallel search: '%s' (mode=%s, limit=%d)", query, mode, limit
             )
-            response = await _get_async_client().beta.search(
+            response = await _get_parallel_client().beta.search(
                 search_queries=[query],
                 objective=query,
                 mode=mode,
@@ -226,7 +163,7 @@ class ParallelWebSearchProvider(WebSearchProvider):
                 ]
 
             logger.info("Parallel extract: %d URL(s)", len(urls))
-            response = await _get_async_client().beta.extract(
+            response = await _get_parallel_client().beta.extract(
                 urls=urls,
                 full_content=True,
             )

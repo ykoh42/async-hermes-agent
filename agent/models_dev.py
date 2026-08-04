@@ -40,7 +40,7 @@ _MODELS_DEV_RETRY_DELAY = 300  # 5 minutes after a failed refresh
 _models_dev_cache: Dict[str, Any] = {}
 _models_dev_cache_time: float = 0
 _models_dev_retry_after: float = 0
-_models_dev_async_lock: Optional[asyncio.Lock] = None
+_models_dev_lock: Optional[asyncio.Lock] = None
 
 
 # ---------------------------------------------------------------------------
@@ -337,7 +337,7 @@ async def fetch_models_dev(
     effect of a request.
     """
     global _models_dev_cache, _models_dev_cache_time, _models_dev_retry_after
-    global _models_dev_async_lock
+    global _models_dev_lock
 
     if (
         not force_refresh
@@ -346,10 +346,10 @@ async def fetch_models_dev(
     ):
         return _models_dev_cache
 
-    if _models_dev_async_lock is None:
-        _models_dev_async_lock = asyncio.Lock()
+    if _models_dev_lock is None:
+        _models_dev_lock = asyncio.Lock()
 
-    async with _models_dev_async_lock:
+    async with _models_dev_lock:
         if (
             not force_refresh
             and _models_dev_cache

@@ -80,7 +80,7 @@ async def test_search_clamps_limit_before_async_provider_call(monkeypatch):
     )
     monkeypatch.setattr("tools.interrupt.is_interrupted", lambda: False)
     monkeypatch.setattr(web_tools._debug, "log_call", lambda *_args: None)
-    monkeypatch.setattr(web_tools._debug, "save", lambda: None)
+    monkeypatch.setattr(web_tools._debug, "save", AsyncMock())
 
     result = json.loads(await web_tools.web_search_tool("docs", limit=500))
 
@@ -100,7 +100,7 @@ async def test_sync_provider_fails_fast(monkeypatch):
     )
     monkeypatch.setattr("tools.interrupt.is_interrupted", lambda: False)
     monkeypatch.setattr(web_tools._debug, "log_call", lambda *_args: None)
-    monkeypatch.setattr(web_tools._debug, "save", lambda: None)
+    monkeypatch.setattr(web_tools._debug, "save", AsyncMock())
 
     result = json.loads(await web_tools.web_search_tool("docs"))
 
@@ -119,7 +119,7 @@ async def test_provider_error_does_not_leak_traceback(monkeypatch):
     )
     monkeypatch.setattr("tools.interrupt.is_interrupted", lambda: False)
     monkeypatch.setattr(web_tools._debug, "log_call", lambda *_args: None)
-    monkeypatch.setattr(web_tools._debug, "save", lambda: None)
+    monkeypatch.setattr(web_tools._debug, "save", AsyncMock())
 
     result = json.loads(await web_tools.web_search_tool("docs"))
 

@@ -109,6 +109,7 @@ import aiofiles.os
 from tools.registry import tool_error
 
 logger = logging.getLogger(__name__)
+_which = aiofiles.os.wrap(shutil.which)
 
 # Upper bound for the OSV malware preflight during stdio MCP startup. The
 # check makes a blocking urllib HTTPS call whose own timeout can fail to
@@ -664,9 +665,7 @@ async def _resolve_stdio_command(command: str, env: dict) -> tuple[str, dict]:
 
     if os.sep not in resolved_command:
         path_arg = resolved_env["PATH"] if "PATH" in resolved_env else None
-        which_hit = await aiofiles.os.wrap(shutil.which)(
-            resolved_command, path=path_arg
-        )
+        which_hit = await _which(resolved_command, path=path_arg)
         if which_hit:
             resolved_command = which_hit
         elif resolved_command in {"npx", "npm", "node"}:

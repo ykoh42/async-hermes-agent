@@ -451,10 +451,10 @@ async def build_turn_context(
     # Generate unique task_id if not provided to isolate VMs between tasks.
     effective_task_id = task_id or str(uuid.uuid4())
     agent._current_task_id = effective_task_id
-    task_ids = getattr(agent, "_async_task_ids", None)
+    task_ids = getattr(agent, "_task_ids", None)
     if task_ids is None:
         task_ids = set()
-        agent._async_task_ids = task_ids
+        agent._task_ids = task_ids
     task_ids.add(effective_task_id)
     turn_id = (
         f"{agent.session_id or 'session'}:{effective_task_id}:{uuid.uuid4().hex[:8]}"

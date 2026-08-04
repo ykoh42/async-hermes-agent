@@ -5806,7 +5806,7 @@ async def _refresh_nous_auxiliary_client(
     return client, final_model
 
 
-def _force_close_async_httpx(client: Any) -> None:
+def _force_close_httpx_transport(client: Any) -> None:
     """Mark the httpx AsyncClient inside an AsyncOpenAI client as closed.
 
     This prevents ``AsyncHttpxClientWrapper.__del__`` from scheduling
@@ -5933,7 +5933,7 @@ async def _get_cached_client(
             stale_client = cached_client
             del _client_cache[cache_key]
     if stale_client is not None:
-        _force_close_async_httpx(stale_client)
+        _force_close_httpx_transport(stale_client)
     # Build outside the lock.
     # For pool-backed api_key providers, derive the active API key from the
     # pool entry rather than from env vars.  resolve_api_key_provider_credentials

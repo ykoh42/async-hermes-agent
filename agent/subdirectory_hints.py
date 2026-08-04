@@ -26,6 +26,7 @@ import aiofiles.os
 from agent.prompt_builder import _scan_context_content
 
 logger = logging.getLogger(__name__)
+_realpath = aiofiles.os.wrap(os.path.realpath)
 
 # Context files to look for in subdirectories, in priority order.
 # Same filenames as prompt_builder.py but we load ALL found (not first-wins)
@@ -138,7 +139,7 @@ class SubdirectoryHintTracker:
             p = Path(raw_path).expanduser()
             if not p.is_absolute():
                 p = self.working_dir / p
-            p = Path(await aiofiles.os.wrap(os.path.realpath)(p))
+            p = Path(await _realpath(p))
             # Use parent if it's a file path (has extension or doesn't exist as dir)
             if p.suffix or (
                 await aiofiles.os.path.exists(p)

@@ -283,8 +283,8 @@ async def test_model_switch_uses_deferred_native_provider_runtime(monkeypatch):
         agent.api_key = pending["api_key"]
         agent.base_url = pending["base_url"]
         agent.api_mode = pending["api_mode"]
-        agent._async_provider_request_timeout = None
-        agent._async_provider_stale_timeout = None
+        agent._provider_request_timeout = None
+        agent._provider_stale_timeout = None
         agent._deferred_provider_runtime = None
 
     async def persist_route():
@@ -339,7 +339,7 @@ async def test_deferred_runtime_rejects_sync_only_context_engine_early():
     async def assert_rejected(**attributes):
         state = {
             "_deferred_provider_runtime": {"provider": "openrouter", "model": "test"},
-            "_async_provider_init_lock": None,
+            "_provider_init_lock": None,
             "_dotenv_loaded": True,
             "_runtime_config_loaded": True,
             "_runtime_config_snapshot": {"context": {"engine": "compressor"}},
@@ -366,8 +366,8 @@ def test_api_timeout_resolution_uses_the_constructor_snapshot(monkeypatch):
     monkeypatch.setattr(run_agent, "get_provider_request_timeout", fail_if_settings_are_read)
     monkeypatch.setattr(run_agent, "get_provider_stale_timeout", fail_if_settings_are_read)
     agent = SimpleNamespace(
-        _async_provider_request_timeout=42.0,
-        _async_provider_stale_timeout=84.0,
+        _provider_request_timeout=42.0,
+        _provider_stale_timeout=84.0,
         provider="custom",
         model="test-model",
     )

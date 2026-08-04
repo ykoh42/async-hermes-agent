@@ -1037,12 +1037,12 @@ def init_agent(
     )
     agent._credential_pool = credential_pool
     agent._credential_pool_entry_id = None
-    agent._async_provider_timeout_settings: dict[str, Any] = {}
+    agent._provider_timeout_settings: dict[str, Any] = {}
     # TLS configuration is resolved while constructing immutable agent state,
     # then reused by the native async client initializer.  A conversation turn
     # must not reopen config.yaml or synchronously inspect CA-bundle paths.
-    agent._async_default_httpx_verify = resolve_httpx_verify()
-    agent._async_tls_verify_by_route: dict[str, Any] = {}
+    agent._default_httpx_verify = resolve_httpx_verify()
+    agent._tls_verify_by_route: dict[str, Any] = {}
     # A missing credential is resolved only when the async runtime starts.
     # ``init_agent`` must not open auth.json or invoke an OAuth refresher.
     agent._deferred_provider_runtime = None
@@ -1210,7 +1210,7 @@ def init_agent(
     # close so persistent terminal environments and background commands from
     # earlier turns are reaped even after a later turn has replaced
     # ``_current_task_id``.
-    agent._async_task_ids: set[str] = set()
+    agent._task_ids: set[str] = set()
     
     # Store OpenRouter provider preferences
     agent.providers_allowed = providers_allowed
@@ -1360,8 +1360,8 @@ def init_agent(
     agent._anthropic_client_source = None
     agent._is_anthropic_oauth = False
 
-    agent._async_provider_request_timeout = None
-    agent._async_provider_stale_timeout = None
+    agent._provider_request_timeout = None
+    agent._provider_stale_timeout = None
 
     if agent.api_mode == "anthropic_messages":
         # Bedrock + Claude → use AnthropicBedrock SDK for full feature parity
@@ -1383,8 +1383,8 @@ def init_agent(
                 "api_key": agent.api_key,
                 "base_url": base_url,
                 "api_mode": agent.api_mode,
-                "request_timeout": agent._async_provider_request_timeout,
-                "stale_timeout": agent._async_provider_stale_timeout,
+                "request_timeout": agent._provider_request_timeout,
+                "stale_timeout": agent._provider_stale_timeout,
             }
             if not agent.quiet_mode:
                 print(f"🤖 AI Agent initialized with model: {agent.model} (AWS Bedrock + AnthropicBedrock SDK, {_br_region})")
@@ -1426,8 +1426,8 @@ def init_agent(
                 "api_key": effective_key,
                 "base_url": base_url,
                 "api_mode": agent.api_mode,
-                "request_timeout": agent._async_provider_request_timeout,
-                "stale_timeout": agent._async_provider_stale_timeout,
+                "request_timeout": agent._provider_request_timeout,
+                "stale_timeout": agent._provider_stale_timeout,
             }
             if not agent.quiet_mode:
                 print(f"🤖 AI Agent initialized with model: {agent.model} (Anthropic native)")
@@ -1500,8 +1500,8 @@ def init_agent(
                 }
             else:
                 client_kwargs = {"api_key": api_key, "base_url": base_url}
-            if agent._async_provider_request_timeout is not None:
-                client_kwargs["timeout"] = agent._async_provider_request_timeout
+            if agent._provider_request_timeout is not None:
+                client_kwargs["timeout"] = agent._provider_request_timeout
             effective_base = base_url
             if base_url_host_matches(effective_base, "openrouter.ai"):
                 from agent.auxiliary_client import build_or_headers
@@ -1553,8 +1553,8 @@ def init_agent(
                 # for the first async resolution instead of forcing
                 # OPENAI_BASE_URL to duplicate the constructor argument.
                 "base_url": base_url or "",
-                "request_timeout": agent._async_provider_request_timeout,
-                "stale_timeout": agent._async_provider_stale_timeout,
+                "request_timeout": agent._provider_request_timeout,
+                "stale_timeout": agent._provider_stale_timeout,
             }
             client_kwargs = {
                 "api_key": "async-runtime-pending",
@@ -1600,8 +1600,8 @@ def init_agent(
                 "api_key": client_kwargs.get("api_key"),
                 "base_url": client_kwargs.get("base_url"),
                 "api_mode": agent.api_mode,
-                "request_timeout": agent._async_provider_request_timeout,
-                "stale_timeout": agent._async_provider_stale_timeout,
+                "request_timeout": agent._provider_request_timeout,
+                "stale_timeout": agent._provider_stale_timeout,
                 # Preserve options already derived from explicit constructor
                 # inputs/config while deferring SDK construction to the first
                 # await boundary.
@@ -2745,8 +2745,8 @@ def init_agent(
         "api_mode": agent.api_mode,
         "api_key": getattr(agent, "api_key", ""),
         "client_kwargs": dict(agent._client_kwargs),
-        "request_timeout": agent._async_provider_request_timeout,
-        "stale_timeout": agent._async_provider_stale_timeout,
+        "request_timeout": agent._provider_request_timeout,
+        "stale_timeout": agent._provider_stale_timeout,
         "use_prompt_caching": agent._use_prompt_caching,
         "use_native_cache_layout": agent._use_native_cache_layout,
         # Context engine state that _try_activate_fallback() overwrites.
@@ -2783,10 +2783,10 @@ async def initialize_deferred_runtime(agent: Any) -> bool:
     if not pending and getattr(agent, "_runtime_config_loaded", False):
         return False
 
-    lock = getattr(agent, "_async_provider_init_lock", None)
+    lock = getattr(agent, "_provider_init_lock", None)
     if lock is None:
         lock = asyncio.Lock()
-        agent._async_provider_init_lock = lock
+        agent._provider_init_lock = lock
 
     async with lock:
         pending = getattr(agent, "_deferred_provider_runtime", None)
@@ -3053,7 +3053,7 @@ async def initialize_deferred_runtime(agent: Any) -> bool:
 
             configured_providers = config_snapshot.get("providers", {})
             if isinstance(configured_providers, dict):
-                agent._async_provider_timeout_settings = dict(configured_providers)
+                agent._provider_timeout_settings = dict(configured_providers)
 
             if base_url_host_matches(agent.base_url, "openrouter.ai"):
                 deferred_client_kwargs["default_headers"] = build_or_headers(
@@ -3090,14 +3090,14 @@ async def initialize_deferred_runtime(agent: Any) -> bool:
                     custom_providers=custom_providers,
                 )
                 if tls:
-                    agent._async_tls_verify_by_route[route] = resolve_httpx_verify(
+                    agent._tls_verify_by_route[route] = resolve_httpx_verify(
                         ca_bundle=tls.get("ssl_ca_cert"),
                         ssl_verify=tls.get("ssl_verify"),
                         base_url=route,
                     )
             selected_route = _normalize_route_base_url(agent.base_url)
             if selected_route:
-                agent._async_tls_verify_by_route[selected_route] = resolve_httpx_verify(
+                agent._tls_verify_by_route[selected_route] = resolve_httpx_verify(
                     ca_bundle=deferred_client_kwargs.get("ssl_ca_cert"),
                     ssl_verify=deferred_client_kwargs.get("ssl_verify"),
                     base_url=selected_route,
@@ -3107,20 +3107,20 @@ async def initialize_deferred_runtime(agent: Any) -> bool:
         except Exception:
             logger.debug("async runtime config snapshot skipped", exc_info=True)
 
-        timeout_settings = getattr(agent, "_async_provider_timeout_settings", {})
+        timeout_settings = getattr(agent, "_provider_timeout_settings", {})
         if provider in timeout_settings:
-            agent._async_provider_request_timeout = _provider_timeout_from_snapshot(
+            agent._provider_request_timeout = _provider_timeout_from_snapshot(
                 timeout_settings, provider, model, "timeout_seconds",
             )
-            agent._async_provider_stale_timeout = _provider_timeout_from_snapshot(
+            agent._provider_stale_timeout = _provider_timeout_from_snapshot(
                 timeout_settings, provider, model, "stale_timeout_seconds",
             )
         else:
             # A fallback has no pending values and must not inherit a primary
             # provider's timeout. Rotation/restoration carries the current
             # snapshot explicitly.
-            agent._async_provider_request_timeout = pending.get("request_timeout")
-            agent._async_provider_stale_timeout = pending.get("stale_timeout")
+            agent._provider_request_timeout = pending.get("request_timeout")
+            agent._provider_stale_timeout = pending.get("stale_timeout")
 
         # Ollama defaults to a 2048-token context unless ``num_ctx`` is sent.
         # The constructor only records explicit configuration; discover the
@@ -3154,7 +3154,7 @@ async def initialize_deferred_runtime(agent: Any) -> bool:
 
         # This value was snapshotted before the turn. Never consult the
         # synchronous settings layer while creating the native client.
-        timeout = agent._async_provider_request_timeout
+        timeout = agent._provider_request_timeout
         if agent.api_mode == "anthropic_messages":
             from agent.anthropic_adapter import _is_oauth_token, build_anthropic_client
 
@@ -3237,9 +3237,9 @@ async def initialize_deferred_runtime(agent: Any) -> bool:
                 client_kwargs["default_headers"] = headers
             http_client = build_keepalive_http_client(
                 agent.base_url,
-                verify=getattr(agent, "_async_tls_verify_by_route", {}).get(
+                verify=getattr(agent, "_tls_verify_by_route", {}).get(
                     _normalize_route_base_url(agent.base_url),
-                    getattr(agent, "_async_default_httpx_verify", True),
+                    getattr(agent, "_default_httpx_verify", True),
                 ),
             )
             if http_client is not None:
@@ -3283,8 +3283,8 @@ async def initialize_deferred_runtime(agent: Any) -> bool:
                 "api_mode": agent.api_mode,
                 "api_key": agent.api_key,
                 "client_kwargs": dict(agent._client_kwargs),
-                "request_timeout": agent._async_provider_request_timeout,
-                "stale_timeout": agent._async_provider_stale_timeout,
+                "request_timeout": agent._provider_request_timeout,
+                "stale_timeout": agent._provider_stale_timeout,
                 "use_prompt_caching": agent._use_prompt_caching,
                 "use_native_cache_layout": agent._use_native_cache_layout,
             })

@@ -163,14 +163,14 @@ class MemoryStore:
         # Per-turn counter of failed at-capacity consolidation attempts; reset
         # at each turn boundary by reset_consolidation_failures() (#42405).
         self._consolidation_failures = 0
-        self._async_write_lock = None
+        self._write_lock = None
 
-    def _get_async_write_lock(self) -> asyncio.Lock:
+    def _get_write_lock(self) -> asyncio.Lock:
         """Return the per-store lock used by native async mutations."""
-        lock = self._async_write_lock
+        lock = self._write_lock
         if lock is None:
             lock = asyncio.Lock()
-            self._async_write_lock = lock
+            self._write_lock = lock
         return lock
 
     def reset_consolidation_failures(self) -> None:
@@ -318,7 +318,7 @@ class MemoryStore:
         if scan_error:
             return {"success": False, "error": scan_error}
 
-        async with self._get_async_write_lock():
+        async with self._get_write_lock():
             if await self._reload_target(target, skip_drift=True) is _READ_FAILED:
                 return _read_failed_error(self._path_for(target))
             entries = self._entries_for(target)
@@ -364,7 +364,7 @@ class MemoryStore:
         if scan_error:
             return {"success": False, "error": scan_error}
 
-        async with self._get_async_write_lock():
+        async with self._get_write_lock():
             backup = await self._reload_target(target)
             if backup is _READ_FAILED:
                 return _read_failed_error(self._path_for(target))
@@ -412,7 +412,7 @@ class MemoryStore:
         old_text = old_text.strip()
         if not old_text:
             return {"success": False, "error": "old_text cannot be empty."}
-        async with self._get_async_write_lock():
+        async with self._get_write_lock():
             backup = await self._reload_target(target)
             if backup is _READ_FAILED:
                 return _read_failed_error(self._path_for(target))
@@ -454,7 +454,7 @@ class MemoryStore:
                 if scan_error:
                     return {"success": False, "error": f"Operation {index + 1}: {scan_error}"}
 
-        async with self._get_async_write_lock():
+        async with self._get_write_lock():
             backup = await self._reload_target(target)
             if backup is _READ_FAILED:
                 return _read_failed_error(self._path_for(target))

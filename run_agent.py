@@ -1363,7 +1363,7 @@ class AIAgent:
         passed as a per-call ``timeout=`` kwarg, overriding the client-level
         timeout the AIAgent.__init__ path configured.
         """
-        cfg = getattr(self, "_async_provider_request_timeout", None)
+        cfg = getattr(self, "_provider_request_timeout", None)
         if cfg is not None:
             return cfg
         return env_float("HERMES_API_TIMEOUT", 1800.0)
@@ -1386,7 +1386,7 @@ class AIAgent:
         explicitly configured a stale timeout, such as auto-disabling the
         detector for local endpoints.
         """
-        cfg = getattr(self, "_async_provider_stale_timeout", None)
+        cfg = getattr(self, "_provider_stale_timeout", None)
         if cfg is not None:
             return cfg, False
 
@@ -3676,7 +3676,7 @@ class AIAgent:
 
         self._closed = True
 
-        task_ids = set(getattr(self, "_async_task_ids", set()) or ())
+        task_ids = set(getattr(self, "_task_ids", set()) or ())
         current_task_id = getattr(self, "_current_task_id", None)
         if current_task_id:
             task_ids.add(current_task_id)
@@ -3691,7 +3691,7 @@ class AIAgent:
             for task_id in task_ids or {"default"}:
                 await cleanup_vm(task_id)
             task_ids.clear()
-            self._async_task_ids = set()
+            self._task_ids = set()
         except Exception:
             pass
 
@@ -4270,8 +4270,8 @@ class AIAgent:
             # protocol (a custom Anthropic account can explicitly use an
             # OpenAI-compatible relay, for example).
             "api_mode": self.api_mode,
-            "request_timeout": getattr(self, "_async_provider_request_timeout", None),
-            "stale_timeout": getattr(self, "_async_provider_stale_timeout", None),
+            "request_timeout": getattr(self, "_provider_request_timeout", None),
+            "stale_timeout": getattr(self, "_provider_stale_timeout", None),
             # Pool selection must not replace the user-selected primary
             # snapshot while a fallback is temporarily active.
             "update_primary": False,
@@ -4354,7 +4354,7 @@ class AIAgent:
                     self._anthropic_client = build_anthropic_client(
                         anthropic_key,
                         getattr(self, "_anthropic_base_url", None),
-                        timeout=getattr(self, "_async_provider_request_timeout", None),
+                        timeout=getattr(self, "_provider_request_timeout", None),
                         drop_context_1m_beta=client_source[2],
                     )
                     self._anthropic_client_source = client_source

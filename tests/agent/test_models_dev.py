@@ -150,12 +150,12 @@ class TestFetchModelsDev:
         md._models_dev_cache = {}
         md._models_dev_cache_time = 0
         md._models_dev_retry_after = 0
-        md._models_dev_async_lock = None
+        md._models_dev_lock = None
         yield
         md._models_dev_cache = {}
         md._models_dev_cache_time = 0
         md._models_dev_retry_after = 0
-        md._models_dev_async_lock = None
+        md._models_dev_lock = None
 
     @pytest.mark.asyncio
     async def test_disk_cache_short_circuits_network(self, tmp_path, monkeypatch):
