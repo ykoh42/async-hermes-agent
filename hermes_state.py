@@ -303,7 +303,6 @@ class SessionDB:
         session_id: str,
         include_ancestors: bool,
         repair_alternation: bool,
-        include_row_ids: bool = False,
     ) -> List[Dict[str, Any]]:
         """Decode fetched message rows into the OpenAI conversation format.
 
@@ -318,14 +317,6 @@ class SessionDB:
             if row["role"] in {"user", "assistant"} and isinstance(content, str):
                 content = sanitize_context(content).strip()
             msg = {"role": row["role"], "content": content}
-            # Durable per-message identity for surfaces that need to address a
-            # specific row later (desktop reactions). OPT-IN: only the gateway
-            # asks for it — every other consumer (ACP restore, export,
-            # inspection) gets the transcript in its historical shape.
-            # Underscore-prefixed so every transport's convert_messages()
-            # strips it before the wire.
-            if include_row_ids and row["id"] is not None:
-                msg["_row_id"] = row["id"]
             # api_content is the byte-fidelity sidecar: the exact string sent
             # to the API when it differed from the clean content. Returned
             # VERBATIM — no sanitize_context, no strip — because the replay
@@ -1367,13 +1358,7 @@ class SessionDB:
         await self._write(_update_route)
 
     async def get_meta(self, key: str) -> Optional[str]:
-        """Read a value from the durable ``state_meta`` store.
-
-        This is the asynchronous counterpart of :meth:`SessionDB.get_meta`.
-        It performs the lookup on the native aiosqlite connection rather than
-        delegating to the compatibility ``SessionDB`` object or a worker
-        thread.
-        """
+        """Read a value from the durable ``state_meta`` store."""
         connection = await self._get_connection()
         cursor = await connection.execute(
             "SELECT value FROM state_meta WHERE key = ?", (key,)
@@ -1403,45 +1388,6 @@ class SessionDB:
             return cursor.rowcount > 0
 
         return await self._write(_delete)
-
-    async def list_gateway_sessions(
-        self,
-        *,
-        platform: Optional[str] = None,
-        active_only: bool = True,
-    ) -> list[dict[str, Any]]:
-        """List the newest routed session for each gateway session key.
-
-        The result shape and filtering semantics match
-        :meth:`SessionDB.list_gateway_sessions`; the query is executed on the
-        native async connection so status/dashboard consumers can migrate
-        without reintroducing synchronous SQLite I/O.
-        """
-        connection = await self._get_connection()
-        query = """
-            SELECT sessions.*,
-                   COALESCE(
-                       (SELECT MAX(m.timestamp) FROM messages m
-                        WHERE m.session_id = sessions.id),
-                       sessions.started_at
-                   ) AS last_active
-            FROM sessions
-            WHERE session_key IS NOT NULL
-              AND started_at = (
-                  SELECT MAX(s2.started_at) FROM sessions s2
-                  WHERE s2.session_key = sessions.session_key
-              )
-        """
-        params: list[Any] = []
-        if platform:
-            query += " AND LOWER(source) = LOWER(?)"
-            params.append(platform)
-        if active_only:
-            query += " AND ended_at IS NULL"
-        query += " ORDER BY last_active DESC"
-        cursor = await connection.execute(query, params)
-        rows = await cursor.fetchall()
-        return [dict(row) for row in rows]
 
     async def get_session(self, session_id: str) -> Optional[Dict[str, Any]]:
         """Return one session row through the adapter's async connection."""
@@ -2001,7 +1947,6 @@ class SessionDB:
         include_ancestors: bool = False,
         include_inactive: bool = False,
         repair_alternation: bool = False,
-        include_row_ids: bool = False,
     ) -> List[Dict[str, Any]]:
         """Load a conversation through the native async SQLite connection."""
         if not session_id:
@@ -2040,7 +1985,6 @@ class SessionDB:
             session_id=session_id,
             include_ancestors=include_ancestors,
             repair_alternation=repair_alternation,
-            include_row_ids=include_row_ids,
         )
 
     async def find_live_compression_child(

@@ -176,8 +176,8 @@ async def test_async_session_db_can_bootstrap_from_a_path(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_async_session_db_meta_and_gateway_listing_match_native_shape(tmp_path):
-    """Management readers can migrate without reopening the sync database."""
+async def test_async_session_db_meta_round_trip(tmp_path):
+    """Session metadata uses the native async connection."""
     database = SessionDB(tmp_path / "state.db")
     try:
         await database.set_meta("goal:session", '{"status":"active"}')
@@ -186,29 +186,6 @@ async def test_async_session_db_meta_and_gateway_listing_match_native_shape(tmp_
         assert await database.delete_meta("goal:session") is True
         assert await database.get_meta("goal:session") is None
 
-        await database.create_session(
-            "gateway-old",
-            "telegram",
-            session_key="chat:1",
-            started_at=1.0,
-        )
-        await database.create_session(
-            "gateway-new",
-            "telegram",
-            session_key="chat:1",
-            started_at=2.0,
-        )
-        await database.create_session(
-            "gateway-other",
-            "discord",
-            session_key="chat:2",
-            started_at=3.0,
-        )
-        await database.end_session("gateway-old", "superseded")
-
-        rows = await database.list_gateway_sessions(platform="telegram")
-        assert [row["id"] for row in rows] == ["gateway-new"]
-        assert rows[0]["session_key"] == "chat:1"
     finally:
         await database.close()
 
