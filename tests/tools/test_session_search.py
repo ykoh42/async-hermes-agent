@@ -126,6 +126,70 @@ class TestBrowseShape:
         sids = [r["session_id"] for r in result["results"]]
         assert "s_newest" not in sids
 
+    @pytest.mark.asyncio
+    async def test_closes_database_created_for_default_lookup(self, monkeypatch):
+        import hermes_state
+
+        class OwnedDatabase:
+            closed = False
+
+            def __init__(self, _path):
+                pass
+
+            async def list_sessions_rich(self, **_kwargs):
+                return []
+
+            async def close(self):
+                self.closed = True
+
+        database = OwnedDatabase("unused")
+        monkeypatch.setattr(hermes_state, "SessionDB", lambda _path: database)
+
+        result = json.loads(await session_search())
+
+        assert result["success"] is True
+        assert database.closed is True
+
+    @pytest.mark.asyncio
+    async def test_closes_cross_profile_database_but_not_borrowed_database(
+        self, monkeypatch
+    ):
+        from tools import session_search_tool
+
+        class Database:
+            def __init__(self, *, session=None):
+                self.closed = False
+                self.session = session
+
+            async def get_session(self, _session_id):
+                return self.session
+
+            async def get_messages(self, _session_id):
+                return []
+
+            async def close(self):
+                self.closed = True
+
+        borrowed = Database()
+        profile_database = Database(
+            session={"source": "cli", "model": "test", "title": "Profile session"}
+        )
+
+        async def resolve_profile_database(_profile):
+            return profile_database
+
+        monkeypatch.setattr(
+            session_search_tool, "_resolve_profile_db", resolve_profile_database
+        )
+
+        result = json.loads(
+            await session_search(db=borrowed, profile="work", session_id="profile-session")
+        )
+
+        assert result["success"] is True
+        assert profile_database.closed is True
+        assert borrowed.closed is False
+
 
 # =========================================================================
 # Discovery shape (with query)
