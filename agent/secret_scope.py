@@ -24,8 +24,7 @@ from __future__ import annotations
 
 import os
 from contextvars import ContextVar, Token
-from pathlib import Path
-from typing import Dict, Mapping, Optional
+from typing import Mapping, Optional
 
 
 # ── multiplex-active flag ────────────────────────────────────────────────
@@ -175,50 +174,3 @@ def get_secret(name: str, default: Optional[str] = None) -> Optional[str]:
 
     val = os.environ.get(name)
     return val if val is not None else default
-
-
-def load_env_file(env_path: Path) -> Dict[str, str]:
-    """Parse a ``.env`` file into a plain dict WITHOUT touching ``os.environ``.
-
-    Used to load a profile's secrets into an isolated mapping for
-    ``set_secret_scope``. Mirrors python-dotenv's basic parsing (KEY=VALUE,
-    ``export`` prefix, ``#`` comments, optional matching quotes) but never
-    mutates the process environment — that isolation is the whole point.
-    """
-    secrets: Dict[str, str] = {}
-    try:
-        text = env_path.read_text(encoding="utf-8")
-    except (FileNotFoundError, OSError, UnicodeDecodeError):
-        return secrets
-
-    for raw in text.splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#"):
-            continue
-        if line.startswith("export "):
-            line = line[len("export "):].lstrip()
-        if "=" not in line:
-            continue
-        key, _, value = line.partition("=")
-        key = key.strip()
-        if not key:
-            continue
-        value = value.strip()
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
-            value = value[1:-1]
-        secrets[key] = value
-
-    return secrets
-
-
-def build_profile_secret_scope(hermes_home: Path) -> Dict[str, str]:
-    """Build a profile's secret mapping from its ``<home>/.env``.
-
-    Returns a fresh dict (safe to install via ``set_secret_scope``). Genuinely
-    global vars are intentionally NOT copied in — ``get_secret`` reads those
-    from ``os.environ`` directly, so the scope holds only profile secrets.
-    """
-    home = Path(hermes_home)
-    secrets = load_env_file(home / ".env")
-
-    return secrets
