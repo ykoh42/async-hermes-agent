@@ -10,9 +10,8 @@ Design
 ------
 A process-wide singleton ``FileStateRegistry`` tracks, per resolved path:
 
-  * per-agent read stamps: {task_id: {path: (mtime, read_ts, partial)}}
+  * per-agent read stamps: {task_id: {path: (read_ts, partial)}}
   * last writer globally: {path: (task_id, write_ts)}
-  * per-path ``threading.Lock`` for read→modify→write critical sections
 
 Three public hooks are used by the file tools:
 
@@ -20,9 +19,9 @@ Three public hooks are used by the file tools:
   * ``note_write(task_id, path)`` — called after write_file / patch
   * ``check_stale(task_id, path)`` — called BEFORE write_file / patch
 
-Plus ``lock_path(path)`` — a context-manager returning a per-path lock to
-wrap the whole read→modify→write block. And ``writes_since(task_id,
-since_ts, paths)`` for the subagent-completion reminder in delegate_tool.
+Plus ``writes_since(task_id, since_ts, paths)`` for the subagent-completion
+reminder in delegate_tool. Native file-operation serialization lives in
+``file_tools.py`` where it can use per-path ``asyncio.Lock`` instances.
 
 All methods are no-ops when ``HERMES_DISABLE_FILE_STATE_GUARD=1`` is set.
 
@@ -36,16 +35,15 @@ import os
 import threading
 import time
 from collections import defaultdict
-from contextlib import contextmanager
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
 
 # ── Public stamp type ────────────────────────────────────────────────
-# (mtime, read_ts, partial).  partial=True when read_file returned a
+# (read_ts, partial).  partial=True when read_file returned a
 # windowed view (offset > 1 or limit < total_lines) — writes that happen
 # after a partial read should still warn so the model re-reads in full.
-ReadStamp = Tuple[float, float, bool]
+ReadStamp = Tuple[float, bool]
 
 # Number of resolved-path entries retained per agent.  Bounded to keep
 # long sessions from accumulating unbounded state.  On overflow we drop
@@ -62,32 +60,7 @@ class FileStateRegistry:
     def __init__(self) -> None:
         self._reads: Dict[str, Dict[str, ReadStamp]] = defaultdict(dict)
         self._last_writer: Dict[str, Tuple[str, float]] = {}
-        self._path_locks: Dict[str, threading.Lock] = {}
-        self._meta_lock = threading.Lock()  # guards _path_locks
         self._state_lock = threading.Lock()  # guards _reads + _last_writer
-
-    # ── Path lock management ────────────────────────────────────────
-    def _lock_for(self, resolved: str) -> threading.Lock:
-        with self._meta_lock:
-            lock = self._path_locks.get(resolved)
-            if lock is None:
-                lock = threading.Lock()
-                self._path_locks[resolved] = lock
-            return lock
-
-    @contextmanager
-    def lock_path(self, resolved: str):
-        """Acquire the per-path lock for a read→modify→write section.
-
-        Same process, same filesystem — threads on the same path serialize.
-        Different paths proceed in parallel.
-        """
-        lock = self._lock_for(resolved)
-        lock.acquire()
-        try:
-            yield
-        finally:
-            lock.release()
 
     # ── Read/write accounting ───────────────────────────────────────
     def record_read(
@@ -96,27 +69,19 @@ class FileStateRegistry:
         resolved: str,
         *,
         partial: bool = False,
-        mtime: Optional[float] = None,
     ) -> None:
         if _disabled():
             return
-        if mtime is None:
-            try:
-                mtime = os.path.getmtime(resolved)
-            except OSError:
-                return
         now = time.time()
         with self._state_lock:
             agent_reads = self._reads[task_id]
-            agent_reads[resolved] = (float(mtime), now, bool(partial))
+            agent_reads[resolved] = (now, bool(partial))
             _cap_dict(agent_reads, _MAX_PATHS_PER_AGENT)
 
     def note_write(
         self,
         task_id: str,
         resolved: str,
-        *,
-        mtime: Optional[float] = None,
     ) -> None:
         """Record a successful write.
 
@@ -126,17 +91,12 @@ class FileStateRegistry:
         """
         if _disabled():
             return
-        if mtime is None:
-            try:
-                mtime = os.path.getmtime(resolved)
-            except OSError:
-                return
         now = time.time()
         with self._state_lock:
             self._last_writer[resolved] = (task_id, now)
             _cap_dict(self._last_writer, _MAX_GLOBAL_WRITERS)
             # Writer's own view is now up-to-date.
-            self._reads[task_id][resolved] = (float(mtime), now, False)
+            self._reads[task_id][resolved] = (now, False)
             _cap_dict(self._reads[task_id], _MAX_PATHS_PER_AGENT)
 
     def check_stale(self, task_id: str, resolved: str) -> Optional[str]:
@@ -145,8 +105,11 @@ class FileStateRegistry:
         Three staleness classes, in order of severity:
 
           1. Sibling subagent wrote this file after this agent's last read.
-          2. External/unknown change (mtime differs from our last read).
+          2. Agent only read a partial view of the file.
           3. Agent never read the file (write-without-read).
+
+        Filesystem mtime drift is checked by the native async file handler;
+        this process-wide registry only coordinates in-memory agent state.
 
         Returns ``None`` when the write is safe.  Does not raise — callers
         decide whether to block or warn.
@@ -163,12 +126,6 @@ class FileStateRegistry:
         if stamp is None and last_writer is None:
             return None
 
-        try:
-            current_mtime = os.path.getmtime(resolved)
-        except OSError:
-            # File doesn't exist — write will create it; not stale.
-            return None
-
         # Case 1: sibling subagent modified after our last read.
         if last_writer is not None:
             writer_tid, writer_ts = last_writer
@@ -180,7 +137,7 @@ class FileStateRegistry:
                         "Read the file before writing to avoid overwriting "
                         "the sibling's changes."
                     )
-                read_ts = stamp[1]
+                read_ts = stamp[0]
                 if writer_ts > read_ts:
                     return (
                         f"{resolved} was modified by sibling subagent "
@@ -189,15 +146,9 @@ class FileStateRegistry:
                         "Re-read the file before writing."
                     )
 
-        # Case 2: external / unknown modification (mtime drifted).
+        # Case 2: the agent only saw a partial view.
         if stamp is not None:
-            read_mtime, _read_ts, partial = stamp
-            if current_mtime != read_mtime:
-                return (
-                    f"{resolved} was modified since you last read it "
-                    "on disk (external edit or unrecorded writer). "
-                    "Re-read the file before writing."
-                )
+            _read_ts, partial = stamp
             if partial:
                 return (
                     f"{resolved} was last read with offset/limit pagination "
@@ -254,8 +205,6 @@ class FileStateRegistry:
         with self._state_lock:
             self._reads.clear()
             self._last_writer.clear()
-        with self._meta_lock:
-            self._path_locks.clear()
 
 
 # ── Module-level singleton + helpers ─────────────────────────────────
@@ -304,10 +253,6 @@ def check_stale(task_id: str, resolved_or_path: str | Path) -> Optional[str]:
     return _registry.check_stale(task_id, str(resolved_or_path))
 
 
-def lock_path(resolved_or_path: str | Path):
-    return _registry.lock_path(str(resolved_or_path))
-
-
 def writes_since(
     exclude_task_id: str,
     since_ts: float,
@@ -326,7 +271,6 @@ __all__ = [
     "record_read",
     "note_write",
     "check_stale",
-    "lock_path",
     "writes_since",
     "known_reads",
 ]
