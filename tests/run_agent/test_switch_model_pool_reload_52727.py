@@ -64,10 +64,7 @@ def _make_agent(current_provider, current_model, current_pool):
     agent._credential_pool = current_pool
     agent._credential_pool_entry_id = None
     agent.reasoning_config = None
-    agent._async_client = None
-    agent._async_client_source = None
-    agent._async_anthropic_client = None
-    agent._async_anthropic_source = None
+    agent._anthropic_client_source = None
     # Real-ish instance methods that switch_model calls
     agent._anthropic_prompt_cache_policy = MagicMock(return_value=(False, False))
     agent._ensure_lmstudio_runtime_loaded = MagicMock()

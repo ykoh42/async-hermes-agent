@@ -3709,33 +3709,35 @@ class AIAgent:
         except Exception:
             pass
 
-        # 4. The sync OpenAI client is construction metadata for the native
-        # async client.  A full-async turn never sends work through it, so do
-        # not call its blocking close() from this event loop.  Drop the
-        # reference; the native clients below own all active transports.
-        self.client = None
-        self._async_client_source = None
-        self._async_codex_client_source = None
-
-        # Native async clients are owned by the async turn path. Close them on
-        # the same event loop that consumed their streams instead of routing
-        # teardown through the legacy synchronous OpenAI client helper.
-        for attribute in (
-            "_async_client",
-            "_async_anthropic_client",
-            "_async_codex_client",
-        ):
+        # Native clients are owned by the agent and closed on the event loop
+        # that consumed them. ``client`` covers OpenAI-compatible, Codex,
+        # Gemini, and MoA transports; Anthropic keeps its provider-specific
+        # slot because it does not expose the OpenAI-shaped interface.
+        closed_client_ids: set[int] = set()
+        for attribute in ("client", "_anthropic_client"):
             client = getattr(self, attribute, None)
             if client is None:
                 continue
+            if id(client) in closed_client_ids:
+                setattr(self, attribute, None)
+                continue
+            closed_client_ids.add(id(client))
             try:
                 close_client = getattr(client, "aclose", None) or getattr(client, "close", None)
-                if callable(close_client):
+                if callable(close_client) and inspect.iscoroutinefunction(
+                    inspect.unwrap(close_client)
+                ):
                     await close_client()
+                elif callable(close_client):
+                    logger.error(
+                        "Native async client %s exposes only a synchronous close()",
+                        attribute,
+                    )
             except Exception:
-                logger.debug("Async client close failed for %s", attribute, exc_info=True)
+                logger.debug("Client close failed for %s", attribute, exc_info=True)
             finally:
                 setattr(self, attribute, None)
+        self._anthropic_client_source = None
 
         # 7. Free conversation history.  Mirrors _release_evicted_agent_soft's
         # soft-eviction clear — close() is the hard teardown for true session
@@ -4316,25 +4318,19 @@ class AIAgent:
         native transport fail before the request rather than using a worker.
         """
         if self.api_mode == "codex_responses":
-            # Deferred provider initialization already builds AsyncOpenAI.
-            # Keep the Responses stream on that owning event loop directly.
-            if getattr(self, "_async_codex_client_source", None) is not self.client:
-                self._async_codex_client = self.client
-                self._async_codex_client_source = self.client
-
             if use_streaming:
                 from agent.codex_runtime import run_codex_stream
 
                 return await run_codex_stream(
                     self,
                     api_kwargs,
-                    client=self._async_codex_client,
+                    client=self.client,
                     on_first_delta=on_first_delta,
                 )
 
             request = dict(api_kwargs)
             request.pop("stream", None)
-            return await self._async_codex_client.responses.create(**request)
+            return await self.client.responses.create(**request)
 
         if self.api_mode == "anthropic_messages":
             # Anthropic ships a native async SDK.  Use it directly for static
@@ -4349,19 +4345,19 @@ class AIAgent:
                     create_anthropic_message,
                 )
 
-                async_source = (
+                client_source = (
                     anthropic_key,
                     getattr(self, "_anthropic_base_url", None),
                     bool(getattr(self, "_oauth_1m_beta_disabled", False)),
                 )
-                if getattr(self, "_async_anthropic_source", None) != async_source:
-                    self._async_anthropic_client = build_anthropic_client(
+                if getattr(self, "_anthropic_client_source", None) != client_source:
+                    self._anthropic_client = build_anthropic_client(
                         anthropic_key,
                         getattr(self, "_anthropic_base_url", None),
                         timeout=getattr(self, "_async_provider_request_timeout", None),
-                        drop_context_1m_beta=async_source[2],
+                        drop_context_1m_beta=client_source[2],
                     )
-                    self._async_anthropic_source = async_source
+                    self._anthropic_client_source = client_source
 
                 first_event = True
 
@@ -4373,7 +4369,7 @@ class AIAgent:
                             on_first_delta()
 
                 return await create_anthropic_message(
-                    self._async_anthropic_client,
+                    self._anthropic_client,
                     api_kwargs,
                     log_prefix=getattr(self, "log_prefix", ""),
                     prefer_stream=use_streaming,
@@ -4388,13 +4384,7 @@ class AIAgent:
                 "or add a native async provider implementation."
             )
 
-        client = getattr(self, "_async_client", None)
-        if getattr(self, "_async_client_source", None) is not self.client:
-            client = self.client
-            self._async_client = client
-            self._async_client_source = self.client
-
-        create_completion = client.chat.completions.create
+        create_completion = self.client.chat.completions.create
         if not inspect.iscoroutinefunction(inspect.unwrap(create_completion)):
             raise RuntimeError(
                 f"provider={self.provider!r} resolves to a synchronous adapter. "

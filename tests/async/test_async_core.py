@@ -1522,22 +1522,18 @@ async def test_close_is_awaitable_and_idempotent():
 
 
 @pytest.mark.asyncio
-async def test_close_never_calls_the_sync_client_close():
-    """The async lifecycle owns only native async transports."""
+async def test_close_awaits_the_native_primary_client():
+    """The async lifecycle closes the primary transport directly."""
     agent = AIAgent.__new__(AIAgent)
     closed_native = False
-
-    class SyncSource:
-        def close(self):
-            raise AssertionError("async close must not call sync client.close()")
 
     class NativeClient:
         async def aclose(self):
             nonlocal closed_native
             closed_native = True
 
-    agent.client = SyncSource()
-    agent._async_client = NativeClient()
+    agent.client = NativeClient()
+    agent._anthropic_client = None
     await agent.close()
 
     assert closed_native is True
@@ -2261,7 +2257,7 @@ async def test_codex_responses_main_path_uses_native_async_client(monkeypatch):
     )
 
     assert result == "native-response"
-    assert agent._async_codex_client is native_client
+    assert agent.client is native_client
     assert created_requests == [{"model": "gpt-test"}]
 
 

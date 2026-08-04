@@ -1357,6 +1357,7 @@ def init_agent(
     # raw_codex=True because the main agent needs direct responses.stream()
     # access for Codex Responses API streaming.
     agent._anthropic_client = None
+    agent._anthropic_client_source = None
     agent._is_anthropic_oauth = False
 
     agent._async_provider_request_timeout = None
@@ -1589,14 +1590,10 @@ def init_agent(
             # resolver selects a real entry. The placeholder must never mask a
             # persisted credential-pool key.
             agent.client = None
-            agent._async_client = None
-            agent._async_client_source = None
         else:
             agent.api_key = client_kwargs.get("api_key", "")
             agent.base_url = client_kwargs.get("base_url", agent.base_url)
             agent.client = None
-            agent._async_client = None
-            agent._async_client_source = None
             agent._deferred_provider_runtime = {
                 "provider": agent.provider or "auto",
                 "model": agent.model,
@@ -2888,8 +2885,7 @@ async def initialize_deferred_runtime(agent: Any) -> bool:
             agent.base_url = "moa://local"
             agent.client = build_moa_facade(agent, model)
             agent._anthropic_client = None
-            agent._async_client = None
-            agent._async_client_source = None
+            agent._anthropic_client_source = None
             agent._client_kwargs = {}
             agent._deferred_provider_runtime = None
             agent._use_prompt_caching, agent._use_native_cache_layout = (
@@ -3169,8 +3165,7 @@ async def initialize_deferred_runtime(agent: Any) -> bool:
                 agent.base_url,
                 timeout=timeout,
             )
-            agent._async_anthropic_client = agent._anthropic_client
-            agent._async_anthropic_source = (
+            agent._anthropic_client_source = (
                 api_key,
                 agent.base_url,
                 bool(getattr(agent, "_oauth_1m_beta_disabled", False)),
@@ -3180,8 +3175,6 @@ async def initialize_deferred_runtime(agent: Any) -> bool:
             )
             agent.client = None
             agent._client_kwargs = {}
-            agent._async_client = None
-            agent._async_client_source = None
         elif provider == "gemini":
             from agent.gemini_native_adapter import is_native_gemini_base_url
 
@@ -3202,9 +3195,8 @@ async def initialize_deferred_runtime(agent: Any) -> bool:
                 "base_url": agent.base_url,
                 "timeout": timeout,
             }
-            agent._async_client = agent.client
-            agent._async_client_source = agent.client
             agent._anthropic_client = None
+            agent._anthropic_client_source = None
         else:
             from agent.auxiliary_client import (
                 _AI_GATEWAY_HEADERS,
@@ -3262,12 +3254,10 @@ async def initialize_deferred_runtime(agent: Any) -> bool:
             agent._client_kwargs = {
                 key: value for key, value in client_kwargs.items() if key != "http_client"
             }
-            agent._async_client = agent.client
-            agent._async_client_source = agent.client
-
             # A fallback can leave an Anthropic client attached while the
             # next selected credential uses the OpenAI wire format.
             agent._anthropic_client = None
+            agent._anthropic_client_source = None
 
         agent._use_prompt_caching, agent._use_native_cache_layout = (
             agent._anthropic_prompt_cache_policy()

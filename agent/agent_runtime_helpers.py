@@ -1490,6 +1490,7 @@ async def restore_primary_runtime(agent) -> bool:
 
             agent.client = build_moa_facade(agent, agent.model)
             agent._anthropic_client = None
+            agent._anthropic_client_source = None
         else:
             # The legacy restore path rebuilt a synchronous provider client
             # and synchronously loaded timeout/settings policy. Restore the
@@ -2108,10 +2109,7 @@ async def switch_model(agent, new_model, new_provider, api_key='', base_url='', 
         "_anthropic_base_url",
         "_anthropic_client",
         "_is_anthropic_oauth",
-        "_async_client",
-        "_async_client_source",
-        "_async_anthropic_client",
-        "_async_anthropic_source",
+        "_anthropic_client_source",
         "_credential_pool",
         "_credential_pool_entry_id",
         "_use_prompt_caching",

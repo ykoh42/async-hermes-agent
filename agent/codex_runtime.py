@@ -354,7 +354,7 @@ async def run_codex_stream(
     shape identical for tool-loop parsing without moving the stream to a
     background worker.
     """
-    active_client = client or getattr(agent, "_async_codex_client", None)
+    active_client = client or getattr(agent, "client", None)
     if active_client is None:
         raise RuntimeError("Async Codex client is not initialized")
 

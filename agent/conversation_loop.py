@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import asyncio
+import inspect
 import logging
 import os
 import random
@@ -3684,26 +3685,26 @@ async def run_conversation(
                     _retry.oauth_1m_beta_retry_attempted = True
                     if not getattr(agent, "_oauth_1m_beta_disabled", False):
                         agent._oauth_1m_beta_disabled = True
-                        # The async request path owns this client.  Discarding
-                        # its source marker makes _execute_model_request()
-                        # construct the replacement with the reduced beta set
-                        # on the next iteration; do not touch the legacy sync
-                        # Anthropic client from the event loop.
-                        async_client = getattr(agent, "_async_anthropic_client", None)
-                        if async_client is not None:
+                        # Discarding the source marker makes
+                        # _execute_model_request() construct the replacement
+                        # with the reduced beta set on the next iteration.
+                        anthropic_client = getattr(agent, "_anthropic_client", None)
+                        if anthropic_client is not None:
                             try:
-                                close = getattr(async_client, "aclose", None) or getattr(
-                                    async_client, "close", None
+                                close = getattr(anthropic_client, "aclose", None) or getattr(
+                                    anthropic_client, "close", None
                                 )
-                                if callable(close):
+                                if callable(close) and inspect.iscoroutinefunction(
+                                    inspect.unwrap(close)
+                                ):
                                     await close()
                             except Exception:
                                 logger.debug(
                                     "Async Anthropic client close failed during 1M beta recovery",
                                     exc_info=True,
                                 )
-                        agent._async_anthropic_client = None
-                        agent._async_anthropic_source = None
+                        agent._anthropic_client = None
+                        agent._anthropic_client_source = None
                         agent._vprint(
                             f"{agent.log_prefix}🔕 OAuth subscription doesn't support "
                             f"the 1M-context beta — disabled for this session and retrying...",

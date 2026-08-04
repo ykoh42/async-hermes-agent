@@ -48,10 +48,7 @@ def _make_agent_openrouter():
     agent._fallback_model = None
     agent._config_context_length = None
     agent._deferred_provider_runtime = None
-    agent._async_client = None
-    agent._async_client_source = None
-    agent._async_anthropic_client = None
-    agent._async_anthropic_source = None
+    agent._anthropic_client_source = None
     agent._credential_pool = MagicMock(provider="openrouter")
     agent._credential_pool.provider = "openrouter"
     agent._credential_pool_entry_id = None
@@ -88,10 +85,7 @@ def _make_agent_anthropic():
     agent._fallback_model = None
     agent._config_context_length = None
     agent._deferred_provider_runtime = None
-    agent._async_client = None
-    agent._async_client_source = None
-    agent._async_anthropic_client = agent._anthropic_client
-    agent._async_anthropic_source = None
+    agent._anthropic_client_source = None
     agent._credential_pool = MagicMock(provider="anthropic")
     agent._credential_pool.provider = "anthropic"
     agent._credential_pool_entry_id = None
