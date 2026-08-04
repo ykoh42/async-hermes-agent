@@ -30,7 +30,7 @@ dependencies = [
   # introduce ranges back without a written justification.
   #
   # Scope rule: only packages used by EVERY hermes session belong here.
-  # Anything that's provider-specific (`anthropic`, `firecrawl-py`,
+  # Anything that's provider-specific (`anthropic`,
   # `exa-py`, `fal-client`, `edge-tts`, `parallel-web`) belongs in an
   # extra and fails fast with an install hint when the user picks that
   # backend. Smaller `dependencies` = smaller blast
@@ -99,7 +99,6 @@ anthropic = ["anthropic==0.87.0"]  # CVE-2026-34450, CVE-2026-34452
 # Web search backends — each only loaded when the user picks it as their
 # search provider (configured via `hermes tools` or config.yaml).
 exa = ["exa-py==2.10.2"]
-firecrawl = ["firecrawl-py==4.17.0"]
 parallel-web = ["parallel-web==0.4.2"]
 hindsight = ["hindsight-client==0.6.1"]
 dev = ["debugpy==1.8.20", "pytest==9.0.2", "pytest-asyncio==1.3.0", "mcp==1.26.0", "starlette==1.3.1", "ty==0.0.21", "ruff==0.15.10", "setuptools==81.0.0"]  # starlette: CVE-2026-48710; setuptools: latest <82 (torch >=2.11 caps setuptools<82)

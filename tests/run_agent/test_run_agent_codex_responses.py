@@ -7,7 +7,6 @@ import pytest
 
 
 sys.modules.setdefault("fire", types.SimpleNamespace(Fire=lambda *a, **k: None))
-sys.modules.setdefault("firecrawl", types.SimpleNamespace(Firecrawl=object))
 sys.modules.setdefault("fal_client", types.SimpleNamespace())
 
 import run_agent
@@ -1693,7 +1692,6 @@ async def test_duplicate_detection_uses_commentary_when_hidden_reasoning_changes
     reasoning_items = interim_msgs[0].get("codex_reasoning_items")
     if reasoning_items:
         assert reasoning_items[0].get("id") == "rs_second"
-
 
 
 

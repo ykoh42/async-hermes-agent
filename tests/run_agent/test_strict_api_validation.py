@@ -7,7 +7,6 @@ import types
 
 
 sys.modules.setdefault("fire", types.SimpleNamespace(Fire=lambda *a, **k: None))
-sys.modules.setdefault("firecrawl", types.SimpleNamespace(Firecrawl=object))
 sys.modules.setdefault("fal_client", types.SimpleNamespace())
 
 from run_agent import AIAgent
@@ -131,4 +130,3 @@ class TestStrictApiValidation:
 
         # Should sanitize for Fireworks (chat_completions mode)
         assert agent._should_sanitize_tool_calls() is True
-

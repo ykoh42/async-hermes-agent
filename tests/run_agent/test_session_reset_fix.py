@@ -16,7 +16,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 # Stub out optional heavy dependencies not installed in the test environment
 sys.modules.setdefault("fire", types.SimpleNamespace(Fire=lambda *a, **k: None))
-sys.modules.setdefault("firecrawl", types.SimpleNamespace(Firecrawl=object))
 sys.modules.setdefault("fal_client", types.SimpleNamespace())
 
 from run_agent import AIAgent
@@ -88,5 +87,4 @@ class TestResetSessionState:
         assert agent._user_turn_count == 0, (
             f"_user_turn_count must be 0 after reset; got: {agent._user_turn_count}"
         )
-
 

@@ -146,8 +146,7 @@ class TestWebSearchUsesSearchBackend:
         monkeypatch.setattr(web_tools, "_load_web_config", lambda: {"backend": "firecrawl"})
         monkeypatch.setenv("FIRECRAWL_API_KEY", "fake")
 
-        # The function will fail at Firecrawl client level but we just
-        # need to verify _get_search_backend was called
+        # The request may fail, but this test only verifies backend selection.
         try:
             await web_tools.web_search_tool("test", 1)
         except Exception:
@@ -186,8 +185,6 @@ class TestUnconfiguredErrorEnvelopeParity:
             "PARALLEL_API_KEY",
             "FIRECRAWL_API_KEY",
             "FIRECRAWL_API_URL",
-            "FIRECRAWL_GATEWAY_URL",
-            "TOOL_GATEWAY_DOMAIN",
         ):
             monkeypatch.delenv(k, raising=False)
 
@@ -199,9 +196,6 @@ class TestUnconfiguredErrorEnvelopeParity:
         from tools import web_tools
 
         self._clear_web_creds(monkeypatch)
-        # Reset firecrawl client cache so the unconfigured state is re-evaluated
-        monkeypatch.setattr(web_tools, "_firecrawl_client", None, raising=False)
-        monkeypatch.setattr(web_tools, "_firecrawl_client_config", None, raising=False)
         monkeypatch.setattr(web_tools, "_ddgs_package_importable", lambda: False)
         monkeypatch.setattr(web_tools, "_load_web_config", lambda: {})
 

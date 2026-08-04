@@ -40,16 +40,14 @@ def test_configured_backend_is_preserved():
 def test_direct_credentials_select_backend(env, backend):
     with patch.object(web_tools, "_load_web_config", return_value={}), patch.dict(
         "os.environ", env
-    ), patch.object(web_tools, "_is_tool_gateway_ready", return_value=False), patch.object(
-        web_tools, "_ddgs_package_importable", return_value=False
-    ):
+    ), patch.object(web_tools, "_ddgs_package_importable", return_value=False):
         assert web_tools._get_backend() == backend
 
 
 def test_null_backend_config_is_safe():
     with patch.object(web_tools, "_load_web_config", return_value={"backend": None}), patch.object(
-        web_tools, "_is_tool_gateway_ready", return_value=False
-    ), patch.object(web_tools, "_ddgs_package_importable", return_value=False), patch(
+        web_tools, "_ddgs_package_importable", return_value=False
+    ), patch(
         "agent.web_search_registry.get_active_search_provider", return_value=None
     ), patch("agent.web_search_registry.get_active_extract_provider", return_value=None):
         assert web_tools.check_web_api_key() is False

@@ -4,16 +4,13 @@ Standalone Web Tools Module
 
 This module provides generic web tools that work with multiple backend providers.
 Backend is selected during ``hermes tools`` setup (web.backend in config.yaml).
-When available, Hermes can route Firecrawl calls through a Nous-hosted tool-gateway
-for Nous Subscribers only.
-
 Available tools:
 - web_search_tool: Search the web for information
 - web_extract_tool: Extract content from specific web pages
 
 Backend compatibility:
 - Exa: https://exa.ai (search, extract)
-- Firecrawl: https://docs.firecrawl.dev/introduction (search, extract; direct or derived firecrawl-gateway.<domain> for Nous Subscribers)
+- Firecrawl: https://docs.firecrawl.dev/introduction (search, extract; cloud or self-hosted)
 - Parallel: https://docs.parallel.ai (search, extract)
 - Tavily: https://tavily.com (search, extract)
 
@@ -42,25 +39,13 @@ import os
 import re
 import asyncio
 import contextvars
-from typing import List, Dict, Any, Optional, TYPE_CHECKING
+from typing import List, Dict, Any, Optional
 import httpx  # noqa: F401 — kept at module top so tests can patch tools.web_tools.httpx
 
 _web_config_snapshot: contextvars.ContextVar[dict] = contextvars.ContextVar(
     "web_config_snapshot", default={}
 )
-# After the web-provider plugin migration (PR #25182), the Firecrawl SDK
-# proxy, client construction, and response-shape normalizers all live in
-# plugins.web.firecrawl.provider. We re-export the names that external
-# code, integration tests, and unit-test patches reach for so the public
-# surface stays stable.
-if TYPE_CHECKING:
-    from firecrawl import Firecrawl  # noqa: F401 — type hints only
 from plugins.web.firecrawl.provider import (
-    Firecrawl,  # noqa: F401  # re-exported for tests that mock.patch("tools.web_tools.Firecrawl")
-    _firecrawl_backend_help_suffix,
-    _get_firecrawl_client,  # noqa: F401  # re-exported for tests that `from tools.web_tools import _get_firecrawl_client`
-    _get_firecrawl_gateway_url,
-    _is_tool_gateway_ready,
     check_firecrawl_api_key,
 )
 # Tavily helpers re-exported for backward-compat with existing unit tests
@@ -82,21 +67,11 @@ from plugins.web.exa.provider import _get_exa_client  # noqa: F401
 # Module-level cache slots for the per-vendor clients. The plugins read/write
 # these via tools.web_tools so unit tests that reset
 # ``tools.web_tools._<vendor>_client = None`` between cases keep working.
-_firecrawl_client: Optional[Any] = None
-_firecrawl_client_config: Optional[Any] = None
 _parallel_client: Optional[Any] = None
 _async_parallel_client: Optional[Any] = None
 _exa_client: Optional[Any] = None
 
 from tools.debug_helpers import DebugSession
-# Imported solely so unit tests can monkeypatch these names on
-# tools.web_tools (the firecrawl plugin reads them via its own import chain).
-from tools.managed_tool_gateway import (  # noqa: F401 — backward-compat names for tests
-    build_vendor_gateway_url,
-    peek_nous_access_token as _peek_nous_access_token,
-    read_nous_access_token as _read_nous_access_token,
-    resolve_managed_tool_gateway,
-)
 from tools.url_safety import is_safe_url, normalize_url_for_request, sensitive_query_param_name
 import sys
 
@@ -238,18 +213,12 @@ def _get_backend() -> str:
         return configured
 
     # Fallback for manual / legacy config — pick the highest-priority
-    # available backend. Explicit user credentials (TAVILY_API_KEY etc.)
-    # beat the managed-tool-gateway probe so a deliberate setup is not
-    # pre-empted by a Nous OAuth token whose subscription tier may not
-    # actually grant web-search access (the gateway then fails at runtime
-    # with "no subscription" and the tool returns an error to the agent
-    # without falling back). Free-tier backends trail the paid ones.
+    # available backend. Free-tier backends trail the paid ones.
     backend_candidates = (
         ("tavily", _has_env("TAVILY_API_KEY")),
         ("exa", _has_env("EXA_API_KEY")),
         ("parallel", _has_env("PARALLEL_API_KEY")),
         ("firecrawl", _has_env("FIRECRAWL_API_KEY") or _has_env("FIRECRAWL_API_URL")),
-        ("firecrawl", _is_tool_gateway_ready()),
         ("searxng", _has_env("SEARXNG_URL")),
         ("brave-free", _has_env("BRAVE_SEARCH_API_KEY")),
         ("ddgs", _ddgs_package_importable()),
@@ -372,38 +341,14 @@ def _ddgs_package_importable() -> bool:
     except ImportError:
         return False
 
-# ─── Firecrawl Client ────────────────────────────────────────────────────────
-
-# ─── Firecrawl Client ────────────────────────────────────────────────────────
-# After PR #25182, the firecrawl client, lazy SDK proxy, dual-auth config
-# resolution, response normalizers, and check_firecrawl_api_key() all live
-# in plugins.web.firecrawl.provider and are re-exported at the top of this
-# module so external callers (integration tests, tool-registry gating) and
-# unit tests that patch tools.web_tools.<name> continue to work.
-
-
 def _web_requires_env() -> list[str]:
-    """Return tool metadata env vars for the currently enabled web backends.
-
-    The gateway env vars are always reported — they're metadata strings
-    used by the tool registry to light up the tool when the variable is
-    set.  Gating them on ``managed_nous_tools_enabled()`` only saved
-    string noise in the metadata list, but cost a synchronous HTTP
-    refresh against the Nous portal on every CLI startup (invoked at
-    tool-registration time).  The behavioral contract is: if the env var
-    is set, the tool sees it; if not, it doesn't.  Not-logged-in users
-    simply don't have the vars set, so the extra entries are harmless.
-    """
+    """Return credential metadata for the bundled web backends."""
     return [
         "EXA_API_KEY",
         "PARALLEL_API_KEY",
         "TAVILY_API_KEY",
         "FIRECRAWL_API_KEY",
         "FIRECRAWL_API_URL",
-        "FIRECRAWL_GATEWAY_URL",
-        "TOOL_GATEWAY_DOMAIN",
-        "TOOL_GATEWAY_SCHEME",
-        "TOOL_GATEWAY_USER_TOKEN",
     ]
 
 
@@ -413,11 +358,8 @@ def _web_requires_env() -> list[str]:
 #   - parallel: plugins/web/parallel/provider.py
 #   - tavily:   plugins/web/tavily/provider.py
 #   - firecrawl: plugins/web/firecrawl/provider.py
-# The names from the firecrawl plugin (Firecrawl proxy, _get_firecrawl_client,
-# _to_plain_object, _normalize_result_list, _extract_web_search_results,
-# _extract_scrape_payload, _is_tool_gateway_ready, etc.) are re-exported at
-# the top of this module for backward-compat with integration tests and
-# unit-test patches.
+# Firecrawl credential checks are re-exported at the top of this module for
+# the setup flow.
 
 
 # Default budget (characters) of clean page text sent to the model. Pages at
@@ -1112,7 +1054,6 @@ if __name__ == "__main__":
 
     # Check if API keys are available
     web_available = check_web_api_key()
-    tool_gateway_available = _is_tool_gateway_ready()
     from hermes_cli.config import get_env_value as _gev
     firecrawl_key_available = bool((_gev("FIRECRAWL_API_KEY") or "").strip())
     firecrawl_url_available = bool((_gev("FIRECRAWL_API_URL") or "").strip())
@@ -1136,15 +1077,13 @@ if __name__ == "__main__":
             print(f"   Using self-hosted Firecrawl: {(_gev('FIRECRAWL_API_URL') or '').strip().rstrip('/')}")
         elif firecrawl_key_available:
             print("   Using direct Firecrawl cloud API")
-        elif tool_gateway_available:
-            print(f"   Using Firecrawl tool-gateway: {_get_firecrawl_gateway_url()}")
         else:
             print("   Firecrawl backend selected but not configured")
     else:
         print("❌ No web search backend configured")
         print(
-            "Set EXA_API_KEY, PARALLEL_API_KEY, TAVILY_API_KEY, FIRECRAWL_API_KEY, FIRECRAWL_API_URL"
-            f"{_firecrawl_backend_help_suffix()}"
+            "Set EXA_API_KEY, PARALLEL_API_KEY, TAVILY_API_KEY, "
+            "FIRECRAWL_API_KEY, or FIRECRAWL_API_URL"
         )
 
     if not web_available:
