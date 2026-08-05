@@ -168,6 +168,20 @@ Each input line must be JSON with a `prompt` field. Outputs are written under
 `data/<run_name>/`: per-batch JSONL shards, merged `trajectories.jsonl`,
 `checkpoint.json`, and `statistics.json`.
 
+Before handing the merged file to a trainer, audit its interleaving invariants
+and atomically export a metadata-free ShareGPT JSONL file:
+
+```bash
+python -m trajectory_validator \
+  data/tool-training/trajectories.jsonl \
+  --require-tools \
+  --export data/tool-training/training.jsonl
+```
+
+The export fails closed on malformed JSON, duplicate prompt indices,
+incomplete samples, missing reasoning, orphaned tool observations, or mismatched
+tool-call/result counts. The source batch shards and checkpoint remain intact.
+
 ## Service integration
 
 No web framework is bundled. A service should own its HTTP lifecycle and await

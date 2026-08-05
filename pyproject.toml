@@ -124,6 +124,7 @@ py-modules = [
   "toolsets",
   "batch_runner",
   "trajectory_compressor",
+  "trajectory_validator",
   "toolset_distributions",
   "hermes_bootstrap",
   "hermes_constants",
