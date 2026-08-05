@@ -1,4 +1,4 @@
-"""Native async Responses API stream tests."""
+"""Responses API stream contract tests."""
 
 from types import SimpleNamespace
 

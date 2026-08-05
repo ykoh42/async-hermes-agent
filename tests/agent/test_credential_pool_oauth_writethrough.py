@@ -181,7 +181,7 @@ async def test_unsupported_codex_pool_refresh_fails_fast(monkeypatch, tmp_path):
     )
     pool = CredentialPool(provider, [entry])
 
-    from agent.agent_runtime_helpers import AsyncCapabilityError
+    from agent.agent_runtime_helpers import UnsupportedCapabilityError
 
-    with pytest.raises(AsyncCapabilityError, match="not native async yet"):
+    with pytest.raises(UnsupportedCapabilityError, match="not native async yet"):
         await pool._refresh_entry(entry, force=True)

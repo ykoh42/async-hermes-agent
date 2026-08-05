@@ -98,7 +98,7 @@ class TestRuntimeProvider:
         """When bedrock is auto-detected (not explicitly requested) and no
         credentials are found, runtime resolution should raise AuthError."""
         from hermes_cli.runtime_provider import resolve_runtime_provider
-        from agent.agent_runtime_helpers import AsyncCapabilityError
+        from agent.agent_runtime_helpers import UnsupportedCapabilityError
 
         # Clear all AWS env vars
         for var in ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_PROFILE",
@@ -115,13 +115,13 @@ class TestRuntimeProvider:
              patch.dict("sys.modules", {"botocore": MagicMock(), "botocore.session": MagicMock()}):
             import botocore.session as _bs
             _bs.get_session = MagicMock(return_value=mock_session)
-            with pytest.raises(AsyncCapabilityError, match="AWS Bedrock"):
+            with pytest.raises(UnsupportedCapabilityError, match="AWS Bedrock"):
                 await resolve_runtime_provider(requested="auto")
 
     @pytest.mark.asyncio
     async def test_bedrock_runtime_explicit_skips_credential_check(self, monkeypatch):
         """Explicit Bedrock requests fail before a blocking boto3 transport is built."""
-        from agent.agent_runtime_helpers import AsyncCapabilityError
+        from agent.agent_runtime_helpers import UnsupportedCapabilityError
         from hermes_cli.runtime_provider import resolve_runtime_provider
 
         # No AWS env vars set — but explicit bedrock request should not raise
@@ -131,7 +131,7 @@ class TestRuntimeProvider:
 
         with patch("hermes_cli.runtime_provider.resolve_provider", return_value="bedrock"), \
              patch("hermes_cli.runtime_provider._get_model_config", return_value={"provider": "bedrock"}):
-            with pytest.raises(AsyncCapabilityError, match="AWS Bedrock"):
+            with pytest.raises(UnsupportedCapabilityError, match="AWS Bedrock"):
                 await resolve_runtime_provider(requested="bedrock")
 
 
@@ -358,7 +358,7 @@ class TestAuxiliaryClientBedrockResolution:
     @pytest.mark.asyncio
     async def test_bedrock_returns_client_with_credentials(self, monkeypatch):
         """Auxiliary Bedrock fails fast instead of constructing a blocking client."""
-        from agent.agent_runtime_helpers import AsyncCapabilityError
+        from agent.agent_runtime_helpers import UnsupportedCapabilityError
         monkeypatch.setenv("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE")
         monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY")
         monkeypatch.setenv("AWS_REGION", "us-west-2")
@@ -367,16 +367,16 @@ class TestAuxiliaryClientBedrockResolution:
         with patch("agent.anthropic_adapter.build_anthropic_bedrock_client",
                    return_value=mock_anthropic_bedrock):
             from agent.auxiliary_client import resolve_provider_client
-            with pytest.raises(AsyncCapabilityError, match="AWS Bedrock"):
+            with pytest.raises(UnsupportedCapabilityError, match="AWS Bedrock"):
                 await resolve_provider_client("bedrock", None)
 
     @pytest.mark.asyncio
     async def test_bedrock_returns_none_without_credentials(self, monkeypatch):
         """The unsupported transport is reported consistently without credentials."""
-        from agent.agent_runtime_helpers import AsyncCapabilityError
+        from agent.agent_runtime_helpers import UnsupportedCapabilityError
         with patch("agent.bedrock_adapter.has_aws_credentials", return_value=False):
             from agent.auxiliary_client import resolve_provider_client
-            with pytest.raises(AsyncCapabilityError, match="AWS Bedrock"):
+            with pytest.raises(UnsupportedCapabilityError, match="AWS Bedrock"):
                 await resolve_provider_client("bedrock", None)
 
 
@@ -385,14 +385,14 @@ class TestAuxiliaryClientBedrockResolution:
     @pytest.mark.asyncio
     async def test_bedrock_default_model_is_haiku(self, monkeypatch):
         """Model selection never hides the unsupported blocking transport."""
-        from agent.agent_runtime_helpers import AsyncCapabilityError
+        from agent.agent_runtime_helpers import UnsupportedCapabilityError
         monkeypatch.setenv("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE")
         monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY")
 
         with patch("agent.anthropic_adapter.build_anthropic_bedrock_client",
                    return_value=MagicMock()):
             from agent.auxiliary_client import resolve_provider_client
-            with pytest.raises(AsyncCapabilityError, match="AWS Bedrock"):
+            with pytest.raises(UnsupportedCapabilityError, match="AWS Bedrock"):
                 await resolve_provider_client("bedrock", None)
 
 

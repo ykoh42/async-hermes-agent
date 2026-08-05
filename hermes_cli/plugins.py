@@ -1779,14 +1779,14 @@ class PluginManager:
         for callback in callbacks:
             try:
                 if not inspect.iscoroutinefunction(callback):
-                    raise AsyncPluginCapabilityError(
+                    raise PluginContractError(
                         "Async Hermes requires coroutine lifecycle hooks; "
                         f"{getattr(callback, '__name__', repr(callback))} is synchronous"
                     )
                 result = await callback(**kwargs)
                 if result is not None:
                     results.append(result)
-            except AsyncPluginCapabilityError:
+            except PluginContractError:
                 raise
             except Exception as exc:
                 logger.warning(
@@ -1894,7 +1894,7 @@ def discover_plugins(force: bool = False) -> None:
     get_plugin_manager().discover_and_load(force=force)
 
 
-class AsyncPluginCapabilityError(RuntimeError):
+class PluginContractError(RuntimeError):
     """Raised when an unconverted plugin reaches the native async runtime."""
 
 
@@ -2052,7 +2052,7 @@ async def resolve_pre_tool_block(
             return f"BLOCKED: plugin approval required for {tool_name}"
         try:
             if not inspect.iscoroutinefunction(callback):
-                raise AsyncPluginCapabilityError(
+                raise PluginContractError(
                     "Async Hermes requires a coroutine approval callback"
                 )
             decision = await callback(
@@ -2063,7 +2063,7 @@ async def resolve_pre_tool_block(
                 task_id=task_id,
                 session_id=session_id,
             )
-        except AsyncPluginCapabilityError:
+        except PluginContractError:
             raise
         except Exception:
             logger.exception("Plugin approval callback failed for %s", tool_name)

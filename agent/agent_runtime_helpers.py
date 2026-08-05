@@ -48,7 +48,7 @@ from utils import base_url_host_matches, base_url_hostname, env_var_enabled
 logger = logging.getLogger(__name__)
 
 
-class AsyncCapabilityError(RuntimeError):
+class UnsupportedCapabilityError(RuntimeError):
     """Raised when a sync-only capability reaches the async agent core.
 
     The async distribution deliberately does not hide a blocking tool behind a
@@ -2461,7 +2461,7 @@ async def invoke_tool(
 
     entry = registry.get_entry(function_name)
     if entry is None:
-        raise AsyncCapabilityError(
+        raise UnsupportedCapabilityError(
             f"Tool '{function_name}' has no native async handler. "
             "The async agent does not execute sync tools on a worker thread."
         )

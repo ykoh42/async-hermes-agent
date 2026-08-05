@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from agent.agent_runtime_helpers import AsyncCapabilityError
+from agent.agent_runtime_helpers import UnsupportedCapabilityError
 from hermes_cli import runtime_provider as rp
 
 pytestmark = pytest.mark.asyncio
@@ -90,7 +90,7 @@ async def test_openai_codex_pool_fails_fast_without_native_async_lifecycle(monke
     monkeypatch.setattr(rp, "resolve_provider", AsyncMock(return_value="openai-codex"))
     monkeypatch.setattr(rp, "load_pool", AsyncMock(return_value=_Pool()))
 
-    with pytest.raises(AsyncCapabilityError, match="openai-codex requires an OAuth lifecycle"):
+    with pytest.raises(UnsupportedCapabilityError, match="openai-codex requires an OAuth lifecycle"):
         await rp.resolve_runtime_provider(requested="openai-codex")
 
 
@@ -98,7 +98,7 @@ async def test_qwen_oauth_fails_fast_without_native_async_lifecycle(monkeypatch)
     monkeypatch.setattr(rp, "resolve_provider", AsyncMock(return_value="qwen-oauth"))
     monkeypatch.setattr(rp, "_get_model_config", lambda *_args, **_kwargs: {})
 
-    with pytest.raises(AsyncCapabilityError, match="qwen-oauth requires an OAuth lifecycle"):
+    with pytest.raises(UnsupportedCapabilityError, match="qwen-oauth requires an OAuth lifecycle"):
         await rp.resolve_runtime_provider(requested="qwen-oauth")
 
 
@@ -777,7 +777,7 @@ async def test_auto_detected_nous_fails_fast_without_native_async_lifecycle(monk
         ),
     )
 
-    with pytest.raises(AsyncCapabilityError, match="nous requires an OAuth lifecycle"):
+    with pytest.raises(UnsupportedCapabilityError, match="nous requires an OAuth lifecycle"):
         await rp.resolve_runtime_provider(requested="auto")
 
 
@@ -1090,7 +1090,7 @@ async def test_minimax_oauth_fails_fast_without_native_async_lifecycle(monkeypat
         AsyncMock(return_value=None),
     )
 
-    with pytest.raises(AsyncCapabilityError, match="minimax-oauth requires an OAuth lifecycle"):
+    with pytest.raises(UnsupportedCapabilityError, match="minimax-oauth requires an OAuth lifecycle"):
         await rp.resolve_runtime_provider(requested="minimax-oauth")
 
 
@@ -1123,7 +1123,7 @@ async def test_minimax_oauth_pool_still_fails_fast_without_native_lifecycle(monk
     monkeypatch.setattr(rp, "_resolve_named_custom_runtime", AsyncMock(return_value=None))
     monkeypatch.setattr(rp, "_resolve_explicit_runtime", AsyncMock(return_value=None))
 
-    with pytest.raises(AsyncCapabilityError, match="minimax-oauth requires an OAuth lifecycle"):
+    with pytest.raises(UnsupportedCapabilityError, match="minimax-oauth requires an OAuth lifecycle"):
         await rp.resolve_runtime_provider(requested="minimax-oauth")
 
 
@@ -1288,7 +1288,7 @@ def _patch_bedrock(monkeypatch, config_default=""):
 async def test_resolve_runtime_provider_bedrock_fails_fast(monkeypatch):
     _patch_bedrock(monkeypatch, config_default="amazon.nova-pro-v1:0")
 
-    with pytest.raises(AsyncCapabilityError, match="AWS Bedrock currently uses"):
+    with pytest.raises(UnsupportedCapabilityError, match="AWS Bedrock currently uses"):
         await rp.resolve_runtime_provider(
             requested="bedrock",
             target_model="global.anthropic.claude-sonnet-4-6",

@@ -561,8 +561,8 @@ async def test_post_compress_exception_stops_lock_refresher(tmp_path: Path, monk
     with pytest.raises(RuntimeError, match="warn boom"):
         await agent._compress_context(messages, "sys", approx_tokens=120_000)
 
-    async_db = agent._session_db
-    assert await async_db.try_acquire_compression_lock(parent_sid, "probe", ttl_seconds=1.0)
+    session_db = agent._session_db
+    assert await session_db.try_acquire_compression_lock(parent_sid, "probe", ttl_seconds=1.0)
 
 
 

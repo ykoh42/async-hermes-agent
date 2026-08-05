@@ -1157,7 +1157,7 @@ class CredentialPool:
         # This cannot be a module import because runtime helpers already import
         # this module.  Bind it before the try block so the exception handler
         # is valid for the Anthropic branch as well.
-        from agent.agent_runtime_helpers import AsyncCapabilityError
+        from agent.agent_runtime_helpers import UnsupportedCapabilityError
 
         if entry.auth_type != AUTH_TYPE_OAUTH or not entry.refresh_token:
             if force:
@@ -1166,7 +1166,7 @@ class CredentialPool:
             return None
 
         if self.provider not in {"anthropic", "xai-oauth"}:
-            raise AsyncCapabilityError(
+            raise UnsupportedCapabilityError(
                 f"Credential pool OAuth refresh for {self.provider} is not native async yet."
             )
 
@@ -1266,7 +1266,7 @@ class CredentialPool:
                     updated.expires_at_ms or 0,
                 )
             return updated
-        except AsyncCapabilityError:
+        except UnsupportedCapabilityError:
             # Never silently downgrade an unsupported OAuth refresh into an
             # exhausted credential.  The async distribution has no sync or
             # worker-thread fallback for this path, so callers need a clear

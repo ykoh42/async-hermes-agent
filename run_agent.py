@@ -851,9 +851,9 @@ class AIAgent:
             return None
         if (getattr(self, "lmstudio_load_mode", "explicit") or "explicit").strip().lower() == "jit":
             return None
-        from agent.agent_runtime_helpers import AsyncCapabilityError
+        from agent.agent_runtime_helpers import UnsupportedCapabilityError
 
-        raise AsyncCapabilityError(
+        raise UnsupportedCapabilityError(
             "LM Studio explicit model loading uses a blocking management API and "
             "is disabled in async-hermes-agent. Set model.lmstudio_load_mode to "
             "'jit' or add a native async LM Studio loader."
@@ -4297,9 +4297,9 @@ class AIAgent:
             or self.base_url
         )
         if not runtime_key or not runtime_base:
-            from agent.agent_runtime_helpers import AsyncCapabilityError
+            from agent.agent_runtime_helpers import UnsupportedCapabilityError
 
-            raise AsyncCapabilityError(
+            raise UnsupportedCapabilityError(
                 "The selected credential has no native async API key and base URL."
             )
 
@@ -4809,13 +4809,13 @@ class AIAgent:
     async def _ensure_provider_runtime(self) -> bool:
         """Resolve a deferred provider through the native async auth boundary."""
         from agent.agent_init import initialize_deferred_runtime
-        from agent.agent_runtime_helpers import AsyncCapabilityError
+        from agent.agent_runtime_helpers import UnsupportedCapabilityError
 
-        initialization_error: AsyncCapabilityError | None = None
+        initialization_error: UnsupportedCapabilityError | None = None
         allow_startup_fallback = False
         try:
             return await initialize_deferred_runtime(self)
-        except AsyncCapabilityError as exc:
+        except UnsupportedCapabilityError as exc:
             initialization_error = exc
             pending = getattr(self, "_deferred_provider_runtime", None) or {}
             allow_startup_fallback = bool(pending.get("update_primary", True))

@@ -542,9 +542,9 @@ class TestRuntimeProviderResolution:
 
         from hermes_cli.runtime_provider import resolve_runtime_provider
 
-        from agent.agent_runtime_helpers import AsyncCapabilityError
+        from agent.agent_runtime_helpers import UnsupportedCapabilityError
 
-        with pytest.raises(AsyncCapabilityError, match="blocking subprocess"):
+        with pytest.raises(UnsupportedCapabilityError, match="blocking subprocess"):
             await resolve_runtime_provider(requested="copilot-acp")
 
 

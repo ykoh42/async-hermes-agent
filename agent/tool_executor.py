@@ -495,10 +495,10 @@ async def execute_tool_calls_segmented(
         if registry.get_entry(getattr(tc.function, "name", "")) is None
     ]
     if unsupported:
-        from agent.agent_runtime_helpers import AsyncCapabilityError
+        from agent.agent_runtime_helpers import UnsupportedCapabilityError
 
         names = ", ".join(sorted(set(unsupported)))
-        raise AsyncCapabilityError(
+        raise UnsupportedCapabilityError(
             f"Native async handlers are required for: {names}. "
             "Sync tool execution is not available in async-hermes-agent."
         )

@@ -218,7 +218,7 @@ async def run_tool_execution_middleware(
     )
 
 
-class AsyncMiddlewareCapabilityError(RuntimeError):
+class MiddlewareContractError(RuntimeError):
     """Raised when a synchronous plugin callback reaches the async agent."""
 
 
@@ -230,14 +230,14 @@ async def _invoke_middleware(kind: str, **kwargs: Any) -> List[Any]:
     for callback in callbacks:
         try:
             if not inspect.iscoroutinefunction(callback):
-                raise AsyncMiddlewareCapabilityError(
+                raise MiddlewareContractError(
                     "Async Hermes requires coroutine middleware callbacks; "
                     f"{getattr(callback, '__name__', repr(callback))} is synchronous"
                 )
             result = await callback(**payload)
             if result is not None:
                 results.append(result)
-        except AsyncMiddlewareCapabilityError:
+        except MiddlewareContractError:
             raise
         except Exception as exc:
             logger.warning(
@@ -308,14 +308,14 @@ async def _run_execution_chain(
         call_kwargs["next_call"] = next_call
         try:
             if not inspect.iscoroutinefunction(callback):
-                raise AsyncMiddlewareCapabilityError(
+                raise MiddlewareContractError(
                     "Async Hermes requires coroutine middleware callbacks; "
                     f"{getattr(callback, '__name__', repr(callback))} is synchronous"
                 )
             return await callback(**call_kwargs)
         except _DownstreamExecutionError as exc:
             raise exc.original
-        except AsyncMiddlewareCapabilityError:
+        except MiddlewareContractError:
             raise
         except Exception as exc:
             logger.warning(

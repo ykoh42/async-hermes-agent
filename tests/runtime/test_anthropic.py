@@ -1,4 +1,4 @@
-"""Native async Anthropic transport tests."""
+"""Anthropic transport contract tests."""
 
 import pytest
 
@@ -51,7 +51,7 @@ async def test_anthropic_stream_is_consumed_without_a_thread():
 
 
 @pytest.mark.asyncio
-async def test_agent_uses_native_async_messages_dispatch(monkeypatch):
+async def test_agent_uses_native_transport_messages_dispatch(monkeypatch):
     agent = AIAgent.__new__(AIAgent)
     agent.api_mode = "anthropic_messages"
     agent.provider = "anthropic"
@@ -68,7 +68,7 @@ async def test_agent_uses_native_async_messages_dispatch(monkeypatch):
         return object()
 
     async def fake_create(*args, **kwargs):
-        return {"native_async": True}
+        return {"native_transport": True}
 
     monkeypatch.setattr("agent.anthropic_adapter.build_anthropic_client", fake_build)
     monkeypatch.setattr("agent.anthropic_adapter.create_anthropic_message", fake_create)
@@ -77,11 +77,11 @@ async def test_agent_uses_native_async_messages_dispatch(monkeypatch):
         {"model": "claude-test", "messages": []}, use_streaming=False
     )
 
-    assert result == {"native_async": True}
+    assert result == {"native_transport": True}
 
 
 @pytest.mark.asyncio
-async def test_claude_code_credentials_use_native_async_file_io(tmp_path, monkeypatch):
+async def test_claude_code_credentials_use_native_transport_file_io(tmp_path, monkeypatch):
     from agent.anthropic_adapter import (
         _write_claude_code_credentials,
         read_claude_code_credentials,

@@ -1,4 +1,4 @@
-"""Coroutine-native MCP tool dispatch tests."""
+"""MCP tool dispatch contract tests."""
 
 import asyncio
 import inspect

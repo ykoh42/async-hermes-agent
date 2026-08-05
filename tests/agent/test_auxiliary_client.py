@@ -2481,9 +2481,9 @@ class TestAuxiliaryAuthRefreshRetry:
 
     @pytest.mark.asyncio
     async def test_resolve_provider_client_vertex_none_when_no_credentials(self):
-        from agent.agent_runtime_helpers import AsyncCapabilityError
+        from agent.agent_runtime_helpers import UnsupportedCapabilityError
 
-        with pytest.raises(AsyncCapabilityError, match="Vertex AI credential minting"):
+        with pytest.raises(UnsupportedCapabilityError, match="Vertex AI credential minting"):
             await resolve_provider_client(
                 "vertex",
                 "google/gemini-3-flash-preview",

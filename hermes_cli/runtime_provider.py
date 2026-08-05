@@ -1444,9 +1444,9 @@ async def _resolve_explicit_runtime(
         # resolver on its event loop; callers with an explicit key + endpoint
         # can still use the native Responses transport.
         if not explicit_api_key or not explicit_base_url:
-            from agent.agent_runtime_helpers import AsyncCapabilityError
+            from agent.agent_runtime_helpers import UnsupportedCapabilityError
 
-            raise AsyncCapabilityError(
+            raise UnsupportedCapabilityError(
                 "openai-codex OAuth resolution has no native async credential "
                 "lifecycle yet. Pass an explicit api_key and base_url, or use "
                 "an API-key provider in async-hermes-agent."
@@ -1463,9 +1463,9 @@ async def _resolve_explicit_runtime(
 
     if provider == "nous":
         if not explicit_api_key or not explicit_base_url:
-            from agent.agent_runtime_helpers import AsyncCapabilityError
+            from agent.agent_runtime_helpers import UnsupportedCapabilityError
 
-            raise AsyncCapabilityError(
+            raise UnsupportedCapabilityError(
                 "Nous Portal OAuth resolution has no native async credential "
                 "lifecycle yet. Pass an explicit api_key and base_url, or use "
                 "an API-key provider in async-hermes-agent."
@@ -1487,9 +1487,9 @@ async def _resolve_explicit_runtime(
         # Entra ID token providers are synchronous callables.  Passing one to
         # AsyncOpenAI would execute the refresh inside the event loop.
         if str(model_cfg.get("auth_mode") or "api_key").strip().lower() == "entra_id":
-            from agent.agent_runtime_helpers import AsyncCapabilityError
+            from agent.agent_runtime_helpers import UnsupportedCapabilityError
 
-            raise AsyncCapabilityError(
+            raise UnsupportedCapabilityError(
                 "Azure Foundry Entra ID requires a native async token provider; "
                 "use a static AZURE_FOUNDRY_API_KEY or an async-compatible route."
             )
@@ -1641,9 +1641,9 @@ async def resolve_runtime_provider(
     # regardless of whether the caller passed explicit_* args.
     if requested_provider == "azure-foundry":
         if str(model_config_snapshot.get("auth_mode") or "api_key").strip().lower() == "entra_id":
-            from agent.agent_runtime_helpers import AsyncCapabilityError
+            from agent.agent_runtime_helpers import UnsupportedCapabilityError
 
-            raise AsyncCapabilityError(
+            raise UnsupportedCapabilityError(
                 "Azure Foundry Entra ID requires a native async token provider; "
                 "use a static AZURE_FOUNDRY_API_KEY or an async-compatible route."
             )
@@ -1681,9 +1681,9 @@ async def resolve_runtime_provider(
     # the project ID + region. The token is re-minted per call with a five-minute
     # refresh margin.
     if requested_provider in ("vertex", "google-vertex", "vertex-ai", "gcp-vertex", "vertexai"):
-        from agent.agent_runtime_helpers import AsyncCapabilityError
+        from agent.agent_runtime_helpers import UnsupportedCapabilityError
 
-        raise AsyncCapabilityError(
+        raise UnsupportedCapabilityError(
             "Vertex AI credential minting currently uses the synchronous "
             "google-auth transport and is disabled in async-hermes-agent. "
             "Use Gemini's native async REST provider or add an async Vertex "
@@ -1783,9 +1783,9 @@ async def resolve_runtime_provider(
         return explicit_runtime
 
     if provider in {"nous", "openai-codex", "qwen-oauth", "minimax-oauth"}:
-        from agent.agent_runtime_helpers import AsyncCapabilityError
+        from agent.agent_runtime_helpers import UnsupportedCapabilityError
 
-        raise AsyncCapabilityError(
+        raise UnsupportedCapabilityError(
             f"{provider} requires an OAuth lifecycle that is not native async; "
             "use explicit credentials or an API-key provider."
         )
@@ -1879,9 +1879,9 @@ async def resolve_runtime_provider(
             )
 
     if provider == "copilot-acp":
-        from agent.agent_runtime_helpers import AsyncCapabilityError
+        from agent.agent_runtime_helpers import UnsupportedCapabilityError
 
-        raise AsyncCapabilityError(
+        raise UnsupportedCapabilityError(
             "Copilot ACP uses a blocking subprocess transport and is disabled "
             "in async-hermes-agent until a native async implementation exists."
         )
@@ -1957,9 +1957,9 @@ async def resolve_runtime_provider(
 
     # AWS Bedrock (native Converse API via boto3)
     if provider == "bedrock":
-        from agent.agent_runtime_helpers import AsyncCapabilityError
+        from agent.agent_runtime_helpers import UnsupportedCapabilityError
 
-        raise AsyncCapabilityError(
+        raise UnsupportedCapabilityError(
             "AWS Bedrock currently uses boto3/Anthropic sync credential and "
             "transport paths and is disabled in async-hermes-agent until a "
             "native async implementation is available."

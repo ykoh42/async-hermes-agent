@@ -1406,9 +1406,9 @@ def init_agent(
             # native async first-turn lifecycle.
             effective_key = api_key or ""
             if callable(effective_key) and not isinstance(effective_key, str):
-                from agent.agent_runtime_helpers import AsyncCapabilityError
+                from agent.agent_runtime_helpers import UnsupportedCapabilityError
 
-                raise AsyncCapabilityError(
+                raise UnsupportedCapabilityError(
                     "Callable credential providers are synchronous and unsupported "
                     "by async-hermes-agent. Configure a static provider API key."
                 )
@@ -2814,7 +2814,7 @@ async def initialize_deferred_runtime(agent: Any) -> bool:
             for env_path in loaded_env_paths:
                 logger.info("Loaded environment variables from %s", env_path)
 
-        from agent.agent_runtime_helpers import AsyncCapabilityError
+        from agent.agent_runtime_helpers import UnsupportedCapabilityError
         from agent.credential_pool import load_pool
         from hermes_cli.auth import PROVIDER_REGISTRY
         from hermes_constants import OPENROUTER_BASE_URL
@@ -2853,7 +2853,7 @@ async def initialize_deferred_runtime(agent: Any) -> bool:
             else "compressor"
         )
         if configured_context_engine != "compressor":
-            raise AsyncCapabilityError(
+            raise UnsupportedCapabilityError(
                 "Context engine "
                 f"{configured_context_engine!r} has no native async lifecycle "
                 "contract and is disabled in async-hermes-agent. Use the built-in "
@@ -2864,7 +2864,7 @@ async def initialize_deferred_runtime(agent: Any) -> bool:
             isinstance(value, dict) and value.get("enabled")
             for value in secrets_config.values()
         ):
-            raise AsyncCapabilityError(
+            raise UnsupportedCapabilityError(
                 "External secret-source plugins use blocking subprocess APIs and "
                 "are disabled in async-hermes-agent. Supply credentials through "
                 "the process environment or an async credential provider."
@@ -2877,7 +2877,7 @@ async def initialize_deferred_runtime(agent: Any) -> bool:
         model = str(pending.get("model") or getattr(agent, "model", "") or "")
         explicit_base_url = str(pending.get("base_url") or "").strip()
         if requested == "copilot-acp" or explicit_base_url.startswith(("acp://", "acp+tcp://")):
-            raise AsyncCapabilityError(
+            raise UnsupportedCapabilityError(
                 "Copilot ACP uses a blocking subprocess transport and is disabled "
                 "in async-hermes-agent until it has a native async implementation."
             )
@@ -2915,10 +2915,10 @@ async def initialize_deferred_runtime(agent: Any) -> bool:
             try:
                 pool = await load_pool(provider)
                 entry = await pool.select()
-            except AsyncCapabilityError:
+            except UnsupportedCapabilityError:
                 raise
             except Exception as exc:
-                raise AsyncCapabilityError(
+                raise UnsupportedCapabilityError(
                     f"Could not load the native async credential pool for {provider!r}: {exc}"
                 ) from exc
 
@@ -2960,7 +2960,7 @@ async def initialize_deferred_runtime(agent: Any) -> bool:
                 unavailable.append(provider)
                 continue
             if getattr(config, "auth_type", "api_key") != "api_key":
-                raise AsyncCapabilityError(
+                raise UnsupportedCapabilityError(
                     f"Provider {provider!r} requires a native async OAuth resolver. "
                     "Its synchronous credential source is disabled in async-hermes-agent."
                 )
@@ -2990,7 +2990,7 @@ async def initialize_deferred_runtime(agent: Any) -> bool:
 
         if resolved is None:
             hints = ", ".join(unavailable) or requested
-            raise AsyncCapabilityError(
+            raise UnsupportedCapabilityError(
                 f"No native async credentials are available for provider {requested!r} "
                 f"({hints}). Pass api_key and base_url to AIAgent, persist a credential "
                 "with Hermes auth, or configure an API-key environment variable."
@@ -2998,13 +2998,13 @@ async def initialize_deferred_runtime(agent: Any) -> bool:
 
         provider, api_key, base_url, pool, entry = resolved
         if str(pending.get("api_mode") or "") == "bedrock_converse" or provider == "bedrock":
-            raise AsyncCapabilityError(
+            raise UnsupportedCapabilityError(
                 "Bedrock has no native async transport in async-hermes-agent yet."
             )
         if provider == "lmstudio" and (
             getattr(agent, "lmstudio_load_mode", "explicit") or "explicit"
         ).strip().lower() != "jit":
-            raise AsyncCapabilityError(
+            raise UnsupportedCapabilityError(
                 "LM Studio explicit model loading uses a blocking management API "
                 "and is disabled in async-hermes-agent. Set "
                 "model.lmstudio_load_mode to 'jit' or add a native async loader."
@@ -3189,7 +3189,7 @@ async def initialize_deferred_runtime(agent: Any) -> bool:
             from agent.gemini_native_adapter import is_native_gemini_base_url
 
             if not is_native_gemini_base_url(agent.base_url):
-                raise AsyncCapabilityError(
+                raise UnsupportedCapabilityError(
                     "Gemini provider resolved to a non-native endpoint without "
                     "an OpenAI-compatible async route."
                 )

@@ -2,7 +2,7 @@
 when primary provider credentials are exhausted."""
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
-from agent.agent_runtime_helpers import AsyncCapabilityError
+from agent.agent_runtime_helpers import UnsupportedCapabilityError
 from run_agent import AIAgent
 
 
@@ -73,5 +73,5 @@ async def test_init_raises_when_no_fallback_configured():
             skip_memory=True,
             fallback_model=None,
         )
-        with pytest.raises(AsyncCapabilityError, match="No native async credentials"):
+        with pytest.raises(UnsupportedCapabilityError, match="No native async credentials"):
             await agent._ensure_provider_runtime()

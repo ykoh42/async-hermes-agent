@@ -1,10 +1,10 @@
-"""Async LLM execution middleware contract tests."""
+"""LLM execution middleware contract tests."""
 
 import pytest
 
 
 @pytest.mark.asyncio
-async def test_async_middleware_can_await_next_call(monkeypatch):
+async def test_middleware_can_await_next_call(monkeypatch):
     import importlib
 
     middleware = importlib.import_module("hermes_cli.middleware")

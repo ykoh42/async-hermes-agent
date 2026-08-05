@@ -48,7 +48,7 @@ def _client_async():
     return client
 
 
-def _patches(client, *, task_timeout, async_validation=False):
+def _patches(client, *, task_timeout, coroutine_validation=False):
     """Common mocks: provider resolution, cached client, response validation,
     and the config-derived task timeout."""
     validation_patch = (
@@ -57,7 +57,7 @@ def _patches(client, *, task_timeout, async_validation=False):
             new_callable=AsyncMock,
             side_effect=lambda resp, _task, **_kw: resp,
         )
-        if async_validation
+        if coroutine_validation
         else patch(
             "agent.auxiliary_client._validate_llm_response_shape",
             side_effect=lambda resp, _task, **_kw: resp,
@@ -83,7 +83,7 @@ class TestCompressionTimeoutFloor:
         client with at least the 300 s floor."""
         client = _client_async()
         p1, p2, p3, p4 = _patches(
-            client, task_timeout=COMPRESSION_CONFIG_TIMEOUT, async_validation=True
+            client, task_timeout=COMPRESSION_CONFIG_TIMEOUT, coroutine_validation=True
         )
         with p1, p2, p3, p4:
             await call_llm(
@@ -106,7 +106,7 @@ class TestCompressionTimeoutFloor:
         task with the same low config timeout must pass it through."""
         client = _client_async()
         low = 30.0
-        p1, p2, p3, p4 = _patches(client, task_timeout=low, async_validation=True)
+        p1, p2, p3, p4 = _patches(client, task_timeout=low, coroutine_validation=True)
         with p1, p2, p3, p4:
             await call_llm(
                 task="title_generation",
@@ -123,7 +123,7 @@ class TestCompressionTimeoutFloor:
     async def test_config_derived_compression_timeout_is_raised_to_floor_for_second_callsite(self):
         client = _client_async()
         p1, p2, p3, p4 = _patches(
-            client, task_timeout=COMPRESSION_CONFIG_TIMEOUT, async_validation=True
+            client, task_timeout=COMPRESSION_CONFIG_TIMEOUT, coroutine_validation=True
         )
         with p1, p2, p3, p4:
             await call_llm(
@@ -141,7 +141,7 @@ class TestCompressionTimeoutFloor:
         client = _client_async()
         explicit = 45.0
         p1, p2, p3, p4 = _patches(
-            client, task_timeout=COMPRESSION_CONFIG_TIMEOUT, async_validation=True
+            client, task_timeout=COMPRESSION_CONFIG_TIMEOUT, coroutine_validation=True
         )
         with p1, p2, p3, p4:
             await call_llm(
@@ -157,7 +157,7 @@ class TestCompressionTimeoutFloor:
         client = _client_async()
         low = 30.0
         p1, p2, p3, p4 = _patches(
-            client, task_timeout=low, async_validation=True
+            client, task_timeout=low, coroutine_validation=True
         )
         with p1, p2, p3, p4:
             await call_llm(

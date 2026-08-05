@@ -1148,15 +1148,15 @@ class TestBearerTokenRoutesToConverse:
     @pytest.mark.asyncio
     async def test_bearer_token_fails_without_native_bedrock_transport(self, monkeypatch):
         """Bearer auth must not revive boto3's synchronous Converse path."""
-        from agent.agent_runtime_helpers import AsyncCapabilityError
+        from agent.agent_runtime_helpers import UnsupportedCapabilityError
 
-        with pytest.raises(AsyncCapabilityError, match="disabled in async-hermes-agent"):
+        with pytest.raises(UnsupportedCapabilityError, match="disabled in async-hermes-agent"):
             await self._resolve(monkeypatch, bearer=True)
 
     @pytest.mark.asyncio
     async def test_sigv4_fails_without_native_bedrock_transport(self, monkeypatch):
         """SigV4 must not revive the synchronous AnthropicBedrock SDK path."""
-        from agent.agent_runtime_helpers import AsyncCapabilityError
+        from agent.agent_runtime_helpers import UnsupportedCapabilityError
 
-        with pytest.raises(AsyncCapabilityError, match="disabled in async-hermes-agent"):
+        with pytest.raises(UnsupportedCapabilityError, match="disabled in async-hermes-agent"):
             await self._resolve(monkeypatch, bearer=False)

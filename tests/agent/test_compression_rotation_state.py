@@ -328,8 +328,8 @@ class TestAutomaticCompressionStateRefreshAfterLock:
 
         # A competing path completes rotation after this call's initial checks
         # but before it acquires the parent lock.
-        async_db = agent._session_db
-        real_acquire = async_db.try_acquire_compression_lock
+        session_db = agent._session_db
+        real_acquire = session_db.try_acquire_compression_lock
 
         async def _acquire_after_rotation(*args, **kwargs):
             await db.end_session(parent_id, "compression")
@@ -340,7 +340,7 @@ class TestAutomaticCompressionStateRefreshAfterLock:
             )
             return await real_acquire(*args, **kwargs)
 
-        async_db.try_acquire_compression_lock = _acquire_after_rotation
+        session_db.try_acquire_compression_lock = _acquire_after_rotation
         agent.context_compressor = compressor
         agent.compression_in_place = False
         agent._compression_feasibility_checked = True

@@ -1638,9 +1638,9 @@ async def cleanup_task_resources(agent, task_id: str) -> None:
     # Calling a legacy synchronous environment manager here would silently
     # block the agent event loop, so unsupported ephemeral backends must be
     # explicit until their lifecycle API is native async.
-    from agent.agent_runtime_helpers import AsyncCapabilityError
+    from agent.agent_runtime_helpers import UnsupportedCapabilityError
 
-    raise AsyncCapabilityError(
+    raise UnsupportedCapabilityError(
         "The configured terminal backend has no native async cleanup API. "
         "Use the local persistent terminal or install an async backend."
     )

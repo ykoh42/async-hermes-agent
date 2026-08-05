@@ -1049,7 +1049,7 @@ async def build_turn_context(
     # must either migrate the plugin hook or disable it.
     try:
         from hermes_cli.lifecycle import invoke_hook
-        from hermes_cli.plugins import AsyncPluginCapabilityError
+        from hermes_cli.plugins import PluginContractError
 
         pre_llm_results = await invoke_hook(
             "pre_llm_call",
@@ -1060,7 +1060,7 @@ async def build_turn_context(
             model=agent.model,
             platform=getattr(agent, "platform", None) or "",
         )
-    except AsyncPluginCapabilityError:
+    except PluginContractError:
         raise
     except Exception as exc:
         logger.warning("pre_llm_call hook failed: %s", exc)

@@ -26,7 +26,7 @@ async def test_credential_rotation_rebuilds_natively_without_sync_settings_io():
     with (
         patch("run_agent.get_tool_definitions", return_value=[]),
         patch("run_agent.check_toolset_requirements", return_value={}),
-        patch("run_agent.OpenAI", return_value=native_client) as async_openai,
+        patch("run_agent.OpenAI", return_value=native_client) as openai_factory,
         patch(
             "hermes_cli.config.load_config_readonly",
             side_effect=AssertionError("credential rotation must not read settings"),
@@ -57,7 +57,7 @@ async def test_credential_rotation_rebuilds_natively_without_sync_settings_io():
     assert agent._credential_pool_entry_id == "pool-entry-b"
     assert agent.client is native_client
     assert agent.client._platform == "Unknown"
-    async_openai.assert_called_once()
+    openai_factory.assert_called_once()
     await agent.close()
 
 

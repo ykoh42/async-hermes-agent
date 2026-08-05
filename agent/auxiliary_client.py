@@ -59,7 +59,7 @@ from types import SimpleNamespace
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import urlparse, parse_qs, urlunparse
 
-from agent.agent_runtime_helpers import AsyncCapabilityError
+from agent.agent_runtime_helpers import UnsupportedCapabilityError
 
 from agent.credential_pool import load_pool
 from agent.model_metadata import (
@@ -1582,9 +1582,9 @@ async def _maybe_wrap_anthropic(
     try:
         from agent.anthropic_adapter import build_anthropic_client
     except ImportError as exc:
-        from agent.agent_runtime_helpers import AsyncCapabilityError
+        from agent.agent_runtime_helpers import UnsupportedCapabilityError
 
-        raise AsyncCapabilityError(
+        raise UnsupportedCapabilityError(
             "This endpoint requires the Anthropic async transport, but the "
             "anthropic adapter is unavailable. Install the provider dependency "
             "instead of falling back to the incompatible OpenAI wire format."
@@ -1731,9 +1731,9 @@ async def _resolve_nous_runtime_api(*, force_refresh: bool = False) -> Optional[
     if pooled is not None:
         return pooled
 
-    from agent.agent_runtime_helpers import AsyncCapabilityError
+    from agent.agent_runtime_helpers import UnsupportedCapabilityError
 
-    raise AsyncCapabilityError(
+    raise UnsupportedCapabilityError(
         "Nous Portal OAuth refresh has no native async credential lifecycle "
         "yet; a stale or missing pool entry cannot be refreshed from the "
         "async auxiliary path."
@@ -1780,9 +1780,9 @@ async def _resolve_xai_oauth_for_aux() -> Optional[Tuple[str, str]]:
     except Exception as exc:
         logger.debug("Auxiliary xAI OAuth pool credential resolution failed: %s", exc)
 
-    from agent.agent_runtime_helpers import AsyncCapabilityError
+    from agent.agent_runtime_helpers import UnsupportedCapabilityError
 
-    raise AsyncCapabilityError(
+    raise UnsupportedCapabilityError(
         "xAI OAuth refresh has no native async credential lifecycle yet; a "
         "stale or missing pool entry cannot be refreshed from the async "
         "auxiliary path."
@@ -3776,7 +3776,7 @@ async def _try_payment_fallback(
             continue
         try:
             client, model = await try_fn()
-        except AsyncCapabilityError as exc:
+        except UnsupportedCapabilityError as exc:
             logger.debug(
                 "Auxiliary fallback: skipping %s without native async support: %s",
                 label,
@@ -4482,7 +4482,7 @@ async def _resolve_auto(
             continue
         try:
             client, model = await try_fn()
-        except AsyncCapabilityError as exc:
+        except UnsupportedCapabilityError as exc:
             logger.debug(
                 "Auxiliary auto-detect: skipping %s without native async support: %s",
                 label,
@@ -4653,9 +4653,9 @@ async def resolve_provider_client(
     # sent to Codex after the main lane fell back to gpt-5.5). Let _resolve_auto()
     # return the actual current runtime model when the caller did not explicitly
     # request one. (# compression-current-model)
-    async_main_model = await _read_main_model_for_aux(config)
+    main_model = await _read_main_model_for_aux(config)
     if not model and provider != "auto":
-        model = _get_aux_model_for_provider(provider) or async_main_model or model
+        model = _get_aux_model_for_provider(provider) or main_model or model
 
     def _needs_codex_wrap(client_obj, base_url_str: str, model_str: str) -> bool:
         """Decide if a plain OpenAI client should be wrapped for Responses API.
@@ -4949,7 +4949,7 @@ async def resolve_provider_client(
                     model
                     or custom_entry.get("model")
                     or (main_runtime.get("model") if main_runtime else None)
-                    or async_main_model
+                    or main_model
                     or "gpt-4o-mini",
                     provider,
                 )
@@ -5200,18 +5200,18 @@ async def resolve_provider_client(
         return client, final_model
 
     if pconfig.auth_type == "external_process":
-        from agent.agent_runtime_helpers import AsyncCapabilityError
+        from agent.agent_runtime_helpers import UnsupportedCapabilityError
 
-        raise AsyncCapabilityError(
+        raise UnsupportedCapabilityError(
             f"Provider {provider!r} uses a blocking external-process transport "
             "and is disabled in async-hermes-agent until a native async "
             "implementation is available."
         )
 
     elif pconfig.auth_type == "vertex":
-        from agent.agent_runtime_helpers import AsyncCapabilityError
+        from agent.agent_runtime_helpers import UnsupportedCapabilityError
 
-        raise AsyncCapabilityError(
+        raise UnsupportedCapabilityError(
             "Vertex AI credential minting currently uses the synchronous "
             "google-auth transport and is disabled in async-hermes-agent. "
             "Use Gemini's native async REST provider or add an async Vertex "
@@ -5219,9 +5219,9 @@ async def resolve_provider_client(
         )
 
     elif pconfig.auth_type == "aws_sdk":
-        from agent.agent_runtime_helpers import AsyncCapabilityError
+        from agent.agent_runtime_helpers import UnsupportedCapabilityError
 
-        raise AsyncCapabilityError(
+        raise UnsupportedCapabilityError(
             "AWS Bedrock currently uses boto3/Anthropic sync transport paths "
             "and is disabled in async-hermes-agent until a native async "
             "implementation is available."
@@ -5377,7 +5377,7 @@ async def _resolve_strict_vision_backend(
 async def _strict_vision_backend_available(provider: str) -> bool:
     try:
         return (await _resolve_strict_vision_backend(provider))[0] is not None
-    except AsyncCapabilityError:
+    except UnsupportedCapabilityError:
         return False
 
 

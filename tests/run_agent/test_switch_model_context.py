@@ -264,9 +264,9 @@ async def test_direct_start_preserves_context_for_normalized_default_model_alias
 @pytest.mark.asyncio
 async def test_lmstudio_explicit_switch_fails_before_blocking_preload(monkeypatch):
     agent = _make_agent_with_compressor(config_context_length=32_768)
-    from agent.agent_runtime_helpers import AsyncCapabilityError
+    from agent.agent_runtime_helpers import UnsupportedCapabilityError
 
-    with pytest.raises(AsyncCapabilityError, match="LM Studio explicit model loading"):
+    with pytest.raises(UnsupportedCapabilityError, match="LM Studio explicit model loading"):
         await agent.switch_model(
             "lmstudio/new-model",
             "lmstudio",

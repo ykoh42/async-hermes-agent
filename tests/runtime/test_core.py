@@ -1,4 +1,4 @@
-"""Regression coverage for the async-first public core."""
+"""Regression coverage for the public runtime core."""
 
 import inspect
 import asyncio
@@ -138,28 +138,28 @@ def test_constructor_does_not_read_runtime_config_or_create_logs():
 
 
 @pytest.mark.asyncio
-async def test_async_session_billing_route_update_uses_native_connection(tmp_path):
+async def test_session_billing_route_update_uses_native_connection(tmp_path):
     """A model switch must not fall back to the synchronous SessionDB writer."""
     database = SessionDB(tmp_path / "state.db")
-    async_database = database
+    database = database
     try:
-        await async_database.create_session("route", "test", model="initial")
-        await async_database.update_session_billing_route(
+        await database.create_session("route", "test", model="initial")
+        await database.update_session_billing_route(
             "route",
             provider="openrouter",
             base_url="https://openrouter.ai/api/v1",
             billing_mode="chat_completions",
         )
-        session = await async_database.get_session("route")
+        session = await database.get_session("route")
         assert session["billing_provider"] == "openrouter"
         assert session["billing_base_url"] == "https://openrouter.ai/api/v1"
         assert session["billing_mode"] == "chat_completions"
     finally:
-        await async_database.close()
+        await database.close()
 
 
 @pytest.mark.asyncio
-async def test_async_session_db_can_bootstrap_from_a_path(tmp_path):
+async def test_session_db_can_bootstrap_from_a_path(tmp_path):
     """The active path does not need a synchronously opened SessionDB."""
     database = SessionDB(tmp_path / "state.db")
     try:
@@ -176,7 +176,7 @@ async def test_async_session_db_can_bootstrap_from_a_path(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_async_session_db_meta_round_trip(tmp_path):
+async def test_session_db_meta_round_trip(tmp_path):
     """Session metadata uses the native async connection."""
     database = SessionDB(tmp_path / "state.db")
     try:
@@ -222,7 +222,7 @@ async def test_native_file_read_deduplicates_and_write_invalidates(tmp_path, mon
 async def test_model_switch_route_is_deferred_to_the_async_turn_boundary(tmp_path):
     """The sync state switch never writes SQLite directly."""
     database = SessionDB(tmp_path / "state.db")
-    async_database = database
+    database = database
     agent = AIAgent.__new__(AIAgent)
     agent._session_db = database
     agent._persist_disabled = False
@@ -233,13 +233,13 @@ async def test_model_switch_route_is_deferred_to_the_async_turn_boundary(tmp_pat
         "billing_mode": "chat_completions",
     }
     try:
-        await async_database.create_session("route", "test")
+        await database.create_session("route", "test")
         await agent._persist_pending_billing_route()
-        session = await async_database.get_session("route")
+        session = await database.get_session("route")
         assert session["billing_provider"] == "openrouter"
         assert agent._pending_billing_route is None
     finally:
-        await async_database.close()
+        await database.close()
 
 
 @pytest.mark.asyncio
@@ -314,13 +314,13 @@ async def test_model_switch_uses_deferred_native_provider_runtime(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_async_plugin_lifecycle_requires_coroutine_callbacks():
+async def test_plugin_lifecycle_requires_coroutine_callbacks():
     """Sync plugin hooks cannot quietly stall an async agent turn."""
-    from hermes_cli.plugins import AsyncPluginCapabilityError, PluginManager
+    from hermes_cli.plugins import PluginContractError, PluginManager
 
     manager = PluginManager()
     manager._hooks["turn"] = [lambda **_kwargs: None]
-    with pytest.raises(AsyncPluginCapabilityError, match="coroutine lifecycle hooks"):
+    with pytest.raises(PluginContractError, match="coroutine lifecycle hooks"):
         await manager.invoke_hook("turn")
 
     async def callback(**_kwargs):
@@ -334,7 +334,7 @@ async def test_async_plugin_lifecycle_requires_coroutine_callbacks():
 async def test_deferred_runtime_rejects_sync_only_context_engine_early():
     """Provider construction must stop before an external legacy extension runs."""
     from agent.agent_init import initialize_deferred_runtime
-    from agent.agent_runtime_helpers import AsyncCapabilityError
+    from agent.agent_runtime_helpers import UnsupportedCapabilityError
 
     async def assert_rejected(**attributes):
         state = {
@@ -346,7 +346,7 @@ async def test_deferred_runtime_rejects_sync_only_context_engine_early():
         }
         state.update(attributes)
         agent = SimpleNamespace(**state)
-        with pytest.raises(AsyncCapabilityError):
+        with pytest.raises(UnsupportedCapabilityError):
             await initialize_deferred_runtime(agent)
 
     await assert_rejected(
@@ -377,7 +377,7 @@ def test_api_timeout_resolution_uses_the_constructor_snapshot(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_api_key_pool_rotation_is_native_async_and_persistent(monkeypatch, tmp_path):
+async def test_api_key_pool_rotation_is_native_transport_and_persistent(monkeypatch, tmp_path):
     """A billing failure rotates pool keys without a thread-bound I/O path."""
     from agent.agent_runtime_helpers import recover_with_credential_pool
     from agent.credential_pool import AUTH_TYPE_API_KEY, CredentialPool, PooledCredential
@@ -555,7 +555,7 @@ async def test_explicit_credentials_defer_sdk_construction_until_await(monkeypat
     with (
         patch("run_agent.get_tool_definitions", return_value=[]),
         patch("run_agent.check_toolset_requirements", return_value={}),
-        patch("run_agent.OpenAI", return_value=native_client) as async_openai,
+        patch("run_agent.OpenAI", return_value=native_client) as openai_factory,
     ):
         agent = AIAgent(
             provider="custom",
@@ -568,7 +568,7 @@ async def test_explicit_credentials_defer_sdk_construction_until_await(monkeypat
         )
         assert agent.client is None
         assert agent._deferred_provider_runtime is not None
-        async_openai.assert_not_called()
+        openai_factory.assert_not_called()
 
         monkeypatch.setattr(
             asyncio,
@@ -579,7 +579,7 @@ async def test_explicit_credentials_defer_sdk_construction_until_await(monkeypat
         )
         await agent._ensure_provider_runtime()
 
-    async_openai.assert_called_once()
+    openai_factory.assert_called_once()
     assert agent.client is native_client
     assert agent.client._platform == "Unknown"
     await agent.close()
@@ -601,7 +601,7 @@ async def test_custom_env_key_preserves_constructor_route_and_tls_snapshot(
     with (
         patch("run_agent.get_tool_definitions", return_value=[]),
         patch("run_agent.check_toolset_requirements", return_value={}),
-        patch("run_agent.OpenAI", return_value=native_client) as async_openai,
+        patch("run_agent.OpenAI", return_value=native_client) as openai_factory,
         patch("hermes_cli.config.load_config", return_value={
             "custom_providers": [{
                 "name": "Local endpoint",
@@ -623,7 +623,7 @@ async def test_custom_env_key_preserves_constructor_route_and_tls_snapshot(
             skip_context_files=True,
             skip_memory=True,
         )
-        async_openai.assert_not_called()
+        openai_factory.assert_not_called()
         monkeypatch.setattr(
             asyncio,
             "to_thread",
@@ -734,7 +734,7 @@ async def test_turn_retries_with_rotated_api_key_pool_entry(monkeypatch, tmp_pat
 
 
 @pytest.mark.asyncio
-async def test_anthropic_pool_refresh_uses_native_async_transport(monkeypatch, tmp_path):
+async def test_anthropic_pool_refresh_uses_native_transport_transport(monkeypatch, tmp_path):
     """Anthropic OAuth refresh never reaches urllib or the sync pool method."""
     from agent.credential_pool import AUTH_TYPE_OAUTH, CredentialPool, PooledCredential
 
@@ -785,7 +785,7 @@ async def test_anthropic_pool_refresh_uses_native_async_transport(monkeypatch, t
 @pytest.mark.asyncio
 async def test_unsupported_oauth_pool_refresh_fails_fast_without_a_thread(monkeypatch):
     """A provider without a native OAuth lifecycle is never silently bridged."""
-    from agent.agent_runtime_helpers import AsyncCapabilityError
+    from agent.agent_runtime_helpers import UnsupportedCapabilityError
     from agent.credential_pool import AUTH_TYPE_OAUTH, CredentialPool, PooledCredential
 
     pool = CredentialPool(
@@ -808,7 +808,7 @@ async def test_unsupported_oauth_pool_refresh_fails_fast_without_a_thread(monkey
         raise AssertionError("unsupported OAuth must not use asyncio.to_thread")
 
     monkeypatch.setattr(asyncio, "to_thread", fail_if_threaded)
-    with pytest.raises(AsyncCapabilityError, match="openai-codex"):
+    with pytest.raises(UnsupportedCapabilityError, match="openai-codex"):
         await pool.try_refresh_matching(credential_id="codex")
 
 
@@ -1127,7 +1127,7 @@ async def test_clarify_tool_awaits_the_platform_callback():
 
 
 @pytest.mark.asyncio
-async def test_fallback_swaps_to_a_native_async_client(monkeypatch):
+async def test_fallback_swaps_to_a_native_transport_client(monkeypatch):
     """A fallback client must be awaited directly, never thread-wrapped."""
 
     class NativeCompletions:
@@ -1186,13 +1186,13 @@ async def test_fallback_swaps_to_a_native_async_client(monkeypatch):
 
     monkeypatch.setattr(asyncio, "to_thread", fail_if_threaded)
     try:
-        with patch("run_agent.OpenAI", return_value=native_client) as async_openai:
+        with patch("run_agent.OpenAI", return_value=native_client) as openai_factory:
             assert await agent._try_activate_fallback()
             response = await agent._execute_model_request(
                 {"model": agent.model, "messages": []}
             )
 
-        async_openai.assert_called_once()
+        openai_factory.assert_called_once()
         assert agent.client is native_client
         assert response.choices[0].message.content == "fallback answer"
     finally:
@@ -1550,7 +1550,7 @@ async def test_trajectory_writer_is_awaitable(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_async_session_db_writes_without_to_thread(tmp_path, monkeypatch):
+async def test_session_db_writes_without_to_thread(tmp_path, monkeypatch):
     database = SessionDB(tmp_path / "state.db")
     session_db = database
 
@@ -1594,7 +1594,7 @@ async def test_conversation_root_uses_async_session_db(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_async_session_db_loads_compression_snapshot(tmp_path, monkeypatch):
+async def test_session_db_loads_compression_snapshot(tmp_path, monkeypatch):
     database = SessionDB(tmp_path / "state.db")
     session_db = database
     monkeypatch.setattr(
@@ -1627,7 +1627,7 @@ async def test_async_session_db_loads_compression_snapshot(tmp_path, monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_async_session_db_persists_compression_guards(tmp_path, monkeypatch):
+async def test_session_db_persists_compression_guards(tmp_path, monkeypatch):
     database = SessionDB(tmp_path / "state.db")
     session_db = database
     monkeypatch.setattr(
@@ -1721,7 +1721,7 @@ async def test_micro_compaction_persists_through_async_session_db(tmp_path, monk
 
 
 @pytest.mark.asyncio
-async def test_async_auxiliary_accounting_writes_without_to_thread(tmp_path, monkeypatch):
+async def test_auxiliary_accounting_writes_without_to_thread(tmp_path, monkeypatch):
     """An auxiliary model response persists usage through SessionDB only."""
     from agent.aux_accounting import reset_accounting_context, set_accounting_context
     from agent.auxiliary_client import _validate_llm_response
@@ -1757,7 +1757,7 @@ async def test_async_auxiliary_accounting_writes_without_to_thread(tmp_path, mon
 
 
 @pytest.mark.asyncio
-async def test_async_session_db_backfills_api_sidecar_without_to_thread(
+async def test_session_db_backfills_api_sidecar_without_to_thread(
     tmp_path, monkeypatch
 ):
     database = SessionDB(tmp_path / "state.db")
@@ -1785,7 +1785,7 @@ async def test_async_session_db_backfills_api_sidecar_without_to_thread(
 
 
 @pytest.mark.asyncio
-async def test_async_session_db_compacts_and_releases_lease_without_to_thread(
+async def test_session_db_compacts_and_releases_lease_without_to_thread(
     tmp_path, monkeypatch
 ):
     """The async compaction primitives preserve active/archived transcript rows."""
@@ -1835,7 +1835,7 @@ async def test_async_session_db_compacts_and_releases_lease_without_to_thread(
 
 
 @pytest.mark.asyncio
-async def test_in_place_compression_uses_native_async_sqlite_path(tmp_path, monkeypatch):
+async def test_in_place_compression_uses_native_transport_sqlite_path(tmp_path, monkeypatch):
     """A complete in-place compaction never re-enters the sync SessionDB API."""
     database = SessionDB(tmp_path / "state.db")
     session_db = database
@@ -1925,7 +1925,7 @@ async def test_in_place_compression_uses_native_async_sqlite_path(tmp_path, monk
 
 
 @pytest.mark.asyncio
-async def test_rotating_compression_publishes_child_with_native_async_sqlite(tmp_path):
+async def test_rotating_compression_publishes_child_with_native_transport_sqlite(tmp_path):
     """The optional rotation mode retains its atomic parent/child handoff."""
     database = SessionDB(tmp_path / "state.db")
     session_db = database
@@ -2006,7 +2006,7 @@ async def test_rotating_compression_publishes_child_with_native_async_sqlite(tmp
 
 
 @pytest.mark.asyncio
-async def test_agent_session_lifecycle_uses_native_async_store(tmp_path, monkeypatch):
+async def test_agent_session_lifecycle_uses_native_transport_store(tmp_path, monkeypatch):
     database = SessionDB(tmp_path / "state.db")
     agent = AIAgent.__new__(AIAgent)
     agent._persist_disabled = False
@@ -2102,7 +2102,7 @@ async def test_persist_session_does_not_reenter_its_async_lock(tmp_path, monkeyp
 
 
 @pytest.mark.asyncio
-async def test_native_async_terminal_does_not_use_to_thread(monkeypatch, tmp_path):
+async def test_native_transport_terminal_does_not_use_to_thread(monkeypatch, tmp_path):
     def fail_if_called(*args, **kwargs):
         raise AssertionError("terminal must use asyncio subprocesses directly")
 
@@ -2191,7 +2191,7 @@ async def test_synthetic_turn_records_trajectory_without_to_thread(monkeypatch, 
 @pytest.mark.asyncio
 async def test_oauth_renewal_fails_fast_without_sync_refresh(monkeypatch, tmp_path):
     """An async turn must not invoke the legacy OAuth-refresh helpers."""
-    from agent.agent_runtime_helpers import AsyncCapabilityError
+    from agent.agent_runtime_helpers import UnsupportedCapabilityError
 
     class UnauthorizedError(Exception):
         status_code = 401
@@ -2225,7 +2225,7 @@ async def test_oauth_renewal_fails_fast_without_sync_refresh(monkeypatch, tmp_pa
         AssertionError("async turn must not call the sync credential refresher")
     )
     try:
-        with pytest.raises(AsyncCapabilityError, match="OAuth renewal"):
+        with pytest.raises(UnsupportedCapabilityError, match="OAuth renewal"):
             await agent.run_conversation("hello async")
     finally:
         await agent.close()
@@ -2233,7 +2233,7 @@ async def test_oauth_renewal_fails_fast_without_sync_refresh(monkeypatch, tmp_pa
 
 
 @pytest.mark.asyncio
-async def test_codex_responses_main_path_uses_native_async_client(monkeypatch):
+async def test_codex_responses_main_path_uses_native_transport_client(monkeypatch):
     """Codex main turns use AsyncOpenAI Responses, never a chat shim thread."""
     agent = AIAgent.__new__(AIAgent)
     agent.api_mode = "codex_responses"
@@ -2526,7 +2526,7 @@ async def test_cancelled_tool_batch_persists_ordered_cancelled_observation(
 
 
 @pytest.mark.asyncio
-async def test_async_registry_handler_is_awaited(monkeypatch):
+async def test_registry_handler_is_awaited(monkeypatch):
     name = "__async_core_test_tool__"
 
     async def handler(args, **kwargs):
@@ -2556,7 +2556,7 @@ async def test_async_registry_handler_is_awaited(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_memory_tool_uses_native_async_file_path(monkeypatch, tmp_path):
+async def test_memory_tool_uses_native_transport_file_path(monkeypatch, tmp_path):
     """Memory remains durable without exposing a blocking handler to the loop."""
     import importlib
 
@@ -2650,7 +2650,7 @@ async def test_skills_tools_keep_the_public_name_and_use_async_file_reads(
 
 
 @pytest.mark.asyncio
-async def test_async_tool_scheduler_preserves_barriers_and_result_order(monkeypatch):
+async def test_tool_scheduler_preserves_barriers_and_result_order(monkeypatch):
     import importlib
 
     active_executor = importlib.import_module("agent.tool_executor")

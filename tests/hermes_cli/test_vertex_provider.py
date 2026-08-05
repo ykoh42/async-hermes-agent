@@ -20,10 +20,10 @@ import pytest
 async def test_resolve_runtime_provider_raises_autherror_when_unresolved(monkeypatch):
     import agent.vertex_adapter as va
     from hermes_cli import runtime_provider as rp
-    from agent.agent_runtime_helpers import AsyncCapabilityError
+    from agent.agent_runtime_helpers import UnsupportedCapabilityError
 
     monkeypatch.setattr(va, "get_vertex_config", lambda: (None, None))
-    with pytest.raises(AsyncCapabilityError) as exc:
+    with pytest.raises(UnsupportedCapabilityError) as exc:
         await rp.resolve_runtime_provider(requested="vertex")
     msg = str(exc.value)
     assert "synchronous google-auth transport" in msg

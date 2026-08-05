@@ -28,7 +28,7 @@ import time
 from typing import Any, Dict, List, Optional
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
-from agent.agent_runtime_helpers import AsyncCapabilityError
+from agent.agent_runtime_helpers import UnsupportedCapabilityError
 from agent.conversation_compression import (
     COMPRESSION_RETRY_CONTEXT_REDUCED_STATUS_TEMPLATE,
     COMPRESSION_RETRY_MESSAGES_STATUS_TEMPLATE,
@@ -3655,7 +3655,7 @@ async def run_conversation(
                     and not _retry.nous_paid_entitlement_refresh_attempted
                 ):
                     _retry.nous_paid_entitlement_refresh_attempted = True
-                    raise AsyncCapabilityError(
+                    raise UnsupportedCapabilityError(
                         "Nous paid-entitlement credential renewal has no native async "
                         "implementation. Refresh credentials before starting the async agent."
                     )
@@ -3789,7 +3789,7 @@ async def run_conversation(
                     and not _retry.codex_auth_retry_attempted
                 ):
                     _retry.codex_auth_retry_attempted = True
-                    raise AsyncCapabilityError(
+                    raise UnsupportedCapabilityError(
                         f"{agent.provider} OAuth renewal has no native async implementation. "
                         "Refresh credentials before starting the async agent."
                     )
@@ -3800,7 +3800,7 @@ async def run_conversation(
                     and not _retry.vertex_auth_retry_attempted
                 ):
                     _retry.vertex_auth_retry_attempted = True
-                    raise AsyncCapabilityError(
+                    raise UnsupportedCapabilityError(
                         "Vertex OAuth renewal has no native async implementation. "
                         "Refresh credentials before starting the async agent."
                     )
@@ -3811,7 +3811,7 @@ async def run_conversation(
                     and not _retry.nous_auth_retry_attempted
                 ):
                     _retry.nous_auth_retry_attempted = True
-                    raise AsyncCapabilityError(
+                    raise UnsupportedCapabilityError(
                         "Nous credential renewal has no native async implementation. "
                         "Refresh credentials before starting the async agent."
                     )
@@ -3821,7 +3821,7 @@ async def run_conversation(
                     and not _retry.copilot_auth_retry_attempted
                 ):
                     _retry.copilot_auth_retry_attempted = True
-                    raise AsyncCapabilityError(
+                    raise UnsupportedCapabilityError(
                         "Copilot credential renewal has no native async implementation. "
                         "Refresh credentials before starting the async agent."
                     )
@@ -3834,7 +3834,7 @@ async def run_conversation(
                     _retry.anthropic_auth_retry_attempted = True
                     from agent.anthropic_adapter import _is_oauth_token
                     if getattr(agent, "_is_anthropic_oauth", False):
-                        raise AsyncCapabilityError(
+                        raise UnsupportedCapabilityError(
                             "Anthropic OAuth renewal has no native async implementation. "
                             "Refresh credentials before starting the async agent."
                         )

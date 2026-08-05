@@ -677,7 +677,7 @@ def _supported_compression_kwargs(
     return {name: value for name, value in candidates.items() if name in parameters}
 
 
-class _AsyncCompressionActivityHeartbeat:
+class _CompressionActivityHeartbeat:
     """Event-loop heartbeat for the native async compression path."""
 
     def __init__(self, agent: Any, interval_seconds: float | None = None) -> None:
@@ -695,7 +695,7 @@ class _AsyncCompressionActivityHeartbeat:
         self._interval_seconds = max(0.1, interval_seconds)
         self._task: asyncio.Task | None = None
 
-    def start(self) -> "_AsyncCompressionActivityHeartbeat":
+    def start(self) -> "_CompressionActivityHeartbeat":
         self._touch("context compression started")
         self._task = asyncio.create_task(
             self._run(), name="compression-activity-heartbeat"
@@ -1651,7 +1651,7 @@ async def compress_context(
                 existing_prompt = await agent._build_system_prompt(system_message)
             return messages, existing_prompt
 
-    _activity_heartbeat: Optional[_AsyncCompressionActivityHeartbeat] = None
+    _activity_heartbeat: Optional[_CompressionActivityHeartbeat] = None
     try:
         if _lock_holder is not None:
             try:
@@ -1740,7 +1740,7 @@ async def compress_context(
                 )
 
         messages_before_compression = copy.deepcopy(messages)
-        _activity_heartbeat = _AsyncCompressionActivityHeartbeat(agent).start()
+        _activity_heartbeat = _CompressionActivityHeartbeat(agent).start()
         # Publish forward progress to the commit fence while the summary LLM
         # call streams. Async hosts (gateway session hygiene) poll
         # ``commit_fence.seconds_since_progress()`` to extend their deadline
