@@ -1,4 +1,4 @@
-"""Rate-limit-aware live concurrency benchmark for the async Hermes loop.
+"""Live OpenRouter concurrency benchmark for the Hermes agent loop.
 
 The live path is intentionally opt-in and conservative.  It creates one
 ``AIAgent`` per request, so a stage measures inter-agent concurrency without
@@ -18,7 +18,6 @@ import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any
 
 import aiofiles
 import aiofiles.os
@@ -34,7 +33,6 @@ DEFAULT_STAGES = (1, 2, 4)
 @dataclass(slots=True)
 class LiveResponse:
     response_ok: bool
-    rate_limits: dict[str, Any] | None = None
     failure_status: str | None = None
     error_type: str | None = None
 
@@ -44,10 +42,7 @@ class RequestResult:
     request_id: str
     status: str
     latency_seconds: float
-    status_code: int | None = None
-    retry_after_seconds: float | None = None
     response_ok: bool = False
-    rate_limits: dict[str, Any] | None = None
     error_type: str | None = None
 
 
@@ -130,36 +125,6 @@ def _percentile(values: Sequence[float], percentile: float) -> float:
     return ordered[lower] + (ordered[upper] - ordered[lower]) * fraction
 
 
-def _retry_after_seconds(exc: BaseException) -> float | None:
-    response = getattr(exc, "response", None)
-    headers = getattr(response, "headers", None)
-    if not headers:
-        return None
-    value = headers.get("retry-after")
-    try:
-        return max(0.0, float(value))
-    except (TypeError, ValueError):
-        return None
-
-
-def _status_code(exc: BaseException) -> int | None:
-    value = getattr(exc, "status_code", None)
-    if value is None:
-        value = getattr(getattr(exc, "response", None), "status_code", None)
-    return value if isinstance(value, int) else None
-
-
-def _classify_exception(exc: BaseException) -> str:
-    status_code = _status_code(exc)
-    if status_code == 429:
-        return "rate_limited"
-    if isinstance(exc, TimeoutError):
-        return "timeout"
-    if status_code is not None:
-        return "provider_error"
-    return "error"
-
-
 async def _run_request(
     request_runner: RequestRunner,
     request_id: str,
@@ -177,16 +142,13 @@ async def _run_request(
             status=status,
             latency_seconds=time.perf_counter() - started,
             response_ok=response.response_ok,
-            rate_limits=response.rate_limits,
             error_type=response.error_type,
         )
     except Exception as exc:
         return RequestResult(
             request_id=request_id,
-            status=_classify_exception(exc),
+            status="timeout" if isinstance(exc, TimeoutError) else "error",
             latency_seconds=time.perf_counter() - started,
-            status_code=_status_code(exc),
-            retry_after_seconds=_retry_after_seconds(exc),
             error_type=type(exc).__name__,
         )
 
@@ -302,9 +264,6 @@ async def run_benchmark(
             timeout_seconds,
         )
         stage_results.append(stage)
-        if stage.statuses.get("rate_limited", 0):
-            stop_reason = "rate_limited"
-            break
         if stage.statuses.get("success", 0) == 0:
             stop_reason = "stage_had_no_successes"
             break
@@ -319,27 +278,6 @@ async def run_benchmark(
         stages=stage_results,
         stop_reason=stop_reason,
     )
-
-
-def _normalise_rate_limits(state: Any) -> dict[str, Any] | None:
-    if state is None or not getattr(state, "has_data", False):
-        return None
-
-    def bucket(name: str) -> dict[str, int | float]:
-        value = getattr(state, name)
-        return {
-            "limit": value.limit,
-            "remaining": value.remaining,
-            "reset_seconds": value.reset_seconds,
-        }
-
-    return {
-        "provider": state.provider,
-        "requests_min": bucket("requests_min"),
-        "requests_hour": bucket("requests_hour"),
-        "tokens_min": bucket("tokens_min"),
-        "tokens_hour": bucket("tokens_hour"),
-    }
 
 
 def make_openrouter_runner(
@@ -367,26 +305,13 @@ def make_openrouter_runner(
             session_db=session_db,
         )
         async with agent:
-            # The benchmark request budget counts real HTTP attempts, not
-            # conversation calls hidden behind Hermes' normal retry policy.
-            agent._api_max_retries = 1
             result = await agent.run_conversation(
                 f"Reply with exactly this text and nothing else: {marker}"
             )
             final_response = str(result.get("final_response") or "")
-            failure_reason = str(result.get("failure_reason") or "")
-            if result.get("failed"):
-                if failure_reason in {"rate_limit", "upstream_rate_limit"}:
-                    failure_status = "rate_limited"
-                elif failure_reason == "timeout":
-                    failure_status = "timeout"
-                else:
-                    failure_status = "provider_error"
-            else:
-                failure_status = None
+            failure_status = "provider_error" if result.get("failed") else None
             return LiveResponse(
                 response_ok=marker in final_response,
-                rate_limits=_normalise_rate_limits(agent.get_rate_limit_state()),
                 failure_status=failure_status,
                 error_type="AIAgentResultError" if failure_status else None,
             )
@@ -435,7 +360,7 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-async def _async_main(
+async def _run_cli(
     args: argparse.Namespace,
     *,
     api_key: str,
@@ -479,7 +404,7 @@ def main() -> int:
             os.environ["HERMES_HOME"] = temp_dir
             try:
                 result = asyncio.run(
-                    _async_main(
+                    _run_cli(
                         args,
                         api_key=api_key,
                         model=model,

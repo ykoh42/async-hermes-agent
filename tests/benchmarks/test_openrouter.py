@@ -1,12 +1,10 @@
 import argparse
 import asyncio
-from types import SimpleNamespace
 
 import pytest
 
-from benchmarks.openrouter_async import (
+from benchmarks.openrouter import (
     LiveResponse,
-    _normalise_rate_limits,
     parse_stages,
     run_benchmark,
     validate_model,
@@ -65,40 +63,6 @@ async def test_stage_requests_overlap_and_leave_no_benchmark_tasks():
         and not task.done()
         and task.get_name().startswith("benchmark-")
     ]
-
-
-@pytest.mark.asyncio
-async def test_rate_limit_stops_later_stages_and_records_retry_after():
-    calls = 0
-
-    class RateLimitedError(Exception):
-        status_code = 429
-        response = SimpleNamespace(headers={"retry-after": "17"}, status_code=429)
-
-    async def runner(_request_id: str) -> LiveResponse:
-        nonlocal calls
-        calls += 1
-        if calls == 2:
-            raise RateLimitedError
-        return LiveResponse(response_ok=True)
-
-    result = await run_benchmark(
-        runner,
-        model="fake:free",
-        stages=(2, 4),
-        timeout_seconds=1,
-        cooldown_seconds=0,
-    )
-
-    assert calls == 2
-    assert result.stop_reason == "rate_limited"
-    assert len(result.stages) == 1
-    limited = next(
-        item for item in result.stages[0].results if item.status == "rate_limited"
-    )
-    assert limited.status_code == 429
-    assert limited.retry_after_seconds == 17
-    assert limited.error_type == "RateLimitedError"
 
 
 @pytest.mark.asyncio
@@ -177,26 +141,3 @@ async def test_structured_agent_failure_is_not_reported_as_invalid_response():
     assert request.status == "provider_error"
     assert request.error_type == "AIAgentResultError"
     assert result.stop_reason == "stage_had_no_successes"
-
-
-def test_rate_limit_state_is_reduced_to_safe_numeric_fields():
-    def bucket(limit: int, remaining: int, reset: float):
-        return SimpleNamespace(limit=limit, remaining=remaining, reset_seconds=reset)
-
-    state = SimpleNamespace(
-        has_data=True,
-        provider="openrouter",
-        requests_min=bucket(20, 19, 3.0),
-        requests_hour=bucket(100, 99, 60.0),
-        tokens_min=bucket(1000, 900, 3.0),
-        tokens_hour=bucket(5000, 4900, 60.0),
-        secret="must-not-leak",
-    )
-
-    assert _normalise_rate_limits(state) == {
-        "provider": "openrouter",
-        "requests_min": {"limit": 20, "remaining": 19, "reset_seconds": 3.0},
-        "requests_hour": {"limit": 100, "remaining": 99, "reset_seconds": 60.0},
-        "tokens_min": {"limit": 1000, "remaining": 900, "reset_seconds": 3.0},
-        "tokens_hour": {"limit": 5000, "remaining": 4900, "reset_seconds": 60.0},
-    }

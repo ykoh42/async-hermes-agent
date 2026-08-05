@@ -7,11 +7,11 @@ deltas while increasing inter-agent concurrency.
 
 The default run is deliberately small: concurrency `1,2,4`, one request per
 worker, and at most seven requests. Only `:free` OpenRouter models are accepted
-unless `--allow-paid-model` is supplied. A 429 or a stage with no successful
-responses stops the run before the next stage.
+unless `--allow-paid-model` is supplied. A stage with no successful responses
+stops the run before the next stage.
 
 ```bash
-.venv/bin/python benchmarks/openrouter_async.py \
+.venv/bin/python benchmarks/openrouter.py \
   --live \
   --env-file ~/Desktop/collie/.env \
   --model openai/gpt-oss-20b:free \
@@ -26,10 +26,9 @@ that continue to grow across repeated runs. The first stage includes cold
 client, schema, and logging initialization, so use later-stage deltas to judge
 steady-state leakage.
 
-Offline tests cover scheduler overlap, request-budget enforcement, 429 early
-termination, timeouts, and task cleanup without using credentials or network
-access:
+Offline tests cover scheduler overlap, request-budget enforcement, timeouts,
+and task cleanup without using credentials or network access:
 
 ```bash
-.venv/bin/python -m pytest tests/benchmarks/test_openrouter_async.py -q
+.venv/bin/python -m pytest tests/benchmarks/test_openrouter.py -q
 ```
