@@ -340,7 +340,7 @@ async def run_compress_context_with_progress_timeout(
                         pass
                     raise AuxiliaryExplicitCancellation()
                 if task in done:
-                    return task.result()
+                    return await task
                 continue
 
             cancellation_won = await fence.cancel_before_commit()

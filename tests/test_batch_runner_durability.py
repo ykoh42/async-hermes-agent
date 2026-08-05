@@ -161,3 +161,78 @@ class TestTaskCleanupOnInterruption:
         with pytest.raises(asyncio.CancelledError):
             await run_task
         assert cancelled == 2
+
+
+@pytest.mark.asyncio
+async def test_concurrent_batches_write_complete_rows_and_resume_without_duplicates(
+    tmp_path, monkeypatch
+):
+    prompts = [f"prompt-{index}" for index in range(4)]
+    dataset = tmp_path / "dataset.jsonl"
+    dataset.write_text(
+        "".join(json.dumps({"prompt": prompt}) + "\n" for prompt in prompts),
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    runner = BatchRunner(
+        dataset_file=str(dataset),
+        batch_size=1,
+        run_name="concurrent-trajectories",
+        num_workers=2,
+    )
+
+    active = 0
+    max_active = 0
+    processed = []
+
+    async def process_prompt(prompt_index, prompt_data, *_args, **_kwargs):
+        nonlocal active, max_active
+        active += 1
+        max_active = max(max_active, active)
+        try:
+            await asyncio.sleep(0.01)
+            processed.append(prompt_index)
+            return {
+                "success": True,
+                "trajectory": [
+                    {"from": "human", "value": prompt_data["prompt"]},
+                    {"from": "gpt", "value": "<think>reasoning</think>done"},
+                ],
+                "reasoning_stats": {
+                    "has_any_reasoning": True,
+                    "total_assistant_turns": 1,
+                    "turns_with_reasoning": 1,
+                    "turns_without_reasoning": 0,
+                },
+                "tool_stats": {},
+                "metadata": {},
+                "completed": True,
+                "api_calls": 1,
+                "toolsets_used": [],
+            }
+        finally:
+            active -= 1
+
+    monkeypatch.setattr(batch_runner, "_process_single_prompt", process_prompt)
+
+    await runner.run()
+
+    combined_file = runner.output_dir / "trajectories.jsonl"
+    rows = [
+        json.loads(line)
+        for line in combined_file.read_text(encoding="utf-8").splitlines()
+    ]
+    checkpoint = json.loads(runner.checkpoint_file.read_text(encoding="utf-8"))
+    assert max_active == 2
+    assert sorted(processed) == [0, 1, 2, 3]
+    assert sorted(row["prompt_index"] for row in rows) == [0, 1, 2, 3]
+    assert checkpoint["completed_prompts"] == [0, 1, 2, 3]
+
+    await runner.run(resume=True)
+
+    resumed_rows = [
+        json.loads(line)
+        for line in combined_file.read_text(encoding="utf-8").splitlines()
+    ]
+    assert sorted(processed) == [0, 1, 2, 3]
+    assert resumed_rows == rows

@@ -2260,6 +2260,7 @@ async def test_codex_responses_main_path_uses_native_transport_client(monkeypatc
 @pytest.mark.asyncio
 async def test_synthetic_model_tool_observation_turn_preserves_order(monkeypatch, tmp_path):
     """The model → tool → observation → model training shape stays ordered."""
+    monkeypatch.chdir(tmp_path)
     database = SessionDB(tmp_path / "state.db")
     with (
         patch("run_agent.get_tool_definitions", return_value=[]),
@@ -2273,7 +2274,7 @@ async def test_synthetic_model_tool_observation_turn_preserves_order(monkeypatch
             quiet_mode=True,
             skip_context_files=True,
             skip_memory=True,
-            save_trajectories=False,
+            save_trajectories=True,
         )
     agent._session_db = database
     agent._session_db_created = False
@@ -2363,6 +2364,28 @@ async def test_synthetic_model_tool_observation_turn_preserves_order(monkeypatch
             "tool",
             "assistant",
         ]
+
+        rows = [
+            json.loads(line)
+            for line in (tmp_path / "trajectory_samples.jsonl")
+            .read_text(encoding="utf-8")
+            .splitlines()
+        ]
+        assert len(rows) == 1
+        trajectory = rows[0]["conversations"]
+        assert [turn["from"] for turn in trajectory] == [
+            "system",
+            "human",
+            "gpt",
+            "tool",
+            "gpt",
+        ]
+        assert "<think>\ninspect the tool result\n</think>" in trajectory[2]["value"]
+        assert '"name": "terminal"' in trajectory[2]["value"]
+        assert '"tool_call_id": "call-1"' in trajectory[3]["value"]
+        assert "tool-observation" in trajectory[3]["value"]
+        assert "<think>\nanswer after observation\n</think>" in trajectory[4]["value"]
+        assert trajectory[4]["value"].endswith("tool observation incorporated")
     finally:
         await agent.close()
         await database.close()
