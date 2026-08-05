@@ -497,13 +497,19 @@ async def _process_single_prompt(
             result["completed"]
         )
         
+        completed = bool(result.get("completed"))
+        failed = bool(result.get("failed"))
         return {
-            "success": True,
+            # A provider failure can still return messages and therefore a
+            # convertible partial trajectory. It is not a successful training
+            # sample: the worker must leave it out of JSONL and checkpointing
+            # so ``resume=True`` retries the original prompt.
+            "success": completed and not failed,
             "prompt_index": prompt_index,
             "trajectory": trajectory,
             "tool_stats": tool_stats,
             "reasoning_stats": reasoning_stats,
-            "completed": result["completed"],
+            "completed": completed,
             "partial": result.get("partial", False),
             "api_calls": result["api_calls"],
             "toolsets_used": selected_toolsets,
@@ -845,7 +851,10 @@ class BatchRunner:
         checkpoint_data["last_updated"] = datetime.now().isoformat()
         await _atomic_json_write(self.checkpoint_file, checkpoint_data)
     
-    async def _scan_completed_prompts_by_content(self) -> set:
+    async def _scan_completed_prompts_by_content(
+        self,
+        incomplete_prompt_indices: Optional[set[int]] = None,
+    ) -> set:
         """
         Scan all batch files and extract completed prompts by their actual content.
         
@@ -870,8 +879,17 @@ class BatchRunner:
                         try:
                             entry = json.loads(line.strip())
                             
-                            # Skip failed entries - we want to retry these
-                            if entry.get("failed", False):
+                            # Only a completed training sample may suppress a
+                            # prompt on resume. Older runners could persist a
+                            # convertible partial trajectory after a provider
+                            # failure, without a ``failed`` field.
+                            if entry.get("failed", False) or entry.get("completed") is not True:
+                                prompt_index = entry.get("prompt_index")
+                                if (
+                                    incomplete_prompt_indices is not None
+                                    and isinstance(prompt_index, int)
+                                ):
+                                    incomplete_prompt_indices.add(prompt_index)
                                 continue
                             
                             # Extract the human/user prompt from conversations
@@ -888,7 +906,7 @@ class BatchRunner:
                 print(f"  ⚠️  Warning: Error reading {batch_file.name}: {e}")
         
         return completed_prompts
-    
+
     def _filter_dataset_by_completed(self, completed_prompts: set) -> Tuple[List[Dict], List[int]]:
         """
         Filter the dataset to exclude prompts that have already been completed.
@@ -958,10 +976,17 @@ class BatchRunner:
         
         # Smart resume: scan batch files by content to find completed prompts
         completed_prompt_texts = set()
+        incomplete_prompt_indices: set[int] = set()
         if resume:
-            completed_prompt_texts = await self._scan_completed_prompts_by_content()
+            completed_prompt_texts = await self._scan_completed_prompts_by_content(
+                incomplete_prompt_indices
+            )
             if completed_prompt_texts:
                 print(f"   Found {len(completed_prompt_texts)} already-completed prompts by content matching")
+            if incomplete_prompt_indices:
+                print(
+                    f"   Found {len(incomplete_prompt_indices)} incomplete prompts to retry"
+                )
         
         # Filter dataset to only include unprocessed prompts
         if resume and completed_prompt_texts:
@@ -1038,6 +1063,7 @@ class BatchRunner:
         
         # For backward compatibility, still track by index (but this is secondary to content matching)
         completed_prompts_set = set(checkpoint_data.get("completed_prompts", []))
+        completed_prompts_set.difference_update(incomplete_prompt_indices)
         
         # Aggregate statistics across all batches
         total_tool_stats = {}
@@ -1197,6 +1223,12 @@ class BatchRunner:
                         total_entries += 1
                         try:
                             data = json.loads(line)
+                            if data.get("completed") is not True:
+                                filtered_entries += 1
+                                print(
+                                    f"   ⚠️  Filtering incomplete entry (batch {batch_num})"
+                                )
+                                continue
                             tool_stats = data.get('tool_stats', {})
                             
                             # Check for invalid tool names (model hallucinations)
