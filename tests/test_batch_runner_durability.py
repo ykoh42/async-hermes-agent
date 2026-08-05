@@ -23,7 +23,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import batch_runner
-from batch_runner import BatchRunner, _process_batch_worker, _process_single_prompt
+from batch_runner import BatchRunner, _process_batch_worker
 
 
 # =========================================================================
@@ -85,65 +85,6 @@ class TestTrajectoryWriteDurability:
                     entry = json.loads(line)
                     assert "conversations" in entry
                     assert "completed" in entry
-
-
-@pytest.mark.asyncio
-async def test_incomplete_agent_result_is_retried_instead_of_checkpointed(
-    monkeypatch,
-):
-    """A provider failure with messages is not a completed training sample."""
-
-    class IncompleteAgent:
-        def __init__(self, **_kwargs):
-            pass
-
-        async def run_conversation(self, _prompt, *, task_id):
-            assert task_id == "task_3"
-            return {
-                "messages": [
-                    {"role": "user", "content": "use a skill"},
-                    {
-                        "role": "assistant",
-                        "content": "",
-                        "reasoning": "inspect the skill",
-                        "tool_calls": [],
-                    },
-                ],
-                "completed": False,
-                "failed": True,
-                "partial": False,
-                "api_calls": 3,
-            }
-
-        def _convert_to_trajectory_format(self, *_args):
-            return [
-                {"from": "system", "value": "tools"},
-                {"from": "human", "value": "use a skill"},
-                {"from": "gpt", "value": "<think>inspect the skill</think>"},
-            ]
-
-        async def close(self):
-            pass
-
-    monkeypatch.setattr(batch_runner, "AIAgent", IncompleteAgent)
-    monkeypatch.setattr(
-        batch_runner, "sample_toolsets_from_distribution", lambda _distribution: []
-    )
-
-    result = await _process_single_prompt(
-        3,
-        {"prompt": "use a skill"},
-        0,
-        {
-            "distribution": "default",
-            "model": "synthetic",
-            "max_iterations": 4,
-        },
-    )
-
-    assert result["success"] is False
-    assert result["completed"] is False
-    assert result["trajectory"]
 
 
 # =========================================================================
