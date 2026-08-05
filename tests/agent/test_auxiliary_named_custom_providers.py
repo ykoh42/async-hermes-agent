@@ -291,7 +291,7 @@ class TestProvidersDictApiModeAnthropicMessages:
         # The optional Anthropic SDK may be absent; either the native wrapper
         # or the OpenAI-wire fallback is valid, and both are async transports.
         if isinstance(client, AnthropicAuxiliaryClient):
-            assert client.real_client is not None
+            assert client._real_client is not None
         else:
             assert hasattr(client.chat.completions, "create")
 

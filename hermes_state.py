@@ -2796,8 +2796,3 @@ class SessionDB:
             except asyncio.CancelledError:
                 await asyncio.shield(close_task)
                 raise
-
-    def __getattr__(self, name: str):
-        raise AttributeError(
-            f"SessionDB does not implement {name!r}; add a native async method instead"
-        )

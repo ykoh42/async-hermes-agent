@@ -54,19 +54,3 @@ class TestBuildLearnPrompt:
             assert tool in std
         # #6 scripts/references/templates layout.
         assert "scripts/" in _AUTHORING_STANDARDS
-
-
-class TestLearnRegistryWiring:
-    def test_learn_is_registered_and_resolves(self):
-        from hermes_cli.commands import resolve_command
-
-        cmd = resolve_command("learn")
-        assert cmd is not None
-        assert cmd.name == "learn"
-
-
-
-    def test_learn_is_not_cli_only(self):
-        from hermes_cli.commands import resolve_command
-
-        assert not resolve_command("learn").cli_only

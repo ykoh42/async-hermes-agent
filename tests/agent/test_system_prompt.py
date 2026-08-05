@@ -107,7 +107,7 @@ class TestCodingContextBlock:
         monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
         agent = _make_agent(valid_tool_names=["read_file"], platform="cli")
         # Drive the real path: force the resolved mode to "off" via config.
-        with patch("agent.coding_context._coding_mode_from_config", return_value="off"):
+        with patch("agent.coding_context._coding_mode", return_value="off"):
             stable = await _stable_prompt(agent)
         assert "coding agent" not in stable
 

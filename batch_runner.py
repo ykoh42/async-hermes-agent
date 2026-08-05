@@ -142,36 +142,6 @@ async def _communicate_with_timeout(
         raise
 
 
-async def _training_toolsets(selected_toolsets: List[str]) -> List[str]:
-    """Add the harness capabilities that every training trajectory needs.
-
-    Distribution entries describe task-specific extras.  The async training
-    runtime exposes only its native harness waist, however: terminal, files,
-    skills, planning, and clarify. Configured MCP server aliases are the only
-    way their discovered tools enter a scoped agent. Persistent memory is
-    deliberately not added here because batch workers pass ``skip_memory`` to
-    keep samples isolated from the user's on-disk memory.
-    """
-    result = list(dict.fromkeys(str(name) for name in (selected_toolsets or [])))
-    for required in ("terminal", "file", "skills", "todo", "clarify"):
-        if required not in result:
-            result.append(required)
-
-    try:
-        from hermes_cli.config import load_config_readonly
-        from hermes_cli.tools_config import enabled_mcp_server_names
-
-        config = await load_config_readonly()
-        for server_name in sorted(enabled_mcp_server_names(config)):
-            if server_name not in result:
-                result.append(server_name)
-    except Exception:
-        # MCP is optional at runtime; the agent's normal startup discovery
-        # remains fail-soft when config or the SDK is unavailable.
-        pass
-    return result
-
-
 def _normalize_tool_stats(tool_stats: Dict[str, Dict[str, int]]) -> Dict[str, Dict[str, int]]:
     """
     Normalize tool_stats to include all possible tools with consistent schema.
@@ -449,9 +419,7 @@ async def _process_single_prompt(
     agent = None
     try:
         # Sample toolsets from distribution for this prompt
-        selected_toolsets = await _training_toolsets(
-            sample_toolsets_from_distribution(config["distribution"])
-        )
+        selected_toolsets = sample_toolsets_from_distribution(config["distribution"])
         
         if config.get("verbose"):
             print(f"   Prompt {prompt_index}: Using toolsets {selected_toolsets}")

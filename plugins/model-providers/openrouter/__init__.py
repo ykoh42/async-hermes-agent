@@ -1,15 +1,10 @@
 """OpenRouter provider profile."""
 
-import logging
 from typing import Any
 
 from agent.portal_tags import get_conversation_context
 from providers import register_provider
 from providers.base import ProviderProfile
-
-logger = logging.getLogger(__name__)
-
-_CACHE: list[str] | None = None
 
 # Anthropic model families that still accept an explicit "disable thinking"
 # request (the manual ``thinking: {type: "disabled"}`` form OpenRouter emits
@@ -47,32 +42,6 @@ def _anthropic_reasoning_is_mandatory(model: str | None) -> bool:
 
 class OpenRouterProfile(ProviderProfile):
     """OpenRouter aggregator — provider preferences, reasoning config passthrough."""
-
-    def fetch_models(
-        self,
-        *,
-        api_key: str | None = None,
-        base_url: str | None = None,
-        timeout: float = 8.0,
-    ) -> list[str] | None:
-        """Fetch from public OpenRouter catalog — no auth required.
-
-        Note: Tool-call capability filtering is applied by hermes_cli/models.py
-        via fetch_openrouter_models() → _openrouter_model_supports_tools(), not
-        here. The picker early-returns via the dedicated openrouter path before
-        reaching this method, so filtering here would be unreachable.
-        """
-        global _CACHE  # noqa: PLW0603
-        if _CACHE is not None:
-            return _CACHE
-        try:
-            result = super().fetch_models(api_key=None, base_url=base_url, timeout=timeout)
-            if result is not None:
-                _CACHE = result
-            return result
-        except Exception as exc:
-            logger.debug("fetch_models(openrouter): %s", exc)
-            return None
 
     def build_extra_body(
         self, *, session_id: str | None = None, **context: Any

@@ -49,19 +49,6 @@ class VertexProfile(ProviderProfile):
             return {}
         return {"extra_body": {"google": {"thinking_config": thinking_config}}}
 
-    def fetch_models(
-        self,
-        *,
-        api_key: str | None = None,
-        base_url: str | None = None,
-        timeout: float = 8.0,
-    ) -> list[str] | None:
-        """Vertex's OpenAI-compat endpoint has no ``/models`` listing route;
-        model discovery is not available. The setup wizard ships a curated list.
-        """
-        return None
-
-
 vertex = VertexProfile(
     name="vertex",
     aliases=("google-vertex", "vertex-ai", "gcp-vertex"),

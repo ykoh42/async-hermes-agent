@@ -7,7 +7,6 @@ Config files are stored in ~/.hermes/ for easy access:
 
 This module provides:
 - hermes config          - Show current configuration
-- hermes config edit     - Open config in editor
 - hermes config get      - Print a resolved configuration value
 - hermes config set      - Set a specific value
 - hermes config unset    - Remove a user configuration value
@@ -22,7 +21,6 @@ import platform
 import re
 import shutil
 import stat
-import subprocess
 import sys
 import tempfile
 import threading
@@ -4440,50 +4438,8 @@ def show_config():
 
     print()
     print(color("─" * 60, Colors.DIM))
-    print(color("  hermes config edit     # Edit config file", Colors.DIM))
     print(color("  hermes config set <key> <value>", Colors.DIM))
-    print(color("  hermes setup           # Run setup wizard", Colors.DIM))
     print()
-
-
-def edit_config():
-    """Open config file in user's editor."""
-    if is_managed():
-        managed_error("edit configuration")
-        return
-    config_path = get_config_path()
-    
-    # Ensure config exists
-    if not config_path.exists():
-        save_config(DEFAULT_CONFIG, strip_defaults=False)
-        print(f"Created {config_path}")
-    
-    # Find editor
-    editor = os.getenv('EDITOR') or os.getenv('VISUAL')
-
-    if not editor:
-        # Try common editors — order is platform-aware so Windows users
-        # land on a working editor (notepad) even without Git Bash or nano
-        # installed.  On POSIX, prefer nano/vim over code/notepad because
-        # it's more likely to be present on headless / server systems.
-        import shutil
-        import sys as _sys
-        if _sys.platform == "win32":
-            candidates = ['notepad', 'code', 'vim', 'vi', 'nano']
-        else:
-            candidates = ['nano', 'vim', 'vi', 'code', 'notepad']
-        for cmd in candidates:
-            if shutil.which(cmd):
-                editor = cmd
-                break
-    
-    if not editor:
-        print("No editor found. Config file is at:")
-        print(f"  {config_path}")
-        return
-    
-    print(f"Opening {config_path} in {editor}...")
-    subprocess.run([editor, str(config_path)])
 
 
 def _cron_model_drift_axis_for_config_key(key: str) -> Optional[str]:

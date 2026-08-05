@@ -174,11 +174,11 @@ class TestErrorClassifierBedrock:
 
 
 # ---------------------------------------------------------------------------
-# pyproject.toml bedrock extra
+# pyproject.toml async boundary
 # ---------------------------------------------------------------------------
 
 class TestPackaging:
-    """Verify Bedrock remains a declared lazy optional dependency."""
+    """Verify disabled sync Bedrock dependencies are not published."""
 
     @staticmethod
     def _optional_dependencies():
@@ -188,10 +188,9 @@ class TestPackaging:
         content = (Path(__file__).parent.parent.parent / "pyproject.toml").read_text()
         return tomllib.loads(content)["project"]["optional-dependencies"]
 
-    def test_bedrock_extra_exists(self):
+    def test_bedrock_extra_is_not_advertised(self):
         extras = self._optional_dependencies()
-        assert "bedrock" in extras
-        assert any(dep.startswith("boto3==") for dep in extras["bedrock"])
+        assert "bedrock" not in extras
 
     def test_bedrock_is_not_eager_installed(self):
         import tomllib
@@ -199,7 +198,9 @@ class TestPackaging:
 
         content = (Path(__file__).parent.parent.parent / "pyproject.toml").read_text()
         dependencies = tomllib.loads(content)["project"]["dependencies"]
-        assert not any(dep.startswith("boto3") for dep in dependencies)
+        assert not any(
+            dep.startswith(("boto3", "urllib3")) for dep in dependencies
+        )
 
 
 # ---------------------------------------------------------------------------

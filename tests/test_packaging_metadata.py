@@ -13,8 +13,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 # 1.0.1. Anything below that lets a malformed Host header desync
 # ``request.url.path`` from the dispatched ASGI path, bypassing path-based
 # authz in middleware/endpoints that gate on ``request.url``. Starlette is a
-# transitive dep (sse-starlette/mcp in the core and [dev]) so we pin it
-# directly in every retained extra that exposes a server surface and
+# transitive dep of sse-starlette/mcp in the core, so we pin it directly and
 # enforce the floor in both pyproject and the committed lockfile.
 _STARLETTE_CVE_FLOOR = (1, 0, 1)
 _UPDATE_DOWNGRADE_GUARD_FLOORS = {
@@ -59,12 +58,10 @@ def test_starlette_pinned_above_cve_2026_48710_floor_in_pyproject():
                 ver = spec.split("==", 1)[1].split(";", 1)[0].strip()
                 found[extra] = ver
 
-    # MCP is a core dependency; dev repeats the pin for test environments.
-    for extra in ("core", "dev"):
-        assert extra in found, (
-            f"[{extra}] no longer pins starlette directly — CVE-2026-48710 "
-            f"regression risk (MCP pulls it transitively with no upper bound)"
-        )
+    assert "core" in found, (
+        "[core] no longer pins starlette directly — CVE-2026-48710 "
+        "regression risk (MCP pulls it transitively with no upper bound)"
+    )
 
     for extra, ver in found.items():
         assert _version_tuple(ver) >= _STARLETTE_CVE_FLOOR, (
@@ -100,6 +97,21 @@ def test_locked_starlette_is_not_vulnerable_to_cve_2026_48710():
             f"floor {'.'.join(map(str, _STARLETTE_CVE_FLOOR))} — regenerate the "
             f"lockfile after bumping the pin"
         )
+
+
+def test_sync_only_provider_dependencies_are_not_published_as_extras():
+    """Do not advertise install extras for providers disabled by async runtime."""
+    data = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    extras = data["project"]["optional-dependencies"]
+    declared = {
+        _canonical(re.split(r"[<>=!~;\[]", spec, maxsplit=1)[0].strip())
+        for specs in (data["project"]["dependencies"], *extras.values())
+        for spec in specs
+    }
+
+    assert "bedrock" not in extras
+    assert "vertex" not in extras
+    assert {"boto3", "google-auth", "urllib3"}.isdisjoint(declared)
 
 
 

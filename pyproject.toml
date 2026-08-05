@@ -30,8 +30,8 @@ dependencies = [
   # introduce ranges back without a written justification.
   #
   # Scope rule: only packages used by EVERY hermes session belong here.
-  # Anything that's provider-specific (`anthropic`,
-  # `exa-py`, `fal-client`, `edge-tts`, `parallel-web`) belongs in an
+  # Anything that's provider-specific (`anthropic`, `fal-client`,
+  # `edge-tts`, `parallel-web`) belongs in an
   # extra and fails fast with an install hint when the user picks that
   # backend. Smaller `dependencies` = smaller blast
   # radius for the next supply-chain attack.
@@ -53,9 +53,6 @@ dependencies = [
   # MCP's HTTP/SSE stack imports Starlette. Pin the patched release directly
   # rather than relying on its unconstrained transitive resolution.
   "starlette==1.3.1",  # CVE-2026-48710
-  # urllib3 2.7.0 fixes GHSA-mf9v-mfxr-j63j (decompression-bomb bypass)
-  # and GHSA-qccp-gfcp-xxvc (header leak across origins).
-  "urllib3>=2.7.0,<3",
   # Windows has no IANA tzdata shipped with the OS, so Python's ``zoneinfo``
   # (PEP 615) raises ``ZoneInfoNotFoundError`` for every non-UTC timezone
   # out of the box.  ``tzdata`` ships the Olson database as a data package
@@ -98,9 +95,8 @@ dependencies = [
 anthropic = ["anthropic==0.87.0"]  # CVE-2026-34450, CVE-2026-34452
 # Web search backends — each only loaded when the user picks it as their
 # search provider (configured via `hermes tools` or config.yaml).
-exa = ["exa-py==2.10.2"]
 parallel-web = ["parallel-web==0.4.2"]
-dev = ["debugpy==1.8.20", "pytest==9.1.1", "pytest-asyncio==1.3.0", "ty==0.0.21", "ruff==0.15.10", "setuptools==83.0.0", "starlette==1.3.1"]
+dev = ["pytest==9.1.1", "pytest-asyncio==1.3.0", "ty==0.0.21", "ruff==0.15.10", "setuptools==83.0.0"]
 # CVE-2026-48710 (BadHost): Starlette is pulled transitively by MCP's
 # sse-starlette / HTTP-SSE stack. Before
 # 1.0.1, a malformed Host header makes `request.url.path` desync from the path
@@ -109,8 +105,6 @@ dev = ["debugpy==1.8.20", "pytest==9.1.1", "pytest-asyncio==1.3.0", "ty==0.0.21"
 # extra that exposes a Starlette-backed server surface so pip/uv can't resolve
 # a vulnerable pre-1.0.1 transitive. Bump in lockstep with uv.lock.
 mcp = []  # External MCP is a retained core dependency; compatibility extra.
-bedrock = ["boto3==1.42.89"]
-vertex = ["google-auth==2.55.1"]
 
 [build-system]
 requires = ["setuptools>=77.0,<83"]
@@ -124,7 +118,6 @@ py-modules = [
   "toolsets",
   "batch_runner",
   "trajectory_compressor",
-  "trajectory_validator",
   "toolset_distributions",
   "hermes_bootstrap",
   "hermes_constants",

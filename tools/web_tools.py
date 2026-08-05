@@ -55,17 +55,14 @@ from plugins.web.tavily.provider import (  # noqa: F401 — backward-compat name
     _normalize_tavily_search_results,
     _tavily_request,
 )
-# Parallel + Exa clients are imported for provider setup and tests.
+# Parallel's native async client is imported for provider setup and tests.
 from plugins.web.parallel.provider import (  # noqa: F401 — backward-compat names
     _get_parallel_client,
 )
-from plugins.web.exa.provider import _get_exa_client  # noqa: F401
 
-# Module-level cache slots for the per-vendor clients. The plugins read/write
-# these via tools.web_tools so unit tests that reset
-# ``tools.web_tools._<vendor>_client = None`` between cases keep working.
+# Module-level cache slot for the Parallel client. The plugin reads/writes it
+# through tools.web_tools so tests can reset the client between cases.
 _parallel_client: Optional[Any] = None
-_exa_client: Optional[Any] = None
 
 from tools.debug_helpers import DebugSession
 from tools.url_safety import is_safe_url, normalize_url_for_request, sensitive_query_param_name

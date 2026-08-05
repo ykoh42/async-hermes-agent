@@ -1,8 +1,7 @@
 """Exa web search + content extraction — plugin form.
 
-Subclasses :class:`agent.web_search_provider.WebSearchProvider`. The active
-provider uses Exa's native async HTTP API; the optional SDK is imported only
-by the legacy client-inspection helper.
+Subclasses :class:`agent.web_search_provider.WebSearchProvider` and uses
+Exa's HTTP API through a native async client.
 
 Config keys this provider responds to::
 
@@ -24,68 +23,17 @@ ABC method-name change.
 from __future__ import annotations
 
 import logging
-import os
 from typing import Any, Dict, List
 
 from agent.web_search_provider import WebSearchProvider
 
 logger = logging.getLogger(__name__)
 
-# Module-level note: the canonical ``_exa_client`` cache slot lives on
-# :mod:`tools.web_tools` so tests that do ``tools.web_tools._exa_client =
-# None`` between cases see fresh state. The plugin reads/writes through
-# that public module (see :func:`_get_exa_client`).
-
-
-def _get_exa_client() -> Any:
-    """Lazy-import and cache an Exa SDK client.
-
-    Cache lives on :mod:`tools.web_tools` (as ``_exa_client``) so unit
-    tests that reset that name between cases keep working. Raises
-    ``ValueError`` when ``EXA_API_KEY`` is unset.
-    """
-    import tools.web_tools as _wt
-
-    cached = getattr(_wt, "_exa_client", None)
-    if cached is not None:
-        return cached
-
-    from agent.web_search_provider import get_provider_env
-
-    api_key = get_provider_env("EXA_API_KEY")
-    if not api_key:
-        raise ValueError(
-            "EXA_API_KEY environment variable not set. "
-            "Get your API key at https://exa.ai"
-        )
-
-    try:
-        from exa_py import Exa  # noqa: WPS433 — deliberately lazy
-    except ImportError as exc:
-        raise ImportError(
-            "The optional Exa SDK is not installed. Install async-hermes-agent[exa]."
-        ) from exc
-
-    client = Exa(api_key=api_key)
-    client.headers["x-exa-integration"] = "hermes-agent"
-    _wt._exa_client = client
-    return client
-
-
-def _reset_client_for_tests() -> None:
-    """Drop the cached Exa client so tests can re-instantiate cleanly."""
-    import tools.web_tools as _wt
-
-    _wt._exa_client = None
-
-
 class ExaWebSearchProvider(WebSearchProvider):
     """Exa search + extract provider.
 
-    The provider uses Exa's JSON HTTP API directly.  This keeps both
-    operations native async even when the optional ``exa-py`` SDK is not
-    installed; the SDK remains available through ``_get_exa_client`` for
-    legacy introspection only and is never used on the active path.
+    The provider uses Exa's JSON HTTP API directly, keeping both operations
+    native async without a provider-specific SDK dependency.
     """
 
     @staticmethod
@@ -173,10 +121,7 @@ class ExaWebSearchProvider(WebSearchProvider):
 
             return {"success": True, "data": {"web": web_results}}
         except ValueError as exc:
-            # Raised by _get_exa_client when EXA_API_KEY missing
             return {"success": False, "error": str(exc)}
-        except ImportError as exc:
-            return {"success": False, "error": f"Exa SDK not installed: {exc}"}
         except Exception as exc:  # noqa: BLE001 — surface as failure
             logger.warning("Exa search error: %s", exc)
             return {"success": False, "error": f"Exa search failed: {exc}"}

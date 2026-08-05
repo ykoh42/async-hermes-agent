@@ -12,8 +12,6 @@ import asyncio
 import os
 import re
 import urllib.parse
-import urllib.request
-import urllib.error
 import time
 import aiofiles
 import aiofiles.os
@@ -23,8 +21,6 @@ from pathlib import Path
 from typing import Any, NamedTuple, Optional
 
 from hermes_cli import __version__ as _HERMES_VERSION
-from hermes_cli.urllib_security import open_credentialed_url
-
 # Identify ourselves so endpoints fronted by Cloudflare's Browser Integrity
 # Check (error 1010) don't reject the default ``Python-urllib/*`` signature.
 _HERMES_USER_AGENT = f"hermes-cli/{_HERMES_VERSION}"

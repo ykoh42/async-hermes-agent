@@ -125,11 +125,7 @@ async def test_incomplete_agent_result_is_retried_instead_of_checkpointed(
         async def close(self):
             pass
 
-    async def toolsets(_selected):
-        return []
-
     monkeypatch.setattr(batch_runner, "AIAgent", IncompleteAgent)
-    monkeypatch.setattr(batch_runner, "_training_toolsets", toolsets)
     monkeypatch.setattr(
         batch_runner, "sample_toolsets_from_distribution", lambda _distribution: []
     )

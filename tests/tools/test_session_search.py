@@ -452,11 +452,10 @@ class TestSessionLink:
 # =========================================================================
 
 class TestCrossProfileRead:
-    def _patch_profiles(self, monkeypatch, home, exists=True):
+    def _patch_profiles(self, monkeypatch, home):
         from hermes_cli import profiles as profiles_mod
         monkeypatch.setattr(profiles_mod, "normalize_profile_name", lambda n: n)
         monkeypatch.setattr(profiles_mod, "validate_profile_name", lambda n: None)
-        monkeypatch.setattr(profiles_mod, "profile_exists", lambda n: exists)
         monkeypatch.setattr(profiles_mod, "get_profile_dir", lambda n: home)
 
     @pytest.mark.asyncio

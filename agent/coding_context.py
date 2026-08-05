@@ -64,8 +64,6 @@ from typing import Any, Optional
 import aiofiles
 import aiofiles.os
 
-from hermes_cli._subprocess_compat import bounded_git_probe
-
 logger = logging.getLogger("hermes.coding_context")
 
 CODING_TOOLSET = "coding"
@@ -370,7 +368,7 @@ async def _load_coding_config(config: Optional[dict[str, Any]]) -> dict[str, Any
         return {}
 
 
-def _coding_mode_from_config(config: Optional[dict[str, Any]]) -> str:
+def _coding_mode(config: Optional[dict[str, Any]]) -> str:
     """Normalize the configured coding-context mode without I/O."""
     raw = ((config or {}).get("agent", {}) or {}).get("coding_context", "auto")
     mode = str(raw).strip().lower()
@@ -381,15 +379,6 @@ def _coding_mode_from_config(config: Optional[dict[str, Any]]) -> str:
     if mode in {"off", "false", "no", "0", "never"}:
         return "off"
     return "auto"
-
-
-def _coding_instructions_from_config(config: Optional[dict[str, Any]]) -> str:
-    raw = ((config or {}).get("agent", {}) or {}).get("coding_instructions", "")
-    if isinstance(raw, (list, tuple)):
-        return "\n".join(str(item).strip() for item in raw if str(item).strip())
-    return str(raw or "").strip()
-
-
 
 
 async def _resolve_cwd(cwd: Optional[str | Path]) -> Path:
@@ -589,7 +578,7 @@ async def resolve_runtime_mode(
     """Resolve a runtime mode without blocking the active event loop."""
     resolved_config = await _load_coding_config(config)
     resolved_cwd = await _resolve_cwd(cwd)
-    mode = _coding_mode_from_config(resolved_config)
+    mode = _coding_mode(resolved_config)
     name = await _detect_profile_name(
         mode, (platform or "").strip().lower(), resolved_cwd
     )
@@ -599,7 +588,7 @@ async def resolve_runtime_mode(
         cwd=resolved_cwd,
         config_mode=mode,
         model=model,
-        instructions=_coding_instructions_from_config(resolved_config),
+        instructions=_coding_instructions(resolved_config),
     )
 
 

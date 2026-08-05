@@ -519,7 +519,8 @@ class PluginContext:
         parameterless in Discord and still accept trailing text when invoked
         as free-form chat.
 
-        Names conflicting with built-in commands are rejected with a warning.
+        Names are unique within the plugin command registry; later
+        registrations replace earlier entries with the same normalized name.
         """
         clean = name.lower().strip().lstrip("/").replace(" ", "-")
         if not clean:
@@ -528,19 +529,6 @@ class PluginContext:
                 self.manifest.name,
             )
             return
-
-        # Reject if it conflicts with a built-in command
-        try:
-            from hermes_cli.commands import resolve_command
-            if resolve_command(clean) is not None:
-                logger.warning(
-                    "Plugin '%s' tried to register command '/%s' which conflicts "
-                    "with a built-in command. Skipping.",
-                    self.manifest.name, clean,
-                )
-                return
-        except Exception:
-            pass  # If commands module isn't available, skip the check
 
         self._manager._plugin_commands[clean] = {
             "handler": handler,

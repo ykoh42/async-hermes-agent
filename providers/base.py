@@ -21,20 +21,6 @@ logger = logging.getLogger(__name__)
 OMIT_TEMPERATURE = object()
 
 
-def _profile_user_agent() -> str:
-    """Return a ``hermes-cli/<version>`` UA string, with a stable fallback.
-
-    Used by ``ProviderProfile.fetch_models`` so the catalog probe is not
-    served the default ``Python-urllib/<ver>`` UA — some providers
-    (OpenCode Zen, etc.) sit behind a WAF that returns 403 for that.
-    """
-    try:
-        from hermes_cli import __version__ as _ver  # lazy: avoid layer cycle at import time
-        return f"hermes-cli/{_ver}"
-    except Exception:
-        return "hermes-cli"
-
-
 @dataclass
 class ProviderProfile:
     """Base provider profile — subclass or instantiate with overrides."""
@@ -177,62 +163,3 @@ class ProviderProfile:
         per-model.
         """
         return self.default_max_tokens
-
-    def fetch_models(
-        self,
-        *,
-        api_key: str | None = None,
-        base_url: str | None = None,
-        timeout: float = 8.0,
-    ) -> list[str] | None:
-        """Fetch the live model list from the provider's models endpoint.
-
-        Returns a list of model ID strings, or None if the fetch failed or
-        the provider does not support live model listing.
-
-        Resolution order for the endpoint URL:
-          1. self.models_url  (explicit override — use when the models
-             endpoint differs from the inference base URL, e.g. OpenRouter
-             exposes a public catalog at /api/v1/models while inference is
-             at /api/v1)
-          2. base_url (caller override — user-configured model.base_url)
-          3. self.base_url + "/models"  (standard OpenAI-compat fallback)
-
-        The default implementation sends Bearer auth when api_key is given
-        and forwards self.default_headers. Override to customise auth, path,
-        response shape, or to return None for providers with no REST catalog.
-
-        Callers must always fall back to the static _PROVIDER_MODELS list
-        when this returns None.
-        """
-        effective_base = base_url or self.base_url
-        url = (self.models_url or "").strip()
-        if not url:
-            if not effective_base:
-                return None
-            url = effective_base.rstrip("/") + "/models"
-
-        import json
-        import urllib.request
-
-        from hermes_cli.urllib_security import open_credentialed_url
-
-        req = urllib.request.Request(url)
-        if api_key:
-            req.add_header("Authorization", f"Bearer {api_key}")
-        req.add_header("Accept", "application/json")
-        # Some providers (e.g. OpenCode Zen) sit behind a WAF that blocks
-        # the default ``Python-urllib/<ver>`` User-Agent.  Set a generic
-        # hermes-cli UA so the catalog endpoint is reachable.
-        req.add_header("User-Agent", _profile_user_agent())
-        for k, v in self.default_headers.items():
-            req.add_header(k, v)
-
-        try:
-            with open_credentialed_url(req, timeout=timeout) as resp:
-                data = json.loads(resp.read().decode())
-            items = data if isinstance(data, list) else data.get("data", [])
-            return [m["id"] for m in items if isinstance(m, dict) and "id" in m]
-        except Exception as exc:
-            logger.debug("fetch_models(%s): %s", self.name, exc)
-            return None
