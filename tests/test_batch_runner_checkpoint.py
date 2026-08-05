@@ -165,7 +165,7 @@ class TestResumePreservesProgress:
 
 class TestBatchWorkerResumeBehavior:
     @pytest.mark.asyncio
-    async def test_discarded_no_reasoning_prompts_are_marked_completed(self, tmp_path, monkeypatch):
+    async def test_no_reasoning_prompts_are_preserved(self, tmp_path, monkeypatch):
         batch_file = tmp_path / "batch_1.jsonl"
         prompt_result = {
             "success": True,
@@ -191,9 +191,11 @@ class TestBatchWorkerResumeBehavior:
             {"verbose": False},
         ))
 
-        assert result["discarded_no_reasoning"] == 1
         assert result["completed_prompts"] == [0]
-        assert not batch_file.exists() or batch_file.read_text() == ""
+        entries = [json.loads(line) for line in batch_file.read_text().splitlines()]
+        assert len(entries) == 1
+        assert entries[0]["prompt_index"] == 0
+        assert entries[0]["conversations"] == prompt_result["trajectory"]
 
 
 class TestFinalCheckpointNoDuplicates:
