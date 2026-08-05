@@ -13,22 +13,34 @@ The public core API keeps the upstream names and module locations. Existing
 library integrations normally only need to add `await`:
 
 ```python
+import asyncio
+import os
+
 from run_agent import AIAgent
 
-async with AIAgent(
-    provider="openrouter",
-    model="openrouter/auto",
-    api_key="...",
-) as agent:
-    result = await agent.run_conversation("Investigate this repository")
-    print(result["final_response"])
+
+async def main():
+    async with AIAgent(
+        provider="openrouter",
+        model="openrouter/auto",
+        api_key=os.environ["OPENROUTER_API_KEY"],
+    ) as agent:
+        result = await agent.run_conversation("Investigate this repository")
+        print(result["final_response"])
+
+
+asyncio.run(main())
 ```
 
-The compact string-returning interface is async as well:
+Inside an async function, the compact string-returning interface and explicit
+lifecycle are:
 
 ```python
-answer = await agent.chat("Summarize the result")
-await agent.close()
+agent = AIAgent(provider="openrouter", model="openrouter/auto")
+try:
+    answer = await agent.chat("Summarize the result")
+finally:
+    await agent.close()
 ```
 
 `AIAgent.__init__()` performs state-only construction. Configuration, provider
@@ -62,13 +74,43 @@ uv sync --extra vertex
 
 ## Skills, MCP, and memory
 
-User skills use the existing Hermes layout. Put each skill at:
+Skills follow the existing Hermes layout. `HERMES_HOME` defaults to
+`~/.hermes`; put each active skill at:
 
 ```text
-~/.hermes/skills/<skill-name>/SKILL.md
+$HERMES_HOME/skills/<skill-name>/SKILL.md
 ```
 
-MCP servers are configured under `mcp_servers` in `~/.hermes/config.yaml`:
+Each `SKILL.md` is a normal Hermes skill document with YAML frontmatter:
+
+```markdown
+---
+name: code-review
+description: Review a code change before it is merged.
+---
+
+# Code review
+
+Read the change, run its tests, and report correctness issues first.
+```
+
+Upstream Hermes seeds its source-bundled skills through the product installer.
+This library does not include that installer, so Git/wheel users add skill
+directories explicitly or point at shared directories in `config.yaml`:
+
+```yaml
+skills:
+  external_dirs:
+    - ~/.agents/skills
+    - /shared/team-skills
+```
+
+The `skills_list` and `skill_view` tools discover both the local and configured
+external directories. Skill content remains outside the model-tool schema until
+the model selects and reads it.
+
+MCP servers are configured under `mcp_servers` in
+`$HERMES_HOME/config.yaml`:
 
 ```yaml
 mcp_servers:
@@ -76,6 +118,10 @@ mcp_servers:
     command: npx
     args: ["-y", "@modelcontextprotocol/server-filesystem", "/workspace"]
 ```
+
+The first awaited agent boundary discovers configured servers and registers
+their tools under the server's toolset. MCP subprocesses and client sessions
+are closed by `await agent.close()` or the async context manager.
 
 The file-backed memory and user profile surfaces also retain the normal Hermes
 home under `~/.hermes`. Enable the `memory` toolset and the corresponding
@@ -85,12 +131,42 @@ home under `~/.hermes`. Enable the `memory` toolset and the corresponding
 
 Set `save_trajectories=True` on `AIAgent` for individual conversations. The
 saved sequence preserves reasoning, tool calls, observations, and the final
-answer for interleaved-thinking fine-tuning.
+answer for interleaved-thinking fine-tuning. Completed samples append to
+`trajectory_samples.jsonl` in the process working directory.
 
 For datasets, use `BatchRunner` from the unchanged `batch_runner.py` module and
 await its existing `run()` method. It retains bounded concurrency, checkpoints,
 resume support, and JSONL output. `trajectory_compressor.py` remains available
 for post-processing generated trajectories.
+
+```python
+import asyncio
+import os
+
+from batch_runner import BatchRunner
+
+
+async def main():
+    runner = BatchRunner(
+        dataset_file="prompts.jsonl",
+        batch_size=8,
+        run_name="tool-training",
+        distribution="terminal_only",
+        base_url="https://openrouter.ai/api/v1",
+        api_key=os.environ["OPENROUTER_API_KEY"],
+        model="openai/gpt-oss-20b:free",
+        num_workers=4,
+        reasoning_config={"enabled": True, "effort": "low"},
+    )
+    await runner.run(resume=True)
+
+
+asyncio.run(main())
+```
+
+Each input line must be JSON with a `prompt` field. Outputs are written under
+`data/<run_name>/`: per-batch JSONL shards, merged `trajectories.jsonl`,
+`checkpoint.json`, and `statistics.json`.
 
 ## Service integration
 
