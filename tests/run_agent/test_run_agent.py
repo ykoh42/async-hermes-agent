@@ -2857,6 +2857,33 @@ class TestRunConversation:
         assert result["api_calls"] == 2  # 1 original + 1 nudge retry
 
     @pytest.mark.asyncio
+    async def test_empty_response_backoff_uses_async_sleep(self, agent):
+        """The upstream retry delay is preserved without blocking the loop."""
+        self._setup_agent(agent)
+        agent.base_url = "http://127.0.0.1:1234/v1"
+        empty_resp = _mock_response(content=None, finish_reason="stop")
+        content_resp = _mock_response(content="Recovered.", finish_reason="stop")
+        agent._execute_model_request = AsyncMock(
+            side_effect=[empty_resp, content_resp]
+        )
+
+        from agent import conversation_loop as _conv_loop
+
+        async_sleep = AsyncMock(wraps=asyncio.sleep)
+        with (
+            patch.object(agent, "_persist_session", new_callable=AsyncMock),
+            patch.object(agent, "_save_trajectory", new_callable=AsyncMock),
+            patch.object(agent, "_cleanup_task_resources", new_callable=AsyncMock),
+            patch.object(_conv_loop, "jittered_backoff", return_value=0.05),
+            patch.object(_conv_loop.asyncio, "sleep", async_sleep),
+        ):
+            result = await agent.run_conversation("answer me")
+
+        assert result["final_response"] == "Recovered."
+        async_sleep.assert_awaited()
+        assert all(call.args[0] == 0.2 for call in async_sleep.await_args_list)
+
+    @pytest.mark.asyncio
     async def test_empty_response_triggers_fallback_provider(self, agent):
         """After 3 empty retries, fallback provider is activated and produces content."""
         self._setup_agent(agent)
