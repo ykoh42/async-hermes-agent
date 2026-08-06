@@ -20,6 +20,8 @@ import sys
 import types
 from pathlib import Path
 
+import pytest
+
 # Ensure repo root is importable
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
@@ -98,50 +100,54 @@ def _simulate_cron_session_state(c):
 
 
 
-def test_ineffective_compression_count_does_not_leak_across_sessions():
+@pytest.mark.asyncio
+async def test_ineffective_compression_count_does_not_leak_across_sessions():
     """A cron session that hit ineffective compression limits must not
     suppress compression in a subsequent live session."""
     c = _make_compressor()
     c._ineffective_compression_count = 2  # hit the anti-thrashing limit
     c._last_compression_savings_pct = 3.0
 
-    c.on_session_end("cron-session", [])
+    await c.on_session_end("cron-session", [])
 
     # After session end, the next session must start with a clean slate
     assert c._ineffective_compression_count == 0
     assert c._last_compression_savings_pct == 100.0
 
 
-def test_summary_failure_cooldown_does_not_leak_across_sessions():
+@pytest.mark.asyncio
+async def test_summary_failure_cooldown_does_not_leak_across_sessions():
     """A cron session's summary failure cooldown must not block summary
     generation in a subsequent live session."""
     c = _make_compressor()
     c._summary_failure_cooldown_until = 9999999999.0
 
-    c.on_session_end("cron-session", [])
+    await c.on_session_end("cron-session", [])
 
     assert c._summary_failure_cooldown_until == 0.0
 
 
-def test_compress_aborted_flag_does_not_leak_across_sessions():
+@pytest.mark.asyncio
+async def test_compress_aborted_flag_does_not_leak_across_sessions():
     """A cron session's _last_compress_aborted flag must not make callers
     think compression is still aborted in a subsequent live session."""
     c = _make_compressor()
     c._last_compress_aborted = True
 
-    c.on_session_end("cron-session", [])
+    await c.on_session_end("cron-session", [])
 
     assert c._last_compress_aborted is False
 
 
-def test_aux_model_failure_does_not_leak_across_sessions():
+@pytest.mark.asyncio
+async def test_aux_model_failure_does_not_leak_across_sessions():
     """Stale aux model failure info from a cron session must not produce
     misleading error warnings in a subsequent live session."""
     c = _make_compressor()
     c._last_aux_model_failure_error = "cron-model/v1 failed"
     c._last_aux_model_failure_model = "cron-model/v1"
 
-    c.on_session_end("cron-session", [])
+    await c.on_session_end("cron-session", [])
 
     assert c._last_aux_model_failure_error is None
     assert c._last_aux_model_failure_model is None

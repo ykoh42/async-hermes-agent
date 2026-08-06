@@ -35,7 +35,7 @@ class _StubEngine(ContextEngine):
     def should_compress(self, prompt_tokens=None):
         return False
 
-    def compress(self, messages, current_tokens=None):
+    async def compress(self, messages, current_tokens=None):
         return messages
 
 

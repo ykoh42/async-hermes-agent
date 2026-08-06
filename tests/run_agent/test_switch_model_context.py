@@ -19,7 +19,7 @@ class _StubStartupCompressor:
     def get_tool_schemas(self):
         return []
 
-    def on_session_start(self, *args, **kwargs):
+    async def on_session_start(self, *args, **kwargs):
         return None
 
     def update_model(self, *, model, context_length=None, **_kwargs):

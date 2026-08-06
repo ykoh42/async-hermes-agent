@@ -18,6 +18,8 @@ from __future__ import annotations
 from typing import Any, Dict, List
 from unittest.mock import MagicMock
 
+import pytest
+
 from agent.context_engine import ContextEngine
 from agent.conversation_loop import (
     _apply_context_engine_selection,
@@ -38,7 +40,7 @@ class _MinimalEngine(ContextEngine):
     def should_compress(self, prompt_tokens: int = None) -> bool:
         return False
 
-    def compress(
+    async def compress(
         self,
         messages: List[Dict[str, Any]],
         current_tokens: int = None,
@@ -69,7 +71,8 @@ HISTORY = [{"role": "user", "content": "hello"}]
 
 
 
-def test_base_noop_select_context_is_short_circuited_not_called():
+@pytest.mark.asyncio
+async def test_base_noop_select_context_is_short_circuited_not_called():
     """Non-implementing engines skip the hook entirely (no call, no copies).
 
     The built-in ContextCompressor — and any engine that merely inherits the
@@ -83,14 +86,14 @@ def test_base_noop_select_context_is_short_circuited_not_called():
     """
     from unittest.mock import patch as _patch
 
-    def _explode(self, request_messages, **kwargs):
+    async def _explode(self, request_messages, **kwargs):
         raise AssertionError("base select_context must not be invoked")
 
     engine = _MinimalEngine()  # inherits the ABC default
     agent = _agent_with(engine)
     logger = MagicMock()
     with _patch.object(ContextEngine, "select_context", _explode):
-        out = _apply_context_engine_selection(
+        out = await _apply_context_engine_selection(
             agent, REQUEST, HISTORY, HISTORY[-1], logger=logger
         )
     assert out is REQUEST
@@ -111,7 +114,8 @@ def test_base_noop_select_context_is_short_circuited_not_called():
 
 
 
-def test_empty_list_keeps_original_request():
+@pytest.mark.asyncio
+async def test_empty_list_keeps_original_request():
     """An empty list must fall open to the original request.
 
     ``all([])`` is ``True``, so without an emptiness check a ``[]`` returned by
@@ -122,19 +126,20 @@ def test_empty_list_keeps_original_request():
     """
 
     class _Engine(_MinimalEngine):
-        def select_context(self, request_messages, **kwargs):
+        async def select_context(self, request_messages, **kwargs):
             return []
 
     logger = MagicMock()
     agent = _agent_with(_Engine())
-    out = _apply_context_engine_selection(
+    out = await _apply_context_engine_selection(
         agent, REQUEST, HISTORY, HISTORY[-1], logger=logger
     )
     assert out is REQUEST
     assert logger.warning.called
 
 
-def test_engine_mutating_inputs_cannot_corrupt_persisted_state():
+@pytest.mark.asyncio
+async def test_engine_mutating_inputs_cannot_corrupt_persisted_state():
     """An engine that mutates its read-only inputs in place must not affect the
     persisted conversation history / incoming message.
 
@@ -149,8 +154,8 @@ def test_engine_mutating_inputs_cannot_corrupt_persisted_state():
     incoming_snapshot = dict(incoming)
 
     class _Engine(_MinimalEngine):
-        def select_context(self, request_messages, *, conversation_messages=None,
-                            incoming_message=None, **kwargs):
+        async def select_context(self, request_messages, *, conversation_messages=None,
+                                 incoming_message=None, **kwargs):
             # Misbehaving engine: mutate the read-only inputs in place.
             if conversation_messages is not None:
                 conversation_messages.append({"role": "user", "content": "INJECTED"})
@@ -161,7 +166,7 @@ def test_engine_mutating_inputs_cannot_corrupt_persisted_state():
             return None
 
     agent = _agent_with(_Engine())
-    _apply_context_engine_selection(
+    await _apply_context_engine_selection(
         agent, REQUEST, history, incoming, logger=MagicMock()
     )
     # Persisted history + incoming message are untouched despite the engine's
@@ -170,11 +175,12 @@ def test_engine_mutating_inputs_cannot_corrupt_persisted_state():
     assert incoming == incoming_snapshot
 
 
-def test_persisted_history_not_mutated():
+@pytest.mark.asyncio
+async def test_persisted_history_not_mutated():
     """The hook must not mutate the persisted conversation history."""
 
     class _Engine(_MinimalEngine):
-        def select_context(self, request_messages, *, conversation_messages=None, **kwargs):
+        async def select_context(self, request_messages, *, conversation_messages=None, **kwargs):
             # Even a misbehaving engine touching its inputs must not affect
             # what the host persists — the host passes the live list, so we
             # assert the host contract by checking the engine received it and
@@ -183,7 +189,7 @@ def test_persisted_history_not_mutated():
 
     history_snapshot = [dict(m) for m in HISTORY]
     agent = _agent_with(_Engine())
-    _apply_context_engine_selection(
+    await _apply_context_engine_selection(
         agent, REQUEST, HISTORY, HISTORY[-1], logger=MagicMock()
     )
     assert HISTORY == history_snapshot
@@ -193,7 +199,8 @@ def test_persisted_history_not_mutated():
 
 
 
-def test_role_unusual_replacement_passed_through_for_downstream_sanitizers():
+@pytest.mark.asyncio
+async def test_role_unusual_replacement_passed_through_for_downstream_sanitizers():
     """The hook does structural validation only; role/tool normalization is
     deferred to the existing downstream sanitizers.
 
@@ -211,11 +218,11 @@ def test_role_unusual_replacement_passed_through_for_downstream_sanitizers():
     ]
 
     class _Engine(_MinimalEngine):
-        def select_context(self, request_messages, **kwargs):
+        async def select_context(self, request_messages, **kwargs):
             return role_unusual
 
     agent = _agent_with(_Engine())
-    out = _apply_context_engine_selection(
+    out = await _apply_context_engine_selection(
         agent, REQUEST, HISTORY, HISTORY[-1], logger=MagicMock()
     )
     assert out is role_unusual  # accepted structurally; downstream sanitizers normalize
@@ -225,18 +232,19 @@ def test_role_unusual_replacement_passed_through_for_downstream_sanitizers():
 
 
 
-def test_on_turn_complete_called_with_snapshot_and_meta():
+@pytest.mark.asyncio
+async def test_on_turn_complete_called_with_snapshot_and_meta():
     """Host forwards a transcript copy + metadata; base no-op is skipped."""
     captured = {}
 
     class _Engine(_MinimalEngine):
-        def on_turn_complete(self, messages, usage=None, **kwargs):
+        async def on_turn_complete(self, messages, usage=None, **kwargs):
             captured["messages"] = messages
             captured["usage"] = usage
             captured["kwargs"] = kwargs
 
     agent = _agent_with(_Engine())
-    _notify_context_engine_turn_complete(
+    await _notify_context_engine_turn_complete(
         agent, HISTORY, usage={"total_tokens": 12}, logger=MagicMock(),
         turn_id="t1", api_call_count=1,
     )
@@ -245,7 +253,6 @@ def test_on_turn_complete_called_with_snapshot_and_meta():
     assert captured["usage"] == {"total_tokens": 12}
     assert captured["kwargs"]["turn_id"] == "t1"
     assert captured["kwargs"]["api_call_count"] == 1
-
 
 
 

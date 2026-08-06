@@ -10,6 +10,8 @@ import sys
 import types
 from pathlib import Path
 
+import pytest
+
 
 # Ensure repo root is importable
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
@@ -55,7 +57,8 @@ def _make_minimal_agent() -> AIAgent:
 class TestResetSessionState:
     """reset_session_state() must clear ALL session-scoped state."""
 
-    def test_previous_summary_cleared_on_reset(self):
+    @pytest.mark.asyncio
+    async def test_previous_summary_cleared_on_reset(self):
         """Compression summary from old session must not leak into new session."""
         agent = _make_minimal_agent()
         compressor = ContextCompressor.__new__(ContextCompressor)
@@ -69,22 +72,22 @@ class TestResetSessionState:
 
         agent.context_compressor = compressor
 
-        agent.reset_session_state()
+        await agent.reset_session_state()
 
         assert compressor._previous_summary is None, (
             "_previous_summary must be None after reset; got: "
             f"{compressor._previous_summary!r}"
         )
 
-    def test_user_turn_count_cleared_on_reset(self):
+    @pytest.mark.asyncio
+    async def test_user_turn_count_cleared_on_reset(self):
         """Turn counter must reset to 0 on new session."""
         agent = _make_minimal_agent()
         agent._user_turn_count = 7  # simulates turns accumulated in previous session
         agent.context_compressor = None
 
-        agent.reset_session_state()
+        await agent.reset_session_state()
 
         assert agent._user_turn_count == 0, (
             f"_user_turn_count must be 0 after reset; got: {agent._user_turn_count}"
         )
-

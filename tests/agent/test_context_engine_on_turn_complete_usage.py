@@ -47,7 +47,7 @@ class _CapturingEngine(ContextEngine):
     def should_compress(self, prompt_tokens: int = None) -> bool:
         return False
 
-    def compress(
+    async def compress(
         self,
         messages: List[Dict[str, Any]],
         current_tokens: int = None,
@@ -55,7 +55,7 @@ class _CapturingEngine(ContextEngine):
     ) -> List[Dict[str, Any]]:
         return messages
 
-    def on_turn_complete(self, messages, usage=None, **kwargs):
+    async def on_turn_complete(self, messages, usage=None, **kwargs):
         self.captured["seen"] = True
         self.captured["usage"] = usage
         self.captured["kwargs"] = kwargs

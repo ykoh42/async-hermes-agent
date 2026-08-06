@@ -160,7 +160,7 @@ class ContextEngine(ABC):
         return self.should_compress(prompt_tokens), None
 
     @abstractmethod
-    def compress(
+    async def compress(
         self,
         messages: List[Dict[str, Any]],
         current_tokens: Optional[int] = None,
@@ -212,7 +212,7 @@ class ContextEngine(ABC):
 
     # -- Optional: per-turn context selection (distinct from compression) --
 
-    def select_context(
+    async def select_context(
         self,
         request_messages: List[Dict[str, Any]],
         *,
@@ -278,7 +278,7 @@ class ContextEngine(ABC):
         """
         return None
 
-    def on_turn_complete(
+    async def on_turn_complete(
         self,
         messages: List[Dict[str, Any]],
         usage: Dict[str, Any] = None,
@@ -384,21 +384,25 @@ class ContextEngine(ABC):
 
     # -- Optional: session lifecycle ---------------------------------------
 
-    def on_session_start(self, session_id: str, **kwargs) -> None:
+    async def on_session_start(self, session_id: str, **kwargs) -> None:
         """Called when a new conversation session begins.
 
         Use this to load persisted state (DAG, store) for the session.
         kwargs may include hermes_home, platform, model, etc.
         """
 
-    def on_session_end(self, session_id: str, messages: List[Dict[str, Any]]) -> None:
+    async def on_session_end(
+        self,
+        session_id: str,
+        messages: List[Dict[str, Any]],
+    ) -> None:
         """Called at real session boundaries (CLI exit, /reset, gateway expiry).
 
         Use this to flush state, close DB connections, etc.
         NOT called per-turn — only when the session truly ends.
         """
 
-    def on_session_reset(self) -> None:
+    async def on_session_reset(self) -> None:
         """Called on /new or /reset. Reset per-session state.
 
         Default resets compression_count and token tracking.
@@ -418,7 +422,12 @@ class ContextEngine(ABC):
         """
         return []
 
-    def handle_tool_call(self, name: str, args: Dict[str, Any], **kwargs) -> str:
+    async def handle_tool_call(
+        self,
+        name: str,
+        args: Dict[str, Any],
+        **kwargs,
+    ) -> str:
         """Handle a tool call from the agent.
 
         Only called for tool names returned by get_tool_schemas().

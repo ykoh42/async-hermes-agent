@@ -265,6 +265,7 @@ class TestPreApiLockDeferDoesNotBurnBudget:
             should_defer_preflight_to_real_usage=lambda _t: False,
             get_active_compression_failure_cooldown=lambda: None,
         )
+        agent._context_engine_started = True
 
         agent.client.chat.completions.create.side_effect = [
             _make_413_error(),

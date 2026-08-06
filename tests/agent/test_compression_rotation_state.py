@@ -239,7 +239,7 @@ class TestFallbackStreakFollowsRotation:
             source="telegram",
             parent_session_id=parent,
         )
-        compressor.on_session_start(
+        await compressor.on_session_start(
             "CHILD_FALLBACK_ROT",
             session_db=db,
             boundary_reason="compression",

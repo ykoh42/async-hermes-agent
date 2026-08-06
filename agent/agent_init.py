@@ -2606,19 +2606,10 @@ def init_agent(
             agent._context_engine_tool_names.add(_tname)
             _existing_tool_names.add(_tname)
 
-    # Notify context engine of session start
-    if hasattr(agent, "context_compressor") and agent.context_compressor:
-        try:
-            agent.context_compressor.on_session_start(
-                agent.session_id,
-                hermes_home=str(get_hermes_home()),
-                platform=agent.platform or "cli",
-                model=agent.model,
-                context_length=getattr(agent.context_compressor, "context_length", 0),
-                conversation_id=getattr(agent, "_gateway_session_key", None),
-            )
-        except Exception as _ce_err:
-            _ra().logger.debug("Context engine on_session_start: %s", _ce_err)
+    # Lifecycle starts at the first awaited runtime boundary.
+    agent._context_engine_selected = False
+    agent._context_engine_is_plugin = False
+    agent._context_engine_started = False
 
     agent._subdirectory_hints = SubdirectoryHintTracker(
         working_dir=os.getenv("TERMINAL_CWD") or None,
@@ -2775,6 +2766,208 @@ def init_agent(
 
 
 
+def _select_context_engine(
+    agent: Any,
+    config_snapshot: Dict[str, Any],
+) -> None:
+    """Select and validate the configured engine before transport startup."""
+    if getattr(agent, "_context_engine_selected", False):
+        return
+
+    context_config = config_snapshot.get("context", {})
+    engine_name = (
+        str(context_config.get("engine") or "compressor").strip()
+        if isinstance(context_config, dict)
+        else "compressor"
+    )
+    selected_engine = None
+    copy_failed = False
+
+    if engine_name != "compressor":
+        try:
+            from plugins.context_engine import load_context_engine
+
+            selected_engine = load_context_engine(engine_name)
+        except Exception as exc:
+            logger.debug(
+                "Context engine load from plugins/context_engine/: %s",
+                exc,
+            )
+
+        if selected_engine is None:
+            candidate = None
+            try:
+                from hermes_cli.plugins import get_plugin_context_engine
+
+                candidate = get_plugin_context_engine()
+            except Exception:
+                candidate = None
+            if candidate is not None and candidate.name == engine_name:
+                import copy
+
+                try:
+                    selected_engine = copy.deepcopy(candidate)
+                except Exception as exc:
+                    copy_failed = True
+                    logger.warning(
+                        "Context engine '%s' could not be safely copied for this "
+                        "agent (%s) — falling back to built-in compressor. Plugin "
+                        "engines that hold uncopyable state (locks, DB connections) "
+                        "should implement __deepcopy__ to copy only mutable budget "
+                        "state.",
+                        engine_name,
+                        exc,
+                    )
+
+        if selected_engine is None and not copy_failed:
+            logger.warning(
+                "Context engine '%s' not found — falling back to built-in compressor",
+                engine_name,
+            )
+
+    if selected_engine is not None:
+        from hermes_cli.plugins import PluginContractError
+
+        async_methods = (
+            "compress",
+            "select_context",
+            "on_turn_complete",
+            "on_session_start",
+            "on_session_end",
+            "on_session_reset",
+            "handle_tool_call",
+        )
+        for method_name in async_methods:
+            method = getattr(selected_engine, method_name, None)
+            if not callable(method) or not inspect.iscoroutinefunction(
+                inspect.unwrap(method)
+            ):
+                raise PluginContractError(
+                    f"Context engine {engine_name!r} must implement "
+                    f"{method_name}() as a coroutine"
+                )
+        carry_over = getattr(selected_engine, "carry_over_new_session_context", None)
+        if callable(carry_over) and not inspect.iscoroutinefunction(
+            inspect.unwrap(carry_over)
+        ):
+            raise PluginContractError(
+                f"Context engine {engine_name!r} must implement "
+                "carry_over_new_session_context() as a coroutine"
+            )
+
+        agent.context_compressor = selected_engine
+        agent._compression_threshold_autoraised = None
+
+    agent._context_engine_is_plugin = selected_engine is not None
+    agent._context_engine_selected = True
+
+
+async def _initialize_context_engine(
+    agent: Any,
+    config_snapshot: Dict[str, Any],
+) -> None:
+    """Configure and start the selected context engine exactly once."""
+    if getattr(agent, "_context_engine_started", False):
+        return
+    _select_context_engine(agent, config_snapshot)
+
+    if getattr(agent, "_context_engine_is_plugin", False):
+        from agent.model_metadata import get_model_context_length
+
+        plugin_context_length = await get_model_context_length(
+            agent.model,
+            base_url=agent.base_url,
+            api_key=(
+                agent.api_key if isinstance(agent.api_key, str) else ""
+            ),
+            config_context_length=getattr(agent, "_config_context_length", None),
+            provider=agent.provider,
+            custom_providers=getattr(agent, "_custom_providers", None),
+        )
+        compression_config = config_snapshot.get("compression", {})
+        raw_thresholds = (
+            compression_config.get("model_thresholds", {})
+            if isinstance(compression_config, dict)
+            else {}
+        )
+        if isinstance(raw_thresholds, dict):
+            agent.context_compressor.model_thresholds = {
+                str(key): float(value)
+                for key, value in raw_thresholds.items()
+                if isinstance(value, (int, float))
+                and not isinstance(value, bool)
+            }
+        agent.context_compressor.update_model(
+            model=agent.model,
+            context_length=plugin_context_length,
+            base_url=agent.base_url,
+            api_key=(
+                agent.api_key if isinstance(agent.api_key, str) else ""
+            ),
+            provider=agent.provider,
+            api_mode=agent.api_mode,
+        )
+        if not agent.quiet_mode:
+            logger.info("Using context engine: %s", agent.context_compressor.name)
+
+    bind_session_state = getattr(agent.context_compressor, "bind_session_state", None)
+    if callable(bind_session_state):
+        try:
+            bind_session_state(session_db=None, session_id=agent.session_id)
+        except Exception:
+            pass
+
+    context_engine_tool_names = getattr(agent, "_context_engine_tool_names", None)
+    if context_engine_tool_names is None:
+        context_engine_tool_names = set()
+        agent._context_engine_tool_names = context_engine_tool_names
+    if (
+        getattr(agent, "tools", None) is not None
+        and (
+            getattr(agent, "enabled_toolsets", None) is None
+            or "context_engine" in agent.enabled_toolsets
+        )
+    ):
+        existing_tool_names = {
+            tool.get("function", {}).get("name")
+            for tool in agent.tools
+            if isinstance(tool, dict)
+        }
+        from agent.memory_manager import normalize_tool_schema
+
+        for raw_schema in agent.context_compressor.get_tool_schemas():
+            schema = normalize_tool_schema(raw_schema)
+            if schema is None:
+                logger.warning(
+                    "Context engine returned a tool schema with no resolvable "
+                    "name; skipping to avoid poisoning the request (%r)",
+                    raw_schema,
+                )
+                continue
+            tool_name = schema["name"]
+            if tool_name in existing_tool_names:
+                continue
+            agent.tools.append({"type": "function", "function": schema})
+            agent.valid_tool_names.add(tool_name)
+            context_engine_tool_names.add(tool_name)
+            existing_tool_names.add(tool_name)
+
+    try:
+        await agent.context_compressor.on_session_start(
+            agent.session_id,
+            hermes_home=str(get_hermes_home()),
+            platform=agent.platform or "cli",
+            model=agent.model,
+            context_length=getattr(agent.context_compressor, "context_length", 0),
+            conversation_id=getattr(agent, "_gateway_session_key", None),
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.debug("Context engine on_session_start: %s", exc)
+    agent._context_engine_started = True
+
+
 async def initialize_deferred_runtime(agent: Any) -> bool:
     """Resolve a no-credential constructor through native async primitives.
 
@@ -2787,8 +2980,6 @@ async def initialize_deferred_runtime(agent: Any) -> bool:
     conversation turn.
     """
     pending = getattr(agent, "_deferred_provider_runtime", None)
-    if not pending and getattr(agent, "_runtime_config_loaded", False):
-        return False
 
     lock = getattr(agent, "_provider_init_lock", None)
     if lock is None:
@@ -2798,6 +2989,10 @@ async def initialize_deferred_runtime(agent: Any) -> bool:
     async with lock:
         pending = getattr(agent, "_deferred_provider_runtime", None)
         if not pending and getattr(agent, "_runtime_config_loaded", False):
+            config_snapshot = getattr(agent, "_runtime_config_snapshot", {})
+            if not isinstance(config_snapshot, dict):
+                config_snapshot = {}
+            await _initialize_context_engine(agent, config_snapshot)
             return False
 
         if not getattr(agent, "_dotenv_loaded", False):
@@ -2840,19 +3035,7 @@ async def initialize_deferred_runtime(agent: Any) -> bool:
                         ),
                     )
                     await _record_codex_gpt55_autoraise_notice(autoraise)
-        context_config = config_snapshot.get("context", {})
-        configured_context_engine = (
-            str(context_config.get("engine") or "compressor").strip()
-            if isinstance(context_config, dict)
-            else "compressor"
-        )
-        if configured_context_engine != "compressor":
-            raise UnsupportedCapabilityError(
-                "Context engine "
-                f"{configured_context_engine!r} has no native async lifecycle "
-                "contract and is disabled in async-hermes-agent. Use the built-in "
-                "'compressor' engine or provide a native async implementation."
-            )
+        _select_context_engine(agent, config_snapshot)
         secrets_config = config_snapshot.get("secrets", {})
         if isinstance(secrets_config, dict) and any(
             isinstance(value, dict) and value.get("enabled")
@@ -2865,6 +3048,7 @@ async def initialize_deferred_runtime(agent: Any) -> bool:
             )
 
         if not pending:
+            await _initialize_context_engine(agent, config_snapshot)
             return False
 
         requested = str(pending.get("provider") or "auto").strip().lower()
@@ -2890,6 +3074,7 @@ async def initialize_deferred_runtime(agent: Any) -> bool:
             agent._use_prompt_caching, agent._use_native_cache_layout = (
                 agent._anthropic_prompt_cache_policy()
             )
+            await _initialize_context_engine(agent, config_snapshot)
             logger.info("Initialized native async MoA runtime for %s", model)
             return True
         pending_api_key = pending.get("api_key")
@@ -3304,6 +3489,7 @@ async def initialize_deferred_runtime(agent: Any) -> bool:
                 provider=agent.provider,
                 api_mode=agent.api_mode,
             )
+        await _initialize_context_engine(agent, config_snapshot)
 
         primary = getattr(agent, "_primary_runtime", None)
         if pending.get("update_primary", True) and isinstance(primary, dict):

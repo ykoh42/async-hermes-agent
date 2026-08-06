@@ -48,7 +48,8 @@ def _bare_agent() -> AIAgent:
 
 
 
-def test_transition_skips_optional_hooks_when_engine_lacks_them():
+@pytest.mark.asyncio
+async def test_transition_skips_optional_hooks_when_engine_lacks_them():
     """Engines that don't implement on_session_end/carry_over still work."""
     class MinimalEngine:
         def __init__(self):
@@ -56,10 +57,10 @@ def test_transition_skips_optional_hooks_when_engine_lacks_them():
             self.reset_called = False
             self.start_called_with = None
 
-        def on_session_reset(self):
+        async def on_session_reset(self):
             self.reset_called = True
 
-        def on_session_start(self, sid, **kw):
+        async def on_session_start(self, sid, **kw):
             self.start_called_with = (sid, kw)
 
     engine = MinimalEngine()
@@ -67,7 +68,7 @@ def test_transition_skips_optional_hooks_when_engine_lacks_them():
     agent.context_compressor = engine
 
     # Should not raise even though on_session_end / carry_over are missing.
-    agent._transition_context_engine_session(
+    await agent._transition_context_engine_session(
         old_session_id="old",
         new_session_id="new",
         previous_messages=[{"role": "user", "content": "hi"}],
@@ -118,7 +119,7 @@ async def test_reset_session_state_rebinds_builtin_compressor_after_session_swit
     agent.context_compressor = compressor
     agent.session_id = "new-sid"
 
-    agent.reset_session_state()
+    await agent.reset_session_state()
 
     assert compressor._session_id == "new-sid"
     assert compressor.get_active_compression_failure_cooldown() is None

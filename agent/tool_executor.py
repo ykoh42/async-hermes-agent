@@ -493,6 +493,8 @@ async def execute_tool_calls_segmented(
         getattr(tc.function, "name", "")
         for tc in tool_calls
         if registry.get_entry(getattr(tc.function, "name", "")) is None
+        and getattr(tc.function, "name", "")
+        not in (getattr(agent, "_context_engine_tool_names", None) or set())
     ]
     if unsupported:
         from agent.agent_runtime_helpers import UnsupportedCapabilityError
@@ -534,6 +536,14 @@ async def execute_tool_calls_segmented(
         )
         if malformed_args_result is None:
             async def _dispatch(next_args, middleware_trace):
+                if name in (
+                    getattr(agent, "_context_engine_tool_names", None) or set()
+                ):
+                    return await agent.context_compressor.handle_tool_call(
+                        name,
+                        next_args,
+                        messages=messages,
+                    )
                 dispatch_kwargs = {
                     "tool_call_id": getattr(tc, "id", "") or "",
                     "session_id": getattr(agent, "session_id", "") or "",

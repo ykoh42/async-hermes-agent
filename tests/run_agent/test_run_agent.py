@@ -1925,6 +1925,39 @@ class TestConcurrentToolExecution:
         assert agent_runtime_owns_post_tool_hook(agent, "web_search") is False
 
 
+    @pytest.mark.asyncio
+    async def test_context_engine_tool_uses_native_async_handler(self, agent):
+        """Context-engine tools bypass the registry without a sync bridge."""
+        handler = AsyncMock(return_value='{"matches": ["result"]}')
+        agent.context_compressor = SimpleNamespace(
+            context_length=128_000,
+            handle_tool_call=handler,
+        )
+        agent._context_engine_tool_names = {"context_query"}
+        tool_call = _mock_tool_call(
+            name="context_query",
+            arguments='{"query": "needle"}',
+            call_id="context-1",
+        )
+        assistant_message = _mock_assistant_msg(content="", tool_calls=[tool_call])
+        messages = []
+
+        with patch("tools.registry.registry.get_entry", return_value=None):
+            await agent._execute_tool_calls(
+                assistant_message,
+                messages,
+                "task-1",
+            )
+
+        handler.assert_awaited_once_with(
+            "context_query",
+            {"query": "needle"},
+            messages=messages,
+        )
+        assert messages[0]["role"] == "tool"
+        assert json.loads(messages[0]["content"]) == {"matches": ["result"]}
+
+
 
 
 

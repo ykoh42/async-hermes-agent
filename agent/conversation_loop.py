@@ -1066,7 +1066,7 @@ async def _redecorate_prompt_cache_for_provider(
     return messages, prepared, planned_tools
 
 
-def _apply_context_engine_selection(
+async def _apply_context_engine_selection(
     agent: Any,
     api_messages: List[Dict[str, Any]],
     conversation_messages: List[Dict[str, Any]],
@@ -1115,7 +1115,7 @@ def _apply_context_engine_selection(
         if conversation_messages is not None else None
     _incoming_copy = dict(incoming_message) if isinstance(incoming_message, dict) else incoming_message
     try:
-        selected = engine.select_context(
+        selected = await engine.select_context(
             api_messages,
             conversation_messages=_conv_copy,
             incoming_message=_incoming_copy,
@@ -1148,7 +1148,7 @@ def _apply_context_engine_selection(
     return api_messages
 
 
-def _notify_context_engine_turn_complete(
+async def _notify_context_engine_turn_complete(
     agent: Any,
     messages: List[Dict[str, Any]],
     *,
@@ -1183,7 +1183,7 @@ def _notify_context_engine_turn_complete(
         pass
 
     try:
-        hook(
+        await hook(
             [dict(m) if isinstance(m, dict) else m for m in messages],
             usage=usage,
             **meta,
@@ -1707,7 +1707,7 @@ async def run_conversation(
             if 0 <= current_turn_user_idx < len(messages)
             else None
         )
-        api_messages = _apply_context_engine_selection(
+        api_messages = await _apply_context_engine_selection(
             agent,
             api_messages,
             messages,

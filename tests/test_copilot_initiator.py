@@ -88,10 +88,11 @@ class TestUserInitiatedTurnFlag:
         agent = _make_agent(monkeypatch, "https://api.githubcopilot.com")
         assert agent._is_user_initiated_turn is False
 
-    def test_reset_session_clears_flag(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_reset_session_clears_flag(self, monkeypatch):
         agent = _make_agent(monkeypatch, "https://api.githubcopilot.com")
         agent._is_user_initiated_turn = True
-        agent.reset_session_state()
+        await agent.reset_session_state()
         assert agent._is_user_initiated_turn is False
 
 

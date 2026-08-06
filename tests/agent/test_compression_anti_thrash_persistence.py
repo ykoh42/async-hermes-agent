@@ -230,7 +230,7 @@ class TestCompressionBoundaryCarry:
         assert await db.get_compression_ineffective_count("parent") == 1
 
         await db.create_session("child", source="cli", parent_session_id="parent")
-        cc.on_session_start(
+        await cc.on_session_start(
             "child",
             boundary_reason="compression",
             old_session_id="parent",

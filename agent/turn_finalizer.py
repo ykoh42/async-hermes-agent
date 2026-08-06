@@ -563,7 +563,7 @@ async def finalize_turn(
         # provider response (early failure / interrupt), which is exactly the
         # contract: real usage when available, ``None`` otherwise.
         _turn_usage = getattr(agent, "_last_turn_usage", None)
-        _notify_context_engine_turn_complete(
+        await _notify_context_engine_turn_complete(
             agent,
             messages,
             usage=_turn_usage,

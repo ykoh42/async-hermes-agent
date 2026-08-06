@@ -1285,9 +1285,9 @@ class ContextCompressor(ContextEngine):
     def name(self) -> str:
         return "compressor"
 
-    def on_session_reset(self) -> None:
+    async def on_session_reset(self) -> None:
         """Reset all per-session state for /new or /reset."""
-        super().on_session_reset()
+        await super().on_session_reset()
         self._context_probed = False
         self._context_probe_persistable = False
         self._previous_summary = None
@@ -1534,7 +1534,11 @@ class ContextCompressor(ContextEngine):
     def max_summary_tokens(self, value: int) -> None:
         self._max_summary_tokens = value
 
-    def on_session_end(self, session_id: str, messages: List[Dict[str, Any]]) -> None:
+    async def on_session_end(
+        self,
+        session_id: str,
+        messages: List[Dict[str, Any]],
+    ) -> None:
         """Clear all per-session compaction state at a real session boundary.
 
         Session end (CLI exit, gateway expiry, session-id rotation) goes
@@ -1601,9 +1605,9 @@ class ContextCompressor(ContextEngine):
         # Durable state is loaded by ``_hydrate_persisted_compression_guards``
         # through SessionDB at the async turn boundary.
 
-    def on_session_start(self, session_id: str, **kwargs) -> None:
+    async def on_session_start(self, session_id: str, **kwargs) -> None:
         """Bind session-scoped compression state for a new or resumed session."""
-        super().on_session_start(session_id, **kwargs)
+        await super().on_session_start(session_id, **kwargs)
         boundary_reason = kwargs.get("boundary_reason")
         session_db = kwargs.get("session_db", getattr(self, "_session_db", None))
         previous_fallback_streak = self._fallback_compression_streak

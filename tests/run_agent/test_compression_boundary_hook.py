@@ -67,6 +67,7 @@ class TestCompressionBoundaryHook:
 
             # Stub the context compressor: we only need to observe the hook.
             compressor = MagicMock()
+            compressor.on_session_start = AsyncMock()
             compressor.compress = AsyncMock(return_value=[
                 {"role": "user", "content": "[CONTEXT COMPACTION] summary"},
                 {"role": "user", "content": "tail question"},
@@ -124,6 +125,7 @@ class TestCompressionBoundaryHook:
             db = _async_db(Path(tmpdir) / "test.db")
             agent = self._make_agent(db)
             compressor = MagicMock()
+            compressor.on_session_start = AsyncMock()
             compressor.compress = AsyncMock(return_value=[
                 {"role": "user", "content": "summary"}
             ])
@@ -163,6 +165,7 @@ class TestCompressionBoundaryHook:
             db = _async_db(Path(tmpdir) / "test.db")
             agent = self._make_agent(db)
             compressor = MagicMock()
+            compressor.on_session_start = AsyncMock()
             compressor.compress = AsyncMock(
                 side_effect=RuntimeError("synthetic compression failure")
             )
@@ -185,6 +188,7 @@ class TestCompressionBoundaryHook:
             db = _async_db(Path(tmpdir) / "test.db")
             agent = self._make_agent(db)
             compressor = MagicMock()
+            compressor.on_session_start = AsyncMock()
             compressor.compress = AsyncMock(
                 side_effect=lambda messages, **_kwargs: messages
             )
@@ -220,6 +224,7 @@ class TestCompressionBoundaryHook:
             )
 
         compressor = MagicMock()
+        compressor.on_session_start = AsyncMock()
         compressor.compress = AsyncMock(
             return_value=[{"role": "user", "content": "x"}]
         )
@@ -254,6 +259,7 @@ class TestCompressionBoundaryHook:
             agent = self._make_agent(db)
 
             compressor = MagicMock()
+            compressor.on_session_start = AsyncMock()
             compressor.compress = AsyncMock(
                 return_value=[{"role": "user", "content": "summary"}]
             )
@@ -305,6 +311,7 @@ class TestSessionCompressEvent:
 
     def _stub_compressor(self):
         compressor = MagicMock()
+        compressor.on_session_start = AsyncMock()
         compressor.compress = AsyncMock(return_value=[
             {"role": "user", "content": "[CONTEXT COMPACTION] summary"},
             {"role": "user", "content": "tail"},

@@ -111,7 +111,7 @@ class TestContextEngineModelThresholds:
             def should_compress(self, prompt_tokens=None):
                 return False
 
-            def compress(self, messages, current_tokens=None, focus_topic=None):
+            async def compress(self, messages, current_tokens=None, focus_topic=None):
                 return messages
 
         engine = TestEngine()
@@ -123,4 +123,3 @@ class TestContextEngineModelThresholds:
         engine.update_model(model="glm-5.2-1M", context_length=1_000_000)
         assert engine.threshold_percent == 0.25
         assert engine.threshold_tokens == int(1_000_000 * 0.25)
-

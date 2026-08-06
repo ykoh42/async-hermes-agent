@@ -119,13 +119,14 @@ class TestRestartSemantics:
         assert await db.get_compression_ineffective_count("sess-1") == 1
         await db.close()
 
-    def test_session_reset_disarms_the_recovery_clock(self):
+    @pytest.mark.asyncio
+    async def test_session_reset_disarms_the_recovery_clock(self):
         cc = _compressor()
         _trip(cc)
         base = 1000.0
         with patch("agent.context_compressor.time.monotonic", return_value=base):
             assert cc.should_compress(cc.threshold_tokens + 1) is False
         assert cc._anti_thrash_recovery_deadline > 0.0
-        cc.on_session_reset()
+        await cc.on_session_reset()
         assert cc._anti_thrash_recovery_deadline == 0.0
         assert cc._ineffective_compression_count == 0

@@ -80,6 +80,8 @@ def _build_agent_with_db(db: SessionDB, session_id: str):
         ]
 
     compressor.compress = AsyncMock(side_effect=_compress_with_overlap)
+    compressor.on_session_start = AsyncMock()
+    compressor.on_session_end = AsyncMock()
     compressor.compression_count = 1
     compressor.last_prompt_tokens = 0
     compressor.last_completion_tokens = 0

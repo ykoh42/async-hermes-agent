@@ -216,7 +216,7 @@ async def test_init_feasibility_check_uses_aux_context_override_from_config():
         def get_tool_schemas(self):
             return []
 
-        def on_session_start(self, *args, **kwargs):
+        async def on_session_start(self, *args, **kwargs):
             return None
 
     cfg = {

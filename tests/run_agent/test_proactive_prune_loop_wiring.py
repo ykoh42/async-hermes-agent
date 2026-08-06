@@ -206,6 +206,7 @@ class TestProactivePruneLoopWiring:
             get_active_compression_failure_cooldown=lambda: None,
         )
         agent.context_compressor = compressor
+        agent._context_engine_started = True
         result = await _run_tool_loop(agent, n_tool_iterations=2)
         assert result["completed"] is True
 

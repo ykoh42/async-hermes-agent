@@ -42,7 +42,7 @@ class StubEngine(ContextEngine):
         tokens = prompt_tokens if prompt_tokens is not None else self.last_prompt_tokens
         return tokens >= self.threshold_tokens
 
-    def compress(self, messages: List[Dict[str, Any]], current_tokens: int = None) -> List[Dict[str, Any]]:
+    async def compress(self, messages: List[Dict[str, Any]], current_tokens: int = None) -> List[Dict[str, Any]]:
         self._compress_called = True
         self.compression_count += 1
         # Trivial: just return as-is
@@ -57,7 +57,7 @@ class StubEngine(ContextEngine):
             }
         ]
 
-    def handle_tool_call(self, name: str, args: Dict[str, Any]) -> str:
+    async def handle_tool_call(self, name: str, args: Dict[str, Any]) -> str:
         self._tools_called.append(name)
         return json.dumps({"ok": True, "tool": name})
 
@@ -105,11 +105,12 @@ class TestDefaults:
         assert 0 < status["usage_percent"] <= 100
 
 
-    def test_on_session_reset(self):
+    @pytest.mark.asyncio
+    async def test_on_session_reset(self):
         engine = StubEngine()
         engine.last_prompt_tokens = 999
         engine.compression_count = 3
-        engine.on_session_reset()
+        await engine.on_session_reset()
         assert engine.last_prompt_tokens == 0
         assert engine.compression_count == 0
 
@@ -129,9 +130,10 @@ class TestStubEngine:
         assert len(schemas) == 1
         assert schemas[0]["name"] == "stub_search"
 
-    def test_handle_tool_call(self):
+    @pytest.mark.asyncio
+    async def test_handle_tool_call(self):
         engine = StubEngine()
-        result = engine.handle_tool_call("stub_search", {})
+        result = await engine.handle_tool_call("stub_search", {})
         assert json.loads(result)["ok"] is True
         assert "stub_search" in engine._tools_called
 
@@ -145,7 +147,8 @@ class TestStubEngine:
 class TestCompressorSessionReset:
     """Verify ContextCompressor.on_session_reset() clears all state."""
 
-    def test_reset_clears_state(self):
+    @pytest.mark.asyncio
+    async def test_reset_clears_state(self):
         c = ContextCompressor(model="test", quiet_mode=True, config_context_length=200000)
         c.last_prompt_tokens = 50000
         c.compression_count = 3
@@ -153,7 +156,7 @@ class TestCompressorSessionReset:
         c._context_probed = True
         c._context_probe_persistable = True
 
-        c.on_session_reset()
+        await c.on_session_reset()
 
         assert c.last_prompt_tokens == 0
         assert c.last_completion_tokens == 0

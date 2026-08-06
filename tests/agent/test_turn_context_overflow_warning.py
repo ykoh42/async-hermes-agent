@@ -215,7 +215,7 @@ class TestPluginEngineDefault:
             def should_compress(self, prompt_tokens=None):
                 return False
 
-            def compress(self, messages, current_tokens=None, focus_topic=None, **kwargs):
+            async def compress(self, messages, current_tokens=None, focus_topic=None, **kwargs):
                 return messages
 
         engine = _StubEngine()
@@ -236,7 +236,7 @@ class TestPluginEngineDefault:
             def should_compress(self, prompt_tokens=None):
                 return True
 
-            def compress(self, messages, current_tokens=None, focus_topic=None):
+            async def compress(self, messages, current_tokens=None, focus_topic=None):
                 return messages
 
         assert _TrueEngine().should_compress_info(1) == (True, None)

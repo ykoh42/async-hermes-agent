@@ -9,6 +9,8 @@ on older plugins.
 
 from unittest.mock import MagicMock
 
+import pytest
+
 
 from run_agent import AIAgent
 
@@ -35,7 +37,8 @@ def _make_agent_with_engine(engine):
     return agent
 
 
-def test_compress_context_falls_back_when_engine_rejects_focus_topic():
+@pytest.mark.asyncio
+async def test_compress_context_falls_back_when_engine_rejects_focus_topic():
     """Older plugins without focus_topic in compress() signature don't crash."""
     captured_kwargs = []
 
@@ -44,7 +47,7 @@ def test_compress_context_falls_back_when_engine_rejects_focus_topic():
 
         compression_count = 0
 
-        def compress(self, messages, current_tokens=None):
+        async def compress(self, messages, current_tokens=None):
             # NOTE: no focus_topic kwarg — TypeError if caller passes one.
             captured_kwargs.append({"current_tokens": current_tokens})
             return [messages[0], messages[-1]]
@@ -62,9 +65,13 @@ def test_compress_context_falls_back_when_engine_rejects_focus_topic():
     # Directly invoke the compression call site — this is the line that
     # used to blow up with TypeError under focus_topic+strict plugin.
     try:
-        compressed = engine.compress(messages, current_tokens=100, focus_topic="foo")
+        compressed = await engine.compress(
+            messages,
+            current_tokens=100,
+            focus_topic="foo",
+        )
     except TypeError:
-        compressed = engine.compress(messages, current_tokens=100)
+        compressed = await engine.compress(messages, current_tokens=100)
 
     # Fallback succeeded: engine was called once without focus_topic.
     assert compressed == [messages[0], messages[-1]]

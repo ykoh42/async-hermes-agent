@@ -559,7 +559,7 @@ async def _adopt_live_compression_child(
     on_session_start = getattr(agent.context_compressor, "on_session_start", None)
     if callable(on_session_start):
         try:
-            on_session_start(
+            await on_session_start(
                 child_session_id,
                 boundary_reason="compression",
                 old_session_id=parent_session_id,
@@ -1217,7 +1217,7 @@ _PENDING_CONTEXT_ENGINE_NOTIFICATION = (
 )
 
 
-def _notify_context_engine_compression_complete(
+async def _notify_context_engine_compression_complete(
     agent: Any,
     *,
     new_session_id: str,
@@ -1228,7 +1228,7 @@ def _notify_context_engine_compression_complete(
     if not callable(callback):
         return False
     try:
-        callback(
+        await callback(
             new_session_id,
             boundary_reason="compression",
             old_session_id=old_session_id,
@@ -1256,8 +1256,8 @@ def _queue_context_engine_compression_notification(
     if callable(getattr(agent, _PENDING_CONTEXT_ENGINE_NOTIFICATION, None)):
         raise RuntimeError("a compression notification is already pending")
 
-    def _notify() -> bool:
-        return _notify_context_engine_compression_complete(
+    async def _notify() -> bool:
+        return await _notify_context_engine_compression_complete(
             agent,
             new_session_id=new_session_id,
             old_session_id=old_session_id,
@@ -1266,7 +1266,7 @@ def _queue_context_engine_compression_notification(
     setattr(agent, _PENDING_CONTEXT_ENGINE_NOTIFICATION, _notify)
 
 
-def finalize_context_engine_compression_notification(
+async def finalize_context_engine_compression_notification(
     agent: Any,
     *,
     committed: bool,
@@ -1276,7 +1276,7 @@ def finalize_context_engine_compression_notification(
     setattr(agent, _PENDING_CONTEXT_ENGINE_NOTIFICATION, None)
     if not committed or not callable(pending):
         return False
-    return bool(pending())
+    return bool(await pending())
 
 
 async def compress_context(
@@ -1604,7 +1604,7 @@ async def compress_context(
                         agent.context_compressor, "on_session_start", None
                     )
                     if callable(on_session_start):
-                        on_session_start(
+                        await on_session_start(
                             agent.session_id,
                             boundary_reason="compression",
                             old_session_id=_lock_sid,
@@ -2209,7 +2209,7 @@ async def compress_context(
                     old_session_id=_boundary_parent,
                 )
             else:
-                _notify_context_engine_compression_complete(
+                await _notify_context_engine_compression_complete(
                     agent,
                     new_session_id=agent.session_id or "",
                     old_session_id=_boundary_parent,

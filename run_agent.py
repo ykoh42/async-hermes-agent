@@ -661,7 +661,7 @@ class AIAgent:
             return
         self._pending_billing_route = None
 
-    def _transition_context_engine_session(
+    async def _transition_context_engine_session(
         self,
         *,
         old_session_id: Optional[str] = None,
@@ -686,13 +686,13 @@ class AIAgent:
 
         if old_session_id and previous_messages is not None and hasattr(engine, "on_session_end"):
             try:
-                engine.on_session_end(old_session_id, previous_messages)
+                await engine.on_session_end(old_session_id, previous_messages)
             except Exception as exc:
                 logger.debug("context engine on_session_end during transition: %s", exc)
 
         if reset_engine and hasattr(engine, "on_session_reset"):
             try:
-                engine.on_session_reset()
+                await engine.on_session_reset()
             except Exception as exc:
                 logger.debug("context engine on_session_reset during transition: %s", exc)
 
@@ -715,7 +715,7 @@ class AIAgent:
             start_context.update(extra_context)
             start_context = {k: v for k, v in start_context.items() if v not in (None, "")}
             try:
-                engine.on_session_start(target_session_id, **start_context)
+                await engine.on_session_start(target_session_id, **start_context)
             except Exception as exc:
                 logger.debug("context engine on_session_start during transition: %s", exc)
 
@@ -726,11 +726,14 @@ class AIAgent:
             and hasattr(engine, "carry_over_new_session_context")
         ):
             try:
-                engine.carry_over_new_session_context(old_session_id, target_session_id)
+                await engine.carry_over_new_session_context(
+                    old_session_id,
+                    target_session_id,
+                )
             except Exception as exc:
                 logger.debug("context engine carry_over_new_session_context during transition: %s", exc)
 
-    def reset_session_state(
+    async def reset_session_state(
         self,
         previous_messages: Optional[list] = None,
         old_session_id: Optional[str] = None,
@@ -778,7 +781,7 @@ class AIAgent:
         self._is_user_initiated_turn = False
 
         # Context engine reset/transition (works for built-in compressor and plugins)
-        self._transition_context_engine_session(
+        await self._transition_context_engine_session(
             old_session_id=old_session_id,
             new_session_id=getattr(self, "session_id", None),
             previous_messages=previous_messages,
@@ -3622,7 +3625,7 @@ class AIAgent:
         # Notify the built-in context engine of the session boundary.
         if hasattr(self, "context_compressor") and self.context_compressor:
             try:
-                self.context_compressor.on_session_end(
+                await self.context_compressor.on_session_end(
                     self.session_id or "",
                     messages or [],
                 )
@@ -3639,7 +3642,7 @@ class AIAgent:
         # See issue #22394.
         if hasattr(self, "context_compressor") and self.context_compressor:
             try:
-                self.context_compressor.on_session_end(
+                await self.context_compressor.on_session_end(
                     self.session_id or "",
                     messages or [],
                 )

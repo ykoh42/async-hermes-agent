@@ -31,6 +31,11 @@ from tools.terminal_tool import terminal_tool
 
 
 def test_conversation_and_chat_are_coroutines():
+    from agent.context_engine import ContextEngine
+    from agent.conversation_loop import (
+        _apply_context_engine_selection,
+        _notify_context_engine_turn_complete,
+    )
     from run_agent import main as agent_main
     from agent.agent_runtime_helpers import (
         invoke_tool,
@@ -70,6 +75,8 @@ def test_conversation_and_chat_are_coroutines():
     assert inspect.iscoroutinefunction(AIAgent._dump_api_request_debug)
     assert inspect.iscoroutinefunction(AIAgent.shutdown_memory_provider)
     assert inspect.iscoroutinefunction(AIAgent.commit_memory_session)
+    assert inspect.iscoroutinefunction(AIAgent.reset_session_state)
+    assert inspect.iscoroutinefunction(AIAgent._transition_context_engine_session)
     assert inspect.iscoroutinefunction(AIAgent._handle_max_iterations)
     assert inspect.iscoroutinefunction(AIAgent._execute_tool_calls)
     assert inspect.iscoroutinefunction(AIAgent._conversation_root_id)
@@ -78,6 +85,15 @@ def test_conversation_and_chat_are_coroutines():
     assert inspect.iscoroutinefunction(finalize_turn)
     assert inspect.iscoroutinefunction(run_conversation)
     assert inspect.iscoroutinefunction(compress_context)
+    assert inspect.iscoroutinefunction(ContextEngine.compress)
+    assert inspect.iscoroutinefunction(ContextEngine.select_context)
+    assert inspect.iscoroutinefunction(ContextEngine.on_turn_complete)
+    assert inspect.iscoroutinefunction(ContextEngine.on_session_start)
+    assert inspect.iscoroutinefunction(ContextEngine.on_session_end)
+    assert inspect.iscoroutinefunction(ContextEngine.on_session_reset)
+    assert inspect.iscoroutinefunction(ContextEngine.handle_tool_call)
+    assert inspect.iscoroutinefunction(_apply_context_engine_selection)
+    assert inspect.iscoroutinefunction(_notify_context_engine_turn_complete)
     assert inspect.iscoroutinefunction(execute_tool_calls_segmented)
     assert inspect.iscoroutinefunction(BatchRunner.run)
     assert inspect.iscoroutinefunction(batch_main)
@@ -331,10 +347,30 @@ async def test_plugin_lifecycle_requires_coroutine_callbacks():
 
 
 @pytest.mark.asyncio
-async def test_deferred_runtime_rejects_sync_only_context_engine_early():
+async def test_deferred_runtime_rejects_sync_only_context_engine_early(monkeypatch):
     """Provider construction must stop before an external legacy extension runs."""
     from agent.agent_init import initialize_deferred_runtime
-    from agent.agent_runtime_helpers import UnsupportedCapabilityError
+    from agent.context_engine import ContextEngine
+    from hermes_cli.plugins import PluginContractError
+
+    class SyncEngine(ContextEngine):
+        @property
+        def name(self):
+            return "third-party"
+
+        def update_from_response(self, usage):
+            return None
+
+        def should_compress(self, prompt_tokens=None):
+            return False
+
+        def compress(self, messages, **kwargs):
+            return messages
+
+    monkeypatch.setattr(
+        "hermes_cli.plugins.get_plugin_context_engine",
+        lambda: SyncEngine(),
+    )
 
     async def assert_rejected(**attributes):
         state = {
@@ -346,12 +382,92 @@ async def test_deferred_runtime_rejects_sync_only_context_engine_early():
         }
         state.update(attributes)
         agent = SimpleNamespace(**state)
-        with pytest.raises(UnsupportedCapabilityError):
+        with pytest.raises(PluginContractError, match="compress.*coroutine"):
             await initialize_deferred_runtime(agent)
 
     await assert_rejected(
         _runtime_config_snapshot={"context": {"engine": "third-party"}}
     )
+
+
+@pytest.mark.asyncio
+async def test_deferred_runtime_starts_native_context_engine_with_tools(monkeypatch):
+    """A configured native engine keeps the upstream selection/tool contract."""
+    from agent.context_engine import ContextEngine
+
+    class NativeEngine(ContextEngine):
+        def __init__(self):
+            self.started = []
+
+        @property
+        def name(self):
+            return "native-test"
+
+        def update_from_response(self, usage):
+            return None
+
+        def should_compress(self, prompt_tokens=None):
+            return False
+
+        async def compress(self, messages, **kwargs):
+            return messages
+
+        async def on_session_start(self, session_id, **kwargs):
+            self.started.append((session_id, kwargs))
+
+        def get_tool_schemas(self):
+            return [{
+                "name": "context_lookup",
+                "description": "Look up context",
+                "parameters": {"type": "object", "properties": {}},
+            }]
+
+        async def handle_tool_call(self, name, args, **kwargs):
+            return json.dumps({"name": name})
+
+    source_engine = NativeEngine()
+    config = {
+        "context": {"engine": "native-test"},
+        "compression": {"model_thresholds": {"test-model": 0.42}},
+    }
+    monkeypatch.setattr(
+        "hermes_cli.plugins.get_plugin_context_engine",
+        lambda: source_engine,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly",
+        AsyncMock(return_value=config),
+    )
+    context_length = AsyncMock(return_value=128_000)
+    monkeypatch.setattr(
+        "agent.model_metadata.get_model_context_length",
+        context_length,
+    )
+
+    agent = AIAgent(
+        api_key="test-key",
+        base_url="https://openrouter.ai/api/v1",
+        provider="openrouter",
+        model="test-model",
+        quiet_mode=True,
+        skip_context_files=True,
+        skip_memory=True,
+    )
+    await agent._ensure_provider_runtime()
+
+    assert agent.context_compressor is not source_engine
+    assert agent.context_compressor.name == "native-test"
+    assert agent.context_compressor.context_length == 128_000
+    assert agent.context_compressor.model_thresholds == {"test-model": 0.42}
+    assert len(agent.context_compressor.started) == 1
+    assert "context_lookup" in agent._context_engine_tool_names
+    assert "context_lookup" in agent.valid_tool_names
+    assert any(
+        tool.get("function", {}).get("name") == "context_lookup"
+        for tool in agent.tools
+    )
+    context_length.assert_awaited_once()
+    await agent.close()
 
 
 
