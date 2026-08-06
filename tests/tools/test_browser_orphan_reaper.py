@@ -5,6 +5,9 @@ import os
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from blockbuster import BlockBuster
+from pyleak import no_event_loop_blocking, no_task_leaks
+from pyleak.eventloop import LeakAction
 
 
 pytestmark = pytest.mark.asyncio
@@ -125,17 +128,23 @@ class TestOwnerPidCrossProcess:
             fake_tmpdir, "h_alive_owner", pid=12345, owner_pid=os.getpid()
         )
 
-        kill_calls = []
+        # Owner alive → reaper skips without ever probing the daemon. Run the
+        # real liveness path under both exact blocking-call and event-loop
+        # stall detectors.
+        terminate = AsyncMock()
+        with patch("tools.browser_tool._terminate_host_pid", terminate):
+            async with (
+                no_event_loop_blocking(action=LeakAction.RAISE, threshold=0.1),
+                no_task_leaks(action=LeakAction.RAISE),
+            ):
+                blockbuster = BlockBuster()
+                blockbuster.activate()
+                try:
+                    await _reap_orphaned_browser_sessions()
+                finally:
+                    blockbuster.deactivate()
 
-        def mock_terminate(pid):
-            kill_calls.append(pid)
-
-        # Owner alive → reaper skips without ever probing the daemon.
-        with patch("gateway.status._pid_exists", return_value=True), \
-             patch("tools.browser_tool._terminate_host_pid", new_callable=AsyncMock, side_effect=mock_terminate):
-            await _reap_orphaned_browser_sessions()
-
-        assert 12345 not in kill_calls
+        terminate.assert_not_awaited()
         assert d.exists()
 
 
