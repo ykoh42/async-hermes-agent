@@ -28,6 +28,9 @@ import logging
 import sys
 from pathlib import Path
 from typing import List, Optional, Tuple, TYPE_CHECKING
+
+import aiofiles
+
 from hermes_cli.config import cfg_get
 
 if TYPE_CHECKING:
@@ -172,8 +175,8 @@ async def discover_memory_providers() -> List[Tuple[str, str, bool]]:
         if yaml_file.exists():
             try:
                 import yaml
-                with open(yaml_file, encoding="utf-8-sig") as f:
-                    meta = yaml.safe_load(f) or {}
+                async with aiofiles.open(yaml_file, encoding="utf-8-sig") as f:
+                    meta = yaml.safe_load(await f.read()) or {}
                 desc = meta.get("description", "")
             except Exception:
                 pass

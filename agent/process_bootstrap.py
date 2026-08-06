@@ -2,10 +2,8 @@
 
 Three concerns, all tied to ``AIAgent`` boot-time / runtime IO setup:
 
-1. **Lazy OpenAI SDK import** — ``_load_openai_cls`` + ``_OpenAIProxy``
-   defer the 240ms-ish ``from openai import AsyncOpenAI`` cost until first use,
-   while preserving ``isinstance(client, OpenAI)`` checks and
-   ``patch("run_agent.OpenAI", ...)`` test patterns.
+1. **OpenAI SDK bootstrap** — import ``AsyncOpenAI`` before an event loop starts
+   while preserving Hermes' stable ``OpenAI`` name and patch location.
 
 2. **Crash-resistant stdio** — ``_SafeWriter`` wraps stdout/stderr so
    ``OSError: Input/output error`` from broken pipes (systemd, Docker,
@@ -28,36 +26,9 @@ import sys
 import urllib.request
 from typing import Any, Optional
 
+from openai import AsyncOpenAI as OpenAI
+
 from utils import base_url_hostname, normalize_proxy_url
-
-
-# Cached at module level so we only pay the OpenAI SDK import cost once
-# per process (after the first lazy load).
-_OPENAI_CLS_CACHE = None
-
-
-def _load_openai_cls() -> type:
-    """Import and cache ``openai.AsyncOpenAI``."""
-    global _OPENAI_CLS_CACHE
-    if _OPENAI_CLS_CACHE is None:
-        from openai import AsyncOpenAI as _cls
-        _OPENAI_CLS_CACHE = _cls
-    return _OPENAI_CLS_CACHE
-
-
-class _OpenAIProxy:
-    """Lazy factory retaining Hermes' stable ``OpenAI`` import name."""
-
-    __slots__ = ()
-
-    def __call__(self, *args, **kwargs):
-        return _load_openai_cls()(*args, **kwargs)
-
-    def __instancecheck__(self, obj):
-        return isinstance(obj, _load_openai_cls())
-
-    def __repr__(self):
-        return "<lazy openai.AsyncOpenAI proxy>"
 
 
 class _SafeWriter:
@@ -114,8 +85,14 @@ def _get_proxy_from_env() -> Optional[str]:
     Checks HTTPS_PROXY, HTTP_PROXY, ALL_PROXY (and lowercase variants) in order.
     Returns the first valid proxy URL found, or None if no proxy is configured.
     """
-    for key in ("HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY",
-                "https_proxy", "http_proxy", "all_proxy"):
+    for key in (
+        "HTTPS_PROXY",
+        "HTTP_PROXY",
+        "ALL_PROXY",
+        "https_proxy",
+        "http_proxy",
+        "all_proxy",
+    ):
         value = os.environ.get(key, "").strip()
         if value:
             return normalize_proxy_url(value)
@@ -209,17 +186,8 @@ def _install_safe_stdio() -> None:
             setattr(sys, stream_name, _SafeWriter(stream))
 
 
-# Module-level proxy instance — creates ``openai.AsyncOpenAI`` while preserving
-# Hermes' long-standing import/patch location. Imported as
-# ``from agent.process_bootstrap import OpenAI`` (or re-exported via
-# ``run_agent`` for legacy tests).
-OpenAI = _OpenAIProxy()
-
-
 __all__ = [
     "OpenAI",
-    "_OpenAIProxy",
-    "_load_openai_cls",
     "_SafeWriter",
     "_install_safe_stdio",
     "_get_proxy_from_env",

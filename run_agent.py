@@ -47,13 +47,6 @@ import time
 import uuid
 import warnings
 from typing import List, Dict, Any, Optional, Callable
-# NOTE: `from openai import AsyncOpenAI` is deliberately NOT at module top — the
-# SDK pulls ~240 ms of imports. We expose `OpenAI` as a thin proxy object
-# that imports the SDK on first call/isinstance check. This preserves:
-#   (a) the stable `OpenAI(**client_kwargs)` factory name while constructing a
-#       native async client, and
-#   (b) `patch("run_agent.OpenAI", ...)` integration seams.
-#
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -98,7 +91,7 @@ def _session_source_for_agent(platform: Optional[str]) -> str:
     return platform or "cli"
 
 
-# OpenAI lazy proxy + safe stdio + proxy URL helpers — see agent/process_bootstrap.py.
+# OpenAI async client + safe stdio + proxy URL helpers — see agent/process_bootstrap.py.
 # `OpenAI` is re-exported here so `patch("run_agent.OpenAI", ...)` in tests works.
 # The other F401 re-exports below cover names accessed via
 # `mock.patch("run_agent.<X>")`, `from run_agent import <X>` in production
@@ -3823,13 +3816,23 @@ class AIAgent:
         # 1. Terminate/reap native background terminal commands and release
         # their local environment bookkeeping on this event loop.  The legacy
         # ProcessRegistry is synchronous and is not used by the async runtime.
+        resource_task_ids = task_ids or {"default"}
         try:
-            for task_id in task_ids or {"default"}:
+            for task_id in resource_task_ids:
                 await cleanup_vm(task_id)
-            task_ids.clear()
-            self._task_ids = set()
         except Exception:
             pass
+
+        try:
+            from tools.browser_tool import cleanup_browser
+
+            for task_id in resource_task_ids:
+                await cleanup_browser(task_id)
+        except Exception:
+            pass
+
+        task_ids.clear()
+        self._task_ids = set()
 
         # 2. Close active child agents
         try:

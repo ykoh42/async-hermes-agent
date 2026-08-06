@@ -28,7 +28,7 @@ from typing import List, Dict, Any, Set, Optional
 
 # Shared tool list for the synchronous training/runtime harness.
 # Keep this list limited to tools that are part of the local agent loop or the
-# trajectory-generating surface. Optional UI, voice, browser, sandbox-backend,
+# trajectory-generating surface. Optional UI, voice, sandbox-backend,
 # and messaging integrations are registered separately when they exist.
 _HERMES_CORE_TOOLS = [
     # Web

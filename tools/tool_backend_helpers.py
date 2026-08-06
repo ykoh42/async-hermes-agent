@@ -7,6 +7,15 @@ from typing import Any
 from utils import is_truthy_value
 
 
+_DEFAULT_BROWSER_PROVIDER = "local"
+
+
+def normalize_browser_cloud_provider(value: object | None) -> str:
+    """Return a normalized browser provider key."""
+    provider = str(value or _DEFAULT_BROWSER_PROVIDER).strip().lower()
+    return provider or _DEFAULT_BROWSER_PROVIDER
+
+
 async def managed_nous_tools_enabled(*, force_fresh: bool = False) -> bool:
     """Return whether the current Nous account can use a managed tool gateway."""
     try:

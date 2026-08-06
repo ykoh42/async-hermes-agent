@@ -4,6 +4,7 @@ Import-safe module with no dependencies — can be imported from anywhere
 without risk of circular imports.
 """
 
+import asyncio
 import os
 import stat
 import sys
@@ -177,6 +178,57 @@ def get_hermes_dir(
     if _legacy_path_has_content(old_path):
         return old_path
     return home / new_subpath
+
+
+def iter_hermes_node_dirs(home: Path | None = None) -> list[Path]:
+    """Return Hermes-managed Node.js directories in lookup order."""
+    root = home or get_hermes_home()
+    node_dir = root / "node"
+    bin_dir = node_dir / "bin"
+    if sys.platform == "win32":
+        return [node_dir, bin_dir]
+    return [bin_dir, node_dir]
+
+
+def with_hermes_node_path(env: dict[str, str] | None = None) -> dict[str, str]:
+    """Return *env* with Hermes-managed Node directories prepended to PATH."""
+    merged = dict(os.environ if env is None else env)
+    parts = [part for part in merged.get("PATH", "").split(os.pathsep) if part]
+    managed = [
+        str(directory) for directory in iter_hermes_node_dirs() if directory.is_dir()
+    ]
+    for entry in reversed(managed):
+        if entry not in parts:
+            parts.insert(0, entry)
+    merged["PATH"] = os.pathsep.join(parts)
+    return merged
+
+
+async def agent_browser_runnable(path: str | None) -> bool:
+    """Return whether *path* is an executable agent-browser CLI."""
+    if not path:
+        return False
+    if " " in path and path.split()[0].endswith("npx"):
+        return True
+    if not os.path.exists(path) or not os.access(path, os.X_OK):
+        return False
+
+    process: asyncio.subprocess.Process | None = None
+    try:
+        process = await asyncio.create_subprocess_exec(
+            path,
+            "--version",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=with_hermes_node_path(),
+        )
+        await asyncio.wait_for(process.communicate(), timeout=10)
+    except (OSError, TimeoutError, ValueError):
+        if process is not None and process.returncode is None:
+            process.kill()
+            await process.wait()
+        return False
+    return process.returncode == 0
 
 
 def _legacy_path_has_content(path: Path) -> bool:

@@ -44,12 +44,14 @@ jobs:
       - name: Lint
         run: uv run ruff check .
 
-      - name: Reject blocking calls in the async runtime
-        run: >-
-          uv run ruff check
-          --select ASYNC210,ASYNC220,ASYNC221,ASYNC222,ASYNC230,ASYNC251
-          agent tools run_agent.py model_tools.py batch_runner.py hermes_state.py
-          trajectory_compressor.py
+      - name: Audit the native async runtime
+        shell: bash
+        run: |
+          rg --files -0 agent tools plugins hermes_cli -g '*.py' | \
+          xargs -0 uv run flake8-async --asyncio \
+            --enable=ASYNC210,ASYNC211,ASYNC220,ASYNC221,ASYNC222,ASYNC230,ASYNC250,ASYNC251,ASYNC300 \
+            run_agent.py model_tools.py batch_runner.py \
+            hermes_state.py trajectory_compressor.py
 
       - name: Test
         run: uv run pytest -q -W error::pytest.PytestUnhandledThreadExceptionWarning

@@ -1610,7 +1610,7 @@ async def handle_max_iterations(agent, messages: list, api_call_count: int) -> s
 
 
 async def cleanup_task_resources(agent, task_id: str) -> None:
-    """Clean up terminal resources for a given task.
+    """Clean up terminal and browser resources for a given task.
 
     Skips ``cleanup_vm`` when the active terminal environment is marked
     persistent (``persistent_filesystem=True``) so that long-lived sandbox
@@ -1618,6 +1618,9 @@ async def cleanup_task_resources(agent, task_id: str) -> None:
     ``terminal_tool._cleanup_inactive_envs`` still tears them down once
     ``terminal.lifetime_seconds`` is exceeded. Non-persistent backends are
     torn down per-turn as before to prevent resource leakage.
+
+    Headed browser sessions remain visible between turns and are reclaimed by
+    the browser inactivity task. Headless sessions are closed per turn.
     """
     try:
         if is_persistent_env(task_id):
@@ -1631,6 +1634,23 @@ async def cleanup_task_resources(agent, task_id: str) -> None:
     except Exception as exc:
         if agent.verbose_logging:
             logger.warning("Failed to cleanup VM for task %s: %s", task_id, exc)
+
+    try:
+        from tools.browser_tool import _is_headed_mode, cleanup_browser
+
+        headed = await _is_headed_mode()
+        if headed:
+            if agent.verbose_logging:
+                logging.debug(
+                    "Skipping per-turn cleanup_browser for headed session %s; "
+                    "idle reaper will handle it.",
+                    task_id,
+                )
+        else:
+            await cleanup_browser(task_id)
+    except Exception as exc:
+        if agent.verbose_logging:
+            logger.warning("Failed to cleanup browser for task %s: %s", task_id, exc)
 
 
 # ── Provider fallback ──────────────────────────────────────────────────

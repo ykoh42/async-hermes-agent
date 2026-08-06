@@ -436,7 +436,7 @@ class TestGenerateErrors:
 
     async def test_url_download_failure_falls_back_to_bare_url(self, http_calls):
         """Mirror of xAI behaviour — if local cache fails, return the URL."""
-        import requests as req_lib
+        import httpx
         from plugins.image_gen.krea import KreaImageGenProvider
 
         url = "https://krea.cdn/expired-soon.png"
@@ -448,7 +448,7 @@ class TestGenerateErrors:
              patch(
                  "plugins.image_gen.krea.save_url_image",
                  new_callable=AsyncMock,
-                 side_effect=req_lib.HTTPError("404"),
+                 side_effect=httpx.HTTPError("404"),
              ), \
              patch("plugins.image_gen.krea.asyncio.sleep", new_callable=AsyncMock):
             result = await KreaImageGenProvider().generate(prompt="test")

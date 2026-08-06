@@ -2461,6 +2461,7 @@ async def test_native_transport_terminal_does_not_use_to_thread(monkeypatch, tmp
 @pytest.mark.asyncio
 async def test_synthetic_turn_records_trajectory_without_to_thread(monkeypatch, tmp_path):
     """Exercise the public turn path with an async model and real session DB."""
+    from pyleak import no_event_loop_blocking, no_task_leaks
     from run_agent import AIAgent
 
     database = SessionDB(tmp_path / "state.db")
@@ -2507,7 +2508,11 @@ async def test_synthetic_turn_records_trajectory_without_to_thread(monkeypatch, 
 
     monkeypatch.setattr(asyncio, "to_thread", fail_if_called)
     try:
-        result = await agent.run_conversation("hello async")
+        async with (
+            no_event_loop_blocking(action="raise", threshold=0.1),
+            no_task_leaks(action="raise"),
+        ):
+            result = await agent.run_conversation("hello async")
         assert result["completed"] is True
         assert result["final_response"] == "async answer"
         assert [message["role"] for message in result["messages"]] == [

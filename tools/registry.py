@@ -40,6 +40,9 @@ _realpath = aiofiles.os.wrap(os.path.realpath)
 # their schemas as import side effects, so filtering later would still load
 # optional SDKs and their operational dependencies on every worker.
 _TRAINING_RUNTIME_TOOL_MODULES = frozenset({
+    "browser_cdp_tool",
+    "browser_dialog_tool",
+    "browser_tool",
     "clarify_tool",
     "delegate_tool",
     "file_tools",
@@ -65,6 +68,9 @@ _BUILTIN_TOOL_MODULES = tuple(
 # compatibility wrapper: a tool joins the model schema only after its original
 # handler has been converted to native async and its module is added here.
 _ASYNC_RUNTIME_HANDLER_MODULES = frozenset({
+    "tools.browser_cdp_tool",
+    "tools.browser_dialog_tool",
+    "tools.browser_tool",
     "tools.clarify_tool",
     "tools.delegate_tool",
     "tools.file_tools",
