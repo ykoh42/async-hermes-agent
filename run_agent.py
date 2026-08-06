@@ -4321,6 +4321,69 @@ class AIAgent:
         }
         await self._ensure_provider_runtime()
 
+    async def _try_refresh_codex_client_credentials(
+        self,
+        *,
+        force: bool = True,
+    ) -> bool:
+        """Refresh the active Codex/xAI singleton without changing accounts."""
+        if (
+            self.api_mode != "codex_responses"
+            or self.provider not in {"openai-codex", "xai-oauth"}
+        ):
+            return False
+
+        try:
+            from agent.credential_pool import load_pool
+
+            pool = getattr(self, "_credential_pool", None)
+            if (
+                pool is None
+                or str(getattr(pool, "provider", "") or "").strip().lower()
+                != self.provider
+            ):
+                pool = await load_pool(self.provider)
+
+            active_key = str(self.api_key or "").strip()
+            singleton = next(
+                (
+                    entry
+                    for entry in pool.entries()
+                    if entry.source == "device_code"
+                    and (
+                        not active_key
+                        or str(entry.runtime_api_key or "").strip() == active_key
+                    )
+                ),
+                None,
+            )
+            if singleton is None:
+                logger.debug(
+                    "%s singleton tokens differ from the active api_key; "
+                    "skipping singleton force-refresh to avoid silent account swap",
+                    self.provider,
+                )
+                return False
+
+            refreshed = await pool.try_refresh_matching(
+                api_key_hint=active_key or None,
+                credential_id=singleton.id,
+            )
+            new_key = str(
+                getattr(refreshed, "runtime_api_key", None) or ""
+            ).strip()
+            if refreshed is None or not new_key or (active_key and new_key == active_key):
+                return False
+
+            self._credential_pool = pool
+            await self._swap_credential(refreshed)
+            return True
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.debug("%s credential refresh failed: %s", self.provider, exc)
+            return False
+
     async def _recover_with_credential_pool(
         self,
         *,

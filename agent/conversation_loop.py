@@ -3789,10 +3789,12 @@ async def run_conversation(
                     and not _retry.codex_auth_retry_attempted
                 ):
                     _retry.codex_auth_retry_attempted = True
-                    raise UnsupportedCapabilityError(
-                        f"{agent.provider} OAuth renewal has no native async implementation. "
-                        "Refresh credentials before starting the async agent."
-                    )
+                    if await agent._try_refresh_codex_client_credentials(force=True):
+                        _label = "xAI OAuth" if agent.provider == "xai-oauth" else "Codex"
+                        agent._buffer_vprint(
+                            f"🔐 {_label} auth refreshed after 401. Retrying request..."
+                        )
+                        continue
                 if (
                     agent.api_mode == "chat_completions"
                     and agent.provider == "vertex"

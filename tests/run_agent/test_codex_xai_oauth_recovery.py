@@ -70,6 +70,69 @@ def _make_codex_agent():
     return agent
 
 
+@pytest.mark.asyncio
+async def test_singleton_401_fallback_refreshes_active_account_natively():
+    """The no-pool fallback reuses the native pool lifecycle after a 401."""
+    agent = _make_codex_agent()
+    old_entry = SimpleNamespace(
+        id="singleton",
+        source="device_code",
+        runtime_api_key="test-key",
+    )
+    new_entry = SimpleNamespace(
+        id="singleton",
+        source="device_code",
+        runtime_api_key="fresh-key",
+    )
+
+    class _Pool:
+        provider = "xai-oauth"
+
+        def entries(self):
+            return [old_entry]
+
+        async def try_refresh_matching(self, **kwargs):
+            assert kwargs == {
+                "api_key_hint": "test-key",
+                "credential_id": "singleton",
+            }
+            return new_entry
+
+    pool = _Pool()
+    agent._credential_pool = pool
+    agent._swap_credential = AsyncMock()
+
+    assert await agent._try_refresh_codex_client_credentials(force=True) is True
+    assert agent._credential_pool is pool
+    agent._swap_credential.assert_awaited_once_with(new_entry)
+
+
+@pytest.mark.asyncio
+async def test_singleton_401_fallback_never_switches_accounts():
+    agent = _make_codex_agent()
+
+    class _Pool:
+        provider = "xai-oauth"
+
+        def entries(self):
+            return [
+                SimpleNamespace(
+                    id="other-account",
+                    source="device_code",
+                    runtime_api_key="other-key",
+                )
+            ]
+
+        async def try_refresh_matching(self, **_kwargs):
+            raise AssertionError("a different account must never be refreshed")
+
+    agent._credential_pool = _Pool()
+    agent._swap_credential = AsyncMock()
+
+    assert await agent._try_refresh_codex_client_credentials(force=True) is False
+    agent._swap_credential.assert_not_awaited()
+
+
 @pytest.mark.parametrize(
     "provider_message",
     [
