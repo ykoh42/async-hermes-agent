@@ -212,6 +212,22 @@ def _is_copilot_provider(agent: Any) -> bool:
         }
 
 
+def _is_stale_copilot_credential_error(
+    status_code: Optional[int], error_message: str
+) -> bool:
+    """Detect a Copilot 400 caused by a stale or degraded credential."""
+    lowered = (error_message or "").lower()
+    is_400 = status_code == 400 or "error code: 400" in lowered
+    if not is_400:
+        return False
+    return (
+        "model_not_available_for_integrator" in lowered
+        or "not available for integrator" in lowered
+        or "model_not_supported" in lowered
+        or "the requested model is not supported" in lowered
+    )
+
+
 def _image_error_max_dimension(error: Exception) -> Optional[int]:
     """Extract a provider-reported image dimension ceiling, if present."""
     parts = []
@@ -3857,10 +3873,12 @@ async def run_conversation(
                     and not _retry.copilot_auth_retry_attempted
                 ):
                     _retry.copilot_auth_retry_attempted = True
-                    raise UnsupportedCapabilityError(
-                        "Copilot credential renewal has no native async implementation. "
-                        "Refresh credentials before starting the async agent."
-                    )
+                    if await agent._try_refresh_copilot_client_credentials():
+                        agent._buffer_vprint(
+                            "🔐 Copilot credentials refreshed after 401. "
+                            "Retrying request..."
+                        )
+                        continue
                 if (
                     agent.api_mode == "anthropic_messages"
                     and status_code == 401
@@ -4898,6 +4916,22 @@ async def run_conversation(
                 ) and not is_context_length_error
 
                 if is_client_error:
+                    if (
+                        _is_copilot_provider(agent)
+                        and not _retry.copilot_stale_cred_retry_attempted
+                        and _is_stale_copilot_credential_error(
+                            status_code,
+                            str(getattr(api_error, "message", "") or api_error),
+                        )
+                    ):
+                        _retry.copilot_stale_cred_retry_attempted = True
+                        if await agent._try_recover_stale_copilot_credential():
+                            agent._buffer_vprint(
+                                "🔐 Copilot credential re-exchanged after "
+                                "model_not_available 400. Retrying request..."
+                            )
+                            retry_count = 0
+                            continue
                     # Try fallback before aborting — a different provider may
                     # not have the same issue (rate limit, auth, etc.). Only
                     # announce the attempt when a fallback chain actually

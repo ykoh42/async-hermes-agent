@@ -1,3 +1,4 @@
+import asyncio
 import sys
 import types
 from types import SimpleNamespace
@@ -77,6 +78,92 @@ def _build_copilot_agent(monkeypatch, *, model="gpt-5.4"):
     agent._persist_session = AsyncMock()
     agent._save_trajectory = AsyncMock()
     return agent
+
+
+@pytest.mark.asyncio
+async def test_copilot_401_refresh_rebuilds_with_fresh_exchanged_token(monkeypatch):
+    agent = _build_copilot_agent(monkeypatch)
+    agent._ensure_provider_runtime = AsyncMock(return_value=True)
+    resolve = AsyncMock(return_value=("gho_raw", "GH_TOKEN"))
+    evict = AsyncMock()
+    exchange = AsyncMock(
+        return_value=(
+            "tid=fresh",
+            "https://api.enterprise.githubcopilot.com",
+        )
+    )
+    monkeypatch.setattr(
+        "hermes_cli.copilot_auth.resolve_copilot_token", resolve
+    )
+    monkeypatch.setattr(
+        "hermes_cli.copilot_auth.evict_cached_exchanged_token", evict
+    )
+    monkeypatch.setattr(
+        "hermes_cli.copilot_auth.get_copilot_api_token", exchange
+    )
+
+    assert await agent._try_refresh_copilot_client_credentials() is True
+    assert agent._deferred_provider_runtime["api_key"] == "tid=fresh"
+    assert agent._deferred_provider_runtime["base_url"] == (
+        "https://api.enterprise.githubcopilot.com"
+    )
+    resolve.assert_awaited_once()
+    evict.assert_awaited_once_with("gho_raw")
+    exchange.assert_awaited_once_with("gho_raw")
+
+
+@pytest.mark.asyncio
+async def test_copilot_401_refresh_falls_back_to_raw_token(monkeypatch):
+    agent = _build_copilot_agent(monkeypatch)
+    agent._ensure_provider_runtime = AsyncMock(return_value=True)
+    monkeypatch.setattr(
+        "hermes_cli.copilot_auth.resolve_copilot_token",
+        AsyncMock(return_value=("gho_raw", "GH_TOKEN")),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.copilot_auth.evict_cached_exchanged_token",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.copilot_auth.get_copilot_api_token",
+        AsyncMock(side_effect=RuntimeError("offline")),
+    )
+
+    assert await agent._try_refresh_copilot_client_credentials() is True
+    assert agent._deferred_provider_runtime["api_key"] == "gho_raw"
+
+
+@pytest.mark.asyncio
+async def test_stale_copilot_recovery_rejects_degraded_raw_token(monkeypatch):
+    agent = _build_copilot_agent(monkeypatch)
+    agent._ensure_provider_runtime = AsyncMock(return_value=True)
+    monkeypatch.setattr(
+        "hermes_cli.copilot_auth.resolve_copilot_token",
+        AsyncMock(return_value=("gho_raw", "GH_TOKEN")),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.copilot_auth.evict_cached_exchanged_token",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.copilot_auth.get_copilot_api_token",
+        AsyncMock(return_value=("gho_raw", None)),
+    )
+
+    assert await agent._try_recover_stale_copilot_credential() is False
+    agent._ensure_provider_runtime.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_copilot_refresh_propagates_cancellation(monkeypatch):
+    agent = _build_copilot_agent(monkeypatch)
+    monkeypatch.setattr(
+        "hermes_cli.copilot_auth.resolve_copilot_token",
+        AsyncMock(side_effect=asyncio.CancelledError),
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await agent._try_refresh_copilot_client_credentials()
 
 
 def _codex_message_response(text: str):
@@ -1692,6 +1779,4 @@ async def test_duplicate_detection_uses_commentary_when_hidden_reasoning_changes
     reasoning_items = interim_msgs[0].get("codex_reasoning_items")
     if reasoning_items:
         assert reasoning_items[0].get("id") == "rs_second"
-
-
 

@@ -1,8 +1,11 @@
 """Tests for hermes_cli.copilot_auth — Copilot token validation and resolution."""
 
-import pytest
-from unittest.mock import AsyncMock, patch
+import asyncio
+import inspect
+from unittest.mock import AsyncMock, Mock, patch
 
+import httpx
+import pytest
 
 class TestTokenValidation:
     """Token type validation."""
@@ -66,6 +69,35 @@ class TestResolveToken:
         mock_cli.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_gh_cli_cancellation_reaps_subprocess(self, monkeypatch):
+        from hermes_cli import copilot_auth
+
+        blocked = asyncio.Event()
+        process = Mock(returncode=None)
+        process.communicate = AsyncMock(side_effect=blocked.wait)
+        process.wait = AsyncMock(return_value=0)
+        process.kill = Mock()
+        monkeypatch.setattr(
+            copilot_auth,
+            "_gh_cli_candidates",
+            AsyncMock(return_value=["gh"]),
+        )
+        monkeypatch.setattr(
+            copilot_auth.asyncio,
+            "create_subprocess_exec",
+            AsyncMock(return_value=process),
+        )
+
+        task = asyncio.create_task(copilot_auth._try_gh_cli_token())
+        await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        process.kill.assert_called_once()
+        process.wait.assert_awaited_once()
+
+    @pytest.mark.asyncio
     async def test_all_env_vars_invalid_skips_gh_cli_fallback(self, monkeypatch):
         """All three env vars set to classic PATs → no gh CLI call."""
         from hermes_cli.copilot_auth import resolve_copilot_token
@@ -77,6 +109,50 @@ class TestResolveToken:
         assert token == ""
         assert source == ""
         mock_cli.assert_not_called()
+
+
+class TestDeviceCodeLogin:
+    @pytest.mark.asyncio
+    async def test_device_code_flow_is_native_async(self, monkeypatch):
+        from hermes_cli import copilot_auth
+
+        responses = [
+            {
+                "device_code": "device",
+                "user_code": "ABCD-EFGH",
+                "verification_uri": "https://github.com/login/device",
+                "interval": 1,
+            },
+            {"error": "authorization_pending"},
+            {"access_token": "ghu_authorized"},
+        ]
+
+        class Client:
+            def __init__(self, **_kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+            async def post(self, url, **_kwargs):
+                return httpx.Response(
+                    200,
+                    request=httpx.Request("POST", url),
+                    json=responses.pop(0),
+                )
+
+        sleep = AsyncMock()
+        monkeypatch.setattr(copilot_auth.httpx, "AsyncClient", Client)
+        monkeypatch.setattr(copilot_auth.asyncio, "sleep", sleep)
+
+        token = await copilot_auth.copilot_device_code_login(timeout_seconds=30)
+
+        assert token == "ghu_authorized"
+        assert sleep.await_count == 2
+        assert inspect.iscoroutinefunction(copilot_auth.copilot_device_code_login)
 
 
 class TestRequestHeaders:

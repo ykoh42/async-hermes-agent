@@ -4479,6 +4479,115 @@ class AIAgent:
             logger.debug("Vertex credential refresh failed: %s", exc)
             return False
 
+    async def _try_refresh_copilot_client_credentials(self) -> bool:
+        """Refresh Copilot credentials and rebuild the shared async client."""
+        if not self._is_copilot_provider():
+            return False
+
+        try:
+            from hermes_cli.copilot_auth import (
+                evict_cached_exchanged_token,
+                get_copilot_api_token,
+                resolve_copilot_token,
+            )
+
+            new_token, token_source = await resolve_copilot_token()
+            new_token = str(new_token or "").strip()
+            if not new_token:
+                return False
+            try:
+                await evict_cached_exchanged_token(new_token)
+                api_token, enterprise_base_url = await get_copilot_api_token(
+                    new_token
+                )
+                if isinstance(api_token, str) and api_token.strip():
+                    new_token = api_token.strip()
+                    if enterprise_base_url:
+                        self.base_url = enterprise_base_url.rstrip("/")
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.debug(
+                    "Copilot 401 re-exchange failed, using resolved token: %s",
+                    exc,
+                )
+
+            self._deferred_provider_runtime = {
+                "provider": self.provider,
+                "model": self.model,
+                "api_key": new_token,
+                "base_url": self.base_url,
+                "api_mode": self.api_mode,
+                "request_timeout": getattr(self, "_provider_request_timeout", None),
+                "stale_timeout": getattr(self, "_provider_stale_timeout", None),
+                "update_primary": False,
+            }
+            refreshed = await self._ensure_provider_runtime()
+            if refreshed:
+                logger.info("Copilot credentials refreshed from %s", token_source)
+            return refreshed
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.debug("Copilot credential refresh failed: %s", exc)
+            return False
+
+    async def _try_recover_stale_copilot_credential(self) -> bool:
+        """Force a fresh Copilot token exchange and async client rebuild."""
+        if not self._is_copilot_provider():
+            return False
+
+        try:
+            from hermes_cli.copilot_auth import (
+                evict_cached_exchanged_token,
+                get_copilot_api_token,
+                resolve_copilot_token,
+            )
+
+            raw_token, token_source = await resolve_copilot_token()
+            raw_token = str(raw_token or "").strip()
+            if not raw_token:
+                return False
+            await evict_cached_exchanged_token(raw_token)
+            api_token, enterprise_base_url = await get_copilot_api_token(raw_token)
+            api_token = str(api_token or "").strip()
+            if not api_token:
+                return False
+            if api_token == raw_token and not enterprise_base_url:
+                logger.warning(
+                    "Copilot stale-credential recovery: exchange still degraded "
+                    "to raw token; skipping retry."
+                )
+                return False
+
+            self._deferred_provider_runtime = {
+                "provider": self.provider,
+                "model": self.model,
+                "api_key": api_token,
+                "base_url": (
+                    enterprise_base_url.rstrip("/")
+                    if enterprise_base_url
+                    else self.base_url
+                ),
+                "api_mode": self.api_mode,
+                "request_timeout": getattr(self, "_provider_request_timeout", None),
+                "stale_timeout": getattr(self, "_provider_stale_timeout", None),
+                "update_primary": False,
+            }
+            recovered = await self._ensure_provider_runtime()
+            if recovered:
+                logger.info(
+                    "Copilot credentials re-exchanged after stale-credential "
+                    "400 (source=%s)",
+                    token_source,
+                )
+            return recovered
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.debug("Copilot stale-credential recovery failed: %s", exc)
+            return False
+
     async def _try_refresh_anthropic_client_credentials(self) -> bool:
         if (
             self.api_mode != "anthropic_messages"

@@ -3277,6 +3277,10 @@ async def initialize_deferred_runtime(agent: Any) -> bool:
                 headers = dict(_AI_GATEWAY_HEADERS)
             elif base_url_host_matches(agent.base_url, "integrate.api.nvidia.com"):
                 headers = build_nvidia_nim_headers(agent.base_url)
+            elif base_url_host_matches(agent.base_url, "githubcopilot.com"):
+                from hermes_cli.models import copilot_default_headers
+
+                headers = copilot_default_headers()
             elif base_url_host_matches(agent.base_url, "api.kimi.com"):
                 headers = {"User-Agent": "claude-code/0.1.0"}
             elif base_url_host_matches(agent.base_url, "portal.qwen.ai"):
