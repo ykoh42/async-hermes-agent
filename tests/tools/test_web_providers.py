@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 from typing import Any, Dict, List
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -256,7 +257,7 @@ class TestDispatchersTriggerPluginDiscovery:
         (issue #27580).
         """
         import json
-        from unittest.mock import MagicMock
+        from unittest.mock import AsyncMock
         from agent.web_search_provider import WebSearchProvider
         from agent import web_search_registry
         from tools import web_tools
@@ -288,7 +289,7 @@ class TestDispatchersTriggerPluginDiscovery:
             # Simulate "plugin discovery loads the firecrawl plugin": the
             # wrapped helper registers the provider, mirroring what
             # ``plugins/web/firecrawl/__init__.py:register`` does at
-            # real-process startup. Wrapping with ``MagicMock`` lets us
+            # real-process startup. Wrapping with ``AsyncMock`` lets us
             # also assert the dispatcher actually invoked the hook — if
             # a future refactor accidentally drops the call the regression
             # would otherwise hide behind a still-populated registry.
@@ -296,7 +297,7 @@ class TestDispatchersTriggerPluginDiscovery:
                 if web_search_registry.get_provider("firecrawl") is None:
                     web_search_registry.register_provider(FakeFirecrawl())
 
-            mock_hook = MagicMock(wraps=_register_fake)
+            mock_hook = AsyncMock(side_effect=_register_fake)
             # Patch the helper on ``tools.web_tools`` directly rather than the
             # underlying ``hermes_cli.plugins._ensure_plugins_discovered`` so
             # the test stays valid even if the import inside the helper is
@@ -335,7 +336,7 @@ class TestDispatchersTriggerPluginDiscovery:
         path (issue #27580 root cause applies to all dispatchers).
         """
         import json
-        from unittest.mock import MagicMock
+        from unittest.mock import AsyncMock
         from agent.web_search_provider import WebSearchProvider
         from agent import web_search_registry
         from tools import web_tools
@@ -367,7 +368,7 @@ class TestDispatchersTriggerPluginDiscovery:
                 if web_search_registry.get_provider("brave-free") is None:
                     web_search_registry.register_provider(FakeBrave())
 
-            mock_hook = MagicMock(wraps=_register_fake)
+            mock_hook = AsyncMock(side_effect=_register_fake)
             monkeypatch.setattr(
                 web_tools, "_ensure_web_plugins_loaded", mock_hook
             )
@@ -446,7 +447,11 @@ class TestDisabledPluginDiagnostic:
 
         restore = self._clear_registry()
         try:
-            monkeypatch.setattr(web_tools, "_ensure_web_plugins_loaded", lambda: None)
+            monkeypatch.setattr(
+                web_tools,
+                "_ensure_web_plugins_loaded",
+                AsyncMock(return_value=None),
+            )
             monkeypatch.setattr(
                 web_tools, "_load_web_config",
                 lambda: {"search_backend": "firecrawl"},

@@ -1,5 +1,6 @@
 """Tests for the Hermes plugin system (hermes_cli.plugins)."""
 
+import asyncio
 import logging
 import sys
 import textwrap
@@ -111,7 +112,7 @@ class TestPluginDiscovery:
         monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes_test"))
 
         mgr = PluginManager()
-        mgr.discover_and_load()
+        await mgr.discover_and_load()
 
         assert "llm_request" in VALID_MIDDLEWARE
         assert "tool_request" in VALID_MIDDLEWARE
@@ -159,7 +160,8 @@ class TestPluginDiscovery:
 
 
 
-    def test_failed_discovery_is_not_cached(self, tmp_path, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_failed_discovery_is_not_cached(self, tmp_path, monkeypatch):
         """A sweep that raises must not cache 'discovered' with no plugins.
 
         Regression for the stranded-empty-registry class of failures: callers
@@ -174,18 +176,18 @@ class TestPluginDiscovery:
 
         mgr = PluginManager()
 
-        def _boom(self_inner):
+        async def _boom(self_inner):
             raise RuntimeError("sweep failed")
 
         monkeypatch.setattr(PluginManager, "_discover_and_load_inner", _boom)
         with pytest.raises(RuntimeError, match="sweep failed"):
-            mgr.discover_and_load()
+            await mgr.discover_and_load()
         assert mgr._discovered is False, "failed sweep was cached as discovered"
 
         # A later call (with discovery healthy again) must do the real scan.
         monkeypatch.undo()
         monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes_test"))
-        mgr.discover_and_load()
+        await mgr.discover_and_load()
         assert mgr._discovered is True
         non_bundled = {
             n: p for n, p in mgr._plugins.items()
@@ -193,9 +195,32 @@ class TestPluginDiscovery:
         }
         assert len(non_bundled) == 1
 
+    @pytest.mark.asyncio
+    async def test_concurrent_discovery_runs_single_sweep(self, monkeypatch):
+        """Concurrent first users share one discovery sweep."""
+        manager = PluginManager()
+        release = asyncio.Event()
+        calls = 0
+
+        async def sweep(_manager):
+            nonlocal calls
+            calls += 1
+            await release.wait()
+
+        monkeypatch.setattr(PluginManager, "_discover_and_load_inner", sweep)
+        tasks = [asyncio.create_task(manager.discover_and_load()) for _ in range(3)]
+        await asyncio.sleep(0)
+
+        assert calls == 1
+        release.set()
+        await asyncio.gather(*tasks)
+        assert manager._discovered is True
+        assert calls == 1
 
 
-    def test_force_rediscover_clears_all_plugin_registries(self, monkeypatch):
+
+    @pytest.mark.asyncio
+    async def test_force_rediscover_clears_all_plugin_registries(self, monkeypatch):
         """force=True must clear every plugin-populated registry.
 
         Regression: ``_plugin_platform_names`` was populated by
@@ -222,8 +247,12 @@ class TestPluginDiscovery:
         mgr._slack_action_handlers.append(("aid", lambda **_: None, "p"))
         mgr._discovered = True
 
-        monkeypatch.setattr(PluginManager, "_discover_and_load_inner", lambda self_inner: None)
-        mgr.discover_and_load(force=True)
+        monkeypatch.setattr(
+            PluginManager,
+            "_discover_and_load_inner",
+            AsyncMock(return_value=None),
+        )
+        await mgr.discover_and_load(force=True)
 
         assert mgr._plugins == {}
         assert mgr._hooks == {}
@@ -246,7 +275,8 @@ class TestPluginLoading:
 
 
 
-    def test_load_registers_namespace_module(self, tmp_path, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_load_registers_namespace_module(self, tmp_path, monkeypatch):
         """Directory plugins are importable under hermes_plugins.<name>."""
         plugins_dir = tmp_path / "hermes_test" / "plugins"
         _make_plugin_dir(plugins_dir, "ns_plugin")
@@ -256,11 +286,12 @@ class TestPluginLoading:
         sys.modules.pop("hermes_plugins.ns_plugin", None)
 
         mgr = PluginManager()
-        mgr.discover_and_load()
+        await mgr.discover_and_load()
 
         assert "hermes_plugins.ns_plugin" in sys.modules
 
-    def test_user_memory_plugin_auto_coerced_to_exclusive(self, tmp_path, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_user_memory_plugin_auto_coerced_to_exclusive(self, tmp_path, monkeypatch):
         """User-installed memory plugins must NOT be loaded by the general
         PluginManager — they belong to plugins/memory discovery.
 
@@ -293,7 +324,7 @@ class TestPluginLoading:
         monkeypatch.setenv("HERMES_HOME", str(hermes_home))
 
         mgr = PluginManager()
-        mgr.discover_and_load()
+        await mgr.discover_and_load()
 
         assert "mempalace" in mgr._plugins
         entry = mgr._plugins["mempalace"]
@@ -329,7 +360,7 @@ class TestPluginHooks:
         monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes_test"))
 
         mgr = PluginManager()
-        mgr.discover_and_load()
+        await mgr.discover_and_load()
 
         results = await mgr.invoke_hook(
             "pre_gateway_dispatch",
@@ -359,7 +390,7 @@ class TestPluginHooks:
         monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes_test"))
 
         mgr = PluginManager()
-        mgr.discover_and_load()
+        await mgr.discover_and_load()
 
         assert mgr.has_hook("pre_api_request") is True
         assert mgr.has_hook("post_api_request") is False
@@ -563,7 +594,7 @@ class TestPluginContext:
             mgr = PluginManager()
             # PluginManager catches and logs the registration error, so the
             # plugin is skipped and the built-in tool is left untouched.
-            mgr.discover_and_load()
+            await mgr.discover_and_load()
 
             entry = registry._tools.get("gated_override_target")
             assert entry is not None, "built-in tool should still be registered"
@@ -643,7 +674,7 @@ class TestPluginContext:
             monkeypatch.setenv("HERMES_HOME", str(hermes_home))
 
             mgr = PluginManager()
-            mgr.discover_and_load()
+            await mgr.discover_and_load()
 
             # Immediately after load, the built-in is intact.
             entry = registry._tools.get("gated_override_target")
@@ -703,7 +734,7 @@ class TestPluginToolVisibility:
         monkeypatch.setenv("HERMES_HOME", str(hermes_home))
 
         mgr = PluginManager()
-        mgr.discover_and_load()
+        await mgr.discover_and_load()
         monkeypatch.setattr(plugins_mod, "_plugin_manager", mgr)
 
         from model_tools import get_tool_definitions
@@ -743,7 +774,8 @@ class TestPluginManagerList:
         mgr = PluginManager()
         assert mgr.list_plugins() == []
 
-    def test_list_returns_sorted(self, tmp_path, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_list_returns_sorted(self, tmp_path, monkeypatch):
         """list_plugins() returns results sorted by key."""
         plugins_dir = tmp_path / "hermes_test" / "plugins"
         _make_plugin_dir(plugins_dir, "zulu")
@@ -751,7 +783,7 @@ class TestPluginManagerList:
         monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes_test"))
 
         mgr = PluginManager()
-        mgr.discover_and_load()
+        await mgr.discover_and_load()
 
         listing = mgr.list_plugins()
         # list_plugins sorts by key (path-derived, e.g. ``image_gen/openai``),
@@ -760,7 +792,8 @@ class TestPluginManagerList:
         assert keys == sorted(keys)
 
 
-    def test_shared_hook_name_credited_to_every_plugin(self, tmp_path, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_shared_hook_name_credited_to_every_plugin(self, tmp_path, monkeypatch):
         """Two plugins registering the SAME hook name are each credited.
 
         Regression: hook/middleware/tool attribution diffed names against all
@@ -790,7 +823,7 @@ class TestPluginManagerList:
         monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes_test"))
 
         mgr = PluginManager()
-        mgr.discover_and_load()
+        await mgr.discover_and_load()
 
         by_name = {p["name"]: p for p in mgr.list_plugins()}
         assert by_name["first_hooker"]["hooks"] == 1
@@ -829,7 +862,7 @@ class TestPreLlmCallTargetRouting:
         monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes_test"))
 
         mgr = PluginManager()
-        mgr.discover_and_load()
+        await mgr.discover_and_load()
 
         results = await mgr.invoke_hook(
             "pre_llm_call", session_id="s1", user_message="hi",
@@ -863,7 +896,7 @@ class TestPreLlmCallTargetRouting:
         monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes_test"))
 
         mgr = PluginManager()
-        mgr.discover_and_load()
+        await mgr.discover_and_load()
 
         results = await mgr.invoke_hook(
             "pre_llm_call", session_id="s1", user_message="hi",
@@ -907,7 +940,8 @@ class TestPluginCommands:
 
 
 
-    def test_get_plugin_context_engine_discovers_plugins_lazily(self, tmp_path, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_get_plugin_context_engine_discovers_plugins_lazily(self, tmp_path, monkeypatch):
         """Context engine lookup should work before any explicit discover_plugins() call."""
         hermes_home = tmp_path / "hermes_test"
         plugins_dir = hermes_home / "plugins"
@@ -944,7 +978,7 @@ class TestPluginCommands:
         import hermes_cli.plugins as plugins_mod
 
         with patch.object(plugins_mod, "_plugin_manager", None):
-            engine = plugins_mod.get_plugin_context_engine()
+            engine = await plugins_mod.get_plugin_context_engine()
             assert engine is not None
             assert engine.name == "stub-engine"
 

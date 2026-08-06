@@ -1,6 +1,7 @@
 """Regression tests for model-forwarded web-search result objects."""
 
 import json
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -43,7 +44,11 @@ def extract_provider(monkeypatch):
 
     provider = _FakeExtractProvider()
     web_search_registry.register_provider(provider)
-    monkeypatch.setattr(web_tools, "_ensure_web_plugins_loaded", lambda: None)
+    monkeypatch.setattr(
+        web_tools,
+        "_ensure_web_plugins_loaded",
+        AsyncMock(return_value=None),
+    )
     monkeypatch.setattr(
         web_tools,
         "_load_web_config",

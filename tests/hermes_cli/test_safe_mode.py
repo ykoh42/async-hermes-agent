@@ -21,7 +21,8 @@ def _clean_env(monkeypatch):
         os.environ.pop(var, None)
 
 
-def test_plugin_discovery_skipped(monkeypatch):
+@pytest.mark.asyncio
+async def test_plugin_discovery_skipped(monkeypatch):
     monkeypatch.setenv("HERMES_SAFE_MODE", "1")
     from hermes_cli.plugins import PluginManager
 
@@ -29,12 +30,11 @@ def test_plugin_discovery_skipped(monkeypatch):
     called = []
     monkeypatch.setattr(mgr, "_discover_and_load_inner", lambda: called.append(True))
 
-    mgr.discover_and_load()
+    await mgr.discover_and_load()
 
     assert called == []
     assert mgr._discovered is True
     assert mgr._plugins == {}
-
 
 
 

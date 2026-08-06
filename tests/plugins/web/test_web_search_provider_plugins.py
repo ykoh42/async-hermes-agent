@@ -22,6 +22,7 @@ import asyncio
 import inspect
 
 import pytest
+import pytest_asyncio
 
 
 # ---------------------------------------------------------------------------
@@ -47,10 +48,10 @@ def _clear_web_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def _ensure_plugins_loaded() -> None:
-    """Idempotently load plugins so the registry is populated."""
-    from hermes_cli.plugins import _ensure_plugins_discovered
+    """Assert the async autouse fixture populated the registry."""
+    from hermes_cli.plugins import get_plugin_manager
 
-    _ensure_plugins_discovered()
+    assert get_plugin_manager()._discovered
 
 
 # ---------------------------------------------------------------------------
@@ -58,10 +59,13 @@ def _ensure_plugins_loaded() -> None:
 # ---------------------------------------------------------------------------
 
 
-@pytest.fixture(autouse=True)
-def _isolate_env(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest_asyncio.fixture(autouse=True)
+async def _isolate_env(monkeypatch: pytest.MonkeyPatch) -> None:
     """Each test starts with a clean web-provider env."""
     _clear_web_env(monkeypatch)
+    from hermes_cli.plugins import _ensure_plugins_discovered
+
+    await _ensure_plugins_discovered()
 
 
 class TestBundledPluginsRegister:

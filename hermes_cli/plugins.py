@@ -33,6 +33,7 @@ so plugin-defined tools appear alongside the built-in tools.
 
 from __future__ import annotations
 
+import asyncio
 import importlib.metadata
 import importlib.util
 import inspect
@@ -43,6 +44,9 @@ import types
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set, Union
+
+import aiofiles
+import aiofiles.os
 
 from hermes_constants import get_hermes_home
 from utils import env_var_enabled, fast_safe_load
@@ -206,7 +210,7 @@ def _env_enabled(name: str) -> bool:
     return env_var_enabled(name)
 
 
-def _get_disabled_plugins() -> set:
+async def _get_disabled_plugins() -> set:
     """Read the disabled plugins list from config.yaml.
 
     Kept for backward compat and explicit deny-list semantics. A plugin
@@ -214,15 +218,16 @@ def _get_disabled_plugins() -> set:
     ``plugins.enabled``.
     """
     try:
-        from hermes_cli.config import load_config
-        config = load_config()
+        from hermes_cli.config import load_config_readonly
+
+        config = await load_config_readonly()
         disabled = cfg_get(config, "plugins", "disabled", default=[])
         return set(disabled) if isinstance(disabled, list) else set()
     except Exception:
         return set()
 
 
-def _get_enabled_plugins() -> Optional[set]:
+async def _get_enabled_plugins() -> Optional[set]:
     """Read the enabled-plugins allow-list from config.yaml.
 
     Plugins are opt-in by default — only plugins whose name appears in
@@ -237,8 +242,9 @@ def _get_enabled_plugins() -> Optional[set]:
     * ``set(...)`` — the concrete allow-list.
     """
     try:
-        from hermes_cli.config import load_config
-        config = load_config()
+        from hermes_cli.config import load_config_readonly
+
+        config = await load_config_readonly()
         plugins_cfg = config.get("plugins")
         if not isinstance(plugins_cfg, dict):
             return None
@@ -1162,49 +1168,45 @@ class PluginManager:
         # ``re.Pattern``, or a constraint dict); ``callback`` is an async
         # function with the slack_bolt signature ``(ack, body, action)``.
         self._slack_action_handlers: List[tuple] = []
+        self._discovery_lock = asyncio.Lock()
 
     # -----------------------------------------------------------------------
     # Public
     # -----------------------------------------------------------------------
 
-    def discover_and_load(self, force: bool = False) -> None:
+    async def discover_and_load(self, force: bool = False) -> None:
         """Scan all plugin sources and load each plugin found.
 
         When ``force`` is true, clear cached discovery state first so config
         changes or newly-added bundled backends become visible in long-lived
         sessions without requiring a full agent restart.
         """
-        if self._discovered and not force:
-            return
-        if env_var_enabled("HERMES_SAFE_MODE"):
-            logger.info("HERMES_SAFE_MODE=1 — plugin discovery skipped")
+        async with self._discovery_lock:
+            if self._discovered and not force:
+                return
+            if env_var_enabled("HERMES_SAFE_MODE"):
+                logger.info("HERMES_SAFE_MODE=1 — plugin discovery skipped")
+                self._discovered = True
+                return
+            if force:
+                self._plugins.clear()
+                self._hooks.clear()
+                self._middleware.clear()
+                self._plugin_tool_names.clear()
+                self._plugin_platform_names.clear()
+                self._plugin_commands.clear()
+                self._plugin_skills.clear()
+                self._aux_tasks.clear()
+                self._slack_action_handlers.clear()
+                self._context_engine = None
+            try:
+                await self._discover_and_load_inner()
+            except BaseException:
+                self._discovered = False
+                raise
             self._discovered = True
-            return
-        if force:
-            self._plugins.clear()
-            self._hooks.clear()
-            self._middleware.clear()
-            self._plugin_tool_names.clear()
-            self._plugin_platform_names.clear()
-            self._plugin_commands.clear()
-            self._plugin_skills.clear()
-            self._aux_tasks.clear()
-            self._slack_action_handlers.clear()
-            self._context_engine = None
-        # Set the flag up front as a re-entrancy guard (a plugin's register()
-        # can transitively trigger discovery again), but reset it if the sweep
-        # raises so a failed scan is NOT cached as "discovered with an empty
-        # registry" — callers swallow the exception and would otherwise be
-        # permanently stranded on the early-return above (the "No web provider
-        # configured" class of failures).
-        self._discovered = True
-        try:
-            self._discover_and_load_inner()
-        except BaseException:
-            self._discovered = False
-            raise
 
-    def _discover_and_load_inner(self) -> None:
+    async def _discover_and_load_inner(self) -> None:
         """The actual discovery sweep — see :meth:`discover_and_load`."""
         manifests: List[PluginManifest] = []
 
@@ -1223,14 +1225,14 @@ class PluginManager:
         # below).
         repo_plugins = get_bundled_plugins_dir()
         logger.debug("Scanning bundled plugins: %s", repo_plugins)
-        bundled = self._scan_directory(
+        bundled = await self._scan_directory(
             repo_plugins,
             source="bundled",
             skip_names={"memory", "context_engine", "platforms", "model-providers"},
         )
         logger.debug("  bundled (top-level): %d manifest(s)", len(bundled))
         manifests.extend(bundled)
-        bundled_platforms = self._scan_directory(
+        bundled_platforms = await self._scan_directory(
             repo_plugins / "platforms", source="bundled"
         )
         logger.debug("  bundled/platforms: %d manifest(s)", len(bundled_platforms))
@@ -1239,7 +1241,7 @@ class PluginManager:
         # 2. User plugins (~/.hermes/plugins/)
         user_dir = get_hermes_home() / "plugins"
         logger.debug("Scanning user plugins: %s", user_dir)
-        user_manifests = self._scan_directory(user_dir, source="user")
+        user_manifests = await self._scan_directory(user_dir, source="user")
         logger.debug("  user: %d manifest(s)", len(user_manifests))
         manifests.extend(user_manifests)
 
@@ -1247,7 +1249,9 @@ class PluginManager:
         if _env_enabled("HERMES_ENABLE_PROJECT_PLUGINS"):
             project_dir = Path.cwd() / ".hermes" / "plugins"
             logger.debug("Scanning project plugins: %s", project_dir)
-            project_manifests = self._scan_directory(project_dir, source="project")
+            project_manifests = await self._scan_directory(
+                project_dir, source="project"
+            )
             logger.debug("  project: %d manifest(s)", len(project_manifests))
             manifests.extend(project_manifests)
         else:
@@ -1267,8 +1271,8 @@ class PluginManager:
         # winner. Keys are path-derived (``image_gen/openai``,
         # ``disk-cleanup``) so ``tts/openai`` and ``image_gen/openai``
         # don't collide even when both manifests say ``name: openai``.
-        disabled = _get_disabled_plugins()
-        enabled = _get_enabled_plugins()  # None = opt-in default (nothing enabled)
+        disabled = await _get_disabled_plugins()
+        enabled = await _get_enabled_plugins()  # None = opt-in default (nothing enabled)
         winners: Dict[str, PluginManifest] = {}
         for manifest in manifests:
             winners[manifest.key or manifest.name] = manifest
@@ -1369,7 +1373,7 @@ class PluginManager:
     # Directory scanning
     # -----------------------------------------------------------------------
 
-    def _scan_directory(
+    async def _scan_directory(
         self,
         path: Path,
         source: str,
@@ -1390,11 +1394,11 @@ class PluginManager:
         top level (kept for back-compat; the current call sites no longer
         pass it now that categories are first-class).
         """
-        return self._scan_directory_level(
+        return await self._scan_directory_level(
             path, source, skip_names=skip_names, prefix="", depth=0
         )
 
-    def _scan_directory_level(
+    async def _scan_directory_level(
         self,
         path: Path,
         source: str,
@@ -1410,20 +1414,21 @@ class PluginManager:
         cap at 2 so ``<root>/a/b/c/`` is ignored.
         """
         manifests: List[PluginManifest] = []
-        if not path.is_dir():
+        if not await aiofiles.os.path.isdir(path):
             return manifests
 
-        for child in sorted(path.iterdir()):
-            if not child.is_dir():
+        for child_name in sorted(await aiofiles.os.listdir(path)):
+            child = path / child_name
+            if not await aiofiles.os.path.isdir(child):
                 continue
             if depth == 0 and skip_names and child.name in skip_names:
                 continue
             manifest_file = child / "plugin.yaml"
-            if not manifest_file.exists():
+            if not await aiofiles.os.path.exists(manifest_file):
                 manifest_file = child / "plugin.yml"
 
-            if manifest_file.exists():
-                manifest = self._parse_manifest(
+            if await aiofiles.os.path.exists(manifest_file):
+                manifest = await self._parse_manifest(
                     manifest_file, child, source, prefix
                 )
                 if manifest is not None:
@@ -1439,7 +1444,7 @@ class PluginManager:
 
             sub_prefix = f"{prefix}/{child.name}" if prefix else child.name
             manifests.extend(
-                self._scan_directory_level(
+                await self._scan_directory_level(
                     child,
                     source,
                     skip_names=None,
@@ -1450,7 +1455,7 @@ class PluginManager:
 
         return manifests
 
-    def _parse_manifest(
+    async def _parse_manifest(
         self,
         manifest_file: Path,
         plugin_dir: Path,
@@ -1465,7 +1470,8 @@ class PluginManager:
             if yaml is None:
                 logger.warning("PyYAML not installed – cannot load %s", manifest_file)
                 return None
-            data = fast_safe_load(manifest_file.read_text(encoding="utf-8")) or {}
+            async with aiofiles.open(manifest_file, encoding="utf-8") as handle:
+                data = fast_safe_load(await handle.read()) or {}
 
             name = data.get("name", plugin_dir.name)
             key = f"{prefix}/{plugin_dir.name}" if prefix else name
@@ -1489,9 +1495,12 @@ class PluginManager:
             # Bundled memory providers are already skipped via skip_names.
             if kind == "standalone" and "kind" not in data:
                 init_file = plugin_dir / "__init__.py"
-                if init_file.exists():
+                if await aiofiles.os.path.exists(init_file):
                     try:
-                        source_text = init_file.read_text(errors="replace", encoding="utf-8")[:8192]
+                        async with aiofiles.open(
+                            init_file, errors="replace", encoding="utf-8"
+                        ) as handle:
+                            source_text = (await handle.read(8192))
                         if (
                             "register_memory_provider" in source_text
                             or "MemoryProvider" in source_text
@@ -1894,13 +1903,13 @@ def get_plugin_manager() -> PluginManager:
     return _plugin_manager
 
 
-def discover_plugins(force: bool = False) -> None:
+async def discover_plugins(force: bool = False) -> None:
     """Discover and load all plugins.
 
     Default behavior is idempotent. Pass ``force=True`` to rescan plugin
     manifests and reload state in the current process.
     """
-    get_plugin_manager().discover_and_load(force=force)
+    await get_plugin_manager().discover_and_load(force=force)
 
 
 class PluginContractError(RuntimeError):
@@ -1909,6 +1918,7 @@ class PluginContractError(RuntimeError):
 
 async def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
     """Await native lifecycle hooks without a sync compatibility bridge."""
+    await discover_plugins()
     return await get_plugin_manager().invoke_hook(hook_name, **kwargs)
 
 
@@ -2144,34 +2154,34 @@ async def get_pre_verify_continue_message(
     return None
 
 
-def _ensure_plugins_discovered(force: bool = False) -> PluginManager:
+async def _ensure_plugins_discovered(force: bool = False) -> PluginManager:
     """Return the global manager after ensuring plugin discovery has run.
 
     Pass ``force=True`` to rescan in the current process.
     """
     manager = get_plugin_manager()
-    manager.discover_and_load(force=force)
+    await manager.discover_and_load(force=force)
     return manager
 
 
-def get_plugin_context_engine():
+async def get_plugin_context_engine():
     """Return the plugin-registered context engine, or None."""
-    return _ensure_plugins_discovered()._context_engine
+    return (await _ensure_plugins_discovered())._context_engine
 
 
-def get_plugin_command_handler(name: str) -> Optional[Callable]:
+async def get_plugin_command_handler(name: str) -> Optional[Callable]:
     """Return the handler for a plugin-registered slash command, or ``None``."""
-    entry = _ensure_plugins_discovered()._plugin_commands.get(name)
+    entry = (await _ensure_plugins_discovered())._plugin_commands.get(name)
     return entry["handler"] if entry else None
 
 
-def get_plugin_commands() -> Dict[str, dict]:
+async def get_plugin_commands() -> Dict[str, dict]:
     """Return the full plugin commands dict (name → {handler, description, plugin}).
 
     Triggers idempotent plugin discovery so callers can use plugin commands
     before any explicit discover_plugins() call.
     """
-    return _ensure_plugins_discovered()._plugin_commands
+    return (await _ensure_plugins_discovered())._plugin_commands
 
 
 def get_plugin_auxiliary_tasks() -> List[Dict[str, Any]]:
@@ -2181,11 +2191,11 @@ def get_plugin_auxiliary_tasks() -> List[Dict[str, Any]]:
     :meth:`PluginContext.register_auxiliary_task`:
     ``{key, display_name, description, defaults, plugin}``.
 
-    Triggers idempotent plugin discovery so callers can read the registry
-    before any explicit ``discover_plugins()`` call. Sorted by ``key`` for
-    deterministic ordering in pickers and tests.
+    Async runtime bootstrap performs discovery before auxiliary resolution;
+    this accessor only reads the resulting in-memory registry. Sorted by
+    ``key`` for deterministic ordering in pickers and tests.
     """
-    manager = _ensure_plugins_discovered()
+    manager = get_plugin_manager()
     return [manager._aux_tasks[k] for k in sorted(manager._aux_tasks)]
 
 

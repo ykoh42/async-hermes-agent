@@ -70,7 +70,8 @@ def _enable(hermes_home: Path, name: str) -> None:
 
 
 class TestCategoryNamespaceRecursion:
-    def test_category_namespace_discovered(self, tmp_path, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_category_namespace_discovered(self, tmp_path, monkeypatch):
         """A nested ``<root>/category/name/plugin.yaml`` is discovered with
         a path-derived key when the category parent has no manifest."""
         import os
@@ -81,7 +82,7 @@ class TestCategoryNamespaceRecursion:
         _enable(hermes_home, "category/name")
 
         mgr = PluginManager()
-        mgr.discover_and_load()
+        await mgr.discover_and_load()
 
         assert "category/name" in mgr._plugins
         loaded = mgr._plugins["category/name"]
@@ -90,7 +91,8 @@ class TestCategoryNamespaceRecursion:
         assert loaded.enabled is True
 
 
-    def test_depth_cap_two(self, tmp_path, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_depth_cap_two(self, tmp_path, monkeypatch):
         """Plugins nested three levels deep are not discovered.
 
         ``<root>/a/b/c/plugin.yaml`` should NOT be picked up — cap is
@@ -103,7 +105,7 @@ class TestCategoryNamespaceRecursion:
         _write_plugin(user_plugins, ["a", "b", "c"])
 
         mgr = PluginManager()
-        mgr.discover_and_load()
+        await mgr.discover_and_load()
 
         non_bundled = [
             k for k, p in mgr._plugins.items()
@@ -117,19 +119,21 @@ class TestCategoryNamespaceRecursion:
 
 
 class TestKindField:
-    def test_default_kind_is_standalone(self, tmp_path, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_default_kind_is_standalone(self, tmp_path, monkeypatch):
         import os
         hermes_home = Path(os.environ["HERMES_HOME"])  # set by hermetic conftest fixture
         _write_plugin(hermes_home / "plugins", ["p1"])
         _enable(hermes_home, "p1")
 
         mgr = PluginManager()
-        mgr.discover_and_load()
+        await mgr.discover_and_load()
 
         assert mgr._plugins["p1"].manifest.kind == "standalone"
 
     @pytest.mark.parametrize("kind", ["backend", "exclusive", "standalone"])
-    def test_valid_kinds_parsed(self, kind, tmp_path, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_valid_kinds_parsed(self, kind, tmp_path, monkeypatch):
         import os
         hermes_home = Path(os.environ["HERMES_HOME"])  # set by hermetic conftest fixture
         _write_plugin(
@@ -141,12 +145,13 @@ class TestKindField:
         _enable(hermes_home, "p1")
 
         mgr = PluginManager()
-        mgr.discover_and_load()
+        await mgr.discover_and_load()
 
         assert "p1" in mgr._plugins
         assert mgr._plugins["p1"].manifest.kind == kind
 
-    def test_unknown_kind_falls_back_to_standalone(self, tmp_path, monkeypatch, caplog):
+    @pytest.mark.asyncio
+    async def test_unknown_kind_falls_back_to_standalone(self, tmp_path, monkeypatch, caplog):
         import os
         hermes_home = Path(os.environ["HERMES_HOME"])  # set by hermetic conftest fixture
         _write_plugin(
@@ -158,7 +163,7 @@ class TestKindField:
 
         with caplog.at_level("WARNING"):
             mgr = PluginManager()
-            mgr.discover_and_load()
+            await mgr.discover_and_load()
 
         assert mgr._plugins["p1"].manifest.kind == "standalone"
         assert any(
@@ -170,7 +175,8 @@ class TestKindField:
 
 
 class TestBackendGate:
-    def test_user_backend_still_gated_by_enabled(self, tmp_path, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_user_backend_still_gated_by_enabled(self, tmp_path, monkeypatch):
         """User-installed ``kind: backend`` plugins still require opt-in —
         they're not trusted by default."""
         import os
@@ -185,14 +191,15 @@ class TestBackendGate:
         # Do NOT opt in.
 
         mgr = PluginManager()
-        mgr.discover_and_load()
+        await mgr.discover_and_load()
 
         loaded = mgr._plugins["category/fancy"]
         assert loaded.enabled is False
         assert "not enabled" in (loaded.error or "")
 
 
-    def test_exclusive_kind_skipped(self, tmp_path, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_exclusive_kind_skipped(self, tmp_path, monkeypatch):
         """``kind: exclusive`` plugins are recorded but not loaded — the
         category's own discovery system handles them (memory today)."""
         import os
@@ -205,7 +212,7 @@ class TestBackendGate:
         _enable(hermes_home, "some-backend")
 
         mgr = PluginManager()
-        mgr.discover_and_load()
+        await mgr.discover_and_load()
 
         loaded = mgr._plugins["some-backend"]
         assert loaded.enabled is False

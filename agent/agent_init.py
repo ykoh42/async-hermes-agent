@@ -2754,7 +2754,7 @@ def init_agent(
 
 
 
-def _select_context_engine(
+async def _select_context_engine(
     agent: Any,
     config_snapshot: Dict[str, Any],
 ) -> None:
@@ -2787,7 +2787,7 @@ def _select_context_engine(
             try:
                 from hermes_cli.plugins import get_plugin_context_engine
 
-                candidate = get_plugin_context_engine()
+                candidate = await get_plugin_context_engine()
             except Exception:
                 candidate = None
             if candidate is not None and candidate.name == engine_name:
@@ -2857,7 +2857,7 @@ async def _initialize_context_engine(
     """Configure and start the selected context engine exactly once."""
     if getattr(agent, "_context_engine_started", False):
         return
-    _select_context_engine(agent, config_snapshot)
+    await _select_context_engine(agent, config_snapshot)
 
     if getattr(agent, "_context_engine_is_plugin", False):
         from agent.model_metadata import get_model_context_length
@@ -3127,7 +3127,7 @@ async def initialize_deferred_runtime(agent: Any) -> bool:
                         ),
                     )
                     await _record_codex_gpt55_autoraise_notice(autoraise)
-        _select_context_engine(agent, config_snapshot)
+        await _select_context_engine(agent, config_snapshot)
 
         if not pending:
             await _initialize_memory_manager(agent, config_snapshot)

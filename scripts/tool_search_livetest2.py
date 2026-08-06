@@ -105,7 +105,7 @@ async def run_one(scenario: Dict[str, Any], mode: str, rep: int, out_dir: Path) 
             platform="cli", max_iterations=15,
         )
         from hermes_cli.plugins import get_plugin_manager, discover_plugins
-        discover_plugins()  # idempotent; ensures no later clear wipes our hook
+        await discover_plugins()  # idempotent; ensures no later clear wipes our hook
         pm = get_plugin_manager()
         pm._hooks.setdefault("post_api_request", []).append(usage_hook)
         # Belt-and-braces: normalize_usage in the conversation loop is called

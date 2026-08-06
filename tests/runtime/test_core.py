@@ -437,7 +437,7 @@ async def test_deferred_runtime_rejects_sync_only_context_engine_early(monkeypat
 
     monkeypatch.setattr(
         "hermes_cli.plugins.get_plugin_context_engine",
-        lambda: SyncEngine(),
+        AsyncMock(return_value=SyncEngine()),
     )
 
     async def assert_rejected(**attributes):
@@ -500,7 +500,7 @@ async def test_deferred_runtime_starts_native_context_engine_with_tools(monkeypa
     }
     monkeypatch.setattr(
         "hermes_cli.plugins.get_plugin_context_engine",
-        lambda: source_engine,
+        AsyncMock(return_value=source_engine),
     )
     monkeypatch.setattr(
         "hermes_cli.config.load_config_readonly",

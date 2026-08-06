@@ -7440,7 +7440,9 @@ async def call_llm(
     # session switches models while this task is awaiting network I/O.
     main_runtime = _normalize_main_runtime(main_runtime)
     from hermes_cli.config import load_config_readonly
+    from hermes_cli.plugins import discover_plugins
 
+    await discover_plugins()
     config_snapshot = await load_config_readonly()
     resolved_provider, resolved_model, resolved_base_url, resolved_api_key, resolved_api_mode = _resolve_task_provider_model(
         task, provider, model, base_url, api_key, config=config_snapshot)

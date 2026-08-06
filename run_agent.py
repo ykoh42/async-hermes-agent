@@ -594,6 +594,9 @@ class AIAgent:
     async def __aenter__(self):
         """Support ``async with AIAgent(...)`` without a separate start API."""
         await self._ensure_provider_runtime()
+        from hermes_cli.plugins import discover_plugins
+
+        await discover_plugins()
         if not getattr(self, "_mcp_discovery_started", False):
             from tools.mcp_tool import (
                 discover_mcp_tools,

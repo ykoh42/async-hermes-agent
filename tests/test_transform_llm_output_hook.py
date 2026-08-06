@@ -66,7 +66,7 @@ async def test_hook_receives_expected_kwargs(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
 
     mgr = PluginManager()
-    mgr.discover_and_load()
+    await mgr.discover_and_load()
 
     results = await mgr.invoke_hook(
         "transform_llm_output",
@@ -104,7 +104,7 @@ async def test_hook_exception_does_not_replace_response(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
 
     mgr = PluginManager()
-    mgr.discover_and_load()
+    await mgr.discover_and_load()
 
     results = await mgr.invoke_hook(
         "transform_llm_output",

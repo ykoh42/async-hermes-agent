@@ -530,7 +530,7 @@ async def _truncate_with_footer(
 # dispatchers in this file resolve them via get_active_*_provider().
 
 
-def _ensure_web_plugins_loaded() -> None:
+async def _ensure_web_plugins_loaded() -> None:
     """Idempotently trigger plugin discovery so the web registry is populated.
 
     Every bundled web provider (brave-free, ddgs, searxng, exa, parallel,
@@ -550,7 +550,7 @@ def _ensure_web_plugins_loaded() -> None:
     try:
         from hermes_cli.plugins import _ensure_plugins_discovered
 
-        _ensure_plugins_discovered()
+        await _ensure_plugins_discovered()
     except Exception as exc:  # noqa: BLE001
         # Warning, not debug: if a plugin import is genuinely broken the
         # user otherwise hits the misleading "No web extract provider
@@ -623,7 +623,7 @@ async def web_search_tool(query: str, limit: int = 5) -> str:
         # delegation. Every provider is native async; sync implementations are
         # rejected by the provider contract instead of being hidden behind a
         # thread-pool compatibility bridge.
-        _ensure_web_plugins_loaded()
+        await _ensure_web_plugins_loaded()
         from agent.web_search_registry import (
             get_active_search_provider,
             get_provider as _wsp_get_provider,
@@ -818,7 +818,7 @@ async def web_extract_tool(
             # registry lookup + delegation. Every provider implements the
             # native async extract contract; a sync SDK implementation is
             # rejected instead of hidden behind a worker thread.
-            _ensure_web_plugins_loaded()
+            await _ensure_web_plugins_loaded()
             from agent.web_search_registry import (
                 get_active_extract_provider,
                 get_provider as _wsp_get_provider,

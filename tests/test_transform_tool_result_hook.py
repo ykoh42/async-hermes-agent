@@ -166,7 +166,7 @@ async def test_transform_tool_result_integration_with_real_plugin(monkeypatch, t
 
     # Force a fresh plugin manager so the new config is picked up.
     plugins_mod._plugin_manager = plugins_mod.PluginManager()
-    plugins_mod.discover_plugins()
+    await plugins_mod.discover_plugins()
 
     out = await _run_handle_function_call(
         monkeypatch,

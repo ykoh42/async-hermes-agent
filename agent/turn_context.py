@@ -419,6 +419,9 @@ async def build_turn_context(
         agent, "_tool_snapshot_initialized", False
     )
     try:
+        from hermes_cli.plugins import discover_plugins
+
+        await discover_plugins()
         if not getattr(agent, "_skip_mcp_refresh", False):
             # The first discovery is intentionally lazy: ``AIAgent.__init__``
             # must not open an MCP transport or synchronously wait on a remote

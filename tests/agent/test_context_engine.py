@@ -188,7 +188,8 @@ class TestPluginContextEngineSlot:
 
 
 
-    def test_get_plugin_context_engine(self):
+    @pytest.mark.asyncio
+    async def test_get_plugin_context_engine(self):
         from hermes_cli.plugins import PluginManager, get_plugin_context_engine
         import hermes_cli.plugins as plugins_mod
 
@@ -198,11 +199,11 @@ class TestPluginContextEngineSlot:
             mgr = PluginManager()
             plugins_mod._plugin_manager = mgr
 
-            assert get_plugin_context_engine() is None
+            assert await get_plugin_context_engine() is None
 
             engine = StubEngine()
             mgr._context_engine = engine
-            assert get_plugin_context_engine() is engine
+            assert await get_plugin_context_engine() is engine
         finally:
             plugins_mod._plugin_manager = old_mgr
 
