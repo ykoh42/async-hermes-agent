@@ -197,6 +197,32 @@ async def test_web_tool_availability_does_not_block_event_loop(
         blockbuster.deactivate()
 
 
+@pytest.mark.asyncio
+async def test_builtin_tool_availability_checks_do_not_block_event_loop(
+    monkeypatch, tmp_path
+):
+    from tools.registry import discover_builtin_tools
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    discover_builtin_tools()
+    checks = {
+        entry.check_fn
+        for entry in registry._tools.values()
+        if entry.check_fn is not None
+    }
+
+    blockbuster = BlockBuster()
+    blockbuster.activate()
+    try:
+        for check in checks:
+            result = check()
+            if inspect.isawaitable(result):
+                result = await result
+            assert isinstance(result, bool)
+    finally:
+        blockbuster.deactivate()
+
+
 def test_constructor_does_not_read_runtime_config_or_create_logs():
     """AIAgent construction is state-only; I/O starts at the first await."""
     with (
