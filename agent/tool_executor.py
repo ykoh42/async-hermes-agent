@@ -566,6 +566,11 @@ async def execute_tool_calls_segmented(
                     "skip_tool_execution_middleware": True,
                     "tool_request_middleware_trace": list(middleware_trace),
                 }
+                entry = registry.get_entry(name)
+                if str(getattr(entry, "toolset", "")).startswith("mcp-"):
+                    dispatch_kwargs["elicitation_callback"] = getattr(
+                        agent, "clarify_callback", None
+                    )
                 if name == "memory":
                     dispatch_kwargs["store"] = getattr(agent, "_memory_store", None)
                 elif name == "todo":

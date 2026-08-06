@@ -1671,21 +1671,14 @@ class ElicitationHandler:
 
     Elicitation lets a server ask the client to collect structured input from
     the user mid-tool-call (e.g. payment authorization, OAuth confirmation).
-    Form-mode elicitations are routed through Hermes' existing approval
-    system (``tools.approval.prompt_dangerous_approval``), which surfaces
-    the prompt on whichever surface the active session uses -- CLI, TUI,
-    Telegram, Slack, etc. URL-mode elicitations are declined as unsupported.
+    Form-mode elicitations use the active agent's native async
+    ``clarify_callback``. URL-mode elicitations are declined as unsupported,
+    matching the upstream contract.
 
     Failure modes are fail-closed: any timeout, exception, or unexpected
     state returns ``decline``/``cancel`` rather than silently accepting.
     The server treats this as the user not approving.
     """
-
-    # Outer cap for the approval await. ``prompt_dangerous_approval`` runs
-    # its own input() timeout via the approval-config value; this is an
-    # asyncio-side safety net so the MCP event loop never blocks
-    # indefinitely if the inner timeout machinery is bypassed.
-    _OUTER_TIMEOUT_GRACE_SECONDS = 5
 
     def __init__(self, server_name: str, config: dict, owner: Optional["MCPServerTask"] = None):
         self.server_name = server_name
@@ -1732,13 +1725,75 @@ class ElicitationHandler:
             self.metrics["declined"] += 1
             return ElicitResult(action="decline")
 
-        # This library runtime intentionally has no gateway/CLI bridge to a
-        # blocking human-consent prompt.  Decline rather than dispatching that
-        # callback to a worker: callers can handle the structured refusal, and
-        # a future native async approval surface can replace this branch.
+        callback = (
+            getattr(self.owner, "_pending_elicitation_callback", None)
+            if self.owner
+            else None
+        )
+        if callback is None:
+            logger.info(
+                "MCP server '%s' requested elicitation; async library runtime "
+                "declined because no native approval callback is configured",
+                self.server_name,
+            )
+            self.metrics["declined"] += 1
+            return ElicitResult(action="decline")
+        if not inspect.iscoroutinefunction(inspect.unwrap(callback)):
+            logger.error(
+                "MCP server '%s' elicitation callback is synchronous; declining",
+                self.server_name,
+            )
+            self.metrics["errors"] += 1
+            return ElicitResult(action="decline")
+
+        message = getattr(params, "message", "") or (
+            f"MCP server '{self.server_name}' is requesting your approval"
+        )
+        schema = getattr(params, "requested_schema", {}) or {}
+        description = _format_elicitation_schema_summary(schema, self.server_name)
+        question = f"{message}\n\n{description}"
+        choices = ["Approve", "Decline"]
+
+        captured = (
+            getattr(self.owner, "_pending_call_context", None)
+            if self.owner
+            else None
+        )
+        consent_task = asyncio.create_task(
+            callback(question, choices),
+            context=captured.copy() if captured is not None else None,
+        )
+        try:
+            answer = await asyncio.wait_for(consent_task, timeout=self.timeout)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "MCP server '%s' elicitation timed out after %ds",
+                self.server_name,
+                int(self.timeout),
+            )
+            self.metrics["errors"] += 1
+            return ElicitResult(action="cancel")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.error(
+                "MCP server '%s' elicitation failed: %s",
+                self.server_name,
+                exc,
+                exc_info=True,
+            )
+            self.metrics["errors"] += 1
+            return ElicitResult(action="decline")
+
+        normalized = str(answer or "").strip().lower()
+        if normalized in {"approve", "approved", "accept", "accepted", "yes", "allow"}:
+            self.metrics["accepted"] += 1
+            return ElicitResult(action="accept", content={})
+        if normalized in {"cancel", "cancelled", "canceled"}:
+            self.metrics["errors"] += 1
+            return ElicitResult(action="cancel")
         logger.info(
-            "MCP server '%s' requested elicitation; async library runtime "
-            "declined because no native approval handler is configured",
+            "MCP server '%s' elicitation was declined by the caller",
             self.server_name,
         )
         self.metrics["declined"] += 1
@@ -1766,7 +1821,7 @@ class MCPServerTask:
         "_sampling", "_elicitation",
         "_registered_tool_names", "_auth_type", "_refresh_lock",
         "_rpc_lock", "_pending_refresh_tasks",
-        "_pending_call_context",
+        "_pending_call_context", "_pending_elicitation_callback",
         "_lifecycle_started_at", "_last_tool_call_at",
         "_idle_timeout_seconds", "_max_lifetime_seconds", "_recycled_reason",
         "initialize_result", "_ping_unsupported",
@@ -1825,6 +1880,7 @@ class MCPServerTask:
         # gateway-platform attribution and routes the approval prompt
         # to the right surface (Telegram, Slack, etc.).
         self._pending_call_context: Optional[contextvars.Context] = None
+        self._pending_elicitation_callback: Optional[Callable[..., Coroutine]] = None
         now = time.monotonic()
         self._lifecycle_started_at: float = now
         self._last_tool_call_at: float = now
@@ -4484,6 +4540,7 @@ async def _call_mcp_tool(
     tool_name: str,
     server: Any,
     args: dict,
+    elicitation_callback: Optional[Callable[..., Coroutine]] = None,
 ) -> str:
     """Perform and render one MCP ``tools/call`` RPC on the caller's loop."""
     _mark_server_call_started(server)
@@ -4491,10 +4548,12 @@ async def _call_mcp_tool(
         # Snapshot the agent's context so an elicitation callback triggered
         # during this call can replay the gateway platform/session context.
         server._pending_call_context = contextvars.copy_context()
+        server._pending_elicitation_callback = elicitation_callback
         try:
             result = await server.session.call_tool(tool_name, arguments=args)
         finally:
             server._pending_call_context = None
+            server._pending_elicitation_callback = None
 
     _mark_proven = getattr(server, "_mark_session_proven", None)
     if _mark_proven is not None:
@@ -4560,6 +4619,7 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
     """Return a coroutine-native handler for a discovered MCP tool."""
 
     async def _handler(args: dict, **kwargs) -> str:
+        elicitation_callback = kwargs.get("elicitation_callback")
         if _server_error_counts.get(server_name, 0) >= _CIRCUIT_BREAKER_THRESHOLD:
             opened_at = _server_breaker_opened_at.get(server_name, 0.0)
             age = time.monotonic() - opened_at
@@ -4595,7 +4655,13 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
 
         try:
             result = await _await_mcp_operation(
-                lambda: _call_mcp_tool(server_name, tool_name, server, args),
+                lambda: _call_mcp_tool(
+                    server_name,
+                    tool_name,
+                    server,
+                    args,
+                    elicitation_callback,
+                ),
                 timeout=tool_timeout,
             )
             try:
@@ -4618,7 +4684,13 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                 if retry_server is None or retry_server.session is None:
                     raise RuntimeError(f"MCP server '{server_name}' did not reconnect")
                 return await _await_mcp_operation(
-                    lambda: _call_mcp_tool(server_name, tool_name, retry_server, args),
+                    lambda: _call_mcp_tool(
+                        server_name,
+                        tool_name,
+                        retry_server,
+                        args,
+                        elicitation_callback,
+                    ),
                     timeout=tool_timeout,
                 )
 

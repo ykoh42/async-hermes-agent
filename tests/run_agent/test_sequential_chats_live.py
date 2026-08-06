@@ -17,6 +17,7 @@ Requires ``OPENROUTER_API_KEY`` to be set (or sourced via ~/.hermes/.env).
 """
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 
@@ -57,22 +58,24 @@ pytestmark = [
 LIVE_MODEL = os.environ.get("OPENROUTER_MODEL") or "google/gemini-2.5-flash"
 
 
-def _make_live_agent():
+def _make_live_agent(**overrides):
     from run_agent import AIAgent
 
-    return AIAgent(
-        model=LIVE_MODEL,
-        provider="openrouter",
-        api_key=OR_KEY,
-        base_url="https://openrouter.ai/api/v1",
-        max_iterations=3,
-        quiet_mode=True,
-        skip_context_files=True,
-        skip_memory=True,
-        # All toolsets off so the agent just produces a single text reply
-        # per turn — we want to test the HTTP client lifecycle, not tools.
-        disabled_toolsets=["*"],
-    )
+    kwargs = {
+        "model": LIVE_MODEL,
+        "provider": "openrouter",
+        "api_key": OR_KEY,
+        "base_url": "https://openrouter.ai/api/v1",
+        "max_iterations": 3,
+        "quiet_mode": True,
+        "skip_context_files": True,
+        "skip_memory": True,
+        # All toolsets off so the default lifecycle test produces one text
+        # reply per turn. Tool integration explicitly overrides this below.
+        "disabled_toolsets": ["*"],
+    }
+    kwargs.update(overrides)
+    return AIAgent(**kwargs)
 
 
 def _looks_like_error_reply(reply: str) -> tuple[bool, str]:
@@ -143,3 +146,57 @@ async def test_three_sequential_chats_across_client_rebuild():
 
         r3 = await agent.chat("Respond with only the word: THREE")
         _assert_healthy_reply(r3, "turn 3 (post-rebuild)")
+
+
+@pytest.mark.asyncio
+async def test_live_model_tool_observation_and_trajectory_round_trip(
+    tmp_path, monkeypatch
+):
+    """Exercise provider → terminal → observation → provider → trajectory."""
+    from hermes_state import SessionDB
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    database = SessionDB(tmp_path / "state.db")
+    async with (
+        no_event_loop_blocking(action=LeakAction.RAISE, threshold=0.25),
+        no_task_leaks(action=LeakAction.RAISE),
+        _make_live_agent(
+            max_iterations=4,
+            enabled_toolsets=["terminal"],
+            disabled_toolsets=None,
+            save_trajectories=True,
+            session_db=database,
+        ) as agent,
+    ):
+        result = await agent.run_conversation(
+            "Call the terminal tool exactly once with the command "
+            "`printf HERMES_ASYNC_TOOL_OK`. After reading the tool output, "
+            "reply with exactly HERMES_ASYNC_FINAL_OK."
+        )
+
+    assert result["completed"] is True
+    assert "HERMES_ASYNC_FINAL_OK" in result["final_response"]
+    roles = [message["role"] for message in result["messages"]]
+    assert roles == ["user", "assistant", "tool", "assistant"]
+    observation = result["messages"][2]["content"]
+    assert "HERMES_ASYNC_TOOL_OK" in observation
+
+    rows = [
+        json.loads(line)
+        for line in (tmp_path / "trajectory_samples.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert len(rows) == 1
+    trajectory = rows[0]["conversations"]
+    assert [turn["from"] for turn in trajectory] == [
+        "system",
+        "human",
+        "gpt",
+        "tool",
+        "gpt",
+    ]
+    assert '"name": "terminal"' in trajectory[2]["value"]
+    assert "HERMES_ASYNC_TOOL_OK" in trajectory[3]["value"]
+    assert "HERMES_ASYNC_FINAL_OK" in trajectory[4]["value"]

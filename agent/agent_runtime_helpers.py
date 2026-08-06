@@ -2477,6 +2477,10 @@ async def invoke_tool(
             "The async agent does not execute sync tools on a worker thread."
         )
     handler_context = {}
+    if str(getattr(entry, "toolset", "")).startswith("mcp-"):
+        handler_context["elicitation_callback"] = getattr(
+            agent, "clarify_callback", None
+        )
     if function_name == "memory":
         handler_context["store"] = getattr(agent, "_memory_store", None)
     elif function_name == "todo":

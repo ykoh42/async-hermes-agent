@@ -48,11 +48,15 @@ async def echo_mcp(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
     server_script = tmp_path / "echo_server.py"
     server_script.write_text(
-        "from mcp.server.fastmcp import FastMCP\n"
+        "from mcp.server.fastmcp import Context, FastMCP\n"
+        "from pydantic import BaseModel\n"
         "server = FastMCP('training-mcp')\n"
+        "class Consent(BaseModel):\n"
+        "    pass\n"
         "@server.tool()\n"
-        "async def echo(value: str) -> str:\n"
-        "    return f'mcp-observation:{value}'\n"
+        "async def echo(value: str, ctx: Context) -> str:\n"
+        "    consent = await ctx.elicit('Allow the echo observation?', Consent)\n"
+        "    return f'mcp-observation:{value}:{consent.action}'\n"
         "if __name__ == '__main__':\n"
         "    server.run(transport='stdio')\n",
         encoding="utf-8",
@@ -100,6 +104,12 @@ async def test_skill_and_stdio_mcp_calls_are_preserved_in_trajectory(
         encoding="utf-8",
     )
     database = SessionDB(tmp_path / "state.db")
+    elicitation_calls = []
+
+    async def clarify(question, choices):
+        elicitation_calls.append((question, choices))
+        return "Approve"
+
     agent = AIAgent(
         api_key="synthetic",
         base_url="https://example.invalid/v1",
@@ -111,6 +121,7 @@ async def test_skill_and_stdio_mcp_calls_are_preserved_in_trajectory(
         skip_context_files=True,
         skip_memory=True,
         session_db=database,
+        clarify_callback=clarify,
     )
     responses = iter(
         [
@@ -180,8 +191,15 @@ async def test_skill_and_stdio_mcp_calls_are_preserved_in_trajectory(
     ]
     assert "trajectory-training" in observations[0]
     assert "Always retain tool observations" in observations[1]
-    assert "mcp-observation:hello" in observations[2]
+    assert "mcp-observation:hello:accept" in observations[2]
     assert '<untrusted_tool_result source="mcp__training_mcp__echo">' in observations[2]
+    assert elicitation_calls == [
+        (
+            "Allow the echo observation?\n\nApproval requested by MCP server "
+            "'training-mcp'.",
+            ["Approve", "Decline"],
+        )
+    ]
 
     rows = [
         json.loads(line)
@@ -205,4 +223,4 @@ async def test_skill_and_stdio_mcp_calls_are_preserved_in_trajectory(
     assert '"name": "skills_list"' in trajectory[2]["value"]
     assert '"name": "skill_view"' in trajectory[4]["value"]
     assert f'"name": "{echo_mcp}"' in trajectory[6]["value"]
-    assert "mcp-observation:hello" in trajectory[7]["value"]
+    assert "mcp-observation:hello:accept" in trajectory[7]["value"]
