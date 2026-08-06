@@ -93,7 +93,7 @@ class ProcessRegistry:
         else:
             process = await asyncio.create_subprocess_exec(
                 shell,
-                "-lic",
+                "-lc",
                 f"set +m; {safe_command}",
                 cwd=workdir,
                 env=env,

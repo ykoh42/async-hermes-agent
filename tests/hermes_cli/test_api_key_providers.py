@@ -378,14 +378,20 @@ class TestResolveApiKeyProviderCredentials:
 
     @pytest.mark.asyncio
     async def test_try_gh_cli_token_uses_homebrew_path_when_not_on_path(self, monkeypatch):
+        async def _is_homebrew_file(path):
+            return path == "/opt/homebrew/bin/gh"
+
+        async def _is_homebrew_executable(path, mode):
+            return path == "/opt/homebrew/bin/gh" and mode == os.X_OK
+
         monkeypatch.setattr("hermes_cli.copilot_auth.shutil.which", lambda command: None)
         monkeypatch.setattr(
-            "hermes_cli.copilot_auth.os.path.isfile",
-            lambda path: path == "/opt/homebrew/bin/gh",
+            "hermes_cli.copilot_auth.aiofiles.os.path.isfile",
+            _is_homebrew_file,
         )
         monkeypatch.setattr(
-            "hermes_cli.copilot_auth.os.access",
-            lambda path, mode: path == "/opt/homebrew/bin/gh" and mode == os.X_OK,
+            "hermes_cli.copilot_auth.aiofiles.os.access",
+            _is_homebrew_executable,
         )
 
         calls = []
