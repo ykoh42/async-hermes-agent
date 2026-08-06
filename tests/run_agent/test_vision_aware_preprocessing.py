@@ -13,9 +13,15 @@ Covers:
 
 from __future__ import annotations
 
+import asyncio
+import base64
+import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from blockbuster import BlockBuster
+from pyleak import no_event_loop_blocking, no_task_leaks
+from pyleak.eventloop import LeakAction
 
 from run_agent import AIAgent
 
@@ -41,6 +47,96 @@ IMG_PARTS_USER_MSG = {
 }
 
 PLAIN_USER_MSG = {"role": "user", "content": "hello, no images here"}
+
+
+# ─── native text fallback ────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_text_fallback_awaits_vision_tool_and_caches(monkeypatch):
+    agent = _make_agent()
+    analyze = AsyncMock(
+        return_value=json.dumps({"success": True, "analysis": "a tabby cat"})
+    )
+    monkeypatch.setattr("tools.vision_tools.vision_analyze_tool", analyze)
+
+    def reject_nested_loop(*_args, **_kwargs):
+        raise AssertionError("vision fallback must not call asyncio.run")
+
+    monkeypatch.setattr(asyncio, "run", reject_nested_loop)
+    image_url = "https://example.test/cat.png"
+
+    first = await agent._describe_image_for_anthropic_fallback(image_url, "user")
+    second = await agent._describe_image_for_anthropic_fallback(image_url, "user")
+
+    assert first == second
+    assert first == (
+        "[The user attached an image. Here's what it contains:\n"
+        "a tabby cat]\n"
+        "[If you need a closer look, use vision_analyze with image_url: "
+        "https://example.test/cat.png]"
+    )
+    analyze.assert_awaited_once()
+    assert analyze.await_args.kwargs["image_url"] == image_url
+
+
+@pytest.mark.asyncio
+async def test_text_fallback_propagates_cancellation(monkeypatch):
+    agent = _make_agent()
+    monkeypatch.setattr(
+        "tools.vision_tools.vision_analyze_tool",
+        AsyncMock(side_effect=asyncio.CancelledError),
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await agent._describe_image_for_anthropic_fallback(
+            "data:image/png;base64,AAAA", "user"
+        )
+
+
+@pytest.mark.asyncio
+async def test_text_fallback_runs_native_vision_path_without_blocking(
+    monkeypatch, tmp_path
+):
+    agent = _make_agent()
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    response = MagicMock()
+    choice = MagicMock()
+    choice.message.content = "native async description"
+    response.choices = [choice]
+    jpeg = base64.b64encode(b"\xff\xd8\xff" + b"\x00" * 32).decode("ascii")
+
+    with (
+        patch(
+            "hermes_cli.config.load_config_readonly",
+            new=AsyncMock(return_value={}),
+        ),
+        patch(
+            "tools.vision_tools._image_to_base64_data_url",
+            new=AsyncMock(return_value="data:image/jpeg;base64,abc"),
+        ),
+        patch(
+            "tools.vision_tools.call_llm",
+            new=AsyncMock(return_value=response),
+        ),
+    ):
+        async with (
+            no_event_loop_blocking(action=LeakAction.RAISE, threshold=0.25),
+            no_task_leaks(action=LeakAction.RAISE),
+        ):
+            blockbuster = BlockBuster()
+            blockbuster.activate()
+            try:
+                note = await agent._describe_image_for_anthropic_fallback(
+                    f"data:image/jpeg;base64,{jpeg}", "assistant"
+                )
+            finally:
+                blockbuster.deactivate()
+
+    assert note == (
+        "[The assistant attached an image. Here's what it contains:\n"
+        "native async description]"
+    )
 
 
 # ─── _prepare_anthropic_messages_for_api ─────────────────────────────────────

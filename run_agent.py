@@ -34,6 +34,7 @@ except ModuleNotFoundError:
     pass
 
 import asyncio
+import base64
 import copy
 import hashlib
 import inspect
@@ -47,6 +48,7 @@ import time
 import uuid
 import warnings
 import aiofiles.os
+import aiofiles.tempfile
 from typing import List, Dict, Any, Optional, Callable
 from datetime import datetime
 from pathlib import Path
@@ -5405,20 +5407,114 @@ class AIAgent:
                 return True
         return False
 
-    def _describe_image_for_anthropic_fallback(self, image_url: str, role: str) -> str:
+    # 20 MB base64 ≈ 15 MB decoded image — generous but prevents OOM from an
+    # oversized data: URL (a 100 MB+ payload creates ~275 MB of memory pressure,
+    # and gateway users sharing the same process can trivially OOM it).
+    _MAX_DATA_URL_BASE64_BYTES = 20 * 1024 * 1024
+
+    @staticmethod
+    async def _materialize_data_url_for_vision(
+        image_url: str,
+    ) -> tuple[str, Optional[Path]]:
+        header, _, data = str(image_url or "").partition(",")
+        if len(data) > AIAgent._MAX_DATA_URL_BASE64_BYTES:
+            logger.warning(
+                "data-URL payload too large (%d bytes), skipping", len(data)
+            )
+            return "", None
+        mime = "image/jpeg"
+        if header.startswith("data:"):
+            mime_part = header[len("data:"):].split(";", 1)[0].strip()
+            if mime_part.startswith("image/"):
+                mime = mime_part
+        suffix = {
+            "image/png": ".png",
+            "image/gif": ".gif",
+            "image/webp": ".webp",
+            "image/jpeg": ".jpg",
+            "image/jpg": ".jpg",
+        }.get(mime, ".jpg")
+        path: Optional[Path] = None
+        try:
+            async with aiofiles.tempfile.NamedTemporaryFile(
+                prefix="anthropic_image_",
+                suffix=suffix,
+                delete=False,
+            ) as tmp:
+                path = Path(tmp.name)
+                await tmp.write(base64.b64decode(data))
+        except (asyncio.CancelledError, Exception):
+            if path is not None:
+                try:
+                    await aiofiles.os.remove(path)
+                except OSError:
+                    pass
+            raise
+        return str(path), path
+
+    async def _describe_image_for_anthropic_fallback(
+        self, image_url: str, role: str
+    ) -> str:
+        cache_key = hashlib.sha256(
+            str(image_url or "").encode("utf-8")
+        ).hexdigest()
+        cached = self._anthropic_image_fallback_cache.get(cache_key)
+        if cached:
+            return cached
+
         role_label = {
             "assistant": "assistant",
             "tool": "tool result",
         }.get(role, "user")
-        # The old non-vision fallback synchronously ran a vision tool through
-        # a nested event loop while preparing a model request. Vision is outside
-        # this fork's native tool waist, so retain a truthful prompt-side note
-        # instead of nesting an event loop or blocking the agent turn.
-        return (
-            f"[The {role_label} attached an image, but the active model does not "
-            "support image input and native vision fallback is unavailable in "
-            "async-hermes-agent.]"
+        analysis_prompt = (
+            "Describe everything visible in this image in thorough detail. "
+            "Include any text, code, UI, data, objects, people, layout, colors, "
+            "and any other notable visual information."
         )
+
+        vision_source = str(image_url or "")
+        cleanup_path: Optional[Path] = None
+        if vision_source.startswith("data:"):
+            vision_source, cleanup_path = (
+                await self._materialize_data_url_for_vision(vision_source)
+            )
+
+        description = ""
+        try:
+            from tools.vision_tools import vision_analyze_tool
+
+            result_json = await vision_analyze_tool(
+                image_url=vision_source,
+                user_prompt=analysis_prompt,
+            )
+            result = json.loads(result_json) if isinstance(result_json, str) else {}
+            description = (result.get("analysis") or "").strip()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            description = f"Image analysis failed: {exc}"
+        finally:
+            if cleanup_path is not None:
+                try:
+                    await aiofiles.os.remove(cleanup_path)
+                except OSError:
+                    pass
+
+        if not description:
+            description = "Image analysis failed."
+
+        note = (
+            f"[The {role_label} attached an image. Here's what it contains:\n"
+            f"{description}]"
+        )
+        if vision_source and not str(image_url or "").startswith("data:"):
+            note += (
+                "\n[If you need a closer look, use vision_analyze with image_url: "
+                f"{vision_source}]"
+            )
+
+        self._anthropic_image_fallback_cache[cache_key] = note
+        return note
 
     async def _model_supports_vision(self) -> bool:
         """Return True if the active provider+model reports native vision.
@@ -5470,7 +5566,7 @@ class AIAgent:
             pass
         return True  # default: assume compatible
 
-    def _preprocess_anthropic_content(self, content: Any, role: str) -> Any:
+    async def _preprocess_anthropic_content(self, content: Any, role: str) -> Any:
         if not self._content_has_image_parts(content):
             return content
 
@@ -5495,7 +5591,11 @@ class AIAgent:
                 image_data = part.get("image_url", {})
                 image_url = image_data.get("url", "") if isinstance(image_data, dict) else str(image_data or "")
                 if image_url:
-                    image_notes.append(self._describe_image_for_anthropic_fallback(image_url, role))
+                    image_notes.append(
+                        await self._describe_image_for_anthropic_fallback(
+                            image_url, role
+                        )
+                    )
                 else:
                     image_notes.append("[An image was attached but no image source was available.]")
                 continue
@@ -5554,7 +5654,7 @@ class AIAgent:
         for msg in transformed:
             if not isinstance(msg, dict):
                 continue
-            msg["content"] = self._preprocess_anthropic_content(
+            msg["content"] = await self._preprocess_anthropic_content(
                 msg.get("content"),
                 str(msg.get("role", "user") or "user"),
             )
@@ -5586,7 +5686,7 @@ class AIAgent:
             # identical (walk content parts, replace images with cached
             # descriptions, merge back into a single text or structured
             # content). Naming is historical.
-            msg["content"] = self._preprocess_anthropic_content(
+            msg["content"] = await self._preprocess_anthropic_content(
                 msg.get("content"),
                 str(msg.get("role", "user") or "user"),
             )

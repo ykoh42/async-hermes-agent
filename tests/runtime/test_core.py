@@ -142,6 +142,11 @@ def test_conversation_and_chat_are_coroutines():
     assert inspect.iscoroutinefunction(AIAgent._recover_with_credential_pool)
     assert inspect.iscoroutinefunction(AIAgent._replace_primary_openai_client)
     assert inspect.iscoroutinefunction(AIAgent._swap_credential)
+    assert inspect.iscoroutinefunction(
+        AIAgent._describe_image_for_anthropic_fallback
+    )
+    assert inspect.iscoroutinefunction(AIAgent._materialize_data_url_for_vision)
+    assert inspect.iscoroutinefunction(AIAgent._preprocess_anthropic_content)
     assert inspect.iscoroutinefunction(recover_with_credential_pool)
     assert inspect.iscoroutinefunction(try_recover_primary_transport)
     assert inspect.iscoroutinefunction(load_pool)
