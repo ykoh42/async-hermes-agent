@@ -655,6 +655,20 @@ async def finalize_turn(
     # Clear stream callback so it doesn't leak into future calls
     agent._stream_callback = None
 
+    # External memory provider: sync the completed turn and warm recall for
+    # the next turn. Interrupted/partial turns are intentionally excluded by
+    # the helper so aborted state never becomes durable memory.
+    sync_external_memory = getattr(
+        agent, "_sync_external_memory_for_turn", None
+    )
+    if callable(sync_external_memory):
+        await sync_external_memory(
+            original_user_message=original_user_message,
+            final_response=final_response,
+            interrupted=interrupted,
+            messages=messages,
+        )
+
     # Plugin hook: on_session_end
     # Fired at the very end of every run_conversation call.
     # Plugins can use this for cleanup, flushing buffers, etc.

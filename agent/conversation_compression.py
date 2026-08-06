@@ -1709,10 +1709,21 @@ async def compress_context(
                 _pre_msg_count = len(messages)
                 approx_tokens = 0
 
-        # Optional external memory providers have a synchronous lifecycle and
-        # are rejected at the turn/runtime boundary. The native built-in memory
-        # path contributes no ephemeral pre-compression text here.
+        # Give the external memory provider a chance to preserve insights before
+        # compression discards old context.
         memory_context = ""
+        memory_manager = getattr(agent, "_memory_manager", None)
+        if memory_manager:
+            try:
+                provider_context = await memory_manager.on_pre_compress(
+                    messages
+                )
+                if isinstance(provider_context, str):
+                    memory_context = sanitize_memory_context(provider_context)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.debug("Memory provider on_pre_compress failed", exc_info=True)
 
         compress_fn = agent.context_compressor.compress
         compress_kwargs = _supported_compression_kwargs(
@@ -1986,6 +1997,7 @@ async def compress_context(
         # block during on_pre_compress(), so they retain the rebuild path.
         if (
             cached_system_prompt is not None
+            and getattr(agent, "_memory_manager", None) is None
             and _cached_prompt_reflects_builtin_memory(agent, cached_system_prompt)
         ):
             new_system_prompt = cached_system_prompt
@@ -2213,6 +2225,26 @@ async def compress_context(
                     agent,
                     new_session_id=agent.session_id or "",
                     old_session_id=_boundary_parent,
+                )
+
+        # Refresh provider-cached per-session state at the same committed
+        # compaction boundary. In-place compaction intentionally sends the same
+        # session id with reset=False.
+        memory_manager = getattr(agent, "_memory_manager", None)
+        if _is_boundary and memory_manager:
+            try:
+                await memory_manager.on_session_switch(
+                    agent.session_id or "",
+                    parent_session_id=_boundary_parent,
+                    reset=False,
+                    reason="compression",
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.debug(
+                    "memory manager on_session_switch (compression): %s",
+                    exc,
                 )
 
         # Warn on repeated compressions (quality degrades with each pass).

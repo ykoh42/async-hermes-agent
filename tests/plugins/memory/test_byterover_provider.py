@@ -1,0 +1,78 @@
+"""Tests for the native-async ByteRover memory provider."""
+
+import asyncio
+
+import pytest
+
+from plugins.memory.byterover import ByteRoverMemoryProvider, _run_brv
+
+
+@pytest.mark.asyncio
+async def test_auto_extract_false_skips_sync_turn(monkeypatch):
+    calls = []
+    provider = ByteRoverMemoryProvider({"auto_extract": False})
+    await provider.initialize("session-1")
+
+    async def run_brv(*args, **kwargs):
+        calls.append((args, kwargs))
+
+    monkeypatch.setattr("plugins.memory.byterover._run_brv", run_brv)
+
+    await provider.sync_turn("please remember this detail", "acknowledged")
+
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_prefetch_awaits_native_subprocess_result(monkeypatch):
+    provider = ByteRoverMemoryProvider()
+    provider._cwd = "/tmp"
+
+    async def run_brv(*args, **kwargs):
+        return {
+            "success": True,
+            "output": "A sufficiently long remembered project decision.",
+        }
+
+    monkeypatch.setattr("plugins.memory.byterover._run_brv", run_brv)
+
+    result = await provider.prefetch("what architecture did we choose?")
+
+    assert result == (
+        "## ByteRover Context\n"
+        "A sufficiently long remembered project decision."
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_brv_timeout_keeps_event_loop_responsive(tmp_path, monkeypatch):
+    executable = tmp_path / "brv"
+    executable.write_text(
+        "#!/usr/bin/env python3\n"
+        "import time\n"
+        "time.sleep(1)\n",
+        encoding="utf-8",
+    )
+    executable.chmod(0o755)
+    monkeypatch.setattr(
+        "plugins.memory.byterover._cached_brv_path",
+        str(executable),
+    )
+    heartbeat = 0
+
+    async def beat():
+        nonlocal heartbeat
+        while True:
+            heartbeat += 1
+            await asyncio.sleep(0)
+
+    task = asyncio.create_task(beat())
+    try:
+        result = await _run_brv(["status"], timeout=0.01, cwd=str(tmp_path))
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert result == {"success": False, "error": "brv timed out after 0.01s"}
+    assert heartbeat > 1

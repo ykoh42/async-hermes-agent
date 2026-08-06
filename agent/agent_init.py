@@ -1848,6 +1848,8 @@ def init_agent(
     agent._memory_nudge_interval = 10
     agent._turns_since_memory = 0
     agent._iters_since_skill = 0
+    agent._memory_manager = None
+    agent._memory_manager_started = False
     # ``skip_memory`` suppresses the persistent store for isolated batch
     # samples, but an explicitly requested memory tool still needs a store so
     # its calls can be represented in the trajectory.
@@ -2968,6 +2970,109 @@ async def _initialize_context_engine(
     agent._context_engine_started = True
 
 
+async def _initialize_memory_manager(
+    agent: Any,
+    config_snapshot: Dict[str, Any],
+) -> None:
+    """Load and initialize the configured memory provider once."""
+    if getattr(agent, "_memory_manager_started", False):
+        return
+    if getattr(agent, "skip_memory", False):
+        agent._memory_manager_started = True
+        return
+
+    memory_config = config_snapshot.get("memory", {}) or {}
+    if not isinstance(memory_config, dict):
+        memory_config = {}
+    provider_name = str(memory_config.get("provider") or "").strip()
+    if not provider_name:
+        agent._memory_manager_started = True
+        return
+
+    from hermes_cli.plugins import PluginContractError
+
+    try:
+        from agent.memory_manager import (
+            MemoryManager,
+            inject_memory_provider_tools,
+        )
+        from plugins.memory import load_memory_provider
+
+        manager = MemoryManager()
+        provider = load_memory_provider(provider_name)
+        if provider is None or not provider.is_available():
+            logger.debug(
+                "Memory provider '%s' not found or not available",
+                provider_name,
+            )
+            agent._memory_manager_started = True
+            return
+        manager.add_provider(provider)
+
+        init_kwargs: Dict[str, Any] = {
+            "platform": agent.platform or "cli",
+            "hermes_home": str(get_hermes_home()),
+            "agent_context": "primary",
+        }
+        if init_kwargs["platform"] == "cli":
+            init_kwargs["warning_callback"] = agent._emit_warning
+            init_kwargs["status_callback"] = agent._emit_status
+        session_db = getattr(agent, "_session_db", None)
+        if session_db is not None:
+            try:
+                session_title = await session_db.get_session_title(agent.session_id)
+                if session_title:
+                    init_kwargs["session_title"] = session_title
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.debug("Memory provider session-title lookup failed", exc_info=True)
+        for attribute, key in (
+            ("_user_id", "user_id"),
+            ("_user_id_alt", "user_id_alt"),
+            ("_user_name", "user_name"),
+            ("_chat_id", "chat_id"),
+            ("_chat_name", "chat_name"),
+            ("_chat_type", "chat_type"),
+            ("_thread_id", "thread_id"),
+            ("_gateway_session_key", "gateway_session_key"),
+        ):
+            value = getattr(agent, attribute, None)
+            if value:
+                init_kwargs[key] = value
+        try:
+            from hermes_cli.profiles import get_active_profile_name
+
+            init_kwargs["agent_identity"] = get_active_profile_name()
+            init_kwargs["agent_workspace"] = "hermes"
+        except Exception:
+            logger.debug("Memory provider profile lookup failed", exc_info=True)
+
+        await manager.initialize_all(session_id=agent.session_id, **init_kwargs)
+        agent._memory_manager = manager
+        inject_memory_provider_tools(agent)
+        agent._memory_manager_started = True
+        logger.info("Memory provider '%s' activated", provider_name)
+    except asyncio.CancelledError:
+        raise
+    except PluginContractError:
+        agent._memory_manager = None
+        logger.warning(
+            "Memory provider '%s' violates the native async contract",
+            provider_name,
+            exc_info=True,
+        )
+        raise
+    except Exception:
+        agent._memory_manager = None
+        agent._memory_manager_started = True
+        logger.warning(
+            "Memory provider plugin init failed: %s",
+            provider_name,
+            exc_info=True,
+        )
+
+
 async def initialize_deferred_runtime(agent: Any) -> bool:
     """Resolve a no-credential constructor through native async primitives.
 
@@ -2992,6 +3097,7 @@ async def initialize_deferred_runtime(agent: Any) -> bool:
             config_snapshot = getattr(agent, "_runtime_config_snapshot", {})
             if not isinstance(config_snapshot, dict):
                 config_snapshot = {}
+            await _initialize_memory_manager(agent, config_snapshot)
             await _initialize_context_engine(agent, config_snapshot)
             return False
 
@@ -3048,6 +3154,7 @@ async def initialize_deferred_runtime(agent: Any) -> bool:
             )
 
         if not pending:
+            await _initialize_memory_manager(agent, config_snapshot)
             await _initialize_context_engine(agent, config_snapshot)
             return False
 
@@ -3074,6 +3181,7 @@ async def initialize_deferred_runtime(agent: Any) -> bool:
             agent._use_prompt_caching, agent._use_native_cache_layout = (
                 agent._anthropic_prompt_cache_policy()
             )
+            await _initialize_memory_manager(agent, config_snapshot)
             await _initialize_context_engine(agent, config_snapshot)
             logger.info("Initialized native async MoA runtime for %s", model)
             return True
@@ -3489,6 +3597,7 @@ async def initialize_deferred_runtime(agent: Any) -> bool:
                 provider=agent.provider,
                 api_mode=agent.api_mode,
             )
+        await _initialize_memory_manager(agent, config_snapshot)
         await _initialize_context_engine(agent, config_snapshot)
 
         primary = getattr(agent, "_primary_runtime", None)

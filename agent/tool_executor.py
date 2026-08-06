@@ -489,12 +489,17 @@ async def execute_tool_calls_segmented(
         return
     tool_budget = _budget_for_agent(agent)
     active_env = get_active_env(effective_task_id)
+    memory_manager = getattr(agent, "_memory_manager", None)
     unsupported = [
         getattr(tc.function, "name", "")
         for tc in tool_calls
         if registry.get_entry(getattr(tc.function, "name", "")) is None
         and getattr(tc.function, "name", "")
         not in (getattr(agent, "_context_engine_tool_names", None) or set())
+        and not (
+            memory_manager
+            and memory_manager.has_tool(getattr(tc.function, "name", ""))
+        )
     ]
     if unsupported:
         from agent.agent_runtime_helpers import UnsupportedCapabilityError
@@ -544,6 +549,9 @@ async def execute_tool_calls_segmented(
                         next_args,
                         messages=messages,
                     )
+                memory_manager = getattr(agent, "_memory_manager", None)
+                if memory_manager and memory_manager.has_tool(name):
+                    return await memory_manager.handle_tool_call(name, next_args)
                 dispatch_kwargs = {
                     "tool_call_id": getattr(tc, "id", "") or "",
                     "session_id": getattr(agent, "session_id", "") or "",
@@ -590,6 +598,16 @@ async def execute_tool_calls_segmented(
             blocked = managed.blocked
             failed, _ = _detect_tool_failure(name, result)
             if not managed.blocked:
+                memory_manager = getattr(agent, "_memory_manager", None)
+                if name == "memory" and memory_manager:
+                    await memory_manager.notify_memory_tool_write(
+                        result,
+                        managed.args,
+                        build_metadata=lambda: agent._build_memory_write_metadata(
+                            task_id=effective_task_id,
+                            tool_call_id=getattr(tc, "id", None),
+                        ),
+                    )
                 if isinstance(result, str):
                     result = agent._append_guardrail_observation(
                         name,

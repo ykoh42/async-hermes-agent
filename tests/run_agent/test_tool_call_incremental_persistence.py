@@ -202,3 +202,35 @@ async def test_interrupt_before_later_segment_persists_cancelled_observations():
     assert [message["tool_call_id"] for message in messages] == ["terminal-1", "read-1"]
     assert "cancelled" in messages[-1]["content"]
     assert snapshots[-1][-1]["tool_call_id"] == "read-1"
+
+
+@pytest.mark.asyncio
+async def test_external_memory_tool_uses_native_manager_dispatch():
+    async def flush(_messages):
+        return True
+
+    agent = _agent(flush)
+    memory_dispatch = AsyncMock(return_value=json.dumps({"memories": ["fact"]}))
+    agent._memory_manager = SimpleNamespace(
+        has_tool=lambda name: name == "external_recall",
+        handle_tool_call=memory_dispatch,
+    )
+    call = _tool_call("external_recall", "memory-1")
+    messages = []
+
+    with (
+        patch("tools.registry.registry.get_entry", return_value=None),
+        _native_policy_path(),
+        patch("model_tools.handle_function_call", new_callable=AsyncMock) as registry_dispatch,
+    ):
+        await execute_tool_calls_segmented(
+            agent,
+            SimpleNamespace(tool_calls=[call]),
+            messages,
+            "task-1",
+            segments=[("sequential", [call])],
+        )
+
+    memory_dispatch.assert_awaited_once_with("external_recall", {})
+    registry_dispatch.assert_not_awaited()
+    assert json.loads(messages[0]["content"]) == {"memories": ["fact"]}

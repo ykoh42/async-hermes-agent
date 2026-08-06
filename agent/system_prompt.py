@@ -503,6 +503,17 @@ async def build_system_prompt_parts(agent: Any, system_message: Optional[str] = 
             if user_block:
                 volatile_parts.append(user_block)
 
+    # External memory-provider guidance is session-static once the provider is
+    # initialized. Keep it in the same volatile tier as built-in memory.
+    memory_manager = getattr(agent, "_memory_manager", None)
+    if memory_manager:
+        try:
+            external_memory_block = memory_manager.build_system_prompt()
+            if external_memory_block:
+                volatile_parts.append(external_memory_block)
+        except Exception:
+            logger.debug("External memory system-prompt block failed", exc_info=True)
+
     from hermes_time import now as _hermes_now
     now = _hermes_now()
     # Date-only (not minute-precision) so the system prompt is byte-stable

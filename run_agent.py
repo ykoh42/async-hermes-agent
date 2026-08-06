@@ -3621,8 +3621,25 @@ class AIAgent:
         }
 
     async def shutdown_memory_provider(self, messages: list = None) -> None:
-        """Finish native context state at a real session boundary."""
-        # Notify the built-in context engine of the session boundary.
+        """Shut down memory and context providers at a real session boundary."""
+        memory_manager = getattr(self, "_memory_manager", None)
+        if memory_manager:
+            try:
+                await memory_manager.on_session_end(messages or [])
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning(
+                    "Memory provider on_session_end failed during shutdown: %s",
+                    exc,
+                    exc_info=True,
+                )
+            try:
+                await memory_manager.shutdown_all()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.debug("Memory provider shutdown failed", exc_info=True)
         if hasattr(self, "context_compressor") and self.context_compressor:
             try:
                 await self.context_compressor.on_session_end(
@@ -3633,7 +3650,15 @@ class AIAgent:
                 pass
 
     async def commit_memory_session(self, messages: list = None) -> None:
-        """Commit built-in context-engine state at a compression boundary."""
+        """Commit provider state at a compression boundary without teardown."""
+        memory_manager = getattr(self, "_memory_manager", None)
+        if memory_manager:
+            try:
+                await memory_manager.on_session_end(messages or [])
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.debug("Memory provider session commit failed", exc_info=True)
         # Notify context engine of session end too — same lifecycle moment as
         # the memory manager's on_session_end. Without this, engines that
         # accumulate per-session state (DAGs, summaries) leak that state from
@@ -3648,6 +3673,45 @@ class AIAgent:
                 )
             except Exception:
                 pass
+
+    async def _sync_external_memory_for_turn(
+        self,
+        *,
+        original_user_message: Any,
+        final_response: Any,
+        interrupted: bool,
+        messages: list | None = None,
+    ) -> None:
+        """Persist a completed turn and queue recall for the next turn."""
+        if interrupted:
+            return
+        memory_manager = getattr(self, "_memory_manager", None)
+        if not (memory_manager and final_response and original_user_message):
+            return
+        user_text = flatten_message_text(original_user_message, sep="\n")
+        response_text = flatten_message_text(final_response, sep="\n")
+        if not (user_text and response_text):
+            return
+        try:
+            sync_kwargs = {"session_id": self.session_id or ""}
+            if messages is not None:
+                sync_kwargs["messages"] = messages
+            await memory_manager.sync_all(
+                user_text,
+                response_text,
+                **sync_kwargs,
+            )
+            from agent.memory_provider import is_trivial_prompt
+
+            if not is_trivial_prompt(user_text):
+                await memory_manager.queue_prefetch_all(
+                    user_text,
+                    session_id=self.session_id or "",
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.debug("External memory turn sync failed", exc_info=True)
 
     async def close(self) -> None:
         """Release all resources held by this agent instance.
@@ -3805,6 +3869,17 @@ class AIAgent:
                 logger.debug("MCP lifecycle release failed", exc_info=True)
             else:
                 self._mcp_lifecycle_retained = False
+
+        # Flush and close external memory-provider state before discarding the
+        # transcript it may need for end-of-session extraction.
+        try:
+            await self.shutdown_memory_provider(
+                list(getattr(self, "_session_messages", None) or [])
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.debug("Memory/context provider shutdown failed", exc_info=True)
 
         # 7. Free conversation history.  Mirrors _release_evicted_agent_soft's
         # soft-eviction clear — close() is the hard teardown for true session

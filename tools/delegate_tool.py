@@ -2314,6 +2314,25 @@ async def _finalize_child_results(
     """Apply host-owned summary, hook, and cost contracts once."""
     await _apply_summary_budget(results, parent_agent)
     child_by_index = {index: child for index, _task, child in children}
+    task_by_index = {index: task for index, task, _child in children}
+
+    memory_manager = getattr(parent_agent, "_memory_manager", None)
+    if memory_manager:
+        for entry in results:
+            try:
+                task_index = entry.get("task_index", -1)
+                task_spec = task_by_index.get(task_index) or {}
+                child = child_by_index.get(task_index)
+                await memory_manager.on_delegation(
+                    task=str(task_spec.get("goal") or ""),
+                    result=entry.get("summary", "") or "",
+                    child_session_id=getattr(child, "session_id", ""),
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.debug("Memory provider delegation hook failed", exc_info=True)
+
     try:
         from hermes_cli.plugins import invoke_hook
     except Exception:

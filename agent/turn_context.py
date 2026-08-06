@@ -42,6 +42,7 @@ from agent.conversation_compression import (
 from agent.context_engine import automatic_compaction_status_message
 from agent.iteration_budget import IterationBudget
 from agent.memory_manager import build_memory_context_block
+from agent.memory_provider import is_trivial_prompt
 from agent.model_metadata import (
     estimate_messages_tokens_rough,
     estimate_request_tokens_rough,
@@ -1114,10 +1115,43 @@ async def build_turn_context(
     else:
         agent._interrupt_message = None
 
-    # No external-memory prefetch is composed into the prompt in this
-    # distribution. Built-in persisted memory is already part of the stable
-    # system prompt and remains available to the model through the memory tool.
+    # Notify memory providers before recall so cadence-sensitive providers see
+    # the current turn number before deciding whether to inject context.
+    memory_manager = getattr(agent, "_memory_manager", None)
+    if memory_manager:
+        try:
+            turn_message = (
+                original_user_message
+                if isinstance(original_user_message, str)
+                else ""
+            )
+            await memory_manager.on_turn_start(
+                agent._user_turn_count,
+                turn_message,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.debug("Memory provider on_turn_start failed", exc_info=True)
+
+    # External memory provider: prefetch once before the tool loop. Trivial
+    # prompts carry no useful recall signal and intentionally skip injection.
     ext_prefetch_cache = ""
+    if memory_manager:
+        try:
+            query = (
+                original_user_message
+                if isinstance(original_user_message, str)
+                else ""
+            )
+            if not is_trivial_prompt(query):
+                ext_prefetch_cache = (
+                    await memory_manager.prefetch_all(query)
+                ) or ""
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.debug("Memory provider prefetch failed", exc_info=True)
 
     # ── api_content sidecar: persist what you send ──
     # The prefetch/plugin context above is injected into the API copy of this
