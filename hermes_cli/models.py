@@ -1987,6 +1987,87 @@ _deepinfra_catalog_neg_cache: dict[str, float] = {}
 _DEEPINFRA_CATALOG_NEG_TTL = 60.0  # seconds
 
 
+def _deepinfra_catalog_url() -> tuple[str, str]:
+    """Return ``(cache_key, full_url)`` for the DeepInfra catalog endpoint."""
+    base = os.getenv("DEEPINFRA_BASE_URL", "").strip() or _DEEPINFRA_DEFAULT_BASE_URL
+    cache_key = base.rstrip("/")
+    return cache_key, f"{cache_key}/models?{_DEEPINFRA_MODELS_QUERY}"
+
+
+async def _fetch_deepinfra_catalog(
+    *,
+    timeout: float = 5.0,
+    force_refresh: bool = False,
+) -> Optional[list[dict]]:
+    """Fetch and cache the shared DeepInfra catalog with native async HTTP."""
+    cache_key, url = _deepinfra_catalog_url()
+    if not force_refresh:
+        if cache_key in _deepinfra_catalog_cache:
+            return _deepinfra_catalog_cache[cache_key]
+        last_fail = _deepinfra_catalog_neg_cache.get(cache_key)
+        if last_fail is not None and (time.monotonic() - last_fail) < _DEEPINFRA_CATALOG_NEG_TTL:
+            return None
+
+    headers: dict[str, str] = {"User-Agent": _HERMES_USER_AGENT}
+    api_key = os.getenv("DEEPINFRA_API_KEY", "").strip()
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    try:
+        async with httpx.AsyncClient(timeout=timeout, headers=headers) as client:
+            response = await client.get(url)
+            response.raise_for_status()
+            payload = response.json()
+    except Exception:
+        _deepinfra_catalog_neg_cache[cache_key] = time.monotonic()
+        return None
+
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(data, list):
+        _deepinfra_catalog_neg_cache[cache_key] = time.monotonic()
+        return None
+
+    _deepinfra_catalog_cache[cache_key] = data
+    _deepinfra_catalog_neg_cache.pop(cache_key, None)
+    return data
+
+
+async def _fetch_deepinfra_models_by_tag(
+    tag: str,
+    *,
+    timeout: float = 5.0,
+    force_refresh: bool = False,
+) -> Optional[list[dict]]:
+    """Return DeepInfra models whose ``metadata.tags`` includes *tag*."""
+    data = await _fetch_deepinfra_catalog(
+        timeout=timeout,
+        force_refresh=force_refresh,
+    )
+    if data is None:
+        return None
+
+    matched: list[dict] = []
+    for item in data:
+        mid = item.get("id")
+        if not mid:
+            continue
+        raw_metadata = item.get("metadata")
+        if raw_metadata is None:
+            continue
+        metadata = raw_metadata if isinstance(raw_metadata, dict) else {}
+        raw_tags = metadata.get("tags")
+        tags = raw_tags if isinstance(raw_tags, list) else []
+        has_surface_tag = any(value in _DEEPINFRA_SURFACE_TAGS for value in tags)
+        if has_surface_tag:
+            if tag in tags:
+                matched.append({"id": mid, "metadata": metadata})
+            continue
+        if tag == "chat" and not _DEEPINFRA_EXCLUDE_RE.search(mid):
+            matched.append({"id": mid, "metadata": metadata})
+
+    return matched
+
+
 
 
 

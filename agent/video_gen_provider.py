@@ -96,7 +96,7 @@ class VideoGenProvider(abc.ABC):
         """Human-readable label shown in ``hermes tools``. Defaults to ``name.title()``."""
         return self.name.title()
 
-    def is_available(self) -> bool:
+    async def is_available(self) -> bool:
         """Return True when this provider can service calls.
 
         Typically checks for a required API key and optional-dependency
@@ -104,7 +104,7 @@ class VideoGenProvider(abc.ABC):
         """
         return True
 
-    def list_models(self) -> List[Dict[str, Any]]:
+    async def list_models(self) -> List[Dict[str, Any]]:
         """Return catalog entries for ``hermes tools`` model picker.
 
         Each entry represents a **model family** that supports text-to-video
@@ -123,7 +123,7 @@ class VideoGenProvider(abc.ABC):
         """
         return []
 
-    def get_setup_schema(self) -> Dict[str, Any]:
+    async def get_setup_schema(self) -> Dict[str, Any]:
         """Return provider metadata for the ``hermes tools`` picker."""
         return {
             "name": self.display_name,
@@ -132,9 +132,9 @@ class VideoGenProvider(abc.ABC):
             "env_vars": [],
         }
 
-    def default_model(self) -> Optional[str]:
+    async def default_model(self) -> Optional[str]:
         """Return the default model id, or None if not applicable."""
-        models = self.list_models()
+        models = await self.list_models()
         if models:
             return models[0].get("id")
         return None
@@ -397,7 +397,7 @@ class OpenAICompatibleVideoGenProvider(VideoGenProvider):
             name = "foo"
             _env_key = "FOO_API_KEY"
             _default_base_url = "https://api.foo.com/v1/openai"
-            def list_models(self):
+            async def list_models(self):
                 return [...]   # entries with an "id" key; default_model() uses [0]
 
     ``image_url`` routes to image-to-video; its absence routes to text-to-video.
@@ -422,7 +422,7 @@ class OpenAICompatibleVideoGenProvider(VideoGenProvider):
 
         return os.environ.get(self._env_key, "").strip()
 
-    def is_available(self) -> bool:
+    async def is_available(self) -> bool:
         return bool(self._api_key())
 
     async def _create_and_poll(self, client: Any, call_kwargs: Dict[str, Any]) -> Any:
@@ -489,7 +489,7 @@ class OpenAICompatibleVideoGenProvider(VideoGenProvider):
                 provider=self.name,
             )
 
-        model_id = model or self.default_model()
+        model_id = model or await self.default_model()
         if not model_id:
             return error_response(
                 error=f"no {self.name} video model available (live catalog empty?)",

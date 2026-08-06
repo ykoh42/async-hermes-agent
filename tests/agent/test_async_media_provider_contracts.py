@@ -82,6 +82,10 @@ def _reset_registries():
 def test_media_and_browser_provider_io_contracts_are_native_async():
     assert inspect.iscoroutinefunction(ImageGenProvider.generate)
     assert inspect.iscoroutinefunction(VideoGenProvider.generate)
+    assert inspect.iscoroutinefunction(VideoGenProvider.is_available)
+    assert inspect.iscoroutinefunction(VideoGenProvider.list_models)
+    assert inspect.iscoroutinefunction(VideoGenProvider.default_model)
+    assert inspect.iscoroutinefunction(VideoGenProvider.get_setup_schema)
     assert inspect.iscoroutinefunction(TTSProvider.synthesize)
     assert inspect.isasyncgenfunction(TTSProvider.stream)
     assert inspect.iscoroutinefunction(TranscriptionProvider.transcribe)

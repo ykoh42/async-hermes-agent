@@ -2,9 +2,18 @@
 
 from __future__ import annotations
 
+import datetime
 import json
 import os
+import uuid
 from typing import Any, Dict, Optional
+
+import aiofiles
+import aiofiles.os
+
+
+MAX_XAI_STORAGE_EXPIRES_AFTER_SECONDS = 30 * 24 * 60 * 60
+SAFE_XAI_STORAGE_EXPIRES_AFTER_SECONDS = 2 * 24 * 60 * 60
 
 
 def has_xai_credentials() -> bool:
@@ -89,10 +98,12 @@ def get_env_value(name: str, default=None):
 def hermes_xai_user_agent() -> str:
     """Return a stable Hermes-specific User-Agent for xAI HTTP calls."""
     try:
-        from hermes_cli import __version__
+        from hermes_cli import __version__ as imported_version
+
+        package_version = str(imported_version)
     except Exception:
-        __version__ = "unknown"
-    return f"Hermes-Agent/{__version__}"
+        package_version = "unknown"
+    return f"Hermes-Agent/{package_version}"
 
 
 def hermes_xai_default_headers() -> Dict[str, str]:
@@ -103,6 +114,125 @@ def hermes_xai_default_headers() -> Dict[str, str]:
     matching the direct HTTP integrations (search, TTS, STT, image, video).
     """
     return {"User-Agent": hermes_xai_user_agent()}
+
+
+async def _load_config_section(section_name: str) -> Dict[str, Any]:
+    """Return a top-level Hermes config section as a dict, or empty."""
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        cfg = await load_config_readonly()
+        section = cfg.get(section_name) if isinstance(cfg, dict) else None
+        return section if isinstance(section, dict) else {}
+    except Exception:
+        return {}
+
+
+def _coerce_bool(value: Any, default: bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on", "enabled"}:
+            return True
+        if normalized in {"0", "false", "no", "off", "disabled"}:
+            return False
+    return default
+
+
+def _coerce_expires_after(value: Any) -> Optional[int]:
+    """Normalize an xAI storage TTL."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"", "default", "none", "null", "never", "permanent", "forever", "0"}:
+            return None
+        try:
+            value = int(normalized)
+        except ValueError:
+            return SAFE_XAI_STORAGE_EXPIRES_AFTER_SECONDS
+    if isinstance(value, (int, float)):
+        seconds = int(value)
+        if seconds <= 0:
+            return None
+        return min(seconds, MAX_XAI_STORAGE_EXPIRES_AFTER_SECONDS)
+    return SAFE_XAI_STORAGE_EXPIRES_AFTER_SECONDS
+
+
+async def read_xai_imagine_storage_config(section_name: str) -> Dict[str, Any]:
+    """Read xAI Imagine storage settings from image/video provider config."""
+    section = await _load_config_section(section_name)
+    xai_section = section.get("xai") if isinstance(section, dict) else None
+    storage = xai_section.get("storage") if isinstance(xai_section, dict) else None
+    storage = storage if isinstance(storage, dict) else {}
+    return {
+        "enabled": _coerce_bool(storage.get("enabled"), True),
+        "public_url": _coerce_bool(storage.get("public_url"), True),
+        "expires_after": _coerce_expires_after(storage.get("expires_after")),
+    }
+
+
+async def build_xai_storage_options(
+    section_name: str,
+    *,
+    filename_prefix: str,
+    extension: str,
+) -> Optional[Dict[str, Any]]:
+    """Return an xAI ``storage_options`` payload, or None when disabled."""
+    cfg = await read_xai_imagine_storage_config(section_name)
+    if not cfg["enabled"]:
+        return None
+
+    now = datetime.datetime.now(datetime.UTC)
+    ts = now.strftime("%Y%m%d-%H%M%S")
+    short = uuid.uuid4().hex[:8]
+    ext = extension.lstrip(".") or "bin"
+    payload: Dict[str, Any] = {
+        "filename": f"{filename_prefix}-{ts}-{short}.{ext}",
+        "public_url": bool(cfg["public_url"]),
+    }
+    if cfg["expires_after"] is not None:
+        payload["expires_after"] = cfg["expires_after"]
+    return payload
+
+
+async def xai_storage_notice_text(section_name: str) -> str:
+    """Return the user-facing notice for enabled xAI Imagine storage."""
+    cfg = await read_xai_imagine_storage_config(section_name)
+    if not cfg["enabled"]:
+        return ""
+    if cfg["expires_after"] is None:
+        retention = "without an automatic expiry"
+    else:
+        days = cfg["expires_after"] / (24 * 60 * 60)
+        retention = f"for about {days:g} day{'s' if days != 1 else ''}"
+    return (
+        "xAI Imagine storage is enabled so generated media gets a reusable "
+        f"public URL {retention}. xAI may bill for stored files and public URL "
+        f"hosting. Disable this with `{section_name}.xai.storage.enabled: false` "
+        "or set `expires_after` to change the retention."
+    )
+
+
+async def maybe_mark_xai_storage_notice_seen(section_name: str) -> Optional[str]:
+    """Return the storage notice once per Hermes home, then mark it seen."""
+    notice = await xai_storage_notice_text(section_name)
+    if not notice:
+        return None
+    try:
+        from hermes_constants import get_hermes_home
+
+        marker_dir = get_hermes_home() / "state"
+        await aiofiles.os.makedirs(marker_dir, exist_ok=True)
+        marker = marker_dir / f"{section_name}_xai_storage_notice_seen"
+        if await aiofiles.os.path.exists(marker):
+            return None
+        async with aiofiles.open(marker, "w", encoding="utf-8") as marker_file:
+            await marker_file.write(datetime.datetime.now(datetime.UTC).isoformat() + "\n")
+        return notice
+    except Exception:
+        return notice
 
 
 async def resolve_xai_http_credentials(

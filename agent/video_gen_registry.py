@@ -26,7 +26,6 @@ from __future__ import annotations
 
 import logging
 import inspect
-import threading
 from typing import Dict, List, Optional
 
 from agent.video_gen_provider import VideoGenProvider
@@ -35,7 +34,6 @@ logger = logging.getLogger(__name__)
 
 
 _providers: Dict[str, VideoGenProvider] = {}
-_lock = threading.Lock()
 
 
 def register_provider(provider: VideoGenProvider) -> None:
@@ -55,9 +53,8 @@ def register_provider(provider: VideoGenProvider) -> None:
         raise ValueError("Video gen provider .name must be a non-empty string")
     if not inspect.iscoroutinefunction(provider.generate):
         raise TypeError("Video gen provider .generate must be async")
-    with _lock:
-        existing = _providers.get(name)
-        _providers[name] = provider
+    existing = _providers.get(name)
+    _providers[name] = provider
     if existing is not None:
         logger.debug("Video gen provider '%s' re-registered (was %r)", name, type(existing).__name__)
     else:
@@ -66,8 +63,7 @@ def register_provider(provider: VideoGenProvider) -> None:
 
 def list_providers() -> List[VideoGenProvider]:
     """Return all registered providers, sorted by name."""
-    with _lock:
-        items = list(_providers.values())
+    items = list(_providers.values())
     return sorted(items, key=lambda p: p.name)
 
 
@@ -75,8 +71,7 @@ def get_provider(name: str) -> Optional[VideoGenProvider]:
     """Return the provider registered under *name*, or None."""
     if not isinstance(name, str):
         return None
-    with _lock:
-        return _providers.get(name.strip())
+    return _providers.get(name.strip())
 
 
 async def get_active_provider() -> Optional[VideoGenProvider]:
@@ -98,8 +93,7 @@ async def get_active_provider() -> Optional[VideoGenProvider]:
     except Exception as exc:
         logger.debug("Could not read video_gen.provider from config: %s", exc)
 
-    with _lock:
-        snapshot = dict(_providers)
+    snapshot = dict(_providers)
 
     if configured:
         provider = snapshot.get(configured)
@@ -111,10 +105,10 @@ async def get_active_provider() -> Optional[VideoGenProvider]:
         )
         return None
 
-    def _is_available_safe(p: VideoGenProvider) -> bool:
+    async def _is_available_safe(p: VideoGenProvider) -> bool:
         """Wrap ``is_available()`` so a buggy provider doesn't kill resolution."""
         try:
-            return bool(p.is_available())
+            return bool(await p.is_available())
         except Exception as exc:  # noqa: BLE001
             logger.debug("video_gen provider %s.is_available() raised %s", p.name, exc)
             return False
@@ -123,7 +117,7 @@ async def get_active_provider() -> Optional[VideoGenProvider]:
     # box with credentials for only one backend auto-selects it even when
     # other providers (fal/xai) register unconditionally without keys.
     # Mirrors agent/image_gen_registry.get_active_provider().
-    available = [p for p in snapshot.values() if _is_available_safe(p)]
+    available = [p for p in snapshot.values() if await _is_available_safe(p)]
     if len(available) == 1:
         return available[0]
 
@@ -132,5 +126,4 @@ async def get_active_provider() -> Optional[VideoGenProvider]:
 
 def _reset_for_tests() -> None:
     """Clear the registry. **Test-only.**"""
-    with _lock:
-        _providers.clear()
+    _providers.clear()

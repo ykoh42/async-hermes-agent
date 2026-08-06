@@ -17,7 +17,7 @@ class _FakeProvider(VideoGenProvider):
     def name(self) -> str:
         return self._name
 
-    def is_available(self) -> bool:
+    async def is_available(self) -> bool:
         return self._available
 
     async def generate(self, prompt, **kw):
