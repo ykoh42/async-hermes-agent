@@ -1192,6 +1192,7 @@ def init_agent(
     agent._interrupt_event = asyncio.Event()
     agent._hard_interrupt_requested = asyncio.Event()
     agent._model_request_active = asyncio.Event()
+    agent._active_request_abort = None
     agent._supports_active_turn_redirect = True
 
     # /steer mechanism — inject a user note into the next tool result

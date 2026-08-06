@@ -2313,21 +2313,47 @@ async def run_conversation(
                         run_llm_execution_middleware,
                     )
 
-                    response = await run_llm_execution_middleware(
-                        api_kwargs,
-                        _perform_api_call,
-                        original_request=_original_api_kwargs,
-                        task_id=effective_task_id,
-                        turn_id=turn_id,
-                        api_request_id=api_request_id,
-                        session_id=agent.session_id or "",
-                        platform=agent.platform or "",
-                        model=agent.model,
-                        provider=agent.provider,
-                        base_url=agent.base_url,
-                        api_mode=agent.api_mode,
-                        api_call_count=api_call_count,
+                    request_task = asyncio.create_task(
+                        run_llm_execution_middleware(
+                            api_kwargs,
+                            _perform_api_call,
+                            original_request=_original_api_kwargs,
+                            task_id=effective_task_id,
+                            turn_id=turn_id,
+                            api_request_id=api_request_id,
+                            session_id=agent.session_id or "",
+                            platform=agent.platform or "",
+                            model=agent.model,
+                            provider=agent.provider,
+                            base_url=agent.base_url,
+                            api_mode=agent.api_mode,
+                            api_call_count=api_call_count,
+                            middleware_trace=list(_llm_middleware_trace),
+                        ),
+                        name=f"hermes-model-request-{turn_id}",
                     )
+                    request_loop = asyncio.get_running_loop()
+
+                    def _abort_request(_reason: str) -> None:
+                        request_loop.call_soon_threadsafe(request_task.cancel)
+
+                    agent._active_request_abort = _abort_request
+                    if agent._interrupt_requested:
+                        _abort_request("pre_request_interrupt")
+                    try:
+                        response = await request_task
+                    except asyncio.CancelledError:
+                        current_task = asyncio.current_task()
+                        if agent._interrupt_requested and not (
+                            current_task and current_task.cancelling()
+                        ):
+                            raise InterruptedError(
+                                "Agent interrupted during model request"
+                            ) from None
+                        raise
+                    finally:
+                        if getattr(agent, "_active_request_abort", None) is _abort_request:
+                            agent._active_request_abort = None
                 finally:
                     if _model_request_active is not None:
                         _model_request_active.clear()
@@ -2343,6 +2369,8 @@ async def run_conversation(
                     else:
                         interrupted = True
                     break
+                if agent._interrupt_requested:
+                    raise InterruptedError("Agent interrupted after model response")
                 
                 api_duration = time.time() - api_start_time
                 

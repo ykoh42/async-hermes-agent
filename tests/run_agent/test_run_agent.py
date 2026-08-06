@@ -3165,6 +3165,7 @@ class TestRunConversation:
         self._setup_agent(agent)
         agent.reasoning_callback = lambda _text: None
         entered = asyncio.Event()
+        request_cancelled = asyncio.Event()
         redirect_result = {}
         calls = 0
         final = _mock_response(content="Corrected answer.", finish_reason="stop")
@@ -3175,9 +3176,11 @@ class TestRunConversation:
             if calls == 1:
                 agent._fire_reasoning_delta("Following the original approach.")
                 entered.set()
-                while not agent._interrupt_requested:
-                    await asyncio.sleep(0)
-                raise InterruptedError("request cancelled by redirect")
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    request_cancelled.set()
+                    raise
             return final
 
         with (
@@ -3201,6 +3204,8 @@ class TestRunConversation:
 
         assert input_thread.is_alive() is False
         assert redirect_result["accepted"] is True
+        assert request_cancelled.is_set()
+        assert agent._active_request_abort is None
         assert calls == 2
         assert result["completed"] is True
         assert result["final_response"] == "Corrected answer."
@@ -3212,6 +3217,38 @@ class TestRunConversation:
         assert result["messages"][-2]["content"] == (
             "Use the corrected approach."
         )
+
+    @pytest.mark.asyncio
+    async def test_interrupt_cancels_live_native_model_request(self, agent):
+        """A sibling task's stop request cancels the provider await immediately."""
+        self._setup_agent(agent)
+        entered = asyncio.Event()
+        request_cancelled = asyncio.Event()
+
+        async def _slow_model_request(*_args, **_kwargs):
+            agent._current_streamed_assistant_text = "Partial native response"
+            entered.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                request_cancelled.set()
+                raise
+
+        with (
+            patch.object(agent, "_execute_model_request", side_effect=_slow_model_request),
+            patch.object(agent, "_persist_session", new_callable=AsyncMock),
+            patch.object(agent, "_save_trajectory", new_callable=AsyncMock),
+            patch.object(agent, "_cleanup_task_resources", new_callable=AsyncMock),
+        ):
+            turn = asyncio.create_task(agent.run_conversation("Start a slow response."))
+            await asyncio.wait_for(entered.wait(), timeout=2)
+            agent.interrupt()
+            result = await asyncio.wait_for(turn, timeout=2)
+
+        assert request_cancelled.is_set()
+        assert agent._active_request_abort is None
+        assert result["interrupted"] is True
+        assert result["final_response"] == "Partial native response"
 
 
     @pytest.mark.asyncio

@@ -769,13 +769,16 @@ async def test_copilot_final_preflight_sanitizes_both_middleware_layers(monkeypa
             payload=replacement,
             original_payload=request,
             changed=True,
-            trace=[],
+            trace=[{"source": "request-middleware"}],
         )
 
-    async def _execution_middleware(request, next_call, **_context):
+    async def _execution_middleware(request, next_call, **context):
         # Request middleware runs after the initial preflight, so its ID is
         # still present here. The dispatch chokepoint must remove the ID that
         # this execution middleware introduces immediately before the API call.
+        assert context["middleware_trace"] == [
+            {"source": "request-middleware"}
+        ]
         assert request["input"][0]["id"] == "request_middleware_id"
         replacement = dict(request)
         replacement["input"] = [
@@ -1779,4 +1782,3 @@ async def test_duplicate_detection_uses_commentary_when_hidden_reasoning_changes
     reasoning_items = interim_msgs[0].get("codex_reasoning_items")
     if reasoning_items:
         assert reasoning_items[0].get("id") == "rs_second"
-
