@@ -898,7 +898,7 @@ def build_anthropic_client(
     return client
 
 
-def build_anthropic_bedrock_client(region: str):
+async def build_anthropic_bedrock_client(region: str):
     """Create an AnthropicBedrock client for Bedrock Claude models.
 
     Uses the Anthropic SDK's native Bedrock adapter, which provides full
@@ -912,18 +912,14 @@ def build_anthropic_bedrock_client(region: str):
     it, Bedrock caps these models at 200K even though the Anthropic API
     serves them with 1M natively.
 
-    Auth uses the boto3 default credential chain (IAM roles, SSO, env vars).
+    Auth credentials are resolved through aiobotocore's async default chain
+    (IAM roles, SSO, environment variables) before client construction.
     """
     _anthropic_sdk = _get_anthropic_sdk()
     if _anthropic_sdk is None:
         raise ImportError(
             "The 'anthropic' package is required for the Bedrock provider. "
             "Install it with: pip install 'anthropic>=0.39.0'"
-        )
-    if not hasattr(_anthropic_sdk, "AnthropicBedrock"):
-        raise ImportError(
-            "anthropic.AnthropicBedrock not available. "
-            "Upgrade with: pip install 'anthropic>=0.39.0'"
         )
     from httpx import Timeout
 
@@ -933,7 +929,21 @@ def build_anthropic_bedrock_client(region: str):
             "The installed 'anthropic' package does not provide "
             "AsyncAnthropicBedrock; upgrade it before using Hermes's async runtime."
         )
-    return client_class(
+    try:
+        from aiobotocore.session import get_session
+    except ImportError as exc:
+        raise ImportError(
+            "The 'aiobotocore' package is required for native-async Bedrock "
+            "credentials. Install async-hermes-agent[bedrock]."
+        ) from exc
+    credentials = await get_session().get_credentials()
+    if credentials is None:
+        raise RuntimeError("could not resolve credentials from AWS session")
+    frozen = await credentials.get_frozen_credentials()
+    client = client_class(
+        aws_access_key=frozen.access_key,
+        aws_secret_key=frozen.secret_key,
+        aws_session_token=frozen.token,
         aws_region=region,
         timeout=Timeout(timeout=900.0, connect=10.0),
         # Delegate retry to hermes's outer loop (honors Retry-After); the SDK
@@ -941,6 +951,8 @@ def build_anthropic_bedrock_client(region: str):
         max_retries=0,
         default_headers={"anthropic-beta": ",".join([*_COMMON_BETAS, _CONTEXT_1M_BETA])},
     )
+    client._hermes_aws_credentials = credentials
+    return client
 
 
 

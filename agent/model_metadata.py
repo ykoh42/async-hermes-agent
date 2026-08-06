@@ -722,9 +722,9 @@ def get_static_context_length(
     )
     if is_bedrock_context:
         try:
-            from agent.bedrock_adapter import get_bedrock_context_length
+            from agent.bedrock_adapter import _static_bedrock_context_length
 
-            return get_bedrock_context_length(model, probe=False)
+            return _static_bedrock_context_length(model)
         except ImportError:
             pass
 
@@ -2578,7 +2578,9 @@ async def get_model_context_length(
             elif is_bedrock_context:
                 try:
                     from agent.bedrock_adapter import get_bedrock_context_length
-                    bedrock_ctx = get_bedrock_context_length(model)
+                    bedrock_ctx = await get_bedrock_context_length(
+                        model, probe=False
+                    )
                     if cached < bedrock_ctx:
                         logger.info(
                             "Dropping stale Bedrock cache entry %s@%s -> %s; "
@@ -2637,13 +2639,16 @@ async def get_model_context_length(
                     region = _m.group(1)
             if not region:
                 try:
-                    region = resolve_bedrock_region()
+                    region = await resolve_bedrock_region()
                 except Exception:
                     region = ""
-            # boto3's control plane is synchronous. Context resolution stays
-            # non-blocking by using the curated provider table; inference is
-            # handled by the provider's native async transport.
-            ctx = get_bedrock_context_length(model, region=region, probe=False)
+            ctx = await get_bedrock_context_length(
+                model,
+                region=region,
+                probe=bool(region),
+            )
+            if ctx and region:
+                await save_context_length(model, cache_key_url, ctx)
             return ctx
 
     if provider == "novita" or (base_url and base_url_host_matches(base_url, "api.novita.ai")):

@@ -24,120 +24,69 @@ Architecture follows the same pattern as ``anthropic_adapter.py``:
 Reference: OpenClaw's ``extensions/amazon-bedrock/`` plugin, which implements
 the same Converse API integration in TypeScript via ``@aws-sdk/client-bedrock``.
 
-Requires: ``boto3`` (optional dependency — only needed when using the Bedrock provider).
+Requires: ``aiobotocore`` (optional dependency — only needed when using the Bedrock provider).
 """
 
+import configparser
 import json
 import logging
 import os
 import re
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
+
+import aiofiles
 
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Lazy boto3 import — only loaded when the Bedrock provider is actually used.
+# Lazy aiobotocore import — only loaded when Bedrock is actually used.
 # This keeps startup fast for users who don't use Bedrock.
 # ---------------------------------------------------------------------------
 
-_bedrock_runtime_client_cache: Dict[str, Any] = {}
-_bedrock_control_client_cache: Dict[str, Any] = {}
-
-
-_MIN_BOTO3_VERSION = (1, 34, 59)
-
-
-def _require_boto3():
-    """Import boto3, raising a clear error if not installed or too old."""
+def _require_aiobotocore():
+    """Import aiobotocore, raising a clear provider-specific install error."""
     try:
-        import boto3
+        from aiobotocore.session import get_session
     except ImportError:
         raise ImportError(
-            "The 'boto3' package is required for the AWS Bedrock provider. "
-            "Install it with: pip install boto3\n"
-            "Or install Hermes with Bedrock support: pip install -e '.[bedrock]'"
+            "The 'aiobotocore' package is required for the AWS Bedrock provider. "
+            "Install Hermes with Bedrock support: pip install 'async-hermes-agent[bedrock]'"
         )
-    # converse() / converse_stream() were added in boto3 1.34.59.
-    # When Hermes is installed editable into system Python, the system boto3
-    # (e.g. Ubuntu 24.04 ships 1.34.46) may take precedence over the venv
-    # version pinned in pyproject.toml.
-    try:
-        version = tuple(int(x) for x in boto3.__version__.split(".")[:3])
-    except (AttributeError, ValueError):
-        return boto3  # can't parse — don't block on version check
-    if version < _MIN_BOTO3_VERSION:
-        raise RuntimeError(
-            f"boto3 {boto3.__version__} does not support converse_stream "
-            f"(minimum 1.34.59 required). Upgrade with: "
-            f"pip install --upgrade boto3"
-        )
-    return boto3
+    return get_session
 
 
 def _get_bedrock_runtime_client(region: str):
-    """Get or create a cached ``bedrock-runtime`` client for the given region.
+    """Create a native-async ``bedrock-runtime`` client context manager.
 
     Uses the default AWS credential chain (env vars → profile → instance role).
     """
-    if region not in _bedrock_runtime_client_cache:
-        boto3 = _require_boto3()
-        _bedrock_runtime_client_cache[region] = boto3.client(
-            "bedrock-runtime", region_name=region,
-        )
-    return _bedrock_runtime_client_cache[region]
+    return _require_aiobotocore()().create_client(
+        "bedrock-runtime", region_name=region
+    )
 
 
 def _get_bedrock_control_client(region: str):
-    """Get or create a cached ``bedrock`` control-plane client for model discovery."""
-    if region not in _bedrock_control_client_cache:
-        boto3 = _require_boto3()
-        _bedrock_control_client_cache[region] = boto3.client(
-            "bedrock", region_name=region,
-        )
-    return _bedrock_control_client_cache[region]
-
-
-def reset_client_cache():
-    """Clear cached boto3 clients. Used in tests and profile switches."""
-    _bedrock_runtime_client_cache.clear()
-    _bedrock_control_client_cache.clear()
-
-
-def invalidate_runtime_client(region: str) -> bool:
-    """Evict the cached ``bedrock-runtime`` client for a single region.
-
-    Per-region counterpart to :func:`reset_client_cache`. Used by the converse
-    call wrappers to discard clients whose underlying HTTP connection has
-    gone stale, so the next call allocates a fresh client (with a fresh
-    connection pool) instead of reusing a dead socket.
-
-    Returns True if a cached entry was evicted, False if the region was not
-    cached.
-    """
-    existed = region in _bedrock_runtime_client_cache
-    _bedrock_runtime_client_cache.pop(region, None)
-    return existed
+    """Create a native-async ``bedrock`` control-plane client context manager."""
+    return _require_aiobotocore()().create_client("bedrock", region_name=region)
 
 
 # ---------------------------------------------------------------------------
 # Stale-connection detection
 # ---------------------------------------------------------------------------
 #
-# boto3 caches its HTTPS connection pool inside the client object. When a
-# pooled connection is killed out from under us (NAT timeout, VPN flap,
-# server-side TCP RST, proxy idle cull, etc.), the next use surfaces as
-# one of a handful of low-level exceptions — most commonly
+# A Bedrock HTTPS connection can be killed out from under a request (NAT
+# timeout, VPN flap, server-side TCP RST, proxy idle cull, etc.). The failed
+# request then surfaces as one of a handful of low-level exceptions — most commonly
 # ``botocore.exceptions.ConnectionClosedError`` or
 # ``urllib3.exceptions.ProtocolError``. urllib3 also trips an internal
 # ``assert`` in a couple of paths (connection pool state checks, chunked
 # response readers) which bubbles up as a bare ``AssertionError`` with an
 # empty ``str(exc)``.
 #
-# In all of these cases the client is the problem, not the request: retrying
-# with the same cached client reproduces the failure until the process
-# restarts. The fix is to evict the region's cached client so the next
-# attempt builds a new one.
+# Each native-async call owns and closes its aiobotocore client context, so an
+# outer retry automatically receives a fresh connection pool.
 
 _STALE_LIB_MODULE_PREFIXES = (
     "urllib3.",
@@ -167,7 +116,7 @@ def is_stale_connection_error(exc: BaseException) -> bool:
         ``ConnectionError`` (best-effort import — urllib3 is a transitive
         dependency of botocore so it is always available in practice).
       * Bare ``AssertionError`` raised from a frame inside urllib3, botocore,
-        or boto3. These are internal-invariant failures (typically triggered
+        or the AWS SDK. These are internal-invariant failures (typically triggered
         by corrupted connection-pool state after a dropped socket) and are
         recoverable by swapping the client.
 
@@ -185,7 +134,7 @@ def is_stale_connection_error(exc: BaseException) -> bool:
             HTTPClientError,
         )
         botocore_errors: tuple = (BotoConnectionError, HTTPClientError)
-    except ImportError:  # pragma: no cover — botocore always present with boto3
+    except ImportError:  # pragma: no cover — botocore is required by aiobotocore
         botocore_errors = ()
     if botocore_errors and isinstance(exc, botocore_errors):
         return True
@@ -226,7 +175,7 @@ def is_streaming_access_denied_error(exc: BaseException) -> bool:
     so callers should flip to the non-streaming ``converse()`` path (which maps
     to ``bedrock:InvokeModel``) instead of burning retries.
 
-    Detection is deliberately message-based: boto3 surfaces this as a
+    Detection is deliberately message-based: the AWS SDK surfaces this as a
     ``ClientError`` with ``Error.Code == "AccessDeniedException"``, and the
     AnthropicBedrock SDK wraps the same AWS response in its own exception
     types, but both preserve the action name in the message.
@@ -237,7 +186,7 @@ def is_streaming_access_denied_error(exc: BaseException) -> bool:
     # ClientError with an explicit access-denied code is the canonical form.
     try:
         from botocore.exceptions import ClientError
-    except ImportError:  # pragma: no cover — botocore always present with boto3
+    except ImportError:  # pragma: no cover — botocore is required by aiobotocore
         ClientError = None  # type: ignore[assignment]
     if ClientError is not None and isinstance(exc, ClientError):
         code = (getattr(exc, "response", None) or {}).get("Error", {}).get("Code", "")
@@ -260,17 +209,19 @@ _AWS_CREDENTIAL_ENV_VARS = [
     "AWS_BEARER_TOKEN_BEDROCK",
     "AWS_ACCESS_KEY_ID",
     "AWS_PROFILE",
-    # These are checked by boto3's default chain but we list them for
+    # These are checked by the AWS SDK's default chain but we list them for
     # has_aws_credentials() detection:
     "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
     "AWS_WEB_IDENTITY_TOKEN_FILE",
 ]
 
 
-def resolve_aws_auth_env_var(env: Optional[Dict[str, str]] = None) -> Optional[str]:
+async def resolve_aws_auth_env_var(
+    env: Optional[Dict[str, str]] = None,
+) -> Optional[str]:
     """Return the name of the AWS auth source that is active, or None.
 
-    Checks environment variables first, then falls back to boto3's credential
+    Checks environment variables first, then falls back to aiobotocore's credential
     chain for implicit sources (EC2 IMDS, ECS task role, etc.).
 
     This mirrors OpenClaw's ``resolveAwsSdkEnvVarName()`` — used to detect
@@ -294,14 +245,13 @@ def resolve_aws_auth_env_var(env: Optional[Dict[str, str]] = None) -> Optional[s
     # Web identity (EKS IRSA)
     if env.get("AWS_WEB_IDENTITY_TOKEN_FILE", "").strip():
         return "AWS_WEB_IDENTITY_TOKEN_FILE"
-    # No env vars — check if boto3 can resolve credentials via IMDS or other
-    # implicit sources (EC2 instance role, ECS task role, Lambda, etc.)
+    # No env vars — check whether the async SDK can resolve an implicit source
+    # such as EC2 IMDS, an ECS task role, or a Lambda execution role.
     try:
-        import botocore.session
-        session = botocore.session.get_session()
-        credentials = session.get_credentials()
+        session = _require_aiobotocore()()
+        credentials = await session.get_credentials()
         if credentials is not None:
-            resolved = credentials.get_frozen_credentials()
+            resolved = await credentials.get_frozen_credentials()
             if resolved and resolved.access_key:
                 return "iam-role"
     except Exception:
@@ -309,47 +259,31 @@ def resolve_aws_auth_env_var(env: Optional[Dict[str, str]] = None) -> Optional[s
     return None
 
 
-def has_aws_credentials(env: Optional[Dict[str, str]] = None) -> bool:
+async def has_aws_credentials(env: Optional[Dict[str, str]] = None) -> bool:
     """Return True if any AWS credential source is detected.
 
-    Checks environment variables first (fast, no I/O), then falls back to
-    boto3's credential chain which covers EC2 instance roles, ECS task roles,
-    Lambda execution roles, and other IMDS-based sources that don't set
-    environment variables.
+    Checks environment variables first (fast, no I/O), then uses aiobotocore's
+    credential chain for EC2 instance roles, ECS task roles, Lambda execution
+    roles, and other IMDS-based sources that don't set environment variables.
 
     This two-tier approach mirrors the pattern from OpenClaw PR #62673:
     cloud environments (EC2, ECS, Lambda) provide credentials via instance
-    metadata, not environment variables. The env-var check is a fast path
-    for local development; the boto3 fallback covers all cloud deployments.
+    metadata, not environment variables. The env-var check is a fast path for
+    local development; the async SDK chain covers cloud deployments.
     """
-    if resolve_aws_auth_env_var(env) is not None:
-        return True
-    # Fall back to boto3's credential resolver — this covers EC2 instance
-    # metadata (IMDS), ECS container credentials, and other implicit sources
-    # that don't set environment variables.
-    try:
-        import botocore.session
-        session = botocore.session.get_session()
-        credentials = session.get_credentials()
-        if credentials is not None:
-            resolved = credentials.get_frozen_credentials()
-            if resolved and resolved.access_key:
-                return True
-    except Exception:
-        pass
-    return False
+    return await resolve_aws_auth_env_var(env) is not None
 
 
-def resolve_bedrock_region(env: Optional[Dict[str, str]] = None) -> str:
+async def resolve_bedrock_region(env: Optional[Dict[str, str]] = None) -> str:
     """Resolve the AWS region for Bedrock API calls.
 
     Priority:
       1. AWS_REGION env var
       2. AWS_DEFAULT_REGION env var
-      3. boto3/botocore configured region (from ~/.aws/config or SSO profile)
+      3. configured region from ~/.aws/config or the selected AWS profile
       4. us-east-1 (hard fallback)
 
-    The boto3 fallback is critical for EU/AP users who configure their region
+    Reading the AWS config is critical for EU/AP users who configure their region
     in ~/.aws/config via a named profile rather than env vars — without it,
     live model discovery would always return us.* profile IDs regardless of
     the user's actual region.
@@ -361,17 +295,25 @@ def resolve_bedrock_region(env: Optional[Dict[str, str]] = None) -> str:
     )
     if explicit:
         return explicit
+    config_path = Path(
+        env.get("AWS_CONFIG_FILE", "").strip() or Path.home() / ".aws" / "config"
+    ).expanduser()
+    profile = env.get("AWS_PROFILE", "").strip() or "default"
+    section = "default" if profile == "default" else f"profile {profile}"
     try:
-        import botocore.session
-        region = botocore.session.get_session().get_config_variable("region")
+        async with aiofiles.open(config_path, encoding="utf-8") as handle:
+            raw_config = await handle.read()
+        parser = configparser.RawConfigParser()
+        parser.read_string(raw_config)
+        region = parser.get(section, "region", fallback="").strip()
         if region:
             return region
-    except Exception:
+    except (OSError, configparser.Error):
         pass
     return "us-east-1"
 
 
-def bedrock_model_ids_or_none() -> Optional[List[str]]:
+async def bedrock_model_ids_or_none() -> Optional[List[str]]:
     """Live-discover Bedrock model IDs for the active region.
 
     Returns a list of model ID strings if discovery succeeds and yields
@@ -383,7 +325,7 @@ def bedrock_model_ids_or_none() -> Optional[List[str]]:
     ``list_authenticated_providers`` section 2, and section 3.
     """
     try:
-        discovered = discover_bedrock_models(resolve_bedrock_region())
+        discovered = await discover_bedrock_models(await resolve_bedrock_region())
         if discovered:
             return [m["id"] for m in discovered]
     except Exception:
@@ -562,7 +504,7 @@ def _convert_content_to_converse(content) -> List[Dict]:
                         mime_part = header[5:].split(";")[0]
                         if mime_part:
                             media_type = mime_part
-                    # Decode base64 to raw bytes — boto3 re-encodes at the
+                    # Decode base64 to raw bytes — the AWS SDK re-encodes at the
                     # wire layer, so passing the base64 string directly
                     # results in double-encoding and Bedrock rejects it with
                     # "Failed to sanitize image".  Ref: #33317.
@@ -813,7 +755,7 @@ def normalize_converse_response(response: Dict) -> SimpleNamespace:
 # Streaming response conversion
 # ---------------------------------------------------------------------------
 
-def normalize_converse_stream_events(event_stream) -> SimpleNamespace:
+async def normalize_converse_stream_events(event_stream) -> SimpleNamespace:
     """Consume a Bedrock ConverseStream event stream and build an OpenAI-compatible response.
 
     Processes the stream events in order:
@@ -826,10 +768,10 @@ def normalize_converse_stream_events(event_stream) -> SimpleNamespace:
 
     Returns the same shape as ``normalize_converse_response()``.
     """
-    return stream_converse_with_callbacks(event_stream)
+    return await stream_converse_with_callbacks(event_stream)
 
 
-def stream_converse_with_callbacks(
+async def stream_converse_with_callbacks(
     event_stream,
     on_text_delta=None,
     on_tool_start=None,
@@ -843,8 +785,8 @@ def stream_converse_with_callbacks(
     display and the gateway's progressive message updates.
 
     Args:
-        event_stream: The boto3 ``converse_stream()`` response containing a
-            ``stream`` key with an iterable of events.
+        event_stream: The aiobotocore ``converse_stream()`` response containing
+            a ``stream`` key with an async iterable of events.
         on_text_delta: Called with each text chunk as it arrives. Only fires
             when no tool_use blocks have been seen (same semantics as the
             Anthropic and chat_completions streaming paths).
@@ -875,7 +817,7 @@ def stream_converse_with_callbacks(
     stop_reason = "end_turn"
     usage_data: Dict[str, int] = {}
 
-    for event in event_stream.get("stream", []):
+    async for event in event_stream.get("stream", []):
         # Wire-level liveness signal: fire on EVERY yielded event (text, tool
         # input, reasoning, metadata) before branching so an external watchdog
         # can tell a still-flowing stream from a wedged one. Best-effort — a
@@ -1076,7 +1018,7 @@ def build_converse_kwargs(
     return kwargs
 
 
-def call_converse(
+async def call_converse(
     region: str,
     model: str,
     messages: List[Dict],
@@ -1091,7 +1033,6 @@ def call_converse(
 
     This is the primary entry point for the agent loop when using the Bedrock provider.
     """
-    client = _get_bedrock_runtime_client(region)
     kwargs = build_converse_kwargs(
         model=model,
         messages=messages,
@@ -1103,21 +1044,23 @@ def call_converse(
         guardrail_config=guardrail_config,
     )
 
-    try:
-        response = client.converse(**kwargs)
-    except Exception as exc:
-        if is_stale_connection_error(exc):
-            logger.warning(
-                "bedrock: stale-connection error on converse(region=%s, model=%s): "
-                "%s — evicting cached client so the next call reconnects.",
-                region, model, type(exc).__name__,
-            )
-            invalidate_runtime_client(region)
-        raise
+    async with _get_bedrock_runtime_client(region) as client:
+        try:
+            response = await client.converse(**kwargs)
+        except Exception as exc:
+            if is_stale_connection_error(exc):
+                logger.warning(
+                    "bedrock: stale-connection error on converse(region=%s, model=%s): "
+                    "%s — the next call will create a fresh client.",
+                    region,
+                    model,
+                    type(exc).__name__,
+                )
+            raise
     return normalize_converse_response(response)
 
 
-def call_converse_stream(
+async def call_converse_stream(
     region: str,
     model: str,
     messages: List[Dict],
@@ -1133,7 +1076,6 @@ def call_converse_stream(
     Consumes the full stream and returns the assembled response. For true
     streaming with delta callbacks, use ``iter_converse_stream()`` instead.
     """
-    client = _get_bedrock_runtime_client(region)
     kwargs = build_converse_kwargs(
         model=model,
         messages=messages,
@@ -1145,28 +1087,30 @@ def call_converse_stream(
         guardrail_config=guardrail_config,
     )
 
-    try:
-        response = client.converse_stream(**kwargs)
-    except Exception as exc:
-        if is_streaming_access_denied_error(exc):
-            # IAM allows bedrock:InvokeModel but not
-            # InvokeModelWithResponseStream — permanent for this session.
-            # Fall back to the non-streaming converse() path.
-            logger.info(
-                "bedrock: converse_stream denied by IAM on (region=%s, model=%s) — "
-                "falling back to non-streaming converse().",
-                region, model,
-            )
-            return normalize_converse_response(client.converse(**kwargs))
-        if is_stale_connection_error(exc):
-            logger.warning(
-                "bedrock: stale-connection error on converse_stream(region=%s, "
-                "model=%s): %s — evicting cached client so the next call reconnects.",
-                region, model, type(exc).__name__,
-            )
-            invalidate_runtime_client(region)
-        raise
-    return normalize_converse_stream_events(response)
+    async with _get_bedrock_runtime_client(region) as client:
+        try:
+            response = await client.converse_stream(**kwargs)
+        except Exception as exc:
+            if is_streaming_access_denied_error(exc):
+                # IAM allows bedrock:InvokeModel but not
+                # InvokeModelWithResponseStream — permanent for this request.
+                logger.info(
+                    "bedrock: converse_stream denied by IAM on (region=%s, model=%s) — "
+                    "falling back to non-streaming converse().",
+                    region,
+                    model,
+                )
+                return normalize_converse_response(await client.converse(**kwargs))
+            if is_stale_connection_error(exc):
+                logger.warning(
+                    "bedrock: stale-connection error on converse_stream(region=%s, "
+                    "model=%s): %s — the next call will create a fresh client.",
+                    region,
+                    model,
+                    type(exc).__name__,
+                )
+            raise
+        return await normalize_converse_stream_events(response)
 
 
 # ---------------------------------------------------------------------------
@@ -1182,7 +1126,7 @@ def reset_discovery_cache():
     _discovery_cache.clear()
 
 
-def discover_bedrock_models(
+async def discover_bedrock_models(
     region: str,
     provider_filter: Optional[List[str]] = None,
 ) -> List[Dict[str, Any]]:
@@ -1208,105 +1152,101 @@ def discover_bedrock_models(
     if cached and (time.time() - cached["timestamp"]) < _DISCOVERY_CACHE_TTL_SECONDS:
         return cached["models"]
 
-    try:
-        client = _get_bedrock_control_client(region)
-    except Exception as e:
-        logger.warning("Failed to create Bedrock client for model discovery: %s", e)
-        return []
-
     models = []
     seen_ids = set()
     filter_set = {f.lower() for f in (provider_filter or [])}
-
-    # 1. Discover foundation models
     try:
-        response = client.list_foundation_models()
-        for summary in response.get("modelSummaries", []):
-            model_id = (summary.get("modelId") or "").strip()
-            if not model_id:
-                continue
+        async with _get_bedrock_control_client(region) as client:
+            # 1. Discover foundation models
+            try:
+                response = await client.list_foundation_models()
+                for summary in response.get("modelSummaries", []):
+                    model_id = (summary.get("modelId") or "").strip()
+                    if not model_id:
+                        continue
+                    if filter_set:
+                        provider_name = (summary.get("providerName") or "").lower()
+                        model_prefix = (
+                            model_id.split(".")[0].lower() if "." in model_id else ""
+                        )
+                        if (
+                            provider_name not in filter_set
+                            and model_prefix not in filter_set
+                        ):
+                            continue
+                    lifecycle = summary.get("modelLifecycle", {})
+                    if lifecycle.get("status", "").upper() != "ACTIVE":
+                        continue
+                    if not summary.get("responseStreamingSupported", False):
+                        continue
+                    output_mods = summary.get("outputModalities", [])
+                    if "TEXT" not in output_mods:
+                        continue
+                    models.append(
+                        {
+                            "id": model_id,
+                            "name": (summary.get("modelName") or model_id).strip(),
+                            "provider": (summary.get("providerName") or "").strip(),
+                            "input_modalities": summary.get("inputModalities", []),
+                            "output_modalities": output_mods,
+                            "streaming": True,
+                        }
+                    )
+                    seen_ids.add(model_id.lower())
+            except Exception as exc:
+                logger.warning("Failed to list Bedrock foundation models: %s", exc)
 
-            # Apply provider filter
-            if filter_set:
-                provider_name = (summary.get("providerName") or "").lower()
-                model_prefix = model_id.split(".")[0].lower() if "." in model_id else ""
-                if provider_name not in filter_set and model_prefix not in filter_set:
-                    continue
+            # 2. Discover inference profiles (cross-region, better capacity)
+            try:
+                profiles = []
+                next_token = None
+                while True:
+                    kwargs = {"nextToken": next_token} if next_token else {}
+                    response = await client.list_inference_profiles(**kwargs)
+                    profiles.extend(response.get("inferenceProfileSummaries", []))
+                    next_token = response.get("nextToken")
+                    if not next_token:
+                        break
 
-            # Only include active, streaming-capable, text-output models
-            lifecycle = summary.get("modelLifecycle", {})
-            if lifecycle.get("status", "").upper() != "ACTIVE":
-                continue
-            if not summary.get("responseStreamingSupported", False):
-                continue
-            output_mods = summary.get("outputModalities", [])
-            if "TEXT" not in output_mods:
-                continue
+                for profile in profiles:
+                    profile_id = (profile.get("inferenceProfileId") or "").strip()
+                    if not profile_id or profile.get("status") != "ACTIVE":
+                        continue
+                    if profile_id.lower() in seen_ids:
+                        continue
+                    if filter_set:
+                        matches = any(
+                            _extract_provider_from_arn(model.get("modelArn", "")).lower()
+                            in filter_set
+                            for model in profile.get("models", [])
+                        )
+                        if not matches:
+                            continue
+                    models.append(
+                        {
+                            "id": profile_id,
+                            "name": (
+                                profile.get("inferenceProfileName") or profile_id
+                            ).strip(),
+                            "provider": "inference-profile",
+                            "input_modalities": ["TEXT"],
+                            "output_modalities": ["TEXT"],
+                            "streaming": True,
+                        }
+                    )
+                    seen_ids.add(profile_id.lower())
+            except Exception as exc:
+                logger.debug("Skipping inference profile discovery: %s", exc)
+    except Exception as exc:
+        logger.warning("Failed to create Bedrock client for model discovery: %s", exc)
+        return []
 
-            models.append({
-                "id": model_id,
-                "name": (summary.get("modelName") or model_id).strip(),
-                "provider": (summary.get("providerName") or "").strip(),
-                "input_modalities": summary.get("inputModalities", []),
-                "output_modalities": output_mods,
-                "streaming": True,
-            })
-            seen_ids.add(model_id.lower())
-    except Exception as e:
-        logger.warning("Failed to list Bedrock foundation models: %s", e)
-
-    # 2. Discover inference profiles (cross-region, better capacity)
-    try:
-        profiles = []
-        next_token = None
-        while True:
-            kwargs = {}
-            if next_token:
-                kwargs["nextToken"] = next_token
-            response = client.list_inference_profiles(**kwargs)
-            for profile in response.get("inferenceProfileSummaries", []):
-                profiles.append(profile)
-            next_token = response.get("nextToken")
-            if not next_token:
-                break
-
-        for profile in profiles:
-            profile_id = (profile.get("inferenceProfileId") or "").strip()
-            if not profile_id:
-                continue
-            if profile.get("status") != "ACTIVE":
-                continue
-            if profile_id.lower() in seen_ids:
-                continue
-
-            # Apply provider filter to underlying models
-            if filter_set:
-                profile_models = profile.get("models", [])
-                matches = any(
-                    _extract_provider_from_arn(m.get("modelArn", "")).lower() in filter_set
-                    for m in profile_models
-                )
-                if not matches:
-                    continue
-
-            models.append({
-                "id": profile_id,
-                "name": (profile.get("inferenceProfileName") or profile_id).strip(),
-                "provider": "inference-profile",
-                "input_modalities": ["TEXT"],
-                "output_modalities": ["TEXT"],
-                "streaming": True,
-            })
-            seen_ids.add(profile_id.lower())
-    except Exception as e:
-        logger.debug("Skipping inference profile discovery: %s", e)
-
-    # Sort: global cross-region profiles first (recommended), then alphabetical
-    models.sort(key=lambda m: (
-        0 if m["id"].startswith("global.") else 1,
-        m["name"].lower(),
-    ))
-
+    models.sort(
+        key=lambda model: (
+            0 if model["id"].startswith("global.") else 1,
+            model["name"].lower(),
+        )
+    )
     _discovery_cache[cache_key] = {
         "timestamp": time.time(),
         "models": models,
@@ -1460,7 +1400,9 @@ def _static_bedrock_context_length(model_id: str) -> int:
     return best_val
 
 
-def probe_bedrock_context_length(model_id: str, region: str) -> Optional[int]:
+async def probe_bedrock_context_length(
+    model_id: str, region: str
+) -> Optional[int]:
     """Discover a Bedrock model's real context window by provoking a length error.
 
     Bedrock does not expose the context window via any metadata API
@@ -1489,44 +1431,44 @@ def probe_bedrock_context_length(model_id: str, region: str) -> Optional[int]:
     except ImportError:  # pragma: no cover — same package
         return None
 
+    last_error = ""
     try:
-        client = _get_bedrock_runtime_client(region)
-    except Exception as exc:  # boto3 missing / credential resolution failure
+        async with _get_bedrock_runtime_client(region) as client:
+            for tier_tokens in _BEDROCK_PROBE_TIERS:
+                pad_words = int(tier_tokens / _WORDS_PER_TOKEN)
+                oversized = "data " * pad_words
+                try:
+                    await client.converse(
+                        modelId=model_id,
+                        messages=[
+                            {
+                                "role": "user",
+                                "content": [{"text": oversized}],
+                            }
+                        ],
+                        inferenceConfig={"maxTokens": 8},
+                    )
+                    logger.debug(
+                        "Bedrock context probe for %s accepted ~%s-token prompt; "
+                        "window is at least that",
+                        model_id,
+                        f"{tier_tokens:,}",
+                    )
+                    return tier_tokens
+                except Exception as exc:
+                    msg = str(exc)
+                    last_error = msg
+                    limit = parse_context_limit_from_error(msg)
+                    if limit and limit >= 1024:
+                        logger.info(
+                            "Probed Bedrock context window for %s: %s tokens",
+                            model_id,
+                            f"{limit:,}",
+                        )
+                        return limit
+    except Exception as exc:
         logger.debug("Bedrock context probe skipped for %s: %s", model_id, exc)
         return None
-
-    last_error = ""
-    for tier_tokens in _BEDROCK_PROBE_TIERS:
-        pad_words = int(tier_tokens / _WORDS_PER_TOKEN)
-        oversized = "data " * pad_words
-        try:
-            client.converse(
-                modelId=model_id,
-                messages=[{"role": "user", "content": [{"text": oversized}]}],
-                inferenceConfig={"maxTokens": 8},
-            )
-            # Accepted a prompt this large → the window is at least this tier.
-            # Returning the tier as a lower bound is safe and avoids inventing
-            # a number we can't confirm.
-            logger.debug(
-                "Bedrock context probe for %s accepted ~%s-token prompt; "
-                "window is at least that", model_id, f"{tier_tokens:,}",
-            )
-            return tier_tokens
-        except Exception as exc:
-            msg = str(exc)
-            last_error = msg
-            limit = parse_context_limit_from_error(msg)
-            if limit and limit >= 1024:
-                logger.info(
-                    "Probed Bedrock context window for %s: %s tokens",
-                    model_id, f"{limit:,}",
-                )
-                return limit
-            # No parseable limit at this tier (opaque server error, auth,
-            # throttle).  Try the next, smaller-overage strategy is N/A here —
-            # tiers ascend — so just continue; if all fail we return None.
-            continue
 
     logger.debug(
         "Bedrock context probe for %s returned no parseable limit: %s",
@@ -1535,7 +1477,9 @@ def probe_bedrock_context_length(model_id: str, region: str) -> Optional[int]:
     return None
 
 
-def get_bedrock_context_length(model_id: str, region: str = "", probe: bool = True) -> int:
+async def get_bedrock_context_length(
+    model_id: str, region: str = "", probe: bool = True
+) -> int:
     """Resolve the context window for a Bedrock model.
 
     Resolution order:
@@ -1554,7 +1498,7 @@ def get_bedrock_context_length(model_id: str, region: str = "", probe: bool = Tr
     the static table only — used by pure-offline/display code paths.
     """
     if probe and region:
-        probed = probe_bedrock_context_length(model_id, region)
+        probed = await probe_bedrock_context_length(model_id, region)
         if probed:
             return probed
     return _static_bedrock_context_length(model_id)

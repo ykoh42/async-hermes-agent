@@ -1454,7 +1454,7 @@ def init_agent(
         if not agent.quiet_mode:
             print(f"🤖 AI Agent initialized with MoA preset: {agent.model} (native async)")
     elif agent.api_mode == "bedrock_converse":
-        # AWS Bedrock — uses boto3 directly, no OpenAI client needed.
+        # AWS Bedrock Converse uses aiobotocore directly; no OpenAI client is needed.
         # Region is extracted from the base_url or defaults to us-east-1.
         _region_match = re.search(r"bedrock-runtime\.([a-z0-9-]+)\.", base_url or "")
         agent._bedrock_region = _region_match.group(1) if _region_match else "us-east-1"
@@ -2973,6 +2973,26 @@ async def initialize_deferred_runtime(agent: Any) -> bool:
                     break
                 unavailable.append("Vertex OAuth2 credentials")
                 continue
+            if provider == "bedrock":
+                from hermes_cli.runtime_provider import resolve_runtime_provider
+
+                bedrock_runtime = await resolve_runtime_provider(
+                    requested="bedrock",
+                    target_model=model,
+                )
+                pending["api_mode"] = bedrock_runtime["api_mode"]
+                pending["region"] = bedrock_runtime["region"]
+                pending["guardrail_config"] = bedrock_runtime.get(
+                    "guardrail_config"
+                )
+                resolved = (
+                    provider,
+                    bedrock_runtime["api_key"],
+                    bedrock_runtime["base_url"],
+                    None,
+                    None,
+                )
+                break
             try:
                 pool = await load_pool(provider)
                 entry = await pool.select()
@@ -3058,10 +3078,6 @@ async def initialize_deferred_runtime(agent: Any) -> bool:
             )
 
         provider, api_key, base_url, pool, entry = resolved
-        if str(pending.get("api_mode") or "") == "bedrock_converse" or provider == "bedrock":
-            raise UnsupportedCapabilityError(
-                "Bedrock has no native async transport in async-hermes-agent yet."
-            )
         if provider == "lmstudio" and (
             getattr(agent, "lmstudio_load_mode", "explicit") or "explicit"
         ).strip().lower() != "jit":
@@ -3106,6 +3122,14 @@ async def initialize_deferred_runtime(agent: Any) -> bool:
         agent.model = model
         agent.api_key = api_key
         agent.base_url = base_url.rstrip("/")
+        if provider == "bedrock":
+            agent._bedrock_region = str(
+                pending.get("region")
+                or getattr(agent, "_bedrock_region", None)
+                or "us-east-1"
+            )
+            if pending.get("guardrail_config") is not None:
+                agent._bedrock_guardrail_config = pending["guardrail_config"]
 
         # Configuration is file-backed and therefore belongs to this first
         # await boundary, never ``AIAgent.__init__``.  Keep the resulting
@@ -3251,6 +3275,29 @@ async def initialize_deferred_runtime(agent: Any) -> bool:
                 "command": command,
                 "args": list(args or []),
             }
+            agent._anthropic_client = None
+            agent._anthropic_client_source = None
+        elif provider == "bedrock" and agent.api_mode == "anthropic_messages":
+            from agent.anthropic_adapter import build_anthropic_bedrock_client
+
+            agent._anthropic_api_key = "aws-sdk"
+            agent._anthropic_base_url = agent.base_url
+            agent._anthropic_client = await build_anthropic_bedrock_client(
+                agent._bedrock_region
+            )
+            agent._anthropic_client_source = (
+                "aws-sdk",
+                agent.base_url,
+                False,
+            )
+            agent._is_anthropic_oauth = False
+            agent.client = None
+            agent._client_kwargs = {}
+        elif agent.api_mode == "bedrock_converse":
+            # aiobotocore clients are opened and closed around each awaited
+            # Converse request; no synchronous SDK client lives on the agent.
+            agent.client = None
+            agent._client_kwargs = {}
             agent._anthropic_client = None
             agent._anthropic_client_source = None
         elif agent.api_mode == "anthropic_messages":

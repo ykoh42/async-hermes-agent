@@ -1310,6 +1310,15 @@ class _AnthropicCompletionsAdapter:
         from agent.anthropic_adapter import build_anthropic_kwargs, create_anthropic_message
         from agent.transports import get_transport
 
+        credentials = getattr(self._client, "__dict__", {}).get(
+            "_hermes_aws_credentials"
+        )
+        if credentials is not None:
+            frozen = await credentials.get_frozen_credentials()
+            self._client.aws_access_key = frozen.access_key
+            self._client.aws_secret_key = frozen.secret_key
+            self._client.aws_session_token = frozen.token
+
         messages = kwargs.get("messages", [])
         model = kwargs.get("model", self._model)
         tools = kwargs.get("tools")
@@ -1487,10 +1496,23 @@ class _BedrockCompletionsAdapter:
         self._model = model
 
     async def create(self, **kwargs) -> Any:
-        raise RuntimeError(
-            "AWS Bedrock Converse auxiliary calls require a native async "
-            "transport; the blocking boto3 adapter is disabled in Hermes's "
-            "async runtime."
+        from agent.bedrock_adapter import call_converse
+
+        stop = kwargs.get("stop")
+        if isinstance(stop, str):
+            stop = [stop]
+        max_tokens = kwargs.get("max_tokens") or kwargs.get(
+            "max_completion_tokens"
+        )
+        return await call_converse(
+            region=self._region,
+            model=kwargs.get("model", self._model),
+            messages=kwargs.get("messages", []),
+            tools=kwargs.get("tools"),
+            max_tokens=int(max_tokens) if max_tokens else 4096,
+            temperature=kwargs.get("temperature"),
+            top_p=kwargs.get("top_p"),
+            stop_sequences=stop,
         )
 
 
@@ -5342,13 +5364,41 @@ async def resolve_provider_client(
         return client, final_model
 
     elif pconfig.auth_type == "aws_sdk":
-        from agent.agent_runtime_helpers import UnsupportedCapabilityError
-
-        raise UnsupportedCapabilityError(
-            "AWS Bedrock currently uses boto3/Anthropic sync transport paths "
-            "and is disabled in async-hermes-agent until a native async "
-            "implementation is available."
+        from agent.anthropic_adapter import build_anthropic_bedrock_client
+        from agent.bedrock_adapter import (
+            has_aws_credentials,
+            is_anthropic_bedrock_model,
+            resolve_bedrock_region,
         )
+
+        if not await has_aws_credentials():
+            logger.debug(
+                "resolve_provider_client: bedrock requested but no AWS credentials found"
+            )
+            return None, None
+        region = await resolve_bedrock_region()
+        default_model = "anthropic.claude-haiku-4-5-20251001-v1:0"
+        final_model = _normalize_resolved_model(
+            model or default_model,
+            provider,
+        )
+        base_url = f"https://bedrock-runtime.{region}.amazonaws.com"
+        if is_anthropic_bedrock_model(final_model) and not os.environ.get(
+            "AWS_BEARER_TOKEN_BEDROCK", ""
+        ).strip():
+            real_client = await build_anthropic_bedrock_client(region)
+            client = AnthropicAuxiliaryClient(
+                real_client,
+                final_model,
+                api_key="aws-sdk",
+                base_url=base_url,
+            )
+        else:
+            client = BedrockAuxiliaryClient(region, final_model)
+        logger.debug(
+            "resolve_provider_client: bedrock (%s, %s)", final_model, region
+        )
+        return client, final_model
 
     elif pconfig.auth_type in {"oauth_device_code", "oauth_external"}:
         # OAuth providers — route through their specific try functions

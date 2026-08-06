@@ -10,22 +10,39 @@ Covers:
 """
 
 import json
-from contextlib import contextmanager
-from types import ModuleType
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 
-@contextmanager
-def _mock_botocore_session(*, return_value=None, side_effect=None):
-    """Patch botocore.session even when botocore is not installed."""
-    botocore_mod = ModuleType("botocore")
-    session_mod = ModuleType("botocore.session")
-    session_mod.get_session = MagicMock(return_value=return_value, side_effect=side_effect)
-    botocore_mod.session = session_mod
-    with patch.dict("sys.modules", {"botocore": botocore_mod, "botocore.session": session_mod}):
-        yield session_mod.get_session
+class _AsyncContext:
+    def __init__(self, value):
+        self.value = value
+        self.exited = False
+
+    async def __aenter__(self):
+        return self.value
+
+    async def __aexit__(self, *_exc):
+        self.exited = True
+        return False
+
+
+class _AsyncEvents:
+    def __init__(self, events):
+        self.events = list(events)
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if not self.events:
+            raise StopAsyncIteration
+        return self.events.pop(0)
+
+
+def _async_stream(events):
+    return {"stream": _AsyncEvents(events["stream"])}
 
 
 # ---------------------------------------------------------------------------
@@ -40,56 +57,63 @@ class TestResolveAwsAuthEnvVar:
 
 
 
-    def test_requires_both_access_key_and_secret(self):
+    @pytest.mark.asyncio
+    async def test_requires_both_access_key_and_secret(self):
         from agent.bedrock_adapter import resolve_aws_auth_env_var
         # Only access key, no secret → should not match
         env = {"AWS_ACCESS_KEY_ID": "AKIA..."}
-        assert resolve_aws_auth_env_var(env) != "AWS_ACCESS_KEY_ID"
+        session = MagicMock(get_credentials=AsyncMock(return_value=None))
+        with patch(
+            "agent.bedrock_adapter._require_aiobotocore",
+            return_value=lambda: session,
+        ):
+            assert await resolve_aws_auth_env_var(env) != "AWS_ACCESS_KEY_ID"
 
 
 
 
-    def test_returns_none_when_no_aws_auth(self):
+    @pytest.mark.asyncio
+    async def test_returns_none_when_no_aws_auth(self):
         from agent.bedrock_adapter import resolve_aws_auth_env_var
-        # Mock botocore to return no credentials (covers EC2 IMDS fallback)
-        mock_session = MagicMock()
-        mock_session.get_credentials.return_value = None
-        with patch.dict("sys.modules", {"botocore": MagicMock(), "botocore.session": MagicMock()}):
-            import botocore.session as _bs
-            _bs.get_session = MagicMock(return_value=mock_session)
-            assert resolve_aws_auth_env_var({}) is None
+        session = MagicMock(get_credentials=AsyncMock(return_value=None))
+        with patch(
+            "agent.bedrock_adapter._require_aiobotocore",
+            return_value=lambda: session,
+        ):
+            assert await resolve_aws_auth_env_var({}) is None
 
 
 
 class TestHasAwsCredentials:
-    def test_true_with_profile(self):
+    @pytest.mark.asyncio
+    async def test_true_with_profile(self):
         from agent.bedrock_adapter import has_aws_credentials
-        assert has_aws_credentials({"AWS_PROFILE": "default"}) is True
+        assert await has_aws_credentials({"AWS_PROFILE": "default"}) is True
 
-    def test_false_with_empty_env(self):
+    @pytest.mark.asyncio
+    async def test_false_with_empty_env(self):
         from agent.bedrock_adapter import has_aws_credentials
-        mock_session = MagicMock()
-        mock_session.get_credentials.return_value = None
-        with patch.dict("sys.modules", {"botocore": MagicMock(), "botocore.session": MagicMock()}):
-            import botocore.session as _bs
-            _bs.get_session = MagicMock(return_value=mock_session)
-            assert has_aws_credentials({}) is False
+        session = MagicMock(get_credentials=AsyncMock(return_value=None))
+        with patch(
+            "agent.bedrock_adapter._require_aiobotocore",
+            return_value=lambda: session,
+        ):
+            assert await has_aws_credentials({}) is False
 
 
 class TestResolveBedrocRegion:
-    def test_prefers_aws_region(self):
+    @pytest.mark.asyncio
+    async def test_prefers_aws_region(self):
         from agent.bedrock_adapter import resolve_bedrock_region
         env = {"AWS_REGION": "eu-west-1", "AWS_DEFAULT_REGION": "us-west-2"}
-        assert resolve_bedrock_region(env) == "eu-west-1"
+        assert await resolve_bedrock_region(env) == "eu-west-1"
 
 
-    def test_defaults_to_us_east_1(self):
+    @pytest.mark.asyncio
+    async def test_defaults_to_us_east_1(self, tmp_path):
         from agent.bedrock_adapter import resolve_bedrock_region
-        from unittest.mock import MagicMock
-        mock_session = MagicMock()
-        mock_session.get_config_variable.return_value = None
-        with _mock_botocore_session(return_value=mock_session):
-            assert resolve_bedrock_region({}) == "us-east-1"
+        env = {"AWS_CONFIG_FILE": str(tmp_path / "missing-config")}
+        assert await resolve_bedrock_region(env) == "us-east-1"
 
 
 
@@ -309,7 +333,8 @@ class TestNormalizeConverseResponse:
 class TestNormalizeConverseStreamEvents:
     """Test Bedrock ConverseStream event → OpenAI format conversion."""
 
-    def test_text_stream(self):
+    @pytest.mark.asyncio
+    async def test_text_stream(self):
         from agent.bedrock_adapter import normalize_converse_stream_events
         events = {"stream": [
             {"messageStart": {"role": "assistant"}},
@@ -320,13 +345,14 @@ class TestNormalizeConverseStreamEvents:
             {"messageStop": {"stopReason": "end_turn"}},
             {"metadata": {"usage": {"inputTokens": 5, "outputTokens": 3}}},
         ]}
-        result = normalize_converse_stream_events(events)
+        result = await normalize_converse_stream_events(_async_stream(events))
         assert result.choices[0].message.content == "Hello, world!"
         assert result.choices[0].finish_reason == "stop"
         assert result.usage.prompt_tokens == 5
         assert result.usage.completion_tokens == 3
 
-    def test_tool_use_stream(self):
+    @pytest.mark.asyncio
+    async def test_tool_use_stream(self):
         from agent.bedrock_adapter import normalize_converse_stream_events
         events = {"stream": [
             {"messageStart": {"role": "assistant"}},
@@ -343,7 +369,7 @@ class TestNormalizeConverseStreamEvents:
             {"messageStop": {"stopReason": "tool_use"}},
             {"metadata": {"usage": {"inputTokens": 10, "outputTokens": 8}}},
         ]}
-        result = normalize_converse_stream_events(events)
+        result = await normalize_converse_stream_events(_async_stream(events))
         assert result.choices[0].finish_reason == "tool_calls"
         tc = result.choices[0].message.tool_calls
         assert len(tc) == 1
@@ -447,12 +473,13 @@ class TestDiscoverBedrockModels:
 
 
 
-    def test_provider_filter(self):
+    @pytest.mark.asyncio
+    async def test_provider_filter(self):
         from agent.bedrock_adapter import discover_bedrock_models, reset_discovery_cache
         reset_discovery_cache()
 
         mock_client = MagicMock()
-        mock_client.list_foundation_models.return_value = {
+        mock_client.list_foundation_models = AsyncMock(return_value={
             "modelSummaries": [
                 {
                     "modelId": "anthropic.claude-v2",
@@ -473,21 +500,29 @@ class TestDiscoverBedrockModels:
                     "modelLifecycle": {"status": "ACTIVE"},
                 },
             ],
-        }
-        mock_client.list_inference_profiles.return_value = {"inferenceProfileSummaries": []}
+        })
+        mock_client.list_inference_profiles = AsyncMock(
+            return_value={"inferenceProfileSummaries": []}
+        )
 
-        with patch("agent.bedrock_adapter._get_bedrock_control_client", return_value=mock_client):
-            models = discover_bedrock_models("us-east-1", provider_filter=["anthropic"])
+        with patch(
+            "agent.bedrock_adapter._get_bedrock_control_client",
+            return_value=_AsyncContext(mock_client),
+        ):
+            models = await discover_bedrock_models(
+                "us-east-1", provider_filter=["anthropic"]
+            )
 
         assert len(models) == 1
         assert models[0]["id"] == "anthropic.claude-v2"
 
-    def test_caches_results(self):
+    @pytest.mark.asyncio
+    async def test_caches_results(self):
         from agent.bedrock_adapter import discover_bedrock_models, reset_discovery_cache
         reset_discovery_cache()
 
         mock_client = MagicMock()
-        mock_client.list_foundation_models.return_value = {
+        mock_client.list_foundation_models = AsyncMock(return_value={
             "modelSummaries": [{
                 "modelId": "test-model",
                 "modelName": "Test",
@@ -497,12 +532,17 @@ class TestDiscoverBedrockModels:
                 "responseStreamingSupported": True,
                 "modelLifecycle": {"status": "ACTIVE"},
             }],
-        }
-        mock_client.list_inference_profiles.return_value = {"inferenceProfileSummaries": []}
+        })
+        mock_client.list_inference_profiles = AsyncMock(
+            return_value={"inferenceProfileSummaries": []}
+        )
 
-        with patch("agent.bedrock_adapter._get_bedrock_control_client", return_value=mock_client):
-            first = discover_bedrock_models("us-east-1")
-            second = discover_bedrock_models("us-east-1")
+        with patch(
+            "agent.bedrock_adapter._get_bedrock_control_client",
+            return_value=_AsyncContext(mock_client),
+        ):
+            first = await discover_bedrock_models("us-east-1")
+            second = await discover_bedrock_models("us-east-1")
 
         # Should only call the API once (second call uses cache)
         assert mock_client.list_foundation_models.call_count == 1
@@ -510,12 +550,13 @@ class TestDiscoverBedrockModels:
 
 
 
-    def test_handles_api_error_gracefully(self):
+    @pytest.mark.asyncio
+    async def test_handles_api_error_gracefully(self):
         from agent.bedrock_adapter import discover_bedrock_models, reset_discovery_cache
         reset_discovery_cache()
 
         with patch("agent.bedrock_adapter._get_bedrock_control_client", side_effect=Exception("No creds")):
-            models = discover_bedrock_models("us-east-1")
+            models = await discover_bedrock_models("us-east-1")
 
         assert models == []
 
@@ -534,31 +575,14 @@ class TestExtractProviderFromArn:
 
 
 # ---------------------------------------------------------------------------
-# Client cache management
-# ---------------------------------------------------------------------------
-
-class TestClientCache:
-    def test_reset_clears_caches(self):
-        from agent.bedrock_adapter import (
-            _bedrock_runtime_client_cache,
-            _bedrock_control_client_cache,
-            reset_client_cache,
-        )
-        _bedrock_runtime_client_cache["test"] = "dummy"
-        _bedrock_control_client_cache["test"] = "dummy"
-        reset_client_cache()
-        assert len(_bedrock_runtime_client_cache) == 0
-        assert len(_bedrock_control_client_cache) == 0
-
-
-# ---------------------------------------------------------------------------
 # Streaming with callbacks
 # ---------------------------------------------------------------------------
 
 class TestStreamConverseWithCallbacks:
     """Test real-time streaming with delta callbacks."""
 
-    def test_cache_tokens_folded_into_prompt_tokens(self):
+    @pytest.mark.asyncio
+    async def test_cache_tokens_folded_into_prompt_tokens(self):
         """The streaming path must fold cacheRead/WriteInputTokens into
         prompt_tokens the same way the non-streaming path does (see
         TestNormalizeConverseResponse.test_cache_tokens_folded_into_prompt_tokens)."""
@@ -576,14 +600,15 @@ class TestStreamConverseWithCallbacks:
                 "cacheWriteInputTokens": 300,
             }}},
         ]}
-        result = stream_converse_with_callbacks(events)
+        result = await stream_converse_with_callbacks(_async_stream(events))
         assert result.usage.prompt_tokens == 50 + 900 + 300
         assert result.usage.total_tokens == 50 + 900 + 300 + 20
         assert result.usage.cache_read_input_tokens == 900
         assert result.usage.cache_creation_input_tokens == 300
 
 
-    def test_text_deltas_suppressed_when_tool_use_present(self):
+    @pytest.mark.asyncio
+    async def test_text_deltas_suppressed_when_tool_use_present(self):
         """Text deltas should NOT fire when tool_use blocks are present."""
         from agent.bedrock_adapter import stream_converse_with_callbacks
         deltas = []
@@ -602,8 +627,8 @@ class TestStreamConverseWithCallbacks:
             {"messageStop": {"stopReason": "tool_use"}},
             {"metadata": {"usage": {"inputTokens": 0, "outputTokens": 0}}},
         ]}
-        result = stream_converse_with_callbacks(
-            events, on_text_delta=lambda t: deltas.append(t),
+        result = await stream_converse_with_callbacks(
+            _async_stream(events), on_text_delta=lambda t: deltas.append(t),
         )
         # Text delta for "Let me check." should fire (before tool_use was seen)
         assert "Let me check." in deltas
@@ -691,19 +716,21 @@ class TestBedrockContextLength:
 
 
 
-    def test_unknown_model_gets_default(self):
+    @pytest.mark.asyncio
+    async def test_unknown_model_gets_default(self):
         from agent.bedrock_adapter import get_bedrock_context_length, BEDROCK_DEFAULT_CONTEXT_LENGTH
-        assert get_bedrock_context_length("unknown.model-v1:0") == BEDROCK_DEFAULT_CONTEXT_LENGTH
+        assert await get_bedrock_context_length("unknown.model-v1:0") == BEDROCK_DEFAULT_CONTEXT_LENGTH
 
 
 
-    def test_no_region_skips_probe_uses_table(self):
+    @pytest.mark.asyncio
+    async def test_no_region_skips_probe_uses_table(self):
         # Default call (no region) must NOT hit the network — returns the
         # static table value.  Guards backward compatibility for callers that
         # still invoke get_bedrock_context_length(model_id) with one arg.
         from agent.bedrock_adapter import get_bedrock_context_length
         with patch("agent.bedrock_adapter.probe_bedrock_context_length") as mock_probe:
-            assert get_bedrock_context_length("anthropic.claude-opus-4-6") == 1_000_000
+            assert await get_bedrock_context_length("anthropic.claude-opus-4-6") == 1_000_000
             mock_probe.assert_not_called()
 
 
@@ -713,25 +740,27 @@ class TestBedrockContextProbe:
 
     def _client_raising(self, message):
         client = MagicMock()
-        client.converse.side_effect = Exception(message)
-        return client
+        client.converse = AsyncMock(side_effect=Exception(message))
+        return _AsyncContext(client)
 
 
 
-    def test_probe_returns_none_when_client_unavailable(self):
+    @pytest.mark.asyncio
+    async def test_probe_returns_none_when_client_unavailable(self):
         from agent.bedrock_adapter import probe_bedrock_context_length
         with patch("agent.bedrock_adapter._get_bedrock_runtime_client",
-                   side_effect=RuntimeError("boto3 missing")):
-            assert probe_bedrock_context_length("any.model", "eu-central-1") is None
+                   side_effect=RuntimeError("aiobotocore missing")):
+            assert await probe_bedrock_context_length("any.model", "eu-central-1") is None
 
-    def test_probe_result_beats_static_table(self):
+    @pytest.mark.asyncio
+    async def test_probe_result_beats_static_table(self):
         # A successful probe (1M) must override the stale table value (200K
         # via the 'anthropic.claude-opus-4' substring match).
         from agent.bedrock_adapter import get_bedrock_context_length
         err = "prompt is too long: 5000032 tokens > 1000000 maximum"
         with patch("agent.bedrock_adapter._get_bedrock_runtime_client",
                    return_value=self._client_raising(err)):
-            assert get_bedrock_context_length(
+            assert await get_bedrock_context_length(
                 "eu.anthropic.claude-opus-4-8",
                 region="eu-central-1") == 1_000_000
 
@@ -834,34 +863,8 @@ class TestEmptyTextBlockFix:
 
 
 # ---------------------------------------------------------------------------
-# Stale-connection detection and per-region client invalidation
+# Stale-connection detection
 # ---------------------------------------------------------------------------
-
-class TestInvalidateRuntimeClient:
-    """Per-region eviction used to discard dead/stale bedrock-runtime clients."""
-
-    def test_evicts_only_the_target_region(self):
-        from agent.bedrock_adapter import (
-            _bedrock_runtime_client_cache,
-            invalidate_runtime_client,
-            reset_client_cache,
-        )
-        reset_client_cache()
-        _bedrock_runtime_client_cache["us-east-1"] = "dead-client"
-        _bedrock_runtime_client_cache["us-west-2"] = "live-client"
-
-        evicted = invalidate_runtime_client("us-east-1")
-
-        assert evicted is True
-        assert "us-east-1" not in _bedrock_runtime_client_cache
-        assert _bedrock_runtime_client_cache["us-west-2"] == "live-client"
-
-    def test_returns_false_when_region_not_cached(self):
-        from agent.bedrock_adapter import invalidate_runtime_client, reset_client_cache
-        reset_client_cache()
-        assert invalidate_runtime_client("eu-west-1") is False
-
-
 class TestIsStaleConnectionError:
     """Classifier that decides whether an exception warrants client eviction."""
 
@@ -900,65 +903,65 @@ class TestIsStaleConnectionError:
         assert is_stale_connection_error(KeyError("missing")) is False
 
 
-class TestCallConverseInvalidatesOnStaleError:
-    """call_converse / call_converse_stream evict the cached client when the
-    boto3 call raises a stale-connection error — so the next invocation
-    reconnects instead of reusing the dead socket."""
+class TestCallConverseClientLifecycle:
+    """Every native async Bedrock request closes its SDK client context."""
 
-
-    def test_converse_stream_evicts_client_on_stale_error(self):
+    @pytest.mark.asyncio
+    async def test_converse_stream_closes_client_on_stale_error(self):
         pytest.importorskip("botocore", reason="botocore required for Bedrock exception tests")
-        from agent.bedrock_adapter import (
-            _bedrock_runtime_client_cache,
-            call_converse_stream,
-            reset_client_cache,
-        )
+        from agent.bedrock_adapter import call_converse_stream
         from botocore.exceptions import ConnectionClosedError
 
-        reset_client_cache()
         dead_client = MagicMock()
-        dead_client.converse_stream.side_effect = ConnectionClosedError(
-            endpoint_url="https://bedrock.example",
-        )
-        _bedrock_runtime_client_cache["us-east-1"] = dead_client
-
-        with pytest.raises(ConnectionClosedError):
-            call_converse_stream(
-                region="us-east-1",
-                model="anthropic.claude-3-sonnet-20240229-v1:0",
-                messages=[{"role": "user", "content": "hi"}],
+        dead_client.converse_stream = AsyncMock(
+            side_effect=ConnectionClosedError(
+                endpoint_url="https://bedrock.example",
             )
-
-        assert "us-east-1" not in _bedrock_runtime_client_cache
-
-    def test_converse_does_not_evict_on_non_stale_error(self):
-        """Non-stale errors (e.g. ValidationException) leave the client cache alone."""
-        pytest.importorskip("botocore", reason="botocore required for Bedrock exception tests")
-        from agent.bedrock_adapter import (
-            _bedrock_runtime_client_cache,
-            call_converse,
-            reset_client_cache,
         )
+        context = _AsyncContext(dead_client)
+
+        with patch(
+            "agent.bedrock_adapter._get_bedrock_runtime_client",
+            return_value=context,
+        ):
+            with pytest.raises(ConnectionClosedError):
+                await call_converse_stream(
+                    region="us-east-1",
+                    model="anthropic.claude-3-sonnet-20240229-v1:0",
+                    messages=[{"role": "user", "content": "hi"}],
+                )
+
+        assert context.exited is True
+
+    @pytest.mark.asyncio
+    async def test_converse_closes_client_on_non_stale_error(self):
+        pytest.importorskip("botocore", reason="botocore required for Bedrock exception tests")
+        from agent.bedrock_adapter import call_converse
         from botocore.exceptions import ClientError
 
-        reset_client_cache()
         live_client = MagicMock()
-        live_client.converse.side_effect = ClientError(
-            error_response={"Error": {"Code": "ValidationException", "Message": "bad"}},
-            operation_name="Converse",
-        )
-        _bedrock_runtime_client_cache["us-east-1"] = live_client
-
-        with pytest.raises(ClientError):
-            call_converse(
-                region="us-east-1",
-                model="anthropic.claude-3-sonnet-20240229-v1:0",
-                messages=[{"role": "user", "content": "hi"}],
+        live_client.converse = AsyncMock(
+            side_effect=ClientError(
+                error_response={
+                    "Error": {"Code": "ValidationException", "Message": "bad"}
+                },
+                operation_name="Converse",
             )
-
-        assert _bedrock_runtime_client_cache.get("us-east-1") is live_client, (
-            "validation errors do not indicate a dead connection — keep the client"
         )
+        context = _AsyncContext(live_client)
+
+        with patch(
+            "agent.bedrock_adapter._get_bedrock_runtime_client",
+            return_value=context,
+        ):
+            with pytest.raises(ClientError):
+                await call_converse(
+                    region="us-east-1",
+                    model="anthropic.claude-3-sonnet-20240229-v1:0",
+                    messages=[{"role": "user", "content": "hi"}],
+                )
+
+        assert context.exited is True
 
 
 
@@ -1004,82 +1007,66 @@ class TestCallConverseStreamIamFallback:
     """call_converse_stream() falls back to converse() when IAM denies the
     streaming action — InvokeModel-only policies keep working."""
 
-    def test_falls_back_to_converse_on_streaming_denial(self):
+    @pytest.mark.asyncio
+    async def test_falls_back_to_converse_on_streaming_denial(self):
         pytest.importorskip("botocore", reason="botocore required for Bedrock exception tests")
-        from agent.bedrock_adapter import (
-            _bedrock_runtime_client_cache,
-            call_converse_stream,
-            reset_client_cache,
-        )
+        from agent.bedrock_adapter import call_converse_stream
         from botocore.exceptions import ClientError
 
-        reset_client_cache()
         client = MagicMock()
-        client.converse_stream.side_effect = ClientError(
-            error_response={
-                "Error": {
-                    "Code": "AccessDeniedException",
-                    "Message": (
-                        "User is not authorized to perform: "
-                        "bedrock:InvokeModelWithResponseStream"
-                    ),
-                }
-            },
-            operation_name="ConverseStream",
+        client.converse_stream = AsyncMock(
+            side_effect=ClientError(
+                error_response={
+                    "Error": {
+                        "Code": "AccessDeniedException",
+                        "Message": (
+                            "User is not authorized to perform: "
+                            "bedrock:InvokeModelWithResponseStream"
+                        ),
+                    }
+                },
+                operation_name="ConverseStream",
+            )
         )
-        client.converse.return_value = {
+        client.converse = AsyncMock(return_value={
             "output": {"message": {"role": "assistant", "content": [{"text": "hi"}]}},
             "stopReason": "end_turn",
             "usage": {"inputTokens": 1, "outputTokens": 1, "totalTokens": 2},
-        }
-        _bedrock_runtime_client_cache["us-east-1"] = client
+        })
+        context = _AsyncContext(client)
 
-        result = call_converse_stream(
-            region="us-east-1",
-            model="anthropic.claude-3-sonnet-20240229-v1:0",
-            messages=[{"role": "user", "content": "hi"}],
-        )
+        with patch(
+            "agent.bedrock_adapter._get_bedrock_runtime_client",
+            return_value=context,
+        ):
+            result = await call_converse_stream(
+                region="us-east-1",
+                model="anthropic.claude-3-sonnet-20240229-v1:0",
+                messages=[{"role": "user", "content": "hi"}],
+            )
 
-        client.converse.assert_called_once()
+        client.converse.assert_awaited_once()
         assert result.choices[0].message.content == "hi"
-        # Not a stale connection — client stays cached.
-        assert _bedrock_runtime_client_cache.get("us-east-1") is client
+        assert context.exited is True
 
 
 # ---------------------------------------------------------------------------
-# boto3 version check
+# Native async SDK availability
 # ---------------------------------------------------------------------------
 
 
-class TestRequireBoto3VersionCheck:
-    """Test that _require_boto3() rejects boto3 versions older than 1.34.59."""
+class TestRequireAiobotocore:
+    def test_returns_native_async_session_factory(self):
+        from agent.bedrock_adapter import _require_aiobotocore
 
-    def test_raises_runtime_error_when_boto3_too_old(self):
-        """boto3 < 1.34.59 should raise RuntimeError with upgrade instructions."""
-        from agent.bedrock_adapter import _require_boto3
-
-        fake_boto3 = MagicMock()
-        fake_boto3.__version__ = "1.34.46"
-        with patch.dict("sys.modules", {"boto3": fake_boto3}):
-            with pytest.raises(RuntimeError, match="does not support converse_stream"):
-                _require_boto3()
-
-    def test_accepts_boto3_at_minimum_version(self):
-        """boto3 == 1.34.59 should be accepted."""
-        from agent.bedrock_adapter import _require_boto3
-
-        fake_boto3 = MagicMock()
-        fake_boto3.__version__ = "1.34.59"
-        with patch.dict("sys.modules", {"boto3": fake_boto3}):
-            result = _require_boto3()
-            assert result is fake_boto3
+        assert callable(_require_aiobotocore())
 
 
 
 class TestImageBase64Decoding:
     """Image data URLs must be decoded to raw bytes before passing to Converse API.
 
-    boto3 re-encodes at the wire layer, so passing the base64 string directly
+    The AWS SDK re-encodes at the wire layer, so passing the base64 string directly
     results in double-encoding. Bedrock rejects with 'Failed to sanitize image'.
     Ref: #33317.
     """
@@ -1146,17 +1133,13 @@ class TestBearerTokenRoutesToConverse:
         return await rp.resolve_runtime_provider(requested="bedrock")
 
     @pytest.mark.asyncio
-    async def test_bearer_token_fails_without_native_bedrock_transport(self, monkeypatch):
-        """Bearer auth must not revive boto3's synchronous Converse path."""
-        from agent.agent_runtime_helpers import UnsupportedCapabilityError
-
-        with pytest.raises(UnsupportedCapabilityError, match="disabled in async-hermes-agent"):
-            await self._resolve(monkeypatch, bearer=True)
+    async def test_bearer_token_routes_to_native_async_converse(self, monkeypatch):
+        runtime = await self._resolve(monkeypatch, bearer=True)
+        assert runtime["api_mode"] == "bedrock_converse"
+        assert "bedrock_anthropic" not in runtime
 
     @pytest.mark.asyncio
-    async def test_sigv4_fails_without_native_bedrock_transport(self, monkeypatch):
-        """SigV4 must not revive the synchronous AnthropicBedrock SDK path."""
-        from agent.agent_runtime_helpers import UnsupportedCapabilityError
-
-        with pytest.raises(UnsupportedCapabilityError, match="disabled in async-hermes-agent"):
-            await self._resolve(monkeypatch, bearer=False)
+    async def test_sigv4_routes_to_native_async_anthropic(self, monkeypatch):
+        runtime = await self._resolve(monkeypatch, bearer=False)
+        assert runtime["api_mode"] == "anthropic_messages"
+        assert runtime["bedrock_anthropic"] is True

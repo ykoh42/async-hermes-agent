@@ -586,6 +586,64 @@ async def test_explicit_credentials_defer_sdk_construction_until_await(monkeypat
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("model", "api_mode"),
+    [
+        ("global.anthropic.claude-sonnet-4-6", "anthropic_messages"),
+        ("amazon.nova-pro-v1:0", "bedrock_converse"),
+    ],
+)
+async def test_bedrock_runtime_is_built_only_at_async_boundary(
+    monkeypatch,
+    model,
+    api_mode,
+):
+    """Both Bedrock transports preserve lazy construction and native async dispatch."""
+    bedrock_client = SimpleNamespace(aclose=AsyncMock())
+    build_bedrock = AsyncMock(return_value=bedrock_client)
+    with (
+        patch("run_agent.get_tool_definitions", return_value=[]),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch(
+            "agent.anthropic_adapter.build_anthropic_bedrock_client",
+            new=build_bedrock,
+        ),
+    ):
+        agent = AIAgent(
+            provider="bedrock",
+            model=model,
+            api_key="aws-sdk",
+            base_url="https://bedrock-runtime.eu-west-1.amazonaws.com",
+            api_mode=api_mode,
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+        assert agent.client is None
+        assert agent._deferred_provider_runtime is not None
+        build_bedrock.assert_not_awaited()
+
+        monkeypatch.setattr(
+            asyncio,
+            "to_thread",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("Bedrock initialization must not thread-hop"),
+            ),
+        )
+        await agent._ensure_provider_runtime()
+
+    assert agent.api_mode == api_mode
+    assert agent._bedrock_region == "eu-west-1"
+    if api_mode == "anthropic_messages":
+        build_bedrock.assert_awaited_once_with("eu-west-1")
+        assert agent._anthropic_client is bedrock_client
+    else:
+        build_bedrock.assert_not_awaited()
+        assert agent._anthropic_client is None
+    await agent.close()
+
+
+@pytest.mark.asyncio
 async def test_custom_env_key_preserves_constructor_route_and_tls_snapshot(
     monkeypatch, tmp_path,
 ):

@@ -486,7 +486,7 @@ async def build_api_kwargs(
         return _merge_nous_portal_messages_extra_body(agent, anthropic_kwargs)
 
     # AWS Bedrock native Converse API — bypasses the OpenAI client entirely.
-    # The adapter handles message/tool conversion and boto3 calls directly.
+    # The adapter handles message/tool conversion and native async AWS calls directly.
     if agent.api_mode == "bedrock_converse":
         _bt = agent._get_transport()
         region = getattr(agent, "_bedrock_region", None) or "us-east-1"

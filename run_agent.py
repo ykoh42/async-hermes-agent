@@ -4701,6 +4701,18 @@ class AIAgent:
                     self.api_key = refreshed_key
                     self._anthropic_api_key = refreshed_key
                     self._anthropic_client_source = None
+            if self.provider == "bedrock":
+                credentials = getattr(
+                    self._anthropic_client, "__dict__", {}
+                ).get("_hermes_aws_credentials")
+                if credentials is None:
+                    raise RuntimeError(
+                        "Bedrock Anthropic client has no async AWS credential source"
+                    )
+                frozen = await credentials.get_frozen_credentials()
+                self._anthropic_client.aws_access_key = frozen.access_key
+                self._anthropic_client.aws_secret_key = frozen.secret_key
+                self._anthropic_client.aws_session_token = frozen.token
             if not callable(anthropic_key):
                 from agent.anthropic_adapter import (
                     build_anthropic_client,
@@ -4737,6 +4749,65 @@ class AIAgent:
                     prefer_stream=use_streaming,
                     on_stream_event=_on_anthropic_event if use_streaming else None,
                     on_response=self._capture_anthropic_response_headers,
+                )
+
+        if self.api_mode == "bedrock_converse":
+            from agent.bedrock_adapter import (
+                _get_bedrock_runtime_client,
+                is_stale_connection_error,
+                is_streaming_access_denied_error,
+                normalize_converse_response,
+                stream_converse_with_callbacks,
+            )
+
+            request = dict(api_kwargs)
+            region = request.pop("__bedrock_region__", "us-east-1")
+            request.pop("__bedrock_converse__", None)
+            async with _get_bedrock_runtime_client(region) as client:
+                if not use_streaming:
+                    try:
+                        return normalize_converse_response(
+                            await client.converse(**request)
+                        )
+                    except Exception as exc:
+                        if is_stale_connection_error(exc):
+                            logger.warning(
+                                "bedrock: stale connection on converse; the next "
+                                "request will create a fresh client"
+                            )
+                        raise
+
+                try:
+                    response = await client.converse_stream(**request)
+                except Exception as exc:
+                    if is_streaming_access_denied_error(exc):
+                        self._disable_streaming = True
+                        return normalize_converse_response(
+                            await client.converse(**request)
+                        )
+                    if is_stale_connection_error(exc):
+                        logger.warning(
+                            "bedrock: stale connection on converse_stream; the "
+                            "next request will create a fresh client"
+                        )
+                    raise
+
+                first_event = True
+
+                def _on_event() -> None:
+                    nonlocal first_event
+                    if first_event:
+                        first_event = False
+                        if on_first_delta is not None:
+                            on_first_delta()
+
+                return await stream_converse_with_callbacks(
+                    response,
+                    on_text_delta=self._fire_stream_delta,
+                    on_tool_start=self._fire_tool_gen_started,
+                    on_reasoning_delta=self._fire_reasoning_delta,
+                    on_interrupt_check=lambda: self._interrupt_requested,
+                    on_event=_on_event,
                 )
 
         if self.api_mode != "chat_completions":

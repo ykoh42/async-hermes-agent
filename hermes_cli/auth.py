@@ -1699,6 +1699,17 @@ async def resolve_provider(
             )
         return _oauth_active
 
+    # AWS Bedrock — detect through the native async credential chain. This
+    # remains after API-key and logged-in providers so explicit credentials
+    # preserve their upstream precedence.
+    try:
+        from agent.bedrock_adapter import has_aws_credentials
+
+        if await has_aws_credentials():
+            return "bedrock"
+    except ImportError:
+        pass  # The optional Bedrock transport is not installed.
+
     raise AuthError(
         "No inference provider configured. Run 'hermes model' to choose a "
         "provider and model, or set an API key (OPENROUTER_API_KEY, "

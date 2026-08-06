@@ -109,7 +109,10 @@ def test_provider_extras_only_publish_native_async_dependencies():
         for spec in specs
     }
 
-    assert "bedrock" not in extras
+    assert extras["bedrock"] == [
+        "aiobotocore==3.8.0",
+        "anthropic[bedrock]==0.87.0",
+    ]
     assert extras["vertex"] == ["google-auth[aiohttp]==2.56.2"]
     assert extras["azure-identity"] == [
         "azure-identity==1.25.3",
@@ -117,6 +120,7 @@ def test_provider_extras_only_publish_native_async_dependencies():
     ]
     assert "google-auth" in declared
     assert "azure-identity" in declared
+    assert "aiobotocore" in declared
     assert "boto3" not in declared
 
 

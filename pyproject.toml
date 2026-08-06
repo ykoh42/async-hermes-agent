@@ -112,6 +112,10 @@ dev = ["pytest==9.1.1", "pytest-asyncio==1.3.0", "ty==0.0.21", "ruff==0.15.10", 
 # extra that exposes a Starlette-backed server surface so pip/uv can't resolve
 # a vulnerable pre-1.0.1 transitive. Bump in lockstep with uv.lock.
 mcp = []  # External MCP is a retained core dependency; compatibility extra.
+bedrock = [
+    "aiobotocore==3.8.0",
+    "anthropic[bedrock]==0.87.0",
+]
 
 [build-system]
 requires = ["setuptools>=77.0,<83"]

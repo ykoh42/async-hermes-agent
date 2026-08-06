@@ -1,9 +1,9 @@
 """AWS Bedrock Converse API transport.
 
 Delegates to the existing adapter functions in agent/bedrock_adapter.py.
-Bedrock uses its own boto3 client (not the OpenAI SDK), so the transport
-owns format conversion and normalization, while client construction and
-boto3 calls stay on AIAgent.
+Bedrock uses its own native async AWS client (not the OpenAI SDK), so the
+transport owns format conversion and normalization while client construction
+and network I/O stay on AIAgent.
 """
 
 from typing import Any, Dict, List, Optional
@@ -59,7 +59,7 @@ class BedrockTransport(ProviderTransport):
             temperature=params.get("temperature"),
             guardrail_config=guardrail,
         )
-        # Sentinel keys for dispatch — agent pops these before the boto3 call
+        # Sentinel keys for dispatch — agent pops these before the AWS call
         kwargs["__bedrock_converse__"] = True
         kwargs["__bedrock_region__"] = region
         return kwargs
@@ -68,7 +68,7 @@ class BedrockTransport(ProviderTransport):
         """Normalize Bedrock response to NormalizedResponse.
 
         Handles two shapes:
-        1. Raw boto3 dict (from direct converse() calls)
+        1. Raw Converse dict (from direct converse() calls)
         2. Already-normalized SimpleNamespace with .choices (from dispatch site)
         """
         from agent.bedrock_adapter import normalize_converse_response
@@ -78,7 +78,7 @@ class BedrockTransport(ProviderTransport):
             # Already normalized at dispatch site
             ns = response
         else:
-            # Raw boto3 dict
+            # Raw Converse dict
             ns = normalize_converse_response(response)
 
         choice = ns.choices[0]

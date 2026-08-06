@@ -9,7 +9,10 @@ These tests guard the invariant that the header is always emitted on the
 Bedrock client path, and that it survives the MiniMax bearer-auth strip.
 """
 
-from unittest.mock import MagicMock, patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
 
 
 class TestBedrockContext1MBeta:
@@ -35,7 +38,8 @@ class TestBedrockContext1MBeta:
             # Other betas still present
             assert "interleaved-thinking-2025-05-14" in betas
 
-    def test_build_anthropic_bedrock_client_sends_1m_beta(self):
+    @pytest.mark.asyncio
+    async def test_build_anthropic_bedrock_client_sends_1m_beta(self):
         """AnthropicBedrock client must carry the 1M beta in default_headers.
 
         This is the load-bearing assertion for the reported bug:
@@ -46,8 +50,23 @@ class TestBedrockContext1MBeta:
         fake_sdk = MagicMock()
         fake_sdk.AsyncAnthropicBedrock = MagicMock()
 
-        with patch.object(adapter, "_anthropic_sdk", fake_sdk):
-            adapter.build_anthropic_bedrock_client(region="us-west-2")
+        credentials = MagicMock(
+            get_frozen_credentials=AsyncMock(
+                return_value=SimpleNamespace(
+                    access_key="access",
+                    secret_key="secret",
+                    token="token",
+                )
+            )
+        )
+        session = MagicMock(
+            get_credentials=AsyncMock(return_value=credentials)
+        )
+        with (
+            patch.object(adapter, "_anthropic_sdk", fake_sdk),
+            patch("aiobotocore.session.get_session", return_value=session),
+        ):
+            await adapter.build_anthropic_bedrock_client(region="us-west-2")
 
         call_kwargs = fake_sdk.AsyncAnthropicBedrock.call_args.kwargs
         assert call_kwargs["aws_region"] == "us-west-2"

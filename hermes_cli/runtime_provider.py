@@ -2054,15 +2054,80 @@ async def resolve_runtime_provider(
             "requested_provider": requested_provider,
         }
 
-    # AWS Bedrock (native Converse API via boto3)
+    # AWS Bedrock: Claude uses the official async Anthropic Bedrock client;
+    # all other models use native-async Converse through aiobotocore.
     if provider == "bedrock":
-        from agent.agent_runtime_helpers import UnsupportedCapabilityError
-
-        raise UnsupportedCapabilityError(
-            "AWS Bedrock currently uses boto3/Anthropic sync credential and "
-            "transport paths and is disabled in async-hermes-agent until a "
-            "native async implementation is available."
+        from agent.bedrock_adapter import (
+            is_anthropic_bedrock_model,
+            resolve_aws_auth_env_var,
+            resolve_bedrock_region,
         )
+
+        is_explicit = requested_provider in {
+            "bedrock",
+            "aws",
+            "aws-bedrock",
+            "amazon-bedrock",
+            "amazon",
+        }
+        auth_source = await resolve_aws_auth_env_var()
+        if not is_explicit and not auth_source:
+            raise AuthError(
+                "No AWS credentials found for Bedrock. Configure one of:\n"
+                "  - AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY\n"
+                "  - AWS_PROFILE (for SSO / named profiles)\n"
+                "  - IAM instance role (EC2, ECS, Lambda)\n"
+                "Or run 'aws configure' to set up credentials.",
+                code="no_aws_credentials",
+            )
+        bedrock_cfg = config_snapshot.get("bedrock", {})
+        if not isinstance(bedrock_cfg, dict):
+            bedrock_cfg = {}
+        region = str(bedrock_cfg.get("region") or "").strip()
+        if not region:
+            region = await resolve_bedrock_region()
+        auth_source = auth_source or "aws-sdk-default-chain"
+        guardrail = bedrock_cfg.get("guardrail", {})
+        guardrail_config = None
+        if isinstance(guardrail, dict) and guardrail.get(
+            "guardrail_identifier"
+        ) and guardrail.get("guardrail_version"):
+            guardrail_config = {
+                "guardrailIdentifier": guardrail["guardrail_identifier"],
+                "guardrailVersion": guardrail["guardrail_version"],
+            }
+            if guardrail.get("stream_processing_mode"):
+                guardrail_config["streamProcessingMode"] = guardrail[
+                    "stream_processing_mode"
+                ]
+            if guardrail.get("trace"):
+                guardrail_config["trace"] = guardrail["trace"]
+
+        current_model = str(
+            target_model or model_cfg.get("default") or ""
+        ).strip()
+        has_bearer_token = bool(
+            os.environ.get("AWS_BEARER_TOKEN_BEDROCK", "").strip()
+        )
+        use_anthropic = (
+            is_anthropic_bedrock_model(current_model) and not has_bearer_token
+        )
+        runtime = {
+            "provider": "bedrock",
+            "api_mode": (
+                "anthropic_messages" if use_anthropic else "bedrock_converse"
+            ),
+            "base_url": f"https://bedrock-runtime.{region}.amazonaws.com",
+            "api_key": "aws-sdk",
+            "source": auth_source,
+            "region": region,
+            "requested_provider": requested_provider,
+        }
+        if use_anthropic:
+            runtime["bedrock_anthropic"] = True
+        if guardrail_config:
+            runtime["guardrail_config"] = guardrail_config
+        return runtime
 
     # API-key providers (z.ai/GLM, Kimi, MiniMax, MiniMax-CN)
     pconfig = PROVIDER_REGISTRY.get(provider)

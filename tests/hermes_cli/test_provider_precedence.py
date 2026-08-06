@@ -35,7 +35,10 @@ def _config(monkeypatch, model_cfg):
 
 def _no_aws(monkeypatch):
     # Neutralize any ambient AWS creds so Bedrock auto-detect can't interfere.
-    monkeypatch.setattr("agent.bedrock_adapter.has_aws_credentials", lambda: False)
+    monkeypatch.setattr(
+        "agent.bedrock_adapter.has_aws_credentials",
+        AsyncMock(return_value=False),
+    )
 
 
 def _clear_provider_env(monkeypatch):

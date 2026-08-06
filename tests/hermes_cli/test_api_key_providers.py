@@ -337,7 +337,7 @@ class TestResolveProvider:
         # behavior, not the Bedrock fallback.
         monkeypatch.setattr(
             "agent.bedrock_adapter.has_aws_credentials",
-            lambda env=None: False,
+            AsyncMock(return_value=False),
         )
         monkeypatch.setenv("GITHUB_TOKEN", "gh-test-token")
         with pytest.raises(AuthError, match="No inference provider configured"):

@@ -6,7 +6,6 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from agent.agent_runtime_helpers import UnsupportedCapabilityError
 from hermes_cli import runtime_provider as rp
 
 pytestmark = pytest.mark.asyncio
@@ -1368,19 +1367,33 @@ def _patch_bedrock(monkeypatch, config_default=""):
 
     monkeypatch.setattr(rp, "resolve_provider", AsyncMock(return_value="bedrock"))
     monkeypatch.setattr(rp, "_get_model_config", lambda *_args, **_kwargs: {"default": config_default})
-    monkeypatch.setattr(ba, "has_aws_credentials", lambda: True)
-    monkeypatch.setattr(ba, "resolve_aws_auth_env_var", lambda: "AWS_PROFILE")
-    monkeypatch.setattr(ba, "resolve_bedrock_region", lambda: "eu-north-1")
+    monkeypatch.setattr(ba, "resolve_aws_auth_env_var", AsyncMock(return_value="AWS_PROFILE"))
+    monkeypatch.setattr(ba, "resolve_bedrock_region", AsyncMock(return_value="eu-north-1"))
 
 
-async def test_resolve_runtime_provider_bedrock_fails_fast(monkeypatch):
+async def test_resolve_runtime_provider_bedrock_claude_uses_anthropic(monkeypatch):
     _patch_bedrock(monkeypatch, config_default="amazon.nova-pro-v1:0")
 
-    with pytest.raises(UnsupportedCapabilityError, match="AWS Bedrock currently uses"):
-        await rp.resolve_runtime_provider(
-            requested="bedrock",
-            target_model="global.anthropic.claude-sonnet-4-6",
-        )
+    runtime = await rp.resolve_runtime_provider(
+        requested="bedrock",
+        target_model="global.anthropic.claude-sonnet-4-6",
+    )
+
+    assert runtime["api_mode"] == "anthropic_messages"
+    assert runtime["bedrock_anthropic"] is True
+    assert runtime["region"] == "eu-north-1"
+
+
+async def test_resolve_runtime_provider_bedrock_nova_uses_converse(monkeypatch):
+    _patch_bedrock(monkeypatch, config_default="global.anthropic.claude-sonnet-4-6")
+
+    runtime = await rp.resolve_runtime_provider(
+        requested="bedrock",
+        target_model="amazon.nova-pro-v1:0",
+    )
+
+    assert runtime["api_mode"] == "bedrock_converse"
+    assert "bedrock_anthropic" not in runtime
 
 
 async def test_auto_provider_with_local_base_url_bypasses_anthropic_key(monkeypatch):

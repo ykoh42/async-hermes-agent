@@ -2,14 +2,16 @@
 
 Verifies that the Bedrock provider is correctly registered in the
 provider registry, model catalog, and runtime resolution pipeline.
-These tests do NOT require AWS credentials or boto3 — all AWS calls
+These tests do NOT require AWS credentials or a live Bedrock endpoint — all AWS calls
 are mocked.
 
 Note: Tests that import ``hermes_cli.auth`` or ``hermes_cli.runtime_provider``
 require Python 3.10+ due to ``str | None`` type syntax in the import chain.
 """
 
-from unittest.mock import MagicMock, patch
+import asyncio
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -87,6 +89,35 @@ class TestResolveProvider:
         result = await resolve_provider("aws")
         assert result == "bedrock"
 
+    @pytest.mark.asyncio
+    async def test_auto_detects_bedrock_after_other_provider_sources(self, monkeypatch):
+        from hermes_cli.auth import PROVIDER_REGISTRY, resolve_provider
+
+        for provider in PROVIDER_REGISTRY.values():
+            for env_var in provider.api_key_env_vars:
+                monkeypatch.delenv(env_var, raising=False)
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+
+        has_credentials = AsyncMock(return_value=True)
+        with (
+            patch(
+                "hermes_cli.config.load_config_readonly",
+                new=AsyncMock(return_value={}),
+            ),
+            patch(
+                "hermes_cli.auth._load_auth_store",
+                new=AsyncMock(return_value={}),
+            ),
+            patch(
+                "agent.bedrock_adapter.has_aws_credentials",
+                new=has_credentials,
+            ),
+        ):
+            assert await resolve_provider("auto") == "bedrock"
+
+        has_credentials.assert_awaited_once_with()
+
 
 class TestRuntimeProvider:
     """Verify resolve_runtime_provider() handles bedrock correctly."""
@@ -98,7 +129,7 @@ class TestRuntimeProvider:
         """When bedrock is auto-detected (not explicitly requested) and no
         credentials are found, runtime resolution should raise AuthError."""
         from hermes_cli.runtime_provider import resolve_runtime_provider
-        from agent.agent_runtime_helpers import UnsupportedCapabilityError
+        from hermes_cli.auth import AuthError
 
         # Clear all AWS env vars
         for var in ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_PROFILE",
@@ -106,22 +137,16 @@ class TestRuntimeProvider:
                      "AWS_WEB_IDENTITY_TOKEN_FILE"]:
             monkeypatch.delenv(var, raising=False)
 
-        # Mock both the provider resolution and boto3's credential chain
-        mock_session = MagicMock()
-        mock_session.get_credentials.return_value = None
         with patch("hermes_cli.runtime_provider.resolve_provider", return_value="bedrock"), \
              patch("hermes_cli.runtime_provider._get_model_config", return_value={"provider": "bedrock"}), \
              patch("hermes_cli.runtime_provider.resolve_requested_provider", return_value="auto"), \
-             patch.dict("sys.modules", {"botocore": MagicMock(), "botocore.session": MagicMock()}):
-            import botocore.session as _bs
-            _bs.get_session = MagicMock(return_value=mock_session)
-            with pytest.raises(UnsupportedCapabilityError, match="AWS Bedrock"):
+             patch("agent.bedrock_adapter.resolve_aws_auth_env_var", new=AsyncMock(return_value=None)):
+            with pytest.raises(AuthError, match="No AWS credentials"):
                 await resolve_runtime_provider(requested="auto")
 
     @pytest.mark.asyncio
     async def test_bedrock_runtime_explicit_skips_credential_check(self, monkeypatch):
-        """Explicit Bedrock requests fail before a blocking boto3 transport is built."""
-        from agent.agent_runtime_helpers import UnsupportedCapabilityError
+        """Explicit Bedrock trusts the SDK's IAM/instance-role chain."""
         from hermes_cli.runtime_provider import resolve_runtime_provider
 
         # No AWS env vars set — but explicit bedrock request should not raise
@@ -129,10 +154,15 @@ class TestRuntimeProvider:
                      "AWS_BEARER_TOKEN_BEDROCK"]:
             monkeypatch.delenv(var, raising=False)
 
+        monkeypatch.setenv("AWS_DEFAULT_REGION", "us-west-2")
         with patch("hermes_cli.runtime_provider.resolve_provider", return_value="bedrock"), \
-             patch("hermes_cli.runtime_provider._get_model_config", return_value={"provider": "bedrock"}):
-            with pytest.raises(UnsupportedCapabilityError, match="AWS Bedrock"):
-                await resolve_runtime_provider(requested="bedrock")
+             patch("hermes_cli.runtime_provider._get_model_config", return_value={"provider": "bedrock"}), \
+             patch("agent.bedrock_adapter.resolve_aws_auth_env_var", new=AsyncMock(return_value=None)):
+            runtime = await resolve_runtime_provider(requested="bedrock")
+
+        assert runtime["provider"] == "bedrock"
+        assert runtime["region"] == "us-west-2"
+        assert runtime["api_key"] == "aws-sdk"
 
 
 # ---------------------------------------------------------------------------
@@ -188,9 +218,12 @@ class TestPackaging:
         content = (Path(__file__).parent.parent.parent / "pyproject.toml").read_text()
         return tomllib.loads(content)["project"]["optional-dependencies"]
 
-    def test_bedrock_extra_is_not_advertised(self):
+    def test_bedrock_extra_is_native_async(self):
         extras = self._optional_dependencies()
-        assert "bedrock" not in extras
+        assert extras["bedrock"] == [
+            "aiobotocore==3.8.0",
+            "anthropic[bedrock]==0.87.0",
+        ]
 
     def test_bedrock_is_not_eager_installed(self):
         import tomllib
@@ -358,62 +391,218 @@ class TestAuxiliaryClientBedrockResolution:
 
     @pytest.mark.asyncio
     async def test_bedrock_returns_client_with_credentials(self, monkeypatch):
-        """Auxiliary Bedrock fails fast instead of constructing a blocking client."""
-        from agent.agent_runtime_helpers import UnsupportedCapabilityError
+        """Auxiliary Bedrock returns the native async Anthropic adapter."""
         monkeypatch.setenv("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE")
         monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY")
         monkeypatch.setenv("AWS_REGION", "us-west-2")
 
         mock_anthropic_bedrock = MagicMock()
         with patch("agent.anthropic_adapter.build_anthropic_bedrock_client",
-                   return_value=mock_anthropic_bedrock):
+                   new=AsyncMock(return_value=mock_anthropic_bedrock)):
             from agent.auxiliary_client import resolve_provider_client
-            with pytest.raises(UnsupportedCapabilityError, match="AWS Bedrock"):
-                await resolve_provider_client("bedrock", None)
+            client, model = await resolve_provider_client("bedrock", None)
+
+        assert client._real_client is mock_anthropic_bedrock
+        assert model == "anthropic.claude-haiku-4-5-20251001-v1:0"
 
     @pytest.mark.asyncio
     async def test_bedrock_returns_none_without_credentials(self, monkeypatch):
-        """The unsupported transport is reported consistently without credentials."""
-        from agent.agent_runtime_helpers import UnsupportedCapabilityError
-        with patch("agent.bedrock_adapter.has_aws_credentials", return_value=False):
+        with patch(
+            "agent.bedrock_adapter.has_aws_credentials",
+            new=AsyncMock(return_value=False),
+        ):
             from agent.auxiliary_client import resolve_provider_client
-            with pytest.raises(UnsupportedCapabilityError, match="AWS Bedrock"):
-                await resolve_provider_client("bedrock", None)
+            assert await resolve_provider_client("bedrock", None) == (None, None)
 
 
 
 
     @pytest.mark.asyncio
     async def test_bedrock_default_model_is_haiku(self, monkeypatch):
-        """Model selection never hides the unsupported blocking transport."""
-        from agent.agent_runtime_helpers import UnsupportedCapabilityError
+        """The native async path preserves Hermes's default Bedrock model."""
         monkeypatch.setenv("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE")
         monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY")
 
         with patch("agent.anthropic_adapter.build_anthropic_bedrock_client",
-                   return_value=MagicMock()):
+                   new=AsyncMock(return_value=MagicMock())):
             from agent.auxiliary_client import resolve_provider_client
-            with pytest.raises(UnsupportedCapabilityError, match="AWS Bedrock"):
-                await resolve_provider_client("bedrock", None)
+            _, model = await resolve_provider_client("bedrock", None)
+
+        assert model == "anthropic.claude-haiku-4-5-20251001-v1:0"
 
 
 
 
 
     @pytest.mark.asyncio
-    async def test_bedrock_converse_shim_fails_fast(self, monkeypatch):
-        """The compatibility shim must never call blocking boto3 from the loop."""
+    async def test_bedrock_converse_shim_awaits_native_transport(self, monkeypatch):
         monkeypatch.setenv("AWS_ACCESS_KEY_ID", "AKIAIO...MPLE")
         monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY")
 
         from agent.auxiliary_client import BedrockAuxiliaryClient
 
         client = BedrockAuxiliaryClient("us-east-1", "openai.gpt-oss-20b-1:0")
-        with patch("agent.bedrock_adapter.call_converse") as mock_converse:
-            with pytest.raises(RuntimeError, match="native async transport"):
-                await client.chat.completions.create(
-                    model="openai.gpt-oss-20b-1:0",
-                    messages=[{"role": "user", "content": "hi"}],
-                    stream=True,
-                )
-        mock_converse.assert_not_called()
+        response = SimpleNamespace(choices=[])
+        with patch(
+            "agent.bedrock_adapter.call_converse",
+            new=AsyncMock(return_value=response),
+        ) as mock_converse:
+            result = await client.chat.completions.create(
+                model="openai.gpt-oss-20b-1:0",
+                messages=[{"role": "user", "content": "hi"}],
+                stream=True,
+            )
+        assert result is response
+        mock_converse.assert_awaited_once()
+
+
+class _BedrockClientContext:
+    def __init__(self, client):
+        self.client = client
+        self.entered = False
+        self.exited = False
+
+    async def __aenter__(self):
+        self.entered = True
+        return self.client
+
+    async def __aexit__(self, *_args):
+        self.exited = True
+        return False
+
+
+class TestAIAgentBedrockDispatch:
+    @staticmethod
+    def _agent():
+        from run_agent import AIAgent
+
+        agent = AIAgent.__new__(AIAgent)
+        agent.api_mode = "bedrock_converse"
+        agent.provider = "bedrock"
+        agent._disable_streaming = False
+        agent._interrupt_requested = False
+        agent._fire_stream_delta = lambda _text: None
+        agent._fire_tool_gen_started = lambda _name: None
+        agent._fire_reasoning_delta = lambda _text: None
+        return agent
+
+    @pytest.mark.asyncio
+    async def test_nonstream_request_is_awaited_and_client_is_closed(self, monkeypatch):
+        agent = self._agent()
+        client = SimpleNamespace(
+            converse=AsyncMock(
+                return_value={
+                    "output": {
+                        "message": {
+                            "role": "assistant",
+                            "content": [{"text": "native async"}],
+                        }
+                    },
+                    "stopReason": "end_turn",
+                    "usage": {"inputTokens": 2, "outputTokens": 3},
+                }
+            )
+        )
+        context = _BedrockClientContext(client)
+        monkeypatch.setattr(
+            "agent.bedrock_adapter._get_bedrock_runtime_client",
+            lambda region: context,
+        )
+
+        response = await agent._execute_model_request(
+            {
+                "modelId": "amazon.nova-pro-v1:0",
+                "messages": [{"role": "user", "content": [{"text": "hi"}]}],
+                "__bedrock_converse__": True,
+                "__bedrock_region__": "eu-west-1",
+            }
+        )
+
+        assert response.choices[0].message.content == "native async"
+        client.converse.assert_awaited_once_with(
+            modelId="amazon.nova-pro-v1:0",
+            messages=[{"role": "user", "content": [{"text": "hi"}]}],
+        )
+        assert context.entered and context.exited
+
+    @pytest.mark.asyncio
+    async def test_stream_request_preserves_callbacks_and_closes_client(self, monkeypatch):
+        agent = self._agent()
+        text_deltas = []
+        reasoning_deltas = []
+        first_deltas = []
+        agent._fire_stream_delta = text_deltas.append
+        agent._fire_reasoning_delta = reasoning_deltas.append
+
+        async def events():
+            yield {
+                "contentBlockDelta": {
+                    "contentBlockIndex": 0,
+                    "delta": {"reasoningContent": {"text": "think"}},
+                }
+            }
+            yield {
+                "contentBlockDelta": {
+                    "contentBlockIndex": 0,
+                    "delta": {"text": "answer"},
+                }
+            }
+            yield {"contentBlockStop": {"contentBlockIndex": 0}}
+            yield {"messageStop": {"stopReason": "end_turn"}}
+
+        client = SimpleNamespace(
+            converse_stream=AsyncMock(return_value={"stream": events()})
+        )
+        context = _BedrockClientContext(client)
+        monkeypatch.setattr(
+            "agent.bedrock_adapter._get_bedrock_runtime_client",
+            lambda region: context,
+        )
+
+        response = await agent._execute_model_request(
+            {
+                "modelId": "amazon.nova-pro-v1:0",
+                "messages": [],
+                "__bedrock_region__": "us-east-2",
+            },
+            use_streaming=True,
+            on_first_delta=lambda: first_deltas.append(True),
+        )
+
+        assert response.choices[0].message.content == "answer"
+        assert response.choices[0].message.reasoning_content == "think"
+        assert text_deltas == ["answer"]
+        assert reasoning_deltas == ["think"]
+        assert first_deltas == [True]
+        assert context.entered and context.exited
+
+    @pytest.mark.asyncio
+    async def test_cancellation_closes_inflight_client_context(self, monkeypatch):
+        agent = self._agent()
+        started = asyncio.Event()
+
+        async def converse(**_kwargs):
+            started.set()
+            await asyncio.Event().wait()
+
+        context = _BedrockClientContext(SimpleNamespace(converse=converse))
+        monkeypatch.setattr(
+            "agent.bedrock_adapter._get_bedrock_runtime_client",
+            lambda region: context,
+        )
+
+        task = asyncio.create_task(
+            agent._execute_model_request(
+                {
+                    "modelId": "amazon.nova-pro-v1:0",
+                    "messages": [],
+                    "__bedrock_region__": "us-east-1",
+                }
+            )
+        )
+        await started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert context.entered and context.exited
