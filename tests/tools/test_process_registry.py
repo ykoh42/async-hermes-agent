@@ -10,6 +10,7 @@ import sys
 
 import pytest
 from pyleak import no_event_loop_blocking, no_task_leaks
+from pyleak.eventloop import LeakAction
 
 from tools.process_registry import ProcessRegistry, _handle_process
 
@@ -23,8 +24,8 @@ async def test_spawn_wait_poll_and_log_preserve_result_contract(tmp_path):
     process_registry = ProcessRegistry()
 
     async with (
-        no_event_loop_blocking(action="raise", threshold=0.1),
-        no_task_leaks(action="raise"),
+        no_event_loop_blocking(action=LeakAction.RAISE, threshold=0.1),
+        no_task_leaks(action=LeakAction.RAISE),
     ):
         session = await process_registry.spawn_local(
             _python_command("print('first'); print('second')"),
@@ -44,7 +45,7 @@ async def test_spawn_wait_poll_and_log_preserve_result_contract(tmp_path):
 async def test_submit_writes_stdin_and_close_sends_eof(tmp_path):
     process_registry = ProcessRegistry()
 
-    async with no_task_leaks(action="raise"):
+    async with no_task_leaks(action=LeakAction.RAISE):
         session = await process_registry.spawn_local(
             _python_command(
                 "import sys; print(sys.stdin.readline().strip()); print(sys.stdin.read())"
@@ -71,8 +72,8 @@ async def test_pty_background_process_accepts_interactive_input(tmp_path):
     process_registry = ProcessRegistry()
 
     async with (
-        no_event_loop_blocking(action="raise", threshold=0.1),
-        no_task_leaks(action="raise"),
+        no_event_loop_blocking(action=LeakAction.RAISE, threshold=0.1),
+        no_task_leaks(action=LeakAction.RAISE),
     ):
         session = await process_registry.spawn_local(
             _python_command("print(input())"),
@@ -91,7 +92,7 @@ async def test_pty_background_process_accepts_interactive_input(tmp_path):
 async def test_wait_cancellation_propagates_without_killing_process(tmp_path):
     process_registry = ProcessRegistry()
 
-    async with no_task_leaks(action="raise"):
+    async with no_task_leaks(action=LeakAction.RAISE):
         session = await process_registry.spawn_local(
             _python_command("import time; time.sleep(30)"),
             cwd=str(tmp_path),

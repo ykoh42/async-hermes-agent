@@ -16,6 +16,7 @@ import sys
 from typing import Any
 
 import pytest
+import pytest_asyncio
 
 
 LIVE = os.environ.get("HERMES_LIVE_TESTS") == "1"
@@ -69,12 +70,13 @@ def _jsonable(value: Any) -> Any:
 
 
 def _print_trace(label: str, value: Any) -> None:
-    sys.__stdout__.write(f"\n--- {label} ---\n")
-    sys.__stdout__.write(
+    stream = sys.__stdout__ or sys.stdout
+    stream.write(f"\n--- {label} ---\n")
+    stream.write(
         json.dumps(_jsonable(value), ensure_ascii=False, indent=2, sort_keys=True)
     )
-    sys.__stdout__.write("\n")
-    sys.__stdout__.flush()
+    stream.write("\n")
+    stream.flush()
 
 
 def _message_snapshot(message) -> dict:
@@ -88,9 +90,18 @@ def _message_snapshot(message) -> dict:
 
 
 def _make_live_client():
-    from openai import OpenAI
+    from openai import AsyncOpenAI
 
-    return OpenAI(api_key=DEEPSEEK_KEY, base_url=LIVE_BASE_URL)
+    return AsyncOpenAI(api_key=DEEPSEEK_KEY, base_url=LIVE_BASE_URL)
+
+
+@pytest_asyncio.fixture
+async def live_client():
+    client = _make_live_client()
+    try:
+        yield client
+    finally:
+        await client.close()
 
 
 def _make_agent_for_message_building(model: str):
@@ -118,7 +129,10 @@ def _raw_reasoning_content(message):
 
 
 @pytest.mark.parametrize("live_model", LIVE_MODELS)
-def test_deepseek_v4_thinking_tool_call_replay_round_trip(live_model: str):
+@pytest.mark.asyncio
+async def test_deepseek_v4_thinking_tool_call_replay_round_trip(
+    live_model: str, live_client
+):
     """Hit DeepSeek twice and replay the assistant tool-call turn.
 
     The first request forces a tool call with thinking enabled. The second
@@ -127,7 +141,7 @@ def test_deepseek_v4_thinking_tool_call_replay_round_trip(live_model: str):
     second request is the live guardrail for the V4 thinking replay contract.
     """
 
-    client = _make_live_client()
+    client = live_client
     agent = _make_agent_for_message_building(live_model)
 
     first_request = {
@@ -148,7 +162,7 @@ def test_deepseek_v4_thinking_tool_call_replay_round_trip(live_model: str):
         **_thinking_kwargs(),
     }
     _print_trace(f"{live_model} first request", first_request)
-    first = client.chat.completions.create(**first_request)
+    first = await client.chat.completions.create(**first_request)
     _print_trace(f"{live_model} first raw response", first)
 
     first_choice = first.choices[0]
@@ -226,7 +240,7 @@ def test_deepseek_v4_thinking_tool_call_replay_round_trip(live_model: str):
         **_thinking_kwargs(),
     }
     _print_trace(f"{live_model} second request", second_request)
-    second = client.chat.completions.create(**second_request)
+    second = await client.chat.completions.create(**second_request)
     _print_trace(f"{live_model} second raw response", second)
     _print_trace(
         f"{live_model} second assistant message",

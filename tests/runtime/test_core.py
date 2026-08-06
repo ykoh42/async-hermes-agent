@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 from pyleak import no_event_loop_blocking, no_task_leaks
+from pyleak.eventloop import LeakAction
 
 from agent.conversation_loop import run_conversation
 from agent.conversation_compression import compress_context
@@ -124,6 +125,7 @@ def test_conversation_and_chat_are_coroutines():
     assert inspect.iscoroutinefunction(AIAgent._try_activate_fallback)
     assert inspect.iscoroutinefunction(AIAgent._try_recover_primary_transport)
     assert inspect.iscoroutinefunction(AIAgent._recover_with_credential_pool)
+    assert inspect.iscoroutinefunction(AIAgent._replace_primary_openai_client)
     assert inspect.iscoroutinefunction(AIAgent._swap_credential)
     assert inspect.iscoroutinefunction(recover_with_credential_pool)
     assert inspect.iscoroutinefunction(try_recover_primary_transport)
@@ -158,6 +160,46 @@ def test_constructor_does_not_read_runtime_config_or_create_logs():
     assert agent._deferred_provider_runtime is not None
     assert agent.tools == []
     assert agent.valid_tool_names == set()
+
+
+@pytest.mark.asyncio
+async def test_openai_client_rebuild_reuses_native_async_runtime_recipe():
+    agent = AIAgent.__new__(AIAgent)
+    agent.provider = "openrouter"
+    agent.model = "test-model"
+    agent.api_mode = "chat_completions"
+    agent.api_key = "old-key"
+    agent.base_url = "https://old.example/v1"
+    agent._provider_request_timeout = 12
+    agent._provider_stale_timeout = 34
+    agent._client_kwargs = {
+        "api_key": "new-key",
+        "base_url": "https://new.example/v1",
+        "default_headers": {"X-Test": "preserved"},
+    }
+    agent._deferred_provider_runtime = None
+    captured = None
+
+    async def ensure_runtime():
+        nonlocal captured
+        captured = dict(agent._deferred_provider_runtime)
+        agent._deferred_provider_runtime = None
+        return True
+
+    agent._ensure_provider_runtime = ensure_runtime
+
+    assert await agent._replace_primary_openai_client(reason="test") is True
+    assert captured == {
+        "provider": "openrouter",
+        "model": "test-model",
+        "api_key": "new-key",
+        "base_url": "https://new.example/v1",
+        "api_mode": "chat_completions",
+        "request_timeout": 12,
+        "stale_timeout": 34,
+        "client_kwargs": agent._client_kwargs,
+        "update_primary": False,
+    }
 
 
 @pytest.mark.asyncio
@@ -1846,7 +1888,7 @@ async def test_close_cancels_and_awaits_active_turn_without_task_leak():
         turn_started.set()
         await asyncio.Event().wait()
 
-    async with no_task_leaks(action="raise"):
+    async with no_task_leaks(action=LeakAction.RAISE):
         turn_task = asyncio.create_task(active_turn())
         await turn_started.wait()
         agent._active_turn_task = turn_task
@@ -2529,8 +2571,8 @@ async def test_synthetic_turn_records_trajectory_without_to_thread(monkeypatch, 
     monkeypatch.setattr(asyncio, "to_thread", fail_if_called)
     try:
         async with (
-            no_event_loop_blocking(action="raise", threshold=0.1),
-            no_task_leaks(action="raise"),
+            no_event_loop_blocking(action=LeakAction.RAISE, threshold=0.1),
+            no_task_leaks(action=LeakAction.RAISE),
         ):
             result = await agent.run_conversation("hello async")
         assert result["completed"] is True
@@ -2788,7 +2830,7 @@ async def test_cancelled_turn_persists_partial_session_and_reraises(monkeypatch,
     monkeypatch.setattr(asyncio, "to_thread", fail_if_called)
     task = None
     try:
-        async with no_task_leaks(action="raise"):
+        async with no_task_leaks(action=LeakAction.RAISE):
             task = asyncio.create_task(
                 agent.run_conversation("persist this before cancel")
             )
@@ -2893,7 +2935,7 @@ async def test_cancelled_tool_batch_persists_ordered_cancelled_observation(
 
     task = None
     try:
-        async with no_task_leaks(action="raise"):
+        async with no_task_leaks(action=LeakAction.RAISE):
             task = asyncio.create_task(agent.run_conversation("cancel this tool"))
             await asyncio.wait_for(tool_started.wait(), timeout=0.5)
             task.cancel()

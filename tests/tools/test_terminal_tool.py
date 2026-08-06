@@ -9,6 +9,7 @@ import sys
 
 import pytest
 from pyleak import no_event_loop_blocking, no_task_leaks
+from pyleak.eventloop import LeakAction
 
 import tools.terminal_tool as terminal
 
@@ -29,8 +30,8 @@ async def test_exported_environment_persists_between_calls(tmp_path):
     task_id = "persistent-environment"
     try:
         async with (
-            no_event_loop_blocking(action="raise", threshold=0.1),
-            no_task_leaks(action="raise"),
+            no_event_loop_blocking(action=LeakAction.RAISE, threshold=0.1),
+            no_task_leaks(action=LeakAction.RAISE),
         ):
             first = json.loads(
                 await terminal.terminal_tool(
@@ -153,7 +154,7 @@ async def test_async_sudo_callback_supplies_password(monkeypatch):
 @pytest.mark.asyncio
 async def test_sync_sudo_callback_fails_fast(monkeypatch):
     monkeypatch.delenv("SUDO_PASSWORD", raising=False)
-    terminal.set_sudo_password_callback(lambda: "legacy-pass")  # type: ignore[arg-type]
+    terminal.set_sudo_password_callback(lambda: "legacy-pass")
     try:
         with pytest.raises(RuntimeError, match="coroutine sudo password callback"):
             await terminal._transform_sudo_command("sudo true")
@@ -178,8 +179,8 @@ async def test_local_environment_pipes_sudo_password_before_stdin(tmp_path, monk
     environment = terminal.LocalEnvironment(str(tmp_path))
     environment.env["PATH"] = f"{fake_bin}{os.pathsep}{environment.env['PATH']}"
     async with (
-        no_event_loop_blocking(action="raise", threshold=0.1),
-        no_task_leaks(action="raise"),
+        no_event_loop_blocking(action=LeakAction.RAISE, threshold=0.1),
+        no_task_leaks(action=LeakAction.RAISE),
     ):
         result = await environment.execute("sudo target", stdin_data="payload-data\n")
 

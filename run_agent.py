@@ -4421,6 +4421,45 @@ class AIAgent:
         if merged:
             self._client_kwargs["default_headers"] = merged
 
+    async def _replace_primary_openai_client(self, *, reason: str) -> bool:
+        """Rebuild the current OpenAI-compatible client on the async runtime."""
+        client_kwargs = dict(getattr(self, "_client_kwargs", {}) or {})
+        api_key = client_kwargs.get("api_key", getattr(self, "api_key", ""))
+        base_url = client_kwargs.get("base_url", getattr(self, "base_url", ""))
+        if not api_key or not base_url:
+            logger.warning(
+                "Failed to rebuild async OpenAI client (%s): incomplete runtime",
+                reason,
+            )
+            return False
+
+        previous_pending = getattr(self, "_deferred_provider_runtime", None)
+        self._deferred_provider_runtime = {
+            "provider": self.provider,
+            "model": self.model,
+            "api_key": api_key,
+            "base_url": base_url,
+            "api_mode": self.api_mode,
+            "request_timeout": getattr(self, "_provider_request_timeout", None),
+            "stale_timeout": getattr(self, "_provider_stale_timeout", None),
+            "client_kwargs": client_kwargs,
+            "update_primary": False,
+        }
+        try:
+            await self._ensure_provider_runtime()
+        except asyncio.CancelledError:
+            self._deferred_provider_runtime = previous_pending
+            raise
+        except Exception as exc:
+            self._deferred_provider_runtime = previous_pending
+            logger.warning(
+                "Failed to rebuild async OpenAI client (%s): %s",
+                reason,
+                exc,
+            )
+            return False
+        return True
+
     async def _swap_credential(self, entry) -> None:
         """Install a selected pool credential through the native async path.
 

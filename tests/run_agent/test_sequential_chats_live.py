@@ -21,6 +21,8 @@ import os
 from pathlib import Path
 
 import pytest
+from pyleak import no_event_loop_blocking, no_task_leaks
+from pyleak.eventloop import LeakAction
 
 
 # Load ~/.hermes/.env so live runs pick up OPENROUTER_API_KEY without
@@ -52,7 +54,7 @@ pytestmark = [
 ]
 
 # Cheap, fast, tool-capable. Swap if it ever goes dark.
-LIVE_MODEL = "google/gemini-2.5-flash"
+LIVE_MODEL = os.environ.get("OPENROUTER_MODEL") or "google/gemini-2.5-flash"
 
 
 def _make_live_agent():
@@ -121,18 +123,23 @@ async def test_three_sequential_chats_across_client_rebuild():
     credential rotation, model switch) and is the path that actually
     stored the closed transport into ``self._client_kwargs`` in #10933.
     """
-    agent = _make_live_agent()
+    async with (
+        no_event_loop_blocking(action=LeakAction.RAISE, threshold=0.25),
+        no_task_leaks(action=LeakAction.RAISE),
+        _make_live_agent() as agent,
+    ):
+        r1 = await agent.chat("Respond with only the word: ONE")
+        _assert_healthy_reply(r1, "turn 1")
 
-    r1 = await agent.chat("Respond with only the word: ONE")
-    _assert_healthy_reply(r1, "turn 1")
+        r2 = await agent.chat("Respond with only the word: TWO")
+        _assert_healthy_reply(r2, "turn 2")
 
-    r2 = await agent.chat("Respond with only the word: TWO")
-    _assert_healthy_reply(r2, "turn 2")
+        # Force a client rebuild through the real path — mimics 401 refresh /
+        # credential rotation / model switch lifecycle.
+        rebuilt = await agent._replace_primary_openai_client(
+            reason="regression_test_rebuild"
+        )
+        assert rebuilt, "rebuild via _replace_primary_openai_client returned False"
 
-    # Force a client rebuild through the real path — mimics 401 refresh /
-    # credential rotation / model switch lifecycle.
-    rebuilt = agent._replace_primary_openai_client(reason="regression_test_rebuild")
-    assert rebuilt, "rebuild via _replace_primary_openai_client returned False"
-
-    r3 = await agent.chat("Respond with only the word: THREE")
-    _assert_healthy_reply(r3, "turn 3 (post-rebuild)")
+        r3 = await agent.chat("Respond with only the word: THREE")
+        _assert_healthy_reply(r3, "turn 3 (post-rebuild)")

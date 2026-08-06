@@ -17,6 +17,8 @@ import asyncio
 from pathlib import Path
 
 import pytest
+from pyleak import no_event_loop_blocking, no_task_leaks
+from pyleak.eventloop import LeakAction
 
 # batch_runner is a root-level module (not part of an installed package),
 # so make the repo root importable when tests run from elsewhere.
@@ -133,8 +135,9 @@ class TestTaskCleanupOnInterruption:
                 raise
 
         monkeypatch.setattr(batch_runner, "_process_batch_worker", worker)
-        with pytest.raises(RuntimeError, match="boom"):
-            await runner.run()
+        async with no_task_leaks(action=LeakAction.RAISE):
+            with pytest.raises(RuntimeError, match="boom"):
+                await runner.run()
         assert sibling_cancelled.is_set()
 
     @pytest.mark.asyncio
@@ -155,11 +158,12 @@ class TestTaskCleanupOnInterruption:
                 raise
 
         monkeypatch.setattr(batch_runner, "_process_batch_worker", worker)
-        run_task = asyncio.create_task(runner.run())
-        await started.wait()
-        run_task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await run_task
+        async with no_task_leaks(action=LeakAction.RAISE):
+            run_task = asyncio.create_task(runner.run())
+            await started.wait()
+            run_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await run_task
         assert cancelled == 2
 
 
@@ -215,7 +219,11 @@ async def test_concurrent_batches_write_complete_rows_and_resume_without_duplica
 
     monkeypatch.setattr(batch_runner, "_process_single_prompt", process_prompt)
 
-    await runner.run()
+    async with (
+        no_event_loop_blocking(action=LeakAction.RAISE, threshold=0.1),
+        no_task_leaks(action=LeakAction.RAISE),
+    ):
+        await runner.run()
 
     combined_file = runner.output_dir / "trajectories.jsonl"
     rows = [
@@ -228,7 +236,11 @@ async def test_concurrent_batches_write_complete_rows_and_resume_without_duplica
     assert sorted(row["prompt_index"] for row in rows) == [0, 1, 2, 3]
     assert checkpoint["completed_prompts"] == [0, 1, 2, 3]
 
-    await runner.run(resume=True)
+    async with (
+        no_event_loop_blocking(action=LeakAction.RAISE, threshold=0.1),
+        no_task_leaks(action=LeakAction.RAISE),
+    ):
+        await runner.run(resume=True)
 
     resumed_rows = [
         json.loads(line)

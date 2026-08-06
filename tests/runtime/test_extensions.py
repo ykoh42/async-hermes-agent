@@ -7,6 +7,8 @@ from types import SimpleNamespace
 
 import pytest
 import pytest_asyncio
+from pyleak import no_event_loop_blocking, no_task_leaks
+from pyleak.eventloop import LeakAction
 
 from hermes_state import SessionDB
 from run_agent import AIAgent
@@ -149,7 +151,11 @@ async def test_skill_and_stdio_mcp_calls_are_preserved_in_trajectory(
     agent._execute_model_request = model_response
     agent.compression_enabled = False
     try:
-        async with agent:
+        async with (
+            no_event_loop_blocking(action=LeakAction.RAISE, threshold=0.1),
+            no_task_leaks(action=LeakAction.RAISE),
+            agent,
+        ):
             result = await agent.run_conversation(
                 "Read the trajectory-training skill, then call MCP echo."
             )
