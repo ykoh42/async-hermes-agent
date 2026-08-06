@@ -93,6 +93,10 @@ dependencies = [
 # Native Anthropic provider — only needed when provider=anthropic (not via
 # OpenRouter or other aggregators).
 anthropic = ["anthropic==0.87.0"]  # CVE-2026-34450, CVE-2026-34452
+# Vertex credential refresh uses google-auth's coroutine credentials and its
+# aiohttp transport. It is provider-specific and therefore stays out of the
+# base install.
+vertex = ["google-auth[aiohttp]==2.56.2"]
 # Web search backends — each only loaded when the user picks it as their
 # search provider (configured via `hermes tools` or config.yaml).
 parallel-web = ["parallel-web==0.4.2"]

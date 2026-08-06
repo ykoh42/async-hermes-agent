@@ -3834,10 +3834,11 @@ async def run_conversation(
                     and not _retry.vertex_auth_retry_attempted
                 ):
                     _retry.vertex_auth_retry_attempted = True
-                    raise UnsupportedCapabilityError(
-                        "Vertex OAuth renewal has no native async implementation. "
-                        "Refresh credentials before starting the async agent."
-                    )
+                    if await agent._try_refresh_vertex_client_credentials():
+                        agent._buffer_vprint(
+                            "🔐 Vertex AI token refreshed after 401. Retrying request..."
+                        )
+                        continue
                 if (
                     agent.api_mode in ("chat_completions", "anthropic_messages")
                     and agent.provider == "nous"

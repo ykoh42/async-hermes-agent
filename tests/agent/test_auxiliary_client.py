@@ -2469,34 +2469,52 @@ class TestAuxiliaryAuthRefreshRetry:
         stale_client.aclose.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_refresh_provider_credentials_rejects_sync_vertex_refresh(self):
-        """Vertex refresh is unsupported until google-auth has a native path."""
+    async def test_refresh_provider_credentials_refreshes_vertex_and_evicts_cache(self):
         stale_client = MagicMock()
+        stale_client.aclose = AsyncMock()
         cache_key = ("vertex", False, None, None, None)
 
-        with patch("agent.auxiliary_client._client_cache", {cache_key: (stale_client, "google/gemini-3-flash-preview", None)}):
+        with (
+            patch(
+                "agent.auxiliary_client._client_cache",
+                {cache_key: (stale_client, "google/gemini-3-flash-preview", None)},
+            ),
+            patch(
+                "agent.vertex_adapter.get_vertex_config",
+                new=AsyncMock(
+                    return_value=("fresh-token", "https://aiplatform.googleapis.com/v1")
+                ),
+            ),
+        ):
             from agent.auxiliary_client import _refresh_provider_credentials
 
-            assert await _refresh_provider_credentials("vertex") is False
+            assert await _refresh_provider_credentials("vertex") is True
 
-        stale_client.close.assert_not_called()
+        stale_client.aclose.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_refresh_provider_credentials_vertex_returns_false_when_unminted(self):
         from agent.auxiliary_client import _refresh_provider_credentials
 
-        assert await _refresh_provider_credentials("vertex") is False
+        with patch(
+            "agent.vertex_adapter.get_vertex_config",
+            new=AsyncMock(return_value=(None, None)),
+        ):
+            assert await _refresh_provider_credentials("vertex") is False
 
 
     @pytest.mark.asyncio
     async def test_resolve_provider_client_vertex_none_when_no_credentials(self):
-        from agent.agent_runtime_helpers import UnsupportedCapabilityError
-
-        with pytest.raises(UnsupportedCapabilityError, match="Vertex AI credential minting"):
-            await resolve_provider_client(
+        with patch(
+            "agent.vertex_adapter.has_vertex_credentials",
+            new=AsyncMock(return_value=False),
+        ):
+            client, model = await resolve_provider_client(
                 "vertex",
                 "google/gemini-3-flash-preview",
             )
+        assert client is None
+        assert model is None
 
 
 

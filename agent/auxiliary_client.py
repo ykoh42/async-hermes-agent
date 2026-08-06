@@ -3622,6 +3622,14 @@ async def _refresh_provider_credentials(provider: str) -> bool:
             await resolve_minimax_oauth_runtime_credentials(force_refresh=True)
             await _evict_cached_clients(normalized)
             return True
+        if normalized == "vertex":
+            from agent.vertex_adapter import get_vertex_config
+
+            token, base_url = await get_vertex_config()
+            if not token or not base_url:
+                return False
+            await _evict_cached_clients(normalized)
+            return True
     except Exception as exc:
         logger.debug("Auxiliary provider credential refresh failed for %s: %s", normalized, exc)
         return False
@@ -5261,14 +5269,40 @@ async def resolve_provider_client(
         )
 
     elif pconfig.auth_type == "vertex":
-        from agent.agent_runtime_helpers import UnsupportedCapabilityError
+        try:
+            from agent.vertex_adapter import get_vertex_config, has_vertex_credentials
+        except ImportError:
+            logger.warning(
+                "resolve_provider_client: vertex requested but google-auth not installed"
+            )
+            return None, None
 
-        raise UnsupportedCapabilityError(
-            "Vertex AI credential minting currently uses the synchronous "
-            "google-auth transport and is disabled in async-hermes-agent. "
-            "Use Gemini's native async REST provider or add an async Vertex "
-            "credential implementation."
-        )
+        if not await has_vertex_credentials():
+            logger.debug(
+                "resolve_provider_client: vertex requested but no GCP credentials found"
+            )
+            return None, None
+
+        token, base_url = await get_vertex_config()
+        if not token or not base_url:
+            logger.warning(
+                "resolve_provider_client: vertex requested but could not mint token / resolve project"
+            )
+            return None, None
+
+        default_model = "google/gemini-3-flash-preview"
+        final_model = _normalize_resolved_model(model or default_model, provider)
+        try:
+            client = _build_async_openai_client(
+                api_key=token,
+                base_url=base_url,
+                config=config,
+            )
+        except Exception as exc:
+            logger.warning("resolve_provider_client: cannot create Vertex client: %s", exc)
+            return None, None
+        logger.debug("resolve_provider_client: vertex (%s)", final_model)
+        return client, final_model
 
     elif pconfig.auth_type == "aws_sdk":
         from agent.agent_runtime_helpers import UnsupportedCapabilityError

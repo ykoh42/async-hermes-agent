@@ -4425,6 +4425,39 @@ class AIAgent:
             logger.debug("Nous credential refresh failed: %s", exc)
             return False
 
+    async def _try_refresh_vertex_client_credentials(self) -> bool:
+        """Re-mint the Vertex OAuth2 access token and rebuild the OpenAI client."""
+        if self.api_mode != "chat_completions" or self.provider != "vertex":
+            return False
+
+        try:
+            from agent.vertex_adapter import get_vertex_config
+
+            token, base_url = await get_vertex_config()
+            token = str(token or "").strip()
+            base_url = str(base_url or "").strip().rstrip("/")
+            if not token or not base_url:
+                return False
+            self._deferred_provider_runtime = {
+                "provider": self.provider,
+                "model": self.model,
+                "api_key": token,
+                "base_url": base_url,
+                "api_mode": self.api_mode,
+                "request_timeout": getattr(self, "_provider_request_timeout", None),
+                "stale_timeout": getattr(self, "_provider_stale_timeout", None),
+                "update_primary": False,
+            }
+            refreshed = await self._ensure_provider_runtime()
+            if refreshed:
+                logger.info("Vertex AI OAuth token refreshed")
+            return refreshed
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.debug("Vertex credential refresh failed: %s", exc)
+            return False
+
     async def _try_refresh_anthropic_client_credentials(self) -> bool:
         if (
             self.api_mode != "anthropic_messages"

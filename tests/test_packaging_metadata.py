@@ -99,8 +99,8 @@ def test_locked_starlette_is_not_vulnerable_to_cve_2026_48710():
         )
 
 
-def test_sync_only_provider_dependencies_are_not_published_as_extras():
-    """Do not advertise install extras for providers disabled by async runtime."""
+def test_provider_extras_only_publish_native_async_dependencies():
+    """Only providers with native async transports may publish install extras."""
     data = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
     extras = data["project"]["optional-dependencies"]
     declared = {
@@ -110,8 +110,9 @@ def test_sync_only_provider_dependencies_are_not_published_as_extras():
     }
 
     assert "bedrock" not in extras
-    assert "vertex" not in extras
-    assert {"boto3", "google-auth", "urllib3"}.isdisjoint(declared)
+    assert extras["vertex"] == ["google-auth[aiohttp]==2.56.2"]
+    assert "google-auth" in declared
+    assert "boto3" not in declared
 
 
 

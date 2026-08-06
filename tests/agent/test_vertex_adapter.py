@@ -1,118 +1,216 @@
-"""Tests for the Vertex AI adapter (agent/vertex_adapter.py).
-
-Vertex uses OAuth2 (short-lived access tokens from a service-account JSON or
-ADC), NOT a static API key. These tests mock google-auth entirely — no network
-calls — and cover token minting, the config.yaml→env precedence bridge, the
-global vs regional base-URL shapes, and the ADC→service-account fallback.
-"""
+"""Tests for the native-async Vertex AI adapter."""
 
 from __future__ import annotations
 
+import asyncio
 import importlib
-import sys
-import types
+from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 import pytest
 
 
-def _install_fake_google_auth(monkeypatch, *, adc_ok=True, adc_project="adc-project",
-                              sa_project="sa-project", token="ya29.FAKE"):
-    """Register a fake google-auth tree in sys.modules and return the module set."""
-    ga = types.ModuleType("google.auth")
-    gt = types.ModuleType("google.auth.transport")
-    gtr = types.ModuleType("google.auth.transport.requests")
-    go = types.ModuleType("google.oauth2")
-    gsa = types.ModuleType("google.oauth2.service_account")
-    gp = types.ModuleType("google")
+class _Credentials:
+    def __init__(self, *, project_id=None, token="ya29.FAKE"):
+        self.project_id = project_id
+        self.token = None
+        self.expiry = None
+        self.expired = False
+        self._next_token = token
+        self.refresh_count = 0
 
-    gtr.Request = type("Request", (), {})
+    async def refresh(self, request):
+        await asyncio.sleep(0)
+        self.refresh_count += 1
+        self.token = self._next_token
+        self.expiry = datetime.now(timezone.utc) + timedelta(hours=1)
 
-    class _Creds:
-        def __init__(self):
-            self.token = None
-            self.expiry = None
-            self.expired = False
 
-        def refresh(self, req):
-            self.token = token
+class _Request:
+    instances = []
 
-    def _default(scopes=None):
-        if not adc_ok:
-            raise RuntimeError("Could not automatically determine credentials")
-        return _Creds(), adc_project
+    def __init__(self):
+        self.closed = False
+        self.instances.append(self)
 
-    ga.default = _default
-    ga.transport = gt
-    gt.requests = gtr
-
-    class _SA:
-        @staticmethod
-        def from_service_account_file(path, scopes=None):
-            c = _Creds()
-            c.project_id = sa_project
-            return c
-
-    gsa.Credentials = _SA
-    go.service_account = gsa
-    gp.auth = ga
-    gp.oauth2 = go
-
-    for name, mod in [
-        ("google", gp), ("google.auth", ga), ("google.auth.transport", gt),
-        ("google.auth.transport.requests", gtr), ("google.oauth2", go),
-        ("google.oauth2.service_account", gsa),
-    ]:
-        monkeypatch.setitem(sys.modules, name, mod)
-    return gp
+    async def close(self):
+        self.closed = True
 
 
 @pytest.fixture
-def vertex_adapter(monkeypatch):
-    """Fresh vertex_adapter with a fake google-auth and clean caches/env."""
-    for var in ("VERTEX_CREDENTIALS_PATH", "GOOGLE_APPLICATION_CREDENTIALS",
-                "VERTEX_PROJECT_ID", "VERTEX_REGION", "GOOGLE_CLOUD_PROJECT"):
+def vertex_adapter(monkeypatch, tmp_path):
+    for var in (
+        "VERTEX_CREDENTIALS_PATH",
+        "GOOGLE_APPLICATION_CREDENTIALS",
+        "VERTEX_PROJECT_ID",
+        "VERTEX_REGION",
+        "GOOGLE_CLOUD_PROJECT",
+        "GCLOUD_PROJECT",
+        "GCE_METADATA_HOST",
+    ):
         monkeypatch.delenv(var, raising=False)
-    _install_fake_google_auth(monkeypatch)
+
     import agent.vertex_adapter as va
+
     va = importlib.reload(va)
     va._creds_cache.clear()
-    # Neutralize config.yaml by default; individual tests re-patch _vertex_config.
+    va._cache_locks.clear()
+    _Request.instances.clear()
     monkeypatch.setattr(va, "_vertex_config", lambda: {})
+    monkeypatch.setattr(
+        va,
+        "aiohttp_requests",
+        SimpleNamespace(Request=_Request),
+    )
+    monkeypatch.setattr(
+        va,
+        "service_account",
+        SimpleNamespace(
+            Credentials=SimpleNamespace(
+                from_service_account_info=lambda info, scopes: _Credentials(
+                    project_id=info.get("project_id")
+                )
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        va,
+        "user_credentials",
+        SimpleNamespace(
+            Credentials=SimpleNamespace(
+                from_authorized_user_info=lambda info, scopes: _Credentials()
+            )
+        ),
+    )
+    adc_path = tmp_path / "missing-adc.json"
+    monkeypatch.setattr(
+        va,
+        "_cloud_sdk",
+        SimpleNamespace(
+            get_application_default_credentials_path=lambda: str(adc_path)
+        ),
+    )
     return va
 
 
+@pytest.mark.asyncio
+async def test_service_account_refresh_is_awaited_and_cached(
+    vertex_adapter, monkeypatch, tmp_path
+):
+    credentials_path = tmp_path / "service-account.json"
+    credentials_path.write_text(
+        '{"type":"service_account","project_id":"sa-project"}',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("VERTEX_CREDENTIALS_PATH", str(credentials_path))
+
+    first = await vertex_adapter.get_vertex_credentials()
+    second = await vertex_adapter.get_vertex_credentials()
+
+    assert first == second == ("ya29.FAKE", "sa-project")
+    creds, _ = vertex_adapter._creds_cache[str(credentials_path)]
+    assert creds.refresh_count == 1
+    assert _Request.instances[0].closed is True
 
 
+@pytest.mark.asyncio
+async def test_authorized_user_adc_uses_async_refresh_and_gcloud_project(
+    vertex_adapter, monkeypatch, tmp_path
+):
+    adc_path = tmp_path / "application_default_credentials.json"
+    adc_path.write_text('{"type":"authorized_user"}', encoding="utf-8")
+    monkeypatch.setattr(
+        vertex_adapter,
+        "_cloud_sdk",
+        SimpleNamespace(get_application_default_credentials_path=lambda: str(adc_path)),
+    )
+
+    async def project_id():
+        return "gcloud-project"
+
+    monkeypatch.setattr(vertex_adapter, "_gcloud_project_id", project_id)
+
+    assert await vertex_adapter.get_vertex_credentials() == (
+        "ya29.FAKE",
+        "gcloud-project",
+    )
 
 
+@pytest.mark.asyncio
+async def test_metadata_adc_is_cached_with_refresh_margin(vertex_adapter, monkeypatch):
+    calls = 0
+
+    async def metadata_credentials():
+        nonlocal calls
+        calls += 1
+        vertex_adapter._creds_cache["__metadata__"] = {
+            "token": "metadata-token",
+            "project_id": "metadata-project",
+            "expires_at": vertex_adapter.time.time() + 3600,
+        }
+        return "metadata-token", "metadata-project"
+
+    monkeypatch.setattr(vertex_adapter, "_metadata_credentials", metadata_credentials)
+
+    assert await vertex_adapter.get_vertex_credentials() == (
+        "metadata-token",
+        "metadata-project",
+    )
+    assert await vertex_adapter.get_vertex_credentials() == (
+        "metadata-token",
+        "metadata-project",
+    )
+    assert calls == 1
 
 
+@pytest.mark.asyncio
+async def test_get_vertex_config_preserves_regional_url(
+    vertex_adapter, monkeypatch
+):
+    async def credentials(path=None):
+        return "token", "project"
+
+    monkeypatch.setattr(vertex_adapter, "get_vertex_credentials", credentials)
+
+    assert await vertex_adapter.get_vertex_config(region="us-central1") == (
+        "token",
+        "https://us-central1-aiplatform.googleapis.com/v1beta1/projects/"
+        "project/locations/us-central1/endpoints/openapi",
+    )
 
 
+def test_build_vertex_base_url_global_and_regional(vertex_adapter):
+    assert vertex_adapter.build_vertex_base_url("p") == (
+        "https://aiplatform.googleapis.com/v1beta1/projects/p/locations/"
+        "global/endpoints/openapi"
+    )
+    assert vertex_adapter.build_vertex_base_url("p", "europe-west4") == (
+        "https://europe-west4-aiplatform.googleapis.com/v1beta1/projects/p/"
+        "locations/europe-west4/endpoints/openapi"
+    )
 
 
-def test_has_vertex_credentials_via_config_project(vertex_adapter, monkeypatch):
+@pytest.mark.asyncio
+async def test_has_vertex_credentials_via_config_project(vertex_adapter, monkeypatch):
     monkeypatch.setattr(vertex_adapter, "_vertex_config", lambda: {"project_id": "p"})
-    assert vertex_adapter.has_vertex_credentials() is True
+    assert await vertex_adapter.has_vertex_credentials() is True
 
 
-def test_has_vertex_credentials_false_when_nothing_set(vertex_adapter):
-    assert vertex_adapter.has_vertex_credentials() is False
+@pytest.mark.asyncio
+async def test_has_vertex_credentials_false_when_nothing_set(vertex_adapter):
+    assert await vertex_adapter.has_vertex_credentials() is False
 
 
-
-
-def test_multiplex_scope_takes_precedence_over_raw_environ(vertex_adapter, monkeypatch):
-    """In a multiplex gateway, a profile's own secret scope must win over a
-    stale value in process os.environ left behind by another profile's
-    dotenv load at boot — otherwise Profile B's turn could resolve Profile
-    A's Vertex project (or worse, its credentials file path)."""
+def test_multiplex_scope_takes_precedence_over_raw_environ(
+    vertex_adapter, monkeypatch
+):
     from agent import secret_scope
 
     monkeypatch.setenv("VERTEX_PROJECT_ID", "other-profile-project")
-
     secret_scope.set_multiplex_active(True)
-    token = secret_scope.set_secret_scope({"VERTEX_PROJECT_ID": "this-profile-project"})
+    token = secret_scope.set_secret_scope(
+        {"VERTEX_PROJECT_ID": "this-profile-project"}
+    )
     try:
         assert vertex_adapter._resolve_project_override() == "this-profile-project"
     finally:
@@ -121,9 +219,6 @@ def test_multiplex_scope_takes_precedence_over_raw_environ(vertex_adapter, monke
 
 
 def test_multiplex_unscoped_read_fails_closed(vertex_adapter, monkeypatch):
-    """A credential read with no profile scope installed while multiplexing
-    is active must raise rather than silently fall back to (possibly another
-    profile's) raw os.environ value."""
     from agent import secret_scope
 
     monkeypatch.setenv("VERTEX_PROJECT_ID", "leaked-project")
@@ -135,27 +230,42 @@ def test_multiplex_unscoped_read_fails_closed(vertex_adapter, monkeypatch):
         secret_scope.set_multiplex_active(False)
 
 
-def test_adc_refuses_foreign_profile_google_application_credentials(
+@pytest.mark.asyncio
+async def test_adc_refuses_foreign_profile_google_application_credentials(
     vertex_adapter, monkeypatch, tmp_path
 ):
-    """When this profile's scope defines no Vertex credentials, but os.environ
-    still carries a *different* profile's GOOGLE_APPLICATION_CREDENTIALS (left
-    there by python-dotenv at gateway boot), ADC must not silently mint a
-    token under that foreign service account."""
     from agent import secret_scope
 
     sa_file = tmp_path / "other_profile_sa.json"
-    sa_file.write_text('{"project_id": "other-profile"}')
+    sa_file.write_text(
+        '{"type":"service_account","project_id":"other-profile"}',
+        encoding="utf-8",
+    )
     monkeypatch.setenv("GOOGLE_APPLICATION_CREDENTIALS", str(sa_file))
 
     secret_scope.set_multiplex_active(True)
-    token = secret_scope.set_secret_scope({})  # this profile defines nothing
+    token = secret_scope.set_secret_scope({})
     try:
-        assert vertex_adapter.get_vertex_credentials() == (None, None)
+        assert await vertex_adapter.get_vertex_credentials() == (None, None)
     finally:
         secret_scope.reset_secret_scope(token)
         secret_scope.set_multiplex_active(False)
 
 
+@pytest.mark.asyncio
+async def test_refresh_cancellation_closes_transport(vertex_adapter, monkeypatch):
+    started = asyncio.Event()
 
+    class BlockingCredentials:
+        async def refresh(self, request):
+            started.set()
+            await asyncio.Event().wait()
 
+    task = asyncio.create_task(
+        vertex_adapter._refresh_credentials(BlockingCredentials())
+    )
+    await started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert _Request.instances[-1].closed is True

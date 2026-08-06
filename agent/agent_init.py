@@ -2912,6 +2912,27 @@ async def initialize_deferred_runtime(agent: Any) -> bool:
             resolved = (candidates[0], explicit_api_key, explicit_base_url, None, None)
 
         for provider in (candidates if resolved is None else ()):
+            if provider in {
+                "vertex",
+                "google-vertex",
+                "vertex-ai",
+                "gcp-vertex",
+                "vertexai",
+            }:
+                from agent.vertex_adapter import get_vertex_config
+
+                vertex_token, vertex_base_url = await get_vertex_config()
+                if vertex_token and vertex_base_url:
+                    resolved = (
+                        "vertex",
+                        vertex_token,
+                        vertex_base_url,
+                        None,
+                        None,
+                    )
+                    break
+                unavailable.append("Vertex OAuth2 credentials")
+                continue
             try:
                 pool = await load_pool(provider)
                 entry = await pool.select()

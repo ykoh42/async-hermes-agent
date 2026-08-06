@@ -16,25 +16,48 @@ Non-secret routing settings (project_id, region) also live in config.yaml
 under the ``vertex:`` section; env vars take precedence over config.yaml.
 """
 
+import asyncio
+import json
 import logging
 import os
 import time
+import weakref
 from typing import Optional, Tuple
+
+import aiofiles
+import aiofiles.os
+import httpx
 
 from agent.secret_scope import get_secret as _get_secret, is_multiplex_active
 
 try:
-    import google.auth
-    import google.auth.transport.requests
-    from google.oauth2 import service_account
+    from google.auth import _cloud_sdk
+    from google.auth.transport import aiohttp_requests
+    from google.oauth2 import _credentials_async as user_credentials
+    from google.oauth2 import _service_account_async as service_account
 except ImportError:
-    google = None  # type: ignore[assignment]
+    _cloud_sdk = None  # type: ignore[assignment]
+    aiohttp_requests = None  # type: ignore[assignment]
+    user_credentials = None  # type: ignore[assignment]
+    service_account = None  # type: ignore[assignment]
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_REGION = "global"
 
 _creds_cache: dict = {}
+_cache_locks: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Lock]" = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def _cache_lock() -> asyncio.Lock:
+    loop = asyncio.get_running_loop()
+    lock = _cache_locks.get(loop)
+    if lock is None:
+        lock = asyncio.Lock()
+        _cache_locks[loop] = lock
+    return lock
 
 
 def _vertex_config() -> dict:
@@ -77,8 +100,8 @@ def _resolve_project_override() -> Optional[str]:
     return cfg_project or None
 
 
-def _resolve_credentials_path(explicit: Optional[str]) -> Optional[str]:
-    if explicit and os.path.exists(explicit):
+async def _resolve_credentials_path(explicit: Optional[str]) -> Optional[str]:
+    if explicit and await aiofiles.os.path.exists(explicit):
         return explicit
     # Routed through get_secret (not a raw os.environ read): in a multiplex
     # gateway serving several profiles from one process, os.environ reflects
@@ -88,39 +111,112 @@ def _resolve_credentials_path(explicit: Optional[str]) -> Optional[str]:
     # profile's service-account file. See agent/secret_scope.py.
     for env_var in ("VERTEX_CREDENTIALS_PATH", "GOOGLE_APPLICATION_CREDENTIALS"):
         path = _get_secret(env_var)
-        if path and os.path.exists(path):
+        if path and await aiofiles.os.path.exists(path):
             return path
     return None
 
 
-def _refresh_credentials(creds) -> None:
-    auth_req = google.auth.transport.requests.Request()
-    creds.refresh(auth_req)
+async def _refresh_credentials(creds) -> None:
+    auth_req = aiohttp_requests.Request()
+    try:
+        await creds.refresh(auth_req)
+    finally:
+        await auth_req.close()
 
 
-def get_vertex_credentials(credentials_path: Optional[str] = None) -> Tuple[Optional[str], Optional[str]]:
+async def _load_credentials_file(path: str):
+    async with aiofiles.open(path, encoding="utf-8") as credentials_file:
+        info = json.loads(await credentials_file.read())
+
+    credential_type = info.get("type")
+    if credential_type == "service_account":
+        creds = service_account.Credentials.from_service_account_info(
+            info,
+            scopes=["https://www.googleapis.com/auth/cloud-platform"],
+        )
+        return creds, info.get("project_id")
+    if credential_type == "authorized_user":
+        creds = user_credentials.Credentials.from_authorized_user_info(
+            info,
+            scopes=["https://www.googleapis.com/auth/cloud-platform"],
+        )
+        return creds, None
+    raise ValueError(
+        "Vertex async credentials must be a service_account or authorized_user JSON file"
+    )
+
+
+async def _gcloud_project_id() -> Optional[str]:
+    project_id = (
+        os.getenv("GOOGLE_CLOUD_PROJECT")
+        or os.getenv("GCLOUD_PROJECT")
+        or ""
+    ).strip()
+    if project_id:
+        return project_id
+    try:
+        process = await asyncio.create_subprocess_exec(
+            "gcloud.cmd" if os.name == "nt" else "gcloud",
+            "config",
+            "get",
+            "project",
+            "--format=value(core.project)",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        stdout, _ = await process.communicate()
+    except (FileNotFoundError, OSError):
+        return None
+    if process.returncode != 0:
+        return None
+    return stdout.decode("utf-8", errors="replace").strip() or None
+
+
+async def _metadata_credentials() -> Tuple[Optional[str], Optional[str]]:
+    metadata_host = os.getenv("GCE_METADATA_HOST", "metadata.google.internal").strip()
+    base_url = f"http://{metadata_host}/computeMetadata/v1"
+    headers = {"Metadata-Flavor": "Google"}
+    timeout = httpx.Timeout(3.0)
+    async with httpx.AsyncClient(timeout=timeout, trust_env=False) as client:
+        project_response, token_response = await asyncio.gather(
+            client.get(f"{base_url}/project/project-id", headers=headers),
+            client.get(
+                f"{base_url}/instance/service-accounts/default/token",
+                headers=headers,
+            ),
+        )
+        project_response.raise_for_status()
+        token_response.raise_for_status()
+        token_data = token_response.json()
+    token = str(token_data.get("access_token") or "").strip()
+    project_id = project_response.text.strip()
+    if not token or not project_id:
+        return None, None
+    expires_in = max(int(token_data.get("expires_in") or 0), 0)
+    _creds_cache["__metadata__"] = {
+        "token": token,
+        "project_id": project_id,
+        "expires_at": time.time() + expires_in,
+    }
+    return token, project_id
+
+
+async def get_vertex_credentials(credentials_path: Optional[str] = None) -> Tuple[Optional[str], Optional[str]]:
     """Return a (fresh access_token, project_id) pair or (None, None) on failure.
 
     Caches the underlying Credentials object and refreshes it when within
     5 minutes of expiry, so repeated calls don't thrash the token endpoint.
     """
-    if google is None:
+    if service_account is None:
         logger.warning("google-auth package not installed. Cannot use Vertex AI.")
         return None, None
 
-    resolved_path = _resolve_credentials_path(credentials_path)
-    cache_key = resolved_path or "__adc__"
+    resolved_path = await _resolve_credentials_path(credentials_path)
+    cache_key = resolved_path
 
     try:
-        cached = _creds_cache.get(cache_key)
-        if cached is None:
-            if resolved_path:
-                creds = service_account.Credentials.from_service_account_file(
-                    resolved_path,
-                    scopes=["https://www.googleapis.com/auth/cloud-platform"],
-                )
-                project_id = creds.project_id
-            else:
+        async with _cache_lock():
+            if resolved_path is None:
                 # google.auth.default() reads GOOGLE_APPLICATION_CREDENTIALS
                 # straight from os.environ internally — it has no notion of
                 # the profile secret scope. _resolve_credentials_path already
@@ -139,40 +235,61 @@ def get_vertex_credentials(credentials_path: Optional[str] = None) -> Tuple[Opti
                         "in this profile's .env instead of relying on ADC."
                     )
                     return None, None
-                creds, project_id = google.auth.default(
-                    scopes=["https://www.googleapis.com/auth/cloud-platform"]
-                )
-            _creds_cache[cache_key] = (creds, project_id)
-        else:
-            creds, project_id = cached
+                adc_path = _cloud_sdk.get_application_default_credentials_path()
+                if await aiofiles.os.path.isfile(adc_path):
+                    resolved_path = adc_path
+                    cache_key = resolved_path
+                else:
+                    cached_metadata = _creds_cache.get("__metadata__")
+                    if (
+                        isinstance(cached_metadata, dict)
+                        and cached_metadata.get("expires_at", 0) - time.time() >= 300
+                    ):
+                        token = cached_metadata.get("token")
+                        project_id = cached_metadata.get("project_id")
+                    else:
+                        token, project_id = await _metadata_credentials()
+                    override_project = _resolve_project_override()
+                    return token, override_project or project_id
 
-        needs_refresh = (
-            not getattr(creds, "token", None)
-            or getattr(creds, "expired", False)
-            or (
-                getattr(creds, "expiry", None) is not None
-                and (creds.expiry.timestamp() - time.time()) < 300
+            cached = _creds_cache.get(cache_key)
+            if cached is None:
+                creds, project_id = await _load_credentials_file(resolved_path)
+                if project_id is None and resolved_path == _cloud_sdk.get_application_default_credentials_path():
+                    project_id = await _gcloud_project_id()
+                _creds_cache[cache_key] = (creds, project_id)
+            else:
+                creds, project_id = cached
+
+            needs_refresh = (
+                not getattr(creds, "token", None)
+                or getattr(creds, "expired", False)
+                or (
+                    getattr(creds, "expiry", None) is not None
+                    and (creds.expiry.timestamp() - time.time()) < 300
+                )
             )
-        )
-        if needs_refresh:
-            _refresh_credentials(creds)
+            if needs_refresh:
+                await _refresh_credentials(creds)
 
         override_project = _resolve_project_override()
         if override_project:
             project_id = override_project
 
         return creds.token, project_id
+    except asyncio.CancelledError:
+        raise
     except Exception as e:
         logger.error(f"Failed to resolve Vertex AI credentials: {e}")
         _creds_cache.pop(cache_key, None)
 
         # If ADC failed (e.g. expired refresh token), try the SA file
         # before giving up — it may have been added after initial startup.
-        if cache_key == "__adc__":
-            sa_path = _resolve_credentials_path(credentials_path)
-            if sa_path:
+        if credentials_path is None:
+            sa_path = await _resolve_credentials_path(credentials_path)
+            if sa_path and sa_path != cache_key:
                 logger.info("ADC failed, retrying with service account: %s", sa_path)
-                return get_vertex_credentials(sa_path)
+                return await get_vertex_credentials(sa_path)
 
         return None, None
 
@@ -189,12 +306,12 @@ def build_vertex_base_url(project_id: str, region: str = DEFAULT_REGION) -> str:
     return f"https://{host}/v1beta1/projects/{project_id}/locations/{region}/endpoints/openapi"
 
 
-def get_vertex_config(
+async def get_vertex_config(
     credentials_path: Optional[str] = None,
     region: Optional[str] = None,
 ) -> Tuple[Optional[str], Optional[str]]:
     """Resolve (access_token, base_url) for Vertex AI, or (None, None) on failure."""
-    token, project_id = get_vertex_credentials(credentials_path)
+    token, project_id = await get_vertex_credentials(credentials_path)
     if not token or not project_id:
         return None, None
 
@@ -203,7 +320,7 @@ def get_vertex_config(
     return token, base_url
 
 
-def has_vertex_credentials() -> bool:
+async def has_vertex_credentials() -> bool:
     """Fast check for whether Vertex credentials appear configured.
 
     No network calls and no google-auth import — safe for provider
@@ -211,7 +328,7 @@ def has_vertex_credentials() -> bool:
     account JSON path is resolvable, or an explicit project ID is configured
     (env or config.yaml, implying ADC is intended).
     """
-    if _resolve_credentials_path(None):
+    if await _resolve_credentials_path(None):
         return True
     if _resolve_project_override():
         return True
