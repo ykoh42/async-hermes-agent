@@ -50,7 +50,7 @@ class _TranscriptionProvider(TranscriptionProvider):
 class _BrowserProvider(BrowserProvider):
     name = "test-browser"
 
-    def is_available(self):
+    async def is_available(self):
         return True
 
     async def create_session(self, task_id):
@@ -94,6 +94,8 @@ def test_media_and_browser_provider_io_contracts_are_native_async():
     assert inspect.iscoroutinefunction(TTSProvider.synthesize)
     assert inspect.isasyncgenfunction(TTSProvider.stream)
     assert inspect.iscoroutinefunction(TranscriptionProvider.transcribe)
+    assert inspect.iscoroutinefunction(BrowserProvider.is_available)
+    assert inspect.iscoroutinefunction(BrowserProvider.get_setup_schema)
     assert inspect.iscoroutinefunction(BrowserProvider.create_session)
     assert inspect.iscoroutinefunction(BrowserProvider.close_session)
     assert inspect.iscoroutinefunction(BrowserProvider.emergency_cleanup)

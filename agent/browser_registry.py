@@ -38,7 +38,6 @@ from __future__ import annotations
 
 import logging
 import inspect
-import threading
 from typing import Dict, List, Optional
 
 from agent.browser_provider import BrowserProvider
@@ -47,7 +46,6 @@ logger = logging.getLogger(__name__)
 
 
 _providers: Dict[str, BrowserProvider] = {}
-_lock = threading.Lock()
 
 
 def register_provider(provider: BrowserProvider) -> None:
@@ -65,12 +63,17 @@ def register_provider(provider: BrowserProvider) -> None:
     name = provider.name
     if not isinstance(name, str) or not name.strip():
         raise ValueError("Browser provider .name must be a non-empty string")
-    for method_name in ("create_session", "close_session", "emergency_cleanup"):
+    for method_name in (
+        "is_available",
+        "get_setup_schema",
+        "create_session",
+        "close_session",
+        "emergency_cleanup",
+    ):
         if not inspect.iscoroutinefunction(getattr(provider, method_name)):
             raise TypeError(f"Browser provider .{method_name} must be async")
-    with _lock:
-        existing = _providers.get(name)
-        _providers[name] = provider
+    existing = _providers.get(name)
+    _providers[name] = provider
     if existing is not None:
         logger.debug(
             "Browser provider '%s' re-registered (was %r)",
@@ -85,8 +88,7 @@ def register_provider(provider: BrowserProvider) -> None:
 
 def list_providers() -> List[BrowserProvider]:
     """Return all registered providers, sorted by name."""
-    with _lock:
-        items = list(_providers.values())
+    items = list(_providers.values())
     return sorted(items, key=lambda p: p.name)
 
 
@@ -94,8 +96,7 @@ def get_provider(name: str) -> Optional[BrowserProvider]:
     """Return the provider registered under *name*, or None."""
     if not isinstance(name, str):
         return None
-    with _lock:
-        return _providers.get(name.strip())
+    return _providers.get(name.strip())
 
 
 # ---------------------------------------------------------------------------
@@ -114,7 +115,7 @@ _LEGACY_PREFERENCE = (
 )
 
 
-def _resolve(configured: Optional[str]) -> Optional[BrowserProvider]:
+async def _resolve(configured: Optional[str]) -> Optional[BrowserProvider]:
     """Resolve the active browser provider.
 
     Resolution rules (in order):
@@ -147,13 +148,12 @@ def _resolve(configured: Optional[str]) -> Optional[BrowserProvider]:
     matches the legacy preference; the dispatcher then falls back to local
     browser mode.
     """
-    with _lock:
-        snapshot = dict(_providers)
+    snapshot = dict(_providers)
 
-    def _is_available_safe(p: BrowserProvider) -> bool:
+    async def _is_available_safe(p: BrowserProvider) -> bool:
         """Wrap ``is_available()`` so a buggy provider doesn't kill resolution."""
         try:
-            return bool(p.is_available())
+            return bool(await p.is_available())
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "Browser provider %s.is_available() raised %s — treating as unavailable",
@@ -184,7 +184,7 @@ def _resolve(configured: Optional[str]) -> Optional[BrowserProvider]:
     #    we do NOT fall back to "any single-eligible registered provider".
     for legacy in _LEGACY_PREFERENCE:
         provider = snapshot.get(legacy)
-        if provider is not None and _is_available_safe(provider):
+        if provider is not None and await _is_available_safe(provider):
             return provider
 
     return None
@@ -192,5 +192,4 @@ def _resolve(configured: Optional[str]) -> Optional[BrowserProvider]:
 
 def _reset_for_tests() -> None:
     """Clear the registry. **Test-only.**"""
-    with _lock:
-        _providers.clear()
+    _providers.clear()

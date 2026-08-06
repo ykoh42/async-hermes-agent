@@ -75,7 +75,7 @@ class BrowserProvider(abc.ABC):
         return self.name
 
     @abc.abstractmethod
-    def is_available(self) -> bool:
+    async def is_available(self) -> bool:
         """Return True when this provider can service calls.
 
         Typically a cheap check (env var present, managed-gateway token
@@ -83,8 +83,8 @@ class BrowserProvider(abc.ABC):
         calls — this runs at tool-registration time and on every
         ``hermes tools`` paint.
 
-        Mirrors the legacy ``CloudBrowserProvider.is_configured()`` method;
-        renamed for parity with :class:`agent.web_search_provider.WebSearchProvider`.
+        Uses the same availability semantics as
+        :class:`agent.web_search_provider.WebSearchProvider`.
         """
 
     @abc.abstractmethod
@@ -126,7 +126,7 @@ class BrowserProvider(abc.ABC):
         credentials, network errors, etc. — log and move on. Must not raise.
         """
 
-    def get_setup_schema(self) -> Dict[str, Any]:
+    async def get_setup_schema(self) -> Dict[str, Any]:
         """Return provider metadata for the ``hermes tools`` picker.
 
         Used by :mod:`hermes_cli.tools_config` to inject this provider as a
@@ -155,23 +155,3 @@ class BrowserProvider(abc.ABC):
             "tag": "",
             "env_vars": [],
         }
-
-    # ------------------------------------------------------------------
-    # Backward-compat shims for the legacy CloudBrowserProvider API
-    # ------------------------------------------------------------------
-    #
-    # The pre-PR-#25214 ABC exposed ``is_configured()`` and ``provider_name()``;
-    # ``tools.browser_tool`` has ~6 callers that still use those names. Rather
-    # than churn every callsite (and break out-of-tree downstream code that
-    # subclassed CloudBrowserProvider), we expose the old names as thin
-    # delegations to the new API. Subclasses MUST implement :meth:`is_available`
-    # and :attr:`name`; they may override ``is_configured`` / ``provider_name``
-    # for compatibility with the legacy ABC but it is not required.
-
-    def is_configured(self) -> bool:
-        """Backward-compat alias for :meth:`is_available`."""
-        return self.is_available()
-
-    def provider_name(self) -> str:
-        """Backward-compat alias returning :attr:`display_name`."""
-        return self.display_name

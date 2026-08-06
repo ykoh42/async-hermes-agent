@@ -52,6 +52,21 @@ async def read_nous_access_token() -> Optional[str]:
         return None
 
 
+async def peek_nous_access_token() -> Optional[str]:
+    """Return a cached Nous token without refreshing it over the network."""
+    explicit = await _read_user_token_override()
+    if explicit:
+        return explicit
+    try:
+        from hermes_cli.auth import get_provider_auth_state
+
+        state = await get_provider_auth_state("nous") or {}
+        value = state.get("access_token")
+        return str(value).strip() or None
+    except Exception:
+        return None
+
+
 def get_tool_gateway_scheme() -> str:
     scheme = os.getenv("TOOL_GATEWAY_SCHEME", "").strip().lower()
     if not scheme:
@@ -90,3 +105,16 @@ async def resolve_managed_tool_gateway(
         nous_user_token=token,
         managed_mode=True,
     )
+
+
+async def is_managed_tool_gateway_ready(
+    vendor: str,
+    gateway_builder: Optional[Callable[[str], str]] = None,
+    token_reader=None,
+) -> bool:
+    """Return whether a managed gateway can be resolved without token refresh."""
+    return await resolve_managed_tool_gateway(
+        vendor,
+        gateway_builder=gateway_builder,
+        token_reader=token_reader or peek_nous_access_token,
+    ) is not None
