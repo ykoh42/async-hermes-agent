@@ -42,13 +42,6 @@ _creation_locks: weakref.WeakKeyDictionary[
 _task_env_overrides: dict[str, dict[str, Any]] = {}
 _session_cwds: dict[str, str] = {}
 _CONTAINER_BACKENDS = frozenset()
-# Native ``background=true`` commands are owned by the running event loop,
-# not the legacy ProcessRegistry (which is backed by blocking Popen readers).
-# Keeping their handles here lets ``AIAgent.close()`` terminate and reap them
-# without leaking child processes when a service request/session ends.
-_background_processes: dict[str, set[asyncio.subprocess.Process]] = {}
-_background_reapers: dict[asyncio.subprocess.Process, asyncio.Task] = {}
-
 _approval_callback: contextvars.ContextVar[Callable[..., Any] | None] = (
     contextvars.ContextVar("terminal_approval_callback", default=None)
 )
@@ -108,6 +101,12 @@ def _looks_like_help_or_version_command(command: str) -> bool:
         or " --version" in normalized
         or normalized.endswith(" -v")
     )
+
+
+def _command_requires_pipe_stdin(command: str) -> bool:
+    """Return True when PTY mode would break an EOF-driven command."""
+    normalized = " ".join(command.lower().split())
+    return normalized.startswith("gh auth login") and "--with-token" in normalized
 
 
 def _foreground_background_guidance(command: str) -> str | None:
@@ -189,10 +188,6 @@ def _docker_has_host_access(_config: dict[str, Any] | None = None) -> bool:
 
 def _check_vercel_sandbox_requirements(_config: dict[str, Any] | None = None) -> bool:
     return False
-
-
-def _start_cleanup_thread() -> None:
-    """Compatibility hook; local environments live until explicit cleanup."""
 
 
 def _get_approval_callback() -> Callable[..., Any] | None:
@@ -492,7 +487,7 @@ class LocalEnvironment:
                 wrapped,
                 executable=shell,
                 cwd=workdir,
-                **({"start_new_session": True} if os.name == "posix" else {}),
+                start_new_session=os.name == "posix",
                 stdin=asyncio.subprocess.PIPE if stdin_data is not None else None,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
@@ -516,7 +511,7 @@ class LocalEnvironment:
                 asyncio.create_task(_drain(process.stdout, stdout_chunks)),
                 asyncio.create_task(_drain(process.stderr, stderr_chunks)),
             ]
-            if process.stdin is not None:
+            if stdin_data is not None and process.stdin is not None:
                 try:
                     process.stdin.write(stdin_data.encode())
                     await process.stdin.drain()
@@ -651,53 +646,14 @@ async def cleanup_vm(task_id: str | None = None) -> None:
     closed agent or remain as zombies after their parent request is cancelled.
     """
     key = _resolve_container_task_id(task_id)
-    processes = list(_background_processes.pop(key, set()))
-    reapers = [
-        _background_reapers.pop(process, None)
-        for process in processes
-    ]
-    if processes:
-        # Use the same process-group aware termination path as foreground
-        # commands; terminating only the shell can strand its child command.
-        await asyncio.gather(
-            *(_terminate_process(process) for process in processes),
-            return_exceptions=True,
-        )
-    for reaper in reapers:
-        if reaper is not None and not reaper.done():
-            reaper.cancel()
-    if reapers:
-        await asyncio.gather(
-            *(reaper for reaper in reapers if reaper is not None),
-            return_exceptions=True,
-        )
+    from tools.process_registry import process_registry
+
+    await process_registry.kill_all(key, source="agent.close", consume_output=False)
     with _env_lock:
         env = _active_environments.pop(key, None)
         if env is not None:
             record_session_cwd(key, env.cwd)
         _last_activity.pop(key, None)
-
-
-def _track_background_process(
-    task_id: str | None,
-    process: asyncio.subprocess.Process,
-) -> None:
-    """Register a native child and remove it once its awaited reaper exits."""
-    key = _resolve_container_task_id(task_id)
-    _background_processes.setdefault(key, set()).add(process)
-
-    async def _reap() -> None:
-        try:
-            await process.wait()
-        finally:
-            processes = _background_processes.get(key)
-            if processes is not None:
-                processes.discard(process)
-                if not processes:
-                    _background_processes.pop(key, None)
-            _background_reapers.pop(process, None)
-
-    _background_reapers[process] = asyncio.create_task(_reap())
 
 
 def cleanup_all_environments() -> None:
@@ -775,30 +731,6 @@ async def terminal_tool(
             },
             ensure_ascii=False,
         )
-    if pty:
-        return json.dumps(
-            {
-                "output": "",
-                "exit_code": -1,
-                "error": "PTY execution is not supported by the native async local terminal.",
-                "status": "error",
-            },
-            ensure_ascii=False,
-        )
-    if notify_on_complete or watch_patterns:
-        return json.dumps(
-            {
-                "output": "",
-                "exit_code": -1,
-                "error": (
-                    "Background notification flags require the removed messaging gateway "
-                    "and are not supported by the async library runtime."
-                ),
-                "status": "error",
-            },
-            ensure_ascii=False,
-        )
-
     from tools.approval import validate_terminal_command
 
     guard = await validate_terminal_command(command)
@@ -887,28 +819,39 @@ async def terminal_tool(
             env.cwd = recovered
             record_session_cwd(task_id, recovered)
         if background:
-            process = await asyncio.create_subprocess_shell(
-                command,
-                executable=os.environ.get("SHELL") or "/bin/sh",
+            from tools.process_registry import process_registry
+
+            effective_pty = pty and not _command_requires_pipe_stdin(command)
+            process_session = await process_registry.spawn_local(
+                command=command,
                 cwd=cwd,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
-                env=build_subprocess_env(
-                    scrub_secrets=True,
+                task_id=_resolve_container_task_id(task_id),
+                session_key=str(session_id or task_id or ""),
+                use_pty=effective_pty,
+            )
+            payload = {
+                "output": "Background process started",
+                "session_id": process_session.id,
+                "pid": process_session.pid,
+                "exit_code": 0,
+                "error": None,
+                "hint": (
+                    "This process runs silently. Use process(action='poll') or "
+                    "process(action='wait') to observe completion."
                 ),
-                **({"start_new_session": True} if os.name == "posix" else {}),
-            )
-            _track_background_process(task_id, process)
-            return json.dumps(
-                {
-                    "output": "Background process started",
-                    "session_id": str(process.pid),
-                    "pid": process.pid,
-                    "exit_code": 0,
-                    "error": None,
-                },
-                ensure_ascii=False,
-            )
+            }
+            if pty and not effective_pty:
+                payload["pty_note"] = (
+                    "PTY disabled for this command because it expects piped stdin/EOF."
+                )
+            if notify_on_complete or watch_patterns:
+                payload["notify_on_complete"] = False
+                payload["notify_unsupported"] = (
+                    "notify_on_complete / watch_patterns are not available in this "
+                    "library session. The process is running; retrieve its result "
+                    "with process(action='poll') or process(action='wait')."
+                )
+            return json.dumps(payload, ensure_ascii=False)
 
         starting_cwd = env.cwd
         result = await env.execute(command, cwd=cwd, timeout=timeout)
@@ -1045,27 +988,86 @@ def check_terminal_requirements() -> bool:
     return True
 
 
+TERMINAL_TOOL_DESCRIPTION = """Execute shell commands on a Linux environment. Filesystem, current working directory, and exported environment variables persist between calls.
+
+Do NOT use cat/head/tail (use read_file), grep/rg/find/ls (use search_files), sed/awk (use patch), or echo/heredoc file creation (use write_file). Reserve terminal for: builds, installs, git, processes, scripts, network, package managers, and anything that needs a shell.
+Environment state persists: activate a virtualenv or export variables once per session, not before every command.
+
+Foreground (default): returns INSTANTLY when the command finishes, even with a high timeout — set timeout generously for long builds.
+Background: set background=true (returns a session_id). Pair with notify_on_complete=true for bounded tasks; leave silent only for servers/daemons that never exit. Never use nohup/setsid/trailing '&' — use background=true so Hermes tracks the process. After starting a server, verify readiness with a health check, then act in a separate call; no blind sleep loops. Manage with process(action="poll"/"wait").
+Working directory: use 'workdir' for per-command cwd. When a command changes the session cwd (cd, pushd), the result includes a "cwd" field — trust it instead of prefixing every command with 'cd'.
+PTY: set pty=true for interactive CLIs (they hang without it). Pipe git output to cat if it might page.
+"""
+
+
 TERMINAL_SCHEMA = {
     "name": "terminal",
-    "description": "Run a local shell command in the session working directory.",
+    "description": TERMINAL_TOOL_DESCRIPTION,
     "parameters": {
         "type": "object",
         "properties": {
-            "command": {"type": "string", "description": "Shell command to execute."},
+            "command": {
+                "type": "string",
+                "description": "The command to execute on the VM",
+            },
+            "background": {
+                "type": "boolean",
+                "description": (
+                    "Run in the background, returning a session_id. Pair with "
+                    "notify_on_complete=true for anything with a defined end "
+                    "(tests, builds, deploys) — without it the process runs silently. "
+                    "Only servers/watchers/daemons that never exit should stay silent. "
+                    "Short commands: prefer foreground with a generous timeout."
+                ),
+                "default": False,
+            },
             "timeout": {
                 "type": "integer",
                 "minimum": 1,
                 "description": (
-                    f"Timeout in seconds. Foreground maximum is {FOREGROUND_MAX_TIMEOUT}; "
+                    f"Max seconds to wait (default: 180, foreground max: "
+                    f"{FOREGROUND_MAX_TIMEOUT}). Returns INSTANTLY when command "
+                    "finishes — set high for long tasks, you won't wait unnecessarily. "
+                    f"Foreground timeout above {FOREGROUND_MAX_TIMEOUT}s is rejected; "
                     "use background=true for longer commands."
                 ),
             },
-            "background": {"type": "boolean", "description": "Start without waiting for completion."},
             "workdir": {
                 "type": "string",
-                "description": "Absolute working directory for this command.",
+                "description": (
+                    "Working directory for this command (absolute path). Defaults "
+                    "to the session working directory."
+                ),
             },
-            "pty": {"type": "boolean", "description": "Unsupported in the async local runtime."},
+            "pty": {
+                "type": "boolean",
+                "description": (
+                    "Run in pseudo-terminal (PTY) mode for interactive CLI tools "
+                    "like Codex, Claude Code, or Python REPL. Only works with local "
+                    "and SSH backends. Default: false."
+                ),
+                "default": False,
+            },
+            "notify_on_complete": {
+                "type": "boolean",
+                "description": (
+                    "With background=true: get exactly one notification when the "
+                    "process exits. The right choice for nearly every bounded long "
+                    "task — set it and keep working. MUTUALLY EXCLUSIVE with "
+                    "watch_patterns (watch_patterns is dropped when both are set)."
+                ),
+                "default": False,
+            },
+            "watch_patterns": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "Strings to watch for in background output. ONLY for rare one-shot "
+                    "mid-process signals on processes that never exit. NOT for "
+                    "end-of-run markers and NOT for per-iteration patterns. MUTUALLY "
+                    "EXCLUSIVE with notify_on_complete."
+                ),
+            },
         },
         "required": ["command"],
     },
@@ -1082,6 +1084,8 @@ async def _handle_terminal(args: dict, **kwargs) -> str:
         session_id=kwargs.get("session_id"),
         workdir=args.get("workdir"),
         pty=bool(args.get("pty", False)),
+        notify_on_complete=bool(args.get("notify_on_complete", False)),
+        watch_patterns=args.get("watch_patterns"),
     )
 
 

@@ -2987,19 +2987,24 @@ async def test_native_background_terminal_process_is_reaped_at_cleanup():
     import importlib
 
     terminal_module = importlib.import_module("tools.terminal_tool")
+    process_module = importlib.import_module("tools.process_registry")
 
     task_id = "async-background-reap"
     command = f"{shlex.quote(sys.executable)} -c 'import time; time.sleep(30)'"
-    started = await terminal_module.terminal_tool(
-        command, background=True, task_id=task_id
+    started = json.loads(
+        await terminal_module.terminal_tool(command, background=True, task_id=task_id)
     )
-    assert "Background process started" in started
-    processes = list(terminal_module._background_processes[task_id])
+    assert started["output"] == "Background process started"
+    session = process_module.process_registry.get(started["session_id"])
+    assert session is not None
+    assert session.process is not None
 
     await terminal_module.cleanup_vm(task_id)
 
-    assert task_id not in terminal_module._background_processes
-    assert all(process.returncode is not None for process in processes)
+    assert started["session_id"] not in process_module.process_registry.snapshot_running_ids(
+        task_id
+    )
+    assert session.process.returncode is not None
 
 
 @pytest.mark.asyncio
