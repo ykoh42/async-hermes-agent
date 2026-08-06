@@ -81,6 +81,11 @@ def _reset_registries():
 
 def test_media_and_browser_provider_io_contracts_are_native_async():
     assert inspect.iscoroutinefunction(ImageGenProvider.generate)
+    assert inspect.iscoroutinefunction(ImageGenProvider.is_available)
+    assert inspect.iscoroutinefunction(ImageGenProvider.list_models)
+    assert inspect.iscoroutinefunction(ImageGenProvider.default_model)
+    assert inspect.iscoroutinefunction(ImageGenProvider.get_setup_schema)
+    assert inspect.iscoroutinefunction(ImageGenProvider.capabilities)
     assert inspect.iscoroutinefunction(VideoGenProvider.generate)
     assert inspect.iscoroutinefunction(VideoGenProvider.is_available)
     assert inspect.iscoroutinefunction(VideoGenProvider.list_models)
@@ -139,6 +144,15 @@ def test_sync_override_is_rejected_instead_of_hidden_behind_a_bridge():
 
     with pytest.raises(TypeError, match="generate must be async"):
         image_gen_registry.register_provider(SyncImageProvider())
+
+    class SyncMetadataProvider(_ImageProvider):
+        name = "sync-image-metadata"
+
+        def is_available(self):
+            return True
+
+    with pytest.raises(TypeError, match="is_available must be async"):
+        image_gen_registry.register_provider(SyncMetadataProvider())
 
 
 @pytest.mark.asyncio

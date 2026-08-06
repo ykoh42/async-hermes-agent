@@ -18,6 +18,33 @@ async def managed_nous_tools_enabled(*, force_fresh: bool = False) -> bool:
         return False
 
 
+async def nous_tool_gateway_unavailable_message(
+    capability: str = "the Nous Tool Gateway",
+    *,
+    force_fresh: bool = False,
+) -> str:
+    """Return account-aware guidance for an unavailable managed tool path."""
+    try:
+        from hermes_cli.nous_account import (
+            format_nous_portal_entitlement_message,
+            get_nous_portal_account_info,
+        )
+
+        account_info = await get_nous_portal_account_info(force_fresh=force_fresh)
+        message = format_nous_portal_entitlement_message(
+            account_info,
+            capability=capability,
+        )
+        if message:
+            return message
+    except Exception:
+        pass
+    return (
+        f"{capability} is unavailable. Run `hermes model` to refresh your "
+        "Nous Portal login and billing status."
+    )
+
+
 async def prefers_gateway(config_section: str) -> bool:
     """Return the ``<section>.use_gateway`` preference from config.yaml."""
     try:

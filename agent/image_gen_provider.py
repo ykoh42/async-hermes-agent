@@ -84,7 +84,7 @@ class ImageGenProvider(abc.ABC):
         """Human-readable label shown in ``hermes tools``. Defaults to ``name.title()``."""
         return self.name.title()
 
-    def is_available(self) -> bool:
+    async def is_available(self) -> bool:
         """Return True when this provider can service calls.
 
         Typically checks for a required API key. Default: True
@@ -92,7 +92,7 @@ class ImageGenProvider(abc.ABC):
         """
         return True
 
-    def list_models(self) -> List[Dict[str, Any]]:
+    async def list_models(self) -> List[Dict[str, Any]]:
         """Return catalog entries for ``hermes tools`` model picker.
 
         Each entry::
@@ -109,7 +109,7 @@ class ImageGenProvider(abc.ABC):
         """
         return []
 
-    def get_setup_schema(self) -> Dict[str, Any]:
+    async def get_setup_schema(self) -> Dict[str, Any]:
         """Return provider metadata for the ``hermes tools`` picker.
 
         Used by ``tools_config.py`` to inject this provider as a row in
@@ -136,14 +136,14 @@ class ImageGenProvider(abc.ABC):
             "env_vars": [],
         }
 
-    def default_model(self) -> Optional[str]:
+    async def default_model(self) -> Optional[str]:
         """Return the default model id, or None if not applicable."""
-        models = self.list_models()
+        models = await self.list_models()
         if models:
             return models[0].get("id")
         return None
 
-    def capabilities(self) -> Dict[str, Any]:
+    async def capabilities(self) -> Dict[str, Any]:
         """Return what this provider supports.
 
         Returned dict (all keys optional)::

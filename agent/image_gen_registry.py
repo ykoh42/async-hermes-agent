@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import logging
 import inspect
-import threading
 from typing import Dict, List, Optional
 
 from agent.image_gen_provider import ImageGenProvider
@@ -31,7 +30,6 @@ logger = logging.getLogger(__name__)
 
 
 _providers: Dict[str, ImageGenProvider] = {}
-_lock = threading.Lock()
 
 
 def register_provider(provider: ImageGenProvider) -> None:
@@ -49,11 +47,18 @@ def register_provider(provider: ImageGenProvider) -> None:
     name = provider.name
     if not isinstance(name, str) or not name.strip():
         raise ValueError("Image gen provider .name must be a non-empty string")
-    if not inspect.iscoroutinefunction(provider.generate):
-        raise TypeError("Image gen provider .generate must be async")
-    with _lock:
-        existing = _providers.get(name)
-        _providers[name] = provider
+    for method_name in (
+        "is_available",
+        "list_models",
+        "default_model",
+        "get_setup_schema",
+        "capabilities",
+        "generate",
+    ):
+        if not inspect.iscoroutinefunction(getattr(provider, method_name)):
+            raise TypeError(f"Image gen provider .{method_name} must be async")
+    existing = _providers.get(name)
+    _providers[name] = provider
     if existing is not None:
         logger.debug("Image gen provider '%s' re-registered (was %r)", name, type(existing).__name__)
     else:
@@ -62,8 +67,7 @@ def register_provider(provider: ImageGenProvider) -> None:
 
 def list_providers() -> List[ImageGenProvider]:
     """Return all registered providers, sorted by name."""
-    with _lock:
-        items = list(_providers.values())
+    items = list(_providers.values())
     return sorted(items, key=lambda p: p.name)
 
 
@@ -71,8 +75,7 @@ def get_provider(name: str) -> Optional[ImageGenProvider]:
     """Return the provider registered under *name*, or None."""
     if not isinstance(name, str):
         return None
-    with _lock:
-        return _providers.get(name.strip())
+    return _providers.get(name.strip())
 
 
 async def get_active_provider() -> Optional[ImageGenProvider]:
@@ -105,13 +108,12 @@ async def get_active_provider() -> Optional[ImageGenProvider]:
     except Exception as exc:
         logger.debug("Could not read image_gen.provider from config: %s", exc)
 
-    with _lock:
-        snapshot = dict(_providers)
+    snapshot = dict(_providers)
 
-    def _is_available_safe(p: ImageGenProvider) -> bool:
+    async def _is_available_safe(p: ImageGenProvider) -> bool:
         """Wrap ``is_available()`` so a buggy provider doesn't kill resolution."""
         try:
-            return bool(p.is_available())
+            return bool(await p.is_available())
         except Exception as exc:  # noqa: BLE001
             logger.debug("image_gen provider %s.is_available() raised %s", p.name, exc)
             return False
@@ -130,13 +132,13 @@ async def get_active_provider() -> Optional[ImageGenProvider]:
 
     # 2. Fallback: single registered provider — but only if it's actually
     #    available (no credentials = don't surface it as "active").
-    available = [p for p in snapshot.values() if _is_available_safe(p)]
+    available = [p for p in snapshot.values() if await _is_available_safe(p)]
     if len(available) == 1:
         return available[0]
 
     # 3. Fallback: prefer legacy FAL for backward compat, when available.
     fal = snapshot.get("fal")
-    if fal is not None and _is_available_safe(fal):
+    if fal is not None and await _is_available_safe(fal):
         return fal
 
     return None
@@ -144,5 +146,4 @@ async def get_active_provider() -> Optional[ImageGenProvider]:
 
 def _reset_for_tests() -> None:
     """Clear the registry. **Test-only.**"""
-    with _lock:
-        _providers.clear()
+    _providers.clear()

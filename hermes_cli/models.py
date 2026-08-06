@@ -1987,6 +1987,17 @@ _deepinfra_catalog_neg_cache: dict[str, float] = {}
 _DEEPINFRA_CATALOG_NEG_TTL = 60.0  # seconds
 
 
+def deepinfra_base_url(section: Optional[dict] = None) -> str:
+    """Resolve the normalized DeepInfra OpenAI-compatible base URL.
+
+    Precedence is the upstream contract: config-section ``base_url``, then
+    ``DEEPINFRA_BASE_URL``, then the canonical DeepInfra default.
+    """
+    candidate = section.get("base_url") if isinstance(section, dict) else None
+    value = candidate or os.getenv("DEEPINFRA_BASE_URL") or _DEEPINFRA_DEFAULT_BASE_URL
+    return str(value).strip().rstrip("/")
+
+
 def _deepinfra_catalog_url() -> tuple[str, str]:
     """Return ``(cache_key, full_url)`` for the DeepInfra catalog endpoint."""
     base = os.getenv("DEEPINFRA_BASE_URL", "").strip() or _DEEPINFRA_DEFAULT_BASE_URL
