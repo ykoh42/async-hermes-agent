@@ -39,7 +39,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-from typing import Any, Callable, Dict, FrozenSet, Iterable, List, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, FrozenSet, Iterable, List, Optional, Tuple
 from urllib.parse import parse_qs, urlencode, urlparse
 
 import httpx
@@ -2799,3 +2799,275 @@ async def get_api_key_provider_status(provider_id: str) -> Dict[str, Any]:
 
 
 # ==================== MiniMax Portal OAuth ====================
+
+_MINIMAX_OAUTH_ERROR_BODY_LIMIT = 16 * 1024
+
+
+async def _minimax_response_error_text(
+    response: httpx.Response,
+    *,
+    limit: int = _MINIMAX_OAUTH_ERROR_BODY_LIMIT,
+) -> str:
+    """Read and close a streamed MiniMax OAuth error response with a bound."""
+    limit = max(0, int(limit))
+    chunks: list[bytes] = []
+    total = 0
+    truncated = False
+    try:
+        if response.is_stream_consumed:
+            text = response.text
+            return text[:limit] + ("...[truncated]" if len(text) > limit else "")
+        async for chunk in response.aiter_bytes():
+            if not chunk:
+                continue
+            remaining = limit + 1 - total
+            if remaining <= 0:
+                truncated = True
+                break
+            if len(chunk) > remaining:
+                chunks.append(chunk[:remaining])
+                total += remaining
+                truncated = True
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+        raw = b"".join(chunks)
+        if len(raw) > limit:
+            raw = raw[:limit]
+            truncated = True
+        encoding = response.encoding or "utf-8"
+        text = raw.decode(encoding, errors="replace")
+        return text + ("...[truncated]" if truncated else "")
+    finally:
+        await response.aclose()
+
+
+async def _minimax_post_form(
+    client: httpx.AsyncClient,
+    url: str,
+    *,
+    data: Dict[str, Any],
+    headers: Dict[str, str],
+) -> httpx.Response:
+    """POST a MiniMax OAuth form without eagerly reading error bodies."""
+    request = client.build_request("POST", url, data=data, headers=headers)
+    response = await client.send(request, stream=True)
+    if response.status_code == 200:
+        await response.aread()
+    return response
+
+
+def _minimax_expired_in_looks_like_unix_ms(
+    expired_in: int,
+    *,
+    now_ms: int,
+) -> bool:
+    """Return whether MiniMax supplied an absolute millisecond timestamp."""
+    return int(expired_in) > (now_ms // 2)
+
+
+def _minimax_resolve_token_expiry_unix(
+    expired_in: int,
+    *,
+    now: datetime,
+) -> float:
+    raw = int(expired_in)
+    now_ms = int(now.timestamp() * 1000)
+    if _minimax_expired_in_looks_like_unix_ms(raw, now_ms=now_ms):
+        return raw / 1000.0
+    return now.timestamp() + max(1, raw)
+
+
+async def _refresh_minimax_oauth_state(
+    state: Dict[str, Any],
+    *,
+    timeout_seconds: float = 15.0,
+    force: bool = False,
+) -> Dict[str, Any]:
+    """Refresh MiniMax OAuth state through native async file and HTTP I/O."""
+    lock_timeout = max(
+        float(AUTH_LOCK_TIMEOUT_SECONDS),
+        float(timeout_seconds) + 5.0,
+    )
+    async with _auth_store_transaction(timeout_seconds=lock_timeout):
+        auth_store = await _load_auth_store()
+        current = _load_provider_state(auth_store, "minimax-oauth") or dict(state)
+        refresh_token = str(current.get("refresh_token") or "").strip()
+        if not refresh_token:
+            raise AuthError(
+                "MiniMax OAuth state has no refresh_token; please re-login.",
+                provider="minimax-oauth",
+                code="no_refresh_token",
+                relogin_required=True,
+            )
+        try:
+            expires_at = datetime.fromisoformat(
+                str(current.get("expires_at") or "")
+            ).timestamp()
+        except Exception:
+            expires_at = 0.0
+        if (
+            not force
+            and expires_at - time.time() > MINIMAX_OAUTH_REFRESH_SKEW_SECONDS
+        ):
+            return current
+
+        portal_base_url = str(current.get("portal_base_url") or "").rstrip("/")
+        client_id = str(current.get("client_id") or "").strip()
+        if not portal_base_url or not client_id:
+            raise AuthError(
+                "MiniMax OAuth state is missing portal_base_url or client_id; please re-login.",
+                provider="minimax-oauth",
+                code="refresh_state_incomplete",
+                relogin_required=True,
+            )
+
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(timeout_seconds),
+            follow_redirects=True,
+        ) as client:
+            response = await _minimax_post_form(
+                client,
+                f"{portal_base_url}/oauth/token",
+                data={
+                    "grant_type": "refresh_token",
+                    "client_id": client_id,
+                    "refresh_token": refresh_token,
+                },
+                headers={
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Accept": "application/json",
+                },
+            )
+            if response.status_code != 200:
+                body = (await _minimax_response_error_text(response)).strip()
+                body_lower = body.lower()
+                relogin = any(
+                    marker in body_lower
+                    for marker in (
+                        "invalid_grant",
+                        "refresh_token_reused",
+                        "invalid_refresh_token",
+                    )
+                )
+                raise AuthError(
+                    "MiniMax OAuth refresh failed: "
+                    f"{body or response.reason_phrase}",
+                    provider="minimax-oauth",
+                    code="refresh_failed",
+                    relogin_required=relogin,
+                )
+
+        payload = response.json()
+        if payload.get("status") != "success":
+            raise AuthError(
+                "MiniMax OAuth refresh did not return success.",
+                provider="minimax-oauth",
+                code="refresh_failed",
+                relogin_required=True,
+            )
+        now = datetime.now(timezone.utc)
+        expires_at_unix = _minimax_resolve_token_expiry_unix(
+            int(payload["expired_in"]),
+            now=now,
+        )
+        refreshed = dict(current)
+        refreshed.update(
+            {
+                "access_token": payload["access_token"],
+                "refresh_token": payload.get("refresh_token", refresh_token),
+                "obtained_at": now.isoformat(),
+                "expires_at": datetime.fromtimestamp(
+                    expires_at_unix,
+                    tz=timezone.utc,
+                ).isoformat(),
+                "expires_in": max(0, int(expires_at_unix - now.timestamp())),
+            }
+        )
+        _save_provider_state(auth_store, "minimax-oauth", refreshed)
+        await _save_auth_store(auth_store)
+        return refreshed
+
+
+async def _minimax_oauth_quarantine_on_terminal_refresh(
+    state: Dict[str, Any],
+    exc: AuthError,
+) -> None:
+    if not (exc.relogin_required and state.get("refresh_token")):
+        return
+    async with _auth_store_transaction():
+        auth_store = await _load_auth_store()
+        current = _load_provider_state(auth_store, "minimax-oauth")
+        if not current:
+            return
+        failed_refresh = str(state.get("refresh_token") or "").strip()
+        current_refresh = str(current.get("refresh_token") or "").strip()
+        if current_refresh and current_refresh != failed_refresh:
+            return
+        for key in (
+            "access_token",
+            "refresh_token",
+            "expires_at",
+            "expires_in",
+            "obtained_at",
+        ):
+            current.pop(key, None)
+        current["last_auth_error"] = {
+            "provider": "minimax-oauth",
+            "code": exc.code or "refresh_failed",
+            "message": str(exc),
+            "reason": "runtime_refresh_failure",
+            "relogin_required": True,
+            "at": datetime.now(timezone.utc).isoformat(),
+        }
+        _save_provider_state(auth_store, "minimax-oauth", current)
+        await _save_auth_store(auth_store)
+
+
+def build_minimax_oauth_token_provider() -> Callable[[], Awaitable[str]]:
+    """Return an awaitable token provider for native async consumers."""
+
+    async def _provide() -> str:
+        credentials = await resolve_minimax_oauth_runtime_credentials()
+        return str(credentials["api_key"])
+
+    return _provide
+
+
+async def resolve_minimax_oauth_runtime_credentials(
+    *,
+    min_token_ttl_seconds: int = MINIMAX_OAUTH_REFRESH_SKEW_SECONDS,
+    as_token_provider: bool = False,
+    force_refresh: bool = False,
+) -> Dict[str, Any]:
+    """Resolve a current MiniMax OAuth credential without blocking the loop."""
+    auth_store = await _load_auth_store()
+    state = _load_provider_state(auth_store, "minimax-oauth")
+    if not state or not state.get("access_token"):
+        raise AuthError(
+            "Not logged into MiniMax OAuth. Run `hermes model` and select "
+            "MiniMax (OAuth).",
+            provider="minimax-oauth",
+            code="not_logged_in",
+            relogin_required=True,
+        )
+    try:
+        state = await _refresh_minimax_oauth_state(
+            state,
+            force=force_refresh,
+        )
+    except AuthError as exc:
+        await _minimax_oauth_quarantine_on_terminal_refresh(state, exc)
+        raise
+
+    api_key: Any
+    if as_token_provider:
+        api_key = build_minimax_oauth_token_provider()
+    else:
+        api_key = state["access_token"]
+    return {
+        "provider": "minimax-oauth",
+        "api_key": api_key,
+        "base_url": str(state["inference_base_url"]).rstrip("/"),
+        "source": "oauth",
+    }

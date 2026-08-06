@@ -4439,12 +4439,30 @@ class AIAgent:
             return await self.client.responses.create(**request)
 
         if self.api_mode == "anthropic_messages":
-            # Anthropic ships a native async SDK.  Use it directly for static
-            # credentials instead of routing the Messages call through the
-            # synchronous interrupt worker.  Callable Entra credentials still
-            # use the compatibility path until an AsyncClient-aware bearer
-            # hook is available (the token provider itself is synchronous).
             anthropic_key = getattr(self, "_anthropic_api_key", None)
+            minimax_pool = getattr(self, "_credential_pool", None)
+            managed_minimax_oauth = (
+                self.provider == "minimax-oauth"
+                and str(getattr(minimax_pool, "provider", "") or "").strip().lower()
+                == "minimax-oauth"
+                and any(
+                    entry.source == "oauth"
+                    and entry.runtime_api_key == anthropic_key
+                    for entry in minimax_pool.entries()
+                )
+            )
+            if managed_minimax_oauth:
+                from hermes_cli.auth import (
+                    resolve_minimax_oauth_runtime_credentials,
+                )
+
+                credentials = await resolve_minimax_oauth_runtime_credentials()
+                refreshed_key = credentials["api_key"]
+                if refreshed_key != anthropic_key:
+                    anthropic_key = refreshed_key
+                    self.api_key = refreshed_key
+                    self._anthropic_api_key = refreshed_key
+                    self._anthropic_client_source = None
             if not callable(anthropic_key):
                 from agent.anthropic_adapter import (
                     build_anthropic_client,

@@ -3834,6 +3834,44 @@ async def run_conversation(
                     and not _retry.anthropic_auth_retry_attempted
                 ):
                     _retry.anthropic_auth_retry_attempted = True
+                    minimax_pool = getattr(agent, "_credential_pool", None)
+                    managed_minimax_oauth = (
+                        agent.provider == "minimax-oauth"
+                        and str(
+                            getattr(minimax_pool, "provider", "") or ""
+                        ).strip().lower()
+                        == "minimax-oauth"
+                        and any(
+                            entry.source == "oauth"
+                            and entry.runtime_api_key == agent._anthropic_api_key
+                            for entry in minimax_pool.entries()
+                        )
+                    )
+                    if managed_minimax_oauth:
+                        from hermes_cli.auth import (
+                            resolve_minimax_oauth_runtime_credentials,
+                        )
+
+                        try:
+                            credentials = await resolve_minimax_oauth_runtime_credentials(
+                                force_refresh=True,
+                            )
+                        except Exception:
+                            logger.debug(
+                                "MiniMax OAuth refresh failed after 401",
+                                exc_info=True,
+                            )
+                        else:
+                            refreshed_key = credentials["api_key"]
+                            if refreshed_key != agent._anthropic_api_key:
+                                agent.api_key = refreshed_key
+                                agent._anthropic_api_key = refreshed_key
+                                agent._anthropic_client_source = None
+                                agent._buffer_vprint(
+                                    "🔐 MiniMax OAuth refreshed after 401. "
+                                    "Retrying request..."
+                                )
+                                continue
                     from agent.anthropic_adapter import _is_oauth_token
                     if getattr(agent, "_is_anthropic_oauth", False):
                         raise UnsupportedCapabilityError(

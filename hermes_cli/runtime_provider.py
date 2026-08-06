@@ -1801,7 +1801,18 @@ async def resolve_runtime_provider(
                 "Qwen OAuth credentials failed; falling through to next provider."
             )
 
-    if provider in {"nous", "minimax-oauth"}:
+    if provider == "minimax-oauth":
+        creds = await auth_mod.resolve_minimax_oauth_runtime_credentials()
+        return {
+            "provider": "minimax-oauth",
+            "api_mode": "anthropic_messages",
+            "base_url": creds["base_url"],
+            "api_key": creds["api_key"],
+            "source": creds.get("source", "oauth"),
+            "requested_provider": requested_provider,
+        }
+
+    if provider == "nous":
         from agent.agent_runtime_helpers import UnsupportedCapabilityError
 
         raise UnsupportedCapabilityError(

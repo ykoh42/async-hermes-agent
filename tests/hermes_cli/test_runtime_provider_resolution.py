@@ -1098,7 +1098,7 @@ class TestProviderEntryApiKeyEnvAlias:
 # minimax-oauth runtime resolution tests (added by feat/minimax-oauth-provider)
 # ---------------------------------------------------------------------------
 
-async def test_minimax_oauth_fails_fast_without_native_async_lifecycle(monkeypatch):
+async def test_minimax_oauth_resolves_native_async_credentials(monkeypatch):
     monkeypatch.setattr(rp, "resolve_provider", AsyncMock(return_value="minimax-oauth"))
     monkeypatch.setattr(rp, "_get_model_config", lambda *_args, **_kwargs: {"provider": "minimax-oauth"})
     monkeypatch.setattr(rp, "load_pool", AsyncMock(return_value=None))
@@ -1113,12 +1113,34 @@ async def test_minimax_oauth_fails_fast_without_native_async_lifecycle(monkeypat
         AsyncMock(return_value=None),
     )
 
-    with pytest.raises(UnsupportedCapabilityError, match="minimax-oauth requires an OAuth lifecycle"):
-        await rp.resolve_runtime_provider(requested="minimax-oauth")
+    resolve = AsyncMock(
+        return_value={
+            "provider": "minimax-oauth",
+            "api_key": "oauth-token",
+            "base_url": "https://api.minimax.io/anthropic",
+            "source": "oauth",
+        }
+    )
+    monkeypatch.setattr(
+        rp.auth_mod,
+        "resolve_minimax_oauth_runtime_credentials",
+        resolve,
+    )
+
+    runtime = await rp.resolve_runtime_provider(requested="minimax-oauth")
+
+    assert runtime == {
+        "provider": "minimax-oauth",
+        "api_mode": "anthropic_messages",
+        "base_url": "https://api.minimax.io/anthropic",
+        "api_key": "oauth-token",
+        "source": "oauth",
+        "requested_provider": "minimax-oauth",
+    }
+    resolve.assert_awaited_once_with()
 
 
-async def test_minimax_oauth_pool_still_fails_fast_without_native_lifecycle(monkeypatch):
-    """A stored token does not re-enable a disabled synchronous OAuth lifecycle."""
+async def test_minimax_oauth_runtime_does_not_use_stale_pool_token(monkeypatch):
 
     class _Entry:
         access_token = "oauth-token"
@@ -1145,9 +1167,24 @@ async def test_minimax_oauth_pool_still_fails_fast_without_native_lifecycle(monk
     monkeypatch.setattr(rp, "load_pool", AsyncMock(return_value=_Pool()))
     monkeypatch.setattr(rp, "_resolve_named_custom_runtime", AsyncMock(return_value=None))
     monkeypatch.setattr(rp, "_resolve_explicit_runtime", AsyncMock(return_value=None))
+    resolve = AsyncMock(
+        return_value={
+            "provider": "minimax-oauth",
+            "api_key": "fresh-oauth-token",
+            "base_url": "https://api.minimax.io/anthropic",
+            "source": "oauth",
+        }
+    )
+    monkeypatch.setattr(
+        rp.auth_mod,
+        "resolve_minimax_oauth_runtime_credentials",
+        resolve,
+    )
 
-    with pytest.raises(UnsupportedCapabilityError, match="minimax-oauth requires an OAuth lifecycle"):
-        await rp.resolve_runtime_provider(requested="minimax-oauth")
+    runtime = await rp.resolve_runtime_provider(requested="minimax-oauth")
+
+    assert runtime["api_key"] == "fresh-oauth-token"
+    resolve.assert_awaited_once_with()
 
 
 # ----------------------------------------------------------------------

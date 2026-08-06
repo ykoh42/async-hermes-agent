@@ -1207,13 +1207,60 @@ class CredentialPool:
                 await self._persist()
             return None
 
-        if self.provider not in {"anthropic", "openai-codex", "xai-oauth"}:
+        if self.provider not in {
+            "anthropic",
+            "minimax-oauth",
+            "openai-codex",
+            "xai-oauth",
+        }:
             raise UnsupportedCapabilityError(
                 f"Credential pool OAuth refresh for {self.provider} is not native async yet."
             )
 
         codex_target_path = None
         try:
+            if self.provider == "minimax-oauth":
+                if entry.source != "oauth":
+                    raise UnsupportedCapabilityError(
+                        "Manual MiniMax OAuth pool entries cannot be refreshed; "
+                        "log in through the Hermes MiniMax OAuth flow."
+                    )
+                await auth_mod.resolve_minimax_oauth_runtime_credentials(
+                    force_refresh=force,
+                )
+                auth_store = await auth_mod._load_auth_store()
+                state = auth_mod._load_provider_state(
+                    auth_store,
+                    "minimax-oauth",
+                )
+                if not state or not state.get("access_token"):
+                    return None
+                expires_at_ms = None
+                try:
+                    expires_at_ms = int(
+                        datetime.fromisoformat(
+                            str(state.get("expires_at") or "")
+                        ).timestamp()
+                        * 1000
+                    )
+                except Exception:
+                    pass
+                updated = replace(
+                    entry,
+                    access_token=state["access_token"],
+                    refresh_token=state.get("refresh_token"),
+                    expires_at_ms=expires_at_ms,
+                    last_status=STATUS_OK,
+                    last_status_at=None,
+                    last_error_code=None,
+                    last_error_reason=None,
+                    last_error_message=None,
+                    last_error_reset_at=None,
+                )
+                self._replace_entry(entry, updated)
+                await self._persist()
+                return updated
+
             if self.provider == "openai-codex":
                 refresh_timeout = auth_mod.env_float(
                     "HERMES_CODEX_REFRESH_TIMEOUT_SECONDS",
@@ -2027,7 +2074,37 @@ async def _seed_from_singletons(
             logger.debug("Qwen OAuth token seed failed: %s", exc)
 
     elif provider == "minimax-oauth":
-        return changed, active_sources
+        state = _load_provider_state(auth_store, provider)
+        if state and state.get("access_token"):
+            source_name = "oauth"
+            if not _is_suppressed(source_name):
+                active_sources.add(source_name)
+                expires_at_ms = None
+                try:
+                    raw_expiry = state.get("expires_at", "")
+                    if raw_expiry:
+                        expires_at_ms = int(
+                            datetime.fromisoformat(raw_expiry).timestamp() * 1000
+                        )
+                except Exception:
+                    pass
+                changed |= _upsert_entry(
+                    entries,
+                    provider,
+                    source_name,
+                    {
+                        "source": source_name,
+                        "auth_type": AUTH_TYPE_OAUTH,
+                        "access_token": state["access_token"],
+                        "refresh_token": state.get("refresh_token"),
+                        "expires_at_ms": expires_at_ms,
+                        "base_url": str(
+                            state.get("inference_base_url", "") or ""
+                        ).rstrip("/"),
+                        "label": state.get("label", "")
+                        or label_from_token(state["access_token"], source_name),
+                    },
+                )
 
     elif provider == "openai-codex":
         # Respect user suppression — `hermes auth remove openai-codex` marks

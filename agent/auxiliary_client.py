@@ -1450,10 +1450,20 @@ class _AnthropicChatShim:
 class AnthropicAuxiliaryClient:
     """OpenAI-client-compatible wrapper over a native Anthropic client."""
 
-    def __init__(self, real_client: Any, model: str, api_key: str, base_url: str, is_oauth: bool = False):
+    def __init__(
+        self,
+        real_client: Any,
+        model: str,
+        api_key: str,
+        base_url: str,
+        is_oauth: bool = False,
+    ):
         self._real_client = real_client
         adapter = _AnthropicCompletionsAdapter(
-            real_client, model, is_oauth=is_oauth, base_url=base_url,
+            real_client,
+            model,
+            is_oauth=is_oauth,
+            base_url=base_url,
         )
         self.chat = _AnthropicChatShim(adapter)
         self.api_key = api_key
@@ -3446,6 +3456,11 @@ def _recoverable_pool_provider(
         return "kimi-coding"
     if base_url_host_matches(base, "api.x.ai"):
         return "xai-oauth"
+    if base_url_host_matches(base, "api.minimax.io") or base_url_host_matches(
+        base,
+        "api.minimaxi.com",
+    ):
+        return "minimax-oauth"
     # For api_key providers not in the hardcoded list (e.g. opencode-go), match
     # the client base URL against all registered api_key providers so that
     # credential-pool rotation works for any provider the user configured.
@@ -3597,6 +3612,14 @@ async def _refresh_provider_credentials(provider: str) -> bool:
                 return False
             await _evict_cached_clients(normalized)
             return True
+        if normalized == "minimax-oauth":
+            from hermes_cli.auth import (
+                resolve_minimax_oauth_runtime_credentials,
+            )
+
+            await resolve_minimax_oauth_runtime_credentials(force_refresh=True)
+            await _evict_cached_clients(normalized)
+            return True
     except Exception as exc:
         logger.debug("Auxiliary provider credential refresh failed for %s: %s", normalized, exc)
         return False
@@ -3625,6 +3648,11 @@ def _auth_refresh_provider_for_route(
         return "anthropic"
     if base_url_host_matches(client_base_url, "inference-api.nousresearch.com"):
         return "nous"
+    if base_url_host_matches(
+        client_base_url,
+        "api.minimax.io",
+    ) or base_url_host_matches(client_base_url, "api.minimaxi.com"):
+        return "minimax-oauth"
     return normalized
 
 
@@ -4820,6 +4848,28 @@ async def resolve_provider_client(
             return None, None
         final_model = _normalize_resolved_model(model or default, provider)
         return client, final_model
+
+    if provider == "minimax-oauth":
+        from agent.anthropic_adapter import build_anthropic_client
+        from hermes_cli.auth import resolve_minimax_oauth_runtime_credentials
+
+        credentials = await resolve_minimax_oauth_runtime_credentials()
+        token = str(credentials["api_key"])
+        base_url = str(credentials["base_url"])
+        final_model = _normalize_resolved_model(
+            model or _get_aux_model_for_provider(provider),
+            provider,
+        )
+        real_client = build_anthropic_client(token, base_url)
+        return (
+            AnthropicAuxiliaryClient(
+                real_client,
+                final_model,
+                token,
+                base_url,
+            ),
+            final_model,
+        )
 
     # ── Custom endpoint (OPENAI_BASE_URL + OPENAI_API_KEY) ───────────
     if provider == "custom":

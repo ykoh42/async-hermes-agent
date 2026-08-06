@@ -789,12 +789,12 @@ async def test_unsupported_oauth_pool_refresh_fails_fast_without_a_thread(monkey
     from agent.credential_pool import AUTH_TYPE_OAUTH, CredentialPool, PooledCredential
 
     pool = CredentialPool(
-        "minimax-oauth",
+        "unsupported-oauth",
         [
             PooledCredential(
-                provider="minimax-oauth",
-                id="minimax",
-                label="MiniMax",
+                provider="unsupported-oauth",
+                id="unsupported",
+                label="Unsupported",
                 auth_type=AUTH_TYPE_OAUTH,
                 priority=0,
                 source="manual",
@@ -808,8 +808,8 @@ async def test_unsupported_oauth_pool_refresh_fails_fast_without_a_thread(monkey
         raise AssertionError("unsupported OAuth must not use asyncio.to_thread")
 
     monkeypatch.setattr(asyncio, "to_thread", fail_if_threaded)
-    with pytest.raises(UnsupportedCapabilityError, match="minimax-oauth"):
-        await pool.try_refresh_matching(credential_id="minimax")
+    with pytest.raises(UnsupportedCapabilityError, match="unsupported-oauth"):
+        await pool.try_refresh_matching(credential_id="unsupported")
 
 
 @pytest.mark.asyncio
