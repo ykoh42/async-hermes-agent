@@ -18,7 +18,7 @@ This test class covers all FIVE sites that assign ``_is_anthropic_oauth``:
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -70,6 +70,37 @@ class TestOAuthFlagOnCredentialSwap:
             await agent._swap_credential(entry)
 
         assert agent._is_anthropic_oauth is False
+
+
+class TestNativeAnthropicRefresh:
+    @pytest.mark.asyncio
+    async def test_refresh_awaits_token_resolution_and_rebuilds_runtime(
+        self,
+        agent,
+        monkeypatch,
+    ):
+        agent.api_mode = "anthropic_messages"
+        agent.provider = "anthropic"
+        agent.model = "claude-sonnet-4-6"
+        agent._anthropic_api_key = _OAUTH_LIKE_TOKEN
+        agent._anthropic_base_url = "https://api.anthropic.com"
+        agent._provider_request_timeout = None
+        agent._provider_stale_timeout = None
+        agent._ensure_provider_runtime = AsyncMock(return_value=True)
+        resolve = AsyncMock(return_value="sk-ant-oat01-refreshed-token")
+        monkeypatch.setattr(
+            "agent.anthropic_adapter.resolve_anthropic_token",
+            resolve,
+        )
+
+        refreshed = await agent._try_refresh_anthropic_client_credentials()
+
+        assert refreshed is True
+        resolve.assert_awaited_once_with()
+        assert agent._deferred_provider_runtime["api_key"] == (
+            "sk-ant-oat01-refreshed-token"
+        )
+        agent._ensure_provider_runtime.assert_awaited_once_with()
 
 
 class TestOAuthFlagOnConstruction:

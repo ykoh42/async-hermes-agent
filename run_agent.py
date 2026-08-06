@@ -4425,6 +4425,40 @@ class AIAgent:
             logger.debug("Nous credential refresh failed: %s", exc)
             return False
 
+    async def _try_refresh_anthropic_client_credentials(self) -> bool:
+        if (
+            self.api_mode != "anthropic_messages"
+            or self.provider != "anthropic"
+            or not hasattr(self, "_anthropic_api_key")
+        ):
+            return False
+        base_url = str(getattr(self, "_anthropic_base_url", "") or "")
+        if "azure.com" in base_url:
+            return False
+        try:
+            from agent.anthropic_adapter import resolve_anthropic_token
+
+            token = await resolve_anthropic_token()
+            new_token = str(token or "").strip()
+            if not new_token or new_token == self._anthropic_api_key:
+                return False
+            self._deferred_provider_runtime = {
+                "provider": self.provider,
+                "model": self.model,
+                "api_key": new_token,
+                "base_url": base_url or "https://api.anthropic.com",
+                "api_mode": self.api_mode,
+                "request_timeout": getattr(self, "_provider_request_timeout", None),
+                "stale_timeout": getattr(self, "_provider_stale_timeout", None),
+                "update_primary": False,
+            }
+            return await self._ensure_provider_runtime()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.debug("Anthropic credential refresh failed: %s", exc)
+            return False
+
     async def _recover_with_credential_pool(
         self,
         *,

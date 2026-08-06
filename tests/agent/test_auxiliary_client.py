@@ -594,6 +594,15 @@ class TestReadCodexAccessToken:
 
 class TestResolveXaiOAuthForAux:
     @pytest.mark.asyncio
+    async def test_missing_credentials_return_none(self, monkeypatch):
+        monkeypatch.setattr(
+            "agent.auxiliary_client.load_pool",
+            AsyncMock(return_value=None),
+        )
+
+        assert await _resolve_xai_oauth_for_aux() is None
+
+    @pytest.mark.asyncio
     async def test_uses_pool_backed_credentials_without_singleton(self, tmp_path, monkeypatch):
         """Auxiliary xAI OAuth must see pool-only credentials.
 

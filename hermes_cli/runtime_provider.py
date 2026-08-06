@@ -1439,25 +1439,30 @@ async def _resolve_explicit_runtime(
         }
 
     if provider == "openai-codex":
-        # Codex OAuth token refresh still goes through the synchronous auth
-        # store/network resolver.  The async agent must never invoke that
-        # resolver on its event loop; callers with an explicit key + endpoint
-        # can still use the native Responses transport.
-        if not explicit_api_key or not explicit_base_url:
-            from agent.agent_runtime_helpers import UnsupportedCapabilityError
-
-            raise UnsupportedCapabilityError(
-                "openai-codex OAuth resolution has no native async credential "
-                "lifecycle yet. Pass an explicit api_key and base_url, or use "
-                "an API-key provider in async-hermes-agent."
-            )
+        base_url = explicit_base_url or DEFAULT_CODEX_BASE_URL
+        api_key = explicit_api_key
+        last_refresh = None
+        if not api_key:
+            pool = await load_pool("openai-codex")
+            entry = await pool.select() if pool and pool.has_credentials() else None
+            if entry is None or not entry.runtime_api_key:
+                raise AuthError(
+                    "No Codex OAuth credentials found. Authenticate with "
+                    "`hermes auth add openai-codex`.",
+                    provider="openai-codex",
+                    relogin_required=True,
+                )
+            api_key = entry.runtime_api_key
+            last_refresh = entry.last_refresh
+            if not explicit_base_url:
+                base_url = entry.runtime_base_url or base_url
         return {
             "provider": "openai-codex",
             "api_mode": "codex_responses",
-            "base_url": explicit_base_url,
-            "api_key": explicit_api_key,
+            "base_url": str(base_url).rstrip("/"),
+            "api_key": api_key,
             "source": "explicit",
-            "last_refresh": None,
+            "last_refresh": last_refresh,
             "requested_provider": requested_provider,
         }
 

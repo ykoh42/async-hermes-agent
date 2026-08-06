@@ -3906,11 +3906,12 @@ async def run_conversation(
                                 )
                                 continue
                     from agent.anthropic_adapter import _is_oauth_token
-                    if getattr(agent, "_is_anthropic_oauth", False):
-                        raise UnsupportedCapabilityError(
-                            "Anthropic OAuth renewal has no native async implementation. "
-                            "Refresh credentials before starting the async agent."
+                    if await agent._try_refresh_anthropic_client_credentials():
+                        agent._buffer_vprint(
+                            "🔐 Anthropic credentials refreshed after 401. "
+                            "Retrying request..."
                         )
+                        continue
                     # Credential refresh didn't help — show diagnostic info
                     key = agent._anthropic_api_key
                     print(f"{agent.log_prefix}🔐 Anthropic 401 — authentication failed.")

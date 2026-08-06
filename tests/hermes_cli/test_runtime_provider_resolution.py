@@ -98,6 +98,32 @@ async def test_openai_codex_resolves_from_native_async_pool(monkeypatch):
     assert resolved["base_url"] == "https://chatgpt.com/backend-api/codex"
 
 
+async def test_openai_codex_explicit_base_uses_native_async_pool(monkeypatch):
+    class _Entry:
+        runtime_api_key = "pool-token"
+        runtime_base_url = "https://chatgpt.com/backend-api/codex"
+        last_refresh = "2026-08-06T00:00:00+00:00"
+
+    class _Pool:
+        def has_credentials(self):
+            return True
+
+        async def select(self):
+            return _Entry()
+
+    monkeypatch.setattr(rp, "resolve_provider", AsyncMock(return_value="openai-codex"))
+    monkeypatch.setattr(rp, "load_pool", AsyncMock(return_value=_Pool()))
+
+    resolved = await rp.resolve_runtime_provider(
+        requested="openai-codex",
+        explicit_base_url="https://codex.example.test/v1/",
+    )
+
+    assert resolved["api_key"] == "pool-token"
+    assert resolved["base_url"] == "https://codex.example.test/v1"
+    assert resolved["last_refresh"] == "2026-08-06T00:00:00+00:00"
+
+
 async def test_qwen_oauth_resolves_native_async_credentials(monkeypatch):
     monkeypatch.setattr(rp, "resolve_provider", AsyncMock(return_value="qwen-oauth"))
     monkeypatch.setattr(rp, "_get_model_config", lambda *_args, **_kwargs: {})

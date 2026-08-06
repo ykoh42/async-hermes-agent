@@ -1798,13 +1798,7 @@ async def _resolve_xai_oauth_for_aux() -> Optional[Tuple[str, str]]:
     except Exception as exc:
         logger.debug("Auxiliary xAI OAuth pool credential resolution failed: %s", exc)
 
-    from agent.agent_runtime_helpers import UnsupportedCapabilityError
-
-    raise UnsupportedCapabilityError(
-        "xAI OAuth refresh has no native async credential lifecycle yet; a "
-        "stale or missing pool entry cannot be refreshed from the async "
-        "auxiliary path."
-    )
+    return None
 
 
 async def _read_codex_access_token() -> Optional[str]:
