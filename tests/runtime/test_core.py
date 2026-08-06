@@ -7,9 +7,10 @@ import shlex
 import sys
 import time
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 import pytest
-from unittest.mock import AsyncMock, patch
+from pyleak import no_event_loop_blocking, no_task_leaks
 
 from agent.conversation_loop import run_conversation
 from agent.conversation_compression import compress_context
@@ -1837,6 +1838,26 @@ async def test_close_is_awaitable_and_idempotent():
 
 
 @pytest.mark.asyncio
+async def test_close_cancels_and_awaits_active_turn_without_task_leak():
+    agent = AIAgent.__new__(AIAgent)
+    turn_started = asyncio.Event()
+
+    async def active_turn() -> None:
+        turn_started.set()
+        await asyncio.Event().wait()
+
+    async with no_task_leaks(action="raise"):
+        turn_task = asyncio.create_task(active_turn())
+        await turn_started.wait()
+        agent._active_turn_task = turn_task
+
+        await agent.close()
+
+        assert turn_task.cancelled()
+        assert agent._closed is True
+
+
+@pytest.mark.asyncio
 async def test_close_releases_retained_mcp_lifecycle(monkeypatch):
     from tools import mcp_tool
 
@@ -2461,7 +2482,6 @@ async def test_native_transport_terminal_does_not_use_to_thread(monkeypatch, tmp
 @pytest.mark.asyncio
 async def test_synthetic_turn_records_trajectory_without_to_thread(monkeypatch, tmp_path):
     """Exercise the public turn path with an async model and real session DB."""
-    from pyleak import no_event_loop_blocking, no_task_leaks
     from run_agent import AIAgent
 
     database = SessionDB(tmp_path / "state.db")
@@ -2766,12 +2786,16 @@ async def test_cancelled_turn_persists_partial_session_and_reraises(monkeypatch,
         raise AssertionError("cancelled async turn must not call asyncio.to_thread")
 
     monkeypatch.setattr(asyncio, "to_thread", fail_if_called)
-    task = asyncio.create_task(agent.run_conversation("persist this before cancel"))
+    task = None
     try:
-        await asyncio.wait_for(model_started.wait(), timeout=0.5)
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
+        async with no_task_leaks(action="raise"):
+            task = asyncio.create_task(
+                agent.run_conversation("persist this before cancel")
+            )
+            await asyncio.wait_for(model_started.wait(), timeout=0.5)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
         assert [
             message["content"]
             for message in await database.get_messages(agent.session_id)
@@ -2779,7 +2803,7 @@ async def test_cancelled_turn_persists_partial_session_and_reraises(monkeypatch,
             "persist this before cancel"
         ]
     finally:
-        if not task.done():
+        if task is not None and not task.done():
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
         await agent.close()
@@ -2867,12 +2891,14 @@ async def test_cancelled_tool_batch_persists_ordered_cancelled_observation(
 
     agent._execute_model_request = model_response
 
-    task = asyncio.create_task(agent.run_conversation("cancel this tool"))
+    task = None
     try:
-        await asyncio.wait_for(tool_started.wait(), timeout=0.5)
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
+        async with no_task_leaks(action="raise"):
+            task = asyncio.create_task(agent.run_conversation("cancel this tool"))
+            await asyncio.wait_for(tool_started.wait(), timeout=0.5)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
 
         stored = await database.get_messages(agent.session_id)
         assert [message["role"] for message in stored] == [
@@ -2884,7 +2910,7 @@ async def test_cancelled_tool_batch_persists_ordered_cancelled_observation(
         assert "cancelled" in stored[-2]["content"].lower()
         assert stored[-1]["content"] == "Operation interrupted."
     finally:
-        if not task.done():
+        if task is not None and not task.done():
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
         await agent.close()
