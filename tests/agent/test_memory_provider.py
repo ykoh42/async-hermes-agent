@@ -26,7 +26,7 @@ class _Provider(MemoryProvider):
     def name(self):
         return self._name
 
-    def is_available(self):
+    async def is_available(self):
         return True
 
     async def initialize(self, session_id, **kwargs):
@@ -196,6 +196,19 @@ def test_memory_manager_rejects_sync_provider_contract():
 
 
 @pytest.mark.asyncio
+async def test_memory_manager_propagates_provider_initialization_failure():
+    class _BrokenProvider(_Provider):
+        async def initialize(self, session_id, **kwargs):
+            raise RuntimeError("provider unavailable")
+
+    manager = MemoryManager()
+    manager.add_provider(_BrokenProvider())
+
+    with pytest.raises(RuntimeError, match="provider unavailable"):
+        await manager.initialize_all("session")
+
+
+@pytest.mark.asyncio
 async def test_user_memory_provider_loads_with_native_async_contract(
     tmp_path,
     monkeypatch,
@@ -211,7 +224,7 @@ class ExampleMemoryProvider(MemoryProvider):
     def name(self):
         return "example_memory"
 
-    def is_available(self):
+    async def is_available(self):
         return True
 
     async def initialize(self, session_id, **kwargs):
@@ -257,7 +270,7 @@ class DeferredMemoryProvider(MemoryProvider):
     def name(self):
         return "deferred_memory"
 
-    def is_available(self):
+    async def is_available(self):
         return True
 
     async def initialize(self, session_id, **kwargs):

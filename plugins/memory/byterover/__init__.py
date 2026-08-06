@@ -122,7 +122,7 @@ def _resolve_brv_path() -> Optional[str]:
 async def _run_brv(
     args: List[str],
     timeout: int = _QUERY_TIMEOUT,
-    cwd: str = None,
+    cwd: Optional[str] = None,
 ) -> dict:
     """Run a brv CLI command. Returns {success, output, error}."""
     brv_path = _resolve_brv_path()
@@ -246,7 +246,7 @@ class ByteRoverMemoryProvider(MemoryProvider):
     def name(self) -> str:
         return "byterover"
 
-    def is_available(self) -> bool:
+    async def is_available(self) -> bool:
         """Check if brv CLI is installed. No network calls."""
         return _resolve_brv_path() is not None
 

@@ -15,7 +15,7 @@ Only ONE provider can be active at a time, selected via
 Usage:
     from plugins.memory import discover_memory_providers, load_memory_provider
 
-    available = discover_memory_providers()   # [(name, desc, available), ...]
+    available = await discover_memory_providers()  # [(name, desc, available), ...]
     provider = load_memory_provider("mnemosyne")  # MemoryProvider instance
 """
 
@@ -27,8 +27,11 @@ import importlib.util
 import logging
 import sys
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, TYPE_CHECKING
 from hermes_cli.config import cfg_get
+
+if TYPE_CHECKING:
+    from agent.memory_provider import MemoryProvider
 
 logger = logging.getLogger(__name__)
 
@@ -154,7 +157,7 @@ def list_memory_provider_names() -> List[str]:
     return sorted({name for name, _ in _iter_provider_dirs()})
 
 
-def discover_memory_providers() -> List[Tuple[str, str, bool]]:
+async def discover_memory_providers() -> List[Tuple[str, str, bool]]:
     """Scan bundled and user-installed directories for available providers.
 
     Returns list of (name, description, is_available) tuples.
@@ -180,7 +183,7 @@ def discover_memory_providers() -> List[Tuple[str, str, bool]]:
         try:
             provider = _load_provider_from_dir(child)
             if provider:
-                available = provider.is_available()
+                available = await provider.is_available()
             else:
                 available = False
         except Exception:
@@ -253,7 +256,7 @@ def _load_provider_from_dir(provider_dir: Path) -> Optional["MemoryProvider"]:
                         parent, str(parent_init),
                         submodule_search_locations=[str(parent_path)]
                     )
-                    if spec:
+                    if spec and spec.loader:
                         parent_mod = importlib.util.module_from_spec(spec)
                         sys.modules[parent] = parent_mod
                         try:
@@ -271,7 +274,7 @@ def _load_provider_from_dir(provider_dir: Path) -> Optional["MemoryProvider"]:
             module_name, str(init_file),
             submodule_search_locations=[str(provider_dir)]
         )
-        if not spec:
+        if not spec or not spec.loader:
             return None
 
         mod = importlib.util.module_from_spec(spec)
@@ -288,7 +291,7 @@ def _load_provider_from_dir(provider_dir: Path) -> Optional["MemoryProvider"]:
                 sub_spec = importlib.util.spec_from_file_location(
                     full_sub_name, str(sub_file)
                 )
-                if sub_spec:
+                if sub_spec and sub_spec.loader:
                     sub_mod = importlib.util.module_from_spec(sub_spec)
                     sys.modules[full_sub_name] = sub_mod
                     try:

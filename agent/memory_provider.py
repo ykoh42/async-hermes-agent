@@ -89,11 +89,13 @@ class MemoryProvider(ABC):
     # -- Core lifecycle (implement these) ------------------------------------
 
     @abstractmethod
-    def is_available(self) -> bool:
+    async def is_available(self) -> bool:
         """Return True if this provider is configured, has credentials, and is ready.
 
         Called during agent init to decide whether to activate the provider.
         Should not make network calls — just check config and installed deps.
+        The coroutine contract lets providers read profile-scoped config
+        without blocking the event loop.
         """
 
     @abstractmethod

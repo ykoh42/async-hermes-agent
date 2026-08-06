@@ -116,6 +116,9 @@ bedrock = [
     "aiobotocore==3.8.0",
     "anthropic[bedrock]==0.87.0",
 ]
+# Mem0 Platform/OSS memory provider. Self-hosted HTTP mode uses the core
+# httpx dependency and does not require this extra.
+mem0 = ["mem0ai==2.0.10"]
 
 [build-system]
 requires = ["setuptools>=77.0,<83"]

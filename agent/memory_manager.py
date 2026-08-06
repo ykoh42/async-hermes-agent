@@ -398,6 +398,7 @@ class MemoryManager:
         from hermes_cli.plugins import PluginContractError
 
         for method_name in (
+            "is_available",
             "initialize",
             "prefetch",
             "queue_prefetch",
@@ -1142,7 +1143,7 @@ class MemoryManager:
     async def _drain_background_tasks(self) -> None:
         """Give queued FIFO work a bounded chance, then abandon explicitly."""
         self._shutting_down = True
-        tracked = {
+        tracked: Dict[asyncio.Task[Any], str] = {
             task: kind
             for task, kind in self._background_tasks.items()
             if not task.done()
@@ -1207,8 +1208,11 @@ class MemoryManager:
         for provider in self._providers:
             try:
                 await provider.initialize(session_id=session_id, **kwargs)
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
                 logger.warning(
                     "Memory provider '%s' initialize failed: %s",
                     provider.name, e,
                 )
+                raise
