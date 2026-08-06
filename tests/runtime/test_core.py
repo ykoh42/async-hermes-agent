@@ -549,6 +549,68 @@ async def test_deferred_runtime_initializes_from_async_pool_without_legacy_route
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("constructor_provider", ["qwen-oauth", None])
+async def test_deferred_runtime_uses_native_qwen_oauth_resolver(
+    monkeypatch,
+    tmp_path,
+    constructor_provider,
+):
+    """Explicit and config-selected Qwen routes keep the upstream OAuth path."""
+    hermes_home = tmp_path / "hermes"
+    hermes_home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    config = {
+        "context": {"engine": "compressor"},
+        "model": {"provider": "qwen-oauth", "default": "qwen3-coder-plus"},
+    }
+    resolve_qwen = AsyncMock(
+        return_value={
+            "provider": "qwen-oauth",
+            "base_url": "https://portal.qwen.ai/v1",
+            "api_key": "qwen-access-token",
+            "source": "qwen-cli",
+            "expires_at_ms": 123456789,
+        }
+    )
+
+    with (
+        patch("run_agent.get_tool_definitions", return_value=[]),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI"),
+        patch(
+            "hermes_cli.config.load_config_readonly",
+            new=AsyncMock(return_value=config),
+        ),
+        patch(
+            "hermes_cli.auth.resolve_qwen_runtime_credentials",
+            new=resolve_qwen,
+        ),
+    ):
+        agent = AIAgent(
+            provider=constructor_provider,
+            model="qwen3-coder-plus",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+        monkeypatch.setattr(
+            asyncio,
+            "to_thread",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("Qwen OAuth resolution must not thread-hop"),
+            ),
+        )
+        await agent._ensure_provider_runtime()
+
+    assert agent.provider == "qwen-oauth"
+    assert agent.api_mode == "chat_completions"
+    assert agent.api_key == "qwen-access-token"
+    assert agent.base_url == "https://portal.qwen.ai/v1"
+    resolve_qwen.assert_awaited()
+    await agent.close()
+
+
+@pytest.mark.asyncio
 async def test_explicit_credentials_defer_sdk_construction_until_await(monkeypatch):
     """``AIAgent.__init__`` remains state-only even with an explicit key."""
     native_client = SimpleNamespace(close=AsyncMock(), _platform=None)

@@ -2812,9 +2812,6 @@ async def initialize_deferred_runtime(agent: Any) -> bool:
                 logger.info("Loaded environment variables from %s", env_path)
 
         from agent.agent_runtime_helpers import UnsupportedCapabilityError
-        from agent.credential_pool import load_pool
-        from hermes_cli.auth import PROVIDER_REGISTRY
-        from hermes_constants import OPENROUTER_BASE_URL
 
         if getattr(agent, "_runtime_config_loaded", False):
             config_snapshot = getattr(agent, "_runtime_config_snapshot", {})
@@ -2895,190 +2892,53 @@ async def initialize_deferred_runtime(agent: Any) -> bool:
             )
             logger.info("Initialized native async MoA runtime for %s", model)
             return True
-        candidates = ["openrouter"] if requested in {"", "auto"} else [requested]
         pending_api_key = pending.get("api_key")
         explicit_api_key: Any = (
             pending_api_key
             if callable(pending_api_key) and not isinstance(pending_api_key, str)
             else str(pending_api_key or "").strip()
         )
-        resolved: tuple[str, Any, str, Any, Any] | None = None
-        unavailable: list[str] = []
+        if (
+            not explicit_api_key
+            and requested == "custom"
+            and explicit_base_url
+        ):
+            explicit_api_key = str(os.getenv("OPENAI_API_KEY") or "").strip()
 
         if explicit_api_key and explicit_base_url:
-            resolved = (candidates[0], explicit_api_key, explicit_base_url, None, None)
+            direct_provider = "openrouter" if requested in {"", "auto"} else requested
+            runtime = {
+                "provider": direct_provider,
+                "requested_provider": requested,
+                "api_key": explicit_api_key,
+                "base_url": explicit_base_url,
+                "api_mode": pending.get("api_mode"),
+            }
+        else:
+            from hermes_cli.auth import AuthError
+            from hermes_cli.runtime_provider import resolve_runtime_provider
 
-        for provider in (candidates if resolved is None else ()):
-            if provider == "copilot-acp":
-                from hermes_cli.auth import (
-                    resolve_external_process_provider_credentials,
-                )
-
-                credentials = await resolve_external_process_provider_credentials(
-                    provider
-                )
-                pending["command"] = credentials.get("command")
-                pending["args"] = list(credentials.get("args") or [])
-                resolved = (
-                    provider,
-                    credentials.get("api_key", "copilot-acp"),
-                    credentials.get("base_url", "acp://copilot"),
-                    None,
-                    None,
-                )
-                break
-            if provider == "azure-foundry":
-                from hermes_cli.runtime_provider import _resolve_azure_foundry_runtime
-
-                model_config = config_snapshot.get("model", {})
-                if not isinstance(model_config, dict):
-                    model_config = {}
-                azure_runtime = await _resolve_azure_foundry_runtime(
-                    requested_provider=provider,
-                    model_cfg=model_config,
-                    explicit_base_url=explicit_base_url or None,
-                    resolved_api_key=(
-                        explicit_api_key
-                        if isinstance(explicit_api_key, str)
-                        else None
-                    ),
-                    target_model=model,
-                )
-                pending["api_mode"] = azure_runtime["api_mode"]
-                resolved = (
-                    provider,
-                    azure_runtime["api_key"],
-                    azure_runtime["base_url"],
-                    None,
-                    None,
-                )
-                break
-            if provider in {
-                "vertex",
-                "google-vertex",
-                "vertex-ai",
-                "gcp-vertex",
-                "vertexai",
-            }:
-                from agent.vertex_adapter import get_vertex_config
-
-                vertex_token, vertex_base_url = await get_vertex_config()
-                if vertex_token and vertex_base_url:
-                    resolved = (
-                        "vertex",
-                        vertex_token,
-                        vertex_base_url,
-                        None,
-                        None,
-                    )
-                    break
-                unavailable.append("Vertex OAuth2 credentials")
-                continue
-            if provider == "bedrock":
-                from hermes_cli.runtime_provider import resolve_runtime_provider
-
-                bedrock_runtime = await resolve_runtime_provider(
-                    requested="bedrock",
-                    target_model=model,
-                )
-                pending["api_mode"] = bedrock_runtime["api_mode"]
-                pending["region"] = bedrock_runtime["region"]
-                pending["guardrail_config"] = bedrock_runtime.get(
-                    "guardrail_config"
-                )
-                resolved = (
-                    provider,
-                    bedrock_runtime["api_key"],
-                    bedrock_runtime["base_url"],
-                    None,
-                    None,
-                )
-                break
             try:
-                pool = await load_pool(provider)
-                entry = await pool.select()
-            except UnsupportedCapabilityError:
-                raise
-            except Exception as exc:
+                runtime = await resolve_runtime_provider(
+                    requested=requested,
+                    explicit_api_key=explicit_api_key or None,
+                    explicit_base_url=explicit_base_url or None,
+                    target_model=model,
+                )
+            except AuthError as exc:
                 raise UnsupportedCapabilityError(
-                    f"Could not load the native async credential pool for {provider!r}: {exc}"
+                    f"No native async credentials are available for provider "
+                    f"{requested!r}: {exc}"
                 ) from exc
 
-            if entry is not None:
-                api_key = str(
-                    getattr(entry, "runtime_api_key", None)
-                    or getattr(entry, "access_token", "")
-                    or ""
-                ).strip()
-                base_url = str(
-                    getattr(entry, "runtime_base_url", None)
-                    or getattr(entry, "base_url", None)
-                    or ""
-                ).strip()
-                if api_key:
-                    config = PROVIDER_REGISTRY.get(provider)
-                    base_url = base_url or str(
-                        getattr(config, "inference_base_url", "") or ""
-                    ).strip()
-                    if provider == "openrouter":
-                        base_url = base_url or OPENROUTER_BASE_URL
-                    if base_url:
-                        resolved = (provider, api_key, base_url, pool, entry)
-                        break
-
-            if provider == "custom":
-                api_key = str(os.getenv("OPENAI_API_KEY") or "").strip()
-                base_url = explicit_base_url or str(
-                    os.getenv("OPENAI_BASE_URL") or ""
-                ).strip()
-                if api_key and base_url:
-                    resolved = (provider, api_key, base_url, None, None)
-                    break
-                unavailable.append("OPENAI_API_KEY + OPENAI_BASE_URL")
-                continue
-
-            config = PROVIDER_REGISTRY.get(provider)
-            if config is None:
-                unavailable.append(provider)
-                continue
-            if getattr(config, "auth_type", "api_key") != "api_key":
-                raise UnsupportedCapabilityError(
-                    f"Provider {provider!r} requires a native async OAuth resolver. "
-                    "Its synchronous credential source is disabled in async-hermes-agent."
-                )
-
-            api_key = next(
-                (
-                    value
-                    for env_name in getattr(config, "api_key_env_vars", ())
-                    if (value := str(os.getenv(env_name) or "").strip())
-                ),
-                "",
-            )
-            base_url_env = str(getattr(config, "base_url_env_var", "") or "")
-            base_url = (
-                str(os.getenv(base_url_env) or "").strip()
-                if base_url_env
-                else ""
-            ) or str(getattr(config, "inference_base_url", "") or "").strip()
-            if provider == "openrouter":
-                base_url = base_url or OPENROUTER_BASE_URL
-            if api_key and base_url:
-                resolved = (provider, api_key, base_url, None, None)
-                break
-            unavailable.append(
-                "/".join(getattr(config, "api_key_env_vars", ()) or (provider,))
-            )
-
-        if resolved is None:
-            hints = ", ".join(unavailable) or requested
-            raise UnsupportedCapabilityError(
-                f"No native async credentials are available for provider {requested!r} "
-                f"({hints}). Pass api_key and base_url to AIAgent, persist a credential "
-                "with Hermes auth, or configure an API-key environment variable."
-            )
-
-        provider, api_key, base_url, pool, entry = resolved
+        provider = str(runtime.get("provider") or requested).strip().lower()
+        api_key = runtime.get("api_key")
+        base_url = str(runtime.get("base_url") or "").strip()
+        pool = runtime.get("credential_pool")
+        entry = pool.current() if pool is not None else None
+        for key in ("command", "args", "region", "guardrail_config"):
+            if key in runtime:
+                pending[key] = runtime[key]
         if provider == "lmstudio" and (
             getattr(agent, "lmstudio_load_mode", "explicit") or "explicit"
         ).strip().lower() != "jit":
@@ -3103,7 +2963,9 @@ async def initialize_deferred_runtime(agent: Any) -> bool:
             deferred_client_kwargs = {}
         else:
             deferred_client_kwargs = dict(deferred_client_kwargs)
-        explicit_api_mode = str(pending.get("api_mode") or "").strip()
+        explicit_api_mode = str(
+            pending.get("api_mode") or runtime.get("api_mode") or ""
+        ).strip()
         if explicit_api_mode:
             agent.api_mode = explicit_api_mode
         elif (
@@ -3119,7 +2981,11 @@ async def initialize_deferred_runtime(agent: Any) -> bool:
         else:
             agent.api_mode = "chat_completions"
         agent.provider = provider
-        agent.requested_provider = provider
+        agent.requested_provider = str(
+            runtime.get("requested_provider")
+            or getattr(agent, "requested_provider", None)
+            or requested
+        ).strip().lower()
         agent.model = model
         agent.api_key = api_key
         agent.base_url = base_url.rstrip("/")
