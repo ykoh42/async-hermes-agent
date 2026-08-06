@@ -715,6 +715,27 @@ class PluginContext:
             self.manifest.name, provider.name,
         )
 
+    # -- secret source registration ---------------------------------------
+
+    def register_secret_source(self, source) -> None:
+        """Register a native-async external secret-manager backend."""
+        from agent.secret_sources.base import SecretSource
+        from agent.secret_sources.registry import register_source
+
+        if not isinstance(source, SecretSource):
+            logger.warning(
+                "Plugin '%s' tried to register a secret source that does "
+                "not inherit from SecretSource. Ignoring.",
+                self.manifest.name,
+            )
+            return
+        if register_source(source):
+            logger.info(
+                "Plugin '%s' registered secret source: %s",
+                self.manifest.name,
+                source.name,
+            )
+
     # -- TTS provider registration -------------------------------------------
 
     def register_tts_provider(self, provider) -> None:

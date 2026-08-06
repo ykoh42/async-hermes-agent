@@ -3142,16 +3142,6 @@ async def initialize_deferred_runtime(agent: Any) -> bool:
                     )
                     await _record_codex_gpt55_autoraise_notice(autoraise)
         _select_context_engine(agent, config_snapshot)
-        secrets_config = config_snapshot.get("secrets", {})
-        if isinstance(secrets_config, dict) and any(
-            isinstance(value, dict) and value.get("enabled")
-            for value in secrets_config.values()
-        ):
-            raise UnsupportedCapabilityError(
-                "External secret-source plugins use blocking subprocess APIs and "
-                "are disabled in async-hermes-agent. Supply credentials through "
-                "the process environment or an async credential provider."
-            )
 
         if not pending:
             await _initialize_memory_manager(agent, config_snapshot)

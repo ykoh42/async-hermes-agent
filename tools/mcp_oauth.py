@@ -591,7 +591,7 @@ class HermesTokenStorage:
             try:
                 async with aiofiles.open(path, "wb") as handle:
                     await handle.write(data)
-                await aiofiles.os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)
+                await aiofiles.os.wrap(os.chmod)(path, stat.S_IRUSR | stat.S_IWUSR)
             except OSError as exc:
                 logger.warning("Failed to restore OAuth state %s: %s", fname, exc)
 

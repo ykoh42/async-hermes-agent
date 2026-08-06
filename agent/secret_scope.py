@@ -20,11 +20,16 @@ This module provides a fail-closed, context-local secret scope:
 
 Design rationale lives in ``docs/design/multiplexing-gateway.md`` (Workstream A).
 """
+
 from __future__ import annotations
 
 import os
+import re
 from contextvars import ContextVar, Token
-from typing import Mapping, Optional
+from pathlib import Path
+from typing import Dict, Mapping, Optional
+
+import aiofiles
 
 
 # ── multiplex-active flag ────────────────────────────────────────────────
@@ -174,3 +179,70 @@ def get_secret(name: str, default: Optional[str] = None) -> Optional[str]:
 
     val = os.environ.get(name)
     return val if val is not None else default
+
+
+def _strip_inline_comment(value: str) -> str:
+    """Strip a dotenv-style inline comment from a raw value."""
+    value = value.strip()
+    if not value:
+        return value
+    quote = value[0]
+    if quote in ("'", '"'):
+        index = 1
+        while index < len(value):
+            character = value[index]
+            if quote == '"' and character == "\\":
+                index += 2
+                continue
+            if character == quote:
+                remainder = value[index + 1 :].lstrip()
+                if remainder.startswith("#"):
+                    return value[: index + 1]
+                return value
+            index += 1
+        return value
+    return re.split(r"\s+#", value, maxsplit=1)[0].strip()
+
+
+async def load_env_file(env_path: Path) -> Dict[str, str]:
+    """Parse a dotenv file without mutating the process environment."""
+    secrets: Dict[str, str] = {}
+    try:
+        async with aiofiles.open(env_path, encoding="utf-8-sig") as file:
+            text = await file.read()
+    except (FileNotFoundError, OSError, UnicodeDecodeError):
+        return secrets
+
+    from hermes_cli.config import _parse_env_value
+
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export ") :].lstrip()
+        if "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        if key:
+            secrets[key] = _parse_env_value(_strip_inline_comment(value))
+    return secrets
+
+
+async def build_profile_secret_scope(hermes_home: Path) -> Dict[str, str]:
+    """Build a fresh profile secret mapping from dotenv and source snapshots."""
+    home = Path(hermes_home)
+    secrets = await load_env_file(home / ".env")
+
+    try:
+        from hermes_cli.env_loader import get_secret_source_values
+
+        external_secrets = get_secret_source_values(home)
+    except Exception:
+        external_secrets = {}
+
+    for key, value in external_secrets.items():
+        if not _is_global_env(key):
+            secrets[key] = value
+    return secrets
