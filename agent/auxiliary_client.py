@@ -5274,13 +5274,36 @@ async def resolve_provider_client(
         return client, final_model
 
     if pconfig.auth_type == "external_process":
-        from agent.agent_runtime_helpers import UnsupportedCapabilityError
+        from hermes_cli.auth import resolve_external_process_provider_credentials
 
-        raise UnsupportedCapabilityError(
-            f"Provider {provider!r} uses a blocking external-process transport "
-            "and is disabled in async-hermes-agent until a native async "
-            "implementation is available."
+        credentials = await resolve_external_process_provider_credentials(provider)
+        final_model = _normalize_resolved_model(
+            model
+            or (main_runtime.get("model") if main_runtime else None)
+            or _read_main_model_for_aux(),
+            provider,
         )
+        if provider == "copilot-acp":
+            api_key = str(credentials.get("api_key", "")).strip()
+            base_url = str(credentials.get("base_url", "")).strip()
+            if not final_model or not api_key or not base_url:
+                logger.warning(
+                    "resolve_provider_client: copilot-acp credentials or model "
+                    "are incomplete"
+                )
+                return None, None
+            from agent.copilot_acp_client import CopilotACPClient
+
+            return (
+                CopilotACPClient(
+                    api_key=api_key,
+                    base_url=base_url,
+                    command=str(credentials.get("command", "")).strip() or None,
+                    args=list(credentials.get("args") or []),
+                ),
+                final_model,
+            )
+        return None, None
 
     elif pconfig.auth_type == "vertex":
         try:

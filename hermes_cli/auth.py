@@ -640,6 +640,52 @@ async def resolve_api_key_provider_credentials(
     }
 
 
+async def resolve_external_process_provider_credentials(
+    provider_id: str,
+) -> Dict[str, Any]:
+    """Resolve runtime details for a native-async subprocess provider."""
+    pconfig = PROVIDER_REGISTRY.get(provider_id)
+    if not pconfig or pconfig.auth_type != "external_process":
+        raise AuthError(
+            f"Provider '{provider_id}' is not an external-process provider.",
+            provider=provider_id,
+            code="invalid_provider",
+        )
+
+    base_url = (
+        os.getenv(pconfig.base_url_env_var, "").strip()
+        if pconfig.base_url_env_var
+        else ""
+    ) or pconfig.inference_base_url
+    command = (
+        os.getenv("HERMES_COPILOT_ACP_COMMAND", "").strip()
+        or os.getenv("COPILOT_CLI_PATH", "").strip()
+        or "copilot"
+    )
+    raw_args = os.getenv("HERMES_COPILOT_ACP_ARGS", "").strip()
+    args = shlex.split(raw_args) if raw_args else ["--acp", "--stdio"]
+    resolved_command = (
+        await aiofiles.os.wrap(shutil.which)(command) if command else None
+    )
+    if not resolved_command and not base_url.startswith("acp+tcp://"):
+        raise AuthError(
+            f"Could not find the Copilot CLI command '{command}'. "
+            "Install GitHub Copilot CLI or set "
+            "HERMES_COPILOT_ACP_COMMAND/COPILOT_CLI_PATH.",
+            provider=provider_id,
+            code="missing_copilot_cli",
+        )
+
+    return {
+        "provider": provider_id,
+        "api_key": "copilot-acp",
+        "base_url": base_url.rstrip("/"),
+        "command": resolved_command or command,
+        "args": args,
+        "source": "process",
+    }
+
+
 # =============================================================================
 # Z.AI Endpoint Detection
 # =============================================================================

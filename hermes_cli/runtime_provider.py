@@ -1971,12 +1971,19 @@ async def resolve_runtime_provider(
             )
 
     if provider == "copilot-acp":
-        from agent.agent_runtime_helpers import UnsupportedCapabilityError
-
-        raise UnsupportedCapabilityError(
-            "Copilot ACP uses a blocking subprocess transport and is disabled "
-            "in async-hermes-agent until a native async implementation exists."
+        credentials = await auth_mod.resolve_external_process_provider_credentials(
+            provider
         )
+        return {
+            "provider": "copilot-acp",
+            "api_mode": "chat_completions",
+            "base_url": credentials.get("base_url", "").rstrip("/"),
+            "api_key": credentials.get("api_key", ""),
+            "command": credentials.get("command", ""),
+            "args": list(credentials.get("args") or []),
+            "source": credentials.get("source", "process"),
+            "requested_provider": requested_provider,
+        }
 
     # Anthropic (native Messages API)
     if provider == "anthropic":

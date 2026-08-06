@@ -2274,6 +2274,12 @@ async def run_conversation(
                 # session instead of re-failing every retry.
                 if getattr(agent, "_disable_streaming", False):
                     _use_streaming = False
+                elif (
+                    agent.provider == "copilot-acp"
+                    or str(agent.base_url or "").lower().startswith("acp://copilot")
+                    or str(agent.base_url or "").lower().startswith("acp+tcp://")
+                ):
+                    _use_streaming = False
                 elif not agent._has_stream_consumers():
                     # No display/TTS consumer. Still prefer streaming for
                     # health checking, but skip for Mock clients in tests

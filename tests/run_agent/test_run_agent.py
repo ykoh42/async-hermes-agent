@@ -4403,7 +4403,7 @@ class TestFallbackAnthropicProvider:
 
 
 @pytest.mark.asyncio
-async def test_copilot_acp_fails_fast_without_native_async_transport():
+async def test_copilot_acp_lazy_initializes_native_async_transport():
     with (
         patch("run_agent.get_tool_definitions", return_value=_make_tool_defs("web_search")),
         patch("run_agent.check_toolset_requirements", return_value={}),
@@ -4423,8 +4423,14 @@ async def test_copilot_acp_fails_fast_without_native_async_transport():
     assert agent.client is None
     mock_openai.assert_not_called()
 
-    with pytest.raises(RuntimeError, match="Copilot ACP uses a blocking subprocess transport"):
-        await agent._ensure_provider_runtime()
+    try:
+        assert await agent._ensure_provider_runtime() is True
+        from agent.copilot_acp_client import CopilotACPClient
+
+        assert isinstance(agent.client, CopilotACPClient)
+        assert inspect.iscoroutinefunction(agent.client.chat.completions.create)
+    finally:
+        await agent.close()
 
 
 def test_quiet_spinner_allowed_with_explicit_print_fn(agent):

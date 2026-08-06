@@ -1144,6 +1144,9 @@ def init_agent(
     if (
         api_mode is None
         and agent.api_mode == "chat_completions"
+        and agent.provider != "copilot-acp"
+        and not str(agent.base_url or "").lower().startswith("acp://copilot")
+        and not str(agent.base_url or "").lower().startswith("acp+tcp://")
         and not agent._is_azure_openai_url()
         and (
             agent._is_direct_openai_url()
@@ -2869,11 +2872,6 @@ async def initialize_deferred_runtime(agent: Any) -> bool:
         requested = str(pending.get("provider") or "auto").strip().lower()
         model = str(pending.get("model") or getattr(agent, "model", "") or "")
         explicit_base_url = str(pending.get("base_url") or "").strip()
-        if requested == "copilot-acp" or explicit_base_url.startswith(("acp://", "acp+tcp://")):
-            raise UnsupportedCapabilityError(
-                "Copilot ACP uses a blocking subprocess transport and is disabled "
-                "in async-hermes-agent until it has a native async implementation."
-            )
         if requested == "moa":
             # MoA has no external credentials or HTTP endpoint.  Its native
             # async facade owns the TaskGroup fan-out and the aggregator
@@ -2910,6 +2908,24 @@ async def initialize_deferred_runtime(agent: Any) -> bool:
             resolved = (candidates[0], explicit_api_key, explicit_base_url, None, None)
 
         for provider in (candidates if resolved is None else ()):
+            if provider == "copilot-acp":
+                from hermes_cli.auth import (
+                    resolve_external_process_provider_credentials,
+                )
+
+                credentials = await resolve_external_process_provider_credentials(
+                    provider
+                )
+                pending["command"] = credentials.get("command")
+                pending["args"] = list(credentials.get("args") or [])
+                resolved = (
+                    provider,
+                    credentials.get("api_key", "copilot-acp"),
+                    credentials.get("base_url", "acp://copilot"),
+                    None,
+                    None,
+                )
+                break
             if provider == "azure-foundry":
                 from hermes_cli.runtime_provider import _resolve_azure_foundry_runtime
 
@@ -3210,7 +3226,34 @@ async def initialize_deferred_runtime(agent: Any) -> bool:
         # This value was snapshotted before the turn. Never consult the
         # synchronous settings layer while creating the native client.
         timeout = agent._provider_request_timeout
-        if agent.api_mode == "anthropic_messages":
+        if provider == "copilot-acp":
+            from agent.copilot_acp_client import CopilotACPClient
+
+            command = (
+                pending.get("command")
+                or getattr(agent, "acp_command", None)
+                or None
+            )
+            args = (
+                list(pending.get("args") or [])
+                or list(getattr(agent, "acp_args", None) or [])
+                or None
+            )
+            agent.client = CopilotACPClient(
+                api_key=str(api_key or "copilot-acp"),
+                base_url=agent.base_url,
+                command=command,
+                args=args,
+            )
+            agent._client_kwargs = {
+                "api_key": str(api_key or "copilot-acp"),
+                "base_url": agent.base_url,
+                "command": command,
+                "args": list(args or []),
+            }
+            agent._anthropic_client = None
+            agent._anthropic_client_source = None
+        elif agent.api_mode == "anthropic_messages":
             from agent.anthropic_adapter import _is_oauth_token, build_anthropic_client
 
             agent._anthropic_api_key = api_key
@@ -3384,12 +3427,16 @@ async def initialize_deferred_runtime(agent: Any) -> bool:
             if id(stale_client) in closed_client_ids:
                 continue
             closed_client_ids.add(id(stale_client))
-            aclose = getattr(stale_client, "aclose", None)
-            if aclose is None or not inspect.iscoroutinefunction(aclose):
+            close_client = getattr(stale_client, "aclose", None) or getattr(
+                stale_client, "close", None
+            )
+            if close_client is None or not inspect.iscoroutinefunction(
+                inspect.unwrap(close_client)
+            ):
                 continue
             token_provider = getattr(stale_client, "_hermes_token_provider", None)
             try:
-                await aclose()
+                await close_client()
             finally:
                 if token_provider is not None:
                     from agent.azure_identity_adapter import release_token_provider

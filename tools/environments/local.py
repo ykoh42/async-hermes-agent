@@ -60,6 +60,32 @@ def _build_provider_env_blocklist() -> frozenset[str]:
 
 _HERMES_PROVIDER_ENV_BLOCKLIST = _build_provider_env_blocklist()
 
+_ALWAYS_STRIP_KEYS = frozenset(
+    {
+        "GH_TOKEN",
+        "GITHUB_TOKEN",
+        "GITHUB_APP_ID",
+        "GITHUB_APP_PRIVATE_KEY_PATH",
+        "GITHUB_APP_INSTALLATION_ID",
+        "TELEGRAM_BOT_TOKEN",
+        "DISCORD_BOT_TOKEN",
+        "SLACK_BOT_TOKEN",
+        "SLACK_APP_TOKEN",
+        "SLACK_SIGNING_SECRET",
+        "GATEWAY_ALLOWED_USERS",
+        "GATEWAY_ALLOW_ALL_USERS",
+        "GATEWAY_RELAY_ID",
+        "GATEWAY_RELAY_SECRET",
+        "GATEWAY_RELAY_DELIVERY_KEY",
+        "HASS_TOKEN",
+        "EMAIL_PASSWORD",
+        "HERMES_DASHBOARD_SESSION_TOKEN",
+        "MODAL_TOKEN_ID",
+        "MODAL_TOKEN_SECRET",
+        "DAYTONA_API_KEY",
+    }
+)
+
 
 def _is_hermes_internal_secret(key: str) -> bool:
     upper = key.upper()
@@ -141,3 +167,35 @@ def build_subprocess_env(
     if extra:
         source.update(extra)
     return source
+
+
+def hermes_subprocess_env(*, inherit_credentials: bool = False) -> dict[str, str]:
+    """Build a sanitized environment for a non-terminal child process.
+
+    Tier-1 gateway, GitHub, and infrastructure credentials are always removed.
+    Provider credentials are retained only for explicitly model-driving CLIs.
+    """
+    env = os.environ.copy()
+    for key in _ALWAYS_STRIP_KEYS:
+        env.pop(key, None)
+    for key in list(env):
+        if key.startswith(_HERMES_PROVIDER_ENV_FORCE_PREFIX) or _is_hermes_internal_secret(
+            key
+        ):
+            env.pop(key, None)
+    if not inherit_credentials:
+        for key in _HERMES_PROVIDER_ENV_BLOCKLIST:
+            env.pop(key, None)
+    env.setdefault("PYTHONUTF8", "1")
+    try:
+        from hermes_constants import apply_subprocess_home_env, get_hermes_home_override
+
+        override = get_hermes_home_override()
+        if override:
+            env["HERMES_HOME"] = override
+        apply_subprocess_home_env(env)
+    except Exception:
+        pass
+    for marker in _ACTIVE_VENV_MARKER_VARS:
+        env.pop(marker, None)
+    return env
