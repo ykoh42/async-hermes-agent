@@ -1782,7 +1782,26 @@ async def resolve_runtime_provider(
     if explicit_runtime:
         return explicit_runtime
 
-    if provider in {"nous", "qwen-oauth", "minimax-oauth"}:
+    if provider == "qwen-oauth":
+        try:
+            creds = await auth_mod.resolve_qwen_runtime_credentials()
+            return {
+                "provider": "qwen-oauth",
+                "api_mode": "chat_completions",
+                "base_url": creds.get("base_url", "").rstrip("/"),
+                "api_key": creds.get("api_key", ""),
+                "source": creds.get("source", "qwen-cli"),
+                "expires_at_ms": creds.get("expires_at_ms"),
+                "requested_provider": requested_provider,
+            }
+        except AuthError:
+            if requested_provider != "auto":
+                raise
+            logger.info(
+                "Qwen OAuth credentials failed; falling through to next provider."
+            )
+
+    if provider in {"nous", "minimax-oauth"}:
         from agent.agent_runtime_helpers import UnsupportedCapabilityError
 
         raise UnsupportedCapabilityError(

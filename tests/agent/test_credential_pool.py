@@ -1486,15 +1486,31 @@ async def test_load_pool_skips_resolve_when_all_copilot_sources_suppressed(
 
 
 
-async def test_load_pool_does_not_read_qwen_cli_tokens(tmp_path, monkeypatch):
-    """Pool loading must not cross the synchronous Qwen CLI token boundary."""
+async def test_load_pool_seeds_qwen_cli_tokens_without_refresh(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
     _write_auth_store(tmp_path, {"version": 1, "credential_pool": {}})
 
+    from agent import credential_pool as credential_pool_module
     from agent.credential_pool import load_pool
+    resolve = AsyncMock(
+        return_value={
+            "api_key": "qwen-token",
+            "source": "qwen-cli",
+            "expires_at_ms": 123456789,
+            "base_url": "https://portal.qwen.ai/v1",
+            "auth_file": "/tmp/qwen/oauth_creds.json",
+        }
+    )
+    monkeypatch.setattr(
+        credential_pool_module.auth_mod,
+        "resolve_qwen_runtime_credentials",
+        resolve,
+    )
     pool = await load_pool("qwen-oauth")
 
-    assert not pool.has_credentials()
+    assert pool.has_credentials()
+    assert pool.entries()[0].access_token == "qwen-token"
+    resolve.assert_awaited_once_with(refresh_if_expiring=False)
 
 
 async def test_load_pool_does_not_seed_qwen_oauth_when_no_token(tmp_path, monkeypatch):
@@ -1502,7 +1518,21 @@ async def test_load_pool_does_not_seed_qwen_oauth_when_no_token(tmp_path, monkey
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
     _write_auth_store(tmp_path, {"version": 1, "credential_pool": {}})
 
+    from agent import credential_pool as credential_pool_module
     from agent.credential_pool import load_pool
+    from hermes_cli.auth import AuthError
+
+    monkeypatch.setattr(
+        credential_pool_module.auth_mod,
+        "resolve_qwen_runtime_credentials",
+        AsyncMock(
+            side_effect=AuthError(
+                "missing",
+                provider="qwen-oauth",
+                code="qwen_auth_missing",
+            )
+        ),
+    )
     pool = await load_pool("qwen-oauth")
 
     assert not pool.has_credentials()

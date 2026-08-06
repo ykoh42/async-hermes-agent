@@ -789,12 +789,12 @@ async def test_unsupported_oauth_pool_refresh_fails_fast_without_a_thread(monkey
     from agent.credential_pool import AUTH_TYPE_OAUTH, CredentialPool, PooledCredential
 
     pool = CredentialPool(
-        "qwen-oauth",
+        "minimax-oauth",
         [
             PooledCredential(
-                provider="qwen-oauth",
-                id="qwen",
-                label="Qwen",
+                provider="minimax-oauth",
+                id="minimax",
+                label="MiniMax",
                 auth_type=AUTH_TYPE_OAUTH,
                 priority=0,
                 source="manual",
@@ -808,8 +808,8 @@ async def test_unsupported_oauth_pool_refresh_fails_fast_without_a_thread(monkey
         raise AssertionError("unsupported OAuth must not use asyncio.to_thread")
 
     monkeypatch.setattr(asyncio, "to_thread", fail_if_threaded)
-    with pytest.raises(UnsupportedCapabilityError, match="qwen-oauth"):
-        await pool.try_refresh_matching(credential_id="qwen")
+    with pytest.raises(UnsupportedCapabilityError, match="minimax-oauth"):
+        await pool.try_refresh_matching(credential_id="minimax")
 
 
 @pytest.mark.asyncio
@@ -2189,10 +2189,8 @@ async def test_synthetic_turn_records_trajectory_without_to_thread(monkeypatch, 
 
 
 @pytest.mark.asyncio
-async def test_oauth_renewal_fails_fast_without_sync_refresh(monkeypatch, tmp_path):
-    """An async turn must not invoke the legacy OAuth-refresh helpers."""
-    from agent.agent_runtime_helpers import UnsupportedCapabilityError
-
+async def test_oauth_renewal_uses_native_async_refresh(monkeypatch, tmp_path):
+    """A reactive OAuth renewal is awaited and never replaced by a sync helper."""
     class UnauthorizedError(Exception):
         status_code = 401
 
@@ -2221,12 +2219,13 @@ async def test_oauth_renewal_fails_fast_without_sync_refresh(monkeypatch, tmp_pa
         raise UnauthorizedError("expired OAuth token")
 
     agent._execute_model_request = unauthorized_model
-    agent._try_refresh_codex_client_credentials = lambda **_kwargs: (_ for _ in ()).throw(
-        AssertionError("async turn must not call the sync credential refresher")
-    )
+    agent._try_refresh_codex_client_credentials = AsyncMock(return_value=False)
     try:
-        with pytest.raises(UnsupportedCapabilityError, match="OAuth renewal"):
-            await agent.run_conversation("hello async")
+        result = await agent.run_conversation("hello async")
+        assert result["completed"] is False
+        assert result["failed"] is True
+        assert "expired OAuth token" in result["error"]
+        agent._try_refresh_codex_client_credentials.assert_awaited_once_with(force=True)
     finally:
         await agent.close()
         await database.close()

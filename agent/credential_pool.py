@@ -2000,13 +2000,33 @@ async def _seed_from_singletons(
         except Exception as exc:
             logger.debug("Copilot token seed failed: %s", exc)
 
-    elif provider in {"qwen-oauth", "minimax-oauth"}:
-        # These providers previously seeded credentials by invoking a CLI,
-        # reading a vendor-owned file, or consulting a synchronous auth state
-        # helper.  The native async runtime deliberately does not cross those
-        # blocking boundaries.  Copilot environment credentials are still
-        # discovered by ``_seed_from_env``; the OAuth/CLI variants fail fast at
-        # provider resolution until a native async lifecycle is available.
+    elif provider == "qwen-oauth":
+        try:
+            creds = await auth_mod.resolve_qwen_runtime_credentials(
+                refresh_if_expiring=False,
+            )
+            token = creds.get("api_key", "")
+            if token:
+                source_name = creds.get("source", "qwen-cli")
+                if not _is_suppressed(source_name):
+                    active_sources.add(source_name)
+                    changed |= _upsert_entry(
+                        entries,
+                        provider,
+                        source_name,
+                        {
+                            "source": source_name,
+                            "auth_type": AUTH_TYPE_OAUTH,
+                            "access_token": token,
+                            "expires_at_ms": creds.get("expires_at_ms"),
+                            "base_url": creds.get("base_url", ""),
+                            "label": creds.get("auth_file", source_name),
+                        },
+                    )
+        except Exception as exc:
+            logger.debug("Qwen OAuth token seed failed: %s", exc)
+
+    elif provider == "minimax-oauth":
         return changed, active_sources
 
     elif provider == "openai-codex":

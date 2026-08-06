@@ -98,12 +98,31 @@ async def test_openai_codex_resolves_from_native_async_pool(monkeypatch):
     assert resolved["base_url"] == "https://chatgpt.com/backend-api/codex"
 
 
-async def test_qwen_oauth_fails_fast_without_native_async_lifecycle(monkeypatch):
+async def test_qwen_oauth_resolves_native_async_credentials(monkeypatch):
     monkeypatch.setattr(rp, "resolve_provider", AsyncMock(return_value="qwen-oauth"))
     monkeypatch.setattr(rp, "_get_model_config", lambda *_args, **_kwargs: {})
+    resolve = AsyncMock(
+        return_value={
+            "base_url": "https://portal.qwen.ai/v1",
+            "api_key": "qwen-access",
+            "source": "qwen-cli",
+            "expires_at_ms": 123456789,
+        }
+    )
+    monkeypatch.setattr(rp.auth_mod, "resolve_qwen_runtime_credentials", resolve)
 
-    with pytest.raises(UnsupportedCapabilityError, match="qwen-oauth requires an OAuth lifecycle"):
-        await rp.resolve_runtime_provider(requested="qwen-oauth")
+    resolved = await rp.resolve_runtime_provider(requested="qwen-oauth")
+
+    assert resolved == {
+        "provider": "qwen-oauth",
+        "api_mode": "chat_completions",
+        "base_url": "https://portal.qwen.ai/v1",
+        "api_key": "qwen-access",
+        "source": "qwen-cli",
+        "expires_at_ms": 123456789,
+        "requested_provider": "qwen-oauth",
+    }
+    resolve.assert_awaited_once_with()
 
 
 async def test_resolve_runtime_provider_ai_gateway(monkeypatch):
