@@ -80,6 +80,118 @@ async def test_background_process_inherits_session_environment(tmp_path):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "command",
+    [
+        "rg --line-number 'sudo' .",
+        "printf '%s\\n' sudo",
+        "grep -n sudo README.md",
+    ],
+)
+async def test_sudo_mentions_are_not_rewritten(command, monkeypatch):
+    monkeypatch.delenv("SUDO_PASSWORD", raising=False)
+
+    transformed, sudo_stdin = await terminal._transform_sudo_command(command)
+
+    assert transformed == command
+    assert sudo_stdin is None
+
+
+@pytest.mark.asyncio
+async def test_configured_sudo_password_rewrites_real_invocations(monkeypatch):
+    monkeypatch.setenv("SUDO_PASSWORD", "testpass")
+
+    transformed, sudo_stdin = await terminal._transform_sudo_command(
+        "sudo first && VALUE=1 sudo second"
+    )
+
+    assert transformed == "sudo -S -p '' first && VALUE=1 sudo -S -p '' second"
+    assert sudo_stdin == "testpass\ntestpass\n"
+
+
+@pytest.mark.asyncio
+async def test_profile_scoped_sudo_password_wins_over_process_env(monkeypatch):
+    from agent.secret_scope import reset_secret_scope, set_secret_scope
+
+    monkeypatch.setenv("SUDO_PASSWORD", "wrong-global-pass")
+    token = set_secret_scope({"SUDO_PASSWORD": "scoped-pass"})
+    try:
+        _transformed, sudo_stdin = await terminal._transform_sudo_command("sudo true")
+    finally:
+        reset_secret_scope(token)
+
+    assert sudo_stdin == "scoped-pass\n"
+
+
+@pytest.mark.asyncio
+async def test_explicit_empty_sudo_password_is_still_configured(monkeypatch):
+    monkeypatch.setenv("SUDO_PASSWORD", "")
+
+    transformed, sudo_stdin = await terminal._transform_sudo_command("sudo true")
+
+    assert transformed == "sudo -S -p '' true"
+    assert sudo_stdin == "\n"
+
+
+@pytest.mark.asyncio
+async def test_async_sudo_callback_supplies_password(monkeypatch):
+    monkeypatch.delenv("SUDO_PASSWORD", raising=False)
+
+    async def password_callback():
+        return "callback-pass"
+
+    terminal.set_sudo_password_callback(password_callback)
+    try:
+        transformed, sudo_stdin = await terminal._transform_sudo_command("sudo true")
+    finally:
+        terminal.set_sudo_password_callback(None)
+
+    assert transformed == "sudo -S -p '' true"
+    assert sudo_stdin == "callback-pass\n"
+
+
+@pytest.mark.asyncio
+async def test_sync_sudo_callback_fails_fast(monkeypatch):
+    monkeypatch.delenv("SUDO_PASSWORD", raising=False)
+    terminal.set_sudo_password_callback(lambda: "legacy-pass")  # type: ignore[arg-type]
+    try:
+        with pytest.raises(RuntimeError, match="coroutine sudo password callback"):
+            await terminal._transform_sudo_command("sudo true")
+    finally:
+        terminal.set_sudo_password_callback(None)
+
+
+@pytest.mark.asyncio
+async def test_local_environment_pipes_sudo_password_before_stdin(tmp_path, monkeypatch):
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_sudo = fake_bin / "sudo"
+    fake_sudo.write_text(
+        "#!/bin/sh\n"
+        "IFS= read -r password\n"
+        "IFS= read -r payload\n"
+        "printf 'password=%s\\npayload=%s\\n' \"$password\" \"$payload\"\n"
+    )
+    fake_sudo.chmod(0o755)
+    monkeypatch.setenv("SUDO_PASSWORD", "testpass")
+
+    environment = terminal.LocalEnvironment(str(tmp_path))
+    environment.env["PATH"] = f"{fake_bin}{os.pathsep}{environment.env['PATH']}"
+    async with (
+        no_event_loop_blocking(action="raise", threshold=0.1),
+        no_task_leaks(action="raise"),
+    ):
+        result = await environment.execute("sudo target", stdin_data="payload-data\n")
+
+    assert result["returncode"] == 0
+    assert result["output"].splitlines() == [
+        "password=testpass",
+        "payload=payload-data",
+    ]
+    assert "SUDO_PASSWORD" not in environment.env
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("command", [None, "", "   "])
 async def test_rejects_invalid_commands(command):
     result = json.loads(await terminal.terminal_tool(command))

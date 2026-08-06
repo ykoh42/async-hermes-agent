@@ -23,7 +23,7 @@ import time
 import uuid
 import weakref
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Awaitable, Callable, Optional
 
 import aiofiles
 import aiofiles.os
@@ -46,7 +46,9 @@ _CONTAINER_BACKENDS = frozenset()
 _approval_callback: contextvars.ContextVar[Callable[..., Any] | None] = (
     contextvars.ContextVar("terminal_approval_callback", default=None)
 )
-_sudo_password_callback: Callable[..., Any] | None = None
+_sudo_password_callback: contextvars.ContextVar[
+    Callable[[], Awaitable[str | None]] | None
+] = contextvars.ContextVar("terminal_sudo_password_callback", default=None)
 
 
 def _safe_parse_import_env(name: str, default: Any, converter: Callable[[str], Any], type_label: str) -> Any:
@@ -199,13 +201,14 @@ def set_approval_callback(callback: Callable[..., Any] | None) -> None:
     _approval_callback.set(callback)
 
 
-def _get_sudo_password_callback() -> Callable[..., Any] | None:
-    return _sudo_password_callback
+def _get_sudo_password_callback() -> Callable[[], Awaitable[str | None]] | None:
+    return _sudo_password_callback.get()
 
 
-def set_sudo_password_callback(callback: Callable[..., Any] | None) -> None:
-    global _sudo_password_callback
-    _sudo_password_callback = callback
+def set_sudo_password_callback(
+    callback: Callable[[], Awaitable[str | None]] | None,
+) -> None:
+    _sudo_password_callback.set(callback)
 
 
 def _read_shell_token(command: str, start: int) -> tuple[str, int]:
@@ -242,6 +245,65 @@ def _read_shell_token(command: str, start: int) -> tuple[str, int]:
         index += 1
 
     return command[start:index], index
+
+
+def _looks_like_env_assignment(token: str) -> bool:
+    if "=" not in token or token.startswith("="):
+        return False
+    name, _value = token.split("=", 1)
+    return bool(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name))
+
+
+def _rewrite_real_sudo_invocations(command: str) -> tuple[str, int]:
+    """Rewrite unquoted sudo command words and return their count."""
+    output: list[str] = []
+    index = 0
+    length = len(command)
+    command_start = True
+    sudo_count = 0
+
+    while index < length:
+        char = command[index]
+        if char.isspace():
+            output.append(char)
+            if char == "\n":
+                command_start = True
+            index += 1
+            continue
+        if char == "#" and command_start:
+            newline = command.find("\n", index)
+            if newline == -1:
+                output.append(command[index:])
+                break
+            output.append(command[index:newline])
+            index = newline
+            continue
+        if command.startswith(("&&", "||", ";;"), index):
+            output.append(command[index : index + 2])
+            index += 2
+            command_start = True
+            continue
+        if char in ";|&(":
+            output.append(char)
+            index += 1
+            command_start = True
+            continue
+        if char == ")":
+            output.append(char)
+            index += 1
+            command_start = False
+            continue
+
+        token, next_index = _read_shell_token(command, index)
+        if command_start and token == "sudo":
+            output.append("sudo -S -p ''")
+            sudo_count += 1
+        else:
+            output.append(token)
+        command_start = command_start and _looks_like_env_assignment(token)
+        index = next_index
+
+    return "".join(output), sudo_count
 
 
 def _rewrite_compound_background(command: str, *_args: Any, **_kwargs: Any) -> str:
@@ -349,11 +411,36 @@ def _rewrite_compound_background(command: str, *_args: Any, **_kwargs: Any) -> s
     return result
 
 
-def _transform_sudo_command(command: str, *_args: Any, **_kwargs: Any) -> tuple[str, str | None]:
-    # BaseEnvironment expects the historical ``(command, sudo_stdin)`` pair.
-    # The lean local backend does not inject a password, so the second item is
-    # always empty while the protocol remains compatible with file/process
-    # helpers and the local shell snapshot tests.
+async def _transform_sudo_command(
+    command: str | None, *_args: Any, **_kwargs: Any
+) -> tuple[str | None, str | None]:
+    """Prepare real sudo invocations for configured or async-supplied input."""
+    if command is None:
+        return None, None
+    transformed, sudo_count = _rewrite_real_sudo_invocations(command)
+    if sudo_count == 0:
+        return command, None
+
+    try:
+        from agent.secret_scope import get_secret
+    except ImportError:
+        configured_password = os.environ.get("SUDO_PASSWORD")
+    else:
+        configured_password = get_secret("SUDO_PASSWORD")
+
+    if configured_password is not None:
+        return transformed, (f"{configured_password}\n" * sudo_count)
+
+    password = None
+    if (callback := _get_sudo_password_callback()) is not None:
+        if not inspect.iscoroutinefunction(callback):
+            raise RuntimeError(
+                "Async Hermes requires a coroutine sudo password callback"
+            )
+        password = await callback()
+
+    if password:
+        return transformed, (f"{password}\n" * sudo_count)
     return command, None
 
 
@@ -461,6 +548,11 @@ class LocalEnvironment:
         **_kwargs: Any,
     ) -> dict[str, Any]:
         """Run a local shell command without blocking the agent event loop."""
+        prepared_command, sudo_stdin = await _transform_sudo_command(command)
+        if prepared_command is None:
+            return {"output": "Command must be a string", "returncode": 1}
+        if sudo_stdin is not None:
+            stdin_data = sudo_stdin + (stdin_data or "")
         workdir = os.path.abspath(os.path.expanduser(cwd or self.cwd))
         if not await aiofiles.os.path.isdir(workdir):
             recovered = await _nearest_existing_directory(workdir)
@@ -484,7 +576,7 @@ class LocalEnvironment:
         env_marker = f"\n{marker}_ENV\n"
         end_marker = f"\n{marker}_END\n"
         wrapped = (
-            f"cd {shlex.quote(workdir)} && {{ {command}; }}; _rc=$?; "
+            f"cd {shlex.quote(workdir)} && {{ {prepared_command}; }}; _rc=$?; "
             f"command printf {shlex.quote(cwd_marker + '%s' + env_marker)} \"$PWD\"; "
             f"/usr/bin/env -0; command printf {shlex.quote(end_marker)}; exit $_rc"
         )

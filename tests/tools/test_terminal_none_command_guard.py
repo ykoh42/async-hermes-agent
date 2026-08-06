@@ -7,8 +7,9 @@ import pytest
 from tools.terminal_tool import _transform_sudo_command, terminal_tool
 
 
-def test_transform_sudo_command_none_returns_cleanly():
-    transformed, sudo_stdin = _transform_sudo_command(None)
+@pytest.mark.asyncio
+async def test_transform_sudo_command_none_returns_cleanly():
+    transformed, sudo_stdin = await _transform_sudo_command(None)
 
     assert transformed is None
     assert sudo_stdin is None

@@ -41,6 +41,7 @@ def _build_provider_env_blocklist() -> frozenset[str]:
         "VERTEX_CREDENTIALS_PATH",
         "GOOGLE_APPLICATION_CREDENTIALS",
         "AWS_BEARER_TOKEN_BEDROCK",
+        "SUDO_PASSWORD",
         "GH_TOKEN",
         "GITHUB_TOKEN",
         "HERMES_DASHBOARD_SESSION_TOKEN",
@@ -104,9 +105,10 @@ def _sanitize_subprocess_env(
 ) -> dict[str, str]:
     """Strip Hermes inference credentials from a model-driven subprocess."""
     try:
-        from tools.env_passthrough import is_env_passthrough
+        from tools.env_passthrough import is_env_passthrough as _is_env_passthrough
     except ImportError:
-        is_env_passthrough = lambda _name: False
+        def _is_env_passthrough(_name: str) -> bool:
+            return False
 
     sanitized: dict[str, str] = {}
     for key, value in dict(base_env or {}).items():
@@ -114,14 +116,14 @@ def _sanitize_subprocess_env(
             continue
         if _is_hermes_internal_secret(key):
             continue
-        if key not in _HERMES_PROVIDER_ENV_BLOCKLIST or is_env_passthrough(key):
+        if key not in _HERMES_PROVIDER_ENV_BLOCKLIST or _is_env_passthrough(key):
             sanitized[key] = value
     for key, value in dict(extra_env or {}).items():
         if key.startswith(_HERMES_PROVIDER_ENV_FORCE_PREFIX):
             key = key[len(_HERMES_PROVIDER_ENV_FORCE_PREFIX):]
         if _is_hermes_internal_secret(key):
             continue
-        if key not in _HERMES_PROVIDER_ENV_BLOCKLIST or is_env_passthrough(key):
+        if key not in _HERMES_PROVIDER_ENV_BLOCKLIST or _is_env_passthrough(key):
             sanitized[key] = value
 
     try:
