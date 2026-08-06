@@ -3215,7 +3215,7 @@ class TestRunConversation:
 
 
     @pytest.mark.asyncio
-    async def test_nous_401_fails_fast_without_sync_credential_renewal(self, agent):
+    async def test_nous_401_awaits_native_credential_renewal(self, agent):
         self._setup_agent(agent)
         agent.provider = "nous"
         agent.api_mode = "chat_completions"
@@ -3240,13 +3240,18 @@ class TestRunConversation:
             patch.object(agent, "_save_trajectory", new_callable=AsyncMock),
             patch.object(agent, "_cleanup_task_resources", new_callable=AsyncMock),
             patch.object(agent, "_execute_model_request", side_effect=_fake_model_request),
+            patch.object(
+                agent,
+                "_try_refresh_nous_client_credentials",
+                new_callable=AsyncMock,
+                return_value=True,
+            ) as refresh,
         ):
-            with pytest.raises(
-                RuntimeError, match="no native async implementation"
-            ):
-                await agent.run_conversation("hello")
+            result = await agent.run_conversation("hello")
 
-        assert calls["api"] == 1
+        assert calls["api"] == 2
+        assert result["final_response"] == "Recovered after remint"
+        refresh.assert_awaited_once_with(force=True)
 
     @pytest.mark.asyncio
     async def test_context_compression_triggered(self, agent):

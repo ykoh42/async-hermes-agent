@@ -1210,6 +1210,7 @@ class CredentialPool:
         if self.provider not in {
             "anthropic",
             "minimax-oauth",
+            "nous",
             "openai-codex",
             "xai-oauth",
         }:
@@ -1219,6 +1220,64 @@ class CredentialPool:
 
         codex_target_path = None
         try:
+            if self.provider == "nous":
+                if entry.source not in {"device_code", "manual:device_code"}:
+                    raise UnsupportedCapabilityError(
+                        "Manual Nous OAuth pool entries cannot be refreshed; "
+                        "log in through the Hermes Nous OAuth flow."
+                    )
+                credentials = await auth_mod.resolve_nous_runtime_credentials(
+                    force_refresh=force,
+                )
+                state_path = Path(credentials["state_path"])
+                auth_store = await auth_mod._load_auth_store(state_path)
+                state = auth_mod._load_provider_state(auth_store, "nous")
+                if not state:
+                    return None
+                extra = dict(entry.extra)
+                for key in (
+                    "token_type",
+                    "scope",
+                    "client_id",
+                    "portal_base_url",
+                    "obtained_at",
+                    "expires_in",
+                    "agent_key_id",
+                    "agent_key_expires_in",
+                    "agent_key_reused",
+                    "agent_key_obtained_at",
+                    "tls",
+                ):
+                    value = state.get(key)
+                    if value is not None:
+                        extra[key] = value
+                updated = replace(
+                    entry,
+                    access_token=str(state.get("access_token") or ""),
+                    refresh_token=state.get("refresh_token"),
+                    expires_at=state.get("expires_at"),
+                    inference_base_url=state.get("inference_base_url"),
+                    agent_key=state.get("agent_key"),
+                    agent_key_expires_at=state.get("agent_key_expires_at"),
+                    extra=extra,
+                    last_status=STATUS_OK,
+                    last_status_at=None,
+                    last_error_code=None,
+                    last_error_reason=None,
+                    last_error_message=None,
+                    last_error_reset_at=None,
+                )
+                self._replace_entry(entry, updated)
+                try:
+                    is_local_state = state_path.resolve(strict=False) == (
+                        auth_mod._auth_file_path().resolve(strict=False)
+                    )
+                except Exception:
+                    is_local_state = state_path == auth_mod._auth_file_path()
+                if is_local_state:
+                    await self._persist()
+                return updated
+
             if self.provider == "minimax-oauth":
                 if entry.source != "oauth":
                     raise UnsupportedCapabilityError(

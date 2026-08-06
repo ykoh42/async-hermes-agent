@@ -4384,6 +4384,47 @@ class AIAgent:
             logger.debug("%s credential refresh failed: %s", self.provider, exc)
             return False
 
+    async def _try_refresh_nous_client_credentials(
+        self,
+        *,
+        force: bool = True,
+    ) -> bool:
+        if self.provider != "nous" or self.api_mode not in {
+            "chat_completions",
+            "anthropic_messages",
+        }:
+            return False
+        try:
+            from hermes_cli.auth import resolve_nous_runtime_credentials
+
+            credentials = await resolve_nous_runtime_credentials(
+                timeout_seconds=env_float("HERMES_NOUS_TIMEOUT_SECONDS", 15),
+                force_refresh=force,
+            )
+            api_key = str(credentials.get("api_key") or "").strip()
+            base_url = str(credentials.get("base_url") or "").strip().rstrip("/")
+            if not api_key or not base_url:
+                return False
+            old_key = str(self.api_key or "").strip()
+            if old_key and api_key == old_key:
+                return False
+            self._deferred_provider_runtime = {
+                "provider": self.provider,
+                "model": self.model,
+                "api_key": api_key,
+                "base_url": base_url,
+                "api_mode": self.api_mode,
+                "request_timeout": getattr(self, "_provider_request_timeout", None),
+                "stale_timeout": getattr(self, "_provider_stale_timeout", None),
+                "update_primary": False,
+            }
+            return await self._ensure_provider_runtime()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.debug("Nous credential refresh failed: %s", exc)
+            return False
+
     async def _recover_with_credential_pool(
         self,
         *,

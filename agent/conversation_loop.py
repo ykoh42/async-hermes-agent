@@ -295,7 +295,22 @@ def _ra():
 
 
 async def _nous_entitlement_message(capability: str) -> str:
-    return ""
+    try:
+        from hermes_cli.nous_account import (
+            format_nous_portal_entitlement_message,
+            get_nous_portal_account_info,
+        )
+
+        account_info = await get_nous_portal_account_info(force_fresh=True)
+        message = format_nous_portal_entitlement_message(
+            account_info,
+            capability=capability,
+        )
+        return message or ""
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        return ""
 
 
 async def _print_nous_entitlement_guidance(agent, capability: str) -> bool:
@@ -305,6 +320,20 @@ async def _print_nous_entitlement_guidance(agent, capability: str) -> bool:
     for line in message.splitlines():
         agent._vprint(f"{agent.log_prefix}   💡 {line}", force=True)
     return True
+
+
+async def _try_refresh_nous_paid_entitlement_credentials(agent) -> bool:
+    try:
+        from hermes_cli.nous_account import get_nous_portal_account_info
+
+        account_info = await get_nous_portal_account_info(force_fresh=True)
+        if account_info.paid_service_access is not True:
+            return False
+        return await agent._try_refresh_nous_client_credentials(force=True)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        return False
 
 
 def _is_nous_inference_route(provider: str, base_url: str) -> bool:
@@ -3655,10 +3684,13 @@ async def run_conversation(
                     and not _retry.nous_paid_entitlement_refresh_attempted
                 ):
                     _retry.nous_paid_entitlement_refresh_attempted = True
-                    raise UnsupportedCapabilityError(
-                        "Nous paid-entitlement credential renewal has no native async "
-                        "implementation. Refresh credentials before starting the async agent."
-                    )
+                    if await _try_refresh_nous_paid_entitlement_credentials(agent):
+                        agent._vprint(
+                            f"{agent.log_prefix}🔐 Nous paid access verified — "
+                            "refreshed runtime credentials and retrying request...",
+                            force=True,
+                        )
+                        continue
 
                 # API-key pool rotation is native async: it mutates the pool
                 # under its task lock and persists via aiofiles. OAuth refresh
@@ -3813,10 +3845,11 @@ async def run_conversation(
                     and not _retry.nous_auth_retry_attempted
                 ):
                     _retry.nous_auth_retry_attempted = True
-                    raise UnsupportedCapabilityError(
-                        "Nous credential renewal has no native async implementation. "
-                        "Refresh credentials before starting the async agent."
-                    )
+                    if await agent._try_refresh_nous_client_credentials(force=True):
+                        agent._buffer_vprint(
+                            "🔐 Nous agent key refreshed after 401. Retrying request..."
+                        )
+                        continue
                 if (
                     _is_copilot_provider(agent)
                     and status_code == 401

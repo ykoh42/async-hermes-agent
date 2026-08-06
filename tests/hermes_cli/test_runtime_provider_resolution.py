@@ -780,7 +780,7 @@ async def test_opencode_go_model_derivation_beats_stale_persisted_api_mode(monke
 
 
 
-async def test_auto_detected_nous_fails_fast_without_native_async_lifecycle(monkeypatch):
+async def test_auto_detected_stale_nous_falls_through_to_openrouter(monkeypatch):
     monkeypatch.setenv("OPENROUTER_API_KEY", "test-or-key")
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
@@ -800,8 +800,10 @@ async def test_auto_detected_nous_fails_fast_without_native_async_lifecycle(monk
         ),
     )
 
-    with pytest.raises(UnsupportedCapabilityError, match="nous requires an OAuth lifecycle"):
-        await rp.resolve_runtime_provider(requested="auto")
+    resolved = await rp.resolve_runtime_provider(requested="auto")
+
+    assert resolved["provider"] == "openrouter"
+    assert resolved["api_key"] == "test-or-key"
 
 
 # ------------------------------------------------------------------

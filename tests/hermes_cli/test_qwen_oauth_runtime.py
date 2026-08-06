@@ -15,6 +15,7 @@ from hermes_cli import auth
 def qwen_auth_path(tmp_path, monkeypatch):
     path = tmp_path / ".qwen" / "oauth_creds.json"
     monkeypatch.setattr(auth, "_qwen_cli_auth_path", lambda: path)
+    monkeypatch.delenv("HERMES_QWEN_BASE_URL", raising=False)
     return path
 
 

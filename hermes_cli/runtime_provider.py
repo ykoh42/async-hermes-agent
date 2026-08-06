@@ -1462,23 +1462,42 @@ async def _resolve_explicit_runtime(
         }
 
     if provider == "nous":
-        if not explicit_api_key or not explicit_base_url:
-            from agent.agent_runtime_helpers import UnsupportedCapabilityError
-
-            raise UnsupportedCapabilityError(
-                "Nous Portal OAuth resolution has no native async credential "
-                "lifecycle yet. Pass an explicit api_key and base_url, or use "
-                "an API-key provider in async-hermes-agent."
-            )
         from hermes_cli.providers import nous_api_mode
 
+        auth_store = await auth_mod._load_auth_store()
+        state = auth_mod._load_provider_state(auth_store, "nous") or {}
+        base_url = (
+            explicit_base_url
+            or _nous_inference_base_url_override()
+            or str(
+                state.get("inference_base_url")
+                or auth_mod.DEFAULT_NOUS_INFERENCE_URL
+            ).strip().rstrip("/")
+        )
+        api_key = explicit_api_key or (
+            str(state.get("agent_key") or "").strip()
+            if _agent_key_is_usable(
+                state,
+                max(60, env_int("HERMES_NOUS_MIN_KEY_TTL_SECONDS", 1800)),
+            )
+            else ""
+        )
+        expires_at = state.get("agent_key_expires_at") or state.get("expires_at")
+        if not api_key:
+            credentials = await auth_mod.resolve_nous_runtime_credentials(
+                timeout_seconds=float(_getenv("HERMES_NOUS_TIMEOUT_SECONDS", "15")),
+            )
+            api_key = credentials.get("api_key", "")
+            expires_at = credentials.get("expires_at")
+            if not explicit_base_url:
+                base_url = credentials.get("base_url", "").rstrip("/") or base_url
         return {
             "provider": "nous",
             "api_mode": nous_api_mode(target_model or model_cfg.get("default") or ""),
-            "base_url": explicit_base_url,
-            "api_key": explicit_api_key,
+            "base_url": base_url,
+            "api_key": api_key,
             "source": "explicit",
-            "expires_at": None,
+            "expires_at": expires_at,
             "requested_provider": requested_provider,
         }
 
@@ -1812,14 +1831,6 @@ async def resolve_runtime_provider(
             "requested_provider": requested_provider,
         }
 
-    if provider == "nous":
-        from agent.agent_runtime_helpers import UnsupportedCapabilityError
-
-        raise UnsupportedCapabilityError(
-            f"{provider} requires an OAuth lifecycle that is not native async; "
-            "use explicit credentials or an API-key provider."
-        )
-
     should_use_pool = provider != "openrouter"
     if provider == "openrouter":
         cfg_provider = str(model_cfg.get("provider") or "").strip().lower()
@@ -1906,6 +1917,32 @@ async def resolve_runtime_provider(
                 model_cfg=model_cfg,
                 pool=pool,
                 target_model=target_model,
+            )
+
+    if provider == "nous":
+        try:
+            from hermes_cli.providers import nous_api_mode
+
+            credentials = await auth_mod.resolve_nous_runtime_credentials(
+                timeout_seconds=float(_getenv("HERMES_NOUS_TIMEOUT_SECONDS", "15")),
+            )
+            return {
+                "provider": "nous",
+                "api_mode": nous_api_mode(
+                    target_model or model_cfg.get("default") or ""
+                ),
+                "base_url": credentials.get("base_url", "").rstrip("/"),
+                "api_key": credentials.get("api_key", ""),
+                "source": credentials.get("source", "portal"),
+                "expires_at": credentials.get("expires_at"),
+                "requested_provider": requested_provider,
+            }
+        except AuthError:
+            if requested_provider != "auto":
+                raise
+            logger.info(
+                "Auto-detected Nous provider but credentials failed; "
+                "falling through to next provider."
             )
 
     if provider == "copilot-acp":

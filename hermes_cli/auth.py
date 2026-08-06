@@ -19,6 +19,7 @@ Nous authentication paths:
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 import os
@@ -34,7 +35,7 @@ import threading
 import time
 import uuid
 import webbrowser
-from contextlib import asynccontextmanager, contextmanager
+from contextlib import AsyncExitStack, asynccontextmanager, contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -1229,6 +1230,16 @@ async def _load_global_auth_store() -> Dict[str, Any]:
         return {}
 
 
+async def get_provider_auth_state(provider_id: str) -> Optional[Dict[str, Any]]:
+    """Return profile-local provider state, falling back to the global root."""
+    auth_store = await _load_auth_store()
+    state = _load_provider_state(auth_store, provider_id)
+    if state is not None:
+        return state
+    global_store = await _load_global_auth_store()
+    return _load_provider_state(global_store, provider_id)
+
+
 async def read_credential_pool(provider_id: Optional[str] = None) -> Dict[str, Any]:
     """Awaitably read one credential-pool slice with profile shadowing."""
     auth_store, global_store = await asyncio.gather(
@@ -1735,6 +1746,33 @@ _ALLOWED_NOUS_INFERENCE_HOSTS: FrozenSet[str] = frozenset({
 })
 
 
+def _validate_nous_inference_url_from_network(url: Optional[str]) -> Optional[str]:
+    """Validate a Portal-returned inference URL before persisting it."""
+    if not isinstance(url, str):
+        return None
+    cleaned = url.strip()
+    if not cleaned:
+        return None
+    try:
+        parsed = urlparse(cleaned)
+    except Exception:
+        return None
+    if parsed.scheme != "https":
+        logger.warning(
+            "nous: refusing non-https inference URL scheme %r from Portal response",
+            parsed.scheme,
+        )
+        return None
+    if parsed.hostname not in _ALLOWED_NOUS_INFERENCE_HOSTS:
+        logger.warning(
+            "nous: refusing inference URL host %r from Portal response "
+            "(not in allowlist); falling back to default",
+            parsed.hostname,
+        )
+        return None
+    return cleaned.rstrip("/")
+
+
 
 
 def _nous_inference_env_override() -> Optional[str]:
@@ -1748,6 +1786,13 @@ def _nous_inference_env_override() -> Optional[str]:
     the env var is unset/blank.
     """
     return _optional_base_url(os.getenv("NOUS_INFERENCE_BASE_URL"))
+
+
+def _nous_portal_env_override() -> Optional[str]:
+    """Return the trusted operator Portal URL override, if configured."""
+    return _optional_base_url(
+        os.getenv("HERMES_PORTAL_BASE_URL") or os.getenv("NOUS_PORTAL_BASE_URL")
+    )
 
 
 
@@ -1825,6 +1870,28 @@ def _nous_invoke_jwt_is_usable(
             min_ttl_seconds=min_ttl_seconds,
         )
         is None
+    )
+
+
+def _assert_nous_inference_jwt_usable(
+    state: Dict[str, Any],
+    *,
+    access_token: Any = None,
+) -> None:
+    token = state.get("access_token") if access_token is None else access_token
+    reason = _nous_invoke_jwt_status(
+        token,
+        scope=state.get("scope"),
+        expires_at=state.get("expires_at"),
+    )
+    if reason is None:
+        return
+    raise AuthError(
+        "Nous Portal access token is not a usable inference JWT "
+        f"({reason}). Re-authenticate with: hermes auth add nous",
+        provider="nous",
+        code=reason,
+        relogin_required=True,
     )
 
 
@@ -1914,6 +1981,14 @@ _NOUS_EFFECTIVE_STATE_IGNORED_KEYS = frozenset({
     "expires_in",
     "agent_key_expires_in",
 })
+
+
+def _nous_effective_provider_state(state: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        key: value
+        for key, value in state.items()
+        if key not in _NOUS_EFFECTIVE_STATE_IGNORED_KEYS
+    }
 
 
 
@@ -2587,6 +2662,51 @@ def _xai_validate_inference_base_url(value: str, *, fallback: str) -> str:
 # =============================================================================
 
 
+def _default_verify() -> bool | ssl.SSLContext:
+    if sys.platform == "darwin":
+        try:
+            import certifi
+
+            return ssl.create_default_context(cafile=certifi.where())
+        except ImportError:
+            pass
+    return True
+
+
+def _resolve_verify(
+    *,
+    insecure: Optional[bool] = None,
+    ca_bundle: Optional[str] = None,
+    auth_state: Optional[Dict[str, Any]] = None,
+) -> bool | ssl.SSLContext:
+    tls_state = auth_state.get("tls") if isinstance(auth_state, dict) else {}
+    tls_state = tls_state if isinstance(tls_state, dict) else {}
+    effective_insecure = (
+        is_truthy_value(insecure, default=False)
+        if insecure is not None
+        else is_truthy_value(tls_state.get("insecure", False), default=False)
+    )
+    effective_ca = (
+        ca_bundle
+        or tls_state.get("ca_bundle")
+        or os.getenv("HERMES_CA_BUNDLE")
+        or os.getenv("SSL_CERT_FILE")
+        or os.getenv("REQUESTS_CA_BUNDLE")
+    )
+    if effective_insecure:
+        return False
+    if effective_ca:
+        ca_path = str(effective_ca)
+        if not os.path.isfile(ca_path):
+            logger.warning(
+                "CA bundle path does not exist: %s — falling back to default certificates",
+                ca_path,
+            )
+            return _default_verify()
+        return ssl.create_default_context(cafile=ca_path)
+    return _default_verify()
+
+
 
 
 
@@ -2622,7 +2742,248 @@ def _xai_validate_inference_base_url(value: str, *, fallback: str) -> str:
 # -----------------------------------------------------------------------------
 
 NOUS_SHARED_STORE_FILENAME = "nous_auth.json"
-_nous_shared_lock_holder = threading.local()
+
+
+def _nous_shared_auth_dir() -> Path:
+    override = os.getenv("HERMES_SHARED_AUTH_DIR", "").strip()
+    if override:
+        return Path(override).expanduser()
+    from hermes_constants import get_default_hermes_root
+
+    return get_default_hermes_root() / "shared"
+
+
+def _nous_shared_store_path() -> Path:
+    path = _nous_shared_auth_dir() / NOUS_SHARED_STORE_FILENAME
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        from hermes_constants import get_default_hermes_root
+
+        real_store = (
+            get_default_hermes_root() / "shared" / NOUS_SHARED_STORE_FILENAME
+        ).resolve(strict=False)
+        try:
+            resolved = path.resolve(strict=False)
+        except Exception:
+            resolved = path
+        if resolved == real_store:
+            raise RuntimeError(
+                "Refusing to touch real user shared Nous auth store during test run: "
+                f"{path}. Set HERMES_SHARED_AUTH_DIR to a tmp_path in your test fixture."
+            )
+    return path
+
+
+async def _read_shared_nous_state() -> Optional[Dict[str, Any]]:
+    try:
+        path = _nous_shared_store_path()
+    except RuntimeError:
+        return None
+    if not await aiofiles.os.path.isfile(path):
+        return None
+    try:
+        async with aiofiles.open(path, encoding="utf-8") as handle:
+            payload = json.loads(await handle.read())
+    except (OSError, ValueError) as exc:
+        logger.debug("Shared Nous auth store at %s is unreadable: %s", path, exc)
+        return None
+    if not isinstance(payload, dict):
+        return None
+    refresh_token = payload.get("refresh_token")
+    access_token = payload.get("access_token")
+    if not (isinstance(refresh_token, str) and refresh_token.strip()):
+        return None
+    if not (isinstance(access_token, str) and access_token.strip()):
+        return None
+    return payload
+
+
+async def _save_shared_nous_state(state: Dict[str, Any]) -> None:
+    """Write shared state while the caller holds its transaction lock."""
+    path = _nous_shared_store_path()
+    refresh_token = state.get("refresh_token")
+    access_token = state.get("access_token")
+    if not (isinstance(refresh_token, str) and refresh_token.strip()):
+        return
+    if not (isinstance(access_token, str) and access_token.strip()):
+        return
+    shared = {
+        "_schema": 1,
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "token_type": state.get("token_type") or "Bearer",
+        "scope": state.get("scope") or DEFAULT_NOUS_SCOPE,
+        "client_id": state.get("client_id") or DEFAULT_NOUS_CLIENT_ID,
+        "portal_base_url": state.get("portal_base_url") or DEFAULT_NOUS_PORTAL_URL,
+        "inference_base_url": state.get("inference_base_url") or DEFAULT_NOUS_INFERENCE_URL,
+        "obtained_at": state.get("obtained_at"),
+        "expires_at": state.get("expires_at"),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    await aiofiles.os.makedirs(path.parent, exist_ok=True)
+    secure_parent_dir(path)
+    tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}")
+
+    def secure_opener(file: str, flags: int) -> int:
+        return os.open(file, flags | os.O_EXCL, stat.S_IRUSR | stat.S_IWUSR)
+
+    try:
+        async with aiofiles.open(
+            tmp,
+            "w",
+            encoding="utf-8",
+            opener=secure_opener,
+        ) as handle:
+            await handle.write(json.dumps(shared, indent=2, sort_keys=True))
+            await handle.flush()
+        await aiofiles.os.replace(tmp, path)
+    finally:
+        try:
+            await aiofiles.os.remove(tmp)
+        except FileNotFoundError:
+            pass
+    _oauth_trace(
+        "nous_shared_store_written",
+        path=str(path),
+        refresh_token_fp=_token_fingerprint(refresh_token),
+    )
+
+
+async def _write_shared_nous_state(state: Dict[str, Any]) -> None:
+    """Best-effort cross-profile mirror of the Nous OAuth token chain."""
+    try:
+        path = _nous_shared_store_path()
+        async with _auth_store_transaction(path):
+            await _save_shared_nous_state(state)
+    except Exception as exc:
+        logger.debug("Failed to write shared Nous auth store: %s", exc)
+
+
+async def _merge_shared_nous_oauth_state(state: Dict[str, Any]) -> bool:
+    shared = await _read_shared_nous_state()
+    if not shared:
+        return False
+    shared_refresh = shared.get("refresh_token")
+    if not isinstance(shared_refresh, str) or not shared_refresh.strip():
+        return False
+    local_refresh = state.get("refresh_token")
+    shared_access_exp = _parse_iso_timestamp(shared.get("expires_at")) or 0.0
+    local_access_exp = _parse_iso_timestamp(state.get("expires_at")) or 0.0
+    refresh_changed = shared_refresh.strip() != str(local_refresh or "").strip()
+    if not refresh_changed and shared_access_exp <= local_access_exp:
+        return False
+    for key in (
+        "access_token",
+        "refresh_token",
+        "token_type",
+        "scope",
+        "client_id",
+        "portal_base_url",
+        "inference_base_url",
+        "obtained_at",
+        "expires_at",
+    ):
+        value = shared.get(key)
+        if value not in {None, ""}:
+            state[key] = value
+    return True
+
+
+async def _clear_shared_nous_state(reason: str) -> None:
+    try:
+        path = _nous_shared_store_path()
+        async with _auth_store_transaction(path):
+            try:
+                await aiofiles.os.remove(path)
+            except FileNotFoundError:
+                pass
+        _oauth_trace("nous_shared_store_cleared", reason=reason)
+    except Exception as exc:
+        logger.debug("Failed to clear shared Nous auth store: %s", exc)
+
+
+def _is_terminal_nous_refresh_error(exc: Exception) -> bool:
+    return (
+        isinstance(exc, AuthError)
+        and exc.provider == "nous"
+        and exc.code in {"invalid_grant", "invalid_token", "refresh_token_reused"}
+        and bool(exc.relogin_required)
+    )
+
+
+def _quarantine_nous_oauth_state(
+    state: Dict[str, Any],
+    error: AuthError,
+    *,
+    reason: str,
+) -> None:
+    logger.warning(
+        "Nous OAuth state quarantined (terminal auth death): %s",
+        json.dumps(
+            {
+                "reason": reason,
+                "error_code": error.code,
+                "client_id": state.get("client_id"),
+                "agent_key_id": state.get("agent_key_id"),
+                "refresh_token_fp": _token_fingerprint(state.get("refresh_token")),
+            },
+            sort_keys=True,
+            ensure_ascii=False,
+        ),
+    )
+    for key in (
+        "access_token",
+        "refresh_token",
+        "expires_at",
+        "expires_in",
+        "obtained_at",
+        "agent_key",
+        "agent_key_id",
+        "agent_key_expires_at",
+        "agent_key_expires_in",
+        "agent_key_reused",
+        "agent_key_obtained_at",
+    ):
+        state.pop(key, None)
+    state["last_auth_error"] = {
+        "provider": "nous",
+        "code": error.code,
+        "message": str(error),
+        "reason": reason,
+        "relogin_required": True,
+        "at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def _quarantine_nous_pool_entries(
+    auth_store: Dict[str, Any],
+    error: AuthError,
+    *,
+    reason: str,
+) -> bool:
+    pool = auth_store.get("credential_pool")
+    if not isinstance(pool, dict):
+        return False
+    entries = pool.get("nous")
+    if not isinstance(entries, list):
+        return False
+    singleton_sources = {NOUS_DEVICE_CODE_SOURCE, f"manual:{NOUS_DEVICE_CODE_SOURCE}"}
+    retained = [
+        entry
+        for entry in entries
+        if not (
+            isinstance(entry, dict)
+            and entry.get("source") in singleton_sources
+        )
+    ]
+    if len(retained) == len(entries):
+        return False
+    pool["nous"] = retained
+    _oauth_trace(
+        "nous_pool_device_code_quarantined",
+        reason=reason,
+        error_code=error.code,
+    )
+    return True
 
 
 
@@ -2665,6 +3026,436 @@ def _agent_key_is_usable(state: Dict[str, Any], min_ttl_seconds: int) -> bool:
         expires_at=state.get("agent_key_expires_at"),
         min_ttl_seconds=max(0, int(min_ttl_seconds)),
     )
+
+
+async def _refresh_access_token(
+    *,
+    client: httpx.AsyncClient,
+    portal_base_url: str,
+    client_id: str,
+    refresh_token: str,
+) -> Dict[str, Any]:
+    response = await client.post(
+        f"{portal_base_url}/api/oauth/token",
+        headers={"x-nous-refresh-token": refresh_token},
+        data={
+            "grant_type": "refresh_token",
+            "client_id": client_id,
+        },
+    )
+    if response.status_code == 200:
+        payload = response.json()
+        if "access_token" not in payload:
+            raise AuthError(
+                "Refresh response missing access_token",
+                provider="nous",
+                code="invalid_token",
+                relogin_required=True,
+            )
+        return payload
+    try:
+        error_payload = response.json()
+    except Exception as exc:
+        raise AuthError(
+            "Refresh token exchange failed",
+            provider="nous",
+            relogin_required=True,
+        ) from exc
+    code = str(error_payload.get("error", "invalid_grant"))
+    description = str(
+        error_payload.get("error_description") or "Refresh token exchange failed"
+    )
+    relogin = code in {"invalid_grant", "invalid_token", "refresh_token_reused"}
+    lowered = description.lower()
+    if code == "refresh_token_reused" or "reuse" in lowered:
+        description = (
+            "Nous Portal detected refresh-token reuse and revoked this session.\n"
+            "This usually means another process used Hermes's single-use refresh "
+            "token without persisting the rotated token.\n"
+            "Re-authenticate with: hermes auth add nous"
+        )
+        relogin = True
+    raise AuthError(
+        description,
+        provider="nous",
+        code=code,
+        relogin_required=relogin,
+    )
+
+
+async def refresh_nous_oauth_pure(
+    access_token: str,
+    refresh_token: str,
+    client_id: str,
+    portal_base_url: str,
+    inference_base_url: str,
+    *,
+    token_type: str = "Bearer",
+    scope: str = DEFAULT_NOUS_SCOPE,
+    obtained_at: Optional[str] = None,
+    expires_at: Optional[str] = None,
+    agent_key: Optional[str] = None,
+    agent_key_expires_at: Optional[str] = None,
+    timeout_seconds: float = 15.0,
+    insecure: Optional[bool] = None,
+    ca_bundle: Optional[str] = None,
+    force_refresh: bool = False,
+    on_state_update: Optional[
+        Callable[[Dict[str, Any], str], Optional[Awaitable[None]]]
+    ] = None,
+) -> Dict[str, Any]:
+    """Refresh Nous OAuth without owning a particular credential store."""
+    state: Dict[str, Any] = {
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "client_id": client_id or DEFAULT_NOUS_CLIENT_ID,
+        "portal_base_url": (portal_base_url or DEFAULT_NOUS_PORTAL_URL).rstrip("/"),
+        "inference_base_url": (
+            inference_base_url or DEFAULT_NOUS_INFERENCE_URL
+        ).rstrip("/"),
+        "token_type": token_type or "Bearer",
+        "scope": scope or DEFAULT_NOUS_SCOPE,
+        "obtained_at": obtained_at,
+        "expires_at": expires_at,
+        "agent_key": agent_key,
+        "agent_key_expires_at": agent_key_expires_at,
+        "tls": {"insecure": bool(insecure), "ca_bundle": ca_bundle},
+    }
+    verify = _resolve_verify(
+        insecure=insecure,
+        ca_bundle=ca_bundle,
+        auth_state=state,
+    )
+    timeout = httpx.Timeout(timeout_seconds if timeout_seconds else 15.0)
+    async with httpx.AsyncClient(
+        timeout=timeout,
+        headers={"Accept": "application/json"},
+        verify=verify,
+    ) as client:
+        invoke_status = _nous_invoke_jwt_status(
+            state.get("access_token"),
+            scope=state.get("scope"),
+            expires_at=state.get("expires_at"),
+        )
+        if force_refresh or invoke_status is not None:
+            refresh_value = state.get("refresh_token")
+            if not isinstance(refresh_value, str) or not refresh_value:
+                reason = invoke_status or "force_refresh"
+                raise AuthError(
+                    "Nous Portal access token is not a usable inference JWT "
+                    f"({reason}) and no refresh token is available. "
+                    "Re-authenticate with: hermes auth add nous",
+                    provider="nous",
+                    code=reason,
+                    relogin_required=True,
+                )
+            refreshed = await _refresh_access_token(
+                client=client,
+                portal_base_url=state["portal_base_url"],
+                client_id=state["client_id"],
+                refresh_token=refresh_value,
+            )
+            now = datetime.now(timezone.utc)
+            access_ttl = _coerce_ttl_seconds(refreshed.get("expires_in"))
+            state["access_token"] = refreshed["access_token"]
+            state["refresh_token"] = refreshed.get("refresh_token") or refresh_value
+            state["token_type"] = (
+                refreshed.get("token_type") or state.get("token_type") or "Bearer"
+            )
+            state["scope"] = refreshed.get("scope") or state.get("scope")
+            refreshed_url = _validate_nous_inference_url_from_network(
+                refreshed.get("inference_base_url")
+            )
+            state["inference_base_url"] = (
+                refreshed_url or DEFAULT_NOUS_INFERENCE_URL
+            )
+            state["obtained_at"] = now.isoformat()
+            state["expires_in"] = access_ttl
+            state["expires_at"] = datetime.fromtimestamp(
+                now.timestamp() + access_ttl,
+                tz=timezone.utc,
+            ).isoformat()
+            if on_state_update is not None:
+                update_result = on_state_update(
+                    dict(state),
+                    "post_refresh_access_token",
+                )
+                if inspect.isawaitable(update_result):
+                    await update_result
+        _assert_nous_inference_jwt_usable(state)
+        _select_nous_invoke_jwt(state)
+    return state
+
+
+async def refresh_nous_oauth_from_state(
+    state: Dict[str, Any],
+    *,
+    timeout_seconds: float = 15.0,
+    force_refresh: bool = False,
+    on_state_update: Optional[
+        Callable[[Dict[str, Any], str], Optional[Awaitable[None]]]
+    ] = None,
+) -> Dict[str, Any]:
+    tls = state.get("tls") or {}
+    return await refresh_nous_oauth_pure(
+        state.get("access_token", ""),
+        state.get("refresh_token", ""),
+        state.get("client_id", DEFAULT_NOUS_CLIENT_ID),
+        state.get("portal_base_url", DEFAULT_NOUS_PORTAL_URL),
+        state.get("inference_base_url", DEFAULT_NOUS_INFERENCE_URL),
+        token_type=state.get("token_type", "Bearer"),
+        scope=state.get("scope", DEFAULT_NOUS_SCOPE),
+        obtained_at=state.get("obtained_at"),
+        expires_at=state.get("expires_at"),
+        agent_key=state.get("agent_key"),
+        agent_key_expires_at=state.get("agent_key_expires_at"),
+        timeout_seconds=timeout_seconds,
+        insecure=tls.get("insecure"),
+        ca_bundle=tls.get("ca_bundle"),
+        force_refresh=force_refresh,
+        on_state_update=on_state_update,
+    )
+
+
+async def resolve_nous_runtime_credentials(
+    *,
+    timeout_seconds: float = 15.0,
+    insecure: Optional[bool] = None,
+    ca_bundle: Optional[str] = None,
+    force_refresh: bool = False,
+) -> Dict[str, Any]:
+    """Resolve and persist a usable Nous inference JWT with native async I/O."""
+    local_path = _auth_file_path()
+    local_store = await _load_auth_store(local_path)
+    target_path: Optional[Path] = local_path
+    if _load_provider_state(local_store, "nous") is None:
+        global_path = _global_auth_file_path()
+        global_store = await _load_global_auth_store()
+        if global_path is not None and _load_provider_state(global_store, "nous"):
+            target_path = global_path
+
+    lock_timeout = max(
+        float(AUTH_LOCK_TIMEOUT_SECONDS),
+        float(timeout_seconds) + 5.0,
+    )
+    sequence_id = uuid.uuid4().hex[:12]
+    async with _auth_store_transaction(
+        target_path,
+        timeout_seconds=lock_timeout,
+    ):
+        auth_store = await _load_auth_store(target_path)
+        state = _load_provider_state(auth_store, "nous")
+        if not state:
+            raise AuthError(
+                "Hermes is not logged into Nous Portal.",
+                provider="nous",
+                relogin_required=True,
+            )
+        persisted_state = dict(state)
+
+        def resolve_routing() -> tuple[str, str, str, str]:
+            portal_url = (
+                _optional_base_url(state.get("portal_base_url"))
+                or DEFAULT_NOUS_PORTAL_URL
+            ).rstrip("/")
+            env_portal = _nous_portal_env_override()
+            if env_portal:
+                portal_url = env_portal.rstrip("/")
+            else:
+                parsed = urlparse(portal_url)
+                loopback_http = (
+                    parsed.scheme == "http"
+                    and parsed.hostname in {"localhost", "127.0.0.1"}
+                )
+                if (
+                    not parsed.hostname
+                    or parsed.hostname not in _NOUS_PORTAL_ALLOWED_HOSTS
+                    or (parsed.scheme != "https" and not loopback_http)
+                ):
+                    logger.warning(
+                        "auth: ignoring invalid portal_base_url %r "
+                        "(host %r or scheme not allowed), using default",
+                        portal_url,
+                        parsed.hostname,
+                    )
+                    portal_url = DEFAULT_NOUS_PORTAL_URL
+            stored_inference = (
+                _validate_nous_inference_url_from_network(
+                    _optional_base_url(state.get("inference_base_url"))
+                )
+                or DEFAULT_NOUS_INFERENCE_URL
+            )
+            effective_inference = (
+                _nous_inference_env_override() or stored_inference
+            )
+            return (
+                portal_url,
+                stored_inference,
+                effective_inference,
+                str(state.get("client_id") or DEFAULT_NOUS_CLIENT_ID),
+            )
+
+        try:
+            shared_path: Optional[Path] = _nous_shared_store_path()
+        except RuntimeError:
+            shared_path = None
+
+        async with AsyncExitStack() as stack:
+            if shared_path is not None:
+                await stack.enter_async_context(
+                    _auth_store_transaction(
+                        shared_path,
+                        timeout_seconds=lock_timeout,
+                    )
+                )
+                await _merge_shared_nous_oauth_state(state)
+
+            portal_url, stored_inference, inference_url, client_id = resolve_routing()
+            state["portal_base_url"] = portal_url
+            state["inference_base_url"] = stored_inference
+            state["client_id"] = client_id
+            tls = state.get("tls") if isinstance(state.get("tls"), dict) else {}
+            effective_insecure = (
+                insecure if insecure is not None else tls.get("insecure")
+            )
+            effective_ca = ca_bundle or tls.get("ca_bundle")
+            state["tls"] = {
+                "insecure": bool(effective_insecure),
+                "ca_bundle": effective_ca,
+            }
+
+            async def persist_refresh(
+                updated: Dict[str, Any],
+                _reason: str,
+            ) -> None:
+                merged = dict(state)
+                merged.update(updated)
+                state.clear()
+                state.update(merged)
+                _save_provider_state(auth_store, "nous", state)
+                await _save_auth_store(auth_store, target_path)
+                if shared_path is not None:
+                    try:
+                        await _save_shared_nous_state(state)
+                    except Exception as exc:
+                        logger.debug("Failed to mirror refreshed Nous state: %s", exc)
+
+            try:
+                refreshed = await refresh_nous_oauth_from_state(
+                    state,
+                    timeout_seconds=timeout_seconds,
+                    force_refresh=force_refresh,
+                    on_state_update=persist_refresh,
+                )
+            except AuthError as exc:
+                if _is_terminal_nous_refresh_error(exc):
+                    failed_refresh = str(state.get("refresh_token") or "")
+                    current = _load_provider_state(auth_store, "nous") or {}
+                    current_refresh = str(current.get("refresh_token") or "")
+                    if not current_refresh or current_refresh == failed_refresh:
+                        _quarantine_nous_oauth_state(
+                            state,
+                            exc,
+                            reason="runtime_access_refresh_failure",
+                        )
+                        _quarantine_nous_pool_entries(
+                            auth_store,
+                            exc,
+                            reason="runtime_access_refresh_failure",
+                        )
+                        _save_provider_state(auth_store, "nous", state)
+                        await _save_auth_store(auth_store, target_path)
+                        if shared_path is not None:
+                            try:
+                                await aiofiles.os.remove(shared_path)
+                            except FileNotFoundError:
+                                pass
+                            except OSError as remove_exc:
+                                logger.debug(
+                                    "Failed to clear shared Nous auth store: %s",
+                                    remove_exc,
+                                )
+                raise
+
+            state.update(refreshed)
+            state["portal_base_url"] = portal_url
+            state["inference_base_url"] = stored_inference
+            state["client_id"] = client_id
+            verify = _resolve_verify(
+                insecure=effective_insecure,
+                ca_bundle=effective_ca,
+                auth_state=state,
+            )
+            state["tls"] = {
+                "insecure": verify is False,
+                "ca_bundle": effective_ca,
+            }
+            if _nous_effective_provider_state(state) != _nous_effective_provider_state(
+                persisted_state
+            ):
+                _save_provider_state(auth_store, "nous", state)
+                await _save_auth_store(auth_store, target_path)
+                if shared_path is not None:
+                    try:
+                        await _save_shared_nous_state(state)
+                    except Exception as exc:
+                        logger.debug("Failed to mirror resolved Nous state: %s", exc)
+
+    api_key = state.get("agent_key")
+    if not isinstance(api_key, str) or not api_key:
+        raise AuthError(
+            "Failed to resolve a Nous inference API key",
+            provider="nous",
+            code="server_error",
+        )
+    expires_at = state.get("agent_key_expires_at")
+    expires_epoch = _parse_iso_timestamp(expires_at)
+    expires_in = (
+        max(0, int(expires_epoch - time.time()))
+        if expires_epoch is not None
+        else _coerce_ttl_seconds(state.get("agent_key_expires_in"))
+    )
+    _oauth_trace(
+        "nous_runtime_credentials_resolved",
+        sequence_id=sequence_id,
+        access_token_fp=_token_fingerprint(api_key),
+    )
+    return {
+        "provider": "nous",
+        "base_url": inference_url,
+        "api_key": api_key,
+        "key_id": state.get("agent_key_id"),
+        "expires_at": expires_at,
+        "expires_in": expires_in,
+        "source": NOUS_AUTH_PATH_INVOKE_JWT,
+        "auth_path": NOUS_AUTH_PATH_INVOKE_JWT,
+        "state_path": str(target_path or local_path),
+    }
+
+
+async def resolve_nous_access_token(
+    *,
+    timeout_seconds: float = 15.0,
+    insecure: Optional[bool] = None,
+    ca_bundle: Optional[str] = None,
+    refresh_skew_seconds: int = ACCESS_TOKEN_REFRESH_SKEW_SECONDS,
+) -> str:
+    """Resolve a refresh-aware Nous bearer for Portal-managed services."""
+    state = await get_provider_auth_state("nous") or {}
+    access_token = state.get("access_token")
+    if (
+        isinstance(access_token, str)
+        and access_token
+        and not _is_expiring(state.get("expires_at"), refresh_skew_seconds)
+    ):
+        return access_token
+    credentials = await resolve_nous_runtime_credentials(
+        timeout_seconds=timeout_seconds,
+        insecure=insecure,
+        ca_bundle=ca_bundle,
+        force_refresh=True,
+    )
+    return str(credentials["api_key"])
 
 
 

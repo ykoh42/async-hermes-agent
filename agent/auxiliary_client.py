@@ -1741,13 +1741,21 @@ async def _resolve_nous_runtime_api(*, force_refresh: bool = False) -> Optional[
     if pooled is not None:
         return pooled
 
-    from agent.agent_runtime_helpers import UnsupportedCapabilityError
+    try:
+        from hermes_cli.auth import resolve_nous_runtime_credentials
 
-    raise UnsupportedCapabilityError(
-        "Nous Portal OAuth refresh has no native async credential lifecycle "
-        "yet; a stale or missing pool entry cannot be refreshed from the "
-        "async auxiliary path."
-    )
+        credentials = await resolve_nous_runtime_credentials(
+            timeout_seconds=env_float("HERMES_NOUS_TIMEOUT_SECONDS", 15),
+            force_refresh=force_refresh,
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.debug("Auxiliary Nous singleton credential resolution failed: %s", exc)
+        return None
+    api_key = str(credentials.get("api_key") or "").strip()
+    base_url = str(credentials.get("base_url") or "").strip().rstrip("/")
+    return (api_key, base_url) if api_key and base_url else None
 
 
 async def _resolve_xai_oauth_for_aux() -> Optional[Tuple[str, str]]:
