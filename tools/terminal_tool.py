@@ -20,6 +20,7 @@ import logging
 import signal
 import threading
 import time
+import uuid
 import weakref
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -448,6 +449,7 @@ class LocalEnvironment:
     def __init__(self, cwd: str, timeout: int = 120):
         self.cwd = os.path.abspath(cwd)
         self.timeout = timeout
+        self.env = build_subprocess_env(scrub_secrets=True)
         self._lock = asyncio.Lock()
 
     async def execute(
@@ -477,10 +479,14 @@ class LocalEnvironment:
                 self.cwd = recovered
         limit = float(timeout or self.timeout)
         shell = os.environ.get("SHELL") or "/bin/sh"
-        marker = "__HERMES_LOCAL_CWD_7F3A__"
+        marker = f"__HERMES_LOCAL_STATE_{uuid.uuid4().hex}__"
+        cwd_marker = f"\n{marker}_CWD="
+        env_marker = f"\n{marker}_ENV\n"
+        end_marker = f"\n{marker}_END\n"
         wrapped = (
             f"cd {shlex.quote(workdir)} && {{ {command}; }}; _rc=$?; "
-            f"printf '\\n{marker}%s\\n' \"$PWD\"; exit $_rc"
+            f"command printf {shlex.quote(cwd_marker + '%s' + env_marker)} \"$PWD\"; "
+            f"/usr/bin/env -0; command printf {shlex.quote(end_marker)}; exit $_rc"
         )
         try:
             process = await asyncio.create_subprocess_shell(
@@ -491,9 +497,7 @@ class LocalEnvironment:
                 stdin=asyncio.subprocess.PIPE if stdin_data is not None else None,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                env=build_subprocess_env(
-                    scrub_secrets=True,
-                ),
+                env=build_subprocess_env(base=self.env, scrub_secrets=False),
             )
             stdout_chunks: list[bytes] = []
             stderr_chunks: list[bytes] = []
@@ -544,14 +548,33 @@ class LocalEnvironment:
         except OSError as exc:
             return {"output": f"Failed to execute command: {exc}", "returncode": 1}
 
-        output = _decode_process_output(stdout_chunks, stderr_chunks)
-        match = re.search(rf"\n{re.escape(marker)}([^\n]*)\n?$", output)
-        if match:
-            new_cwd = match.group(1).strip()
-            output = output[: match.start()].rstrip("\n")
-            if new_cwd and await aiofiles.os.path.isdir(new_cwd):
-                async with self._lock:
-                    self.cwd = new_cwd
+        stdout = b"".join(stdout_chunks)
+        cwd_token = cwd_marker.encode()
+        env_token = env_marker.encode()
+        end_token = end_marker.encode()
+        cwd_start = stdout.rfind(cwd_token)
+        env_start = stdout.find(env_token, cwd_start + len(cwd_token))
+        state_end = stdout.find(end_token, env_start + len(env_token))
+        if cwd_start >= 0:
+            if env_start >= 0 and state_end >= 0:
+                new_cwd = os.fsdecode(stdout[cwd_start + len(cwd_token) : env_start])
+                captured_env: dict[str, str] = {}
+                for entry in stdout[
+                    env_start + len(env_token) : state_end
+                ].split(b"\0"):
+                    if b"=" not in entry:
+                        continue
+                    key, value = entry.split(b"=", 1)
+                    captured_env[os.fsdecode(key)] = os.fsdecode(value)
+                if captured_env:
+                    async with self._lock:
+                        self.env = captured_env
+                        if new_cwd and await aiofiles.os.path.isdir(new_cwd):
+                            self.cwd = new_cwd
+            stdout = stdout[:cwd_start].rstrip(b"\n")
+        output = stdout.decode(errors="replace") + b"".join(stderr_chunks).decode(
+            errors="replace"
+        )
         return {"output": output, "returncode": process.returncode}
 
 
@@ -827,6 +850,7 @@ async def terminal_tool(
                 cwd=cwd,
                 task_id=_resolve_container_task_id(task_id),
                 session_key=str(session_id or task_id or ""),
+                env_vars=env.env,
                 use_pty=effective_pty,
             )
             payload = {

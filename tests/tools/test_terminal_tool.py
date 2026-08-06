@@ -8,6 +8,7 @@ import shlex
 import sys
 
 import pytest
+from pyleak import no_event_loop_blocking, no_task_leaks
 
 import tools.terminal_tool as terminal
 
@@ -21,6 +22,61 @@ async def test_executes_local_command_and_reports_exit_code(tmp_path):
     )
     assert result["exit_code"] == 0
     assert result["output"] == "hello"
+
+
+@pytest.mark.asyncio
+async def test_exported_environment_persists_between_calls(tmp_path):
+    task_id = "persistent-environment"
+    try:
+        async with (
+            no_event_loop_blocking(action="raise", threshold=0.1),
+            no_task_leaks(action="raise"),
+        ):
+            first = json.loads(
+                await terminal.terminal_tool(
+                    "export HERMES_STICKY_ENV_PROBE=sticky; "
+                    'printf "first=%s" "$HERMES_STICKY_ENV_PROBE"',
+                    workdir=str(tmp_path),
+                    task_id=task_id,
+                )
+            )
+            second = json.loads(
+                await terminal.terminal_tool(
+                    'printf "second=%s" "$HERMES_STICKY_ENV_PROBE"',
+                    task_id=task_id,
+                )
+            )
+    finally:
+        await terminal.cleanup_vm(task_id)
+
+    assert first["output"] == "first=sticky"
+    assert second["output"] == "second=sticky"
+
+
+@pytest.mark.asyncio
+async def test_background_process_inherits_session_environment(tmp_path):
+    from tools.process_registry import process_registry
+
+    task_id = "background-environment"
+    await terminal.terminal_tool(
+        "export HERMES_BACKGROUND_ENV_PROBE=from-session",
+        workdir=str(tmp_path),
+        task_id=task_id,
+    )
+    started = json.loads(
+        await terminal.terminal_tool(
+            'printf "%s" "$HERMES_BACKGROUND_ENV_PROBE"',
+            background=True,
+            task_id=task_id,
+        )
+    )
+    try:
+        result = await process_registry.wait(started["session_id"], timeout=2)
+    finally:
+        await terminal.cleanup_vm(task_id)
+
+    assert result["status"] == "exited"
+    assert result["output"] == "from-session"
 
 
 @pytest.mark.asyncio
