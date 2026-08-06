@@ -9,6 +9,7 @@ import random
 import time
 import uuid
 import re
+import aiofiles.os
 from dataclasses import dataclass, fields, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1259,8 +1260,9 @@ class CredentialPool:
                 )
                 self._replace_entry(entry, updated)
                 try:
-                    is_local_state = state_path.resolve(strict=False) == (
-                        auth_mod._auth_file_path().resolve(strict=False)
+                    realpath = aiofiles.os.wrap(os.path.realpath)
+                    is_local_state = await realpath(state_path) == await realpath(
+                        auth_mod._auth_file_path()
                     )
                 except Exception:
                     is_local_state = state_path == auth_mod._auth_file_path()

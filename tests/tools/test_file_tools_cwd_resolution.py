@@ -19,6 +19,7 @@ import os
 from pathlib import Path
 
 import pytest
+import pytest_asyncio
 
 import tools.file_tools as ft
 import tools.terminal_tool as terminal_tool
@@ -41,7 +42,10 @@ def _isolated_cwd(tmp_path, monkeypatch):
     return workspace, decoy
 
 
-def test_relative_terminal_cwd_anchors_to_absolute_not_process_cwd(_isolated_cwd, monkeypatch):
+@pytest.mark.asyncio
+async def test_relative_terminal_cwd_anchors_to_absolute_not_process_cwd(
+    _isolated_cwd, monkeypatch
+):
     """TERMINAL_CWD='.' must NOT silently mean 'the agent process cwd'.
 
     A relative base is meaningless as a resolution anchor. The resolver must
@@ -52,7 +56,7 @@ def test_relative_terminal_cwd_anchors_to_absolute_not_process_cwd(_isolated_cwd
     # Poison config: literal relative '.'
     monkeypatch.setenv("TERMINAL_CWD", ".")
 
-    resolved = ft._resolve_path_for_task("target.py", task_id="default")
+    resolved = await ft._resolve_path_for_task("target.py", task_id="default")
 
     assert resolved.is_absolute(), f"resolution base leaked a relative path: {resolved}"
     # The exact anchor for a bare '.' is the process cwd resolved to absolute —
@@ -63,7 +67,10 @@ def test_relative_terminal_cwd_anchors_to_absolute_not_process_cwd(_isolated_cwd
     assert str(resolved) == str((Path(os.getcwd()) / "target.py").resolve())
 
 
-def test_live_tracking_cwd_wins_over_relative_terminal_cwd(_isolated_cwd, monkeypatch):
+@pytest.mark.asyncio
+async def test_live_tracking_cwd_wins_over_relative_terminal_cwd(
+    _isolated_cwd, monkeypatch
+):
     """When the terminal reports its absolute cwd, that is authoritative.
 
     This is the real-world fix: the terminal's tracked absolute cwd (the
@@ -72,29 +79,33 @@ def test_live_tracking_cwd_wins_over_relative_terminal_cwd(_isolated_cwd, monkey
     """
     workspace, decoy = _isolated_cwd
     monkeypatch.setenv("TERMINAL_CWD", ".")
-    terminal_tool.record_session_cwd("default", str(workspace))
+    await terminal_tool.record_session_cwd("default", str(workspace))
 
-    resolved = ft._resolve_path_for_task("target.py", task_id="default")
+    resolved = await ft._resolve_path_for_task("target.py", task_id="default")
 
     assert resolved == (workspace / "target.py")
 
 
-def test_absolute_terminal_cwd_used_verbatim(_isolated_cwd, monkeypatch):
+@pytest.mark.asyncio
+async def test_absolute_terminal_cwd_used_verbatim(_isolated_cwd, monkeypatch):
     """An absolute TERMINAL_CWD is the resolution base (no live tracking)."""
     workspace, decoy = _isolated_cwd
     monkeypatch.setenv("TERMINAL_CWD", str(workspace))
 
-    resolved = ft._resolve_path_for_task("target.py", task_id="default")
+    resolved = await ft._resolve_path_for_task("target.py", task_id="default")
 
     assert resolved == (workspace / "target.py")
 
 
-def test_resolution_base_always_absolute_no_terminal_cwd(_isolated_cwd, monkeypatch):
+@pytest.mark.asyncio
+async def test_resolution_base_always_absolute_no_terminal_cwd(
+    _isolated_cwd, monkeypatch
+):
     """With TERMINAL_CWD unset, the base falls back to an ABSOLUTE process cwd."""
     workspace, decoy = _isolated_cwd
     monkeypatch.delenv("TERMINAL_CWD", raising=False)
 
-    resolved = ft._resolve_path_for_task("target.py", task_id="default")
+    resolved = await ft._resolve_path_for_task("target.py", task_id="default")
 
     assert resolved.is_absolute()
     assert str(resolved) == str((Path(os.getcwd()) / "target.py").resolve())
@@ -122,8 +133,8 @@ def test_resolution_base_always_absolute_no_terminal_cwd(_isolated_cwd, monkeypa
 # state lives in its own record, keyed by the raw session id.)
 
 
-@pytest.fixture
-def _two_worktree_sessions(tmp_path, monkeypatch):
+@pytest_asyncio.fixture
+async def _two_worktree_sessions(tmp_path, monkeypatch):
     """Two worktree sessions: B has cd'd (record), both registered overrides."""
     wt_a = tmp_path / "wt_a"
     wt_b = tmp_path / "wt_b"
@@ -137,8 +148,8 @@ def _two_worktree_sessions(tmp_path, monkeypatch):
     monkeypatch.setattr(terminal_tool, "_session_cwds", {})
     # Both sessions register their worktree cwd (TUI/desktop registration path;
     # registration seeds each session's record).
-    terminal_tool.register_task_env_overrides("sess-a", {"cwd": str(wt_a)})
-    terminal_tool.register_task_env_overrides("sess-b", {"cwd": str(wt_b)})
+    await terminal_tool.register_task_env_overrides("sess-a", {"cwd": str(wt_a)})
+    await terminal_tool.register_task_env_overrides("sess-b", {"cwd": str(wt_b)})
     # Session B ran the last command; the shared env's live cwd is wt_b but
     # only B's RECORD carries it.
     monkeypatch.setattr(
@@ -154,12 +165,13 @@ class _FakeEnv:
         self.cwd = cwd
 
 
-def test_unregistered_session_never_inherits_another_sessions_record(
+@pytest.mark.asyncio
+async def test_unregistered_session_never_inherits_another_sessions_record(
     _two_worktree_sessions, monkeypatch
 ):
     """Session C: no record, no override. Must NOT inherit A's or B's cwd."""
     wt_a, wt_b, main = _two_worktree_sessions
-    resolved = ft._resolve_path_for_task("target.py", task_id="sess-c")
+    resolved = await ft._resolve_path_for_task("target.py", task_id="sess-c")
     assert not str(resolved).startswith(str(wt_a))
     assert not str(resolved).startswith(str(wt_b))
     assert resolved == (main / "target.py").resolve()
@@ -185,7 +197,9 @@ async def test_v4a_patch_applies_to_resolved_workspace_not_backend_cwd(
 
     # Tool layer resolves against the workspace (worktree registration path).
     monkeypatch.setattr(terminal_tool, "_task_env_overrides", {})
-    terminal_tool.register_task_env_overrides(task_id, {"cwd": str(workspace)})
+    await terminal_tool.register_task_env_overrides(
+        task_id, {"cwd": str(workspace)}
+    )
 
     out = json.loads(
         await ft.patch_tool(

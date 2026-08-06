@@ -124,19 +124,15 @@ async def _skills_scan_signature(dirs_to_scan, disabled) -> tuple:
         except OSError:
             continue
         try:
-            iterator = await aiofiles.os.scandir(directory)
-            try:
-                for entry in iterator:
-                    candidate = Path(entry.path)
-                    try:
-                        if not await aiofiles.os.path.isdir(candidate):
-                            continue
-                        child_stat = await aiofiles.os.stat(candidate)
-                        newest = max(newest, child_stat.st_mtime)
-                    except OSError:
+            for name in await aiofiles.os.listdir(directory):
+                candidate = directory / name
+                try:
+                    if not await aiofiles.os.path.isdir(candidate):
                         continue
-            finally:
-                iterator.close()
+                    child_stat = await aiofiles.os.stat(candidate)
+                    newest = max(newest, child_stat.st_mtime)
+                except OSError:
+                    continue
         except OSError:
             pass
         sig.append((str(directory), newest))
@@ -234,24 +230,20 @@ async def _iter_skill_index_files(skills_dir: Path, filename: str):
 
     async def walk(directory: Path):
         try:
-            iterator = await aiofiles.os.scandir(directory)
+            names = await aiofiles.os.listdir(directory)
         except OSError:
             return
         files: list[str] = []
         directories: list[Path] = []
-        try:
-            for entry in iterator:
-                name = entry.name
-                candidate = Path(entry.path)
-                try:
-                    if await aiofiles.os.path.isdir(candidate):
-                        directories.append(candidate)
-                    elif name == filename:
-                        files.append(name)
-                except OSError:
-                    continue
-        finally:
-            iterator.close()
+        for name in names:
+            candidate = directory / name
+            try:
+                if await aiofiles.os.path.isdir(candidate):
+                    directories.append(candidate)
+                elif name == filename:
+                    files.append(name)
+            except OSError:
+                continue
 
         if filename in files:
             yield directory / filename
@@ -279,22 +271,19 @@ async def _iter_skill_index_files(skills_dir: Path, filename: str):
 async def _iter_files(directory: Path):
     """Yield regular files below *directory* without blocking the loop."""
     try:
-        iterator = await aiofiles.os.scandir(directory)
+        names = await aiofiles.os.listdir(directory)
     except OSError:
         return
     directories: list[Path] = []
-    try:
-        for entry in iterator:
-            candidate = Path(entry.path)
-            try:
-                if await aiofiles.os.path.isdir(candidate):
-                    directories.append(candidate)
-                elif await aiofiles.os.path.isfile(candidate):
-                    yield candidate
-            except OSError:
-                continue
-    finally:
-        iterator.close()
+    for name in names:
+        candidate = directory / name
+        try:
+            if await aiofiles.os.path.isdir(candidate):
+                directories.append(candidate)
+            elif await aiofiles.os.path.isfile(candidate):
+                yield candidate
+        except OSError:
+            continue
     for child in sorted(directories, key=lambda path: path.name):
         async for result in _iter_files(child):
             yield result

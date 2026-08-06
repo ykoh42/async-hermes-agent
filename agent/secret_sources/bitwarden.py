@@ -371,8 +371,9 @@ async def _safe_extract_member(
     ``dest_dir`` (a "zip-slip").  We resolve the would-be target and
     confirm it stays within ``dest_dir`` before extracting.
     """
-    dest_root = os.path.realpath(dest_dir)
-    target = os.path.realpath(os.path.join(dest_root, member))
+    realpath = aiofiles.os.wrap(os.path.realpath)
+    dest_root = await realpath(dest_dir)
+    target = await realpath(os.path.join(dest_root, member))
     # ``commonpath`` raises ValueError for e.g. different drives on
     # Windows; treat that as an escape too.
     try:

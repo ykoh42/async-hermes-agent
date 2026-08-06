@@ -9,6 +9,7 @@ runtime owns them directly.
 from __future__ import annotations
 
 import ipaddress
+import os
 import re
 import socket
 import uuid
@@ -103,7 +104,9 @@ async def cache_document_from_bytes(data: bytes, filename: str) -> str:
         name = "document"
     target_dir = await _cache_dir("documents")
     path = target_dir / f"doc_{uuid.uuid4().hex[:12]}_{name}"
-    if target_dir.resolve() not in path.resolve().parents:
+    realpath = aiofiles.os.wrap(os.path.realpath)
+    target_root = Path(await realpath(target_dir))
+    if target_root not in Path(await realpath(path)).parents:
         raise ValueError(f"Path traversal rejected: {filename!r}")
     async with aiofiles.open(path, "wb") as handle:
         await handle.write(data)
@@ -117,10 +120,13 @@ async def _cleanup_cache(kind: str, max_age_hours: int = 24) -> int:
     cutoff = time.time() - max(0, int(max_age_hours)) * 3600
     removed = 0
     cache_dir = await _cache_dir(kind)
-    for entry in await aiofiles.os.scandir(cache_dir):
+    for name in await aiofiles.os.listdir(cache_dir):
+        path = cache_dir / name
         try:
-            if entry.is_file() and (await aiofiles.os.stat(entry.path)).st_mtime < cutoff:
-                await aiofiles.os.remove(entry.path)
+            if await aiofiles.os.path.isfile(path) and (
+                await aiofiles.os.stat(path)
+            ).st_mtime < cutoff:
+                await aiofiles.os.remove(path)
                 removed += 1
         except OSError:
             continue

@@ -51,7 +51,10 @@ class TestExpandTilde:
 class TestResolvePathUsesProfileHome:
     """Verify _resolve_path_for_task resolves ~ to the profile home."""
 
-    def test_relative_tilde_resolves_to_profile_home(self, tmp_path, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_relative_tilde_resolves_to_profile_home(
+        self, tmp_path, monkeypatch
+    ):
         """A ~/path argument resolves under the profile home, not process HOME."""
         profile_home = tmp_path / "profile_home"
         profile_home.mkdir()
@@ -62,12 +65,15 @@ class TestResolvePathUsesProfileHome:
         monkeypatch.setattr(terminal_tool, "_session_cwds", {})
 
         with patch("hermes_constants.get_subprocess_home", return_value=str(profile_home)):
-            resolved = ft._resolve_path_for_task("~/test_file.txt", task_id="test")
+            resolved = await ft._resolve_path_for_task(
+                "~/test_file.txt", task_id="test"
+            )
 
         assert str(resolved).startswith(str(profile_home))
         assert "process_home" not in str(resolved)
 
-    def test_absolute_tilde_in_workspace_root(self, tmp_path, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_absolute_tilde_in_workspace_root(self, tmp_path, monkeypatch):
         """A workspace root specified with ~ resolves to profile home."""
         profile_home = tmp_path / "profile_home"
         profile_home.mkdir()
@@ -80,7 +86,9 @@ class TestResolvePathUsesProfileHome:
         with patch("hermes_constants.get_subprocess_home", return_value=str(profile_home)):
             # _resolve_base_dir uses the workspace root from config; if it contains ~,
             # it should resolve to profile home
-            resolved = ft._resolve_path_for_task("~/data/config.json", task_id="test")
+            resolved = await ft._resolve_path_for_task(
+                "~/data/config.json", task_id="test"
+            )
 
         assert str(profile_home) in str(resolved)
         assert str(process_home) not in str(resolved)

@@ -11,7 +11,7 @@ import tools.terminal_tool as terminal
 @pytest.mark.asyncio
 async def test_registered_task_cwd_is_used(tmp_path):
     task_id = "cwd-task"
-    terminal.register_task_env_overrides(task_id, {"cwd": str(tmp_path)})
+    await terminal.register_task_env_overrides(task_id, {"cwd": str(tmp_path)})
     try:
         result = json.loads(await terminal.terminal_tool("pwd", task_id=task_id))
         assert result["output"] == str(tmp_path)
@@ -27,7 +27,7 @@ async def test_explicit_workdir_wins_over_task_cwd(tmp_path):
     configured.mkdir()
     explicit.mkdir()
     task_id = "cwd-override"
-    terminal.register_task_env_overrides(task_id, {"cwd": str(configured)})
+    await terminal.register_task_env_overrides(task_id, {"cwd": str(configured)})
     try:
         result = json.loads(
             await terminal.terminal_tool("pwd", task_id=task_id, workdir=str(explicit))
@@ -44,8 +44,8 @@ async def test_different_tasks_keep_independent_cwds(tmp_path):
     second = tmp_path / "second"
     first.mkdir()
     second.mkdir()
-    terminal.register_task_env_overrides("one", {"cwd": str(first)})
-    terminal.register_task_env_overrides("two", {"cwd": str(second)})
+    await terminal.register_task_env_overrides("one", {"cwd": str(first)})
+    await terminal.register_task_env_overrides("two", {"cwd": str(second)})
     try:
         one, two = await asyncio.gather(
             terminal.terminal_tool("pwd", task_id="one"),

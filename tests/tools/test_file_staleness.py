@@ -87,7 +87,7 @@ class TestStalenessCheck(unittest.IsolatedAsyncioTestCase):
         from tools import terminal_tool
 
         # The session cd'd into the worktree (recorded by the completed command).
-        terminal_tool.record_session_cwd("live_task", live_dir)
+        await terminal_tool.record_session_cwd("live_task", live_dir)
 
         try:
             with patch.dict(os.environ, {"TERMINAL_CWD": start_dir}, clear=False):

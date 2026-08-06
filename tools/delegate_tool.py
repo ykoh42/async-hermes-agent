@@ -1920,7 +1920,9 @@ async def _run_single_child(
         try:
             from tools.terminal_tool import get_session_cwd, record_session_cwd
 
-            record_session_cwd(child_task_id, get_session_cwd(parent_task_id))
+            await record_session_cwd(
+                child_task_id, await get_session_cwd(parent_task_id)
+            )
         except Exception as e:
             logger.debug("Child cwd seed failed: %s", e)
         wall_start = time.time()

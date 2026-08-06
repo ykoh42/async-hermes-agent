@@ -109,7 +109,7 @@ class ProviderConfigSchema:
 _SCHEMA_CACHE: dict[str, ProviderConfigSchema] = {}
 
 
-def get_provider_config_schema(name: str) -> ProviderConfigSchema | None:
+async def get_provider_config_schema(name: str) -> ProviderConfigSchema | None:
     """Return the ``CONFIG_SCHEMA`` declared by the provider plugin ``name``.
 
     Providers without a ``config_schema.py`` (e.g. ``builtin``) return ``None``
@@ -120,9 +120,14 @@ def get_provider_config_schema(name: str) -> ProviderConfigSchema | None:
 
     from plugins.memory import find_provider_dir
 
-    provider_dir = find_provider_dir(name)
+    provider_dir = await find_provider_dir(name)
     path = provider_dir / "config_schema.py" if provider_dir else None
-    if path is None or not path.is_file():
+    if path is None:
+        return None
+
+    import aiofiles.os
+
+    if not await aiofiles.os.path.isfile(path):
         return None
 
     key = str(path)

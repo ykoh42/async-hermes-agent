@@ -16,7 +16,7 @@ Usage:
     from plugins.memory import discover_memory_providers, load_memory_provider
 
     available = await discover_memory_providers()  # [(name, desc, available), ...]
-    provider = load_memory_provider("mnemosyne")  # MemoryProvider instance
+    provider = await load_memory_provider("mnemosyne")  # MemoryProvider instance
 """
 
 from __future__ import annotations
@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import List, Optional, Tuple, TYPE_CHECKING
 
 import aiofiles
+import aiofiles.os
 
 from hermes_cli.config import cfg_get
 
@@ -67,33 +68,36 @@ def _register_synthetic_package(name: str, search_locations: List[str]) -> None:
 # Directory helpers
 # ---------------------------------------------------------------------------
 
-def _get_user_plugins_dir() -> Optional[Path]:
+async def _get_user_plugins_dir() -> Optional[Path]:
     """Return ``$HERMES_HOME/plugins/`` or None if unavailable."""
     try:
         from hermes_constants import get_hermes_home
         d = get_hermes_home() / "plugins"
-        return d if d.is_dir() else None
+        return d if await aiofiles.os.path.isdir(d) else None
     except Exception:
         return None
 
 
-def _is_memory_provider_dir(path: Path) -> bool:
+async def _is_memory_provider_dir(path: Path) -> bool:
     """Heuristic: does *path* look like a memory provider plugin?
 
     Checks for ``register_memory_provider`` or ``MemoryProvider`` in the
     ``__init__.py`` source.  Cheap text scan — no import needed.
     """
     init_file = path / "__init__.py"
-    if not init_file.exists():
+    if not await aiofiles.os.path.exists(init_file):
         return False
     try:
-        source = init_file.read_text(errors="replace", encoding="utf-8")[:8192]
+        async with aiofiles.open(
+            init_file, errors="replace", encoding="utf-8"
+        ) as handle:
+            source = await handle.read(8192)
         return "register_memory_provider" in source or "MemoryProvider" in source
     except Exception:
         return False
 
 
-def _iter_provider_dirs() -> List[Tuple[str, Path]]:
+async def _iter_provider_dirs() -> List[Tuple[str, Path]]:
     """Yield ``(name, path)`` for all discovered provider directories.
 
     Scans bundled first, then user-installed.  Bundled takes precedence
@@ -103,44 +107,48 @@ def _iter_provider_dirs() -> List[Tuple[str, Path]]:
     dirs: List[Tuple[str, Path]] = []
 
     # 1. Bundled providers (plugins/memory/<name>/)
-    if _MEMORY_PLUGINS_DIR.is_dir():
-        for child in sorted(_MEMORY_PLUGINS_DIR.iterdir()):
-            if not child.is_dir() or child.name.startswith(("_", ".")):
+    if await aiofiles.os.path.isdir(_MEMORY_PLUGINS_DIR):
+        for child_name in sorted(await aiofiles.os.listdir(_MEMORY_PLUGINS_DIR)):
+            child = _MEMORY_PLUGINS_DIR / child_name
+            if not await aiofiles.os.path.isdir(child) or child.name.startswith(("_", ".")):
                 continue
-            if not (child / "__init__.py").exists():
+            if not await aiofiles.os.path.exists(child / "__init__.py"):
                 continue
             seen.add(child.name)
             dirs.append((child.name, child))
 
     # 2. User-installed providers ($HERMES_HOME/plugins/<name>/)
-    user_dir = _get_user_plugins_dir()
+    user_dir = await _get_user_plugins_dir()
     if user_dir:
-        for child in sorted(user_dir.iterdir()):
-            if not child.is_dir() or child.name.startswith(("_", ".")):
+        for child_name in sorted(await aiofiles.os.listdir(user_dir)):
+            child = user_dir / child_name
+            if not await aiofiles.os.path.isdir(child) or child.name.startswith(("_", ".")):
                 continue
             if child.name in seen:
                 continue  # bundled takes precedence
-            if not _is_memory_provider_dir(child):
+            if not await _is_memory_provider_dir(child):
                 continue  # skip non-memory plugins
             dirs.append((child.name, child))
 
     return dirs
 
 
-def find_provider_dir(name: str) -> Optional[Path]:
+async def find_provider_dir(name: str) -> Optional[Path]:
     """Resolve a provider name to its directory.
 
     Checks bundled first, then user-installed.
     """
     # Bundled
     bundled = _MEMORY_PLUGINS_DIR / name
-    if bundled.is_dir() and (bundled / "__init__.py").exists():
+    if await aiofiles.os.path.isdir(bundled) and await aiofiles.os.path.exists(
+        bundled / "__init__.py"
+    ):
         return bundled
     # User-installed
-    user_dir = _get_user_plugins_dir()
+    user_dir = await _get_user_plugins_dir()
     if user_dir:
         user = user_dir / name
-        if user.is_dir() and _is_memory_provider_dir(user):
+        if await aiofiles.os.path.isdir(user) and await _is_memory_provider_dir(user):
             return user
     return None
 
@@ -149,7 +157,7 @@ def find_provider_dir(name: str) -> Optional[Path]:
 # Public API
 # ---------------------------------------------------------------------------
 
-def list_memory_provider_names() -> List[str]:
+async def list_memory_provider_names() -> List[str]:
     """Cheap name-only listing of discoverable memory providers.
 
     Unlike :func:`discover_memory_providers`, this does NOT import provider
@@ -157,7 +165,7 @@ def list_memory_provider_names() -> List[str]:
     call at module-import time (e.g. when building the dashboard config
     schema).
     """
-    return sorted({name for name, _ in _iter_provider_dirs()})
+    return sorted({name for name, _ in await _iter_provider_dirs()})
 
 
 async def discover_memory_providers() -> List[Tuple[str, str, bool]]:
@@ -168,11 +176,11 @@ async def discover_memory_providers() -> List[Tuple[str, str, bool]]:
     """
     results = []
 
-    for name, child in _iter_provider_dirs():
+    for name, child in await _iter_provider_dirs():
         # Read description from plugin.yaml if available
         desc = ""
         yaml_file = child / "plugin.yaml"
-        if yaml_file.exists():
+        if await aiofiles.os.path.exists(yaml_file):
             try:
                 import yaml
                 async with aiofiles.open(yaml_file, encoding="utf-8-sig") as f:
@@ -184,7 +192,7 @@ async def discover_memory_providers() -> List[Tuple[str, str, bool]]:
         # Quick availability check — try loading and calling is_available()
         available = True
         try:
-            provider = _load_provider_from_dir(child)
+            provider = await _load_provider_from_dir(child)
             if provider:
                 available = await provider.is_available()
             else:
@@ -197,7 +205,7 @@ async def discover_memory_providers() -> List[Tuple[str, str, bool]]:
     return results
 
 
-def load_memory_provider(name: str) -> Optional["MemoryProvider"]:
+async def load_memory_provider(name: str) -> Optional["MemoryProvider"]:
     """Load and return a MemoryProvider instance by name.
 
     Checks both bundled (``plugins/memory/<name>/``) and user-installed
@@ -206,13 +214,13 @@ def load_memory_provider(name: str) -> Optional["MemoryProvider"]:
 
     Returns None if the provider is not found or fails to load.
     """
-    provider_dir = find_provider_dir(name)
+    provider_dir = await find_provider_dir(name)
     if not provider_dir:
         logger.debug("Memory provider '%s' not found in bundled or user plugins", name)
         return None
 
     try:
-        provider = _load_provider_from_dir(provider_dir)
+        provider = await _load_provider_from_dir(provider_dir)
         if provider:
             return provider
         logger.warning("Memory provider '%s' loaded but no provider instance found", name)
@@ -222,7 +230,7 @@ def load_memory_provider(name: str) -> Optional["MemoryProvider"]:
         return None
 
 
-def _load_provider_from_dir(provider_dir: Path) -> Optional["MemoryProvider"]:
+async def _load_provider_from_dir(provider_dir: Path) -> Optional["MemoryProvider"]:
     """Import a provider module and extract the MemoryProvider instance.
 
     The module must have either:
@@ -236,7 +244,7 @@ def _load_provider_from_dir(provider_dir: Path) -> Optional["MemoryProvider"]:
     module_name = f"plugins.memory.{name}" if _is_bundled else f"{_USER_NAMESPACE}.{name}"
     init_file = provider_dir / "__init__.py"
 
-    if not init_file.exists():
+    if not await aiofiles.os.path.exists(init_file):
         return None
 
     # Check if already loaded.  A synthetic package shell registered by
@@ -254,7 +262,7 @@ def _load_provider_from_dir(provider_dir: Path) -> Optional["MemoryProvider"]:
                 if parent == "plugins":
                     parent_path = parent_path.parent
                 parent_init = parent_path / "__init__.py"
-                if parent_init.exists():
+                if await aiofiles.os.path.exists(parent_init):
                     spec = importlib.util.spec_from_file_location(
                         parent, str(parent_init),
                         submodule_search_locations=[str(parent_path)]
@@ -285,7 +293,10 @@ def _load_provider_from_dir(provider_dir: Path) -> Optional["MemoryProvider"]:
 
         # Register submodules so relative imports work
         # e.g., "from .store import MemoryStore" in holographic plugin
-        for sub_file in provider_dir.glob("*.py"):
+        for child_name in await aiofiles.os.listdir(provider_dir):
+            sub_file = provider_dir / child_name
+            if sub_file.suffix != ".py":
+                continue
             if sub_file.name == "__init__.py":
                 continue
             sub_name = sub_file.stem
@@ -353,7 +364,7 @@ class _ProviderCollector:
         pass  # CLI registration happens via discover_plugin_cli_commands()
 
 
-def _get_active_memory_provider() -> Optional[str]:
+async def _get_active_memory_provider() -> Optional[str]:
     """Read the active memory provider name from config.yaml.
 
     Returns the provider name (e.g. ``"honcho"``) or None if no
@@ -361,14 +372,15 @@ def _get_active_memory_provider() -> Optional[str]:
     no plugin loading.
     """
     try:
-        from hermes_cli.config import load_config
-        config = load_config()
+        from hermes_cli.config import load_config_readonly
+
+        config = await load_config_readonly()
         return cfg_get(config, "memory", "provider") or None
     except Exception:
         return None
 
 
-def discover_plugin_cli_commands() -> List[dict]:
+async def discover_plugin_cli_commands() -> List[dict]:
     """Return CLI commands for the **active** memory plugin only.
 
     Only one memory provider can be active at a time (set via
@@ -386,20 +398,20 @@ def discover_plugin_cli_commands() -> List[dict]:
     any provider is loaded.
     """
     results: List[dict] = []
-    if not _MEMORY_PLUGINS_DIR.is_dir():
+    if not await aiofiles.os.path.isdir(_MEMORY_PLUGINS_DIR):
         return results
 
-    active_provider = _get_active_memory_provider()
+    active_provider = await _get_active_memory_provider()
     if not active_provider:
         return results
 
     # Only look at the active provider's directory
-    plugin_dir = find_provider_dir(active_provider)
+    plugin_dir = await find_provider_dir(active_provider)
     if not plugin_dir:
         return results
 
     cli_file = plugin_dir / "cli.py"
-    if not cli_file.exists():
+    if not await aiofiles.os.path.exists(cli_file):
         return results
 
     _is_bundled = _MEMORY_PLUGINS_DIR in plugin_dir.parents or plugin_dir.parent == _MEMORY_PLUGINS_DIR
@@ -438,11 +450,12 @@ def discover_plugin_cli_commands() -> List[dict]:
         help_text = f"Manage {active_provider} memory plugin"
         description = ""
         yaml_file = plugin_dir / "plugin.yaml"
-        if yaml_file.exists():
+        if await aiofiles.os.path.exists(yaml_file):
             try:
                 import yaml
-                with open(yaml_file, encoding="utf-8-sig") as f:
-                    meta = yaml.safe_load(f) or {}
+
+                async with aiofiles.open(yaml_file, encoding="utf-8-sig") as f:
+                    meta = yaml.safe_load(await f.read()) or {}
                 desc = meta.get("description", "")
                 if desc:
                     help_text = desc

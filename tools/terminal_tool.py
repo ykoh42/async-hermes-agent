@@ -158,12 +158,16 @@ async def _get_env_config() -> dict[str, Any]:
     raw_cwd = os.getenv("TERMINAL_CWD", "").strip()
     expanded_cwd = os.path.expanduser(raw_cwd) if raw_cwd else ""
     if expanded_cwd and os.path.isabs(expanded_cwd):
-        cwd = expanded_cwd if await aiofiles.os.path.isdir(expanded_cwd) else os.getcwd()
+        cwd = (
+            expanded_cwd
+            if await aiofiles.os.path.isdir(expanded_cwd)
+            else await aiofiles.os.getcwd()
+        )
     else:
-        cwd = os.getcwd()
+        cwd = await aiofiles.os.getcwd()
     return {
         "env_type": "local",
-        "cwd": os.path.abspath(cwd),
+        "cwd": os.path.normpath(cwd),  # noqa: ASYNC240 - lexical only
         "timeout": _parse_env_var("TERMINAL_TIMEOUT", "120"),
         "docker_forward_env": _parse_env_var(
             "TERMINAL_DOCKER_FORWARD_ENV", "[]", json.loads, "valid JSON"
@@ -448,12 +452,16 @@ def resolve_task_overrides(task_id: str | None = None) -> dict[str, Any]:
     return dict(_task_env_overrides.get(str(task_id or "default"), {}))
 
 
-def register_task_env_overrides(task_id: str, overrides: dict[str, Any]) -> None:
+async def register_task_env_overrides(task_id: str, overrides: dict[str, Any]) -> None:
     key = str(task_id or "default")
     _task_env_overrides[key] = dict(overrides or {})
     cwd = _task_env_overrides[key].get("cwd")
-    if isinstance(cwd, str) and os.path.isabs(cwd) and os.path.isdir(cwd):
-        record_session_cwd(key, cwd)
+    if (
+        isinstance(cwd, str)
+        and os.path.isabs(cwd)
+        and await aiofiles.os.path.isdir(cwd)
+    ):
+        await record_session_cwd(key, cwd)
 
 
 def clear_task_env_overrides(task_id: str) -> None:
@@ -463,11 +471,10 @@ def clear_task_env_overrides(task_id: str) -> None:
     clear_session_cwd(key)
 
 
-def get_session_cwd(task_id: str | None = None) -> str:
+async def get_session_cwd(task_id: str | None = None) -> str:
     """Return the in-memory cwd anchor for a session.
 
-    This lookup performs no filesystem I/O, so it remains a synchronous state
-    accessor even though environment creation and command execution are async.
+    The state lookup is immediate; only the process-cwd fallback is awaited.
     """
     key = str(task_id or "default")
     with _env_lock:
@@ -481,13 +488,18 @@ def get_session_cwd(task_id: str | None = None) -> str:
     if configured:
         configured = os.path.expanduser(configured)
         if os.path.isabs(configured):
-            return os.path.abspath(configured)
-    return os.getcwd()
+            return os.path.normpath(configured)  # noqa: ASYNC240 - lexical only
+    return await aiofiles.os.getcwd()
 
 
-def record_session_cwd(task_id: str | None, cwd: str) -> None:
-    if cwd:
-        _session_cwds[str(task_id or "default")] = os.path.abspath(os.path.expanduser(cwd))
+async def record_session_cwd(task_id: str | None, cwd: str) -> None:
+    expanded = os.path.expanduser(cwd) if cwd else ""
+    if expanded:
+        if not os.path.isabs(expanded):
+            expanded = os.path.join(await aiofiles.os.getcwd(), expanded)
+        _session_cwds[str(task_id or "default")] = os.path.normpath(  # noqa: ASYNC240 - lexical only
+            expanded
+        )
 
 
 def clear_session_cwd(task_id: str | None = None) -> None:
@@ -534,7 +546,7 @@ class LocalEnvironment:
     """Small shell-backed environment implementing the file-op protocol."""
 
     def __init__(self, cwd: str, timeout: int = 120):
-        self.cwd = os.path.abspath(cwd)
+        self.cwd = os.path.normpath(cwd)
         self.timeout = timeout
         self.env = build_subprocess_env(scrub_secrets=True)
         self._lock = asyncio.Lock()
@@ -553,7 +565,9 @@ class LocalEnvironment:
             return {"output": "Command must be a string", "returncode": 1}
         if sudo_stdin is not None:
             stdin_data = sudo_stdin + (stdin_data or "")
-        workdir = os.path.abspath(os.path.expanduser(cwd or self.cwd))
+        workdir = os.path.normpath(  # noqa: ASYNC240 - lexical only
+            os.path.expanduser(cwd or self.cwd)
+        )
         if not await aiofiles.os.path.isdir(workdir):
             recovered = await _nearest_existing_directory(workdir)
             if recovered is None:
@@ -690,7 +704,10 @@ def _decode_process_output(
 
 async def _nearest_existing_directory(path: str) -> str | None:
     """Return the closest existing directory at or above *path*."""
-    candidate = Path(os.path.abspath(os.path.expanduser(path)))
+    expanded = os.path.expanduser(path)
+    if not os.path.isabs(expanded):
+        expanded = os.path.join(await aiofiles.os.getcwd(), expanded)
+    candidate = Path(os.path.normpath(expanded))  # noqa: ASYNC240 - lexical only
     for current in (candidate, *candidate.parents):
         if await aiofiles.os.path.isdir(current):
             return str(current)
@@ -739,7 +756,7 @@ async def _get_or_create_environment(
                 return env
         overrides = resolve_task_overrides(raw_key)
         config = await _get_env_config()
-        cwd = overrides.get("cwd") or get_session_cwd(raw_key)
+        cwd = overrides.get("cwd") or await get_session_cwd(raw_key)
         env = LocalEnvironment(cwd or config["cwd"], int(config["timeout"]))
         with _env_lock:
             # Another turn may have created the environment while async config
@@ -750,7 +767,7 @@ async def _get_or_create_environment(
             else:
                 _active_environments[raw_key] = env
                 _last_activity[raw_key] = time.time()
-        record_session_cwd(raw_key, env.cwd)
+        await record_session_cwd(raw_key, env.cwd)
         return env
 
 
@@ -767,14 +784,16 @@ async def cleanup_vm(task_id: str | None = None) -> None:
     with _env_lock:
         env = _active_environments.pop(key, None)
         if env is not None:
-            record_session_cwd(key, env.cwd)
+            await record_session_cwd(key, env.cwd)
         _last_activity.pop(key, None)
 
 
-def cleanup_all_environments() -> None:
+async def cleanup_all_environments() -> None:
     with _env_lock:
         for key, env in list(_active_environments.items()):
-            record_session_cwd(key, env.cwd)
+            _session_cwds[key] = os.path.normpath(  # noqa: ASYNC240 - lexical only
+                env.cwd
+            )
         _active_environments.clear()
         _last_activity.clear()
 
@@ -892,7 +911,9 @@ async def terminal_tool(
     try:
         env = await _get_or_create_environment(task_id)
         cwd = workdir or env.cwd
-        cwd = os.path.abspath(os.path.expanduser(str(cwd)))
+        cwd = os.path.normpath(  # noqa: ASYNC240 - lexical only
+            os.path.expanduser(str(cwd))
+        )
         if workdir and not os.path.isabs(os.path.expanduser(workdir)):
             return json.dumps(
                 {
@@ -932,7 +953,7 @@ async def terminal_tool(
             )
             cwd = recovered
             env.cwd = recovered
-            record_session_cwd(task_id, recovered)
+            await record_session_cwd(task_id, recovered)
         if background:
             from tools.process_registry import process_registry
 
@@ -977,7 +998,7 @@ async def terminal_tool(
             # a transient override.
             env.cwd = starting_cwd
         else:
-            record_session_cwd(task_id, env.cwd)
+            await record_session_cwd(task_id, env.cwd)
         exit_code = int(result.get("returncode", 0))
         raw_output = str(result.get("output", ""))
         output, truncation = await _prepare_terminal_output(raw_output, command)
@@ -988,7 +1009,8 @@ async def terminal_tool(
         }
         if not workdir and exit_code == 0:
             try:
-                if os.path.realpath(env.cwd) != os.path.realpath(starting_cwd):
+                realpath = aiofiles.os.wrap(os.path.realpath)
+                if await realpath(env.cwd) != await realpath(starting_cwd):
                     payload["cwd"] = env.cwd
             except (OSError, TypeError, ValueError):
                 pass

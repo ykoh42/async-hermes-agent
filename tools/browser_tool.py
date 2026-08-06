@@ -57,6 +57,7 @@ import os
 import re
 import subprocess
 import shutil
+import stat
 import sys
 import tempfile
 import time
@@ -1191,7 +1192,7 @@ async def _run_chrome_fallback_command(
     # bare container), fall back to the bare name and let Popen raise with
     # a readable "FileNotFoundError: 'npx'" rather than WinError 193.
     if browser_cmd == "npx agent-browser":
-        _npx_bin = shutil.which("npx") or "npx"
+        _npx_bin = await aiofiles.os.wrap(shutil.which)("npx") or "npx"
         cmd_prefix = [_npx_bin, "agent-browser"]
     else:
         cmd_prefix = [browser_cmd]
@@ -1758,12 +1759,18 @@ async def _write_owner_pid(socket_dir: str, session_name: str) -> None:
 async def _remove_tree(root: str) -> None:
     """Best-effort recursive removal without blocking the event loop."""
     try:
-        entries = await aiofiles.os.scandir(root)
+        names = await aiofiles.os.listdir(root)
     except OSError:
         return
-    for entry in entries:
-        path = os.path.join(root, entry.name)
-        if entry.is_dir(follow_symlinks=False):
+    for name in names:
+        path = os.path.join(root, name)
+        try:
+            is_directory = stat.S_ISDIR(
+                (await aiofiles.os.stat(path, follow_symlinks=False)).st_mode
+            )
+        except OSError:
+            continue
+        if is_directory:
             await _remove_tree(path)
         else:
             try:
@@ -2409,12 +2416,14 @@ async def _get_session_info(task_id: Optional[str] = None) -> Dict[str, Any]:
     return session_info
 
 
-def _agent_browser_candidate_present(path: str | None) -> bool:
+async def _agent_browser_candidate_present(path: str | None) -> bool:
     if not path:
         return False
     if " " in path and path.split()[0].endswith("npx"):
         return True
-    return os.path.exists(path) and (os.name == "nt" or os.access(path, os.X_OK))
+    return await aiofiles.os.path.exists(path) and (
+        os.name == "nt" or await aiofiles.os.access(path, os.X_OK)
+    )
 
 
 async def _find_agent_browser(*, validate: bool = True) -> str:
@@ -2454,12 +2463,14 @@ async def _find_agent_browser(*, validate: bool = True) -> str:
     # the next working resolution (extended PATH → local .bin → npx) instead of
     # caching the broken one and silently killing every browser tool.
 
+    which = aiofiles.os.wrap(shutil.which)
+
     # Check if it's in PATH (global install)
-    which_result = shutil.which("agent-browser")
+    which_result = await which("agent-browser")
     if which_result and (
         await agent_browser_runnable(which_result)
         if validate
-        else _agent_browser_candidate_present(which_result)
+        else await _agent_browser_candidate_present(which_result)
     ):
         if not validate:
             return which_result
@@ -2471,11 +2482,11 @@ async def _find_agent_browser(*, validate: bool = True) -> str:
     # versioned Homebrew installs, and fallback system dirs like Termux.
     extended_path = _merge_browser_path("")
     if extended_path:
-        which_result = shutil.which("agent-browser", path=extended_path)
+        which_result = await which("agent-browser", path=extended_path)
         if which_result and (
             await agent_browser_runnable(which_result)
             if validate
-            else _agent_browser_candidate_present(which_result)
+            else await _agent_browser_candidate_present(which_result)
         ):
             if not validate:
                 return which_result
@@ -2493,12 +2504,12 @@ async def _find_agent_browser(*, validate: bool = True) -> str:
     # with an explicit path so POSIX hosts still pick the extensionless shim.
     repo_root = Path(__file__).parent.parent
     local_bin_dir = repo_root / "node_modules" / ".bin"
-    if local_bin_dir.is_dir():
-        local_which = shutil.which("agent-browser", path=str(local_bin_dir))
+    if await aiofiles.os.path.isdir(local_bin_dir):
+        local_which = await which("agent-browser", path=str(local_bin_dir))
         if local_which and (
             await agent_browser_runnable(local_which)
             if validate
-            else _agent_browser_candidate_present(local_which)
+            else await _agent_browser_candidate_present(local_which)
         ):
             if not validate:
                 return local_which
@@ -2507,9 +2518,9 @@ async def _find_agent_browser(*, validate: bool = True) -> str:
             return _cached_agent_browser
 
     # Check common npx locations (also search the extended fallback PATH)
-    npx_path = shutil.which("npx")
+    npx_path = await which("npx")
     if not npx_path and extended_path:
-        npx_path = shutil.which("npx", path=extended_path)
+        npx_path = await which("npx", path=extended_path)
     if npx_path:
         if not validate:
             return "npx agent-browser"
@@ -2659,7 +2670,7 @@ async def _run_browser_command(
     # Only the synthetic npx fallback needs to expand into multiple argv items.
     # shutil.which resolves npx → npx.cmd on Windows; bare "npx" stays on POSIX.
     if browser_cmd == "npx agent-browser":
-        _npx_bin = shutil.which("npx") or "npx"
+        _npx_bin = await aiofiles.os.wrap(shutil.which)("npx") or "npx"
         cmd_prefix = [_npx_bin, "agent-browser"]
     else:
         cmd_prefix = [browser_cmd]
@@ -2855,7 +2866,9 @@ async def _run_browser_command(
                             combined_text
                         )
 
-                        if recovered_path and Path(recovered_path).exists():
+                        if recovered_path and await aiofiles.os.path.exists(
+                            recovered_path
+                        ):
                             logger.info(
                                 "browser 'screenshot' recovered file from non-JSON output: %s",
                                 recovered_path,
@@ -5133,17 +5146,18 @@ async def _chromium_installed() -> bool:
 
     # 1. AGENT_BROWSER_EXECUTABLE_PATH — explicit user-configured browser
     ab_path = os.environ.get("AGENT_BROWSER_EXECUTABLE_PATH", "").strip()
+    which = aiofiles.os.wrap(shutil.which)
     if ab_path:
-        if os.path.isfile(ab_path) or shutil.which(ab_path):
+        if await aiofiles.os.path.isfile(ab_path) or await which(ab_path):
             _cached_chromium_installed = True
             return True
 
     # 2. System Chrome/Chromium in PATH (common names)
     system_chrome = (
-        shutil.which("google-chrome")
-        or shutil.which("chromium")
-        or shutil.which("chromium-browser")
-        or shutil.which("chrome")
+        await which("google-chrome")
+        or await which("chromium")
+        or await which("chromium-browser")
+        or await which("chrome")
     )
     if system_chrome:
         _cached_chromium_installed = True
@@ -5215,7 +5229,8 @@ async def _maybe_autoinstall_chromium() -> bool:
         return False
 
     if browser_cmd == "npx agent-browser":
-        install_cmd = [shutil.which("npx") or "npx", "-y", "agent-browser", "install"]
+        npx = await aiofiles.os.wrap(shutil.which)("npx") or "npx"
+        install_cmd = [npx, "-y", "agent-browser", "install"]
     else:
         install_cmd = [browser_cmd, "install"]
 
@@ -5258,7 +5273,7 @@ async def _maybe_autoinstall_chromium() -> bool:
 
 async def _running_in_docker() -> bool:
     """Best-effort detection of whether we're inside a Docker container."""
-    if os.path.exists("/.dockerenv"):
+    if await aiofiles.os.path.exists("/.dockerenv"):
         return True
     try:
         async with aiofiles.open("/proc/1/cgroup", "rt", encoding="utf-8") as fp:

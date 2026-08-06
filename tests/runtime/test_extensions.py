@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 import pytest_asyncio
+from blockbuster import BlockBuster
 from pyleak import no_event_loop_blocking, no_task_leaks
 from pyleak.eventloop import LeakAction
 
@@ -167,9 +168,14 @@ async def test_skill_and_stdio_mcp_calls_are_preserved_in_trajectory(
             no_task_leaks(action=LeakAction.RAISE),
             agent,
         ):
-            result = await agent.run_conversation(
-                "Read the trajectory-training skill, then call MCP echo."
-            )
+            blockbuster = BlockBuster()
+            blockbuster.activate()
+            try:
+                result = await agent.run_conversation(
+                    "Read the trajectory-training skill, then call MCP echo."
+                )
+            finally:
+                blockbuster.deactivate()
     finally:
         await database.close()
 

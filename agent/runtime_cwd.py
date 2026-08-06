@@ -72,7 +72,7 @@ async def resolve_agent_cwd() -> Path:
         if await aiofiles.os.path.isdir(p):
             return p
         logger.warning("TERMINAL_CWD does not exist: %s", raw)
-    return Path(os.getcwd())
+    return Path(await aiofiles.os.wrap(os.getcwd)())
 
 
 async def resolve_context_cwd() -> Path | None:

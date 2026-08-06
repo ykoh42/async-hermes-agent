@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from blockbuster import BlockBuster
 from pyleak import no_event_loop_blocking, no_task_leaks
 from pyleak.eventloop import LeakAction
 
@@ -52,10 +53,16 @@ def test_conversation_and_chat_are_coroutines():
         _create_with_stream,
     )
     from tools.file_tools import (
+        _resolve_path_for_task,
         patch_tool,
         read_file_tool,
         search_tool,
         write_file_tool,
+    )
+    from tools.terminal_tool import (
+        get_session_cwd,
+        record_session_cwd,
+        register_task_env_overrides,
     )
     from batch_runner import BatchRunner, main as batch_main
     from trajectory_compressor import (
@@ -108,6 +115,10 @@ def test_conversation_and_chat_are_coroutines():
     assert inspect.iscoroutinefunction(trajectory_main)
     assert inspect.iscoroutinefunction(SessionDB._parse_schema_columns)
     assert inspect.iscoroutinefunction(terminal_tool)
+    assert inspect.iscoroutinefunction(get_session_cwd)
+    assert inspect.iscoroutinefunction(record_session_cwd)
+    assert inspect.iscoroutinefunction(register_task_env_overrides)
+    assert inspect.iscoroutinefunction(_resolve_path_for_task)
     assert inspect.iscoroutinefunction(read_file_tool)
     assert inspect.iscoroutinefunction(write_file_tool)
     assert inspect.iscoroutinefunction(patch_tool)
@@ -1376,42 +1387,45 @@ async def test_native_file_tools_do_not_use_a_sync_dispatch_bridge(monkeypatch, 
         ),
     )
 
-    written = json.loads(
-        await active_registry.dispatch(
-            "write_file",
-            {"path": "notes.txt", "content": "first\nsecond\n"},
-            task_id="native-file-test",
+    blockbuster = BlockBuster()
+    blockbuster.activate()
+    try:
+        written = json.loads(
+            await active_registry.dispatch(
+                "write_file",
+                {"path": "notes.txt", "content": "first\nsecond\n"},
+                task_id="native-file-test",
+            )
         )
-    )
+        patched = json.loads(
+            await active_registry.dispatch(
+                "patch",
+                {
+                    "path": "notes.txt",
+                    "old_string": "second",
+                    "new_string": "third",
+                },
+                task_id="native-file-test",
+            )
+        )
+        read = json.loads(
+            await active_registry.dispatch(
+                "read_file", {"path": "notes.txt"}, task_id="native-file-test"
+            )
+        )
+        found = json.loads(
+            await active_registry.dispatch(
+                "search_files",
+                {"pattern": "third", "path": "."},
+                task_id="native-file-test",
+            )
+        )
+    finally:
+        blockbuster.deactivate()
+
     assert written["bytes_written"] == len("first\nsecond\n".encode())
-
-    patched = json.loads(
-        await active_registry.dispatch(
-            "patch",
-            {
-                "path": "notes.txt",
-                "old_string": "second",
-                "new_string": "third",
-            },
-            task_id="native-file-test",
-        )
-    )
     assert patched["replacements"] == 1
-
-    read = json.loads(
-        await active_registry.dispatch(
-            "read_file", {"path": "notes.txt"}, task_id="native-file-test"
-        )
-    )
     assert read["content"] == "1|first\n2|third"
-
-    found = json.loads(
-        await active_registry.dispatch(
-            "search_files",
-            {"pattern": "third", "path": "."},
-            task_id="native-file-test",
-        )
-    )
     assert found["total_count"] == 1
 
 
@@ -2508,11 +2522,17 @@ async def test_native_transport_terminal_does_not_use_to_thread(monkeypatch, tmp
         raise AssertionError("terminal must use asyncio subprocesses directly")
 
     monkeypatch.setattr(asyncio, "to_thread", fail_if_called)
-    monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
+    monkeypatch.delenv("TERMINAL_CWD", raising=False)
+    monkeypatch.chdir(tmp_path)
 
-    result = json.loads(
-        await terminal_tool("printf async-terminal", task_id="async-test")
-    )
+    blockbuster = BlockBuster()
+    blockbuster.activate()
+    try:
+        result = json.loads(
+            await terminal_tool("printf async-terminal", task_id="async-test")
+        )
+    finally:
+        blockbuster.deactivate()
 
     assert result == {
         "output": "async-terminal",
@@ -2574,7 +2594,12 @@ async def test_synthetic_turn_records_trajectory_without_to_thread(monkeypatch, 
             no_event_loop_blocking(action=LeakAction.RAISE, threshold=0.1),
             no_task_leaks(action=LeakAction.RAISE),
         ):
-            result = await agent.run_conversation("hello async")
+            blockbuster = BlockBuster()
+            blockbuster.activate()
+            try:
+                result = await agent.run_conversation("hello async")
+            finally:
+                blockbuster.deactivate()
         assert result["completed"] is True
         assert result["final_response"] == "async answer"
         assert [message["role"] for message in result["messages"]] == [
@@ -3004,23 +3029,29 @@ async def test_memory_tool_uses_native_transport_file_path(monkeypatch, tmp_path
 
     monkeypatch.setattr(asyncio, "to_thread", fail_if_called)
     store = memory_tool_module.MemoryStore(memory_char_limit=200, user_char_limit=200)
-    await store.load_from_disk()
-    initial_snapshot = store.format_for_system_prompt("memory")
-    response = await memory_tool_module.memory_tool(
-        action="add",
-        target="memory",
-        content="Prefer native async file I/O.",
-        store=store,
-    )
+    blockbuster = BlockBuster()
+    blockbuster.activate()
+    try:
+        await store.load_from_disk()
+        initial_snapshot = store.format_for_system_prompt("memory")
+        response = await memory_tool_module.memory_tool(
+            action="add",
+            target="memory",
+            content="Prefer native async file I/O.",
+            store=store,
+        )
+        registry_response = await active_registry.dispatch(
+            "memory",
+            {"action": "add", "target": "memory", "content": "Registry awaits handlers."},
+            store=store,
+        )
+    finally:
+        blockbuster.deactivate()
 
     assert '"success": true' in response
     assert "Prefer native async file I/O." in (tmp_path / "memories" / "MEMORY.md").read_text()
     assert store.format_for_system_prompt("memory") == initial_snapshot
-    assert await active_registry.dispatch(
-        "memory",
-        {"action": "add", "target": "memory", "content": "Registry awaits handlers."},
-        store=store,
-    )
+    assert registry_response
 
 
 @pytest.mark.asyncio

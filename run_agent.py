@@ -46,6 +46,7 @@ import sys
 import time
 import uuid
 import warnings
+import aiofiles.os
 from typing import List, Dict, Any, Optional, Callable
 from datetime import datetime
 from pathlib import Path
@@ -54,7 +55,7 @@ from types import SimpleNamespace
 from hermes_constants import get_hermes_home
 
 
-def _launch_cwd_for_session(source: str) -> Optional[str]:
+async def _launch_cwd_for_session(source: str) -> Optional[str]:
     """Working directory to stamp on a new session row, or None.
 
     Only local CLI sessions get a recorded cwd: the directory the process was
@@ -72,7 +73,7 @@ def _launch_cwd_for_session(source: str) -> Optional[str]:
     if backend and backend != "local":
         return None
     try:
-        return os.getcwd()
+        return await aiofiles.os.getcwd()
     except OSError:
         # cwd was unlinked out from under us — nothing meaningful to record.
         return None
@@ -653,7 +654,7 @@ class AIAgent:
                 system_prompt=self._cached_system_prompt,
                 user_id=None,
                 parent_session_id=self._parent_session_id,
-                cwd=_launch_cwd_for_session(source),
+                cwd=await _launch_cwd_for_session(source),
                 profile_name=_profile_for_session,
             )
             self._session_db_created = True

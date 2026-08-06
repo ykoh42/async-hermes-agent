@@ -54,7 +54,7 @@ from hermes_cli.config import cfg_get
 from hermes_cli.middleware import OBSERVER_SCHEMA_VERSION, VALID_MIDDLEWARE
 
 
-def get_bundled_plugins_dir() -> Path:
+async def get_bundled_plugins_dir() -> Path:
     """Locate the bundled ``plugins/`` directory.
 
     Honours ``HERMES_BUNDLED_PLUGINS`` (set by the Nix wrapper / packaged
@@ -64,7 +64,8 @@ def get_bundled_plugins_dir() -> Path:
     env_override = os.getenv("HERMES_BUNDLED_PLUGINS")
     if env_override:
         return Path(env_override)
-    return Path(__file__).resolve().parent.parent / "plugins"
+    resolved_file = await aiofiles.os.wrap(os.path.realpath)(__file__)
+    return Path(resolved_file).parent.parent / "plugins"
 
 try:
     import yaml
@@ -1223,7 +1224,7 @@ class PluginManager:
         # (plugins/memory/__init__.py, providers/__init__.py). ``platforms/``
         # is a category holding platform adapters (scanned one level deeper
         # below).
-        repo_plugins = get_bundled_plugins_dir()
+        repo_plugins = await get_bundled_plugins_dir()
         logger.debug("Scanning bundled plugins: %s", repo_plugins)
         bundled = await self._scan_directory(
             repo_plugins,
@@ -1734,8 +1735,6 @@ class PluginManager:
         """
         plugin_dir = Path(manifest.path)  # type: ignore[arg-type]
         init_file = plugin_dir / "__init__.py"
-        if not init_file.exists():
-            raise FileNotFoundError(f"No __init__.py in {plugin_dir}")
 
         # Ensure the namespace parent package exists
         if _NS_PARENT not in sys.modules:
@@ -1759,7 +1758,13 @@ class PluginManager:
         module.__package__ = module_name
         module.__path__ = [str(plugin_dir)]  # type: ignore[attr-defined]
         sys.modules[module_name] = module
-        spec.loader.exec_module(module)
+        try:
+            spec.loader.exec_module(module)
+        except FileNotFoundError as exc:
+            if exc.filename != str(init_file):
+                raise
+            sys.modules.pop(module_name, None)
+            raise FileNotFoundError(f"No __init__.py in {plugin_dir}") from exc
         return module
 
     def _load_entrypoint_module(self, manifest: PluginManifest) -> types.ModuleType:

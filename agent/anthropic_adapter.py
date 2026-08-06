@@ -1222,7 +1222,7 @@ async def run_oauth_setup_token() -> Optional[str]:
     import shutil
     import subprocess
 
-    claude_path = shutil.which("claude")
+    claude_path = await aiofiles.os.wrap(shutil.which)("claude")
     if not claude_path:
         raise FileNotFoundError(
             "The 'claude' CLI is not installed. "

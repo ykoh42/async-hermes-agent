@@ -118,31 +118,27 @@ async def _has_code_files(root: Path) -> bool:
     while stack:
         directory, is_root = stack.pop()
         try:
-            entries = await aiofiles.os.scandir(directory)
+            names = await aiofiles.os.listdir(directory)
         except OSError:
             continue
-        try:
-            for entry in entries:
-                seen += 1
-                if seen > _CODE_SCAN_MAX_ENTRIES:
-                    return False
-                name = entry.name
-                path = Path(entry.path)
-                try:
-                    if await aiofiles.os.path.isfile(path):
-                        if os.path.splitext(name)[1].lower() in _CODE_EXTENSIONS:
-                            return True
-                    elif (
-                        is_root
-                        and name not in _CODE_SCAN_SKIP_DIRS
-                        and not name.startswith(".")
-                        and await aiofiles.os.path.isdir(path)
-                    ):
-                        stack.append((path, False))
-                except OSError:
-                    continue
-        finally:
-            entries.close()
+        for name in names:
+            seen += 1
+            if seen > _CODE_SCAN_MAX_ENTRIES:
+                return False
+            path = directory / name
+            try:
+                if await aiofiles.os.path.isfile(path):
+                    if os.path.splitext(name)[1].lower() in _CODE_EXTENSIONS:
+                        return True
+                elif (
+                    is_root
+                    and name not in _CODE_SCAN_SKIP_DIRS
+                    and not name.startswith(".")
+                    and await aiofiles.os.path.isdir(path)
+                ):
+                    stack.append((path, False))
+            except OSError:
+                continue
     return False
 
 # Lockfile → package manager, checked in priority order.

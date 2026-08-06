@@ -17,6 +17,7 @@ import asyncio
 from pathlib import Path
 
 import pytest
+from blockbuster import BlockBuster
 from pyleak import no_event_loop_blocking, no_task_leaks
 from pyleak.eventloop import LeakAction
 
@@ -223,7 +224,12 @@ async def test_concurrent_batches_write_complete_rows_and_resume_without_duplica
         no_event_loop_blocking(action=LeakAction.RAISE, threshold=0.1),
         no_task_leaks(action=LeakAction.RAISE),
     ):
-        await runner.run()
+        blockbuster = BlockBuster()
+        blockbuster.activate()
+        try:
+            await runner.run()
+        finally:
+            blockbuster.deactivate()
 
     combined_file = runner.output_dir / "trajectories.jsonl"
     rows = [
@@ -240,7 +246,12 @@ async def test_concurrent_batches_write_complete_rows_and_resume_without_duplica
         no_event_loop_blocking(action=LeakAction.RAISE, threshold=0.1),
         no_task_leaks(action=LeakAction.RAISE),
     ):
-        await runner.run(resume=True)
+        blockbuster = BlockBuster()
+        blockbuster.activate()
+        try:
+            await runner.run(resume=True)
+        finally:
+            blockbuster.deactivate()
 
     resumed_rows = [
         json.loads(line)

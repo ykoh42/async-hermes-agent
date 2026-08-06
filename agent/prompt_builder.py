@@ -973,7 +973,7 @@ async def build_environment_hints() -> str:
     elif sys.platform == "win32":
         host_lines.append(f"Host: Windows ({platform.release()})")
     elif sys.platform == "darwin":
-        mac_ver = platform.mac_ver()[0]
+        mac_ver = (await aiofiles.os.wrap(platform.mac_ver)())[0]
         host_lines.append(f"Host: macOS ({mac_ver or platform.release()})")
     else:
         host_lines.append(f"Host: {platform.system()} ({platform.release()})")
@@ -1838,14 +1838,14 @@ async def _load_cursorrules(
 
     cursor_rules_dir = cwd_path / ".cursor" / "rules"
     if await aiofiles.os.path.isdir(cursor_rules_dir):
-        entries = await aiofiles.os.scandir(cursor_rules_dir)
-        try:
-            mdc_files = sorted(
-                (Path(entry.path) for entry in entries if entry.name.endswith(".mdc")),
-                key=lambda path: path.name,
-            )
-        finally:
-            entries.close()
+        mdc_files = sorted(
+            (
+                cursor_rules_dir / name
+                for name in await aiofiles.os.listdir(cursor_rules_dir)
+                if name.endswith(".mdc")
+            ),
+            key=lambda path: path.name,
+        )
         for mdc_file in mdc_files:
             try:
                 async with aiofiles.open(mdc_file, encoding="utf-8") as handle:

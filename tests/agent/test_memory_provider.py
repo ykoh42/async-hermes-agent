@@ -5,6 +5,7 @@ import json
 from types import SimpleNamespace
 
 import pytest
+from blockbuster import BlockBuster
 
 from agent.memory_manager import (
     MemoryManager,
@@ -242,7 +243,12 @@ class ExampleMemoryProvider(MemoryProvider):
 
     from plugins.memory import load_memory_provider
 
-    provider = load_memory_provider("example_memory")
+    blockbuster = BlockBuster()
+    blockbuster.activate()
+    try:
+        provider = await load_memory_provider("example_memory")
+    finally:
+        blockbuster.deactivate()
     assert provider is not None
     manager = MemoryManager()
     manager.add_provider(provider)
@@ -310,10 +316,15 @@ class DeferredMemoryProvider(MemoryProvider):
 
     from agent.agent_init import _initialize_memory_manager
 
-    await _initialize_memory_manager(
-        agent,
-        {"memory": {"provider": "deferred_memory"}},
-    )
+    blockbuster = BlockBuster()
+    blockbuster.activate()
+    try:
+        await _initialize_memory_manager(
+            agent,
+            {"memory": {"provider": "deferred_memory"}},
+        )
+    finally:
+        blockbuster.deactivate()
 
     assert agent._memory_manager_started is True
     assert agent._memory_manager.build_system_prompt() == "deferred memory guidance"

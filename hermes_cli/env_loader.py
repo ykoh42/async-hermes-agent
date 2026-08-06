@@ -30,11 +30,11 @@ def get_secret_source(env_var: str) -> str | None:
     return _SECRET_SOURCES.get(env_var)
 
 
-def get_secret_source_values(
+async def get_secret_source_values(
     hermes_home: str | os.PathLike,
 ) -> dict[str, str]:
     """Return the immutable external-secret snapshot for one Hermes home."""
-    home_key = str(Path(hermes_home).resolve())
+    home_key = str(await aiofiles.os.wrap(os.path.realpath)(hermes_home))
     return dict(_SECRET_SOURCE_VALUES_BY_HOME.get(home_key, {}))
 
 
@@ -173,7 +173,7 @@ def _remediation_hint(source_name: str, error_kind, secrets_cfg: dict) -> str:
 async def _apply_external_secret_sources(home_path: Path) -> None:
     """Fetch and apply every enabled source once per Hermes home."""
     home = Path(home_path)
-    home_key = str(home.resolve())
+    home_key = str(await aiofiles.os.wrap(os.path.realpath)(home))
     async with _SECRET_SOURCE_CACHE_LOCK:
         if home_key in _APPLIED_HOMES:
             return
@@ -232,10 +232,10 @@ async def hydrate_profile_secret_sources(
 ) -> dict[str, str]:
     """Resolve a profile's sources into an isolated environment snapshot."""
     home = Path(hermes_home)
-    home_key = str(home.resolve())
+    home_key = str(await aiofiles.os.wrap(os.path.realpath)(home))
     async with _SECRET_SOURCE_CACHE_LOCK:
         if home_key in _APPLIED_HOMES:
-            return get_secret_source_values(home)
+            return await get_secret_source_values(home)
 
         secrets_config = await _load_secrets_config(home)
         if not secrets_config:
@@ -317,7 +317,8 @@ async def _reapply_terminal_config_bridge(home: Path) -> None:
     process_home = Path(
         os.getenv("HERMES_HOME", Path.home() / ".hermes")
     )
-    if home.resolve() != process_home.resolve():
+    realpath = aiofiles.os.wrap(os.path.realpath)
+    if await realpath(home) != await realpath(process_home):
         return
 
     config_path = home / "config.yaml"

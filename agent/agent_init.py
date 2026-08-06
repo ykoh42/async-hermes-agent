@@ -2985,7 +2985,7 @@ async def _initialize_memory_manager(
         from plugins.memory import load_memory_provider
 
         manager = MemoryManager()
-        provider = load_memory_provider(provider_name)
+        provider = await load_memory_provider(provider_name)
         if provider is None or not await provider.is_available():
             logger.debug(
                 "Memory provider '%s' not found or not available",

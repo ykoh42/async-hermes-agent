@@ -20,6 +20,9 @@ def _mock_client(api_key="fb-key-1234567890", base_url="https://fb.example.com/v
 
 
 class _EmptyPool:
+    def has_credentials(self):
+        return False
+
     async def select(self):
         return None
 

@@ -249,7 +249,9 @@ async def _local_image_to_data_url(value: str) -> str:
     import aiofiles
     import aiofiles.os
 
-    path = Path(os.path.expanduser(value)).resolve()
+    path = Path(
+        await aiofiles.os.wrap(os.path.realpath)(os.path.expanduser(value))
+    )
     if not await aiofiles.os.path.isfile(path):
         raise ValueError(f"Image input path does not exist or is not a file: {value}")
     size = (await aiofiles.os.stat(path)).st_size

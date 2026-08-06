@@ -221,11 +221,13 @@ _BLOCKED_DEVICE_PATHS = frozenset({
 })
 
 
-def _resolve_path(filepath: str, task_id: str = "default") -> Path | PurePosixPath:
+async def _resolve_path(
+    filepath: str, task_id: str = "default"
+) -> Path | PurePosixPath:
     """Resolve a path relative to TERMINAL_CWD (the worktree base directory)
     instead of the main repository root.
     """
-    return _resolve_path_for_task(filepath, task_id)
+    return await _resolve_path_for_task(filepath, task_id)
 
 
 # Sentinel ``TERMINAL_CWD`` values that mean "not configured", NOT a literal
@@ -311,7 +313,7 @@ def _registered_task_cwd_override(task_id: str = "default") -> str | None:
     return _sentinel_free_abs_cwd(overrides.get("cwd"))
 
 
-def _authoritative_workspace_root(task_id: str = "default") -> str | None:
+async def _authoritative_workspace_root(task_id: str = "default") -> str | None:
     """Best-effort absolute workspace root for divergence checks.
 
     Resolution:
@@ -334,7 +336,7 @@ def _authoritative_workspace_root(task_id: str = "default") -> str | None:
     try:
         from tools.terminal_tool import get_session_cwd
 
-        recorded = get_session_cwd(task_id)
+        recorded = await get_session_cwd(task_id)
     except Exception:
         recorded = None
     if recorded:
@@ -345,7 +347,7 @@ def _authoritative_workspace_root(task_id: str = "default") -> str | None:
     return _configured_terminal_cwd()
 
 
-def _resolve_base_dir(
+async def _resolve_base_dir(
     task_id: str = "default",
     *,
     container_paths: bool | None = None,
@@ -372,7 +374,7 @@ def _resolve_base_dir(
     outright (rather than anchoring them to the process cwd) and fall through to
     the process cwd only as a last resort, deterministically.
     """
-    root = _authoritative_workspace_root(task_id)
+    root = await _authoritative_workspace_root(task_id)
     if container_paths is None:
         container_paths = _uses_container_paths(task_id)
     if root:
@@ -399,11 +401,13 @@ def _resolve_base_dir(
         # Last-resort anchoring: a live cwd should already be absolute, but if a
         # terminal backend ever reports a relative cwd, anchor it to the process
         # cwd once, here, so the result no longer depends on cwd at resolve().
-        base = Path(os.getcwd()) / base
-    return Path(os.path.abspath(base))
+        base = Path(await aiofiles.os.getcwd()) / base
+    return Path(os.path.normpath(base))  # noqa: ASYNC240 - lexical only
 
 
-def _resolve_path_for_task(filepath: str, task_id: str = "default") -> Path | PurePosixPath:
+async def _resolve_path_for_task(
+    filepath: str, task_id: str = "default"
+) -> Path | PurePosixPath:
     """Resolve *filepath* against the task's absolute base directory.
 
     See :func:`_resolve_base_dir` for how the base is chosen. Absolute input
@@ -418,7 +422,7 @@ def _resolve_path_for_task(filepath: str, task_id: str = "default") -> Path | Pu
         expanded = _expand_tilde(filepath)
         if posixpath.isabs(expanded):
             return _normalize_without_host_deref(expanded)
-        resolved = _resolve_base_dir(task_id, container_paths=True) / expanded
+        resolved = await _resolve_base_dir(task_id, container_paths=True) / expanded
         return _normalize_without_host_deref(resolved)
 
     # Host paths only — never rewrite Linux paths inside a container/WSL env.
@@ -430,14 +434,16 @@ def _resolve_path_for_task(filepath: str, task_id: str = "default") -> Path | Pu
 
         if ntpath.isabs(expanded):
             return Path(ntpath.normpath(expanded))
-        joined = ntpath.join(str(_resolve_base_dir(task_id, container_paths=False)), expanded)
+        joined = ntpath.join(
+            str(await _resolve_base_dir(task_id, container_paths=False)), expanded
+        )
         return Path(ntpath.normpath(joined))
 
     p = Path(expanded)
     if p.is_absolute():
-        return Path(os.path.abspath(p))
-    resolved = _resolve_base_dir(task_id, container_paths=False) / p
-    return Path(os.path.abspath(resolved))
+        return Path(os.path.normpath(p))  # noqa: ASYNC240 - lexical only
+    resolved = await _resolve_base_dir(task_id, container_paths=False) / p
+    return Path(os.path.normpath(resolved))  # noqa: ASYNC240 - lexical only
 
 
 def _is_blocked_device_path(path: str) -> bool:
@@ -486,7 +492,7 @@ async def _is_blocked_device(filepath: str, base_dir: str | Path | None = None) 
     expanded = _expand_tilde(filepath)
     if base_dir is not None and not os.path.isabs(expanded):
         expanded = os.path.join(os.fspath(base_dir), expanded)
-    normalized = os.path.normpath(expanded)
+    normalized = os.path.normpath(expanded)  # noqa: ASYNC240 - lexical only
     if _is_blocked_device_path(normalized):
         return True
 
@@ -499,7 +505,7 @@ async def _is_blocked_device(filepath: str, base_dir: str | Path | None = None) 
             break
         if not os.path.isabs(target):
             target = os.path.join(os.path.dirname(current), target)
-        target = os.path.normpath(target)
+        target = os.path.normpath(target)  # noqa: ASYNC240 - lexical only
         if _is_blocked_device_path(target):
             return True
         if target in seen:
@@ -509,7 +515,9 @@ async def _is_blocked_device(filepath: str, base_dir: str | Path | None = None) 
 
     try:
         realpath = aiofiles.os.wrap(os.path.realpath)
-        resolved = os.path.normpath(await realpath(normalized))
+        resolved = os.path.normpath(  # noqa: ASYNC240 - lexical only
+            await realpath(normalized)
+        )
     except (OSError, ValueError):
         return False
     if _is_blocked_device_path(resolved):
@@ -555,10 +563,12 @@ def _get_hermes_config_path() -> str | None:
 async def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None:
     """Return an error message if the path targets a sensitive system location."""
     try:
-        resolved = str(_resolve_path_for_task(filepath, task_id))
+        resolved = str(await _resolve_path_for_task(filepath, task_id))
     except (OSError, ValueError):
         resolved = filepath
-    normalized = os.path.normpath(_expand_tilde(filepath))
+    normalized = os.path.normpath(  # noqa: ASYNC240 - lexical only
+        _expand_tilde(filepath)
+    )
     _err = (
         f"Refusing to write to sensitive system path: {filepath}\n"
         "Use the terminal tool with sudo if you need to modify system files."
@@ -598,7 +608,7 @@ async def _check_cross_profile_path(
 ) -> str | None:
     """Apply the retained local-runtime cross-profile soft guard."""
     try:
-        resolved = str(_resolve_path_for_task(filepath, task_id))
+        resolved = str(await _resolve_path_for_task(filepath, task_id))
     except (OSError, ValueError):
         resolved = filepath
 
@@ -687,9 +697,9 @@ def notify_other_tool_call(task_id: str = "default") -> None:
             state.setdefault("dedup_hits", {}).clear()
 
 
-def _invalidate_dedup_for_path(filepath: str, task_id: str) -> None:
+async def _invalidate_dedup_for_path(filepath: str, task_id: str) -> None:
     try:
-        resolved = str(_resolve_path(filepath, task_id))
+        resolved = str(await _resolve_path(filepath, task_id))
     except (OSError, ValueError):
         return
     with _read_tracker_lock:
@@ -708,7 +718,7 @@ async def _search_result_read_block_error(
 ) -> str | None:
     """Apply the credential read guard to a search result path."""
     try:
-        resolved = _resolve_path_for_task(path, task_id)
+        resolved = await _resolve_path_for_task(path, task_id)
     except (OSError, ValueError, RuntimeError):
         return await get_read_block_error(path)
     return await get_read_block_error(str(resolved))
@@ -896,10 +906,10 @@ async def _file_lock(path: Path) -> asyncio.Lock:
         return _file_locks.setdefault(key, asyncio.Lock())
 
 
-def _native_file_path(path: str, task_id: str) -> Path | str:
+async def _native_file_path(path: str, task_id: str) -> Path | str:
     """Resolve a host path or return the user-facing reason it cannot run."""
     try:
-        resolved = _resolve_path_for_task(path, task_id)
+        resolved = await _resolve_path_for_task(path, task_id)
     except (OSError, ValueError) as exc:
         return tool_error(f"Invalid file path {path!r}: {exc}")
     if not isinstance(resolved, Path):
@@ -920,7 +930,7 @@ async def _file_mtime(path: Path) -> float | None:
 
 async def _check_file_staleness(path: str, task_id: str) -> str | None:
     try:
-        resolved = str(_resolve_path(path, task_id))
+        resolved = str(await _resolve_path(path, task_id))
     except (OSError, ValueError):
         return None
     with _read_tracker_lock:
@@ -940,9 +950,9 @@ async def _check_file_staleness(path: str, task_id: str) -> str | None:
 
 async def _refresh_read_timestamp(path: str, task_id: str) -> None:
     """Invalidate cached ranges and record the post-write mtime asynchronously."""
-    _invalidate_dedup_for_path(path, task_id)
+    await _invalidate_dedup_for_path(path, task_id)
     try:
-        resolved = str(_resolve_path(path, task_id))
+        resolved = str(await _resolve_path(path, task_id))
     except (OSError, ValueError):
         return
     mtime = await _file_mtime(Path(resolved))
@@ -995,13 +1005,17 @@ async def _handle_read_file(args, **kw):
         return tool_error("read_file: missing required field 'path'.")
 
     offset, limit = normalize_read_pagination(args.get("offset", 1), args.get("limit", 500))
-    device_base = None if Path(_expand_tilde(path)).is_absolute() else _resolve_base_dir(task_id)
+    device_base = (
+        None
+        if Path(_expand_tilde(path)).is_absolute()
+        else await _resolve_base_dir(task_id)
+    )
     if await _is_blocked_device(path, base_dir=device_base):
         return tool_error(
             f"Cannot read '{path}': this is a device file that would block or produce infinite output."
         )
 
-    resolved = _native_file_path(path, task_id)
+    resolved = await _native_file_path(path, task_id)
     if isinstance(resolved, str):
         return resolved
     if has_binary_extension(str(resolved)):
@@ -1162,7 +1176,7 @@ async def _handle_write_file(args, **kw):
             "Refusing to write internal read_file display text as file content."
         )
 
-    resolved = _native_file_path(path, task_id)
+    resolved = await _native_file_path(path, task_id)
     if isinstance(resolved, str):
         return resolved
     denied_error = await get_write_denied_error(str(resolved))
@@ -1349,7 +1363,7 @@ async def _handle_v4a_patch(args: dict, task_id: str) -> str:
 
     resolved_by_raw: dict[str, Path] = {}
     for raw_path in raw_paths:
-        resolved = _native_file_path(raw_path, task_id)
+        resolved = await _native_file_path(raw_path, task_id)
         if isinstance(resolved, str):
             return resolved
         denied_error = await get_write_denied_error(str(resolved))
@@ -1478,7 +1492,7 @@ async def _handle_patch(args, **kw):
     if sensitive_error:
         return tool_error(sensitive_error)
 
-    resolved = _native_file_path(path, task_id)
+    resolved = await _native_file_path(path, task_id)
     if isinstance(resolved, str):
         return resolved
     denied_error = await get_write_denied_error(str(resolved))
@@ -1660,7 +1674,7 @@ async def _handle_search_files(args, **kw):
             already_searched=count,
         )
     raw_path = str(args.get("path", "."))
-    resolved = _native_file_path(raw_path, task_id)
+    resolved = await _native_file_path(raw_path, task_id)
     if isinstance(resolved, str):
         return resolved
     if await aiofiles.os.path.exists(resolved):
@@ -1672,7 +1686,7 @@ async def _handle_search_files(args, **kw):
     existing_paths: list[Path] = []
     missing_paths: list[str] = []
     for requested_path in requested_paths:
-        candidate = _native_file_path(requested_path, task_id)
+        candidate = await _native_file_path(requested_path, task_id)
         if isinstance(candidate, str):
             return candidate
         if await aiofiles.os.path.exists(candidate):

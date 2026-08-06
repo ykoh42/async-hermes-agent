@@ -53,18 +53,14 @@ from agent.retry_utils import jittered_backoff
 async def _list_jsonl_files(directory: Path) -> List[Path]:
     """Return JSONL files without blocking the event loop on directory I/O."""
     try:
-        iterator = await aiofiles.os.scandir(directory)
+        names = await aiofiles.os.listdir(directory)
     except OSError:
         return []
     paths: list[Path] = []
-    try:
-        for entry in iterator:
-            if entry.name.endswith(".jsonl") and await aiofiles.os.path.isfile(
-                entry.path
-            ):
-                paths.append(Path(entry.path))
-    finally:
-        iterator.close()
+    for name in names:
+        path = directory / name
+        if name.endswith(".jsonl") and await aiofiles.os.path.isfile(path):
+            paths.append(path)
     return sorted(paths)
 
 

@@ -23,10 +23,11 @@ def test_empty_task_id_maps_to_default():
     assert terminal_tool._resolve_container_task_id("") == "default"
 
 
-def test_cwd_override_keeps_own_session_id(tmp_path):
+@pytest.mark.asyncio
+async def test_cwd_override_keeps_own_session_id(tmp_path):
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    terminal_tool.register_task_env_overrides(
+    await terminal_tool.register_task_env_overrides(
         "session-abc", {"cwd": str(workspace)}
     )
     try:
@@ -35,11 +36,14 @@ def test_cwd_override_keeps_own_session_id(tmp_path):
         terminal_tool.clear_task_env_overrides("session-abc")
 
 
-def test_clear_override_removes_cwd_anchor(tmp_path):
+@pytest.mark.asyncio
+async def test_clear_override_removes_cwd_anchor(tmp_path):
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    terminal_tool.register_task_env_overrides("session", {"cwd": str(workspace)})
+    await terminal_tool.register_task_env_overrides(
+        "session", {"cwd": str(workspace)}
+    )
     terminal_tool.clear_task_env_overrides("session")
 
     assert terminal_tool.resolve_task_overrides("session") == {}
-    assert terminal_tool.get_session_cwd("session") != str(workspace)
+    assert await terminal_tool.get_session_cwd("session") != str(workspace)

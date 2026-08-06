@@ -238,7 +238,7 @@ async def build_profile_secret_scope(hermes_home: Path) -> Dict[str, str]:
     try:
         from hermes_cli.env_loader import get_secret_source_values
 
-        external_secrets = get_secret_source_values(home)
+        external_secrets = await get_secret_source_values(home)
     except Exception:
         external_secrets = {}
 

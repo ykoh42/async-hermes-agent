@@ -111,20 +111,18 @@ async def _append_jsonl_line(path: Path, payload: Dict[str, Any]) -> None:
 async def _list_batch_files(directory: Path) -> List[Path]:
     """List batch JSONL shards without a synchronous directory glob."""
     try:
-        iterator = await aiofiles.os.scandir(directory)
+        names = await aiofiles.os.listdir(directory)
     except OSError:
         return []
     paths: list[Path] = []
-    try:
-        for entry in iterator:
-            if (
-                entry.name.startswith("batch_")
-                and entry.name.endswith(".jsonl")
-                and await aiofiles.os.path.isfile(entry.path)
-            ):
-                paths.append(Path(entry.path))
-    finally:
-        iterator.close()
+    for name in names:
+        path = directory / name
+        if (
+            name.startswith("batch_")
+            and name.endswith(".jsonl")
+            and await aiofiles.os.path.isfile(path)
+        ):
+            paths.append(path)
     return sorted(paths)
 
 
@@ -412,7 +410,7 @@ async def _process_single_prompt(
         }
         if prompt_data.get("cwd"):
             overrides["cwd"] = prompt_data["cwd"]
-        register_task_env_overrides(task_id, overrides)
+        await register_task_env_overrides(task_id, overrides)
         if config.get("verbose"):
             print(f"   Prompt {prompt_index}: Using container image {container_image}")
     
