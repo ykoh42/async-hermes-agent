@@ -235,7 +235,7 @@ async def _normalize_to_supported_image(
     if detected_mime in _ANTHROPIC_SUPPORTED_MEDIA_TYPES:
         return image_path, detected_mime, None
 
-    out_dir = get_hermes_dir("cache/vision", "temp_vision_images")
+    out_dir = await get_hermes_dir("cache/vision", "temp_vision_images")
     await aiofiles.os.makedirs(out_dir, exist_ok=True)
     out_path = out_dir / f"converted_{uuid.uuid4()}.png"
 
@@ -893,7 +893,7 @@ async def _vision_analyze_native(
 
         detected_mime_type = resolved.mime
         image_size_bytes = len(resolved.data)
-        temp_dir = get_hermes_dir("cache/vision", "temp_vision_images")
+        temp_dir = await get_hermes_dir("cache/vision", "temp_vision_images")
         await aiofiles.os.makedirs(temp_dir, exist_ok=True)
         temp_image_path = temp_dir / f"temp_image_{uuid.uuid4()}.img"
         async with aiofiles.open(temp_image_path, "wb") as output:
@@ -1064,7 +1064,7 @@ async def vision_analyze_tool(
             raise ValueError(str(exc))
 
         detected_mime_type = resolved.mime
-        temp_dir = get_hermes_dir("cache/vision", "temp_vision_images")
+        temp_dir = await get_hermes_dir("cache/vision", "temp_vision_images")
         await aiofiles.os.makedirs(temp_dir, exist_ok=True)
         temp_image_path = temp_dir / f"temp_image_{uuid.uuid4()}.img"
         async with aiofiles.open(temp_image_path, "wb") as output:
@@ -1550,7 +1550,7 @@ async def video_analyze_tool(
             blocked = await check_website_access(video_url)
             if blocked:
                 raise PermissionError(blocked["message"])
-            temp_dir = get_hermes_dir("cache/video", "temp_video_files")
+            temp_dir = await get_hermes_dir("cache/video", "temp_video_files")
             temp_video_path = temp_dir / f"temp_video_{uuid.uuid4()}.mp4"
             await _download_video(video_url, temp_video_path)
             should_cleanup = True

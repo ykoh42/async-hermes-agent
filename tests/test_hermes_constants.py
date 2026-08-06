@@ -345,16 +345,18 @@ class TestGetHermesDir:
     def _set_home(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
 
-    def test_neither_exists_returns_new(self, tmp_path, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_neither_exists_returns_new(self, tmp_path, monkeypatch):
         self._set_home(tmp_path, monkeypatch)
-        result = get_hermes_dir("platforms/pairing", "pairing")
+        result = await get_hermes_dir("platforms/pairing", "pairing")
         assert result == tmp_path / "platforms/pairing"
 
 
 
 
 
-    def test_legacy_is_file_treated_as_content(self, tmp_path, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_legacy_is_file_treated_as_content(self, tmp_path, monkeypatch):
         """A non-directory file at the legacy path counts as occupied.
 
         Defensive against odd installs where the caller previously wrote a
@@ -363,12 +365,13 @@ class TestGetHermesDir:
         self._set_home(tmp_path, monkeypatch)
         legacy = tmp_path / "image_cache"
         legacy.write_bytes(b"sentinel")
-        result = get_hermes_dir("cache/images", "image_cache")
+        result = await get_hermes_dir("cache/images", "image_cache")
         assert result == legacy
 
 
 
-    def test_dangling_legacy_symlink_returns_new(self, tmp_path, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_dangling_legacy_symlink_returns_new(self, tmp_path, monkeypatch):
         """A dangling legacy symlink must NOT shadow populated new-layout data.
 
         ``lstat()`` reports the link itself (not its missing target), so the
@@ -383,10 +386,11 @@ class TestGetHermesDir:
         new = tmp_path / "platforms" / "pairing"
         new.mkdir(parents=True)
         (new / "discord-approved.json").write_text("[]")
-        result = get_hermes_dir("platforms/pairing", "pairing")
+        result = await get_hermes_dir("platforms/pairing", "pairing")
         assert result == new
 
-    def test_symlink_to_populated_dir_returns_legacy(self, tmp_path, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_symlink_to_populated_dir_returns_legacy(self, tmp_path, monkeypatch):
         """A legacy symlink pointing at a populated directory is honoured."""
         self._set_home(tmp_path, monkeypatch)
         real = tmp_path / "real_store"
@@ -394,7 +398,7 @@ class TestGetHermesDir:
         (real / "cached.png").write_bytes(b"x")
         legacy = tmp_path / "image_cache"
         legacy.symlink_to(real)
-        result = get_hermes_dir("cache/images", "image_cache")
+        result = await get_hermes_dir("cache/images", "image_cache")
         assert result == legacy
 
 

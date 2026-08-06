@@ -601,11 +601,17 @@ class TestErrorClassification:
 
 
 class TestVisionRegistration:
-    def test_vision_analyze_is_excluded_from_the_minimal_training_toolset(self):
-        from tools.registry import registry
+    def test_vision_tools_are_registered_with_native_async_handlers(self):
+        import inspect
 
-        entry = registry._tools.get("vision_analyze")
-        assert entry is None
+        from tools.registry import discover_builtin_tools, registry
+
+        discover_builtin_tools()
+
+        for name in ("vision_analyze", "video_analyze"):
+            entry = registry.get_entry(name)
+            assert entry is not None
+            assert inspect.iscoroutinefunction(entry.handler)
 
 
 # ---------------------------------------------------------------------------

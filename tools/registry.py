@@ -54,6 +54,7 @@ _TRAINING_RUNTIME_TOOL_MODULES = frozenset({
     "terminal_tool",
     "todo_tool",
     "video_generation_tool",
+    "vision_tools",
     "web_tools",
 })
 
@@ -84,6 +85,7 @@ _ASYNC_RUNTIME_HANDLER_MODULES = frozenset({
     "tools.terminal_tool",
     "tools.todo_tool",
     "tools.video_generation_tool",
+    "tools.vision_tools",
     "tools.web_tools",
 })
 

@@ -1,7 +1,7 @@
 """Shared constants for Hermes Agent.
 
-Import-safe module with no dependencies — can be imported from anywhere
-without risk of circular imports.
+Import-safe module with no Hermes-internal dependencies — can be imported from
+anywhere without risk of circular imports.
 """
 
 import asyncio
@@ -11,6 +11,7 @@ import sys
 from contextvars import ContextVar, Token
 from pathlib import Path
 
+import aiofiles.os
 
 _UNSET = object()
 _HERMES_HOME_OVERRIDE: ContextVar[str | object] = ContextVar(
@@ -142,7 +143,7 @@ def get_default_hermes_root() -> Path:
     return env_path
 
 
-def get_hermes_dir(
+async def get_hermes_dir(
     new_subpath: str,
     old_name: str,
     *,
@@ -175,7 +176,7 @@ def get_hermes_dir(
     """
     home = home or get_hermes_home()
     old_path = home / old_name
-    if _legacy_path_has_content(old_path):
+    if await _legacy_path_has_content(old_path):
         return old_path
     return home / new_subpath
 
@@ -231,7 +232,7 @@ async def agent_browser_runnable(path: str | None) -> bool:
     return process.returncode == 0
 
 
-def _legacy_path_has_content(path: Path) -> bool:
+async def _legacy_path_has_content(path: Path) -> bool:
     """Return ``True`` iff ``path`` exists and has content worth honouring.
 
     A populated *directory* (any entry inside) counts. A non-directory
@@ -250,7 +251,7 @@ def _legacy_path_has_content(path: Path) -> bool:
     ``exists()`` gate's behaviour for broken links.
     """
     try:
-        st = path.lstat()
+        st = await aiofiles.os.stat(path, follow_symlinks=False)
     except FileNotFoundError:
         return False
     except OSError:
@@ -261,7 +262,7 @@ def _legacy_path_has_content(path: Path) -> bool:
         # Resolve the link's target. A dangling symlink has no content and
         # must not shadow the new layout; a valid one is judged on its target.
         try:
-            target_st = path.stat()  # follows the link
+            target_st = await aiofiles.os.stat(path)  # follows the link
         except FileNotFoundError:
             return False  # dangling symlink → fall through to new layout
         except OSError:
@@ -272,12 +273,9 @@ def _legacy_path_has_content(path: Path) -> bool:
     elif not stat.S_ISDIR(st.st_mode):
         return True
     try:
-        next(path.iterdir())
-    except StopIteration:
-        return False
+        return bool(await aiofiles.os.listdir(path))
     except OSError:
         return True
-    return True
 
 
 def display_hermes_home() -> str:

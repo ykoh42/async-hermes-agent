@@ -2967,7 +2967,7 @@ async def _store_full_snapshot(snapshot_text: str) -> Optional[str]:
                 + f"\n\n[... stored copy truncated at {MAX_STORED_SNAPSHOT_CHARS:,} chars "
                 f"of {len(content):,} ...]"
             )
-        cache_dir = get_hermes_dir("cache/web", "web_cache")
+        cache_dir = await get_hermes_dir("cache/web", "web_cache")
         await aiofiles.os.makedirs(cache_dir, exist_ok=True)
         digest = hashlib.sha256(content.encode("utf-8")).hexdigest()[:10]
         path = cache_dir / f"browser-snapshot-{digest}.txt"
@@ -4527,7 +4527,7 @@ async def browser_vision(
     import uuid as uuid_mod
     from hermes_constants import get_hermes_dir
 
-    screenshots_dir = get_hermes_dir("cache/screenshots", "browser_screenshots")
+    screenshots_dir = await get_hermes_dir("cache/screenshots", "browser_screenshots")
     screenshot_path = screenshots_dir / f"browser_screenshot_{uuid_mod.uuid4().hex}.png"
     effective_task_id = _last_session_key(task_id or "default")
     result: Dict[str, Any] = {}
@@ -4602,7 +4602,7 @@ async def browser_vision(
             if fb_path and await aiofiles.os.path.exists(fb_path):
                 from hermes_constants import get_hermes_dir
 
-                screenshots_dir = get_hermes_dir(
+                screenshots_dir = await get_hermes_dir(
                     "cache/screenshots", "browser_screenshots"
                 )
                 await aiofiles.os.makedirs(screenshots_dir, exist_ok=True)

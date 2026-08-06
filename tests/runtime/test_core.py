@@ -72,6 +72,7 @@ def test_conversation_and_chat_are_coroutines():
         main as trajectory_main,
     )
     from hermes_cli.middleware import run_llm_execution_middleware
+    from hermes_constants import get_hermes_dir
 
     assert inspect.iscoroutinefunction(AIAgent.run_conversation)
     assert inspect.iscoroutinefunction(AIAgent.chat)
@@ -116,6 +117,7 @@ def test_conversation_and_chat_are_coroutines():
     assert inspect.iscoroutinefunction(TrajectoryCompressor.close)
     assert inspect.iscoroutinefunction(trajectory_main)
     assert inspect.iscoroutinefunction(SessionDB._parse_schema_columns)
+    assert inspect.iscoroutinefunction(get_hermes_dir)
     assert inspect.iscoroutinefunction(terminal_tool)
     assert inspect.iscoroutinefunction(get_session_cwd)
     assert inspect.iscoroutinefunction(record_session_cwd)

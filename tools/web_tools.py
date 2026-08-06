@@ -437,7 +437,7 @@ async def _store_full_text(url: str, content: str) -> Optional[str]:
         from urllib.parse import urlparse
         from hermes_constants import get_hermes_dir
 
-        cache_dir = get_hermes_dir("cache/web", "web_cache")
+        cache_dir = await get_hermes_dir("cache/web", "web_cache")
         await aiofiles.os.makedirs(cache_dir, exist_ok=True)
 
         host = (urlparse(url).hostname or "page").replace(":", "_")

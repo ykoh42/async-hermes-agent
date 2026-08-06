@@ -13,6 +13,7 @@ import json
 from unittest.mock import patch
 
 import pytest
+from blockbuster import BlockBuster
 
 from tools.vision_tools import (
     _build_native_vision_tool_result,
@@ -84,7 +85,12 @@ class TestVisionAnalyzeNative:
     async def test_local_file_returns_multimodal_envelope(self, tmp_path):
         img = tmp_path / "test.png"
         img.write_bytes(_TINY_PNG)
-        result = await _vision_analyze_native(str(img), "what is this?")
+        blockbuster = BlockBuster()
+        blockbuster.activate()
+        try:
+            result = await _vision_analyze_native(str(img), "what is this?")
+        finally:
+            blockbuster.deactivate()
         assert isinstance(result, dict)
         assert result.get("_multimodal") is True
         parts = result["content"]
