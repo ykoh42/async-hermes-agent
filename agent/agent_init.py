@@ -3222,14 +3222,6 @@ async def initialize_deferred_runtime(agent: Any) -> bool:
         for key in ("command", "args", "region", "guardrail_config"):
             if key in runtime:
                 pending[key] = runtime[key]
-        if provider == "lmstudio" and (
-            getattr(agent, "lmstudio_load_mode", "explicit") or "explicit"
-        ).strip().lower() != "jit":
-            raise UnsupportedCapabilityError(
-                "LM Studio explicit model loading uses a blocking management API "
-                "and is disabled in async-hermes-agent. Set "
-                "model.lmstudio_load_mode to 'jit' or add a native async loader."
-            )
         if provider == "gemini":
             from agent.gemini_native_adapter import is_native_gemini_base_url
 
@@ -3272,6 +3264,18 @@ async def initialize_deferred_runtime(agent: Any) -> bool:
         agent.model = model
         agent.api_key = api_key
         agent.base_url = base_url.rstrip("/")
+        agent._lmstudio_runtime_context_length = (
+            await agent._ensure_lmstudio_runtime_loaded(
+                getattr(agent, "_config_context_length", None)
+            )
+        )
+        if agent._lmstudio_load_was_unverified(
+            agent._lmstudio_runtime_context_length
+        ):
+            logger.warning(
+                "LM Studio model activation was rejected or completed without a "
+                "verifiable active context length; falling back to configured context"
+            )
         if provider == "bedrock":
             agent._bedrock_region = str(
                 pending.get("region")
@@ -3579,9 +3583,22 @@ async def initialize_deferred_runtime(agent: Any) -> bool:
         )
         compressor = getattr(agent, "context_compressor", None)
         if compressor is not None:
+            context_length = getattr(compressor, "context_length", None)
+            if provider == "lmstudio":
+                context_length = agent._effective_lmstudio_context_length(
+                    getattr(agent, "_config_context_length", None),
+                    agent._lmstudio_runtime_context_length,
+                )
+                if context_length is None:
+                    context_length = get_static_context_length(
+                        agent.model,
+                        base_url=agent.base_url,
+                        provider=agent.provider,
+                        custom_providers=getattr(agent, "_custom_providers", None),
+                    )
             compressor.update_model(
                 model=agent.model,
-                context_length=compressor.context_length,
+                context_length=context_length,
                 base_url=agent.base_url,
                 api_key=agent.api_key,
                 provider=agent.provider,

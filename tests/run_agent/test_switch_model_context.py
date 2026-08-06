@@ -262,14 +262,48 @@ async def test_direct_start_preserves_context_for_normalized_default_model_alias
 
 
 @pytest.mark.asyncio
-async def test_lmstudio_explicit_switch_fails_before_blocking_preload(monkeypatch):
+async def test_lmstudio_explicit_switch_awaits_native_preload(monkeypatch):
     agent = _make_agent_with_compressor(config_context_length=32_768)
-    from agent.agent_runtime_helpers import UnsupportedCapabilityError
+    from hermes_cli.models import LMStudioLoadResult
 
-    with pytest.raises(UnsupportedCapabilityError, match="LM Studio explicit model loading"):
-        await agent.switch_model(
-            "lmstudio/new-model",
-            "lmstudio",
-            api_key="not-needed",
-            base_url="http://127.0.0.1:1234/v1",
-        )
+    preload = AsyncMock(return_value=LMStudioLoadResult(64_000))
+    monkeypatch.setattr(
+        "hermes_cli.models.ensure_lmstudio_model_loaded",
+        preload,
+    )
+
+    await agent.switch_model(
+        "lmstudio/new-model",
+        "lmstudio",
+        api_key="not-needed",
+        base_url="http://127.0.0.1:1234/v1",
+    )
+
+    preload.assert_awaited_once()
+    assert agent.context_compressor.context_length == 64_000
+
+
+@pytest.mark.asyncio
+async def test_lmstudio_rejected_context_is_not_reapplied_by_metadata(monkeypatch):
+    agent = _make_agent_with_compressor(config_context_length=32_768)
+    from hermes_cli.models import LMStudioLoadResult
+
+    monkeypatch.setattr(
+        "hermes_cli.models.ensure_lmstudio_model_loaded",
+        AsyncMock(return_value=LMStudioLoadResult(None, rejected=True)),
+    )
+    static_context = MagicMock(return_value=131_072)
+    monkeypatch.setattr(
+        "agent.model_metadata.get_static_context_length",
+        static_context,
+    )
+
+    await agent.switch_model(
+        "lmstudio/new-model",
+        "lmstudio",
+        api_key="not-needed",
+        base_url="http://127.0.0.1:1234/v1",
+    )
+
+    assert static_context.call_args.kwargs["config_context_length"] is None
+    assert agent.context_compressor.context_length == 131_072

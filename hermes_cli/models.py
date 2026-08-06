@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import asyncio
+import logging
 import os
 import re
 import urllib.parse
@@ -1265,6 +1266,237 @@ def _lmstudio_request_headers(api_key: Optional[str] = None) -> dict:
     return headers
 
 
+async def _lmstudio_fetch_raw_models(
+    api_key: Optional[str] = None,
+    base_url: Optional[str] = None,
+    timeout: float = 5.0,
+) -> Optional[list[dict]]:
+    """Fetch LM Studio's raw native model catalog without blocking the loop."""
+    server_root = _lmstudio_server_root(base_url)
+    if not server_root:
+        return None
+
+    from hermes_cli.auth import AuthError
+
+    try:
+        async with httpx.AsyncClient(
+            timeout=timeout,
+            headers=_lmstudio_request_headers(api_key),
+        ) as client:
+            response = await client.get(f"{server_root}/api/v1/models")
+            if response.status_code in {401, 403}:
+                raise AuthError(
+                    f"LM Studio rejected the request with HTTP {response.status_code}.",
+                    provider="lmstudio",
+                    code="auth_rejected",
+                )
+            response.raise_for_status()
+            payload = response.json()
+    except asyncio.CancelledError:
+        raise
+    except AuthError:
+        raise
+    except Exception as exc:
+        logging.getLogger(__name__).debug(
+            "LM Studio probe at %s failed: %s", server_root, exc
+        )
+        return None
+
+    raw_models = payload.get("models") if isinstance(payload, dict) else None
+    if not isinstance(raw_models, list):
+        logging.getLogger(__name__).debug(
+            "LM Studio probe at %s returned malformed payload (no `models` list)",
+            server_root,
+        )
+        return None
+    return raw_models
+
+
+async def probe_lmstudio_models(
+    api_key: Optional[str] = None,
+    base_url: Optional[str] = None,
+    timeout: float = 5.0,
+) -> Optional[list[str]]:
+    """Probe LM Studio and return chat-capable model keys when reachable."""
+    raw_models = await _lmstudio_fetch_raw_models(
+        api_key=api_key,
+        base_url=base_url,
+        timeout=timeout,
+    )
+    if raw_models is None:
+        return None
+
+    keys: list[str] = []
+    for raw in raw_models:
+        if not isinstance(raw, dict):
+            continue
+        if str(raw.get("type") or "").strip().lower() == "embedding":
+            continue
+        key = str(raw.get("key") or raw.get("id") or "").strip()
+        if key and key not in keys:
+            keys.append(key)
+    return keys
+
+
+async def fetch_lmstudio_models(
+    api_key: Optional[str] = None,
+    base_url: Optional[str] = None,
+    timeout: float = 5.0,
+) -> list[str]:
+    """Fetch LM Studio chat-capable model keys, or ``[]`` when unreachable."""
+    models = await probe_lmstudio_models(
+        api_key=api_key,
+        base_url=base_url,
+        timeout=timeout,
+    )
+    return models or []
+
+
+class LMStudioLoadResult(NamedTuple):
+    """Verified LM Studio runtime plus load-attempt provenance."""
+
+    context_length: Optional[int]
+    load_attempted: bool = False
+    rejected: bool = False
+
+
+async def ensure_lmstudio_model_loaded(
+    model: str,
+    base_url: Optional[str],
+    api_key: Optional[str],
+    target_context_length: Optional[int],
+    timeout: float = 120.0,
+    *,
+    return_load_result: bool = False,
+) -> Optional[int] | LMStudioLoadResult:
+    """Ensure ``model`` is loaded and return its verified runtime context."""
+
+    def _result(
+        context_length: Optional[int],
+        *,
+        load_attempted: bool = False,
+        rejected: bool = False,
+    ) -> Optional[int] | LMStudioLoadResult:
+        value = LMStudioLoadResult(context_length, load_attempted, rejected)
+        return value if return_load_result else context_length
+
+    def _positive_int(value: Any) -> Optional[int]:
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+            return value
+        return None
+
+    def _loaded_context(entry: dict) -> Optional[int]:
+        instances = entry.get("loaded_instances")
+        if not isinstance(instances, list):
+            return None
+        for instance in instances:
+            config = instance.get("config") if isinstance(instance, dict) else None
+            context = config.get("context_length") if isinstance(config, dict) else None
+            parsed = _positive_int(context)
+            if parsed is not None:
+                return parsed
+        return None
+
+    def _find_entry(raw_models: list[dict]) -> Optional[dict]:
+        for raw in raw_models:
+            if isinstance(raw, dict) and (
+                raw.get("key") == model or raw.get("id") == model
+            ):
+                return raw
+        return None
+
+    server_root = _lmstudio_server_root(base_url)
+    if not server_root:
+        return _result(None)
+
+    explicit_context = _positive_int(target_context_length)
+    if target_context_length is not None and explicit_context is None:
+        return _result(None)
+
+    try:
+        raw_models = await _lmstudio_fetch_raw_models(
+            api_key=api_key,
+            base_url=base_url,
+            timeout=10,
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        raw_models = None
+    if raw_models is None:
+        return _result(None)
+
+    target_entry = _find_entry(raw_models)
+    if target_entry is None:
+        return _result(None)
+
+    max_context = _positive_int(target_entry.get("max_context_length"))
+    if (
+        explicit_context is not None
+        and max_context is not None
+        and explicit_context > max_context
+    ):
+        return _result(None, rejected=True)
+
+    current_context = _loaded_context(target_entry)
+    if current_context is not None:
+        return _result(current_context)
+
+    loaded_instances = target_entry.get("loaded_instances")
+    if not isinstance(loaded_instances, list) or loaded_instances:
+        return _result(None)
+
+    load_payload: dict[str, Any] = {"model": model, "echo_load_config": True}
+    if explicit_context is not None:
+        load_payload["context_length"] = explicit_context
+    try:
+        async with httpx.AsyncClient(
+            timeout=timeout,
+            headers=_lmstudio_request_headers(api_key),
+        ) as client:
+            response = await client.post(
+                f"{server_root}/api/v1/models/load",
+                json=load_payload,
+            )
+            response.raise_for_status()
+            response_payload = response.json()
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        return _result(None, load_attempted=True)
+
+    load_config = (
+        response_payload.get("load_config")
+        if isinstance(response_payload, dict)
+        else None
+    )
+    applied_context = (
+        _positive_int(load_config.get("context_length"))
+        if isinstance(load_config, dict)
+        else None
+    )
+    if applied_context is not None:
+        return _result(applied_context, load_attempted=True)
+
+    try:
+        refreshed_models = await _lmstudio_fetch_raw_models(
+            api_key=api_key,
+            base_url=base_url,
+            timeout=10,
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        refreshed_models = None
+    if refreshed_models is None:
+        return _result(None, load_attempted=True)
+    refreshed_entry = _find_entry(refreshed_models)
+    refreshed_context = (
+        _loaded_context(refreshed_entry) if refreshed_entry is not None else None
+    )
+    return _result(refreshed_context, load_attempted=True)
+
+
 
 
 
@@ -1287,18 +1519,14 @@ async def lmstudio_model_reasoning_options(
     Returns ``[]`` when the model is unknown, the endpoint is unreachable,
     or the model does not declare a reasoning capability.
     """
-    server_root = _lmstudio_server_root(base_url)
-    if not server_root:
-        return []
     try:
-        async with httpx.AsyncClient(
+        raw_models = await _lmstudio_fetch_raw_models(
+            api_key=api_key,
+            base_url=base_url,
             timeout=timeout,
-            headers=_lmstudio_request_headers(api_key),
-        ) as client:
-            response = await client.get(f"{server_root}/api/v1/models")
-            response.raise_for_status()
-            payload = response.json()
-        raw_models = payload.get("models") if isinstance(payload, dict) else None
+        )
+    except asyncio.CancelledError:
+        raise
     except Exception:
         raw_models = None
     if not raw_models:

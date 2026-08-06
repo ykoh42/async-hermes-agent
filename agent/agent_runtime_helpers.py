@@ -2281,6 +2281,7 @@ async def switch_model(agent, new_model, new_provider, api_key='', base_url='', 
         "_credential_pool_entry_id",
         "_use_prompt_caching",
         "_use_native_cache_layout",
+        "_lmstudio_runtime_context_length",
     )
     missing = object()
     rollback_state = {
@@ -2365,13 +2366,23 @@ async def switch_model(agent, new_model, new_provider, api_key='', base_url='', 
     if compressor is not None:
         from agent.model_metadata import get_static_context_length
 
-        context_length = get_static_context_length(
-            agent.model,
-            base_url=agent.base_url,
-            provider=agent.provider,
-            config_context_length=destination_context,
-            custom_providers=custom_providers,
-        )
+        if current_provider == "lmstudio":
+            context_length = agent._effective_lmstudio_context_length(
+                destination_context,
+                getattr(agent, "_lmstudio_runtime_context_length", None),
+            )
+        else:
+            context_length = None
+        if context_length is None:
+            context_length = get_static_context_length(
+                agent.model,
+                base_url=agent.base_url,
+                provider=agent.provider,
+                config_context_length=(
+                    None if current_provider == "lmstudio" else destination_context
+                ),
+                custom_providers=custom_providers,
+            )
         compressor.update_model(
             model=agent.model,
             context_length=context_length,

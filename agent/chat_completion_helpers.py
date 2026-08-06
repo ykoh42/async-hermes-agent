@@ -1277,12 +1277,24 @@ async def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -
         if hasattr(agent, 'context_compressor') and agent.context_compressor:
             from agent.model_metadata import get_static_context_length
 
-            fb_context_length = get_static_context_length(
-                agent.model, base_url=agent.base_url,
-                provider=agent.provider,
-                config_context_length=getattr(agent, "_config_context_length", None),
-                custom_providers=getattr(agent, "_custom_providers", None),
-            )
+            if fb_provider == "lmstudio":
+                fb_context_length = agent._effective_lmstudio_context_length(
+                    getattr(agent, "_config_context_length", None),
+                    getattr(agent, "_lmstudio_runtime_context_length", None),
+                )
+            else:
+                fb_context_length = None
+            if fb_context_length is None:
+                fb_context_length = get_static_context_length(
+                    agent.model, base_url=agent.base_url,
+                    provider=agent.provider,
+                    config_context_length=(
+                        None
+                        if fb_provider == "lmstudio"
+                        else getattr(agent, "_config_context_length", None)
+                    ),
+                    custom_providers=getattr(agent, "_custom_providers", None),
+                )
             agent.context_compressor.update_model(
                 model=agent.model,
                 context_length=fb_context_length,

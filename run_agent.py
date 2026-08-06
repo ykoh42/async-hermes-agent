@@ -845,21 +845,27 @@ class AIAgent:
             and getattr(load_result, "context_length", None) is None
         )
 
-    def _ensure_lmstudio_runtime_loaded(
+    async def _ensure_lmstudio_runtime_loaded(
         self,
         config_context_length: Optional[int] = None,
     ) -> Any:
-        """Reject the legacy blocking LM Studio preloader on the async path."""
+        """Preload LM Studio unless configured to rely on JIT loading."""
         if (self.provider or "").strip().lower() != "lmstudio":
             return None
         if (getattr(self, "lmstudio_load_mode", "explicit") or "explicit").strip().lower() == "jit":
+            logger.debug("LM Studio explicit preload skipped: lmstudio_load_mode=jit")
             return None
-        from agent.agent_runtime_helpers import UnsupportedCapabilityError
 
-        raise UnsupportedCapabilityError(
-            "LM Studio explicit model loading uses a blocking management API and "
-            "is disabled in async-hermes-agent. Set model.lmstudio_load_mode to "
-            "'jit' or add a native async LM Studio loader."
+        from hermes_cli.models import ensure_lmstudio_model_loaded
+
+        if config_context_length is None:
+            config_context_length = getattr(self, "_config_context_length", None)
+        return await ensure_lmstudio_model_loaded(
+            self.model,
+            self.base_url,
+            getattr(self, "api_key", ""),
+            config_context_length,
+            return_load_result=True,
         )
 
     async def switch_model(self, new_model, new_provider, api_key='', base_url='', api_mode=''):
