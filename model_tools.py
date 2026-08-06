@@ -8,16 +8,16 @@ This module triggers discovery (by importing all tool modules), then provides
 the public API that run_agent.py, cli.py, batch_runner.py, and the RL
 environments consume.
 
-Public API (signatures preserved from the original 2,400-line version):
-    get_tool_definitions(enabled_toolsets, disabled_toolsets, quiet_mode) -> list
+Public API (names and arguments preserved from the original 2,400-line version):
+    await get_tool_definitions(enabled_toolsets, disabled_toolsets, quiet_mode) -> list
     handle_function_call(function_name, function_args, task_id, user_task) -> str
     TOOL_TO_TOOLSET_MAP: dict          (for batch_runner.py)
     TOOLSET_REQUIREMENTS: dict         (for cli.py, doctor.py)
     get_all_tool_names() -> list
     get_toolset_for_tool(name) -> str
-    get_available_toolsets() -> dict
-    check_toolset_requirements() -> dict
-    check_tool_availability(quiet) -> tuple
+    await get_available_toolsets() -> dict
+    await check_toolset_requirements() -> dict
+    await check_tool_availability(quiet) -> tuple
 """
 
 import os
@@ -25,6 +25,7 @@ import json
 import re
 import logging
 import time
+import aiofiles.os
 from typing import Dict, Any, List, Optional, Tuple
 
 from tools.registry import (
@@ -111,7 +112,7 @@ _LEGACY_TOOLSET_MAP = {
 
 # Module-level memoization for get_tool_definitions(). Keyed on
 # (frozenset(enabled_toolsets), frozenset(disabled_toolsets), registry._generation).
-# Hot callers (gateway runner, AIAgent.__init__) invoke this on every turn
+# Hot callers invoke this at each async tool-snapshot refresh
 # with quiet_mode=True; caching avoids ~7 ms of registry walking + schema
 # filtering + check_fn probing per call. Only active when quiet_mode=True
 # because quiet_mode=False has stdout side effects (tool-selection prints).
@@ -136,7 +137,7 @@ def _clear_tool_defs_cache() -> None:
     _tool_defs_cache.clear()
 
 
-def get_tool_definitions(
+async def get_tool_definitions(
     enabled_toolsets: Optional[List[str]] = None,
     disabled_toolsets: Optional[List[str]] = None,
     quiet_mode: bool = False,
@@ -173,11 +174,11 @@ def get_tool_definitions(
         try:
             from hermes_cli.config import get_config_path
             cfg_path = get_config_path()
-            cfg_stat = cfg_path.stat()
+            cfg_stat = await aiofiles.os.stat(cfg_path)
             cfg_fp = (cfg_stat.st_mtime_ns, cfg_stat.st_size)
         except (FileNotFoundError, OSError, ImportError):
             cfg_fp = None
-        profile_scope = check_fn_cache_scope()
+        profile_scope = await check_fn_cache_scope()
         if profile_scope != CHECK_FN_CACHE_BYPASS:
             cache_key = (
                 frozenset(enabled_toolsets) if enabled_toolsets is not None else None,
@@ -195,7 +196,7 @@ def get_tool_definitions(
             # schemas are treated as read-only by all known callers.
             return list(cached)
 
-    result = _compute_tool_definitions(
+    result = await _compute_tool_definitions(
         enabled_toolsets,
         disabled_toolsets,
         quiet_mode,
@@ -222,7 +223,7 @@ def get_tool_definitions(
     return result
 
 
-def _compute_tool_definitions(
+async def _compute_tool_definitions(
     enabled_toolsets: Optional[List[str]] = None,
     disabled_toolsets: Optional[List[str]] = None,
     quiet_mode: bool = False,
@@ -309,7 +310,7 @@ def _compute_tool_definitions(
                 print(f"⚠️  Unknown toolset: {toolset_name}")
 
     # Ask the registry for schemas (only returns tools whose check_fn passes)
-    filtered_tools = registry.get_definitions(
+    filtered_tools = await registry.get_definitions(
         tools_to_include,
         quiet=quiet_mode,
         probe_availability=probe_availability,
@@ -986,16 +987,16 @@ def get_toolset_for_tool(tool_name: str) -> Optional[str]:
     return registry.get_toolset_for_tool(tool_name)
 
 
-def get_available_toolsets() -> Dict[str, dict]:
+async def get_available_toolsets() -> Dict[str, dict]:
     """Return toolset availability info for UI display."""
-    return registry.get_available_toolsets()
+    return await registry.get_available_toolsets()
 
 
-def check_toolset_requirements() -> Dict[str, bool]:
+async def check_toolset_requirements() -> Dict[str, bool]:
     """Return {toolset: available_bool} for every registered toolset."""
-    return registry.check_toolset_requirements()
+    return await registry.check_toolset_requirements()
 
 
-def check_tool_availability(quiet: bool = False) -> Tuple[List[str], List[dict]]:
+async def check_tool_availability(quiet: bool = False) -> Tuple[List[str], List[dict]]:
     """Return (available_toolsets, unavailable_info)."""
-    return registry.check_tool_availability(quiet=quiet)
+    return await registry.check_tool_availability(quiet=quiet)

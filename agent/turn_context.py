@@ -415,6 +415,9 @@ async def build_turn_context(
     # (the common case, gated by the cheap ``has_registered_mcp_tools`` check)
     # or when the tool set is unchanged (``refresh_agent_mcp_tools`` diffs by
     # name and leaves the snapshot untouched on no-change).
+    initial_tool_snapshot = not getattr(
+        agent, "_tool_snapshot_initialized", False
+    )
     try:
         if not getattr(agent, "_skip_mcp_refresh", False):
             # The first discovery is intentionally lazy: ``AIAgent.__init__``
@@ -432,13 +435,34 @@ async def build_turn_context(
                 await retain_mcp_lifecycle(agent)
                 agent._mcp_lifecycle_retained = True
                 await discover_mcp_tools()
-            if (
-                not getattr(agent, "_tool_snapshot_initialized", False)
-                or has_registered_mcp_tools()
-            ):
-                await refresh_agent_mcp_tools(agent, quiet_mode=True)
+            if initial_tool_snapshot or has_registered_mcp_tools():
+                await refresh_agent_mcp_tools(
+                    agent,
+                    quiet_mode=(
+                        True
+                        if not initial_tool_snapshot
+                        else getattr(agent, "quiet_mode", False)
+                    ),
+                )
                 agent._tool_snapshot_initialized = True
-    except Exception:
+                from agent.prompt_builder import KANBAN_GUIDANCE
+
+                agent._kanban_worker_guidance = (
+                    KANBAN_GUIDANCE
+                    if "kanban_show" in agent.valid_tool_names
+                    else ""
+                )
+    except BaseException as exc:
+        if initial_tool_snapshot:
+            if getattr(agent, "_mcp_lifecycle_retained", False):
+                from tools.mcp_tool import release_mcp_lifecycle
+
+                await release_mcp_lifecycle(agent)
+                agent._mcp_lifecycle_retained = False
+            agent._mcp_discovery_started = False
+            raise
+        if isinstance(exc, asyncio.CancelledError):
+            raise
         logger.debug("between-turns MCP tool refresh skipped", exc_info=True)
 
     # Sanitize surrogate characters from user input.

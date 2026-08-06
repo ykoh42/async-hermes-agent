@@ -94,6 +94,9 @@ def agent():
         a.client = MagicMock()
         a.client.chat.completions.create = AsyncMock()
         a._deferred_provider_runtime = None
+        a.tools = _make_tool_defs("web_search")
+        a.valid_tool_names = {"web_search"}
+        a._tool_snapshot_initialized = True
         a._runtime_config_loaded = True
         a._runtime_config_snapshot = {}
         a.provider = a.requested_provider = "openrouter"

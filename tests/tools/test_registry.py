@@ -1,5 +1,6 @@
 """Tests for the central tool registry."""
 
+import asyncio
 import json
 import logging
 import threading
@@ -103,7 +104,8 @@ class TestRegisterAndDispatch:
         )
 
 class TestGetDefinitions:
-    def test_returns_openai_format(self):
+    @pytest.mark.asyncio
+    async def test_returns_openai_format(self):
         reg = ToolRegistry()
         reg.register(
             name="t1", toolset="s1", schema=_make_schema("t1"), handler=_dummy_handler
@@ -112,14 +114,15 @@ class TestGetDefinitions:
             name="t2", toolset="s1", schema=_make_schema("t2"), handler=_dummy_handler
         )
 
-        defs = reg.get_definitions({"t1", "t2"})
+        defs = await reg.get_definitions({"t1", "t2"})
         assert len(defs) == 2
         assert all(d["type"] == "function" for d in defs)
         names = {d["function"]["name"] for d in defs}
         assert names == {"t1", "t2"}
 
 
-    def test_reuses_shared_check_fn_once_per_call(self):
+    @pytest.mark.asyncio
+    async def test_reuses_shared_check_fn_once_per_call(self):
         reg = ToolRegistry()
         calls = {"count": 0}
 
@@ -142,9 +145,36 @@ class TestGetDefinitions:
             check_fn=shared_check,
         )
 
-        defs = reg.get_definitions({"first", "second"})
+        defs = await reg.get_definitions({"first", "second"})
         assert len(defs) == 2
         assert calls["count"] == 1
+
+    @pytest.mark.asyncio
+    async def test_awaits_async_check_and_dynamic_schema(self):
+        reg = ToolRegistry()
+        calls = []
+
+        async def check():
+            calls.append("check")
+            return True
+
+        async def overrides():
+            calls.append("schema")
+            return {"description": "dynamic"}
+
+        reg.register(
+            name="dynamic",
+            toolset="async",
+            schema=_make_schema("dynamic"),
+            handler=_dummy_handler,
+            check_fn=check,
+            dynamic_schema_overrides=overrides,
+        )
+
+        definitions = await reg.get_definitions({"dynamic"})
+
+        assert definitions[0]["function"]["description"] == "dynamic"
+        assert calls == ["check", "schema"]
 
 
 class TestUnknownToolDispatch:
@@ -157,14 +187,16 @@ class TestUnknownToolDispatch:
 
 
 class TestToolsetAvailability:
-    def test_no_check_fn_is_available(self):
+    @pytest.mark.asyncio
+    async def test_no_check_fn_is_available(self):
         reg = ToolRegistry()
         reg.register(
             name="t", toolset="free", schema=_make_schema(), handler=_dummy_handler
         )
-        assert reg.is_toolset_available("free") is True
+        assert await reg.is_toolset_available("free") is True
 
-    def test_check_fn_controls_availability(self):
+    @pytest.mark.asyncio
+    async def test_check_fn_controls_availability(self):
         reg = ToolRegistry()
         reg.register(
             name="t",
@@ -173,7 +205,7 @@ class TestToolsetAvailability:
             handler=_dummy_handler,
             check_fn=lambda: False,
         )
-        assert reg.is_toolset_available("locked") is False
+        assert await reg.is_toolset_available("locked") is False
 
 
     @pytest.mark.asyncio
@@ -194,7 +226,8 @@ class TestToolsetAvailability:
 class TestCheckFnExceptionHandling:
     """Verify that a raising check_fn is caught rather than crashing."""
 
-    def test_is_toolset_available_catches_exception(self):
+    @pytest.mark.asyncio
+    async def test_is_toolset_available_catches_exception(self):
         reg = ToolRegistry()
         reg.register(
             name="t",
@@ -204,10 +237,11 @@ class TestCheckFnExceptionHandling:
             check_fn=lambda: 1 / 0,  # ZeroDivisionError
         )
         # Should return False, not raise
-        assert reg.is_toolset_available("broken") is False
+        assert await reg.is_toolset_available("broken") is False
 
 
-    def test_check_tool_availability_survives_raising_check(self):
+    @pytest.mark.asyncio
+    async def test_check_tool_availability_survives_raising_check(self):
         reg = ToolRegistry()
         reg.register(
             name="a",
@@ -224,7 +258,7 @@ class TestCheckFnExceptionHandling:
             check_fn=lambda: 1 / 0,
         )
 
-        available, unavailable = reg.check_tool_availability()
+        available, unavailable = await reg.check_tool_availability()
         assert "works" in available
         assert any(u["name"] == "crashes" for u in unavailable)
 
@@ -291,7 +325,8 @@ class TestSecretCaptureResultContract:
 
 
 class TestThreadSafety:
-    def test_get_available_toolsets_uses_coherent_snapshot(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_get_available_toolsets_uses_coherent_snapshot(self, monkeypatch):
         reg = ToolRegistry()
         reg.register(
             name="alpha",
@@ -309,7 +344,7 @@ class TestThreadSafety:
 
         monkeypatch.setattr(reg, "_snapshot_state", snapshot_then_mutate)
 
-        toolsets = reg.get_available_toolsets()
+        toolsets = await reg.get_available_toolsets()
         assert toolsets["gated"]["available"] is False
         assert toolsets["gated"]["tools"] == ["alpha"]
 
@@ -342,7 +377,7 @@ class TestThreadSafety:
 
         def reader():
             try:
-                result_holder["value"] = reg.check_tool_availability()
+                result_holder["value"] = asyncio.run(reg.check_tool_availability())
             except Exception as exc:  # pragma: no cover - exercised on failure only
                 errors.append(exc)
 
@@ -402,7 +437,7 @@ class TestThreadSafety:
 
         def reader():
             try:
-                result_holder["value"] = reg.get_available_toolsets()
+                result_holder["value"] = asyncio.run(reg.get_available_toolsets())
             except Exception as exc:  # pragma: no cover - exercised on failure only
                 errors.append(exc)
 
@@ -429,7 +464,8 @@ class TestThreadSafety:
 
 
 class TestToolsetAvailabilityAggregation:
-    def test_mixed_toolset_available_when_general_tool_passes(self):
+    @pytest.mark.asyncio
+    async def test_mixed_toolset_available_when_general_tool_passes(self):
         """Desktop-only helpers must not hide general-purpose tools from doctor."""
         reg = ToolRegistry()
         reg.register(
@@ -453,14 +489,15 @@ class TestToolsetAvailabilityAggregation:
             handler=_dummy_handler,
         )
 
-        available, unavailable = reg.check_tool_availability()
+        available, unavailable = await reg.check_tool_availability()
 
         assert "terminal" in available
         assert unavailable == []
-        assert reg.is_toolset_available("terminal")
-        assert reg.get_available_toolsets()["terminal"]["available"] is True
+        assert await reg.is_toolset_available("terminal")
+        assert (await reg.get_available_toolsets())["terminal"]["available"] is True
 
-    def test_mixed_toolset_unavailable_when_every_tool_is_gated(self):
+    @pytest.mark.asyncio
+    async def test_mixed_toolset_unavailable_when_every_tool_is_gated(self):
         reg = ToolRegistry()
         reg.register(
             name="read_terminal",
@@ -477,7 +514,7 @@ class TestToolsetAvailabilityAggregation:
             check_fn=lambda: False,
         )
 
-        available, unavailable = reg.check_tool_availability()
+        available, unavailable = await reg.check_tool_availability()
 
         assert "terminal" not in available
         assert any(item["name"] == "terminal" for item in unavailable)

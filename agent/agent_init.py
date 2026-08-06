@@ -1649,29 +1649,15 @@ def init_agent(
     agent._mcp_discovery_started = False
     agent._mcp_lifecycle_retained = False
 
-    # Build a static schema snapshot without running availability probes or
-    # reading configuration. MCP transport discovery remains deferred.
-    agent.tools = _ra().get_tool_definitions(
-        enabled_toolsets=enabled_toolsets,
-        disabled_toolsets=disabled_toolsets,
-        quiet_mode=agent.quiet_mode,
-        probe_availability=False,
-    )
-    agent.valid_tool_names = {
-        tool["function"]["name"] for tool in (agent.tools or [])
-    }
-    agent._tool_snapshot_initialized = True
+    # Tool availability and dynamic schemas may require async config or
+    # provider checks. The first turn prologue builds the complete snapshot
+    # before constructing the system prompt or making a model request.
+    agent.tools = []
+    agent.valid_tool_names = set()
+    agent._tool_snapshot_initialized = False
 
-    # Kanban worker/orchestrator lifecycle guidance is session-static:
-    # the dispatcher decides at spawn time whether this process is a kanban
-    # worker (kanban_show tool is present iff HERMES_KANBAN_TASK is set).
-    # Resolving the ~835-token block once here avoids re-running the
-    # membership test + reference on every system-prompt rebuild
-    # (init + each context compression).
-    from agent.prompt_builder import KANBAN_GUIDANCE
-    agent._kanban_worker_guidance = (
-        KANBAN_GUIDANCE if "kanban_show" in agent.valid_tool_names else ""
-    )
+    # Populated with the first async tool snapshot before prompt construction.
+    agent._kanban_worker_guidance = ""
 
     # Show trajectory saving status
     if agent.save_trajectories and not agent.quiet_mode:

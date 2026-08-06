@@ -299,7 +299,8 @@ class TestDisabledToolsetsPostureToolset:
     not own -- same non-core-delta subtraction as hermes-* bundles (#33924) --
     while atomic toolsets stay fully removable."""
 
-    def test_disabling_coding_preserves_core_but_atomic_disables_still_remove(self):
+    @pytest.mark.asyncio
+    async def test_disabling_coding_preserves_core_but_atomic_disables_still_remove(self):
         from model_tools import get_tool_definitions
 
         # web_search is check_fn-gated (needs an API key); probe only the core
@@ -308,7 +309,7 @@ class TestDisabledToolsetsPostureToolset:
 
         baseline = {
             t["function"]["name"]
-            for t in get_tool_definitions(quiet_mode=True)
+            for t in await get_tool_definitions(quiet_mode=True)
         }
         present_core = core_probe & baseline
         # Sanity: at least some probed core tools are available in this env.
@@ -316,7 +317,7 @@ class TestDisabledToolsetsPostureToolset:
 
         no_coding = {
             t["function"]["name"]
-            for t in get_tool_definitions(
+            for t in await get_tool_definitions(
                 disabled_toolsets=["coding"], quiet_mode=True
             )
         }
@@ -329,7 +330,7 @@ class TestDisabledToolsetsPostureToolset:
         # Atomic (non-posture) toolsets must still be fully removable.
         no_terminal = {
             t["function"]["name"]
-            for t in get_tool_definitions(
+            for t in await get_tool_definitions(
                 disabled_toolsets=["terminal"], quiet_mode=True
             )
         }
@@ -337,7 +338,7 @@ class TestDisabledToolsetsPostureToolset:
 
         no_file = {
             t["function"]["name"]
-            for t in get_tool_definitions(
+            for t in await get_tool_definitions(
                 disabled_toolsets=["file"], quiet_mode=True
             )
         }

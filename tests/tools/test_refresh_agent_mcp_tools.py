@@ -10,6 +10,7 @@ freezing any particular tool list.
 
 import asyncio
 import types
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -35,10 +36,11 @@ async def test_refresh_adds_late_landing_tools(monkeypatch):
     agent = _agent(["read_file", "terminal"])
 
     new_defs = [_tool(n) for n in ("read_file", "terminal", "mcp_granola_get_account_info")]
-    monkeypatch.setattr(mcp_tool, "get_tool_definitions", lambda **kw: new_defs, raising=False)
-    # get_tool_definitions is imported inside the helper from model_tools, so patch there too.
+    # get_tool_definitions is imported inside the helper from model_tools.
     import model_tools
-    monkeypatch.setattr(model_tools, "get_tool_definitions", lambda **kw: new_defs)
+    monkeypatch.setattr(
+        model_tools, "get_tool_definitions", AsyncMock(return_value=new_defs)
+    )
 
     added = await mcp_tool.refresh_agent_mcp_tools(agent)
 
@@ -71,7 +73,7 @@ async def test_refresh_preserves_context_engine_tools(monkeypatch):
     # the context tools (they're never in get_tool_definitions output).
     monkeypatch.setattr(
         model_tools, "get_tool_definitions",
-        lambda **kw: [_tool("read_file"), _tool("mcp_new_server_tool")],
+        AsyncMock(return_value=[_tool("read_file"), _tool("mcp_new_server_tool")]),
     )
 
     added = await mcp_tool.refresh_agent_mcp_tools(agent)
@@ -96,7 +98,7 @@ async def test_refresh_respects_context_engine_toolset_gate(monkeypatch):
     import model_tools
     monkeypatch.setattr(
         model_tools, "get_tool_definitions",
-        lambda **kw: [_tool("read_file"), _tool("mcp_new_tool")],
+        AsyncMock(return_value=[_tool("read_file"), _tool("mcp_new_tool")]),
     )
 
     await mcp_tool.refresh_agent_mcp_tools(agent)
@@ -114,7 +116,9 @@ async def test_refreshed_tool_is_callable_through_valid_tool_names_guard(monkeyp
     import model_tools
     monkeypatch.setattr(
         model_tools, "get_tool_definitions",
-        lambda **kw: [_tool("read_file"), _tool("mcp_granola_list_meetings")],
+        AsyncMock(
+            return_value=[_tool("read_file"), _tool("mcp_granola_list_meetings")]
+        ),
     )
 
     # Before refresh the run loop would reject the call ("Tool does not exist").
@@ -147,7 +151,7 @@ async def test_refresh_is_task_safe_under_concurrent_calls(monkeypatch):
         return list(next(flip))
 
     import model_tools
-    monkeypatch.setattr(model_tools, "get_tool_definitions", _gtd)
+    monkeypatch.setattr(model_tools, "get_tool_definitions", AsyncMock(side_effect=_gtd))
 
     async def _worker():
         for _ in range(50):

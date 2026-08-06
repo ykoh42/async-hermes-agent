@@ -70,7 +70,11 @@ def _make_agent(monkeypatch, provider, api_mode="chat_completions", base_url="ht
         kwargs["model"] = model
     elif provider == "nous":
         kwargs["model"] = "gpt-5"
-    return AIAgent(**kwargs)
+    agent = AIAgent(**kwargs)
+    agent.tools = _tool_defs("web_search", "terminal")
+    agent.valid_tool_names = {"web_search", "terminal"}
+    agent._tool_snapshot_initialized = True
+    return agent
 
 
 # ── _build_api_kwargs tests ─────────────────────────────────────────────────

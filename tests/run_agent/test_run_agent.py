@@ -78,6 +78,9 @@ def agent():
         a.client.chat.completions.create = AsyncMock()
         a._deferred_provider_runtime = None
         a.provider = a.requested_provider = "openrouter"
+        a.tools = _make_tool_defs("web_search")
+        a.valid_tool_names = {"web_search"}
+        a._tool_snapshot_initialized = True
         return a
 
 
@@ -191,6 +194,9 @@ def agent_with_memory_tool():
         a.client.chat.completions.create = AsyncMock()
         a._deferred_provider_runtime = None
         a.provider = a.requested_provider = "openrouter"
+        a.tools = _make_tool_defs("web_search", "memory")
+        a.valid_tool_names = {"web_search", "memory"}
+        a._tool_snapshot_initialized = True
         return a
 
 
@@ -892,6 +898,11 @@ class TestBuildSystemPrompt:
                 skip_context_files=True,
                 skip_memory=True,
             )
+            agent.tools = tools
+            agent.valid_tool_names = {
+                tool["function"]["name"] for tool in tools
+            }
+            agent._tool_snapshot_initialized = True
 
             prompt = await agent._build_system_prompt()
 
@@ -929,6 +940,9 @@ class TestToolUseEnforcementConfig:
                 skip_memory=True,
             )
             a.client = MagicMock()
+            a.tools = _make_tool_defs("terminal", "web_search")
+            a.valid_tool_names = {"terminal", "web_search"}
+            a._tool_snapshot_initialized = True
             return a
 
     @pytest.mark.asyncio
@@ -1019,6 +1033,9 @@ class TestTaskCompletionGuidance:
                 skip_memory=True,
             )
             a.client = MagicMock()
+            a.tools = _make_tool_defs("terminal", "web_search")
+            a.valid_tool_names = {"terminal", "web_search"}
+            a._tool_snapshot_initialized = True
             return a
 
     @pytest.mark.asyncio

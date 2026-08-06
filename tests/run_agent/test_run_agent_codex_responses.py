@@ -57,6 +57,18 @@ def _build_agent(monkeypatch):
     agent._save_trajectory = AsyncMock()
     agent._runtime_config_loaded = True
     agent._runtime_config_snapshot = {}
+    agent.tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "terminal",
+                "description": "Run shell commands.",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }
+    ]
+    agent.valid_tool_names = {"terminal"}
+    agent._tool_snapshot_initialized = True
     return agent
 
 

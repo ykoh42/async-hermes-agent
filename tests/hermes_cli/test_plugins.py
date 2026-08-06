@@ -669,7 +669,8 @@ class TestPluginContext:
 class TestPluginToolVisibility:
     """Plugin-registered tools appear in get_tool_definitions()."""
 
-    def test_plugin_tools_in_definitions(self, tmp_path, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_plugin_tools_in_definitions(self, tmp_path, monkeypatch):
         """Plugin tools are reachable when their toolset is in enabled_toolsets.
 
         Under tiered disclosure (any MCP/plugin tool defers behind the
@@ -716,16 +717,16 @@ class TestPluginToolVisibility:
             return bool(search and "vis_tool" in search["function"]["description"])
 
         # Reachable when its toolset is explicitly enabled
-        tools = get_tool_definitions(enabled_toolsets=["terminal", "plugin_vis_plugin"], quiet_mode=True)
+        tools = await get_tool_definitions(enabled_toolsets=["terminal", "plugin_vis_plugin"], quiet_mode=True)
         assert _reachable(tools)
 
         # Excluded entirely when only other toolsets are enabled — not
         # direct, not in the deferred listing.
-        tools2 = get_tool_definitions(enabled_toolsets=["terminal"], quiet_mode=True)
+        tools2 = await get_tool_definitions(enabled_toolsets=["terminal"], quiet_mode=True)
         assert not _reachable(tools2)
 
         # Reachable when no toolset filter is active (all enabled)
-        tools3 = get_tool_definitions(quiet_mode=True)
+        tools3 = await get_tool_definitions(quiet_mode=True)
         assert _reachable(tools3)
 
         registry.deregister("vis_tool")

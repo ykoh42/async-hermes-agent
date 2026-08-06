@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import types
 import asyncio
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -309,12 +309,11 @@ async def test_between_turns_refresh_adds_late_tool_when_servers_registered():
 
     import model_tools
     with patch("tools.mcp_tool.has_registered_mcp_tools", return_value=True), \
-         patch.object(model_tools, "get_tool_definitions", return_value=[new_def]):
+         patch.object(model_tools, "get_tool_definitions", new=AsyncMock(return_value=[new_def])):
         await _build(agent)
 
     assert "mcp_x_tool" in agent.valid_tool_names
     assert any(t["function"]["name"] == "mcp_x_tool" for t in agent.tools)
-
 
 
 

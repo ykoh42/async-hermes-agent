@@ -594,6 +594,37 @@ class AIAgent:
     async def __aenter__(self):
         """Support ``async with AIAgent(...)`` without a separate start API."""
         await self._ensure_provider_runtime()
+        if not getattr(self, "_mcp_discovery_started", False):
+            from tools.mcp_tool import (
+                discover_mcp_tools,
+                release_mcp_lifecycle,
+                refresh_agent_mcp_tools,
+                retain_mcp_lifecycle,
+            )
+
+            self._mcp_discovery_started = True
+            try:
+                await retain_mcp_lifecycle(self)
+                self._mcp_lifecycle_retained = True
+                await discover_mcp_tools()
+                if not getattr(self, "_tool_snapshot_initialized", False):
+                    await refresh_agent_mcp_tools(
+                        self, quiet_mode=getattr(self, "quiet_mode", False)
+                    )
+                    self._tool_snapshot_initialized = True
+                    from agent.prompt_builder import KANBAN_GUIDANCE
+
+                    self._kanban_worker_guidance = (
+                        KANBAN_GUIDANCE
+                        if "kanban_show" in self.valid_tool_names
+                        else ""
+                    )
+            except BaseException:
+                if self._mcp_lifecycle_retained:
+                    await release_mcp_lifecycle(self)
+                    self._mcp_lifecycle_retained = False
+                self._mcp_discovery_started = False
+                raise
         return self
 
     async def __aexit__(self, exc_type, exc, tb) -> bool:
@@ -6520,7 +6551,7 @@ async def main(
         
         # Show legacy toolset compatibility
         print("\n📦 Legacy Toolsets (for backward compatibility):")
-        legacy_toolsets = get_available_toolsets()
+        legacy_toolsets = await get_available_toolsets()
         for name, info in legacy_toolsets.items():
             status = "✅" if info["available"] else "❌"
             print(f"  {status} {name}: {info['description']}")

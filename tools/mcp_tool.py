@@ -6253,11 +6253,10 @@ async def refresh_agent_mcp_tools(
     # publish below happen together in ONE critical section so two concurrent
     # callers can't torn-publish or compute overlapping ``added`` sets.
     new_defs = list(
-        get_tool_definitions(
+        await get_tool_definitions(
             enabled_toolsets=enabled,
             disabled_toolsets=disabled,
             quiet_mode=quiet_mode,
-            probe_availability=False,
         )
         or []
     )

@@ -49,7 +49,8 @@ class TestCheckFnTransientFailureSuppression:
         yield
         invalidate_check_fn_cache()
 
-    def test_transient_failure_after_success_is_suppressed(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_transient_failure_after_success_is_suppressed(self, monkeypatch):
         import tools.registry as reg
 
         calls = {"n": 0}
@@ -64,13 +65,14 @@ class TestCheckFnTransientFailureSuppression:
         t = {"now": 1000.0}
         monkeypatch.setattr(reg.time, "monotonic", lambda: t["now"])
 
-        assert reg._check_fn_cached(flaky) is True  # records last-good
+        assert await reg._check_fn_cached(flaky) is True  # records last-good
         t["now"] += reg._CHECK_FN_TTL_SECONDS + 1  # expire the TTL cache
         # Within grace window of the success → flake suppressed, stays True.
-        assert reg._check_fn_cached(flaky) is True
+        assert await reg._check_fn_cached(flaky) is True
         assert calls["n"] == 2  # the probe actually ran (not just cached)
 
-    def test_persistent_failure_after_grace_is_honored(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_persistent_failure_after_grace_is_honored(self, monkeypatch):
         import tools.registry as reg
 
         def good():
@@ -82,14 +84,15 @@ class TestCheckFnTransientFailureSuppression:
         t = {"now": 1000.0}
         monkeypatch.setattr(reg.time, "monotonic", lambda: t["now"])
 
-        assert reg._check_fn_cached(good) is True
+        assert await reg._check_fn_cached(good) is True
         # Advance past the failure grace window, then fail.
         t["now"] += reg._CHECK_FN_FAILURE_GRACE_SECONDS + 1
         # Different fn so last-good for `good` doesn't apply; bad has no success.
-        assert reg._check_fn_cached(bad) is False
+        assert await reg._check_fn_cached(bad) is False
 
 
-    def test_grace_expiry_lets_real_outage_through(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_grace_expiry_lets_real_outage_through(self, monkeypatch):
         import tools.registry as reg
 
         state = {"ok": True}
@@ -100,16 +103,17 @@ class TestCheckFnTransientFailureSuppression:
         t = {"now": 1000.0}
         monkeypatch.setattr(reg.time, "monotonic", lambda: t["now"])
 
-        assert reg._check_fn_cached(probe) is True
+        assert await reg._check_fn_cached(probe) is True
         state["ok"] = False
         # Just past TTL, within grace → flake suppressed.
         t["now"] += reg._CHECK_FN_TTL_SECONDS + 1
-        assert reg._check_fn_cached(probe) is True
+        assert await reg._check_fn_cached(probe) is True
         # Now move well past the grace window since the last success → honored.
         t["now"] += reg._CHECK_FN_FAILURE_GRACE_SECONDS + 1
-        assert reg._check_fn_cached(probe) is False
+        assert await reg._check_fn_cached(probe) is False
 
-    def test_profile_scoped_availability_does_not_cross_multiplex_profiles(
+    @pytest.mark.asyncio
+    async def test_profile_scoped_availability_does_not_cross_multiplex_profiles(
         self, tmp_path
     ):
         """Both availability caches must use the active profile as a key."""
@@ -154,7 +158,7 @@ class TestCheckFnTransientFailureSuppression:
             home_a = set_hermes_home_override(str(profile_a))
             secrets_a = set_secret_scope({"PROFILE_CACHE_TEST_TOKEN": "token-a"})
             try:
-                tools_a = get_tool_definitions(
+                tools_a = await get_tool_definitions(
                     enabled_toolsets=["profile-cache-test"],
                     quiet_mode=True,
                     skip_tool_search_assembly=True,
@@ -166,7 +170,7 @@ class TestCheckFnTransientFailureSuppression:
             home_b = set_hermes_home_override(str(profile_b))
             secrets_b = set_secret_scope({})
             try:
-                tools_b = get_tool_definitions(
+                tools_b = await get_tool_definitions(
                     enabled_toolsets=["profile-cache-test"],
                     quiet_mode=True,
                     skip_tool_search_assembly=True,
@@ -183,7 +187,8 @@ class TestCheckFnTransientFailureSuppression:
             reg.invalidate_check_fn_cache()
             _clear_tool_defs_cache()
 
-    def test_unscoped_multiplex_request_bypasses_cache(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_unscoped_multiplex_request_bypasses_cache(self, monkeypatch):
         """An unknown profile must never share another request's cache entry."""
         import model_tools
         import tools.registry as reg
@@ -195,19 +200,19 @@ class TestCheckFnTransientFailureSuppression:
         def probe():
             return next(values)
 
-        def compute_definitions(*_args, **_kwargs):
+        async def compute_definitions(*_args, **_kwargs):
             definition_calls["n"] += 1
             return []
 
         set_multiplex_active(True)
         monkeypatch.setattr(model_tools, "_compute_tool_definitions", compute_definitions)
         try:
-            assert reg._check_fn_cached(probe) is True
-            assert reg._check_fn_cached(probe) is False
+            assert await reg._check_fn_cached(probe) is True
+            assert await reg._check_fn_cached(probe) is False
             assert not reg._check_fn_cache
 
-            model_tools.get_tool_definitions(quiet_mode=True)
-            model_tools.get_tool_definitions(quiet_mode=True)
+            await model_tools.get_tool_definitions(quiet_mode=True)
+            await model_tools.get_tool_definitions(quiet_mode=True)
             assert definition_calls["n"] == 2
             assert not model_tools._tool_defs_cache
         finally:
@@ -215,23 +220,29 @@ class TestCheckFnTransientFailureSuppression:
             reg.invalidate_check_fn_cache()
             model_tools._clear_tool_defs_cache()
 
-    def test_profile_scoped_check_cache_is_bounded(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_profile_scoped_check_cache_is_bounded(self, monkeypatch):
         """Many multiplex profiles must not grow registry caches forever."""
         import tools.registry as reg
 
         scopes = iter(f"/profiles/{index}" for index in range(1_000))
-        monkeypatch.setattr(reg, "check_fn_cache_scope", lambda: next(scopes))
+
+        async def next_scope():
+            return next(scopes)
+
+        monkeypatch.setattr(reg, "check_fn_cache_scope", next_scope)
 
         def available():
             return True
 
         for _ in range(1_000):
-            assert reg._check_fn_cached(available) is True
+            assert await reg._check_fn_cached(available) is True
 
         assert len(reg._check_fn_cache) <= reg._CHECK_FN_CACHE_MAX
         assert len(reg._check_fn_last_good) <= reg._CHECK_FN_CACHE_MAX
 
-    def test_subagent_keeps_file_tools_through_docker_flake(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_subagent_keeps_file_tools_through_docker_flake(self, monkeypatch):
         """End-to-end: a docker probe that flakes on the 2nd build keeps the
         file/terminal toolset available for the subagent being constructed."""
         import tools.registry as reg
@@ -262,14 +273,14 @@ class TestCheckFnTransientFailureSuppression:
         reg.invalidate_check_fn_cache()
         _clear_tool_defs_cache()
         # Parent build (probe ok) → records last-good.
-        parent = get_tool_definitions(enabled_toolsets=["terminal", "file"], quiet_mode=True)
+        parent = await get_tool_definitions(enabled_toolsets=["terminal", "file"], quiet_mode=True)
         assert "read_file" in {x["function"]["name"] for x in parent}
 
         # Subagent build moments later: TTL expired, probe flakes False, but
         # within grace → file/terminal tools must still resolve.
         t["now"] += reg._CHECK_FN_TTL_SECONDS + 1
         _clear_tool_defs_cache()
-        child = get_tool_definitions(enabled_toolsets=["terminal", "file"], quiet_mode=True)
+        child = await get_tool_definitions(enabled_toolsets=["terminal", "file"], quiet_mode=True)
         child_names = {x["function"]["name"] for x in child}
         assert {"read_file", "write_file", "patch", "search_files", "terminal"}.issubset(
             child_names

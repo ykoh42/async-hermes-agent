@@ -21,8 +21,8 @@ from agent import tool_executor
 from agent.tool_executor import execute_tool_calls_segmented
 from hermes_state import SessionDB
 from run_agent import AIAgent
-from model_tools import handle_function_call
-from tools.registry import registry
+from model_tools import get_tool_definitions, handle_function_call
+from tools.registry import ToolRegistry, check_fn_cache_scope, registry
 from tools.clarify_tool import clarify_tool
 from tools.memory_tool import MemoryStore, memory_tool
 from tools.skills_tool import skill_view, skills_list
@@ -95,6 +95,10 @@ def test_conversation_and_chat_are_coroutines():
     assert inspect.iscoroutinefunction(_apply_context_engine_selection)
     assert inspect.iscoroutinefunction(_notify_context_engine_turn_complete)
     assert inspect.iscoroutinefunction(execute_tool_calls_segmented)
+    assert inspect.iscoroutinefunction(get_tool_definitions)
+    assert inspect.iscoroutinefunction(ToolRegistry.get_definitions)
+    assert inspect.iscoroutinefunction(ToolRegistry.check_tool_availability)
+    assert inspect.iscoroutinefunction(check_fn_cache_scope)
     assert inspect.iscoroutinefunction(BatchRunner.run)
     assert inspect.iscoroutinefunction(batch_main)
     assert inspect.iscoroutinefunction(CompressionConfig.from_yaml)
@@ -151,6 +155,70 @@ def test_constructor_does_not_read_runtime_config_or_create_logs():
         )
 
     assert agent._deferred_provider_runtime is not None
+    assert agent.tools == []
+    assert agent.valid_tool_names == set()
+
+
+@pytest.mark.asyncio
+async def test_async_context_manager_initializes_provider_mcp_and_tools():
+    agent = AIAgent(
+        api_key="test-key",
+        base_url="https://example.invalid/v1",
+        model="test-model",
+        quiet_mode=True,
+        skip_context_files=True,
+        skip_memory=True,
+    )
+    agent._ensure_provider_runtime = AsyncMock()
+    agent.close = AsyncMock()
+
+    with (
+        patch("tools.mcp_tool.retain_mcp_lifecycle", new=AsyncMock()) as retain,
+        patch("tools.mcp_tool.discover_mcp_tools", new=AsyncMock()) as discover,
+        patch("tools.mcp_tool.release_mcp_lifecycle", new=AsyncMock()) as release,
+        patch(
+            "tools.mcp_tool.refresh_agent_mcp_tools", new=AsyncMock()
+        ) as refresh,
+    ):
+        async with agent as entered:
+            assert entered is agent
+            assert agent._tool_snapshot_initialized is True
+
+    agent._ensure_provider_runtime.assert_awaited_once()
+    retain.assert_awaited_once_with(agent)
+    discover.assert_awaited_once()
+    refresh.assert_awaited_once_with(agent, quiet_mode=True)
+    release.assert_not_awaited()
+    agent.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_async_context_manager_rolls_back_failed_mcp_initialization():
+    agent = AIAgent(
+        api_key="test-key",
+        base_url="https://example.invalid/v1",
+        model="test-model",
+        quiet_mode=True,
+        skip_context_files=True,
+        skip_memory=True,
+    )
+    agent._ensure_provider_runtime = AsyncMock()
+
+    with (
+        patch("tools.mcp_tool.retain_mcp_lifecycle", new=AsyncMock()),
+        patch("tools.mcp_tool.discover_mcp_tools", new=AsyncMock()),
+        patch("tools.mcp_tool.release_mcp_lifecycle", new=AsyncMock()) as release,
+        patch(
+            "tools.mcp_tool.refresh_agent_mcp_tools",
+            new=AsyncMock(side_effect=RuntimeError("snapshot failed")),
+        ),
+        pytest.raises(RuntimeError, match="snapshot failed"),
+    ):
+        await agent.__aenter__()
+
+    release.assert_awaited_once_with(agent)
+    assert agent._mcp_lifecycle_retained is False
+    assert agent._mcp_discovery_started is False
 
 
 @pytest.mark.asyncio
@@ -2729,6 +2797,7 @@ async def test_cancelled_tool_batch_persists_ordered_cancelled_observation(
     agent._session_db_created = False
     agent.compression_enabled = False
     agent.valid_tool_names = {tool_name}
+    agent._tool_snapshot_initialized = True
 
     async def model_response(*_args, **_kwargs):
         return SimpleNamespace(

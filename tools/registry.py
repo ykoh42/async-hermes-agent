@@ -18,13 +18,16 @@ import importlib
 import inspect
 import json
 import logging
+import os
 import sys
 import threading
 import time
-from pathlib import Path
 from typing import Callable, Dict, List, Optional, Set
 
+import aiofiles.os
+
 logger = logging.getLogger(__name__)
+_realpath = aiofiles.os.wrap(os.path.realpath)
 
 
 # This checkout uses the registry as the async training/runtime waist. Keep the
@@ -174,7 +177,7 @@ def _prune_check_fn_caches(now: float) -> None:
         _check_fn_last_good.pop(next(iter(_check_fn_last_good)))
 
 
-def check_fn_cache_scope() -> Optional[str]:
+async def check_fn_cache_scope() -> Optional[str]:
     """Return the active profile key for multiplexed availability checks."""
     try:
         from agent.secret_scope import is_multiplex_active
@@ -186,18 +189,21 @@ def check_fn_cache_scope() -> Optional[str]:
         override = get_hermes_home_override()
         if not override:
             return CHECK_FN_CACHE_BYPASS
-        return str(Path(override).expanduser().resolve())
+        return await _realpath(os.path.expanduser(str(override)))
     except Exception:
         return CHECK_FN_CACHE_BYPASS
 
 
-def _check_fn_cached(fn: Callable) -> bool:
+async def _check_fn_cached(fn: Callable) -> bool:
     """Return bool(fn()), TTL-cached across calls."""
     now = time.monotonic()
-    scope = check_fn_cache_scope()
+    scope = await check_fn_cache_scope()
     if scope == CHECK_FN_CACHE_BYPASS:
         try:
-            return bool(fn())
+            value = fn()
+            if inspect.isawaitable(value):
+                value = await value
+            return bool(value)
         except Exception:
             logger.warning(
                 "check_fn %s raised while profile cache scope was unresolved",
@@ -216,7 +222,10 @@ def _check_fn_cached(fn: Callable) -> bool:
 
     raised = False
     try:
-        value = bool(fn())
+        value = fn()
+        if inspect.isawaitable(value):
+            value = await value
+        value = bool(value)
     except Exception:
         value = False
         raised = True
@@ -287,7 +296,7 @@ class ToolRegistry:
         """Return a stable snapshot of registered tool entries."""
         return self._snapshot_state()[0]
 
-    def _toolset_has_exposable_tools(
+    async def _toolset_has_exposable_tools(
         self,
         toolset: str,
         entries: List[ToolEntry],
@@ -306,7 +315,7 @@ class ToolRegistry:
             if not entry.check_fn:
                 return True
             if entry.check_fn not in check_results:
-                check_results[entry.check_fn] = _check_fn_cached(entry.check_fn)
+                check_results[entry.check_fn] = await _check_fn_cached(entry.check_fn)
             if check_results[entry.check_fn]:
                 return True
         return False
@@ -408,12 +417,12 @@ class ToolRegistry:
         toolset: str,
         schema: dict,
         handler: Callable,
-        check_fn: Callable = None,
-        requires_env: list = None,
+        check_fn: Optional[Callable] = None,
+        requires_env: Optional[list] = None,
         description: str = "",
         emoji: str = "",
         max_result_size_chars: int | float | None = None,
-        dynamic_schema_overrides: Callable = None,
+        dynamic_schema_overrides: Optional[Callable] = None,
         override: bool = False,
     ):
         """Register a tool.  Called at module-import time by each tool file.
@@ -571,7 +580,7 @@ class ToolRegistry:
     # Schema retrieval
     # ------------------------------------------------------------------
 
-    def get_definitions(
+    async def get_definitions(
         self,
         tool_names: Set[str],
         quiet: bool = False,
@@ -600,7 +609,7 @@ class ToolRegistry:
                 continue
             if entry.check_fn and probe_availability:
                 if entry.check_fn not in check_results:
-                    check_results[entry.check_fn] = _check_fn_cached(entry.check_fn)
+                    check_results[entry.check_fn] = await _check_fn_cached(entry.check_fn)
                 if not check_results[entry.check_fn]:
                     if not quiet:
                         logger.debug("Tool %s unavailable (check failed)", name)
@@ -615,6 +624,8 @@ class ToolRegistry:
             if entry.dynamic_schema_overrides is not None:
                 try:
                     overrides = entry.dynamic_schema_overrides()
+                    if inspect.isawaitable(overrides):
+                        overrides = await overrides
                     if isinstance(overrides, dict):
                         schema_with_name.update(overrides)
                 except Exception as exc:
@@ -730,25 +741,25 @@ class ToolRegistry:
         """Return ``{tool_name: toolset_name}`` for every registered tool."""
         return {entry.name: entry.toolset for entry in self._snapshot_entries()}
 
-    def is_toolset_available(self, toolset: str) -> bool:
+    async def is_toolset_available(self, toolset: str) -> bool:
         """Check if a toolset has at least one exposable tool.
 
         Returns False (rather than crashing) when a per-tool check raises
         an unexpected exception (e.g. network error, missing import, bad config).
         """
         entries, _ = self._snapshot_state()
-        return self._toolset_has_exposable_tools(toolset, entries)
+        return await self._toolset_has_exposable_tools(toolset, entries)
 
-    def check_toolset_requirements(self) -> Dict[str, bool]:
+    async def check_toolset_requirements(self) -> Dict[str, bool]:
         """Return ``{toolset: available_bool}`` for every toolset."""
         entries, _ = self._snapshot_state()
         toolsets = sorted({entry.toolset for entry in entries})
         return {
-            toolset: self._toolset_has_exposable_tools(toolset, entries)
+            toolset: await self._toolset_has_exposable_tools(toolset, entries)
             for toolset in toolsets
         }
 
-    def get_available_toolsets(self) -> Dict[str, dict]:
+    async def get_available_toolsets(self) -> Dict[str, dict]:
         """Return toolset metadata for UI display."""
         toolsets: Dict[str, dict] = {}
         entries, _ = self._snapshot_state()
@@ -756,7 +767,7 @@ class ToolRegistry:
             ts = entry.toolset
             if ts not in toolsets:
                 toolsets[ts] = {
-                    "available": self._toolset_has_exposable_tools(ts, entries),
+                    "available": await self._toolset_has_exposable_tools(ts, entries),
                     "tools": [],
                     "description": "",
                     "requirements": [],
@@ -789,14 +800,14 @@ class ToolRegistry:
                     result[ts]["env_vars"].append(env)
         return result
 
-    def check_tool_availability(self, quiet: bool = False):
+    async def check_tool_availability(self, quiet: bool = False):
         """Return (available_toolsets, unavailable_info) like the old function."""
         available = []
         unavailable = []
         entries, _ = self._snapshot_state()
         for ts in sorted({entry.toolset for entry in entries}):
             ts_entries = [entry for entry in entries if entry.toolset == ts]
-            if self._toolset_has_exposable_tools(ts, entries):
+            if await self._toolset_has_exposable_tools(ts, entries):
                 available.append(ts)
             else:
                 unavailable.append({

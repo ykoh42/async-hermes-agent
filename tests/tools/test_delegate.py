@@ -139,7 +139,7 @@ class TestStripBlockedTools(unittest.IsolatedAsyncioTestCase):
             "memory",
         ):
             self.assertIn(toolset_name, disabled)
-        definitions = model_tools.get_tool_definitions(
+        definitions = await model_tools.get_tool_definitions(
             enabled_toolsets=kwargs["enabled_toolsets"],
             disabled_toolsets=disabled,
             quiet_mode=True,
@@ -177,7 +177,7 @@ class TestStripBlockedTools(unittest.IsolatedAsyncioTestCase):
         _, kwargs = MockAgent.call_args
         disabled = kwargs["disabled_toolsets"]
         self.assertNotIn("delegation", disabled)
-        definitions = model_tools.get_tool_definitions(
+        definitions = await model_tools.get_tool_definitions(
             enabled_toolsets=kwargs["enabled_toolsets"],
             disabled_toolsets=disabled,
             quiet_mode=True,

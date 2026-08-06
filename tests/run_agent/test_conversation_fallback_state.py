@@ -84,6 +84,8 @@ async def test_substantive_tool_only_turn_invalidates_older_housekeeping_fallbac
     agent.compression_enabled = False
     agent.save_trajectories = False
     agent.valid_tool_names = {"todo", "web_search"}
+    agent.tools = _tool_defs("todo", "web_search")
+    agent._tool_snapshot_initialized = True
     agent._deferred_provider_runtime = None
     agent.client = MagicMock()
     agent.client.chat.completions.create = AsyncMock(side_effect=[

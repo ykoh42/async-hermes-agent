@@ -31,10 +31,11 @@ def _clear_cache():
 
 class TestQuietModeCacheIsolation:
 
-    def test_first_uncached_call_returns_fresh_list(self):
+    @pytest.mark.asyncio
+    async def test_first_uncached_call_returns_fresh_list(self):
         """The first quiet_mode call must not alias the cached object \u2014
         otherwise a caller mutating the returned list mutates the cache."""
-        first = model_tools.get_tool_definitions(quiet_mode=True)
+        first = await model_tools.get_tool_definitions(quiet_mode=True)
         assert isinstance(first, list)
         # Find the cached value to compare identity.
         assert len(model_tools._tool_defs_cache) == 1
@@ -44,39 +45,42 @@ class TestQuietModeCacheIsolation:
             "by reference \u2014 mutations will leak into subsequent calls."
         )
 
-    def test_cache_hit_returns_fresh_list(self):
+    @pytest.mark.asyncio
+    async def test_cache_hit_returns_fresh_list(self):
         """The cache-hit path already returned a copy pre-fix; pin it."""
-        first = model_tools.get_tool_definitions(quiet_mode=True)
-        second = model_tools.get_tool_definitions(quiet_mode=True)
+        first = await model_tools.get_tool_definitions(quiet_mode=True)
+        second = await model_tools.get_tool_definitions(quiet_mode=True)
         assert first is not second
         cached = next(iter(model_tools._tool_defs_cache.values()))
         assert second is not cached
 
 
 
-    def test_cache_bounded_by_eviction(self):
+    @pytest.mark.asyncio
+    async def test_cache_bounded_by_eviction(self):
         """The cache evicts the oldest entry when it reaches the cap,
         keeping the cache bounded instead of growing unbounded over a
         long-lived Gateway's lifetime (#19251)."""
         cap = model_tools._TOOL_DEFS_CACHE_MAX
         # Fill cache to the cap with distinct keys by varying enabled_toolsets.
         for i in range(cap):
-            model_tools.get_tool_definitions(
+            await model_tools.get_tool_definitions(
                 enabled_toolsets=[f"fake_toolset_{i}"], quiet_mode=True,
             )
         assert len(model_tools._tool_defs_cache) == cap
 
         # Adding one more must evict the oldest, not clear everything and
         # not grow past the cap.
-        model_tools.get_tool_definitions(
+        await model_tools.get_tool_definitions(
             enabled_toolsets=["fake_toolset_overflow"], quiet_mode=True,
         )
         assert len(model_tools._tool_defs_cache) == cap, (
             "Eviction should keep the cache at the cap, not clear it or grow"
         )
 
-    def test_non_quiet_mode_does_not_use_cache(self):
+    @pytest.mark.asyncio
+    async def test_non_quiet_mode_does_not_use_cache(self):
         """Sanity: quiet_mode=False (TUI path) skips the cache entirely \u2014
         explains why the bug only hit Gateway."""
-        model_tools.get_tool_definitions(quiet_mode=False)
+        await model_tools.get_tool_definitions(quiet_mode=False)
         assert len(model_tools._tool_defs_cache) == 0
