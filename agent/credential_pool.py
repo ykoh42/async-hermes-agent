@@ -1195,12 +1195,7 @@ class CredentialPool:
     async def _refresh_entry(
         self, entry: PooledCredential, *, force: bool,
     ) -> Optional[PooledCredential]:
-        """Refresh an OAuth entry only through a native provider transport."""
-        # This cannot be a module import because runtime helpers already import
-        # this module.  Bind it before the try block so the exception handler
-        # is valid for the Anthropic branch as well.
-        from agent.agent_runtime_helpers import UnsupportedCapabilityError
-
+        """Refresh an OAuth entry through its native provider transport."""
         if entry.auth_type != AUTH_TYPE_OAUTH or not entry.refresh_token:
             if force:
                 self._mark_exhausted(entry, None)
@@ -1214,18 +1209,13 @@ class CredentialPool:
             "openai-codex",
             "xai-oauth",
         }:
-            raise UnsupportedCapabilityError(
-                f"Credential pool OAuth refresh for {self.provider} is not native async yet."
-            )
+            return entry
 
         codex_target_path = None
         try:
             if self.provider == "nous":
                 if entry.source not in {"device_code", "manual:device_code"}:
-                    raise UnsupportedCapabilityError(
-                        "Manual Nous OAuth pool entries cannot be refreshed; "
-                        "log in through the Hermes Nous OAuth flow."
-                    )
+                    return entry
                 credentials = await auth_mod.resolve_nous_runtime_credentials(
                     force_refresh=force,
                 )
@@ -1280,10 +1270,7 @@ class CredentialPool:
 
             if self.provider == "minimax-oauth":
                 if entry.source != "oauth":
-                    raise UnsupportedCapabilityError(
-                        "Manual MiniMax OAuth pool entries cannot be refreshed; "
-                        "log in through the Hermes MiniMax OAuth flow."
-                    )
+                    return entry
                 await auth_mod.resolve_minimax_oauth_runtime_credentials(
                     force_refresh=force,
                 )
@@ -1526,12 +1513,6 @@ class CredentialPool:
                     updated.expires_at_ms or 0,
                 )
             return updated
-        except UnsupportedCapabilityError:
-            # Never silently downgrade an unsupported OAuth refresh into an
-            # exhausted credential.  The async distribution has no sync or
-            # worker-thread fallback for this path, so callers need a clear
-            # capability failure instead of a misleading quota error.
-            raise
         except Exception as exc:
             if self.provider == "openai-codex":
                 async with auth_mod._auth_store_transaction(codex_target_path):

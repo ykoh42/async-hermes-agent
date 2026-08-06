@@ -1087,9 +1087,8 @@ async def test_anthropic_pool_refresh_uses_native_transport_transport(monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_unsupported_oauth_pool_refresh_fails_fast_without_a_thread(monkeypatch):
-    """A provider without a native OAuth lifecycle is never silently bridged."""
-    from agent.agent_runtime_helpers import UnsupportedCapabilityError
+async def test_unsupported_oauth_pool_refresh_preserves_upstream_noop(monkeypatch):
+    """An unknown OAuth provider keeps the upstream no-op refresh semantics."""
     from agent.credential_pool import AUTH_TYPE_OAUTH, CredentialPool, PooledCredential
 
     pool = CredentialPool(
@@ -1112,8 +1111,43 @@ async def test_unsupported_oauth_pool_refresh_fails_fast_without_a_thread(monkey
         raise AssertionError("unsupported OAuth must not use asyncio.to_thread")
 
     monkeypatch.setattr(asyncio, "to_thread", fail_if_threaded)
-    with pytest.raises(UnsupportedCapabilityError, match="unsupported-oauth"):
-        await pool.try_refresh_matching(credential_id="unsupported")
+    refreshed = await pool.try_refresh_matching(credential_id="unsupported")
+
+    assert refreshed is not None
+    assert refreshed.id == "unsupported"
+    assert refreshed.access_token == "expired-access"
+
+
+@pytest.mark.asyncio
+async def test_nonpersistent_terminal_cleanup_awaits_native_handler(monkeypatch):
+    from agent import chat_completion_helpers
+
+    cleanup = AsyncMock()
+    monkeypatch.setattr(chat_completion_helpers, "is_persistent_env", lambda _task_id: False)
+    monkeypatch.setattr(chat_completion_helpers, "cleanup_vm", cleanup)
+
+    await chat_completion_helpers.cleanup_task_resources(
+        SimpleNamespace(verbose_logging=False),
+        "task-1",
+    )
+
+    cleanup.assert_awaited_once_with("task-1")
+
+
+@pytest.mark.asyncio
+async def test_persistent_terminal_cleanup_remains_deferred(monkeypatch):
+    from agent import chat_completion_helpers
+
+    cleanup = AsyncMock()
+    monkeypatch.setattr(chat_completion_helpers, "is_persistent_env", lambda _task_id: True)
+    monkeypatch.setattr(chat_completion_helpers, "cleanup_vm", cleanup)
+
+    await chat_completion_helpers.cleanup_task_resources(
+        SimpleNamespace(verbose_logging=False),
+        "task-1",
+    )
+
+    cleanup.assert_not_awaited()
 
 
 @pytest.mark.asyncio

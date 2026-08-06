@@ -7,14 +7,11 @@ and per-turn resource cleanup.
 
 Each function takes the parent ``AIAgent`` as its first argument
 (``agent``).  :class:`AIAgent` keeps thin forwarder methods so call
-sites unchanged.  Symbols that tests patch on ``run_agent`` (e.g.
-``cleanup_vm`` in ``test_zombie_process_cleanup.py``) are resolved through
-:func:`_ra` so the patch contract is preserved.
+sites remain unchanged.
 """
 
 from __future__ import annotations
 
-import contextvars
 import json
 import logging
 import math
@@ -36,7 +33,7 @@ from agent.message_sanitization import (
     _sanitize_surrogates,
     _repair_tool_call_arguments,
 )
-from tools.terminal_tool import is_persistent_env
+from tools.terminal_tool import cleanup_vm, is_persistent_env
 from utils import base_url_host_matches, base_url_hostname, env_float, env_int
 
 logger = logging.getLogger(__name__)
@@ -52,22 +49,6 @@ _OPENROUTER_PROVIDER_SORT_VALUES = {"throughput", "latency", "price"}
 # billing reasons keep their own 60s cooldown (set above); this is the
 # narrower non-rate-limit case.  See issue #24996.
 _FALLBACK_EXHAUSTED_COOLDOWN_S = 5.0
-
-
-def _context_thread_target(callback):
-    """Bind a no-argument thread target to the caller's ContextVars."""
-    context = contextvars.copy_context()
-    return lambda: context.run(callback)
-
-
-def _ra():
-    """Lazy ``run_agent`` reference.
-
-    Used to honor test patches like ``patch("run_agent.cleanup_vm")`` that
-    target symbols imported into ``run_agent``'s namespace.
-    """
-    import run_agent
-    return run_agent
 
 
 def estimate_request_context_tokens(api_payload: Any) -> int:
@@ -1638,24 +1619,18 @@ async def cleanup_task_resources(agent, task_id: str) -> None:
     ``terminal.lifetime_seconds`` is exceeded. Non-persistent backends are
     torn down per-turn as before to prevent resource leakage.
     """
-    if is_persistent_env(task_id):
+    try:
+        if is_persistent_env(task_id):
+            if agent.verbose_logging:
+                logging.debug(
+                    f"Skipping per-turn cleanup_vm for persistent env {task_id}; "
+                    f"idle reaper will handle it."
+                )
+        else:
+            await cleanup_vm(task_id)
+    except Exception as exc:
         if agent.verbose_logging:
-            logging.debug(
-                f"Skipping per-turn cleanup_vm for persistent env {task_id}; "
-                f"idle reaper will handle it."
-            )
-        return
-
-    # This distribution currently exposes the local persistent terminal only.
-    # Calling a legacy synchronous environment manager here would silently
-    # block the agent event loop, so unsupported ephemeral backends must be
-    # explicit until their lifecycle API is native async.
-    from agent.agent_runtime_helpers import UnsupportedCapabilityError
-
-    raise UnsupportedCapabilityError(
-        "The configured terminal backend has no native async cleanup API. "
-        "Use the local persistent terminal or install an async backend."
-    )
+            logger.warning("Failed to cleanup VM for task %s: %s", task_id, exc)
 
 
 # ── Provider fallback ──────────────────────────────────────────────────
