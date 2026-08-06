@@ -254,6 +254,7 @@ for line in sys.stdin:
 
 
 @pytest.mark.asyncio
+@pytest.mark.live_system_guard_bypass
 async def test_real_async_subprocess_round_trip(tmp_path):
     client = CopilotACPClient(
         acp_command=sys.executable,
