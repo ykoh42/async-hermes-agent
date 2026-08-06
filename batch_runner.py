@@ -544,6 +544,7 @@ async def _process_batch_worker(args: Tuple) -> Dict[str, Any]:
     batch_tool_stats = {}
     batch_reasoning_stats = {"total_assistant_turns": 0, "turns_with_reasoning": 0, "turns_without_reasoning": 0}
     completed_in_batch = []
+    discarded_no_reasoning = 0
     
     # Process each prompt sequentially in this batch
     for prompt_index, prompt_data in prompts_to_process:
@@ -557,6 +558,14 @@ async def _process_batch_worker(args: Tuple) -> Dict[str, Any]:
         
         # Save trajectory if successful
         if result["success"] and result["trajectory"]:
+            # Discard samples with zero reasoning across all turns
+            reasoning = result.get("reasoning_stats", {})
+            if not reasoning.get("has_any_reasoning", True):
+                print(f"   🚫 Prompt {prompt_index} discarded (no reasoning in any turn)")
+                discarded_no_reasoning += 1
+                completed_in_batch.append(prompt_index)
+                continue
+
             # Get and normalize tool stats for consistent schema across all entries
             raw_tool_stats = result.get("tool_stats", {})
             tool_stats = _normalize_tool_stats(raw_tool_stats)
@@ -618,6 +627,7 @@ async def _process_batch_worker(args: Tuple) -> Dict[str, Any]:
         "skipped": len(batch_data) - len(prompts_to_process),
         "tool_stats": batch_tool_stats,
         "reasoning_stats": batch_reasoning_stats,
+        "discarded_no_reasoning": discarded_no_reasoning,
         "completed_prompts": completed_in_batch
     }
 
@@ -1078,6 +1088,7 @@ class BatchRunner:
                             checkpoint_data.setdefault("batch_stats", {})[str(batch_num)] = {
                                 "processed": result.get("processed", 0),
                                 "skipped": result.get("skipped", 0),
+                                "discarded_no_reasoning": result.get("discarded_no_reasoning", 0),
                             }
 
                         checkpoint_data["completed_prompts"] = sorted(completed_prompts_set)
@@ -1224,6 +1235,8 @@ class BatchRunner:
             print("No tool calls were made during this run.")
         
         # Print reasoning coverage stats
+        total_discarded = sum(r.get("discarded_no_reasoning", 0) for r in results)
+
         print("\n🧠 Reasoning Coverage:")
         print("-" * 70)
         total_turns = total_reasoning_stats["total_assistant_turns"]
@@ -1237,6 +1250,9 @@ class BatchRunner:
             print(f"   Without reasoning:        {without_reasoning:,} ({pct_without}%)")
         else:
             print("   No assistant turns recorded.")
+        if total_discarded > 0:
+            print(f"   🚫 Samples discarded (zero reasoning): {total_discarded:,}")
+
         print(f"\n💾 Results saved to: {self.output_dir}")
         print("   - Trajectories: trajectories.jsonl (combined)")
         print("   - Individual batches: batch_*.jsonl (for debugging)")
