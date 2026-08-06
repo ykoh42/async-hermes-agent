@@ -64,6 +64,7 @@ def test_conversation_and_chat_are_coroutines():
         record_session_cwd,
         register_task_env_overrides,
     )
+    from tools.session_search_tool import check_session_search_requirements
     from batch_runner import BatchRunner, main as batch_main
     from trajectory_compressor import (
         CompressionConfig,
@@ -78,6 +79,7 @@ def test_conversation_and_chat_are_coroutines():
     assert inspect.iscoroutinefunction(agent_main)
     assert inspect.iscoroutinefunction(AIAgent.switch_model)
     assert inspect.iscoroutinefunction(AIAgent._ensure_db_session)
+    assert inspect.iscoroutinefunction(check_session_search_requirements)
     assert inspect.iscoroutinefunction(AIAgent._persist_session)
     assert inspect.iscoroutinefunction(AIAgent._flush_messages_to_session_db)
     assert inspect.iscoroutinefunction(AIAgent._save_session_log)
@@ -144,6 +146,53 @@ def test_conversation_and_chat_are_coroutines():
     active_entries = list(registry._tools.values())
     assert active_entries
     assert all(inspect.iscoroutinefunction(entry.handler) for entry in active_entries)
+
+
+@pytest.mark.asyncio
+async def test_session_search_availability_does_not_block_event_loop(
+    monkeypatch, tmp_path
+):
+    import hermes_state
+    from tools.session_search_tool import check_session_search_requirements
+
+    monkeypatch.setattr(
+        hermes_state, "_default_db_path", lambda: tmp_path / "state.db"
+    )
+
+    blockbuster = BlockBuster()
+    blockbuster.activate()
+    try:
+        assert await check_session_search_requirements() is True
+    finally:
+        blockbuster.deactivate()
+
+
+@pytest.mark.asyncio
+async def test_web_tool_availability_does_not_block_event_loop(
+    monkeypatch, tmp_path
+):
+    from tools import web_tools
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    for key in (
+        "BRAVE_SEARCH_API_KEY",
+        "EXA_API_KEY",
+        "FIRECRAWL_API_KEY",
+        "FIRECRAWL_API_URL",
+        "PARALLEL_API_KEY",
+        "SEARXNG_URL",
+        "TAVILY_API_KEY",
+        "XAI_API_KEY",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setattr(web_tools, "_ddgs_package_importable", lambda: False)
+
+    blockbuster = BlockBuster()
+    blockbuster.activate()
+    try:
+        assert await web_tools.check_web_api_key() is False
+    finally:
+        blockbuster.deactivate()
 
 
 def test_constructor_does_not_read_runtime_config_or_create_logs():

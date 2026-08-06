@@ -78,12 +78,13 @@ def _force_inprocess_search(monkeypatch, prov):
 
 
 class TestDDGSProviderIsConfigured:
-    def test_configured_when_package_importable(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_configured_when_package_importable(self, monkeypatch):
         _install_fake_ddgs(monkeypatch)
         # Drop any cached ``plugins.web.ddgs.provider`` so is_configured re-imports ddgs fresh
         monkeypatch.delitem(sys.modules, "plugins.web.ddgs.provider", raising=False)
         from plugins.web.ddgs.provider import DDGSWebSearchProvider
-        assert DDGSWebSearchProvider().is_available() is True
+        assert await DDGSWebSearchProvider().is_available() is True
 
 
     def test_implements_web_search_provider(self):
@@ -243,26 +244,29 @@ class TestDDGSProcessIsolation:
 
 
 class TestDDGSBackendWiring:
-    def test_is_backend_available_true_when_package_importable(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_is_backend_available_true_when_package_importable(self, monkeypatch):
         from tools import web_tools
         monkeypatch.setattr(web_tools, "_ddgs_package_importable", lambda: True)
-        assert web_tools._is_backend_available("ddgs") is True
+        assert await web_tools._is_backend_available("ddgs") is True
 
 
-    def test_auto_detect_picks_ddgs_as_last_resort(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_auto_detect_picks_ddgs_as_last_resort(self, monkeypatch):
         from tools import web_tools
         monkeypatch.setattr(web_tools, "_load_web_config", lambda: {})
         for key in ("FIRECRAWL_API_KEY", "FIRECRAWL_API_URL", "PARALLEL_API_KEY",
                     "TAVILY_API_KEY", "EXA_API_KEY", "SEARXNG_URL", "BRAVE_SEARCH_API_KEY"):
             monkeypatch.delenv(key, raising=False)
         monkeypatch.setattr(web_tools, "_ddgs_package_importable", lambda: True)
-        assert web_tools._get_backend() == "ddgs"
+        assert await web_tools._get_backend() == "ddgs"
 
-    def test_check_web_api_key_true_when_ddgs_configured(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_check_web_api_key_true_when_ddgs_configured(self, monkeypatch):
         from tools import web_tools
         monkeypatch.setattr(web_tools, "_load_web_config", lambda: {"backend": "ddgs"})
         monkeypatch.setattr(web_tools, "_ddgs_package_importable", lambda: True)
-        assert web_tools.check_web_api_key() is True
+        assert await web_tools.check_web_api_key() is True
 
 
 # ---------------------------------------------------------------------------

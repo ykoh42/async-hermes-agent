@@ -125,7 +125,7 @@ class XAIWebSearchProvider(WebSearchProvider):
     def display_name(self) -> str:
         return "xAI Web Search (Grok)"
 
-    def is_available(self) -> bool:
+    async def is_available(self) -> bool:
         """Cheap availability probe — env var OR auth-store has OAuth tokens.
 
         Delegates to :func:`tools.xai_http.has_xai_credentials`, which is
@@ -135,7 +135,7 @@ class XAIWebSearchProvider(WebSearchProvider):
         every ``hermes tools`` repaint and at tool-registration time.
         Token freshness / refresh is handled inside :meth:`search`.
         """
-        return has_xai_credentials()
+        return await has_xai_credentials()
 
     def supports_search(self) -> bool:
         return True

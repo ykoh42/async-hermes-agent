@@ -55,12 +55,15 @@ import abc
 import os
 from typing import Any, Dict, List, Optional
 
+import aiofiles
 
-def get_provider_env(name: str) -> str:
+
+async def get_provider_env(name: str) -> str:
     """Config-aware env lookup for web providers.
 
-    Resolves *name* via :func:`hermes_cli.config.get_env_value` (checks
-    ``os.environ`` first, then ``~/.hermes/.env``) so credentials set
+    Resolves *name* with the same order as
+    :func:`hermes_cli.config.get_env_value` (active secret scope/process
+    environment first, then ``~/.hermes/.env``) so credentials set
     through Hermes' config layer are visible even when they were never
     exported into the process environment — gateway sessions, delegate
     children, and subprocess agent runs (issue #40190). Falls back to a
@@ -71,9 +74,34 @@ def get_provider_env(name: str) -> str:
     """
     val: Optional[str] = None
     try:
-        from hermes_cli.config import get_env_value
+        from agent.secret_scope import get_secret
+        from hermes_cli.config import (
+            _parse_env_value,
+            _sanitize_env_lines,
+            get_env_path,
+        )
 
-        val = get_env_value(name)
+        val = get_secret(name)
+        if val is None:
+            try:
+                async with aiofiles.open(
+                    get_env_path(),
+                    "r",
+                    encoding="utf-8-sig",
+                    errors="replace",
+                ) as env_file:
+                    raw_lines = await env_file.readlines()
+            except FileNotFoundError:
+                raw_lines = []
+            for line in _sanitize_env_lines(raw_lines):
+                stripped = line.strip()
+                if not stripped or stripped.startswith("#") or "=" not in stripped:
+                    continue
+                if stripped.startswith("export "):
+                    stripped = stripped[7:]
+                key, _, value = stripped.partition("=")
+                if key.strip() == name:
+                    val = _parse_env_value(value)
     except Exception:  # noqa: BLE001 — config layer optional here
         val = None
     if val is None:
@@ -114,7 +142,7 @@ class WebSearchProvider(abc.ABC):
         return self.name
 
     @abc.abstractmethod
-    def is_available(self) -> bool:
+    async def is_available(self) -> bool:
         """Return True when this provider can service calls.
 
         Typically a cheap check (env var present, optional Python dep

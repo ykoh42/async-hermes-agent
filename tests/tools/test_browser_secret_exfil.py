@@ -162,7 +162,7 @@ class TestWebExtractSecretExfil:
             def name(self) -> str:
                 return "fake-extract"
 
-            def is_available(self) -> bool:
+            async def is_available(self) -> bool:
                 return True
 
             def supports_search(self) -> bool:
@@ -187,7 +187,11 @@ class TestWebExtractSecretExfil:
         web_search_registry._reset_for_tests()
         web_search_registry.register_provider(FakeExtractProvider())
         monkeypatch.setattr(web_tools, "_ensure_web_plugins_loaded", AsyncMock())
-        monkeypatch.setattr(web_tools, "_get_extract_backend", lambda: "fake-extract")
+        monkeypatch.setattr(
+            web_tools,
+            "_get_extract_backend",
+            AsyncMock(return_value="fake-extract"),
+        )
         monkeypatch.setattr(web_tools, "is_safe_url", allow_url)
 
         try:

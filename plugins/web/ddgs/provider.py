@@ -251,7 +251,7 @@ class DDGSWebSearchProvider(WebSearchProvider):
     def display_name(self) -> str:
         return "DuckDuckGo (ddgs)"
 
-    def is_available(self) -> bool:
+    async def is_available(self) -> bool:
         """Return True when the ``ddgs`` package is importable.
 
         Probes the import once; cheap because Python caches the import. Must

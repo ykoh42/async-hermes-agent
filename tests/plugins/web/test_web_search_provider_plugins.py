@@ -137,57 +137,73 @@ class TestBundledPluginsRegister:
 class TestIsAvailable:
     """Each plugin's ``is_available()`` returns False without env config."""
 
-    def test_brave_free_requires_api_key(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    @pytest.mark.asyncio
+    async def test_brave_free_requires_api_key(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         _ensure_plugins_loaded()
         from agent.web_search_registry import get_provider
 
         p = get_provider("brave-free")
         assert p is not None
-        assert p.is_available() is False  # no BRAVE_SEARCH_API_KEY
+        assert await p.is_available() is False  # no BRAVE_SEARCH_API_KEY
         monkeypatch.setenv("BRAVE_SEARCH_API_KEY", "real")
-        assert p.is_available() is True
+        assert await p.is_available() is True
 
-    def test_searxng_requires_url(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    @pytest.mark.asyncio
+    async def test_searxng_requires_url(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         _ensure_plugins_loaded()
         from agent.web_search_registry import get_provider
 
         p = get_provider("searxng")
         assert p is not None
-        assert p.is_available() is False
+        assert await p.is_available() is False
         monkeypatch.setenv("SEARXNG_URL", "http://localhost:8080")
-        assert p.is_available() is True
+        assert await p.is_available() is True
 
-    def test_tavily_requires_api_key(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    @pytest.mark.asyncio
+    async def test_tavily_requires_api_key(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         _ensure_plugins_loaded()
         from agent.web_search_registry import get_provider
 
         p = get_provider("tavily")
         assert p is not None
-        assert p.is_available() is False
+        assert await p.is_available() is False
         monkeypatch.setenv("TAVILY_API_KEY", "real")
-        assert p.is_available() is True
+        assert await p.is_available() is True
 
-    def test_exa_requires_api_key(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    @pytest.mark.asyncio
+    async def test_exa_requires_api_key(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         _ensure_plugins_loaded()
         from agent.web_search_registry import get_provider
 
         p = get_provider("exa")
         assert p is not None
-        assert p.is_available() is False
+        assert await p.is_available() is False
         monkeypatch.setenv("EXA_API_KEY", "real")
-        assert p.is_available() is True
+        assert await p.is_available() is True
 
-    def test_parallel_requires_api_key(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    @pytest.mark.asyncio
+    async def test_parallel_requires_api_key(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         _ensure_plugins_loaded()
         from agent.web_search_registry import get_provider
 
         p = get_provider("parallel")
         assert p is not None
-        assert p.is_available() is False
+        assert await p.is_available() is False
         monkeypatch.setenv("PARALLEL_API_KEY", "real")
-        assert p.is_available() is True
+        assert await p.is_available() is True
 
-    def test_firecrawl_requires_either_key_or_url(
+    @pytest.mark.asyncio
+    async def test_firecrawl_requires_either_key_or_url(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         _ensure_plugins_loaded()
@@ -195,37 +211,39 @@ class TestIsAvailable:
 
         p = get_provider("firecrawl")
         assert p is not None
-        assert p.is_available() is False
+        assert await p.is_available() is False
 
         # Either FIRECRAWL_API_KEY or FIRECRAWL_API_URL lights it up.
         monkeypatch.setenv("FIRECRAWL_API_KEY", "real")
-        assert p.is_available() is True
+        assert await p.is_available() is True
         monkeypatch.delenv("FIRECRAWL_API_KEY", raising=False)
         monkeypatch.setenv("FIRECRAWL_API_URL", "http://localhost:3002")
-        assert p.is_available() is True
+        assert await p.is_available() is True
 
-    def test_firecrawl_request_config_uses_direct_async_http_settings(
+    @pytest.mark.asyncio
+    async def test_firecrawl_request_config_uses_direct_async_http_settings(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         from plugins.web.firecrawl.provider import FirecrawlWebSearchProvider
 
         with pytest.raises(ValueError, match="Web tools are not configured"):
-            FirecrawlWebSearchProvider._request_config()
+            await FirecrawlWebSearchProvider._request_config()
 
         monkeypatch.setenv("FIRECRAWL_API_KEY", "fc-test")
-        assert FirecrawlWebSearchProvider._request_config() == (
+        assert await FirecrawlWebSearchProvider._request_config() == (
             "https://api.firecrawl.dev/v1",
             "fc-test",
         )
 
         monkeypatch.delenv("FIRECRAWL_API_KEY")
         monkeypatch.setenv("FIRECRAWL_API_URL", "http://localhost:3002/")
-        assert FirecrawlWebSearchProvider._request_config() == (
+        assert await FirecrawlWebSearchProvider._request_config() == (
             "http://localhost:3002",
             "",
         )
 
-    def test_ddgs_always_available_when_package_importable(self) -> None:
+    @pytest.mark.asyncio
+    async def test_ddgs_always_available_when_package_importable(self) -> None:
         """DDGS is the always-on fallback — no API key required.
 
         It may report unavailable if the ``ddgs`` package itself isn't
@@ -239,18 +257,21 @@ class TestIsAvailable:
         p = get_provider("ddgs")
         assert p is not None
         # Truthy or falsy, just must not raise.
-        _ = bool(p.is_available())
+        _ = bool(await p.is_available())
 
-    def test_xai_requires_api_key_or_oauth(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    @pytest.mark.asyncio
+    async def test_xai_requires_api_key_or_oauth(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """xAI needs XAI_API_KEY or OAuth tokens in auth.json."""
         _ensure_plugins_loaded()
         from agent.web_search_registry import get_provider
 
         p = get_provider("xai")
         assert p is not None
-        assert p.is_available() is False  # no XAI_API_KEY, no auth.json
+        assert await p.is_available() is False  # no XAI_API_KEY, no auth.json
         monkeypatch.setenv("XAI_API_KEY", "real")
-        assert p.is_available() is True
+        assert await p.is_available() is True
 
 
 # ---------------------------------------------------------------------------
@@ -261,7 +282,8 @@ class TestIsAvailable:
 class TestRegistryResolution:
     """``_resolve()`` follows explicit-config + availability-filtered fallback."""
 
-    def test_explicit_configured_provider_returned_even_when_unavailable(
+    @pytest.mark.asyncio
+    async def test_explicit_configured_provider_returned_even_when_unavailable(
         self,
     ) -> None:
         """Explicit ``web.search_backend`` wins regardless of is_available().
@@ -274,14 +296,15 @@ class TestRegistryResolution:
         from agent.web_search_registry import _resolve
 
         # No BRAVE_SEARCH_API_KEY (fixture cleared it).
-        result = _resolve("brave-free", capability="search")
+        result = await _resolve("brave-free", capability="search")
         assert result is not None
         assert result.name == "brave-free"
         # Confirm it's the unavailable one — dispatcher will surface
         # a typed credential-missing error to the caller.
-        assert result.is_available() is False
+        assert await result.is_available() is False
 
-    def test_unknown_configured_name_falls_back_to_available_provider(
+    @pytest.mark.asyncio
+    async def test_unknown_configured_name_falls_back_to_available_provider(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """Typo / uninstalled plugin → walk legacy preference, pick available."""
@@ -289,15 +312,16 @@ class TestRegistryResolution:
         from agent.web_search_registry import _resolve
 
         monkeypatch.setenv("EXA_API_KEY", "real")
-        result = _resolve("not-a-real-provider", capability="search")
+        result = await _resolve("not-a-real-provider", capability="search")
         # Either ddgs (no-key fallback) or exa (the only available
         # premium provider) — both are valid. The point is the unknown
         # name shouldn't return None when SOMETHING is available.
         assert result is not None
-        assert result.is_available() is True
+        assert await result.is_available() is True
 
 
-    def test_no_config_no_credentials_returns_none(
+    @pytest.mark.asyncio
+    async def test_no_config_no_credentials_returns_none(
         self,
     ) -> None:
         """No backend configured AND no available providers → typically None.
@@ -309,11 +333,11 @@ class TestRegistryResolution:
         _ensure_plugins_loaded()
         from agent.web_search_registry import _resolve
 
-        result = _resolve(None, capability="search")
+        result = await _resolve(None, capability="search")
         if result is not None:
             # The only no-credential provider is ddgs; anything else
             # means an env var leaked in.
-            assert result.is_available() is True
+            assert await result.is_available() is True
 
 
 # ---------------------------------------------------------------------------

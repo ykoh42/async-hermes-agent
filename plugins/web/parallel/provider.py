@@ -28,7 +28,7 @@ from agent.web_search_provider import WebSearchProvider
 
 logger = logging.getLogger(__name__)
 
-def _get_parallel_client() -> Any:
+async def _get_parallel_client() -> Any:
     """Lazy-load and cache the native async Parallel client."""
     import tools.web_tools as _wt
 
@@ -38,7 +38,7 @@ def _get_parallel_client() -> Any:
 
     from agent.web_search_provider import get_provider_env
 
-    api_key = get_provider_env("PARALLEL_API_KEY")
+    api_key = await get_provider_env("PARALLEL_API_KEY")
     if not api_key:
         raise ValueError(
             "PARALLEL_API_KEY environment variable not set. "
@@ -84,11 +84,11 @@ class ParallelWebSearchProvider(WebSearchProvider):
     def display_name(self) -> str:
         return "Parallel"
 
-    def is_available(self) -> bool:
+    async def is_available(self) -> bool:
         """Return True when ``PARALLEL_API_KEY`` is set to a non-empty value."""
         from agent.web_search_provider import get_provider_env
 
-        return bool(get_provider_env("PARALLEL_API_KEY"))
+        return bool(await get_provider_env("PARALLEL_API_KEY"))
 
     def supports_search(self) -> bool:
         return True
@@ -113,7 +113,8 @@ class ParallelWebSearchProvider(WebSearchProvider):
             logger.info(
                 "Parallel search: '%s' (mode=%s, limit=%d)", query, mode, limit
             )
-            response = await _get_parallel_client().beta.search(
+            client = await _get_parallel_client()
+            response = await client.beta.search(
                 search_queries=[query],
                 objective=query,
                 mode=mode,
@@ -163,7 +164,8 @@ class ParallelWebSearchProvider(WebSearchProvider):
                 ]
 
             logger.info("Parallel extract: %d URL(s)", len(urls))
-            response = await _get_parallel_client().beta.extract(
+            client = await _get_parallel_client()
+            response = await client.beta.extract(
                 urls=urls,
                 full_content=True,
             )

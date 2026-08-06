@@ -47,11 +47,11 @@ class BraveFreeWebSearchProvider(WebSearchProvider):
     def display_name(self) -> str:
         return "Brave Search (Free)"
 
-    def is_available(self) -> bool:
+    async def is_available(self) -> bool:
         """Return True when ``BRAVE_SEARCH_API_KEY`` is set to a non-empty value."""
         from agent.web_search_provider import get_provider_env
 
-        return bool(get_provider_env("BRAVE_SEARCH_API_KEY"))
+        return bool(await get_provider_env("BRAVE_SEARCH_API_KEY"))
 
     def supports_search(self) -> bool:
         return True
@@ -69,7 +69,7 @@ class BraveFreeWebSearchProvider(WebSearchProvider):
 
         from agent.web_search_provider import get_provider_env
 
-        api_key = get_provider_env("BRAVE_SEARCH_API_KEY")
+        api_key = await get_provider_env("BRAVE_SEARCH_API_KEY")
         if not api_key:
             return {"success": False, "error": "BRAVE_SEARCH_API_KEY is not set"}
 

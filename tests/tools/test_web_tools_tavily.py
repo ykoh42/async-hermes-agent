@@ -10,7 +10,7 @@ Coverage:
 import json
 import os
 import pytest
-from unittest.mock import patch, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from tests.tools.conftest import register_all_web_providers
 
@@ -150,7 +150,7 @@ class TestWebSearchTavily:
         }
         mock_response.raise_for_status = MagicMock()
 
-        with patch("tools.web_tools._get_backend", return_value="tavily"), \
+        with patch("tools.web_tools._get_backend", new=AsyncMock(return_value="tavily")), \
              patch.dict(os.environ, {"TAVILY_API_KEY": "tvly-test"}), \
              patch("httpx.AsyncClient", return_value=AsyncClientStub(mock_response)), \
              patch("tools.interrupt.is_interrupted", return_value=False):
@@ -183,7 +183,7 @@ class TestWebExtractTavily:
         }
         mock_response.raise_for_status = MagicMock()
 
-        with patch("tools.web_tools._get_backend", return_value="tavily"), \
+        with patch("tools.web_tools._get_backend", new=AsyncMock(return_value="tavily")), \
              patch.dict(os.environ, {"TAVILY_API_KEY": "tvly-test"}), \
              patch("httpx.AsyncClient", return_value=AsyncClientStub(mock_response)):
             from tools.web_tools import web_extract_tool

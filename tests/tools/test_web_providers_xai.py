@@ -93,22 +93,25 @@ class TestXAIProviderIsAvailable:
     visible CLI latency.
     """
 
-    def test_available_via_env_var(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_available_via_env_var(self, monkeypatch):
         monkeypatch.setenv("XAI_API_KEY", "sk-xai-test")
         from plugins.web.xai.provider import XAIWebSearchProvider
-        assert XAIWebSearchProvider().is_available() is True
+        assert await XAIWebSearchProvider().is_available() is True
 
 
-    def test_unavailable_when_auth_store_corrupted(self, monkeypatch, tmp_path):
+    @pytest.mark.asyncio
+    async def test_unavailable_when_auth_store_corrupted(self, monkeypatch, tmp_path):
         """A malformed auth.json must not crash availability scans."""
         monkeypatch.delenv("XAI_API_KEY", raising=False)
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         (tmp_path / "auth.json").write_text("not json at all }{")
 
         from plugins.web.xai.provider import XAIWebSearchProvider
-        assert XAIWebSearchProvider().is_available() is False
+        assert await XAIWebSearchProvider().is_available() is False
 
-    def test_is_available_does_not_call_resolver(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_is_available_does_not_call_resolver(self, monkeypatch):
         """Regression guard: ``is_available()`` must NEVER touch the resolver,
         because the OAuth resolver can trigger a network refresh."""
         monkeypatch.setenv("XAI_API_KEY", "sk-xai-test")
@@ -118,7 +121,7 @@ class TestXAIProviderIsAvailable:
             xai_provider, "resolve_xai_http_credentials",
             side_effect=AssertionError("is_available must not call the resolver"),
         ):
-            assert xai_provider.XAIWebSearchProvider().is_available() is True
+            assert await xai_provider.XAIWebSearchProvider().is_available() is True
 
 
 # ---------------------------------------------------------------------------
@@ -494,14 +497,16 @@ class TestXAIProviderSearchErrors:
 
 
 class TestXAIBackendWiring:
-    def test_is_backend_available_true_via_env_var(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_is_backend_available_true_via_env_var(self, monkeypatch):
         from tools import web_tools
 
         monkeypatch.setenv("XAI_API_KEY", "sk-xai-test")
-        assert web_tools._is_backend_available("xai") is True
+        assert await web_tools._is_backend_available("xai") is True
 
 
-    def test_is_backend_available_does_not_call_resolver(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_is_backend_available_does_not_call_resolver(self, monkeypatch):
         """Regression guard — `_is_backend_available` runs on every web_search
         dispatch and every `hermes tools` repaint. It must not invoke the
         OAuth resolver (which can trigger a network refresh)."""
@@ -512,14 +517,16 @@ class TestXAIBackendWiring:
             "tools.xai_http.resolve_xai_http_credentials",
             side_effect=AssertionError("must not call resolver"),
         ):
-            assert web_tools._is_backend_available("xai") is True
+            assert await web_tools._is_backend_available("xai") is True
 
-    def test_configured_backend_xai_accepted(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_configured_backend_xai_accepted(self, monkeypatch):
         from tools import web_tools
         monkeypatch.setattr(web_tools, "_load_web_config", lambda: {"backend": "xai"})
-        assert web_tools._get_backend() == "xai"
+        assert await web_tools._get_backend() == "xai"
 
-    def test_xai_not_in_legacy_backend_candidate_chain(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_xai_not_in_legacy_backend_candidate_chain(self, monkeypatch):
         """The hardcoded ``backend_candidates`` tuple in ``_get_backend()``
         does not include xAI — by design, since the no-config legacy
         chain is for users who set env vars but never ran ``hermes tools``,
@@ -542,7 +549,7 @@ class TestXAIBackendWiring:
             monkeypatch.delenv(key, raising=False)
         monkeypatch.setenv("XAI_API_KEY", "xai-test-key")
         monkeypatch.setattr(web_tools, "_ddgs_package_importable", lambda: False)
-        assert web_tools._get_backend() != "xai"
+        assert await web_tools._get_backend() != "xai"
 
 
 # ---------------------------------------------------------------------------

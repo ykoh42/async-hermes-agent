@@ -22,7 +22,7 @@ class _FakeExtractProvider(WebSearchProvider):
     def display_name(self) -> str:
         return "Dict URL Test"
 
-    def is_available(self) -> bool:
+    async def is_available(self) -> bool:
         return True
 
     def supports_extract(self) -> bool:

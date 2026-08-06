@@ -5,7 +5,7 @@ _get_extract_char_limit, and the end-to-end web_extract_tool truncation behavior
 """
 import json
 import os
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 import aiofiles
@@ -90,7 +90,7 @@ class TestEndToEnd:
                          "raw_content": big, "metadata": {}}]
 
         with patch("tools.web_tools._ensure_web_plugins_loaded"), \
-             patch("tools.web_tools._get_extract_backend", return_value="fake"), \
+             patch("tools.web_tools._get_extract_backend", new=AsyncMock(return_value="fake")), \
              patch("tools.web_tools.is_safe_url", new=_AsyncTrue()), \
              patch("agent.web_search_registry.get_provider", return_value=FakeProvider()):
             result = json.loads(

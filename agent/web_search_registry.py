@@ -117,7 +117,9 @@ _LEGACY_PREFERENCE = (
 )
 
 
-def _resolve(configured: Optional[str], *, capability: str) -> Optional[WebSearchProvider]:
+async def _resolve(
+    configured: Optional[str], *, capability: str
+) -> Optional[WebSearchProvider]:
     """Resolve the active provider for a capability ("search" | "extract").
 
     Resolution rules (in order):
@@ -157,10 +159,10 @@ def _resolve(configured: Optional[str], *, capability: str) -> Optional[WebSearc
             return bool(p.supports_extract())
         return False
 
-    def _is_available_safe(p: WebSearchProvider) -> bool:
+    async def _is_available_safe(p: WebSearchProvider) -> bool:
         """Wrap ``is_available()`` so a buggy provider doesn't kill resolution."""
         try:
-            return bool(p.is_available())
+            return bool(await p.is_available())
         except Exception as exc:  # noqa: BLE001
             logger.debug("provider %s.is_available() raised %s", p.name, exc)
             return False
@@ -187,10 +189,10 @@ def _resolve(configured: Optional[str], *, capability: str) -> Optional[WebSearc
     #    a provider the user has no credentials for. Without this filter,
     #    a registered-but-unconfigured provider could end up "active" on
     #    a fresh install with no API keys at all.
-    eligible = [
-        p for p in snapshot.values()
-        if _capable(p) and _is_available_safe(p)
-    ]
+    eligible = []
+    for provider in snapshot.values():
+        if _capable(provider) and await _is_available_safe(provider):
+            eligible.append(provider)
     if len(eligible) == 1:
         return eligible[0]
 
@@ -199,7 +201,7 @@ def _resolve(configured: Optional[str], *, capability: str) -> Optional[WebSearc
         if (
             provider is not None
             and _capable(provider)
-            and _is_available_safe(provider)
+            and await _is_available_safe(provider)
         ):
             return provider
 
@@ -265,24 +267,24 @@ def _disabled_web_plugin_for(configured: Optional[str] = None, *, capability: Op
     return None
 
 
-def get_active_search_provider() -> Optional[WebSearchProvider]:
+async def get_active_search_provider() -> Optional[WebSearchProvider]:
     """Resolve the currently-active web search provider.
 
     Reads ``web.search_backend`` (preferred) or ``web.backend`` (shared
     fallback) from config.yaml; falls back per the module docstring.
     """
     explicit = _read_config_key("web", "search_backend") or _read_config_key("web", "backend")
-    return _resolve(explicit, capability="search")
+    return await _resolve(explicit, capability="search")
 
 
-def get_active_extract_provider() -> Optional[WebSearchProvider]:
+async def get_active_extract_provider() -> Optional[WebSearchProvider]:
     """Resolve the currently-active web extract provider.
 
     Reads ``web.extract_backend`` (preferred) or ``web.backend`` (shared
     fallback) from config.yaml; falls back per the module docstring.
     """
     explicit = _read_config_key("web", "extract_backend") or _read_config_key("web", "backend")
-    return _resolve(explicit, capability="extract")
+    return await _resolve(explicit, capability="extract")
 
 
 def _reset_for_tests() -> None:

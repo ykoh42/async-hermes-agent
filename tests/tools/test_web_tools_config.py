@@ -23,9 +23,10 @@ def clean_web_registry(monkeypatch):
         monkeypatch.delenv(key, raising=False)
 
 
-def test_configured_backend_is_preserved():
+@pytest.mark.asyncio
+async def test_configured_backend_is_preserved():
     with patch.object(web_tools, "_load_web_config", return_value={"backend": "parallel"}):
-        assert web_tools._get_backend() == "parallel"
+        assert await web_tools._get_backend() == "parallel"
 
 
 @pytest.mark.parametrize(
@@ -37,20 +38,25 @@ def test_configured_backend_is_preserved():
         ({"FIRECRAWL_API_KEY": "key"}, "firecrawl"),
     ],
 )
-def test_direct_credentials_select_backend(env, backend):
+@pytest.mark.asyncio
+async def test_direct_credentials_select_backend(env, backend):
     with patch.object(web_tools, "_load_web_config", return_value={}), patch.dict(
         "os.environ", env
     ), patch.object(web_tools, "_ddgs_package_importable", return_value=False):
-        assert web_tools._get_backend() == backend
+        assert await web_tools._get_backend() == backend
 
 
-def test_null_backend_config_is_safe():
+@pytest.mark.asyncio
+async def test_null_backend_config_is_safe():
     with patch.object(web_tools, "_load_web_config", return_value={"backend": None}), patch.object(
         web_tools, "_ddgs_package_importable", return_value=False
     ), patch(
-        "agent.web_search_registry.get_active_search_provider", return_value=None
-    ), patch("agent.web_search_registry.get_active_extract_provider", return_value=None):
-        assert web_tools.check_web_api_key() is False
+        "agent.web_search_registry.get_active_search_provider", new=AsyncMock(return_value=None)
+    ), patch(
+        "agent.web_search_registry.get_active_extract_provider",
+        new=AsyncMock(return_value=None),
+    ):
+        assert await web_tools.check_web_api_key() is False
 
 
 def test_search_schema_exposes_bounded_limit():
@@ -62,8 +68,37 @@ def test_search_schema_exposes_bounded_limit():
 
 
 def test_public_web_functions_are_coroutines():
+    from agent.web_search_provider import WebSearchProvider, get_provider_env
+    from agent.web_search_registry import (
+        get_active_extract_provider,
+        get_active_search_provider,
+    )
+
     assert inspect.iscoroutinefunction(web_tools.web_search_tool)
     assert inspect.iscoroutinefunction(web_tools.web_extract_tool)
+    assert inspect.iscoroutinefunction(web_tools.check_web_api_key)
+    assert inspect.iscoroutinefunction(web_tools._get_backend)
+    assert inspect.iscoroutinefunction(get_provider_env)
+    assert inspect.iscoroutinefunction(WebSearchProvider.is_available)
+    assert inspect.iscoroutinefunction(get_active_search_provider)
+    assert inspect.iscoroutinefunction(get_active_extract_provider)
+
+
+@pytest.mark.asyncio
+async def test_provider_env_preserves_process_then_dotenv_precedence(
+    monkeypatch, tmp_path
+):
+    from agent.web_search_provider import get_provider_env
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / ".env").write_text(
+        'TAVILY_API_KEY="dotenv-value"\n', encoding="utf-8"
+    )
+    monkeypatch.setenv("TAVILY_API_KEY", "process-value")
+    assert await get_provider_env("TAVILY_API_KEY") == "process-value"
+
+    monkeypatch.delenv("TAVILY_API_KEY")
+    assert await get_provider_env("TAVILY_API_KEY") == "dotenv-value"
 
 
 @pytest.mark.asyncio
@@ -74,7 +109,9 @@ async def test_search_clamps_limit_before_async_provider_call(monkeypatch):
     provider.search = AsyncMock(
         return_value={"success": True, "data": {"web": []}}
     )
-    monkeypatch.setattr(web_tools, "_get_search_backend", lambda: "test")
+    monkeypatch.setattr(
+        web_tools, "_get_search_backend", AsyncMock(return_value="test")
+    )
     monkeypatch.setattr(
         "agent.web_search_registry.get_provider", lambda _name: provider
     )
@@ -94,7 +131,9 @@ async def test_sync_provider_fails_fast(monkeypatch):
     provider.name = "sync-only"
     provider.supports_search.return_value = True
     provider.search = lambda *_args: {"success": True}
-    monkeypatch.setattr(web_tools, "_get_search_backend", lambda: "sync-only")
+    monkeypatch.setattr(
+        web_tools, "_get_search_backend", AsyncMock(return_value="sync-only")
+    )
     monkeypatch.setattr(
         "agent.web_search_registry.get_provider", lambda _name: provider
     )
@@ -113,7 +152,9 @@ async def test_provider_error_does_not_leak_traceback(monkeypatch):
     provider.name = "broken"
     provider.supports_search.return_value = True
     provider.search = AsyncMock(side_effect=RuntimeError("boom"))
-    monkeypatch.setattr(web_tools, "_get_search_backend", lambda: "broken")
+    monkeypatch.setattr(
+        web_tools, "_get_search_backend", AsyncMock(return_value="broken")
+    )
     monkeypatch.setattr(
         "agent.web_search_registry.get_provider", lambda _name: provider
     )

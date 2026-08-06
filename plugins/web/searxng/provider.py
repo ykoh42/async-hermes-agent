@@ -31,12 +31,12 @@ from agent.web_search_provider import WebSearchProvider
 logger = logging.getLogger(__name__)
 
 
-def _searxng_url() -> str:
+async def _searxng_url() -> str:
     """Return SEARXNG_URL from Hermes config-aware env, falling back to process env."""
     try:
-        from hermes_cli.config import get_env_value
+        from agent.web_search_provider import get_provider_env
 
-        val = get_env_value("SEARXNG_URL")
+        val = await get_provider_env("SEARXNG_URL")
     except Exception:
         val = None
     if val is None:
@@ -55,9 +55,9 @@ class SearXNGWebSearchProvider(WebSearchProvider):
     def display_name(self) -> str:
         return "SearXNG"
 
-    def is_available(self) -> bool:
+    async def is_available(self) -> bool:
         """Return True when ``SEARXNG_URL`` is set."""
-        return bool(_searxng_url())
+        return bool(await _searxng_url())
 
     def supports_search(self) -> bool:
         return True
@@ -69,7 +69,7 @@ class SearXNGWebSearchProvider(WebSearchProvider):
         """Execute a search against the configured SearXNG instance."""
         import httpx
 
-        base_url = _searxng_url().rstrip("/")
+        base_url = (await _searxng_url()).rstrip("/")
         if not base_url:
             return {"success": False, "error": "SEARXNG_URL is not set"}
 

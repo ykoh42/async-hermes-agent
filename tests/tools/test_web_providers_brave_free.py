@@ -26,10 +26,11 @@ from tests.tools.conftest import register_all_web_providers
 
 
 class TestBraveFreeProviderIsConfigured:
-    def test_configured_when_key_set(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_configured_when_key_set(self, monkeypatch):
         monkeypatch.setenv("BRAVE_SEARCH_API_KEY", "BSAkey123")
         from plugins.web.brave_free.provider import BraveFreeWebSearchProvider
-        assert BraveFreeWebSearchProvider().is_available() is True
+        assert await BraveFreeWebSearchProvider().is_available() is True
 
 
     def test_implements_web_search_provider(self):
@@ -142,13 +143,15 @@ class TestBraveFreeProviderSearch:
 
 
 class TestBraveFreeBackendWiring:
-    def test_is_backend_available_true_when_key_set(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_is_backend_available_true_when_key_set(self, monkeypatch):
         monkeypatch.setenv("BRAVE_SEARCH_API_KEY", "BSAkey123")
         from tools.web_tools import _is_backend_available
-        assert _is_backend_available("brave-free") is True
+        assert await _is_backend_available("brave-free") is True
 
 
-    def test_brave_free_does_not_override_paid_provider(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_brave_free_does_not_override_paid_provider(self, monkeypatch):
         """Tavily (higher priority) should win in auto-detect."""
         from tools import web_tools
         monkeypatch.setattr(web_tools, "_load_web_config", lambda: {})
@@ -156,13 +159,14 @@ class TestBraveFreeBackendWiring:
             monkeypatch.delenv(key, raising=False)
         monkeypatch.setenv("TAVILY_API_KEY", "tvly")
         monkeypatch.setenv("BRAVE_SEARCH_API_KEY", "BSAkey123")
-        assert web_tools._get_backend() == "tavily"
+        assert await web_tools._get_backend() == "tavily"
 
-    def test_check_web_api_key_true_when_brave_free_configured(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_check_web_api_key_true_when_brave_free_configured(self, monkeypatch):
         from tools import web_tools
         monkeypatch.setattr(web_tools, "_load_web_config", lambda: {"backend": "brave-free"})
         monkeypatch.setenv("BRAVE_SEARCH_API_KEY", "BSAkey123")
-        assert web_tools.check_web_api_key() is True
+        assert await web_tools.check_web_api_key() is True
 
 
 # ---------------------------------------------------------------------------

@@ -53,13 +53,13 @@ class TestWebProviderABCs:
             def display_name(self) -> str:
                 return "Search Only"
 
-            def is_available(self) -> bool:
+            async def is_available(self) -> bool:
                 return True
 
             def supports_search(self) -> bool:
                 return True
 
-            def search(self, query: str, limit: int = 5) -> Dict[str, Any]:
+            async def search(self, query: str, limit: int = 5) -> Dict[str, Any]:
                 return {"success": True, "data": {"web": []}}
 
         # Should instantiate fine — extract has default supports_*()
@@ -78,7 +78,8 @@ class TestWebProviderABCs:
 class TestPerCapabilityBackendSelection:
     """_get_search_backend and _get_extract_backend read per-capability config."""
 
-    def test_search_backend_overrides_generic(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_search_backend_overrides_generic(self, monkeypatch):
         from tools import web_tools
 
         monkeypatch.setattr(web_tools, "_load_web_config", lambda: {
@@ -86,10 +87,11 @@ class TestPerCapabilityBackendSelection:
             "search_backend": "tavily",
         })
         monkeypatch.setenv("TAVILY_API_KEY", "test-key")
-        assert web_tools._get_search_backend() == "tavily"
+        assert await web_tools._get_search_backend() == "tavily"
 
 
-    def test_fully_backward_compatible_with_web_backend_only(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_fully_backward_compatible_with_web_backend_only(self, monkeypatch):
         from tools import web_tools
 
         monkeypatch.setattr(web_tools, "_load_web_config", lambda: {
@@ -97,8 +99,8 @@ class TestPerCapabilityBackendSelection:
         })
         monkeypatch.setenv("TAVILY_API_KEY", "test-key")
         # No search_backend or extract_backend set — both fall through
-        assert web_tools._get_search_backend() == "tavily"
-        assert web_tools._get_extract_backend() == "tavily"
+        assert await web_tools._get_search_backend() == "tavily"
+        assert await web_tools._get_extract_backend() == "tavily"
 
 
 # ---------------------------------------------------------------------------
@@ -138,8 +140,8 @@ class TestWebSearchUsesSearchBackend:
         called_with = []
         original_get_search = web_tools._get_search_backend
 
-        def tracking_get_search():
-            result = original_get_search()
+        async def tracking_get_search():
+            result = await original_get_search()
             called_with.append(("search", result))
             return result
 
@@ -273,7 +275,7 @@ class TestDispatchersTriggerPluginDiscovery:
                 def display_name(self) -> str:
                     return "Fake Firecrawl"
 
-                def is_available(self) -> bool:
+                async def is_available(self) -> bool:
                     return True
 
                 def supports_extract(self) -> bool:
@@ -352,7 +354,7 @@ class TestDispatchersTriggerPluginDiscovery:
                 def display_name(self) -> str:
                     return "Fake Brave"
 
-                def is_available(self) -> bool:
+                async def is_available(self) -> bool:
                     return True
 
                 def supports_search(self) -> bool:

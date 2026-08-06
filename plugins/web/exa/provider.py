@@ -40,7 +40,7 @@ class ExaWebSearchProvider(WebSearchProvider):
     async def _request(endpoint: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         from agent.web_search_provider import get_provider_env
 
-        api_key = get_provider_env("EXA_API_KEY")
+        api_key = await get_provider_env("EXA_API_KEY")
         if not api_key:
             raise ValueError(
                 "EXA_API_KEY environment variable not set. "
@@ -72,11 +72,11 @@ class ExaWebSearchProvider(WebSearchProvider):
     def display_name(self) -> str:
         return "Exa"
 
-    def is_available(self) -> bool:
+    async def is_available(self) -> bool:
         """Return True when ``EXA_API_KEY`` is set to a non-empty value."""
         from agent.web_search_provider import get_provider_env
 
-        return bool(get_provider_env("EXA_API_KEY"))
+        return bool(await get_provider_env("EXA_API_KEY"))
 
     def supports_search(self) -> bool:
         return True

@@ -16,7 +16,7 @@ MAX_XAI_STORAGE_EXPIRES_AFTER_SECONDS = 30 * 24 * 60 * 60
 SAFE_XAI_STORAGE_EXPIRES_AFTER_SECONDS = 2 * 24 * 60 * 60
 
 
-def has_xai_credentials() -> bool:
+async def has_xai_credentials() -> bool:
     """Cheap probe — return True when xAI credentials are *likely* usable.
 
     Deliberately avoids awaiting :func:`resolve_xai_http_credentials` so callers in
@@ -51,9 +51,10 @@ def has_xai_credentials() -> bool:
         from hermes_constants import get_hermes_home
 
         auth_path = get_hermes_home() / "auth.json"
-        if not auth_path.exists():
+        if not await aiofiles.os.path.exists(auth_path):
             return False
-        store = json.loads(auth_path.read_text(encoding="utf-8"))
+        async with aiofiles.open(auth_path, encoding="utf-8") as auth_file:
+            store = json.loads(await auth_file.read())
         providers = store.get("providers") if isinstance(store, dict) else None
         xai_state = providers.get("xai-oauth") if isinstance(providers, dict) else None
         tokens = xai_state.get("tokens") if isinstance(xai_state, dict) else None

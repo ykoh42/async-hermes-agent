@@ -12,7 +12,7 @@ Covers:
 from __future__ import annotations
 
 import json
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -25,10 +25,11 @@ from tests.tools.conftest import register_all_web_providers
 
 
 class TestSearXNGSearchProviderIsConfigured:
-    def test_configured_when_url_set(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_configured_when_url_set(self, monkeypatch):
         monkeypatch.setenv("SEARXNG_URL", "http://localhost:8080")
         from plugins.web.searxng.provider import SearXNGWebSearchProvider
-        assert SearXNGWebSearchProvider().is_available() is True
+        assert await SearXNGWebSearchProvider().is_available() is True
 
 
     def test_implements_web_search_provider(self):
@@ -134,15 +135,17 @@ class TestSearXNGSearchProviderSearch:
 
 
 class TestIsBackendAvailable:
-    def test_searxng_available_when_url_set(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_searxng_available_when_url_set(self, monkeypatch):
         monkeypatch.setenv("SEARXNG_URL", "http://localhost:8080")
         from tools.web_tools import _is_backend_available
-        assert _is_backend_available("searxng") is True
+        assert await _is_backend_available("searxng") is True
 
 
-    def test_unknown_backend_still_false(self):
+    @pytest.mark.asyncio
+    async def test_unknown_backend_still_false(self):
         from tools.web_tools import _is_backend_available
-        assert _is_backend_available("unknownbackend") is False
+        assert await _is_backend_available("unknownbackend") is False
 
 
 # ---------------------------------------------------------------------------
@@ -151,14 +154,16 @@ class TestIsBackendAvailable:
 
 
 class TestGetBackendSearXNG:
-    def test_configured_searxng_returns_searxng(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_configured_searxng_returns_searxng(self, monkeypatch):
         from tools import web_tools
         monkeypatch.setattr(web_tools, "_load_web_config", lambda: {"backend": "searxng"})
         monkeypatch.setenv("SEARXNG_URL", "http://localhost:8080")
-        assert web_tools._get_backend() == "searxng"
+        assert await web_tools._get_backend() == "searxng"
 
 
-    def test_searxng_does_not_override_higher_priority_provider(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_searxng_does_not_override_higher_priority_provider(self, monkeypatch):
         """Tavily (higher priority than searxng) should win in auto-detect."""
         from tools import web_tools
         monkeypatch.setattr(web_tools, "_load_web_config", lambda: {})
@@ -167,12 +172,12 @@ class TestGetBackendSearXNG:
         monkeypatch.delenv("PARALLEL_API_KEY", raising=False)
         monkeypatch.setenv("TAVILY_API_KEY", "tvly-key")
         monkeypatch.setenv("SEARXNG_URL", "http://localhost:8080")
-        assert web_tools._get_backend() == "tavily"
+        assert await web_tools._get_backend() == "tavily"
 
-    def test_auto_detect_picks_searxng_when_url_only_in_hermes_config(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_auto_detect_picks_searxng_when_url_only_in_hermes_config(self, monkeypatch):
         """#34290 follow-up: a config-only SEARXNG_URL (absent from process env)
         must still drive auto-detect via the now config-aware ``_has_env``."""
-        from hermes_cli import config as hermes_config
         from tools import web_tools
         monkeypatch.setattr(web_tools, "_load_web_config", lambda: {})
         monkeypatch.delenv("FIRECRAWL_API_KEY", raising=False)
@@ -182,11 +187,14 @@ class TestGetBackendSearXNG:
         monkeypatch.delenv("EXA_API_KEY", raising=False)
         monkeypatch.delenv("SEARXNG_URL", raising=False)
         monkeypatch.setattr(
-            hermes_config,
-            "get_env_value",
-            lambda key: "http://config-only:8080" if key == "SEARXNG_URL" else None,
+            "agent.web_search_provider.get_provider_env",
+            AsyncMock(
+                side_effect=lambda key: (
+                    "http://config-only:8080" if key == "SEARXNG_URL" else ""
+                )
+            ),
         )
-        assert web_tools._get_backend() == "searxng"
+        assert await web_tools._get_backend() == "searxng"
 
 
 # ---------------------------------------------------------------------------
@@ -195,26 +203,31 @@ class TestGetBackendSearXNG:
 
 
 class TestCheckWebApiKey:
-    def test_searxng_satisfies_check_web_api_key(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_searxng_satisfies_check_web_api_key(self, monkeypatch):
         from tools import web_tools
         monkeypatch.setattr(web_tools, "_load_web_config", lambda: {"backend": "searxng"})
         monkeypatch.setenv("SEARXNG_URL", "http://localhost:8080")
-        assert web_tools.check_web_api_key() is True
+        assert await web_tools.check_web_api_key() is True
 
-    def test_searxng_config_only_satisfies_check_web_api_key(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_searxng_config_only_satisfies_check_web_api_key(self, monkeypatch):
         """#34290 follow-up: config-only SEARXNG_URL satisfies the credential check."""
-        from hermes_cli import config as hermes_config
         from tools import web_tools
         monkeypatch.setattr(web_tools, "_load_web_config", lambda: {"backend": "searxng"})
         monkeypatch.delenv("SEARXNG_URL", raising=False)
         monkeypatch.setattr(
-            hermes_config,
-            "get_env_value",
-            lambda key: "http://config-only:8080" if key == "SEARXNG_URL" else None,
+            "agent.web_search_provider.get_provider_env",
+            AsyncMock(
+                side_effect=lambda key: (
+                    "http://config-only:8080" if key == "SEARXNG_URL" else ""
+                )
+            ),
         )
-        assert web_tools.check_web_api_key() is True
+        assert await web_tools.check_web_api_key() is True
 
-    def test_no_credentials_fails(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_no_credentials_fails(self, monkeypatch):
         from tools import web_tools
         monkeypatch.setattr(web_tools, "_load_web_config", lambda: {})
         monkeypatch.delenv("FIRECRAWL_API_KEY", raising=False)
@@ -223,9 +236,11 @@ class TestCheckWebApiKey:
         monkeypatch.delenv("TAVILY_API_KEY", raising=False)
         monkeypatch.delenv("EXA_API_KEY", raising=False)
         monkeypatch.delenv("SEARXNG_URL", raising=False)
-        monkeypatch.setattr(web_tools, "check_firecrawl_api_key", lambda: False)
+        monkeypatch.setattr(
+            web_tools, "check_firecrawl_api_key", AsyncMock(return_value=False)
+        )
         monkeypatch.setattr(web_tools, "_ddgs_package_importable", lambda: False)
-        assert web_tools.check_web_api_key() is False
+        assert await web_tools.check_web_api_key() is False
 
 
 # ---------------------------------------------------------------------------

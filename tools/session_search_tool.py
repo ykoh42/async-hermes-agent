@@ -1010,11 +1010,11 @@ async def session_search(
                 logging.debug("Failed to close session-search database", exc_info=True)
 
 
-def check_session_search_requirements() -> bool:
+async def check_session_search_requirements() -> bool:
     """Requires the SQLite state database."""
     try:
         from hermes_state import _default_db_path
-        return _default_db_path().parent.exists()
+        return await aiofiles.os.path.exists(_default_db_path().parent)
     except ImportError:
         return False
 

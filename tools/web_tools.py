@@ -88,7 +88,7 @@ def _web_extract_url(value: Any) -> Optional[str]:
 
 # ─── Backend Selection ────────────────────────────────────────────────────────
 
-def _env_value(name: str) -> str:
+async def _env_value(name: str) -> str:
     """Resolve ``name`` via Hermes config-aware env, falling back to process env.
 
     Mirrors the SearXNG provider's ``_searxng_url()`` so that values set
@@ -98,9 +98,9 @@ def _env_value(name: str) -> str:
     auto-detect cascade and ``check_web_api_key()`` blind to it. See #34290.
     """
     try:
-        from hermes_cli.config import get_env_value
+        from agent.web_search_provider import get_provider_env
 
-        val = get_env_value(name)
+        val = await get_provider_env(name)
     except Exception:
         val = None
     if val is None:
@@ -108,8 +108,8 @@ def _env_value(name: str) -> str:
     return (val or "").strip()
 
 
-def _has_env(name: str) -> bool:
-    return bool(_env_value(name))
+async def _has_env(name: str) -> bool:
+    return bool(await _env_value(name))
 
 def _load_web_config() -> dict:
     """Return settings captured at the current async tool boundary."""
@@ -166,7 +166,7 @@ def _registered_web_provider(backend: str):
         return None
 
 
-def _registered_web_provider_available(backend: str):
+async def _registered_web_provider_available(backend: str):
     """Availability of a *registered* web provider, or ``None`` if unregistered.
 
     Returns ``True``/``False`` when *backend* names a registered provider
@@ -177,7 +177,7 @@ def _registered_web_provider_available(backend: str):
     if provider is None:
         return None
     try:
-        return bool(provider.is_available())
+        return bool(await provider.is_available())
     except Exception as exc:  # noqa: BLE001 — a broken provider is "unavailable"
         logger.debug("web provider %r.is_available() raised: %s", backend, exc)
         return False
@@ -194,7 +194,7 @@ def _list_registered_web_providers():
         return []
 
 
-def _get_backend() -> str:
+async def _get_backend() -> str:
     """Determine which web backend to use (shared fallback).
 
     Reads ``web.backend`` from config.yaml (set by ``hermes tools``).
@@ -208,12 +208,16 @@ def _get_backend() -> str:
     # Fallback for manual / legacy config — pick the highest-priority
     # available backend. Free-tier backends trail the paid ones.
     backend_candidates = (
-        ("tavily", _has_env("TAVILY_API_KEY")),
-        ("exa", _has_env("EXA_API_KEY")),
-        ("parallel", _has_env("PARALLEL_API_KEY")),
-        ("firecrawl", _has_env("FIRECRAWL_API_KEY") or _has_env("FIRECRAWL_API_URL")),
-        ("searxng", _has_env("SEARXNG_URL")),
-        ("brave-free", _has_env("BRAVE_SEARCH_API_KEY")),
+        ("tavily", await _has_env("TAVILY_API_KEY")),
+        ("exa", await _has_env("EXA_API_KEY")),
+        ("parallel", await _has_env("PARALLEL_API_KEY")),
+        (
+            "firecrawl",
+            await _has_env("FIRECRAWL_API_KEY")
+            or await _has_env("FIRECRAWL_API_URL"),
+        ),
+        ("searxng", await _has_env("SEARXNG_URL")),
+        ("brave-free", await _has_env("BRAVE_SEARCH_API_KEY")),
         ("ddgs", _ddgs_package_importable()),
     )
     for backend, available in backend_candidates:
@@ -230,7 +234,7 @@ def _get_backend() -> str:
         if provider.name in _LEGACY_WEB_BACKENDS:
             continue
         try:
-            if provider.is_available():
+            if await provider.is_available():
                 return provider.name
         except Exception as exc:  # noqa: BLE001 — a broken provider is skipped
             logger.debug("web provider %r.is_available() raised: %s", provider.name, exc)
@@ -238,7 +242,7 @@ def _get_backend() -> str:
     return "firecrawl"  # default (backward compat)
 
 
-def _get_search_backend() -> str:
+async def _get_search_backend() -> str:
     """Determine which backend to use for web_search specifically.
 
     Selection priority:
@@ -249,10 +253,10 @@ def _get_search_backend() -> str:
     This enables using different providers for search vs extract
     (e.g. SearXNG for search + Firecrawl for extract).
     """
-    return _get_capability_backend("search")
+    return await _get_capability_backend("search")
 
 
-def _get_extract_backend() -> str:
+async def _get_extract_backend() -> str:
     """Determine which backend to use for web_extract specifically.
 
     Selection priority:
@@ -260,10 +264,10 @@ def _get_extract_backend() -> str:
     2. ``web.backend`` (shared fallback — existing behavior)
     3. Auto-detect from env vars
     """
-    return _get_capability_backend("extract")
+    return await _get_capability_backend("extract")
 
 
-def _get_capability_backend(capability: str) -> str:
+async def _get_capability_backend(capability: str) -> str:
     """Shared helper for per-capability backend selection.
 
     Reads ``web.{capability}_backend`` from config; if set and available,
@@ -271,12 +275,12 @@ def _get_capability_backend(capability: str) -> str:
     """
     cfg = _load_web_config()
     specific = (cfg.get(f"{capability}_backend") or "").lower().strip()
-    if specific and _is_backend_available(specific):
+    if specific and await _is_backend_available(specific):
         return specific
-    return _get_backend()
+    return await _get_backend()
 
 
-def _is_backend_available(backend: str) -> bool:
+async def _is_backend_available(backend: str) -> bool:
     """Return True when the selected backend is currently usable.
 
     For plugin-registered backends (any name outside
@@ -290,21 +294,21 @@ def _is_backend_available(backend: str) -> bool:
     """
     backend = (backend or "").lower().strip()
     if backend not in _LEGACY_WEB_BACKENDS:
-        registered = _registered_web_provider_available(backend)
+        registered = await _registered_web_provider_available(backend)
         if registered is not None:
             return registered
     if backend == "exa":
-        return _has_env("EXA_API_KEY")
+        return await _has_env("EXA_API_KEY")
     if backend == "parallel":
-        return _has_env("PARALLEL_API_KEY")
+        return await _has_env("PARALLEL_API_KEY")
     if backend == "firecrawl":
-        return check_firecrawl_api_key()
+        return await check_firecrawl_api_key()
     if backend == "tavily":
-        return _has_env("TAVILY_API_KEY")
+        return await _has_env("TAVILY_API_KEY")
     if backend == "searxng":
-        return _has_env("SEARXNG_URL")
+        return await _has_env("SEARXNG_URL")
     if backend == "brave-free":
-        return _has_env("BRAVE_SEARCH_API_KEY")
+        return await _has_env("BRAVE_SEARCH_API_KEY")
     if backend == "ddgs":
         return _ddgs_package_importable()
     if backend == "xai":
@@ -314,7 +318,7 @@ def _is_backend_available(backend: str) -> bool:
         # runs on every web_search dispatch + every `hermes tools` repaint.
         try:
             from tools.xai_http import has_xai_credentials
-            return has_xai_credentials()
+            return await has_xai_credentials()
         except Exception:
             return False
     return False
@@ -630,13 +634,13 @@ async def web_search_tool(query: str, limit: int = 5) -> str:
             _disabled_web_plugin_for,
         )
 
-        backend = _get_search_backend()
+        backend = await _get_search_backend()
         provider = _wsp_get_provider(backend) if backend else None
         if provider is None or not provider.supports_search():
             # Fall back to availability-walked active provider when the
             # configured backend isn't a registered search provider (typo,
             # uninstalled plugin, or capability mismatch).
-            provider = get_active_search_provider()
+            provider = await get_active_search_provider()
 
         if provider is None:
             # A bundled web plugin the user explicitly disabled looks
@@ -811,7 +815,7 @@ async def web_extract_tool(
         if not safe_urls:
             results = []
         else:
-            backend = _get_extract_backend()
+            backend = await _get_extract_backend()
 
             # All seven providers (brave-free, ddgs, searxng, exa, parallel,
             # tavily, firecrawl) now live as plugins. The dispatcher is a
@@ -846,7 +850,7 @@ async def web_extract_tool(
                         },
                         ensure_ascii=False,
                     )
-                provider = get_active_extract_provider()
+                provider = await get_active_extract_provider()
                 if provider is None:
                     # If the configured backend is a bundled web plugin the
                     # user explicitly disabled, the backend is set correctly
@@ -1000,7 +1004,7 @@ async def web_extract_tool(
 
 
 # Convenience function to check Firecrawl credentials
-def check_web_api_key() -> bool:
+async def check_web_api_key() -> bool:
     """Check whether the configured web backend is available.
 
     Used as the ``check_fn`` gate for the ``web_search`` and ``web_extract``
@@ -1013,12 +1017,13 @@ def check_web_api_key() -> bool:
     # ``or ""``: a null ``web.backend`` value yields None from ``.get``, and
     # ``None.lower()`` would raise. Mirrors ``_get_backend``.
     configured = (_load_web_config().get("backend") or "").lower().strip()
-    if configured and _is_backend_available(configured):
+    if configured and await _is_backend_available(configured):
         return True
     # Any built-in backend with credentials present. This is a boolean OR, so
     # unlike _get_backend() the probe order is irrelevant.
-    if any(_is_backend_available(backend) for backend in _LEGACY_WEB_BACKENDS):
-        return True
+    for backend in _LEGACY_WEB_BACKENDS:
+        if await _is_backend_available(backend):
+            return True
     # Any plugin-registered provider the registry considers active for either
     # capability. Delegating to the registry's own availability-filtered
     # resolvers keeps a single authority for "is a custom provider usable"
@@ -1029,10 +1034,9 @@ def check_web_api_key() -> bool:
             get_active_extract_provider,
         )
 
-        return (
-            get_active_search_provider() is not None
-            or get_active_extract_provider() is not None
-        )
+        if (await get_active_search_provider()) is not None:
+            return True
+        return (await get_active_extract_provider()) is not None
     except Exception as exc:  # noqa: BLE001 — registry optional; never fatal
         logger.debug("web provider registry availability check failed: %s", exc)
         return False
@@ -1046,13 +1050,14 @@ if __name__ == "__main__":
     print("=" * 40)
 
     # Check if API keys are available
-    web_available = check_web_api_key()
-    from hermes_cli.config import get_env_value as _gev
-    firecrawl_key_available = bool((_gev("FIRECRAWL_API_KEY") or "").strip())
-    firecrawl_url_available = bool((_gev("FIRECRAWL_API_URL") or "").strip())
+    web_available = asyncio.run(check_web_api_key())
+    firecrawl_key = asyncio.run(_env_value("FIRECRAWL_API_KEY"))
+    firecrawl_url = asyncio.run(_env_value("FIRECRAWL_API_URL"))
+    firecrawl_key_available = bool(firecrawl_key)
+    firecrawl_url_available = bool(firecrawl_url)
 
     if web_available:
-        backend = _get_backend()
+        backend = asyncio.run(_get_backend())
         print(f"✅ Web backend: {backend}")
         if backend == "exa":
             print("   Using Exa API (https://exa.ai)")
@@ -1061,13 +1066,16 @@ if __name__ == "__main__":
         elif backend == "tavily":
             print("   Using Tavily API (https://tavily.com)")
         elif backend == "searxng":
-            print(f"   Using SearXNG (search only): {_env_value('SEARXNG_URL')}")
+            print(
+                "   Using SearXNG (search only): "
+                f"{asyncio.run(_env_value('SEARXNG_URL'))}"
+            )
         elif backend == "brave-free":
             print("   Using Brave Search free tier (search only)")
         elif backend == "ddgs":
             print("   Using DuckDuckGo via ddgs package (search only)")
         elif firecrawl_url_available:
-            print(f"   Using self-hosted Firecrawl: {(_gev('FIRECRAWL_API_URL') or '').strip().rstrip('/')}")
+            print(f"   Using self-hosted Firecrawl: {firecrawl_url.rstrip('/')}")
         elif firecrawl_key_available:
             print("   Using direct Firecrawl cloud API")
         else:

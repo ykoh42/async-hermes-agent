@@ -35,12 +35,12 @@ from tools.website_policy import check_website_access
 logger = logging.getLogger(__name__)
 
 
-def _get_direct_firecrawl_config() -> Optional[Dict[str, str]]:
+async def _get_direct_firecrawl_config() -> Optional[Dict[str, str]]:
     """Return direct Firecrawl request configuration, or ``None`` when unset."""
-    from hermes_cli.config import get_env_value
+    from agent.web_search_provider import get_provider_env
 
-    api_key = (get_env_value("FIRECRAWL_API_KEY") or "").strip()
-    api_url = (get_env_value("FIRECRAWL_API_URL") or "").strip().rstrip("/")
+    api_key = (await get_provider_env("FIRECRAWL_API_KEY") or "").strip()
+    api_url = (await get_provider_env("FIRECRAWL_API_URL") or "").strip().rstrip("/")
 
     if not api_key and not api_url:
         return None
@@ -54,18 +54,18 @@ def _get_direct_firecrawl_config() -> Optional[Dict[str, str]]:
     return kwargs
 
 
-def _has_direct_firecrawl_config() -> bool:
+async def _has_direct_firecrawl_config() -> bool:
     """Return True when direct Firecrawl config is explicitly configured."""
-    return _get_direct_firecrawl_config() is not None
+    return await _get_direct_firecrawl_config() is not None
 
 
-def check_firecrawl_api_key() -> bool:
+async def check_firecrawl_api_key() -> bool:
     """Return True when a direct or self-hosted Firecrawl backend is usable.
 
     Re-exported by :mod:`tools.web_tools` for backward compatibility with
     existing tests and the ``hermes tools`` setup flow.
     """
-    return _has_direct_firecrawl_config()
+    return await _has_direct_firecrawl_config()
 
 
 def _raise_web_backend_configuration_error() -> None:
@@ -172,9 +172,9 @@ class FirecrawlWebSearchProvider(WebSearchProvider):
     """Native-async Firecrawl search + extract provider."""
 
     @staticmethod
-    def _request_config() -> tuple[str, str]:
+    async def _request_config() -> tuple[str, str]:
         """Resolve the active Firecrawl HTTP origin and bearer token."""
-        direct_config = _get_direct_firecrawl_config()
+        direct_config = await _get_direct_firecrawl_config()
         if direct_config is None:
             _raise_web_backend_configuration_error()
         return (
@@ -186,7 +186,7 @@ class FirecrawlWebSearchProvider(WebSearchProvider):
     async def _request(cls, endpoint: str, payload: Dict[str, Any]) -> Any:
         import httpx
 
-        origin, token = cls._request_config()
+        origin, token = await cls._request_config()
         if not origin.endswith("/v1"):
             origin = f"{origin}/v1"
         async with httpx.AsyncClient(timeout=60) as client:
@@ -210,9 +210,9 @@ class FirecrawlWebSearchProvider(WebSearchProvider):
     def display_name(self) -> str:
         return "Firecrawl"
 
-    def is_available(self) -> bool:
+    async def is_available(self) -> bool:
         """Return True when direct or self-hosted Firecrawl is configured."""
-        return check_firecrawl_api_key()
+        return await check_firecrawl_api_key()
 
     def supports_search(self) -> bool:
         return True

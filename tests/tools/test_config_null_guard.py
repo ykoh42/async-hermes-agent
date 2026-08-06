@@ -7,6 +7,8 @@ return ``None`` instead of the default — calling ``.lower()`` on that raises
 
 from unittest.mock import patch
 
+import pytest
+
 
 # ── Web tools ─────────────────────────────────────────────────────────────
 
@@ -14,19 +16,21 @@ class TestWebBackendNullGuard:
     """tools/web_tools.py — _get_backend()"""
 
     @patch("tools.web_tools._load_web_config", return_value={"backend": None})
-    def test_explicit_null_backend_does_not_crash(self, _cfg):
+    @pytest.mark.asyncio
+    async def test_explicit_null_backend_does_not_crash(self, _cfg):
         """YAML ``web: {backend: null}`` should not raise AttributeError."""
         from tools.web_tools import _get_backend
 
         # Should not raise — the exact return depends on env key fallback
-        result = _get_backend()
+        result = await _get_backend()
         assert isinstance(result, str)
 
     @patch("tools.web_tools._load_web_config", return_value={})
-    def test_missing_backend_does_not_crash(self, _cfg):
+    @pytest.mark.asyncio
+    async def test_missing_backend_does_not_crash(self, _cfg):
         from tools.web_tools import _get_backend
 
-        result = _get_backend()
+        result = await _get_backend()
         assert isinstance(result, str)
 
 
