@@ -17,7 +17,8 @@ mocking the save boundary, so they exercise the actual atomic write path.
 """
 
 import json
-import threading
+import asyncio
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -76,8 +77,8 @@ def profile_and_root(tmp_path, monkeypatch):
 
 
 
-@pytest.mark.skip(reason="legacy synchronous pool write-through was removed from the async runtime")
-def test_global_write_through_preserves_concurrent_root_update(
+@pytest.mark.asyncio
+async def test_global_write_through_preserves_concurrent_root_update(
     profile_and_root, monkeypatch
 ):
     """A stale profile write-through must not erase a concurrent root login."""
@@ -98,38 +99,30 @@ def test_global_write_through_preserves_concurrent_root_update(
         },
     )
 
-    helper_loaded = threading.Event()
-    helper_has_target_lock = threading.Event()
-    allow_helper_save = threading.Event()
-    writer_started = threading.Event()
-    writer_done = threading.Event()
+    helper_loaded = asyncio.Event()
+    allow_helper_save = asyncio.Event()
+    writer_started = asyncio.Event()
     real_auth_load = A._load_auth_store
 
-    def paused_helper_load(path=None):
-        store = real_auth_load(path)
-        if threading.current_thread().name == "profile-write-through":
-            target_holder = A._auth_lock_holder_for(root_path)
-            if getattr(target_holder, "depth", 0) > 0:
-                helper_has_target_lock.set()
+    async def paused_helper_load(path=None):
+        store = await real_auth_load(path)
+        if asyncio.current_task().get_name() == "profile-write-through":
             helper_loaded.set()
-            assert allow_helper_save.wait(timeout=5)
+            await allow_helper_save.wait()
         return store
 
     monkeypatch.setattr(A, "_load_auth_store", paused_helper_load)
-    # The pre-fix implementation imported the loader directly; patch both
-    # bindings so reverting the safe helper still exercises the stale ordering.
-    monkeypatch.setattr(CP, "_load_auth_store", paused_helper_load)
 
-    def profile_write_through():
-        CP._write_through_provider_state_to_global_root(
+    async def profile_write_through():
+        await CP._write_through_provider_state_to_global_root(
             "xai-oauth",
             {"tokens": {"access_token": "new-xai", "refresh_token": "new-r"}},
         )
 
-    def concurrent_codex_login():
+    async def concurrent_codex_login():
         writer_started.set()
-        with A._auth_store_lock(target_path=root_path):
-            store = A._load_auth_store(root_path)
+        async with A._auth_store_transaction(root_path):
+            store = await A._load_auth_store(root_path)
             A._store_provider_state(
                 store,
                 "openai-codex",
@@ -138,27 +131,20 @@ def test_global_write_through_preserves_concurrent_root_update(
             )
             pool = store.setdefault("credential_pool", {})
             pool["openai-codex"] = [{"id": "codex-login"}]
-            A._save_auth_store(store, target_path=root_path)
-        writer_done.set()
+            await A._save_auth_store(store, target_path=root_path)
 
-    helper = threading.Thread(target=profile_write_through, name="profile-write-through")
-    helper.start()
-    assert helper_loaded.wait(timeout=5)
+    helper = asyncio.create_task(
+        profile_write_through(),
+        name="profile-write-through",
+    )
+    await asyncio.wait_for(helper_loaded.wait(), timeout=5)
 
-    writer = threading.Thread(target=concurrent_codex_login, name="concurrent-login")
-    writer.start()
-    assert writer_started.wait(timeout=5)
-    # A fixed helper already owns the target lock, so the writer will merge
-    # after release. A reverted unlocked helper must first let the competing
-    # login finish; only then do we release its stale save. This makes the
-    # losing pre-fix ordering deterministic rather than scheduler-dependent.
-    if not helper_has_target_lock.is_set():
-        assert writer_done.wait(timeout=5)
+    writer = asyncio.create_task(concurrent_codex_login(), name="concurrent-login")
+    await asyncio.wait_for(writer_started.wait(), timeout=5)
+    await asyncio.sleep(0)
+    assert not writer.done()
     allow_helper_save.set()
-    helper.join(timeout=5)
-    writer.join(timeout=5)
-    assert not helper.is_alive()
-    assert not writer.is_alive()
+    await asyncio.wait_for(asyncio.gather(helper, writer), timeout=5)
 
     root = _read_store(root_path)
     assert root["providers"]["xai-oauth"]["tokens"]["refresh_token"] == "new-r"
@@ -169,8 +155,7 @@ def test_global_write_through_preserves_concurrent_root_update(
 
 
 @pytest.mark.asyncio
-async def test_unsupported_codex_pool_refresh_fails_fast(monkeypatch, tmp_path):
-    """Codex refresh fails before crossing the removed synchronous boundary."""
+async def test_codex_pool_refresh_uses_native_async_transport(monkeypatch, tmp_path):
     provider = "openai-codex"
 
     entry = _entry(
@@ -181,7 +166,184 @@ async def test_unsupported_codex_pool_refresh_fails_fast(monkeypatch, tmp_path):
     )
     pool = CredentialPool(provider, [entry])
 
-    from agent.agent_runtime_helpers import UnsupportedCapabilityError
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    await A._save_auth_store(
+        {
+            "providers": {
+                provider: {
+                    "tokens": {
+                        "access_token": "stale-access",
+                        "refresh_token": "stale-refresh",
+                    }
+                }
+            }
+        }
+    )
+    refresh = AsyncMock(
+        return_value={
+            "access_token": "fresh-access",
+            "refresh_token": "fresh-refresh",
+            "last_refresh": "2026-08-06T00:00:00Z",
+        }
+    )
+    monkeypatch.setattr(A, "refresh_codex_oauth_pure", refresh)
 
-    with pytest.raises(UnsupportedCapabilityError, match="not native async yet"):
-        await pool._refresh_entry(entry, force=True)
+    updated = await pool._refresh_entry(entry, force=True)
+
+    assert updated is not None
+    assert updated.access_token == "fresh-access"
+    assert updated.refresh_token == "fresh-refresh"
+    refresh.assert_awaited_once_with(
+        "stale-access",
+        "stale-refresh",
+        timeout_seconds=20,
+    )
+    persisted = await A._load_auth_store()
+    assert persisted["providers"][provider]["tokens"] == {
+        "access_token": "fresh-access",
+        "refresh_token": "fresh-refresh",
+    }
+    assert persisted["credential_pool"][provider][0]["access_token"] == "fresh-access"
+
+
+@pytest.mark.asyncio
+async def test_codex_pool_refresh_updates_global_owner(
+    profile_and_root,
+    monkeypatch,
+):
+    profile_path, root_path = profile_and_root
+    provider = "openai-codex"
+    entry = _entry(
+        provider,
+        id="codex-root",
+        access_token="root-access",
+        refresh_token="root-refresh",
+    )
+    _write_store(
+        root_path,
+        {
+            "version": 1,
+            "providers": {
+                provider: {
+                    "tokens": {
+                        "access_token": "root-access",
+                        "refresh_token": "root-refresh",
+                    }
+                }
+            },
+            "credential_pool": {provider: [entry.to_dict()]},
+        },
+    )
+    refresh = AsyncMock(
+        return_value={
+            "access_token": "rotated-access",
+            "refresh_token": "rotated-refresh",
+            "last_refresh": "2026-08-06T01:00:00Z",
+        }
+    )
+    monkeypatch.setattr(A, "refresh_codex_oauth_pure", refresh)
+
+    updated = await CredentialPool(provider, [entry])._refresh_entry(
+        entry,
+        force=True,
+    )
+
+    assert updated is not None
+    root = _read_store(root_path)
+    assert root["providers"][provider]["tokens"]["refresh_token"] == "rotated-refresh"
+    assert root["credential_pool"][provider][0]["access_token"] == "rotated-access"
+    assert not profile_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_codex_terminal_refresh_failure_quarantines_singleton(
+    monkeypatch,
+    tmp_path,
+):
+    provider = "openai-codex"
+    entry = _entry(
+        provider,
+        id="codex-terminal",
+        access_token="dead-access",
+        refresh_token="dead-refresh",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    await A._save_auth_store(
+        {
+            "providers": {
+                provider: {
+                    "tokens": {
+                        "access_token": entry.access_token,
+                        "refresh_token": entry.refresh_token,
+                    }
+                }
+            },
+            "credential_pool": {provider: [entry.to_dict()]},
+        }
+    )
+    monkeypatch.setattr(
+        A,
+        "refresh_codex_oauth_pure",
+        AsyncMock(
+            side_effect=A.AuthError(
+                "expired",
+                provider=provider,
+                code="invalid_grant",
+                relogin_required=True,
+            )
+        ),
+    )
+    pool = CredentialPool(provider, [entry])
+
+    assert await pool._refresh_entry(entry, force=True) is None
+
+    persisted = await A._load_auth_store()
+    assert persisted["providers"][provider]["tokens"] == {}
+    assert persisted["providers"][provider]["last_auth_error"]["code"] == "invalid_grant"
+    assert persisted["credential_pool"][provider] == []
+    assert pool.entries() == []
+
+
+@pytest.mark.asyncio
+async def test_codex_transient_refresh_failure_keeps_credential(monkeypatch, tmp_path):
+    provider = "openai-codex"
+    entry = _entry(
+        provider,
+        id="codex-limited",
+        access_token="limited-access",
+        refresh_token="limited-refresh",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    await A._save_auth_store(
+        {
+            "providers": {
+                provider: {
+                    "tokens": {
+                        "access_token": entry.access_token,
+                        "refresh_token": entry.refresh_token,
+                    }
+                }
+            },
+            "credential_pool": {provider: [entry.to_dict()]},
+        }
+    )
+    monkeypatch.setattr(
+        A,
+        "refresh_codex_oauth_pure",
+        AsyncMock(
+            side_effect=A.AuthError(
+                "limited",
+                provider=provider,
+                code=A.CODEX_RATE_LIMITED_CODE,
+                relogin_required=False,
+            )
+        ),
+    )
+    pool = CredentialPool(provider, [entry])
+
+    assert await pool._refresh_entry(entry, force=True) is None
+
+    persisted_entry = (await A._load_auth_store())["credential_pool"][provider][0]
+    assert persisted_entry["access_token"] == "limited-access"
+    assert persisted_entry["last_status"] == "exhausted"
+    assert pool.entries()[0].last_status == "exhausted"

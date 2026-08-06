@@ -74,7 +74,7 @@ def _fake_invoke_jwt(ttl_seconds=3600):
     return f"{header}.{payload}.sig"
 
 
-async def test_openai_codex_pool_fails_fast_without_native_async_lifecycle(monkeypatch):
+async def test_openai_codex_resolves_from_native_async_pool(monkeypatch):
     class _Entry:
         access_token = "pool-token"
         source = "manual"
@@ -90,8 +90,12 @@ async def test_openai_codex_pool_fails_fast_without_native_async_lifecycle(monke
     monkeypatch.setattr(rp, "resolve_provider", AsyncMock(return_value="openai-codex"))
     monkeypatch.setattr(rp, "load_pool", AsyncMock(return_value=_Pool()))
 
-    with pytest.raises(UnsupportedCapabilityError, match="openai-codex requires an OAuth lifecycle"):
-        await rp.resolve_runtime_provider(requested="openai-codex")
+    resolved = await rp.resolve_runtime_provider(requested="openai-codex")
+
+    assert resolved["provider"] == "openai-codex"
+    assert resolved["api_mode"] == "codex_responses"
+    assert resolved["api_key"] == "pool-token"
+    assert resolved["base_url"] == "https://chatgpt.com/backend-api/codex"
 
 
 async def test_qwen_oauth_fails_fast_without_native_async_lifecycle(monkeypatch):

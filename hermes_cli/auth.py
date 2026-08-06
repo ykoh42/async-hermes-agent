@@ -1379,47 +1379,64 @@ async def write_credential_pool(
     are retained and a newer on-disk cooldown wins over stale in-memory state.
     The transaction itself is non-blocking for the event loop.
     """
-    removed = {rid for rid in (removed_ids or ()) if rid}
     async with _auth_store_transaction():
         auth_store = await _load_auth_store()
-        pool = auth_store.get("credential_pool")
-        if not isinstance(pool, dict):
-            pool = {}
-            auth_store["credential_pool"] = pool
-        sanitized_entries = [
-            sanitize_borrowed_credential_payload(entry, provider_id)
-            if isinstance(entry, dict) else entry
-            for entry in entries
-        ]
-        existing = pool.get(provider_id)
-        existing_list = existing if isinstance(existing, list) else []
-        existing_by_id = {
-            entry.get("id"): entry
-            for entry in existing_list
-            if isinstance(entry, dict) and entry.get("id")
-        }
-        new_ids = {
-            entry.get("id")
-            for entry in sanitized_entries
-            if isinstance(entry, dict) and entry.get("id")
-        }
-        merged: List[Dict[str, Any]] = [
-            _merge_disk_cooldown_state(
-                entry, existing_by_id.get(entry.get("id")), provider_id
-            )
-            if isinstance(entry, dict)
-            else entry
-            for entry in sanitized_entries
-        ]
-        for disk_entry in existing_list:
-            if not isinstance(disk_entry, dict):
-                continue
-            disk_id = disk_entry.get("id")
-            if not disk_id or disk_id in new_ids or disk_id in removed:
-                continue
-            merged.append(sanitize_borrowed_credential_payload(disk_entry, provider_id))
-        pool[provider_id] = merged
+        _merge_credential_pool_entries(
+            auth_store,
+            provider_id,
+            entries,
+            removed_ids=removed_ids,
+        )
         return await _save_auth_store(auth_store)
+
+
+def _merge_credential_pool_entries(
+    auth_store: Dict[str, Any],
+    provider_id: str,
+    entries: List[Dict[str, Any]],
+    *,
+    removed_ids: Optional[Iterable[str]] = None,
+) -> None:
+    """Apply the credential-pool merge to an already locked auth snapshot."""
+    removed = {rid for rid in (removed_ids or ()) if rid}
+    pool = auth_store.get("credential_pool")
+    if not isinstance(pool, dict):
+        pool = {}
+        auth_store["credential_pool"] = pool
+    sanitized_entries = [
+        sanitize_borrowed_credential_payload(entry, provider_id)
+        if isinstance(entry, dict)
+        else entry
+        for entry in entries
+    ]
+    existing = pool.get(provider_id)
+    existing_list = existing if isinstance(existing, list) else []
+    existing_by_id = {
+        entry.get("id"): entry
+        for entry in existing_list
+        if isinstance(entry, dict) and entry.get("id")
+    }
+    new_ids = {
+        entry.get("id")
+        for entry in sanitized_entries
+        if isinstance(entry, dict) and entry.get("id")
+    }
+    merged: List[Dict[str, Any]] = [
+        _merge_disk_cooldown_state(
+            entry, existing_by_id.get(entry.get("id")), provider_id
+        )
+        if isinstance(entry, dict)
+        else entry
+        for entry in sanitized_entries
+    ]
+    for disk_entry in existing_list:
+        if not isinstance(disk_entry, dict):
+            continue
+        disk_id = disk_entry.get("id")
+        if not disk_id or disk_id in new_ids or disk_id in removed:
+            continue
+        merged.append(sanitize_borrowed_credential_payload(disk_entry, provider_id))
+    pool[provider_id] = merged
 
 
 
@@ -1907,6 +1924,147 @@ def _codex_access_token_is_expiring(access_token: Any, skew_seconds: int) -> boo
     if not isinstance(exp, (int, float)):
         return False
     return float(exp) <= (time.time() + max(0, int(skew_seconds)))
+
+
+async def refresh_codex_oauth_pure(
+    access_token: str,
+    refresh_token: str,
+    *,
+    timeout_seconds: float = 20.0,
+) -> Dict[str, Any]:
+    """Refresh Codex OAuth tokens without mutating Hermes auth state."""
+    del access_token
+    if not isinstance(refresh_token, str) or not refresh_token.strip():
+        raise AuthError(
+            "Codex auth is missing refresh_token. Run `hermes auth` to re-authenticate.",
+            provider="openai-codex",
+            code="codex_auth_missing_refresh_token",
+            relogin_required=True,
+        )
+
+    timeout = httpx.Timeout(max(5.0, float(timeout_seconds)))
+    async with httpx.AsyncClient(
+        timeout=timeout,
+        headers={
+            "Accept": "application/json",
+            "User-Agent": CODEX_OAUTH_USER_AGENT,
+        },
+    ) as client:
+        response = await client.post(
+            CODEX_OAUTH_TOKEN_URL,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            data={
+                "grant_type": "refresh_token",
+                "refresh_token": refresh_token,
+                "client_id": CODEX_OAUTH_CLIENT_ID,
+            },
+        )
+
+    if response.status_code == 429:
+        retry_after = _parse_retry_after_seconds(getattr(response, "headers", None))
+        if retry_after is not None:
+            message = (
+                f"Codex provider quota exhausted (429); retry after {retry_after}s. "
+                "Credentials are still valid."
+            )
+        else:
+            message = (
+                "Codex provider quota exhausted (429). Credentials are still valid; "
+                "retry after the usage limit resets."
+            )
+        raise AuthError(
+            message,
+            provider="openai-codex",
+            code=CODEX_RATE_LIMITED_CODE,
+            relogin_required=False,
+        )
+
+    if response.status_code != 200:
+        code = "codex_refresh_failed"
+        message = f"Codex token refresh failed with status {response.status_code}."
+        relogin_required = False
+        try:
+            error_payload = response.json()
+            if isinstance(error_payload, dict):
+                error = error_payload.get("error")
+                if isinstance(error, dict):
+                    nested_code = error.get("code") or error.get("type")
+                    if isinstance(nested_code, str) and nested_code.strip():
+                        code = nested_code.strip()
+                    nested_message = error.get("message")
+                    if isinstance(nested_message, str) and nested_message.strip():
+                        message = f"Codex token refresh failed: {nested_message.strip()}"
+                elif isinstance(error, str) and error.strip():
+                    code = error.strip()
+                    description = error_payload.get("error_description") or error_payload.get("message")
+                    if isinstance(description, str) and description.strip():
+                        message = f"Codex token refresh failed: {description.strip()}"
+        except Exception:
+            pass
+        if code in {"invalid_grant", "invalid_token", "invalid_request"}:
+            relogin_required = True
+        if code == "refresh_token_reused":
+            message = (
+                "Codex refresh token was already consumed by another client "
+                "(e.g. Codex CLI or VS Code extension). "
+                "Run `codex` in your terminal to generate fresh tokens, "
+                "then run `hermes auth` to re-authenticate."
+            )
+            relogin_required = True
+        if response.status_code in {401, 403} and not relogin_required:
+            relogin_required = True
+        raise AuthError(
+            message,
+            provider="openai-codex",
+            code=code,
+            relogin_required=relogin_required,
+        )
+
+    try:
+        refresh_payload = response.json()
+    except Exception as exc:
+        raise AuthError(
+            "Codex token refresh returned invalid JSON.",
+            provider="openai-codex",
+            code="codex_refresh_invalid_json",
+            relogin_required=True,
+        ) from exc
+
+    refreshed_access = refresh_payload.get("access_token")
+    if not isinstance(refreshed_access, str) or not refreshed_access.strip():
+        raise AuthError(
+            "Codex token refresh response was missing access_token.",
+            provider="openai-codex",
+            code="codex_refresh_missing_access_token",
+            relogin_required=True,
+        )
+
+    updated = {
+        "access_token": refreshed_access.strip(),
+        "refresh_token": refresh_token.strip(),
+        "last_refresh": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+    }
+    next_refresh = refresh_payload.get("refresh_token")
+    if isinstance(next_refresh, str) and next_refresh.strip():
+        updated["refresh_token"] = next_refresh.strip()
+    return updated
+
+
+def _is_terminal_codex_oauth_refresh_error(exc: Exception) -> bool:
+    """Return whether retrying the same Codex refresh token cannot succeed."""
+    return (
+        isinstance(exc, AuthError)
+        and exc.provider == "openai-codex"
+        and exc.code
+        in {
+            "codex_refresh_failed",
+            "codex_auth_missing_refresh_token",
+            "invalid_grant",
+            "invalid_token",
+            "refresh_token_reused",
+        }
+        and bool(exc.relogin_required)
+    )
 
 
 

@@ -789,12 +789,12 @@ async def test_unsupported_oauth_pool_refresh_fails_fast_without_a_thread(monkey
     from agent.credential_pool import AUTH_TYPE_OAUTH, CredentialPool, PooledCredential
 
     pool = CredentialPool(
-        "openai-codex",
+        "qwen-oauth",
         [
             PooledCredential(
-                provider="openai-codex",
-                id="codex",
-                label="Codex",
+                provider="qwen-oauth",
+                id="qwen",
+                label="Qwen",
                 auth_type=AUTH_TYPE_OAUTH,
                 priority=0,
                 source="manual",
@@ -808,8 +808,8 @@ async def test_unsupported_oauth_pool_refresh_fails_fast_without_a_thread(monkey
         raise AssertionError("unsupported OAuth must not use asyncio.to_thread")
 
     monkeypatch.setattr(asyncio, "to_thread", fail_if_threaded)
-    with pytest.raises(UnsupportedCapabilityError, match="openai-codex"):
-        await pool.try_refresh_matching(credential_id="codex")
+    with pytest.raises(UnsupportedCapabilityError, match="qwen-oauth"):
+        await pool.try_refresh_matching(credential_id="qwen")
 
 
 @pytest.mark.asyncio

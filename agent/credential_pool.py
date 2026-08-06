@@ -809,6 +809,48 @@ class CredentialPool:
             logger.debug("Failed to sync xAI OAuth entry from auth store: %s", exc)
             return entry
 
+    def _sync_codex_entry_from_auth_store(
+        self,
+        entry: PooledCredential,
+        auth_store: Dict[str, Any],
+    ) -> PooledCredential:
+        """Adopt a newer singleton Codex token pair from a locked snapshot."""
+        if entry.source not in {"device_code", "manual:device_code"}:
+            return entry
+        state = auth_mod._load_provider_state(auth_store, "openai-codex")
+        tokens = state.get("tokens") if isinstance(state, dict) else None
+        if not isinstance(tokens, dict):
+            return entry
+        store_access = str(tokens.get("access_token") or "").strip()
+        store_refresh = str(tokens.get("refresh_token") or "").strip()
+        should_adopt = bool(
+            store_access
+            and (
+                store_access != entry.access_token
+                or (store_refresh and store_refresh != str(entry.refresh_token or ""))
+            )
+        ) or bool(
+            store_refresh
+            and store_refresh != str(entry.refresh_token or "")
+            and not store_access
+        )
+        if not should_adopt:
+            return entry
+        updated = replace(
+            entry,
+            access_token=store_access or entry.access_token,
+            refresh_token=store_refresh or entry.refresh_token,
+            last_refresh=state.get("last_refresh") or entry.last_refresh,
+            last_status=STATUS_OK,
+            last_status_at=None,
+            last_error_code=None,
+            last_error_reason=None,
+            last_error_message=None,
+            last_error_reset_at=None,
+        )
+        self._replace_entry(entry, updated)
+        return updated
+
     async def _sync_device_code_entry_to_auth_store(
         self, entry: PooledCredential,
     ) -> None:
@@ -1165,12 +1207,124 @@ class CredentialPool:
                 await self._persist()
             return None
 
-        if self.provider not in {"anthropic", "xai-oauth"}:
+        if self.provider not in {"anthropic", "openai-codex", "xai-oauth"}:
             raise UnsupportedCapabilityError(
                 f"Credential pool OAuth refresh for {self.provider} is not native async yet."
             )
 
+        codex_target_path = None
         try:
+            if self.provider == "openai-codex":
+                refresh_timeout = auth_mod.env_float(
+                    "HERMES_CODEX_REFRESH_TIMEOUT_SECONDS",
+                    20,
+                )
+                lock_timeout = max(
+                    float(auth_mod.AUTH_LOCK_TIMEOUT_SECONDS),
+                    float(refresh_timeout) + 5.0,
+                )
+                local_store = await auth_mod._load_auth_store()
+                local_pool = local_store.get("credential_pool")
+                local_entries = (
+                    local_pool.get(self.provider)
+                    if isinstance(local_pool, dict)
+                    else None
+                )
+                local_owns_entry = bool(
+                    isinstance(local_entries, list)
+                    and any(
+                        isinstance(candidate, dict)
+                        and candidate.get("id") == entry.id
+                        for candidate in local_entries
+                    )
+                )
+                local_state = auth_mod._load_provider_state(
+                    local_store,
+                    self.provider,
+                )
+                if not local_owns_entry and local_state is None:
+                    global_path = auth_mod._global_auth_file_path()
+                    if global_path is not None:
+                        global_store = await auth_mod._load_global_auth_store()
+                        global_pool = global_store.get("credential_pool")
+                        global_entries = (
+                            global_pool.get(self.provider)
+                            if isinstance(global_pool, dict)
+                            else None
+                        )
+                        if (
+                            isinstance(global_entries, list)
+                            and any(
+                                isinstance(candidate, dict)
+                                and candidate.get("id") == entry.id
+                                for candidate in global_entries
+                            )
+                        ) or auth_mod._load_provider_state(
+                            global_store,
+                            self.provider,
+                        ) is not None:
+                            codex_target_path = global_path
+                async with auth_mod._auth_store_transaction(
+                    codex_target_path,
+                    timeout_seconds=lock_timeout,
+                ):
+                    auth_store = await auth_mod._load_auth_store(codex_target_path)
+                    entry = self._sync_codex_entry_from_auth_store(entry, auth_store)
+                    if not force and not self._entry_needs_refresh(entry):
+                        auth_mod._merge_credential_pool_entries(
+                            auth_store,
+                            self.provider,
+                            [candidate.to_dict() for candidate in self._entries],
+                        )
+                        await auth_mod._save_auth_store(
+                            auth_store,
+                            codex_target_path,
+                        )
+                        return entry
+
+                    refreshed = await auth_mod.refresh_codex_oauth_pure(
+                        entry.access_token,
+                        entry.refresh_token or "",
+                        timeout_seconds=refresh_timeout,
+                    )
+                    updated = replace(
+                        entry,
+                        access_token=refreshed["access_token"],
+                        refresh_token=refreshed["refresh_token"],
+                        last_refresh=refreshed.get("last_refresh"),
+                        last_status=STATUS_OK,
+                        last_status_at=None,
+                        last_error_code=None,
+                        last_error_reason=None,
+                        last_error_message=None,
+                        last_error_reset_at=None,
+                    )
+                    self._replace_entry(entry, updated)
+                    auth_mod._merge_credential_pool_entries(
+                        auth_store,
+                        self.provider,
+                        [candidate.to_dict() for candidate in self._entries],
+                    )
+                    if updated.source == "device_code":
+                        state = auth_mod._load_provider_state(
+                            auth_store,
+                            self.provider,
+                        )
+                        if isinstance(state, dict):
+                            tokens = state.get("tokens")
+                            if isinstance(tokens, dict):
+                                tokens["access_token"] = updated.access_token
+                                tokens["refresh_token"] = updated.refresh_token
+                                state["last_refresh"] = updated.last_refresh
+                                auth_mod._store_provider_state(
+                                    auth_store,
+                                    self.provider,
+                                    state,
+                                    set_active=False,
+                                )
+                    await auth_mod._save_auth_store(auth_store, codex_target_path)
+                return updated
+
             if self.provider == "xai-oauth":
                 synced = await self._sync_xai_oauth_entry_from_auth_store(entry)
                 if synced is not entry:
@@ -1273,6 +1427,84 @@ class CredentialPool:
             # capability failure instead of a misleading quota error.
             raise
         except Exception as exc:
+            if self.provider == "openai-codex":
+                async with auth_mod._auth_store_transaction(codex_target_path):
+                    auth_store = await auth_mod._load_auth_store(codex_target_path)
+                    synced = self._sync_codex_entry_from_auth_store(entry, auth_store)
+                    if synced.refresh_token != entry.refresh_token:
+                        auth_mod._merge_credential_pool_entries(
+                            auth_store,
+                            self.provider,
+                            [candidate.to_dict() for candidate in self._entries],
+                        )
+                        await auth_mod._save_auth_store(
+                            auth_store,
+                            codex_target_path,
+                        )
+                        return synced
+                    if auth_mod._is_terminal_codex_oauth_refresh_error(exc):
+                        state = auth_mod._load_provider_state(
+                            auth_store,
+                            self.provider,
+                        )
+                        if isinstance(state, dict):
+                            tokens = state.get("tokens")
+                            if isinstance(tokens, dict):
+                                store_refresh = str(
+                                    tokens.get("refresh_token") or ""
+                                ).strip()
+                                entry_refresh = str(entry.refresh_token or "").strip()
+                                if not store_refresh or store_refresh == entry_refresh:
+                                    tokens.pop("access_token", None)
+                                    tokens.pop("refresh_token", None)
+                                    state["last_auth_error"] = {
+                                        "provider": self.provider,
+                                        "code": getattr(exc, "code", "unknown"),
+                                        "message": str(exc),
+                                        "reason": "credential_pool_refresh_failure",
+                                        "relogin_required": True,
+                                        "at": datetime.now(timezone.utc).isoformat(),
+                                    }
+                                    auth_mod._store_provider_state(
+                                        auth_store,
+                                        self.provider,
+                                        state,
+                                        set_active=False,
+                                    )
+                        removed_ids = [
+                            candidate.id
+                            for candidate in self._entries
+                            if candidate.source == "device_code"
+                        ]
+                        self._entries = [
+                            candidate
+                            for candidate in self._entries
+                            if candidate.source != "device_code"
+                        ]
+                        if self._current_id in removed_ids:
+                            self._current_id = None
+                        auth_mod._merge_credential_pool_entries(
+                            auth_store,
+                            self.provider,
+                            [candidate.to_dict() for candidate in self._entries],
+                            removed_ids=removed_ids,
+                        )
+                        await auth_mod._save_auth_store(
+                            auth_store,
+                            codex_target_path,
+                        )
+                        return None
+                    self._mark_exhausted(entry, None)
+                    auth_mod._merge_credential_pool_entries(
+                        auth_store,
+                        self.provider,
+                        [candidate.to_dict() for candidate in self._entries],
+                    )
+                    await auth_mod._save_auth_store(
+                        auth_store,
+                        codex_target_path,
+                    )
+                    return None
             if self.provider == "xai-oauth":
                 synced = await self._sync_xai_oauth_entry_from_auth_store(entry)
                 if synced is not entry:

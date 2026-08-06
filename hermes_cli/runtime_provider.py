@@ -1782,7 +1782,7 @@ async def resolve_runtime_provider(
     if explicit_runtime:
         return explicit_runtime
 
-    if provider in {"nous", "openai-codex", "qwen-oauth", "minimax-oauth"}:
+    if provider in {"nous", "qwen-oauth", "minimax-oauth"}:
         from agent.agent_runtime_helpers import UnsupportedCapabilityError
 
         raise UnsupportedCapabilityError(
