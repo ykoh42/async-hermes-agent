@@ -693,19 +693,68 @@ def _build_anthropic_client_with_bearer_hook(
     *,
     drop_context_1m_beta: bool = False,
 ):
-    """Reject the legacy synchronous Entra bearer transport.
+    """Build an AsyncAnthropic client with per-request Entra token refresh."""
+    anthropic_sdk = _get_anthropic_sdk()
+    if anthropic_sdk is None:
+        raise ImportError(
+            "The 'anthropic' package is required for Azure Foundry "
+            "Anthropic-style endpoints. Install it with: "
+            "pip install 'async-hermes-agent[anthropic]'"
+        )
 
-    The previous implementation built a synchronous ``httpx.Client`` and a
-    synchronous ``anthropic.Anthropic`` instance. Keeping that path behind a
-    coroutine API would silently block the event loop, so Entra bearer auth is
-    explicitly unsupported until an async credential transport is available.
-    Static API keys continue through :class:`AsyncAnthropic`.
-    """
-    raise RuntimeError(
-        "Azure Foundry Anthropic Entra ID requires a native async bearer "
-        "transport; the legacy synchronous token hook is disabled. Use a "
-        "static API key or an async-compatible provider transport."
+    normalize_proxy_env_vars()
+
+    from httpx import Timeout
+    from agent.azure_identity_adapter import build_bearer_http_client
+
+    read_timeout = (
+        timeout
+        if isinstance(timeout, (int, float)) and timeout > 0
+        else 900.0
     )
+    timeout_obj = Timeout(timeout=float(read_timeout), connect=10.0)
+    normalized_base_url = _normalize_base_url_text(base_url)
+    if normalized_base_url:
+        import re as _re
+
+        normalized_base_url = _re.sub(
+            r"/v1/?$", "", normalized_base_url.rstrip("/")
+        )
+
+    kwargs = {
+        "timeout": timeout_obj,
+        "http_client": build_bearer_http_client(
+            token_provider,
+            timeout=timeout_obj,
+        ),
+        "max_retries": 0,
+        "auth_token": "entra-id-bearer-via-http-hook",
+    }
+    if normalized_base_url:
+        kwargs["base_url"] = normalized_base_url
+        if (
+            _is_azure_anthropic_endpoint(normalized_base_url)
+            and "api-version" not in normalized_base_url
+        ):
+            kwargs["default_query"] = {"api-version": "2025-04-15"}
+    common_betas = _common_betas_for_base_url(
+        normalized_base_url,
+        drop_context_1m_beta=drop_context_1m_beta,
+    )
+    if common_betas:
+        kwargs["default_headers"] = {
+            "anthropic-beta": ",".join(common_betas)
+        }
+
+    client_class = getattr(anthropic_sdk, "AsyncAnthropic", None)
+    if client_class is None:
+        raise ImportError(
+            "The installed 'anthropic' package does not provide AsyncAnthropic."
+        )
+    client = client_class(**kwargs)
+    client.api_key = None
+    client._hermes_token_provider = token_provider
+    return client
 
 
 def build_anthropic_client(
@@ -721,9 +770,8 @@ def build_anthropic_client(
 
     * a static ``str`` — the historical contract for all key-based and
       OAuth flows.
-    * a ``Callable[[], str]`` — currently rejected because the old bearer
-      hook requires a synchronous Anthropic client and would block the async
-      runtime. This fails fast instead of silently falling back to a thread.
+    * a ``Callable[[], Awaitable[str]]`` — an Entra ID token provider used by
+      the native async bearer hook.
 
     If *timeout* is provided it overrides the default 900s read timeout.  The
     connect timeout stays at 10s.  Callers pass this from the per-provider /

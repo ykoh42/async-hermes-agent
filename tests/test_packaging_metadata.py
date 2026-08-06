@@ -111,7 +111,12 @@ def test_provider_extras_only_publish_native_async_dependencies():
 
     assert "bedrock" not in extras
     assert extras["vertex"] == ["google-auth[aiohttp]==2.56.2"]
+    assert extras["azure-identity"] == [
+        "azure-identity==1.25.3",
+        "aiohttp==3.14.3",
+    ]
     assert "google-auth" in declared
+    assert "azure-identity" in declared
     assert "boto3" not in declared
 
 

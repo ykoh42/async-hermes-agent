@@ -1405,13 +1405,6 @@ def init_agent(
             # Credential lookup and refresh are deliberately deferred to the
             # native async first-turn lifecycle.
             effective_key = api_key or ""
-            if callable(effective_key) and not isinstance(effective_key, str):
-                from agent.agent_runtime_helpers import UnsupportedCapabilityError
-
-                raise UnsupportedCapabilityError(
-                    "Callable credential providers are synchronous and unsupported "
-                    "by async-hermes-agent. Configure a static provider API key."
-                )
 
             agent.api_key = effective_key
             agent._anthropic_api_key = effective_key
@@ -2904,14 +2897,45 @@ async def initialize_deferred_runtime(agent: Any) -> bool:
             logger.info("Initialized native async MoA runtime for %s", model)
             return True
         candidates = ["openrouter"] if requested in {"", "auto"} else [requested]
-        explicit_api_key = str(pending.get("api_key") or "").strip()
-        resolved: tuple[str, str, str, Any, Any] | None = None
+        pending_api_key = pending.get("api_key")
+        explicit_api_key: Any = (
+            pending_api_key
+            if callable(pending_api_key) and not isinstance(pending_api_key, str)
+            else str(pending_api_key or "").strip()
+        )
+        resolved: tuple[str, Any, str, Any, Any] | None = None
         unavailable: list[str] = []
 
         if explicit_api_key and explicit_base_url:
             resolved = (candidates[0], explicit_api_key, explicit_base_url, None, None)
 
         for provider in (candidates if resolved is None else ()):
+            if provider == "azure-foundry":
+                from hermes_cli.runtime_provider import _resolve_azure_foundry_runtime
+
+                model_config = config_snapshot.get("model", {})
+                if not isinstance(model_config, dict):
+                    model_config = {}
+                azure_runtime = await _resolve_azure_foundry_runtime(
+                    requested_provider=provider,
+                    model_cfg=model_config,
+                    explicit_base_url=explicit_base_url or None,
+                    resolved_api_key=(
+                        explicit_api_key
+                        if isinstance(explicit_api_key, str)
+                        else None
+                    ),
+                    target_model=model,
+                )
+                pending["api_mode"] = azure_runtime["api_mode"]
+                resolved = (
+                    provider,
+                    azure_runtime["api_key"],
+                    azure_runtime["base_url"],
+                    None,
+                    None,
+                )
+                break
             if provider in {
                 "vertex",
                 "google-vertex",
@@ -3191,11 +3215,18 @@ async def initialize_deferred_runtime(agent: Any) -> bool:
 
             agent._anthropic_api_key = api_key
             agent._anthropic_base_url = agent.base_url
-            agent._anthropic_client = build_anthropic_client(
-                api_key,
-                agent.base_url,
-                timeout=timeout,
-            )
+            try:
+                agent._anthropic_client = build_anthropic_client(
+                    api_key,
+                    agent.base_url,
+                    timeout=timeout,
+                )
+            except Exception:
+                if callable(api_key) and not isinstance(api_key, str):
+                    from agent.azure_identity_adapter import release_token_provider
+
+                    await release_token_provider(api_key)
+                raise
             agent._anthropic_client_source = (
                 api_key,
                 agent.base_url,
@@ -3275,7 +3306,16 @@ async def initialize_deferred_runtime(agent: Any) -> bool:
             )
             if http_client is not None:
                 client_kwargs["http_client"] = http_client
-            agent.client = _ra().OpenAI(**client_kwargs)
+            try:
+                agent.client = _ra().OpenAI(**client_kwargs)
+            except Exception:
+                if callable(api_key) and not isinstance(api_key, str):
+                    from agent.azure_identity_adapter import release_token_provider
+
+                    await release_token_provider(api_key)
+                raise
+            if callable(api_key) and not isinstance(api_key, str):
+                agent.client._hermes_token_provider = api_key
             # OpenAI>=2 lazily resolves the platform on the first request.
             # The value only controls an SDK telemetry
             # header, so use a stable conservative value and keep the agent
@@ -3343,7 +3383,14 @@ async def initialize_deferred_runtime(agent: Any) -> bool:
             aclose = getattr(stale_client, "aclose", None)
             if aclose is None or not inspect.iscoroutinefunction(aclose):
                 continue
-            await aclose()
+            token_provider = getattr(stale_client, "_hermes_token_provider", None)
+            try:
+                await aclose()
+            finally:
+                if token_provider is not None:
+                    from agent.azure_identity_adapter import release_token_provider
+
+                    await release_token_provider(token_provider)
 
         agent._deferred_provider_runtime = None
         logger.info("Initialized native async runtime for %s", provider)

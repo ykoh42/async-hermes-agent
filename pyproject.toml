@@ -97,6 +97,9 @@ anthropic = ["anthropic==0.87.0"]  # CVE-2026-34450, CVE-2026-34452
 # aiohttp transport. It is provider-specific and therefore stays out of the
 # base install.
 vertex = ["google-auth[aiohttp]==2.56.2"]
+# Microsoft Entra ID uses azure.identity.aio; aiohttp is its documented async
+# transport and remains provider-specific.
+azure-identity = ["azure-identity==1.25.3", "aiohttp==3.14.3"]
 # Web search backends — each only loaded when the user picks it as their
 # search provider (configured via `hermes tools` or config.yaml).
 parallel-web = ["parallel-web==0.4.2"]

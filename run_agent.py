@@ -3743,10 +3743,14 @@ class AIAgent:
         # Gemini, and MoA transports; Anthropic keeps its provider-specific
         # slot because it does not expose the OpenAI-shaped interface.
         closed_client_ids: set[int] = set()
+        token_providers = []
         for attribute in ("client", "_anthropic_client"):
             client = getattr(self, attribute, None)
             if client is None:
                 continue
+            token_provider = getattr(client, "_hermes_token_provider", None)
+            if token_provider is not None:
+                token_providers.append(token_provider)
             if id(client) in closed_client_ids:
                 setattr(self, attribute, None)
                 continue
@@ -3767,6 +3771,23 @@ class AIAgent:
             finally:
                 setattr(self, attribute, None)
         self._anthropic_client_source = None
+        active_api_key = getattr(self, "api_key", None)
+        if callable(active_api_key) and not isinstance(active_api_key, str):
+            token_providers.append(active_api_key)
+        if token_providers:
+            try:
+                from agent.azure_identity_adapter import release_token_provider
+
+                released_ids: set[int] = set()
+                for token_provider in token_providers:
+                    if id(token_provider) in released_ids:
+                        continue
+                    released_ids.add(id(token_provider))
+                    await release_token_provider(token_provider)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.debug("Async token provider release failed", exc_info=True)
 
         # MCP transports are shared by agents on this async runtime. Release
         # this instance's lease and close them only after the final consumer.

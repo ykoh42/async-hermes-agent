@@ -182,6 +182,8 @@ def _create_openai_client(
     # override via kwargs.
     kwargs.setdefault("max_retries", 0)
     client = AsyncOpenAI(api_key=api_key, base_url=base_url, **kwargs)
+    if callable(api_key) and not isinstance(api_key, str):
+        client._hermes_token_provider = api_key
     client._platform = "Unknown"
     return client
 
@@ -2673,8 +2675,7 @@ async def _try_azure_foundry(
 
     * ``auth_mode: api_key`` (default) gets the static
       ``AZURE_FOUNDRY_API_KEY`` string.
-    * ``auth_mode: entra_id`` fails fast because its bearer provider is
-      synchronous and cannot be used by the async runtime.
+    * ``auth_mode: entra_id`` uses Azure Identity's coroutine token provider.
     * Per-model ``api_mode`` auto-routing for GPT-5.x / o-series /
       codex models works.
     * ``model.entra.{tenant_id,client_id,authority,scope}`` config
@@ -2723,7 +2724,7 @@ async def _try_azure_foundry(
         ).strip()
 
     try:
-        runtime = _resolve_azure_foundry_runtime(
+        runtime = await _resolve_azure_foundry_runtime(
             requested_provider="azure-foundry",
             model_cfg=model_cfg,
             explicit_api_key=explicit_api_key,
@@ -2771,25 +2772,38 @@ async def _try_azure_foundry(
     if _dq:
         extra["default_query"] = _dq
 
-    client = _create_openai_client(
-        api_key=api_key, base_url=_clean_base, config=config, **extra
-    )
+    if runtime_api_mode == "anthropic_messages":
+        try:
+            return await _maybe_wrap_anthropic(
+                None,
+                final_model,
+                api_key,
+                base_url,
+                runtime_api_mode,
+            ), final_model
+        except Exception:
+            if callable(api_key) and not isinstance(api_key, str):
+                from agent.azure_identity_adapter import release_token_provider
+
+                await release_token_provider(api_key)
+            raise
+
+    try:
+        client = _create_openai_client(
+            api_key=api_key, base_url=_clean_base, config=config, **extra
+        )
+    except Exception:
+        if callable(api_key) and not isinstance(api_key, str):
+            from agent.azure_identity_adapter import release_token_provider
+
+            await release_token_provider(api_key)
+        raise
 
     if runtime_api_mode == "codex_responses":
         # GPT-5.x / o-series / codex models on Azure Foundry are
         # Responses-API-only — wrap so chat.completions.create() is
         # translated to /responses behind the scenes.
         return CodexAuxiliaryClient(client, final_model), final_model
-
-    if runtime_api_mode == "anthropic_messages":
-        # Forward ``api_key`` verbatim — for static keys it's a string,
-        # for Entra ID it's a callable. ``_maybe_wrap_anthropic`` →
-        # ``build_anthropic_client`` detects the callable and installs
-        # the bearer-injecting httpx hook.
-        return await _maybe_wrap_anthropic(
-            client, final_model, api_key,
-            base_url, runtime_api_mode,
-        ), final_model
 
     # chat_completions — return the plain OpenAI client.
     return client, final_model
@@ -5111,8 +5125,8 @@ async def resolve_provider_client(
     # static ``AZURE_FOUNDRY_API_KEY`` env var. That misses two important
     # cases for the ``azure-foundry`` provider:
     #
-    #   1. ``model.auth_mode: entra_id`` — rejected explicitly because its
-    #      bearer-provider callback is synchronous.
+    #   1. ``model.auth_mode: entra_id`` — resolved through its coroutine
+    #      bearer-token provider.
     #   2. Non-default ``model.base_url`` (Foundry projects path) — the
     #      env-var-only resolver doesn't apply config-yaml-driven URL
     #      overrides.
@@ -5971,6 +5985,18 @@ async def _close_cached_client(client: Any) -> None:
             await close()
     except Exception:
         logger.debug("Failed to close auxiliary client", exc_info=True)
+    finally:
+        token_provider = getattr(client, "_hermes_token_provider", None)
+        if token_provider is None:
+            real_client = getattr(client, "_real_client", None)
+            token_provider = getattr(real_client, "_hermes_token_provider", None)
+        if token_provider is not None:
+            try:
+                from agent.azure_identity_adapter import release_token_provider
+
+                await release_token_provider(token_provider)
+            except Exception:
+                logger.debug("Failed to release auxiliary token provider", exc_info=True)
 
 
 async def shutdown_cached_clients() -> None:

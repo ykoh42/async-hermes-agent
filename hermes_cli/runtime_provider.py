@@ -1291,7 +1291,7 @@ async def _resolve_openrouter_runtime(
     }
 
 
-def _resolve_azure_foundry_runtime(
+async def _resolve_azure_foundry_runtime(
     *,
     requested_provider: str,
     model_cfg: Dict[str, Any],
@@ -1307,9 +1307,8 @@ def _resolve_azure_foundry_runtime(
     strips a trailing ``/v1`` for Anthropic-style endpoints because the
     Anthropic SDK appends ``/v1/messages`` internally.
 
-    ``model.auth_mode == "entra_id"`` is rejected explicitly: Azure's
-    synchronous bearer-provider callable has no native async SDK contract and
-    would block the event loop. Static Azure API keys remain supported.
+    ``model.auth_mode == "entra_id"`` returns the coroutine token provider
+    accepted by the async OpenAI SDK. Static Azure API keys remain supported.
 
     Raises :class:`AuthError` when required values are missing.
     """
@@ -1320,10 +1319,14 @@ def _resolve_azure_foundry_runtime(
     cfg_base_url = ""
     cfg_api_mode = "chat_completions"
     cfg_auth_mode = "api_key"
+    cfg_entra: Dict[str, Any] = {}
     if cfg_provider == "azure-foundry":
         cfg_base_url = str(model_cfg.get("base_url") or "").strip().rstrip("/")
         cfg_api_mode = _parse_api_mode(model_cfg.get("api_mode")) or "chat_completions"
         cfg_auth_mode = str(model_cfg.get("auth_mode") or "api_key").strip().lower() or "api_key"
+        entra = model_cfg.get("entra")
+        if isinstance(entra, dict):
+            cfg_entra = entra
 
     # Model-family inference: Azure Foundry deploys GPT-5.x / codex / o1-o4
     # reasoning models as Responses-API-only.  Calling /chat/completions
@@ -1358,12 +1361,32 @@ def _resolve_azure_foundry_runtime(
         if explicit_api_key:
             cfg_auth_mode = "api_key"
         else:
-            raise AuthError(
-                "Azure Foundry Entra ID authentication is unavailable in "
-                "async-hermes-agent because azure-identity exposes a synchronous "
-                "bearer-provider callback. Use AZURE_FOUNDRY_API_KEY until a "
-                "native async credential transport is implemented."
-            )
+            try:
+                from agent.azure_identity_adapter import (
+                    EntraIdentityConfig,
+                    SCOPE_AI_AZURE_DEFAULT,
+                    build_token_provider,
+                )
+
+                scope = (
+                    str(cfg_entra.get("scope") or "").strip()
+                    or SCOPE_AI_AZURE_DEFAULT
+                )
+                token_provider = await build_token_provider(
+                    config=EntraIdentityConfig(scope=scope)
+                )
+            except ImportError as exc:
+                raise AuthError(str(exc)) from exc
+            return {
+                "provider": "azure-foundry",
+                "api_mode": cfg_api_mode,
+                "base_url": base_url,
+                "api_key": token_provider,
+                "auth_mode": "entra_id",
+                "entra": {"scope": scope} if cfg_entra.get("scope") else {},
+                "source": "entra_id",
+                "requested_provider": requested_provider,
+            }
 
     # ── Static API key (legacy / default) ──────────────────────────────
     api_key = explicit_api_key or str(resolved_api_key or "").strip()
@@ -1508,16 +1531,7 @@ async def _resolve_explicit_runtime(
 
     # Azure Foundry: user-configured endpoint with selectable API mode
     if provider == "azure-foundry":
-        # Entra ID token providers are synchronous callables.  Passing one to
-        # AsyncOpenAI would execute the refresh inside the event loop.
-        if str(model_cfg.get("auth_mode") or "api_key").strip().lower() == "entra_id":
-            from agent.agent_runtime_helpers import UnsupportedCapabilityError
-
-            raise UnsupportedCapabilityError(
-                "Azure Foundry Entra ID requires a native async token provider; "
-                "use a static AZURE_FOUNDRY_API_KEY or an async-compatible route."
-            )
-        return _resolve_azure_foundry_runtime(
+        return await _resolve_azure_foundry_runtime(
             requested_provider=requested_provider,
             model_cfg=model_cfg,
             explicit_api_key=explicit_api_key,
@@ -1664,13 +1678,6 @@ async def resolve_runtime_provider(
     # config is always picked up from model.base_url + model.api_mode,
     # regardless of whether the caller passed explicit_* args.
     if requested_provider == "azure-foundry":
-        if str(model_config_snapshot.get("auth_mode") or "api_key").strip().lower() == "entra_id":
-            from agent.agent_runtime_helpers import UnsupportedCapabilityError
-
-            raise UnsupportedCapabilityError(
-                "Azure Foundry Entra ID requires a native async token provider; "
-                "use a static AZURE_FOUNDRY_API_KEY or an async-compatible route."
-            )
         azure_api_key = str(explicit_api_key or "").strip()
         if not azure_api_key:
             for key in ("api_key", "api"):
@@ -1685,7 +1692,7 @@ async def resolve_runtime_provider(
                 or "AZURE_FOUNDRY_API_KEY"
             ).strip()
             azure_api_key = (await get_env_value_prefer_dotenv(key_env) or "").strip()
-        azure_runtime = _resolve_azure_foundry_runtime(
+        azure_runtime = await _resolve_azure_foundry_runtime(
             requested_provider=requested_provider,
             model_cfg=model_config_snapshot,
             explicit_api_key=explicit_api_key,

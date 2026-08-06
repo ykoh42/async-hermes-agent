@@ -68,8 +68,8 @@ Provider-specific dependencies remain opt-in, for example:
 
 ```bash
 uv sync --extra anthropic
-uv sync --extra bedrock
 uv sync --extra vertex
+uv sync --extra azure-identity
 ```
 
 ## Skills, MCP, and memory
