@@ -2260,6 +2260,162 @@ async def create_openai_client(
     return client
 
 
+def _iter_httpx_pool_objects(http_client: Any):
+    """Yield connection pools reachable through default and mounted transports."""
+    seen_pools: set[int] = set()
+
+    def emit(pool: Any):
+        if pool is None or id(pool) in seen_pools:
+            return
+        seen_pools.add(id(pool))
+        yield pool
+
+    def pools_for_transport(transport: Any):
+        if transport is None:
+            return
+        pool = getattr(transport, "_pool", None)
+        if pool is not None:
+            yield from emit(pool)
+        elif getattr(transport, "_connections", None) is not None:
+            yield from emit(transport)
+
+    try:
+        yield from pools_for_transport(getattr(http_client, "_transport", None))
+        for mounted in list((getattr(http_client, "_mounts", None) or {}).values()):
+            yield from pools_for_transport(mounted)
+    except Exception:
+        return
+
+
+def _connection_candidates(connection: Any):
+    """Walk nested httpcore connection wrappers."""
+    seen: set[int] = set()
+    stack = [connection]
+    while stack:
+        candidate = stack.pop()
+        if candidate is None or id(candidate) in seen:
+            continue
+        seen.add(id(candidate))
+        yield candidate
+        inner = getattr(candidate, "_connection", None)
+        if inner is not None:
+            stack.append(inner)
+
+
+def _iter_pool_sockets(client: Any):
+    """Yield raw sockets reachable from an OpenAI/httpx async client."""
+    try:
+        http_client = getattr(client, "_client", None) or client
+        pools = list(_iter_httpx_pool_objects(http_client))
+    except Exception:
+        return
+
+    seen: set[int] = set()
+    for pool in pools:
+        connections = (
+            getattr(pool, "_connections", None)
+            or getattr(pool, "_pool", None)
+            or []
+        )
+        for connection in list(connections):
+            for candidate in _connection_candidates(connection):
+                stream = (
+                    getattr(candidate, "_network_stream", None)
+                    or getattr(candidate, "_stream", None)
+                )
+                if stream is None:
+                    continue
+                sock = getattr(stream, "_sock", None)
+                if sock is None:
+                    get_extra_info = getattr(stream, "get_extra_info", None)
+                    if callable(get_extra_info):
+                        try:
+                            sock = get_extra_info("socket")
+                        except Exception:
+                            sock = None
+                if sock is None:
+                    wrapped = getattr(stream, "stream", None)
+                    if wrapped is not None:
+                        sock = getattr(wrapped, "_sock", None)
+                if sock is None:
+                    wrapped = getattr(stream, "_stream", None)
+                    extra = getattr(wrapped, "extra", None)
+                    if callable(extra):
+                        try:
+                            from anyio.abc import SocketAttribute
+
+                            sock = extra(SocketAttribute.raw_socket)
+                        except Exception:
+                            sock = None
+                if sock is None or id(sock) in seen:
+                    continue
+                seen.add(id(sock))
+                yield sock
+
+
+async def cleanup_dead_connections(agent: Any) -> bool:
+    """Rebuild the native async primary client when its pool contains dead sockets."""
+    client = getattr(agent, "client", None)
+    if client is None:
+        return False
+    try:
+        import socket as socket_module
+
+        dead_count = 0
+        for sock in _iter_pool_sockets(client):
+            getblocking = getattr(sock, "getblocking", None)
+            original_blocking = getblocking() if callable(getblocking) else False
+            try:
+                sock.setblocking(False)
+                if sock.recv(
+                    1,
+                    socket_module.MSG_PEEK | socket_module.MSG_DONTWAIT,
+                ) == b"":
+                    dead_count += 1
+            except BlockingIOError:
+                pass
+            except OSError:
+                dead_count += 1
+            finally:
+                try:
+                    sock.setblocking(original_blocking)
+                except OSError:
+                    pass
+        if dead_count == 0:
+            return False
+        logger.warning(
+            "Found %d dead connection(s) in client pool — rebuilding client",
+            dead_count,
+        )
+        return bool(
+            await agent._replace_primary_openai_client(
+                reason="dead_connection_cleanup",
+            )
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.debug("Dead connection check error: %s", exc)
+        return False
+
+
+def force_close_tcp_sockets(client: Any) -> int:
+    """Shut down reachable TCP sockets without releasing their file descriptors."""
+    import socket as socket_module
+
+    shutdown_count = 0
+    try:
+        for sock in _iter_pool_sockets(client):
+            try:
+                sock.shutdown(socket_module.SHUT_RDWR)
+            except OSError:
+                pass
+            shutdown_count += 1
+    except Exception as exc:
+        logger.debug("Force-close TCP sockets sweep error: %s", exc)
+    return shutdown_count
+
+
 async def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mode=''):
     """Switch a live agent through the native async provider lifecycle.
 

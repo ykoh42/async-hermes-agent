@@ -45,6 +45,7 @@ def test_conversation_and_chat_are_coroutines():
     )
     from run_agent import main as agent_main
     from agent.agent_runtime_helpers import (
+        cleanup_dead_connections,
         create_openai_client,
         invoke_tool,
         recover_with_credential_pool,
@@ -170,6 +171,7 @@ def test_conversation_and_chat_are_coroutines():
     assert inspect.iscoroutinefunction(AIAgent._preprocess_anthropic_content)
     assert inspect.iscoroutinefunction(recover_with_credential_pool)
     assert inspect.iscoroutinefunction(try_recover_primary_transport)
+    assert inspect.iscoroutinefunction(cleanup_dead_connections)
     assert inspect.iscoroutinefunction(create_openai_client)
     assert inspect.iscoroutinefunction(load_pool)
     active_entries = list(registry._tools.values())
@@ -216,6 +218,49 @@ async def test_create_openai_client_preserves_kwargs_and_owns_async_transport():
     }
     factory.assert_called_once_with(**client_kwargs, http_client=http_client)
     assert client._platform == "Unknown"
+
+
+def _client_with_pool_socket(sock):
+    stream = SimpleNamespace(_sock=sock)
+    connection = SimpleNamespace(_network_stream=stream, _connection=None)
+    pool = SimpleNamespace(_connections=[connection])
+    transport = SimpleNamespace(_pool=pool)
+    http_client = SimpleNamespace(_transport=transport, _mounts={})
+    return SimpleNamespace(_client=http_client)
+
+
+@pytest.mark.asyncio
+async def test_dead_connection_cleanup_preserves_async_socket_mode():
+    from agent.agent_runtime_helpers import cleanup_dead_connections
+
+    sock = MagicMock()
+    sock.getblocking.return_value = False
+    sock.recv.return_value = b""
+    agent = SimpleNamespace(
+        client=_client_with_pool_socket(sock),
+        _replace_primary_openai_client=AsyncMock(return_value=True),
+    )
+
+    assert await cleanup_dead_connections(agent) is True
+    assert sock.setblocking.call_args_list == [
+        ((False,), {}),
+        ((False,), {}),
+    ]
+    agent._replace_primary_openai_client.assert_awaited_once_with(
+        reason="dead_connection_cleanup"
+    )
+
+
+def test_force_close_tcp_sockets_shutdowns_without_closing():
+    from agent.agent_runtime_helpers import force_close_tcp_sockets
+    import socket
+
+    sock = MagicMock()
+    client = _client_with_pool_socket(sock)
+
+    assert force_close_tcp_sockets(client) == 1
+    sock.shutdown.assert_called_once_with(socket.SHUT_RDWR)
+    sock.close.assert_not_called()
 
 
 @pytest.mark.asyncio
