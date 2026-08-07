@@ -356,6 +356,9 @@ class ProcessRegistry:
                 continue
 
         if session.exited:
+            monitor = session._monitor_task
+            if monitor is not None:
+                await asyncio.shield(monitor)
             self._completion_consumed.add(session_id)
             result = {
                 "status": "exited",
@@ -398,6 +401,9 @@ class ProcessRegistry:
         if session is None:
             return {"status": "not_found", "error": f"No process with ID {session_id}"}
         if session.exited:
+            monitor = session._monitor_task
+            if monitor is not None:
+                await asyncio.shield(monitor)
             if consume_output:
                 self._completion_consumed.add(session_id)
             return {
@@ -417,7 +423,7 @@ class ProcessRegistry:
                 await _terminate_process(process)
             monitor = session._monitor_task
             if monitor is not None:
-                await monitor
+                await asyncio.shield(monitor)
         except asyncio.CancelledError:
             raise
         except Exception as exc:

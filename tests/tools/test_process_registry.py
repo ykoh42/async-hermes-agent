@@ -37,6 +37,8 @@ async def test_spawn_wait_poll_and_log_preserve_result_contract(tmp_path):
     assert result["status"] == "exited"
     assert result["exit_code"] == 0
     assert result["output"].splitlines() == ["first", "second"]
+    assert session._monitor_task is not None
+    assert session._monitor_task.done()
     assert process_registry.poll(session.id)["status"] == "exited"
     assert process_registry.read_log(session.id, limit=1)["output"] == "second"
 
@@ -64,6 +66,8 @@ async def test_submit_writes_stdin_and_close_sends_eof(tmp_path):
 
     assert result["status"] == "exited"
     assert result["output"].splitlines()[0] == "hello"
+    assert session._monitor_task is not None
+    assert session._monitor_task.done()
 
 
 @pytest.mark.asyncio
