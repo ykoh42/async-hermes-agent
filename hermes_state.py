@@ -2648,6 +2648,34 @@ class SessionDB:
             "new_head_id": new_head_id,
         }
 
+    async def restore_rewound(
+        self, session_id: str, since_message_id: int
+    ) -> int:
+        """Mark inactive messages with id >= *since_message_id* active again.
+
+        Returns the number of rows flipped back to ``active=1``.
+        Intended for undo-of-rewind and test cleanup; not wired to a
+        slash command in v1.
+        """
+
+        async def _do(connection):
+            cursor = await connection.execute(
+                "SELECT id FROM messages "
+                "WHERE session_id = ? AND id >= ? AND active = 0",
+                (session_id, since_message_id),
+            )
+            ids = [r[0] for r in await cursor.fetchall()]
+            if ids:
+                placeholders = ",".join("?" for _ in ids)
+                await connection.execute(
+                    f"UPDATE messages SET active = 1 "
+                    f"WHERE id IN ({placeholders})",
+                    ids,
+                )
+            return len(ids)
+
+        return await self._write(_do)
+
     async def get_messages_around(
         self,
         session_id: str,
@@ -3191,6 +3219,172 @@ class SessionDB:
             seen.add(child_id)
             current = child_id
         return current
+
+    async def resolve_resume_session_id(self, session_id: str) -> str:
+        """Redirect a resume target to the descendant session that holds the messages.
+
+        Context compression ends the current session and forks a new child session
+        (linked via ``parent_session_id``). The flush cursor is reset, so the
+        child is where new messages actually land — the parent ends up with
+        ``message_count = 0`` rows unless messages had already been flushed to
+        it before compression. See #15000.
+
+        This helper walks ``parent_session_id`` forward from ``session_id`` and
+        returns the descendant in the chain that has the **most recent** messages.
+        Unlike the original logic, it does NOT short-circuit when the starting
+        session already has messages — a descendant that was created by
+        compression may hold the continuation content and should be preferred
+        by the WebUI and gateway for ``--resume`` and session loading.
+
+        If no descendant (including the starting session) has any messages,
+        the original ``session_id`` is returned unchanged.
+
+        The chain is always walked via the child whose ``started_at`` is
+        latest; that matches the single-chain shape that compression creates.
+        A depth cap (32) guards against accidental loops in malformed data.
+        """
+        if not session_id:
+            return session_id
+
+        # Follow the compression-continuation chain forward to the live tip
+        # FIRST. Auto-compression ends the current session and forks a
+        # continuation child, but a long-lived parent keeps its own flushed
+        # message rows — so the empty-head walk below never redirects it, and
+        # resuming the parent id reloads the pre-compression transcript while
+        # the turns generated *after* compression (and their responses) sit in
+        # the continuation. ``get_compression_tip`` is lineage-aware: it only
+        # follows children whose parent ended with ``end_reason='compression'``
+        # (created after the parent was ended), so delegation / branch children
+        # never hijack the resume. This is the fix for the desktop "I came back
+        # and the reply isn't there" report on large sessions.
+        try:
+            tip = await self.get_compression_tip(session_id)
+        except Exception:
+            tip = session_id
+        if tip and tip != session_id:
+            session_id = tip
+
+        connection = await self._get_connection()
+        current = session_id
+        seen = {current}
+        best = None  # tracks the last (deepest) node with messages
+
+        for _ in range(32):
+            # Check if the current node has messages.
+            try:
+                row = await (
+                    await connection.execute(
+                        "SELECT 1 FROM messages "
+                        "WHERE session_id = ? LIMIT 1",
+                        (current,),
+                    )
+                ).fetchone()
+            except Exception:
+                return session_id
+            if row is not None:
+                best = current
+
+            # Walk to the most-recently-started child — but skip explicit
+            # branch (`_branched_from`), delegate/subagent (`_delegate_from`),
+            # and tool children. They also carry a ``parent_session_id`` yet
+            # are NOT compression continuations; following them would hijack
+            # the resume target to an unrelated session (e.g. a subagent
+            # run). This mirrors the child-exclusion in ``get_compression_tip``.
+            try:
+                child_row = await (
+                    await connection.execute(
+                        "SELECT id FROM sessions "
+                        "WHERE parent_session_id = ? "
+                        "  AND json_extract(COALESCE(model_config, '{}'), "
+                        "'$._branched_from') IS NULL "
+                        "  AND json_extract(COALESCE(model_config, '{}'), "
+                        "'$._delegate_from') IS NULL "
+                        "  AND COALESCE(source, '') != 'tool' "
+                        "ORDER BY started_at DESC, id DESC LIMIT 1",
+                        (current,),
+                    )
+                ).fetchone()
+            except Exception:
+                return session_id
+            if child_row is None:
+                break
+            child_id = (
+                child_row["id"]
+                if hasattr(child_row, "keys")
+                else child_row[0]
+            )
+            if not child_id or child_id in seen:
+                break
+            seen.add(child_id)
+            current = child_id
+
+        return best if best is not None else session_id
+
+    def _is_branch_child_row(self, session: Dict[str, Any]) -> bool:
+        raw = session.get("model_config")
+        if not raw:
+            return False
+        try:
+            cfg = json.loads(raw) if isinstance(raw, str) else raw
+        except (TypeError, json.JSONDecodeError):
+            return False
+        return isinstance(cfg, dict) and cfg.get("_branched_from") is not None
+
+    async def _is_compression_child_row(
+        self, child: Dict[str, Any]
+    ) -> bool:
+        parent_id = child.get("parent_session_id")
+        if not parent_id or self._is_branch_child_row(child):
+            return False
+        parent = await self.get_session(parent_id)
+        return bool(parent and parent.get("end_reason") == "compression")
+
+    async def get_compression_lineage(self, session_id: str) -> List[str]:
+        """Return compression ancestors through tip in chronological order."""
+        session = await self.get_session(session_id)
+        if not session or self._is_branch_child_row(session):
+            return [session_id] if session else []
+
+        root = session
+        ancestors = {root["id"]}
+        while await self._is_compression_child_row(root):
+            parent = await self.get_session(root["parent_session_id"])
+            if not parent or parent["id"] in ancestors:
+                break
+            root = parent
+            ancestors.add(root["id"])
+
+        lineage = [root["id"]]
+        seen = {root["id"]}
+        current = root
+        connection = await self._get_connection()
+        while current.get("end_reason") == "compression":
+            rows = await (
+                await connection.execute(
+                    """
+                    SELECT * FROM sessions
+                    WHERE parent_session_id = ?
+                    ORDER BY started_at ASC
+                    """,
+                    (current["id"],),
+                )
+            ).fetchall()
+            next_child = None
+            for row in rows:
+                candidate = dict(row)
+                if not self._is_branch_child_row(candidate):
+                    next_child = candidate
+                    break
+            if not next_child or next_child["id"] in seen:
+                break
+            lineage.append(next_child["id"])
+            seen.add(next_child["id"])
+            current = next_child
+            if current["id"] == session_id:
+                # Continue to include later compression tips only when the
+                # requested session itself was compacted.
+                continue
+        return lineage if session_id in lineage else [session_id]
 
     async def _get_session_rich_rows_batch(
         self, session_ids, compact_rows: bool = False
@@ -3778,6 +3972,135 @@ class SessionDB:
             repair_alternation=repair_alternation,
             include_row_ids=include_row_ids,
         )
+
+    async def get_resume_conversations(
+        self, session_id: str
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        """Return ``(model_history, display_history)`` for a session resume in ONE SELECT.
+
+        ``session.resume`` needs two projections of the same lineage:
+
+        - ``model_history`` — the tip session's active rows, alternation-repaired
+          (the live-replay working conversation). Equivalent to
+          ``get_messages_as_conversation(session_id, repair_alternation=True)``.
+        - ``display_history`` — the full lineage (ancestors → tip), verbatim, with
+          replayed-user dedup. Equivalent to
+          ``get_messages_as_conversation(session_id, include_ancestors=True)``.
+
+        The display fetch already reads a superset of the model fetch (the tip
+        rows are part of the lineage), so serving both from one lineage SELECT
+        halves the resume's DB work versus two separate calls, with byte-identical
+        output (see test_get_resume_conversations_matches_separate_reads).
+        """
+        session_ids = await self._session_lineage_root_to_tip(session_id)
+        connection = await self._get_connection()
+        placeholders = ",".join("?" for _ in session_ids)
+        rows = await (
+            await connection.execute(
+                f"SELECT session_id, {self._CONVERSATION_ROW_COLUMNS} "
+                f"FROM messages WHERE session_id IN ({placeholders}) "
+                "AND active = 1 "
+                # ORDER BY id (insertion order) — see get_messages_as_conversation
+                # for why timestamp ordering is unsafe.
+                "ORDER BY id",
+                tuple(session_ids),
+            )
+        ).fetchall()
+
+        # Tip rows are exactly the model-fed set (get_messages_as_conversation
+        # with session_ids=[session_id]); filtering the lineage fetch preserves
+        # their relative id order.
+        tip_rows = [r for r in rows if r["session_id"] == session_id]
+        model_history = self._rows_to_conversation(
+            tip_rows,
+            session_id=session_id,
+            include_ancestors=False,
+            repair_alternation=True,
+            include_row_ids=True,
+        )
+        display_history = self._rows_to_conversation(
+            rows,
+            session_id=session_id,
+            include_ancestors=True,
+            repair_alternation=False,
+            include_row_ids=True,
+        )
+        return model_history, display_history
+
+    async def get_ancestor_display_prefix(
+        self, session_id: str
+    ) -> List[Dict[str, Any]]:
+        """Return the ancestor-only display messages for a session lineage.
+
+        These are messages from parent/grandparent sessions (compression
+        ancestors) that appear in the display transcript but NOT in the
+        tip session's model-fed history. Used by ``session.resume`` to
+        build the ``display_history_prefix`` that ``_live_session_payload``
+        prepends to the live model history.
+
+        Previously the prefix was calculated as
+        ``display_history[:len(display) - len(raw)]``, but that overcounts
+        when ``repair_message_sequence`` removes messages from the MIDDLE
+        of the tip history (e.g. verification candidates collapsed by the
+        consecutive-assistant merge) — the length difference includes both
+        ancestor messages AND repair-removed tip messages, but the slice
+        only captures the first N display messages (which are tip messages
+        when there are no ancestors), causing duplication. This method
+        returns ONLY the genuine ancestor messages, identified by
+        ``session_id != tip_session_id``. (#65919)
+        """
+        session_ids = await self._session_lineage_root_to_tip(session_id)
+        if len(session_ids) <= 1:
+            return []
+        connection = await self._get_connection()
+        placeholders = ",".join("?" for _ in session_ids)
+        rows = await (
+            await connection.execute(
+                f"SELECT session_id, {self._CONVERSATION_ROW_COLUMNS} "
+                f"FROM messages WHERE session_id IN ({placeholders}) "
+                "AND active = 1 ORDER BY id",
+                tuple(session_ids),
+            )
+        ).fetchall()
+        ancestor_rows = [r for r in rows if r["session_id"] != session_id]
+        if not ancestor_rows:
+            return []
+        return self._rows_to_conversation(
+            ancestor_rows,
+            session_id=session_id,
+            include_ancestors=True,
+            repair_alternation=False,
+        )
+
+    async def _session_lineage_root_to_tip(
+        self, session_id: str
+    ) -> List[str]:
+        if not session_id:
+            return [session_id]
+
+        chain = []
+        current = session_id
+        seen = set()
+        connection = await self._get_connection()
+        for _ in range(100):
+            if not current or current in seen:
+                break
+            seen.add(current)
+            chain.append(current)
+            row = await (
+                await connection.execute(
+                    "SELECT parent_session_id FROM sessions WHERE id = ?",
+                    (current,),
+                )
+            ).fetchone()
+            if row is None:
+                break
+            current = (
+                row["parent_session_id"]
+                if hasattr(row, "keys")
+                else row[0]
+            )
+        return list(reversed(chain)) or [session_id]
 
     async def find_live_compression_child(
         self, parent_session_id: str

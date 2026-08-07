@@ -319,6 +319,71 @@ async def test_session_lifecycle_does_not_block_or_leak(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_session_resume_lineage_does_not_block_or_leak(tmp_path):
+    """Audit the real resume, compression-lineage, and rewind I/O paths."""
+    from hermes_state import SessionDB
+
+    database = SessionDB(tmp_path / "state.db")
+
+    async with (
+        no_event_loop_blocking(action=LeakAction.RAISE, threshold=0.1),
+        no_task_leaks(action=LeakAction.RAISE),
+    ):
+        blockbuster = BlockBuster()
+        blockbuster.activate()
+        try:
+            await database.create_session("root", source="library")
+            await database.append_message(
+                "root", role="user", content="root question"
+            )
+            await database.append_message(
+                "root", role="assistant", content="root answer"
+            )
+            await database.end_session("root", "compression")
+            await database.create_session(
+                "tip", source="library", parent_session_id="root"
+            )
+            target_id = await database.append_message(
+                "tip", role="user", content="tip question"
+            )
+            await database.append_message(
+                "tip", role="assistant", content="tip answer"
+            )
+
+            assert await database.resolve_resume_session_id("root") == "tip"
+            model_history, display_history = (
+                await database.get_resume_conversations("tip")
+            )
+            assert [message["content"] for message in model_history] == [
+                "tip question",
+                "tip answer",
+            ]
+            assert [message["content"] for message in display_history] == [
+                "root question",
+                "root answer",
+                "tip question",
+                "tip answer",
+            ]
+            assert [
+                message["content"]
+                for message in await database.get_ancestor_display_prefix(
+                    "tip"
+                )
+            ] == ["root question", "root answer"]
+            assert await database.get_compression_lineage("tip") == [
+                "root",
+                "tip",
+            ]
+            assert (
+                await database.rewind_to_message("tip", target_id)
+            )["rewound_count"] == 2
+            assert await database.restore_rewound("tip", target_id) == 2
+        finally:
+            await database.close()
+            blockbuster.deactivate()
+
+
+@pytest.mark.asyncio
 async def test_skill_invocation_does_not_block_or_leak(tmp_path):
     """Audit real skill discovery, preprocessing, and message assembly."""
     import agent.skill_commands as skill_commands

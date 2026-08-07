@@ -41,10 +41,15 @@ def test_public_session_interface_is_async():
         "has_platform_message_id",
         "get_messages",
         "get_messages_as_conversation",
+        "get_resume_conversations",
+        "get_ancestor_display_prefix",
         "search_messages",
         "list_sessions_rich",
         "get_session_rich_row",
         "get_compression_tip",
+        "get_compression_lineage",
+        "resolve_resume_session_id",
+        "restore_rewound",
         "set_session_title",
         "set_auto_title_if_empty",
         "set_session_archived",
@@ -328,6 +333,189 @@ async def test_archive_and_pin_update_the_whole_compression_lineage(db):
     assert (await db.get_session("tip"))["archived"] == 0
     assert (await db.get_session("root"))["pinned"] == 0
     assert (await db.get_session("tip"))["pinned"] == 0
+
+
+@pytest.mark.asyncio
+async def test_resume_resolution_follows_the_message_bearing_continuation(db):
+    await db.create_session("root", source="library")
+    await db.append_message("root", role="user", content="before compression")
+    await db.end_session("root", "compression")
+    await db.create_session(
+        "continuation",
+        source="library",
+        parent_session_id="root",
+    )
+    await db.append_message(
+        "continuation",
+        role="assistant",
+        content="after compression",
+    )
+    await db.create_session(
+        "branch",
+        source="library",
+        parent_session_id="root",
+        model_config={"_branched_from": "root"},
+    )
+    await db.append_message("branch", role="user", content="unrelated")
+
+    connection = await db._get_connection()
+    await connection.execute(
+        "UPDATE sessions SET started_at = ?, ended_at = ? WHERE id = ?",
+        (1.0, 2.0, "root"),
+    )
+    await connection.execute(
+        "UPDATE sessions SET started_at = ? WHERE id = ?",
+        (3.0, "continuation"),
+    )
+    await connection.execute(
+        "UPDATE sessions SET started_at = ? WHERE id = ?",
+        (4.0, "branch"),
+    )
+    await connection.commit()
+
+    assert await db.resolve_resume_session_id("root") == "continuation"
+
+
+@pytest.mark.asyncio
+async def test_resume_resolution_walks_from_the_middle_of_a_plain_chain(db):
+    parent = None
+    for index, session_id in enumerate(("a", "b", "c", "d")):
+        await db.create_session(
+            session_id,
+            source="library",
+            parent_session_id=parent,
+        )
+        connection = await db._get_connection()
+        await connection.execute(
+            "UPDATE sessions SET started_at = ? WHERE id = ?",
+            (float(index), session_id),
+        )
+        parent = session_id
+    await connection.commit()
+    await db.append_message("d", role="user", content="latest")
+
+    assert await db.resolve_resume_session_id("b") == "d"
+    assert await db.resolve_resume_session_id("c") == "d"
+
+
+@pytest.mark.asyncio
+async def test_resume_resolution_keeps_message_bearing_parent(db):
+    await db.create_session("root", source="library")
+    await db.append_message("root", role="user", content="only message")
+    await db.create_session(
+        "empty-child", source="library", parent_session_id="root"
+    )
+
+    assert await db.resolve_resume_session_id("root") == "root"
+
+
+@pytest.mark.asyncio
+async def test_resume_resolution_skips_non_conversation_children(db):
+    await db.create_session("root", source="library")
+    await db.create_session(
+        "continuation", source="library", parent_session_id="root"
+    )
+    await db.create_session(
+        "branch",
+        source="library",
+        parent_session_id="root",
+        model_config={"_branched_from": "root"},
+    )
+    await db.create_session(
+        "delegate",
+        source="library",
+        parent_session_id="root",
+        model_config={"_delegate_from": "root"},
+    )
+    await db.create_session(
+        "tool-child", source="tool", parent_session_id="root"
+    )
+    connection = await db._get_connection()
+    for started_at, session_id in enumerate(
+        ("continuation", "branch", "delegate", "tool-child"), start=1
+    ):
+        await connection.execute(
+            "UPDATE sessions SET started_at = ? WHERE id = ?",
+            (float(started_at), session_id),
+        )
+    await connection.commit()
+    await db.append_message(
+        "continuation", role="user", content="resumable"
+    )
+    await db.append_message("branch", role="user", content="branch")
+    await db.append_message("delegate", role="user", content="delegate")
+    await db.append_message("tool-child", role="tool", content="tool")
+
+    assert await db.resolve_resume_session_id("root") == "continuation"
+
+
+@pytest.mark.asyncio
+async def test_resume_conversations_match_separate_reads_and_prefix(db):
+    await db.create_session("root", source="library")
+    await db.append_message("root", role="user", content="root question")
+    await db.append_message("root", role="assistant", content="root answer")
+    await db.end_session("root", "compression")
+    await db.create_session(
+        "tip", source="library", parent_session_id="root"
+    )
+    await db.append_message("tip", role="user", content="tip question")
+    await db.append_message("tip", role="assistant", content="tip answer")
+
+    model_history, display_history = await db.get_resume_conversations("tip")
+
+    assert model_history == await db.get_messages_as_conversation(
+        "tip", repair_alternation=True, include_row_ids=True
+    )
+    assert display_history == await db.get_messages_as_conversation(
+        "tip", include_ancestors=True, include_row_ids=True
+    )
+    assert [
+        message["content"]
+        for message in await db.get_ancestor_display_prefix("tip")
+    ] == ["root question", "root answer"]
+
+
+@pytest.mark.asyncio
+async def test_compression_lineage_excludes_branch_children(db):
+    await db.create_session("root", source="library")
+    await db.end_session("root", "compression")
+    await db.create_session(
+        "child", source="library", parent_session_id="root"
+    )
+    await db.end_session("child", "compression")
+    await db.create_session(
+        "tip", source="library", parent_session_id="child"
+    )
+    await db.create_session(
+        "branch",
+        source="library",
+        parent_session_id="root",
+        model_config={"_branched_from": "root"},
+    )
+
+    assert await db.get_compression_lineage("tip") == [
+        "root",
+        "child",
+        "tip",
+    ]
+    assert await db.get_compression_lineage("branch") == ["branch"]
+
+
+@pytest.mark.asyncio
+async def test_restore_rewound_reactivates_the_archived_tail(db):
+    await db.create_session("session", source="library")
+    await db.append_message("session", role="user", content="first")
+    await db.append_message("session", role="assistant", content="answer")
+    target_id = await db.append_message(
+        "session", role="user", content="second"
+    )
+    await db.append_message("session", role="assistant", content="later")
+
+    assert (await db.rewind_to_message("session", target_id))["rewound_count"] == 2
+    assert await db.restore_rewound("session", target_id) == 2
+    assert [
+        message["content"] for message in await db.get_messages("session")
+    ] == ["first", "answer", "second", "later"]
 
 
 def test_workspace_key_matches_upstream_grouping_contract():
