@@ -297,6 +297,18 @@ async def test_session_lifecycle_does_not_block_or_leak(tmp_path):
                 "session", message_id
             ) == "user"
             assert await database.resolve_session_id("sess") == "session"
+            assert [
+                row["session_id"]
+                for row in await database.search_messages("hello")
+            ] == ["session"]
+            assert [
+                row["preview"]
+                for row in await database.list_recent_user_messages("session")
+            ] == ["hello"]
+            assert [
+                row["id"]
+                for row in await database.search_sessions_by_id("sess")
+            ] == ["session"]
             assert await database.set_session_title(
                 "session", "  Native\n Async  "
             )
@@ -330,6 +342,7 @@ async def test_session_lifecycle_does_not_block_or_leak(tmp_path):
                 vacuum=False,
             ) == {"skipped": False, "pruned": 0, "vacuumed": False}
             assert (await database.logical_size_bytes()) > 0
+            assert await database.rebuild_fts() >= 1
             assert await database.optimize_fts() >= 0
             assert await database.vacuum() >= 0
 

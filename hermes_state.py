@@ -19,13 +19,19 @@ import aiofiles.os
 
 from agent.memory_manager import sanitize_context
 from agent.message_sanitization import _sanitize_surrogates
+from agent.skill_commands import describe_skill_invocation
 from hermes_constants import get_hermes_home
 from hermes_state_common import (
     DEFERRED_INDEX_SQL,
+    FTS_SQL,
+    FTS_TRIGRAM_SQL,
+    LEGACY_FTS_SQL,
+    LEGACY_FTS_TRIGRAM_SQL,
     MAX_FTS5_QUERY_CHARS,
     SCHEMA_VERSION,
     SCHEMA_SQL,
     _COMPRESSION_CHILD_SQL,
+    _FTS_TRIGGERS,
     _LISTABLE_CHILD_SQL,
     _PREVIEW_RAW_SELECT,
     _shape_preview,
@@ -291,6 +297,14 @@ class SessionDB:
             return True
         return False
 
+    @staticmethod
+    def _is_trigram_unavailable_error(exc: sqlite3.OperationalError) -> bool:
+        err = str(exc).lower()
+        return (
+            "no such tokenizer: trigram" in err
+            or "no such tokenizer: cjk_unicode61" in err
+        )
+
 
     @classmethod
     def _encode_content(cls, content: Any) -> Any:
@@ -532,6 +546,54 @@ class SessionDB:
                 )
         return messages
 
+    async def list_recent_user_messages(
+        self,
+        session_id: str,
+        limit: int = 20,
+        include_inactive: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """Return the most-recent real user turns, newest first."""
+        active_clause = "" if include_inactive else " AND active = 1"
+        connection = await self._get_connection()
+        cursor = await connection.execute(
+            "SELECT id, timestamp, content FROM messages "
+            "WHERE session_id = ? AND role = 'user'"
+            f"{active_clause} AND (display_kind IS NULL OR display_kind = '') "
+            "ORDER BY id DESC LIMIT ?",
+            (session_id, int(limit)),
+        )
+        try:
+            rows = await cursor.fetchall()
+        finally:
+            await cursor.close()
+
+        result: List[Dict[str, Any]] = []
+        for row in rows:
+            decoded = self._decode_content(row["content"])
+            if isinstance(decoded, list):
+                text_parts = [
+                    part.get("text", "")
+                    for part in decoded
+                    if isinstance(part, dict) and part.get("type") == "text"
+                ]
+                preview = " ".join(text for text in text_parts if text).strip()
+                if not preview:
+                    preview = "[multimodal content]"
+            elif isinstance(decoded, str):
+                preview = describe_skill_invocation(decoded) or decoded
+            else:
+                preview = ""
+            preview = " ".join(preview.split())
+            if len(preview) > 80:
+                preview = preview[:77] + "..."
+            result.append(
+                {
+                    "id": row["id"],
+                    "timestamp": row["timestamp"],
+                    "preview": preview,
+                }
+            )
+        return result
 
     @staticmethod
     def _sanitize_fts5_query(query: str) -> str:
@@ -673,6 +735,10 @@ class SessionDB:
         self._write_lock = None
         self._schema_ready = False
         self._closed = False
+        self._fts_enabled = False
+        self._trigram_available = False
+        self._fts_unavailable_warned = False
+        self._trigram_unavailable_warned = False
 
     def _get_connect_lock(self) -> asyncio.Lock:
         if self._connect_lock is None:
@@ -724,6 +790,18 @@ class SessionDB:
                             self._db_path,
                         )
                     await self._ensure_schema(connection)
+                else:
+                    self._fts_enabled = (
+                        await self._fts_table_probe(connection, "messages_fts")
+                        is True
+                    )
+                    if self._fts_enabled:
+                        self._trigram_available = (
+                            await self._fts_table_probe(
+                                connection, "messages_fts_trigram"
+                            )
+                            is True
+                        )
             except BaseException:
                 await connection.close()
                 raise
@@ -733,11 +811,9 @@ class SessionDB:
     async def _ensure_schema(self, connection) -> None:
         """Create/reconcile the transcript tables without a sync DB hop.
 
-        FTS maintenance remains owned by the optional session-search surface;
-        the active turn only needs the durable session/message tables and their
-        indexes.  Column reconciliation is deliberately performed with
-        ``aiosqlite`` PRAGMA/ALTER statements so a first turn against a fresh
-        or older database never executes synchronous SQLite I/O.
+        Column reconciliation and FTS initialization are deliberately
+        performed through ``aiosqlite`` so a first turn against a fresh or
+        older database never executes synchronous SQLite I/O.
         """
         if self._schema_ready:
             return
@@ -761,6 +837,41 @@ class SessionDB:
         await connection.execute(
             "UPDATE messages SET active = 1 WHERE active IS NULL"
         )
+        if await self._sqlite_supports_fts5(connection):
+            legacy_layout = await self._db_has_legacy_inline_fts(connection)
+            triggers_need_repair = (
+                await self._fts_trigger_count(connection) < len(_FTS_TRIGGERS)
+            )
+            if legacy_layout:
+                self._fts_enabled = await self._ensure_fts_schema(
+                    connection, "messages_fts", LEGACY_FTS_SQL
+                )
+                if self._fts_enabled:
+                    self._trigram_available = await self._ensure_fts_schema(
+                        connection,
+                        "messages_fts_trigram",
+                        LEGACY_FTS_TRIGRAM_SQL,
+                    )
+                    if triggers_need_repair:
+                        await self._rebuild_legacy_fts_indexes(
+                            connection,
+                            include_trigram=self._trigram_available,
+                        )
+            else:
+                self._fts_enabled = await self._ensure_fts_schema(
+                    connection, "messages_fts", FTS_SQL
+                )
+                if self._fts_enabled:
+                    self._trigram_available = await self._ensure_fts_schema(
+                        connection, "messages_fts_trigram", FTS_TRIGRAM_SQL
+                    )
+                    if triggers_need_repair:
+                        await self._rebuild_fts_indexes(
+                            connection,
+                            include_trigram=self._trigram_available,
+                        )
+        else:
+            await self._drop_fts_triggers(connection)
         version_row = await (
             await connection.execute("SELECT version FROM schema_version LIMIT 1")
         ).fetchone()
@@ -774,6 +885,156 @@ class SessionDB:
             )
         await connection.commit()
         self._schema_ready = True
+
+    async def _sqlite_supports_fts5(self, connection) -> bool:
+        try:
+            await connection.execute(
+                "CREATE VIRTUAL TABLE temp._hermes_fts5_probe USING fts5(x)"
+            )
+            await connection.execute("DROP TABLE temp._hermes_fts5_probe")
+            return True
+        except sqlite3.OperationalError as exc:
+            if not self._is_fts5_unavailable_error(exc):
+                raise
+            self._warn_fts5_unavailable(exc)
+            return False
+
+    @staticmethod
+    async def _fts_trigger_count(connection) -> int:
+        placeholders = ",".join("?" for _ in _FTS_TRIGGERS)
+        cursor = await connection.execute(
+            "SELECT COUNT(*) FROM sqlite_master "
+            f"WHERE type = 'trigger' AND name IN ({placeholders})",
+            _FTS_TRIGGERS,
+        )
+        try:
+            row = await cursor.fetchone()
+        finally:
+            await cursor.close()
+        return int(row[0])
+
+    @staticmethod
+    async def _db_has_legacy_inline_fts(connection) -> bool:
+        cursor = await connection.execute(
+            "SELECT sql FROM sqlite_master "
+            "WHERE type = 'table' AND name = 'messages_fts'"
+        )
+        try:
+            row = await cursor.fetchone()
+        finally:
+            await cursor.close()
+        if row is None:
+            return False
+        return "tool_name" not in (row[0] or "")
+
+    async def _fts_table_probe(self, connection, table_name: str) -> Optional[bool]:
+        try:
+            cursor = await connection.execute(
+                f"SELECT * FROM {table_name} LIMIT 0"
+            )
+            await cursor.close()
+            return True
+        except sqlite3.OperationalError as exc:
+            if self._is_fts5_unavailable_error(exc):
+                if self._is_trigram_unavailable_error(exc):
+                    self._warn_trigram_unavailable(exc)
+                else:
+                    self._warn_fts5_unavailable(exc)
+                return None
+            if "no such table" in str(exc).lower():
+                return False
+            raise
+
+    async def _ensure_fts_schema(
+        self,
+        connection,
+        table_name: str,
+        ddl: str,
+    ) -> bool:
+        if await self._fts_table_probe(connection, table_name) is None:
+            return False
+        try:
+            await connection.executescript(ddl)
+            return True
+        except sqlite3.OperationalError as exc:
+            if not self._is_fts5_unavailable_error(exc):
+                raise
+            if self._is_trigram_unavailable_error(exc):
+                self._warn_trigram_unavailable(exc)
+            else:
+                self._warn_fts5_unavailable(exc)
+            return False
+
+    @staticmethod
+    async def _rebuild_fts_indexes(
+        connection,
+        *,
+        include_trigram: bool = True,
+    ) -> None:
+        await connection.execute(
+            "INSERT INTO messages_fts(messages_fts) VALUES('rebuild')"
+        )
+        if include_trigram:
+            await connection.execute(
+                "INSERT INTO messages_fts_trigram(messages_fts_trigram) "
+                "VALUES('rebuild')"
+            )
+        await connection.execute(
+            "DELETE FROM state_meta WHERE key IN "
+            "('fts_rebuild_high_water', 'fts_rebuild_progress')"
+        )
+
+    @staticmethod
+    async def _rebuild_legacy_fts_indexes(
+        connection,
+        *,
+        include_trigram: bool = True,
+    ) -> None:
+        await connection.execute("DELETE FROM messages_fts")
+        await connection.execute(
+            "INSERT INTO messages_fts(rowid, content) "
+            "SELECT id, COALESCE(content, '') || ' ' || "
+            "COALESCE(tool_name, '') || ' ' || COALESCE(tool_calls, '') "
+            "FROM messages"
+        )
+        if include_trigram:
+            await connection.execute("DELETE FROM messages_fts_trigram")
+            await connection.execute(
+                "INSERT INTO messages_fts_trigram(rowid, content) "
+                "SELECT id, COALESCE(content, '') || ' ' || "
+                "COALESCE(tool_name, '') || ' ' || COALESCE(tool_calls, '') "
+                "FROM messages"
+            )
+
+    async def _drop_fts_triggers(self, connection) -> None:
+        for trigger in _FTS_TRIGGERS:
+            try:
+                await connection.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+            except sqlite3.OperationalError:
+                pass
+
+    def _warn_trigram_unavailable(self, exc: sqlite3.OperationalError) -> None:
+        if self._trigram_unavailable_warned:
+            return
+        self._trigram_unavailable_warned = True
+        logger.info(
+            "SQLite trigram tokenizer unavailable for %s; "
+            "CJK/substring search will fall back to LIKE: %s",
+            self.db_path,
+            exc,
+        )
+
+    def _warn_fts5_unavailable(self, exc: sqlite3.OperationalError) -> None:
+        self._fts_enabled = False
+        if self._fts_unavailable_warned:
+            return
+        self._fts_unavailable_warned = True
+        logger.warning(
+            "SQLite FTS5 unavailable for %s; full-text session search "
+            "disabled: %s",
+            self.db_path,
+            exc,
+        )
 
     @staticmethod
     async def _store_system_prompt(connection, system_prompt: Optional[str]) -> Optional[str]:
@@ -3148,6 +3409,48 @@ class SessionDB:
         ).fetchall()
         return [self._session_row_dict(row) for row in rows]
 
+    async def search_sessions_by_id(
+        self,
+        query: str,
+        limit: int = 20,
+        include_archived: bool = True,
+        source: str = None,
+        sources: List[str] = None,
+        exclude_sources: List[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Search surfaced sessions by exact, prefix, or substring id."""
+        needle = (query or "").strip().lower()
+        if not needle or limit <= 0:
+            return []
+        candidates = await self.list_sessions_rich(
+            source=source,
+            sources=sources,
+            exclude_sources=exclude_sources,
+            limit=max(limit * 4, limit),
+            offset=0,
+            include_archived=include_archived,
+            order_by_last_active=True,
+            id_query=needle,
+        )
+
+        def score(row: Dict[str, Any]) -> int:
+            ids = [
+                str(row.get("id") or ""),
+                str(row.get("_lineage_root_id") or ""),
+            ]
+            normalized = [value.lower() for value in ids if value]
+            if any(value == needle for value in normalized):
+                return 0
+            if any(value.startswith(needle) for value in normalized):
+                return 1
+            return 2
+
+        ranked = sorted(
+            enumerate(candidates),
+            key=lambda item: (score(item[1]), item[0]),
+        )
+        return [row for _, row in ranked[:limit]]
+
     async def session_count(
         self,
         source: str = None,
@@ -4782,6 +5085,26 @@ class SessionDB:
                         "FTS optimize failed for %s: %s", table_name, exc
                     )
         return optimized
+
+    async def rebuild_fts(self) -> int:
+        """Rebuild present FTS5 indexes from their canonical content tables."""
+        rebuilt = 0
+        async with self._get_write_lock():
+            connection = await self._get_connection()
+            for table_name in self._FTS_TABLES:
+                if not await self._fts_table_exists(table_name):
+                    continue
+                try:
+                    cursor = await connection.execute(
+                        f"INSERT INTO {table_name}({table_name}) VALUES('rebuild')"
+                    )
+                    await cursor.close()
+                    await connection.commit()
+                    rebuilt += 1
+                except sqlite3.OperationalError as exc:
+                    await connection.rollback()
+                    logger.warning("FTS rebuild failed for %s: %s", table_name, exc)
+        return rebuilt
 
     async def vacuum(self) -> int:
         """Run FTS optimization and VACUUM to reclaim database pages."""

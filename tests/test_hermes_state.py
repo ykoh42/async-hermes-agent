@@ -39,6 +39,7 @@ def test_public_session_interface_is_async():
         "archive_stale_sessions",
         "logical_size_bytes",
         "optimize_fts",
+        "rebuild_fts",
         "vacuum",
         "maybe_auto_prune_and_vacuum",
         "maybe_auto_archive",
@@ -56,6 +57,8 @@ def test_public_session_interface_is_async():
         "get_resume_conversations",
         "get_ancestor_display_prefix",
         "search_messages",
+        "list_recent_user_messages",
+        "search_sessions_by_id",
         "list_sessions_rich",
         "get_session_rich_row",
         "get_compression_tip",
@@ -1204,6 +1207,131 @@ async def test_logical_size_optimize_and_vacuum_use_native_async_sqlite(db):
 
 
 @pytest.mark.asyncio
+async def test_fresh_database_creates_search_indexes_and_indexes_new_messages(db):
+    await db.create_session("searchable", source="library")
+    await db.append_message(
+        "searchable", role="user", content="alpha filler beta"
+    )
+
+    connection = await db._get_connection()
+    rows = await (
+        await connection.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type = 'table' AND name IN (?, ?) ORDER BY name",
+            ("messages_fts", "messages_fts_trigram"),
+        )
+    ).fetchall()
+    trigger_count = await (
+        await connection.execute(
+            "SELECT COUNT(*) FROM sqlite_master "
+            "WHERE type = 'trigger' AND name IN (?, ?, ?, ?, ?, ?)",
+            (
+                "messages_fts_insert",
+                "messages_fts_delete",
+                "messages_fts_update",
+                "messages_fts_trigram_insert",
+                "messages_fts_trigram_delete",
+                "messages_fts_trigram_update",
+            ),
+        )
+    ).fetchone()
+
+    assert [row["name"] for row in rows] == [
+        "messages_fts",
+        "messages_fts_trigram",
+    ]
+    assert trigger_count[0] == 6
+    # A literal LIKE fallback cannot match this boolean expression. This proves
+    # the fresh-database path is using the populated FTS index.
+    assert [
+        row["session_id"] for row in await db.search_messages("alpha AND beta")
+    ] == ["searchable"]
+
+
+@pytest.mark.asyncio
+async def test_reopening_repairs_missing_fts_triggers_and_backfills_the_gap(tmp_path):
+    path = tmp_path / "state.db"
+    database = SessionDB(path)
+    await database.create_session("repair", source="library")
+    connection = await database._get_connection()
+    for trigger_name in (
+        "messages_fts_insert",
+        "messages_fts_delete",
+        "messages_fts_update",
+        "messages_fts_trigram_insert",
+        "messages_fts_trigram_delete",
+        "messages_fts_trigram_update",
+    ):
+        await connection.execute(f"DROP TRIGGER {trigger_name}")
+    await connection.commit()
+    await database.append_message(
+        "repair", role="user", content="triggerless woodpecker"
+    )
+    await database.close()
+
+    reopened = SessionDB(path)
+    try:
+        assert [
+            row["session_id"]
+            for row in await reopened.search_messages("woodpecker")
+        ] == ["repair"]
+    finally:
+        await reopened.close()
+
+
+@pytest.mark.asyncio
+async def test_rebuild_fts_restores_index_from_canonical_messages(db):
+    await db.create_session("rebuild", source="library")
+    await db.append_message(
+        "rebuild", role="user", content="recoverable kingfisher"
+    )
+    connection = await db._get_connection()
+    for table_name in ("messages_fts", "messages_fts_trigram"):
+        await connection.execute(
+            f"INSERT INTO {table_name}({table_name}) VALUES('delete-all')"
+        )
+    await connection.commit()
+
+    assert await db.search_messages("kingfisher") == []
+    assert await db.rebuild_fts() == 2
+    assert [
+        row["session_id"] for row in await db.search_messages("kingfisher")
+    ] == ["rebuild"]
+
+
+@pytest.mark.asyncio
+async def test_recent_user_messages_and_session_id_search_preserve_contract(db):
+    await db.create_session("20260807_120000_abcd12", source="library")
+    first = await db.append_message(
+        "20260807_120000_abcd12", role="user", content="first real turn"
+    )
+    await db.append_message(
+        "20260807_120000_abcd12",
+        role="user",
+        content="timeline marker",
+        display_kind="model_switch",
+    )
+    latest = await db.append_message(
+        "20260807_120000_abcd12",
+        role="user",
+        content=[{"type": "text", "text": "latest multimodal turn"}],
+    )
+    await db.rewind_to_message("20260807_120000_abcd12", first)
+
+    recent = await db.list_recent_user_messages("20260807_120000_abcd12")
+    assert recent == []
+    recent_with_inactive = await db.list_recent_user_messages(
+        "20260807_120000_abcd12", include_inactive=True
+    )
+    assert [row["id"] for row in recent_with_inactive] == [latest, first]
+    assert recent_with_inactive[0]["preview"] == "latest multimodal turn"
+
+    assert [
+        row["id"] for row in await db.search_sessions_by_id("ABCD12")
+    ] == ["20260807_120000_abcd12"]
+
+
+@pytest.mark.asyncio
 async def test_rewind_is_auditable_and_excluded_from_live_replay(db):
     await db.create_session("s1", source="library")
     await db.append_message("s1", role="user", content="first")
@@ -1244,11 +1372,20 @@ async def test_read_only_connection_uses_the_same_async_interface(tmp_path):
     path = tmp_path / "state.db"
     writer = SessionDB(path)
     await writer.create_session("s1", source="library")
+    await writer.append_message(
+        "s1", role="user", content="readonly woodpecker"
+    )
     await writer.close()
 
     reader = SessionDB(path, read_only=True)
     try:
         assert (await reader.get_session("s1"))["id"] == "s1"
+        assert reader._fts_enabled is True
+        assert reader._trigram_available is True
+        assert [
+            row["session_id"]
+            for row in await reader.search_messages("woodpecker")
+        ] == ["s1"]
         with pytest.raises(sqlite3.OperationalError):
             await reader.set_meta("forbidden", "write")
     finally:
