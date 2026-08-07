@@ -253,6 +253,19 @@ async def test_session_lifecycle_does_not_block_or_leak(tmp_path):
                 "session", role="user", content="hello"
             )
             await database.end_session("session", "done")
+            assert [
+                row["id"]
+                for row in await database.list_sessions_rich(
+                    search_query="session",
+                    order_by_last_active=True,
+                    include_pinned=True,
+                )
+            ] == ["session"]
+            assert (
+                await database.get_session_rich_row(
+                    "session", compact_rows=True
+                )
+            )["preview"] == "hello"
             assert await database.delete_session(
                 "session", sessions_dir=sessions_dir
             )

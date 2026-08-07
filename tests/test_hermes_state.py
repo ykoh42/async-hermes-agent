@@ -25,6 +25,9 @@ def test_public_session_interface_is_async():
         "get_messages",
         "get_messages_as_conversation",
         "search_messages",
+        "list_sessions_rich",
+        "get_session_rich_row",
+        "get_compression_tip",
         "close",
     ):
         assert inspect.iscoroutinefunction(getattr(SessionDB, name)), name
@@ -121,6 +124,109 @@ async def test_titles_meta_search_and_recent_listing(db):
     assert "cobalt project" in sessions[0]["preview"].lower()
     matches = await db.search_messages("cobalt")
     assert [match["session_id"] for match in matches] == ["s1"]
+
+
+@pytest.mark.asyncio
+async def test_rich_listing_honors_search_id_and_session_scope(db):
+    await db.create_session(
+        "root-an94",
+        source="library",
+        session_key="scope:a",
+    )
+    await db.set_session_title("root-an94", "AN-94 Notes")
+    await db.create_session(
+        "other-session",
+        source="library",
+        session_key="scope:b",
+    )
+    await db.set_session_title("other-session", "Unrelated")
+
+    scoped = await db.list_sessions_rich(
+        session_key="scope:a",
+        order_by_last_active=True,
+    )
+    assert [session["id"] for session in scoped] == ["root-an94"]
+
+    by_id = await db.list_sessions_rich(
+        id_query="ROOT-AN",
+        order_by_last_active=True,
+    )
+    assert [session["id"] for session in by_id] == ["root-an94"]
+
+    by_title = await db.list_sessions_rich(
+        search_query="an94",
+        order_by_last_active=True,
+    )
+    assert [session["id"] for session in by_title] == ["root-an94"]
+
+
+@pytest.mark.asyncio
+async def test_rich_listing_backfills_pinned_rows_beyond_page(db):
+    await db.create_session("old-pinned", source="library")
+    await db.create_session("new-recent", source="library")
+    connection = await db._get_connection()
+    await connection.execute(
+        "UPDATE sessions SET pinned = 1, started_at = 1 WHERE id = ?",
+        ("old-pinned",),
+    )
+    await connection.execute(
+        "UPDATE sessions SET started_at = 2 WHERE id = ?",
+        ("new-recent",),
+    )
+    await connection.commit()
+
+    page = await db.list_sessions_rich(limit=1, include_pinned=True)
+    assert [session["id"] for session in page] == ["new-recent", "old-pinned"]
+
+
+@pytest.mark.asyncio
+async def test_rich_listing_projects_compression_root_to_tip(db):
+    await db.create_session("root", source="library")
+    await db.append_message("root", role="user", content="old preview")
+    await db.end_session("root", "compression")
+    await db.create_session(
+        "middle",
+        source="library",
+        parent_session_id="root",
+    )
+    await db.end_session("middle", "compression")
+    await db.create_session(
+        "tip",
+        source="library",
+        parent_session_id="middle",
+    )
+    await db.append_message("tip", role="user", content="live preview")
+
+    sessions = await db.list_sessions_rich(source="library")
+
+    assert await db.get_compression_tip("root") == "tip"
+    assert await db.get_compression_tip("middle") == "tip"
+    assert [session["id"] for session in sessions] == ["tip"]
+    assert sessions[0]["_lineage_root_id"] == "root"
+    assert sessions[0]["preview"] == "live preview"
+
+
+@pytest.mark.asyncio
+async def test_rich_listing_uses_freshest_activity_and_compact_projection(db):
+    await db.create_session(
+        "activity",
+        source="library",
+        system_prompt="large prompt payload",
+    )
+    await db.append_message("activity", role="user", content="hello", timestamp=20)
+    connection = await db._get_connection()
+    await connection.execute(
+        "UPDATE sessions SET last_activity_at = 10 WHERE id = ?",
+        ("activity",),
+    )
+    await connection.commit()
+
+    row = await db.get_session_rich_row("activity", compact_rows=True)
+
+    assert row is not None
+    assert row["last_active"] == 20
+    assert "system_prompt" not in row
+    assert "system_prompt_hash" not in row
 
 
 @pytest.mark.asyncio

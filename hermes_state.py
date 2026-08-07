@@ -26,7 +26,10 @@ from hermes_state_common import (
     SCHEMA_VERSION,
     SCHEMA_SQL,
     _LISTABLE_CHILD_SQL,
+    _PREVIEW_RAW_SELECT,
     _shape_preview,
+    _sql_session_last_active,
+    _sql_session_last_active_by_id,
 )
 
 try:
@@ -2670,6 +2673,134 @@ class SessionDB:
             if field in requested
         )
 
+    _SESSION_COMPACT_EXCLUDED = frozenset({"system_prompt", "system_prompt_hash"})
+    _session_compact_cols_sql: Optional[str] = None
+
+    @classmethod
+    async def _compact_session_cols(cls) -> str:
+        """Return the upstream compact projection without blocking SQLite."""
+        if cls._session_compact_cols_sql is None:
+            declared = (await cls._parse_schema_columns(SCHEMA_SQL))["sessions"]
+            cls._session_compact_cols_sql = ", ".join(
+                f"s.{name}"
+                for name in declared
+                if name not in cls._SESSION_COMPACT_EXCLUDED
+            )
+        return cls._session_compact_cols_sql
+
+    async def get_compression_tip(self, session_id: str) -> Optional[str]:
+        """Walk a compression-continuation chain and return its live tip."""
+        connection = await self._get_connection()
+        current = session_id
+        seen = {current} if current else set()
+        for _ in range(100):
+            row = await (
+                await connection.execute(
+                    f"""
+                    SELECT child.id
+                    FROM sessions parent
+                    JOIN sessions child ON child.parent_session_id = parent.id
+                    WHERE parent.id = ?
+                      AND parent.end_reason = 'compression'
+                      AND json_extract(COALESCE(child.model_config, '{{}}'), '$._branched_from') IS NULL
+                      AND json_extract(COALESCE(child.model_config, '{{}}'), '$._delegate_from') IS NULL
+                      AND COALESCE(child.source, '') != 'tool'
+                    ORDER BY
+                      CASE
+                        WHEN child.end_reason = 'compression' THEN 0
+                        WHEN child.ended_at IS NULL THEN 1
+                        ELSE 2
+                      END,
+                      {_sql_session_last_active("child")} DESC,
+                      child.started_at DESC,
+                      child.id DESC
+                    LIMIT 1
+                    """,
+                    (current,),
+                )
+            ).fetchone()
+            if row is None:
+                return current
+            child_id = row["id"]
+            if not child_id or child_id in seen:
+                return current
+            seen.add(child_id)
+            current = child_id
+        return current
+
+    async def _get_session_rich_rows_batch(
+        self, session_ids, compact_rows: bool = False
+    ) -> Dict[str, Dict[str, Any]]:
+        """Fetch enriched session rows in bounded native-async batches."""
+        ids = [session_id for session_id in session_ids if session_id]
+        if not ids:
+            return {}
+        chunk_size = 900
+        if len(ids) > chunk_size:
+            result: Dict[str, Dict[str, Any]] = {}
+            for start in range(0, len(ids), chunk_size):
+                result.update(
+                    await self._get_session_rich_rows_batch(
+                        ids[start : start + chunk_size],
+                        compact_rows=compact_rows,
+                    )
+                )
+            return result
+
+        await self.flush_token_counts()
+        select = await self._compact_session_cols() if compact_rows else "s.*"
+        placeholders = ",".join("?" for _ in ids)
+        prompt_select = (
+            ""
+            if compact_rows
+            else ", COALESCE(sp.prompt, s.system_prompt) AS _system_prompt_resolved"
+        )
+        prompt_join = (
+            ""
+            if compact_rows
+            else "LEFT JOIN system_prompts sp ON sp.hash = s.system_prompt_hash"
+        )
+        query = f"""
+            SELECT {select}{prompt_select},
+                COALESCE(
+                    (SELECT {_PREVIEW_RAW_SELECT}
+                     FROM messages m
+                     WHERE m.session_id = s.id AND m.role = 'user' AND m.content IS NOT NULL
+                     ORDER BY m.timestamp, m.id LIMIT 1),
+                    ''
+                ) AS _preview_raw,
+                {_sql_session_last_active("s")} AS last_active
+            FROM sessions s
+            {prompt_join}
+            WHERE s.id IN ({placeholders})
+        """
+        connection = await self._get_connection()
+        rows = await (await connection.execute(query, ids)).fetchall()
+        result = {}
+        for row in rows:
+            session = self._session_row_dict(row)
+            session["preview"] = _shape_preview(session.pop("_preview_raw", ""))
+            result[session["id"]] = session
+        return result
+
+    async def _get_session_rich_row(
+        self, session_id: str, compact_rows: bool = False
+    ) -> Optional[Dict[str, Any]]:
+        """Return one enriched row with the same shape as session listings."""
+        return (
+            await self._get_session_rich_rows_batch(
+                [session_id], compact_rows=compact_rows
+            )
+        ).get(session_id)
+
+    async def get_session_rich_row(
+        self, session_id: str, compact_rows: bool = False
+    ) -> Optional[Dict[str, Any]]:
+        """Public wrapper for the upstream single-session rich-row API."""
+        return await self._get_session_rich_row(
+            session_id, compact_rows=compact_rows
+        )
+
     async def list_sessions_rich(
         self,
         source: str = None,
@@ -2684,68 +2815,261 @@ class SessionDB:
         order_by_last_active: bool = False,
         include_archived: bool = False,
         archived_only: bool = False,
+        id_query: str = None,
+        search_query: str = None,
         compact_rows: bool = False,
-        **_ignored: Any,
+        include_pinned: bool = False,
+        session_key: str = None,
     ) -> List[Dict[str, Any]]:
-        """Return lightweight recent-session rows for async browse surfaces."""
-        connection = await self._get_connection()
-        where: list[str] = []
+        """List enriched sessions with upstream filtering and projection."""
+        await self.flush_token_counts()
+        where_clauses: list[str] = []
         params: list[Any] = []
+
         if not include_children:
-            where.extend([_LISTABLE_CHILD_SQL, f"{_delegate_from_json('s.model_config')} IS NULL"])
+            where_clauses.append(_LISTABLE_CHILD_SQL)
+            where_clauses.append(
+                f"{_delegate_from_json('s.model_config')} IS NULL"
+            )
         include_sources = [source] if source else list(sources or [])
         if include_sources:
-            where.append("s.source IN (" + ",".join("?" for _ in include_sources) + ")")
+            placeholders = ",".join("?" for _ in include_sources)
+            where_clauses.append(f"s.source IN ({placeholders})")
             params.extend(include_sources)
+        if session_key:
+            where_clauses.append("s.session_key = ?")
+            params.append(session_key)
         if exclude_sources:
-            where.append("s.source NOT IN (" + ",".join("?" for _ in exclude_sources) + ")")
+            placeholders = ",".join("?" for _ in exclude_sources)
+            where_clauses.append(f"s.source NOT IN ({placeholders})")
             params.extend(exclude_sources)
         if cwd_prefix:
             clause, clause_params = _cwd_prefix_clause(cwd_prefix)
-            where.append(clause)
+            where_clauses.append(clause)
             params.extend(clause_params)
-        if min_message_count:
-            where.append("s.message_count >= ?")
+        if min_message_count > 0:
+            where_clauses.append("s.message_count >= ?")
             params.append(min_message_count)
         if archived_only:
-            where.append("s.archived = 1")
+            where_clauses.append("s.archived = 1")
         elif not include_archived:
-            where.append("s.archived = 0")
-        where_sql = "WHERE " + " AND ".join(where) if where else ""
-        order_sql = "last_active DESC, s.started_at DESC, s.id DESC" if order_by_last_active else "s.started_at DESC, s.id DESC"
+            where_clauses.append("s.archived = 0")
+
+        where_sql = (
+            f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
+        )
+        base_where_params = list(params)
         prompt_select = (
-            "NULL AS _system_prompt_resolved"
+            ""
             if compact_rows
-            else "COALESCE(sp.prompt, s.system_prompt) AS _system_prompt_resolved"
+            else ", COALESCE(sp.prompt, s.system_prompt) AS _system_prompt_resolved"
         )
         prompt_join = (
-            "" if compact_rows
+            ""
+            if compact_rows
             else "LEFT JOIN system_prompts sp ON sp.hash = s.system_prompt_hash"
         )
-        query_sql = f"""
-            SELECT s.*,
-                   {prompt_select},
-                   COALESCE((SELECT MAX(m.timestamp) FROM messages m
-                             WHERE m.session_id = s.id), s.started_at) AS last_active,
-                   (SELECT m.content FROM messages m
-                    WHERE m.session_id = s.id AND m.role = 'user' AND m.active = 1
-                    ORDER BY m.id LIMIT 1) AS _preview_raw
-            FROM sessions s
-            {prompt_join}
-            {where_sql}
-            ORDER BY {order_sql} LIMIT ? OFFSET ?
-        """
-        cursor = await connection.execute(query_sql, [*params, max(0, int(limit)), max(0, int(offset))])
-        rows = await cursor.fetchall()
-        result = []
+        id_needle = (id_query or "").strip().lower()
+        search_needle = (search_query or "").strip().lower()
+        select = await self._compact_session_cols() if compact_rows else "s.*"
+
+        if order_by_last_active:
+            outer_where = where_sql
+            query_params: List[Any] = []
+            filter_clauses: List[str] = []
+
+            def _like_pattern(needle: str) -> str:
+                escaped = (
+                    needle.replace("\\", "\\\\")
+                    .replace("%", "\\%")
+                    .replace("_", "\\_")
+                )
+                return f"%{escaped}%"
+
+            if id_needle:
+                filter_clauses.append(
+                    "EXISTS (SELECT 1 FROM chain cq"
+                    "        WHERE cq.root_id = s.id"
+                    "          AND LOWER(cq.cur_id) LIKE ? ESCAPE '\\')"
+                )
+                query_params.append(_like_pattern(id_needle))
+            if search_needle:
+                compact_needle = re.sub(r"[\W_]+", "", search_needle)
+                compact_sql = (
+                    "REPLACE(REPLACE(REPLACE(REPLACE(LOWER(COALESCE({0}, '')),"
+                    " '-', ''), '_', ''), '.', ''), ' ', '')"
+                )
+                search_clause = (
+                    "EXISTS (SELECT 1 FROM chain cq"
+                    " JOIN sessions cs ON cs.id = cq.cur_id"
+                    " WHERE cq.root_id = s.id"
+                    " AND (LOWER(COALESCE(cs.title, '')) LIKE ? ESCAPE '\\'"
+                    " OR LOWER(cq.cur_id) LIKE ? ESCAPE '\\'"
+                )
+                query_params.extend([_like_pattern(search_needle)] * 2)
+                if compact_needle:
+                    search_clause += (
+                        f" OR {compact_sql.format('cs.title')} LIKE ? ESCAPE '\\'"
+                    )
+                    query_params.append(_like_pattern(compact_needle))
+                filter_clauses.append(search_clause + "))")
+            if filter_clauses:
+                combined = " AND ".join(filter_clauses)
+                outer_where = (
+                    f"{where_sql} AND {combined}"
+                    if where_sql
+                    else f"WHERE {combined}"
+                )
+            query = f"""
+                WITH RECURSIVE chain(root_id, cur_id) AS (
+                    SELECT s.id, s.id FROM sessions s {where_sql}
+                    UNION ALL
+                    SELECT c.root_id, child.id
+                    FROM chain c
+                    JOIN sessions parent ON parent.id = c.cur_id
+                    JOIN sessions child ON child.parent_session_id = c.cur_id
+                    WHERE parent.end_reason = 'compression'
+                      AND json_extract(COALESCE(child.model_config, '{{}}'), '$._branched_from') IS NULL
+                      AND json_extract(COALESCE(child.model_config, '{{}}'), '$._delegate_from') IS NULL
+                      AND COALESCE(child.source, '') != 'tool'
+                ),
+                chain_max AS (
+                    SELECT
+                        root_id,
+                        MAX({_sql_session_last_active_by_id("cur_id")}) AS effective_last_active
+                    FROM chain
+                    GROUP BY root_id
+                )
+                SELECT {select}{prompt_select},
+                    COALESCE(
+                        (SELECT {_PREVIEW_RAW_SELECT}
+                         FROM messages m
+                         WHERE m.session_id = s.id AND m.role = 'user' AND m.content IS NOT NULL
+                         ORDER BY m.timestamp, m.id LIMIT 1),
+                        ''
+                    ) AS _preview_raw,
+                    {_sql_session_last_active("s")} AS last_active,
+                    COALESCE(cm.effective_last_active, s.started_at) AS _effective_last_active
+                FROM sessions s
+                LEFT JOIN chain_max cm ON cm.root_id = s.id
+                {prompt_join}
+                {outer_where}
+                ORDER BY _effective_last_active DESC, s.started_at DESC, s.id DESC
+                LIMIT ? OFFSET ?
+            """
+            params = params + params + query_params + [limit, offset]
+        else:
+            query = f"""
+                SELECT {select}{prompt_select},
+                    COALESCE(
+                        (SELECT {_PREVIEW_RAW_SELECT}
+                         FROM messages m
+                         WHERE m.session_id = s.id AND m.role = 'user' AND m.content IS NOT NULL
+                         ORDER BY m.timestamp, m.id LIMIT 1),
+                        ''
+                    ) AS _preview_raw,
+                    {_sql_session_last_active("s")} AS last_active
+                FROM sessions s
+                {prompt_join}
+                {where_sql}
+                ORDER BY s.started_at DESC
+                LIMIT ? OFFSET ?
+            """
+            params.extend([limit, offset])
+
+        connection = await self._get_connection()
+        rows = await (await connection.execute(query, params)).fetchall()
+        sessions = []
         for row in rows:
-            item = self._session_row_dict(row)
-            item["preview"] = _shape_preview(self._decode_content(item.pop("_preview_raw", "")))
-            if compact_rows:
-                item.pop("system_prompt", None)
-                item.pop("system_prompt_hash", None)
-            result.append(item)
-        return result
+            session = self._session_row_dict(row)
+            session["preview"] = _shape_preview(session.pop("_preview_raw", ""))
+            session.pop("_effective_last_active", None)
+            sessions.append(session)
+
+        if include_pinned:
+            seen_ids = {session["id"] for session in sessions}
+            pinned_where = (
+                f"{where_sql} AND s.pinned = 1"
+                if where_sql
+                else "WHERE s.pinned = 1"
+            )
+            pinned_query = f"""
+                SELECT {select}{prompt_select},
+                    COALESCE(
+                        (SELECT {_PREVIEW_RAW_SELECT}
+                         FROM messages m
+                         WHERE m.session_id = s.id AND m.role = 'user' AND m.content IS NOT NULL
+                         ORDER BY m.timestamp, m.id LIMIT 1),
+                        ''
+                    ) AS _preview_raw,
+                    COALESCE(
+                        (SELECT MAX(m2.timestamp) FROM messages m2 WHERE m2.session_id = s.id),
+                        s.started_at
+                    ) AS last_active
+                FROM sessions s
+                {prompt_join}
+                {pinned_where}
+                ORDER BY s.started_at DESC
+            """
+            pinned_rows = await (
+                await connection.execute(pinned_query, base_where_params)
+            ).fetchall()
+            for row in pinned_rows:
+                session = self._session_row_dict(row)
+                if session["id"] in seen_ids:
+                    continue
+                session["preview"] = _shape_preview(
+                    session.pop("_preview_raw", "")
+                )
+                seen_ids.add(session["id"])
+                sessions.append(session)
+
+        if project_compression_tips and not include_children:
+            tip_ids_by_root: Dict[str, str] = {}
+            for session in sessions:
+                if session.get("end_reason") != "compression":
+                    continue
+                tip_id = await self.get_compression_tip(session["id"])
+                if tip_id != session["id"]:
+                    tip_ids_by_root[session["id"]] = tip_id
+
+            tip_rows = (
+                await self._get_session_rich_rows_batch(
+                    set(tip_ids_by_root.values()), compact_rows=compact_rows
+                )
+                if tip_ids_by_root
+                else {}
+            )
+            projected = []
+            for session in sessions:
+                tip_id = tip_ids_by_root.get(session["id"])
+                tip_row = tip_rows.get(tip_id) if tip_id else None
+                if not tip_row:
+                    projected.append(session)
+                    continue
+                merged = dict(session)
+                for key in (
+                    "id",
+                    "ended_at",
+                    "end_reason",
+                    "message_count",
+                    "tool_call_count",
+                    "title",
+                    "last_active",
+                    "preview",
+                    "model",
+                    "system_prompt",
+                    "cwd",
+                    "git_branch",
+                    "git_repo_root",
+                ):
+                    if key in tip_row:
+                        merged[key] = tip_row[key]
+                merged["_lineage_root_id"] = session["id"]
+                projected.append(merged)
+            sessions = projected
+
+        return sessions
 
     async def get_compression_failure_cooldown(
         self, session_id: str
