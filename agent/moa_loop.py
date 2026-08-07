@@ -819,7 +819,7 @@ async def _run_references_parallel(
                     # The task is already in ``done``; awaiting it preserves
                     # cancellation and exception semantics in the async loop.
                     results[index] = await task
-                except asyncio.CancelledError:
+                except asyncio.CancelledError:  # noqa: ASYNC103 -- child cancellation is slot data
                     results[index] = (
                         _slot_label(reference_models[index]),
                         _INTERRUPTED_REFERENCE_NOTE,

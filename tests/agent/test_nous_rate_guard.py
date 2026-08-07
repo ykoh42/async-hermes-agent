@@ -1,5 +1,6 @@
 """Tests for agent/nous_rate_guard.py — cross-session Nous Portal rate limit guard."""
 
+import asyncio
 import json
 import os
 import time
@@ -33,6 +34,30 @@ class TestRecordNousRateLimit:
             state = json.load(f)
         assert state["reset_seconds"] == pytest.approx(1800, abs=2)
         assert state["reset_at"] > time.time()
+
+    @pytest.mark.asyncio
+    async def test_cancelled_write_removes_temporary_file(
+        self, rate_guard_env, monkeypatch
+    ):
+        from agent import nous_rate_guard
+
+        replace_started = asyncio.Event()
+
+        async def stalled_replace(_source, _destination):
+            replace_started.set()
+            await asyncio.Event().wait()
+
+        monkeypatch.setattr(
+            nous_rate_guard.aiofiles.os, "replace", stalled_replace
+        )
+        record = asyncio.create_task(nous_rate_guard.record_nous_rate_limit())
+        await asyncio.wait_for(replace_started.wait(), timeout=1)
+        record.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await record
+
+        state_dir = os.path.dirname(nous_rate_guard._state_path())
+        assert not [name for name in os.listdir(state_dir) if name.endswith(".tmp")]
 
 
 

@@ -57,15 +57,19 @@ jobs:
               hermes_state.py trajectory_compressor.py hermes_constants.py
             rg --files -0 agent tools plugins hermes_cli gateway providers -g '*.py'
           } | xargs -0 -n 50 uv run flake8-async --asyncio \
-            --enable=ASYNC200,ASYNC210,ASYNC211,ASYNC212,ASYNC220,ASYNC221,ASYNC222,ASYNC230,ASYNC231,ASYNC232,ASYNC240,ASYNC250,ASYNC251,ASYNC300 \
+            --enable=ASYNC102,ASYNC103,ASYNC104,ASYNC200,ASYNC210,ASYNC211,ASYNC212,ASYNC220,ASYNC221,ASYNC222,ASYNC230,ASYNC231,ASYNC232,ASYNC240,ASYNC250,ASYNC251,ASYNC300 \
             --async200-blocking-calls='shutil.which->aiofiles.os.wrap(shutil.which)'
           uv run flake8-async --asyncio \
-            --enable=ASYNC102,ASYNC103,ASYNC104,ASYNC120 \
+            --enable=ASYNC120 \
             run_agent.py model_tools.py batch_runner.py hermes_state.py \
             agent/conversation_loop.py agent/conversation_compression.py \
             agent/turn_context.py agent/memory_manager.py tools/mcp_tool.py \
             tools/memory_tool.py tools/browser_camofox.py \
-            tools/browser_supervisor.py tools/browser_tool.py
+            tools/browser_supervisor.py tools/browser_tool.py \
+            tools/delegate_tool.py tools/mcp_oauth.py \
+            agent/bounded_response.py agent/moa_loop.py \
+            agent/nous_rate_guard.py plugins/web/ddgs/provider.py \
+            plugins/memory/mem0/__init__.py
 
       - name: Test
         run: uv run pytest -q -W error::pytest.PytestUnhandledThreadExceptionWarning

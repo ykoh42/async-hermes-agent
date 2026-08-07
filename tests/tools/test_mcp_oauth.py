@@ -63,6 +63,28 @@ async def _hit_callback_when_ready(url: str, timeout: float = 15.0) -> None:
 
 class TestHermesTokenStorage:
     @pytest.mark.asyncio
+    async def test_cancelled_atomic_write_removes_temporary_file(
+        self, tmp_path, monkeypatch
+    ):
+        from tools import mcp_oauth
+
+        replace_started = asyncio.Event()
+
+        async def stalled_replace(_source, _destination):
+            replace_started.set()
+            await asyncio.Event().wait()
+
+        monkeypatch.setattr(mcp_oauth.aiofiles.os, "replace", stalled_replace)
+        target = tmp_path / "tokens.json"
+        write = asyncio.create_task(mcp_oauth._write_json(target, {"token": "secret"}))
+        await asyncio.wait_for(replace_started.wait(), timeout=1)
+        write.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await write
+
+        assert not list(tmp_path.glob("tokens.tmp.*"))
+
+    @pytest.mark.asyncio
     async def test_roundtrip_tokens(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         storage = HermesTokenStorage("test-server")

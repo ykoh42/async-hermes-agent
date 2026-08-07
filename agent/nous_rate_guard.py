@@ -118,17 +118,19 @@ async def record_nous_rate_limit(
 
         # Atomic write: write to temp file + rename.
         tmp_path = os.path.join(state_dir, f".{_STATE_FILENAME}.{uuid.uuid4().hex}.tmp")
+        replaced = False
         try:
             async with aiofiles.open(tmp_path, "w", encoding="utf-8") as handle:
                 await handle.write(json.dumps(state))
                 await handle.flush()
             await aiofiles.os.replace(tmp_path, path)
-        except Exception:
-            try:
-                await aiofiles.os.remove(tmp_path)
-            except FileNotFoundError:
-                pass
-            raise
+            replaced = True
+        finally:
+            if not replaced:
+                try:
+                    await aiofiles.os.remove(tmp_path)
+                except FileNotFoundError:
+                    pass
 
         logger.info(
             "Nous rate limit recorded: resets in %.0fs (at %.0f)",

@@ -2274,10 +2274,13 @@ async def _run_single_child(
         _heartbeat_stop.set()
         if _heartbeat_task is not None:
             _heartbeat_task.cancel()
-            try:
-                await _heartbeat_task
-            except asyncio.CancelledError:
-                pass
+            (heartbeat_result,) = await asyncio.gather(
+                _heartbeat_task, return_exceptions=True
+            )
+            if isinstance(heartbeat_result, BaseException) and not isinstance(
+                heartbeat_result, asyncio.CancelledError
+            ):
+                raise heartbeat_result
 
         # Drop the TUI-facing registry entry.  Safe to call even if the
         # child was never registered (e.g. ID missing on test doubles).

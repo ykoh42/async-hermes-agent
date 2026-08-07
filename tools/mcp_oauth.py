@@ -378,6 +378,7 @@ async def _write_json(path: Path, data: dict) -> None:
             stat.S_IRUSR | stat.S_IWUSR,
         )
 
+    replaced = False
     try:
         async with aiofiles.open(
             tmp,
@@ -388,12 +389,13 @@ async def _write_json(path: Path, data: dict) -> None:
             await handle.write(json.dumps(data, indent=2, default=str))
             await handle.flush()
         await aiofiles.os.replace(tmp, path)
-    except OSError:
-        try:
-            await aiofiles.os.remove(tmp)
-        except OSError:
-            pass
-        raise
+        replaced = True
+    finally:
+        if not replaced:
+            try:
+                await aiofiles.os.remove(tmp)
+            except OSError:
+                pass
 
 
 # ---------------------------------------------------------------------------

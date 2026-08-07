@@ -11,6 +11,7 @@ body) or hang forever (body opens then stalls).
 
 from __future__ import annotations
 
+import asyncio
 import http.server
 import json
 import socketserver
@@ -129,3 +130,22 @@ async def test_or_default_returns_text_when_present(server_base, client):
     async with client.stream("POST", server_base + "/normal") as response:
         result = await read_error_body_or_default(response)
     assert result is not None and "RESOURCE_EXHAUSTED" in result
+
+
+@pytest.mark.asyncio
+async def test_stream_cancellation_propagates_and_closes_response():
+    class CancelledResponse:
+        def __init__(self):
+            self.closed = False
+
+        async def aiter_bytes(self):
+            raise asyncio.CancelledError
+            yield b""  # pragma: no cover - keeps this an async iterator
+
+        async def aclose(self):
+            self.closed = True
+
+    response = CancelledResponse()
+    with pytest.raises(asyncio.CancelledError):
+        await read_streaming_error_body(response)
+    assert response.closed is True

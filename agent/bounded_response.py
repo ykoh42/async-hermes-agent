@@ -80,14 +80,14 @@ async def read_streaming_error_body(
 
     try:
         await asyncio.wait_for(_drain(), timeout=timeout_s)
-    except (asyncio.TimeoutError, asyncio.CancelledError):
-        if isinstance(asyncio.current_task(), asyncio.Task) and asyncio.current_task().cancelling():
-            raise
+    except asyncio.TimeoutError:
         logger.debug(
             "bounded async error-body read: hard timeout after %.1fs (%d bytes so far)",
             timeout_s,
             total,
         )
+    except asyncio.CancelledError:
+        raise
     except Exception as exc:  # noqa: BLE001 - error path must not mask HTTP failure
         logger.debug("bounded async error-body read failed: %s", exc)
     finally:

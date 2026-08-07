@@ -200,10 +200,13 @@ async def _run_ddgs_search_bounded(query: str, safe_limit: int) -> list[dict[str
                 logger.warning("DDGS worker pid=%s did not exit after kill", proc.pid)
         if not communicate_task.done():
             communicate_task.cancel()
-            try:
-                await communicate_task
-            except asyncio.CancelledError:
-                pass
+            (communicate_result,) = await asyncio.gather(
+                communicate_task, return_exceptions=True
+            )
+            if isinstance(communicate_result, BaseException) and not isinstance(
+                communicate_result, asyncio.CancelledError
+            ):
+                raise communicate_result
 
     if interrupted:
         raise _SearchInterrupted("DuckDuckGo search interrupted")

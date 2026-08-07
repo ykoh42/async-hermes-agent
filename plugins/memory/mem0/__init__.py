@@ -608,10 +608,7 @@ class Mem0MemoryProvider(MemoryProvider):
     async def shutdown(self) -> None:
         if self._prefetch_task is not None:
             self._prefetch_task.cancel()
-            try:
-                await self._prefetch_task
-            except asyncio.CancelledError:
-                pass
+            await asyncio.gather(self._prefetch_task, return_exceptions=True)
             self._prefetch_task = None
         if self._backend is not None:
             await self._backend.close()
