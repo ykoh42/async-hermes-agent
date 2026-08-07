@@ -1938,6 +1938,16 @@ class SessionDB:
 
         await self._write(_update)
 
+    async def queue_token_counts(self, session_id: str, **kwargs) -> None:
+        """Persist a token/cost update through the native async writer.
+
+        Accepts the same keyword arguments as :meth:`update_token_counts`.
+        The synchronous implementation needed a background thread to move
+        SQLite work off the turn thread; the async implementation awaits the
+        non-blocking database operation directly and preserves enqueue order.
+        """
+        await self.update_token_counts(session_id, **kwargs)
+
     async def update_session_billing_route(
         self,
         session_id: str,

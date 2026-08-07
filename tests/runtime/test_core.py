@@ -274,6 +274,10 @@ async def test_session_lifecycle_does_not_block_or_leak(tmp_path):
             )
             assert await database.session_count(source="library") == 1
             assert await database.session_count_by_source() == {"library": 1}
+            await database.queue_token_counts(
+                "session", input_tokens=3, api_call_count=1
+            )
+            assert await database.flush_token_counts() is True
             assert [
                 row["id"]
                 for row in await database.search_sessions(source="library")
@@ -2933,6 +2937,7 @@ async def test_synthetic_turn_records_trajectory_without_to_thread(monkeypatch, 
     agent._session_db = database
     agent._session_db_created = False
     agent.compression_enabled = False
+    agent._skip_mcp_refresh = True
 
     async def model_response(*_args, **_kwargs):
         return SimpleNamespace(
@@ -2949,7 +2954,11 @@ async def test_synthetic_turn_records_trajectory_without_to_thread(monkeypatch, 
                     ),
                 )
             ],
-            usage=None,
+            usage=SimpleNamespace(
+                prompt_tokens=11,
+                completion_tokens=4,
+                total_tokens=15,
+            ),
         )
 
     agent._execute_model_request = model_response
@@ -2982,6 +2991,10 @@ async def test_synthetic_turn_records_trajectory_without_to_thread(monkeypatch, 
             "hello async",
             "async answer",
         ]
+        session = await database.get_session(agent.session_id)
+        assert session["input_tokens"] == 11
+        assert session["output_tokens"] == 4
+        assert session["api_call_count"] == 1
     finally:
         await agent.close()
         await database.close()

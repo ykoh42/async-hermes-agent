@@ -30,6 +30,7 @@ def test_public_session_interface_is_async():
         "get_message_role",
         "update_session_meta",
         "update_session_model",
+        "queue_token_counts",
         "get_session",
         "resolve_session_id",
         "session_count_ge",
@@ -134,6 +135,31 @@ async def test_session_compatibility_primitives_preserve_upstream_contract(db):
     assert (await db.get_session("session-alpha"))["tool_call_count"] == 0
     await db.end_session("session-alpha", "done")
     assert await db.count_empty_sessions() == 1
+
+
+@pytest.mark.asyncio
+async def test_queue_token_counts_preserves_delta_order_and_absolute_barrier(db):
+    await db.create_session("accounting", source="library")
+
+    await db.queue_token_counts(
+        "accounting", input_tokens=5, output_tokens=2, api_call_count=1
+    )
+    await db.queue_token_counts(
+        "accounting",
+        input_tokens=100,
+        output_tokens=20,
+        api_call_count=1,
+        absolute=True,
+    )
+    await db.queue_token_counts(
+        "accounting", input_tokens=7, output_tokens=3, api_call_count=1
+    )
+
+    assert await db.flush_token_counts() is True
+    session = await db.get_session("accounting")
+    assert session["input_tokens"] == 107
+    assert session["output_tokens"] == 23
+    assert session["api_call_count"] == 2
 
 
 @pytest.mark.asyncio

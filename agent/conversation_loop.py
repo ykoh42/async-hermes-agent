@@ -3301,7 +3301,7 @@ async def run_conversation(
                             session_db = agent._session_db
                             if session_db is None:
                                 raise RuntimeError("Async session DB is unavailable")
-                            await session_db.update_token_counts(
+                            await session_db.queue_token_counts(
                                 agent.session_id,
                                 input_tokens=canonical_usage.input_tokens,
                                 output_tokens=canonical_usage.output_tokens,
