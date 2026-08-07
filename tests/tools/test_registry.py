@@ -11,7 +11,10 @@ import pytest
 from tools.registry import (
     ToolRegistry,
     _BUILTIN_TOOL_MODULES,
+    _check_fn_cached,
     discover_builtin_tools,
+    get_cached_check_fn_result,
+    invalidate_check_fn_cache,
 )
 
 
@@ -120,6 +123,21 @@ class TestRegisterAndDispatch:
         )
 
 class TestGetDefinitions:
+    @pytest.mark.asyncio
+    async def test_cached_check_result_does_not_reexecute_probe(self):
+        invalidate_check_fn_cache()
+        calls = 0
+
+        async def check():
+            nonlocal calls
+            calls += 1
+            return True
+
+        assert await get_cached_check_fn_result(check) is None
+        assert await _check_fn_cached(check) is True
+        assert await get_cached_check_fn_result(check) is True
+        assert calls == 1
+
     @pytest.mark.asyncio
     async def test_returns_openai_format(self):
         reg = ToolRegistry()

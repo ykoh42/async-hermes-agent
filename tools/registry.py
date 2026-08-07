@@ -241,6 +241,20 @@ async def _check_fn_cached(fn: Callable) -> bool:
         return False
 
 
+async def get_cached_check_fn_result(fn: Callable) -> Optional[bool]:
+    """Return a fresh cached verdict for *fn* without executing the probe."""
+    now = time.monotonic()
+    scope = await check_fn_cache_scope()
+    if scope == CHECK_FN_CACHE_BYPASS:
+        return None
+    with _check_fn_cache_lock:
+        cached = _check_fn_cache.get((fn, scope))
+        if cached is None:
+            return None
+        timestamp, value = cached
+        return value if now - timestamp < _CHECK_FN_TTL_SECONDS else None
+
+
 def invalidate_check_fn_cache() -> None:
     """Drop all cached ``check_fn`` results. Call after config changes that
     affect tool availability (e.g. ``hermes tools enable``)."""
@@ -559,8 +573,6 @@ class ToolRegistry:
         self,
         tool_names: Set[str],
         quiet: bool = False,
-        *,
-        probe_availability: bool = True,
     ) -> List[dict]:
         """Return OpenAI-format tool schemas for the requested tool names.
 
@@ -582,7 +594,7 @@ class ToolRegistry:
             entry = entries_by_name.get(name)
             if not entry:
                 continue
-            if entry.check_fn and probe_availability:
+            if entry.check_fn:
                 if entry.check_fn not in check_results:
                     check_results[entry.check_fn] = await _check_fn_cached(entry.check_fn)
                 if not check_results[entry.check_fn]:

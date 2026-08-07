@@ -3222,10 +3222,12 @@ async def initialize_deferred_runtime(agent: Any) -> bool:
         for key in ("command", "args", "region", "guardrail_config"):
             if key in runtime:
                 pending[key] = runtime[key]
+        gemini_native_endpoint = False
         if provider == "gemini":
             from agent.gemini_native_adapter import is_native_gemini_base_url
 
-            if is_native_gemini_base_url(base_url):
+            gemini_native_endpoint = is_native_gemini_base_url(base_url)
+            if gemini_native_endpoint:
                 # The native adapter owns an httpx.AsyncClient and exposes the
                 # same OpenAI-shaped coroutine contract as the other chat
                 # transports.  Keep the provider on this path so Gemini does
@@ -3459,18 +3461,21 @@ async def initialize_deferred_runtime(agent: Any) -> bool:
 
             agent._anthropic_api_key = api_key
             agent._anthropic_base_url = agent.base_url
+            client_error = None
             try:
                 agent._anthropic_client = build_anthropic_client(
                     api_key,
                     agent.base_url,
                     timeout=timeout,
                 )
-            except Exception:
+            except Exception as exc:
+                client_error = exc
+            if client_error is not None:
                 if callable(api_key) and not isinstance(api_key, str):
                     from agent.azure_identity_adapter import release_token_provider
 
                     await release_token_provider(api_key)
-                raise
+                raise client_error
             agent._anthropic_client_source = (
                 api_key,
                 agent.base_url,
@@ -3481,14 +3486,7 @@ async def initialize_deferred_runtime(agent: Any) -> bool:
             )
             agent.client = None
             agent._client_kwargs = {}
-        elif provider == "gemini":
-            from agent.gemini_native_adapter import is_native_gemini_base_url
-
-            if not is_native_gemini_base_url(agent.base_url):
-                raise UnsupportedCapabilityError(
-                    "Gemini provider resolved to a non-native endpoint without "
-                    "an OpenAI-compatible async route."
-                )
+        elif provider == "gemini" and gemini_native_endpoint:
             from agent.gemini_native_adapter import GeminiNativeClient
 
             agent.client = GeminiNativeClient(
@@ -3554,14 +3552,17 @@ async def initialize_deferred_runtime(agent: Any) -> bool:
             )
             if http_client is not None:
                 client_kwargs["http_client"] = http_client
+            client_error = None
             try:
                 agent.client = _ra().OpenAI(**client_kwargs)
-            except Exception:
+            except Exception as exc:
+                client_error = exc
+            if client_error is not None:
                 if callable(api_key) and not isinstance(api_key, str):
                     from agent.azure_identity_adapter import release_token_provider
 
                     await release_token_provider(api_key)
-                raise
+                raise client_error
             if callable(api_key) and not isinstance(api_key, str):
                 agent.client._hermes_token_provider = api_key
             # OpenAI>=2 lazily resolves the platform on the first request.

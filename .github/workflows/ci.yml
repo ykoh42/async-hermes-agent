@@ -62,6 +62,7 @@ jobs:
           uv run flake8-async --asyncio \
             --enable=ASYNC120 \
             run_agent.py model_tools.py batch_runner.py hermes_state.py \
+            agent/agent_init.py agent/tool_executor.py tools/registry.py \
             agent/conversation_loop.py agent/conversation_compression.py \
             agent/turn_context.py agent/memory_manager.py tools/mcp_tool.py \
             tools/memory_tool.py tools/browser_camofox.py \

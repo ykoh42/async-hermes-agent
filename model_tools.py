@@ -142,7 +142,6 @@ async def get_tool_definitions(
     disabled_toolsets: Optional[List[str]] = None,
     quiet_mode: bool = False,
     skip_tool_search_assembly: bool = False,
-    probe_availability: bool = True,
 ) -> List[Dict[str, Any]]:
     """
     Get tool definitions for model API calls with toolset-based filtering.
@@ -169,7 +168,7 @@ async def get_tool_definitions(
     # registry.get_definitions. The config-mtime fingerprint below captures
     # user-visible config edits that affect dynamic schemas without needing an explicit
     # invalidate hook on every config-writer.
-    if quiet_mode and probe_availability:
+    if quiet_mode:
         cache_key = None
         try:
             from hermes_cli.config import get_config_path
@@ -201,9 +200,8 @@ async def get_tool_definitions(
         disabled_toolsets,
         quiet_mode,
         skip_tool_search_assembly=skip_tool_search_assembly,
-        probe_availability=probe_availability,
     )
-    if quiet_mode and probe_availability and cache_key is not None:
+    if quiet_mode and cache_key is not None:
         # Cache the freshly-computed list, but hand callers a shallow copy so
         # downstream mutations (e.g. run_agent appending memory/LCM tool
         # schemas to self.tools) don't poison the cache. Without this, a
@@ -228,7 +226,6 @@ async def _compute_tool_definitions(
     disabled_toolsets: Optional[List[str]] = None,
     quiet_mode: bool = False,
     skip_tool_search_assembly: bool = False,
-    probe_availability: bool = True,
 ) -> List[Dict[str, Any]]:
     """Uncached implementation of :func:`get_tool_definitions`."""
     # Determine which tool names the caller wants
@@ -313,7 +310,6 @@ async def _compute_tool_definitions(
     filtered_tools = await registry.get_definitions(
         tools_to_include,
         quiet=quiet_mode,
-        probe_availability=probe_availability,
     )
 
     if not quiet_mode:

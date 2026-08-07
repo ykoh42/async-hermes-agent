@@ -8,7 +8,11 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from agent.tool_executor import execute_tool_calls_segmented
+from agent.tool_executor import (
+    execute_tool_calls_concurrent,
+    execute_tool_calls_sequential,
+    execute_tool_calls_segmented,
+)
 
 
 def _tool_call(name: str, call_id: str) -> SimpleNamespace:
@@ -67,6 +71,47 @@ def _native_policy_path():
         new_callable=AsyncMock,
         return_value=None,
     )
+
+
+@pytest.mark.parametrize(
+    "executor",
+    [execute_tool_calls_concurrent, execute_tool_calls_sequential],
+)
+@pytest.mark.asyncio
+async def test_public_executor_preserves_finalize_false_contract(executor):
+    async def flush(_messages):
+        return True
+
+    agent = _agent(flush)
+    steer_calls = []
+    agent._apply_pending_steer_to_tool_results = lambda *args: steer_calls.append(args)
+    call = _tool_call("read_file", "read-1")
+    messages = []
+
+    with (
+        patch(
+            "model_tools.handle_function_call",
+            new_callable=AsyncMock,
+            return_value=json.dumps({"content": "data"}),
+        ),
+        patch(
+            "agent.tool_executor.enforce_turn_budget",
+            new_callable=AsyncMock,
+        ) as enforce_budget,
+        _native_tool_entry(),
+        _native_policy_path(),
+    ):
+        await executor(
+            agent,
+            SimpleNamespace(tool_calls=[call]),
+            messages,
+            "task-1",
+            finalize=False,
+        )
+
+    assert [message["tool_call_id"] for message in messages] == ["read-1"]
+    enforce_budget.assert_not_awaited()
+    assert steer_calls == []
 
 
 @pytest.mark.asyncio

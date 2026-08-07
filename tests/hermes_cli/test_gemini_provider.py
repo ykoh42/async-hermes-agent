@@ -3,7 +3,7 @@
 import pytest
 
 pytestmark = pytest.mark.asyncio
-from unittest.mock import patch, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from hermes_cli.auth import PROVIDER_REGISTRY, resolve_provider, resolve_api_key_provider_credentials
 from hermes_cli.models import _PROVIDER_MODELS, _PROVIDER_LABELS, _PROVIDER_ALIASES, normalize_provider
@@ -155,6 +155,30 @@ class TestGeminiAgentInit:
             )
             assert agent.api_mode == "chat_completions"
             assert agent.provider == "gemini"
+
+    async def test_gemini_openai_compat_uses_async_openai_transport(
+        self, monkeypatch
+    ):
+        from run_agent import AIAgent
+
+        async_client = MagicMock()
+        async_client.close = AsyncMock()
+        monkeypatch.setattr("run_agent.OpenAI", MagicMock(return_value=async_client))
+        agent = AIAgent(
+            model="gemini-2.5-flash",
+            provider="gemini",
+            api_key="test-key",
+            base_url="https://generativelanguage.googleapis.com/v1beta/openai",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+
+        await agent._ensure_provider_runtime()
+
+        assert agent.client is async_client
+        assert agent.base_url.endswith("/openai")
+        await agent.close()
 
 
 

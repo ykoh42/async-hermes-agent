@@ -21,7 +21,11 @@ from agent.trajectory import save_trajectory
 from agent.turn_context import build_turn_context
 from agent.turn_finalizer import finalize_turn
 from agent import tool_executor
-from agent.tool_executor import execute_tool_calls_segmented
+from agent.tool_executor import (
+    execute_tool_calls_concurrent,
+    execute_tool_calls_sequential,
+    execute_tool_calls_segmented,
+)
 from hermes_state import SessionDB
 from run_agent import AIAgent
 from model_tools import get_tool_definitions, handle_function_call
@@ -114,6 +118,8 @@ def test_conversation_and_chat_are_coroutines():
     assert inspect.iscoroutinefunction(ContextEngine.handle_tool_call)
     assert inspect.iscoroutinefunction(_apply_context_engine_selection)
     assert inspect.iscoroutinefunction(_notify_context_engine_turn_complete)
+    assert inspect.iscoroutinefunction(execute_tool_calls_concurrent)
+    assert inspect.iscoroutinefunction(execute_tool_calls_sequential)
     assert inspect.iscoroutinefunction(execute_tool_calls_segmented)
     assert inspect.iscoroutinefunction(get_tool_definitions)
     assert inspect.iscoroutinefunction(ToolRegistry.get_definitions)

@@ -524,13 +524,15 @@ def _emit_tool_completion(
                 exc_info=True,
             )
 
-async def execute_tool_calls_segmented(
+async def _execute_tool_calls_native(
     agent,
     assistant_message,
     messages: list,
     effective_task_id: str,
     api_call_count: int = 0,
     segments=None,
+    *,
+    finalize: bool = True,
 ) -> None:
     """Execute a batch through native async handlers only.
 
@@ -895,12 +897,80 @@ async def execute_tool_calls_segmented(
                 risk_metadata=risk_metadata,
             )
 
-    await enforce_turn_budget(
-        messages[-len(tool_calls):],
-        env=active_env,
-        config=tool_budget,
+    if finalize:
+        await enforce_turn_budget(
+            messages[-len(tool_calls):],
+            env=active_env,
+            config=tool_budget,
+        )
+        agent._apply_pending_steer_to_tool_results(messages, len(tool_calls))
+
+
+async def execute_tool_calls_concurrent(
+    agent,
+    assistant_message,
+    messages: list,
+    effective_task_id: str,
+    api_call_count: int = 0,
+    *,
+    finalize: bool = True,
+) -> None:
+    """Execute one parallel-safe tool-call segment in emission order."""
+    tool_calls = list(getattr(assistant_message, "tool_calls", None) or [])
+    await _execute_tool_calls_native(
+        agent,
+        assistant_message,
+        messages,
+        effective_task_id,
+        api_call_count,
+        segments=[("parallel", tool_calls)],
+        finalize=finalize,
     )
-    agent._apply_pending_steer_to_tool_results(messages, len(tool_calls))
 
 
-__all__ = ["execute_tool_calls_segmented"]
+async def execute_tool_calls_sequential(
+    agent,
+    assistant_message,
+    messages: list,
+    effective_task_id: str,
+    api_call_count: int = 0,
+    *,
+    finalize: bool = True,
+) -> None:
+    """Execute one sequential tool-call segment in emission order."""
+    tool_calls = list(getattr(assistant_message, "tool_calls", None) or [])
+    await _execute_tool_calls_native(
+        agent,
+        assistant_message,
+        messages,
+        effective_task_id,
+        api_call_count,
+        segments=[("sequential", tool_calls)],
+        finalize=finalize,
+    )
+
+
+async def execute_tool_calls_segmented(
+    agent,
+    assistant_message,
+    messages: list,
+    effective_task_id: str,
+    api_call_count: int = 0,
+    segments=None,
+) -> None:
+    """Execute a mixed batch as ordered parallel and sequential segments."""
+    await _execute_tool_calls_native(
+        agent,
+        assistant_message,
+        messages,
+        effective_task_id,
+        api_call_count,
+        segments=segments,
+    )
+
+
+__all__ = [
+    "execute_tool_calls_concurrent",
+    "execute_tool_calls_sequential",
+    "execute_tool_calls_segmented",
+]
