@@ -44,7 +44,7 @@ def _make_compressor(**overrides):
     )
     kwargs.update(overrides)
     with patch(
-        "agent.context_compressor.get_static_context_length", return_value=100000
+        "agent.context_compressor._get_static_context_length", return_value=100000
     ):
         return ContextCompressor(**kwargs)
 

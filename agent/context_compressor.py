@@ -29,7 +29,7 @@ from agent.context_engine import ContextEngine, sanitize_memory_context
 from agent.error_classifier import FailoverReason, classify_api_error
 from agent.model_metadata import (
     MINIMUM_CONTEXT_LENGTH,
-    get_static_context_length,
+    _get_static_context_length,
     estimate_messages_tokens_rough,
     estimate_tokens_rough,
 )
@@ -1449,7 +1449,7 @@ class ContextCompressor(ContextEngine):
     def _resolve_context_length(self) -> int:
         """Resolve and cache the model's static context length on first access."""
         if self._resolved_context_length is None:
-            self._resolved_context_length = get_static_context_length(
+            self._resolved_context_length = _get_static_context_length(
                 self.model,
                 base_url=self.base_url,
                 config_context_length=self._config_context_length,

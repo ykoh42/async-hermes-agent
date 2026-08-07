@@ -102,7 +102,7 @@ async def test_reset_session_state_rebinds_builtin_compressor_after_session_swit
     await db.set_compression_fallback_streak("old-sid", 2)
 
     monkeypatch.setattr(
-        "agent.context_compressor.get_static_context_length",
+        "agent.context_compressor._get_static_context_length",
         lambda *_a, **_k: 100_000,
     )
     compressor = ContextCompressor(

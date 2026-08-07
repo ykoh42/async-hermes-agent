@@ -79,7 +79,7 @@ def _bound_context_compressor(
     db: SessionDB, session_id: str
 ) -> ContextCompressor:
     with patch(
-        "agent.context_compressor.get_static_context_length",
+        "agent.context_compressor._get_static_context_length",
         return_value=100_000,
     ):
         compressor = ContextCompressor(
@@ -217,7 +217,7 @@ class TestFallbackStreakFollowsRotation:
         parent = "PARENT_FALLBACK_ROT"
         await db.create_session(parent, source="telegram")
         with patch(
-            "agent.context_compressor.get_static_context_length",
+            "agent.context_compressor._get_static_context_length",
             return_value=100_000,
         ):
             compressor = ContextCompressor(
@@ -274,7 +274,7 @@ class TestFallbackStreakFollowsRotation:
         agent = _build_agent_with_db(db, parent, platform="telegram")
 
         with patch(
-            "agent.context_compressor.get_static_context_length",
+            "agent.context_compressor._get_static_context_length",
             return_value=100_000,
         ):
             compressor = ContextCompressor(

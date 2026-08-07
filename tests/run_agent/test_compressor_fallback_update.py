@@ -44,7 +44,7 @@ def _make_agent_with_compressor() -> AIAgent:
     return agent
 
 
-@patch("agent.model_metadata.get_static_context_length", return_value=128_000)
+@patch("agent.model_metadata._get_static_context_length", return_value=128_000)
 @pytest.mark.asyncio
 async def test_compressor_updated_on_fallback(mock_ctx_len):
     """After fallback activation, the compressor must reflect the fallback model."""

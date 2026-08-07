@@ -1106,7 +1106,7 @@ def _trim(messages, *, window=1000, reserve=None, cache=None, counting=None,
     from agent import model_metadata, moa_loop
 
     stub = counting or _CountingCtxLen(window)
-    monkeypatch.setattr(model_metadata, "get_static_context_length", stub)
+    monkeypatch.setattr(model_metadata, "_get_static_context_length", stub)
     return moa_loop._trim_messages_for_reference(
         messages,
         {"provider": "openrouter", "model": "small-window"},

@@ -79,7 +79,7 @@ async def test_fallback_candidate_call_uses_entry_timeout():
 
 
 def _make_compressor():
-    with patch("agent.context_compressor.get_static_context_length", return_value=100000):
+    with patch("agent.context_compressor._get_static_context_length", return_value=100000):
         return ContextCompressor(model="main-model", quiet_mode=True)
 
 

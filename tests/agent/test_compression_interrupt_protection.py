@@ -74,7 +74,7 @@ class TestCompressionProtectsSummaryCall:
             seen["task"] = kwargs.get("task")
             return _Resp()
 
-        with patch("agent.context_compressor.get_static_context_length", return_value=100000):
+        with patch("agent.context_compressor._get_static_context_length", return_value=100000):
             c = ContextCompressor(model="test", quiet_mode=True)
 
         msgs = [
@@ -100,7 +100,7 @@ class TestCompressionProtectsSummaryCall:
         compression transaction can abort without rotating the session."""
         from agent.context_compressor import ContextCompressor
 
-        with patch("agent.context_compressor.get_static_context_length", return_value=100000):
+        with patch("agent.context_compressor._get_static_context_length", return_value=100000):
             c = ContextCompressor(model="test", quiet_mode=True)
 
         msgs = [
@@ -123,7 +123,7 @@ class TestCompressionProtectsSummaryCall:
         summary-failure fallback semantics when no host cancel was requested."""
         from agent.context_compressor import ContextCompressor
 
-        with patch("agent.context_compressor.get_static_context_length", return_value=100000):
+        with patch("agent.context_compressor._get_static_context_length", return_value=100000):
             c = ContextCompressor(model="test", quiet_mode=True)
 
         msgs = [
@@ -143,7 +143,7 @@ class TestCompressionProtectsSummaryCall:
         """Cancellation after the handoff scan must be a compressor no-op."""
         from agent.context_compressor import ContextCompressor
 
-        with patch("agent.context_compressor.get_static_context_length", return_value=100000):
+        with patch("agent.context_compressor._get_static_context_length", return_value=100000):
             c = ContextCompressor(
                 model="test",
                 protect_first_n=1,

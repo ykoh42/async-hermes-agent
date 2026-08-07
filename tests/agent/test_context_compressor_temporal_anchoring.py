@@ -21,7 +21,7 @@ from agent.context_compressor import ContextCompressor, HISTORICAL_TASK_HEADING
 
 
 def _compressor() -> ContextCompressor:
-    with patch("agent.context_compressor.get_static_context_length", return_value=100000):
+    with patch("agent.context_compressor._get_static_context_length", return_value=100000):
         return ContextCompressor(
             model="test/model",
             threshold_percent=0.85,

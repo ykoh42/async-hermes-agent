@@ -36,7 +36,7 @@ async def _compressor(
     db: SessionDB | None = None, session_id: str = ""
 ) -> ContextCompressor:
     with patch(
-        "agent.context_compressor.get_static_context_length",
+        "agent.context_compressor._get_static_context_length",
         return_value=100_000,
     ):
         cc = ContextCompressor(

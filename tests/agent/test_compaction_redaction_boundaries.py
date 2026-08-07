@@ -42,7 +42,7 @@ def _redaction_globally_disabled(monkeypatch):
 
 def _compressor() -> ContextCompressor:
     with patch(
-        "agent.context_compressor.get_static_context_length",
+        "agent.context_compressor._get_static_context_length",
         return_value=100000,
     ):
         return ContextCompressor(model="test/model", quiet_mode=True)
@@ -198,7 +198,7 @@ async def test_previous_summary_redacted_before_iterative_prompt_reentry():
 async def test_resumed_handoff_summary_redacted_before_iterative_prompt():
     """Persisted handoff messages may contain pre-fix secrets after resume."""
     with patch(
-        "agent.context_compressor.get_static_context_length",
+        "agent.context_compressor._get_static_context_length",
         return_value=100000,
     ):
         c = ContextCompressor(

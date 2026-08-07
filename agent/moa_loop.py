@@ -654,7 +654,7 @@ async def _trim_messages_for_reference(
     from agent.model_metadata import (
         estimate_messages_tokens_rough,
         fetch_endpoint_model_metadata,
-        get_static_context_length,
+        _get_static_context_length,
     )
 
     model = str(slot.get("model") or "")
@@ -678,7 +678,7 @@ async def _trim_messages_for_reference(
             if isinstance(entry, dict) and isinstance(entry.get("context_length"), int):
                 context_length = entry["context_length"]
             else:
-                context_length = get_static_context_length(
+                context_length = _get_static_context_length(
                     model=model,
                     base_url=base_url,
                     provider=provider,

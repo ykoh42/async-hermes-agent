@@ -64,7 +64,7 @@ def _extract_telemetry(caplog):
 
 @pytest.mark.asyncio
 async def test_compression_attempt_telemetry_is_metadata_only(caplog):
-    with patch("agent.context_compressor.get_static_context_length", return_value=100_000):
+    with patch("agent.context_compressor._get_static_context_length", return_value=100_000):
         compressor = ContextCompressor(
             model="test/main-model",
             provider="test-provider",
@@ -121,7 +121,7 @@ async def test_compression_attempt_telemetry_is_metadata_only(caplog):
 
 @pytest.mark.asyncio
 async def test_aux_call_telemetry_records_durations_without_content(caplog):
-    with patch("agent.context_compressor.get_static_context_length", return_value=100_000):
+    with patch("agent.context_compressor._get_static_context_length", return_value=100_000):
         compressor = ContextCompressor(
             model="test/main-model",
             provider="test-provider",

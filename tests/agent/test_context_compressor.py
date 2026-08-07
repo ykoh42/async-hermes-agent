@@ -27,7 +27,7 @@ class StubProviderError(Exception):
 @pytest.fixture()
 def compressor():
     """Create a ContextCompressor with mocked dependencies."""
-    with patch("agent.context_compressor.get_static_context_length", return_value=100000):
+    with patch("agent.context_compressor._get_static_context_length", return_value=100000):
         c = ContextCompressor(
             model="test/model",
             threshold_percent=0.85,
@@ -140,7 +140,7 @@ class TestCompress:
         context only — never re-presented as unfulfilled in-progress/pending
         work.
         """
-        with patch("agent.context_compressor.get_static_context_length", return_value=100000):
+        with patch("agent.context_compressor._get_static_context_length", return_value=100000):
             c = ContextCompressor(model="test/model", quiet_mode=True)
 
         unique_ask = "PLEASE_COMPUTE_THE_ARITHMETIC_CHAIN_XYZ"
@@ -199,7 +199,7 @@ class TestCompress:
         # then `MagicMock <= 0`). int(MagicMock()) returns 1, so coercion
         # yields a harmless positive int rather than crashing — the threshold
         # is computed cleanly with a 1-token reservation.
-        with patch("agent.context_compressor.get_static_context_length", return_value=200000):
+        with patch("agent.context_compressor._get_static_context_length", return_value=200000):
             c = ContextCompressor(model="m", quiet_mode=True, max_tokens=MagicMock())
         assert isinstance(c.max_tokens, int)
         assert isinstance(c.threshold_tokens, int)
@@ -247,7 +247,7 @@ class TestCompress:
         messages don't get re-copied verbatim into every child session and
         fossilize (grow immortal) across a long, repeatedly-compressed
         session. The system prompt is always protected separately."""
-        with patch("agent.context_compressor.get_static_context_length", return_value=100000):
+        with patch("agent.context_compressor._get_static_context_length", return_value=100000):
             c = ContextCompressor(model="test", quiet_mode=True, protect_first_n=3)
 
         msgs = [{"role": "system", "content": "sys"}] + [
@@ -277,7 +277,7 @@ class TestTailBudgetCodexReplayFields:
         tail-cut budget must count them too; otherwise compression preserves an
         oversized tail and immediately starts the next session near the limit.
         """
-        with patch("agent.context_compressor.get_static_context_length", return_value=100000):
+        with patch("agent.context_compressor._get_static_context_length", return_value=100000):
             c = ContextCompressor(
                 model="test/model",
                 protect_first_n=1,
@@ -348,7 +348,7 @@ class TestTailBudgetCodexReplayFields:
     )
     def test_tail_cut_counts_each_hidden_replay_field(self, field_name, field_value):
         """Each provider replay/reasoning field should affect tail budgeting."""
-        with patch("agent.context_compressor.get_static_context_length", return_value=100000):
+        with patch("agent.context_compressor._get_static_context_length", return_value=100000):
             c = ContextCompressor(
                 model="test/model",
                 protect_first_n=1,
@@ -384,7 +384,7 @@ class TestGenerateSummaryNoneContent:
         mock_response.choices = [MagicMock()]
         mock_response.choices[0].message.content = "[CONTEXT SUMMARY]: tool calls happened"
 
-        with patch("agent.context_compressor.get_static_context_length", return_value=100000):
+        with patch("agent.context_compressor._get_static_context_length", return_value=100000):
             c = ContextCompressor(model="test", quiet_mode=True)
 
         messages = [
@@ -405,7 +405,7 @@ class TestGenerateSummaryNoneContent:
     @pytest.mark.asyncio
     async def test_none_content_in_system_message_compress(self):
         """System message with content=None should not crash during compress."""
-        with patch("agent.context_compressor.get_static_context_length", return_value=100000):
+        with patch("agent.context_compressor._get_static_context_length", return_value=100000):
             c = ContextCompressor(model="test", quiet_mode=True, protect_first_n=2, protect_last_n=2)
 
         msgs = [{"role": "system", "content": None}] + [
@@ -433,7 +433,7 @@ class TestNonStringContent:
         mock_response.choices = [MagicMock()]
         mock_response.choices[0].message.content = None
 
-        with patch("agent.context_compressor.get_static_context_length", return_value=100000):
+        with patch("agent.context_compressor._get_static_context_length", return_value=100000):
             # summary_model == model here, so no fallback path: straight to cooldown.
             c = ContextCompressor(model="test", quiet_mode=True)
 
@@ -458,7 +458,7 @@ class TestNonStringContent:
         mock_response.choices = [MagicMock()]
         mock_response.choices[0].message = "plain summary text"
 
-        with patch("agent.context_compressor.get_static_context_length", return_value=100000):
+        with patch("agent.context_compressor._get_static_context_length", return_value=100000):
             c = ContextCompressor(model="test", quiet_mode=True)
 
         messages = [
@@ -484,7 +484,7 @@ class TestNonStringContent:
         those, the deterministic snapshot must look past it to the real ask
         (and return None when no real ask exists at all).
         """
-        with patch("agent.context_compressor.get_static_context_length", return_value=100000):
+        with patch("agent.context_compressor._get_static_context_length", return_value=100000):
             c = ContextCompressor(model="test", quiet_mode=True)
 
         messages = [
@@ -516,7 +516,7 @@ class TestNonStringContent:
         """
         import re as _re
 
-        with patch("agent.context_compressor.get_static_context_length", return_value=100000):
+        with patch("agent.context_compressor._get_static_context_length", return_value=100000):
             c = ContextCompressor(model="test", quiet_mode=True)
 
         summary = (
@@ -540,7 +540,7 @@ class TestNonStringContent:
 class TestSummaryFailureCooldown:
     @pytest.mark.asyncio
     async def test_summary_failure_enters_cooldown_and_skips_retry(self):
-        with patch("agent.context_compressor.get_static_context_length", return_value=100000):
+        with patch("agent.context_compressor._get_static_context_length", return_value=100000):
             c = ContextCompressor(model="test", quiet_mode=True)
 
         messages = [
@@ -599,7 +599,7 @@ class TestAuthFailureAborts:
             "Error code: 400 - {'error': {'message': 'out of extra usage'}}",
             status_code=400,
         )
-        with patch("agent.context_compressor.get_static_context_length", return_value=100000):
+        with patch("agent.context_compressor._get_static_context_length", return_value=100000):
             c = ContextCompressor(
                 model="test",
                 quiet_mode=True,
@@ -625,7 +625,7 @@ class TestAuthFailureAborts:
             "to a different provider with hermes model."
         )
         with patch(
-            "agent.context_compressor.get_static_context_length", return_value=100000
+            "agent.context_compressor._get_static_context_length", return_value=100000
         ):
             c = ContextCompressor(
                 model="test",
@@ -652,7 +652,7 @@ class TestAuthFailureAborts:
             "quota exceeded, please retry after the window resets",
             status_code=402,
         )
-        with patch("agent.context_compressor.get_static_context_length", return_value=100000):
+        with patch("agent.context_compressor._get_static_context_length", return_value=100000):
             c = ContextCompressor(
                 model="test",
                 quiet_mode=True,
@@ -672,7 +672,7 @@ class TestAuthFailureAborts:
 
     @pytest.mark.asyncio
     async def test_403_also_flags_auth_failure(self):
-        with patch("agent.context_compressor.get_static_context_length", return_value=100000):
+        with patch("agent.context_compressor._get_static_context_length", return_value=100000):
             c = ContextCompressor(model="test", quiet_mode=True)
         with patch("agent.context_compressor.call_llm", new=AsyncMock(side_effect=self._auth_err(403))):
             await c._generate_summary(self._msgs())
@@ -684,7 +684,7 @@ class TestAuthFailureAborts:
     async def test_generate_summary_flags_network_failure(self):
         """A connection/network error on the summary call flags
         _last_summary_network_failure (#29559)."""
-        with patch("agent.context_compressor.get_static_context_length", return_value=100000):
+        with patch("agent.context_compressor._get_static_context_length", return_value=100000):
             c = ContextCompressor(model="test", quiet_mode=True)
         with patch("agent.context_compressor.call_llm", new=AsyncMock(side_effect=ConnectionError("Connection error."))):
             result = await c._generate_summary(self._msgs())
@@ -719,7 +719,7 @@ class TestSummaryFallbackToMainModel:
         err_404 = Exception("404 model_not_found: no such model")
         err_404.status_code = 404
 
-        with patch("agent.context_compressor.get_static_context_length", return_value=100000):
+        with patch("agent.context_compressor._get_static_context_length", return_value=100000):
             c = ContextCompressor(
                 model="main-model",
                 summary_model_override="broken-aux-model",
@@ -750,7 +750,7 @@ class TestSummaryFallbackToMainModel:
         to — go straight to cooldown, don't loop retrying the same call."""
         err = Exception("500 internal error")
 
-        with patch("agent.context_compressor.get_static_context_length", return_value=100000):
+        with patch("agent.context_compressor._get_static_context_length", return_value=100000):
             c = ContextCompressor(
                 model="main-model",
                 summary_model_override="main-model",  # same as main
@@ -785,7 +785,7 @@ class TestSummaryFallbackToMainModel:
             "Expecting value", "<!DOCTYPE html><html>...</html>", 0
         )
 
-        with patch("agent.context_compressor.get_static_context_length", return_value=100000):
+        with patch("agent.context_compressor._get_static_context_length", return_value=100000):
             c = ContextCompressor(
                 model="main-model",
                 summary_model_override="aux-via-broken-proxy",
@@ -837,7 +837,7 @@ class TestStreamingClosedFallback:
 
         err = Exception("RemoteProtocolError: incomplete chunked read")
 
-        with patch("agent.context_compressor.get_static_context_length", return_value=100000):
+        with patch("agent.context_compressor._get_static_context_length", return_value=100000):
             c = ContextCompressor(
                 model="main-model",
                 summary_model_override="aux-stream-model",
@@ -863,7 +863,7 @@ class TestStreamingClosedFallback:
         the 30s cooldown, not the default 60s — these errors are transient."""
         err = Exception("RemoteProtocolError: response ended prematurely")
 
-        with patch("agent.context_compressor.get_static_context_length", return_value=100000):
+        with patch("agent.context_compressor._get_static_context_length", return_value=100000):
             c = ContextCompressor(
                 model="main-model",
                 # No summary_model_override → no fallback path.
@@ -909,7 +909,7 @@ class TestAuxModelFallbackSurfacedToCallers:
         err_400 = Exception("400 provider rejected configured model")
         err_400.status_code = 400
 
-        with patch("agent.context_compressor.get_static_context_length", return_value=100000):
+        with patch("agent.context_compressor._get_static_context_length", return_value=100000):
             c = ContextCompressor(
                 model="main-model",
                 summary_model_override="broken-aux-model",
@@ -943,7 +943,7 @@ class TestAuxModelFallbackSurfacedToCallers:
         err_400 = Exception("400 aux model busted")
         err_400.status_code = 400
 
-        with patch("agent.context_compressor.get_static_context_length", return_value=100000):
+        with patch("agent.context_compressor._get_static_context_length", return_value=100000):
             c = ContextCompressor(
                 model="main-model",
                 summary_model_override="broken-aux-model",
@@ -974,7 +974,7 @@ class TestSummaryFailureTrackingForGatewayWarning:
 
     @pytest.mark.asyncio
     async def test_compress_records_fallback_and_dropped_count_on_summary_failure(self):
-        with patch("agent.context_compressor.get_static_context_length", return_value=100000):
+        with patch("agent.context_compressor._get_static_context_length", return_value=100000):
             c = ContextCompressor(model="test", quiet_mode=True, protect_first_n=2, protect_last_n=2)
 
         msgs = [
@@ -1003,7 +1003,7 @@ class TestSummaryFailureTrackingForGatewayWarning:
 
     @pytest.mark.asyncio
     async def test_summary_failure_fallback_preserves_tool_paths_and_redacts_secret_context(self):
-        with patch("agent.context_compressor.get_static_context_length", return_value=100000):
+        with patch("agent.context_compressor._get_static_context_length", return_value=100000):
             c = ContextCompressor(model="test", quiet_mode=True, protect_first_n=1, protect_last_n=1)
 
         secret = "ghp_" + ("a" * 36)
@@ -1063,7 +1063,7 @@ class TestAbortOnSummaryFailure:
         ]
 
     def _make_compressor(self):
-        with patch("agent.context_compressor.get_static_context_length", return_value=100000):
+        with patch("agent.context_compressor._get_static_context_length", return_value=100000):
             return ContextCompressor(
                 model="test",
                 quiet_mode=True,
@@ -1197,7 +1197,7 @@ class TestCompressWithClient:
         mock_response.choices = [MagicMock()]
         mock_response.choices[0].message.content = "summary text"
 
-        with patch("agent.context_compressor.get_static_context_length", return_value=100000):
+        with patch("agent.context_compressor._get_static_context_length", return_value=100000):
             c = ContextCompressor(model="test", quiet_mode=True, protect_first_n=2, protect_last_n=2)
 
         # head_last=assistant, tail_first=assistant (same shape as the
@@ -1237,7 +1237,7 @@ class TestCompressWithClient:
         mock_response.choices[0].message.content = "[CONTEXT SUMMARY]: stuff happened"
         mock_client.chat.completions.create.return_value = mock_response
 
-        with patch("agent.context_compressor.get_static_context_length", return_value=100000):
+        with patch("agent.context_compressor._get_static_context_length", return_value=100000):
             c = ContextCompressor(model="test", quiet_mode=True, protect_first_n=2, protect_last_n=2)
 
         # head_last=user → summary_role="assistant" (same setup as
@@ -1276,7 +1276,7 @@ class TestCompressWithClient:
         mock_response.choices[0].message.content = "[CONTEXT SUMMARY]: stuff happened"
         mock_client.chat.completions.create.return_value = mock_response
 
-        with patch("agent.context_compressor.get_static_context_length", return_value=100000):
+        with patch("agent.context_compressor._get_static_context_length", return_value=100000):
             c = ContextCompressor(model="test", quiet_mode=True, protect_first_n=2, protect_last_n=2)
 
         # Last head message (index 1) is "assistant" → summary should be "user".
@@ -1316,7 +1316,7 @@ class TestCompressWithClient:
         mock_response.choices = [MagicMock()]
         mock_response.choices[0].message.content = "summary text"
 
-        with patch("agent.context_compressor.get_static_context_length", return_value=100000):
+        with patch("agent.context_compressor._get_static_context_length", return_value=100000):
             c = ContextCompressor(model="test", quiet_mode=True, protect_first_n=2, protect_last_n=3)
 
         # Head: [system, user, assistant]  →  last head = assistant
@@ -1370,7 +1370,7 @@ class TestCompressWithClient:
         mock_response.choices = [MagicMock()]
         mock_response.choices[0].message.content = "SUMMARY_BODY"
 
-        with patch("agent.context_compressor.get_static_context_length", return_value=100000):
+        with patch("agent.context_compressor._get_static_context_length", return_value=100000):
             c = ContextCompressor(model="test", quiet_mode=True, protect_first_n=2, protect_last_n=3)
 
         msgs = [
@@ -1455,7 +1455,7 @@ class TestSummaryTargetRatio:
 
     def test_default_threshold_floored_at_75_percent_below_512k(self):
         """Sub-512K models get the 75% small-context threshold floor."""
-        with patch("agent.context_compressor.get_static_context_length", return_value=100_000):
+        with patch("agent.context_compressor._get_static_context_length", return_value=100_000):
             c = ContextCompressor(model="test", quiet_mode=True)
             _ = c.context_length
         assert c.threshold_percent == 0.75
@@ -1475,7 +1475,7 @@ class TestSummaryTargetRatio:
         This is the cleanest configuration for long-running rolling-compaction
         sessions — no user/assistant turn gets pinned verbatim forever just
         because it happened to be early in the session."""
-        with patch("agent.context_compressor.get_static_context_length", return_value=100_000):
+        with patch("agent.context_compressor._get_static_context_length", return_value=100_000):
             c = ContextCompressor(
                 model="test",
                 quiet_mode=True,
@@ -1513,7 +1513,7 @@ class TestSummaryTargetRatio:
         session forever — a user-reported complaint that a week-old
         resolved question kept getting reinserted into every compaction
         summary."""
-        with patch("agent.context_compressor.get_static_context_length", return_value=100_000):
+        with patch("agent.context_compressor._get_static_context_length", return_value=100_000):
             c = ContextCompressor(
                 model="test",
                 quiet_mode=True,
@@ -1547,7 +1547,7 @@ class TestTokenBudgetTailProtection:
     @pytest.fixture()
     def budget_compressor(self):
         """Compressor with known token budget for tail protection tests."""
-        with patch("agent.context_compressor.get_static_context_length", return_value=200_000):
+        with patch("agent.context_compressor._get_static_context_length", return_value=200_000):
             c = ContextCompressor(
                 model="test/model",
                 threshold_percent=0.50,  # 100K threshold
@@ -1691,7 +1691,7 @@ class TestUpdateModelBudgets:
     def test_tail_budget_recalculated(self):
         """tail_token_budget must change after switching to a different context length."""
         from unittest.mock import patch
-        with patch("agent.context_compressor.get_static_context_length", return_value=200_000):
+        with patch("agent.context_compressor._get_static_context_length", return_value=200_000):
             comp = ContextCompressor("model-a", threshold_percent=0.50, quiet_mode=True)
         old_tail = comp.tail_token_budget
         old_max_summary = comp.max_summary_tokens
@@ -1704,7 +1704,7 @@ class TestUpdateModelBudgets:
     def test_budgets_proportional(self):
         """Budgets should be proportional to context_length after update."""
         from unittest.mock import patch
-        with patch("agent.context_compressor.get_static_context_length", return_value=100_000):
+        with patch("agent.context_compressor._get_static_context_length", return_value=100_000):
             comp = ContextCompressor("model-a", threshold_percent=0.50, quiet_mode=True)
         comp.update_model("model-b", context_length=10_000)
         assert comp.tail_token_budget == int(comp.threshold_tokens * comp.summary_target_ratio)
@@ -1720,7 +1720,7 @@ class TestUpdateModelResetsCalibration:
 
     def _comp(self):
         from unittest.mock import patch
-        with patch("agent.context_compressor.get_static_context_length", return_value=200_000):
+        with patch("agent.context_compressor._get_static_context_length", return_value=200_000):
             return ContextCompressor("big-model", threshold_percent=0.50, quiet_mode=True)
 
     def test_real_usage_state_cleared(self):
@@ -1773,7 +1773,7 @@ class TestThresholdTokensCap:
 
     def test_no_cap_uses_ratio_only(self):
         """Without a cap, the ratio-based threshold is used."""
-        with patch("agent.context_compressor.get_static_context_length", return_value=1_000_000):
+        with patch("agent.context_compressor._get_static_context_length", return_value=1_000_000):
             comp = ContextCompressor(
                 "model-a", threshold_percent=0.50, quiet_mode=True,
             )
@@ -1788,7 +1788,7 @@ class TestThresholdTokensCap:
 
     def test_invalid_cap_treated_as_none(self):
         """Non-numeric, zero, or negative cap values are treated as None."""
-        with patch("agent.context_compressor.get_static_context_length", return_value=1_000_000):
+        with patch("agent.context_compressor._get_static_context_length", return_value=1_000_000):
             comp0 = ContextCompressor(
                 "model-a", threshold_percent=0.50, quiet_mode=True,
                 threshold_tokens_cap=0,
@@ -1812,7 +1812,7 @@ class TestThresholdTokensCap:
         """Behavioral: with a cap below the ratio-based threshold,
         should_compress() fires once usage crosses the cap — even though
         the percentage threshold has not been reached (first-fires-wins)."""
-        with patch("agent.context_compressor.get_static_context_length", return_value=1_000_000):
+        with patch("agent.context_compressor._get_static_context_length", return_value=1_000_000):
             comp = ContextCompressor(
                 "model-a", threshold_percent=0.50, quiet_mode=True,
                 threshold_tokens_cap=200_000,
@@ -1828,7 +1828,7 @@ class TestThresholdTokensCap:
         from hermes_cli.config import DEFAULT_CONFIG
         assert DEFAULT_CONFIG["compression"]["threshold_tokens"] is None
 
-        with patch("agent.context_compressor.get_static_context_length", return_value=1_000_000):
+        with patch("agent.context_compressor._get_static_context_length", return_value=1_000_000):
             baseline = ContextCompressor(
                 "model-a", threshold_percent=0.50, quiet_mode=True,
             )
@@ -1905,7 +1905,7 @@ class TestTruncateToolCallArgsJson:
         """End-to-end: Pass 3 must never produce the exact failure payload
         that caused the 400 loop (unterminated string, missing brace)."""
         import json as _json
-        with patch("agent.context_compressor.get_static_context_length", return_value=100000):
+        with patch("agent.context_compressor._get_static_context_length", return_value=100000):
             c = ContextCompressor(
                 model="test/model",
                 threshold_percent=0.85,
@@ -1956,7 +1956,7 @@ class TestLazyContextResolution:
         import logging
 
         with patch(
-            "agent.context_compressor.get_static_context_length",
+            "agent.context_compressor._get_static_context_length",
             return_value=200_000,
         ) as mock_get:
             c = ContextCompressor(model="test/model", quiet_mode=False)
@@ -1990,7 +1990,7 @@ class TestLazyContextResolution:
         """When config_context_length is provided, the resolver must use it
         as the cached value and not make a network call."""
         with patch(
-            "agent.context_compressor.get_static_context_length",
+            "agent.context_compressor._get_static_context_length",
             side_effect=lambda model, **kwargs: kwargs.get("config_context_length"),
         ) as mock_get:
             c = ContextCompressor(
@@ -2259,7 +2259,7 @@ class TestCooldownReentryAbort:
         """ConnectionError → first compress aborts (PR #51881).  Second
         compress within the 30s cooldown must ALSO abort — not drop the
         middle window via the static-fallback path."""
-        with patch("agent.context_compressor.get_static_context_length", return_value=100000):
+        with patch("agent.context_compressor._get_static_context_length", return_value=100000):
             c = ContextCompressor(
                 model="test",
                 quiet_mode=True,
@@ -2289,7 +2289,7 @@ class TestCooldownReentryAbort:
         returns None, second compress must still abort."""
         err = Exception("Error code: 401 - invalid api key")
         err.status_code = 401
-        with patch("agent.context_compressor.get_static_context_length", return_value=100000):
+        with patch("agent.context_compressor._get_static_context_length", return_value=100000):
             c = ContextCompressor(
                 model="test",
                 quiet_mode=True,
@@ -2334,7 +2334,7 @@ class TestDoubleCompactionSummaryRole:
         mock_response.choices = [MagicMock()]
         mock_response.choices[0].message.content = "summary of earlier turns"
 
-        with patch("agent.context_compressor.get_static_context_length", return_value=100000):
+        with patch("agent.context_compressor._get_static_context_length", return_value=100000):
             c = ContextCompressor(
                 model="test", quiet_mode=True, protect_first_n=2, protect_last_n=2,
             )
@@ -2374,7 +2374,7 @@ class TestDoubleCompactionSummaryRole:
         mock_response.choices = [MagicMock()]
         mock_response.choices[0].message.content = "summary of resumed turns"
 
-        with patch("agent.context_compressor.get_static_context_length", return_value=100000):
+        with patch("agent.context_compressor._get_static_context_length", return_value=100000):
             c = ContextCompressor(
                 model="test", quiet_mode=True, protect_first_n=3, protect_last_n=2,
             )
@@ -2405,7 +2405,7 @@ class TestDoubleCompactionSummaryRole:
         mock_response.choices = [MagicMock()]
         mock_response.choices[0].message.content = "summary of earlier turns"
 
-        with patch("agent.context_compressor.get_static_context_length", return_value=100000):
+        with patch("agent.context_compressor._get_static_context_length", return_value=100000):
             c = ContextCompressor(
                 model="test", quiet_mode=True, protect_first_n=2, protect_last_n=2,
             )
@@ -2457,7 +2457,7 @@ class TestSummaryPromptBounding:
         mock_response.choices = [MagicMock()]
         mock_response.choices[0].message.content = "updated summary"
 
-        with patch("agent.context_compressor.get_static_context_length", return_value=272000):
+        with patch("agent.context_compressor._get_static_context_length", return_value=272000):
             c = ContextCompressor(model="test", quiet_mode=True)
         cap = c._SUMMARY_INPUT_MAX_CHARS
         c._previous_summary = "PREV_HEAD " + ("p" * (cap * 2)) + " PREV_TAIL"
@@ -2506,7 +2506,7 @@ class TestMinTailUserMessages:
         user message (a clean boundary).  The preceding tool group stays
         together — it is either entirely in the compressed region or
         entirely in the tail, never split across the boundary."""
-        with patch("agent.context_compressor.get_static_context_length", return_value=200_000):
+        with patch("agent.context_compressor._get_static_context_length", return_value=200_000):
             c = ContextCompressor(
                 model="test/model",
                 threshold_percent=0.50,
@@ -2560,7 +2560,7 @@ class TestMinTailUserMessages:
         tail budget covers only the last turn, so the default is gated to 1
         (= the existing single last-user anchor) and N>1 is opt-in.
         """
-        with patch("agent.context_compressor.get_static_context_length", return_value=200_000):
+        with patch("agent.context_compressor._get_static_context_length", return_value=200_000):
             c_default = ContextCompressor(
                 model="test/model",
                 threshold_percent=0.50,
@@ -2596,7 +2596,7 @@ class TestMinTailUserMessages:
         """A blank platform echo (empty user row) must not consume one of the
         N slots — otherwise the guarantee silently degrades to N-1 real turns
         (the #69291 bug class the single anchor already fixed)."""
-        with patch("agent.context_compressor.get_static_context_length", return_value=200_000):
+        with patch("agent.context_compressor._get_static_context_length", return_value=200_000):
             c = ContextCompressor(
                 model="test/model",
                 threshold_percent=0.50,
@@ -2647,7 +2647,7 @@ class TestMinTailUserMessages:
         the summary, and the floor remains a lower bound, not a cap, on the
         anchored tail.
         """
-        with patch("agent.context_compressor.get_static_context_length", return_value=200_000):
+        with patch("agent.context_compressor._get_static_context_length", return_value=200_000):
             c = ContextCompressor(
                 model="test/model",
                 threshold_percent=0.50,
@@ -2687,7 +2687,7 @@ class TestContextLengthSetterCoherence:
     from the same window."""
 
     def test_same_value_reassignment_preserves_threshold_override(self):
-        with patch("agent.context_compressor.get_static_context_length", return_value=200_000):
+        with patch("agent.context_compressor._get_static_context_length", return_value=200_000):
             c = ContextCompressor(model="test", quiet_mode=True)
             _ = c.context_length
         # Runtime correction (aux-context threshold sync pattern).
@@ -2699,7 +2699,7 @@ class TestContextLengthSetterCoherence:
         assert c.tail_token_budget == 8_400
 
     def test_new_value_assignment_refloors_and_invalidates(self):
-        with patch("agent.context_compressor.get_static_context_length", return_value=1_000_000):
+        with patch("agent.context_compressor._get_static_context_length", return_value=1_000_000):
             c = ContextCompressor(model="test", quiet_mode=True)
             _ = c.context_length
         assert c.threshold_percent == 0.50  # 1M >= 512K: configured value

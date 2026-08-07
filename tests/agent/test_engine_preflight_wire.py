@@ -176,7 +176,7 @@ async def test_builtin_compressor_default_sub_threshold_path_unchanged(tmp_path)
     ) is False
 
     with patch(
-        "agent.context_compressor.get_static_context_length", return_value=1_000_000
+        "agent.context_compressor._get_static_context_length", return_value=1_000_000
     ):
         compressor = ContextCompressor(
             model="test/model",

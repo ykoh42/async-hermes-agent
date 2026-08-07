@@ -21,7 +21,7 @@ from agent.context_compressor import ContextCompressor
 
 
 def _make(ctx: int, pct: float = 0.50) -> ContextCompressor:
-    with patch.object(cc, "get_static_context_length", return_value=ctx):
+    with patch.object(cc, "_get_static_context_length", return_value=ctx):
         comp = ContextCompressor(
             model="test/model", threshold_percent=pct, quiet_mode=True,
         )

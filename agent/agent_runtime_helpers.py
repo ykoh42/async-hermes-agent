@@ -2354,7 +2354,7 @@ async def switch_model(agent, new_model, new_provider, api_key='', base_url='', 
 
     compressor = getattr(agent, "context_compressor", None)
     if compressor is not None:
-        from agent.model_metadata import get_static_context_length
+        from agent.model_metadata import _get_static_context_length
 
         if current_provider == "lmstudio":
             context_length = agent._effective_lmstudio_context_length(
@@ -2364,7 +2364,7 @@ async def switch_model(agent, new_model, new_provider, api_key='', base_url='', 
         else:
             context_length = None
         if context_length is None:
-            context_length = get_static_context_length(
+            context_length = _get_static_context_length(
                 agent.model,
                 base_url=agent.base_url,
                 provider=agent.provider,

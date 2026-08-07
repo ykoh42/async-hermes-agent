@@ -112,7 +112,7 @@ def _lifecycle_agent(db: SessionDB, session_id: str):
 @pytest.fixture()
 def compressor() -> ContextCompressor:
     with patch(
-        "agent.context_compressor.get_static_context_length",
+        "agent.context_compressor._get_static_context_length",
         return_value=100_000,
     ):
         instance = ContextCompressor(
@@ -169,7 +169,7 @@ async def test_zero_user_provenance_survives_iterative_compaction(compressor):
     assert first_handoffs[0][COMPRESSED_SUMMARY_HAS_USER_TURN_KEY] is False
 
     with patch(
-        "agent.context_compressor.get_static_context_length",
+        "agent.context_compressor._get_static_context_length",
         return_value=100_000,
     ):
         resumed = ContextCompressor(

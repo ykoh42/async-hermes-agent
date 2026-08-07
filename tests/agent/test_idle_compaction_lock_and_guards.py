@@ -172,7 +172,7 @@ async def test_idle_compaction_respects_anti_thrash_breaker(tmp_path: Path) -> N
     agent = _prep_idle_agent(db, sid)
 
     with patch(
-        "agent.context_compressor.get_static_context_length", return_value=100_000
+        "agent.context_compressor._get_static_context_length", return_value=100_000
     ):
         compressor = ContextCompressor(
             model="test/model",

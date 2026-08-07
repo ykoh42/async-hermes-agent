@@ -37,7 +37,7 @@ from agent.iteration_budget import IterationBudget
 from agent.memory_manager import StreamingContextScrubber
 from agent.model_metadata import (
     MINIMUM_CONTEXT_LENGTH,
-    get_static_context_length,
+    _get_static_context_length,
     is_local_endpoint,
 )
 from agent.process_bootstrap import _install_safe_stdio
@@ -361,7 +361,7 @@ def _apply_runtime_config(agent: Any, config: Dict[str, Any]) -> None:
                 custom_providers=custom_providers,
             )
         agent._config_context_length = configured_context
-        resolved_context = get_static_context_length(
+        resolved_context = _get_static_context_length(
             agent.model,
             base_url=getattr(agent, "base_url", ""),
             config_context_length=configured_context,
@@ -649,7 +649,7 @@ def _moa_aggregator_context_length(
                 if configured_context > 0:
                     return configured_context
 
-    return get_static_context_length(
+    return _get_static_context_length(
         model,
         provider=provider,
         custom_providers=custom_providers,
@@ -3590,7 +3590,7 @@ async def _initialize_deferred_runtime(agent: Any) -> bool:
                     agent._lmstudio_runtime_context_length,
                 )
                 if context_length is None:
-                    context_length = get_static_context_length(
+                    context_length = _get_static_context_length(
                         agent.model,
                         base_url=agent.base_url,
                         provider=agent.provider,

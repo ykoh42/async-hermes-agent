@@ -35,7 +35,7 @@ def _make_compressor(**kwargs) -> ContextCompressor:
     defaults.update(kwargs)
     # 96K context -> small-context floor raises threshold_percent to 0.75,
     # so threshold_tokens = 72_000. 73_000 is "over threshold".
-    with patch("agent.context_compressor.get_static_context_length", return_value=96000):
+    with patch("agent.context_compressor._get_static_context_length", return_value=96000):
         comp = ContextCompressor(**defaults)
         # Resolve while the mock is active (lazy init, #32221).
         _ = comp.context_length

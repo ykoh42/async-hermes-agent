@@ -33,7 +33,7 @@ from agent.model_metadata import (
     _strip_provider_prefix,
     estimate_tokens_rough,
     estimate_messages_tokens_rough,
-    get_static_context_length,
+    _get_static_context_length,
     get_model_context_length,
     get_next_probe_tier,
     get_cached_context_length,
@@ -47,13 +47,13 @@ from agent.model_metadata import (
 
 class TestStaticContextLength:
     async def test_static_resolution_uses_catalog_without_live_resolver(self, monkeypatch):
-        assert get_static_context_length("gpt-5.6-sol") == 1_050_000
-        assert get_static_context_length(
+        assert _get_static_context_length("gpt-5.6-sol") == 1_050_000
+        assert _get_static_context_length(
             "gpt-5.6-sol", provider="openai-codex"
         ) == 272_000
 
     async def test_static_resolution_preserves_explicit_configuration(self):
-        assert get_static_context_length(
+        assert _get_static_context_length(
             "unknown-model", config_context_length=123_456
         ) == 123_456
 

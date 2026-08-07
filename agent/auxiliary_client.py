@@ -61,7 +61,7 @@ from agent.credential_pool import load_pool
 from agent.model_metadata import (
     MINIMUM_CONTEXT_LENGTH,
     fetch_endpoint_model_metadata,
-    get_static_context_length,
+    _get_static_context_length,
 )
 from hermes_cli.config import get_hermes_home
 from hermes_constants import OPENROUTER_BASE_URL
@@ -4038,7 +4038,7 @@ async def _candidate_context_window(
                 if isinstance(candidate, int) and candidate > 0:
                     ctx = candidate
         if ctx is None:
-            ctx = get_static_context_length(
+            ctx = _get_static_context_length(
                 model,
                 base_url=base_url,
                 provider=provider,

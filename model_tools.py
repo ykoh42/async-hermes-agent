@@ -358,7 +358,7 @@ def _resolve_active_context_length() -> int:
         model_id = (model_cfg.get("model") or model_cfg.get("default") or "").strip()
         if not model_id:
             return 0
-        from agent.model_metadata import get_static_context_length
+        from agent.model_metadata import _get_static_context_length
         # Resolve only from local/static metadata here.  Tool schemas are
         # assembled by the synchronous construction/configuration surface;
         # provider /models probes belong to the deferred async runtime and
@@ -374,7 +374,7 @@ def _resolve_active_context_length() -> int:
         # its authoritative context window after initialization.
         provider = str(model_cfg.get("provider") or "").strip()
         base_url = str(model_cfg.get("base_url") or "").strip()
-        return int(get_static_context_length(
+        return int(_get_static_context_length(
             model_id,
             base_url=base_url,
             config_context_length=config_ctx,

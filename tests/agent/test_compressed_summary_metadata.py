@@ -25,7 +25,7 @@ from agent.context_compressor import (
 
 def _make_compressor():
     with patch(
-        "agent.context_compressor.get_static_context_length", return_value=8000
+        "agent.context_compressor._get_static_context_length", return_value=8000
     ):
         return ContextCompressor(
             model="test-model", quiet_mode=True, config_context_length=8000
@@ -158,7 +158,7 @@ class TestClassifyAgreesWithPredicatesOnLiveEmissions:
         # protection) so the transcript geometry — not protection budgets —
         # decides the merge-vs-standalone path deterministically.
         with patch(
-            "agent.context_compressor.get_static_context_length",
+            "agent.context_compressor._get_static_context_length",
             return_value=100_000,
         ):
             cc = ContextCompressor(

@@ -110,7 +110,7 @@ def _make_agent_with_compressor(config_context_length=None) -> AIAgent:
     return agent
 
 
-@patch("agent.model_metadata.get_static_context_length", return_value=131_072)
+@patch("agent.model_metadata._get_static_context_length", return_value=131_072)
 @pytest.mark.asyncio
 async def test_switch_model_clears_previous_config_context_length(mock_ctx_len):
     """Switching models must not reuse the previous model.context_length override."""
@@ -137,7 +137,7 @@ async def test_switch_model_without_config_context_length():
     """When switching models without config override, config_context_length should be None."""
     agent = _make_agent_with_compressor(config_context_length=None)
 
-    with patch("agent.model_metadata.get_static_context_length", return_value=128_000) as mock_ctx_len:
+    with patch("agent.model_metadata._get_static_context_length", return_value=128_000) as mock_ctx_len:
         # Switch model
         await agent.switch_model("new-model", "openrouter", api_key="sk-new", base_url="https://openrouter.ai/api/v1")
 
@@ -294,7 +294,7 @@ async def test_lmstudio_rejected_context_is_not_reapplied_by_metadata(monkeypatc
     )
     static_context = MagicMock(return_value=131_072)
     monkeypatch.setattr(
-        "agent.model_metadata.get_static_context_length",
+        "agent.model_metadata._get_static_context_length",
         static_context,
     )
 

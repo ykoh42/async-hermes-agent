@@ -71,7 +71,7 @@ def _make_agent(
 # ── Core warning logic ──────────────────────────────────────────────
 
 
-@patch("agent.model_metadata.get_static_context_length", return_value=80_000)
+@patch("agent.model_metadata._get_static_context_length", return_value=80_000)
 @patch("agent.auxiliary_client.get_text_auxiliary_client")
 async def test_auto_corrects_threshold_when_aux_context_below_threshold(mock_get_client, mock_ctx_len):
     """Auto-correction: aux >= 64K floor but < threshold → lower threshold
@@ -114,7 +114,7 @@ async def test_auto_corrects_threshold_when_aux_context_below_threshold(mock_get
     assert agent.context_compressor.tail_token_budget == 16_000
 
 
-@patch("agent.model_metadata.get_static_context_length", return_value=32_768)
+@patch("agent.model_metadata._get_static_context_length", return_value=32_768)
 @patch("agent.auxiliary_client.get_text_auxiliary_client")
 async def test_rejects_aux_below_minimum_context(mock_get_client, mock_ctx_len):
     """Hard floor: aux context < MINIMUM_CONTEXT_LENGTH (64K) → session
@@ -153,7 +153,7 @@ async def test_feasibility_check_passes_live_main_runtime():
     mock_client.api_key = "codex-token"
 
     with patch("agent.auxiliary_client.get_text_auxiliary_client", return_value=(mock_client, "gpt-5.4")) as mock_get_client, \
-         patch("agent.model_metadata.get_static_context_length", return_value=200_000):
+         patch("agent.model_metadata._get_static_context_length", return_value=200_000):
         agent._emit_status = lambda msg: None
         await agent._check_compression_model_feasibility()
 
@@ -170,11 +170,11 @@ async def test_feasibility_check_passes_live_main_runtime():
     )
 
 
-@patch("agent.model_metadata.get_static_context_length", return_value=1_000_000)
+@patch("agent.model_metadata._get_static_context_length", return_value=1_000_000)
 @patch("agent.auxiliary_client.get_text_auxiliary_client")
 async def test_feasibility_check_passes_config_context_length(mock_get_client, mock_ctx_len):
     """auxiliary.compression.context_length from config is forwarded to
-    get_static_context_length so custom endpoints that lack /models still
+    _get_static_context_length so custom endpoints that lack /models still
     report the correct context window (fixes #8499)."""
     agent = _make_agent(main_context=200_000, threshold_percent=0.85)
     agent._aux_compression_context_length_config = 1_000_000
@@ -242,7 +242,7 @@ async def test_init_feasibility_check_uses_aux_context_override_from_config():
         patch("run_agent.OpenAI"),
         patch("run_agent.ContextCompressor", new=_StubCompressor),
         patch("agent.auxiliary_client.get_text_auxiliary_client", return_value=(mock_client, "custom/big-model")),
-        patch("agent.model_metadata.get_static_context_length", return_value=1_000_000) as mock_ctx_len,
+        patch("agent.model_metadata._get_static_context_length", return_value=1_000_000) as mock_ctx_len,
     ):
         agent = AIAgent(
             api_key="test-key-1234567890",
@@ -307,7 +307,7 @@ async def test_no_unavailable_warning_when_configured_fallback_chain_resolves():
         "agent.auxiliary_client._try_configured_fallback_for_unavailable_client",
         return_value=(fallback_client, "gpt-5.4-mini", "fallback_chain[0](openai-codex)"),
     ) as mock_fallback, patch(
-        "agent.model_metadata.get_static_context_length",
+        "agent.model_metadata._get_static_context_length",
         return_value=200_000,
     ) as mock_ctx_len:
         await agent._check_compression_model_feasibility()
@@ -331,7 +331,7 @@ async def test_no_unavailable_warning_when_configured_fallback_chain_resolves():
 # ── Two-phase: __init__ + run_conversation replay ───────────────────
 
 
-@patch("agent.model_metadata.get_static_context_length", return_value=80_000)
+@patch("agent.model_metadata._get_static_context_length", return_value=80_000)
 @patch("agent.auxiliary_client.get_text_auxiliary_client")
 async def test_warning_stored_for_gateway_replay(mock_get_client, mock_ctx_len):
     """__init__ stores the warning; _replay sends it through status_callback."""
@@ -360,7 +360,7 @@ async def test_warning_stored_for_gateway_replay(mock_get_client, mock_ctx_len):
     )
 
 
-@patch("agent.model_metadata.get_static_context_length", return_value=200_000)
+@patch("agent.model_metadata._get_static_context_length", return_value=200_000)
 @patch("agent.auxiliary_client.get_text_auxiliary_client")
 async def test_no_replay_when_no_warning(mock_get_client, mock_ctx_len):
     """_replay_compression_warning is a no-op when there's no stored warning."""
@@ -391,7 +391,7 @@ async def test_no_replay_when_no_warning(mock_get_client, mock_ctx_len):
 
 
 
-@patch("agent.model_metadata.get_static_context_length", return_value=300_000)
+@patch("agent.model_metadata._get_static_context_length", return_value=300_000)
 @patch("agent.auxiliary_client.get_text_auxiliary_client")
 async def test_threshold_suggestion_kept_for_large_context_main(mock_get_client, mock_ctx_len):
     """Main window >= 512K has no floor — any suggestion is honored, so the

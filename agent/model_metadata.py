@@ -671,7 +671,7 @@ def _endpoint_scoped_context_length(model: str, base_url: str) -> Optional[int]:
     return None
 
 
-def get_static_context_length(
+def _get_static_context_length(
     model: str,
     base_url: str = "",
     config_context_length: int | None = None,

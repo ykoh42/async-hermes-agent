@@ -966,7 +966,7 @@ async def check_compression_model_feasibility(agent: Any) -> None:
         )
         from agent.model_metadata import (
             MINIMUM_CONTEXT_LENGTH,
-            get_static_context_length,
+            _get_static_context_length,
         )
 
         # Best-effort aux provider label for the warning message. The
@@ -1023,7 +1023,7 @@ async def check_compression_model_feasibility(agent: Any) -> None:
         # Startup feasibility must not make a provider metadata request. The
         # static bound is refined by native response usage once compression
         # actually runs.
-        aux_context = get_static_context_length(
+        aux_context = _get_static_context_length(
             aux_model,
             base_url=aux_base_url,
             config_context_length=getattr(agent, "_aux_compression_context_length_config", None),

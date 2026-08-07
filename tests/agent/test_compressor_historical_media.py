@@ -125,7 +125,7 @@ class TestCompressIntegration:
 
     @pytest.fixture
     def compressor(self):
-        with patch("agent.context_compressor.get_static_context_length", return_value=100_000):
+        with patch("agent.context_compressor._get_static_context_length", return_value=100_000):
             c = ContextCompressor(
                 model="test/model",
                 threshold_percent=0.50,

@@ -37,7 +37,7 @@ class TestResolveModelThreshold:
 # ---------------------------------------------------------------------------
 
 class TestContextCompressorModelThresholds:
-    @patch("agent.context_compressor.get_static_context_length", return_value=1_000_000)
+    @patch("agent.context_compressor._get_static_context_length", return_value=1_000_000)
     def test_init_large_context_with_override(self, _mock):
         """Large context (>=512K) + per-model override: override applies directly."""
         cc = ContextCompressor(
@@ -53,7 +53,7 @@ class TestContextCompressorModelThresholds:
 
 
 
-    @patch("agent.context_compressor.get_static_context_length", return_value=256_000)
+    @patch("agent.context_compressor._get_static_context_length", return_value=256_000)
     def test_init_no_model_thresholds_dict(self, _mock):
         """Empty model_thresholds dict = backward compatible."""
         cc = ContextCompressor(
@@ -68,7 +68,7 @@ class TestContextCompressorModelThresholds:
         assert cc.model_thresholds == {}
 
 
-    @patch("agent.context_compressor.get_static_context_length")
+    @patch("agent.context_compressor._get_static_context_length")
     def test_update_model_re_resolves_threshold(self, mock_ctx):
         """Switching models re-resolves the per-model threshold + re-applies floor."""
         mock_ctx.return_value = 256_000

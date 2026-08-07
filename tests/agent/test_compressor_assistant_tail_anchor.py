@@ -54,7 +54,7 @@ def compressor():
     the helpers' anchor behaviour is observable."""
     from agent.context_compressor import ContextCompressor
     with patch(
-        "agent.context_compressor.get_static_context_length",
+        "agent.context_compressor._get_static_context_length",
         return_value=100_000,
     ):
         c = ContextCompressor(
