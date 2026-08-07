@@ -1828,6 +1828,31 @@ class PluginManager:
         """Return True when at least one callback is registered for middleware."""
         return bool(self._middleware.get(kind))
 
+    async def invoke_middleware(self, kind: str, **kwargs: Any) -> List[Any]:
+        """Invoke coroutine middleware callbacks registered for *kind*."""
+        callbacks = self._middleware.get(kind, [])
+        results: List[Any] = []
+        for callback in callbacks:
+            try:
+                if not inspect.iscoroutinefunction(callback):
+                    raise _PluginContractError(
+                        "Async Hermes requires coroutine middleware callbacks; "
+                        f"{getattr(callback, '__name__', repr(callback))} is synchronous"
+                    )
+                result = await callback(**kwargs)
+                if result is not None:
+                    results.append(result)
+            except _PluginContractError:
+                raise
+            except Exception as exc:
+                logger.warning(
+                    "Middleware '%s' callback %s raised: %s",
+                    kind,
+                    getattr(callback, "__name__", repr(callback)),
+                    exc,
+                )
+        return results
+
     # -----------------------------------------------------------------------
     # Slack action handler accessor
     # -----------------------------------------------------------------------
@@ -1925,6 +1950,12 @@ async def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
     """Await native lifecycle hooks without a sync compatibility bridge."""
     await discover_plugins()
     return await get_plugin_manager().invoke_hook(hook_name, **kwargs)
+
+
+async def invoke_middleware(kind: str, **kwargs: Any) -> List[Any]:
+    """Invoke registered middleware callbacks through the native async contract."""
+    await discover_plugins()
+    return await get_plugin_manager().invoke_middleware(kind, **kwargs)
 
 
 def has_middleware(kind: str) -> bool:

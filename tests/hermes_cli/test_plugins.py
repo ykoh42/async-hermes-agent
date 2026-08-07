@@ -22,11 +22,14 @@ from hermes_cli.plugins import (
     get_pre_tool_call_block_message,
     get_pre_verify_continue_message,
     has_middleware,
+    invoke_middleware,
 )
 from hermes_cli.middleware import (
     VALID_MIDDLEWARE,
+    apply_api_request_middleware,
     apply_llm_request_middleware,
     apply_tool_request_middleware,
+    run_api_execution_middleware,
     run_tool_execution_middleware,
 )
 
@@ -124,6 +127,12 @@ class TestPluginDiscovery:
         )
         assert llm_result.payload == {"messages": [], "mw": True}
         assert tool_result.payload == {"path": "README.md", "mw": True}
+        assert await mgr.invoke_middleware(
+            "llm_request", request={"messages": []}
+        ) == [{"request": {"messages": [], "mw": True}}]
+        assert await invoke_middleware(
+            "tool_request", args={"path": "README.md"}
+        ) == [{"args": {"path": "README.md", "mw": True}}]
         assert mgr.has_middleware("llm_request") is True
 
 
@@ -136,12 +145,17 @@ class TestPluginDiscovery:
         args = {"path": "README.md"}
 
         llm_result = await apply_llm_request_middleware(request)
+        api_result = await apply_api_request_middleware(request)
         tool_result = await apply_tool_request_middleware("read_file", args)
 
         assert llm_result.payload is request
         assert llm_result.original_payload is request
         assert llm_result.changed is False
         assert llm_result.trace == []
+        assert api_result.payload is request
+        assert api_result.original_payload is request
+        assert api_result.changed is False
+        assert api_result.trace == []
         assert tool_result.payload is args
         assert tool_result.original_payload is args
         assert tool_result.changed is False
@@ -150,6 +164,7 @@ class TestPluginDiscovery:
             return payload
 
         assert await run_tool_execution_middleware("terminal", args, terminal) is args
+        assert await run_api_execution_middleware(request, terminal) is request
         assert has_middleware("tool_request") is False
 
 

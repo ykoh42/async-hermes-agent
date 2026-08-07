@@ -166,6 +166,16 @@ async def apply_tool_request_middleware(
         changed=bool(trace),
         trace=trace,
     )
+
+
+async def apply_api_request_middleware(
+    request: Dict[str, Any],
+    **context: Any,
+) -> RequestMiddlewareResult:
+    """Preserve the upstream API-named alias on the native async path."""
+    return await apply_llm_request_middleware(request, **context)
+
+
 async def run_llm_execution_middleware(
     request: Dict[str, Any],
     next_call: Callable[[Dict[str, Any]], Any],
@@ -218,35 +228,24 @@ async def run_tool_execution_middleware(
     )
 
 
+async def run_api_execution_middleware(
+    request: Dict[str, Any],
+    next_call: Callable[[Dict[str, Any]], Any],
+    **context: Any,
+) -> Any:
+    """Preserve the upstream API-named alias on the native async path."""
+    return await run_llm_execution_middleware(request, next_call, **context)
+
+
 class _MiddlewareContractError(RuntimeError):
     """Raised when a synchronous plugin callback reaches the async agent."""
 
 
 async def _invoke_middleware(kind: str, **kwargs: Any) -> List[Any]:
     """Invoke middleware callbacks without a sync fallback or worker bridge."""
-    callbacks = _get_middleware_callbacks(kind)
-    results: List[Any] = []
-    payload = middleware_payload(**kwargs)
-    for callback in callbacks:
-        try:
-            if not inspect.iscoroutinefunction(callback):
-                raise _MiddlewareContractError(
-                    "Async Hermes requires coroutine middleware callbacks; "
-                    f"{getattr(callback, '__name__', repr(callback))} is synchronous"
-                )
-            result = await callback(**payload)
-            if result is not None:
-                results.append(result)
-        except _MiddlewareContractError:
-            raise
-        except Exception as exc:
-            logger.warning(
-                "Middleware '%s' callback %s raised: %s",
-                kind,
-                getattr(callback, "__name__", repr(callback)),
-                exc,
-            )
-    return results
+    from hermes_cli.plugins import invoke_middleware
+
+    return await invoke_middleware(kind, **middleware_payload(**kwargs))
 
 
 def _has_middleware(kind: str) -> bool:
