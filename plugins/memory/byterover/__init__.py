@@ -94,15 +94,16 @@ async def _load_plugin_config() -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 _cached_brv_path: Optional[str] = None
+_which = aiofiles.os.wrap(shutil.which)
 
 
-def _resolve_brv_path() -> Optional[str]:
+async def _resolve_brv_path() -> Optional[str]:
     """Find the brv binary on PATH or well-known install locations."""
     global _cached_brv_path
     if _cached_brv_path is not None:
         return _cached_brv_path if _cached_brv_path != "" else None
 
-    found = shutil.which("brv")
+    found = await _which("brv")
     if not found:
         home = Path.home()
         candidates = [
@@ -111,7 +112,7 @@ def _resolve_brv_path() -> Optional[str]:
             home / ".npm-global" / "bin" / "brv",
         ]
         for c in candidates:
-            if c.exists():
+            if await aiofiles.os.path.exists(c):
                 found = str(c)
                 break
 
@@ -125,7 +126,7 @@ async def _run_brv(
     cwd: Optional[str] = None,
 ) -> dict:
     """Run a brv CLI command. Returns {success, output, error}."""
-    brv_path = _resolve_brv_path()
+    brv_path = await _resolve_brv_path()
     if not brv_path:
         return {"success": False, "error": "brv CLI not found. Install: npm install -g byterover-cli"}
 
@@ -248,7 +249,7 @@ class ByteRoverMemoryProvider(MemoryProvider):
 
     async def is_available(self) -> bool:
         """Check if brv CLI is installed. No network calls."""
-        return _resolve_brv_path() is not None
+        return await _resolve_brv_path() is not None
 
     def get_config_schema(self):
         return [
@@ -279,7 +280,7 @@ class ByteRoverMemoryProvider(MemoryProvider):
         await aiofiles.os.makedirs(self._cwd, exist_ok=True)
 
     def system_prompt_block(self) -> str:
-        if not _resolve_brv_path():
+        if not _cached_brv_path:
             return ""
         return (
             "# ByteRover Memory\n"

@@ -3,8 +3,33 @@
 import asyncio
 
 import pytest
+from blockbuster import BlockBuster
+from pyleak import no_event_loop_blocking, no_task_leaks
+from pyleak.eventloop import LeakAction
 
 from plugins.memory.byterover import ByteRoverMemoryProvider, _run_brv
+
+
+@pytest.mark.asyncio
+async def test_availability_resolves_binary_without_blocking(tmp_path, monkeypatch):
+    executable = tmp_path / "brv"
+    executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    executable.chmod(0o755)
+    monkeypatch.setenv("PATH", str(tmp_path))
+    monkeypatch.setattr("plugins.memory.byterover._cached_brv_path", None)
+
+    async with (
+        no_event_loop_blocking(action=LeakAction.RAISE, threshold=0.1),
+        no_task_leaks(action=LeakAction.RAISE),
+    ):
+        blockbuster = BlockBuster()
+        blockbuster.activate()
+        try:
+            available = await ByteRoverMemoryProvider().is_available()
+        finally:
+            blockbuster.deactivate()
+
+    assert available is True
 
 
 @pytest.mark.asyncio
