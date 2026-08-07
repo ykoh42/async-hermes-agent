@@ -155,7 +155,8 @@ async def test_native_client_uses_x_goog_api_key_and_native_models_endpoint(monk
     assert recorded["headers"]["x-goog-api-key"] == "AIza-test"
     assert "Authorization" not in recorded["headers"]
     assert response.choices[0].message.content == "hello"
-    await client.aclose()
+    await client.close()
+    assert client.is_closed is True
 
 
 
@@ -190,6 +191,7 @@ def test_native_client_exposes_coroutine_transport():
     from agent.gemini_native_adapter import GeminiNativeClient
 
     assert inspect.iscoroutinefunction(GeminiNativeClient._create_chat_completion)
+    assert inspect.iscoroutinefunction(GeminiNativeClient.close)
 
 
 def test_stream_event_translation_emits_tool_call_delta_with_stable_index():
@@ -231,8 +233,6 @@ def test_stream_event_translation_emits_tool_call_delta_with_stable_index():
 # ---------------------------------------------------------------------------
 # X-Goog-Api-Client header tests
 # ---------------------------------------------------------------------------
-
-
 
 
 

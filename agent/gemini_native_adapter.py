@@ -864,7 +864,7 @@ class GeminiNativeClient:
             timeout=timeout or httpx.Timeout(connect=15.0, read=600.0, write=30.0, pool=30.0)
         )
 
-    async def aclose(self) -> None:
+    async def close(self) -> None:
         self.is_closed = True
         try:
             await self._http.aclose()
