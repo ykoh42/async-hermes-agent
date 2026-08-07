@@ -292,6 +292,57 @@ class TestSkillsList:
 
 @pytest.mark.asyncio
 class TestSkillView:
+    async def test_preprocesses_template_vars_and_preserves_raw_opt_out(
+        self, tmp_path
+    ):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            skill_dir = _make_skill(
+                tmp_path,
+                "templated",
+                body=(
+                    "dir=${HERMES_SKILL_DIR}\n"
+                    "session=${HERMES_SESSION_ID}"
+                ),
+            )
+            rendered = json.loads(
+                await skill_view("templated", task_id="session-42")
+            )
+            raw = json.loads(
+                await skill_view(
+                    "templated",
+                    task_id="session-42",
+                    preprocess=False,
+                )
+            )
+
+        assert f"dir={skill_dir}" in rendered["content"]
+        assert "session=session-42" in rendered["content"]
+        assert "${HERMES_SKILL_DIR}" in raw["content"]
+        assert "${HERMES_SESSION_ID}" in raw["content"]
+
+    async def test_preprocesses_inline_shell_in_skill_directory(self, tmp_path):
+        with (
+            patch("tools.skills_tool.SKILLS_DIR", tmp_path),
+            patch(
+                "agent.skill_preprocessing.load_skills_config",
+                AsyncMock(
+                    return_value={
+                        "template_vars": True,
+                        "inline_shell": True,
+                        "inline_shell_timeout": 5,
+                    }
+                ),
+            ),
+        ):
+            skill_dir = _make_skill(
+                tmp_path,
+                "inline",
+                body="working-directory=!`pwd`",
+            )
+            rendered = json.loads(await skill_view("inline"))
+
+        assert f"working-directory={skill_dir}" in rendered["content"]
+
     async def test_view_resolves_by_dir_name_and_frontmatter_name(self, tmp_path):
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
             _make_skill(

@@ -1,6 +1,8 @@
 """Tests for agent/skill_utils.py."""
 
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
+
+import pytest
 
 from agent.skill_utils import (
     extract_skill_config_vars,
@@ -14,6 +16,7 @@ from agent.skill_utils import (
     parse_frontmatter,
     resolve_skill_config_values,
     skill_matches_platform,
+    skill_matches_environment,
     skill_matches_platform_list,
 )
 
@@ -186,15 +189,18 @@ class TestSkillMatchesPlatformTermux:
 
 
 
+@pytest.mark.asyncio
 class TestNormalizeSkillLookupName:
-    def test_relative_path_unchanged(self, tmp_path, monkeypatch):
+    async def test_relative_path_unchanged(self, tmp_path, monkeypatch):
         from agent.skill_utils import normalize_skill_lookup_name
 
         # Relative identifiers early-return before any root lookup.
-        assert normalize_skill_lookup_name("foo/bar") == "foo/bar"
+        assert await normalize_skill_lookup_name("foo/bar") == "foo/bar"
 
 
-    def test_absolute_via_symlink_uses_lexical_relative_path(self, tmp_path, monkeypatch):
+    async def test_absolute_via_symlink_uses_lexical_relative_path(
+        self, tmp_path, monkeypatch
+    ):
         from agent.skill_utils import normalize_skill_lookup_name
 
         skills_dir = tmp_path / "skills"
@@ -207,7 +213,20 @@ class TestNormalizeSkillLookupName:
         except OSError:
             pytest.skip("Symlinks not supported")
         monkeypatch.setattr("tools.skills_tool.SKILLS_DIR", skills_dir)
-        assert normalize_skill_lookup_name(str(link)) == "my-skill"
+        assert await normalize_skill_lookup_name(str(link)) == "my-skill"
+
+
+@pytest.mark.asyncio
+async def test_skill_environment_detection_is_native_async(monkeypatch):
+    from agent import skill_utils
+
+    skill_utils._ENV_DETECT_CACHE.clear()
+    isdir = AsyncMock(side_effect=[False, True])
+    monkeypatch.setattr("aiofiles.os.path.isdir", isdir)
+
+    assert await skill_matches_environment({"environments": ["s6"]}) is True
+    assert isdir.await_count == 2
+    skill_utils._ENV_DETECT_CACHE.clear()
 
 
 

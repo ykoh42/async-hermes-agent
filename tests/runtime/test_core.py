@@ -74,6 +74,13 @@ def test_conversation_and_chat_are_coroutines():
     from hermes_cli.middleware import run_llm_execution_middleware
     from hermes_constants import get_hermes_dir
     from gateway.status import _pid_exists
+    from agent.skill_commands import (
+        build_skill_invocation_message,
+        get_skill_commands,
+        reload_skills,
+        scan_skill_commands,
+    )
+    from agent.skill_utils import normalize_skill_lookup_name
 
     assert inspect.iscoroutinefunction(AIAgent.run_conversation)
     assert inspect.iscoroutinefunction(AIAgent.chat)
@@ -133,6 +140,11 @@ def test_conversation_and_chat_are_coroutines():
     assert inspect.iscoroutinefunction(memory_tool)
     assert inspect.iscoroutinefunction(skills_list)
     assert inspect.iscoroutinefunction(skill_view)
+    assert inspect.iscoroutinefunction(scan_skill_commands)
+    assert inspect.iscoroutinefunction(get_skill_commands)
+    assert inspect.iscoroutinefunction(reload_skills)
+    assert inspect.iscoroutinefunction(build_skill_invocation_message)
+    assert inspect.iscoroutinefunction(normalize_skill_lookup_name)
     assert inspect.iscoroutinefunction(invoke_tool)
     assert inspect.iscoroutinefunction(_validate_llm_response)
     assert inspect.iscoroutinefunction(_aggregate_chat_stream)
@@ -274,6 +286,84 @@ async def test_session_lifecycle_does_not_block_or_leak(tmp_path):
             blockbuster.deactivate()
 
     assert not (sessions_dir / "session.jsonl").exists()
+
+
+@pytest.mark.asyncio
+async def test_skill_invocation_does_not_block_or_leak(tmp_path):
+    """Audit real skill discovery, preprocessing, and message assembly."""
+    import agent.skill_commands as skill_commands
+    from agent import skill_utils
+    from agent.skill_preprocessing import run_inline_shell
+
+    skill_dir = tmp_path / "native-skill"
+    skill_dir.mkdir()
+    (skill_dir / "SKILL.md").write_text(
+        "---\n"
+        "name: native-skill\n"
+        "description: Native async audit skill.\n"
+        "---\n\n"
+        "session=${HERMES_SESSION_ID}\n"
+        "cwd=!`pwd`\n",
+        encoding="utf-8",
+    )
+    skill_commands._skill_commands = {}
+    skill_commands._skill_commands_platform = None
+
+    async with (
+        no_event_loop_blocking(action=LeakAction.RAISE, threshold=0.1),
+        no_task_leaks(action=LeakAction.RAISE),
+    ):
+        blockbuster = BlockBuster()
+        blockbuster.activate()
+        try:
+            skill_utils._ENV_DETECT_CACHE.clear()
+            assert isinstance(
+                await skill_utils.skill_matches_environment(
+                    {"environments": ["docker"]}
+                ),
+                bool,
+            )
+            with (
+                patch("tools.skills_tool.SKILLS_DIR", tmp_path),
+                patch(
+                    "tools.skills_tool._external_skills_dirs",
+                    AsyncMock(return_value=[]),
+                ),
+                patch(
+                    "tools.skills_tool._get_disabled_skill_names",
+                    AsyncMock(return_value=set()),
+                ),
+                patch(
+                    "agent.skill_preprocessing.load_skills_config",
+                    AsyncMock(
+                        return_value={
+                            "template_vars": True,
+                            "inline_shell": True,
+                            "inline_shell_timeout": 5,
+                        }
+                    ),
+                ),
+            ):
+                await skill_commands.scan_skill_commands()
+                message = await skill_commands.build_skill_invocation_message(
+                    "/native-skill", task_id="audit-session"
+                )
+            inline_shell = asyncio.create_task(
+                run_inline_shell("sleep 30", skill_dir, timeout=60)
+            )
+            await asyncio.sleep(0.05)
+            inline_shell.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await inline_shell
+        finally:
+            blockbuster.deactivate()
+            skill_utils._ENV_DETECT_CACHE.clear()
+            skill_commands._skill_commands = {}
+            skill_commands._skill_commands_platform = None
+
+    assert message is not None
+    assert "session=audit-session" in message
+    assert f"cwd={skill_dir}" in message
 
 
 @pytest.mark.asyncio

@@ -5,12 +5,16 @@ heavy dependency chain.  It is safe to import at module level without triggering
 tool registration or provider resolution.
 """
 
+import asyncio
 import logging
 import os
 import re
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
+
+import aiofiles
+import aiofiles.os
 
 from hermes_constants import get_config_path, get_skills_dir, is_termux
 
@@ -286,7 +290,7 @@ _KNOWN_ENVIRONMENTS = frozenset({"kanban", "docker", "s6"})
 _ENV_DETECT_CACHE: Dict[str, bool] = {}
 
 
-def _detect_environment(env: str) -> bool:
+async def _detect_environment(env: str) -> bool:
     """Return True when the named runtime environment is currently active.
 
     Cached per process. Unknown env names return True (fail-open: never hide a
@@ -306,33 +310,40 @@ def _detect_environment(env: str) -> bool:
         if os.getenv("HERMES_KANBAN_TASK") or os.getenv("HERMES_KANBAN_BOARD"):
             result = True
         else:
-            try:
-                from tools.kanban_tools import _profile_has_kanban_toolset
-
-                result = bool(_profile_has_kanban_toolset())
-            except Exception:
-                result = False
-    elif env == "docker":
-        try:
-            from hermes_constants import is_container
-
-            result = is_container()
-        except Exception:
             result = False
+    elif env == "docker":
+        result = bool(os.getenv("KUBERNETES_SERVICE_HOST"))
+        if not result:
+            result = await aiofiles.os.path.exists(
+                "/.dockerenv"
+            ) or await aiofiles.os.path.exists("/run/.containerenv")
+        markers = ("docker", "podman", "/lxc/", "kubepods", "containerd", "crio")
+        for path, path_markers in (
+            ("/proc/1/cgroup", markers),
+            ("/proc/self/mountinfo", ("kubepods", "containerd", "crio")),
+        ):
+            if result:
+                break
+            try:
+                async with aiofiles.open(path, encoding="utf-8") as handle:
+                    content = await handle.read()
+                result = any(marker in content for marker in path_markers)
+            except OSError:
+                continue
     elif env == "s6":
         # The Hermes Docker image runs s6-overlay as PID 1 (/init). s6 plants
         # its runtime scaffolding under /run/s6 and ships its admin tree under
         # /package/admin/s6-overlay. Either marker means we're inside an
         # s6-supervised container.
-        result = os.path.isdir("/run/s6") or os.path.isdir(
-            "/package/admin/s6-overlay"
-        )
+        result = await aiofiles.os.path.isdir(
+            "/run/s6"
+        ) or await aiofiles.os.path.isdir("/package/admin/s6-overlay")
 
     _ENV_DETECT_CACHE[env] = result
     return result
 
 
-def skill_matches_environment(frontmatter: Dict[str, Any]) -> bool:
+async def skill_matches_environment(frontmatter: Dict[str, Any]) -> bool:
     """Return True when the skill is relevant to the current runtime environment.
 
     Skills may declare an ``environments`` list in their YAML frontmatter::
@@ -366,7 +377,7 @@ def skill_matches_environment(frontmatter: Dict[str, Any]) -> bool:
         if normalized not in _KNOWN_ENVIRONMENTS:
             # Tag we don't understand — don't hide the skill over it.
             return True
-        if _detect_environment(normalized):
+        if await _detect_environment(normalized):
             return True
     return False
 
@@ -574,7 +585,7 @@ def get_all_skills_dirs() -> List[Path]:
     return dirs
 
 
-def normalize_skill_lookup_name(identifier: str) -> str:
+async def normalize_skill_lookup_name(identifier: str) -> str:
     """Normalize a skill identifier to a ``skill_view()``-safe relative path.
 
     Slash commands and cron jobs may store absolute paths to skills that live
@@ -599,13 +610,18 @@ def normalize_skill_lookup_name(identifier: str) -> str:
     # module cycle (tools.skills_tool imports agent.skill_utils).
     try:
         from tools import skills_tool as _skills_tool
+
         primary_root = Path(_skills_tool.SKILLS_DIR)
     except Exception:
         primary_root = get_skills_dir()
 
     trusted_roots = [primary_root]
     try:
-        trusted_roots.extend(get_external_skills_dirs())
+        from tools.skills_tool import _external_skills_dirs
+
+        trusted_roots.extend(await _external_skills_dirs())
+    except asyncio.CancelledError:
+        raise
     except Exception:
         pass
 
@@ -621,7 +637,17 @@ def normalize_skill_lookup_name(identifier: str) -> str:
             continue
 
     try:
-        return str(identifier_path.resolve().relative_to(primary_root.resolve()))
+        import aiofiles.os
+
+        identifier_real = Path(
+            await aiofiles.os.wrap(os.path.realpath)(identifier_path)
+        )
+        primary_real = Path(
+            await aiofiles.os.wrap(os.path.realpath)(primary_root)
+        )
+        return str(identifier_real.relative_to(primary_real))
+    except asyncio.CancelledError:
+        raise
     except Exception:
         logger.debug(
             "Skill identifier %r is an absolute path outside trusted skills "

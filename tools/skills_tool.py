@@ -380,7 +380,7 @@ def skill_matches_platform(frontmatter: Dict[str, Any]) -> bool:
     return _impl(frontmatter)
 
 
-def skill_matches_environment(frontmatter: Dict[str, Any]) -> bool:
+async def skill_matches_environment(frontmatter: Dict[str, Any]) -> bool:
     """Check if a skill is relevant to the current runtime environment.
 
     Delegates to ``agent.skill_utils.skill_matches_environment`` — kept here
@@ -389,7 +389,7 @@ def skill_matches_environment(frontmatter: Dict[str, Any]) -> bool:
     explicit skill loads bypass it.
     """
     from agent.skill_utils import skill_matches_environment as _impl
-    return _impl(frontmatter)
+    return await _impl(frontmatter)
 
 
 def _normalize_prerequisite_values(value: Any) -> List[str]:
@@ -739,7 +739,7 @@ async def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any
                 frontmatter, body = _parse_frontmatter(content)
                 if (
                     not skill_matches_platform(frontmatter)
-                    or not skill_matches_environment(frontmatter)
+                    or not await skill_matches_environment(frontmatter)
                 ):
                     continue
                 name = str(frontmatter.get("name", skill_md.parent.name))[:MAX_NAME_LENGTH]
@@ -801,7 +801,14 @@ async def skills_list(category: str = None, task_id: str = None) -> str:
         return tool_error(str(exc), success=False)
 
 
-async def _serve_plugin_skill(skill_md: Path, namespace: str, bare: str) -> str:
+async def _serve_plugin_skill(
+    skill_md: Path,
+    namespace: str,
+    bare: str,
+    *,
+    preprocess: bool = True,
+    session_id: str | None = None,
+) -> str:
     """Read a registered plugin skill through the native async file boundary."""
     from hermes_cli.config import load_config_readonly
     from hermes_cli.plugins import get_plugin_manager
@@ -877,11 +884,31 @@ async def _serve_plugin_skill(skill_md: Path, namespace: str, bare: str) -> str:
             f"[Bundle context: This skill is part of the '{namespace}' plugin.]\n\n"
         )
 
+    rendered_content = content
+    if preprocess:
+        try:
+            from agent.skill_preprocessing import preprocess_skill_content
+
+            rendered_content = await preprocess_skill_content(
+                content,
+                skill_md.parent,
+                session_id=session_id,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.debug(
+                "Could not preprocess plugin skill %s:%s",
+                namespace,
+                bare,
+                exc_info=True,
+            )
+
     return json.dumps(
         {
             "success": True,
             "name": f"{namespace}:{bare}",
-            "content": f"{banner}{content}",
+            "content": f"{banner}{rendered_content}",
             "description": description,
             "linked_files": None,
             "readiness_status": SkillReadinessStatus.AVAILABLE.value,
@@ -935,7 +962,13 @@ async def skill_view(
                         },
                         ensure_ascii=False,
                     )
-                return await _serve_plugin_skill(plugin_skill_md, namespace, bare)
+                return await _serve_plugin_skill(
+                    plugin_skill_md,
+                    namespace,
+                    bare,
+                    preprocess=preprocess,
+                    session_id=task_id,
+                )
 
             available = manager.list_plugin_skills(namespace)
             if available:
@@ -1091,6 +1124,25 @@ async def skill_view(
             if missing_environment_variables
             else SkillReadinessStatus.AVAILABLE
         )
+        rendered_content = content
+        if preprocess:
+            try:
+                from agent.skill_preprocessing import preprocess_skill_content
+
+                rendered_content = await preprocess_skill_content(
+                    content,
+                    skill_dir,
+                    session_id=task_id,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.debug(
+                    "Could not preprocess skill content for %s",
+                    skill_name,
+                    exc_info=True,
+                )
+
         return json.dumps({
             "success": True,
             "name": skill_name,
@@ -1099,7 +1151,7 @@ async def skill_view(
             "related_skills": _parse_tags(
                 frontmatter.get("related_skills") or hermes_metadata.get("related_skills")
             ),
-            "content": content,
+            "content": rendered_content,
             "path": str(skill_md.relative_to(skill_root)),
             "skill_dir": str(skill_dir) if skill_dir else None,
             "linked_files": linked_files or None,

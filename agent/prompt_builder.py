@@ -1259,7 +1259,7 @@ async def _parse_skill_file(skill_file: Path) -> tuple[bool, dict, str]:
         frontmatter, _ = parse_frontmatter(raw)
         if not skill_matches_platform(frontmatter):
             return False, frontmatter, ""
-        if not skill_matches_environment(frontmatter):
+        if not await skill_matches_environment(frontmatter):
             return False, frontmatter, ""
         return True, frontmatter, extract_skill_description(frontmatter)
     except asyncio.CancelledError:
