@@ -301,6 +301,17 @@ async def test_session_lifecycle_does_not_block_or_leak(tmp_path):
                 row["session_id"]
                 for row in await database.search_messages("hello")
             ] == ["session"]
+            await database.append_message(
+                "session",
+                role="assistant",
+                content="错误日志：数据库连接超时",
+            )
+            cjk_hits = await database.search_messages("数据库连接")
+            assert [row["session_id"] for row in cjk_hits] == ["session"]
+            assert [item["content"] for item in cjk_hits[0]["context"]] == [
+                "hello",
+                "错误日志：数据库连接超时",
+            ]
             assert [
                 row["preview"]
                 for row in await database.list_recent_user_messages("session")

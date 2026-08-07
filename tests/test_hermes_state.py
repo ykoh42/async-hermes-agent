@@ -1332,6 +1332,170 @@ async def test_recent_user_messages_and_session_id_search_preserve_contract(db):
 
 
 @pytest.mark.asyncio
+async def test_search_messages_returns_context_and_honors_projection(db):
+    await db.create_session("context", source="library")
+    await db.append_message("context", role="user", content="before")
+    await db.append_message(
+        "context", role="assistant", content="projectionneedle"
+    )
+    await db.append_message("context", role="user", content="after")
+
+    default = await db.search_messages("projectionneedle")
+    projected = await db.search_messages(
+        "projectionneedle", fields=("session_id", "role", "snippet")
+    )
+    context_only = await db.search_messages(
+        "projectionneedle", fields=("session_id", "context")
+    )
+
+    assert [message["content"] for message in default[0]["context"]] == [
+        "before",
+        "projectionneedle",
+        "after",
+    ]
+    assert set(projected[0]) == {"session_id", "role", "snippet"}
+    assert "context" not in projected[0]
+    assert context_only == [
+        {
+            "session_id": "context",
+            "context": default[0]["context"],
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_search_messages_preserves_cjk_substring_routes(db):
+    await db.create_session("cjk", source="library")
+    await db.append_message(
+        "cjk", role="user", content="错误日志：数据库连接超时"
+    )
+    await db.append_message(
+        "cjk", role="assistant", content="讨论Agent通信协议"
+    )
+    await db.append_message(
+        "cjk", role="assistant", content="修改youer服务端"
+    )
+
+    assert len(await db.search_messages("数据库连接")) == 1
+    assert len(await db.search_messages("连接")) == 1
+    assert len(await db.search_messages("Agent通信")) == 1
+    assert len(await db.search_messages("youer")) == 1
+
+
+@pytest.mark.asyncio
+async def test_search_messages_cjk_like_treats_wildcards_as_literals(db):
+    await db.create_session("literal", source="library")
+    await db.create_session("wildcard", source="library")
+    await db.append_message(
+        "literal", role="user", content="达成100%完成率"
+    )
+    await db.append_message(
+        "wildcard", role="user", content="达成100完成率是目标"
+    )
+
+    assert [
+        row["session_id"] for row in await db.search_messages("100%完成")
+    ] == ["literal"]
+
+
+@pytest.mark.asyncio
+async def test_search_messages_cjk_or_and_tool_role_use_like_fallback(db):
+    await db.create_session("guangxi", source="library")
+    await db.create_session("guilin", source="library")
+    await db.create_session("tool", source="library")
+    await db.append_message("guangxi", role="user", content="广西旅行计划")
+    await db.append_message("guilin", role="user", content="桂林旅行计划")
+    await db.append_message(
+        "tool",
+        role="tool",
+        content="数据库连接超时",
+        tool_name="terminal",
+    )
+
+    assert {
+        row["session_id"] for row in await db.search_messages("广西 OR 桂林")
+    } == {"guangxi", "guilin"}
+    tool_hits = await db.search_messages(
+        "数据库连接", role_filter=["tool"]
+    )
+    assert [(row["session_id"], row["role"]) for row in tool_hits] == [
+        ("tool", "tool")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_search_messages_normalizes_sort_and_preserves_empty_filters(db):
+    await db.create_session("older", source="library")
+    await db.create_session("newer", source="library")
+    older_id = await db.append_message(
+        "older", role="user", content="sortneedle"
+    )
+    newer_id = await db.append_message(
+        "newer", role="user", content="sortneedle"
+    )
+    connection = await db._get_connection()
+    await connection.execute(
+        "UPDATE messages SET timestamp = ? WHERE id = ?", (10.0, older_id)
+    )
+    await connection.execute(
+        "UPDATE messages SET timestamp = ? WHERE id = ?", (20.0, newer_id)
+    )
+    await connection.commit()
+
+    assert [
+        row["session_id"]
+        for row in await db.search_messages("sortneedle", sort=" NEWEST ")
+    ] == ["newer", "older"]
+    assert await db.search_messages("sortneedle", source_filter=[]) == []
+    assert {
+        row["session_id"]
+        for row in await db.search_messages("sortneedle", exclude_sources=[])
+    } == {"older", "newer"}
+
+
+@pytest.mark.asyncio
+async def test_search_messages_visibility_matches_rewind_and_compaction(db):
+    await db.create_session("visibility", source="library")
+    rewound_id = await db.append_message(
+        "visibility", role="user", content="rewoundneedle"
+    )
+    compacted_id = await db.append_message(
+        "visibility", role="assistant", content="compactedneedle"
+    )
+    connection = await db._get_connection()
+    await connection.execute(
+        "UPDATE messages SET active = 0, compacted = 0 WHERE id = ?",
+        (rewound_id,),
+    )
+    await connection.execute(
+        "UPDATE messages SET active = 0, compacted = 1 WHERE id = ?",
+        (compacted_id,),
+    )
+    await connection.commit()
+
+    assert await db.search_messages("rewoundneedle") == []
+    assert len(await db.search_messages("rewoundneedle", include_inactive=True)) == 1
+    assert len(await db.search_messages("compactedneedle")) == 1
+
+
+@pytest.mark.asyncio
+async def test_search_messages_supplements_deferred_rebuild_gap(db):
+    await db.create_session("gap", source="library")
+    connection = await db._get_connection()
+    await connection.execute("DROP TRIGGER messages_fts_insert")
+    await connection.execute("DROP TRIGGER messages_fts_trigram_insert")
+    await connection.commit()
+    message_id = await db.append_message(
+        "gap", role="user", content="deferredgapneedle"
+    )
+    await db.set_meta("fts_rebuild_high_water", str(message_id))
+    await db.set_meta("fts_rebuild_progress", "0")
+
+    hits = await db.search_messages("deferredgapneedle")
+    assert [row["session_id"] for row in hits] == ["gap"]
+
+
+@pytest.mark.asyncio
 async def test_rewind_is_auditable_and_excluded_from_live_replay(db):
     await db.create_session("s1", source="library")
     await db.append_message("s1", role="user", content="first")

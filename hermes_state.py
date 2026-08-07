@@ -56,6 +56,11 @@ _DISK_FULL_MARKERS = (
     "enospc",
 )
 
+_MALFORMED_SCHEMA_MARKERS = (
+    "malformed database schema",
+    "database disk image is malformed",
+)
+
 
 def _system_prompt_hash(system_prompt: str) -> str:
     return hashlib.sha256(system_prompt.encode("utf-8")).hexdigest()
@@ -674,6 +679,50 @@ class SessionDB:
 
         return sanitized.strip()
 
+    @staticmethod
+    def _is_cjk_codepoint(codepoint: int) -> bool:
+        return (
+            0x4E00 <= codepoint <= 0x9FFF
+            or 0x3400 <= codepoint <= 0x4DBF
+            or 0x20000 <= codepoint <= 0x2A6DF
+            or 0x3000 <= codepoint <= 0x303F
+            or 0x3040 <= codepoint <= 0x309F
+            or 0x30A0 <= codepoint <= 0x30FF
+            or 0xAC00 <= codepoint <= 0xD7AF
+        )
+
+    @classmethod
+    def _contains_cjk(cls, text: str) -> bool:
+        """Return whether *text* contains Chinese, Japanese, or Korean text."""
+        return any(cls._is_cjk_codepoint(ord(character)) for character in text)
+
+    @classmethod
+    def _count_cjk(cls, text: str) -> int:
+        return sum(
+            cls._is_cjk_codepoint(ord(character)) for character in text
+        )
+
+    @classmethod
+    def _has_lone_cjk_run(cls, query: str) -> bool:
+        run = 0
+        for character in query:
+            if cls._is_cjk_codepoint(ord(character)):
+                run += 1
+            else:
+                if run == 1:
+                    return True
+                run = 0
+        return run == 1
+
+    @staticmethod
+    def _trigram_eligible_tokens(query: str) -> bool:
+        tokens = [
+            token
+            for token in query.strip('"').strip().split()
+            if token.upper() not in {"AND", "OR", "NOT"}
+        ]
+        return bool(tokens) and all(len(token) >= 3 for token in tokens)
+
 
     @staticmethod
     async def _parse_schema_columns(schema_sql: str) -> Dict[str, Dict[str, str]]:
@@ -737,6 +786,8 @@ class SessionDB:
         self._closed = False
         self._fts_enabled = False
         self._trigram_available = False
+        self._fts_cjk_available = False
+        self._fts_runtime_rebuild_attempted = False
         self._fts_unavailable_warned = False
         self._trigram_unavailable_warned = False
 
@@ -1200,6 +1251,11 @@ class SessionDB:
                 await asyncio.sleep(min(delay, remaining))
                 delay = min(delay * 2, self._WRITE_RETRY_MAX_S)
             except Exception as exc:
+                if (
+                    isinstance(exc, sqlite3.DatabaseError)
+                    and await self._try_runtime_fts_rebuild(exc)
+                ):
+                    continue
                 no_more_rows = (
                     isinstance(exc, sqlite3.Error)
                     and "no more rows available" in str(exc).lower()
@@ -3270,94 +3326,577 @@ class SessionDB:
         include_inactive: bool = False,
         fields: Optional[Collection[str]] = None,
     ) -> List[Dict[str, Any]]:
-        """Search message text natively, preferring FTS5 with LIKE fallback."""
-        result_fields = self._search_message_fields(fields)
-        if not query or not str(query).strip():
-            return []
-        connection = await self._get_connection()
-        limit = max(0, int(limit))
-        offset = max(0, int(offset))
-        sanitized = self._sanitize_fts5_query(str(query))
-        if not sanitized:
-            return []
-        where: list[str] = []
-        params: list[Any] = [sanitized]
+        """Instrumented native-async message search.
+
+        This preserves the v2026.8.3 routing and result contract while keeping
+        every SQLite operation awaitable.
+        """
+        started = time.time()
+        rows = None
+        try:
+            rows = await self._search_messages_impl(
+                query,
+                source_filter=source_filter,
+                exclude_sources=exclude_sources,
+                role_filter=role_filter,
+                limit=limit,
+                offset=offset,
+                sort=sort,
+                include_inactive=include_inactive,
+                fields=fields,
+            )
+            return rows
+        finally:
+            try:
+                threshold = float(os.getenv("HERMES_SEARCH_SLOW_MS", "1000"))
+            except (TypeError, ValueError):
+                threshold = 1000.0
+            elapsed_ms = (time.time() - started) * 1000.0
+            if elapsed_ms >= threshold:
+                logger.info(
+                    "slow session search: path=%s elapsed=%.0fms rows=%s query=%r",
+                    self._describe_search_path(query),
+                    elapsed_ms,
+                    len(rows) if rows is not None else "err",
+                    query[:200],
+                )
+
+    def _describe_search_path(self, query: str) -> str:
+        """Return the upstream route name used for slow-search diagnostics."""
+        try:
+            sanitized = self._sanitize_fts5_query(query or "")
+            if not sanitized:
+                return "empty"
+            if not self._contains_cjk(sanitized):
+                return "fts5"
+            raw = sanitized.strip('"').strip()
+            if self._fts_cjk_available and not self._has_lone_cjk_run(raw):
+                return "fts_cjk"
+            tokens = [
+                token
+                for token in raw.split()
+                if token.upper() not in {"AND", "OR", "NOT"}
+                and self._contains_cjk(token)
+            ]
+            short = any(self._count_cjk(token) < 3 for token in tokens)
+            if self._count_cjk(raw) >= 3 and not short and self._trigram_available:
+                return "trigram"
+            return "like_scan"
+        except Exception:
+            return "unknown"
+
+    async def _run_trigram_search(
+        self,
+        raw_query: str,
+        *,
+        table: str = "messages_fts_trigram",
+        order_by_sql: str,
+        include_inactive: bool,
+        source_filter: List[str] = None,
+        exclude_sources: List[str] = None,
+        role_filter: List[str] = None,
+        limit: int = 20,
+        offset: int = 0,
+    ) -> Optional[List[Dict[str, Any]]]:
+        """Search one of the two upstream substring-capable FTS indexes."""
+        if table not in {"messages_fts_trigram", "messages_fts_cjk"}:
+            raise ValueError(f"unsupported FTS table: {table}")
+        parts = [
+            token
+            if token.upper() in {"AND", "OR", "NOT"}
+            else '"' + token.replace('"', '""') + '"'
+            for token in raw_query.split()
+        ]
+        where = [f"{table} MATCH ?"]
+        params: list[Any] = [" ".join(parts)]
         if not include_inactive:
             where.append("(m.active = 1 OR m.compacted = 1)")
-        if source_filter:
-            where.append("s.source IN (" + ",".join("?" for _ in source_filter) + ")")
+        if source_filter is not None:
+            where.append(
+                "s.source IN (" + ",".join("?" for _ in source_filter) + ")"
+            )
             params.extend(source_filter)
-        if exclude_sources:
-            where.append("s.source NOT IN (" + ",".join("?" for _ in exclude_sources) + ")")
+        if exclude_sources is not None:
+            where.append(
+                "s.source NOT IN ("
+                + ",".join("?" for _ in exclude_sources)
+                + ")"
+            )
             params.extend(exclude_sources)
         if role_filter:
-            where.append("m.role IN (" + ",".join("?" for _ in role_filter) + ")")
-            params.extend(role_filter)
-        where_sql = " AND ".join(where)
-        order_sql = "ORDER BY rank"
-        if sort == "newest":
-            order_sql = "ORDER BY m.timestamp DESC, rank"
-        elif sort == "oldest":
-            order_sql = "ORDER BY m.timestamp ASC, rank"
-        try:
-            query_sql = f"""
-                SELECT m.id, m.session_id, m.role,
-                       snippet(messages_fts, -1, '>>>', '<<<', '...', 40) AS snippet,
-                       m.content, m.timestamp, m.tool_name,
-                       s.source, s.model, s.started_at AS session_started
-                FROM messages_fts
-                JOIN messages m ON m.id = messages_fts.rowid
-                JOIN sessions s ON s.id = m.session_id
-                WHERE messages_fts MATCH ?
-                {(' AND ' + where_sql) if where_sql else ''}
-                {order_sql} LIMIT ? OFFSET ?
-            """
-            cursor = await connection.execute(query_sql, [*params, limit, offset])
-            rows = await cursor.fetchall()
-        except sqlite3.OperationalError:
-            # Older or partially migrated databases may not have the FTS table.
-            # Keep recall useful with a parameterized text search; no sync
-            # fallback is involved.
-            like = f"%{str(query).strip()}%"
-            like_where = ["(m.content LIKE ? OR m.tool_name LIKE ? OR m.tool_calls LIKE ?)"]
-            like_params: list[Any] = [like, like, like]
-            if not include_inactive:
-                like_where.append("(m.active = 1 OR m.compacted = 1)")
-            if source_filter:
-                like_where.append("s.source IN (" + ",".join("?" for _ in source_filter) + ")")
-                like_params.extend(source_filter)
-            if exclude_sources:
-                like_where.append("s.source NOT IN (" + ",".join("?" for _ in exclude_sources) + ")")
-                like_params.extend(exclude_sources)
-            if role_filter:
-                like_where.append("m.role IN (" + ",".join("?" for _ in role_filter) + ")")
-                like_params.extend(role_filter)
-            fallback_sql = f"""
-                SELECT m.id, m.session_id, m.role, m.content, m.timestamp,
-                       m.tool_name, s.source, s.model,
-                       s.started_at AS session_started
-                FROM messages m JOIN sessions s ON s.id = m.session_id
-                WHERE {' AND '.join(like_where)}
-                ORDER BY m.timestamp {'' if sort == 'oldest' else 'DESC'}
-                LIMIT ? OFFSET ?
-            """
-            cursor = await connection.execute(
-                fallback_sql, [*like_params, limit, offset]
+            where.append(
+                "m.role IN (" + ",".join("?" for _ in role_filter) + ")"
             )
-            rows = await cursor.fetchall()
-        results: list[Dict[str, Any]] = []
-        for row in rows:
-            item = dict(row)
-            item["content"] = self._decode_message_row(row).get("content")
-            item.setdefault("snippet", item.get("content") or "")
-            item.pop("content", None)
-            results.append(item)
-        if result_fields is not None:
-            results = [
-                {field: item[field] for field in result_fields if field in item}
-                for item in results
+            params.extend(role_filter)
+        sql = f"""
+            SELECT m.id, m.session_id, m.role,
+                   snippet({table}, -1, '>>>', '<<<', '...', 40) AS snippet,
+                   m.content, m.timestamp, m.tool_name,
+                   s.source, s.model, s.started_at AS session_started
+            FROM {table}
+            JOIN messages m ON m.id = {table}.rowid
+            JOIN sessions s ON s.id = m.session_id
+            WHERE {' AND '.join(where)}
+            {order_by_sql}
+            LIMIT ? OFFSET ?
+        """
+        params.extend([limit, offset])
+        connection = await self._get_connection()
+        try:
+            cursor = await connection.execute(sql, params)
+            try:
+                return [dict(row) for row in await cursor.fetchall()]
+            finally:
+                await cursor.close()
+        except sqlite3.DatabaseError as exc:
+            if not await self._try_runtime_fts_rebuild(exc):
+                return None
+            try:
+                cursor = await connection.execute(sql, params)
+                try:
+                    return [dict(row) for row in await cursor.fetchall()]
+                finally:
+                    await cursor.close()
+            except sqlite3.DatabaseError:
+                logger.warning(
+                    "%s search still failing after in-place rebuild; "
+                    "falling back to LIKE",
+                    table,
+                )
+                return None
+
+    async def _search_messages_impl(
+        self,
+        query: str,
+        source_filter: List[str] = None,
+        exclude_sources: List[str] = None,
+        role_filter: List[str] = None,
+        limit: int = 20,
+        offset: int = 0,
+        sort: str = None,
+        include_inactive: bool = False,
+        fields: Optional[Collection[str]] = None,
+    ) -> List[Dict[str, Any]]:
+        """Full-text search with v2026.8.3 routing and result semantics."""
+        result_fields = self._search_message_fields(fields)
+        connection = await self._get_connection()
+        if not self._fts_enabled or not query or not query.strip():
+            return []
+        query = self._sanitize_fts5_query(query)
+        if not query:
+            return []
+
+        sort_norm = sort.strip().lower() if isinstance(sort, str) else None
+        if sort_norm not in {"newest", "oldest"}:
+            sort_norm = None
+        if sort_norm == "newest":
+            order_by_sql = "ORDER BY m.timestamp DESC, rank"
+        elif sort_norm == "oldest":
+            order_by_sql = "ORDER BY m.timestamp ASC, rank"
+        else:
+            order_by_sql = "ORDER BY rank"
+
+        where = ["messages_fts MATCH ?"]
+        params: list[Any] = [query]
+        if not include_inactive:
+            where.append("(m.active = 1 OR m.compacted = 1)")
+        if source_filter is not None:
+            where.append(
+                "s.source IN (" + ",".join("?" for _ in source_filter) + ")"
+            )
+            params.extend(source_filter)
+        if exclude_sources is not None:
+            where.append(
+                "s.source NOT IN ("
+                + ",".join("?" for _ in exclude_sources)
+                + ")"
+            )
+            params.extend(exclude_sources)
+        if role_filter:
+            where.append(
+                "m.role IN (" + ",".join("?" for _ in role_filter) + ")"
+            )
+            params.extend(role_filter)
+        sql = f"""
+            SELECT m.id, m.session_id, m.role,
+                   snippet(messages_fts, -1, '>>>', '<<<', '...', 40) AS snippet,
+                   m.content, m.timestamp, m.tool_name,
+                   s.source, s.model, s.started_at AS session_started
+            FROM messages_fts
+            JOIN messages m ON m.id = messages_fts.rowid
+            JOIN sessions s ON s.id = m.session_id
+            WHERE {' AND '.join(where)}
+            {order_by_sql}
+            LIMIT ? OFFSET ?
+        """
+        params.extend([limit, offset])
+
+        matches: List[Dict[str, Any]] = []
+        is_cjk = self._contains_cjk(query)
+        used_like = False
+        if is_cjk:
+            raw_query = query.strip('"').strip()
+            cjk_tokens = [
+                token
+                for token in raw_query.split()
+                if token.upper() not in {"AND", "OR", "NOT"}
+                and self._contains_cjk(token)
             ]
-        return results
+            any_short_cjk = any(
+                self._count_cjk(token) < 3 for token in cjk_tokens
+            )
+            wants_tool_rows = bool(role_filter) and "tool" in role_filter
+            substring_matches: Optional[List[Dict[str, Any]]] = None
+            if (
+                self._fts_cjk_available
+                and not wants_tool_rows
+                and not self._has_lone_cjk_run(raw_query)
+            ):
+                substring_matches = await self._run_trigram_search(
+                    raw_query,
+                    table="messages_fts_cjk",
+                    order_by_sql=order_by_sql,
+                    include_inactive=include_inactive,
+                    source_filter=source_filter,
+                    exclude_sources=exclude_sources,
+                    role_filter=role_filter,
+                    limit=limit,
+                    offset=offset,
+                )
+            if (
+                substring_matches is None
+                and self._count_cjk(raw_query) >= 3
+                and not any_short_cjk
+                and self._trigram_available
+                and not wants_tool_rows
+            ):
+                substring_matches = await self._run_trigram_search(
+                    raw_query,
+                    order_by_sql=order_by_sql,
+                    include_inactive=include_inactive,
+                    source_filter=source_filter,
+                    exclude_sources=exclude_sources,
+                    role_filter=role_filter,
+                    limit=limit,
+                    offset=offset,
+                )
+            if substring_matches is not None:
+                matches = substring_matches
+            else:
+                used_like = True
+                tokens = [
+                    token
+                    for token in raw_query.split()
+                    if token.upper() not in {"AND", "OR", "NOT"}
+                ] or [raw_query]
+                token_clauses = []
+                like_params: list[Any] = []
+                for token in tokens:
+                    escaped = (
+                        token.replace("\\", "\\\\")
+                        .replace("%", "\\%")
+                        .replace("_", "\\_")
+                    )
+                    token_clauses.append(
+                        "(m.content LIKE ? ESCAPE '\\' "
+                        "OR m.tool_name LIKE ? ESCAPE '\\' "
+                        "OR m.tool_calls LIKE ? ESCAPE '\\')"
+                    )
+                    like_params.extend([f"%{escaped}%"] * 3)
+                like_where = ["(" + " OR ".join(token_clauses) + ")"]
+                if not include_inactive:
+                    like_where.append("(m.active = 1 OR m.compacted = 1)")
+                if source_filter is not None:
+                    like_where.append(
+                        "s.source IN ("
+                        + ",".join("?" for _ in source_filter)
+                        + ")"
+                    )
+                    like_params.extend(source_filter)
+                if exclude_sources is not None:
+                    like_where.append(
+                        "s.source NOT IN ("
+                        + ",".join("?" for _ in exclude_sources)
+                        + ")"
+                    )
+                    like_params.extend(exclude_sources)
+                if role_filter:
+                    like_where.append(
+                        "m.role IN ("
+                        + ",".join("?" for _ in role_filter)
+                        + ")"
+                    )
+                    like_params.extend(role_filter)
+                like_sql = f"""
+                    SELECT m.id, m.session_id, m.role,
+                           substr(m.content,
+                                  max(1, instr(m.content, ?) - 40),
+                                  120) AS snippet,
+                           m.content, m.timestamp, m.tool_name,
+                           s.source, s.model,
+                           s.started_at AS session_started
+                    FROM messages m
+                    JOIN sessions s ON s.id = m.session_id
+                    WHERE {' AND '.join(like_where)}
+                    ORDER BY m.timestamp DESC
+                    LIMIT ? OFFSET ?
+                """
+                cursor = await connection.execute(
+                    like_sql,
+                    [tokens[0], *like_params, limit, offset],
+                )
+                try:
+                    matches = [dict(row) for row in await cursor.fetchall()]
+                finally:
+                    await cursor.close()
+        else:
+            try:
+                cursor = await connection.execute(sql, params)
+                try:
+                    matches = [dict(row) for row in await cursor.fetchall()]
+                finally:
+                    await cursor.close()
+            except sqlite3.DatabaseError as exc:
+                if (
+                    isinstance(exc, sqlite3.OperationalError)
+                    and not self._is_fts_write_corruption_error(exc)
+                ):
+                    return []
+                if not await self._try_runtime_fts_rebuild(exc):
+                    raise
+                cursor = await connection.execute(sql, params)
+                try:
+                    matches = [dict(row) for row in await cursor.fetchall()]
+                finally:
+                    await cursor.close()
+
+        rebuild_status = await self.fts_rebuild_status()
+        if not used_like and rebuild_status is not None and len(matches) < limit:
+            try:
+                gap_matches = await self._search_unindexed_gap(
+                    query,
+                    limit - len(matches),
+                    include_inactive=include_inactive,
+                    source_filter=source_filter,
+                    exclude_sources=exclude_sources,
+                    role_filter=role_filter,
+                )
+                seen_ids = {match["id"] for match in matches}
+                matches.extend(
+                    match for match in gap_matches if match["id"] not in seen_ids
+                )
+            except sqlite3.OperationalError as exc:
+                logger.debug("Unindexed-gap supplement skipped: %s", exc)
+
+        if (
+            not matches
+            and not is_cjk
+            and not (bool(role_filter) and "tool" in role_filter)
+        ):
+            fallback_query = query.strip('"').strip()
+            if self._fts_cjk_available:
+                cjk_matches = await self._run_trigram_search(
+                    fallback_query,
+                    table="messages_fts_cjk",
+                    order_by_sql=order_by_sql,
+                    include_inactive=include_inactive,
+                    source_filter=source_filter,
+                    exclude_sources=exclude_sources,
+                    role_filter=role_filter,
+                    limit=limit,
+                    offset=offset,
+                )
+                if cjk_matches:
+                    matches = cjk_matches
+            if (
+                not matches
+                and self._trigram_available
+                and self._trigram_eligible_tokens(query)
+            ):
+                trigram_matches = await self._run_trigram_search(
+                    fallback_query,
+                    order_by_sql=order_by_sql,
+                    include_inactive=include_inactive,
+                    source_filter=source_filter,
+                    exclude_sources=exclude_sources,
+                    role_filter=role_filter,
+                    limit=limit,
+                    offset=offset,
+                )
+                if trigram_matches:
+                    matches = trigram_matches
+
+        context_matches = (
+            matches if result_fields is None or "context" in result_fields else ()
+        )
+        for match in context_matches:
+            try:
+                cursor = await connection.execute(
+                    """WITH target AS (
+                           SELECT session_id, timestamp, id
+                           FROM messages WHERE id = ?
+                       )
+                       SELECT role, content FROM (
+                           SELECT m.id, m.timestamp, m.role, m.content
+                           FROM messages m JOIN target t
+                             ON t.session_id = m.session_id
+                           WHERE m.timestamp < t.timestamp
+                              OR (m.timestamp = t.timestamp AND m.id < t.id)
+                           ORDER BY m.timestamp DESC, m.id DESC LIMIT 1
+                       )
+                       UNION ALL
+                       SELECT role, content FROM messages WHERE id = ?
+                       UNION ALL
+                       SELECT role, content FROM (
+                           SELECT m.id, m.timestamp, m.role, m.content
+                           FROM messages m JOIN target t
+                             ON t.session_id = m.session_id
+                           WHERE m.timestamp > t.timestamp
+                              OR (m.timestamp = t.timestamp AND m.id > t.id)
+                           ORDER BY m.timestamp ASC, m.id ASC LIMIT 1
+                       )""",
+                    (match["id"], match["id"]),
+                )
+                try:
+                    context_rows = await cursor.fetchall()
+                finally:
+                    await cursor.close()
+                context = []
+                for row in context_rows:
+                    decoded = self._decode_content(row["content"])
+                    if isinstance(decoded, list):
+                        texts = [
+                            part.get("text", "")
+                            for part in decoded
+                            if isinstance(part, dict)
+                            and part.get("type") == "text"
+                        ]
+                        preview = " ".join(
+                            text for text in texts if text
+                        ).strip()
+                        preview = preview or "[multimodal content]"
+                    elif isinstance(decoded, str):
+                        preview = decoded
+                    else:
+                        preview = ""
+                    context.append(
+                        {"role": row["role"], "content": preview[:200]}
+                    )
+                match["context"] = context
+            except Exception:
+                match["context"] = []
+
+        for match in matches:
+            match.pop("content", None)
+        if result_fields is not None:
+            matches = [
+                {field: match[field] for field in result_fields if field in match}
+                for match in matches
+            ]
+        return matches
+
+    @staticmethod
+    def _is_fts_write_corruption_error(exc: sqlite3.DatabaseError) -> bool:
+        message = str(exc).lower()
+        return any(
+            marker in message for marker in _MALFORMED_SCHEMA_MARKERS
+        ) or ("fts5" in message and "corrupt" in message)
+
+    async def _try_runtime_fts_rebuild(
+        self, exc: sqlite3.DatabaseError
+    ) -> bool:
+        """Perform the upstream one-shot FTS repair without blocking SQLite."""
+        if (
+            self._fts_runtime_rebuild_attempted
+            or not self._fts_enabled
+            or not self._is_fts_write_corruption_error(exc)
+        ):
+            return False
+        self._fts_runtime_rebuild_attempted = True
+        logger.warning(
+            "state.db hit an FTS-corruption error (%s); attempting an "
+            "in-place FTS rebuild",
+            exc,
+        )
+        try:
+            rebuilt = await self.rebuild_fts()
+        except Exception as rebuild_exc:
+            logger.error("In-place FTS rebuild failed: %s", rebuild_exc)
+            return False
+        return rebuilt > 0
+
+    async def _search_unindexed_gap(
+        self,
+        fts_query: str,
+        limit: int,
+        *,
+        include_inactive: bool = False,
+        source_filter: Optional[List[str]] = None,
+        exclude_sources: Optional[List[str]] = None,
+        role_filter: Optional[List[str]] = None,
+    ) -> List[Dict[str, Any]]:
+        """LIKE-scan only the deferred FTS rebuild's unindexed id range."""
+        status = await self.fts_rebuild_status()
+        if status is None or limit <= 0:
+            return []
+        terms = []
+        for raw_token in re.findall(r'"[^"]+"|\S+', fts_query):
+            token = raw_token.strip('"').strip("*").strip()
+            if token and token.upper() not in {"AND", "OR", "NOT", "NEAR"}:
+                terms.append(token)
+        if not terms:
+            return []
+        where = ["m.id > ? AND m.id <= ?"]
+        params: list[Any] = [status["indexed"], status["total"]]
+        for term in terms:
+            escaped = (
+                term.replace("\\", "\\\\")
+                .replace("%", "\\%")
+                .replace("_", "\\_")
+            )
+            where.append(
+                "(m.content LIKE ? ESCAPE '\\' OR m.tool_name LIKE ? ESCAPE '\\' "
+                "OR m.tool_calls LIKE ? ESCAPE '\\')"
+            )
+            params.extend([f"%{escaped}%"] * 3)
+        if not include_inactive:
+            where.append("(m.active = 1 OR m.compacted = 1)")
+        if source_filter is not None:
+            where.append(
+                "s.source IN (" + ",".join("?" for _ in source_filter) + ")"
+            )
+            params.extend(source_filter)
+        if exclude_sources is not None:
+            where.append(
+                "s.source NOT IN ("
+                + ",".join("?" for _ in exclude_sources)
+                + ")"
+            )
+            params.extend(exclude_sources)
+        if role_filter:
+            where.append(
+                "m.role IN (" + ",".join("?" for _ in role_filter) + ")"
+            )
+            params.extend(role_filter)
+        sql = f"""
+            SELECT m.id, m.session_id, m.role,
+                   substr(m.content,
+                          max(1, instr(m.content, ?) - 40),
+                          120) AS snippet,
+                   m.content, m.timestamp, m.tool_name,
+                   s.source, s.model, s.started_at AS session_started
+            FROM messages m
+            JOIN sessions s ON s.id = m.session_id
+            WHERE {' AND '.join(where)}
+            ORDER BY m.timestamp DESC
+            LIMIT ?
+        """
+        connection = await self._get_connection()
+        cursor = await connection.execute(sql, [terms[0], *params, limit])
+        try:
+            return [dict(row) for row in await cursor.fetchall()]
+        finally:
+            await cursor.close()
 
     async def search_sessions(
         self,
