@@ -5,6 +5,9 @@ import inspect
 from types import SimpleNamespace
 
 import pytest
+from blockbuster import BlockBuster
+from pyleak import no_event_loop_blocking, no_task_leaks
+from pyleak.eventloop import LeakAction
 
 from tools import mcp_tool
 
@@ -31,21 +34,25 @@ class _Server:
         pass
 
 @pytest.mark.asyncio
-async def test_mcp_tool_uses_async_cross_loop_bridge(monkeypatch):
+async def test_mcp_tool_dispatch_does_not_block_or_leak(monkeypatch):
     server = _Server()
     monkeypatch.setitem(mcp_tool._servers, "srv", server)
     monkeypatch.setattr(mcp_tool, "_server_error_counts", {})
     monkeypatch.setattr(mcp_tool, "_server_breaker_opened_at", {})
 
-    async def run_inline(coro_or_factory, timeout=30):
-        result = coro_or_factory() if callable(coro_or_factory) else coro_or_factory
-        return await result
-
-    monkeypatch.setattr(mcp_tool, "_await_mcp_operation", run_inline)
     handler = mcp_tool._make_tool_handler("srv", "echo", 5)
 
     assert inspect.iscoroutinefunction(handler)
-    result = await handler({"value": "hello"})
+    async with (
+        no_event_loop_blocking(action=LeakAction.RAISE, threshold=0.1),
+        no_task_leaks(action=LeakAction.RAISE),
+    ):
+        blockbuster = BlockBuster()
+        blockbuster.activate()
+        try:
+            result = await handler({"value": "hello"})
+        finally:
+            blockbuster.deactivate()
 
     assert result == '{"result": "ok:hello"}'
 

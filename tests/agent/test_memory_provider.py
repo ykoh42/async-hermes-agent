@@ -281,6 +281,7 @@ class DeferredMemoryProvider(MemoryProvider):
 
     async def initialize(self, session_id, **kwargs):
         self.session_id = session_id
+        self.init_kwargs = kwargs
 
     def system_prompt_block(self):
         return "deferred memory guidance"
@@ -295,11 +296,11 @@ class DeferredMemoryProvider(MemoryProvider):
         _memory_manager=None,
         _memory_manager_started=False,
         skip_memory=False,
-        platform="api",
+        platform="feishu",
         session_id="session-2",
         _session_db=None,
-        _user_id=None,
-        _user_id_alt=None,
+        _user_id="open-id",
+        _user_id_alt="union-id",
         _user_name=None,
         _chat_id=None,
         _chat_name=None,
@@ -329,3 +330,8 @@ class DeferredMemoryProvider(MemoryProvider):
     assert agent._memory_manager_started is True
     assert agent._memory_manager.build_system_prompt() == "deferred memory guidance"
     assert agent.valid_tool_names == {"deferred_recall"}
+    provider = agent._memory_manager.providers[0]
+    assert provider.session_id == "session-2"
+    assert provider.init_kwargs["platform"] == "feishu"
+    assert provider.init_kwargs["user_id"] == "open-id"
+    assert provider.init_kwargs["user_id_alt"] == "union-id"
