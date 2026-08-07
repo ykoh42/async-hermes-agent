@@ -2709,3 +2709,77 @@ class TestContextLengthSetterCoherence:
         assert c.threshold_percent == 0.75
         # ...and budgets recompute from the same window+percent.
         assert c.threshold_tokens == 150_000
+
+
+class TestPreLlmFeasibilityCheck:
+    @staticmethod
+    def _messages(n_pairs=10, content="short reply"):
+        messages = [{"role": "system", "content": "system prompt"}]
+        for index in range(n_pairs):
+            messages.append({"role": "user", "content": f"question {index}"})
+            messages.append({"role": "assistant", "content": content})
+        return messages
+
+    @pytest.mark.asyncio
+    async def test_skip_avoids_llm_without_incrementing_real_strikes(
+        self, compressor
+    ):
+        compressor._ineffective_compression_count = 1
+        generate = AsyncMock()
+
+        with patch.object(compressor, "_generate_summary", generate):
+            result = await compressor.compress(self._messages(), force=False)
+
+        generate.assert_not_awaited()
+        assert compressor._ineffective_compression_count == 1
+        assert compressor._prellm_skip_count == 1
+        assert compressor._last_feasibility_skip is True
+        assert len(result) < len(self._messages())
+
+    @pytest.mark.asyncio
+    async def test_force_and_first_attempt_still_use_summary_model(self, compressor):
+        generate = AsyncMock(return_value="summary")
+        with patch.object(compressor, "_generate_summary", generate):
+            await compressor.compress(self._messages(), force=False)
+        generate.assert_awaited_once()
+
+        compressor._ineffective_compression_count = 1
+        generate.reset_mock()
+        with patch.object(compressor, "_generate_summary", generate):
+            await compressor.compress(self._messages(), force=True)
+        generate.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_skip_ignores_stale_terminal_failure_flags(self, compressor):
+        compressor._ineffective_compression_count = 1
+        compressor._last_summary_auth_failure = True
+        compressor._last_summary_network_failure = True
+        generate = AsyncMock()
+
+        with patch.object(compressor, "_generate_summary", generate):
+            result = await compressor.compress(self._messages(), force=False)
+
+        generate.assert_not_awaited()
+        assert compressor._last_compress_aborted is False
+        assert len(result) < len(self._messages())
+
+    @pytest.mark.asyncio
+    async def test_skip_count_resets_with_session_state(self, compressor):
+        compressor._prellm_skip_count = 5
+        await compressor.on_session_reset()
+        assert compressor._prellm_skip_count == 0
+
+        compressor._prellm_skip_count = 5
+        compressor.bind_session_state(None, "new-session")
+        assert compressor._prellm_skip_count == 0
+
+    def test_skip_boundary_is_neutral_to_fallback_streak(self, compressor):
+        compressor.record_completed_compaction(used_fallback=True)
+        assert compressor._fallback_compression_streak == 1
+
+        compressor.record_completed_compaction(
+            used_fallback=True,
+            feasibility_skip=True,
+        )
+
+        assert compressor._fallback_compression_streak == 1
