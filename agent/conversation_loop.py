@@ -21,14 +21,12 @@ import asyncio
 import inspect
 import logging
 import os
-import random
 import re
 import ssl
 import time
 from typing import Any, Dict, List, Optional
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
-from agent.agent_runtime_helpers import UnsupportedCapabilityError
 from agent.conversation_compression import (
     COMPRESSION_RETRY_CONTEXT_REDUCED_STATUS_TEMPLATE,
     COMPRESSION_RETRY_MESSAGES_STATUS_TEMPLATE,

@@ -46,7 +46,7 @@ from datetime import datetime
 from utils import base_url_host_matches, base_url_hostname
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn, TimeElapsedColumn, TimeRemainingColumn
 from rich.console import Console
-from hermes_constants import OPENROUTER_BASE_URL, get_hermes_home
+from hermes_constants import OPENROUTER_BASE_URL
 from agent.retry_utils import jittered_backoff
 
 

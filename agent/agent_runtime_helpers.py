@@ -36,7 +36,6 @@ from typing import Any, Dict, List, Optional, Tuple
 import aiofiles
 import aiofiles.os
 
-from hermes_cli.timeouts import get_provider_request_timeout
 from agent.prompt_builder import format_steer_marker
 from agent.tool_dispatch_helpers import _trajectory_normalize_msg, make_tool_result_message
 from agent.trajectory import convert_scratchpad_to_think
@@ -2464,21 +2463,11 @@ async def invoke_tool(
     tool_request_middleware_trace: Optional[List[Dict[str, Any]]] = None,
     skip_tool_execution_middleware: bool = False,
 ) -> str:
-    """Invoke an async registry tool without entering the sync bridge.
-
-    The active registry exposes only native coroutine handlers. Unsupported
-    synchronous tools are absent from the model-visible tool snapshot rather
-    than being hidden behind a worker-thread bridge.
-    """
+    """Invoke one registry tool through the native async dispatch path."""
     from model_tools import handle_function_call
     from tools.registry import registry
 
     entry = registry.get_entry(function_name)
-    if entry is None:
-        raise UnsupportedCapabilityError(
-            f"Tool '{function_name}' has no native async handler. "
-            "The async agent does not execute sync tools on a worker thread."
-        )
     handler_context = {}
     if str(getattr(entry, "toolset", "")).startswith("mcp-"):
         handler_context["elicitation_callback"] = getattr(

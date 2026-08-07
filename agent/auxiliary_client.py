@@ -45,7 +45,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import contextvars
-import functools
 import hashlib
 import inspect
 import json
@@ -53,7 +52,6 @@ import logging
 import os
 import re
 import time
-import uuid
 from pathlib import Path  # noqa: F401 — used by test mocks
 from types import SimpleNamespace
 from typing import Any, Callable, Dict, List, Optional, Tuple, TYPE_CHECKING

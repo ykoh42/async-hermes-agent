@@ -12,16 +12,12 @@ from typing import Any, Optional
 
 from agent.display import (
     build_tool_preview as _build_tool_preview,
-    build_tool_label as _build_tool_label,
-    get_cute_tool_message as _get_cute_tool_message_impl,
-    get_tool_emoji as _get_tool_emoji,
     redact_tool_args_for_display as _redact_tool_args_for_display,
     _detect_tool_failure,
 )
 from agent.tool_dispatch_helpers import (
     _is_destructive_command,
     _is_multimodal_tool_result,
-    _multimodal_text_summary,
     _append_subdir_hint_to_multimodal,
     _plan_tool_batch_segments,
     make_tool_result_message,
@@ -549,26 +545,6 @@ async def _execute_tool_calls_native(
         return
     tool_budget = _budget_for_agent(agent)
     active_env = get_active_env(effective_task_id)
-    memory_manager = getattr(agent, "_memory_manager", None)
-    unsupported = [
-        getattr(tc.function, "name", "")
-        for tc in tool_calls
-        if registry.get_entry(getattr(tc.function, "name", "")) is None
-        and getattr(tc.function, "name", "")
-        not in (getattr(agent, "_context_engine_tool_names", None) or set())
-        and not (
-            memory_manager
-            and memory_manager.has_tool(getattr(tc.function, "name", ""))
-        )
-    ]
-    if unsupported:
-        from agent.agent_runtime_helpers import UnsupportedCapabilityError
-
-        names = ", ".join(sorted(set(unsupported)))
-        raise UnsupportedCapabilityError(
-            f"Native async handlers are required for: {names}. "
-            "Sync tool execution is not available in async-hermes-agent."
-        )
 
     tool_call_indexes = {id(tool_call): index for index, tool_call in enumerate(tool_calls)}
 

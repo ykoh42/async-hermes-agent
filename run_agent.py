@@ -103,14 +103,14 @@ def _session_source_for_agent(platform: Optional[str]) -> str:
 from agent.process_bootstrap import (
     OpenAI,  # noqa: F401  # re-exported for tests that mock.patch("run_agent.OpenAI")
     _SafeWriter,  # noqa: F401  # re-exported for tests that `from run_agent import _SafeWriter`
-    _get_proxy_for_base_url,
+    _get_proxy_for_base_url,  # noqa: F401  # preserve the upstream module surface
 )
 from agent.iteration_budget import IterationBudget
 
 
 from hermes_cli.timeouts import (
-    get_provider_request_timeout,
-    get_provider_stale_timeout,
+    get_provider_request_timeout,  # noqa: F401  # upstream test patch point
+    get_provider_stale_timeout,  # noqa: F401  # preserve the upstream module surface
 )
 
 _hermes_home = get_hermes_home()

@@ -12,27 +12,18 @@ sites remain unchanged.
 
 from __future__ import annotations
 
-import json
 import logging
 import math
 import os
 import re
 import time
 import uuid
-from types import SimpleNamespace
 from typing import Any, Dict, Optional
 
-from hermes_constants import PARTIAL_STREAM_STUB_ID, FINISH_REASON_LENGTH
 from agent.error_classifier import FailoverReason
-from agent.errors import EmptyStreamError
 from agent.turn_context import substitute_api_content
-from agent.gemini_native_adapter import is_native_gemini_base_url
-from agent.model_metadata import is_local_endpoint
 from agent.message_content import flatten_message_text
-from agent.message_sanitization import (
-    _sanitize_surrogates,
-    _repair_tool_call_arguments,
-)
+from agent.message_sanitization import _sanitize_surrogates
 from tools.terminal_tool import cleanup_vm, is_persistent_env
 from utils import base_url_host_matches, base_url_hostname, env_float, env_int
 

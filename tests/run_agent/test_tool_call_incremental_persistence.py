@@ -13,6 +13,7 @@ from agent.tool_executor import (
     execute_tool_calls_sequential,
     execute_tool_calls_segmented,
 )
+from agent.agent_runtime_helpers import invoke_tool
 
 
 def _tool_call(name: str, call_id: str) -> SimpleNamespace:
@@ -112,6 +113,53 @@ async def test_public_executor_preserves_finalize_false_contract(executor):
     assert [message["tool_call_id"] for message in messages] == ["read-1"]
     enforce_budget.assert_not_awaited()
     assert steer_calls == []
+
+
+@pytest.mark.asyncio
+async def test_unknown_tool_is_returned_as_observation_instead_of_fail_fast():
+    async def flush(_messages):
+        return True
+
+    agent = _agent(flush)
+    call = _tool_call("unknown_tool", "unknown-1")
+    messages = []
+
+    with (
+        patch(
+            "model_tools.handle_function_call",
+            new_callable=AsyncMock,
+            return_value=json.dumps({"error": "Unknown tool: unknown_tool"}),
+        ) as dispatch,
+        _native_policy_path(),
+    ):
+        await execute_tool_calls_sequential(
+            agent,
+            SimpleNamespace(tool_calls=[call]),
+            messages,
+            "task-1",
+            finalize=False,
+        )
+
+    dispatch.assert_awaited_once()
+    assert json.loads(messages[0]["content"])["error"] == (
+        "Unknown tool: unknown_tool"
+    )
+
+
+@pytest.mark.asyncio
+async def test_invoke_tool_preserves_unknown_tool_error_contract():
+    agent = _agent(AsyncMock(return_value=True))
+
+    result = await invoke_tool(
+        agent,
+        "unknown_tool",
+        {},
+        "task-1",
+        skip_tool_request_middleware=True,
+        skip_tool_execution_middleware=True,
+    )
+
+    assert json.loads(result)["error"] == "Unknown tool: unknown_tool"
 
 
 @pytest.mark.asyncio
