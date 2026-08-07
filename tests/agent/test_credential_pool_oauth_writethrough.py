@@ -65,8 +65,14 @@ def profile_and_root(tmp_path, monkeypatch):
     profile_path = tmp_path / "profiles" / "work" / "auth.json"
     root_path = tmp_path / "root" / "auth.json"
 
-    monkeypatch.setattr(A, "_auth_file_path", lambda: profile_path)
-    monkeypatch.setattr(A, "_global_auth_file_path", lambda: root_path)
+    async def auth_file_path():
+        return profile_path
+
+    async def global_auth_file_path():
+        return root_path
+
+    monkeypatch.setattr(A, "_auth_file_path", auth_file_path)
+    monkeypatch.setattr(A, "_global_auth_file_path", global_auth_file_path)
     monkeypatch.setenv("HOME", str(tmp_path / "not-the-root"))
     return profile_path, root_path
 

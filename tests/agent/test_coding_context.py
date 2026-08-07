@@ -45,6 +45,10 @@ def _git_init(path):
 class TestIsCodingContext:
 
     async def test_auto_detection_does_not_block_event_loop(self, tmp_path):
+        # Warm the executor before BlockBuster instruments threading internals;
+        # otherwise its own stack inspection can turn first-worker startup into
+        # a false pyleak event on slow CI hosts.
+        await cc._home()
         async with (
             no_event_loop_blocking(action=LeakAction.RAISE, threshold=0.1),
             no_task_leaks(action=LeakAction.RAISE),

@@ -211,7 +211,10 @@ async def agent_browser_runnable(path: str | None) -> bool:
         return False
     if " " in path and path.split()[0].endswith("npx"):
         return True
-    if not os.path.exists(path) or not os.access(path, os.X_OK):
+    if not await aiofiles.os.path.exists(path):
+        return False
+    access = aiofiles.os.wrap(os.access)
+    if not await access(path, os.X_OK):
         return False
 
     process: asyncio.subprocess.Process | None = None
@@ -298,7 +301,7 @@ def display_hermes_home() -> str:
         return str(home)
 
 
-def secure_parent_dir(path: Path) -> None:
+async def secure_parent_dir(path: Path) -> None:
     """Chmod ``0o700`` on the parent directory of *path*, but only if safe.
 
     Refuses to chmod ``/`` or any top-level directory (resolved parent with
@@ -308,12 +311,14 @@ def secure_parent_dir(path: Path) -> None:
 
     See https://github.com/NousResearch/hermes-agent/issues/25821.
     """
-    parent = path.parent.resolve()
+    realpath = aiofiles.os.wrap(os.path.realpath)
+    parent = Path(await realpath(path.parent))
     # Refuse root and its direct children (/usr, /home, /var, /tmp, …).
     if parent == Path("/") or len(parent.parts) < 3:
         return
     try:
-        os.chmod(parent, 0o700)
+        chmod = aiofiles.os.wrap(os.chmod)
+        await chmod(parent, 0o700)
     except OSError:
         pass
 

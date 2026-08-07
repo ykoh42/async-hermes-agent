@@ -47,16 +47,18 @@ jobs:
       - name: Audit the native async runtime
         shell: bash
         run: |
-          rg --files -0 agent tools plugins hermes_cli gateway providers -g '*.py' | \
-          xargs -0 uv run ruff check --select F821 \
-            run_agent.py model_tools.py batch_runner.py \
-            hermes_state.py trajectory_compressor.py
-          rg --files -0 agent tools plugins hermes_cli gateway providers -g '*.py' | \
-          xargs -0 uv run flake8-async --asyncio \
+          {
+            printf '%s\0' run_agent.py model_tools.py batch_runner.py \
+              hermes_state.py trajectory_compressor.py hermes_constants.py
+            rg --files -0 agent tools plugins hermes_cli gateway providers -g '*.py'
+          } | xargs -0 -n 50 uv run ruff check --select F821
+          {
+            printf '%s\0' run_agent.py model_tools.py batch_runner.py \
+              hermes_state.py trajectory_compressor.py hermes_constants.py
+            rg --files -0 agent tools plugins hermes_cli gateway providers -g '*.py'
+          } | xargs -0 -n 50 uv run flake8-async --asyncio \
             --enable=ASYNC200,ASYNC210,ASYNC211,ASYNC212,ASYNC220,ASYNC221,ASYNC222,ASYNC230,ASYNC231,ASYNC232,ASYNC240,ASYNC250,ASYNC251,ASYNC300 \
-            --async200-blocking-calls='shutil.which->aiofiles.os.wrap(shutil.which)' \
-            run_agent.py model_tools.py batch_runner.py \
-            hermes_state.py trajectory_compressor.py
+            --async200-blocking-calls='shutil.which->aiofiles.os.wrap(shutil.which)'
 
       - name: Test
         run: uv run pytest -q -W error::pytest.PytestUnhandledThreadExceptionWarning

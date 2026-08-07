@@ -539,7 +539,7 @@ async def _write_through_provider_state_to_global_root(
     the non-pool xAI refresh path) for the credential-pool refresh path.
     """
     try:
-        global_path = auth_mod._global_auth_file_path()
+        global_path = await auth_mod._global_auth_file_path()
     except Exception:
         return
     if global_path is None:
@@ -1261,11 +1261,12 @@ class CredentialPool:
                 self._replace_entry(entry, updated)
                 try:
                     realpath = aiofiles.os.wrap(os.path.realpath)
+                    local_auth_path = await auth_mod._auth_file_path()
                     is_local_state = await realpath(state_path) == await realpath(
-                        auth_mod._auth_file_path()
+                        local_auth_path
                     )
                 except Exception:
-                    is_local_state = state_path == auth_mod._auth_file_path()
+                    is_local_state = state_path == await auth_mod._auth_file_path()
                 if is_local_state:
                     await self._persist()
                 return updated
@@ -1338,7 +1339,7 @@ class CredentialPool:
                     self.provider,
                 )
                 if not local_owns_entry and local_state is None:
-                    global_path = auth_mod._global_auth_file_path()
+                    global_path = await auth_mod._global_auth_file_path()
                     if global_path is not None:
                         global_store = await auth_mod._load_global_auth_store()
                         global_pool = global_store.get("credential_pool")

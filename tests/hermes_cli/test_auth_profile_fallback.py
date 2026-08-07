@@ -17,6 +17,9 @@ from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
+from blockbuster import BlockBuster
+from pyleak import no_event_loop_blocking, no_task_leaks
+from pyleak.eventloop import LeakAction
 
 pytestmark = pytest.mark.asyncio
 
@@ -83,6 +86,30 @@ async def test_missing_global_auth_file_is_safe(profile_env):
 
     assert (await read_credential_pool("openrouter"))[0]["id"] == "prof-1"
     assert await read_credential_pool("anthropic") == []
+
+
+async def test_auth_transaction_does_not_block_or_leak(profile_env):
+    """Exercise the real path, lock, and atomic auth-store I/O boundaries."""
+    from hermes_cli import auth
+
+    # Keep BlockBuster's instrumentation overhead out of lazy executor startup.
+    await auth._auth_file_path()
+    async with (
+        no_event_loop_blocking(action=LeakAction.RAISE, threshold=0.1),
+        no_task_leaks(action=LeakAction.RAISE),
+    ):
+        blockbuster = BlockBuster()
+        blockbuster.activate()
+        try:
+            async with auth._auth_store_transaction():
+                store = await auth._load_auth_store()
+                store["providers"] = {"openrouter": {"api_key": "test-key"}}
+                await auth._save_auth_store(store)
+        finally:
+            blockbuster.deactivate()
+
+    stored = json.loads((profile_env["profile"] / "auth.json").read_text())
+    assert stored["providers"]["openrouter"]["api_key"] == "test-key"
 
 
 async def test_malformed_global_auth_file_does_not_break_profile_read(profile_env):

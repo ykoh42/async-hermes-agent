@@ -282,10 +282,11 @@ class TestReasoningOverridesDefaultConfig:
         assert result2 == {"enabled": True, "effort": "low"}
 
 
+@pytest.mark.asyncio
 class TestSecureParentDir:
     """Tests for secure_parent_dir() — prevents chmod on / or top-level dirs."""
 
-    def test_safe_path_calls_chmod(self, tmp_path, monkeypatch):
+    async def test_safe_path_calls_chmod(self, tmp_path, monkeypatch):
         """Normal nested path (depth >= 3) should call os.chmod."""
         safe_dir = tmp_path / "home" / "user" / ".hermes"
         safe_dir.mkdir(parents=True)
@@ -295,23 +296,23 @@ class TestSecureParentDir:
         called_with = []
         monkeypatch.setattr(os, "chmod", lambda p, m: called_with.append((str(p), m)))
 
-        secure_parent_dir(target)
+        await secure_parent_dir(target)
         assert len(called_with) == 1
         assert called_with[0] == (str(safe_dir), 0o700)
 
-    def test_root_dir_skipped(self, monkeypatch):
+    async def test_root_dir_skipped(self, monkeypatch):
         """Parent resolving to / must NOT be chmod'd."""
         called_with = []
         monkeypatch.setattr(os, "chmod", lambda p, m: called_with.append((str(p), m)))
 
         # Path("/foo").parent == Path("/")
-        secure_parent_dir(Path("/foo"))
+        await secure_parent_dir(Path("/foo"))
         assert called_with == []
 
 
 
 
-    def test_symlink_resolved(self, tmp_path, monkeypatch):
+    async def test_symlink_resolved(self, tmp_path, monkeypatch):
         """Symlinks should be resolved before checking depth."""
         real_dir = tmp_path / "a" / "b"
         real_dir.mkdir(parents=True)
@@ -328,7 +329,7 @@ class TestSecureParentDir:
 
         # Even though /tmp/link has only 3 parts, the resolved path has 4
         # The resolved parent (real_dir) has depth 4, so it should be chmod'd
-        secure_parent_dir(link_target)
+        await secure_parent_dir(link_target)
         assert len(called_with) == 1
         assert called_with[0] == (str(real_dir), 0o700)
 

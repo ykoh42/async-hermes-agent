@@ -31,7 +31,6 @@ import sys
 import base64
 import hashlib
 import subprocess
-import threading
 import time
 import uuid
 import webbrowser
@@ -45,6 +44,7 @@ from urllib.parse import parse_qs, urlencode, urlparse
 
 import httpx
 import aiofiles
+import aiofiles.os
 
 from hermes_cli.config import (
     get_hermes_home,
@@ -971,7 +971,7 @@ def _oauth_trace(event: str, *, sequence_id: Optional[str] = None, **fields: Any
 # Auth Store — persistence layer for ~/.hermes/auth.json
 # =============================================================================
 
-def _auth_file_path() -> Path:
+async def _auth_file_path() -> Path:
     path = get_hermes_home() / "auth.json"
     # Seat belt: if pytest is running and HERMES_HOME resolves to the real
     # user's auth store, refuse rather than silently corrupt it. This catches
@@ -979,9 +979,12 @@ def _auth_file_path() -> Path:
     # hermetic conftest, or sandbox escapes via threads/subprocesses. In
     # production (no PYTEST_CURRENT_TEST) this is a single dict lookup.
     if os.environ.get("PYTEST_CURRENT_TEST"):
-        real_home_auth = (Path.home() / ".hermes" / "auth.json").resolve(strict=False)
+        realpath = aiofiles.os.wrap(os.path.realpath)
+        real_home_auth = Path(
+            await realpath(Path.home() / ".hermes" / "auth.json")
+        )
         try:
-            resolved = path.resolve(strict=False)
+            resolved = Path(await realpath(path))
         except Exception:
             resolved = path
         if resolved == real_home_auth:
@@ -993,7 +996,7 @@ def _auth_file_path() -> Path:
     return path
 
 
-def _global_auth_file_path() -> Optional[Path]:
+async def _global_auth_file_path() -> Optional[Path]:
     """Return the global-root auth.json when the process is in profile mode.
 
     Returns ``None`` when the profile and global root resolve to the same
@@ -1010,7 +1013,8 @@ def _global_auth_file_path() -> Optional[Path]:
         return None
     profile_home = get_hermes_home()
     try:
-        if profile_home.resolve(strict=False) == global_root.resolve(strict=False):
+        realpath = aiofiles.os.wrap(os.path.realpath)
+        if await realpath(profile_home) == await realpath(global_root):
             return None
     except Exception:
         if profile_home == global_root:
@@ -1027,33 +1031,28 @@ def _global_auth_file_path() -> Optional[Path]:
 
 
 
-_auth_target_lock_holders: Dict[str, threading.local] = {}
-_auth_target_lock_holders_guard = threading.Lock()
 _auth_store_locks: Dict[Tuple[int, str], asyncio.Lock] = {}
-_auth_store_locks_guard = threading.Lock()
 
 
 
 
 
 
-def _auth_store_lock_for(target_path: Path) -> asyncio.Lock:
+async def _auth_store_lock_for(target_path: Path) -> asyncio.Lock:
     """Return this event loop's lock for one auth-store path.
 
-    The synchronous CLI still owns ``_auth_store_lock``.  The async agent must
-    not acquire that blocking lock from its turn loop, so its native path uses
-    a task lock plus a non-blocking ``flock`` transaction below.  Locks are
-    keyed by event loop as well as path: test suites and embedding hosts often
-    create more than one loop in a process.
+    The native path uses a task lock plus the non-blocking ``flock``
+    transaction below. Locks are keyed by event loop as well as path because
+    test suites and embedding hosts often create more than one loop in a
+    process.
     """
     loop = asyncio.get_running_loop()
     try:
-        path_key = str(target_path.resolve(strict=False))
+        path_key = await aiofiles.os.wrap(os.path.realpath)(target_path)
     except Exception:
         path_key = str(target_path)
     key = (id(loop), path_key)
-    with _auth_store_locks_guard:
-        return _auth_store_locks.setdefault(key, asyncio.Lock())
+    return _auth_store_locks.setdefault(key, asyncio.Lock())
 
 
 @asynccontextmanager
@@ -1070,8 +1069,8 @@ async def _auth_store_transaction(
     process-local asyncio lock still serializes all async-hermes writers there
     and the atomic replace below prevents torn JSON files.
     """
-    auth_path = target_path or _auth_file_path()
-    task_lock = _auth_store_lock_for(auth_path)
+    auth_path = target_path or await _auth_file_path()
+    task_lock = await _auth_store_lock_for(auth_path)
     async with task_lock:
         lock_path = auth_path.with_suffix(".lock")
         await aiofiles.os.makedirs(lock_path.parent, exist_ok=True)
@@ -1187,7 +1186,7 @@ async def is_runtime_provider_routable(provider_id: str) -> bool:
 
 async def _load_auth_store(auth_file: Optional[Path] = None) -> Dict[str, Any]:
     """Load the auth store without masking transient filesystem failures."""
-    auth_file = auth_file or _auth_file_path()
+    auth_file = auth_file or await _auth_file_path()
     if not await aiofiles.os.path.exists(auth_file):
         return {"version": AUTH_STORE_VERSION, "providers": {}}
     try:
@@ -1258,7 +1257,7 @@ async def _load_auth_store(auth_file: Optional[Path] = None) -> Dict[str, Any]:
 
 async def _load_global_auth_store() -> Dict[str, Any]:
     """Read the profile fallback store without blocking an async turn."""
-    global_path = _global_auth_file_path()
+    global_path = await _global_auth_file_path()
     if global_path is None or not await aiofiles.os.path.exists(global_path):
         return {}
     if os.environ.get("PYTEST_CURRENT_TEST"):
@@ -1386,15 +1385,10 @@ def _merge_disk_cooldown_state(
 async def _save_auth_store(
     auth_store: Dict[str, Any], target_path: Optional[Path] = None,
 ) -> Path:
-    """Atomically persist ``auth.json`` through ``aiofiles``.
-
-    The temporary file is created with owner-only permissions before any
-    credential bytes are written.  ``os.replace`` is intentionally the final
-    tiny synchronous syscall: it is atomic and cannot wait on filesystem I/O.
-    """
-    auth_file = target_path or _auth_file_path()
+    """Atomically persist ``auth.json`` through awaitable file operations."""
+    auth_file = target_path or await _auth_file_path()
     await aiofiles.os.makedirs(auth_file.parent, exist_ok=True)
-    secure_parent_dir(auth_file)
+    await secure_parent_dir(auth_file)
     auth_store["version"] = AUTH_STORE_VERSION
     auth_store["updated_at"] = datetime.now(timezone.utc).isoformat()
     payload = json.dumps(auth_store, indent=2) + "\n"
@@ -2091,7 +2085,7 @@ async def _read_qwen_cli_tokens() -> Dict[str, Any]:
 async def _save_qwen_cli_tokens(tokens: Dict[str, Any]) -> Path:
     auth_path = _qwen_cli_auth_path()
     await aiofiles.os.makedirs(auth_path.parent, exist_ok=True)
-    secure_parent_dir(auth_path)
+    await secure_parent_dir(auth_path)
     tmp_path = auth_path.with_name(
         f"{auth_path.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}"
     )
@@ -2523,12 +2517,6 @@ _CONSOLE_BROWSER_NAMES: FrozenSet[str] = frozenset(
 
 
 
-# Throttle for the live Codex quota probe below.  The probe runs on the hot
-# credential-selection path while the pool is exhausted, so without a floor a
-# busy gateway would hammer the usage endpoint on every model/auxiliary call.
-CODEX_QUOTA_PROBE_MIN_INTERVAL_SECONDS = 300  # 5 minutes
-_codex_quota_probe_cache: Dict[str, Tuple[float, Optional[bool]]] = {}
-_codex_quota_probe_lock = threading.Lock()
 
 
 
@@ -2810,16 +2798,19 @@ def _nous_shared_auth_dir() -> Path:
     return get_default_hermes_root() / "shared"
 
 
-def _nous_shared_store_path() -> Path:
+async def _nous_shared_store_path() -> Path:
     path = _nous_shared_auth_dir() / NOUS_SHARED_STORE_FILENAME
     if os.environ.get("PYTEST_CURRENT_TEST"):
         from hermes_constants import get_default_hermes_root
 
-        real_store = (
-            get_default_hermes_root() / "shared" / NOUS_SHARED_STORE_FILENAME
-        ).resolve(strict=False)
+        realpath = aiofiles.os.wrap(os.path.realpath)
+        real_store = Path(
+            await realpath(
+                get_default_hermes_root() / "shared" / NOUS_SHARED_STORE_FILENAME
+            )
+        )
         try:
-            resolved = path.resolve(strict=False)
+            resolved = Path(await realpath(path))
         except Exception:
             resolved = path
         if resolved == real_store:
@@ -2832,7 +2823,7 @@ def _nous_shared_store_path() -> Path:
 
 async def _read_shared_nous_state() -> Optional[Dict[str, Any]]:
     try:
-        path = _nous_shared_store_path()
+        path = await _nous_shared_store_path()
     except RuntimeError:
         return None
     if not await aiofiles.os.path.isfile(path):
@@ -2856,7 +2847,7 @@ async def _read_shared_nous_state() -> Optional[Dict[str, Any]]:
 
 async def _save_shared_nous_state(state: Dict[str, Any]) -> None:
     """Write shared state while the caller holds its transaction lock."""
-    path = _nous_shared_store_path()
+    path = await _nous_shared_store_path()
     refresh_token = state.get("refresh_token")
     access_token = state.get("access_token")
     if not (isinstance(refresh_token, str) and refresh_token.strip()):
@@ -2877,7 +2868,7 @@ async def _save_shared_nous_state(state: Dict[str, Any]) -> None:
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
     await aiofiles.os.makedirs(path.parent, exist_ok=True)
-    secure_parent_dir(path)
+    await secure_parent_dir(path)
     tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}")
 
     def secure_opener(file: str, flags: int) -> int:
@@ -2908,7 +2899,7 @@ async def _save_shared_nous_state(state: Dict[str, Any]) -> None:
 async def _write_shared_nous_state(state: Dict[str, Any]) -> None:
     """Best-effort cross-profile mirror of the Nous OAuth token chain."""
     try:
-        path = _nous_shared_store_path()
+        path = await _nous_shared_store_path()
         async with _auth_store_transaction(path):
             await _save_shared_nous_state(state)
     except Exception as exc:
@@ -2947,7 +2938,7 @@ async def _merge_shared_nous_oauth_state(state: Dict[str, Any]) -> bool:
 
 async def _clear_shared_nous_state(reason: str) -> None:
     try:
-        path = _nous_shared_store_path()
+        path = await _nous_shared_store_path()
         async with _auth_store_transaction(path):
             try:
                 await aiofiles.os.remove(path)
@@ -3282,11 +3273,11 @@ async def resolve_nous_runtime_credentials(
     force_refresh: bool = False,
 ) -> Dict[str, Any]:
     """Resolve and persist a usable Nous inference JWT with native async I/O."""
-    local_path = _auth_file_path()
+    local_path = await _auth_file_path()
     local_store = await _load_auth_store(local_path)
     target_path: Optional[Path] = local_path
     if _load_provider_state(local_store, "nous") is None:
-        global_path = _global_auth_file_path()
+        global_path = await _global_auth_file_path()
         global_store = await _load_global_auth_store()
         if global_path is not None and _load_provider_state(global_store, "nous"):
             target_path = global_path
@@ -3353,7 +3344,7 @@ async def resolve_nous_runtime_credentials(
             )
 
         try:
-            shared_path: Optional[Path] = _nous_shared_store_path()
+            shared_path: Optional[Path] = await _nous_shared_store_path()
         except RuntimeError:
             shared_path = None
 
