@@ -108,6 +108,7 @@ import aiofiles
 import aiofiles.os
 
 from tools.registry import tool_error
+from tools.interrupt import is_interrupted
 
 logger = logging.getLogger(__name__)
 _which = aiofiles.os.wrap(shutil.which)
@@ -4241,8 +4242,6 @@ def _filter_mcp_children(pids: set) -> set:
 
 async def _await_mcp_operation(coro_or_factory, timeout: float = 30):
     """Await MCP work on the agent's current event loop."""
-    from tools.interrupt import is_interrupted
-
     if is_interrupted():
         raise InterruptedError("User sent a new message")
 
