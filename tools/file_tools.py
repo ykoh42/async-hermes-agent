@@ -787,7 +787,7 @@ READ_FILE_SCHEMA = {
         "properties": {
             "path": {"type": "string", "description": "Path to the file to read (absolute, relative, or ~/path)"},
             "offset": {"type": "integer", "description": "Line number to start reading from (1-indexed, default: 1)", "default": 1, "minimum": 1},
-            "limit": {"type": "integer", "description": "Maximum number of lines to read (default: 500, max: 2000)", "default": 500, "maximum": 2000}
+            "limit": {"type": "integer", "description": "Maximum number of lines to read (default: 2000, max: 2000). Reads are additionally capped at a ~100K-character budget with a next_offset continuation.", "default": 2000, "maximum": 2000}
         },
         "required": ["path"]
     }
@@ -1776,7 +1776,7 @@ async def _handle_search_files(args, **kw):
 async def read_file_tool(
     path: str,
     offset: int = 1,
-    limit: int = 500,
+    limit: int = 2000,
     task_id: str = "default",
 ) -> str:
     """Read a file through the native async implementation."""

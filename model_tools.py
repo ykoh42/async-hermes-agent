@@ -817,7 +817,6 @@ async def handle_function_call(
     function_args: Dict[str, Any],
     task_id: Optional[str] = None,
     tool_call_id: Optional[str] = None,
-    *,
     session_id: Optional[str] = None,
     turn_id: Optional[str] = None,
     api_request_id: Optional[str] = None,

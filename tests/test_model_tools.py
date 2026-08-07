@@ -21,6 +21,36 @@ from tools.todo_tool import TodoStore
 
 class TestHandleFunctionCall:
     @pytest.mark.asyncio
+    async def test_upstream_positional_dispatch_contract_is_preserved(self):
+        with patch(
+            "model_tools.registry.dispatch",
+            new_callable=AsyncMock,
+            return_value='{"ok":true}',
+        ) as dispatch:
+            result = await handle_function_call(
+                "web_search",
+                {"q": "test"},
+                "task-1",
+                "tool-1",
+                "session-1",
+                "turn-1",
+                "request-1",
+                "user task",
+                ["web_search"],
+                True,
+                True,
+                True,
+                [],
+                ["web"],
+                [],
+            )
+
+        assert result == '{"ok":true}'
+        assert dispatch.await_args.kwargs["session_id"] == "session-1"
+        assert dispatch.await_args.kwargs["turn_id"] == "turn-1"
+        assert dispatch.await_args.kwargs["api_request_id"] == "request-1"
+
+    @pytest.mark.asyncio
     async def test_stateful_tool_dispatches_with_agent_context(self):
         store = TodoStore()
         result = json.loads(

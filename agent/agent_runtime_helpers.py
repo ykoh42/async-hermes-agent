@@ -2459,7 +2459,10 @@ async def invoke_tool(
     effective_task_id: str,
     tool_call_id: Optional[str] = None,
     messages: list = None,
-    **kwargs,
+    pre_tool_block_checked: bool = False,
+    skip_tool_request_middleware: bool = False,
+    tool_request_middleware_trace: Optional[List[Dict[str, Any]]] = None,
+    skip_tool_execution_middleware: bool = False,
 ) -> str:
     """Invoke an async registry tool without entering the sync bridge.
 
@@ -2498,9 +2501,18 @@ async def invoke_tool(
         function_name,
         function_args,
         effective_task_id,
+        tool_call_id=tool_call_id,
         session_id=getattr(agent, "session_id", "") or "",
+        turn_id=getattr(agent, "_current_turn_id", "") or "",
+        api_request_id=getattr(agent, "_current_api_request_id", "") or "",
         user_task=getattr(agent, "_current_user_task", None),
         enabled_tools=list(getattr(agent, "valid_tool_names", None) or []) or None,
+        skip_pre_tool_call_hook=pre_tool_block_checked,
+        skip_tool_request_middleware=skip_tool_request_middleware,
+        skip_tool_execution_middleware=skip_tool_execution_middleware,
+        tool_request_middleware_trace=tool_request_middleware_trace,
+        enabled_toolsets=getattr(agent, "enabled_toolsets", None),
+        disabled_toolsets=getattr(agent, "disabled_toolsets", None),
         **handler_context,
     )
     return result if isinstance(result, str) else json.dumps(result, ensure_ascii=False)

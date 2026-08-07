@@ -34,15 +34,6 @@ async def test_records_are_keyed_and_cleared_by_session(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_relative_record_preserves_abspath_contract(tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)
-
-    await terminal.record_session_cwd("relative", "nested")
-
-    assert await terminal.get_session_cwd("relative") == str(tmp_path / "nested")
-
-
-@pytest.mark.asyncio
 async def test_registered_override_seeds_and_updates_record(tmp_path):
     first = tmp_path / "first"
     second = tmp_path / "second"

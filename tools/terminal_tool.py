@@ -23,7 +23,7 @@ import time
 import uuid
 import weakref
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Optional
+from typing import Any, Awaitable, Callable, List, Optional
 
 import aiofiles
 import aiofiles.os
@@ -176,7 +176,12 @@ async def _get_env_config() -> dict[str, Any]:
         "singularity_image": "",
         "modal_image": "",
         "daytona_image": "",
-        "local_persistent": True,
+        "local_persistent": _parse_env_var(
+            "TERMINAL_LOCAL_PERSISTENT",
+            "false",
+            lambda value: value.lower() in {"true", "1", "yes"},
+            "boolean",
+        ),
     }
 
 
@@ -201,18 +206,16 @@ def _get_approval_callback() -> Callable[..., Any] | None:
     return _approval_callback.get()
 
 
-def set_approval_callback(callback: Callable[..., Any] | None) -> None:
-    _approval_callback.set(callback)
+def set_approval_callback(cb):
+    _approval_callback.set(cb)
 
 
 def _get_sudo_password_callback() -> Callable[[], Awaitable[str | None]] | None:
     return _sudo_password_callback.get()
 
 
-def set_sudo_password_callback(
-    callback: Callable[[], Awaitable[str | None]] | None,
-) -> None:
-    _sudo_password_callback.set(callback)
+def set_sudo_password_callback(cb) -> None:
+    _sudo_password_callback.set(cb)
 
 
 def _read_shell_token(command: str, start: int) -> tuple[str, int]:
@@ -471,40 +474,27 @@ def clear_task_env_overrides(task_id: str) -> None:
     clear_session_cwd(key)
 
 
-async def get_session_cwd(task_id: str | None = None) -> str:
-    """Return the in-memory cwd anchor for a session.
-
-    The state lookup is immediate; only the process-cwd fallback is awaited.
-    """
-    key = str(task_id or "default")
+async def get_session_cwd(session_key: Optional[str]) -> Optional[str]:
+    """Return the recorded working directory for a session, if any."""
+    key = str(session_key or "default")
     with _env_lock:
-        env = _active_environments.get(key)
-        if env is not None and env.cwd:
-            return env.cwd
-        recorded = _session_cwds.get(key)
-    if recorded:
-        return recorded
-    configured = os.getenv("TERMINAL_CWD", "").strip()
-    if configured:
-        configured = os.path.expanduser(configured)
-        if os.path.isabs(configured):
-            return os.path.normpath(configured)  # noqa: ASYNC240 - lexical only
-    return await aiofiles.os.getcwd()
+        return _session_cwds.get(key)
 
 
-async def record_session_cwd(task_id: str | None, cwd: str) -> None:
-    expanded = os.path.expanduser(cwd) if cwd else ""
-    if expanded:
-        if not os.path.isabs(expanded):
-            expanded = os.path.join(await aiofiles.os.getcwd(), expanded)
-        _session_cwds[str(task_id or "default")] = os.path.normpath(  # noqa: ASYNC240 - lexical only
-            expanded
-        )
+async def record_session_cwd(
+    session_key: Optional[str], cwd: Optional[str]
+) -> None:
+    if not isinstance(cwd, str) or not cwd.strip():
+        return
+    key = str(session_key or "default")
+    with _env_lock:
+        _session_cwds[key] = cwd
 
 
-def clear_session_cwd(task_id: str | None = None) -> None:
+def clear_session_cwd(session_key: str) -> None:
     """Forget the durable working-directory anchor for one local session."""
-    _session_cwds.pop(str(task_id or "default"), None)
+    with _env_lock:
+        _session_cwds.pop(session_key, None)
 
 
 async def _terminate_process(process: asyncio.subprocess.Process) -> None:
@@ -549,6 +539,7 @@ class LocalEnvironment:
         self.cwd = os.path.normpath(cwd)
         self.timeout = timeout
         self.env = build_subprocess_env(scrub_secrets=True)
+        self._persistent = False
         self._lock = asyncio.Lock()
 
     async def execute(
@@ -730,8 +721,11 @@ def get_active_env(task_id: str | None = None) -> LocalEnvironment | None:
         return _active_environments.get(key)
 
 
-def is_persistent_env(_task_id: str | None = None) -> bool:
-    return True
+def is_persistent_env(task_id: str) -> bool:
+    env = get_active_env(task_id)
+    if env is None:
+        return False
+    return bool(getattr(env, "_persistent", False))
 
 
 def _get_creation_lock(task_id: str) -> asyncio.Lock:
@@ -758,6 +752,7 @@ async def _get_or_create_environment(
         config = await _get_env_config()
         cwd = overrides.get("cwd") or await get_session_cwd(raw_key)
         env = LocalEnvironment(cwd or config["cwd"], int(config["timeout"]))
+        env._persistent = bool(config.get("local_persistent", False))
         with _env_lock:
             # Another turn may have created the environment while async config
             # was being read. Reuse it rather than replacing its cwd/state.
@@ -771,12 +766,13 @@ async def _get_or_create_environment(
         return env
 
 
-async def cleanup_vm(task_id: str | None = None) -> None:
+async def cleanup_vm(task_id: str, *, force_remove: bool = False) -> None:
     """Terminate and reap native background commands for one task.
 
     Native asyncio subprocesses need an awaited lifecycle so they cannot outlive a
     closed agent or remain as zombies after their parent request is cancelled.
     """
+    del force_remove
     key = _resolve_container_task_id(task_id)
     from tools.process_registry import process_registry
 
@@ -803,15 +799,14 @@ async def cleanup_all_environments() -> None:
 async def terminal_tool(
     command: str,
     background: bool = False,
-    timeout: int | None = None,
-    task_id: str | None = None,
-    session_id: str | None = None,
+    timeout: Optional[int] = None,
+    task_id: Optional[str] = None,
+    session_id: Optional[str] = None,
     force: bool = False,
-    workdir: str | None = None,
+    workdir: Optional[str] = None,
     pty: bool = False,
     notify_on_complete: bool = False,
-    watch_patterns: list[str] | None = None,
-    **_kwargs: Any,
+    watch_patterns: Optional[List[str]] = None,
 ) -> str:
     """Run a local command asynchronously and preserve Hermes' JSON result contract."""
     from tools.tool_output_limits import refresh_tool_output_limits

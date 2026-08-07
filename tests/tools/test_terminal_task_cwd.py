@@ -9,6 +9,24 @@ import tools.terminal_tool as terminal
 
 
 @pytest.mark.asyncio
+async def test_public_session_cwd_keywords_match_upstream_contract(
+    tmp_path, monkeypatch
+):
+    await terminal.record_session_cwd(session_key="keyword-session", cwd=str(tmp_path))
+    try:
+        assert await terminal.get_session_cwd(session_key="keyword-session") == str(
+            tmp_path
+        )
+        assert terminal.is_persistent_env(task_id="keyword-session") is False
+        monkeypatch.setenv("TERMINAL_LOCAL_PERSISTENT", "true")
+        await terminal._get_or_create_environment("keyword-session")
+        assert terminal.is_persistent_env(task_id="keyword-session") is True
+        await terminal.cleanup_vm(task_id="keyword-session", force_remove=True)
+    finally:
+        terminal.clear_session_cwd(session_key="keyword-session")
+
+
+@pytest.mark.asyncio
 async def test_registered_task_cwd_is_used(tmp_path):
     task_id = "cwd-task"
     await terminal.register_task_env_overrides(task_id, {"cwd": str(tmp_path)})

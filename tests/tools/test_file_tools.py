@@ -6,7 +6,7 @@ import json
 
 import pytest
 
-from tools.file_tools import PATCH_SCHEMA
+from tools.file_tools import PATCH_SCHEMA, READ_FILE_SCHEMA
 
 
 @pytest.mark.asyncio
@@ -24,6 +24,20 @@ async def test_read_write_and_empty_content_round_trip(tmp_path):
     truncated = json.loads(await write_file_tool(str(target), ""))
     assert truncated["bytes_written"] == 0
     assert target.read_text() == ""
+
+
+@pytest.mark.asyncio
+async def test_read_file_public_default_matches_upstream_contract(tmp_path):
+    from tools.file_tools import read_file_tool
+
+    target = tmp_path / "long.txt"
+    target.write_text("\n".join(f"line-{index}" for index in range(600)))
+
+    result = json.loads(await read_file_tool(str(target)))
+
+    assert result["total_lines"] == 600
+    assert result["content"].splitlines()[-1] == "600|line-599"
+    assert READ_FILE_SCHEMA["parameters"]["properties"]["limit"]["default"] == 2000
 
 
 @pytest.mark.asyncio
