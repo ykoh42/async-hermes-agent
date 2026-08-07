@@ -16,7 +16,13 @@ from pyleak.eventloop import LeakAction
 
 from agent.conversation_loop import run_conversation
 from agent.conversation_compression import compress_context
-from agent.chat_completion_helpers import handle_max_iterations
+from agent.chat_completion_helpers import (
+    direct_api_call,
+    handle_max_iterations,
+    interruptible_api_call,
+    interruptible_streaming_api_call,
+    should_use_direct_api_call,
+)
 from agent.trajectory import save_trajectory
 from agent.turn_context import build_turn_context
 from agent.turn_finalizer import finalize_turn
@@ -107,6 +113,9 @@ def test_conversation_and_chat_are_coroutines():
     assert inspect.iscoroutinefunction(AIAgent._execute_tool_calls)
     assert inspect.iscoroutinefunction(AIAgent._conversation_root_id)
     assert inspect.iscoroutinefunction(handle_max_iterations)
+    assert inspect.iscoroutinefunction(direct_api_call)
+    assert inspect.iscoroutinefunction(interruptible_api_call)
+    assert inspect.iscoroutinefunction(interruptible_streaming_api_call)
     assert inspect.iscoroutinefunction(build_turn_context)
     assert inspect.iscoroutinefunction(finalize_turn)
     assert inspect.iscoroutinefunction(run_conversation)
@@ -177,6 +186,32 @@ def test_conversation_and_chat_are_coroutines():
     active_entries = list(registry._tools.values())
     assert active_entries
     assert all(inspect.iscoroutinefunction(entry.handler) for entry in active_entries)
+
+
+@pytest.mark.asyncio
+async def test_legacy_model_call_names_route_to_native_async_transport():
+    response = object()
+    execute = AsyncMock(return_value=response)
+    agent = SimpleNamespace(_execute_model_request=execute)
+    payload = {"model": "test"}
+    first_delta = MagicMock()
+
+    assert should_use_direct_api_call(agent) is True
+    assert await direct_api_call(agent, payload) is response
+    assert await interruptible_api_call(agent, payload) is response
+    assert await interruptible_streaming_api_call(
+        agent,
+        payload,
+        on_first_delta=first_delta,
+    ) is response
+    assert execute.await_args_list == [
+        ((payload,), {}),
+        ((payload,), {}),
+        (
+            (payload,),
+            {"use_streaming": True, "on_first_delta": first_delta},
+        ),
+    ]
 
 
 @pytest.mark.asyncio

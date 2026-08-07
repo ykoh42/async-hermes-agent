@@ -312,6 +312,36 @@ def _check_stale_giveup(agent) -> None:
         )
 
 
+def should_use_direct_api_call(agent: Any) -> bool:
+    """Return True because the native async runtime never spawns API workers."""
+    del agent
+    return True
+
+
+async def direct_api_call(agent: Any, api_kwargs: dict) -> Any:
+    """Execute a non-streaming provider request directly on the event loop."""
+    return await agent._execute_model_request(api_kwargs)
+
+
+async def interruptible_api_call(agent: Any, api_kwargs: dict) -> Any:
+    """Execute an interruptible native-async non-streaming provider request."""
+    return await agent._execute_model_request(api_kwargs)
+
+
+async def interruptible_streaming_api_call(
+    agent: Any,
+    api_kwargs: dict,
+    *,
+    on_first_delta=None,
+) -> Any:
+    """Execute an interruptible native-async streaming provider request."""
+    return await agent._execute_model_request(
+        api_kwargs,
+        use_streaming=True,
+        on_first_delta=on_first_delta,
+    )
+
+
 def _derive_stream_stale_timeout(agent, api_kwargs: dict) -> float:
     """Stale-stream patience for a provider that is never a local endpoint.
 
