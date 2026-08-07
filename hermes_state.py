@@ -25,6 +25,7 @@ from hermes_state_common import (
     MAX_FTS5_QUERY_CHARS,
     SCHEMA_VERSION,
     SCHEMA_SQL,
+    _COMPRESSION_CHILD_SQL,
     _LISTABLE_CHILD_SQL,
     _PREVIEW_RAW_SELECT,
     _shape_preview,
@@ -3606,15 +3607,251 @@ class SessionDB:
         ]
         return f"{base} #{max(suffixes, default=1) + 1}"
 
-    async def set_session_title(self, session_id: str, title: str) -> bool:
-        """Set a generated continuation title using the async write path."""
-        async def _set(connection):
-            cursor = await connection.execute(
-                "UPDATE sessions SET title = ? WHERE id = ?", (title, session_id)
-            )
-            return cursor.rowcount > 0
+    MAX_TITLE_LENGTH = 100
 
-        return bool(await self._write(_set))
+    @staticmethod
+    def sanitize_title(title: Optional[str]) -> Optional[str]:
+        """Validate and sanitize a session title.
+
+        - Strips leading/trailing whitespace
+        - Removes ASCII control characters (0x00-0x1F, 0x7F) and problematic
+          Unicode control chars (zero-width, RTL/LTR overrides, etc.)
+        - Collapses internal whitespace runs to single spaces
+        - Normalizes empty/whitespace-only strings to None
+        - Enforces MAX_TITLE_LENGTH
+
+        Returns the cleaned title string or None.
+        Raises ValueError if the title exceeds MAX_TITLE_LENGTH after cleaning.
+        """
+        if not title:
+            return None
+
+        # Lone surrogates cannot be bound by sqlite3 (UnicodeEncodeError at
+        # UTF-8 encode time) — scrub them like every other write path here.
+        title = _sanitize_surrogates(title)
+
+        # Remove ASCII control characters (0x00-0x1F, 0x7F) but keep
+        # whitespace chars so the whitespace collapsing step normalizes them.
+        cleaned = re.sub(
+            r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", title
+        )
+
+        # Remove zero-width, directional, object-replacement, and interlinear
+        # annotation control characters.
+        cleaned = re.sub(
+            r"[\u200b-\u200f\u2028-\u202e\u2060-\u2069\ufeff\ufffc\ufff9-\ufffb]",
+            "",
+            cleaned,
+        )
+
+        # Collapse internal whitespace runs and strip.
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()
+
+        if not cleaned:
+            return None
+
+        if len(cleaned) > SessionDB.MAX_TITLE_LENGTH:
+            raise ValueError(
+                f"Title too long ({len(cleaned)} chars, "
+                f"max {SessionDB.MAX_TITLE_LENGTH})"
+            )
+        return cleaned
+
+    async def _is_compression_ancestor(
+        self, conn, *, ancestor_id: str, descendant_id: str
+    ) -> bool:
+        """Return whether *ancestor_id* is a compression predecessor."""
+        if not ancestor_id or not descendant_id or ancestor_id == descendant_id:
+            return False
+        edge = _COMPRESSION_CHILD_SQL.format(a="child")
+        row = await (
+            await conn.execute(
+                f"""
+                WITH RECURSIVE ancestors(id) AS (
+                    SELECT ?
+                    UNION
+                    SELECT parent.id
+                    FROM ancestors a
+                    JOIN sessions child ON child.id = a.id
+                    JOIN sessions parent ON parent.id = child.parent_session_id
+                    WHERE {edge}
+                )
+                SELECT 1 FROM ancestors WHERE id = ? AND id != ? LIMIT 1
+                """,
+                (descendant_id, ancestor_id, descendant_id),
+            )
+        ).fetchone()
+        return row is not None
+
+    async def _set_session_title(
+        self,
+        session_id: str,
+        title: str,
+        *,
+        only_if_empty: bool,
+    ) -> bool:
+        title = self.sanitize_title(title)
+
+        async def _do(conn):
+            if only_if_empty:
+                current = await (
+                    await conn.execute(
+                        "SELECT title FROM sessions WHERE id = ?",
+                        (session_id,),
+                    )
+                ).fetchone()
+                if current is None or current["title"] is not None:
+                    return 0
+
+            if title:
+                cursor = await conn.execute(
+                    "SELECT id FROM sessions WHERE title = ? AND id != ?",
+                    (title, session_id),
+                )
+                conflict = await cursor.fetchone()
+                if conflict:
+                    conflict_id = conflict["id"]
+                    if await self._is_compression_ancestor(
+                        conn,
+                        ancestor_id=conflict_id,
+                        descendant_id=session_id,
+                    ):
+                        await conn.execute(
+                            "UPDATE sessions SET title = NULL WHERE id = ?",
+                            (conflict_id,),
+                        )
+                    else:
+                        raise ValueError(
+                            f"Title '{title}' is already in use by session "
+                            f"{conflict_id}"
+                        )
+
+            predicate = " AND title IS NULL" if only_if_empty else ""
+            cursor = await conn.execute(
+                f"UPDATE sessions SET title = ? WHERE id = ?{predicate}",
+                (title, session_id),
+            )
+            return cursor.rowcount
+
+        rowcount = await self._write(_do)
+        return rowcount > 0
+
+    async def set_session_title(self, session_id: str, title: str) -> bool:
+        """Set or update a session's title."""
+        return await self._set_session_title(
+            session_id, title, only_if_empty=False
+        )
+
+    async def set_auto_title_if_empty(
+        self, session_id: str, title: str
+    ) -> bool:
+        """Set an auto-generated title only when the current title is null."""
+        return await self._set_session_title(
+            session_id, title, only_if_empty=True
+        )
+
+    async def set_session_archived(
+        self, session_id: str, archived: bool
+    ) -> bool:
+        """Archive or unarchive a session.
+
+        Archived sessions are hidden from the default session list but keep all
+        their messages. Compression chains are updated as one conversation.
+        Returns True when at least one row was updated.
+        """
+        async def _do(conn):
+            cursor = await conn.execute(
+                """
+                WITH RECURSIVE
+                  ancestors(id) AS (
+                    SELECT ?
+                    UNION
+                    SELECT parent.id
+                    FROM ancestors a
+                    JOIN sessions child ON child.id = a.id
+                    JOIN sessions parent ON parent.id = child.parent_session_id
+                    WHERE parent.end_reason = 'compression'
+                  ),
+                  descendants(id) AS (
+                    SELECT ?
+                    UNION
+                    SELECT child.id
+                    FROM descendants d
+                    JOIN sessions parent ON parent.id = d.id
+                    JOIN sessions child ON child.parent_session_id = parent.id
+                    WHERE parent.end_reason = 'compression'
+                  ),
+                  lineage(id) AS (
+                    SELECT id FROM ancestors
+                    UNION
+                    SELECT id FROM descendants
+                  )
+                UPDATE sessions
+                SET archived = ?
+                WHERE id IN (SELECT id FROM lineage)
+                """,
+                (session_id, session_id, 1 if archived else 0),
+            )
+            rowcount = cursor.rowcount
+            if rowcount is None or rowcount < 0:
+                rowcount = (
+                    await (await conn.execute("SELECT changes()")).fetchone()
+                )[0]
+            return rowcount
+
+        rowcount = await self._write(_do)
+        return rowcount > 0
+
+    async def set_session_pinned(
+        self, session_id: str, pinned: bool
+    ) -> bool:
+        """Pin or unpin a session and its whole compression lineage.
+
+        Pinned sessions are exempt from stale-session archival. Returns True
+        when at least one row was updated.
+        """
+        async def _do(conn):
+            cursor = await conn.execute(
+                """
+                WITH RECURSIVE
+                  ancestors(id) AS (
+                    SELECT ?
+                    UNION
+                    SELECT parent.id
+                    FROM ancestors a
+                    JOIN sessions child ON child.id = a.id
+                    JOIN sessions parent ON parent.id = child.parent_session_id
+                    WHERE parent.end_reason = 'compression'
+                  ),
+                  descendants(id) AS (
+                    SELECT ?
+                    UNION
+                    SELECT child.id
+                    FROM descendants d
+                    JOIN sessions parent ON parent.id = d.id
+                    JOIN sessions child ON child.parent_session_id = parent.id
+                    WHERE parent.end_reason = 'compression'
+                  ),
+                  lineage(id) AS (
+                    SELECT id FROM ancestors
+                    UNION
+                    SELECT id FROM descendants
+                  )
+                UPDATE sessions
+                SET pinned = ?
+                WHERE id IN (SELECT id FROM lineage)
+                """,
+                (session_id, session_id, 1 if pinned else 0),
+            )
+            rowcount = cursor.rowcount
+            if rowcount is None or rowcount < 0:
+                rowcount = (
+                    await (await conn.execute("SELECT changes()")).fetchone()
+                )[0]
+            return rowcount
+
+        rowcount = await self._write(_do)
+        return rowcount > 0
 
     async def publish_compression_child(
         self,

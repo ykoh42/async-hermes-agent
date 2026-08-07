@@ -272,6 +272,15 @@ async def test_session_lifecycle_does_not_block_or_leak(tmp_path):
                 "session", message_id
             ) == "user"
             assert await database.resolve_session_id("sess") == "session"
+            assert await database.set_session_title(
+                "session", "  Native\n Async  "
+            )
+            assert not await database.set_auto_title_if_empty(
+                "session", "Ignored"
+            )
+            assert await database.set_session_pinned("session", True)
+            assert await database.set_session_archived("session", True)
+            assert await database.set_session_archived("session", False)
             await database.end_session("session", "done")
             assert [
                 row["id"]

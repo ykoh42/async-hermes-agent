@@ -40,6 +40,10 @@ def test_public_session_interface_is_async():
         "list_sessions_rich",
         "get_session_rich_row",
         "get_compression_tip",
+        "set_session_title",
+        "set_auto_title_if_empty",
+        "set_session_archived",
+        "set_session_pinned",
         "close",
     ):
         assert inspect.iscoroutinefunction(getattr(SessionDB, name)), name
@@ -257,6 +261,68 @@ async def test_titles_meta_search_and_recent_listing(db):
     assert "cobalt project" in sessions[0]["preview"].lower()
     matches = await db.search_messages("cobalt")
     assert [match["session_id"] for match in matches] == ["s1"]
+
+
+def test_sanitize_title_preserves_upstream_validation_contract():
+    assert SessionDB.sanitize_title("  My\n Project  ") == "My Project"
+    assert SessionDB.sanitize_title("hello\x00world\u200b") == "helloworld"
+    assert SessionDB.sanitize_title(" \t\n ") is None
+    with pytest.raises(ValueError, match="too long"):
+        SessionDB.sanitize_title("A" * 101)
+
+
+@pytest.mark.asyncio
+async def test_session_title_uniqueness_and_auto_title_are_atomic(db):
+    await db.create_session("manual", source="library")
+    await db.create_session("automatic", source="library")
+    await db.create_session("duplicate", source="library")
+
+    assert await db.set_session_title("manual", "  Shared\n Title  ") is True
+    assert await db.get_session_title("manual") == "Shared Title"
+    with pytest.raises(ValueError, match="already in use"):
+        await db.set_session_title("duplicate", "Shared Title")
+
+    assert await db.set_auto_title_if_empty("automatic", "Generated") is True
+    assert await db.set_auto_title_if_empty("automatic", "Overwrite") is False
+    assert await db.get_session_title("automatic") == "Generated"
+
+
+@pytest.mark.asyncio
+async def test_compression_tip_can_reclaim_hidden_ancestor_title(db):
+    await db.create_session("root", source="library")
+    await db.set_session_title("root", "fingerprint-scanner")
+    await db.end_session("root", "compression")
+    await db.create_session(
+        "tip", source="library", parent_session_id="root"
+    )
+    await db.set_session_title("tip", "fingerprint-scanner #2")
+
+    assert await db.set_session_title("tip", "fingerprint-scanner") is True
+    assert await db.get_session_title("root") is None
+    assert await db.get_session_title("tip") == "fingerprint-scanner"
+
+
+@pytest.mark.asyncio
+async def test_archive_and_pin_update_the_whole_compression_lineage(db):
+    await db.create_session("root", source="library")
+    await db.end_session("root", "compression")
+    await db.create_session(
+        "tip", source="library", parent_session_id="root"
+    )
+
+    assert await db.set_session_archived("tip", True) is True
+    assert await db.set_session_pinned("root", True) is True
+    assert (await db.get_session("root"))["archived"] == 1
+    assert (await db.get_session("tip"))["archived"] == 1
+    assert (await db.get_session("root"))["pinned"] == 1
+    assert (await db.get_session("tip"))["pinned"] == 1
+
+    assert await db.set_session_archived("root", False) is True
+    assert await db.set_session_pinned("tip", False) is True
+    assert (await db.get_session("root"))["archived"] == 0
+    assert (await db.get_session("tip"))["archived"] == 0
+    assert (await db.get_session("root"))["pinned"] == 0
+    assert (await db.get_session("tip"))["pinned"] == 0
 
 
 @pytest.mark.asyncio
