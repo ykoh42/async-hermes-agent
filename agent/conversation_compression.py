@@ -554,10 +554,7 @@ async def run_compress_context_with_progress_timeout(
                     )
                     if cancellation_won:
                         task.cancel()
-                        try:
-                            await task
-                        except asyncio.CancelledError:
-                            pass
+                        await asyncio.gather(task, return_exceptions=True)
                     else:
                         return await _wait_for_commit()
                     raise AuxiliaryExplicitCancellation()
@@ -571,10 +568,7 @@ async def run_compress_context_with_progress_timeout(
             if not cancellation_won:
                 return await _wait_for_commit()
             task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
+            await asyncio.gather(task, return_exceptions=True)
             await _notify(on_timeout, idle, total_elapsed, since_progress)
             timeout_compressor = getattr(
                 telemetry_agent, "context_compressor", None
@@ -590,20 +584,14 @@ async def run_compress_context_with_progress_timeout(
         cancellation_won = await fence.revoke_commit_admission()
         if cancellation_won:
             task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
+            await asyncio.gather(task, return_exceptions=True)
         else:
             await _wait_for_commit()
         raise
     finally:
         if cancel_task is not None:
             cancel_task.cancel()
-            try:
-                await cancel_task
-            except asyncio.CancelledError:
-                pass
+            await asyncio.gather(cancel_task, return_exceptions=True)
 
 
 async def _hydrate_persisted_compression_guards(
@@ -934,10 +922,7 @@ class _CompressionActivityHeartbeat:
         task, self._task = self._task, None
         if task is not None:
             task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
+            await asyncio.gather(task, return_exceptions=True)
         self._touch(desc)
 
     def _touch(self, desc: str) -> None:
@@ -1789,10 +1774,7 @@ async def compress_context(
             agent._active_compression_lock_holder = None
         if _lock_refresh_task is not None:
             _lock_refresh_task.cancel()
-            try:
-                await _lock_refresh_task
-            except asyncio.CancelledError:
-                pass
+            await asyncio.gather(_lock_refresh_task, return_exceptions=True)
         if _lock_db is not None and _lock_sid and _lock_holder:
             try:
                 await _lock_db.release_compression_lock(_lock_sid, _lock_holder)
@@ -1922,6 +1904,35 @@ async def compress_context(
     _activity_heartbeat: Optional[_CompressionActivityHeartbeat] = None
     messages_before_compression = None
     _hard_cancel_event = getattr(agent, "_hard_interrupt_requested", None)
+
+    async def _abort_cancelled_compression() -> None:
+        nonlocal _activity_heartbeat
+
+        try:
+            await _restore_compressor_attempt_state(
+                agent.context_compressor,
+                _compressor_attempt_snapshot,
+                durable_cooldown_authoritative=_durable_cooldown_authoritative,
+                durable_cooldown_state=_durable_cooldown_state,
+            )
+        finally:
+            if (
+                messages_before_compression is not None
+                and messages != messages_before_compression
+            ):
+                messages[:] = copy.deepcopy(messages_before_compression)
+            if _activity_heartbeat is not None:
+                await _activity_heartbeat.stop("context compression cancelled")
+                _activity_heartbeat = None
+            await _release_lock()
+        _emit_compression_attempt_telemetry(
+            agent,
+            started_at=_attempt_started_at,
+            commit_status="aborted",
+            split_status="aborted",
+            failure_class="explicit_interrupt",
+        )
+
     try:
         if _lock_holder is not None:
             try:
@@ -2059,33 +2070,11 @@ async def compress_context(
                     and _hard_cancel_event.is_set()
                 ):
                     raise AuxiliaryExplicitCancellation()
-    except (AuxiliaryExplicitCancellation, asyncio.CancelledError) as _cancel_exc:
-        try:
-            await _restore_compressor_attempt_state(
-                agent.context_compressor,
-                _compressor_attempt_snapshot,
-                durable_cooldown_authoritative=_durable_cooldown_authoritative,
-                durable_cooldown_state=_durable_cooldown_state,
-            )
-        finally:
-            if (
-                messages_before_compression is not None
-                and messages != messages_before_compression
-            ):
-                messages[:] = copy.deepcopy(messages_before_compression)
-            if _activity_heartbeat is not None:
-                await _activity_heartbeat.stop("context compression cancelled")
-                _activity_heartbeat = None
-            await _release_lock()
-        _emit_compression_attempt_telemetry(
-            agent,
-            started_at=_attempt_started_at,
-            commit_status="aborted",
-            split_status="aborted",
-            failure_class="explicit_interrupt",
-        )
-        if isinstance(_cancel_exc, asyncio.CancelledError):
-            raise
+    except asyncio.CancelledError:
+        await _abort_cancelled_compression()
+        raise
+    except AuxiliaryExplicitCancellation:
+        await _abort_cancelled_compression()
         _existing_sp = getattr(agent, "_cached_system_prompt", None)
         if not _existing_sp:
             _existing_sp = await agent._build_system_prompt(system_message)
@@ -2095,9 +2084,11 @@ async def compress_context(
         # inspection, engine lookup, or compress() — must release the lock so
         # the session isn't permanently blocked from future compression.
         if _activity_heartbeat is not None:
-            await _activity_heartbeat.stop("context compression failed")
+            await _activity_heartbeat.stop(  # noqa: ASYNC120
+                "context compression failed"
+            )
             _activity_heartbeat = None
-        await _release_lock()
+        await _release_lock()  # noqa: ASYNC120
         _emit_compression_attempt_telemetry(
             agent,
             started_at=_attempt_started_at,

@@ -316,6 +316,44 @@ async def test_between_turns_refresh_adds_late_tool_when_servers_registered():
     assert any(t["function"]["name"] == "mcp_x_tool" for t in agent.tools)
 
 
+@pytest.mark.asyncio
+async def test_initial_mcp_discovery_cancellation_releases_lifecycle_and_reraises():
+    agent = _FakeAgent()
+
+    with (
+        patch("hermes_cli.plugins.discover_plugins", new=AsyncMock()),
+        patch("tools.mcp_tool.retain_mcp_lifecycle", new=AsyncMock()),
+        patch(
+            "tools.mcp_tool.discover_mcp_tools",
+            new=AsyncMock(side_effect=asyncio.CancelledError()),
+        ),
+        patch("tools.mcp_tool.release_mcp_lifecycle", new=AsyncMock()) as release,
+        pytest.raises(asyncio.CancelledError),
+    ):
+        await _build(agent)
+
+    release.assert_awaited_once_with(agent)
+    assert agent._mcp_lifecycle_retained is False
+    assert agent._mcp_discovery_started is False
+
+
+@pytest.mark.asyncio
+async def test_between_turns_refresh_never_swallows_non_exception_base_error():
+    class FatalRefresh(BaseException):
+        pass
+
+    agent = _FakeAgent()
+    agent._tool_snapshot_initialized = True
+
+    with (
+        patch(
+            "hermes_cli.plugins.discover_plugins",
+            new=AsyncMock(side_effect=FatalRefresh("fatal")),
+        ),
+        pytest.raises(FatalRefresh, match="fatal"),
+    ):
+        await _build(agent)
+
 
 
 

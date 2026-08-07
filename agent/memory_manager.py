@@ -586,10 +586,7 @@ class MemoryManager:
                 return await task or ""
         except TimeoutError:
             task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
+            await asyncio.gather(task, return_exceptions=True)
             logger.warning(
                 "Memory provider '%s' prefetch timed out after %.1fs",
                 provider.name,

@@ -3326,6 +3326,9 @@ async def test_cancelled_turn_persists_partial_session_and_reraises(monkeypatch,
     agent._session_db = database
     agent._session_db_created = False
     agent.compression_enabled = False
+    agent._tool_snapshot_initialized = True
+    agent._mcp_discovery_started = True
+    agent._skip_mcp_refresh = True
     model_started = asyncio.Event()
 
     async def slow_model(*_args, **_kwargs):
@@ -3338,6 +3341,7 @@ async def test_cancelled_turn_persists_partial_session_and_reraises(monkeypatch,
         raise AssertionError("cancelled async turn must not call asyncio.to_thread")
 
     monkeypatch.setattr(asyncio, "to_thread", fail_if_called)
+    monkeypatch.setattr("hermes_cli.plugins.discover_plugins", AsyncMock())
     task = None
     try:
         async with no_task_leaks(action=LeakAction.RAISE):
@@ -3360,6 +3364,66 @@ async def test_cancelled_turn_persists_partial_session_and_reraises(monkeypatch,
             await asyncio.gather(task, return_exceptions=True)
         await agent.close()
         await database.close()
+
+
+@pytest.mark.asyncio
+async def test_repeated_cancellation_waits_for_turn_finalizer_then_reraises(
+    monkeypatch,
+):
+    with (
+        patch("run_agent.get_tool_definitions", return_value=[]),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI"),
+    ):
+        agent = AIAgent(
+            api_key="test-key",
+            base_url="https://example.invalid/v1",
+            model="test-model",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+    agent.compression_enabled = False
+    agent._tool_snapshot_initialized = True
+    agent._mcp_discovery_started = True
+    agent._skip_mcp_refresh = True
+    model_started = asyncio.Event()
+    finalizer_started = asyncio.Event()
+    release_finalizer = asyncio.Event()
+    finalizer_completed = False
+
+    async def slow_model(*_args, **_kwargs):
+        model_started.set()
+        await asyncio.Event().wait()
+
+    async def controlled_finalizer(*_args, **_kwargs):
+        nonlocal finalizer_completed
+        finalizer_started.set()
+        await release_finalizer.wait()
+        finalizer_completed = True
+        raise RuntimeError("finalizer failed after repeated cancellation")
+
+    agent._execute_model_request = slow_model
+    monkeypatch.setattr("hermes_cli.plugins.discover_plugins", AsyncMock())
+    monkeypatch.setattr("agent.turn_finalizer.finalize_turn", controlled_finalizer)
+
+    turn_task = asyncio.create_task(agent.run_conversation("cancel twice"))
+    try:
+        await asyncio.wait_for(model_started.wait(), timeout=1)
+        turn_task.cancel()
+        await asyncio.wait_for(finalizer_started.wait(), timeout=5)
+        turn_task.cancel()
+        release_finalizer.set()
+
+        with pytest.raises(asyncio.CancelledError):
+            await turn_task
+        assert finalizer_completed is True
+    finally:
+        release_finalizer.set()
+        if not turn_task.done():
+            turn_task.cancel()
+            await asyncio.gather(turn_task, return_exceptions=True)
+        await agent.close()
 
 
 @pytest.mark.asyncio

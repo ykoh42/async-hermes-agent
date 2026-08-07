@@ -1342,6 +1342,45 @@ async def run_conversation(
     # on the next loop iteration. This prevents a second advisor fan-out.
     pending_moa_prepared_request = None
 
+    async def _finalize_cancelled_turn() -> None:
+        nonlocal interrupted, _turn_exit_reason
+
+        interrupted = True
+        _turn_exit_reason = "cancelled"
+        agent._session_messages = messages
+        from agent.turn_finalizer import finalize_turn
+
+        finalizer_task = asyncio.create_task(
+            finalize_turn(
+                agent,
+                final_response=final_response,
+                api_call_count=api_call_count,
+                interrupted=True,
+                failed=failed,
+                messages=messages,
+                conversation_history=conversation_history,
+                effective_task_id=effective_task_id,
+                turn_id=turn_id,
+                user_message=user_message,
+                original_user_message=original_user_message,
+                _should_review_memory=_should_review_memory,
+                _turn_exit_reason=_turn_exit_reason,
+                _pending_verification_response=_pending_verification_response,
+                _pending_verification_response_previewed=(
+                    _pending_verification_response_previewed
+                ),
+            )
+        )
+        try:
+            await asyncio.shield(finalizer_task)
+        except asyncio.CancelledError:  # noqa: ASYNC103 - caller cancellation below
+            try:
+                await asyncio.shield(finalizer_task)
+            except Exception:
+                logger.error("Cancelled turn finalization failed", exc_info=True)
+        except Exception:
+            logger.error("Cancelled turn finalization failed", exc_info=True)
+
     # Per-turn tally of consecutive successful credential-pool token refreshes,
     # keyed by (provider, pool-entry-id). A persistent upstream 401 lets
     # ``try_refresh_current()`` "succeed" forever on a single-entry OAuth pool,
@@ -2350,9 +2389,10 @@ async def run_conversation(
                         if agent._interrupt_requested and not (
                             current_task and current_task.cancelling()
                         ):
-                            raise InterruptedError(
+                            raise InterruptedError(  # noqa: ASYNC104
                                 "Agent interrupted during model request"
                             ) from None
+                        await _finalize_cancelled_turn()
                         raise
                     finally:
                         if getattr(agent, "_active_request_abort", None) is _abort_request:
@@ -6888,41 +6928,7 @@ async def run_conversation(
             # re-raise so the caller still observes cancellation.  The
             # finalizer task is shielded so a second cancellation cannot leave
             # an unmatched tool call or half-written session row behind.
-            interrupted = True
-            _turn_exit_reason = "cancelled"
-            agent._session_messages = messages
-            from agent.turn_finalizer import finalize_turn
-
-            finalizer_task = asyncio.create_task(
-                finalize_turn(
-                    agent,
-                    final_response=final_response,
-                    api_call_count=api_call_count,
-                    interrupted=True,
-                    failed=failed,
-                    messages=messages,
-                    conversation_history=conversation_history,
-                    effective_task_id=effective_task_id,
-                    turn_id=turn_id,
-                    user_message=user_message,
-                    original_user_message=original_user_message,
-                    _should_review_memory=_should_review_memory,
-                    _turn_exit_reason=_turn_exit_reason,
-                    _pending_verification_response=_pending_verification_response,
-                    _pending_verification_response_previewed=(
-                        _pending_verification_response_previewed
-                    ),
-                )
-            )
-            try:
-                await asyncio.shield(finalizer_task)
-            except asyncio.CancelledError:
-                await asyncio.shield(finalizer_task)
-            except Exception:
-                logger.error(
-                    "Cancelled turn finalization failed",
-                    exc_info=True,
-                )
+            await _finalize_cancelled_turn()
             raise
         except Exception as e:
             # Phase-aware error classification. The huge outer try/except spans

@@ -455,16 +455,23 @@ async def build_turn_context(
                     if "kanban_show" in agent.valid_tool_names
                     else ""
                 )
-    except BaseException as exc:
+    except asyncio.CancelledError:
         if initial_tool_snapshot:
             if getattr(agent, "_mcp_lifecycle_retained", False):
                 from tools.mcp_tool import release_mcp_lifecycle
 
-                await release_mcp_lifecycle(agent)
+                await release_mcp_lifecycle(agent)  # noqa: ASYNC120
                 agent._mcp_lifecycle_retained = False
             agent._mcp_discovery_started = False
-            raise
-        if isinstance(exc, asyncio.CancelledError):
+        raise
+    except Exception:
+        if initial_tool_snapshot:
+            if getattr(agent, "_mcp_lifecycle_retained", False):
+                from tools.mcp_tool import release_mcp_lifecycle
+
+                await release_mcp_lifecycle(agent)  # noqa: ASYNC120
+                agent._mcp_lifecycle_retained = False
+            agent._mcp_discovery_started = False
             raise
         logger.debug("between-turns MCP tool refresh skipped", exc_info=True)
 
