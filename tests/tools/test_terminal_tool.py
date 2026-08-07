@@ -200,39 +200,67 @@ async def test_rejects_invalid_commands(command):
 
 
 @pytest.mark.asyncio
-async def test_async_approval_callback_can_allow_and_deny(tmp_path):
+async def test_async_approval_callback_can_allow_and_deny(tmp_path, monkeypatch):
     decisions: list[str] = []
 
-    async def callback(**kwargs):
-        decisions.append(kwargs["command"])
-        return kwargs["command"] == "printf allowed"
+    async def callback(command, _description, **_kwargs):
+        decisions.append(command)
+        return "once" if "allowed" in command else "deny"
 
+    monkeypatch.setenv("HERMES_INTERACTIVE", "1")
     terminal.set_approval_callback(callback)
     try:
         allowed = json.loads(
-            await terminal.terminal_tool("printf allowed", workdir=str(tmp_path))
+            await terminal.terminal_tool(
+                'python -c "print(\'allowed\')"', workdir=str(tmp_path)
+            )
         )
         denied = json.loads(
-            await terminal.terminal_tool("printf denied", workdir=str(tmp_path))
+            await terminal.terminal_tool(
+                'python -c "print(\'denied\')"', workdir=str(tmp_path)
+            )
         )
     finally:
         terminal.set_approval_callback(None)
 
     assert allowed["exit_code"] == 0
     assert denied["status"] == "denied"
-    assert decisions == ["printf allowed", "printf denied"]
+    assert decisions == [
+        'python -c "print(\'allowed\')"',
+        'python -c "print(\'denied\')"',
+    ]
 
 
 @pytest.mark.asyncio
-async def test_force_bypasses_registered_approval_callback(tmp_path):
-    async def deny(**_kwargs):
-        return False
+async def test_safe_command_does_not_request_approval(tmp_path, monkeypatch):
+    async def deny(*_args, **_kwargs):
+        raise AssertionError("safe commands must not reach the approval callback")
 
+    monkeypatch.setenv("HERMES_INTERACTIVE", "1")
+    terminal.set_approval_callback(deny)
+    try:
+        result = json.loads(
+            await terminal.terminal_tool("printf safe", workdir=str(tmp_path))
+        )
+    finally:
+        terminal.set_approval_callback(None)
+
+    assert result["output"] == "safe"
+
+
+@pytest.mark.asyncio
+async def test_force_bypasses_registered_approval_callback(tmp_path, monkeypatch):
+    async def deny(*_args, **_kwargs):
+        return "deny"
+
+    monkeypatch.setenv("HERMES_INTERACTIVE", "1")
     terminal.set_approval_callback(deny)
     try:
         result = json.loads(
             await terminal.terminal_tool(
-                "printf forced", force=True, workdir=str(tmp_path)
+                'python -c "print(\'forced\')"',
+                force=True,
+                workdir=str(tmp_path),
             )
         )
     finally:

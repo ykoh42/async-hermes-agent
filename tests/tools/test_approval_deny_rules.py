@@ -4,7 +4,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from tools.approval import validate_terminal_command
+from tools.approval import check_all_command_guards
 
 
 def set_approval_config(monkeypatch, approvals):
@@ -18,7 +18,7 @@ def set_approval_config(monkeypatch, approvals):
 async def test_matching_deny_rule_is_blocked(monkeypatch):
     set_approval_config(monkeypatch, {"deny": ["git push *"]})
 
-    result = await validate_terminal_command("git push origin main")
+    result = await check_all_command_guards("git push origin main", "local")
 
     assert result["approved"] is False
     assert result["user_deny"] is True
@@ -29,7 +29,7 @@ async def test_matching_deny_rule_is_blocked(monkeypatch):
 async def test_non_matching_command_is_allowed(monkeypatch):
     set_approval_config(monkeypatch, {"deny": ["git push *"]})
 
-    result = await validate_terminal_command("git status")
+    result = await check_all_command_guards("git status", "local")
 
     assert result == {"approved": True, "message": None}
 
@@ -38,7 +38,7 @@ async def test_non_matching_command_is_allowed(monkeypatch):
 async def test_hardline_policy_precedes_user_deny(monkeypatch):
     set_approval_config(monkeypatch, {"deny": ["rm *"]})
 
-    result = await validate_terminal_command("rm -rf /")
+    result = await check_all_command_guards("rm -rf /", "local")
 
     assert result["approved"] is False
     assert result["hardline"] is True
@@ -49,6 +49,6 @@ async def test_hardline_policy_precedes_user_deny(monkeypatch):
 async def test_empty_deny_list_allows_benign_command(monkeypatch):
     set_approval_config(monkeypatch, {"deny": []})
 
-    result = await validate_terminal_command("printf hello")
+    result = await check_all_command_guards("printf hello", "local")
 
     assert result["approved"] is True

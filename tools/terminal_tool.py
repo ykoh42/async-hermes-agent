@@ -29,6 +29,7 @@ import aiofiles
 import aiofiles.os
 
 from tools.environments.local import build_subprocess_env
+from tools.approval import check_all_command_guards
 from tools.registry import registry
 
 logger = logging.getLogger(__name__)
@@ -860,44 +861,20 @@ async def terminal_tool(
             },
             ensure_ascii=False,
         )
-    from tools.approval import validate_terminal_command
-
-    guard = await validate_terminal_command(command)
-    if not guard.get("approved", False):
-        return json.dumps(
-            {
-                "output": "",
-                "exit_code": -1,
-                "error": guard.get("message") or "Terminal command blocked by policy.",
-                "status": "denied",
-            },
-            ensure_ascii=False,
+    if not force:
+        guard = await check_all_command_guards(
+            command,
+            "local",
+            approval_callback=_get_approval_callback(),
         )
-
-    callback = _get_approval_callback()
-    if callback is not None and not force:
-        if not inspect.iscoroutinefunction(callback):
-            raise RuntimeError(
-                "Async Hermes requires a coroutine terminal approval callback"
-            )
-        decision = await callback(
-            command=command,
-            task_id=task_id,
-            session_id=session_id,
-            background=background,
-        )
-        approved = decision is True or str(decision).strip().lower() in {
-            "approve",
-            "approved",
-            "allow",
-            "yes",
-        }
-        if not approved:
+        if not guard.get("approved", False):
             return json.dumps(
                 {
                     "output": "",
                     "exit_code": -1,
-                    "error": "Terminal command denied by the approval callback.",
+                    "error": (
+                        guard.get("message") or "Terminal command blocked by policy."
+                    ),
                     "status": "denied",
                 },
                 ensure_ascii=False,

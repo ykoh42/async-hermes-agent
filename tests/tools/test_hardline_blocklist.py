@@ -13,7 +13,7 @@ from tools.approval import (
     HARDLINE_PATTERNS,
     _check_sudo_stdin_guard,
     detect_hardline_command,
-    validate_terminal_command,
+    check_all_command_guards,
 )
 # -------------------------------------------------------------------------
 
@@ -292,7 +292,7 @@ async def test_quoted_newline_data_not_blocked_by_full_guard_chain():
     """End-to-end: the guard chain must not hardline-block a multi-line
     quoted message (yolo on, so only the unconditional floor can block)."""
     command = 'hermes send -t telegram "status:\nsudo reboot happened at 3am"'
-    result = await validate_terminal_command(command)
+    result = await check_all_command_guards(command, "local")
     assert result["approved"], (
         f"guard chain blocked multi-line quoted data: {result.get('message')}"
     )

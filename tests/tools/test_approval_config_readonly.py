@@ -21,7 +21,9 @@ async def test_guard_awaits_readonly_config_once(monkeypatch):
         load_config_readonly,
     )
 
-    result = await approval.validate_terminal_command("git push --force origin main")
+    result = await approval.check_all_command_guards(
+        "git push --force origin main", "local"
+    )
 
     assert calls == 1
     assert result["approved"] is False
@@ -40,6 +42,6 @@ async def test_guard_does_not_mutate_readonly_config(monkeypatch):
         load_config_readonly,
     )
 
-    await approval.validate_terminal_command("echo safe")
+    await approval.check_all_command_guards("echo safe", "local")
 
     assert config == {"approvals": {"deny": ["rm secret*"]}}
