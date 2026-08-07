@@ -7,14 +7,18 @@ import hashlib
 import json
 import logging
 import os
+import platform
 import random
 import re
 import sqlite3
+import stat
+import sys
 import time
 from collections.abc import Collection
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+import aiofiles
 import aiofiles.os
 
 from agent.memory_manager import sanitize_context
@@ -51,6 +55,12 @@ except ImportError:  # pragma: no cover - minimal installs
 
 logger = logging.getLogger(__name__)
 _COMPRESSION_LOCK_HOLDER_PID_RE = re.compile(r"(?:^|:)pid=(\d+)(?::|$)")
+_chmod = aiofiles.os.wrap(os.chmod)
+_realpath = aiofiles.os.wrap(os.path.realpath)
+_os_open = aiofiles.os.wrap(os.open)
+_os_close = aiofiles.os.wrap(os.close)
+_os_lseek = aiofiles.os.wrap(os.lseek)
+_live_connection_counts: Dict[str, int] = {}
 
 _DISK_FULL_MARKERS = (
     "no space left on device",
@@ -65,6 +75,517 @@ _MALFORMED_SCHEMA_MARKERS = (
     "malformed database schema",
     "database disk image is malformed",
 )
+
+_WAL_INCOMPAT_MARKERS = (
+    "locking protocol",
+    "not authorized",
+    "disk i/o error",
+)
+
+_last_init_error: Optional[str] = None
+_wal_fallback_warned_paths: set[str] = set()
+_wal_reset_bug_warned_paths: set[str] = set()
+
+
+def _set_last_init_error(msg: Optional[str]) -> None:
+    """Record or clear the most recent state database initialization error."""
+    global _last_init_error
+    _last_init_error = msg
+
+
+def get_last_init_error() -> Optional[str]:
+    """Return the most recent state database initialization error."""
+    return _last_init_error
+
+
+def format_session_db_unavailable(
+    prefix: str = "Session database not available",
+) -> str:
+    """Format an unavailable-state error with its captured cause."""
+    cause = get_last_init_error()
+    if not cause:
+        return f"{prefix}."
+    hint = ""
+    if any(marker in cause.lower() for marker in _WAL_INCOMPAT_MARKERS):
+        hint = (
+            " (state.db may be on NFS/SMB/FUSE/ZFS — see "
+            "https://www.sqlite.org/wal.html)"
+        )
+    return f"{prefix}: {cause}{hint}."
+
+
+async def _on_disk_journal_mode(conn) -> Optional[str]:
+    """Read the effective journal mode without changing it."""
+    try:
+        row = await (await conn.execute("PRAGMA journal_mode")).fetchone()
+    except sqlite3.OperationalError:
+        return None
+    if row is None or row[0] is None:
+        return None
+    mode = row[0]
+    if isinstance(mode, bytes):
+        try:
+            mode = mode.decode("ascii")
+        except UnicodeDecodeError:
+            return None
+    return str(mode).strip().lower()
+
+
+async def _apply_macos_checkpoint_barrier(conn) -> None:
+    """Enable SQLite's macOS checkpoint durability barrier, best effort."""
+    if sys.platform != "darwin":
+        return
+    try:
+        await conn.execute("PRAGMA checkpoint_fullfsync=1")
+    except sqlite3.OperationalError:
+        pass
+
+
+async def _enforce_macos_synchronous_full(conn) -> None:
+    """Use FULL synchronous mode for WAL connections on macOS."""
+    if sys.platform != "darwin":
+        return
+    try:
+        await conn.execute("PRAGMA synchronous=FULL")
+    except sqlite3.OperationalError:
+        pass
+
+
+def is_sqlite_wal_reset_vulnerable(
+    version_info: Optional[tuple] = None,
+) -> bool:
+    """Return whether the linked SQLite contains the WAL-reset bug."""
+    values = list(
+        version_info if version_info is not None else sqlite3.sqlite_version_info
+    )
+    values.extend([0] * (3 - len(values)))
+    info = tuple(int(value) for value in values[:3])
+    if info < (3, 7, 0) or info >= (3, 51, 3):
+        return False
+    if (3, 50, 7) <= info < (3, 51, 0):
+        return False
+    if (3, 44, 6) <= info < (3, 45, 0):
+        return False
+    return True
+
+
+async def sqlite_source_id() -> str:
+    """Return ``sqlite_source_id()``, or an empty string when unavailable."""
+    import aiosqlite
+
+    try:
+        connection = await aiosqlite.connect(":memory:")
+        try:
+            row = await (
+                await connection.execute("SELECT sqlite_source_id()")
+            ).fetchone()
+        finally:
+            await connection.close()
+    except sqlite3.Error:
+        return ""
+    return str(row[0]) if row and row[0] is not None else ""
+
+
+async def resolve_journal_mode() -> str:
+    """Return the configured journal mode (``wal`` or ``delete``)."""
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        config = await load_config_readonly() or {}
+        database = config.get("database", {})
+        if not isinstance(database, dict):
+            return "wal"
+        raw = database.get("journal_mode", "wal")
+    except Exception:
+        return "wal"
+    if not isinstance(raw, str):
+        return "wal"
+    mode = raw.strip().lower()
+    return mode if mode in {"wal", "delete"} else "wal"
+
+
+class WalUnsupportedError(sqlite3.OperationalError):
+    """Raised when a caller requires WAL but the filesystem refuses it."""
+
+
+def _log_wal_reset_bug_once(db_label: str, *, kept_wal: bool) -> None:
+    if db_label in _wal_reset_bug_warned_paths:
+        return
+    _wal_reset_bug_warned_paths.add(db_label)
+    action = (
+        "is already in WAL mode — leaving WAL in place (no live downgrade "
+        "under concurrent openers)"
+        if kept_wal
+        else "using journal_mode=DELETE instead of enabling WAL"
+    )
+    logger.warning(
+        "%s: linked SQLite %s is vulnerable to the WAL-reset corruption "
+        "bug (https://sqlite.org/wal.html#walresetbug) — %s. Upgrade to "
+        "SQLite 3.51.3+ (or backports 3.50.7 / 3.44.6).",
+        db_label,
+        sqlite3.sqlite_version,
+        action,
+    )
+
+
+def _log_wal_fallback_once(db_label: str, exc: Exception) -> None:
+    if db_label in _wal_fallback_warned_paths:
+        return
+    _wal_fallback_warned_paths.add(db_label)
+    logger.error(
+        "%s: WAL journal_mode unsupported on this filesystem (%s) — "
+        "falling back to journal_mode=DELETE. See "
+        "https://www.sqlite.org/wal.html for details.",
+        db_label,
+        exc,
+    )
+
+
+async def _apply_delete_for_wal_reset_bug(
+    conn,
+    *,
+    db_label: str,
+    require_delete: bool = False,
+) -> str:
+    current = await _on_disk_journal_mode(conn) or ""
+    if current == "wal":
+        _log_wal_reset_bug_once(db_label, kept_wal=True)
+        await _apply_macos_checkpoint_barrier(conn)
+        await _enforce_macos_synchronous_full(conn)
+        return "wal"
+
+    actual = ""
+    try:
+        row = await (
+            await conn.execute("PRAGMA journal_mode=DELETE")
+        ).fetchone()
+        if row and row[0] is not None:
+            actual = str(row[0]).strip().lower()
+    except sqlite3.OperationalError:
+        if require_delete:
+            raise
+    if require_delete and actual != "delete":
+        raise sqlite3.OperationalError(
+            "could not set configured journal_mode=delete "
+            f"(got {actual or 'no result'})"
+        )
+    _log_wal_reset_bug_once(db_label, kept_wal=False)
+    return "delete"
+
+
+async def apply_wal_with_fallback(
+    conn,
+    *,
+    db_label: str = "state.db",
+    require_wal: bool = False,
+) -> str:
+    """Enable WAL safely, preserving upstream fallback and durability rules."""
+    configured = await resolve_journal_mode()
+    if is_sqlite_wal_reset_vulnerable():
+        return await _apply_delete_for_wal_reset_bug(
+            conn,
+            db_label=db_label,
+            require_delete=configured == "delete",
+        )
+
+    current = await _on_disk_journal_mode(conn)
+    if current == "wal":
+        await _apply_macos_checkpoint_barrier(conn)
+        await _enforce_macos_synchronous_full(conn)
+        return "wal"
+
+    if configured == "delete":
+        row = await (
+            await conn.execute("PRAGMA journal_mode=DELETE")
+        ).fetchone()
+        actual = str(row[0]).lower() if row else ""
+        if actual != "delete":
+            raise sqlite3.OperationalError(
+                "could not set configured journal_mode=delete "
+                f"(got {actual or 'no result'})"
+            )
+        return actual
+
+    try:
+        row = await (
+            await conn.execute("PRAGMA journal_mode=WAL")
+        ).fetchone()
+        mode = str(row[0]).strip().lower() if row and row[0] is not None else ""
+        if mode == "wal":
+            await _apply_macos_checkpoint_barrier(conn)
+            await _enforce_macos_synchronous_full(conn)
+            return "wal"
+        refusal = WalUnsupportedError(
+            f"journal_mode=WAL refused without raising (still {mode!r})"
+        )
+        if require_wal:
+            raise refusal
+        _log_wal_fallback_once(db_label, refusal)
+        return mode or "delete"
+    except sqlite3.OperationalError as caught:
+        exc = caught
+
+    if isinstance(exc, WalUnsupportedError):
+        raise exc
+    message = str(exc).lower()
+    if not any(marker in message for marker in _WAL_INCOMPAT_MARKERS):
+        raise exc
+    if "disk i/o error" in message:
+        for _ in range(2):
+            await asyncio.sleep(0.05)
+            try:
+                row = await (
+                    await conn.execute("PRAGMA journal_mode=WAL")
+                ).fetchone()
+            except sqlite3.OperationalError as retry_exc:
+                if "disk i/o error" not in str(retry_exc).lower():
+                    raise
+                exc = retry_exc
+                continue
+            mode = (
+                str(row[0]).strip().lower()
+                if row and row[0] is not None
+                else ""
+            )
+            if mode == "wal":
+                await _apply_macos_checkpoint_barrier(conn)
+                await _enforce_macos_synchronous_full(conn)
+                return "wal"
+            break
+    if await _on_disk_journal_mode(conn) == "wal":
+        raise exc
+    if require_wal:
+        raise WalUnsupportedError(str(exc)) from exc
+    _log_wal_fallback_once(db_label, exc)
+    await conn.execute("PRAGMA journal_mode=DELETE")
+    return "delete"
+
+
+async def apply_database_pragmas(
+    conn,
+    *,
+    db_label: str = "state.db",
+) -> None:
+    """Apply optional integer database PRAGMAs from ``config.yaml``."""
+    try:
+        from hermes_cli.config import cfg_get, load_config_readonly
+
+        config = await load_config_readonly()
+    except Exception:
+        return
+    for pragma_name in (
+        "cache_size",
+        "mmap_size",
+        "temp_store",
+        "wal_autocheckpoint",
+        "journal_size_limit",
+    ):
+        raw_value = cfg_get(config, "database", pragma_name, default=None)
+        if raw_value is None:
+            continue
+        try:
+            value = int(str(raw_value).strip())
+        except (TypeError, ValueError):
+            logger.warning(
+                "%s: ignoring non-integer database.%s=%r",
+                db_label,
+                pragma_name,
+                raw_value,
+            )
+            continue
+        try:
+            await conn.execute(f"PRAGMA {pragma_name}={value}")
+        except sqlite3.OperationalError:
+            pass
+
+
+def is_malformed_db_error(exc: BaseException) -> bool:
+    """Return whether SQLite reported malformed schema or database bytes."""
+    return isinstance(exc, sqlite3.DatabaseError) and any(
+        marker in str(exc).lower() for marker in _MALFORMED_SCHEMA_MARKERS
+    )
+
+
+async def preflight_db_writability(
+    db_path: Path,
+    *,
+    db_label: str = "state.db",
+) -> None:
+    """Repair or reject read-only database files before opening SQLite."""
+    raw = str(db_path)
+    if raw == ":memory:" or raw.startswith("file:"):
+        return
+
+    try:
+        home = Path(await _realpath(str(get_hermes_home())))
+    except Exception:
+        home = None
+
+    async def _in_repair_scope(path: Path) -> bool:
+        if home is None:
+            return False
+        try:
+            resolved = Path(await _realpath(str(path)))
+            return resolved.is_relative_to(home)
+        except (OSError, ValueError):
+            return False
+
+    async def _ensure_writable(path: Path, *, is_dir: bool = False) -> None:
+        if await aiofiles.os.access(path, os.R_OK | os.W_OK):
+            return
+        if await _in_repair_scope(path):
+            try:
+                mode = (await aiofiles.os.stat(path)).st_mode
+                additions = stat.S_IRUSR | stat.S_IWUSR
+                if is_dir:
+                    additions |= stat.S_IXUSR
+                await _chmod(path, mode | additions)
+            except OSError:
+                pass
+            if await aiofiles.os.access(path, os.R_OK | os.W_OK):
+                logger.info(
+                    "%s preflight: repaired read-only %s (chmod u+rw%s)",
+                    db_label,
+                    path,
+                    "x" if is_dir else "",
+                )
+                return
+        kind = "directory" if is_dir else "file"
+        wal_note = (
+            " Do NOT delete the -wal file — it contains committed data that "
+            "will be merged into the database once it is writable."
+            if path.name.endswith("-wal")
+            else ""
+        )
+        raise sqlite3.OperationalError(
+            f"{db_label} is not writable: {kind} {path} is read-only for this "
+            "user. Hermes needs read-write access to open the database. "
+            f"Fix with: chmod u+rw{'x' if is_dir else ''} '{path}'"
+            f" (files owned by another user may need sudo/chown).{wal_note}"
+        )
+
+    parent = db_path.parent
+    if await aiofiles.os.path.isdir(parent):
+        await _ensure_writable(parent, is_dir=True)
+    for suffix in ("", "-wal", "-shm"):
+        path = db_path.with_name(db_path.name + suffix) if suffix else db_path
+        if await aiofiles.os.path.isfile(path):
+            await _ensure_writable(path)
+
+
+async def is_zeroed_state_db(
+    path: Path,
+    *,
+    probe_bytes: int = 100,
+    force: bool = False,
+) -> bool:
+    """Detect a non-empty state database whose header contains only NULs."""
+    try:
+        tracking_key = str(await _realpath(str(path)))
+        if not force and _live_connection_counts.get(tracking_key, 0) > 0:
+            return False
+        size = (await aiofiles.os.stat(path)).st_size
+    except OSError:
+        return False
+    if size <= 0:
+        return False
+    try:
+        async with aiofiles.open(path, "rb") as handle:
+            head = await handle.read(max(16, probe_bytes))
+    except OSError:
+        return False
+    if not head or head.startswith(b"SQLite format 3"):
+        return False
+    return all(byte == 0 for byte in head)
+
+
+async def quarantine_zeroed_state_db(path: Path) -> Optional[Path]:
+    """Move a zeroed database aside under a cross-process startup lock."""
+    lock_path = path.with_name(path.name + ".quarantine.lock")
+    await aiofiles.os.makedirs(lock_path.parent, exist_ok=True)
+    descriptor = await _os_open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    acquired = False
+    try:
+        deadline = time.monotonic() + 5.0
+        if platform.system() == "Windows":
+            import msvcrt
+
+            while True:
+                try:
+                    await _os_lseek(descriptor, 0, os.SEEK_SET)
+                    msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
+                    acquired = True
+                    break
+                except OSError:
+                    if time.monotonic() >= deadline:
+                        break
+                    await asyncio.sleep(0.020)
+        else:
+            import fcntl
+
+            while True:
+                try:
+                    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    acquired = True
+                    break
+                except (BlockingIOError, OSError):
+                    if time.monotonic() >= deadline:
+                        break
+                    await asyncio.sleep(0.020)
+        if not acquired:
+            logger.error(
+                "quarantine lock for %s not acquired within 5s — refusing "
+                "to quarantine without the cross-process lock",
+                path,
+            )
+            return None
+        if not await aiofiles.os.path.exists(path):
+            return None
+        if not await is_zeroed_state_db(path, force=True):
+            return None
+
+        timestamp = time.strftime("%Y%m%d-%H%M%S")
+        destination = path.with_name(
+            f"{path.name}.zeroed-{timestamp}-{os.getpid()}.bak"
+        )
+        counter = 0
+        while await aiofiles.os.path.exists(destination):
+            counter += 1
+            destination = path.with_name(
+                f"{path.name}.zeroed-{timestamp}-{os.getpid()}-{counter}.bak"
+            )
+        try:
+            await aiofiles.os.rename(path, destination)
+        except OSError as exc:
+            logger.error("Failed to quarantine zeroed %s: %s", path, exc)
+            return None
+        for suffix in ("-wal", "-shm"):
+            sidecar = Path(str(path) + suffix)
+            if await aiofiles.os.path.exists(sidecar):
+                try:
+                    await aiofiles.os.rename(
+                        sidecar,
+                        Path(str(destination) + suffix),
+                    )
+                except OSError:
+                    pass
+        return destination
+    finally:
+        try:
+            if acquired:
+                if platform.system() == "Windows":
+                    import msvcrt
+
+                    await _os_lseek(descriptor, 0, os.SEEK_SET)
+                    msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(descriptor, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        finally:
+            await _os_close(descriptor)
 
 
 def fts5_cjk_so_path() -> Path:
@@ -827,6 +1348,7 @@ class SessionDB:
         self._db_path = self.db_path
         self.read_only = bool(read_only)
         self._connection = None
+        self._connection_tracking_key = None
         self._connect_lock = None
         self._write_lock = None
         self._schema_ready = False
@@ -862,35 +1384,72 @@ class SessionDB:
 
             import aiofiles.os
 
-            if not self.read_only and not await aiofiles.os.path.exists(self._db_path.parent):
-                await aiofiles.os.makedirs(self._db_path.parent, exist_ok=True)
-            database = (
-                f"file:{os.path.abspath(self._db_path)}?mode=ro"
-                if self.read_only
-                else self._db_path
-            )
-            connection = await aiosqlite.connect(
-                database,
-                timeout=1.0,
-                isolation_level=None,
-                uri=self.read_only,
-            )
-            connection.row_factory = sqlite3.Row
+            connection = None
+            initialized = False
             try:
+                if not self.read_only and not await aiofiles.os.path.exists(
+                    self._db_path.parent
+                ):
+                    await aiofiles.os.makedirs(
+                        self._db_path.parent,
+                        exist_ok=True,
+                    )
+                if not self.read_only:
+                    await preflight_db_writability(
+                        self._db_path,
+                        db_label="state.db",
+                    )
+                    if await is_zeroed_state_db(self._db_path):
+                        try:
+                            zeroed_size = (
+                                await aiofiles.os.stat(self._db_path)
+                            ).st_size
+                        except OSError:
+                            zeroed_size = -1
+                        quarantine_path = await quarantine_zeroed_state_db(
+                            self._db_path
+                        )
+                        snapshots = self._db_path.parent / "state-snapshots"
+                        message = (
+                            "state.db looks ZEROED "
+                            f"({zeroed_size} bytes, no SQLite header). "
+                            "Preserved at "
+                            f"{quarantine_path or '(quarantine failed — file left in place)'}. "
+                            f"Restore from {snapshots} via `hermes snapshot list` / "
+                            "`hermes snapshot restore <id>` if available. "
+                            "Opening a fresh empty database so the agent can start."
+                        )
+                        logger.error(message)
+                        _set_last_init_error(message)
+                        if (
+                            quarantine_path is None
+                            and await aiofiles.os.path.exists(self._db_path)
+                            and await is_zeroed_state_db(self._db_path)
+                        ):
+                            raise sqlite3.DatabaseError(message)
+                database = (
+                    f"file:{os.path.abspath(self._db_path)}?mode=ro"
+                    if self.read_only
+                    else self._db_path
+                )
+                connection = await aiosqlite.connect(
+                    database,
+                    timeout=1.0,
+                    isolation_level=None,
+                    uri=self.read_only,
+                )
+                connection.row_factory = sqlite3.Row
                 await connection.execute("PRAGMA foreign_keys=ON")
                 await connection.execute("PRAGMA busy_timeout=1000")
+                await apply_database_pragmas(connection, db_label="state.db")
                 if not self.read_only:
                     self._fts_cjk_loaded = await load_fts5_cjk_extension(
                         connection
                     )
-                    try:
-                        cursor = await connection.execute("PRAGMA journal_mode=WAL")
-                        await cursor.fetchone()
-                    except sqlite3.OperationalError:
-                        logger.warning(
-                            "WAL mode unavailable for %s; using SQLite default journal mode",
-                            self._db_path,
-                        )
+                    await apply_wal_with_fallback(
+                        connection,
+                        db_label="state.db",
+                    )
                     await self._ensure_schema(connection)
                 else:
                     self._fts_enabled = (
@@ -904,9 +1463,23 @@ class SessionDB:
                             )
                             is True
                         )
-            except BaseException:
-                await connection.close()
+                initialized = True
+            except Exception as exc:
+                _set_last_init_error(f"{type(exc).__name__}: {exc}")
                 raise
+            finally:
+                if not initialized and connection is not None:
+                    close_task = asyncio.create_task(connection.close())
+                    try:
+                        await asyncio.shield(close_task)
+                    except asyncio.CancelledError:
+                        await asyncio.shield(close_task)
+                        raise
+            tracking_key = str(await _realpath(str(self._db_path)))
+            _live_connection_counts[tracking_key] = (
+                _live_connection_counts.get(tracking_key, 0) + 1
+            )
+            self._connection_tracking_key = tracking_key
             self._connection = connection
             return connection
 
@@ -6603,10 +7176,20 @@ class SessionDB:
         self._closed = True
         connection = self._connection
         self._connection = None
-        if connection is not None:
-            close_task = asyncio.create_task(connection.close())
-            try:
-                await asyncio.shield(close_task)
-            except asyncio.CancelledError:
-                await asyncio.shield(close_task)
-                raise
+        tracking_key = self._connection_tracking_key
+        self._connection_tracking_key = None
+        if connection is None:
+            return
+        close_task = asyncio.create_task(connection.close())
+        try:
+            await asyncio.shield(close_task)
+        except asyncio.CancelledError:
+            await asyncio.shield(close_task)
+            raise
+        finally:
+            if tracking_key is not None:
+                remaining = _live_connection_counts.get(tracking_key, 1) - 1
+                if remaining > 0:
+                    _live_connection_counts[tracking_key] = remaining
+                else:
+                    _live_connection_counts.pop(tracking_key, None)
