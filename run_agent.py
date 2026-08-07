@@ -3751,6 +3751,84 @@ class AIAgent:
         except Exception:
             logger.debug("External memory turn sync failed", exc_info=True)
 
+    async def release_clients(self) -> None:
+        """Release model clients without tearing down session tool state.
+
+        This is the soft-eviction counterpart to :meth:`close`.  Active child
+        agents and model transports are per-agent resources, while terminal,
+        MCP, memory, and session state remain available for a later turn.
+        """
+        children = list(getattr(self, "_active_children", ()) or ())
+        try:
+            self._active_children.clear()
+        except AttributeError:
+            pass
+        for child in children:
+            try:
+                release_child = getattr(child, "release_clients", None)
+                if callable(release_child) and inspect.iscoroutinefunction(
+                    inspect.unwrap(release_child)
+                ):
+                    await release_child()
+                    continue
+                close_child = getattr(child, "close", None)
+                if callable(close_child) and inspect.iscoroutinefunction(
+                    inspect.unwrap(close_child)
+                ):
+                    await close_child()
+            except Exception:
+                logger.debug("Child client release failed", exc_info=True)
+
+        closed_client_ids: set[int] = set()
+        token_providers = []
+        for attribute in ("client", "_anthropic_client"):
+            client = getattr(self, attribute, None)
+            if client is None:
+                continue
+            token_provider = getattr(client, "_hermes_token_provider", None)
+            if token_provider is not None:
+                token_providers.append(token_provider)
+            if id(client) in closed_client_ids:
+                setattr(self, attribute, None)
+                continue
+            closed_client_ids.add(id(client))
+            try:
+                close_client = getattr(client, "aclose", None) or getattr(
+                    client, "close", None
+                )
+                if callable(close_client) and inspect.iscoroutinefunction(
+                    inspect.unwrap(close_client)
+                ):
+                    await close_client()
+                elif callable(close_client):
+                    logger.error(
+                        "Native async client %s exposes only a synchronous close()",
+                        attribute,
+                    )
+            except Exception:
+                logger.debug("Client release failed for %s", attribute, exc_info=True)
+            finally:
+                setattr(self, attribute, None)
+        self._anthropic_client_source = None
+
+        active_api_key = getattr(self, "api_key", None)
+        if callable(active_api_key) and not isinstance(active_api_key, str):
+            token_providers.append(active_api_key)
+        if token_providers:
+            try:
+                from agent.azure_identity_adapter import release_token_provider
+
+                released_ids: set[int] = set()
+                for token_provider in token_providers:
+                    if id(token_provider) in released_ids:
+                        continue
+                    released_ids.add(id(token_provider))
+                    await release_token_provider(token_provider)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.debug("Async token provider release failed", exc_info=True)
+
     async def close(self) -> None:
         """Release all resources held by this agent instance.
 

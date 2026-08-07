@@ -2434,6 +2434,41 @@ async def test_close_awaits_the_native_primary_client():
 
 
 @pytest.mark.asyncio
+async def test_release_clients_preserves_session_resources():
+    """Soft eviction releases transports without performing hard teardown."""
+    agent = AIAgent.__new__(AIAgent)
+    released = []
+
+    class NativeClient:
+        async def aclose(self):
+            released.append("client")
+
+    class ChildAgent:
+        async def release_clients(self):
+            released.append("child")
+
+    session_db = object()
+    memory_manager = object()
+    agent.client = NativeClient()
+    agent._anthropic_client = None
+    agent._active_children = [ChildAgent()]
+    agent._session_db = session_db
+    agent._memory_manager = memory_manager
+    agent._mcp_lifecycle_retained = True
+
+    await agent.release_clients()
+
+    assert inspect.iscoroutinefunction(AIAgent.release_clients)
+    assert released == ["child", "client"]
+    assert agent.client is None
+    assert agent._active_children == []
+    assert agent._session_db is session_db
+    assert agent._memory_manager is memory_manager
+    assert agent._mcp_lifecycle_retained is True
+    assert not getattr(agent, "_closed", False)
+
+
+@pytest.mark.asyncio
 async def test_trajectory_writer_is_awaitable(tmp_path):
     filename = tmp_path / "trajectory.jsonl"
     await save_trajectory(

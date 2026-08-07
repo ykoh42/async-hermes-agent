@@ -894,7 +894,7 @@ def strip_think_blocks(agent, content: str) -> str:
 
 
 
-def bind_credential_pool_entry_id(agent) -> None:
+def sync_credential_pool_entry_id(agent) -> None:
     """Rebind ``agent._credential_pool_entry_id`` from the current pool + key.
 
     OAuth refreshes can replace the runtime token before a failed request is
