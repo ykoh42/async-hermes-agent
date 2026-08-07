@@ -15,10 +15,22 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any
 
+import httpx
+
 logger = logging.getLogger(__name__)
 
 # Sentinel for "omit temperature entirely" (Kimi: server manages it)
 OMIT_TEMPERATURE = object()
+
+
+def _profile_user_agent() -> str:
+    """Return a ``hermes-cli/<version>`` UA string, with a stable fallback."""
+    try:
+        from hermes_cli import __version__ as version
+
+        return f"hermes-cli/{version}"
+    except Exception:
+        return "hermes-cli"
 
 
 @dataclass
@@ -163,3 +175,42 @@ class ProviderProfile:
         per-model.
         """
         return self.default_max_tokens
+
+    async def fetch_models(
+        self,
+        *,
+        api_key: str | None = None,
+        base_url: str | None = None,
+        timeout: float = 8.0,
+    ) -> list[str] | None:
+        """Fetch the live model list from the provider's models endpoint."""
+        effective_base = base_url or self.base_url
+        url = (self.models_url or "").strip()
+        if not url:
+            if not effective_base:
+                return None
+            url = effective_base.rstrip("/") + "/models"
+
+        headers = httpx.Headers()
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        headers["Accept"] = "application/json"
+        headers["User-Agent"] = _profile_user_agent()
+        headers.update(self.default_headers)
+
+        from hermes_cli.urllib_security import open_credentialed_url
+
+        try:
+            response = await open_credentialed_url(
+                httpx.Request("GET", url, headers=headers), timeout=timeout
+            )
+            data = response.json()
+            items = data if isinstance(data, list) else data.get("data", [])
+            return [
+                model["id"]
+                for model in items
+                if isinstance(model, dict) and "id" in model
+            ]
+        except Exception as exc:
+            logger.debug("fetch_models(%s): %s", self.name, exc)
+            return None

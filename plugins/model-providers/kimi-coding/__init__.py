@@ -36,6 +36,30 @@ def _is_confirmed_kimi_coding_url(base_url: str) -> bool:
 class KimiProfile(ProviderProfile):
     """Kimi/Moonshot — temperature omitted, thinking xor reasoning_effort."""
 
+    async def fetch_models(
+        self,
+        *,
+        api_key: str | None = None,
+        base_url: str | None = None,
+        timeout: float = 8.0,
+    ) -> list[str] | None:
+        """Use Kimi Code's OpenAI-compatible surface for model discovery."""
+        effective_base = (base_url or self.base_url or "").rstrip("/")
+        confirmed_coding_endpoint = _is_confirmed_kimi_coding_url(effective_base)
+        if (
+            confirmed_coding_endpoint
+            and urlparse(effective_base).path.rstrip("/") == "/coding"
+        ):
+            effective_base += "/v1"
+        models = await super().fetch_models(
+            api_key=api_key,
+            base_url=effective_base or None,
+            timeout=timeout,
+        )
+        if models is None or confirmed_coding_endpoint:
+            return models
+        return [model for model in models if model.strip().lower() != "k3"]
+
     def build_api_kwargs_extras(
         self, *, reasoning_config: dict | None = None, **context
     ) -> tuple[dict[str, Any], dict[str, Any]]:

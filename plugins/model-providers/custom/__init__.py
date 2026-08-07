@@ -68,6 +68,21 @@ class CustomProfile(ProviderProfile):
 
         return extra_body, top_level
 
+    async def fetch_models(
+        self,
+        *,
+        api_key: str | None = None,
+        base_url: str | None = None,
+        timeout: float = 8.0,
+    ) -> list[str] | None:
+        """Custom/Ollama: base_url is user-configured; fetch if set."""
+        if not (base_url or self.base_url):
+            return None
+        return await super().fetch_models(
+            api_key=api_key, base_url=base_url, timeout=timeout
+        )
+
+
 custom = CustomProfile(
     name="custom",
     aliases=(

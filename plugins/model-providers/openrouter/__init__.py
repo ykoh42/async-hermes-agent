@@ -1,10 +1,15 @@
 """OpenRouter provider profile."""
 
+import logging
 from typing import Any
 
 from agent.portal_tags import get_conversation_context
 from providers import register_provider
 from providers.base import ProviderProfile
+
+logger = logging.getLogger(__name__)
+
+_CACHE: list[str] | None = None
 
 # Anthropic model families that still accept an explicit "disable thinking"
 # request (the manual ``thinking: {type: "disabled"}`` form OpenRouter emits
@@ -42,6 +47,28 @@ def _anthropic_reasoning_is_mandatory(model: str | None) -> bool:
 
 class OpenRouterProfile(ProviderProfile):
     """OpenRouter aggregator — provider preferences, reasoning config passthrough."""
+
+    async def fetch_models(
+        self,
+        *,
+        api_key: str | None = None,
+        base_url: str | None = None,
+        timeout: float = 8.0,
+    ) -> list[str] | None:
+        """Fetch from the public OpenRouter catalog without authentication."""
+        global _CACHE
+        if _CACHE is not None:
+            return _CACHE
+        try:
+            result = await super().fetch_models(
+                api_key=None, base_url=base_url, timeout=timeout
+            )
+            if result is not None:
+                _CACHE = result
+            return result
+        except Exception as exc:
+            logger.debug("fetch_models(openrouter): %s", exc)
+            return None
 
     def build_extra_body(
         self, *, session_id: str | None = None, **context: Any
