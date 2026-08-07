@@ -10,8 +10,9 @@ Design
 ------
 A process-wide singleton ``FileStateRegistry`` tracks, per resolved path:
 
-  * per-agent read stamps: {task_id: {path: (read_ts, partial)}}
+  * per-agent read stamps: {task_id: {path: (mtime, read_ts, partial)}}
   * last writer globally: {path: (task_id, write_ts)}
+  * per-event-loop path locks for read→modify→write critical sections
 
 Three public hooks are used by the file tools:
 
@@ -19,9 +20,9 @@ Three public hooks are used by the file tools:
   * ``note_write(task_id, path)`` — called after write_file / patch
   * ``check_stale(task_id, path)`` — called BEFORE write_file / patch
 
-Plus ``writes_since(task_id, since_ts, paths)`` for the subagent-completion
-reminder in delegate_tool. Native file-operation serialization lives in
-``file_tools.py`` where it can use per-path ``asyncio.Lock`` instances.
+Plus ``lock_path(path)`` — an async context manager providing a per-path lock
+around the whole read→modify→write block. And ``writes_since(task_id,
+since_ts, paths)`` for the subagent-completion reminder in delegate_tool.
 
 All methods are no-ops when ``HERMES_DISABLE_FILE_STATE_GUARD=1`` is set.
 
@@ -31,19 +32,23 @@ loop detection, which is a different concern.
 """
 from __future__ import annotations
 
+import asyncio
 import os
-import threading
 import time
 from collections import defaultdict
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
+from weakref import WeakKeyDictionary
+
+import aiofiles.os
 
 
 # ── Public stamp type ────────────────────────────────────────────────
-# (read_ts, partial).  partial=True when read_file returned a
+# (mtime, read_ts, partial).  partial=True when read_file returned a
 # windowed view (offset > 1 or limit < total_lines) — writes that happen
 # after a partial read should still warn so the model re-reads in full.
-ReadStamp = Tuple[float, bool]
+ReadStamp = Tuple[float, float, bool]
 
 # Number of resolved-path entries retained per agent.  Bounded to keep
 # long sessions from accumulating unbounded state.  On overflow we drop
@@ -60,28 +65,49 @@ class FileStateRegistry:
     def __init__(self) -> None:
         self._reads: Dict[str, Dict[str, ReadStamp]] = defaultdict(dict)
         self._last_writer: Dict[str, Tuple[str, float]] = {}
-        self._state_lock = threading.Lock()  # guards _reads + _last_writer
+        self._path_locks: WeakKeyDictionary[
+            asyncio.AbstractEventLoop, Dict[str, asyncio.Lock]
+        ] = WeakKeyDictionary()
+
+    # ── Path lock management ────────────────────────────────────────
+    def _lock_for(self, resolved: str) -> asyncio.Lock:
+        loop = asyncio.get_running_loop()
+        locks = self._path_locks.setdefault(loop, {})
+        return locks.setdefault(resolved, asyncio.Lock())
+
+    @asynccontextmanager
+    async def lock_path(self, resolved: str):
+        """Serialize a read→modify→write section for one resolved path."""
+        async with self._lock_for(resolved):
+            yield
 
     # ── Read/write accounting ───────────────────────────────────────
-    def record_read(
+    async def record_read(
         self,
         task_id: str,
         resolved: str,
         *,
         partial: bool = False,
+        mtime: Optional[float] = None,
     ) -> None:
         if _disabled():
             return
+        if mtime is None:
+            try:
+                mtime = (await aiofiles.os.stat(resolved)).st_mtime
+            except OSError:
+                return
         now = time.time()
-        with self._state_lock:
-            agent_reads = self._reads[task_id]
-            agent_reads[resolved] = (now, bool(partial))
-            _cap_dict(agent_reads, _MAX_PATHS_PER_AGENT)
+        agent_reads = self._reads[task_id]
+        agent_reads[resolved] = (float(mtime), now, bool(partial))
+        _cap_dict(agent_reads, _MAX_PATHS_PER_AGENT)
 
-    def note_write(
+    async def note_write(
         self,
         task_id: str,
         resolved: str,
+        *,
+        mtime: Optional[float] = None,
     ) -> None:
         """Record a successful write.
 
@@ -91,39 +117,45 @@ class FileStateRegistry:
         """
         if _disabled():
             return
+        if mtime is None:
+            try:
+                mtime = (await aiofiles.os.stat(resolved)).st_mtime
+            except OSError:
+                return
         now = time.time()
-        with self._state_lock:
-            self._last_writer[resolved] = (task_id, now)
-            _cap_dict(self._last_writer, _MAX_GLOBAL_WRITERS)
-            # Writer's own view is now up-to-date.
-            self._reads[task_id][resolved] = (now, False)
-            _cap_dict(self._reads[task_id], _MAX_PATHS_PER_AGENT)
+        self._last_writer[resolved] = (task_id, now)
+        _cap_dict(self._last_writer, _MAX_GLOBAL_WRITERS)
+        # Writer's own view is now up-to-date.
+        self._reads[task_id][resolved] = (float(mtime), now, False)
+        _cap_dict(self._reads[task_id], _MAX_PATHS_PER_AGENT)
 
-    def check_stale(self, task_id: str, resolved: str) -> Optional[str]:
+    async def check_stale(self, task_id: str, resolved: str) -> Optional[str]:
         """Return a model-facing warning if this write would be stale.
 
         Three staleness classes, in order of severity:
 
           1. Sibling subagent wrote this file after this agent's last read.
-          2. Agent only read a partial view of the file.
+          2. External/unknown change (mtime differs from our last read).
           3. Agent never read the file (write-without-read).
-
-        Filesystem mtime drift is checked by the native async file handler;
-        this process-wide registry only coordinates in-memory agent state.
 
         Returns ``None`` when the write is safe.  Does not raise — callers
         decide whether to block or warn.
         """
         if _disabled():
             return None
-        with self._state_lock:
-            stamp = self._reads.get(task_id, {}).get(resolved)
-            last_writer = self._last_writer.get(resolved)
+        stamp = self._reads.get(task_id, {}).get(resolved)
+        last_writer = self._last_writer.get(resolved)
 
         # Case 3: never read AND we have no write record — net-new file or
         # first touch by this agent.  Let existing _check_sensitive_path
         # and file-exists logic handle it; nothing to warn about here.
         if stamp is None and last_writer is None:
+            return None
+
+        try:
+            current_mtime = (await aiofiles.os.stat(resolved)).st_mtime
+        except OSError:
+            # File doesn't exist — write will create it; not stale.
             return None
 
         # Case 1: sibling subagent modified after our last read.
@@ -137,7 +169,7 @@ class FileStateRegistry:
                         "Read the file before writing to avoid overwriting "
                         "the sibling's changes."
                     )
-                read_ts = stamp[0]
+                read_ts = stamp[1]
                 if writer_ts > read_ts:
                     return (
                         f"{resolved} was modified by sibling subagent "
@@ -146,9 +178,15 @@ class FileStateRegistry:
                         "Re-read the file before writing."
                     )
 
-        # Case 2: the agent only saw a partial view.
+        # Case 2: external / unknown modification (mtime drifted).
         if stamp is not None:
-            _read_ts, partial = stamp
+            read_mtime, _read_ts, partial = stamp
+            if current_mtime != read_mtime:
+                return (
+                    f"{resolved} was modified since you last read it "
+                    "on disk (external edit or unrecorded writer). "
+                    "Re-read the file before writing."
+                )
             if partial:
                 return (
                     f"{resolved} was last read with offset/limit pagination "
@@ -182,29 +220,27 @@ class FileStateRegistry:
             return {}
         paths_set = set(paths)
         out: Dict[str, List[str]] = defaultdict(list)
-        with self._state_lock:
-            for p, (writer_tid, ts) in self._last_writer.items():
-                if writer_tid == exclude_task_id:
-                    continue
-                if ts < since_ts:
-                    continue
-                if p in paths_set:
-                    out[writer_tid].append(p)
+        for p, (writer_tid, ts) in self._last_writer.items():
+            if writer_tid == exclude_task_id:
+                continue
+            if ts < since_ts:
+                continue
+            if p in paths_set:
+                out[writer_tid].append(p)
         return dict(out)
 
     def known_reads(self, task_id: str) -> List[str]:
         """Return the list of resolved paths this agent has read."""
         if _disabled():
             return []
-        with self._state_lock:
-            return list(self._reads.get(task_id, {}).keys())
+        return list(self._reads.get(task_id, {}).keys())
 
     # ── Testing hooks ───────────────────────────────────────────────
     def clear(self) -> None:
         """Reset all state.  Intended for tests only."""
-        with self._state_lock:
-            self._reads.clear()
-            self._last_writer.clear()
+        self._reads.clear()
+        self._last_writer.clear()
+        self._path_locks.clear()
 
 
 # ── Module-level singleton + helpers ─────────────────────────────────
@@ -241,16 +277,32 @@ def _cap_dict(d: dict, limit: int) -> None:
 
 
 # ── Convenience wrappers (short names used at call sites) ────────────
-def record_read(task_id: str, resolved_or_path: str | Path, *, partial: bool = False) -> None:
-    _registry.record_read(task_id, str(resolved_or_path), partial=partial)
+async def record_read(
+    task_id: str,
+    resolved_or_path: str | Path,
+    *,
+    partial: bool = False,
+) -> None:
+    await _registry.record_read(
+        task_id,
+        str(resolved_or_path),
+        partial=partial,
+    )
 
 
-def note_write(task_id: str, resolved_or_path: str | Path) -> None:
-    _registry.note_write(task_id, str(resolved_or_path))
+async def note_write(
+    task_id: str,
+    resolved_or_path: str | Path,
+) -> None:
+    await _registry.note_write(task_id, str(resolved_or_path))
 
 
-def check_stale(task_id: str, resolved_or_path: str | Path) -> Optional[str]:
-    return _registry.check_stale(task_id, str(resolved_or_path))
+async def check_stale(task_id: str, resolved_or_path: str | Path) -> Optional[str]:
+    return await _registry.check_stale(task_id, str(resolved_or_path))
+
+
+def lock_path(resolved_or_path: str | Path):
+    return _registry.lock_path(str(resolved_or_path))
 
 
 def writes_since(
@@ -271,6 +323,7 @@ __all__ = [
     "record_read",
     "note_write",
     "check_stale",
+    "lock_path",
     "writes_since",
     "known_reads",
 ]

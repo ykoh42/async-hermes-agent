@@ -900,16 +900,6 @@ SEARCH_FILES_SCHEMA = {
 # compatibility backend: a caller either awaits the native handler or receives
 # the explicit unsupported-backend error from ``_native_file_path``.
 
-_file_locks: dict[str, asyncio.Lock] = {}
-_file_locks_guard = asyncio.Lock()
-
-
-async def _file_lock(path: Path) -> asyncio.Lock:
-    key = str(path)
-    async with _file_locks_guard:
-        return _file_locks.setdefault(key, asyncio.Lock())
-
-
 async def _native_file_path(path: str, task_id: str) -> Path | str:
     """Resolve a host path or return the user-facing reason it cannot run."""
     try:
@@ -1111,7 +1101,11 @@ async def _handle_read_file(args, **kw):
         truncated=truncated,
     )
     try:
-        file_state.record_read(task_id, resolved_str, partial=offset > 1 or truncated)
+        await file_state.record_read(
+            task_id,
+            resolved_str,
+            partial=offset > 1 or truncated,
+        )
     except Exception:
         logger.debug("file_state.record_read failed", exc_info=True)
     if count >= 4:
@@ -1190,12 +1184,13 @@ async def _handle_write_file(args, **kw):
         profile_error = await _check_cross_profile_path(str(resolved), task_id)
         if profile_error:
             return tool_error(profile_error)
-    cross_warning = file_state.check_stale(task_id, str(resolved))
-    stale_warning = await _check_file_staleness(path, task_id)
+    cross_warning: str | None = None
+    stale_warning: str | None = None
     verified: bool | None = None
-    lock = await _file_lock(resolved)
     try:
-        async with lock:
+        async with file_state.lock_path(resolved):
+            cross_warning = await file_state.check_stale(task_id, str(resolved))
+            stale_warning = await _check_file_staleness(path, task_id)
             try:
                 existing = await _read_native_patch_content(resolved)
             except FileNotFoundError:
@@ -1219,11 +1214,11 @@ async def _handle_write_file(args, **kw):
                 return tool_error(
                     f"Write verification failed: content did not persist at {resolved}"
                 )
+            await _refresh_read_timestamp(path, task_id)
+            await file_state.note_write(task_id, str(resolved))
     except OSError as exc:
         return tool_error(f"Failed to write {path}: {exc}")
 
-    await _refresh_read_timestamp(path, task_id)
-    file_state.note_write(task_id, str(resolved))
     result = {
         "bytes_written": len(content.encode("utf-8")),
         "resolved_path": str(resolved),
@@ -1249,7 +1244,7 @@ def _native_v4a_error(message: str) -> str:
     return tool_error(f"V4A patch validation failed (no files were modified): {message}")
 
 
-async def _apply_native_v4a_update(content: str, operation) -> tuple[str, str | None]:
+def _apply_native_v4a_update(content: str, operation) -> tuple[str, str | None]:
     """Apply one parsed V4A update in memory.
 
     Parsing and fuzzy matching are CPU-only.  Keeping them in this helper lets
@@ -1376,10 +1371,20 @@ async def _handle_v4a_patch(args: dict, task_id: str) -> str:
         resolved_by_raw[raw_path] = resolved
 
     paths = sorted(set(resolved_by_raw.values()), key=str)
-    locks = [await _file_lock(path) for path in paths]
+    stale_warnings: list[str] = []
     async with contextlib.AsyncExitStack() as stack:
-        for lock in locks:
-            await stack.enter_async_context(lock)
+        for path in paths:
+            await stack.enter_async_context(file_state.lock_path(path))
+
+        for raw_path in raw_paths:
+            resolved = resolved_by_raw[raw_path]
+            cross_warning = await file_state.check_stale(task_id, str(resolved))
+            stale_warning = cross_warning or await _check_file_staleness(
+                raw_path,
+                task_id,
+            )
+            if stale_warning:
+                stale_warnings.append(stale_warning)
 
         original: dict[Path, str | None] = {}
         state: dict[Path, str | None] = {}
@@ -1426,21 +1431,22 @@ async def _handle_v4a_patch(args: dict, task_id: str) -> str:
             current = await load(source)
             if current is None:
                 return _native_v4a_error(f"{operation.file_path}: file not found for update")
-            replacement, error = await _apply_native_v4a_update(current, operation)
+            replacement, error = _apply_native_v4a_update(current, operation)
             if error:
                 return _native_v4a_error(error)
             state[source] = replacement
 
         changed_paths = [path for path in paths if state.get(path) != original.get(path)]
         if not changed_paths:
-            return json.dumps(
-                {
-                    "success": True,
-                    "no_change": True,
-                    "note": "Patch was already applied; no files changed.",
-                    "files_modified": [],
-                }
-            )
+            result = {
+                "success": True,
+                "no_change": True,
+                "note": "Patch was already applied; no files changed.",
+                "files_modified": [],
+            }
+            if stale_warnings:
+                result["_warning"] = " | ".join(stale_warnings)
+            return json.dumps(result)
         try:
             for path in changed_paths:
                 content = state[path]
@@ -1452,10 +1458,9 @@ async def _handle_v4a_patch(args: dict, task_id: str) -> str:
             return tool_error(
                 f"V4A apply failed after validation: {exc}. Run git diff to inspect state."
             )
-
-    for path in changed_paths:
-        await _refresh_read_timestamp(str(path), task_id)
-        file_state.note_write(task_id, str(path))
+        for path in changed_paths:
+            await _refresh_read_timestamp(str(path), task_id)
+            await file_state.note_write(task_id, str(path))
     _reset_patch_failures(task_id, [str(path) for path in changed_paths])
     diffs: list[str] = []
     for path in changed_paths:
@@ -1474,6 +1479,8 @@ async def _handle_v4a_patch(args: dict, task_id: str) -> str:
     }
     if len(changed_paths) == 1:
         result["resolved_path"] = str(changed_paths[0])
+    if stale_warnings:
+        result["_warning"] = " | ".join(stale_warnings)
     return json.dumps(result, ensure_ascii=False)
 
 
@@ -1506,11 +1513,12 @@ async def _handle_patch(args, **kw):
         profile_error = await _check_cross_profile_path(str(resolved), task_id)
         if profile_error:
             return tool_error(profile_error)
-    cross_warning = file_state.check_stale(task_id, str(resolved))
-    stale_warning = await _check_file_staleness(path, task_id)
-    lock = await _file_lock(resolved)
+    cross_warning: str | None = None
+    stale_warning: str | None = None
     try:
-        async with lock:
+        async with file_state.lock_path(resolved):
+            cross_warning = await file_state.check_stale(task_id, str(resolved))
+            stale_warning = await _check_file_staleness(path, task_id)
             async with aiofiles.open(resolved, "r", encoding="utf-8", errors="replace", newline="") as handle:
                 content = await handle.read()
             from tools.file_operations import (
@@ -1524,15 +1532,16 @@ async def _handle_patch(args, **kw):
             from tools.fuzzy_match import is_already_applied
 
             if is_already_applied(content, old_string, new_string):
-                return json.dumps(
-                    {
-                        "success": True,
-                        "no_change": True,
-                        "note": "Replacement was already applied; no file changed.",
-                        "resolved_path": str(resolved),
-                        "files_modified": [],
-                    }
-                )
+                result = {
+                    "success": True,
+                    "no_change": True,
+                    "note": "Replacement was already applied; no file changed.",
+                    "resolved_path": str(resolved),
+                    "files_modified": [],
+                }
+                if cross_warning or stale_warning:
+                    result["_warning"] = cross_warning or stale_warning
+                return json.dumps(result)
             occurrences = content.count(old_string)
             if occurrences == 0:
                 return tool_error(
@@ -1545,6 +1554,8 @@ async def _handle_patch(args, **kw):
             replacement_count = occurrences if args.get("replace_all", False) else 1
             updated = content.replace(old_string, new_string, replacement_count)
             await _write_native_file(resolved, updated)
+            await _refresh_read_timestamp(path, task_id)
+            await file_state.note_write(task_id, str(resolved))
     except FileNotFoundError:
         return tool_error(f"File not found: {path}")
     except OSError as exc:
@@ -1552,8 +1563,6 @@ async def _handle_patch(args, **kw):
         return tool_error(f"Failed to patch {path}: {exc}")
 
     _reset_patch_failures(task_id, [str(resolved)])
-    await _refresh_read_timestamp(path, task_id)
-    file_state.note_write(task_id, str(resolved))
     result = {
         "success": True,
         "replacements": replacement_count,

@@ -15,6 +15,8 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+import aiofiles
+
 from tools import file_state
 from tools.file_tools import (
     read_file_tool,
@@ -79,10 +81,10 @@ class TestStalenessCheck(unittest.IsolatedAsyncioTestCase):
 
         start_file = os.path.join(start_dir, "shared.txt")
         live_file = os.path.join(live_dir, "shared.txt")
-        with open(start_file, "w") as f:
-            f.write("start copy\n")
-        with open(live_file, "w") as f:
-            f.write("live copy\n")
+        async with aiofiles.open(start_file, "w") as f:
+            await f.write("start copy\n")
+        async with aiofiles.open(live_file, "w") as f:
+            await f.write("live copy\n")
 
         from tools import terminal_tool
 
@@ -94,8 +96,8 @@ class TestStalenessCheck(unittest.IsolatedAsyncioTestCase):
                 await read_file_tool("shared.txt", task_id="live_task")
 
                 await asyncio.sleep(0.05)
-                with open(live_file, "w") as f:
-                    f.write("live copy modified elsewhere\n")
+                async with aiofiles.open(live_file, "w") as f:
+                    await f.write("live copy modified elsewhere\n")
 
                 result = json.loads(
                     await write_file_tool(
@@ -137,8 +139,8 @@ class TestPatchStaleness(unittest.IsolatedAsyncioTestCase):
         await read_file_tool(self._tmpfile, task_id="p1")
 
         await asyncio.sleep(0.05)
-        with open(self._tmpfile, "w") as f:
-            f.write("original line externally modified\n")
+        async with aiofiles.open(self._tmpfile, "w") as f:
+            await f.write("original line externally modified\n")
 
         result = json.loads(
             await patch_tool(

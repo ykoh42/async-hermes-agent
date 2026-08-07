@@ -15,11 +15,17 @@ Run:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import tempfile
-import time
 import unittest
+
+import aiofiles
+import pytest
+from blockbuster import BlockBuster
+from pyleak import no_event_loop_blocking, no_task_leaks
+from pyleak.eventloop import LeakAction
 
 from tools import file_state
 from tools.file_tools import (
@@ -36,7 +42,7 @@ def _tmp_file(content: str = "initial\n") -> str:
     return path
 
 
-class FileStateRegistryUnitTests(unittest.TestCase):
+class FileStateRegistryUnitTests(unittest.IsolatedAsyncioTestCase):
     """Direct unit tests on the registry singleton."""
 
     def setUp(self) -> None:
@@ -56,30 +62,41 @@ class FileStateRegistryUnitTests(unittest.TestCase):
         self._tmpfiles.append(p)
         return p
 
-    def test_record_read_then_check_stale_returns_none(self):
+    async def test_record_read_then_check_stale_returns_none(self):
         p = self._mk()
-        file_state.record_read("A", p)
-        self.assertIsNone(file_state.check_stale("A", p))
+        await file_state.record_read("A", p)
+        self.assertIsNone(await file_state.check_stale("A", p))
 
-    def test_sibling_write_flags_other_agent_as_stale(self):
+    async def test_sibling_write_flags_other_agent_as_stale(self):
         p = self._mk()
-        file_state.record_read("A", p)
+        await file_state.record_read("A", p)
         # Simulate sibling writing this file later
-        time.sleep(0.01)  # ensure ts ordering across resolution
-        file_state.note_write("B", p)
-        warn = file_state.check_stale("A", p)
+        await asyncio.sleep(0.01)  # ensure ts ordering across resolution
+        await file_state.note_write("B", p)
+        warn = await file_state.check_stale("A", p)
         self.assertIsNotNone(warn)
         self.assertIn("B", warn)
         self.assertIn("sibling", warn.lower())
 
+    async def test_external_write_flags_original_reader_as_stale(self):
+        p = self._mk()
+        await file_state.record_read("A", p)
+        await asyncio.sleep(0.01)
+        async with aiofiles.open(p, "w", encoding="utf-8") as handle:
+            await handle.write("externally changed\n")
 
-    def test_kill_switch_env_var(self):
+        warn = await file_state.check_stale("A", p)
+
+        self.assertIsNotNone(warn)
+        self.assertIn("external edit", warn)
+
+    async def test_kill_switch_env_var(self):
         p = self._mk()
         os.environ["HERMES_DISABLE_FILE_STATE_GUARD"] = "1"
         try:
-            file_state.record_read("A", p)
-            file_state.note_write("B", p)
-            self.assertIsNone(file_state.check_stale("A", p))
+            await file_state.record_read("A", p)
+            await file_state.note_write("B", p)
+            self.assertIsNone(await file_state.check_stale("A", p))
             self.assertEqual(file_state.known_reads("A"), [])
             self.assertEqual(
                 file_state.writes_since("A", 0.0, [p]),
@@ -87,6 +104,30 @@ class FileStateRegistryUnitTests(unittest.TestCase):
             )
         finally:
             del os.environ["HERMES_DISABLE_FILE_STATE_GUARD"]
+
+
+@pytest.mark.asyncio
+async def test_file_state_io_does_not_block_or_leak(tmp_path):
+    path = tmp_path / "state.txt"
+    async with aiofiles.open(path, "w", encoding="utf-8") as handle:
+        await handle.write("initial\n")
+    file_state.get_registry().clear()
+
+    async with (
+        no_event_loop_blocking(action=LeakAction.RAISE, threshold=0.1),
+        no_task_leaks(action=LeakAction.RAISE),
+    ):
+        blockbuster = BlockBuster()
+        blockbuster.activate()
+        try:
+            await file_state.record_read("agent", path)
+            assert await file_state.check_stale("agent", path) is None
+            async with file_state.lock_path(path):
+                await file_state.note_write("agent", path)
+        finally:
+            blockbuster.deactivate()
+
+    file_state.get_registry().clear()
 
 
 class FileToolsIntegrationTests(unittest.IsolatedAsyncioTestCase):
@@ -125,6 +166,52 @@ class FileToolsIntegrationTests(unittest.IsolatedAsyncioTestCase):
         # The cross-agent message names the sibling task_id.
         self.assertIn("agentB", warn)
         self.assertIn("sibling", warn.lower())
+
+    async def test_staleness_is_checked_after_waiting_for_path_lock(self):
+        p = self._write_seed("locked.txt")
+        await read_file_tool(path=p, task_id="agentA")
+        lock_held = asyncio.Event()
+        release_lock = asyncio.Event()
+
+        async def hold_lock():
+            async with file_state.lock_path(p):
+                lock_held.set()
+                await release_lock.wait()
+
+        holder = asyncio.create_task(hold_lock())
+        await lock_held.wait()
+        writer = asyncio.create_task(
+            write_file_tool(path=p, content="agent write\n", task_id="agentA")
+        )
+        await asyncio.sleep(0.01)
+        async with aiofiles.open(p, "w", encoding="utf-8") as handle:
+            await handle.write("external write while waiting\n")
+        release_lock.set()
+
+        result = json.loads(await writer)
+        await holder
+
+        self.assertIn("_warning", result)
+        self.assertIn("external edit", result["_warning"])
+
+    async def test_v4a_patch_surfaces_sibling_staleness_warning(self):
+        p = self._write_seed("v4a.txt")
+        await read_file_tool(path=p, task_id="agentA")
+        await write_file_tool(path=p, content="sibling edit\n", task_id="agentB")
+        patch = (
+            "*** Begin Patch\n"
+            f"*** Update File: {p}\n"
+            "@@\n"
+            "-sibling edit\n"
+            "+patched edit\n"
+            "*** End Patch"
+        )
+
+        result = json.loads(await patch_tool(mode="patch", patch=patch, task_id="agentA"))
+
+        self.assertNotIn("error", result)
+        self.assertIn("_warning", result)
+        self.assertIn("agentB", result["_warning"])
 
 
     async def test_net_new_file_no_warning(self):
