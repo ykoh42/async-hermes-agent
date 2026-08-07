@@ -2542,26 +2542,44 @@ class MCPServerTask:
                 with _lock:
                     for _pid in new_pids:
                         _stdio_pids.pop(_pid, None)
-                    for pid in new_pids:
-                        # ``os.kill(pid, 0)`` is NOT a no-op on Windows
-                        # (bpo-14484). Use the cross-platform check.
-                        pid_alive = await _pid_exists(pid)
-                        pgroup_alive = False
-                        pgid = _stdio_pgids.get(pid)
-                        if not pid_alive and pgid is not None and _killpg is not None:
-                            # Direct child exited but descendants may still be
-                            # in its pgroup (e.g. ``claude mcp serve`` spawned
-                            # by an MCP wrapper that exited first).  Probe with
-                            # signal 0 — succeeds iff any pgroup member is alive.
-                            try:
-                                _killpg(pgid, 0)
-                                pgroup_alive = True
-                            except (ProcessLookupError, PermissionError, OSError):
-                                pgroup_alive = False
+                    tracked_pgids = {
+                        pid: _stdio_pgids.get(pid) for pid in new_pids
+                    }
+
+                liveness: Dict[int, tuple[bool, bool, Optional[int]]] = {}
+                for pid in new_pids:
+                    # ``os.kill(pid, 0)`` is NOT a no-op on Windows
+                    # (bpo-14484). Use the cross-platform check.
+                    pid_alive = await _pid_exists(pid)
+                    pgroup_alive = False
+                    pgid = tracked_pgids[pid]
+                    if not pid_alive and pgid is not None and _killpg is not None:
+                        # Direct child exited but descendants may still be
+                        # in its pgroup (e.g. ``claude mcp serve`` spawned
+                        # by an MCP wrapper that exited first).  Probe with
+                        # signal 0 — succeeds iff any pgroup member is alive.
+                        try:
+                            _killpg(pgid, 0)
+                            pgroup_alive = True
+                        except (ProcessLookupError, PermissionError, OSError):
+                            pgroup_alive = False
+                    liveness[pid] = (pid_alive, pgroup_alive, pgid)
+
+                with _lock:
+                    for pid, (pid_alive, pgroup_alive, pgid) in liveness.items():
+                        # The liveness probes yield to the event loop. If a new
+                        # connection claimed a reused PID in the meantime, its
+                        # ownership wins and this stale cleanup must not mark it
+                        # as an orphan or discard its process-group metadata.
+                        if (
+                            pid in _stdio_pids
+                            or _stdio_pgids.get(pid) != pgid
+                        ):
+                            continue
                         if pid_alive or pgroup_alive:
                             _orphan_stdio_pids.add(pid)
                             _orphan_stdio_pid_servers[pid] = self.name
-                        else:
+                        elif _stdio_pgids.get(pid) == pgid:
                             # Nothing left to reap — drop the pgid entry so
                             # PID-reuse can't surface stale pgroup state later.
                             _stdio_pgids.pop(pid, None)

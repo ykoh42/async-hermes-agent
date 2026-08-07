@@ -780,9 +780,9 @@ async def cleanup_vm(task_id: str, *, force_remove: bool = False) -> None:
     await process_registry.kill_all(key, source="agent.close", consume_output=False)
     with _env_lock:
         env = _active_environments.pop(key, None)
-        if env is not None:
-            await record_session_cwd(key, env.cwd)
         _last_activity.pop(key, None)
+    if env is not None:
+        await record_session_cwd(key, env.cwd)
 
 
 async def cleanup_all_environments() -> None:
