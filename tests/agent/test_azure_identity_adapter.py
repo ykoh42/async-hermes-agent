@@ -60,8 +60,8 @@ async def test_token_provider_is_coroutine_and_credential_is_loop_cached(adapter
     assert await first() == "entra-token"
     assert await second() == "entra-token"
     assert len(credential_type.instances) == 1
-    await module.release_token_provider(first)
-    await module.release_token_provider(second)
+    await module._release_token_provider(first)
+    await module._release_token_provider(second)
 
 
 @pytest.mark.asyncio
@@ -81,12 +81,12 @@ async def test_shared_credential_closes_after_last_provider_lease(adapter):
     first = await module.build_token_provider()
     second = await module.build_token_provider()
 
-    await module.release_token_provider(first)
+    await module._release_token_provider(first)
     assert credential_type.instances[0].closed is False
 
-    await module.release_token_provider(second)
+    await module._release_token_provider(second)
     assert credential_type.instances[0].closed is True
-    await module.release_token_provider(second)
+    await module._release_token_provider(second)
 
 
 @pytest.mark.asyncio
@@ -126,7 +126,7 @@ async def test_async_bearer_hook_replaces_conflicting_headers(adapter):
         response = await client.get("https://foundry.invalid/test")
     finally:
         await client.aclose()
-        await module.release_token_provider(provider)
+        await module._release_token_provider(provider)
 
     assert response.json() == {"ok": True}
 
@@ -215,4 +215,4 @@ async def test_anthropic_foundry_uses_async_bearer_client(adapter, monkeypatch):
         assert client.api_key is None
     finally:
         await client.kwargs["http_client"].aclose()
-        await module.release_token_provider(provider)
+        await module._release_token_provider(provider)

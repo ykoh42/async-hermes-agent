@@ -7,9 +7,9 @@ import asyncio
 import pytest
 
 from tools.interrupt import (
-    bind_interrupt_event,
+    _bind_interrupt_event,
     is_interrupted,
-    reset_interrupt_event,
+    _reset_interrupt_event,
 )
 
 
@@ -48,11 +48,11 @@ def test_prestart_interrupt_is_preserved_when_turn_context_binds():
     agent = _make_bare_agent()
     agent.interrupt("stop before start")
 
-    token = bind_interrupt_event(agent._interrupt_event)
+    token = _bind_interrupt_event(agent._interrupt_event)
     try:
         assert is_interrupted() is True
     finally:
-        reset_interrupt_event(token)
+        _reset_interrupt_event(token)
 
 
 @pytest.mark.asyncio
@@ -63,13 +63,13 @@ async def test_concurrent_agents_have_isolated_interrupt_contexts():
     inspect = asyncio.Event()
 
     async def observe(agent, slot):
-        token = bind_interrupt_event(agent._interrupt_event)
+        token = _bind_interrupt_event(agent._interrupt_event)
         try:
             ready[slot].set()
             await inspect.wait()
             return is_interrupted()
         finally:
-            reset_interrupt_event(token)
+            _reset_interrupt_event(token)
 
     tasks = [
         asyncio.create_task(observe(first, 0)),

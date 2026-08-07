@@ -322,12 +322,12 @@ async def test_initial_mcp_discovery_cancellation_releases_lifecycle_and_reraise
 
     with (
         patch("hermes_cli.plugins.discover_plugins", new=AsyncMock()),
-        patch("tools.mcp_tool.retain_mcp_lifecycle", new=AsyncMock()),
+        patch("tools.mcp_tool._retain_mcp_lifecycle", new=AsyncMock()),
         patch(
             "tools.mcp_tool.discover_mcp_tools",
             new=AsyncMock(side_effect=asyncio.CancelledError()),
         ),
-        patch("tools.mcp_tool.release_mcp_lifecycle", new=AsyncMock()) as release,
+        patch("tools.mcp_tool._release_mcp_lifecycle", new=AsyncMock()) as release,
         pytest.raises(asyncio.CancelledError),
     ):
         await _build(agent)

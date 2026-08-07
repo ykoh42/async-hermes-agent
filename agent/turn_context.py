@@ -430,12 +430,12 @@ async def build_turn_context(
                 discover_mcp_tools,
                 has_registered_mcp_tools,
                 refresh_agent_mcp_tools,
-                retain_mcp_lifecycle,
+                _retain_mcp_lifecycle,
             )
 
             if not getattr(agent, "_mcp_discovery_started", False):
                 agent._mcp_discovery_started = True
-                await retain_mcp_lifecycle(agent)
+                await _retain_mcp_lifecycle(agent)
                 agent._mcp_lifecycle_retained = True
                 await discover_mcp_tools()
             if initial_tool_snapshot or has_registered_mcp_tools():
@@ -458,18 +458,18 @@ async def build_turn_context(
     except asyncio.CancelledError:
         if initial_tool_snapshot:
             if getattr(agent, "_mcp_lifecycle_retained", False):
-                from tools.mcp_tool import release_mcp_lifecycle
+                from tools.mcp_tool import _release_mcp_lifecycle
 
-                await release_mcp_lifecycle(agent)  # noqa: ASYNC120
+                await _release_mcp_lifecycle(agent)  # noqa: ASYNC120
                 agent._mcp_lifecycle_retained = False
             agent._mcp_discovery_started = False
         raise
     except Exception:
         if initial_tool_snapshot:
             if getattr(agent, "_mcp_lifecycle_retained", False):
-                from tools.mcp_tool import release_mcp_lifecycle
+                from tools.mcp_tool import _release_mcp_lifecycle
 
-                await release_mcp_lifecycle(agent)  # noqa: ASYNC120
+                await _release_mcp_lifecycle(agent)  # noqa: ASYNC120
                 agent._mcp_lifecycle_retained = False
             agent._mcp_discovery_started = False
             raise
@@ -1084,7 +1084,7 @@ async def build_turn_context(
     # must either migrate the plugin hook or disable it.
     try:
         from hermes_cli.lifecycle import invoke_hook
-        from hermes_cli.plugins import PluginContractError
+        from hermes_cli.plugins import _PluginContractError
 
         pre_llm_results = await invoke_hook(
             "pre_llm_call",
@@ -1095,7 +1095,7 @@ async def build_turn_context(
             model=agent.model,
             platform=getattr(agent, "platform", None) or "",
         )
-    except PluginContractError:
+    except _PluginContractError:
         raise
     except Exception as exc:
         logger.warning("pre_llm_call hook failed: %s", exc)

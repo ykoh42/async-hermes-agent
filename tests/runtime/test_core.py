@@ -681,9 +681,9 @@ async def test_async_context_manager_initializes_provider_mcp_and_tools():
     agent.close = AsyncMock()
 
     with (
-        patch("tools.mcp_tool.retain_mcp_lifecycle", new=AsyncMock()) as retain,
+        patch("tools.mcp_tool._retain_mcp_lifecycle", new=AsyncMock()) as retain,
         patch("tools.mcp_tool.discover_mcp_tools", new=AsyncMock()) as discover,
-        patch("tools.mcp_tool.release_mcp_lifecycle", new=AsyncMock()) as release,
+        patch("tools.mcp_tool._release_mcp_lifecycle", new=AsyncMock()) as release,
         patch(
             "tools.mcp_tool.refresh_agent_mcp_tools", new=AsyncMock()
         ) as refresh,
@@ -713,9 +713,9 @@ async def test_async_context_manager_rolls_back_failed_mcp_initialization():
     agent._ensure_provider_runtime = AsyncMock()
 
     with (
-        patch("tools.mcp_tool.retain_mcp_lifecycle", new=AsyncMock()),
+        patch("tools.mcp_tool._retain_mcp_lifecycle", new=AsyncMock()),
         patch("tools.mcp_tool.discover_mcp_tools", new=AsyncMock()),
-        patch("tools.mcp_tool.release_mcp_lifecycle", new=AsyncMock()) as release,
+        patch("tools.mcp_tool._release_mcp_lifecycle", new=AsyncMock()) as release,
         patch(
             "tools.mcp_tool.refresh_agent_mcp_tools",
             new=AsyncMock(side_effect=RuntimeError("snapshot failed")),
@@ -908,11 +908,11 @@ async def test_model_switch_uses_deferred_native_provider_runtime(monkeypatch):
 @pytest.mark.asyncio
 async def test_plugin_lifecycle_requires_coroutine_callbacks():
     """Sync plugin hooks cannot quietly stall an async agent turn."""
-    from hermes_cli.plugins import PluginContractError, PluginManager
+    from hermes_cli.plugins import _PluginContractError, PluginManager
 
     manager = PluginManager()
     manager._hooks["turn"] = [lambda **_kwargs: None]
-    with pytest.raises(PluginContractError, match="coroutine lifecycle hooks"):
+    with pytest.raises(_PluginContractError, match="coroutine lifecycle hooks"):
         await manager.invoke_hook("turn")
 
     async def callback(**_kwargs):
@@ -927,7 +927,7 @@ async def test_deferred_runtime_rejects_sync_only_context_engine_early(monkeypat
     """Provider construction must stop before an external legacy extension runs."""
     from agent.agent_init import _initialize_deferred_runtime
     from agent.context_engine import ContextEngine
-    from hermes_cli.plugins import PluginContractError
+    from hermes_cli.plugins import _PluginContractError
 
     class SyncEngine(ContextEngine):
         @property
@@ -958,7 +958,7 @@ async def test_deferred_runtime_rejects_sync_only_context_engine_early(monkeypat
         }
         state.update(attributes)
         agent = SimpleNamespace(**state)
-        with pytest.raises(PluginContractError, match="compress.*coroutine"):
+        with pytest.raises(_PluginContractError, match="compress.*coroutine"):
             await _initialize_deferred_runtime(agent)
 
     await assert_rejected(
@@ -2406,7 +2406,7 @@ async def test_close_releases_retained_mcp_lifecycle(monkeypatch):
     async def release(owner):
         released.append(owner)
 
-    monkeypatch.setattr(mcp_tool, "release_mcp_lifecycle", release)
+    monkeypatch.setattr(mcp_tool, "_release_mcp_lifecycle", release)
 
     await agent.close()
 

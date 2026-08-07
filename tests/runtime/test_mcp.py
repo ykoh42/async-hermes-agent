@@ -73,16 +73,16 @@ async def test_mcp_lifecycle_stops_after_last_agent_releases(monkeypatch):
     monkeypatch.setattr(mcp_tool, "shutdown_mcp_servers", shutdown)
     mcp_tool._mcp_lifecycle_consumers.clear()
     try:
-        await mcp_tool.retain_mcp_lifecycle(first)
-        await mcp_tool.retain_mcp_lifecycle(second)
+        await mcp_tool._retain_mcp_lifecycle(first)
+        await mcp_tool._retain_mcp_lifecycle(second)
 
-        await mcp_tool.release_mcp_lifecycle(first)
+        await mcp_tool._release_mcp_lifecycle(first)
         assert shutdown_calls == 0
 
-        await mcp_tool.release_mcp_lifecycle(second)
+        await mcp_tool._release_mcp_lifecycle(second)
         assert shutdown_calls == 1
 
-        await mcp_tool.release_mcp_lifecycle(second)
+        await mcp_tool._release_mcp_lifecycle(second)
         assert shutdown_calls == 1
     finally:
         mcp_tool._mcp_lifecycle_consumers.clear()

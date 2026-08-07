@@ -990,9 +990,9 @@ def _record_read_metadata(
 
 async def _handle_read_file(args, **kw):
     """Read a local text file with native async I/O and stable line gutters."""
-    from tools.tool_output_limits import refresh_tool_output_limits
+    from tools.tool_output_limits import _refresh_tool_output_limits
 
-    await refresh_tool_output_limits()
+    await _refresh_tool_output_limits()
     task_id = kw.get("task_id") or "default"
     path = args.get("path", "")
     if not isinstance(path, str) or not path:
@@ -1653,9 +1653,9 @@ async def _zero_match_hint(
 
 async def _handle_search_files(args, **kw):
     """Search files using a native subprocess and preserve async cancellation."""
-    from tools.tool_output_limits import refresh_tool_output_limits
+    from tools.tool_output_limits import _refresh_tool_output_limits
 
-    await refresh_tool_output_limits()
+    await _refresh_tool_output_limits()
     task_id = kw.get("task_id") or "default"
     pattern = args.get("pattern", "")
     if not isinstance(pattern, str) or not pattern:

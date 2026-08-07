@@ -2801,9 +2801,9 @@ async def _try_azure_foundry(
             ), final_model
         except Exception:
             if callable(api_key) and not isinstance(api_key, str):
-                from agent.azure_identity_adapter import release_token_provider
+                from agent.azure_identity_adapter import _release_token_provider
 
-                await release_token_provider(api_key)
+                await _release_token_provider(api_key)
             raise
 
     try:
@@ -2812,9 +2812,9 @@ async def _try_azure_foundry(
         )
     except Exception:
         if callable(api_key) and not isinstance(api_key, str):
-            from agent.azure_identity_adapter import release_token_provider
+            from agent.azure_identity_adapter import _release_token_provider
 
-            await release_token_provider(api_key)
+            await _release_token_provider(api_key)
         raise
 
     if runtime_api_mode == "codex_responses":
@@ -6061,9 +6061,9 @@ async def _close_cached_client(client: Any) -> None:
             token_provider = getattr(real_client, "_hermes_token_provider", None)
         if token_provider is not None:
             try:
-                from agent.azure_identity_adapter import release_token_provider
+                from agent.azure_identity_adapter import _release_token_provider
 
-                await release_token_provider(token_provider)
+                await _release_token_provider(token_provider)
             except Exception:
                 logger.debug("Failed to release auxiliary token provider", exc_info=True)
 

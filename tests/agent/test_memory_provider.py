@@ -190,9 +190,9 @@ def test_memory_manager_rejects_sync_provider_contract():
         def prefetch(self, query, *, session_id=""):
             return "blocking"
 
-    from hermes_cli.plugins import PluginContractError
+    from hermes_cli.plugins import _PluginContractError
 
-    with pytest.raises(PluginContractError, match="prefetch"):
+    with pytest.raises(_PluginContractError, match="prefetch"):
         MemoryManager().add_provider(_SyncProvider())
 
 

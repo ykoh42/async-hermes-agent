@@ -139,7 +139,7 @@ async def build_token_provider(
     return provider
 
 
-async def release_token_provider(value: Any) -> None:
+async def _release_token_provider(value: Any) -> None:
     """Release one provider lease and close its credential after the last use."""
     credential = getattr(value, "_hermes_credential", None)
     if credential is None or getattr(value, "_hermes_released", False):
@@ -302,6 +302,5 @@ __all__ = [
     "has_azure_identity_installed",
     "is_token_provider",
     "materialize_bearer_for_http",
-    "release_token_provider",
     "reset_credential_cache",
 ]

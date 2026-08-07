@@ -468,9 +468,9 @@ async def terminal_tool(  # noqa: ASYNC109 - upstream public API names timeout
     watch_patterns: Optional[List[str]] = None,
 ) -> str:
     """Run a local command asynchronously and preserve Hermes' JSON result contract."""
-    from tools.tool_output_limits import refresh_tool_output_limits
+    from tools.tool_output_limits import _refresh_tool_output_limits
 
-    await refresh_tool_output_limits()
+    await _refresh_tool_output_limits()
 
     if not isinstance(command, str):
         return json.dumps(

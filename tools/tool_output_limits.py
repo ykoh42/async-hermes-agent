@@ -69,7 +69,7 @@ def get_tool_output_limits() -> Dict[str, int]:
     return _cached_limits
 
 
-async def refresh_tool_output_limits() -> Dict[str, int]:
+async def _refresh_tool_output_limits() -> Dict[str, int]:
     """Refresh the process snapshot through the native async config loader."""
     global _cached_limits
     try:

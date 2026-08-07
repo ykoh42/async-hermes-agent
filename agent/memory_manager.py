@@ -395,7 +395,7 @@ class MemoryManager:
         Only **one** external (non-builtin) provider is allowed — a second
         attempt is rejected with a warning.
         """
-        from hermes_cli.plugins import PluginContractError
+        from hermes_cli.plugins import _PluginContractError
 
         for method_name in (
             "is_available",
@@ -417,7 +417,7 @@ class MemoryManager:
             if not callable(method) or not inspect.iscoroutinefunction(
                 inspect.unwrap(method)
             ):
-                raise PluginContractError(
+                raise _PluginContractError(
                     f"Memory provider {provider.name!r} must implement "
                     f"{method_name}() as a coroutine"
                 )

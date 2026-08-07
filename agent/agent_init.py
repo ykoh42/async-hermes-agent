@@ -2830,7 +2830,7 @@ async def _select_context_engine(
             )
 
     if selected_engine is not None:
-        from hermes_cli.plugins import PluginContractError
+        from hermes_cli.plugins import _PluginContractError
 
         async_methods = (
             "compress",
@@ -2846,7 +2846,7 @@ async def _select_context_engine(
             if not callable(method) or not inspect.iscoroutinefunction(
                 inspect.unwrap(method)
             ):
-                raise PluginContractError(
+                raise _PluginContractError(
                     f"Context engine {engine_name!r} must implement "
                     f"{method_name}() as a coroutine"
                 )
@@ -2854,7 +2854,7 @@ async def _select_context_engine(
         if callable(carry_over) and not inspect.iscoroutinefunction(
             inspect.unwrap(carry_over)
         ):
-            raise PluginContractError(
+            raise _PluginContractError(
                 f"Context engine {engine_name!r} must implement "
                 "carry_over_new_session_context() as a coroutine"
             )
@@ -2991,7 +2991,7 @@ async def _initialize_memory_manager(
         agent._memory_manager_started = True
         return
 
-    from hermes_cli.plugins import PluginContractError
+    from hermes_cli.plugins import _PluginContractError
 
     try:
         from agent.memory_manager import (
@@ -3057,7 +3057,7 @@ async def _initialize_memory_manager(
         logger.info("Memory provider '%s' activated", provider_name)
     except asyncio.CancelledError:
         raise
-    except PluginContractError:
+    except _PluginContractError:
         agent._memory_manager = None
         logger.warning(
             "Memory provider '%s' violates the native async contract",
@@ -3471,9 +3471,9 @@ async def _initialize_deferred_runtime(agent: Any) -> bool:
                 client_error = exc
             if client_error is not None:
                 if callable(api_key) and not isinstance(api_key, str):
-                    from agent.azure_identity_adapter import release_token_provider
+                    from agent.azure_identity_adapter import _release_token_provider
 
-                    await release_token_provider(api_key)
+                    await _release_token_provider(api_key)
                 raise client_error
             agent._anthropic_client_source = (
                 api_key,
@@ -3558,9 +3558,9 @@ async def _initialize_deferred_runtime(agent: Any) -> bool:
                 client_error = exc
             if client_error is not None:
                 if callable(api_key) and not isinstance(api_key, str):
-                    from agent.azure_identity_adapter import release_token_provider
+                    from agent.azure_identity_adapter import _release_token_provider
 
-                    await release_token_provider(api_key)
+                    await _release_token_provider(api_key)
                 raise client_error
             if callable(api_key) and not isinstance(api_key, str):
                 agent.client._hermes_token_provider = api_key
@@ -3655,9 +3655,9 @@ async def _initialize_deferred_runtime(agent: Any) -> bool:
                 await close_client()
             finally:
                 if token_provider is not None:
-                    from agent.azure_identity_adapter import release_token_provider
+                    from agent.azure_identity_adapter import _release_token_provider
 
-                    await release_token_provider(token_provider)
+                    await _release_token_provider(token_provider)
 
         agent._deferred_provider_runtime = None
         logger.info("Initialized native async runtime for %s", provider)

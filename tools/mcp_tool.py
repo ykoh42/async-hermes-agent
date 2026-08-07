@@ -6479,13 +6479,13 @@ async def shutdown_mcp_servers() -> None:
         await _kill_orphaned_mcp_children(include_active=True)
 
 
-async def retain_mcp_lifecycle(owner: object) -> None:
+async def _retain_mcp_lifecycle(owner: object) -> None:
     """Keep shared MCP transports alive while an agent can use them."""
     async with _mcp_lifecycle_lock:
         _mcp_lifecycle_consumers.add(owner)
 
 
-async def release_mcp_lifecycle(owner: object) -> None:
+async def _release_mcp_lifecycle(owner: object) -> None:
     """Release an agent's MCP lease and stop transports after the last user."""
     async with _mcp_lifecycle_lock:
         if owner not in _mcp_lifecycle_consumers:

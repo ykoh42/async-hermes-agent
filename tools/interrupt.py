@@ -17,14 +17,14 @@ _current_interrupt_event: contextvars.ContextVar[asyncio.Event | None] = (
 )
 
 
-def bind_interrupt_event(
+def _bind_interrupt_event(
     event: asyncio.Event,
 ) -> contextvars.Token[asyncio.Event | None]:
     """Bind an agent-owned interrupt event to the current async context."""
     return _current_interrupt_event.set(event)
 
 
-def reset_interrupt_event(
+def _reset_interrupt_event(
     token: contextvars.Token[asyncio.Event | None],
 ) -> None:
     """Restore the interrupt binding that preceded a conversation turn."""

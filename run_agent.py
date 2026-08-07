@@ -124,8 +124,8 @@ from model_tools import (
 )
 from tools.terminal_tool import cleanup_vm
 from tools.interrupt import (
-    bind_interrupt_event as _bind_interrupt_event,
-    reset_interrupt_event as _reset_interrupt_event,
+    _bind_interrupt_event,
+    _reset_interrupt_event,
     set_interrupt as _set_interrupt,
 )
 
@@ -598,14 +598,14 @@ class AIAgent:
         if not getattr(self, "_mcp_discovery_started", False):
             from tools.mcp_tool import (
                 discover_mcp_tools,
-                release_mcp_lifecycle,
+                _release_mcp_lifecycle,
                 refresh_agent_mcp_tools,
-                retain_mcp_lifecycle,
+                _retain_mcp_lifecycle,
             )
 
             self._mcp_discovery_started = True
             try:
-                await retain_mcp_lifecycle(self)
+                await _retain_mcp_lifecycle(self)
                 self._mcp_lifecycle_retained = True
                 await discover_mcp_tools()
                 if not getattr(self, "_tool_snapshot_initialized", False):
@@ -622,7 +622,7 @@ class AIAgent:
                     )
             except BaseException:
                 if self._mcp_lifecycle_retained:
-                    await release_mcp_lifecycle(self)
+                    await _release_mcp_lifecycle(self)
                     self._mcp_lifecycle_retained = False
                 self._mcp_discovery_started = False
                 raise
@@ -3816,14 +3816,14 @@ class AIAgent:
             token_providers.append(active_api_key)
         if token_providers:
             try:
-                from agent.azure_identity_adapter import release_token_provider
+                from agent.azure_identity_adapter import _release_token_provider
 
                 released_ids: set[int] = set()
                 for token_provider in token_providers:
                     if id(token_provider) in released_ids:
                         continue
                     released_ids.add(id(token_provider))
-                    await release_token_provider(token_provider)
+                    await _release_token_provider(token_provider)
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -3965,14 +3965,14 @@ class AIAgent:
             token_providers.append(active_api_key)
         if token_providers:
             try:
-                from agent.azure_identity_adapter import release_token_provider
+                from agent.azure_identity_adapter import _release_token_provider
 
                 released_ids: set[int] = set()
                 for token_provider in token_providers:
                     if id(token_provider) in released_ids:
                         continue
                     released_ids.add(id(token_provider))
-                    await release_token_provider(token_provider)
+                    await _release_token_provider(token_provider)
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -3982,9 +3982,9 @@ class AIAgent:
         # this instance's lease and close them only after the final consumer.
         if getattr(self, "_mcp_lifecycle_retained", False):
             try:
-                from tools.mcp_tool import release_mcp_lifecycle
+                from tools.mcp_tool import _release_mcp_lifecycle
 
-                await release_mcp_lifecycle(self)
+                await _release_mcp_lifecycle(self)
             except asyncio.CancelledError:
                 raise
             except Exception:

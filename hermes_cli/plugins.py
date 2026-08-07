@@ -1802,14 +1802,14 @@ class PluginManager:
         for callback in callbacks:
             try:
                 if not inspect.iscoroutinefunction(callback):
-                    raise PluginContractError(
+                    raise _PluginContractError(
                         "Async Hermes requires coroutine lifecycle hooks; "
                         f"{getattr(callback, '__name__', repr(callback))} is synchronous"
                     )
                 result = await callback(**kwargs)
                 if result is not None:
                     results.append(result)
-            except PluginContractError:
+            except _PluginContractError:
                 raise
             except Exception as exc:
                 logger.warning(
@@ -1917,7 +1917,7 @@ async def discover_plugins(force: bool = False) -> None:
     await get_plugin_manager().discover_and_load(force=force)
 
 
-class PluginContractError(RuntimeError):
+class _PluginContractError(RuntimeError):
     """Raised when an unconverted plugin reaches the native async runtime."""
 
 
