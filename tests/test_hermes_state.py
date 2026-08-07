@@ -31,6 +31,9 @@ def test_public_session_interface_is_async():
         "update_session_meta",
         "update_session_model",
         "queue_token_counts",
+        "reopen_session",
+        "finalize_orphaned_compression_sessions",
+        "backfill_repo_roots",
         "get_session",
         "resolve_session_id",
         "session_count_ge",
@@ -160,6 +163,83 @@ async def test_queue_token_counts_preserves_delta_order_and_absolute_barrier(db)
     assert session["input_tokens"] == 107
     assert session["output_tokens"] == 23
     assert session["api_call_count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_reopen_session_clears_the_existing_end_boundary(db):
+    await db.create_session("resumable", source="library")
+    await db.end_session("resumable", "completed")
+
+    await db.reopen_session("resumable")
+
+    session = await db.get_session("resumable")
+    assert session["ended_at"] is None
+    assert session["end_reason"] is None
+
+
+@pytest.mark.asyncio
+async def test_finalize_orphaned_compression_sessions_preserves_other_children(db):
+    old = time.time() - 800_000
+    await db.create_session("parent", source="library")
+    await db.end_session("parent", "compression")
+
+    for session_id in ("orphan", "used", "empty", "recent"):
+        await db.create_session(
+            session_id,
+            source="library",
+            parent_session_id="parent",
+        )
+    await db.append_message("orphan", role="user", content="unfinished")
+    await db.append_message("used", role="user", content="completed call")
+    await db.append_message("recent", role="user", content="still active")
+
+    connection = await db._get_connection()
+    await connection.execute(
+        "UPDATE sessions SET started_at = ? "
+        "WHERE id IN ('orphan', 'used', 'empty')",
+        (old,),
+    )
+    await connection.execute(
+        "UPDATE sessions SET api_call_count = 1 WHERE id = 'used'"
+    )
+    await connection.commit()
+
+    assert await db.finalize_orphaned_compression_sessions() == 1
+    assert (await db.get_session("orphan"))["end_reason"] == (
+        "orphaned_compression"
+    )
+    for session_id in ("used", "empty", "recent"):
+        session = await db.get_session(session_id)
+        assert session["ended_at"] is None
+        assert session["end_reason"] is None
+
+
+@pytest.mark.asyncio
+async def test_backfill_repo_roots_only_fills_missing_roots(db):
+    await db.create_session("missing", source="library", cwd="/work/repo")
+    await db.create_session(
+        "recorded",
+        source="library",
+        cwd="/work/repo",
+        git_repo_root="/original/root",
+    )
+    await db.create_session("not-git", source="library", cwd="/work/plain")
+
+    await db.backfill_repo_roots(
+        {
+            "/work/repo": "/resolved/root",
+            "/work/plain": "",
+            "": "/ignored/root",
+        }
+    )
+
+    assert (await db.get_session("missing"))["git_repo_root"] == (
+        "/resolved/root"
+    )
+    assert (await db.get_session("recorded"))["git_repo_root"] == (
+        "/original/root"
+    )
+    assert (await db.get_session("not-git"))["git_repo_root"] is None
 
 
 @pytest.mark.asyncio

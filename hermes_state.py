@@ -1435,6 +1435,16 @@ class SessionDB:
 
         await self._write(_end)
 
+    async def reopen_session(self, session_id: str) -> None:
+        """Clear ended_at/end_reason so a session can be resumed."""
+        async def _reopen(connection):
+            await connection.execute(
+                "UPDATE sessions SET ended_at = NULL, end_reason = NULL WHERE id = ?",
+                (session_id,),
+            )
+
+        await self._write(_reopen)
+
     async def try_acquire_compression_lock(
         self,
         session_id: str,
@@ -1705,6 +1715,27 @@ class SessionDB:
             )
 
         await self._write(_update)
+
+    async def backfill_repo_roots(self, cwd_to_root: Dict[str, str]) -> None:
+        """Persist resolved git repo roots for cwds that don't have one yet.
+
+        Backfills history so projects light up for sessions created before the
+        column existed, without clobbering an already-recorded root. Only
+        non-empty roots are written (a non-git cwd stays NULL).
+        """
+        pairs = [(root, cwd) for cwd, root in cwd_to_root.items() if root and cwd]
+        if not pairs:
+            return
+
+        async def _backfill(connection):
+            for root, cwd in pairs:
+                await connection.execute(
+                    "UPDATE sessions SET git_repo_root = ? "
+                    "WHERE cwd = ? AND COALESCE(git_repo_root, '') = ''",
+                    (root, cwd),
+                )
+
+        await self._write(_backfill)
 
     async def update_session_model(self, session_id: str, model: str) -> None:
         """Persist a mid-session model switch and clear its stale runtime lock."""
@@ -2480,6 +2511,45 @@ class SessionDB:
         for removed_id in removed_ids:
             await self._remove_session_files(sessions_dir, removed_id)
         return count
+
+    async def finalize_orphaned_compression_sessions(self) -> int:
+        """Mark orphaned compression continuation sessions as ended.
+
+        Targets child sessions that were never finalized: parent is ended
+        with reason='compression', child has messages but no end_reason/ended_at
+        and api_call_count=0.  Non-destructive: preserves all messages and sets
+        end_reason='orphaned_compression'.  Fix for #20001.
+        """
+        cutoff = time.time() - 604800  # 7 days
+
+        async def _finalize(connection):
+            now = time.time()
+            result = await connection.execute(
+                """
+                UPDATE sessions
+                SET ended_at = ?,
+                    end_reason = 'orphaned_compression'
+                WHERE api_call_count = 0
+                  AND end_reason IS NULL
+                  AND ended_at IS NULL
+                  AND started_at < ?
+                  AND parent_session_id IS NOT NULL
+                  AND EXISTS (
+                      SELECT 1 FROM sessions p
+                      WHERE p.id = sessions.parent_session_id
+                        AND p.end_reason = 'compression'
+                        AND p.ended_at IS NOT NULL
+                  )
+                  AND EXISTS (
+                      SELECT 1 FROM messages m
+                      WHERE m.session_id = sessions.id
+                  )
+                """,
+                (now, cutoff),
+            )
+            return result.rowcount
+
+        return int(await self._write(_finalize) or 0)
 
     @staticmethod
     def _decode_message_row(row) -> Dict[str, Any]:

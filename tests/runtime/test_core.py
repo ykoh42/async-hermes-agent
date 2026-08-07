@@ -260,7 +260,9 @@ async def test_session_lifecycle_does_not_block_or_leak(tmp_path):
         blockbuster = BlockBuster()
         blockbuster.activate()
         try:
-            await database.ensure_session("session", source="library")
+            await database.ensure_session(
+                "session", source="library", cwd="/workspace/repo"
+            )
             message_id = await database.append_message(
                 "session",
                 role="user",
@@ -278,6 +280,12 @@ async def test_session_lifecycle_does_not_block_or_leak(tmp_path):
                 "session", input_tokens=3, api_call_count=1
             )
             assert await database.flush_token_counts() is True
+            await database.backfill_repo_roots(
+                {"/workspace/repo": "/workspace/repo"}
+            )
+            assert (await database.get_session("session"))["git_repo_root"] == (
+                "/workspace/repo"
+            )
             assert [
                 row["id"]
                 for row in await database.search_sessions(source="library")
@@ -299,6 +307,27 @@ async def test_session_lifecycle_does_not_block_or_leak(tmp_path):
             assert await database.set_session_archived("session", True)
             assert await database.set_session_archived("session", False)
             await database.end_session("session", "done")
+            await database.reopen_session("session")
+            assert (await database.get_session("session"))["ended_at"] is None
+            await database.end_session("session", "done")
+
+            await database.create_session("compression-parent", source="runtime")
+            await database.end_session("compression-parent", "compression")
+            await database.create_session(
+                "compression-orphan",
+                source="runtime",
+                parent_session_id="compression-parent",
+            )
+            await database.append_message(
+                "compression-orphan", role="user", content="unfinished"
+            )
+            connection = await database._get_connection()
+            await connection.execute(
+                "UPDATE sessions SET started_at = ? WHERE id = ?",
+                (time.time() - 800_000, "compression-orphan"),
+            )
+            await connection.commit()
+            assert await database.finalize_orphaned_compression_sessions() == 1
             assert [
                 row["id"]
                 for row in await database.list_sessions_rich(
