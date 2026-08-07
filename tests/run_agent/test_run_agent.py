@@ -1372,6 +1372,8 @@ class TestExecuteToolCalls:
 
     @pytest.mark.asyncio
     async def test_memory_tool_receives_the_agent_memory_store(self, agent):
+        from model_tools import _TOOL_HANDLER_CONTEXT
+
         old_text = "stale preference entry"
         tc = _mock_tool_call(
             name="memory",
@@ -1385,12 +1387,16 @@ class TestExecuteToolCalls:
         mock_msg = _mock_assistant_msg(content="", tool_calls=[tc])
         messages = []
         agent._memory_store = object()
+        captured_context = {}
+
+        async def dispatch(*args, **kwargs):
+            captured_context.update(_TOOL_HANDLER_CONTEXT.get() or {})
+            return json.dumps({"success": True})
 
         with (
             patch(
                 "model_tools.handle_function_call",
-                new_callable=AsyncMock,
-                return_value=json.dumps({"success": True}),
+                side_effect=dispatch,
             ) as dispatch,
             patch(
                 "tools.registry.registry.get_entry",
@@ -1399,7 +1405,7 @@ class TestExecuteToolCalls:
         ):
             await agent._execute_tool_calls(mock_msg, messages, "task-1")
 
-        assert dispatch.await_args.kwargs["store"] is agent._memory_store
+        assert captured_context["store"] is agent._memory_store
         assert dispatch.await_args.args[1]["old_text"] == old_text
         assert messages[-1]["tool_call_id"] == "mem-1"
 

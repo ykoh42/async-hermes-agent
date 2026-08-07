@@ -56,7 +56,21 @@ class TestRegisterAndDispatch:
             handler=handler,
         )
 
-        assert reg.get_entry("new_async") is not None
+        entry = reg.get_entry("new_async")
+        assert entry is not None
+        assert entry.is_async is True
+
+    def test_upstream_is_async_argument_remains_accepted(self):
+        reg = ToolRegistry()
+        reg.register(
+            name="declared_async",
+            toolset="extension",
+            schema=_make_schema("declared_async"),
+            handler=_dummy_handler,
+            is_async=True,
+        )
+
+        assert reg.get_entry("declared_async").is_async is True
 
     @pytest.mark.asyncio
     async def test_register_and_dispatch(self):

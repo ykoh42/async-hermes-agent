@@ -1,6 +1,9 @@
-"""Tests for model_tools.py — function call dispatch, agent-loop interception, legacy toolsets."""
+"""Tests for model_tools.py — function call dispatch and toolsets."""
 
+import asyncio
+import inspect
 import json
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -13,6 +16,7 @@ from model_tools import (
     TOOL_TO_TOOLSET_MAP,
 )
 from tools.todo_tool import TodoStore
+from agent.agent_runtime_helpers import invoke_tool
 
 
 # =========================================================================
@@ -20,6 +24,25 @@ from tools.todo_tool import TodoStore
 # =========================================================================
 
 class TestHandleFunctionCall:
+    def test_public_signature_matches_upstream(self):
+        assert list(inspect.signature(handle_function_call).parameters) == [
+            "function_name",
+            "function_args",
+            "task_id",
+            "tool_call_id",
+            "session_id",
+            "turn_id",
+            "api_request_id",
+            "user_task",
+            "enabled_tools",
+            "skip_pre_tool_call_hook",
+            "skip_tool_request_middleware",
+            "skip_tool_execution_middleware",
+            "tool_request_middleware_trace",
+            "enabled_toolsets",
+            "disabled_toolsets",
+        ]
+
     @pytest.mark.asyncio
     async def test_upstream_positional_dispatch_contract_is_preserved(self):
         with patch(
@@ -53,8 +76,16 @@ class TestHandleFunctionCall:
     @pytest.mark.asyncio
     async def test_stateful_tool_dispatches_with_agent_context(self):
         store = TodoStore()
+        agent = SimpleNamespace(
+            _todo_store=store,
+            valid_tool_names={"todo"},
+            enabled_toolsets=None,
+            disabled_toolsets=None,
+            session_id="session-1",
+        )
         result = json.loads(
-            await handle_function_call(
+            await invoke_tool(
+                agent,
                 "todo",
                 {
                     "todos": [
@@ -65,7 +96,9 @@ class TestHandleFunctionCall:
                         }
                     ]
                 },
-                store=store,
+                "task-1",
+                skip_tool_request_middleware=True,
+                skip_tool_execution_middleware=True,
             )
         )
 
@@ -77,6 +110,50 @@ class TestHandleFunctionCall:
             }
         ]
         assert result["summary"]["completed"] == 1
+
+    @pytest.mark.asyncio
+    async def test_concurrent_agent_tool_contexts_are_isolated(self):
+        agents = [
+            SimpleNamespace(
+                _todo_store=TodoStore(),
+                valid_tool_names={"todo"},
+                enabled_toolsets=None,
+                disabled_toolsets=None,
+                session_id=f"session-{index}",
+            )
+            for index in range(2)
+        ]
+
+        results = await asyncio.gather(
+            *(
+                invoke_tool(
+                    agent,
+                    "todo",
+                    {
+                        "todos": [
+                            {
+                                "id": f"task-{index}",
+                                "content": f"Agent {index}",
+                                "status": "pending",
+                            }
+                        ]
+                    },
+                    f"task-{index}",
+                    skip_tool_request_middleware=True,
+                    skip_tool_execution_middleware=True,
+                )
+                for index, agent in enumerate(agents)
+            )
+        )
+
+        assert [json.loads(result)["todos"][0]["id"] for result in results] == [
+            "task-0",
+            "task-1",
+        ]
+        assert [
+            store.read()[0]["id"]
+            for store in (agent._todo_store for agent in agents)
+        ] == ["task-0", "task-1"]
 
     @pytest.mark.asyncio
     async def test_unknown_tool_returns_error(self):

@@ -86,12 +86,12 @@ class ToolEntry:
 
     __slots__ = (
         "name", "toolset", "schema", "handler", "check_fn",
-        "requires_env", "description", "emoji",
+        "requires_env", "is_async", "description", "emoji",
         "max_result_size_chars", "dynamic_schema_overrides",
     )
 
     def __init__(self, name, toolset, schema, handler, check_fn,
-                 requires_env, description, emoji,
+                 requires_env, is_async, description, emoji,
                  max_result_size_chars=None, dynamic_schema_overrides=None):
         self.name = name
         self.toolset = toolset
@@ -99,6 +99,7 @@ class ToolEntry:
         self.handler = handler
         self.check_fn = check_fn
         self.requires_env = requires_env
+        self.is_async = is_async
         self.description = description
         self.emoji = emoji
         self.max_result_size_chars = max_result_size_chars
@@ -419,6 +420,7 @@ class ToolRegistry:
         handler: Callable,
         check_fn: Optional[Callable] = None,
         requires_env: Optional[list] = None,
+        is_async: bool = False,
         description: str = "",
         emoji: str = "",
         max_result_size_chars: int | float | None = None,
@@ -483,6 +485,9 @@ class ToolRegistry:
                 handler=handler,
                 check_fn=check_fn,
                 requires_env=requires_env or [],
+                # The async-only registry validates the handler itself; retain
+                # the upstream field and argument as compatibility metadata.
+                is_async=True,
                 description=description or schema.get("description", ""),
                 emoji=emoji,
                 max_result_size_chars=max_result_size_chars,

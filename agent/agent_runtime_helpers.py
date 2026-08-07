@@ -2464,7 +2464,7 @@ async def invoke_tool(
     skip_tool_execution_middleware: bool = False,
 ) -> str:
     """Invoke one registry tool through the native async dispatch path."""
-    from model_tools import handle_function_call
+    from model_tools import _TOOL_HANDLER_CONTEXT, handle_function_call
     from tools.registry import registry
 
     entry = registry.get_entry(function_name)
@@ -2486,24 +2486,27 @@ async def invoke_tool(
         handler_context["callback"] = getattr(
             agent, "read_terminal_callback", None
         )
-    result = await handle_function_call(
-        function_name,
-        function_args,
-        effective_task_id,
-        tool_call_id=tool_call_id,
-        session_id=getattr(agent, "session_id", "") or "",
-        turn_id=getattr(agent, "_current_turn_id", "") or "",
-        api_request_id=getattr(agent, "_current_api_request_id", "") or "",
-        user_task=getattr(agent, "_current_user_task", None),
-        enabled_tools=list(getattr(agent, "valid_tool_names", None) or []) or None,
-        skip_pre_tool_call_hook=pre_tool_block_checked,
-        skip_tool_request_middleware=skip_tool_request_middleware,
-        skip_tool_execution_middleware=skip_tool_execution_middleware,
-        tool_request_middleware_trace=tool_request_middleware_trace,
-        enabled_toolsets=getattr(agent, "enabled_toolsets", None),
-        disabled_toolsets=getattr(agent, "disabled_toolsets", None),
-        **handler_context,
-    )
+    context_token = _TOOL_HANDLER_CONTEXT.set(handler_context)
+    try:
+        result = await handle_function_call(
+            function_name,
+            function_args,
+            effective_task_id,
+            tool_call_id=tool_call_id,
+            session_id=getattr(agent, "session_id", "") or "",
+            turn_id=getattr(agent, "_current_turn_id", "") or "",
+            api_request_id=getattr(agent, "_current_api_request_id", "") or "",
+            user_task=getattr(agent, "_current_user_task", None),
+            enabled_tools=list(getattr(agent, "valid_tool_names", None) or []) or None,
+            skip_pre_tool_call_hook=pre_tool_block_checked,
+            skip_tool_request_middleware=skip_tool_request_middleware,
+            skip_tool_execution_middleware=skip_tool_execution_middleware,
+            tool_request_middleware_trace=tool_request_middleware_trace,
+            enabled_toolsets=getattr(agent, "enabled_toolsets", None),
+            disabled_toolsets=getattr(agent, "disabled_toolsets", None),
+        )
+    finally:
+        _TOOL_HANDLER_CONTEXT.reset(context_token)
     return result if isinstance(result, str) else json.dumps(result, ensure_ascii=False)
 
 

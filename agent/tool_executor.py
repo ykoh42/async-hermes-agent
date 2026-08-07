@@ -538,7 +538,7 @@ async def _execute_tool_calls_native(
     order.
     """
     from tools.registry import registry
-    from model_tools import handle_function_call
+    from model_tools import _TOOL_HANDLER_CONTEXT, handle_function_call
 
     tool_calls = list(getattr(assistant_message, "tool_calls", None) or [])
     if not tool_calls:
@@ -622,9 +622,24 @@ async def _execute_tool_calls_native(
                     dispatch_kwargs["callback"] = getattr(
                         agent, "read_terminal_callback", None
                     )
-                return await handle_function_call(
-                    name, next_args, effective_task_id, **dispatch_kwargs
-                )
+                handler_context = {
+                    key: dispatch_kwargs.pop(key)
+                    for key in (
+                        "elicitation_callback",
+                        "store",
+                        "db",
+                        "current_session_id",
+                        "callback",
+                    )
+                    if key in dispatch_kwargs
+                }
+                context_token = _TOOL_HANDLER_CONTEXT.set(handler_context)
+                try:
+                    return await handle_function_call(
+                        name, next_args, effective_task_id, **dispatch_kwargs
+                    )
+                finally:
+                    _TOOL_HANDLER_CONTEXT.reset(context_token)
 
             managed = await _run_agent_tool_execution_middleware(
                 agent,

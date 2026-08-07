@@ -85,7 +85,7 @@ def _cjk_fts_config_enabled() -> bool:
     )
 
 
-async def load_fts5_cjk_extension(connection) -> bool:
+async def load_fts5_cjk_extension(conn) -> bool:
     """Best-effort load of the cjk_unicode61 tokenizer into ``connection``."""
     if not _cjk_fts_config_enabled():
         return False
@@ -93,11 +93,11 @@ async def load_fts5_cjk_extension(connection) -> bool:
     if not await aiofiles.os.path.exists(path):
         return False
     try:
-        await connection.enable_load_extension(True)
+        await conn.enable_load_extension(True)
         try:
-            await connection.load_extension(str(path))
+            await conn.load_extension(str(path))
         finally:
-            await connection.enable_load_extension(False)
+            await conn.enable_load_extension(False)
         return True
     except Exception:
         logger.warning("fts5_cjk extension load failed (%s)", path, exc_info=True)

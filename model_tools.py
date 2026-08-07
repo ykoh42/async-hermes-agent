@@ -26,6 +26,7 @@ import re
 import logging
 import time
 import aiofiles.os
+from contextvars import ContextVar
 from typing import Dict, Any, List, Optional, Tuple
 
 from tools.registry import (
@@ -38,6 +39,14 @@ from tools.registry import (
 from toolsets import resolve_toolset, validate_toolset
 
 logger = logging.getLogger(__name__)
+
+# Per-dispatch state that is not part of Hermes' public
+# ``handle_function_call`` signature. ContextVar keeps concurrent agents and
+# TaskGroup tool calls isolated while preserving the upstream call contract.
+_TOOL_HANDLER_CONTEXT: ContextVar[Optional[Dict[str, Any]]] = ContextVar(
+    "tool_handler_context",
+    default=None,
+)
 
 # Tracks platform-bundle names already flagged in disabled_toolsets so the
 # advisory (#33924) is logged once per name, not on every tool recompute.
@@ -824,7 +833,6 @@ async def handle_function_call(
     tool_request_middleware_trace: Optional[List[Dict[str, Any]]] = None,
     enabled_toolsets: Optional[List[str]] = None,
     disabled_toolsets: Optional[List[str]] = None,
-    **handler_context: Any,
 ) -> str | dict:
     """Dispatch one tool through the native async plugin lifecycle.
 
@@ -838,6 +846,7 @@ async def handle_function_call(
         function_args = {}
     original_args = dict(function_args)
     middleware_trace = list(tool_request_middleware_trace or [])
+    handler_context = _TOOL_HANDLER_CONTEXT.get() or {}
 
     if not skip_tool_request_middleware:
         from hermes_cli.middleware import apply_tool_request_middleware
