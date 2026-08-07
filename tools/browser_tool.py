@@ -1722,7 +1722,7 @@ async def _cleanup_inactive_browser_sessions() -> None:
     """
     Clean up browser sessions that have been inactive for longer than the timeout.
 
-    This function is called periodically by the background cleanup thread to
+    This function is called periodically by the background cleanup task to
     automatically close sessions that haven't been used recently, preventing
     orphaned sessions (local or Browserbase) from accumulating.
     """
@@ -1942,7 +1942,7 @@ async def _reap_orphaned_browser_sessions() -> None:
          ``_active_sessions`` in the current process.  If not tracked here,
          treat as orphan (legacy behavior).
 
-    Safe to call from any context — atexit, cleanup thread, or on demand.
+    Safe to call from the owning event loop's cleanup task or on demand.
     """
     tmpdir = _socket_safe_tmpdir()
     try:

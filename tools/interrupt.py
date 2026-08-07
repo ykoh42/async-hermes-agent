@@ -33,15 +33,17 @@ def _reset_interrupt_event(
 
 def set_interrupt(
     active: bool,
-    event: asyncio.Event | None = None,
-) -> asyncio.Event:
+    thread_id: asyncio.Event | None = None,
+) -> None:
     """Set or clear an interrupt event without blocking the event loop.
 
-    ``event`` is supplied by cross-task agent controls such as
+    ``thread_id`` retains the upstream public parameter name. In the native
+    async runtime it carries the agent-owned event supplied by cross-task
+    controls such as
     :meth:`AIAgent.interrupt`. Tool code normally omits it and operates on the
     event bound to its inherited task context.
     """
-    target = event or _current_interrupt_event.get()
+    target = thread_id or _current_interrupt_event.get()
     if target is None:
         target = asyncio.Event()
         _current_interrupt_event.set(target)
@@ -49,7 +51,11 @@ def set_interrupt(
         target.set()
     else:
         target.clear()
-    return target
+
+
+def clear_current_thread_interrupt() -> None:
+    """Clear the interrupt bound to the current async execution context."""
+    set_interrupt(False)
 
 
 def is_interrupted() -> bool:

@@ -121,7 +121,7 @@ def register_env_passthrough(var_names: Iterable[str]) -> None:
         logger.debug("env passthrough: registered %s", name)
 
 
-def _load_config_passthrough() -> frozenset[str]:
+async def _load_config_passthrough() -> frozenset[str]:
     """Load ``tools.env_passthrough`` from config.yaml (cached)."""
     global _config_passthrough
     if _config_passthrough is not None:
@@ -129,8 +129,9 @@ def _load_config_passthrough() -> frozenset[str]:
 
     result: set[str] = set()
     try:
-        from hermes_cli.config import read_raw_config
-        cfg = read_raw_config()
+        from hermes_cli.config import load_config_readonly
+
+        cfg = await load_config_readonly()
         passthrough = cfg_get(cfg, "terminal", "env_passthrough")
         if isinstance(passthrough, list):
             for item in passthrough:
@@ -161,7 +162,7 @@ def _load_config_passthrough() -> frozenset[str]:
     return _config_passthrough
 
 
-def is_env_passthrough(var_name: str) -> bool:
+async def is_env_passthrough(var_name: str) -> bool:
     """Check whether *var_name* is allowed to pass through to sandboxes.
 
     Returns ``True`` if the variable was registered by a skill or listed in
@@ -169,12 +170,36 @@ def is_env_passthrough(var_name: str) -> bool:
     """
     if var_name in _get_allowed():
         return True
-    return var_name in _load_config_passthrough()
+    return var_name in await _load_config_passthrough()
 
 
-def get_all_passthrough() -> frozenset[str]:
+async def get_all_passthrough() -> frozenset[str]:
     """Return the union of skill-registered and config-based passthrough vars."""
-    return frozenset(_get_allowed()) | _load_config_passthrough()
+    return frozenset(_get_allowed()) | await _load_config_passthrough()
+
+
+def resolve_passthrough_value(
+    name: str,
+    fallback: str | None = None,
+) -> str | None:
+    """Resolve an allowlisted variable without crossing profile boundaries."""
+    from agent.secret_scope import (
+        _is_global_env,
+        current_secret_scope,
+        get_secret,
+        is_multiplex_active,
+    )
+
+    if _is_global_env(name) and fallback is not None:
+        return fallback
+
+    scope = current_secret_scope()
+    multiplex_active = is_multiplex_active()
+    if scope is None:
+        if multiplex_active:
+            return get_secret(name)
+        return fallback
+    return get_secret(name, None if multiplex_active else fallback)
 
 
 def clear_env_passthrough() -> None:

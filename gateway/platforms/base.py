@@ -1,10 +1,4 @@
-"""Small compatibility boundary retained for the lean agent runtime.
-
-The messaging adapters and gateway runner are intentionally excluded.  A few
-core paths still share media-cache and network-safety helpers through this
-historical module path, so those helpers stay here until the async service
-runtime owns them directly.
-"""
+"""Media-cache helpers used by MCP resource handling."""
 
 from __future__ import annotations
 
@@ -144,21 +138,6 @@ async def cleanup_document_cache(max_age_hours: int = 24) -> int:
     return await _cleanup_cache("documents", max_age_hours)
 
 
-def resolve_proxy_url(*_args, **_kwargs) -> str | None:
-    """Compatibility placeholder; transport clients own proxy setup now."""
-    return None
-
-
-def proxy_kwargs_for_aiohttp(*_args, **_kwargs) -> tuple[dict, dict]:
-    """Compatibility placeholder for removed messaging transports."""
-    return {}, {}
-
-
-def utf16_len(value: str) -> int:
-    """Return UTF-16 code-unit length for callers preserving API semantics."""
-    return len(str(value).encode("utf-16-le")) // 2
-
-
 __all__ = [
     "GATEWAY_SECRET_CAPTURE_UNSUPPORTED_MESSAGE",
     "cache_audio_from_bytes",
@@ -168,7 +147,4 @@ __all__ = [
     "cleanup_document_cache",
     "cleanup_image_cache",
     "is_network_accessible",
-    "proxy_kwargs_for_aiohttp",
-    "resolve_proxy_url",
-    "utf16_len",
 ]

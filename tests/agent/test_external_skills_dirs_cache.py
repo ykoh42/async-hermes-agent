@@ -50,14 +50,15 @@ def hermes_home_with_config(tmp_path, monkeypatch):
 
 
 
-def test_cache_invalidates_on_mtime_change(hermes_home_with_config):
+@pytest.mark.asyncio
+async def test_cache_invalidates_on_mtime_change(hermes_home_with_config):
     """A config.yaml edit invalidates the cache on the next call."""
     _home, external, config = hermes_home_with_config
     other = external.parent / "other_skills"
     other.mkdir()
 
     # Prime cache with original contents.
-    first = get_external_skills_dirs()
+    first = await get_external_skills_dirs()
     assert first == [external.resolve()]
 
     # Rewrite config; bump mtime forward explicitly so filesystems with
@@ -73,7 +74,7 @@ def test_cache_invalidates_on_mtime_change(hermes_home_with_config):
     future = stat.st_atime + 10
     os.utime(config, (future, future))
 
-    second = get_external_skills_dirs()
+    second = await get_external_skills_dirs()
     assert second == [other.resolve()]
 
 
@@ -81,7 +82,8 @@ def test_cache_invalidates_on_mtime_change(hermes_home_with_config):
 
 
 
-def test_cache_key_is_per_config_path(tmp_path, monkeypatch):
+@pytest.mark.asyncio
+async def test_cache_key_is_per_config_path(tmp_path, monkeypatch):
     """Two different HERMES_HOMEs keep separate cache entries."""
     home_a = tmp_path / "home_a" / ".hermes"
     home_a.mkdir(parents=True)
@@ -102,11 +104,11 @@ def test_cache_key_is_per_config_path(tmp_path, monkeypatch):
     _external_dirs_cache_clear()
 
     monkeypatch.setenv("HERMES_HOME", str(home_a))
-    assert get_external_skills_dirs() == [ext_a.resolve()]
+    assert await get_external_skills_dirs() == [ext_a.resolve()]
 
     monkeypatch.setenv("HERMES_HOME", str(home_b))
-    assert get_external_skills_dirs() == [ext_b.resolve()]
+    assert await get_external_skills_dirs() == [ext_b.resolve()]
 
     # And switching back still works — both entries coexist in the cache.
     monkeypatch.setenv("HERMES_HOME", str(home_a))
-    assert get_external_skills_dirs() == [ext_a.resolve()]
+    assert await get_external_skills_dirs() == [ext_a.resolve()]

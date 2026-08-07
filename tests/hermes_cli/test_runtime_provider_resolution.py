@@ -123,6 +123,48 @@ async def test_openai_codex_explicit_base_uses_native_async_pool(monkeypatch):
     assert resolved["last_refresh"] == "2026-08-06T00:00:00+00:00"
 
 
+async def test_openai_codex_uses_runtime_resolver_when_pool_is_empty(monkeypatch):
+    pool = SimpleNamespace(has_credentials=lambda: False)
+    resolve = AsyncMock(
+        return_value={
+            "base_url": "https://chatgpt.com/backend-api/codex",
+            "api_key": "singleton-token",
+            "source": "hermes-auth-store",
+            "last_refresh": "2026-08-08T00:00:00Z",
+        }
+    )
+    monkeypatch.setattr(rp, "resolve_provider", AsyncMock(return_value="openai-codex"))
+    monkeypatch.setattr(rp, "load_pool", AsyncMock(return_value=pool))
+    monkeypatch.setattr(rp.auth_mod, "resolve_codex_runtime_credentials", resolve)
+
+    resolved = await rp.resolve_runtime_provider(requested="openai-codex")
+
+    assert resolved["provider"] == "openai-codex"
+    assert resolved["api_key"] == "singleton-token"
+    resolve.assert_awaited_once_with()
+
+
+async def test_xai_oauth_uses_runtime_resolver_when_pool_is_empty(monkeypatch):
+    pool = SimpleNamespace(has_credentials=lambda: False)
+    resolve = AsyncMock(
+        return_value={
+            "base_url": "https://api.x.ai/v1",
+            "api_key": "singleton-token",
+            "source": "hermes-auth-store",
+            "last_refresh": "2026-08-08T00:00:00Z",
+        }
+    )
+    monkeypatch.setattr(rp, "resolve_provider", AsyncMock(return_value="xai-oauth"))
+    monkeypatch.setattr(rp, "load_pool", AsyncMock(return_value=pool))
+    monkeypatch.setattr(rp.auth_mod, "resolve_xai_oauth_runtime_credentials", resolve)
+
+    resolved = await rp.resolve_runtime_provider(requested="xai-oauth")
+
+    assert resolved["provider"] == "xai-oauth"
+    assert resolved["api_key"] == "singleton-token"
+    resolve.assert_awaited_once_with()
+
+
 async def test_qwen_oauth_resolves_native_async_credentials(monkeypatch):
     monkeypatch.setattr(rp, "resolve_provider", AsyncMock(return_value="qwen-oauth"))
     monkeypatch.setattr(rp, "_get_model_config", lambda *_args, **_kwargs: {})
@@ -930,6 +972,21 @@ class TestAzureFoundryResolution:
             # upgrades GPT-5.x / codex deployments to codex_responses.
             "default": "gpt-4.1",
         }
+
+    async def test_azure_foundry_reads_key_env_natively(self, monkeypatch):
+        read_env = AsyncMock(return_value="dotenv-key")
+        monkeypatch.setattr(rp, "get_env_value_prefer_dotenv", read_env)
+
+        resolved = await rp._resolve_azure_foundry_runtime(
+            requested_provider="azure-foundry",
+            model_cfg={
+                **self._make_cfg("https://example.openai.azure.com/openai/v1"),
+                "key_env": "CUSTOM_AZURE_KEY",
+            },
+        )
+
+        assert resolved["api_key"] == "dotenv-key"
+        read_env.assert_awaited_once_with("CUSTOM_AZURE_KEY")
 
 
     async def test_azure_foundry_missing_base_url_raises(self, monkeypatch):

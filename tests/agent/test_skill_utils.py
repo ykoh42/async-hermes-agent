@@ -2,7 +2,11 @@
 
 from unittest.mock import AsyncMock, patch
 
+import aiofiles.os
 import pytest
+from blockbuster import BlockBuster
+from pyleak import no_event_loop_blocking, no_task_leaks
+from pyleak.eventloop import LeakAction
 
 from agent.skill_utils import (
     extract_skill_config_vars,
@@ -31,7 +35,8 @@ from agent.skill_utils import (
 
 
 
-def test_skill_config_helpers_share_raw_config_parse_cache(tmp_path, monkeypatch):
+@pytest.mark.asyncio
+async def test_skill_config_helpers_share_raw_config_parse_cache(tmp_path, monkeypatch):
     """Repeated skill config helpers should parse config.yaml only once."""
     from agent import skill_utils
 
@@ -66,19 +71,66 @@ skills:
     getattr(skill_utils, "_raw_config_cache_clear", lambda: None)()
     monkeypatch.setattr(skill_utils, "yaml_load", counting_yaml_load)
 
-    assert get_disabled_skill_names() == {"hidden-skill"}
-    assert get_external_skills_dirs() == [external.resolve()]
-    assert resolve_skill_config_values([
+    assert await get_disabled_skill_names() == {"hidden-skill"}
+    assert await get_external_skills_dirs() == [external.resolve()]
+    assert (await resolve_skill_config_values([
         {"key": "wiki.path", "description": "Wiki path"}
-    ])["wiki.path"].endswith("/wiki")
+    ]))["wiki.path"].endswith("/wiki")
     assert parse_count == 1
 
 
+@pytest.mark.asyncio
+async def test_skill_metadata_io_is_native_async(tmp_path, monkeypatch):
+    from agent import skill_utils
+
+    hermes_home = tmp_path / ".hermes"
+    skills_dir = hermes_home / "skills"
+    skill_dir = skills_dir / "training"
+    external = tmp_path / "external-skills"
+    skill_dir.mkdir(parents=True)
+    external.mkdir()
+    (skill_dir / "SKILL.md").write_text(
+        "---\nname: training\ndescription: Training skill\n---\n",
+        encoding="utf-8",
+    )
+    (hermes_home / "config.yaml").write_text(
+        "skills:\n"
+        "  disabled: [hidden-skill]\n"
+        "  external_dirs:\n"
+        f"    - {external}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    skill_utils._external_dirs_cache_clear()
+    resolved_external = external.resolve()
+
+    # Warm aiofiles' executor before BlockBuster instruments thread startup.
+    await aiofiles.os.stat(hermes_home)
+    async with (
+        no_event_loop_blocking(action=LeakAction.RAISE, threshold=0.1),
+        no_task_leaks(action=LeakAction.RAISE),
+    ):
+        blockbuster = BlockBuster()
+        blockbuster.activate()
+        try:
+            assert await get_disabled_skill_names() == {"hidden-skill"}
+            assert await get_external_skills_dirs() == [resolved_external]
+            found = [
+                path
+                async for path in iter_skill_index_files(skills_dir, "SKILL.md")
+            ]
+        finally:
+            blockbuster.deactivate()
+
+    assert found == [skill_dir / "SKILL.md"]
 
 
 
 
-def test_iter_skill_index_files_prunes_skill_support_dirs(tmp_path):
+
+
+@pytest.mark.asyncio
+async def test_iter_skill_index_files_prunes_skill_support_dirs(tmp_path):
     """Archived package SKILL.md files under support dirs are not active skills."""
     real = tmp_path / "umbrella"
     real.mkdir()
@@ -95,16 +147,19 @@ def test_iter_skill_index_files_prunes_skill_support_dirs(tmp_path):
     script_package.mkdir(parents=True)
     (script_package / "SKILL.md").write_text("---\nname: helper\n---\n", encoding="utf-8")
 
-    found = list(iter_skill_index_files(tmp_path, "SKILL.md"))
-    desc_found = list(iter_skill_index_files(tmp_path, "DESCRIPTION.md"))
+    found = [path async for path in iter_skill_index_files(tmp_path, "SKILL.md")]
+    desc_found = [
+        path async for path in iter_skill_index_files(tmp_path, "DESCRIPTION.md")
+    ]
 
     assert found == [real / "SKILL.md"]
     assert desc_found == []
-    assert is_skill_support_path(package / "SKILL.md") is True
-    assert is_excluded_skill_path(package / "SKILL.md") is True
+    assert await is_skill_support_path(package / "SKILL.md") is True
+    assert await is_excluded_skill_path(package / "SKILL.md") is True
 
 
-def test_iter_skill_index_files_keeps_support_named_categories(tmp_path):
+@pytest.mark.asyncio
+async def test_iter_skill_index_files_keeps_support_named_categories(tmp_path):
     """A category named scripts/templates/assets/references is still valid."""
     scripts_skill = tmp_path / "scripts" / "bash-helper"
     scripts_skill.mkdir(parents=True)
@@ -118,14 +173,17 @@ def test_iter_skill_index_files_keeps_support_named_categories(tmp_path):
         "---\nname: deck-template\n---\n", encoding="utf-8"
     )
 
-    found = list(iter_skill_index_files(tmp_path, "SKILL.md"))
+    found = [path async for path in iter_skill_index_files(tmp_path, "SKILL.md")]
 
     assert found == [scripts_skill / "SKILL.md", templates_skill / "SKILL.md"]
-    assert is_skill_support_path(scripts_skill / "SKILL.md") is False
-    assert is_excluded_skill_path(scripts_skill / "SKILL.md") is False
+    assert await is_skill_support_path(scripts_skill / "SKILL.md") is False
+    assert await is_excluded_skill_path(scripts_skill / "SKILL.md") is False
 
 
-def test_skill_support_path_uses_explicit_discovery_root_not_cwd(tmp_path, monkeypatch):
+@pytest.mark.asyncio
+async def test_skill_support_path_uses_explicit_discovery_root_not_cwd(
+    tmp_path, monkeypatch
+):
     discovery_root = tmp_path / "site-packages" / "skills"
     umbrella = discovery_root / "category" / "umbrella"
     nested = umbrella / "references" / "archived" / "SKILL.md"
@@ -137,8 +195,8 @@ def test_skill_support_path_uses_explicit_discovery_root_not_cwd(tmp_path, monke
     monkeypatch.chdir(elsewhere)
 
     relative = nested.relative_to(discovery_root)
-    assert is_skill_support_path(relative, root=discovery_root) is True
-    assert is_excluded_skill_path(relative, root=discovery_root) is True
+    assert await is_skill_support_path(relative, root=discovery_root) is True
+    assert await is_excluded_skill_path(relative, root=discovery_root) is True
 
 
 # ── skill_matches_platform on Termux ──────────────────────────────────────

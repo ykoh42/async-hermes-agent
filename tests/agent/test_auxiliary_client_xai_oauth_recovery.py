@@ -5,16 +5,19 @@ an OAuth2 access token has expired.  These tests verify the three fixes:
 
 1. _is_auth_error detects xAI 403 as an auth failure
 2. _recoverable_pool_provider maps api.x.ai to xai-oauth
-3. _refresh_provider_credentials rejects xai-oauth's sync refresh path
+3. _refresh_provider_credentials uses xai-oauth's native async pool refresh
 """
 
 import pytest
+from unittest.mock import AsyncMock, MagicMock, patch
 
 
 # ── _is_auth_error ──────────────────────────────────────────────────────────
 
+
 def _import_is_auth_error():
     from agent.auxiliary_client import _is_auth_error
+
     return _is_auth_error
 
 
@@ -37,9 +40,7 @@ class TestIsAuthErrorXaiOauth403:
 
     def test_xai_403_bad_credentials_without_status_code(self):
         """Fallback match when status_code attribute is missing."""
-        exc = Exception(
-            "Error code: 403 - unauthenticated:bad-credentials"
-        )
+        exc = Exception("Error code: 403 - unauthenticated:bad-credentials")
         # No status_code attribute — should still match via string pattern
         assert self.is_auth_error(exc) is True
 
@@ -49,11 +50,6 @@ class TestIsAuthErrorXaiOauth403:
         exc.status_code = 403
         assert self.is_auth_error(exc) is False
 
-
-
-
-
-
     def test_unauthenticated_without_bad_credentials_is_not_auth_error(self):
         """'unauthenticated' alone (without 'bad-credentials') should not match."""
         exc = Exception("unauthenticated request")
@@ -62,8 +58,10 @@ class TestIsAuthErrorXaiOauth403:
 
 # ── _recoverable_pool_provider ──────────────────────────────────────────────
 
+
 def _import_recoverable_pool_provider():
     from agent.auxiliary_client import _recoverable_pool_provider
+
     return _recoverable_pool_provider
 
 
@@ -81,6 +79,7 @@ class TestRecoverablePoolProviderXaiOAuth:
 
     def test_api_x_ai_host_match(self):
         """api.x.ai base URL maps to xai-oauth pool."""
+
         class MockClient:
             base_url = "https://api.x.ai/v1/"
 
@@ -89,6 +88,7 @@ class TestRecoverablePoolProviderXaiOAuth:
 
     def test_auto_with_unknown_host_returns_none(self):
         """auto provider with unknown host returns None."""
+
         class MockClient:
             base_url = "https://unknown.example.com/v1/"
 
@@ -98,21 +98,44 @@ class TestRecoverablePoolProviderXaiOAuth:
 
 # ── _refresh_provider_credentials (structure check) ─────────────────────────
 
+
 def _import_refresh_provider_credentials():
     from agent.auxiliary_client import _refresh_provider_credentials
+
     return _refresh_provider_credentials
 
 
 class TestRefreshProviderCredentialsXaiOAuth:
-    """Native async mode rejects sync-only xAI OAuth refresh."""
+    """xAI OAuth recovery stays on the native async credential-pool path."""
 
     @pytest.fixture(autouse=True)
     def _import(self):
         self.refresh = _import_refresh_provider_credentials()
 
     @pytest.mark.asyncio
-    async def test_xai_oauth_no_pool_returns_false(self):
-        assert await self.refresh("xai-oauth") is False
+    async def test_xai_oauth_refreshes_pool_and_evicts_cached_client(self):
+        refreshed = MagicMock(runtime_api_key="fresh-token")
+        pool = MagicMock()
+        pool.has_credentials.return_value = True
+        pool.select = AsyncMock(return_value=MagicMock())
+        pool.try_refresh_current = AsyncMock(return_value=refreshed)
+
+        with (
+            patch(
+                "agent.auxiliary_client.load_pool",
+                new=AsyncMock(return_value=pool),
+            ) as load_pool,
+            patch(
+                "agent.auxiliary_client._evict_cached_clients",
+                new=AsyncMock(),
+            ) as evict,
+        ):
+            assert await self.refresh("xai-oauth") is True
+
+        load_pool.assert_awaited_once_with("xai-oauth")
+        pool.select.assert_awaited_once_with()
+        pool.try_refresh_current.assert_awaited_once_with()
+        evict.assert_awaited_once_with("xai-oauth")
 
     @pytest.mark.asyncio
     async def test_unknown_provider_returns_false(self):

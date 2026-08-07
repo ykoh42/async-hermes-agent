@@ -281,7 +281,7 @@ class TestPluginLlmFacade:
         llm = make_plugin_llm_for_test(
             plugin_id="my-plugin",
             policy=_TrustPolicy(plugin_id="my-plugin"),
-            caller=fake_caller,
+            async_caller=fake_caller,
         )
         result = await llm.complete([{"role": "user", "content": "hi"}])
         assert isinstance(result, PluginLlmCompleteResult)
@@ -305,7 +305,7 @@ class TestPluginLlmFacade:
         llm = make_plugin_llm_for_test(
             plugin_id="my-plugin",
             policy=_trusted_policy("my-plugin"),
-            caller=fake_caller,
+            async_caller=fake_caller,
         )
         result = await llm.complete(
             [{"role": "user", "content": "hi"}],
@@ -339,7 +339,7 @@ class TestPluginLlmFacade:
         llm = make_plugin_llm_for_test(
             plugin_id="my-plugin",
             policy=_TrustPolicy(plugin_id="my-plugin"),
-            caller=fake_caller,
+            async_caller=fake_caller,
         )
         result = await llm.complete_structured(
             instructions="Detect language",
@@ -370,7 +370,7 @@ class TestPluginLlmFacade:
         llm = make_plugin_llm_for_test(
             plugin_id="my-plugin",
             policy=_TrustPolicy(plugin_id="my-plugin"),
-            caller=fake_caller,
+            async_caller=fake_caller,
         )
         png = b"fake-bytes"
         await llm.complete_structured(
@@ -399,7 +399,7 @@ class TestAsyncSurface:
         llm = make_plugin_llm_for_test(
             plugin_id="my-plugin",
             policy=_TrustPolicy(plugin_id="my-plugin"),
-            caller=fake_async,
+            async_caller=fake_async,
         )
         result = await llm.complete([{"role": "user", "content": "hi"}])
         assert result.text == "async hello"
@@ -413,7 +413,7 @@ class TestAsyncSurface:
         llm = make_plugin_llm_for_test(
             plugin_id="my-plugin",
             policy=_TrustPolicy(plugin_id="my-plugin"),
-            caller=fake_async,
+            async_caller=fake_async,
         )
         result = await llm.complete_structured(
             instructions="Extract x",
@@ -597,7 +597,7 @@ class TestHookMode:
         ctx._llm = make_plugin_llm_for_test(  # type: ignore[attr-defined]
             plugin_id="hook-plugin",
             policy=_TrustPolicy(plugin_id="hook-plugin"),
-            caller=fake_caller,
+            async_caller=fake_caller,
         )
 
         # Plugin registers a hook that runs ctx.llm.complete on every tool call.
@@ -649,7 +649,7 @@ class TestHookMode:
         ctx._llm = make_plugin_llm_for_test(  # type: ignore[attr-defined]
             plugin_id="hook-async",
             policy=_TrustPolicy(plugin_id="hook-async"),
-            caller=fake_caller,
+            async_caller=fake_caller,
         )
 
         called: list = []

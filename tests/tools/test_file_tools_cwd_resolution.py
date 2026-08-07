@@ -15,6 +15,7 @@ Core invariant these tests pin:
   never left to resolve against whatever the process cwd happens to be.
 """
 
+import json
 import os
 from pathlib import Path
 
@@ -112,6 +113,42 @@ async def test_resolution_base_always_absolute_no_terminal_cwd(
 
 
 # ── B-(ii): workspace-divergence warning ────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_warning_fires_when_relative_path_escapes_workspace(
+    _isolated_cwd,
+):
+    workspace, decoy = _isolated_cwd
+    await terminal_tool.record_session_cwd("default", str(workspace))
+
+    warning = await ft._path_resolution_warning(
+        "../decoy/target.py",
+        decoy / "target.py",
+        task_id="default",
+    )
+
+    assert warning is not None
+    assert "OUTSIDE the active workspace" in warning
+    assert str(decoy) in warning
+    assert str(workspace) in warning
+
+
+@pytest.mark.asyncio
+async def test_write_surfaces_workspace_divergence_warning(_isolated_cwd):
+    workspace, decoy = _isolated_cwd
+    await terminal_tool.record_session_cwd("default", str(workspace))
+
+    result = json.loads(
+        await ft.write_file_tool(
+            "../decoy/new.txt",
+            "content\n",
+            task_id="default",
+        )
+    )
+
+    assert "OUTSIDE the active workspace" in result["_warning"]
+    assert result["resolved_path"] == str(decoy / "new.txt")
 
 
 # ── Fix C: sentinel TERMINAL_CWD + empty-registry worktree anchoring ─────────

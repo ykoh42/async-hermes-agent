@@ -12,7 +12,6 @@ import io
 import json
 import logging
 import re
-import threading
 import time
 import uuid
 from logging.handlers import RotatingFileHandler
@@ -3147,7 +3146,7 @@ class TestRunConversation:
             requests.append(api_kwargs)
             if len(requests) == 1:
                 agent._fire_reasoning_delta("I should implement this with SQLite.")
-                assert agent.redirect("No, use Postgres instead.") is True
+                assert await agent.redirect("No, use Postgres instead.") is True
                 raise InterruptedError("redirect cancelled the first request")
             return final
 
@@ -3204,7 +3203,7 @@ class TestRunConversation:
             nonlocal calls
             calls += 1
             if calls == 1:
-                assert agent.redirect("Use Postgres instead.") is True
+                assert await agent.redirect("Use Postgres instead.") is True
                 return stale
             return corrected
 
@@ -3224,8 +3223,8 @@ class TestRunConversation:
         )
 
     @pytest.mark.asyncio
-    async def test_redirect_from_input_thread_cancels_live_model_request(self, agent):
-        """Exercise the real cross-thread path used by CLI and gateways."""
+    async def test_redirect_from_service_task_cancels_live_model_request(self, agent):
+        """An awaited service-side redirect cancels the live model request."""
         self._setup_agent(agent)
         agent.reasoning_callback = lambda _text: None
         entered = asyncio.Event()
@@ -3257,16 +3256,11 @@ class TestRunConversation:
                 agent.run_conversation("Take the original approach.")
             )
             await asyncio.wait_for(entered.wait(), timeout=2)
-            input_thread = threading.Thread(
-                target=lambda: redirect_result.setdefault(
-                    "accepted", agent.redirect("Use the corrected approach.")
-                )
+            redirect_result["accepted"] = await agent.redirect(
+                "Use the corrected approach."
             )
-            input_thread.start()
-            input_thread.join(timeout=2)
             result = await asyncio.wait_for(turn, timeout=5)
 
-        assert input_thread.is_alive() is False
         assert redirect_result["accepted"] is True
         assert request_cancelled.is_set()
         assert agent._active_request_abort is None

@@ -1,8 +1,14 @@
 """Tests for tools.env_passthrough — skill and config env var passthrough."""
 
 import os
+import inspect
+
+import aiofiles.os
 import pytest
 import yaml
+from blockbuster import BlockBuster
+from pyleak import no_event_loop_blocking, no_task_leaks
+from pyleak.eventloop import LeakAction
 
 import tools.env_passthrough as _ep_mod
 from tools.env_passthrough import (
@@ -24,32 +30,47 @@ def _clean_passthrough():
 
 
 class TestSkillScopedPassthrough:
-    def test_register_and_check(self):
-        assert not is_env_passthrough("TENOR_API_KEY")
+    @pytest.mark.asyncio
+    async def test_register_and_check(self):
+        assert not await is_env_passthrough("TENOR_API_KEY")
         register_env_passthrough(["TENOR_API_KEY"])
-        assert is_env_passthrough("TENOR_API_KEY")
+        assert await is_env_passthrough("TENOR_API_KEY")
 
 
-    def test_skips_empty(self):
+    @pytest.mark.asyncio
+    async def test_skips_empty(self):
         register_env_passthrough(["", "  ", "VALID_KEY"])
-        assert is_env_passthrough("VALID_KEY")
-        assert not is_env_passthrough("")
+        assert await is_env_passthrough("VALID_KEY")
+        assert not await is_env_passthrough("")
 
 
 class TestConfigPassthrough:
-    def test_reads_from_config(self, tmp_path, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_reads_from_config(self, tmp_path, monkeypatch):
         config = {"terminal": {"env_passthrough": ["MY_CUSTOM_KEY", "ANOTHER_TOKEN"]}}
         config_path = tmp_path / "config.yaml"
         config_path.write_text(yaml.dump(config))
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         _ep_mod._config_passthrough = None
 
-        assert is_env_passthrough("MY_CUSTOM_KEY")
-        assert is_env_passthrough("ANOTHER_TOKEN")
-        assert not is_env_passthrough("UNRELATED_VAR")
+        assert inspect.iscoroutinefunction(is_env_passthrough)
+        await aiofiles.os.path.exists(config_path)
+        async with (
+            no_event_loop_blocking(action=LeakAction.RAISE, threshold=0.1),
+            no_task_leaks(action=LeakAction.RAISE),
+        ):
+            blockbuster = BlockBuster()
+            blockbuster.activate()
+            try:
+                assert await is_env_passthrough("MY_CUSTOM_KEY")
+                assert await is_env_passthrough("ANOTHER_TOKEN")
+                assert not await is_env_passthrough("UNRELATED_VAR")
+            finally:
+                blockbuster.deactivate()
 
 
-    def test_union_of_skill_and_config(self, tmp_path, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_union_of_skill_and_config(self, tmp_path, monkeypatch):
         config = {"terminal": {"env_passthrough": ["CONFIG_KEY"]}}
         config_path = tmp_path / "config.yaml"
         config_path.write_text(yaml.dump(config))
@@ -57,7 +78,7 @@ class TestConfigPassthrough:
         _ep_mod._config_passthrough = None
 
         register_env_passthrough(["SKILL_KEY"])
-        all_pt = get_all_passthrough()
+        all_pt = await get_all_passthrough()
         assert "CONFIG_KEY" in all_pt
         assert "SKILL_KEY" in all_pt
 
@@ -65,7 +86,8 @@ class TestConfigPassthrough:
 class TestSandboxIntegration:
     """Verify that passthrough is checked in sandbox environment filtering."""
 
-    def test_secret_substring_blocked_by_default(self):
+    @pytest.mark.asyncio
+    async def test_secret_substring_blocked_by_default(self):
         """TENOR_API_KEY should be blocked without passthrough."""
         _SAFE_ENV_PREFIXES = ("PATH", "HOME", "USER", "LANG", "LC_", "TERM",
                               "TMPDIR", "TMP", "TEMP", "SHELL", "LOGNAME",
@@ -76,7 +98,7 @@ class TestSandboxIntegration:
         test_env = {"PATH": "/usr/bin", "TENOR_API_KEY": "test123", "HOME": "/home/user"}
         child_env = {}
         for k, v in test_env.items():
-            if is_env_passthrough(k):
+            if await is_env_passthrough(k):
                 child_env[k] = v
                 continue
             if any(s in k.upper() for s in _SECRET_SUBSTRINGS):
@@ -88,7 +110,8 @@ class TestSandboxIntegration:
         assert "HOME" in child_env
         assert "TENOR_API_KEY" not in child_env
 
-    def test_passthrough_allows_secret_through(self):
+    @pytest.mark.asyncio
+    async def test_passthrough_allows_secret_through(self):
         """TENOR_API_KEY should pass through when registered."""
         _SAFE_ENV_PREFIXES = ("PATH", "HOME", "USER", "LANG", "LC_", "TERM",
                               "TMPDIR", "TMP", "TEMP", "SHELL", "LOGNAME",
@@ -101,7 +124,7 @@ class TestSandboxIntegration:
         test_env = {"PATH": "/usr/bin", "TENOR_API_KEY": "test123", "HOME": "/home/user"}
         child_env = {}
         for k, v in test_env.items():
-            if is_env_passthrough(k):
+            if await is_env_passthrough(k):
                 child_env[k] = v
                 continue
             if any(s in k.upper() for s in _SECRET_SUBSTRINGS):
@@ -128,7 +151,8 @@ class TestTerminalIntegration:
         assert blocked_var not in result
         assert "PATH" in result
 
-    def test_passthrough_cannot_override_provider_blocklist(self):
+    @pytest.mark.asyncio
+    async def test_passthrough_cannot_override_provider_blocklist(self):
         """GHSA-rhgp-j443-p4rf: register_env_passthrough must NOT accept
         Hermes provider credentials — that was the bypass where a skill
         could declare ANTHROPIC_TOKEN / OPENAI_API_KEY as passthrough and
@@ -143,7 +167,7 @@ class TestTerminalIntegration:
         register_env_passthrough([blocked_var])
 
         # is_env_passthrough must NOT report it as allowed
-        assert not is_env_passthrough(blocked_var)
+        assert not await is_env_passthrough(blocked_var)
 
         # Sanitizer still strips the var from subprocess env
         env = {blocked_var: "secret_value", "PATH": "/usr/bin"}
@@ -151,7 +175,8 @@ class TestTerminalIntegration:
         assert blocked_var not in result
         assert "PATH" in result
 
-    def test_passthrough_cannot_override_internal_dynamic_secret(self):
+    @pytest.mark.asyncio
+    async def test_passthrough_cannot_override_internal_dynamic_secret(self):
         """A skill must NOT be able to register dynamically-named Hermes
         secrets (AUXILIARY_*_API_KEY / _BASE_URL, GATEWAY_RELAY_* auth) as
         passthrough — they aren't in the static blocklist, so this is the
@@ -166,14 +191,15 @@ class TestTerminalIntegration:
             "GATEWAY_RELAY_DELIVERY_KEY",
         ):
             register_env_passthrough([var])
-            assert not is_env_passthrough(var), (
+            assert not await is_env_passthrough(var), (
                 f"{var} should be refused passthrough registration"
             )
             result = _sanitize_subprocess_env({var: "secret", "PATH": "/usr/bin"})
             assert var not in result
             assert "PATH" in result
 
-    def test_passthrough_allows_auxiliary_non_secret_routing(self):
+    @pytest.mark.asyncio
+    async def test_passthrough_allows_auxiliary_non_secret_routing(self):
         """AUXILIARY_*_PROVIDER / _MODEL and GATEWAY_RELAY routing hints are not
         secrets, so a skill may still register them (they're not protected)."""
         register_env_passthrough([
@@ -181,9 +207,9 @@ class TestTerminalIntegration:
             "AUXILIARY_VISION_MODEL",
             "GATEWAY_RELAY_URL",
         ])
-        assert is_env_passthrough("AUXILIARY_VISION_PROVIDER")
-        assert is_env_passthrough("AUXILIARY_VISION_MODEL")
-        assert is_env_passthrough("GATEWAY_RELAY_URL")
+        assert await is_env_passthrough("AUXILIARY_VISION_PROVIDER")
+        assert await is_env_passthrough("AUXILIARY_VISION_MODEL")
+        assert await is_env_passthrough("GATEWAY_RELAY_URL")
 
     def test_make_run_env_blocklist_override_rejected(self):
         """_make_run_env must NOT expose a blocklisted var to subprocess env
@@ -207,19 +233,21 @@ class TestTerminalIntegration:
         finally:
             os.environ.pop(blocked_var, None)
 
-    def test_non_hermes_api_key_still_registerable(self):
+    @pytest.mark.asyncio
+    async def test_non_hermes_api_key_still_registerable(self):
         """Third-party API keys (TENOR_API_KEY, NOTION_TOKEN, etc.) are NOT
         Hermes provider credentials and must still pass through — skills
         that legitimately wrap third-party APIs must keep working."""
         # TENOR_API_KEY is a real example — used by the gif-search skill
         register_env_passthrough(["TENOR_API_KEY"])
-        assert is_env_passthrough("TENOR_API_KEY")
+        assert await is_env_passthrough("TENOR_API_KEY")
 
         # Arbitrary skill-specific var
         register_env_passthrough(["MY_SKILL_CUSTOM_CONFIG"])
-        assert is_env_passthrough("MY_SKILL_CUSTOM_CONFIG")
+        assert await is_env_passthrough("MY_SKILL_CUSTOM_CONFIG")
 
-    def test_provider_blocklist_import_failure_fails_closed(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_provider_blocklist_import_failure_fails_closed(self, monkeypatch):
         """If the dynamic provider blocklist can't be imported, provider
         credentials must be treated as protected and refused passthrough —
         otherwise a skill could tunnel a Hermes credential into a terminal
@@ -251,8 +279,8 @@ class TestTerminalIntegration:
 
         # Registration is refused while the blocklist is unavailable.
         register_env_passthrough(["OPENAI_API_KEY", "ANTHROPIC_API_KEY"])
-        assert not is_env_passthrough("OPENAI_API_KEY")
-        assert not is_env_passthrough("ANTHROPIC_API_KEY")
+        assert not await is_env_passthrough("OPENAI_API_KEY")
+        assert not await is_env_passthrough("ANTHROPIC_API_KEY")
 
         # And the credential never reaches the terminal child.
         child_env = _sanitize_subprocess_env(

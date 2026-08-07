@@ -1726,9 +1726,34 @@ class ElicitationHandler:
             self.metrics["declined"] += 1
             return ElicitResult(action="decline")
 
-        callback = (
-            getattr(self.owner, "_pending_elicitation_callback", None)
+        message = getattr(params, "message", "") or (
+            f"MCP server '{self.server_name}' is requesting your approval"
+        )
+        schema = getattr(params, "requested_schema", {}) or {}
+        description = _format_elicitation_schema_summary(schema, self.server_name)
+
+        try:
+            from tools.approval import (
+                _elicitation_approval_callback,
+                request_elicitation_consent,
+            )
+        except Exception as exc:  # pragma: no cover - defensive import boundary
+            logger.error(
+                "MCP server '%s' elicitation approval unavailable: %s",
+                self.server_name,
+                exc,
+            )
+            self.metrics["errors"] += 1
+            return ElicitResult(action="decline")
+
+        captured = (
+            getattr(self.owner, "_pending_call_context", None)
             if self.owner
+            else None
+        )
+        callback = (
+            captured.get(_elicitation_approval_callback)
+            if captured is not None
             else None
         )
         if callback is None:
@@ -1747,33 +1772,17 @@ class ElicitationHandler:
             self.metrics["errors"] += 1
             return ElicitResult(action="decline")
 
-        message = getattr(params, "message", "") or (
-            f"MCP server '{self.server_name}' is requesting your approval"
-        )
-        schema = getattr(params, "requested_schema", {}) or {}
-        description = _format_elicitation_schema_summary(schema, self.server_name)
-        question = f"{message}\n\n{description}"
-        choices = ["Approve", "Decline"]
-
-        captured = (
-            getattr(self.owner, "_pending_call_context", None)
-            if self.owner
-            else None
-        )
         consent_task = asyncio.create_task(
-            callback(question, choices),
-            context=captured.copy() if captured is not None else None,
+            request_elicitation_consent(
+                message,
+                description,
+                timeout_seconds=int(self.timeout),
+                surface=f"mcp-elicitation/{self.server_name}",
+            ),
+            context=captured.copy(),
         )
         try:
-            answer = await asyncio.wait_for(consent_task, timeout=self.timeout)
-        except asyncio.TimeoutError:
-            logger.warning(
-                "MCP server '%s' elicitation timed out after %ds",
-                self.server_name,
-                int(self.timeout),
-            )
-            self.metrics["errors"] += 1
-            return ElicitResult(action="cancel")
+            answer = await consent_task
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -1822,7 +1831,7 @@ class MCPServerTask:
         "_sampling", "_elicitation",
         "_registered_tool_names", "_auth_type", "_refresh_lock",
         "_rpc_lock", "_pending_refresh_tasks",
-        "_pending_call_context", "_pending_elicitation_callback",
+        "_pending_call_context",
         "_lifecycle_started_at", "_last_tool_call_at",
         "_idle_timeout_seconds", "_max_lifetime_seconds", "_recycled_reason",
         "initialize_result", "_ping_unsupported",
@@ -1881,7 +1890,6 @@ class MCPServerTask:
         # gateway-platform attribution and routes the approval prompt
         # to the right surface (Telegram, Slack, etc.).
         self._pending_call_context: Optional[contextvars.Context] = None
-        self._pending_elicitation_callback: Optional[Callable[..., Coroutine]] = None
         now = time.monotonic()
         self._lifecycle_started_at: float = now
         self._last_tool_call_at: float = now
@@ -4558,13 +4566,15 @@ async def _call_mcp_tool(
     async with server._rpc_lock:
         # Snapshot the agent's context so an elicitation callback triggered
         # during this call can replay the gateway platform/session context.
+        from tools.approval import _elicitation_approval_callback
+
+        token = _elicitation_approval_callback.set(elicitation_callback)
         server._pending_call_context = contextvars.copy_context()
-        server._pending_elicitation_callback = elicitation_callback
         try:
             result = await server.session.call_tool(tool_name, arguments=args)
         finally:
             server._pending_call_context = None
-            server._pending_elicitation_callback = None
+            _elicitation_approval_callback.reset(token)
 
     _mark_proven = getattr(server, "_mark_session_proven", None)
     if _mark_proven is not None:

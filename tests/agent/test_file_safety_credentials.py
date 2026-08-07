@@ -125,9 +125,9 @@ async def test_search_tool_filters_credential_results(fake_home):
     assert str(token) not in raw
     assert "public note" in raw
     assert str(safe) in raw
-    assert out["omitted_sensitive_results"] == 2
+    assert out["_omitted"].startswith("2 result(s) omitted")
     assert out["total_count"] == 1
-    assert out["truncated"] is False
+    assert not out.get("truncated", False)
 
 
 # ---------------------------------------------------------------------------

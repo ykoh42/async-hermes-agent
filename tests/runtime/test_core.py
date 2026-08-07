@@ -746,8 +746,30 @@ def test_constructor_does_not_read_runtime_config_or_create_logs():
         )
 
     assert agent._deferred_provider_runtime is not None
+    assert agent.client is None
+    assert "runtime-pending" not in str(agent.__dict__)
     assert agent.tools == []
     assert agent.valid_tool_names == set()
+
+
+def test_constructor_does_not_store_fake_deferred_credentials():
+    """Credential-free construction records only real caller state."""
+    with (
+        patch("run_agent.get_tool_definitions", return_value=[]),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+    ):
+        agent = AIAgent(
+            provider="openrouter",
+            model="test-model",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+
+    assert agent._deferred_provider_runtime is not None
+    assert agent._client_kwargs == {}
+    assert agent.client is None
+    assert "runtime-pending" not in str(agent.__dict__)
 
 
 @pytest.mark.asyncio
@@ -2001,7 +2023,9 @@ async def test_native_file_tools_do_not_use_a_sync_dispatch_bridge(monkeypatch, 
         blockbuster.deactivate()
 
     assert written["bytes_written"] == len("first\nsecond\n".encode())
-    assert patched["replacements"] == 1
+    assert patched["success"] is True
+    assert "-second" in patched["diff"]
+    assert "+third" in patched["diff"]
     assert read["content"] == "1|first\n2|third"
     assert found["total_count"] == 1
 
@@ -3815,7 +3839,10 @@ async def test_skills_tools_keep_the_public_name_and_use_async_file_reads(
         encoding="utf-8",
     )
     monkeypatch.setattr(skills_tool, "_skills_dir", lambda: root)
-    monkeypatch.setattr(skill_utils, "get_external_skills_dirs", lambda: [])
+    async def no_external_skills():
+        return []
+
+    monkeypatch.setattr(skills_tool, "_external_skills_dirs", no_external_skills)
 
     def fail_if_called(*_args, **_kwargs):
         raise AssertionError("skills tools must not call asyncio.to_thread")

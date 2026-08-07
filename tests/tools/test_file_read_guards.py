@@ -39,8 +39,32 @@ async def test_character_budget_truncates_on_line_boundary(tmp_path, monkeypatch
     result = json.loads(await file_tools.read_file_tool(str(target), limit=100))
 
     assert result["truncated"] is True
+    assert result["truncated_by"] == "bytes"
     assert result["next_offset"] > 1
     assert len(result["content"]) <= 80
+    assert "80-char read budget" in result["hint"]
+
+
+@pytest.mark.asyncio
+async def test_long_line_uses_upstream_truncation_marker(tmp_path, monkeypatch):
+    target = tmp_path / "wide.txt"
+    target.write_text("x" * 50)
+    monkeypatch.setattr("tools.tool_output_limits.get_max_line_length", lambda: 10)
+
+    result = json.loads(await file_tools.read_file_tool(str(target)))
+
+    assert result["content"] == "1|xxxxxxxxxx... [truncated]"
+
+
+@pytest.mark.asyncio
+async def test_large_truncated_file_gets_targeted_read_hint(tmp_path):
+    target = tmp_path / "large.txt"
+    target.write_text("\n".join("x" * 1000 for _ in range(600)))
+
+    result = json.loads(await file_tools.read_file_tool(str(target), limit=500))
+
+    assert result["truncated"] is True
+    assert "This file is large" in result["_hint"]
 
 
 @pytest.mark.asyncio

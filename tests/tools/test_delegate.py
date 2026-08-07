@@ -1407,11 +1407,19 @@ class TestSubagentApprovalCallback(unittest.IsolatedAsyncioTestCase):
       true            → _subagent_auto_approve
     """
 
-    def test_auto_deny_returns_deny(self):
+    async def test_auto_deny_returns_deny(self):
         from tools.delegate_tool import _subagent_auto_deny
         self.assertEqual(
-            _subagent_auto_deny("rm -rf /tmp/x", "dangerous"),
+            await _subagent_auto_deny("rm -rf /tmp/x", "dangerous"),
             "deny",
+        )
+
+    async def test_auto_approve_returns_once(self):
+        from tools.delegate_tool import _subagent_auto_approve
+
+        self.assertEqual(
+            await _subagent_auto_approve("rm -rf /tmp/x", "dangerous"),
+            "once",
         )
 
     @patch("tools.delegate_tool._load_config", return_value={})

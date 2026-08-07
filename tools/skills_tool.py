@@ -85,6 +85,9 @@ from tools.registry import registry, tool_error
 from hermes_cli.config import cfg_get
 from agent.skill_utils import (
     EXCLUDED_SKILL_DIRS as _EXCLUDED_SKILL_DIRS,
+    get_disabled_skill_names as _get_disabled_skill_names,
+    get_external_skills_dirs as _external_skills_dirs,
+    iter_skill_index_files as _iter_skill_index_files,
 )
 
 logger = logging.getLogger(__name__)
@@ -159,113 +162,6 @@ def _skills_dir() -> Path:
     if configured != _SKILLS_DIR_AT_IMPORT:
         return configured
     return get_hermes_home() / "skills"
-
-
-async def _external_skills_dirs() -> List[Path]:
-    """Resolve configured external skill roots without synchronous file I/O."""
-    from hermes_cli.config import get_config_path
-
-    config_path = get_config_path()
-    if not await aiofiles.os.path.isfile(config_path):
-        return []
-    try:
-        async with aiofiles.open(config_path, encoding="utf-8") as handle:
-            raw_config = await handle.read()
-        import yaml
-
-        config = yaml.safe_load(raw_config) or {}
-    except (OSError, UnicodeDecodeError, ValueError):
-        return []
-    if not isinstance(config, dict):
-        return []
-    skills_config = config.get("skills")
-    if not isinstance(skills_config, dict):
-        return []
-    raw_dirs = skills_config.get("external_dirs")
-    if isinstance(raw_dirs, str):
-        raw_dirs = [raw_dirs]
-    if not isinstance(raw_dirs, list):
-        return []
-
-    local_skills = Path(await _realpath(_skills_dir()))
-    roots: list[Path] = []
-    seen: set[Path] = set()
-    for raw_dir in raw_dirs:
-        value = str(raw_dir or "").strip()
-        if not value:
-            continue
-        candidate = Path(os.path.expanduser(os.path.expandvars(value)))
-        if not candidate.is_absolute():
-            candidate = get_hermes_home() / candidate
-        candidate = Path(await _realpath(candidate))
-        if candidate == local_skills or candidate in seen:
-            continue
-        try:
-            if await aiofiles.os.path.isdir(candidate):
-                seen.add(candidate)
-                roots.append(candidate)
-        except OSError:
-            continue
-    return roots
-
-
-async def _active_org_id(skills_dir: Path) -> str | None:
-    marker = skills_dir / "_org" / ".active_org"
-    try:
-        if not await aiofiles.os.path.isfile(marker):
-            return None
-        async with aiofiles.open(marker, encoding="utf-8") as handle:
-            value = (await handle.read()).strip()
-        return value or None
-    except (OSError, UnicodeDecodeError):
-        return None
-
-
-async def _iter_skill_index_files(skills_dir: Path, filename: str):
-    """Yield skill index files using native async directory operations."""
-    from agent.skill_utils import SKILL_SUPPORT_DIRS
-
-    active_org = await _active_org_id(skills_dir)
-    org_root = skills_dir / "_org"
-
-    async def walk(directory: Path):
-        try:
-            names = await aiofiles.os.listdir(directory)
-        except OSError:
-            return
-        files: list[str] = []
-        directories: list[Path] = []
-        for name in names:
-            candidate = directory / name
-            try:
-                if await aiofiles.os.path.isdir(candidate):
-                    directories.append(candidate)
-                elif name == filename:
-                    files.append(name)
-            except OSError:
-                continue
-
-        if filename in files:
-            yield directory / filename
-
-        for child in sorted(directories, key=lambda path: path.name):
-            relative_parts = child.relative_to(skills_dir).parts
-            if any(part in _EXCLUDED_SKILL_DIRS for part in relative_parts):
-                continue
-            if relative_parts and relative_parts[0] == "_org":
-                if active_org is None:
-                    continue
-                if len(relative_parts) == 2 and relative_parts[1] != active_org:
-                    continue
-                if len(relative_parts) > 2 and relative_parts[1] != active_org:
-                    continue
-            if filename in files and child.name in SKILL_SUPPORT_DIRS:
-                continue
-            async for result in walk(child):
-                yield result
-
-    async for result in walk(skills_dir):
-        yield result
 
 
 async def _iter_files(directory: Path):
@@ -608,60 +504,6 @@ def _parse_tags(tags_value) -> List[str]:
 
 
 
-async def _get_disabled_skill_names(platform: str | None = None) -> Set[str]:
-    """Load disabled skill names through the native async config boundary."""
-    from hermes_cli.config import get_config_path
-
-    config_path = get_config_path()
-    try:
-        if not await aiofiles.os.path.isfile(config_path):
-            return set()
-        async with aiofiles.open(config_path, encoding="utf-8") as handle:
-            import yaml
-
-            config = yaml.safe_load(await handle.read()) or {}
-    except asyncio.CancelledError:
-        raise
-    except (OSError, UnicodeDecodeError, ValueError):
-        return set()
-    if not isinstance(config, dict):
-        return set()
-    skills_cfg = config.get("skills")
-    if not isinstance(skills_cfg, dict):
-        return set()
-
-    resolved_platform = platform or os.getenv("HERMES_PLATFORM") or _get_session_platform()
-
-    def _normalize(values: object) -> set[str]:
-        if values is None:
-            return set()
-        if isinstance(values, str):
-            values = [values]
-        return {str(value).strip() for value in values if str(value).strip()}
-
-    disabled = _normalize(skills_cfg.get("disabled"))
-    if resolved_platform:
-        platform_disabled = (skills_cfg.get("platform_disabled") or {}).get(
-            resolved_platform
-        )
-        disabled |= _normalize(platform_disabled)
-    return disabled
-
-
-def _get_session_platform() -> str:
-    """Resolve the current platform from gateway session context.
-
-    Mirrors the platform-resolution logic in
-    ``agent.skill_utils.get_disabled_skill_names`` so that
-    ``_is_skill_disabled`` respects ``HERMES_SESSION_PLATFORM``.
-    """
-    try:
-        from gateway.session_context import get_session_env
-        return get_session_env("HERMES_SESSION_PLATFORM") or ""
-    except Exception:
-        return ""
-
-
 async def _is_skill_disabled(name: str, platform: str = None) -> bool:
     """Check if a skill is disabled in config.
 
@@ -670,30 +512,7 @@ async def _is_skill_disabled(name: str, platform: str = None) -> bool:
     2. ``HERMES_PLATFORM`` environment variable
     3. ``HERMES_SESSION_PLATFORM`` from gateway session context
     """
-    try:
-        config = {}
-        from hermes_cli.config import get_config_path
-        config_path = get_config_path()
-        if await aiofiles.os.path.isfile(config_path):
-            async with aiofiles.open(config_path, encoding="utf-8") as handle:
-                import yaml
-
-                config = yaml.safe_load(await handle.read()) or {}
-        skills_cfg = config.get("skills", {})
-        resolved_platform = platform or os.getenv("HERMES_PLATFORM") or _get_session_platform()
-        global_disabled = skills_cfg.get("disabled", [])
-        if resolved_platform:
-            platform_disabled = cfg_get(skills_cfg, "platform_disabled", resolved_platform)
-            if platform_disabled is not None:
-                # A globally-disabled skill stays disabled on every platform;
-                # the platform list adds to it rather than replacing it. Keep
-                # in sync with agent.skill_utils.get_disabled_skill_names.
-                return name in platform_disabled or name in global_disabled
-        return name in global_disabled
-    except asyncio.CancelledError:
-        raise
-    except Exception:
-        return False
+    return name in await _get_disabled_skill_names(platform)
 
 
 def _sort_skills(skills: List[Dict[str, Any]]) -> List[Dict[str, Any]]:

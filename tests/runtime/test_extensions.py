@@ -146,7 +146,11 @@ async def test_skill_and_stdio_mcp_calls_are_preserved_in_trajectory(
                 "mcp-call",
                 reasoning="call the discovered MCP tool",
                 tool_calls=[
-                    _tool_call("mcp-echo-call", echo_mcp, {"value": "hello"})
+                    _tool_call(
+                        "mcp-echo-call",
+                        "tool_call",
+                        {"name": echo_mcp, "arguments": {"value": "hello"}},
+                    )
                 ],
             ),
             _response(
@@ -228,5 +232,6 @@ async def test_skill_and_stdio_mcp_calls_are_preserved_in_trajectory(
     ]
     assert '"name": "skills_list"' in trajectory[2]["value"]
     assert '"name": "skill_view"' in trajectory[4]["value"]
-    assert f'"name": "{echo_mcp}"' in trajectory[6]["value"]
+    assert '"name": "tool_call"' in trajectory[6]["value"]
+    assert echo_mcp in trajectory[6]["value"]
     assert "mcp-observation:hello:accept" in trajectory[7]["value"]

@@ -1060,7 +1060,13 @@ def init_agent(
     agent._deferred_provider_runtime = None
     agent.acp_command = acp_command or command
     agent.acp_args = list(acp_args or args or [])
-    if api_mode in {"chat_completions", "codex_responses", "anthropic_messages", "bedrock_converse"}:
+    if api_mode in {
+        "chat_completions",
+        "codex_responses",
+        "anthropic_messages",
+        "bedrock_converse",
+        "codex_app_server",
+    }:
         agent.api_mode = api_mode
     elif agent.provider == "openai-codex":
         agent.api_mode = "codex_responses"
@@ -1382,7 +1388,17 @@ def init_agent(
     agent._provider_request_timeout = None
     agent._provider_stale_timeout = None
 
-    if agent.api_mode == "anthropic_messages":
+    if agent.api_mode == "codex_app_server":
+        # The Codex CLI owns provider authentication and model transport.
+        # Keep construction state-only; the app-server subprocess is spawned
+        # lazily by the first awaited turn.
+        agent.api_key = api_key or ""
+        agent.client = None
+        agent._client_kwargs = {}
+        agent._deferred_provider_runtime = None
+        if not agent.quiet_mode:
+            print(f"🤖 AI Agent initialized with model: {agent.model} (Codex app-server)")
+    elif agent.api_mode == "anthropic_messages":
         # Bedrock + Claude → use AnthropicBedrock SDK for full feature parity
         # (prompt caching, thinking budgets, adaptive thinking).
         _is_bedrock_anthropic = agent.provider == "bedrock"
@@ -1552,11 +1568,9 @@ def init_agent(
                 except Exception:
                     pass
         else:
-            # The legacy provider router reads auth files and can refresh OAuth
-            # synchronously.  Keep construction state-only and resolve it from
-            # the first async turn instead.  The placeholder client is never
-            # dispatched: ``_initialize_deferred_runtime`` replaces it before
-            # the turn reaches the model transport.
+            # Credential lookup may read auth files or refresh OAuth tokens.
+            # Keep construction state-only and resolve it at the first awaited
+            # runtime boundary.
             agent._deferred_provider_runtime = {
                 "provider": agent.provider or "auto",
                 "model": agent.model,
@@ -1568,10 +1582,7 @@ def init_agent(
                 "request_timeout": agent._provider_request_timeout,
                 "stale_timeout": agent._provider_stale_timeout,
             }
-            client_kwargs = {
-                "api_key": "async-runtime-pending",
-                "base_url": "https://runtime-pending.invalid/v1",
-            }
+            client_kwargs = {}
         
         agent._client_kwargs = client_kwargs  # stored for rebuilding after interrupt
 
@@ -1599,8 +1610,7 @@ def init_agent(
         )
         if unresolved_credentials:
             # Keep the user-facing state credential-free until the async pool
-            # resolver selects a real entry. The placeholder must never mask a
-            # persisted credential-pool key.
+            # resolver selects a real entry.
             agent.client = None
         else:
             agent.api_key = client_kwargs.get("api_key", "")
@@ -1620,7 +1630,7 @@ def init_agent(
                 "client_kwargs": dict(client_kwargs),
             }
         if not agent.quiet_mode:
-            print(f"🤖 AI Agent initialized with model: {agent.model} (async runtime pending)")
+            print(f"🤖 AI Agent initialized with model: {agent.model}")
             if base_url:
                 print(f"🔗 Using custom base URL: {base_url}")
 
@@ -1987,6 +1997,15 @@ def init_agent(
     except Exception:
         pass
     compression_enabled = str(_compression_cfg.get("enabled", True)).lower() in {"true", "1", "yes"}
+    codex_app_server_auto_compaction = str(
+        _compression_cfg.get("codex_app_server_auto", "native") or "native"
+    ).lower()
+    if codex_app_server_auto_compaction not in {"native", "hermes", "off"}:
+        logger.warning(
+            "Invalid compression.codex_app_server_auto=%r; using 'native'",
+            codex_app_server_auto_compaction,
+        )
+        codex_app_server_auto_compaction = "native"
     compression_target_ratio = float(_compression_cfg.get("target_ratio", 0.20))
     compression_protect_last = int(_compression_cfg.get("protect_last_n", 20))
     # Minimum REAL (actionable) user messages guaranteed to survive in the
@@ -2508,6 +2527,7 @@ def init_agent(
             compression_micro_compact_defrag_tokens
         )
     agent.max_compression_attempts = compression_max_attempts
+    agent.codex_app_server_auto_compaction = codex_app_server_auto_compaction
     agent.compression_idle_compact_after_seconds = (
         compression_idle_compact_after_seconds
     )
@@ -3078,11 +3098,8 @@ async def _initialize_memory_manager(
 async def _initialize_deferred_runtime(agent: Any) -> bool:
     """Resolve a no-credential constructor through native async primitives.
 
-    ``AIAgent.__init__`` deliberately does not call the legacy provider
-    router: that router may read credential files and refresh OAuth tokens.
-    This function is the first-turn counterpart.  It supports persisted
-    credential-pool entries and API-key environment providers without a
-    thread fallback.
+    ``AIAgent.__init__`` deliberately avoids credential file access and OAuth
+    refresh. This function performs that work at the first awaited boundary.
     """
     pending = getattr(agent, "_deferred_provider_runtime", None)
 

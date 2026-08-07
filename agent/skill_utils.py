@@ -19,6 +19,7 @@ import aiofiles.os
 from hermes_constants import get_config_path, get_skills_dir, is_termux
 
 logger = logging.getLogger(__name__)
+_realpath = aiofiles.os.wrap(os.path.realpath)
 
 # ── Platform mapping ──────────────────────────────────────────────────────
 
@@ -53,7 +54,7 @@ EXCLUDED_SKILL_DIRS = frozenset(
 # archive workflow preserves a complete old skill package under references/.
 SKILL_SUPPORT_DIRS = frozenset(("references", "templates", "assets", "scripts"))
 
-# ── Org-shared skills (sync contract) ───────────────────────────
+# ── Org-shared skills (skills-sync contract) ────────────────────
 # Org mirrors live under ~/.hermes/skills/_org/<org_id>/. Resolution is
 # TOKEN-GATED via a marker file the sync client writes after verifying the
 # token (skills_sync_client.pull_org_skills): only the marked org's mirror is
@@ -71,31 +72,36 @@ ORG_PROVENANCE_FILE = ".org-provenance.json"
 ORG_BASELINE_FILE = ".org-baseline.json"
 
 
-def read_active_org_id(skills_dir: Path) -> Optional[str]:
+async def read_active_org_id(skills_dir: Path) -> Optional[str]:
     """The org id whose mirror may resolve, or None (no org skills load)."""
     try:
         marker = skills_dir / ORG_MIRROR_DIR_NAME / ORG_ACTIVE_MARKER
-        if not marker.exists():
+        if not await aiofiles.os.path.isfile(marker):
             return None
-        val = marker.read_text(encoding="utf-8").strip()
+        async with aiofiles.open(marker, encoding="utf-8") as handle:
+            val = (await handle.read()).strip()
         return val or None
     except OSError:
         return None
 
 
-def is_org_mirror_path(path, skills_dir: Path) -> bool:
+async def is_org_mirror_path(path, skills_dir: Path) -> bool:
     """True when *path* is inside the org mirror (``_org/``)."""
     try:
-        rel = Path(path).resolve().relative_to(Path(skills_dir).resolve())
+        rel = Path(await _realpath(path)).relative_to(
+            Path(await _realpath(skills_dir))
+        )
     except (OSError, ValueError):
         return False
     return bool(rel.parts) and rel.parts[0] == ORG_MIRROR_DIR_NAME
 
 
-def org_id_of_path(path, skills_dir: Path) -> Optional[str]:
+async def org_id_of_path(path, skills_dir: Path) -> Optional[str]:
     """The ``<org_id>`` segment for a path under ``_org/<org_id>/...``."""
     try:
-        rel = Path(path).resolve().relative_to(Path(skills_dir).resolve())
+        rel = Path(await _realpath(path)).relative_to(
+            Path(await _realpath(skills_dir))
+        )
     except (OSError, ValueError):
         return None
     if len(rel.parts) >= 2 and rel.parts[0] == ORG_MIRROR_DIR_NAME:
@@ -103,7 +109,7 @@ def org_id_of_path(path, skills_dir: Path) -> Optional[str]:
     return None
 
 
-def is_excluded_skill_path(path, *, root: Optional[Path] = None) -> bool:
+async def is_excluded_skill_path(path, *, root: Optional[Path] = None) -> bool:
     """True if *path* should be skipped by active skill scanners.
 
     Use this on every ``SKILL.md`` path produced by direct ``rglob`` scans to
@@ -118,12 +124,12 @@ def is_excluded_skill_path(path, *, root: Optional[Path] = None) -> bool:
     except AttributeError:
         from pathlib import PurePath
         parts = PurePath(str(path)).parts
-    return any(part in EXCLUDED_SKILL_DIRS for part in parts) or is_skill_support_path(
+    return any(part in EXCLUDED_SKILL_DIRS for part in parts) or await is_skill_support_path(
         path, root=root
     )
 
 
-def is_skill_support_path(path, *, root: Optional[Path] = None) -> bool:
+async def is_skill_support_path(path, *, root: Optional[Path] = None) -> bool:
     """True if *path* is under a support dir of an actual skill root.
 
     ``references/``, ``templates/``, ``assets/``, and ``scripts/`` are
@@ -147,7 +153,7 @@ def is_skill_support_path(path, *, root: Optional[Path] = None) -> bool:
         skill_root = Path(*parts[:idx])
         if root is not None and not path_obj.is_absolute():
             skill_root = root / skill_root
-        if (skill_root / "SKILL.md").exists():
+        if await aiofiles.os.path.isfile(skill_root / "SKILL.md"):
             return True
     return False
 
@@ -393,7 +399,7 @@ def _raw_config_cache_clear() -> None:
     _RAW_CONFIG_CACHE.clear()
 
 
-def _load_raw_config() -> Dict[str, Any]:
+async def _load_raw_config() -> Dict[str, Any]:
     """Read config.yaml with a shared mtime+size keyed cache.
 
     This module intentionally avoids importing ``hermes_cli.config`` on the
@@ -401,10 +407,10 @@ def _load_raw_config() -> Dict[str, Any]:
     win without pulling the heavier CLI config stack into startup.
     """
     config_path = get_config_path()
-    if not config_path.exists():
+    if not await aiofiles.os.path.isfile(config_path):
         return {}
     try:
-        stat = config_path.stat()
+        stat = await aiofiles.os.stat(config_path)
         cache_key = (str(config_path), stat.st_mtime_ns, stat.st_size)
     except OSError:
         cache_key = None
@@ -415,7 +421,8 @@ def _load_raw_config() -> Dict[str, Any]:
             return cached
 
     try:
-        parsed = yaml_load(config_path.read_text(encoding="utf-8"))
+        async with aiofiles.open(config_path, encoding="utf-8") as handle:
+            parsed = yaml_load(await handle.read())
     except Exception as e:
         logger.debug("Could not read skill config %s: %s", config_path, e)
         return {}
@@ -428,7 +435,7 @@ def _load_raw_config() -> Dict[str, Any]:
     return parsed
 
 
-def get_disabled_skill_names(platform: str | None = None) -> Set[str]:
+async def get_disabled_skill_names(platform: str | None = None) -> Set[str]:
     """Read disabled skill names from config.yaml.
 
     Args:
@@ -442,7 +449,7 @@ def get_disabled_skill_names(platform: str | None = None) -> Set[str]:
     Reads the config file directly (no CLI config imports) to stay
     lightweight.
     """
-    parsed = _load_raw_config()
+    parsed = await _load_raw_config()
     if not parsed:
         return set()
 
@@ -491,7 +498,7 @@ def _external_dirs_cache_clear() -> None:
     _raw_config_cache_clear()
 
 
-def get_external_skills_dirs() -> List[Path]:
+async def get_external_skills_dirs() -> List[Path]:
     """Read ``skills.external_dirs`` from config.yaml and return validated paths.
 
     Each entry is expanded (``~`` and ``${VAR}``) and resolved to an absolute
@@ -504,13 +511,13 @@ def get_external_skills_dirs() -> List[Path]:
     when the cache is absent.
     """
     config_path = get_config_path()
-    if not config_path.exists():
+    if not await aiofiles.os.path.isfile(config_path):
         return []
 
     # Cache key: (absolute path, mtime_ns).  stat() is ~2us vs ~85ms for
     # the full YAML parse, so the fast path is nearly free.
     try:
-        stat = config_path.stat()
+        stat = await aiofiles.os.stat(config_path)
         cache_key: Tuple[str, int] = (str(config_path), stat.st_mtime_ns)
     except OSError:
         cache_key = None  # type: ignore[assignment]
@@ -521,7 +528,7 @@ def get_external_skills_dirs() -> List[Path]:
             # Return a copy so callers can't mutate the cached list.
             return list(cached)
 
-    parsed = _load_raw_config()
+    parsed = await _load_raw_config()
     if not parsed:
         return []
 
@@ -543,7 +550,7 @@ def get_external_skills_dirs() -> List[Path]:
     from hermes_constants import get_hermes_home
 
     hermes_home = get_hermes_home()
-    local_skills = get_skills_dir().resolve()
+    local_skills = Path(await _realpath(get_skills_dir()))
     seen: Set[Path] = set()
     result = []
 
@@ -556,14 +563,13 @@ def get_external_skills_dirs() -> List[Path]:
         p = Path(expanded)
         # Resolve relative paths against HERMES_HOME, not cwd
         if not p.is_absolute():
-            p = (hermes_home / p).resolve()
-        else:
-            p = p.resolve()
+            p = hermes_home / p
+        p = Path(await _realpath(p))
         if p == local_skills:
             continue
         if p in seen:
             continue
-        if p.is_dir():
+        if await aiofiles.os.path.isdir(p):
             seen.add(p)
             result.append(p)
         else:
@@ -574,14 +580,14 @@ def get_external_skills_dirs() -> List[Path]:
     return result
 
 
-def get_all_skills_dirs() -> List[Path]:
+async def get_all_skills_dirs() -> List[Path]:
     """Return all skill directories: local ``~/.hermes/skills/`` first, then external.
 
     The local dir is always first (and always included even if it doesn't exist
     yet — callers handle that).  External dirs follow in config order.
     """
     dirs = [get_skills_dir()]
-    dirs.extend(get_external_skills_dirs())
+    dirs.extend(await get_external_skills_dirs())
     return dirs
 
 
@@ -617,9 +623,7 @@ async def normalize_skill_lookup_name(identifier: str) -> str:
 
     trusted_roots = [primary_root]
     try:
-        from tools.skills_tool import _external_skills_dirs
-
-        trusted_roots.extend(await _external_skills_dirs())
+        trusted_roots.extend(await get_external_skills_dirs())
     except asyncio.CancelledError:
         raise
     except Exception:
@@ -637,14 +641,8 @@ async def normalize_skill_lookup_name(identifier: str) -> str:
             continue
 
     try:
-        import aiofiles.os
-
-        identifier_real = Path(
-            await aiofiles.os.wrap(os.path.realpath)(identifier_path)
-        )
-        primary_real = Path(
-            await aiofiles.os.wrap(os.path.realpath)(primary_root)
-        )
+        identifier_real = Path(await _realpath(identifier_path))
+        primary_real = Path(await _realpath(primary_root))
         return str(identifier_real.relative_to(primary_real))
     except asyncio.CancelledError:
         raise
@@ -657,15 +655,15 @@ async def normalize_skill_lookup_name(identifier: str) -> str:
         return raw_identifier
 
 
-def _resolve_for_skill_ownership(path) -> Path:
+async def _resolve_for_skill_ownership(path) -> Path:
     path_obj = path if isinstance(path, Path) else Path(str(path))
     try:
-        return path_obj.expanduser().resolve()
+        return Path(await _realpath(path_obj.expanduser()))
     except (OSError, RuntimeError):
         return path_obj.expanduser().absolute()
 
 
-def is_external_skill_path(path) -> bool:
+async def is_external_skill_path(path) -> bool:
     """Return True when ``path`` lives under a configured external skills dir.
 
     ``skills.external_dirs`` are externally owned: Hermes can discover and view
@@ -674,9 +672,9 @@ def is_external_skill_path(path) -> bool:
     helper centralizes the ownership boundary so curator/reporting/tool paths do
     not each need to re-interpret the config.
     """
-    candidate = _resolve_for_skill_ownership(path)
-    for root in get_external_skills_dirs():
-        resolved_root = _resolve_for_skill_ownership(root)
+    candidate = await _resolve_for_skill_ownership(path)
+    for root in await get_external_skills_dirs():
+        resolved_root = await _resolve_for_skill_ownership(root)
         try:
             candidate.relative_to(resolved_root)
             return True
@@ -767,7 +765,7 @@ def extract_skill_config_vars(frontmatter: Dict[str, Any]) -> List[Dict[str, Any
     return result
 
 
-def discover_all_skill_config_vars() -> List[Dict[str, Any]]:
+async def discover_all_skill_config_vars() -> List[Dict[str, Any]]:
     """Scan all enabled skills and collect their config variable declarations.
 
     Walks every skills directory, parses each SKILL.md frontmatter, and returns
@@ -779,13 +777,14 @@ def discover_all_skill_config_vars() -> List[Dict[str, Any]]:
     all_vars: List[Dict[str, Any]] = []
     seen_keys: set = set()
 
-    disabled = get_disabled_skill_names()
-    for skills_dir in get_all_skills_dirs():
-        if not skills_dir.is_dir():
+    disabled = await get_disabled_skill_names()
+    for skills_dir in await get_all_skills_dirs():
+        if not await aiofiles.os.path.isdir(skills_dir):
             continue
-        for skill_file in iter_skill_index_files(skills_dir, "SKILL.md"):
+        async for skill_file in iter_skill_index_files(skills_dir, "SKILL.md"):
             try:
-                raw = skill_file.read_text(encoding="utf-8")
+                async with aiofiles.open(skill_file, encoding="utf-8") as handle:
+                    raw = await handle.read()
                 frontmatter, _ = parse_frontmatter(raw)
             except Exception:
                 continue
@@ -824,7 +823,7 @@ def _resolve_dotpath(config: Dict[str, Any], dotted_key: str):
     return current
 
 
-def resolve_skill_config_values(
+async def resolve_skill_config_values(
     config_vars: List[Dict[str, Any]],
 ) -> Dict[str, Any]:
     """Resolve current values for skill config vars from config.yaml.
@@ -834,7 +833,7 @@ def resolve_skill_config_values(
     current values (or the declared default if the key isn't set).
     Path values are expanded via ``os.path.expanduser``.
     """
-    config = _load_raw_config()
+    config = await _load_raw_config()
 
     resolved: Dict[str, Any] = {}
     for var in config_vars:
@@ -884,7 +883,7 @@ def is_skill_description_truncated_for_prompt(frontmatter: Dict[str, Any]) -> bo
 # ── File iteration ────────────────────────────────────────────────────────
 
 
-def iter_skill_index_files(skills_dir: Path, filename: str):
+async def iter_skill_index_files(skills_dir: Path, filename: str):
     """Walk skills_dir yielding sorted paths matching *filename*.
 
     Excludes Hermes metadata, VCS, virtualenv/dependency, cache, and skill
@@ -899,27 +898,50 @@ def iter_skill_index_files(skills_dir: Path, filename: str):
     marker at all) is pruned — leave an org and its skills stop resolving,
     without any manual cleanup.
     """
-    skills_dir_str = str(skills_dir)
-    active_org = read_active_org_id(skills_dir)
-    org_root = os.path.join(skills_dir_str, ORG_MIRROR_DIR_NAME)
-    matches: list[str] = []
-    for root, dirs, files in os.walk(skills_dir_str, followlinks=True):
-        has_skill_md = "SKILL.md" in files
-        if root == skills_dir_str and ORG_MIRROR_DIR_NAME in dirs and active_org is None:
-            dirs.remove(ORG_MIRROR_DIR_NAME)
-        elif root == org_root:
-            # Inside _org/: descend ONLY into the active org's mirror.
-            dirs[:] = [d for d in dirs if d == active_org]
-        dirs[:] = [
-            d
-            for d in dirs
-            if d not in EXCLUDED_SKILL_DIRS
-            and not (has_skill_md and d in SKILL_SUPPORT_DIRS)
-        ]
-        if filename in files:
-            matches.append(os.path.join(root, filename))
+    active_org = await read_active_org_id(skills_dir)
+    org_root = skills_dir / ORG_MIRROR_DIR_NAME
+    matches: list[Path] = []
+
+    async def walk(directory: Path) -> None:
+        try:
+            names = await aiofiles.os.listdir(directory)
+        except OSError:
+            return
+
+        has_skill_md = "SKILL.md" in names
+        if filename in names:
+            matches.append(directory / filename)
+
+        directories: list[Path] = []
+        for name in names:
+            candidate = directory / name
+            try:
+                if await aiofiles.os.path.isdir(candidate):
+                    directories.append(candidate)
+            except OSError:
+                continue
+
+        if directory == skills_dir and active_org is None:
+            directories = [
+                child for child in directories
+                if child.name != ORG_MIRROR_DIR_NAME
+            ]
+        elif directory == org_root:
+            directories = [
+                child for child in directories
+                if child.name == active_org
+            ]
+
+        for child in directories:
+            if child.name in EXCLUDED_SKILL_DIRS:
+                continue
+            if has_skill_md and child.name in SKILL_SUPPORT_DIRS:
+                continue
+            await walk(child)
+
+    await walk(skills_dir)
     for path in sorted(matches):
-        yield Path(path)
+        yield path
 
 
 # ── Namespace helpers for plugin-provided skills ───────────────────────────

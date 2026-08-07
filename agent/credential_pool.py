@@ -58,12 +58,12 @@ STATUS_DEAD = "dead"
 # server-side and cannot be recovered by retry/refresh.  Sourced from
 # OpenAI Codex Responses API, Anthropic, xAI, and Google OAuth spec.
 _TERMINAL_AUTH_REASONS = frozenset({
-    "token_invalidated",   # OpenAI Codex: "Your authentication token has been invalidated."
-    "token_revoked",        # OAuth 2.0 RFC 7009: token explicitly revoked
-    "invalid_token",        # RFC 6750: bearer token is malformed/expired/revoked
-    "invalid_grant",        # RFC 6749: refresh_token rejected during refresh
+    "token_invalidated",  # OpenAI Codex: "Your authentication token has been invalidated."
+    "token_revoked",  # OAuth 2.0 RFC 7009: token explicitly revoked
+    "invalid_token",  # RFC 6750: bearer token is malformed/expired/revoked
+    "invalid_grant",  # RFC 6749: refresh_token rejected during refresh
     "unauthorized_client",  # RFC 6749: client no longer authorized
-    "refresh_token_reused", # Single-use refresh token consumed by another process
+    "refresh_token_reused",  # Single-use refresh token consumed by another process
 })
 
 # How long a DEAD manual credential is preserved before being pruned.
@@ -100,9 +100,9 @@ SUPPORTED_POOL_STRATEGIES = {
 # Transient 401 auth failures cool down briefly so single-key setups can recover.
 # 429 (rate-limited), 402 (billing/quota), and other failures cool down after 1 hour.
 # Provider-supplied reset_at timestamps override these defaults.
-EXHAUSTED_TTL_401_SECONDS = 5 * 60           # 5 minutes
-EXHAUSTED_TTL_429_SECONDS = 60 * 60          # 1 hour
-EXHAUSTED_TTL_DEFAULT_SECONDS = 60 * 60      # 1 hour
+EXHAUSTED_TTL_401_SECONDS = 5 * 60  # 5 minutes
+EXHAUSTED_TTL_429_SECONDS = 60 * 60  # 1 hour
+EXHAUSTED_TTL_DEFAULT_SECONDS = 60 * 60  # 1 hour
 
 # Throttle window for the "no available entries" INFO line. Credential
 # selection runs on a hot path (every model call, plus auxiliary tasks like
@@ -126,9 +126,19 @@ CUSTOM_POOL_PREFIX = "custom:"
 
 # Fields that are only round-tripped through JSON — never used for logic as attributes.
 _EXTRA_KEYS = frozenset({
-    "token_type", "scope", "client_id", "portal_base_url", "obtained_at",
-    "expires_in", "agent_key_id", "agent_key_expires_in", "agent_key_reused",
-    "agent_key_obtained_at", "tls", "secret_source", "secret_fingerprint",
+    "token_type",
+    "scope",
+    "client_id",
+    "portal_base_url",
+    "obtained_at",
+    "expires_in",
+    "agent_key_id",
+    "agent_key_expires_in",
+    "agent_key_reused",
+    "agent_key_obtained_at",
+    "tls",
+    "secret_source",
+    "secret_fingerprint",
 })
 
 
@@ -181,7 +191,9 @@ class PooledCredential:
     def __getattr__(self, name: str):
         if name in _EXTRA_KEYS:
             return self.extra.get(name)
-        raise AttributeError(f"'{type(self).__name__}' object has no attribute {name!r}")
+        raise AttributeError(
+            f"'{type(self).__name__}' object has no attribute {name!r}"
+        )
 
     @classmethod
     def from_dict(cls, provider: str, payload: Dict[str, Any]) -> "PooledCredential":
@@ -190,7 +202,11 @@ class PooledCredential:
         # Rehydrated last_status_at may be an ISO string from to_dict() — normalize to float epoch
         if "last_status_at" in data and isinstance(data["last_status_at"], str):
             data["last_status_at"] = _parse_absolute_timestamp(data["last_status_at"])
-        extra = {k: payload[k] for k in _EXTRA_KEYS if k in payload and payload[k] is not None}
+        extra = {
+            k: payload[k]
+            for k in _EXTRA_KEYS
+            if k in payload and payload[k] is not None
+        }
         data["extra"] = extra
         data.setdefault("id", uuid.uuid4().hex[:6])
         data.setdefault("label", payload.get("source", provider))
@@ -310,15 +326,23 @@ def _parse_absolute_timestamp(value: Any) -> Optional[float]:
 def _extract_retry_delay_seconds(message: str) -> Optional[float]:
     if not message:
         return None
-    delay_match = re.search(r"quotaResetDelay[:\s\"]+(\d+(?:\.\d+)?)(ms|s)", message, re.IGNORECASE)
+    delay_match = re.search(
+        r"quotaResetDelay[:\s\"]+(\d+(?:\.\d+)?)(ms|s)", message, re.IGNORECASE
+    )
     if delay_match:
         value = float(delay_match.group(1))
         return value / 1000.0 if delay_match.group(2).lower() == "ms" else value
-    sec_match = re.search(r"retry\s+(?:after\s+)?(\d+(?:\.\d+)?)\s*(?:sec|secs|seconds|s\b)", message, re.IGNORECASE)
+    sec_match = re.search(
+        r"retry\s+(?:after\s+)?(\d+(?:\.\d+)?)\s*(?:sec|secs|seconds|s\b)",
+        message,
+        re.IGNORECASE,
+    )
     if sec_match:
         return float(sec_match.group(1))
     # "Resets in 4hr 5min" format used by OpenCode Go weekly usage limits
-    hr_min_match = re.search(r"resets?\s+in\s+(\d+)\s*hr\s+(\d+)\s*min", message, re.IGNORECASE)
+    hr_min_match = re.search(
+        r"resets?\s+in\s+(\d+)\s*hr\s+(\d+)\s*min", message, re.IGNORECASE
+    )
     if hr_min_match:
         return int(hr_min_match.group(1)) * 3600 + int(hr_min_match.group(2)) * 60
     hr_only_match = re.search(r"resets?\s+in\s+(\d+)\s*hr\b", message, re.IGNORECASE)
@@ -398,8 +422,6 @@ def _iter_custom_providers(config: Optional[dict] = None):
 async def get_custom_provider_pool_key(
     base_url: Optional[str],
     provider_name: Optional[str] = None,
-    *,
-    config: Optional[dict] = None,
 ) -> Optional[str]:
     """Look up the custom_providers list in config.yaml and return 'custom:<name>' for a matching base_url.
 
@@ -411,8 +433,7 @@ async def get_custom_provider_pool_key(
     """
     if not base_url:
         return None
-    if config is None:
-        config = await load_config_readonly()
+    config = await load_config_readonly()
     normalized_url = base_url.strip().rstrip("/")
 
     # When a provider name is given, try to match by name first.
@@ -436,7 +457,8 @@ async def list_custom_pool_providers() -> List[str]:
     """Return all 'custom:*' pool keys that have entries in auth.json."""
     pool_data = await read_credential_pool(None)
     return sorted(
-        key for key in pool_data
+        key
+        for key in pool_data
         if key.startswith(CUSTOM_POOL_PREFIX)
         and isinstance(pool_data.get(key), list)
         and pool_data[key]
@@ -444,12 +466,13 @@ async def list_custom_pool_providers() -> List[str]:
 
 
 def _get_custom_provider_config(
-    pool_key: str, config: Optional[dict] = None,
+    pool_key: str,
+    config: Optional[dict] = None,
 ) -> Optional[Dict[str, Any]]:
     """Return the custom_providers config entry matching a pool key like 'custom:together.ai'."""
     if not pool_key.startswith(CUSTOM_POOL_PREFIX):
         return None
-    suffix = pool_key[len(CUSTOM_POOL_PREFIX):]
+    suffix = pool_key[len(CUSTOM_POOL_PREFIX) :]
     for norm_name, entry in _iter_custom_providers(config):
         if norm_name == suffix:
             return entry
@@ -577,18 +600,14 @@ async def _write_through_provider_state_to_global_root(
 
 
 class CredentialPool:
-    def __init__(
-        self,
-        provider: str,
-        entries: List[PooledCredential],
-        *,
-        strategy: str = STRATEGY_FILL_FIRST,
-    ):
+    def __init__(self, provider: str, entries: List[PooledCredential]):
         self.provider = provider
         self._entries = sorted(entries, key=lambda entry: entry.priority)
         self._current_id: Optional[str] = None
-        self._strategy = strategy
+        self._strategy = STRATEGY_FILL_FIRST
+        self._strategy_loaded = False
         self._lock = asyncio.Lock()
+        self._strategy_lock = asyncio.Lock()
         self._refresh_lock = asyncio.Lock()
         self._active_leases: Dict[str, int] = {}
         self._max_concurrent = DEFAULT_MAX_CONCURRENT_PER_CREDENTIAL
@@ -616,7 +635,9 @@ class CredentialPool:
     def _current_unlocked(self) -> Optional[PooledCredential]:
         if not self._current_id:
             return None
-        return next((entry for entry in self._entries if entry.id == self._current_id), None)
+        return next(
+            (entry for entry in self._entries if entry.id == self._current_id), None
+        )
 
     def current(self) -> Optional[PooledCredential]:
         return self._current_unlocked()
@@ -629,16 +650,13 @@ class CredentialPool:
         """
         current = self._current_unlocked()
         if current is not None and (
-            api_key_hint is None
-            or current.runtime_api_key == api_key_hint
+            api_key_hint is None or current.runtime_api_key == api_key_hint
         ):
             return current.id
         if api_key_hint is None:
             return None
         matches = [
-            entry
-            for entry in self._entries
-            if entry.runtime_api_key == api_key_hint
+            entry for entry in self._entries if entry.runtime_api_key == api_key_hint
         ]
         return matches[0].id if len(matches) == 1 else None
 
@@ -701,6 +719,7 @@ class CredentialPool:
         )
         self._replace_entry(entry, updated)
         return updated
+
     def _entry_needs_refresh(self, entry: PooledCredential) -> bool:
         if entry.auth_type != AUTH_TYPE_OAUTH:
             return False
@@ -726,7 +745,8 @@ class CredentialPool:
         return False
 
     async def _sync_anthropic_entry_from_credentials_file(
-        self, entry: PooledCredential,
+        self,
+        entry: PooledCredential,
     ) -> PooledCredential:
         """Adopt a newer Claude Code credential file snapshot when present."""
         if self.provider != "anthropic" or entry.source != "claude_code":
@@ -743,9 +763,8 @@ class CredentialPool:
         expires_at = creds.get("expiresAt")
         if not access_token and not refresh_token:
             return entry
-        if (
-            access_token == (entry.access_token or "")
-            and refresh_token == (entry.refresh_token or "")
+        if access_token == (entry.access_token or "") and refresh_token == (
+            entry.refresh_token or ""
         ):
             return entry
 
@@ -774,7 +793,8 @@ class CredentialPool:
         )
 
     async def _sync_xai_oauth_entry_from_auth_store(
-        self, entry: PooledCredential,
+        self,
+        entry: PooledCredential,
     ) -> PooledCredential:
         """Adopt a newer singleton xAI token pair without blocking the loop."""
         if entry.source != "device_code":
@@ -853,11 +873,14 @@ class CredentialPool:
         return updated
 
     async def _sync_device_code_entry_to_auth_store(
-        self, entry: PooledCredential,
+        self,
+        entry: PooledCredential,
     ) -> None:
         """Write a rotated singleton-seeded OAuth token pair back to auth.json."""
         if entry.source != "device_code" or self.provider not in {
-            "nous", "openai-codex", "xai-oauth",
+            "nous",
+            "openai-codex",
+            "xai-oauth",
         }:
             return
         state: Optional[Dict[str, Any]] = None
@@ -959,7 +982,11 @@ class CredentialPool:
                         last_error_reset_at=None,
                     )
                     self._replace_entry(
-                        next(candidate for candidate in self._entries if candidate.id == entry.id),
+                        next(
+                            candidate
+                            for candidate in self._entries
+                            if candidate.id == entry.id
+                        ),
                         entry,
                     )
                     changed = True
@@ -973,7 +1000,9 @@ class CredentialPool:
             available.append(entry)
         if entries_to_prune:
             removed = set(entries_to_prune)
-            self._entries = [entry for entry in self._entries if entry.id not in removed]
+            self._entries = [
+                entry for entry in self._entries if entry.id not in removed
+            ]
         if changed:
             await self._persist(removed_ids=entries_to_prune)
         return available
@@ -999,7 +1028,9 @@ class CredentialPool:
             entry = updated
         elif self._strategy == STRATEGY_ROUND_ROBIN and len(available) > 1:
             entry = available[0]
-            rotated = [candidate for candidate in self._entries if candidate.id != entry.id]
+            rotated = [
+                candidate for candidate in self._entries if candidate.id != entry.id
+            ]
             rotated.append(replace(entry, priority=len(self._entries) - 1))
             self._entries = [
                 replace(candidate, priority=index)
@@ -1016,13 +1047,21 @@ class CredentialPool:
         """Emit the empty-pool INFO line at most once per throttle window."""
         now = time.monotonic()
         last = self._last_no_entries_log_at
-        if last is not None and (now - last) < NO_AVAILABLE_ENTRIES_LOG_THROTTLE_SECONDS:
+        if (
+            last is not None
+            and (now - last) < NO_AVAILABLE_ENTRIES_LOG_THROTTLE_SECONDS
+        ):
             return
         self._last_no_entries_log_at = now
         logger.info("credential pool: no available entries (all exhausted or empty)")
 
     async def select(self) -> Optional[PooledCredential]:
         """Select a credential, refreshing OAuth outside the pool lock."""
+        if not self._strategy_loaded:
+            async with self._strategy_lock:
+                if not self._strategy_loaded:
+                    self._strategy = await get_pool_strategy(self.provider)
+                    self._strategy_loaded = True
         while True:
             async with self._lock:
                 refresh_entry = next(
@@ -1058,7 +1097,8 @@ class CredentialPool:
         """Return the current or next usable credential without selecting it."""
         async with self._lock:
             return self._current_unlocked() or next(
-                iter(await self._available_entries(allow_refresh=False)), None,
+                iter(await self._available_entries(allow_refresh=False)),
+                None,
             )
 
     async def has_available(self) -> bool:
@@ -1099,7 +1139,11 @@ class CredentialPool:
             identity_supplied = bool(credential_id or api_key_hint)
             if credential_id:
                 entry = next(
-                    (candidate for candidate in self._entries if candidate.id == credential_id),
+                    (
+                        candidate
+                        for candidate in self._entries
+                        if candidate.id == credential_id
+                    ),
                     None,
                 )
             if entry is None and api_key_hint:
@@ -1143,11 +1187,15 @@ class CredentialPool:
             failed_runtime_key = entry.runtime_api_key
             if identity_supplied and failed_runtime_key:
                 for sibling in list(self._entries):
-                    if sibling.id != entry.id and sibling.runtime_api_key == failed_runtime_key:
+                    if (
+                        sibling.id != entry.id
+                        and sibling.runtime_api_key == failed_runtime_key
+                    ):
                         self._mark_exhausted(sibling, status_code, error_context)
             await self._persist()
             updated_entry = next(
-                (candidate for candidate in self._entries if candidate.id == entry.id), entry,
+                (candidate for candidate in self._entries if candidate.id == entry.id),
+                entry,
             )
             logger.info(
                 "credential pool: marking %s %s (status=%s), rotating",
@@ -1158,7 +1206,10 @@ class CredentialPool:
             self._current_id = None
             next_entry = await self._select_unlocked()
             if next_entry:
-                logger.info("credential pool: rotated to %s", next_entry.label or next_entry.id[:8])
+                logger.info(
+                    "credential pool: rotated to %s",
+                    next_entry.label or next_entry.id[:8],
+                )
             return next_entry
 
     async def try_refresh_matching(
@@ -1169,14 +1220,18 @@ class CredentialPool:
         """Refresh a matching OAuth entry when the native refresher exists.
 
         API-key entries have nothing to refresh and are left for the normal
-        rotation path.  Keeping this explicit prevents accidental calls into
-        the blocking legacy OAuth implementation.
+        rotation path. OAuth entries use their provider's native async
+        refresher.
         """
         async with self._lock:
             entry = None
             if credential_id:
                 entry = next(
-                    (candidate for candidate in self._entries if candidate.id == credential_id),
+                    (
+                        candidate
+                        for candidate in self._entries
+                        if candidate.id == credential_id
+                    ),
                     None,
                 )
             if entry is None and api_key_hint:
@@ -1194,7 +1249,10 @@ class CredentialPool:
             return await self._refresh_entry(entry, force=True)
 
     async def _refresh_entry(
-        self, entry: PooledCredential, *, force: bool,
+        self,
+        entry: PooledCredential,
+        *,
+        force: bool,
     ) -> Optional[PooledCredential]:
         """Refresh an OAuth entry through its native provider transport."""
         if entry.auth_type != AUTH_TYPE_OAUTH or not entry.refresh_token:
@@ -1274,7 +1332,7 @@ class CredentialPool:
             if self.provider == "minimax-oauth":
                 if entry.source != "oauth":
                     return entry
-                await auth_mod.resolve_minimax_oauth_runtime_credentials(
+                await auth_mod._resolve_minimax_oauth_runtime_credentials(
                     force_refresh=force,
                 )
                 auth_store = await auth_mod._load_auth_store()
@@ -1329,8 +1387,7 @@ class CredentialPool:
                 local_owns_entry = bool(
                     isinstance(local_entries, list)
                     and any(
-                        isinstance(candidate, dict)
-                        and candidate.get("id") == entry.id
+                        isinstance(candidate, dict) and candidate.get("id") == entry.id
                         for candidate in local_entries
                     )
                 )
@@ -1427,52 +1484,16 @@ class CredentialPool:
                     entry = synced
                     if not force and not self._entry_needs_refresh(entry):
                         return entry
-                import httpx
-
-                async with httpx.AsyncClient(timeout=20) as client:
-                    discovery_response = await client.get(
-                        auth_mod.XAI_OAUTH_DISCOVERY_URL,
-                        headers={"Accept": "application/json"},
-                    )
-                    discovery_response.raise_for_status()
-                    discovery = discovery_response.json()
-                    token_endpoint = str(
-                        discovery.get("token_endpoint", "")
-                        if isinstance(discovery, dict)
-                        else ""
-                    ).strip()
-                    auth_mod._xai_validate_oauth_endpoint(
-                        token_endpoint,
-                        field="token_endpoint",
-                    )
-                    response = await client.post(
-                        token_endpoint,
-                        headers={
-                            "Accept": "application/json",
-                            "Content-Type": "application/x-www-form-urlencoded",
-                        },
-                        data={
-                            "grant_type": "refresh_token",
-                            "client_id": auth_mod.XAI_OAUTH_CLIENT_ID,
-                            "refresh_token": entry.refresh_token,
-                        },
-                    )
-                    response.raise_for_status()
-                    payload = response.json()
-                access_token = str(
-                    payload.get("access_token", "")
-                    if isinstance(payload, dict)
-                    else ""
-                ).strip()
-                if not access_token:
-                    raise ValueError("xAI OAuth refresh response omitted access_token")
+                refreshed = await auth_mod.refresh_xai_oauth_pure(
+                    entry.access_token,
+                    entry.refresh_token or "",
+                    timeout_seconds=20,
+                )
                 updated = replace(
                     entry,
-                    access_token=access_token,
-                    refresh_token=str(
-                        payload.get("refresh_token") or entry.refresh_token
-                    ).strip(),
-                    last_refresh=datetime.now(timezone.utc).isoformat(),
+                    access_token=refreshed["access_token"],
+                    refresh_token=refreshed["refresh_token"],
+                    last_refresh=refreshed["last_refresh"],
                     last_status=STATUS_OK,
                     last_status_at=None,
                     last_error_code=None,
@@ -1600,6 +1621,82 @@ class CredentialPool:
                 if synced is not entry:
                     await self._persist()
                     return synced
+                if auth_mod._is_terminal_xai_oauth_refresh_error(exc):
+                    async with auth_mod._auth_store_transaction():
+                        auth_store = await auth_mod._load_auth_store()
+                        state = auth_mod._load_provider_state(
+                            auth_store,
+                            self.provider,
+                        )
+                        tokens = state.get("tokens") if isinstance(state, dict) else None
+                        store_refresh = (
+                            str(tokens.get("refresh_token") or "").strip()
+                            if isinstance(tokens, dict)
+                            else ""
+                        )
+                        entry_refresh = str(entry.refresh_token or "").strip()
+                        if store_refresh and store_refresh != entry_refresh:
+                            store_access = str(
+                                tokens.get("access_token") or ""
+                            ).strip()
+                            updated = replace(
+                                entry,
+                                access_token=store_access or entry.access_token,
+                                refresh_token=store_refresh,
+                                last_refresh=state.get("last_refresh") or entry.last_refresh,
+                                last_status=STATUS_OK,
+                                last_status_at=None,
+                                last_error_code=None,
+                                last_error_reason=None,
+                                last_error_message=None,
+                                last_error_reset_at=None,
+                            )
+                            self._replace_entry(entry, updated)
+                            auth_mod._merge_credential_pool_entries(
+                                auth_store,
+                                self.provider,
+                                [candidate.to_dict() for candidate in self._entries],
+                            )
+                            await auth_mod._save_auth_store(auth_store)
+                            return updated
+
+                        if isinstance(state, dict) and isinstance(tokens, dict):
+                            tokens.pop("access_token", None)
+                            tokens.pop("refresh_token", None)
+                            state["last_auth_error"] = {
+                                "provider": self.provider,
+                                "code": getattr(exc, "code", "unknown"),
+                                "message": str(exc),
+                                "reason": "credential_pool_refresh_failure",
+                                "relogin_required": True,
+                                "at": datetime.now(timezone.utc).isoformat(),
+                            }
+                            auth_mod._store_provider_state(
+                                auth_store,
+                                self.provider,
+                                state,
+                                set_active=False,
+                            )
+                        removed_ids = [
+                            candidate.id
+                            for candidate in self._entries
+                            if candidate.source == "device_code"
+                        ]
+                        self._entries = [
+                            candidate
+                            for candidate in self._entries
+                            if candidate.source != "device_code"
+                        ]
+                        if self._current_id in removed_ids:
+                            self._current_id = None
+                        auth_mod._merge_credential_pool_entries(
+                            auth_store,
+                            self.provider,
+                            [candidate.to_dict() for candidate in self._entries],
+                            removed_ids=removed_ids,
+                        )
+                        await auth_mod._save_auth_store(auth_store)
+                    return None
             logger.debug(
                 "Async credential refresh failed for %s/%s: %s",
                 self.provider,
@@ -1620,7 +1717,9 @@ class CredentialPool:
         """
         async with self._lock:
             if credential_id:
-                self._active_leases[credential_id] = self._active_leases.get(credential_id, 0) + 1
+                self._active_leases[credential_id] = (
+                    self._active_leases.get(credential_id, 0) + 1
+                )
                 self._current_id = credential_id
                 return credential_id
 
@@ -1629,13 +1728,17 @@ class CredentialPool:
                 return None
 
             below_cap = [
-                entry for entry in available
+                entry
+                for entry in available
                 if self._active_leases.get(entry.id, 0) < self._max_concurrent
             ]
             candidates = below_cap if below_cap else available
             chosen = min(
                 candidates,
-                key=lambda entry: (self._active_leases.get(entry.id, 0), entry.priority),
+                key=lambda entry: (
+                    self._active_leases.get(entry.id, 0),
+                    entry.priority,
+                ),
             )
             self._active_leases[chosen.id] = self._active_leases.get(chosen.id, 0) + 1
             self._current_id = chosen.id
@@ -1699,7 +1802,9 @@ class CredentialPool:
                 self._current_id = None
             return removed
 
-    def resolve_target(self, target: Any) -> Tuple[Optional[int], Optional[PooledCredential], Optional[str]]:
+    def resolve_target(
+        self, target: Any
+    ) -> Tuple[Optional[int], Optional[PooledCredential], Optional[str]]:
         raw = str(target or "").strip()
         if not raw:
             return None, None, "No credential target provided."
@@ -1716,7 +1821,11 @@ class CredentialPool:
         if len(label_matches) == 1:
             return label_matches[0][0], label_matches[0][1], None
         if len(label_matches) > 1:
-            return None, None, f'Ambiguous credential label "{raw}". Use the numeric index or entry id instead.'
+            return (
+                None,
+                None,
+                f'Ambiguous credential label "{raw}". Use the numeric index or entry id instead.',
+            )
         if raw.isdigit():
             index = int(raw)
             if 1 <= index <= len(self._entries):
@@ -1732,7 +1841,9 @@ class CredentialPool:
             return entry
 
 
-def _upsert_entry(entries: List[PooledCredential], provider: str, source: str, payload: Dict[str, Any]) -> bool:
+def _upsert_entry(
+    entries: List[PooledCredential], provider: str, source: str, payload: Dict[str, Any]
+) -> bool:
     matching_indices = []
     for idx, entry in enumerate(entries):
         if entry.source == source:
@@ -1741,7 +1852,9 @@ def _upsert_entry(entries: List[PooledCredential], provider: str, source: str, p
     existing_idx = matching_indices[0] if matching_indices else None
     duplicate_indices = set(matching_indices[1:])
     if duplicate_indices:
-        entries[:] = [entry for idx, entry in enumerate(entries) if idx not in duplicate_indices]
+        entries[:] = [
+            entry for idx, entry in enumerate(entries) if idx not in duplicate_indices
+        ]
 
     if existing_idx is None:
         payload.setdefault("id", uuid.uuid4().hex[:6])
@@ -1811,88 +1924,9 @@ def _normalize_pool_priorities(provider: str, entries: List[PooledCredential]) -
     return changed
 
 
-async def _is_provider_explicitly_configured(
-    provider_id: str,
-    *,
-    auth_store: Optional[Dict[str, Any]] = None,
-) -> bool:
-    """Check provider opt-in without entering synchronous auth/config paths.
-
-    The synchronous auth helper is intentionally retained for CLI/setup code,
-    but ``load_pool`` runs on the agent event loop.  Keep this check local to
-    the async pool path so external credential discovery cannot block it.
-    """
-    normalized = (provider_id or "").strip().lower()
-    if not normalized:
-        return False
-
-    store = auth_store if isinstance(auth_store, dict) else await _load_auth_store()
-    active = str(store.get("active_provider") or "").strip().lower()
-    if active == normalized:
-        return True
-
-    try:
-        config = await load_config_readonly()
-    except Exception:
-        config = {}
-    model_cfg = config.get("model") if isinstance(config, dict) else None
-    if isinstance(model_cfg, dict):
-        configured = str(model_cfg.get("provider") or "").strip().lower()
-        if configured == normalized:
-            return True
-
-    def _slot_matches(slot: Any) -> bool:
-        return (
-            isinstance(slot, dict)
-            and str(slot.get("provider") or "").strip().lower() == normalized
-        )
-
-    moa_cfg = config.get("moa") if isinstance(config, dict) else None
-    if isinstance(moa_cfg, dict):
-        if any(_slot_matches(slot) for slot in moa_cfg.get("reference_models") or []):
-            return True
-        if _slot_matches(moa_cfg.get("aggregator")):
-            return True
-        presets = moa_cfg.get("presets")
-        if isinstance(presets, dict):
-            for preset in presets.values():
-                if not isinstance(preset, dict):
-                    continue
-                if any(_slot_matches(slot) for slot in preset.get("reference_models") or []):
-                    return True
-                if _slot_matches(preset.get("aggregator")):
-                    return True
-
-    pconfig = PROVIDER_REGISTRY.get(normalized)
-    if pconfig and pconfig.auth_type == AUTH_TYPE_API_KEY:
-        for env_var in pconfig.api_key_env_vars:
-            if env_var == "CLAUDE_CODE_OAUTH_TOKEN":
-                continue
-            value = await get_env_value_prefer_dotenv(env_var)
-            if value and len(value.strip()) >= 4:
-                return True
-
-    try:
-        persisted = await read_credential_pool(normalized)
-    except Exception:
-        persisted = []
-    for entry in persisted:
-        if not isinstance(entry, dict):
-            continue
-        source = str(entry.get("source") or "").strip().lower()
-        if source in {"device_code", "loopback_pkce", "hermes_pkce", "manual"}:
-            return True
-        if source.startswith("manual:"):
-            return True
-        if source.startswith("env:"):
-            env_var = source.split(":", 1)[1].strip()
-            if env_var and await get_env_value_prefer_dotenv(env_var):
-                return True
-    return False
-
-
 async def _seed_from_singletons(
-    provider: str, entries: List[PooledCredential],
+    provider: str,
+    entries: List[PooledCredential],
 ) -> Tuple[bool, Set[str]]:
     changed = False
     active_sources: Set[str] = set()
@@ -1913,9 +1947,7 @@ async def _seed_from_singletons(
         # Without this gate, auxiliary client fallback chains silently read
         # ~/.claude/.credentials.json without user consent.  See PR #4210.
         try:
-            if not await _is_provider_explicitly_configured(
-                "anthropic", auth_store=auth_store
-            ):
+            if not await auth_mod.is_provider_explicitly_configured("anthropic"):
                 return changed, active_sources
         except Exception:
             return changed, active_sources
@@ -1954,7 +1986,8 @@ async def _seed_from_singletons(
             # OAuth entries dormant in auth.json forever and rotation on a
             # transient 401 could revive them.
             retained = [
-                entry for entry in entries
+                entry
+                for entry in entries
                 if entry.source not in {"hermes_pkce", "claude_code"}
             ]
             if len(retained) != len(entries):
@@ -1962,7 +1995,10 @@ async def _seed_from_singletons(
                 changed = True
             return changed, active_sources
 
-        from agent.anthropic_adapter import read_claude_code_credentials, read_hermes_oauth_credentials
+        from agent.anthropic_adapter import (
+            read_claude_code_credentials,
+            read_hermes_oauth_credentials,
+        )
 
         hermes_creds, claude_creds = await asyncio.gather(
             read_hermes_oauth_credentials(),
@@ -1986,7 +2022,9 @@ async def _seed_from_singletons(
                         "access_token": creds.get("accessToken", ""),
                         "refresh_token": creds.get("refreshToken"),
                         "expires_at_ms": creds.get("expiresAt"),
-                        "label": label_from_token(creds.get("accessToken", ""), source_name),
+                        "label": label_from_token(
+                            creds.get("accessToken", ""), source_name
+                        ),
                     },
                 )
 
@@ -2001,7 +2039,8 @@ async def _seed_from_singletons(
         )
         if state and not has_runtime_material:
             retained = [
-                entry for entry in entries
+                entry
+                for entry in entries
                 if entry.source not in {"device_code", "manual:device_code"}
             ]
             if len(retained) != len(entries):
@@ -2046,7 +2085,9 @@ async def _seed_from_singletons(
                     "agent_key_expires_in": state.get("agent_key_expires_in"),
                     "agent_key_reused": state.get("agent_key_reused"),
                     "agent_key_obtained_at": state.get("agent_key_obtained_at"),
-                    "tls": state.get("tls") if isinstance(state.get("tls"), dict) else None,
+                    "tls": state.get("tls")
+                    if isinstance(state.get("tls"), dict)
+                    else None,
                     "label": seeded_label,
                 },
             )
@@ -2064,9 +2105,7 @@ async def _seed_from_singletons(
                 return changed, active_sources
             token, source = await resolve_copilot_token()
             if token:
-                source_name = (
-                    "gh_cli" if source == "gh auth token" else f"env:{source}"
-                )
+                source_name = "gh_cli" if source == "gh auth token" else f"env:{source}"
                 if _is_suppressed(source_name):
                     return changed, active_sources
                 api_token, enterprise_base_url = await get_copilot_api_token(token)
@@ -2179,7 +2218,8 @@ async def _seed_from_singletons(
                     "refresh_token": tokens.get("refresh_token"),
                     "base_url": "https://chatgpt.com/backend-api/codex",
                     "last_refresh": state.get("last_refresh"),
-                    "label": custom_label or label_from_token(tokens.get("access_token", ""), "device_code"),
+                    "label": custom_label
+                    or label_from_token(tokens.get("access_token", ""), "device_code"),
                 },
             )
 
@@ -2220,7 +2260,8 @@ async def _seed_from_singletons(
 
 
 async def _seed_from_env(
-    provider: str, entries: List[PooledCredential],
+    provider: str,
+    entries: List[PooledCredential],
 ) -> Tuple[bool, Set[str]]:
     changed = False
     active_sources: Set[str] = set()
@@ -2312,7 +2353,9 @@ async def _seed_from_env(
         active_sources.add(source)
         base_url = env_url or pconfig.inference_base_url
         if provider == "kimi-coding":
-            base_url = _resolve_kimi_base_url(token, pconfig.inference_base_url, env_url)
+            base_url = _resolve_kimi_base_url(
+                token, pconfig.inference_base_url, env_url
+            )
         elif provider == "zai":
             base_url = await _resolve_zai_base_url(
                 token,
@@ -2369,7 +2412,8 @@ def _prune_stale_seeded_entries(
 
 
 async def _seed_custom_pool(
-    pool_key: str, entries: List[PooledCredential],
+    pool_key: str,
+    entries: List[PooledCredential],
 ) -> Tuple[bool, Set[str]]:
     """Seed a custom endpoint pool from custom_providers config and model config."""
     changed = False
@@ -2424,9 +2468,7 @@ async def _seed_custom_pool(
                     break
             if model_provider == "custom" and model_base_url and model_api_key:
                 # Check if this model's base_url matches our custom provider
-                matched_key = await get_custom_provider_pool_key(
-                    model_base_url, config=config
-                )
+                matched_key = await get_custom_provider_pool_key(model_base_url)
                 if matched_key == pool_key:
                     source = "model_config"
                     if not _is_suppressed(source):
@@ -2469,7 +2511,8 @@ async def load_pool(provider: str) -> CredentialPool:
             provider,
             payload.get("access_token"),
             payload.get("auth_type", AUTH_TYPE_API_KEY),
-        ) != payload.get("auth_type", AUTH_TYPE_API_KEY)
+        )
+        != payload.get("auth_type", AUTH_TYPE_API_KEY)
         for payload in raw_entries
     )
     if raw_needs_auth_normalization:
@@ -2477,16 +2520,22 @@ async def load_pool(provider: str) -> CredentialPool:
         # Keep that fallback read-only: only the store that owns these rows may
         # rewrite them. Loading the default/root profile will heal global rows.
         active_pool = (await _load_auth_store()).get("credential_pool")
-        active_entries = active_pool.get(provider) if isinstance(active_pool, dict) else None
+        active_entries = (
+            active_pool.get(provider) if isinstance(active_pool, dict) else None
+        )
         raw_needs_auth_normalization = bool(active_entries)
 
     if provider.startswith(CUSTOM_POOL_PREFIX):
         # Custom endpoint pool — seed from custom_providers config and model config
         custom_changed, custom_sources = await _seed_custom_pool(provider, entries)
-        changed = raw_needs_sanitization or raw_needs_auth_normalization or custom_changed
+        changed = (
+            raw_needs_sanitization or raw_needs_auth_normalization or custom_changed
+        )
         changed |= _prune_stale_seeded_entries(entries, custom_sources)
     else:
-        singleton_changed, singleton_sources = await _seed_from_singletons(provider, entries)
+        singleton_changed, singleton_sources = await _seed_from_singletons(
+            provider, entries
+        )
         env_changed, env_sources = await _seed_from_env(provider, entries)
         changed = (
             raw_needs_sanitization
@@ -2509,11 +2558,10 @@ async def load_pool(provider: str) -> CredentialPool:
         new_ids = {entry.id for entry in entries}
         await write_credential_pool(
             provider,
-            [entry.to_dict() for entry in sorted(entries, key=lambda item: item.priority)],
+            [
+                entry.to_dict()
+                for entry in sorted(entries, key=lambda item: item.priority)
+            ],
             removed_ids=disk_ids - new_ids,
         )
-    return CredentialPool(
-        provider,
-        entries,
-        strategy=await get_pool_strategy(provider),
-    )
+    return CredentialPool(provider, entries)

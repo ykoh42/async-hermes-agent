@@ -152,6 +152,43 @@ def _cancelled_tool_result(reason: str = "user interrupt") -> str:
     )
 
 
+async def _tool_search_scoped_names(agent) -> frozenset[str]:
+    """Return the deferrable tool names available to this agent session."""
+    try:
+        import model_tools
+        from tools import tool_search
+        from tools.registry import registry
+    except Exception:
+        return frozenset()
+
+    enabled = getattr(agent, "enabled_toolsets", None)
+    disabled = getattr(agent, "disabled_toolsets", None)
+    cache_key = (
+        getattr(registry, "_generation", 0),
+        frozenset(enabled) if enabled is not None else None,
+        frozenset(disabled) if disabled is not None else None,
+    )
+    cached = getattr(agent, "_tool_search_scope_cache", None)
+    if cached is not None and cached[0] == cache_key:
+        return cached[1]
+
+    try:
+        scoped_defs = await model_tools.get_tool_definitions(
+            enabled_toolsets=enabled,
+            disabled_toolsets=disabled,
+            quiet_mode=True,
+            skip_tool_search_assembly=True,
+        )
+        names = tool_search.scoped_deferrable_names(scoped_defs or [])
+    except Exception:
+        names = frozenset()
+    try:
+        agent._tool_search_scope_cache = (cache_key, names)
+    except Exception:
+        pass
+    return names
+
+
 async def _emit_cancelled_terminal_post_tool_call(
     agent,
     *,
@@ -575,6 +612,30 @@ async def _execute_tool_calls_native(
         args, malformed_args_result = _parse_tool_arguments(
             getattr(tc.function, "arguments", "")
         )
+        scope_block = None
+        if malformed_args_result is None:
+            try:
+                from tools import tool_search
+
+                if name == tool_search.TOOL_CALL_NAME:
+                    underlying, underlying_args, error = (
+                        tool_search.resolve_underlying_call(args)
+                    )
+                    if not error and underlying:
+                        if underlying in await _tool_search_scoped_names(agent):
+                            scope_block = tool_search.validate_deferred_call_args(
+                                underlying, underlying_args
+                            )
+                            if scope_block is None:
+                                name = underlying
+                                args = underlying_args
+                        else:
+                            scope_block = (
+                                f"'{underlying}' is not available in this session. "
+                                "Use tool_search to find tools you can call."
+                            )
+            except Exception:
+                pass
         if malformed_args_result is None:
             async def _dispatch(next_args, middleware_trace):
                 if name in (
@@ -597,6 +658,8 @@ async def _execute_tool_calls_native(
                     "enabled_tools": (
                         list(getattr(agent, "valid_tool_names", None) or []) or None
                     ),
+                    "enabled_toolsets": getattr(agent, "enabled_toolsets", None),
+                    "disabled_toolsets": getattr(agent, "disabled_toolsets", None),
                     "skip_pre_tool_call_hook": True,
                     "skip_tool_request_middleware": True,
                     "skip_tool_execution_middleware": True,
@@ -649,6 +712,7 @@ async def _execute_tool_calls_native(
                 tool_call_id=getattr(tc, "id", "") or "",
                 display_index=index + 1,
                 execute=_dispatch,
+                scope_block=scope_block,
             )
             result = managed.result
             blocked = managed.blocked

@@ -1201,7 +1201,7 @@ def get_missing_config_fields() -> List[Dict[str, Any]]:
     return missing
 
 
-def get_missing_skill_config_vars() -> List[Dict[str, Any]]:
+async def get_missing_skill_config_vars() -> List[Dict[str, Any]]:
     """Return skill-declared config vars that are missing or empty in config.yaml.
 
     Scans all enabled skills for ``metadata.hermes.config`` entries, then checks
@@ -1214,7 +1214,7 @@ def get_missing_skill_config_vars() -> List[Dict[str, Any]]:
         return []
 
     try:
-        all_vars = discover_all_skill_config_vars()
+        all_vars = await discover_all_skill_config_vars()
     except Exception as e:
         # A malformed SKILL.md, unreadable external skill dir, or similar
         # should never break `hermes update`.  Skill-config prompting is a
@@ -1227,7 +1227,7 @@ def get_missing_skill_config_vars() -> List[Dict[str, Any]]:
     if not all_vars:
         return []
 
-    config = load_config()
+    config = await load_config_readonly()
     missing: List[Dict[str, Any]] = []
     for var in all_vars:
         # Skill config is stored under skills.config.<logical_key>
@@ -2351,49 +2351,6 @@ def migrate_config(interactive: bool = True, quiet: bool = False) -> Dict[str, A
         config = read_raw_config()
         config["_config_version"] = latest_ver
         _persist_migration(config)
-
-    # ── Skill-declared config vars ──────────────────────────────────────
-    # Skills can declare config.yaml settings they need via
-    # metadata.hermes.config in their SKILL.md frontmatter.
-    # Prompt for any that are missing/empty.
-    missing_skill_config = get_missing_skill_config_vars()
-    if missing_skill_config and interactive and not quiet:
-        print(f"\n  {len(missing_skill_config)} skill setting(s) not configured:")
-        for var in missing_skill_config:
-            skill_name = var.get("skill", "unknown")
-            print(f"    • {var['key']} — {var['description']} (from skill: {skill_name})")
-        print()
-        try:
-            answer = input("  Configure skill settings? [y/N]: ").strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            answer = "n"
-
-        if answer in {"y", "yes"}:
-            print()
-            config = read_raw_config()
-            try:
-                from agent.skill_utils import SKILL_CONFIG_PREFIX
-            except Exception:
-                SKILL_CONFIG_PREFIX = "skills.config"
-            for var in missing_skill_config:
-                default = var.get("default", "")
-                default_hint = f" (default: {default})" if default else ""
-                value = input(f"  {var['prompt']}{default_hint}: ").strip()
-                if not value and default:
-                    value = str(default)
-                if value:
-                    storage_key = f"{SKILL_CONFIG_PREFIX}.{var['key']}"
-                    _set_nested(config, storage_key, value)
-                    results["config_added"].append(var["key"])
-                    print(f"  ✓ Saved {var['key']} = {value}")
-                else:
-                    results["warnings"].append(
-                        f"Skipped {var['key']} — skill '{var.get('skill', '?')}' may ask for it later"
-                    )
-                print()
-            _persist_migration(config)
-        else:
-            print("  Set later with: hermes config set <key> <value>")
 
     return results
 
@@ -4419,23 +4376,6 @@ def show_config():
     print(f"  Telegram:     {'configured' if telegram_token else color('not configured', Colors.DIM)}")
     print(f"  Discord:      {'configured' if discord_token else color('not configured', Colors.DIM)}")
     
-    # Skill config
-    try:
-        from agent.skill_utils import discover_all_skill_config_vars, resolve_skill_config_values
-        skill_vars = discover_all_skill_config_vars()
-        if skill_vars:
-            resolved = resolve_skill_config_values(skill_vars)
-            print()
-            print(color("◆ Skill Settings", Colors.CYAN, Colors.BOLD))
-            for var in skill_vars:
-                key = var["key"]
-                value = resolved.get(key, "")
-                skill_name = var.get("skill", "")
-                display_val = str(value) if value else color("(not set)", Colors.DIM)
-                print(f"  {key:<20s} {display_val}  {color(f'[{skill_name}]', Colors.DIM)}")
-    except Exception:
-        pass
-
     print()
     print(color("─" * 60, Colors.DIM))
     print(color("  hermes config set <key> <value>", Colors.DIM))

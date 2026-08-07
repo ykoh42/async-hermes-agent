@@ -9,6 +9,7 @@ import logging
 import os
 import posixpath
 import re
+import stat
 import sys
 import threading
 import uuid
@@ -25,9 +26,21 @@ from agent.file_safety import (
 )
 from tools.binary_extensions import has_binary_extension
 from tools.file_operations import (
-    MAX_LINE_LENGTH,
+    LINTERS,
+    LINTERS_INPROC,
+    LintResult,
+    PatchResult,
+    ReadResult,
+    SearchMatch,
+    SearchResult,
+    WriteResult,
+    _FAIL_CLOSED_INPROC_EXTS,
+    _has_bom,
+    _looks_like_linter_unusable,
+    _parse_search_context_line,
     _strip_bom,
     normalize_read_pagination,
+    normalize_search_pagination,
 )
 from tools import file_state
 from agent.redact import redact_sensitive_text
@@ -200,6 +213,19 @@ def _truncate_to_char_budget(content: str, max_chars: int) -> tuple[str, int, bo
         kept.append(lines[0][:max_chars])
 
     return "\n".join(kept), len(kept), True
+
+
+def _add_line_numbers(content: str, start_line: int = 1) -> str:
+    """Add the compact upstream line gutter and clamp individual lines."""
+    from tools.tool_output_limits import get_max_line_length
+
+    max_line_length = get_max_line_length()
+    numbered: list[str] = []
+    for line_number, line in enumerate(content.split("\n"), start=start_line):
+        if len(line) > max_line_length:
+            line = line[:max_line_length] + "... [truncated]"
+        numbered.append(f"{line_number}|{line}")
+    return "\n".join(numbered)
 
 
 # If the total file size exceeds this AND the caller didn't specify a narrow
@@ -403,7 +429,8 @@ async def _resolve_base_dir(
         # terminal backend ever reports a relative cwd, anchor it to the process
         # cwd once, here, so the result no longer depends on cwd at resolve().
         base = Path(await aiofiles.os.getcwd()) / base
-    return Path(os.path.normpath(base))  # noqa: ASYNC240 - lexical only
+    realpath = aiofiles.os.wrap(os.path.realpath)
+    return Path(await realpath(base))
 
 
 async def _resolve_path_for_task(
@@ -430,21 +457,52 @@ async def _resolve_path_for_task(
     from tools.environments.local import _msys_to_windows_path
 
     expanded = _expand_tilde(_msys_to_windows_path(filepath))
+    realpath = aiofiles.os.wrap(os.path.realpath)
     if sys.platform == "win32":
         import ntpath
 
         if ntpath.isabs(expanded):
-            return Path(ntpath.normpath(expanded))
+            return Path(await realpath(ntpath.normpath(expanded)))
         joined = ntpath.join(
             str(await _resolve_base_dir(task_id, container_paths=False)), expanded
         )
-        return Path(ntpath.normpath(joined))
+        return Path(await realpath(ntpath.normpath(joined)))
 
     p = Path(expanded)
     if p.is_absolute():
-        return Path(os.path.normpath(p))  # noqa: ASYNC240 - lexical only
+        return Path(await realpath(p))
     resolved = await _resolve_base_dir(task_id, container_paths=False) / p
-    return Path(os.path.normpath(resolved))  # noqa: ASYNC240 - lexical only
+    return Path(await realpath(resolved))
+
+
+async def _path_resolution_warning(
+    filepath: str,
+    resolved: Path,
+    task_id: str = "default",
+) -> str | None:
+    """Warn when a relative path resolves outside the active workspace."""
+    try:
+        if Path(_expand_tilde(filepath)).is_absolute():
+            return None
+        workspace_root = await _authoritative_workspace_root(task_id)
+        if not workspace_root:
+            return None
+        realpath = aiofiles.os.wrap(os.path.realpath)
+        root = Path(await realpath(_expand_tilde(workspace_root)))
+        target = Path(await realpath(resolved))
+        try:
+            target.relative_to(root)
+            return None
+        except ValueError:
+            return (
+                f"Relative path {filepath!r} resolved to {str(resolved)!r}, which is "
+                f"OUTSIDE the active workspace ({str(root)!r}). The edit will land "
+                "in a different directory than the terminal's cwd. If this is not "
+                "intended (e.g. a git-worktree session writing into the main "
+                "checkout), pass an absolute path under the workspace instead."
+            )
+    except Exception:
+        return None
 
 
 def _is_blocked_device_path(path: str) -> bool:
@@ -1012,6 +1070,67 @@ async def _handle_read_file(args, **kw):
     resolved = await _native_file_path(path, task_id)
     if isinstance(resolved, str):
         return resolved
+
+    # Structured documents are binary containers but intentionally render as
+    # text in Hermes. Keep this before the binary-extension guard, matching the
+    # upstream read_file contract.
+    from tools.read_extract import (
+        ExtractionError,
+        extract_document_text,
+        is_extractable_document,
+    )
+
+    if is_extractable_document(str(resolved)):
+        try:
+            extracted_text = await extract_document_text(str(resolved))
+        except ExtractionError:
+            logger.debug("document extraction failed for %s", path, exc_info=True)
+        else:
+            lines = extracted_text.splitlines()
+            page = lines[offset - 1:offset - 1 + limit]
+            numbered = _add_line_numbers("\n".join(page), offset) if page else ""
+            numbered, lines_kept, char_truncated = _truncate_to_char_budget(
+                numbered, await _get_max_read_chars()
+            )
+            next_offset = offset + lines_kept
+            truncated = len(lines) >= next_offset or char_truncated
+            result = {
+                "content": (
+                    redact_sensitive_text(numbered, file_read=True)
+                    if numbered
+                    else ""
+                ),
+                "total_lines": len(lines),
+                "file_size": (await aiofiles.os.stat(resolved)).st_size,
+                "truncated": truncated,
+                "extracted_document": True,
+            }
+            if char_truncated:
+                max_chars = await _get_max_read_chars()
+                shown_end = offset + lines_kept - 1
+                result["truncated_by"] = "bytes"
+                result["next_offset"] = next_offset
+                result["hint"] = (
+                    f"Output truncated at the {max_chars:,}-char read budget "
+                    f"after {lines_kept} line(s) (showing lines {offset}-"
+                    f"{shown_end} of {len(lines)}). Use offset={next_offset} "
+                    "to continue."
+                )
+                if len(numbered.split("\n", 1)[0]) >= max_chars:
+                    result["hint"] += (
+                        " Note: the first line alone exceeded the budget and "
+                        "was clamped mid-line; its remainder is not retrievable "
+                        "via offset."
+                    )
+            elif truncated:
+                result["next_offset"] = next_offset
+                result["hint"] = (
+                    f"Use offset={next_offset} to continue reading "
+                    f"(showing {offset}-{max(offset, next_offset - 1)} "
+                    f"of {len(lines)} lines)"
+                )
+            return json.dumps(result, ensure_ascii=False)
+
     if has_binary_extension(str(resolved)):
         return tool_error(
             f"Cannot read binary file '{path}' ({resolved.suffix.lower()}). "
@@ -1057,40 +1176,113 @@ async def _handle_read_file(args, **kw):
         async with aiofiles.open(resolved, "rb") as handle:
             data = await handle.read()
     except FileNotFoundError:
-        return tool_error(f"File not found: {path}")
+        directory = resolved.parent
+        display_directory = os.path.dirname(path) or "."
+        filename = os.path.basename(path)
+        basename_no_ext = os.path.splitext(filename)[0]
+        extension = os.path.splitext(filename)[1].lower()
+        lower_name = filename.lower()
+        scored: list[tuple[int, str]] = []
+        try:
+            candidates = (await aiofiles.os.listdir(directory))[:50]
+        except OSError:
+            candidates = []
+        for candidate in candidates:
+            lower_candidate = candidate.lower()
+            score = 0
+            if lower_candidate == lower_name:
+                score = 100
+            elif Path(candidate).stem.lower() == basename_no_ext.lower():
+                score = 90
+            elif (
+                lower_candidate.startswith(lower_name)
+                or lower_name.startswith(lower_candidate)
+            ):
+                score = 70
+            elif lower_name in lower_candidate:
+                score = 60
+            elif lower_candidate in lower_name and len(lower_candidate) > 2:
+                score = 40
+            elif extension and Path(candidate).suffix.lower() == extension:
+                common = set(lower_name) & set(lower_candidate)
+                if len(common) >= max(len(lower_name), len(lower_candidate)) * 0.4:
+                    score = 30
+            if score:
+                scored.append((score, os.path.join(display_directory, candidate)))
+        scored.sort(key=lambda item: -item[0])
+        return tool_error(
+            f"File not found: {path}",
+            similar_files=[candidate for _, candidate in scored[:5]],
+        )
     except OSError as exc:
         return tool_error(f"Failed to read {path}: {exc}")
 
-    if b"\x00" in data[:1000]:
-        return tool_error(
-            f"Cannot read binary file '{path}'. Use an appropriate binary tool instead."
+    sample = data[:1000].decode("utf-8", errors="replace")
+    non_printable = sum(
+        1 for character in sample if ord(character) < 32 and character not in "\n\r\t"
+    )
+    if (
+        "\ufffd" in sample
+        or (sample and non_printable / len(sample) > 0.30)
+    ):
+        return json.dumps(
+            ReadResult(
+                file_size=len(data),
+                is_binary=True,
+                error=(
+                    "Binary file - cannot display as text. Use appropriate "
+                    "tools to handle this file type."
+                ),
+            ).to_dict(),
+            ensure_ascii=False,
         )
 
     text = data.decode("utf-8", errors="replace")
     if offset == 1:
         text, _ = _strip_bom(text)
     lines = text.splitlines()
+    total_lines = data.count(b"\n")
     page = lines[offset - 1:offset - 1 + limit]
-    numbered = "\n".join(
-        f"{line_number}|{line[:MAX_LINE_LENGTH]}"
-        for line_number, line in enumerate(page, start=offset)
-    )
+    numbered = _add_line_numbers("\n".join(page), offset) if page else ""
+    max_chars = await _get_max_read_chars()
     numbered, lines_kept, char_truncated = _truncate_to_char_budget(
-        numbered, await _get_max_read_chars()
+        numbered, max_chars
     )
     next_offset = offset + lines_kept
-    truncated = len(lines) >= next_offset or char_truncated
+    truncated = total_lines > offset + limit - 1 or char_truncated
     result = {
         "content": redact_sensitive_text(numbered, file_read=True) if numbered else "",
-        "total_lines": len(lines),
+        "total_lines": total_lines,
         "file_size": len(data),
         "truncated": truncated,
+        "is_binary": False,
+        "is_image": False,
     }
-    if truncated:
+    if char_truncated:
+        shown_end = offset + lines_kept - 1
+        result["truncated_by"] = "bytes"
+        result["next_offset"] = next_offset
+        result["hint"] = (
+            f"Output truncated at the {max_chars:,}-char read budget after "
+            f"{lines_kept} line(s) (showing lines {offset}-{shown_end} of "
+            f"{total_lines}). Use offset={next_offset} to continue."
+        )
+        if len(numbered.split("\n", 1)[0]) >= max_chars:
+            result["hint"] += (
+                " Note: the first line alone exceeded the budget and was "
+                "clamped mid-line; its remainder is not retrievable via offset."
+            )
+    elif truncated:
         result["next_offset"] = next_offset
         result["hint"] = (
             f"Use offset={next_offset} to continue reading "
-            f"(showing {offset}-{max(offset, next_offset - 1)} of {len(lines)} lines)."
+            f"(showing {offset}-{max(offset, next_offset - 1)} of {total_lines} lines)"
+        )
+    if len(data) > _LARGE_FILE_HINT_BYTES and limit > 200 and truncated:
+        result["_hint"] = (
+            f"This file is large ({len(data):,} bytes). Consider reading only "
+            "the section you need with offset and limit to keep context usage "
+            "efficient."
         )
     count = _record_read_metadata(
         task_id,
@@ -1127,17 +1319,36 @@ async def _handle_read_file(args, **kw):
 
 async def _write_native_file(path: Path, content: str) -> None:
     """Atomically replace *path* without leaving a partial write on cancel."""
-    try:
-        await aiofiles.os.makedirs(path.parent, exist_ok=True)
-    except OSError as exc:
-        raise OSError(f"Unable to create parent directory {path.parent}: {exc}") from exc
+    write_path = path
+    is_link = aiofiles.os.wrap(os.path.islink)
+    if await is_link(path):
+        realpath = aiofiles.os.wrap(os.path.realpath)
+        resolved_target = await realpath(path)
+        if resolved_target:
+            write_path = Path(resolved_target)
 
-    temporary = path.parent / f".{path.name}.hermes-{uuid.uuid4().hex}.tmp"
+    original_mode: int | None = None
+    try:
+        original_mode = stat.S_IMODE((await aiofiles.os.stat(write_path)).st_mode)
+    except FileNotFoundError:
+        pass
+    try:
+        await aiofiles.os.makedirs(write_path.parent, exist_ok=True)
+    except OSError as exc:
+        raise OSError(
+            f"Unable to create parent directory {write_path.parent}: {exc}"
+        ) from exc
+
+    temporary = (
+        write_path.parent / f".{write_path.name}.hermes-{uuid.uuid4().hex}.tmp"
+    )
     try:
         async with aiofiles.open(temporary, "w", encoding="utf-8", newline="") as handle:
             await handle.write(content)
             await handle.flush()
-        await aiofiles.os.replace(temporary, path)
+        if original_mode is not None:
+            await aiofiles.os.wrap(os.chmod)(temporary, original_mode)
+        await aiofiles.os.replace(temporary, write_path)
     finally:
         try:
             await aiofiles.os.remove(temporary)
@@ -1151,6 +1362,191 @@ async def _verify_native_file(path: Path, expected: str) -> bool:
         path, "r", encoding="utf-8", errors="strict", newline=""
     ) as handle:
         return await handle.read() == expected
+
+
+async def _check_lint(path: Path, content: str | None = None) -> LintResult:
+    """Run the v2026.8.3 syntax check without blocking the event loop."""
+    extension = path.suffix.lower()
+    in_process = LINTERS_INPROC.get(extension)
+    if in_process is not None:
+        if content is None:
+            try:
+                content = await _read_native_patch_content(path)
+            except OSError:
+                return LintResult(
+                    skipped=True,
+                    message=f"Failed to read {path} for lint",
+                )
+        ok, error = in_process(content)
+        if error == "__SKIP__":
+            return LintResult(
+                skipped=True,
+                message=f"No linter available for {extension} (missing dependency)",
+            )
+        return LintResult(success=ok, output="" if ok else error)
+
+    linter_command = LINTERS.get(extension)
+    if linter_command is None:
+        return LintResult(
+            skipped=True,
+            message=f"No linter for {extension} files",
+        )
+    argv = [
+        str(path) if part == "{file}" else part
+        for part in linter_command.split()
+        if part != "2>&1"
+    ]
+    base_command = argv[0]
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *argv,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+    except FileNotFoundError:
+        return LintResult(skipped=True, message=f"{base_command} not available")
+
+    communicate = asyncio.create_task(process.communicate())
+    try:
+        async with asyncio.timeout(30):
+            stdout, _ = await asyncio.shield(communicate)
+    except TimeoutError:
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
+        stdout, _ = await communicate
+        output = stdout.decode(errors="replace").strip()
+        return LintResult(
+            success=False,
+            output=output or "Lint command timed out after 30s",
+        )
+    except asyncio.CancelledError:
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
+        await asyncio.shield(communicate)
+        raise
+
+    output = stdout.decode(errors="replace").strip()
+    if process.returncode and _looks_like_linter_unusable(base_command, output):
+        from tools.ansi_strip import strip_ansi
+
+        cleaned = strip_ansi(output).strip()
+        first_line = next(
+            (line.strip() for line in cleaned.splitlines() if line.strip()),
+            cleaned[:120],
+        )
+        return LintResult(
+            skipped=True,
+            message=f"{base_command} not usable: {first_line[:200]}",
+        )
+    return LintResult(success=process.returncode == 0, output=output)
+
+
+async def _check_lint_delta(
+    path: Path,
+    pre_content: str | None,
+    post_content: str | None = None,
+) -> LintResult:
+    """Report syntax errors introduced by an edit, preserving upstream semantics."""
+    post = await _check_lint(path, post_content)
+    if post.success or post.skipped or pre_content is None:
+        return post
+
+    pre = await _check_lint(path, pre_content)
+    if pre.success or pre.skipped or not pre.output:
+        return post
+
+    pre_lines = {line.strip() for line in pre.output.splitlines() if line.strip()}
+    post_lines = [
+        line
+        for line in post.output.splitlines()
+        if line.strip() and line.strip() not in pre_lines
+    ]
+    if not post_lines:
+        return LintResult(
+            success=False,
+            output=post.output,
+            message=(
+                "Pre-existing lint errors — this edit didn't introduce new ones "
+                "but the file is still broken."
+            ),
+        )
+    return LintResult(
+        success=False,
+        output=(
+            "New lint errors introduced by this edit "
+            "(pre-existing errors filtered out):\n" + "\n".join(post_lines)
+        ),
+    )
+
+
+async def _write_native_result(path: Path, content: str) -> WriteResult:
+    """Native-async equivalent of v2026.8.3 ``write_file`` mechanics."""
+    extension = path.suffix.lower()
+    in_process_linter = (
+        LINTERS_INPROC.get(extension)
+        if extension in _FAIL_CLOSED_INPROC_EXTS
+        else None
+    )
+    if in_process_linter is not None:
+        valid, lint_error = in_process_linter(content)
+        if not valid and lint_error != "__SKIP__":
+            return WriteResult(
+                error=(
+                    f"Refusing to write '{path}': candidate content fails "
+                    f"{extension} syntax validation ({lint_error}). The file was "
+                    "NOT created or modified. Fix the content and retry."
+                )
+            )
+
+    try:
+        existing = await _read_native_patch_content(path)
+    except FileNotFoundError:
+        existing = None
+    except OSError:
+        existing = None
+
+    if existing is not None:
+        from tools.file_operations import _detect_line_ending, _normalize_line_endings
+
+        original_ending = _detect_line_ending(existing)
+        if original_ending == "\r\n":
+            content = _normalize_line_endings(content, original_ending)
+        if _has_bom(existing) and not _has_bom(content):
+            content = "\ufeff" + content
+
+    try:
+        await _write_native_file(path, content)
+    except OSError as exc:
+        return WriteResult(error=f"Failed to write file: {exc}")
+
+    try:
+        verified = await _verify_native_file(path, content)
+    except (OSError, UnicodeError):
+        verified = None
+    if verified is False:
+        return WriteResult(
+            error=(
+                f"Post-write verification failed for {path}: on-disk content "
+                "hash differs from the intended write. The write did not persist "
+                "correctly — re-read the file and retry."
+            )
+        )
+
+    lint_result = await _check_lint_delta(
+        path,
+        pre_content=(existing if extension in LINTERS_INPROC else None),
+        post_content=content,
+    )
+    return WriteResult(
+        bytes_written=len(content.encode("utf-8")),
+        dirs_created=True,
+        verified=verified,
+        lint=lint_result.to_dict(),
+    )
 
 
 async def _handle_write_file(args, **kw):
@@ -1186,48 +1582,26 @@ async def _handle_write_file(args, **kw):
             return tool_error(profile_error)
     cross_warning: str | None = None
     stale_warning: str | None = None
-    verified: bool | None = None
+    cwd_warning: str | None = None
+    write_result: WriteResult
     try:
         async with file_state.lock_path(resolved):
             cross_warning = await file_state.check_stale(task_id, str(resolved))
             stale_warning = await _check_file_staleness(path, task_id)
-            try:
-                existing = await _read_native_patch_content(resolved)
-            except FileNotFoundError:
-                existing = None
-            if existing is not None:
-                from tools.file_operations import (
-                    _detect_line_ending,
-                    _normalize_line_endings,
-                )
-
-                content = _normalize_line_endings(
-                    content,
-                    _detect_line_ending(existing),
-                )
-            await _write_native_file(resolved, content)
-            try:
-                verified = await _verify_native_file(resolved, content)
-            except (OSError, UnicodeError):
-                logger.warning("Unable to verify write_file result for %s", resolved)
-            if verified is False:
-                return tool_error(
-                    f"Write verification failed: content did not persist at {resolved}"
-                )
-            await _refresh_read_timestamp(path, task_id)
-            await file_state.note_write(task_id, str(resolved))
+            cwd_warning = await _path_resolution_warning(path, resolved, task_id)
+            write_result = await _write_native_result(resolved, content)
+            if not write_result.error:
+                await _refresh_read_timestamp(path, task_id)
+                await file_state.note_write(task_id, str(resolved))
     except OSError as exc:
         return tool_error(f"Failed to write {path}: {exc}")
 
-    result = {
-        "bytes_written": len(content.encode("utf-8")),
-        "resolved_path": str(resolved),
-        "files_modified": [str(resolved)],
-    }
-    if verified is not None:
-        result["verified"] = verified
-    if cross_warning or stale_warning:
-        result["_warning"] = cross_warning or stale_warning
+    result = write_result.to_dict()
+    result["resolved_path"] = str(resolved)
+    if not write_result.error:
+        result["files_modified"] = [str(resolved)]
+    if cross_warning or stale_warning or cwd_warning:
+        result["_warning"] = cross_warning or stale_warning or cwd_warning
     return json.dumps(
         result,
         ensure_ascii=False,
@@ -1240,117 +1614,72 @@ async def _read_native_patch_content(path: Path) -> str:
         return await handle.read()
 
 
-def _native_v4a_error(message: str) -> str:
-    return tool_error(f"V4A patch validation failed (no files were modified): {message}")
+class _V4AFileOperations:
+    """Async file-operations interface consumed by the upstream V4A applier."""
 
+    async def read_file_raw(self, path: str) -> ReadResult:
+        target = Path(path)
+        try:
+            raw_content = await _read_native_patch_content(target)
+        except OSError as exc:
+            return ReadResult(error=f"File not found: {path}" if isinstance(exc, FileNotFoundError) else str(exc))
+        content, _ = _strip_bom(raw_content)
+        return ReadResult(
+            content=content,
+            total_lines=len(content.splitlines()),
+            file_size=len(raw_content.encode("utf-8")),
+        )
 
-def _apply_native_v4a_update(content: str, operation) -> tuple[str, str | None]:
-    """Apply one parsed V4A update in memory.
+    async def write_file(self, path: str, content: str) -> WriteResult:
+        return await _write_native_result(Path(path), content)
 
-    Parsing and fuzzy matching are CPU-only.  Keeping them in this helper lets
-    the surrounding transaction validate every operation before the first
-    filesystem mutation, while all reads and writes remain native async.
-    """
-    from tools.fuzzy_match import (
-        format_no_match_hint,
-        fuzzy_find_and_replace,
-        is_already_applied,
-    )
+    async def delete_file(self, path: str) -> WriteResult:
+        try:
+            await aiofiles.os.remove(path)
+        except OSError as exc:
+            return WriteResult(error=f"Failed to delete {path}: {exc}")
+        return WriteResult()
 
-    updated = content
-    changed = False
-    for hunk_index, hunk in enumerate(operation.hunks, start=1):
-        search_lines = [line.content for line in hunk.lines if line.prefix in {" ", "-"}]
-        replacement_lines = [line.content for line in hunk.lines if line.prefix in {" ", "+"}]
-        if search_lines == replacement_lines:
-            continue
-        if search_lines:
-            search = "\n".join(search_lines)
-            replacement = "\n".join(replacement_lines)
-            next_content, count, _strategy, error = fuzzy_find_and_replace(
-                updated, search, replacement, replace_all=False
-            )
-            if count == 0 and hunk.context_hint:
-                hint_position = updated.find(hunk.context_hint)
-                if hint_position >= 0:
-                    start = max(0, hint_position - 500)
-                    end = min(len(updated), hint_position + 2000)
-                    window, count, _strategy, error = fuzzy_find_and_replace(
-                        updated[start:end], search, replacement, replace_all=False
-                    )
-                    if count:
-                        next_content = updated[:start] + window + updated[end:]
-            if not count:
-                if is_already_applied(updated, search, replacement):
-                    continue
-                detail = error or "could not find a unique match"
-                return content, (
-                    f"{operation.file_path}: hunk {hunk_index} could not be applied: "
-                    f"{detail}{format_no_match_hint(detail, 0, search, updated)}"
-                )
-            updated = next_content
-            changed = True
-            continue
+    async def move_file(self, src: str, dst: str) -> WriteResult:
+        try:
+            await aiofiles.os.rename(src, dst)
+        except OSError as exc:
+            return WriteResult(error=f"Failed to move {src} -> {dst}: {exc}")
+        return WriteResult()
 
-        insert = "\n".join(replacement_lines)
-        if not insert:
-            continue
-        hint = hunk.context_hint
-        if hint:
-            occurrences = updated.count(hint)
-            if occurrences > 1:
-                return content, (
-                    f"{operation.file_path}: addition-only hunk context hint "
-                    f"{hint!r} is ambiguous ({occurrences} occurrences)"
-                )
-            if occurrences == 1:
-                position = updated.find(hint)
-                line_end = updated.find("\n", position)
-                if line_end >= 0:
-                    updated = updated[:line_end + 1] + insert + "\n" + updated[line_end + 1:]
-                else:
-                    updated = updated + "\n" + insert
-            else:
-                updated = updated.rstrip("\n") + "\n" + insert + "\n"
-        else:
-            updated = updated.rstrip("\n") + "\n" + insert + "\n"
-        changed = True
-    if not changed:
-        return content, None
-    return updated, None
+    async def _check_lint(self, path: str) -> LintResult:
+        return await _check_lint(Path(path))
 
 
 async def _handle_v4a_patch(args: dict, task_id: str) -> str:
-    """Validate then apply a V4A patch using only async local-file I/O.
-
-    The original V4A parser is retained as the canonical syntax parser.  Its
-    synchronous *backend adapter* is intentionally not used: this transaction
-    resolves paths once, locks every target in lexical order, computes the full
-    final file state in memory, and only then publishes atomic replacements.
-    """
+    """Apply a V4A patch through the directly async-converted upstream applier."""
     patch_content = args.get("patch")
     if not isinstance(patch_content, str) or not patch_content.strip():
-        return tool_error("patch: mode='patch' requires non-empty 'patch' content.")
+        return tool_error("patch content required")
 
-    from tools.patch_parser import OperationType, parse_v4a_patch
+    from tools.patch_parser import OperationType, apply_v4a_operations, parse_v4a_patch
     from tools.path_security import has_traversal_component
 
     operations, parse_error = parse_v4a_patch(patch_content)
     if parse_error:
-        return _native_v4a_error(parse_error)
-    if not operations:
-        return _native_v4a_error("patch contains no operations")
+        return json.dumps(
+            PatchResult(error=f"Failed to parse patch: {parse_error}").to_dict(),
+            ensure_ascii=False,
+        )
 
     raw_paths: list[str] = []
     for operation in operations:
         raw_paths.append(operation.file_path)
         if operation.operation is OperationType.MOVE and operation.new_path:
             raw_paths.append(operation.new_path)
+
     for raw_path in raw_paths:
         if has_traversal_component(raw_path):
             return tool_error(
                 f"V4A patch header contains '..' traversal: {raw_path!r}. "
-                "Use an absolute or cwd-relative path without '..'."
+                "Use the agent's cwd-relative path (no '..') or an absolute "
+                "path in '*** Update File:' / '*** Add File:' / "
+                "'*** Delete File:' / '*** Move File:' headers."
             )
         sensitive_error = await _check_sensitive_path(raw_path, task_id)
         if sensitive_error:
@@ -1370,117 +1699,51 @@ async def _handle_v4a_patch(args: dict, task_id: str) -> str:
             return tool_error(denied_error)
         resolved_by_raw[raw_path] = resolved
 
-    paths = sorted(set(resolved_by_raw.values()), key=str)
+    for operation in operations:
+        operation.file_path = str(resolved_by_raw[operation.file_path])
+        if operation.operation is OperationType.MOVE and operation.new_path:
+            operation.new_path = str(resolved_by_raw[operation.new_path])
+
+    resolved_paths = sorted(set(resolved_by_raw.values()), key=str)
     stale_warnings: list[str] = []
     async with contextlib.AsyncExitStack() as stack:
-        for path in paths:
-            await stack.enter_async_context(file_state.lock_path(path))
+        for resolved in resolved_paths:
+            await stack.enter_async_context(file_state.lock_path(resolved))
 
         for raw_path in raw_paths:
             resolved = resolved_by_raw[raw_path]
-            cross_warning = await file_state.check_stale(task_id, str(resolved))
-            stale_warning = cross_warning or await _check_file_staleness(
+            warning = await file_state.check_stale(task_id, str(resolved))
+            warning = warning or await _check_file_staleness(raw_path, task_id)
+            warning = warning or await _path_resolution_warning(
                 raw_path,
+                resolved,
                 task_id,
             )
-            if stale_warning:
-                stale_warnings.append(stale_warning)
+            if warning:
+                stale_warnings.append(warning)
 
-        original: dict[Path, str | None] = {}
-        state: dict[Path, str | None] = {}
-
-        async def load(path: Path) -> str | None:
-            if path not in state:
-                try:
-                    content = await _read_native_patch_content(path)
-                except FileNotFoundError:
-                    content = None
-                state[path] = content
-                original[path] = content
-            return state[path]
-
-        for operation in operations:
-            source = resolved_by_raw[operation.file_path]
-            if operation.operation is OperationType.ADD:
-                if await load(source) is not None:
-                    return _native_v4a_error(f"{operation.file_path}: destination already exists")
-                state[source] = "\n".join(
-                    line.content
-                    for hunk in operation.hunks
-                    for line in hunk.lines
-                    if line.prefix == "+"
-                )
-                continue
-            if operation.operation is OperationType.DELETE:
-                if await load(source) is None:
-                    return _native_v4a_error(f"{operation.file_path}: file not found for deletion")
-                state[source] = None
-                continue
-            if operation.operation is OperationType.MOVE:
-                destination = resolved_by_raw[operation.new_path]
-                source_content = await load(source)
-                if source_content is None:
-                    return _native_v4a_error(f"{operation.file_path}: source file not found for move")
-                if await load(destination) is not None:
-                    return _native_v4a_error(
-                        f"{operation.new_path}: destination already exists — move would overwrite"
-                    )
-                state[destination] = source_content
-                state[source] = None
-                continue
-            current = await load(source)
-            if current is None:
-                return _native_v4a_error(f"{operation.file_path}: file not found for update")
-            replacement, error = _apply_native_v4a_update(current, operation)
-            if error:
-                return _native_v4a_error(error)
-            state[source] = replacement
-
-        changed_paths = [path for path in paths if state.get(path) != original.get(path)]
-        if not changed_paths:
-            result = {
-                "success": True,
-                "no_change": True,
-                "note": "Patch was already applied; no files changed.",
-                "files_modified": [],
-            }
-            if stale_warnings:
-                result["_warning"] = " | ".join(stale_warnings)
-            return json.dumps(result)
-        try:
-            for path in changed_paths:
-                content = state[path]
-                if content is None:
-                    await aiofiles.os.remove(path)
-                else:
-                    await _write_native_file(path, content)
-        except OSError as exc:
-            return tool_error(
-                f"V4A apply failed after validation: {exc}. Run git diff to inspect state."
+        patch_result = await apply_v4a_operations(
+            operations,
+            _V4AFileOperations(),
+        )
+        result = patch_result.to_dict()
+        if stale_warnings:
+            result["_warning"] = (
+                stale_warnings[0]
+                if len(stale_warnings) == 1
+                else " | ".join(stale_warnings)
             )
-        for path in changed_paths:
-            await _refresh_read_timestamp(str(path), task_id)
-            await file_state.note_write(task_id, str(path))
-    _reset_patch_failures(task_id, [str(path) for path in changed_paths])
-    diffs: list[str] = []
-    for path in changed_paths:
-        before = original.get(path) or ""
-        after = state.get(path) or ""
-        fromfile = f"a/{path}" if original.get(path) is not None else "/dev/null"
-        tofile = f"b/{path}" if state.get(path) is not None else "/dev/null"
-        diffs.append("".join(difflib.unified_diff(
-            before.splitlines(keepends=True), after.splitlines(keepends=True),
-            fromfile=fromfile, tofile=tofile,
-        )))
-    result = {
-        "success": True,
-        "diff": "".join(diffs),
-        "files_modified": [str(path) for path in changed_paths],
-    }
-    if len(changed_paths) == 1:
-        result["resolved_path"] = str(changed_paths[0])
-    if stale_warnings:
-        result["_warning"] = " | ".join(stale_warnings)
+        if not patch_result.error:
+            resolved_modified = [str(resolved_by_raw[path]) for path in raw_paths]
+            result["files_modified"] = resolved_modified
+            if len(resolved_modified) == 1:
+                result["resolved_path"] = resolved_modified[0]
+            for raw_path in raw_paths:
+                resolved = resolved_by_raw[raw_path]
+                await _refresh_read_timestamp(raw_path, task_id)
+                await file_state.note_write(task_id, str(resolved))
+            _reset_patch_failures(task_id, resolved_modified)
+
     return json.dumps(result, ensure_ascii=False)
 
 
@@ -1515,45 +1778,113 @@ async def _handle_patch(args, **kw):
             return tool_error(profile_error)
     cross_warning: str | None = None
     stale_warning: str | None = None
+    cwd_warning: str | None = None
     try:
         async with file_state.lock_path(resolved):
             cross_warning = await file_state.check_stale(task_id, str(resolved))
             stale_warning = await _check_file_staleness(path, task_id)
-            async with aiofiles.open(resolved, "r", encoding="utf-8", errors="replace", newline="") as handle:
-                content = await handle.read()
+            cwd_warning = await _path_resolution_warning(path, resolved, task_id)
+            raw_content = await _read_native_patch_content(resolved)
+            content, had_bom = _strip_bom(raw_content)
             from tools.file_operations import (
                 _detect_line_ending,
                 _normalize_line_endings,
             )
 
-            line_ending = _detect_line_ending(content)
-            old_string = _normalize_line_endings(old_string, line_ending)
-            new_string = _normalize_line_endings(new_string, line_ending)
-            from tools.fuzzy_match import is_already_applied
+            from tools.fuzzy_match import (
+                format_no_match_hint,
+                fuzzy_find_and_replace,
+                is_already_applied,
+            )
 
-            if is_already_applied(content, old_string, new_string):
+            updated, replacement_count, _strategy, match_error = (
+                fuzzy_find_and_replace(
+                    content,
+                    old_string,
+                    new_string,
+                    bool(args.get("replace_all", False)),
+                )
+            )
+            if match_error or replacement_count == 0:
+                if not is_already_applied(content, old_string, new_string):
+                    error_message = match_error or (
+                        f"Could not find match for old_string in {resolved}"
+                    )
+                    error_message += format_no_match_hint(
+                        error_message,
+                        replacement_count,
+                        old_string,
+                        content,
+                    )
+                    failure_count = _record_patch_failure(task_id, str(resolved))
+                    extra = {}
+                    if failure_count >= 3:
+                        extra["_hint"] = (
+                            f"This is failure #{failure_count} patching {path!r}. "
+                            "Stop retrying with variations of the same old_string. "
+                            "Either: (1) re-read the file fresh to verify current "
+                            "content, (2) use a longer / more unique old_string with "
+                            "surrounding context lines, or (3) use write_file to "
+                            "replace the entire file if the targeted region is hard "
+                            "to anchor."
+                        )
+                    return tool_error(error_message, **extra)
+
+                _reset_patch_failures(task_id, [str(resolved)])
                 result = {
                     "success": True,
                     "no_change": True,
-                    "note": "Replacement was already applied; no file changed.",
+                    "note": (
+                        "File already contains the target text — the edit appears "
+                        f"to be already applied to {resolved}. No write performed; "
+                        "do not re-send this patch."
+                    ),
                     "resolved_path": str(resolved),
-                    "files_modified": [],
+                    "files_modified": [str(resolved)],
                 }
-                if cross_warning or stale_warning:
-                    result["_warning"] = cross_warning or stale_warning
+                if cross_warning or stale_warning or cwd_warning:
+                    result["_warning"] = (
+                        cross_warning or stale_warning or cwd_warning
+                    )
                 return json.dumps(result)
-            occurrences = content.count(old_string)
-            if occurrences == 0:
+
+            line_ending = _detect_line_ending(content)
+            if line_ending:
+                updated = _normalize_line_endings(updated, line_ending)
+            extension = resolved.suffix.lower()
+            in_process_linter = (
+                LINTERS_INPROC.get(extension)
+                if extension in _FAIL_CLOSED_INPROC_EXTS
+                else None
+            )
+            if in_process_linter is not None:
+                valid, lint_error = in_process_linter(updated)
+                if not valid and lint_error != "__SKIP__":
+                    return tool_error(
+                        f"Failed to write changes: Refusing to write '{resolved}': "
+                        f"candidate content fails {extension} syntax validation "
+                        f"({lint_error}). The file was NOT created or modified. "
+                        "Fix the content and retry."
+                    )
+
+            persisted = "\ufeff" + updated if had_bom and not _has_bom(updated) else updated
+            await _write_native_file(resolved, persisted)
+            verified_content = await _read_native_patch_content(resolved)
+            verified_content, _ = _strip_bom(verified_content)
+            if (
+                verified_content.replace("\r\n", "\n").replace("\r", "\n")
+                != updated.replace("\r\n", "\n").replace("\r", "\n")
+            ):
                 return tool_error(
-                    "old_string not found. Use read_file to verify the current content."
+                    f"Post-write verification failed for {resolved}: on-disk "
+                    "content differs from intended write. The patch did not "
+                    "persist. Re-read the file and try again."
                 )
-            if occurrences > 1 and not args.get("replace_all", False):
-                return tool_error(
-                    "old_string appears more than once. Add unique context or set replace_all=true."
-                )
-            replacement_count = occurrences if args.get("replace_all", False) else 1
-            updated = content.replace(old_string, new_string, replacement_count)
-            await _write_native_file(resolved, updated)
+            lint_result = await _check_lint_delta(
+                resolved,
+                pre_content=content,
+                post_content=updated,
+            )
             await _refresh_read_timestamp(path, task_id)
             await file_state.note_write(task_id, str(resolved))
     except FileNotFoundError:
@@ -1563,14 +1894,23 @@ async def _handle_patch(args, **kw):
         return tool_error(f"Failed to patch {path}: {exc}")
 
     _reset_patch_failures(task_id, [str(resolved)])
+    diff = "".join(
+        difflib.unified_diff(
+            content.splitlines(keepends=True),
+            updated.splitlines(keepends=True),
+            fromfile=f"a/{resolved}",
+            tofile=f"b/{resolved}",
+        )
+    )
     result = {
         "success": True,
-        "replacements": replacement_count,
+        "diff": diff,
         "resolved_path": str(resolved),
         "files_modified": [str(resolved)],
+        "lint": lint_result.to_dict(),
     }
-    if cross_warning or stale_warning:
-        result["_warning"] = cross_warning or stale_warning
+    if cross_warning or stale_warning or cwd_warning:
+        result["_warning"] = cross_warning or stale_warning or cwd_warning
     return json.dumps(
         result,
         ensure_ascii=False,
@@ -1591,7 +1931,24 @@ async def _run_rg(arguments: list[str]) -> tuple[int, str, str]:
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=30)
+    communicate = asyncio.create_task(process.communicate())
+    try:
+        async with asyncio.timeout(60):
+            stdout, stderr = await asyncio.shield(communicate)
+    except TimeoutError:
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
+        stdout, stderr = await communicate
+        return 124, stdout.decode(errors="replace"), stderr.decode(errors="replace")
+    except asyncio.CancelledError:
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
+        await asyncio.shield(communicate)
+        raise
     return (
         process.returncode or 0,
         stdout.decode(errors="replace"),
@@ -1663,8 +2020,10 @@ async def _handle_search_files(args, **kw):
     target = {"grep": "content", "find": "files"}.get(
         args.get("target", "content"), args.get("target", "content")
     )
-    limit = max(1, min(int(args.get("limit", 50)), 500))
-    offset = max(0, int(args.get("offset", 0)))
+    offset, limit = normalize_search_pagination(
+        args.get("offset", 0),
+        args.get("limit", 50),
+    )
     search_key = (
         "search", pattern, str(args.get("path", ".")), target,
         args.get("file_glob"), offset, limit, args.get("output_mode", "content"),
@@ -1712,20 +2071,33 @@ async def _handle_search_files(args, **kw):
     if not existing_paths:
         return tool_error(f"Path not found: {raw_path}")
 
+    output_mode = args.get("output_mode", "content")
+    context = max(0, int(args.get("context", 0) or 0))
     if target == "files":
-        command = ["--files", "--glob", pattern, *map(str, existing_paths)]
+        glob_pattern = f"*{pattern}" if "/" not in pattern and not pattern.startswith("*") else pattern
+        command = [
+            "--files",
+            "--sortr=modified",
+            "--glob",
+            glob_pattern,
+            *map(str, existing_paths),
+        ]
     else:
-        command = ["--line-number", "--no-heading", "--color", "never"]
+        command = [
+            "--line-number",
+            "--no-heading",
+            "--with-filename",
+            "--color",
+            "never",
+        ]
         multiline = _pattern_has_regex_newline(pattern)
         if multiline:
             command.append("--multiline")
-        context = max(0, int(args.get("context", 0) or 0))
         if context:
             command.extend(["-C", str(context)])
         file_glob = args.get("file_glob")
         if isinstance(file_glob, str) and file_glob:
             command.extend(["--glob", file_glob])
-        output_mode = args.get("output_mode", "content")
         if output_mode == "files_only":
             command.append("-l")
         elif output_mode == "count":
@@ -1736,36 +2108,45 @@ async def _handle_search_files(args, **kw):
         returncode, stdout, stderr = await _run_rg(command)
     except FileNotFoundError:
         return tool_error("search_files requires ripgrep (rg), which is not installed.")
-    except TimeoutError:
-        return tool_error("search_files timed out after 30 seconds.")
 
-    if returncode not in {0, 1}:
-        return tool_error(stderr or "search_files failed")
+    if target == "files" and returncode not in {0, 1, 124} and not stdout.strip():
+        try:
+            returncode, stdout, stderr = await _run_rg(
+                ["--files", "--glob", glob_pattern, *map(str, existing_paths)]
+            )
+        except FileNotFoundError:
+            return tool_error("search_files requires ripgrep (rg), which is not installed.")
+
+    if returncode not in {0, 1, 124} and not stdout.strip():
+        message = stderr.strip() or stdout.strip() or "Search error"
+        return json.dumps(
+            SearchResult(error=f"Search failed: {message}").to_dict(),
+            ensure_ascii=False,
+        )
+
+    limit_reason = "search_timeout" if returncode == 124 else None
     all_lines = stdout.splitlines()
     all_lines, omitted = await _filter_search_output_lines(all_lines, task_id)
-    page = all_lines[offset:offset + limit]
-    result = {
-        "matches": page,
-        "total_count": len(all_lines),
-        "truncated": len(all_lines) > offset + len(page),
-        "next_offset": offset + len(page) if len(all_lines) > offset + len(page) else None,
-    }
-    if omitted:
-        result["omitted_sensitive_results"] = omitted
-    warnings: list[str] = []
+    fetch_limit = offset + limit + (200 if context else 0)
+    fetched_lines = all_lines[:fetch_limit]
+    truncated_by_limit = len(all_lines) >= fetch_limit
+    warning: str | None = None
     if len(requested_paths) > 1:
-        note = (
+        warning = (
             f"path contained {len(requested_paths)} entries; searched "
             f"{len(existing_paths)} that exist"
         )
         if missing_paths:
-            note += "; skipped missing: " + ", ".join(missing_paths[:3])
-        warnings.append(note)
+            warning += "; skipped missing: " + ", ".join(missing_paths[:3])
+            if len(missing_paths) > 3:
+                warning += f" (+{len(missing_paths) - 3} more)"
     if target != "files" and multiline:
-        warnings.append(
-            "Pattern contains \\n — multiline mode (-U) was enabled automatically."
+        multiline_note = (
+            "Pattern contains \\n — multiline mode (-U) was enabled automatically "
+            "so the regex can match across line boundaries."
         )
-    if target != "files" and not all_lines:
+        warning = f"{warning} {multiline_note}" if warning else multiline_note
+    if target != "files" and not fetched_lines:
         try:
             hint = await _zero_match_hint(
                 pattern,
@@ -1775,15 +2156,97 @@ async def _handle_search_files(args, **kw):
         except (FileNotFoundError, TimeoutError):
             hint = None
         if hint:
-            warnings.append(hint)
-    if warnings:
-        result["warning"] = " ".join(warnings)
+            warning = f"{warning} {hint}" if warning else hint
+
+    if target == "files" or output_mode == "files_only":
+        page = fetched_lines[offset:offset + limit]
+        search_result = SearchResult(
+            files=page,
+            total_count=len(fetched_lines),
+            truncated=(
+                truncated_by_limit or bool(limit_reason)
+                if target == "files"
+                else bool(limit_reason)
+            ),
+            limit_reason=limit_reason,
+            warning=warning,
+        )
+    elif output_mode == "count":
+        counts: dict[str, int] = {}
+        for line in fetched_lines:
+            path_part, separator, count_text = line.rpartition(":")
+            if separator and count_text.isdigit():
+                counts[path_part] = int(count_text)
+        search_result = SearchResult(
+            counts=counts,
+            total_count=sum(counts.values()),
+            truncated=bool(limit_reason),
+            limit_reason=limit_reason,
+            warning=warning,
+        )
+    else:
+        match_pattern = re.compile(r"^([A-Za-z]:)?(.*?):(\d+):(.*)$")
+        matches: list[SearchMatch] = []
+        for line in fetched_lines:
+            if not line or line == "--":
+                continue
+            match = match_pattern.match(line)
+            if match:
+                matches.append(
+                    SearchMatch(
+                        path=(match.group(1) or "") + match.group(2),
+                        line_number=int(match.group(3)),
+                        content=redact_sensitive_text(
+                            match.group(4)[:500],
+                            file_read=True,
+                        ),
+                    )
+                )
+                continue
+            if context:
+                parsed = _parse_search_context_line(line)
+                if parsed:
+                    matches.append(
+                        SearchMatch(
+                            path=parsed[0],
+                            line_number=parsed[1],
+                            content=redact_sensitive_text(
+                                parsed[2][:500],
+                                file_read=True,
+                            ),
+                        )
+                    )
+        total = len(matches)
+        search_result = SearchResult(
+            matches=matches[offset:offset + limit],
+            total_count=total,
+            truncated=(
+                total > offset + limit
+                or bool(limit_reason)
+            ),
+            limit_reason=limit_reason,
+            warning=warning,
+        )
+
+    result = search_result.to_dict(densify=True)
+    if omitted:
+        result["_omitted"] = (
+            f"{omitted} result(s) omitted because they target credential, "
+            "token, cache, or secret-bearing environment files."
+        )
     if count >= 3:
         result["_warning"] = (
             f"You have run this exact search {count} times consecutively. "
             "The results have not changed. Use the information you already have."
         )
-    return json.dumps(result, ensure_ascii=False)
+    result_json = json.dumps(result, ensure_ascii=False)
+    if result.get("truncated"):
+        next_offset = offset + limit
+        result_json += (
+            f"\n\n[Hint: Results truncated. Use offset={next_offset} to see "
+            "more, or narrow with a more specific pattern or file_glob.]"
+        )
+    return result_json
 
 
 async def read_file_tool(

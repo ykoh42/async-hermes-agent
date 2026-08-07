@@ -705,6 +705,7 @@ def extract_edit_diff(
     result: str | None,
     *,
     function_args: dict | None = None,
+    snapshot=None,
 ) -> str | None:
     """Extract a unified diff from a file-edit tool result."""
     if tool_name == "patch" and result:
@@ -831,6 +832,7 @@ def render_edit_diff_with_delta(
     result: str | None,
     *,
     function_args: dict | None = None,
+    snapshot=None,
     print_fn=None,
 ) -> bool:
     """Render an edit diff inline without taking over the terminal UI."""
@@ -838,6 +840,7 @@ def render_edit_diff_with_delta(
         tool_name,
         result,
         function_args=function_args,
+        snapshot=snapshot,
     )
     if not diff:
         return False

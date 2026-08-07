@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import os
+import logging
 from dataclasses import dataclass
 from typing import Callable, Optional
 
 from tools.tool_backend_helpers import managed_nous_tools_enabled
 
+logger = logging.getLogger(__name__)
 
 _DEFAULT_TOOL_GATEWAY_DOMAIN = "nousresearch.com"
 _DEFAULT_TOOL_GATEWAY_SCHEME = "https"
+_NOUS_ACCESS_TOKEN_REFRESH_SKEW_SECONDS = 120
 
 
 @dataclass(frozen=True)
@@ -23,19 +26,33 @@ class ManagedToolGatewayConfig:
 
 async def _read_user_token_override() -> Optional[str]:
     try:
-        from agent.secret_scope import get_secret
+        from agent.secret_scope import UnscopedSecretError, get_secret
 
-        value = get_secret("TOOL_GATEWAY_USER_TOKEN", "")
+        try:
+            value = get_secret("TOOL_GATEWAY_USER_TOKEN")
+        except UnscopedSecretError:
+            from hermes_cli.config import get_env_value_prefer_dotenv
+
+            value = await get_env_value_prefer_dotenv("TOOL_GATEWAY_USER_TOKEN")
     except Exception:
-        value = ""
-    if not str(value or "").strip():
         try:
             from hermes_cli.config import get_env_value_prefer_dotenv
 
             value = await get_env_value_prefer_dotenv("TOOL_GATEWAY_USER_TOKEN")
         except Exception:
             value = ""
-    return str(value).strip() or None
+    if not str(value or "").strip():
+        try:
+            from agent.secret_scope import is_multiplex_active
+
+            if is_multiplex_active():
+                return None
+            from hermes_cli.config import get_env_value_prefer_dotenv
+
+            value = await get_env_value_prefer_dotenv("TOOL_GATEWAY_USER_TOKEN")
+        except Exception:
+            value = ""
+    return str(value or "").strip() or None
 
 
 async def read_nous_access_token() -> Optional[str]:
@@ -43,13 +60,17 @@ async def read_nous_access_token() -> Optional[str]:
     explicit = await _read_user_token_override()
     if explicit:
         return explicit
+    cached_token = await peek_nous_access_token()
     try:
         from hermes_cli.auth import resolve_nous_access_token
 
-        value = await resolve_nous_access_token()
+        value = await resolve_nous_access_token(
+            refresh_skew_seconds=_NOUS_ACCESS_TOKEN_REFRESH_SKEW_SECONDS,
+        )
         return str(value).strip() or None
-    except Exception:
-        return None
+    except Exception as exc:
+        logger.debug("Nous access token refresh failed: %s", exc)
+        return cached_token
 
 
 async def peek_nous_access_token() -> Optional[str]:
@@ -113,8 +134,11 @@ async def is_managed_tool_gateway_ready(
     token_reader=None,
 ) -> bool:
     """Return whether a managed gateway can be resolved without token refresh."""
-    return await resolve_managed_tool_gateway(
-        vendor,
-        gateway_builder=gateway_builder,
-        token_reader=token_reader or peek_nous_access_token,
-    ) is not None
+    return (
+        await resolve_managed_tool_gateway(
+            vendor,
+            gateway_builder=gateway_builder,
+            token_reader=token_reader or peek_nous_access_token,
+        )
+        is not None
+    )

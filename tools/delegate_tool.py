@@ -72,7 +72,7 @@ DELEGATE_BLOCKED_TOOLS = frozenset(
 # Both emit a logger.warning for audit; gateway sessions are unaffected
 # because they resolve approvals via tools/approval.py's per-session queue,
 # not through these TLS callbacks.
-def _subagent_auto_deny(command: str, description: str, **kwargs) -> str:
+async def _subagent_auto_deny(command: str, description: str, **kwargs) -> str:
     """Auto-deny dangerous commands in subagent tasks (safe default).
 
     Returns 'deny' so the subagent sees a refusal it can recover from, and
@@ -86,7 +86,7 @@ def _subagent_auto_deny(command: str, description: str, **kwargs) -> str:
     return "deny"
 
 
-def _subagent_auto_approve(command: str, description: str, **kwargs) -> str:
+async def _subagent_auto_approve(command: str, description: str, **kwargs) -> str:
     """Auto-approve dangerous commands in subagent tasks (opt-in YOLO).
 
     Only installed when delegation.subagent_auto_approve=true. Returns 'once'

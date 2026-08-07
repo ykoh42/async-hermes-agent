@@ -4,6 +4,16 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from agent import secret_scope
+from tools.tool_backend_helpers import fal_key_is_configured
+
+
+@pytest.fixture(autouse=True)
+def _reset_secret_scope():
+    secret_scope.set_multiplex_active(False)
+    yield
+    secret_scope.set_multiplex_active(False)
+
 
 @pytest.mark.asyncio
 async def test_fal_key_whitespace_is_unset(monkeypatch):
@@ -20,6 +30,17 @@ async def test_fal_key_whitespace_is_unset(monkeypatch):
     )
 
     assert await image_generation_tool.check_fal_api_key() is False
+
+
+@pytest.mark.asyncio
+async def test_scoped_fal_key_miss_does_not_borrow_dotenv(monkeypatch):
+    monkeypatch.setenv("FAL_KEY", "other-profile-key")
+    secret_scope.set_multiplex_active(True)
+    token = secret_scope.set_secret_scope({"UNRELATED": "value"})
+    try:
+        assert await fal_key_is_configured() is False
+    finally:
+        secret_scope.reset_secret_scope(token)
 
 
 # ---------------------------------------------------------------------------

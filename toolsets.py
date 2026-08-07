@@ -26,7 +26,7 @@ Usage:
 from typing import List, Dict, Any, Set, Optional
 
 
-# Shared tool list for the synchronous training/runtime harness.
+# Shared tool list for the native-async training/runtime harness.
 # Keep this list limited to tools that are part of the local agent loop or the
 # trajectory-generating surface. Optional UI, voice, sandbox-backend,
 # and messaging integrations are registered separately when they exist.
@@ -37,10 +37,15 @@ _HERMES_CORE_TOOLS = [
     "terminal", "process",
     # File manipulation
     "read_file", "write_file", "patch", "search_files",
-    # Vision (optional at runtime, but useful for multimodal trajectories)
-    "vision_analyze",
+    # Vision and image generation
+    "vision_analyze", "image_generate",
     # Skills
     "skills_list", "skill_view", "skill_manage",
+    # Browser automation
+    "browser_navigate", "browser_snapshot", "browser_click",
+    "browser_type", "browser_scroll", "browser_back",
+    "browser_press", "browser_get_images",
+    "browser_vision", "browser_console", "browser_cdp", "browser_dialog",
     # Planning state + persistent memory.  Both are part of the harness
     # trajectory: todo survives context compression while memory spans turns.
     "todo", "memory",

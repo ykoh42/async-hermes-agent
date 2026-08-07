@@ -455,7 +455,6 @@ async def run_compress_context_with_progress_timeout(
     on_commit_overrun: Callable[[float, float], Any] | None = None,
     fence: CompressionCommitFence | None = None,
     telemetry_agent: Any = None,
-    hard_cancel_event: asyncio.Event | None = None,
 ) -> Tuple[list, str]:
     """Run compression under native async progress and commit fencing.
 
@@ -490,6 +489,11 @@ async def run_compress_context_with_progress_timeout(
             logger.debug("compression timeout callback failed", exc_info=True)
 
     fence = fence if fence is not None else CompressionCommitFence()
+    hard_cancel_event = getattr(
+        telemetry_agent,
+        "_hard_interrupt_requested",
+        None,
+    )
     idle = float(idle_timeout_seconds)
     ceiling = max(float(total_ceiling_seconds), idle)
     task = asyncio.create_task(worker(fence), name="hermes-context-compression")
@@ -1571,6 +1575,37 @@ async def compress_context(
         })
     except Exception:
         pass
+
+    # Codex app-server owns the real thread history, so Hermes' local
+    # summarizer cannot reduce the provider context. Route this boundary to
+    # Codex's native thread compaction while preserving the local transcript.
+    if getattr(agent, "api_mode", None) == "codex_app_server":
+        codex_fence_entered = False
+        if commit_fence is not None:
+            codex_fence_entered = await commit_fence.begin_commit(
+                getattr(agent, "_hard_interrupt_requested", None)
+            )
+            if not codex_fence_entered:
+                await _restore_compressor_attempt_state(
+                    agent.context_compressor,
+                    _compressor_attempt_snapshot,
+                )
+                existing_prompt = getattr(agent, "_cached_system_prompt", None)
+                if not existing_prompt:
+                    existing_prompt = await agent._build_system_prompt(system_message)
+                return messages, existing_prompt
+        try:
+            return await _compress_context_via_codex_app_server(
+                agent,
+                messages,
+                system_message,
+                approx_tokens=approx_tokens,
+                task_id=task_id,
+                force=force,
+            )
+        finally:
+            if codex_fence_entered:
+                commit_fence.finish_commit()
 
     # Every automatic entrypoint must honor the latest durable cooldown and
     # breaker state. Another agent may have cleared a guard since this
@@ -2686,6 +2721,117 @@ async def compress_context(
         finally:
             if _commit_fence_entered:
                 commit_fence.finish_commit()
+
+
+async def _compress_context_via_codex_app_server(
+    agent: Any,
+    messages: list,
+    system_message: Optional[str],
+    *,
+    approx_tokens: Optional[int] = None,
+    task_id: str = "default",
+    force: bool = False,
+) -> Tuple[list, str]:
+    """Compact the provider-owned Codex thread without rewriting history."""
+    auto_mode = str(
+        getattr(agent, "codex_app_server_auto_compaction", "native") or "native"
+    ).lower()
+    if auto_mode not in {"native", "hermes", "off"}:
+        auto_mode = "native"
+    if not force and auto_mode != "hermes":
+        existing_prompt = getattr(agent, "_cached_system_prompt", None)
+        if not existing_prompt:
+            existing_prompt = await agent._build_system_prompt(system_message)
+        return messages, existing_prompt
+
+    codex_session = getattr(agent, "_codex_session", None)
+    if codex_session is None:
+        existing_prompt = getattr(agent, "_cached_system_prompt", None)
+        if not existing_prompt:
+            existing_prompt = await agent._build_system_prompt(system_message)
+        return messages, existing_prompt
+
+    logger.info(
+        "codex app-server compaction started: session=%s messages=%d tokens=~%s",
+        getattr(agent, "session_id", None) or "none",
+        len(messages),
+        f"{approx_tokens:,}" if approx_tokens else "unknown",
+    )
+    try:
+        agent._emit_status(COMPACTION_STATUS)
+    except Exception:
+        pass
+
+    heartbeat = _CompressionActivityHeartbeat(agent).start()
+    try:
+        result = await codex_session.compact_thread()
+    except BaseException:
+        await heartbeat.stop("context compression failed")
+        _emit_compaction_done(agent)
+        raise
+
+    failed = bool(
+        getattr(result, "interrupted", False) or getattr(result, "error", None)
+    )
+    await heartbeat.stop(
+        "context compression failed" if failed else "context compression completed"
+    )
+
+    if getattr(result, "should_retire", False):
+        try:
+            await codex_session.close()
+        except Exception:
+            pass
+        agent._codex_session = None
+
+    if failed:
+        try:
+            agent._emit_warning(
+                f"⚠ Codex app-server compaction failed: {result.error}"
+            )
+        except Exception:
+            pass
+        existing_prompt = getattr(agent, "_cached_system_prompt", None)
+        if not existing_prompt:
+            existing_prompt = await agent._build_system_prompt(system_message)
+        _emit_compaction_done(agent)
+        return messages, existing_prompt
+
+    try:
+        from agent.codex_runtime import (
+            _record_codex_app_server_compaction,
+            _record_codex_app_server_usage,
+        )
+
+        _record_codex_app_server_compaction(
+            agent,
+            result,
+            approx_tokens=approx_tokens,
+            force=True,
+        )
+        if hasattr(agent.context_compressor, "update_from_response"):
+            await _record_codex_app_server_usage(agent, result)
+    except Exception:
+        logger.debug("codex compaction bookkeeping failed", exc_info=True)
+
+    try:
+        from tools.file_tools import reset_file_dedup
+
+        reset_file_dedup(task_id)
+    except Exception:
+        pass
+
+    logger.info(
+        "codex app-server compaction done: session=%s thread=%s turn=%s",
+        getattr(agent, "session_id", None) or "none",
+        getattr(result, "thread_id", None) or "",
+        getattr(result, "turn_id", None) or "",
+    )
+    existing_prompt = getattr(agent, "_cached_system_prompt", None)
+    if not existing_prompt:
+        existing_prompt = await agent._build_system_prompt(system_message)
+    _emit_compaction_done(agent)
+    return messages, existing_prompt
 
 
 async def try_shrink_image_parts_in_messages(

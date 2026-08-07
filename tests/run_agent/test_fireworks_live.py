@@ -26,29 +26,31 @@ pytestmark = [
 ]
 
 
-def _resolve_runtime_client(provider="fireworks"):
+async def _resolve_runtime_client(provider="fireworks"):
     """Build the Fireworks client the way the Hermes runtime does."""
     from agent.auxiliary_client import resolve_provider_client
 
-    client, model = resolve_provider_client(provider)
+    client, model = await resolve_provider_client(provider)
     assert client is not None, "Hermes failed to build a Fireworks client"
     return client, model
 
 
-def test_hermes_wires_fireworks_client():
+@pytest.mark.asyncio
+async def test_hermes_wires_fireworks_client():
     """The runtime resolves a Fireworks client pointed at the right endpoint
     with the partner-attribution headers applied — no network required."""
-    client, model = _resolve_runtime_client()
+    client, model = await _resolve_runtime_client()
     assert "api.fireworks.ai" in str(client.base_url)
     # Default aux model must be a PAYG /models/ id (works with an fw_ key).
     assert model.startswith("accounts/fireworks/models/")
 
 
-def test_fireworks_basic_chat_through_runtime():
+@pytest.mark.asyncio
+async def test_fireworks_basic_chat_through_runtime():
     """A single-turn completion via the Hermes-resolved client returns text."""
-    client, model = _resolve_runtime_client()
+    client, model = await _resolve_runtime_client()
 
-    response = client.chat.completions.create(
+    response = await client.chat.completions.create(
         model=model,
         messages=[{"role": "user", "content": "Say exactly the word 'pong' and nothing else."}],
         timeout=60,
@@ -56,5 +58,4 @@ def test_fireworks_basic_chat_through_runtime():
 
     content = response.choices[0].message.content
     assert content and "pong" in content.lower()
-
 

@@ -1,6 +1,7 @@
 """Native-async explicit cancellation at the compression boundary."""
 
 import asyncio
+from types import SimpleNamespace
 
 import pytest
 
@@ -27,7 +28,9 @@ async def test_hard_cancel_stops_silent_compression_without_thread_fallback():
             system_prompt_fallback="system",
             idle_timeout_seconds=30,
             total_ceiling_seconds=60,
-            hard_cancel_event=hard_cancel,
+            telemetry_agent=SimpleNamespace(
+                _hard_interrupt_requested=hard_cancel,
+            ),
         )
     )
     await entered.wait()
@@ -57,7 +60,9 @@ async def test_hard_cancel_waits_for_started_commit():
             system_prompt_fallback="system",
             idle_timeout_seconds=30,
             total_ceiling_seconds=60,
-            hard_cancel_event=hard_cancel,
+            telemetry_agent=SimpleNamespace(
+                _hard_interrupt_requested=hard_cancel,
+            ),
         )
     )
     await commit_started.wait()

@@ -78,6 +78,10 @@ async def fal_key_is_configured() -> bool:
         pass
     if not str(value or "").strip():
         try:
+            from agent.secret_scope import is_multiplex_active
+
+            if is_multiplex_active():
+                return False
             from hermes_cli.config import get_env_value_prefer_dotenv
 
             value = await get_env_value_prefer_dotenv("FAL_KEY")

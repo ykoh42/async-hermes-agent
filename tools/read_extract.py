@@ -7,11 +7,14 @@ normal text/binary handling.
 
 from __future__ import annotations
 
+import io
 import json
 import posixpath
 import zipfile
 from pathlib import Path
 from xml.etree import ElementTree as ET
+
+import aiofiles
 
 __all__ = ["EXTRACTABLE_EXTENSIONS", "ExtractionError", "extract_document_text", "is_extractable_document"]
 
@@ -39,15 +42,22 @@ def is_extractable_document(path: str) -> bool:
     return bool(_extension(path))
 
 
-def extract_document_text(path: str) -> str:
+async def extract_document_text(path: str) -> str:
     ext = _extension(path)
+    if not ext:
+        raise ExtractionError(f"Unsupported document type: {path!r}")
+    try:
+        async with aiofiles.open(path, "rb") as handle:
+            data = await handle.read()
+    except OSError as exc:
+        raise ExtractionError(str(exc)) from exc
     if ext == ".ipynb":
-        return _extract_notebook(path)
+        return _extract_notebook(data)
     if ext == ".docx":
-        return _extract_docx(path)
+        return _extract_docx(data)
     if ext == ".xlsx":
-        return _extract_xlsx(path)
-    raise ExtractionError(f"Unsupported document type: {path!r}")
+        return _extract_xlsx(data)
+    raise AssertionError(f"unhandled document extension: {ext}")
 
 
 def _source_text(source) -> str:
@@ -58,11 +68,10 @@ def _source_text(source) -> str:
     return ""
 
 
-def _extract_notebook(path: str) -> str:
+def _extract_notebook(data: bytes) -> str:
     try:
-        with open(path, encoding="utf-8", errors="replace") as fh:
-            nb = json.load(fh)
-    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        nb = json.loads(data.decode("utf-8", errors="replace"))
+    except (ValueError, json.JSONDecodeError) as exc:
         raise ExtractionError(f"Not a valid notebook: {exc}") from exc
     if not isinstance(nb, dict):
         raise ExtractionError("Notebook root is not an object")
@@ -104,14 +113,12 @@ def _zip_xml(zf: zipfile.ZipFile, name: str) -> ET.Element:
         raise ExtractionError(f"Malformed XML in {name}: {exc}") from exc
 
 
-def _extract_docx(path: str) -> str:
+def _extract_docx(data: bytes) -> str:
     try:
-        with zipfile.ZipFile(path) as zf:
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
             root = _zip_xml(zf, "word/document.xml")
     except zipfile.BadZipFile as exc:
         raise ExtractionError(f"Not a valid DOCX: {exc}") from exc
-    except OSError as exc:
-        raise ExtractionError(str(exc)) from exc
 
     w = f"{{{_NS_W}}}"
     lines: list[str] = []
@@ -130,9 +137,9 @@ def _extract_docx(path: str) -> str:
     return "\n".join(lines).rstrip("\n") + "\n"
 
 
-def _extract_xlsx(path: str) -> str:
+def _extract_xlsx(data: bytes) -> str:
     try:
-        with zipfile.ZipFile(path) as zf:
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
             names = set(zf.namelist())
             shared = _shared_strings(zf, names)
             sheets = _workbook_sheets(zf)
@@ -155,8 +162,6 @@ def _extract_xlsx(path: str) -> str:
                 out.append("")
     except zipfile.BadZipFile as exc:
         raise ExtractionError(f"Not a valid XLSX: {exc}") from exc
-    except OSError as exc:
-        raise ExtractionError(str(exc)) from exc
 
     if not out:
         raise ExtractionError("XLSX has no visible sheets with content")

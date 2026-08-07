@@ -35,6 +35,17 @@ _approval_session_key: contextvars.ContextVar[str] = contextvars.ContextVar(
     "approval_session_key",
     default="",
 )
+_approval_turn_id: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "approval_turn_id",
+    default="",
+)
+_approval_tool_call_id: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "approval_tool_call_id",
+    default="",
+)
+_elicitation_approval_callback: contextvars.ContextVar[object | None] = (
+    contextvars.ContextVar("elicitation_approval_callback", default=None)
+)
 _session_approved: dict[str, set[str]] = {}
 _session_yolo: set[str] = set()
 _permanent_approved: set[str] = set()
@@ -49,6 +60,84 @@ def set_current_session_key(session_key: str) -> contextvars.Token[str]:
 def reset_current_session_key(token: contextvars.Token[str]) -> None:
     """Restore the prior approval session key."""
     _approval_session_key.reset(token)
+
+
+def set_current_observability_context(
+    *,
+    turn_id: str = "",
+    tool_call_id: str = "",
+) -> tuple[contextvars.Token[str], contextvars.Token[str]]:
+    """Bind active tool correlation IDs to approval hooks."""
+    return (
+        _approval_turn_id.set(turn_id or ""),
+        _approval_tool_call_id.set(tool_call_id or ""),
+    )
+
+
+def reset_current_observability_context(
+    tokens: tuple[contextvars.Token[str], contextvars.Token[str]],
+) -> None:
+    """Restore prior approval-hook correlation IDs."""
+    turn_token, tool_token = tokens
+    _approval_tool_call_id.reset(tool_token)
+    _approval_turn_id.reset(turn_token)
+
+
+async def _fire_approval_hook(hook_name: str, **kwargs) -> None:
+    """Invoke one observer hook without changing approval policy."""
+    try:
+        from hermes_cli.lifecycle import invoke_hook
+
+        kwargs.setdefault("turn_id", _approval_turn_id.get())
+        kwargs.setdefault("tool_call_id", _approval_tool_call_id.get())
+        await invoke_hook(hook_name, **kwargs)
+    except Exception as exc:
+        logger.debug("Approval hook %s dispatch failed: %s", hook_name, exc)
+
+
+async def _prepare_smart_approval_observer(
+    *,
+    command: str,
+    description: str,
+    pattern_key: str,
+    pattern_keys: list[str],
+    session_key: str,
+) -> dict | None:
+    """Redact and emit the pre-decision smart-approval observer hook."""
+    try:
+        from agent.redact import redact_sensitive_text
+
+        hook_command = redact_sensitive_text(command, force=True)
+        hook_description = redact_sensitive_text(description, force=True)
+    except Exception as exc:
+        logger.debug("Smart approval hook redaction failed: %s", exc)
+        return None
+
+    payload = {
+        "command": hook_command,
+        "description": hook_description,
+        "pattern_key": pattern_key,
+        "pattern_keys": list(pattern_keys),
+        "session_key": session_key,
+        "surface": "smart",
+    }
+    await _fire_approval_hook("pre_approval_request", **payload)
+    return payload
+
+
+async def _observe_smart_approval_verdict(
+    payload: dict | None,
+    verdict: str,
+) -> None:
+    """Emit a smart verdict after the auxiliary LLM decision, if safe."""
+    if payload is None or verdict not in {"approve", "deny"}:
+        return
+    await _fire_approval_hook(
+        "post_approval_response",
+        **payload,
+        choice=f"smart_{verdict}",
+        decided_by="aux_llm",
+    )
 
 
 def get_current_session_key(default: str = "default") -> str:
@@ -95,6 +184,22 @@ def is_session_yolo_enabled(session_key: str) -> bool:
 
 def is_current_session_yolo_enabled() -> bool:
     return is_session_yolo_enabled(get_current_session_key(default=""))
+
+
+def is_approval_bypass_active_for_session(session_key: str) -> bool:
+    """Return whether one exact session bypasses Hermes approval prompts."""
+    return (
+        _YOLO_MODE_FROZEN
+        or is_session_yolo_enabled(session_key)
+        or _get_approval_mode() == "off"
+    )
+
+
+def is_approval_bypass_active() -> bool:
+    """Return whether the current approval context has bypass enabled."""
+    return is_approval_bypass_active_for_session(
+        get_current_session_key(default="")
+    )
 
 
 def is_approved(session_key: str, pattern_key: str) -> bool:
@@ -2320,6 +2425,160 @@ async def _load_approval_config_snapshot() -> None:
         _approval_config_snapshot = {}
 
 
+def _format_tirith_description(tirith_result: dict) -> str:
+    """Build the upstream human-readable description from Tirith findings."""
+    findings = tirith_result.get("findings") or []
+    if not findings:
+        summary = tirith_result.get("summary") or "security issue detected"
+        return f"Security scan: {summary}"
+
+    parts = []
+    for finding in findings:
+        severity = finding.get("severity", "")
+        title = finding.get("title", "")
+        description = finding.get("description", "")
+        if title and description:
+            parts.append(
+                f"[{severity}] {title}: {description}"
+                if severity
+                else f"{title}: {description}"
+            )
+        elif title:
+            parts.append(f"[{severity}] {title}" if severity else title)
+    if not parts:
+        summary = tirith_result.get("summary") or "security issue detected"
+        return f"Security scan: {summary}"
+    return "Security scan — " + "; ".join(parts)
+
+
+async def check_dangerous_command(
+    command: str,
+    env_type: str,
+    approval_callback=None,
+    has_host_access: bool = False,
+) -> dict:
+    """Check Hermes' dangerous shell patterns and request native approval."""
+    await _load_approval_config_snapshot()
+
+    if _should_skip_container_guards(env_type, has_host_access):
+        return {"approved": True, "message": None}
+
+    is_hardline, description = detect_hardline_command(command)
+    if is_hardline:
+        return await _hardline_block_result(description, command)
+
+    deny_pattern = _match_user_deny_rule(command)
+    if deny_pattern is not None:
+        return _user_deny_block_result(deny_pattern)
+
+    if (
+        _YOLO_MODE_FROZEN
+        or is_current_session_yolo_enabled()
+        or _get_approval_mode() == "off"
+    ):
+        return {"approved": True, "message": None}
+    if _command_matches_permanent_allowlist(command):
+        return {"approved": True, "message": None}
+
+    is_dangerous, pattern_key, description = detect_dangerous_command(command)
+    if not is_dangerous:
+        return {"approved": True, "message": None}
+    session_key = get_current_session_key()
+    if is_approved(session_key, pattern_key):
+        return {"approved": True, "message": None}
+
+    interactive = is_truthy_value(os.getenv("HERMES_INTERACTIVE", ""))
+    ask = is_truthy_value(os.getenv("HERMES_EXEC_ASK", ""))
+    if not interactive and not ask:
+        return {"approved": True, "message": None}
+
+    smart_denied = False
+    if _get_approval_mode() == "smart":
+        observer_payload = await _prepare_smart_approval_observer(
+            command=command,
+            description=description,
+            pattern_key=pattern_key,
+            pattern_keys=[pattern_key],
+            session_key=session_key,
+        )
+        verdict = await _smart_approve(command, description)
+        await _observe_smart_approval_verdict(observer_payload, verdict)
+        if verdict == "approve":
+            return {
+                "approved": True,
+                "message": None,
+                "smart_approved": True,
+                "description": description,
+            }
+        smart_denied = verdict == "deny"
+
+    if approval_callback is None:
+        return {
+            "approved": False,
+            "message": (
+                f"BLOCKED: approval required ({description}) but no native async "
+                "approval callback is registered."
+            ),
+            "pattern_key": pattern_key,
+            "description": description,
+        }
+
+    await _fire_approval_hook(
+        "pre_approval_request",
+        command=command,
+        description=description,
+        pattern_key=pattern_key,
+        pattern_keys=[pattern_key],
+        session_key=session_key,
+        surface="cli",
+    )
+    choice = await prompt_dangerous_approval(
+        command,
+        description,
+        approval_callback=approval_callback,
+        allow_permanent=not smart_denied,
+        smart_denied=smart_denied,
+    )
+    await _fire_approval_hook(
+        "post_approval_response",
+        command=command,
+        description=description,
+        pattern_key=pattern_key,
+        pattern_keys=[pattern_key],
+        session_key=session_key,
+        surface="cli",
+        choice=choice,
+    )
+
+    normalized_choice = str(choice).strip().lower()
+    if normalized_choice in {"once", "session", "always"}:
+        if normalized_choice == "session" and not smart_denied:
+            approve_session(session_key, pattern_key)
+        elif normalized_choice == "always" and not smart_denied:
+            approve_session(session_key, pattern_key)
+            approve_permanent(pattern_key)
+            await save_permanent_allowlist(_permanent_approved)
+        return {
+            "approved": True,
+            "message": None,
+            "user_approved": True,
+            "description": description,
+        }
+
+    outcome = "timeout" if normalized_choice == "timeout" else "denied"
+    return {
+        "approved": False,
+        "message": (
+            f"BLOCKED: Command {outcome} by the user. The user has NOT consented "
+            "to this action. Do NOT retry or rephrase it."
+        ),
+        "pattern_key": pattern_key,
+        "description": description,
+        "outcome": outcome,
+        "user_consent": False,
+    }
+
+
 async def check_all_command_guards(
     command: str,
     env_type: str,
@@ -2354,13 +2613,6 @@ async def check_all_command_guards(
     if _command_matches_permanent_allowlist(command):
         return {"approved": True, "message": None}
 
-    is_dangerous, pattern_key, description = detect_dangerous_command(command)
-    if not is_dangerous:
-        return {"approved": True, "message": None}
-    session_key = get_current_session_key()
-    if is_approved(session_key, pattern_key):
-        return {"approved": True, "message": None}
-
     interactive = os.getenv("HERMES_INTERACTIVE", "").strip().lower() in {
         "1",
         "true",
@@ -2374,17 +2626,43 @@ async def check_all_command_guards(
         "on",
     }
     if not interactive and not ask:
-        logger.warning(
-            "AUTO-APPROVED dangerous command in non-interactive context "
-            "(pattern: %s): %s",
-            pattern_key,
-            description,
-        )
         return {"approved": True, "message": None}
+
+    from tools.tirith_security import check_command_security
+
+    tirith_result = await check_command_security(command)
+    is_dangerous, pattern_key, description = detect_dangerous_command(command)
+    session_key = get_current_session_key()
+    warnings: list[tuple[str, str, bool]] = []
+    if tirith_result.get("action") in {"block", "warn"}:
+        findings = tirith_result.get("findings") or []
+        rule_id = findings[0].get("rule_id", "unknown") if findings else "unknown"
+        tirith_key = f"tirith:{rule_id}"
+        if not is_approved(session_key, tirith_key):
+            warnings.append(
+                (tirith_key, _format_tirith_description(tirith_result), True)
+            )
+    if is_dangerous and not is_approved(session_key, pattern_key):
+        warnings.append((pattern_key, description, False))
+    if not warnings:
+        return {"approved": True, "message": None}
+
+    pattern_key = warnings[0][0]
+    pattern_keys = [key for key, _, _ in warnings]
+    description = "; ".join(text for _, text, _ in warnings)
+    has_permanent_capable = any(not is_tirith for _, _, is_tirith in warnings)
 
     smart_denied = False
     if _get_approval_mode() == "smart":
+        observer_payload = await _prepare_smart_approval_observer(
+            command=command,
+            description=description,
+            pattern_key=pattern_key,
+            pattern_keys=pattern_keys,
+            session_key=session_key,
+        )
         verdict = await _smart_approve(command, description)
+        await _observe_smart_approval_verdict(observer_payload, verdict)
         if verdict == "approve":
             return {
                 "approved": True,
@@ -2404,21 +2682,47 @@ async def check_all_command_guards(
             "pattern_key": pattern_key,
             "description": description,
         }
+    await _fire_approval_hook(
+        "pre_approval_request",
+        command=command,
+        description=description,
+        pattern_key=pattern_key,
+        pattern_keys=pattern_keys,
+        session_key=session_key,
+        surface="cli",
+    )
     choice = await prompt_dangerous_approval(
         command,
         description,
         approval_callback=approval_callback,
-        allow_permanent=not smart_denied,
+        allow_permanent=has_permanent_capable and not smart_denied,
         smart_denied=smart_denied,
+    )
+    await _fire_approval_hook(
+        "post_approval_response",
+        command=command,
+        description=description,
+        pattern_key=pattern_key,
+        pattern_keys=pattern_keys,
+        session_key=session_key,
+        surface="cli",
+        choice=choice,
     )
     normalized_choice = str(choice).strip().lower()
     if normalized_choice in {"once", "session", "always"}:
-        if normalized_choice == "session" and not smart_denied:
-            approve_session(session_key, pattern_key)
-        elif normalized_choice == "always" and not smart_denied:
-            approve_session(session_key, pattern_key)
-            approve_permanent(pattern_key)
-            await save_permanent_allowlist(_permanent_approved)
+        if not smart_denied:
+            persist_permanently = False
+            for key, _, is_tirith in warnings:
+                if normalized_choice == "session" or (
+                    normalized_choice == "always" and is_tirith
+                ):
+                    approve_session(session_key, key)
+                elif normalized_choice == "always":
+                    approve_session(session_key, key)
+                    approve_permanent(key)
+                    persist_permanently = True
+            if persist_permanently:
+                await save_permanent_allowlist(_permanent_approved)
         return {
             "approved": True,
             "message": None,
@@ -2484,10 +2788,30 @@ async def request_tool_approval(
             "description": description,
         }
 
+    display_target = f"<{tool_name}> (plugin approval rule)"
+    await _fire_approval_hook(
+        "pre_approval_request",
+        command=display_target,
+        description=description,
+        pattern_key=pattern_key,
+        pattern_keys=[pattern_key],
+        session_key=session_key,
+        surface="cli",
+    )
     choice = await prompt_dangerous_approval(
-        f"<{tool_name}> (plugin approval rule)",
+        display_target,
         description,
         approval_callback=approval_callback,
+    )
+    await _fire_approval_hook(
+        "post_approval_response",
+        command=display_target,
+        description=description,
+        pattern_key=pattern_key,
+        pattern_keys=[pattern_key],
+        session_key=session_key,
+        surface="cli",
+        choice=choice,
     )
     normalized_choice = str(choice).strip().lower()
     if normalized_choice in {"once", "session", "always"}:
@@ -2511,3 +2835,50 @@ async def request_tool_approval(
         "outcome": outcome,
         "user_consent": False,
     }
+
+
+async def request_elicitation_consent(
+    message: str,
+    description: str,
+    *,
+    timeout_seconds: int | None = None,
+    surface: str = "mcp-elicitation",
+) -> str:
+    """Request per-call MCP consent through the active async user callback.
+
+    Returns one of ``"accept"``, ``"decline"``, or ``"cancel"`` and fails
+    closed when no interactive surface is active.  ``surface`` remains part of
+    the upstream public contract for caller attribution.
+    """
+    approval_callback = _elicitation_approval_callback.get()
+    if approval_callback is None:
+        logger.warning(
+            "Elicitation requested on %s but no native async callback is active",
+            surface,
+        )
+        return "decline"
+    if not inspect.iscoroutinefunction(inspect.unwrap(approval_callback)):
+        logger.error("Elicitation callback on %s is synchronous", surface)
+        return "decline"
+
+    question = f"{message}\n\n{description}"
+    try:
+        if timeout_seconds is None:
+            choice = await approval_callback(question, ["Approve", "Decline"])
+        else:
+            async with asyncio.timeout(timeout_seconds):
+                choice = await approval_callback(question, ["Approve", "Decline"])
+    except TimeoutError:
+        return "cancel"
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.error("Elicitation callback failed: %s", exc, exc_info=True)
+        return "decline"
+
+    normalized = str(choice or "").strip().lower()
+    if normalized in {"approve", "approved", "accept", "accepted", "yes", "allow"}:
+        return "accept"
+    if normalized in {"cancel", "cancelled", "canceled", "timeout"}:
+        return "cancel"
+    return "decline"

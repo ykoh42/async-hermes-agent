@@ -479,7 +479,6 @@ class Mem0MemoryProvider(MemoryProvider):
         assistant_content: str,
         *,
         session_id: str = "",
-        messages: List[Dict[str, Any]] | None = None,
     ) -> None:
         """Send the turn to Mem0 for server-side fact extraction (non-blocking)."""
         if self._backend is None or self._is_breaker_open():

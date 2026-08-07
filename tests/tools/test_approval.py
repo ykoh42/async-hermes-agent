@@ -18,6 +18,7 @@ from tools.approval import (
     _smart_approve,
     approve_session,
     check_all_command_guards,
+    check_dangerous_command,
     clear_session,
     detect_dangerous_command,
     detect_hardline_command,
@@ -27,6 +28,36 @@ from tools.approval import (
     save_permanent_allowlist,
     set_current_session_key,
 )
+
+
+@pytest.mark.asyncio
+async def test_dangerous_command_public_api_remains_pattern_only(monkeypatch):
+    async def load_config_readonly():
+        return {"approvals": {"mode": "manual"}}
+
+    async def approve_once(*_args, **_kwargs):
+        return "once"
+
+    async def unexpected_tirith(_command):
+        raise AssertionError("pattern-only API must not invoke Tirith")
+
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly",
+        load_config_readonly,
+    )
+    monkeypatch.setattr(
+        "tools.tirith_security.check_command_security",
+        unexpected_tirith,
+    )
+    monkeypatch.setenv("HERMES_INTERACTIVE", "1")
+
+    result = await check_dangerous_command(
+        "rm -rf build",
+        "local",
+        approval_callback=approve_once,
+    )
+
+    assert result["approved"] is True
 
 
 class TestApprovalModeParsing:

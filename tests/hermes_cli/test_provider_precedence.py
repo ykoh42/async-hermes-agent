@@ -122,10 +122,13 @@ class TestProviderPrecedence:
         from hermes_cli import runtime_provider
 
         monkeypatch.setattr(runtime_provider, "load_pool", _load_pool)
+        async def _resolve_requested_provider(requested):
+            return "auto"
+
         monkeypatch.setattr(
             runtime_provider,
             "resolve_requested_provider",
-            lambda requested, config: "auto",
+            _resolve_requested_provider,
         )
         runtime = await runtime_provider.resolve_runtime_provider(requested="auto")
         assert runtime["provider"] == "openrouter"

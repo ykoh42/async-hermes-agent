@@ -2,6 +2,7 @@
 
 import asyncio
 import contextvars
+import inspect
 from types import SimpleNamespace
 
 import pytest
@@ -10,7 +11,21 @@ pytest.importorskip("mcp.types")
 
 from mcp.types import ElicitResult
 
+from tools.approval import (
+    _elicitation_approval_callback,
+    request_elicitation_consent,
+)
 from tools.mcp_tool import ElicitationHandler, _format_elicitation_schema_summary
+
+
+def _callback_context(callback, context=None):
+    captured = context.copy() if context is not None else contextvars.copy_context()
+    captured.run(_elicitation_approval_callback.set, callback)
+    return captured
+
+
+def test_public_consent_router_is_native_async() -> None:
+    assert inspect.iscoroutinefunction(request_elicitation_consent)
 
 
 def test_schema_summary_describes_requested_fields() -> None:
@@ -54,8 +69,7 @@ async def test_form_elicitation_awaits_native_clarify_callback() -> None:
         return "Approve"
 
     owner = SimpleNamespace(
-        _pending_call_context=contextvars.copy_context(),
-        _pending_elicitation_callback=clarify,
+        _pending_call_context=_callback_context(clarify),
     )
     handler = ElicitationHandler("pay", {"timeout": 5}, owner=owner)
     params = SimpleNamespace(
@@ -97,8 +111,7 @@ async def test_form_elicitation_replays_call_context() -> None:
     finally:
         probe.reset(token)
     owner = SimpleNamespace(
-        _pending_call_context=captured,
-        _pending_elicitation_callback=clarify,
+        _pending_call_context=_callback_context(clarify, captured),
     )
     handler = ElicitationHandler("pay", {"timeout": 5}, owner=owner)
 
@@ -117,8 +130,7 @@ async def test_form_elicitation_propagates_caller_cancel() -> None:
         return "Cancel"
 
     owner = SimpleNamespace(
-        _pending_call_context=None,
-        _pending_elicitation_callback=clarify,
+        _pending_call_context=_callback_context(clarify),
     )
     handler = ElicitationHandler("pay", {"timeout": 5}, owner=owner)
 
@@ -137,8 +149,7 @@ async def test_form_elicitation_exception_fails_closed() -> None:
         raise RuntimeError("approval unavailable")
 
     owner = SimpleNamespace(
-        _pending_call_context=None,
-        _pending_elicitation_callback=clarify,
+        _pending_call_context=_callback_context(clarify),
     )
     handler = ElicitationHandler("pay", {"timeout": 5}, owner=owner)
 
@@ -148,7 +159,39 @@ async def test_form_elicitation_exception_fails_closed() -> None:
     )
 
     assert result.action == "decline"
-    assert handler.metrics["errors"] == 1
+    assert handler.metrics["declined"] == 1
+    assert handler.metrics["errors"] == 0
+
+
+@pytest.mark.asyncio
+async def test_form_elicitation_propagates_task_cancellation() -> None:
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def clarify(_question, _choices):
+        started.set()
+        try:
+            await asyncio.Future()
+        finally:
+            cancelled.set()
+
+    owner = SimpleNamespace(
+        _pending_call_context=_callback_context(clarify),
+    )
+    handler = ElicitationHandler("pay", {"timeout": 5}, owner=owner)
+    task = asyncio.create_task(
+        handler(
+            context=None,
+            params=SimpleNamespace(mode="form", message="Confirm", requested_schema={}),
+        )
+    )
+    await started.wait()
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert cancelled.is_set()
 
 
 @pytest.mark.asyncio
@@ -162,8 +205,7 @@ async def test_form_elicitation_timeout_cancels_callback() -> None:
             cancelled.set()
 
     owner = SimpleNamespace(
-        _pending_call_context=None,
-        _pending_elicitation_callback=clarify,
+        _pending_call_context=_callback_context(clarify),
     )
     handler = ElicitationHandler("pay", {"timeout": 0.01}, owner=owner)
     handler.timeout = 0.01
@@ -181,8 +223,7 @@ async def test_form_elicitation_timeout_cancels_callback() -> None:
 @pytest.mark.asyncio
 async def test_sync_elicitation_callback_fails_closed() -> None:
     owner = SimpleNamespace(
-        _pending_call_context=None,
-        _pending_elicitation_callback=lambda *_args: "Approve",
+        _pending_call_context=_callback_context(lambda *_args: "Approve"),
     )
     handler = ElicitationHandler("pay", {"timeout": 5}, owner=owner)
 

@@ -520,9 +520,13 @@ async def test_auxiliary_provider_returns_native_acp_client(monkeypatch):
             }
         ),
     )
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly",
+        AsyncMock(return_value={}),
+    )
 
     client, model = await auxiliary_client.resolve_provider_client(
-        "copilot-acp", "gpt-4.1", config={}
+        "copilot-acp", "gpt-4.1"
     )
     try:
         assert isinstance(client, CopilotACPClient)

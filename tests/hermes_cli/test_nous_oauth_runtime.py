@@ -15,14 +15,17 @@ from hermes_cli import auth
 
 def _jwt(*, expires_in: int = 3600) -> str:
     header = base64.urlsafe_b64encode(b'{"alg":"none"}').decode().rstrip("=")
-    payload = base64.urlsafe_b64encode(
-        json.dumps(
-            {
+    payload = (
+        base64
+        .urlsafe_b64encode(
+            json.dumps({
                 "exp": int(time.time()) + expires_in,
                 "scope": auth.NOUS_INFERENCE_INVOKE_SCOPE,
-            }
-        ).encode()
-    ).decode().rstrip("=")
+            }).encode()
+        )
+        .decode()
+        .rstrip("=")
+    )
     return f"{header}.{payload}.signature"
 
 
@@ -49,6 +52,7 @@ def _state(**overrides):
 
 @pytest.fixture
 def nous_auth_store(tmp_path, monkeypatch):
+    auth._RESOLVE_TOKEN_CACHE = None
     hermes_home = tmp_path / "hermes"
     shared_home = tmp_path / "shared"
     hermes_home.mkdir()
@@ -67,6 +71,74 @@ def nous_auth_store(tmp_path, monkeypatch):
         auth_file.write_text(json.dumps(payload))
 
     return auth_file, shared_home / auth.NOUS_SHARED_STORE_FILENAME, write
+
+
+@pytest.mark.asyncio
+async def test_resolve_nous_access_token_returns_portal_token_not_agent_key(
+    nous_auth_store,
+    monkeypatch,
+):
+    _auth_file, _shared_file, write = nous_auth_store
+    access_token = _jwt()
+    write(_state(access_token=access_token, agent_key="inference-agent-key"))
+    async_client = httpx.AsyncClient
+    transport = httpx.MockTransport(
+        lambda _request: pytest.fail(
+            "fresh access token must not call the token endpoint"
+        )
+    )
+    monkeypatch.setattr(
+        auth.httpx,
+        "AsyncClient",
+        lambda **kwargs: async_client(transport=transport, **kwargs),
+    )
+
+    resolved = await auth.resolve_nous_access_token()
+
+    assert resolved == access_token
+    assert resolved != "inference-agent-key"
+
+
+@pytest.mark.asyncio
+async def test_resolve_nous_access_token_refreshes_and_returns_portal_token(
+    nous_auth_store,
+    monkeypatch,
+):
+    auth_file, shared_file, write = nous_auth_store
+    write(
+        _state(
+            access_token=_jwt(expires_in=-60),
+            expires_at="1970-01-01T00:00:00+00:00",
+            agent_key="stale-inference-agent-key",
+        )
+    )
+    refreshed_access = _jwt(expires_in=7200)
+    async_client = httpx.AsyncClient
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(
+            200,
+            json={
+                "access_token": refreshed_access,
+                "refresh_token": "rotated-refresh",
+                "expires_in": 7200,
+                "scope": auth.DEFAULT_NOUS_SCOPE,
+            },
+        )
+    )
+    monkeypatch.setattr(
+        auth.httpx,
+        "AsyncClient",
+        lambda **kwargs: async_client(transport=transport, **kwargs),
+    )
+
+    resolved = await auth.resolve_nous_access_token()
+
+    assert resolved == refreshed_access
+    persisted = json.loads(auth_file.read_text())["providers"]["nous"]
+    assert persisted["access_token"] == refreshed_access
+    assert persisted["refresh_token"] == "rotated-refresh"
+    assert persisted["agent_key"] == "stale-inference-agent-key"
+    assert json.loads(shared_file.read_text())["access_token"] == refreshed_access
 
 
 @pytest.mark.asyncio

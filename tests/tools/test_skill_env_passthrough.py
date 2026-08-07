@@ -58,7 +58,7 @@ class TestSkillViewRegistersPassthrough:
         result = json.loads(await skill_view(name="test-skill"))
 
         assert result["success"] is True
-        assert is_env_passthrough("TENOR_API_KEY")
+        assert await is_env_passthrough("TENOR_API_KEY")
 
 
     @pytest.mark.asyncio
@@ -75,4 +75,4 @@ class TestSkillViewRegistersPassthrough:
 
         assert result["success"] is True
         from tools.env_passthrough import get_all_passthrough
-        assert len(get_all_passthrough()) == 0
+        assert len(await get_all_passthrough()) == 0

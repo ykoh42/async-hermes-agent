@@ -5,10 +5,13 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import os
 from pathlib import Path
 from typing import List, Optional
 
-import os
+import aiofiles
+import aiofiles.os
+import httpx
 
 logger = logging.getLogger(__name__)
 
@@ -124,19 +127,18 @@ def _extract_chatgpt_account_id(access_token: str) -> Optional[str]:
         return None
 
 
-def _fetch_models_from_api(access_token: str) -> List[str]:
+async def _fetch_models_from_api(access_token: str) -> List[str]:
     """Fetch available models from the Codex API. Returns visible models sorted by priority."""
     try:
-        import httpx
         headers = {"Authorization": f"Bearer {access_token}"}
         acct_id = _extract_chatgpt_account_id(access_token)
         if acct_id:
             headers["ChatGPT-Account-Id"] = acct_id
-        resp = httpx.get(
-            "https://chatgpt.com/backend-api/codex/models?client_version=1.0.0",
-            headers=headers,
-            timeout=10,
-        )
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(
+                "https://chatgpt.com/backend-api/codex/models?client_version=1.0.0",
+                headers=headers,
+            )
         if resp.status_code != 200:
             return []
         data = resp.json()
@@ -168,16 +170,17 @@ def _fetch_models_from_api(access_token: str) -> List[str]:
     return _add_forward_compat_models([slug for _, slug in sortable])
 
 
-def _read_default_model(codex_home: Path) -> Optional[str]:
+async def _read_default_model(codex_home: Path) -> Optional[str]:
     config_path = codex_home / "config.toml"
-    if not config_path.exists():
+    if not await aiofiles.os.path.exists(config_path):
         return None
     try:
         import tomllib
     except Exception:
         return None
     try:
-        payload = tomllib.loads(config_path.read_text(encoding="utf-8"))
+        async with aiofiles.open(config_path, encoding="utf-8") as config_file:
+            payload = tomllib.loads(await config_file.read())
     except Exception:
         return None
     model = payload.get("model") if isinstance(payload, dict) else None
@@ -186,12 +189,13 @@ def _read_default_model(codex_home: Path) -> Optional[str]:
     return None
 
 
-def _read_cache_models(codex_home: Path) -> List[str]:
+async def _read_cache_models(codex_home: Path) -> List[str]:
     cache_path = codex_home / "models_cache.json"
-    if not cache_path.exists():
+    if not await aiofiles.os.path.exists(cache_path):
         return []
     try:
-        raw = json.loads(cache_path.read_text(encoding="utf-8"))
+        async with aiofiles.open(cache_path, encoding="utf-8") as cache_file:
+            raw = json.loads(await cache_file.read())
     except Exception:
         return []
 
@@ -223,7 +227,7 @@ def _read_cache_models(codex_home: Path) -> List[str]:
     return deduped
 
 
-def get_codex_model_ids(access_token: Optional[str] = None) -> List[str]:
+async def get_codex_model_ids(access_token: Optional[str] = None) -> List[str]:
     """Return available Codex model IDs, trying API first, then local sources.
     
     Resolution order: API (live, if token provided) > config.toml default >
@@ -235,16 +239,16 @@ def get_codex_model_ids(access_token: Optional[str] = None) -> List[str]:
 
     # Try live API if we have a token
     if access_token:
-        api_models = _fetch_models_from_api(access_token)
+        api_models = await _fetch_models_from_api(access_token)
         if api_models:
             return _add_forward_compat_models(api_models)
 
     # Fall back to local sources
-    default_model = _read_default_model(codex_home)
+    default_model = await _read_default_model(codex_home)
     if default_model:
         ordered.append(default_model)
 
-    for model_id in _read_cache_models(codex_home):
+    for model_id in await _read_cache_models(codex_home):
         if model_id not in ordered:
             ordered.append(model_id)
 

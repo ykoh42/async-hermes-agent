@@ -1011,7 +1011,7 @@ async def test_load_pool_api_key_path_skips_oauth_autodiscovery(tmp_path, monkey
     monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
     _write_auth_store(tmp_path, {"version": 1, "providers": {}})
     monkeypatch.setattr(
-        "agent.credential_pool._is_provider_explicitly_configured",
+        "hermes_cli.auth.is_provider_explicitly_configured",
         AsyncMock(return_value=True),
     )
 
@@ -1088,7 +1088,7 @@ async def test_load_pool_api_key_path_prunes_stale_oauth_entries(tmp_path, monke
         },
     )
     monkeypatch.setattr(
-        "agent.credential_pool._is_provider_explicitly_configured",
+        "hermes_cli.auth.is_provider_explicitly_configured",
         AsyncMock(return_value=True),
     )
     monkeypatch.setattr(
@@ -1124,7 +1124,7 @@ async def test_load_pool_oauth_path_still_autodiscovers(tmp_path, monkeypatch):
     monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
     _write_auth_store(tmp_path, {"version": 1, "providers": {}})
     monkeypatch.setattr(
-        "agent.credential_pool._is_provider_explicitly_configured",
+        "hermes_cli.auth.is_provider_explicitly_configured",
         AsyncMock(return_value=True),
     )
 
@@ -1308,7 +1308,7 @@ async def test_load_pool_does_not_seed_claude_code_when_anthropic_not_configured
     )
     # User configured kimi-coding, NOT anthropic
     monkeypatch.setattr(
-        "agent.credential_pool._is_provider_explicitly_configured",
+        "hermes_cli.auth.is_provider_explicitly_configured",
         AsyncMock(side_effect=lambda pid, **_: pid == "kimi-coding"),
     )
 
@@ -1610,7 +1610,7 @@ async def test_nous_seed_from_singletons_preserves_obtained_at_timestamps(tmp_pa
 class TestLeastUsedStrategy:
     """Regression: least_used strategy must increment request_count on select."""
 
-    async def test_request_count_increments(self):
+    async def test_request_count_increments(self, monkeypatch):
         """Each select() call should increment the chosen entry's request_count."""
         from agent.credential_pool import CredentialPool, PooledCredential, STRATEGY_LEAST_USED
 
@@ -1620,7 +1620,11 @@ class TestLeastUsedStrategy:
             PooledCredential(provider="test", id="b", label="b", auth_type="api_key",
                              source="b", access_token="tok-b", priority=1, request_count=0),
         ]
-        pool = CredentialPool("test", entries, strategy=STRATEGY_LEAST_USED)
+        monkeypatch.setattr(
+            "agent.credential_pool.get_pool_strategy",
+            AsyncMock(return_value=STRATEGY_LEAST_USED),
+        )
+        pool = CredentialPool("test", entries)
 
         # First select should pick entry with lowest count (both 0 → first)
         e1 = await pool.select()
@@ -1796,7 +1800,7 @@ async def _make_anthropic_claude_code_pool(tmp_path, monkeypatch, *, access_toke
     monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
     _write_auth_store(tmp_path, {"version": 1, "credential_pool": {}})
     monkeypatch.setattr(
-        "agent.credential_pool._is_provider_explicitly_configured",
+        "hermes_cli.auth.is_provider_explicitly_configured",
         AsyncMock(return_value=True),
     )
     monkeypatch.setattr(

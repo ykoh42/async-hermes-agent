@@ -58,42 +58,43 @@ class TestSteerDrain:
 
 
 
+@pytest.mark.asyncio
 class TestActiveTurnRedirect:
-    def test_rejects_when_no_turn_is_active(self):
+    async def test_rejects_when_no_turn_is_active(self):
         agent = _bare_agent()
-        assert agent.redirect("change course") is False
+        assert await agent.redirect("change course") is False
         assert agent._pending_redirect is None
 
-    def test_cancels_only_an_active_model_request(self):
+    async def test_cancels_only_an_active_model_request(self):
         agent = _bare_agent()
         agent._model_request_active.set()
 
-        assert agent.redirect("use Postgres") is True
+        assert await agent.redirect("use Postgres") is True
         assert agent._pending_redirect == "use Postgres"
         assert agent._interrupt_requested is True
         assert agent._interrupt_message is None
 
-    def test_multiple_redirects_preserve_message_boundaries(self):
+    async def test_multiple_redirects_preserve_message_boundaries(self):
         agent = _bare_agent()
         agent._model_request_active.set()
 
-        assert agent.redirect("first correction") is True
-        assert agent.redirect("second correction") is True
+        assert await agent.redirect("first correction") is True
+        assert await agent.redirect("second correction") is True
         assert agent._pending_redirect == (
             "first correction\n\n"
             "[Additional user correction]\n"
             "second correction"
         )
 
-    def test_hard_interrupt_wins_over_new_redirect(self):
+    async def test_hard_interrupt_wins_over_new_redirect(self):
         agent = _bare_agent()
         agent._model_request_active.set()
         agent._interrupt_requested = True
 
-        assert agent.redirect("too late") is False
+        assert await agent.redirect("too late") is False
         assert agent._pending_redirect is None
 
-    def test_reasoning_deltas_are_display_only(self):
+    async def test_reasoning_deltas_are_display_only(self):
         """Streamed reasoning must never accumulate into replayable transcript
         state — an assistant checkpoint that inlines chain-of-thought trips
         Anthropic's output classifier and permanently bricks the session
@@ -108,18 +109,18 @@ class TestActiveTurnRedirect:
         assert seen == ["visible provider thinking"]
         assert not getattr(agent, "_current_streamed_reasoning_text", "")
 
-    def test_response_completion_before_redirect_rejects_correction(self):
+    async def test_response_completion_before_redirect_rejects_correction(self):
         agent = _bare_agent()
         agent._model_request_active.set()
         agent._model_request_active.clear()
 
-        assert agent.redirect("late correction") is False
+        assert await agent.redirect("late correction") is False
         assert agent._pending_redirect is None
 
-    def test_hard_stop_supersedes_accepted_redirect(self):
+    async def test_hard_stop_supersedes_accepted_redirect(self):
         agent = _bare_agent()
         agent._model_request_active.set()
-        assert agent.redirect("change course") is True
+        assert await agent.redirect("change course") is True
 
         agent.interrupt("stop requested")
 
@@ -127,11 +128,11 @@ class TestActiveTurnRedirect:
         assert agent._interrupt_message == "stop requested"
         assert agent._pending_redirect is None
 
-    def test_redirect_during_tool_execution_uses_safe_steer_boundary(self):
+    async def test_redirect_during_tool_execution_uses_safe_steer_boundary(self):
         agent = _bare_agent()
         agent._executing_tools = True
 
-        assert agent.redirect("also check migrations") is True
+        assert await agent.redirect("also check migrations") is True
         assert agent._pending_redirect is None
         assert agent._pending_steer == "also check migrations"
         assert agent._interrupt_requested is False

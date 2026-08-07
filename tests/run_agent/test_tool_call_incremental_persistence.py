@@ -16,11 +16,18 @@ from agent.tool_executor import (
 from agent.agent_runtime_helpers import invoke_tool
 
 
-def _tool_call(name: str, call_id: str) -> SimpleNamespace:
+def _tool_call(
+    name: str,
+    call_id: str,
+    arguments: dict | None = None,
+) -> SimpleNamespace:
     return SimpleNamespace(
         id=call_id,
         type="function",
-        function=SimpleNamespace(name=name, arguments="{}"),
+        function=SimpleNamespace(
+            name=name,
+            arguments=json.dumps(arguments or {}),
+        ),
     )
 
 
@@ -43,6 +50,8 @@ def _agent(flush):
         _current_user_task=None,
         session_id="session-1",
         valid_tool_names={"read_file", "terminal"},
+        enabled_toolsets=None,
+        disabled_toolsets=None,
         _memory_store=None,
         _todo_store=None,
         clarify_callback=None,
@@ -328,3 +337,85 @@ async def test_external_memory_tool_uses_native_manager_dispatch():
     memory_dispatch.assert_awaited_once_with("external_recall", {})
     registry_dispatch.assert_not_awaited()
     assert json.loads(messages[0]["content"]) == {"memories": ["fact"]}
+
+
+@pytest.mark.asyncio
+async def test_tool_call_bridge_unwraps_before_policy_and_mcp_dispatch():
+    from tools.registry import registry
+
+    tool_name = "mcp_async_bridge_read"
+    handler = AsyncMock(return_value=json.dumps({"ok": True}))
+    registry.register(
+        name=tool_name,
+        handler=handler,
+        schema={
+            "name": tool_name,
+            "description": "Read through the async bridge.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+        toolset="mcp-async-bridge-test",
+    )
+
+    agent = _agent(AsyncMock(return_value=True))
+    agent.enabled_toolsets = ["mcp-async-bridge-test"]
+    agent.clarify_callback = object()
+    call = _tool_call(
+        "tool_call",
+        "bridge-1",
+        {"name": tool_name, "arguments": {}},
+    )
+    messages = []
+
+    with _native_policy_path() as policy:
+        await execute_tool_calls_sequential(
+            agent,
+            SimpleNamespace(tool_calls=[call]),
+            messages,
+            "task-1",
+            finalize=False,
+        )
+
+    assert policy.await_args.args[0] == tool_name
+    handler.assert_awaited_once()
+    assert handler.await_args.kwargs["elicitation_callback"] is agent.clarify_callback
+    assert messages[0]["name"] == tool_name
+    assert json.loads(messages[0]["content"]) == {"ok": True}
+
+
+@pytest.mark.asyncio
+async def test_tool_call_bridge_cannot_escape_session_toolset_scope():
+    from tools.registry import registry
+
+    tool_name = "mcp_async_bridge_out_of_scope"
+    handler = AsyncMock(return_value=json.dumps({"executed": True}))
+    registry.register(
+        name=tool_name,
+        handler=handler,
+        schema={
+            "name": tool_name,
+            "description": "An out-of-scope bridge tool.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+        toolset="mcp-async-bridge-out-of-scope",
+    )
+
+    agent = _agent(AsyncMock(return_value=True))
+    agent.enabled_toolsets = ["mcp-unrelated-session-scope"]
+    call = _tool_call(
+        "tool_call",
+        "bridge-2",
+        {"name": tool_name, "arguments": {}},
+    )
+    messages = []
+
+    with _native_policy_path():
+        await execute_tool_calls_sequential(
+            agent,
+            SimpleNamespace(tool_calls=[call]),
+            messages,
+            "task-1",
+            finalize=False,
+        )
+
+    handler.assert_not_awaited()
+    assert "not available in this session" in messages[0]["content"]

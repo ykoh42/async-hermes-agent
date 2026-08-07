@@ -54,6 +54,7 @@ def _build_mock_pool(entries: list[dict], *, strategy: str = "round_robin"):
         entries=[PooledCredential.from_dict("openai-codex", e) for e in entries],
     )
     pool._strategy = strategy
+    pool._strategy_loaded = True
     return pool
 
 

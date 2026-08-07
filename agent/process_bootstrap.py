@@ -121,11 +121,15 @@ def _get_proxy_for_base_url(base_url: Optional[str]) -> Optional[str]:
 def build_keepalive_http_client(
     base_url: str = "",
     *,
+    async_mode: bool = False,
     verify: Any = True,
 ) -> Optional[Any]:
     """Build the native async httpx client for OpenAI SDK calls.
 
-    The Hermes runtime never hides a blocking transport behind an async API.
+    The Hermes runtime always returns the native async transport. The
+    upstream ``async_mode`` argument is retained so existing callers only need
+    to add ``await`` at their async boundary; it no longer selects a sync
+    client.
 
     Uses explicit ``HTTPS_PROXY`` / ``NO_PROXY`` env vars via
     ``_get_proxy_for_base_url``. Plain no-proxy mounts disable httpx's default

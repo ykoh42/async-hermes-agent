@@ -2996,6 +2996,12 @@ class AIAgent:
         if hard_cancel:
             self._hard_interrupt_requested.set()
 
+        if getattr(self, "api_mode", None) == "codex_app_server":
+            codex_session = getattr(self, "_codex_session", None)
+            request_interrupt = getattr(codex_session, "request_interrupt", None)
+            if callable(request_interrupt):
+                request_interrupt()
+
         # The active native client registers an abort callback so a sibling
         # service task can shut down the in-flight request promptly.
         _abort_active_request = getattr(self, "_active_request_abort", None)
@@ -3076,7 +3082,7 @@ class AIAgent:
         self._pending_steer = (existing + "\n" + cleaned) if existing else cleaned
         return True
 
-    def redirect(self, text: str) -> bool:
+    async def redirect(self, text: str) -> bool:
         """Redirect the active turn without converting it into a new task.
 
         During a normal Hermes model request this cancels only that request;
@@ -3090,6 +3096,17 @@ class AIAgent:
         if not text or not text.strip():
             return False
         cleaned = text.strip()
+
+        if getattr(self, "api_mode", None) == "codex_app_server":
+            codex_session = getattr(self, "_codex_session", None)
+            request_steer = getattr(codex_session, "request_steer", None)
+            if not callable(request_steer) or self._interrupt_requested:
+                return False
+            try:
+                return bool(await request_steer(cleaned))
+            except Exception:
+                logger.debug("Codex app-server turn/steer failed", exc_info=True)
+                return False
 
         # Never kill a tool merely to deliver conversational guidance. The
         # existing steer drain puts it on the final tool result before the next
@@ -3926,6 +3943,15 @@ class AIAgent:
                     pass
         except Exception:
             pass
+
+        codex_session = getattr(self, "_codex_session", None)
+        if codex_session is not None:
+            try:
+                await codex_session.close()
+            except Exception:
+                logger.debug("Codex app-server session close failed", exc_info=True)
+            finally:
+                self._codex_session = None
 
         # Native clients are owned by the agent and closed on the event loop
         # that consumed them. ``client`` covers OpenAI-compatible, Codex,
@@ -4886,6 +4912,27 @@ class AIAgent:
         if pool is None:
             return False
         return await pool.has_available()
+
+    async def _run_codex_app_server_turn(
+        self,
+        *,
+        user_message: str,
+        original_user_message: Any,
+        messages: List[Dict[str, Any]],
+        effective_task_id: str,
+        should_review_memory: bool = False,
+    ) -> Dict[str, Any]:
+        """Forwarder — see ``agent.codex_runtime.run_codex_app_server_turn``."""
+        from agent.codex_runtime import run_codex_app_server_turn
+
+        return await run_codex_app_server_turn(
+            self,
+            user_message=user_message,
+            original_user_message=original_user_message,
+            messages=messages,
+            effective_task_id=effective_task_id,
+            should_review_memory=should_review_memory,
+        )
 
     async def _execute_model_request(
         self,
@@ -6548,9 +6595,6 @@ class AIAgent:
                     on_commit_overrun=_on_commit_overrun,
                     fence=active_fence,
                     telemetry_agent=self,
-                    hard_cancel_event=getattr(
-                        self, "_hard_interrupt_requested", None
-                    ),
                 )
                 try:
                     from hermes_logging import set_session_context

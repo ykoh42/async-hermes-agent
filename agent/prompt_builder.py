@@ -21,14 +21,14 @@ from typing import Optional
 
 from agent.runtime_cwd import resolve_agent_cwd
 from agent.skill_utils import (
-    EXCLUDED_SKILL_DIRS,
     ORG_ACTIVE_MARKER,
     ORG_MIRROR_DIR_NAME,
     ORG_PROVENANCE_FILE,
-    SKILL_SUPPORT_DIRS,
     extract_skill_conditions,
     extract_skill_description,
-    org_id_of_path,
+    get_disabled_skill_names as _get_disabled_skill_names,
+    get_external_skills_dirs as _external_skills_dirs,
+    iter_skill_index_files as _iter_skill_index_files,
     parse_frontmatter,
     skill_matches_environment,
     skill_matches_platform,
@@ -1065,47 +1065,6 @@ async def _get_context_file_max_chars(
     return _dynamic_context_file_max_chars(context_length)
 
 
-async def _get_disabled_skill_names(platform: str | None = None) -> set[str]:
-    """Read skill disable rules without the synchronous skill-utils loader."""
-    try:
-        from hermes_cli.config import get_config_path
-        import yaml
-
-        config_path = get_config_path()
-        if not await aiofiles.os.path.isfile(config_path):
-            return set()
-        async with aiofiles.open(config_path, encoding="utf-8") as handle:
-            parsed = yaml.safe_load(await handle.read()) or {}
-        skills_cfg = parsed.get("skills") if isinstance(parsed, dict) else None
-        if not isinstance(skills_cfg, dict):
-            return set()
-        resolved_platform = platform or os.environ.get("HERMES_PLATFORM")
-        if not resolved_platform:
-            session_context = sys.modules.get("gateway.session_context")
-            get_session_env = getattr(session_context, "get_session_env", None)
-            if callable(get_session_env):
-                resolved_platform = get_session_env("HERMES_SESSION_PLATFORM") or ""
-
-        def _normalize(values: object) -> set[str]:
-            if values is None:
-                return set()
-            if isinstance(values, str):
-                values = [values]
-            return {str(value).strip() for value in values if str(value).strip()}
-
-        disabled = _normalize(skills_cfg.get("disabled"))
-        if resolved_platform:
-            platform_disabled = (skills_cfg.get("platform_disabled") or {}).get(
-                resolved_platform
-            )
-            disabled |= _normalize(platform_disabled)
-        return disabled
-    except asyncio.CancelledError:
-        raise
-    except Exception as exc:
-        logger.debug("Could not read disabled skills asynchronously: %s", exc)
-        return set()
-
 # Collect truncation warnings so the caller (run_agent) can surface them.
 # A ContextVar (not a module-global list) isolates accumulation per thread /
 # per async task, so concurrent gateway-session prompt builds can't drain or
@@ -1168,17 +1127,6 @@ def clear_skills_system_prompt_cache(*, clear_snapshot: bool = False) -> None:
 
 
 
-
-
-async def _iter_skill_index_files(skills_dir: Path, filename: str):
-    """Yield skill index files without blocking the conversation loop."""
-    # Keep one directory-walking policy for both the model-facing skill tool
-    # and prompt discovery.  The import is lazy to avoid making prompt
-    # construction import the registry during module startup.
-    from tools.skills_tool import _iter_skill_index_files as _iter
-
-    async for path in _iter(skills_dir, filename):
-        yield path
 
 
 async def _build_skills_manifest(skills_dir: Path) -> dict[str, list[int]]:
@@ -1392,8 +1340,6 @@ async def build_skills_system_prompt(
     """
     skills_dir = get_skills_dir()
     try:
-        from tools.skills_tool import _external_skills_dirs
-
         external_dirs = await _external_skills_dirs()
     except Exception:
         external_dirs = []

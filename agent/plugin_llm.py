@@ -610,11 +610,14 @@ class PluginLlm:
         *,
         plugin_id: str,
         policy_loader: Optional[Callable[[str], Awaitable[_TrustPolicy]]] = None,
-        caller: Optional[Callable[..., Awaitable[Any]]] = None,
+        sync_caller: Optional[Callable[..., Any]] = None,
+        async_caller: Optional[Callable[..., Awaitable[Any]]] = None,
     ) -> None:
+        if sync_caller is not None:
+            raise TypeError("Plugin LLM callers must be async")
         self._plugin_id = plugin_id
         self._policy_loader = policy_loader or _resolve_trust_policy
-        self._caller = caller
+        self._async_caller = async_caller
 
     async def complete(
         self,
@@ -629,7 +632,15 @@ class PluginLlm:
         profile: Optional[str] = None,
         purpose: Optional[str] = None,
     ) -> PluginLlmCompleteResult:
-        """Run a host-owned completion against the active model."""
+        """Run a host-owned chat completion against the user's active model.
+
+        ``messages`` is the standard OpenAI shape. ``provider``,
+        ``model``, ``agent_id``, and ``profile`` follow the same
+        explicit shape as the host's main config (``model.provider``
+        + ``model.model``). Each is independently gated by
+        ``plugins.entries.<id>.llm.allow_*_override`` (see module
+        docstring).
+        """
         if not inspect.iscoroutinefunction(self._policy_loader):
             raise TypeError("Plugin LLM policy loaders must be async")
         policy = await self._policy_loader(self._plugin_id)
@@ -651,7 +662,7 @@ class PluginLlm:
         )
         text = _extract_text(response)
         usage = _extract_usage(response)
-        return PluginLlmCompleteResult(
+        result = PluginLlmCompleteResult(
             text=text,
             provider=real_provider,
             model=real_model,
@@ -663,6 +674,13 @@ class PluginLlm:
                 "profile": eff_profile or "",
             },
         )
+        logger.info(
+            "plugin_llm.complete plugin=%s provider=%s model=%s purpose=%s "
+            "tokens=%d",
+            self._plugin_id, real_provider, real_model, purpose or "",
+            usage.total_tokens,
+        )
+        return result
 
     async def complete_structured(
         self,
@@ -682,7 +700,18 @@ class PluginLlm:
         profile: Optional[str] = None,
         purpose: Optional[str] = None,
     ) -> PluginLlmStructuredResult:
-        """Run a bounded host-owned structured completion."""
+        """Run a bounded host-owned structured completion.
+
+        ``input`` accepts text and image blocks (see
+        :class:`PluginLlmTextInput` / :class:`PluginLlmImageInput`). When
+        ``json_mode=True`` or ``json_schema`` is provided, the response
+        is parsed and (if a schema is given) validated; the parsed value
+        is returned in :attr:`PluginLlmStructuredResult.parsed`.
+
+        Validation requires the optional ``jsonschema`` package. When it
+        isn't installed, JSON mode still works but schema enforcement is
+        skipped with a debug log.
+        """
         if not instructions or not instructions.strip():
             raise ValueError("complete_structured requires non-empty instructions")
         if not input:
@@ -722,7 +751,7 @@ class PluginLlm:
         parsed, content_type = _parse_structured_text(
             text=text, json_mode=json_mode, json_schema=json_schema
         )
-        return PluginLlmStructuredResult(
+        result = PluginLlmStructuredResult(
             text=text,
             provider=real_provider,
             model=real_model,
@@ -737,6 +766,13 @@ class PluginLlm:
                 "schema_name": schema_name or "",
             },
         )
+        logger.info(
+            "plugin_llm.complete_structured plugin=%s provider=%s model=%s "
+            "purpose=%s content_type=%s tokens=%d",
+            self._plugin_id, real_provider, real_model, purpose or "",
+            content_type, usage.total_tokens,
+        )
+        return result
 
     # -- internals ---------------------------------------------------------
 
@@ -774,8 +810,8 @@ class PluginLlm:
         timeout: Optional[float],
         extra_body: Optional[Dict[str, Any]] = None,
     ) -> tuple[str, str, Any]:
-        if self._caller is not None:
-            return await self._caller(
+        if self._async_caller is not None:
+            return await self._async_caller(
                 messages=messages,
                 provider_override=provider_override,
                 model_override=model_override,
@@ -816,20 +852,24 @@ def make_plugin_llm_for_test(
     *,
     plugin_id: str,
     policy: _TrustPolicy,
-    caller: Optional[Callable[..., Awaitable[Any]]] = None,
+    sync_caller: Optional[Callable[..., Any]] = None,
+    async_caller: Optional[Callable[..., Awaitable[Any]]] = None,
 ) -> PluginLlm:
     """Construct a :class:`PluginLlm` with an injected policy and caller.
 
     Used by unit tests that don't want to round-trip through config.yaml
     or hit a real provider. Not part of the public plugin API.
     """
+    if sync_caller is not None:
+        raise TypeError("plugin LLM test callers must be async")
+
     async def load_policy(_plugin_id: str) -> _TrustPolicy:
         return policy
 
     return PluginLlm(
         plugin_id=plugin_id,
         policy_loader=load_policy,
-        caller=caller,
+        async_caller=async_caller,
     )
 
 

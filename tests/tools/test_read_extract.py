@@ -16,6 +16,8 @@ import tempfile
 import unittest
 import zipfile
 
+from blockbuster import BlockBuster
+
 from tools.read_extract import (
     ExtractionError,
     extract_document_text,
@@ -75,7 +77,7 @@ class TestIsExtractable(unittest.TestCase):
 # Notebooks (.ipynb) — #10733
 # ---------------------------------------------------------------------------
 
-class TestNotebookExtraction(unittest.TestCase):
+class TestNotebookExtraction(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="rex_nb_")
 
@@ -83,7 +85,7 @@ class TestNotebookExtraction(unittest.TestCase):
         import shutil
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def test_markdown_and_code_in_order(self):
+    async def test_markdown_and_code_in_order(self):
         p = os.path.join(self.tmp, "nb.ipynb")
         _write_notebook(p, [
             {"cell_type": "markdown", "source": ["# Title\n", "para"]},
@@ -91,7 +93,7 @@ class TestNotebookExtraction(unittest.TestCase):
              "outputs": [{"output_type": "stream", "text": ["1\n"]}],
              "execution_count": 1},
         ])
-        text = extract_document_text(p)
+        text = await extract_document_text(p)
         self.assertIn("# Title", text)
         self.assertIn("print(x)", text)
         # Output payloads must NOT leak into the extracted text.
@@ -101,18 +103,35 @@ class TestNotebookExtraction(unittest.TestCase):
         self.assertLess(text.index("Title"), text.index("print(x)"))
 
 
-    def test_empty_cells_raises(self):
+    async def test_empty_cells_raises(self):
         p = os.path.join(self.tmp, "empty.ipynb")
         _write_notebook(p, [])
         with self.assertRaises(ExtractionError):
-            extract_document_text(p)
+            await extract_document_text(p)
+
+    async def test_read_file_tool_extracts_notebook(self):
+        p = os.path.join(self.tmp, "integrated.ipynb")
+        _write_notebook(
+            p,
+            [{"cell_type": "code", "source": "value = 42"}],
+        )
+
+        blockbuster = BlockBuster()
+        blockbuster.activate()
+        try:
+            result = json.loads(await read_file_tool(p))
+        finally:
+            blockbuster.deactivate()
+
+        self.assertTrue(result["extracted_document"])
+        self.assertIn("value = 42", result["content"])
 
 
 # ---------------------------------------------------------------------------
 # Word documents (.docx) — #10737
 # ---------------------------------------------------------------------------
 
-class TestDocxExtraction(unittest.TestCase):
+class TestDocxExtraction(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="rex_docx_")
 
@@ -124,29 +143,29 @@ class TestDocxExtraction(unittest.TestCase):
         return (f'<?xml version="1.0"?><w:document xmlns:w="{_NS_W}">'
                 f'<w:body>{body}</w:body></w:document>')
 
-    def test_paragraphs_and_runs(self):
+    async def test_paragraphs_and_runs(self):
         p = os.path.join(self.tmp, "d.docx")
         _write_docx(p, self._doc(
             '<w:p><w:r><w:t>Hello </w:t></w:r><w:r><w:t>World</w:t></w:r></w:p>'
             '<w:p><w:r><w:t>Second</w:t></w:r></w:p>'))
-        text = extract_document_text(p)
+        text = await extract_document_text(p)
         self.assertIn("Hello World", text)
         self.assertIn("Second", text)
 
 
-    def test_missing_document_xml_raises(self):
+    async def test_missing_document_xml_raises(self):
         p = os.path.join(self.tmp, "nodoc.docx")
         with zipfile.ZipFile(p, "w") as z:
             z.writestr("other.xml", "<x/>")
         with self.assertRaises(ExtractionError):
-            extract_document_text(p)
+            await extract_document_text(p)
 
 
 # ---------------------------------------------------------------------------
 # Excel workbooks (.xlsx) — #10740
 # ---------------------------------------------------------------------------
 
-class TestXlsxExtraction(unittest.TestCase):
+class TestXlsxExtraction(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="rex_xlsx_")
 
@@ -181,21 +200,21 @@ class TestXlsxExtraction(unittest.TestCase):
                     sheets={"xl/worksheets/sheet1.xml": sheet1,
                             "xl/worksheets/sheet2.xml": sheet2})
 
-    def test_visible_sheet_content(self):
+    async def test_visible_sheet_content(self):
         p = os.path.join(self.tmp, "wb.xlsx")
         self._build(p)
-        text = extract_document_text(p)
+        text = await extract_document_text(p)
         self.assertIn("Data", text)        # sheet label
         self.assertIn("Name\tScore", text)  # shared-string header row
         self.assertIn("Alice\t95", text)    # string + numeric cells
 
 
-    def test_not_a_zip_raises(self):
+    async def test_not_a_zip_raises(self):
         p = os.path.join(self.tmp, "bad.xlsx")
         with open(p, "wb") as fh:
             fh.write(b"nope")
         with self.assertRaises(ExtractionError):
-            extract_document_text(p)
+            await extract_document_text(p)
 
 
 if __name__ == "__main__":

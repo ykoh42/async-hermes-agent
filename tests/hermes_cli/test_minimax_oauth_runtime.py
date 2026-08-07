@@ -321,11 +321,14 @@ async def test_auxiliary_minimax_uses_native_anthropic_client(monkeypatch):
         "build_anthropic_client",
         lambda *_args, **_kwargs: native_client,
     )
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly",
+        AsyncMock(return_value={}),
+    )
 
     client, model = await auxiliary_client.resolve_provider_client(
         "minimax-oauth",
         "MiniMax-M2.7",
-        config={},
     )
 
     assert isinstance(client, auxiliary_client.AnthropicAuxiliaryClient)

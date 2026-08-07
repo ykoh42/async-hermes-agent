@@ -44,56 +44,87 @@ def keyed_provider_config():
     return config
 
 
-def test_display_name_heals_to_the_config_key_identity(keyed_provider_config):
+@pytest.fixture
+def use_config(monkeypatch):
+    def configure(config):
+        async def load_config():
+            return config
+
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config_readonly",
+            load_config,
+        )
+
+    return configure
+
+
+@pytest.mark.asyncio
+async def test_display_name_heals_to_the_config_key_identity(
+    keyed_provider_config,
+    use_config,
+):
     """The regression: the display-name spelling must not mint a second identity."""
-    assert rp.canonical_custom_identity(
-        config_provider=DISPLAY_NAME,
-        config=keyed_provider_config,
+    use_config(keyed_provider_config)
+    assert await rp.canonical_custom_identity(
+        config_provider=DISPLAY_NAME
     ) == CANONICAL
 
 
-def test_config_model_provider_display_name_heals_too(keyed_provider_config):
+@pytest.mark.asyncio
+async def test_config_model_provider_display_name_heals_too(
+    keyed_provider_config,
+    use_config,
+):
     """Same path reached through ``config.model.provider`` rather than an argument."""
     keyed_provider_config["model"] = {"provider": DISPLAY_NAME}
-    assert rp.canonical_custom_identity(config=keyed_provider_config) == CANONICAL
+    use_config(keyed_provider_config)
+    assert await rp.canonical_custom_identity() == CANONICAL
 
 
-def test_config_key_spelling_still_resolves(keyed_provider_config):
+@pytest.mark.asyncio
+async def test_config_key_spelling_still_resolves(
+    keyed_provider_config,
+    use_config,
+):
     """The spelling that already worked keeps working."""
-    assert rp.canonical_custom_identity(
-        config_provider=PROVIDER_KEY,
-        config=keyed_provider_config,
+    use_config(keyed_provider_config)
+    assert await rp.canonical_custom_identity(
+        config_provider=PROVIDER_KEY
     ) == CANONICAL
 
 
-def test_all_recovery_sources_agree_on_one_identity(keyed_provider_config):
+@pytest.mark.asyncio
+async def test_all_recovery_sources_agree_on_one_identity(
+    keyed_provider_config,
+    use_config,
+):
     """Endpoint, model and configured-provider recovery must not disagree.
 
     Three sources feeding the same session-identity slot is only safe while
     they agree; a divergent one silently splits an endpoint in two.
     """
-    by_url = rp.canonical_custom_identity(
-        base_url=BASE_URL, config=keyed_provider_config
-    )
-    by_model = rp.canonical_custom_identity(
-        model=MODEL, config=keyed_provider_config
-    )
-    by_config = rp.canonical_custom_identity(
-        config_provider=DISPLAY_NAME, config=keyed_provider_config
-    )
+    use_config(keyed_provider_config)
+    by_url = await rp.canonical_custom_identity(base_url=BASE_URL)
+    by_model = await rp.canonical_custom_identity(model=MODEL)
+    by_config = await rp.canonical_custom_identity(config_provider=DISPLAY_NAME)
 
     assert {by_url, by_model, by_config} == {CANONICAL}
 
 
-def test_unconfigured_candidate_still_returns_none(keyed_provider_config):
+@pytest.mark.asyncio
+async def test_unconfigured_candidate_still_returns_none(
+    keyed_provider_config,
+    use_config,
+):
     """Fail-closed contract: never invent an identity resolution can't honour."""
-    assert rp.canonical_custom_identity(
-        config_provider="not-a-configured-entry",
-        config=keyed_provider_config,
+    use_config(keyed_provider_config)
+    assert await rp.canonical_custom_identity(
+        config_provider="not-a-configured-entry"
     ) is None
 
 
-def test_legacy_unkeyed_entry_keeps_its_name_identity():
+@pytest.mark.asyncio
+async def test_legacy_unkeyed_entry_keeps_its_name_identity(use_config):
     """``custom_providers:`` entries have no key, so the name stays the identity."""
     config = {
         "custom_providers": [
@@ -105,7 +136,7 @@ def test_legacy_unkeyed_entry_keeps_its_name_identity():
             }
         ]
     }
-    assert rp.canonical_custom_identity(
-        config_provider="Legacy Endpoint",
-        config=config,
+    use_config(config)
+    assert await rp.canonical_custom_identity(
+        config_provider="Legacy Endpoint"
     ) == "custom:legacy-endpoint"

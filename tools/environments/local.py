@@ -153,26 +153,20 @@ def _sanitize_subprocess_env(
     extra_env: Mapping[str, str] | None = None,
 ) -> dict[str, str]:
     """Strip Hermes inference credentials from a model-driven subprocess."""
-    try:
-        from tools.env_passthrough import is_env_passthrough as _is_env_passthrough
-    except ImportError:
-        def _is_env_passthrough(_name: str) -> bool:
-            return False
-
     sanitized: dict[str, str] = {}
     for key, value in dict(base_env or {}).items():
         if key.startswith(_HERMES_PROVIDER_ENV_FORCE_PREFIX):
             continue
         if _is_hermes_internal_secret(key):
             continue
-        if key not in _HERMES_PROVIDER_ENV_BLOCKLIST or _is_env_passthrough(key):
+        if key not in _HERMES_PROVIDER_ENV_BLOCKLIST:
             sanitized[key] = value
     for key, value in dict(extra_env or {}).items():
         if key.startswith(_HERMES_PROVIDER_ENV_FORCE_PREFIX):
             key = key[len(_HERMES_PROVIDER_ENV_FORCE_PREFIX):]
         if _is_hermes_internal_secret(key):
             continue
-        if key not in _HERMES_PROVIDER_ENV_BLOCKLIST or _is_env_passthrough(key):
+        if key not in _HERMES_PROVIDER_ENV_BLOCKLIST:
             sanitized[key] = value
 
     try:

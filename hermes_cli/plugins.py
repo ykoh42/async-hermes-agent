@@ -166,6 +166,8 @@ VALID_HOOKS: Set[str] = {
     "on_session_reset",
     "subagent_start",
     "subagent_stop",
+    "pre_approval_request",
+    "post_approval_response",
     # Gateway pre-dispatch hook. Fired once per incoming MessageEvent
     # after the internal-event guard but BEFORE auth/pairing and agent
     # dispatch. Plugins may return a dict to influence flow:
@@ -404,6 +406,7 @@ class PluginContext:
         handler: Callable,
         check_fn: Callable | None = None,
         requires_env: list | None = None,
+        is_async: bool = False,
         description: str = "",
         emoji: str = "",
         override: bool = False,
@@ -441,6 +444,7 @@ class PluginContext:
             handler=handler,
             check_fn=check_fn,
             requires_env=requires_env,
+            is_async=is_async,
             description=description,
             emoji=emoji,
             override=override,

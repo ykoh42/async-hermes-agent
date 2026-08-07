@@ -376,6 +376,7 @@ _VALID_API_MODES = {
     "codex_responses",
     "anthropic_messages",
     "bedrock_converse",
+    "codex_app_server",
 }
 
 
@@ -397,6 +398,19 @@ def _nous_inference_base_url_override() -> str:
     and intentionally bypasses the network host allowlist there.
     """
     return _nous_inference_env_override() or ""
+
+
+def _maybe_apply_codex_app_server_runtime(
+    *,
+    provider: str,
+    api_mode: str,
+    model_cfg: Optional[Dict[str, Any]],
+) -> str:
+    """Apply the explicit Codex app-server runtime selection for OpenAI."""
+    if not model_cfg or provider not in {"openai", "openai-codex"}:
+        return api_mode
+    runtime = str(model_cfg.get("openai_runtime") or "").strip().lower()
+    return "codex_app_server" if runtime == "codex_app_server" else api_mode
 
 
 def _resolve_runtime_from_pool_entry(
@@ -526,6 +540,12 @@ def _resolve_runtime_from_pool_entry(
 
         base_url = normalize_opencode_base_url(provider, api_mode, base_url)
 
+    api_mode = _maybe_apply_codex_app_server_runtime(
+        provider=provider,
+        api_mode=api_mode,
+        model_cfg=model_cfg,
+    )
+
     if provider == "lmstudio":
         base_url = auth_mod._normalize_lmstudio_runtime_base_url(base_url)
 
@@ -540,15 +560,16 @@ def _resolve_runtime_from_pool_entry(
     }
 
 
-def resolve_requested_provider(
+async def resolve_requested_provider(
     requested: Optional[str] = None,
-    config: Optional[Dict[str, Any]] = None,
 ) -> str:
     """Resolve provider request from explicit arg, config, then env."""
     if requested and requested.strip():
         return requested.strip().lower()
 
-    model_cfg = _get_model_config(config)
+    from hermes_cli.config import load_config_readonly
+
+    model_cfg = _get_model_config(await load_config_readonly())
     cfg_provider = model_cfg.get("provider")
     if isinstance(cfg_provider, str) and cfg_provider.strip():
         return cfg_provider.strip().lower()
@@ -773,10 +794,7 @@ def _get_named_custom_provider(
     return None
 
 
-def has_named_custom_provider(
-    requested_provider: str,
-    config: Optional[Dict[str, Any]] = None,
-) -> bool:
+async def has_named_custom_provider(requested_provider: str) -> bool:
     """Return True when config defines a custom provider matching the request.
 
     Thin public wrapper around :func:`_get_named_custom_provider` so other
@@ -785,15 +803,15 @@ def has_named_custom_provider(
     entry — without reaching into a private helper or duplicating the scan.
     """
     try:
+        from hermes_cli.config import load_config_readonly
+
+        config = await load_config_readonly()
         return _get_named_custom_provider(requested_provider, config=config) is not None
     except Exception:
         return False
 
 
-def find_custom_provider_identity(
-    base_url: str,
-    config: Optional[Dict[str, Any]] = None,
-) -> Optional[str]:
+async def find_custom_provider_identity(base_url: str) -> Optional[str]:
     """Map an endpoint URL back to its canonical ``custom:<name>`` menu key.
 
     Returns the ``custom:<normalized-name>`` slug of the first ``providers:``
@@ -812,7 +830,12 @@ def find_custom_provider_identity(
     target = _normalize_base_url_for_match(base_url)
     if not target:
         return None
-    config = config or {}
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        config = await load_config_readonly()
+    except Exception:
+        return None
 
     providers = config.get("providers")
     if isinstance(providers, dict):
@@ -844,9 +867,8 @@ def find_custom_provider_identity(
     return None
 
 
-def find_custom_provider_identity_by_model(
+async def find_custom_provider_identity_by_model(
     model: str,
-    config: Optional[Dict[str, Any]] = None,
 ) -> Optional[str]:
     """Map a model id back to the ``custom:<name>`` entry that serves it.
 
@@ -865,7 +887,12 @@ def find_custom_provider_identity_by_model(
     target = str(model or "").strip().lower()
     if not target:
         return None
-    config = config or {}
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        config = await load_config_readonly()
+    except Exception:
+        return None
 
     def _entry_serves_model(entry: Dict[str, Any]) -> bool:
         for key in ("model", "default_model"):
@@ -914,12 +941,11 @@ def find_custom_provider_identity_by_model(
     return None
 
 
-def canonical_custom_identity(
+async def canonical_custom_identity(
     *,
     base_url: Optional[str] = None,
     config_provider: Optional[str] = None,
     model: Optional[str] = None,
-    config: Optional[Dict[str, Any]] = None,
 ) -> Optional[str]:
     """Recover a routable ``custom:<name>`` identity for a bare custom provider.
 
@@ -956,17 +982,20 @@ def canonical_custom_identity(
     """
     # 1. Reverse-lookup by endpoint URL.
     if base_url:
-        identity = find_custom_provider_identity(base_url, config=config)
+        identity = await find_custom_provider_identity(base_url)
         if identity:
             return identity
 
     # 2. Reverse-lookup by the session's model name.
     if model:
-        identity = find_custom_provider_identity_by_model(model, config=config)
+        identity = await find_custom_provider_identity_by_model(model)
         if identity:
             return identity
 
     # 3. Fall back to the configured provider when it names a real entry.
+    from hermes_cli.config import load_config_readonly
+
+    config = await load_config_readonly()
     candidate = str(config_provider or "").strip()
     if not candidate:
         try:
@@ -985,9 +1014,8 @@ def canonical_custom_identity(
     try:
         entry = _get_named_custom_provider(candidate, config=config)
         if entry is not None:
-            identity = find_custom_provider_identity(
-                str(entry.get("base_url") or ""),
-                config=config,
+            identity = await find_custom_provider_identity(
+                str(entry.get("base_url") or "")
             )
             if identity:
                 return identity
@@ -1297,7 +1325,6 @@ async def _resolve_azure_foundry_runtime(
     model_cfg: Dict[str, Any],
     explicit_api_key: Optional[str] = None,
     explicit_base_url: Optional[str] = None,
-    resolved_api_key: Optional[str] = None,
     target_model: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Resolve an Azure Foundry runtime entry.
@@ -1389,22 +1416,27 @@ async def _resolve_azure_foundry_runtime(
             }
 
     # ── Static API key (legacy / default) ──────────────────────────────
-    api_key = explicit_api_key or str(resolved_api_key or "").strip()
+    api_key = explicit_api_key
     if not api_key:
-        try:
-            # Synchronous callers may omit ``resolved_api_key``.  Async
-            # provider resolution always supplies it from the native dotenv
-            # reader below, so it never enters this fallback on the event loop.
-            from hermes_cli.config import get_env_value
-            api_key = get_env_value("AZURE_FOUNDRY_API_KEY") or ""
-        except Exception:
-            api_key = ""
+        for key in ("api_key", "api"):
+            candidate = model_cfg.get(key)
+            if isinstance(candidate, str) and candidate.strip():
+                api_key = candidate.strip()
+                break
     if not api_key:
-        api_key = _getenv("AZURE_FOUNDRY_API_KEY", "").strip()
+        key_env = str(
+            model_cfg.get("key_env")
+            or model_cfg.get("api_key_env")
+            or "AZURE_FOUNDRY_API_KEY"
+        ).strip()
+        api_key = (await get_env_value_prefer_dotenv(key_env) or "").strip()
     if not api_key:
         raise AuthError(
             "Azure Foundry requires an API key. Set AZURE_FOUNDRY_API_KEY in "
-            "~/.hermes/.env."
+            "~/.hermes/.env or run 'hermes model' to configure. To use "
+            "keyless Microsoft Entra ID auth instead, set "
+            "model.auth_mode: entra_id in config.yaml (or pick "
+            "'Microsoft Entra ID' in 'hermes model')."
         )
 
     source = "explicit" if (explicit_api_key or explicit_base_url) else "config"
@@ -1610,8 +1642,8 @@ async def resolve_runtime_provider(
     """
     from hermes_cli.config import is_provider_enabled, load_config_readonly
 
+    requested_provider = await resolve_requested_provider(requested)
     config_snapshot = await load_config_readonly()
-    requested_provider = resolve_requested_provider(requested, config_snapshot)
     model_config_snapshot = _get_model_config(config_snapshot)
     if not model_config_snapshot.get("default"):
         local_base_url = str(model_config_snapshot.get("base_url") or "").strip()
@@ -1678,29 +1710,13 @@ async def resolve_runtime_provider(
     # config is always picked up from model.base_url + model.api_mode,
     # regardless of whether the caller passed explicit_* args.
     if requested_provider == "azure-foundry":
-        azure_api_key = str(explicit_api_key or "").strip()
-        if not azure_api_key:
-            for key in ("api_key", "api"):
-                candidate = model_config_snapshot.get(key)
-                if isinstance(candidate, str) and candidate.strip():
-                    azure_api_key = candidate.strip()
-                    break
-        if not azure_api_key:
-            key_env = str(
-                model_config_snapshot.get("key_env")
-                or model_config_snapshot.get("api_key_env")
-                or "AZURE_FOUNDRY_API_KEY"
-            ).strip()
-            azure_api_key = (await get_env_value_prefer_dotenv(key_env) or "").strip()
-        azure_runtime = await _resolve_azure_foundry_runtime(
+        return await _resolve_azure_foundry_runtime(
             requested_provider=requested_provider,
             model_cfg=model_config_snapshot,
             explicit_api_key=explicit_api_key,
             explicit_base_url=explicit_base_url,
-            resolved_api_key=azure_api_key,
             target_model=target_model,
         )
-        return azure_runtime
 
     # Vertex AI: OAuth2-token provider (Gemini via the OpenAI-compatible
     # endpoint). Resolve BEFORE the custom-runtime / credential-pool / generic
@@ -1967,6 +1983,49 @@ async def resolve_runtime_provider(
                 raise
             logger.info(
                 "Auto-detected Nous provider but credentials failed; "
+                "falling through to next provider."
+            )
+
+    if provider == "openai-codex":
+        try:
+            credentials = await auth_mod.resolve_codex_runtime_credentials()
+            return {
+                "provider": "openai-codex",
+                "api_mode": "codex_responses",
+                "base_url": credentials.get("base_url", "").rstrip("/"),
+                "api_key": credentials.get("api_key", ""),
+                "source": credentials.get("source", "hermes-auth-store"),
+                "last_refresh": credentials.get("last_refresh"),
+                "requested_provider": requested_provider,
+            }
+        except AuthError:
+            if requested_provider != "auto":
+                raise
+            logger.info(
+                "Auto-detected Codex provider but credentials failed; "
+                "falling through to next provider."
+            )
+
+    if provider == "xai-oauth":
+        try:
+            credentials = await auth_mod.resolve_xai_oauth_runtime_credentials()
+            return {
+                "provider": "xai-oauth",
+                "api_mode": "codex_responses",
+                "base_url": (
+                    credentials.get("base_url", "").rstrip("/")
+                    or DEFAULT_XAI_OAUTH_BASE_URL
+                ),
+                "api_key": credentials.get("api_key", ""),
+                "source": credentials.get("source", "hermes-auth-store"),
+                "last_refresh": credentials.get("last_refresh"),
+                "requested_provider": requested_provider,
+            }
+        except AuthError:
+            if requested_provider != "auto":
+                raise
+            logger.info(
+                "Auto-detected xAI OAuth provider but credentials failed; "
                 "falling through to next provider."
             )
 

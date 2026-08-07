@@ -864,7 +864,7 @@ Write only the summary, starting with "[CONTEXT SUMMARY]:" prefix."""
         # Create semaphore for rate limiting
         semaphore = asyncio.Semaphore(self.config.max_concurrent_requests)
         
-        # Tracking for progress display (thread-safe with lock)
+        # Tracking for progress display across concurrent asyncio tasks.
         progress_lock = asyncio.Lock()
         compressed_count = 0
         skipped_count = 0
@@ -895,7 +895,7 @@ Write only the summary, starting with "[CONTEXT SUMMARY]:" prefix."""
                     )
                     results[file_path][entry_idx] = (processed_entry, metrics)
                     
-                    # Update aggregate metrics (with lock for thread safety)
+                    # Update aggregate metrics atomically with the counters.
                     async with progress_lock:
                         self.aggregate_metrics.add_trajectory_metrics(metrics)
                         

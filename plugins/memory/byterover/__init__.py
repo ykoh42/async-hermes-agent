@@ -312,7 +312,6 @@ class ByteRoverMemoryProvider(MemoryProvider):
         assistant_content: str,
         *,
         session_id: str = "",
-        messages: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
         """Curate a substantive completed conversation turn."""
         self._turn_count += 1
@@ -339,7 +338,6 @@ class ByteRoverMemoryProvider(MemoryProvider):
         action: str,
         target: str,
         content: str,
-        metadata: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Mirror built-in memory writes to ByteRover."""
         if not self._auto_extract:

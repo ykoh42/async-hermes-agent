@@ -340,43 +340,84 @@ async def _compute_tool_definitions(
     except Exception as e:  # pragma: no cover — defensive
         logger.warning("Schema sanitization skipped: %s", e)
 
+    # Conditionally collapse MCP tools behind Hermes' progressive-disclosure
+    # bridge. This remains the final assembly step so prompt/tool schemas stay
+    # byte-stable for the conversation after the initial snapshot.
+    try:
+        from tools.tool_search import assemble_tool_defs, load_config
+
+        tool_search_config = await load_config()
+        if not skip_tool_search_assembly and tool_search_config.enabled != "off":
+            assembly = await assemble_tool_defs(
+                filtered_tools,
+                context_length=await _resolve_active_context_length(),
+                config=tool_search_config,
+            )
+            if assembly.activated and not quiet_mode:
+                listing_forms = {
+                    "full": "catalog listing embedded",
+                    "names": "names-only listing embedded",
+                    "mixed": "listing embedded (oversized servers summarized)",
+                    "groups": "server summary embedded (search-only discovery)",
+                    "none": "no listing (search-only)",
+                }
+                print(
+                    f"🔎 Tool Search (tier {assembly.tier}): "
+                    f"{assembly.deferred_count} MCP/plugin tools deferred "
+                    f"(~{assembly.deferred_tokens} tokens) behind "
+                    "tool_search/describe/call — "
+                    f"{listing_forms.get(assembly.listing_form, assembly.listing_form)}."
+                )
+            filtered_tools = assembly.tool_defs
+    except Exception as exc:  # pragma: no cover - never break tool loading
+        logger.warning("Tool search assembly skipped: %s", exc)
+
     return filtered_tools
 
 
-def _resolve_active_context_length() -> int:
+async def _resolve_active_context_length() -> int:
     """Look up the active model's context length for the tool-search gate.
 
     Returns 0 when the model can't be resolved — ``should_activate`` falls
     back to a fixed token cutoff in that case.
     """
     try:
-        from hermes_cli.config import load_config as _load
-        cfg = _load() or {}
+        from hermes_cli.config import load_config_readonly
+
+        cfg = await load_config_readonly() or {}
         model_cfg = cfg.get("model") if isinstance(cfg.get("model"), dict) else {}
         if not isinstance(model_cfg, dict):
             model_cfg = {}
         model_id = (model_cfg.get("model") or model_cfg.get("default") or "").strip()
         if not model_id:
             return 0
-        from agent.model_metadata import _get_static_context_length
-        # Resolve only from local/static metadata here.  Tool schemas are
-        # assembled by the synchronous construction/configuration surface;
-        # provider /models probes belong to the deferred async runtime and
-        # must never block a conversation turn.
+        from agent.model_metadata import get_model_context_length
         raw_ctx = model_cfg.get("context_length")
         config_ctx = raw_ctx if isinstance(raw_ctx, int) and raw_ctx > 0 else None
-        # This is a synchronous, CPU/config-only gate used while assembling
-        # the tool schema.  Runtime credential resolution is deliberately not
-        # performed here: ``resolve_runtime_provider`` is an async lifecycle
-        # boundary and awaiting it from this helper would reintroduce a
-        # hidden sync/async bridge.  Provider-aware static fallbacks still use
-        # the configured provider and endpoint below; the live runtime gets
-        # its authoritative context window after initialization.
         provider = str(model_cfg.get("provider") or "").strip()
         base_url = str(model_cfg.get("base_url") or "").strip()
-        return int(_get_static_context_length(
+        api_key = ""
+        if provider:
+            try:
+                from hermes_cli.runtime_provider import resolve_runtime_provider
+
+                runtime = await resolve_runtime_provider(
+                    requested=provider,
+                    target_model=model_id,
+                ) or {}
+                base_url = str(runtime.get("base_url") or base_url or "").strip()
+                api_key = str(runtime.get("api_key") or "").strip()
+            except Exception as runtime_error:
+                logger.debug(
+                    "Runtime credential resolution failed for tool-search "
+                    "context gate (provider=%s): %s — using config values only",
+                    provider,
+                    runtime_error,
+                )
+        return int(await get_model_context_length(
             model_id,
             base_url=base_url,
+            api_key=api_key,
             config_context_length=config_ctx,
             provider=provider,
         ) or 0)
@@ -844,6 +885,74 @@ async def handle_function_call(
     function_args = coerce_tool_args(function_name, function_args)
     if not isinstance(function_args, dict):
         function_args = {}
+    tool_search_module = None
+    try:
+        from tools import tool_search as tool_search_module
+    except Exception:
+        pass
+
+    if (
+        tool_search_module is not None
+        and tool_search_module.is_bridge_tool(function_name)
+    ):
+        try:
+            current_definitions = await get_tool_definitions(
+                enabled_toolsets=enabled_toolsets,
+                disabled_toolsets=disabled_toolsets,
+                quiet_mode=True,
+                skip_tool_search_assembly=True,
+            ) or []
+        except Exception:
+            current_definitions = []
+
+        if function_name == tool_search_module.TOOL_SEARCH_NAME:
+            return await tool_search_module.dispatch_tool_search(
+                function_args,
+                current_tool_defs=current_definitions,
+            )
+        if function_name == tool_search_module.TOOL_DESCRIBE_NAME:
+            return tool_search_module.dispatch_tool_describe(
+                function_args,
+                current_tool_defs=current_definitions,
+            )
+
+        underlying_name, underlying_args, error = (
+            tool_search_module.resolve_underlying_call(function_args)
+        )
+        if error or not underlying_name:
+            return tool_error(error or "tool_call could not be resolved")
+        scoped_names = tool_search_module.scoped_deferrable_names(
+            current_definitions
+        )
+        if underlying_name not in scoped_names:
+            return tool_error(
+                f"'{underlying_name}' is not available in this session. "
+                "Use tool_search to find tools you can call."
+            )
+        validation_error = tool_search_module.validate_deferred_call_args(
+            underlying_name,
+            underlying_args,
+        )
+        if validation_error is not None:
+            return validation_error
+        return await handle_function_call(
+            function_name=underlying_name,
+            function_args=underlying_args,
+            task_id=task_id,
+            tool_call_id=tool_call_id,
+            session_id=session_id,
+            turn_id=turn_id,
+            api_request_id=api_request_id,
+            user_task=user_task,
+            enabled_tools=enabled_tools,
+            skip_pre_tool_call_hook=skip_pre_tool_call_hook,
+            skip_tool_request_middleware=skip_tool_request_middleware,
+            skip_tool_execution_middleware=skip_tool_execution_middleware,
+            tool_request_middleware_trace=list(tool_request_middleware_trace or []),
+            enabled_toolsets=enabled_toolsets,
+            disabled_toolsets=disabled_toolsets,
+        )
+
     original_args = dict(function_args)
     middleware_trace = list(tool_request_middleware_trace or [])
     handler_context = _TOOL_HANDLER_CONTEXT.get() or {}
@@ -919,23 +1028,40 @@ async def handle_function_call(
             **handler_context,
         )
 
-    started = time.monotonic()
-    if skip_tool_execution_middleware:
-        result = await dispatch(function_args)
-    else:
-        from hermes_cli.middleware import run_tool_execution_middleware
+    approval_tokens = None
+    try:
+        from tools.approval import set_current_observability_context
 
-        result = await run_tool_execution_middleware(
-            function_name,
-            function_args,
-            dispatch,
-            original_args=original_args,
-            task_id=task_id or "",
-            session_id=session_id or "",
-            tool_call_id=tool_call_id or "",
+        approval_tokens = set_current_observability_context(
             turn_id=turn_id or "",
-            api_request_id=api_request_id or "",
+            tool_call_id=tool_call_id or "",
         )
+    except Exception:
+        logger.debug("approval correlation setup failed", exc_info=True)
+
+    started = time.monotonic()
+    try:
+        if skip_tool_execution_middleware:
+            result = await dispatch(function_args)
+        else:
+            from hermes_cli.middleware import run_tool_execution_middleware
+
+            result = await run_tool_execution_middleware(
+                function_name,
+                function_args,
+                dispatch,
+                original_args=original_args,
+                task_id=task_id or "",
+                session_id=session_id or "",
+                tool_call_id=tool_call_id or "",
+                turn_id=turn_id or "",
+                api_request_id=api_request_id or "",
+            )
+    finally:
+        if approval_tokens is not None:
+            from tools.approval import reset_current_observability_context
+
+            reset_current_observability_context(approval_tokens)
     duration_ms = int((time.monotonic() - started) * 1000)
 
     await _emit_post_tool_call_hook(

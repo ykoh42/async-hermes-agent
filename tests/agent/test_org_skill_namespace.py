@@ -35,42 +35,52 @@ def _mark_active(skills, org_id):
     (org_root / sku.ORG_ACTIVE_MARKER).write_text(org_id, encoding="utf-8")
 
 
+@pytest.mark.asyncio
 class TestTokenGatedDiscovery:
-    def test_no_marker_no_org_skills(self, tmp_path):
+    async def test_no_marker_no_org_skills(self, tmp_path):
         skills = tmp_path / "skills"
         _mk_skill(skills, "personal-a")
         _mk_skill(skills, f"{sku.ORG_MIRROR_DIR_NAME}/org-1/shared-x", name="shared-x")
-        found = [p.parent.name for p in sku.iter_skill_index_files(skills, "SKILL.md")]
+        found = [
+            path.parent.name
+            async for path in sku.iter_skill_index_files(skills, "SKILL.md")
+        ]
         assert "personal-a" in found
         assert "shared-x" not in found  # unmarked mirror never resolves
 
-    def test_marker_gates_to_active_org_only(self, tmp_path):
+    async def test_marker_gates_to_active_org_only(self, tmp_path):
         skills = tmp_path / "skills"
         _mk_skill(skills, f"{sku.ORG_MIRROR_DIR_NAME}/org-1/shared-x", name="shared-x")
         _mk_skill(skills, f"{sku.ORG_MIRROR_DIR_NAME}/org-OLD/stale-y", name="stale-y")
         _mark_active(skills, "org-1")
-        found = [p.parent.name for p in sku.iter_skill_index_files(skills, "SKILL.md")]
+        found = [
+            path.parent.name
+            async for path in sku.iter_skill_index_files(skills, "SKILL.md")
+        ]
         assert "shared-x" in found
         assert "stale-y" not in found  # stale mirror pruned at resolution
 
-    def test_switching_org_flips_resolution(self, tmp_path):
+    async def test_switching_org_flips_resolution(self, tmp_path):
         skills = tmp_path / "skills"
         _mk_skill(skills, f"{sku.ORG_MIRROR_DIR_NAME}/org-1/shared-x", name="shared-x")
         _mk_skill(skills, f"{sku.ORG_MIRROR_DIR_NAME}/org-2/other-z", name="other-z")
         _mark_active(skills, "org-2")
-        found = [p.parent.name for p in sku.iter_skill_index_files(skills, "SKILL.md")]
+        found = [
+            path.parent.name
+            async for path in sku.iter_skill_index_files(skills, "SKILL.md")
+        ]
         assert found and "other-z" in found and "shared-x" not in found
 
-    def test_helpers(self, tmp_path):
+    async def test_helpers(self, tmp_path):
         skills = tmp_path / "skills"
         d = _mk_skill(skills, f"{sku.ORG_MIRROR_DIR_NAME}/org-9/cat/sk", name="sk")
-        assert sku.is_org_mirror_path(d, skills) is True
-        assert sku.org_id_of_path(d, skills) == "org-9"
+        assert await sku.is_org_mirror_path(d, skills) is True
+        assert await sku.org_id_of_path(d, skills) == "org-9"
         p = _mk_skill(skills, "plain")
-        assert sku.is_org_mirror_path(p, skills) is False
-        assert sku.read_active_org_id(skills) is None
+        assert await sku.is_org_mirror_path(p, skills) is False
+        assert await sku.read_active_org_id(skills) is None
         _mark_active(skills, "org-9")
-        assert sku.read_active_org_id(skills) == "org-9"
+        assert await sku.read_active_org_id(skills) == "org-9"
 
 
 class TestSnapshotEntryProvenance:

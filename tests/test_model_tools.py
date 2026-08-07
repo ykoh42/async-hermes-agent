@@ -221,6 +221,12 @@ class TestHandleFunctionCall:
             (),
             {"_middleware": {"tool_request": [request_middleware], "tool_execution": [execution_middleware]}},
         )()
+        async def invoke_middleware(kind, **kwargs):
+            return [
+                await callback(**kwargs)
+                for callback in manager._middleware.get(kind, [])
+            ]
+        monkeypatch.setattr("hermes_cli.plugins.invoke_middleware", invoke_middleware)
         monkeypatch.setattr("hermes_cli.plugins.get_plugin_manager", lambda: manager)
         hook_calls = []
         async def invoke_hook(hook_name, **kwargs):

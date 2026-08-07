@@ -1393,6 +1393,17 @@ async def run_conversation(
     # stale prior turn's usage.
     agent._last_turn_usage = None
 
+    # Optional opt-in runtime: Codex owns the internal model/tool loop while
+    # Hermes keeps the standard turn prologue, transcript, and result shape.
+    if agent.api_mode == "codex_app_server":
+        return await agent._run_codex_app_server_turn(
+            user_message=user_message,
+            original_user_message=original_user_message,
+            messages=messages,
+            effective_task_id=effective_task_id,
+            should_review_memory=_should_review_memory,
+        )
+
     while (api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0) or agent._budget_grace_call:
         _redirect_text = agent._drain_pending_redirect()
         if _redirect_text:
@@ -3783,11 +3794,9 @@ async def run_conversation(
                         )
                         continue
 
-                # API-key pool rotation is native async: it mutates the pool
-                # under its task lock and persists via aiofiles. OAuth refresh
-                # still fails explicitly inside that path until its provider
-                # transport has been converted; it is never sent through a
-                # worker thread.
+                # API-key rotation and provider-specific OAuth refresh are
+                # native async: pool mutation is task-locked and persistence
+                # uses awaited file and network transports.
                 if (
                     getattr(agent, "_credential_pool", None) is not None
                     and classified.reason
@@ -3976,11 +3985,11 @@ async def run_conversation(
                     )
                     if managed_minimax_oauth:
                         from hermes_cli.auth import (
-                            resolve_minimax_oauth_runtime_credentials,
+                            _resolve_minimax_oauth_runtime_credentials,
                         )
 
                         try:
-                            credentials = await resolve_minimax_oauth_runtime_credentials(
+                            credentials = await _resolve_minimax_oauth_runtime_credentials(
                                 force_refresh=True,
                             )
                         except Exception:

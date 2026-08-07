@@ -51,12 +51,7 @@ def _unwrap_results(response: Any) -> list:
 class PlatformBackend(Mem0Backend):
     """Native-async client for the Mem0 Platform API."""
 
-    def __init__(
-        self,
-        api_key: str,
-        host: str = "https://api.mem0.ai",
-        transport=None,
-    ):
+    def __init__(self, api_key: str):
         import httpx
 
         user_id = hashlib.md5(api_key.encode(), usedforsecurity=False).hexdigest()
@@ -65,10 +60,9 @@ class PlatformBackend(Mem0Backend):
             "Mem0-User-ID": user_id,
         }
         self._client = httpx.AsyncClient(
-            base_url=host.rstrip("/"),
+            base_url="https://api.mem0.ai",
             headers=headers,
             timeout=300.0,
-            transport=transport,
         )
 
     async def _json(self, method: str, path: str, **kwargs) -> Any:

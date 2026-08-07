@@ -41,13 +41,19 @@ class _StubServer:
 
 
 @pytest.mark.asyncio
-async def test_platform_backend_preserves_cloud_request_contract():
+async def test_platform_backend_preserves_cloud_request_contract(monkeypatch):
     server = _StubServer()
-    backend = PlatformBackend(
-        "secret",
-        host="https://api.mem0.test",
-        transport=httpx.MockTransport(server.handler),
-    )
+    async_client = httpx.AsyncClient
+
+    def build_client(*args, **kwargs):
+        return async_client(
+            *args,
+            **kwargs,
+            transport=httpx.MockTransport(server.handler),
+        )
+
+    monkeypatch.setattr(httpx, "AsyncClient", build_client)
+    backend = PlatformBackend("secret")
     try:
         results = await backend.search(
             "test query",
@@ -209,11 +215,17 @@ async def test_http_backends_never_call_asyncio_to_thread(monkeypatch):
 
     monkeypatch.setattr(asyncio, "to_thread", forbidden)
     server = _StubServer()
-    backend = PlatformBackend(
-        "secret",
-        host="https://api.mem0.test",
-        transport=httpx.MockTransport(server.handler),
-    )
+    async_client = httpx.AsyncClient
+
+    def build_client(*args, **kwargs):
+        return async_client(
+            *args,
+            **kwargs,
+            transport=httpx.MockTransport(server.handler),
+        )
+
+    monkeypatch.setattr(httpx, "AsyncClient", build_client)
+    backend = PlatformBackend("secret")
     try:
         assert await backend.search("q", filters={"user_id": "u1"})
     finally:

@@ -663,7 +663,10 @@ class TestXAIProviderOAuthPath:
             async def get(self, url, **_kwargs):
                 assert url.endswith("/.well-known/openid-configuration")
                 return _mock_resp(
-                    {"token_endpoint": "https://auth.x.ai/oauth2/token"}
+                    {
+                        "authorization_endpoint": "https://auth.x.ai/oauth2/authorize",
+                        "token_endpoint": "https://auth.x.ai/oauth2/token",
+                    }
                 )
 
             async def post(self, url, **kwargs):

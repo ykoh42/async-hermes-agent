@@ -170,11 +170,12 @@ class FileToolsIntegrationTests(unittest.IsolatedAsyncioTestCase):
     async def test_staleness_is_checked_after_waiting_for_path_lock(self):
         p = self._write_seed("locked.txt")
         await read_file_tool(path=p, task_id="agentA")
+        resolved = os.path.realpath(p)
         lock_held = asyncio.Event()
         release_lock = asyncio.Event()
 
         async def hold_lock():
-            async with file_state.lock_path(p):
+            async with file_state.lock_path(resolved):
                 lock_held.set()
                 await release_lock.wait()
 

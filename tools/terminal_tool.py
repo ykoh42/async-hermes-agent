@@ -191,18 +191,6 @@ def _resolve_container_task_id(task_id: str | None = None) -> str:
     return str(task_id or "default")
 
 
-def _is_unusable_container_cwd(_cwd: str | None) -> bool:
-    return False
-
-
-def _docker_has_host_access(_config: dict[str, Any] | None = None) -> bool:
-    return False
-
-
-def _check_vercel_sandbox_requirements(_config: dict[str, Any] | None = None) -> bool:
-    return False
-
-
 def _get_approval_callback() -> Callable[..., Any] | None:
     return _approval_callback.get()
 
@@ -316,7 +304,7 @@ def _rewrite_compound_background(command: str, *_args: Any, **_kwargs: Any) -> s
     return result
 
 
-def resolve_task_overrides(task_id: str | None = None) -> dict[str, Any]:
+def resolve_task_overrides(task_id: str | None) -> dict[str, Any]:
     return dict(_task_env_overrides.get(str(task_id or "default"), {}))
 
 
@@ -374,7 +362,7 @@ def _create_environment(
     )
 
 
-def get_active_env(task_id: str | None = None) -> LocalEnvironment | None:
+def get_active_env(task_id: str | None) -> LocalEnvironment | None:
     key = _resolve_container_task_id(task_id)
     with _env_lock:
         return _active_environments.get(key)

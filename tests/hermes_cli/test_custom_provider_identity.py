@@ -8,32 +8,49 @@ tests/tui_gateway/test_custom_provider_session_persistence.py for the
 end-to-end persist/resume round-trip.
 """
 
+import pytest
+
 import hermes_cli.runtime_provider as rp
 
 
-def test_matches_legacy_custom_providers_list():
+@pytest.fixture
+def use_config(monkeypatch):
+    def configure(config):
+        async def load_config():
+            return config
+
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config_readonly",
+            load_config,
+        )
+
+    return configure
+
+
+@pytest.mark.asyncio
+async def test_matches_legacy_custom_providers_list(use_config):
     config = {
         "custom_providers": [
             {"name": "MiMo v2.5 Pro", "base_url": "https://api.mimo.example/v1"}
         ]
     }
-    assert (
-        rp.find_custom_provider_identity("https://api.mimo.example/v1", config=config)
-        == "custom:mimo-v2.5-pro"
-    )
+    use_config(config)
+    assert await rp.find_custom_provider_identity(
+        "https://api.mimo.example/v1"
+    ) == "custom:mimo-v2.5-pro"
 
 
-def test_matches_providers_dict_by_key():
+@pytest.mark.asyncio
+async def test_matches_providers_dict_by_key(use_config):
     config = {"providers": {"local": {"api": "http://127.0.0.1:8000/v1"}}}
-    assert (
-        rp.find_custom_provider_identity(
-            "http://127.0.0.1:8000/v1", config=config
-        )
-        == "custom:local"
-    )
+    use_config(config)
+    assert await rp.find_custom_provider_identity(
+        "http://127.0.0.1:8000/v1"
+    ) == "custom:local"
 
 
-def test_matches_providers_dict_by_stable_key_not_display_name():
+@pytest.mark.asyncio
+async def test_matches_providers_dict_by_stable_key_not_display_name(use_config):
     config = {
         "providers": {
             "local-127.0.0.1:8000": {
@@ -42,9 +59,8 @@ def test_matches_providers_dict_by_stable_key_not_display_name():
             }
         }
     }
-    slug = rp.find_custom_provider_identity(
-        "http://127.0.0.1:8000/v1", config=config
-    )
+    use_config(config)
+    slug = await rp.find_custom_provider_identity("http://127.0.0.1:8000/v1")
     assert slug == "custom:local-127.0.0.1:8000"
 
     entry = rp._get_named_custom_provider(slug, config=config)
@@ -52,36 +68,42 @@ def test_matches_providers_dict_by_stable_key_not_display_name():
     assert entry["name"] == "Local Ollama"
 
 
-def test_match_ignores_trailing_slash_and_case():
+@pytest.mark.asyncio
+async def test_match_ignores_trailing_slash_and_case(use_config):
     config = {
         "custom_providers": [
             {"name": "local", "base_url": "http://Localhost:8000/v1/"}
         ]
     }
-    assert (
-        rp.find_custom_provider_identity("http://localhost:8000/v1", config=config)
-        == "custom:local"
-    )
+    use_config(config)
+    assert await rp.find_custom_provider_identity(
+        "http://localhost:8000/v1"
+    ) == "custom:local"
 
 
-def test_no_match_returns_none():
+@pytest.mark.asyncio
+async def test_no_match_returns_none(use_config):
     config = {
         "custom_providers": [
             {"name": "other", "base_url": "https://elsewhere.example/v1"}
         ]
     }
-    assert rp.find_custom_provider_identity(
-        "https://api.mimo.example/v1", config=config
+    use_config(config)
+    assert await rp.find_custom_provider_identity(
+        "https://api.mimo.example/v1"
     ) is None
 
 
-def test_empty_base_url_returns_none():
+@pytest.mark.asyncio
+async def test_empty_base_url_returns_none(use_config):
     config = {"custom_providers": [{"name": "x"}]}
-    assert rp.find_custom_provider_identity("", config=config) is None
-    assert rp.find_custom_provider_identity(None, config=config) is None
+    use_config(config)
+    assert await rp.find_custom_provider_identity("") is None
+    assert await rp.find_custom_provider_identity(None) is None
 
 
-def test_identity_resolves_back_through_named_lookup():
+@pytest.mark.asyncio
+async def test_identity_resolves_back_through_named_lookup(use_config):
     """The returned slug must be accepted by _get_named_custom_provider —
     that is the whole point of persisting it."""
     config = {
@@ -93,9 +115,8 @@ def test_identity_resolves_back_through_named_lookup():
             }
         ]
     }
-    slug = rp.find_custom_provider_identity(
-        "https://api.mimo.example/v1", config=config
-    )
+    use_config(config)
+    slug = await rp.find_custom_provider_identity("https://api.mimo.example/v1")
     assert slug == "custom:mimo-v2.5-pro"
 
     entry = rp._get_named_custom_provider(slug, config=config)

@@ -22,9 +22,10 @@ def _fresh_cache(monkeypatch, tmp_path):
     an empty external-dirs list + a tmp skills root."""
     st._SKILLS_CACHE.clear()
     monkeypatch.setattr(st, "_skills_dir", lambda: tmp_path / "skills")
-    monkeypatch.setattr(
-        "agent.skill_utils.get_external_skills_dirs", lambda: []
-    )
+    async def no_external_skills():
+        return []
+
+    monkeypatch.setattr(st, "_external_skills_dirs", no_external_skills)
     async def no_disabled_skills():
         return set()
 

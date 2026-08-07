@@ -469,9 +469,9 @@ DEFAULT_CONFIG = {
     "file_read_max_chars": 100_000,
 
     # Seconds to wait at agent-build time for in-flight MCP server discovery
-    # to finish before the agent snapshots its tool list.  MCP discovery runs
-    # in a background thread so a slow/dead server can't freeze startup; this
-    # bounds how long the first agent build blocks on it.  The wait returns
+    # to finish before the agent snapshots its tool list. MCP discovery runs
+    # in background asyncio tasks; this bounds how long the first agent build
+    # awaits a slow/dead server. The wait returns
     # the INSTANT discovery completes, so users with no MCP servers (the common
     # case) or fast servers pay ~0s regardless of this value — the bound is
     # only reached when a server is genuinely still connecting.  The old 0.75s

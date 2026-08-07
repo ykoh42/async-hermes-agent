@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 
 import pytest
@@ -35,7 +36,7 @@ async def test_read_file_public_default_matches_upstream_contract(tmp_path):
 
     result = json.loads(await read_file_tool(str(target)))
 
-    assert result["total_lines"] == 600
+    assert result["total_lines"] == 599
     assert result["content"].splitlines()[-1] == "600|line-599"
     assert READ_FILE_SCHEMA["parameters"]["properties"]["limit"]["default"] == 2000
 
@@ -68,7 +69,7 @@ async def test_write_rejects_non_string_and_read_display(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_patch_replace_and_no_match_hint(tmp_path):
+async def test_patch_replace_and_no_match_error(tmp_path):
     from tools.file_tools import patch_tool
 
     target = tmp_path / "app.py"
@@ -86,7 +87,143 @@ async def test_patch_replace_and_no_match_hint(tmp_path):
             mode="replace", path=str(target), old_string="absent", new_string="x"
         )
     )
-    assert "read_file" in missing["error"]
+    assert "Could not find" in missing["error"]
+
+
+@pytest.mark.asyncio
+async def test_read_file_suggests_similar_filenames(tmp_path):
+    from tools.file_tools import read_file_tool
+
+    (tmp_path / "config.yaml").write_text("enabled: true\n")
+    result = json.loads(await read_file_tool(str(tmp_path / "config.yml")))
+
+    assert result["error"].startswith("File not found:")
+    assert result["similar_files"] == [str(tmp_path / "config.yaml")]
+
+
+@pytest.mark.asyncio
+async def test_structured_write_fails_closed_without_touching_disk(tmp_path):
+    from tools.file_tools import write_file_tool
+
+    target = tmp_path / "config.json"
+    target.write_text('{"valid": true}\n')
+
+    result = json.loads(await write_file_tool(str(target), '{"broken":'))
+
+    assert "Refusing to write" in result["error"]
+    assert target.read_text() == '{"valid": true}\n'
+
+
+@pytest.mark.asyncio
+async def test_python_write_reports_new_syntax_error(tmp_path):
+    from tools.file_tools import write_file_tool
+
+    target = tmp_path / "module.py"
+    target.write_text("value = 1\n")
+
+    result = json.loads(await write_file_tool(str(target), "def broken(:\n"))
+
+    assert result["lint"]["status"] == "error"
+    assert "SyntaxError" in result["lint"]["output"]
+    assert target.read_text() == "def broken(:\n"
+
+
+@pytest.mark.asyncio
+async def test_write_and_patch_preserve_bom_and_mode(tmp_path):
+    from tools.file_tools import patch_tool, write_file_tool
+
+    target = tmp_path / "script.py"
+    target.write_bytes(b"\xef\xbb\xbfvalue = 1\n")
+    target.chmod(0o750)
+
+    await write_file_tool(str(target), "value = 2\n")
+    assert target.read_bytes() == b"\xef\xbb\xbfvalue = 2\n"
+    assert target.stat().st_mode & 0o777 == 0o750
+
+    result = json.loads(
+        await patch_tool(
+            mode="replace",
+            path=str(target),
+            old_string="value = 2",
+            new_string="value = 3",
+        )
+    )
+    assert result["success"] is True
+    assert "replacements" not in result
+    assert "-value = 2" in result["diff"]
+    assert "+value = 3" in result["diff"]
+    assert target.read_bytes() == b"\xef\xbb\xbfvalue = 3\n"
+    assert target.stat().st_mode & 0o777 == 0o750
+
+
+@pytest.mark.asyncio
+async def test_patch_replace_uses_upstream_fuzzy_matching(tmp_path):
+    from tools.file_tools import patch_tool
+
+    target = tmp_path / "fuzzy.py"
+    target.write_text("def greet():\n    return 'hello'\n")
+
+    result = json.loads(
+        await patch_tool(
+            mode="replace",
+            path=str(target),
+            old_string="def greet():\n  return 'hello'",
+            new_string="def greet():\n  return 'hi'",
+        )
+    )
+
+    assert result["success"] is True
+    assert "return 'hi'" in target.read_text()
+
+
+@pytest.mark.asyncio
+async def test_v4a_update_preserves_bom_and_reports_lint(tmp_path):
+    from tools.file_tools import patch_tool
+
+    target = tmp_path / "module.py"
+    target.write_bytes(b"\xef\xbb\xbfvalue = 1\n")
+
+    result = json.loads(
+        await patch_tool(
+            mode="patch",
+            patch=(
+                "*** Begin Patch\n"
+                f"*** Update File: {target}\n"
+                "@@\n"
+                "-value = 1\n"
+                "+value = 2\n"
+                "*** End Patch\n"
+            ),
+        )
+    )
+
+    assert result["success"] is True
+    # v2026.8.3 lints the raw BOM-marked text after V4A writes, so ast.parse
+    # reports the retained marker even though the write itself is valid.
+    assert result["lint"][str(target)]["status"] == "error"
+    assert target.read_bytes() == b"\xef\xbb\xbfvalue = 2\n"
+
+
+@pytest.mark.asyncio
+async def test_v4a_add_rejects_invalid_structured_content(tmp_path):
+    from tools.file_tools import patch_tool
+
+    target = tmp_path / "broken.json"
+    result = json.loads(
+        await patch_tool(
+            mode="patch",
+            patch=(
+                "*** Begin Patch\n"
+                f"*** Add File: {target}\n"
+                '+{"broken":\n'
+                "*** End Patch\n"
+            ),
+        )
+    )
+
+    assert result["success"] is False
+    assert "Refusing to write" in result["error"]
+    assert not target.exists()
 
 
 @pytest.mark.asyncio
@@ -127,12 +264,107 @@ async def test_search_uses_native_subprocess_and_paginates(tmp_path):
 
     (tmp_path / "a.py").write_text("TODO one\n")
     (tmp_path / "b.py").write_text("TODO two\n")
-    result = json.loads(
-        await search_tool(pattern="TODO", path=str(tmp_path), limit=1, task_id="search")
+    output = await search_tool(
+        pattern=".py",
+        target="files",
+        path=str(tmp_path),
+        limit=1,
+        task_id="search",
     )
-    assert len(result["matches"]) == 1
+    payload, hint = output.split("\n\n", 1)
+    result = json.loads(payload)
+    assert len(result["files"]) == 1
     assert result["truncated"] is True
-    assert result["next_offset"] == 1
+    assert "offset=1" in hint
+
+
+@pytest.mark.asyncio
+async def test_search_preserves_upstream_match_shape(tmp_path, monkeypatch):
+    from tools.file_tools import search_tool
+
+    async def fake_run_rg(_arguments):
+        return 0, "a.py:7:TODO item\n", ""
+
+    monkeypatch.setattr("tools.file_tools._run_rg", fake_run_rg)
+    result = json.loads(
+        await search_tool("TODO", path=str(tmp_path), task_id="search-shape")
+    )
+
+    assert result == {
+        "total_count": 1,
+        "matches": [{"path": "a.py", "line": 7, "content": "TODO item"}],
+    }
+
+
+@pytest.mark.asyncio
+async def test_search_keeps_partial_results_on_rg_error(tmp_path, monkeypatch):
+    from tools.file_tools import search_tool
+
+    async def fake_run_rg(_arguments):
+        return 2, "a.py:3:needle\n", "rg: locked.txt: Permission denied\n"
+
+    monkeypatch.setattr("tools.file_tools._run_rg", fake_run_rg)
+    result = json.loads(
+        await search_tool("needle", path=str(tmp_path), task_id="search-partial")
+    )
+
+    assert result["matches"] == [
+        {"path": "a.py", "line": 3, "content": "needle"}
+    ]
+    assert "error" not in result
+
+
+@pytest.mark.asyncio
+async def test_search_timeout_returns_partial_results(tmp_path, monkeypatch):
+    from tools.file_tools import search_tool
+
+    async def fake_run_rg(_arguments):
+        return 124, "a.py:3:needle\n", ""
+
+    monkeypatch.setattr("tools.file_tools._run_rg", fake_run_rg)
+    output = await search_tool(
+        "needle",
+        path=str(tmp_path),
+        task_id="search-timeout",
+    )
+    payload, hint = output.split("\n\n", 1)
+    result = json.loads(payload)
+
+    assert result["matches"] == [
+        {"path": "a.py", "line": 3, "content": "needle"}
+    ]
+    assert result["limit_reason"] == "search_timeout"
+    assert result["truncated"] is True
+    assert "offset=50" in hint
+
+
+@pytest.mark.asyncio
+async def test_search_cancellation_kills_and_drains_process(monkeypatch):
+    from tools.file_tools import _run_rg
+
+    killed = asyncio.Event()
+
+    class FakeProcess:
+        returncode = None
+
+        async def communicate(self):
+            await killed.wait()
+            return b"", b""
+
+        def kill(self):
+            killed.set()
+
+    async def fake_create_subprocess_exec(*_args, **_kwargs):
+        return FakeProcess()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+    task = asyncio.create_task(_run_rg(["needle", "."]))
+    await asyncio.sleep(0)
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert killed.is_set()
 
 
 @pytest.mark.asyncio
