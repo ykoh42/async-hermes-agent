@@ -63,7 +63,7 @@ async def test_skills_tool_load_env_strips_export_prefix(tmp_path, monkeypatch):
 
     importlib.reload(skills_tool)
     with patch.object(skills_tool, "get_hermes_home", return_value=tmp_path):
-        env = await skills_tool._load_env()
+        env = await skills_tool.load_env()
 
     assert env["SOME_SKILL_KEY"] == "skillval"
     assert env["PLAIN"] == "plainval"

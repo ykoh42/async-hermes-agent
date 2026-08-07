@@ -330,7 +330,7 @@ def _skill_lookup_path_error(name: str) -> Optional[str]:
     return None
 
 
-async def _load_env() -> Dict[str, str]:
+async def load_env() -> Dict[str, str]:
     """Read the profile environment file without blocking the event loop."""
     env_path = get_hermes_home() / ".env"
     if not await aiofiles.os.path.isfile(env_path):
@@ -1103,7 +1103,7 @@ async def skill_view(
         if not isinstance(hermes_metadata, dict):
             hermes_metadata = {}
         required_environment_variables = _get_required_environment_variables(frontmatter)
-        env_snapshot = await _load_env()
+        env_snapshot = await load_env()
         missing_environment_variables = [
             entry["name"]
             for entry in required_environment_variables
