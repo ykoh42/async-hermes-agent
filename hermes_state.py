@@ -2,6 +2,7 @@
 """Native-async SQLite session state for Hermes Agent."""
 
 import asyncio
+import datetime
 import errno
 import hashlib
 import json
@@ -60,6 +61,7 @@ _realpath = aiofiles.os.wrap(os.path.realpath)
 _os_open = aiofiles.os.wrap(os.open)
 _os_close = aiofiles.os.wrap(os.close)
 _os_lseek = aiofiles.os.wrap(os.lseek)
+_utime = aiofiles.os.wrap(os.utime)
 _live_connection_counts: Dict[str, int] = {}
 
 _DISK_FULL_MARKERS = (
@@ -85,6 +87,7 @@ _WAL_INCOMPAT_MARKERS = (
 _last_init_error: Optional[str] = None
 _wal_fallback_warned_paths: set[str] = set()
 _wal_reset_bug_warned_paths: set[str] = set()
+_repair_attempted_paths: set[str] = set()
 
 
 def _set_last_init_error(msg: Optional[str]) -> None:
@@ -404,6 +407,277 @@ def is_malformed_db_error(exc: BaseException) -> bool:
     return isinstance(exc, sqlite3.DatabaseError) and any(
         marker in str(exc).lower() for marker in _MALFORMED_SCHEMA_MARKERS
     )
+
+
+def _claim_repair_attempt(db_path: Path) -> bool:
+    """Claim the process-local one-shot repair attempt for ``db_path``."""
+    key = str(db_path)
+    if key in _repair_attempted_paths:
+        return False
+    _repair_attempted_paths.add(key)
+    return True
+
+
+async def _backup_db_file(db_path: Path) -> Optional[Path]:
+    """Copy a malformed database and its sidecars beside the original."""
+    tracking_key = str(await _realpath(str(db_path)))
+    if _live_connection_counts.get(tracking_key, 0) > 0:
+        logger.error(
+            "Refusing to raw-copy %s for backup: a connection to it is still "
+            "open in this process. Close all SessionDB handles first.",
+            db_path,
+        )
+        return None
+
+    stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    backup_path = db_path.with_name(
+        f"{db_path.name}.malformed-backup-{stamp}"
+    )
+    try:
+        for source, destination in (
+            (db_path, backup_path),
+            (
+                db_path.with_name(db_path.name + "-wal"),
+                backup_path.with_name(backup_path.name + "-wal"),
+            ),
+            (
+                db_path.with_name(db_path.name + "-shm"),
+                backup_path.with_name(backup_path.name + "-shm"),
+            ),
+        ):
+            if not await aiofiles.os.path.exists(source):
+                continue
+            metadata = await aiofiles.os.stat(source)
+            async with (
+                aiofiles.open(source, "rb") as reader,
+                aiofiles.open(destination, "wb") as writer,
+            ):
+                while chunk := await reader.read(1024 * 1024):
+                    await writer.write(chunk)
+            await _chmod(destination, stat.S_IMODE(metadata.st_mode))
+            await _utime(
+                destination,
+                ns=(metadata.st_atime_ns, metadata.st_mtime_ns),
+            )
+        return backup_path
+    except Exception as exc:
+        logger.warning("Could not back up malformed DB %s: %s", db_path, exc)
+        return None
+
+
+async def _db_opens_cleanly(db_path: Path) -> Optional[str]:
+    """Probe database integrity plus the FTS read and write paths."""
+    import aiosqlite
+
+    conn = await aiosqlite.connect(db_path, isolation_level=None)
+    try:
+        await load_fts5_cjk_extension(conn)
+        await (await conn.execute("PRAGMA journal_mode")).fetchone()
+        rows = await (await conn.execute("PRAGMA integrity_check")).fetchall()
+        problems = [
+            str(row[0])
+            for row in rows
+            if row and str(row[0]).lower() != "ok"
+        ]
+        if problems:
+            return "; ".join(problems[:3])
+        await (await conn.execute("SELECT COUNT(*) FROM sessions")).fetchone()
+
+        for fts_table in (
+            "messages_fts",
+            "messages_fts_trigram",
+            "messages_fts_cjk",
+        ):
+            try:
+                await (
+                    await conn.execute(
+                        f"SELECT 1 FROM {fts_table} "
+                        f"WHERE {fts_table} MATCH '\"\"' LIMIT 1"
+                    )
+                ).fetchone()
+            except sqlite3.OperationalError as exc:
+                if SessionDB._is_fts5_unavailable_error(exc):
+                    continue
+                message = str(exc).lower()
+                if "no such table" in message or "no such column" in message:
+                    continue
+                return f"fts5 read probe failed on {fts_table}: {exc}"
+            except sqlite3.DatabaseError as exc:
+                return f"fts5 read probe failed on {fts_table}: {exc}"
+
+        probe_session_id = f"_hermes_fts_health_probe_{time.time_ns()}"
+        write_error: Optional[sqlite3.OperationalError] = None
+        try:
+            await conn.execute("BEGIN IMMEDIATE")
+            await conn.execute(
+                "INSERT INTO sessions (id, source, started_at) VALUES (?, ?, ?)",
+                (probe_session_id, "_health_probe", time.time()),
+            )
+            await conn.execute(
+                "INSERT INTO messages (session_id, role, content, timestamp) "
+                "VALUES (?, ?, ?, ?)",
+                (probe_session_id, "user", "_fts_health_probe", time.time()),
+            )
+            await conn.execute("ROLLBACK")
+        except sqlite3.OperationalError as caught:
+            write_error = caught
+        if write_error is not None:
+            try:
+                await conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            message = str(write_error).lower()
+            if "no such table" in message or "no such column" in message:
+                return None
+            if "no such tokenizer: cjk_unicode61" in message:
+                return None
+            return str(write_error)
+        return None
+    except sqlite3.DatabaseError as exc:
+        return str(exc)
+    finally:
+        await conn.close()
+
+
+async def repair_state_db_schema(
+    db_path: Path,
+    *,
+    backup: bool = True,
+) -> Dict[str, Any]:
+    """Repair malformed schema, FTS, and stale B-tree index damage."""
+    import aiosqlite
+
+    report: Dict[str, Any] = {
+        "repaired": False,
+        "strategy": None,
+        "backup_path": None,
+        "error": None,
+    }
+    db_path = Path(db_path)
+    if not await aiofiles.os.path.exists(db_path):
+        report["error"] = f"{db_path} does not exist"
+        return report
+    if await _db_opens_cleanly(db_path) is None:
+        report["repaired"] = True
+        report["strategy"] = "already_healthy"
+        return report
+    if backup:
+        backup_path = await _backup_db_file(db_path)
+        report["backup_path"] = str(backup_path) if backup_path else None
+
+    try:
+        conn = await aiosqlite.connect(db_path, isolation_level=None)
+        try:
+            await load_fts5_cjk_extension(conn)
+            for table_name in (
+                "messages_fts",
+                "messages_fts_trigram",
+                "messages_fts_cjk",
+            ):
+                try:
+                    await conn.execute(
+                        f"INSERT INTO {table_name}({table_name}) "
+                        "VALUES('rebuild')"
+                    )
+                except sqlite3.OperationalError:
+                    continue
+        finally:
+            await conn.close()
+        if await _db_opens_cleanly(db_path) is None:
+            report["repaired"] = True
+            report["strategy"] = "rebuild_fts"
+            logger.warning(
+                "state.db FTS indexes rebuilt in place (schema preserved): %s",
+                db_path,
+            )
+            return report
+    except sqlite3.DatabaseError as exc:
+        logger.warning("state.db FTS in-place rebuild pass failed: %s", exc)
+
+    try:
+        conn = await aiosqlite.connect(db_path, isolation_level=None)
+        try:
+            await conn.execute("REINDEX")
+            await conn.commit()
+        finally:
+            await conn.close()
+        if await _db_opens_cleanly(db_path) is None:
+            report["repaired"] = True
+            report["strategy"] = "reindex_btree"
+            logger.warning(
+                "state.db B-tree indexes rebuilt via REINDEX: %s",
+                db_path,
+            )
+            return report
+    except sqlite3.DatabaseError as exc:
+        logger.warning("state.db REINDEX pass failed: %s", exc)
+
+    try:
+        conn = await aiosqlite.connect(db_path, isolation_level=None)
+        try:
+            await conn.execute("PRAGMA writable_schema=ON")
+            duplicates = await (
+                await conn.execute(
+                    "SELECT type, name, COUNT(*) AS c, MIN(rowid) AS keep "
+                    "FROM sqlite_master GROUP BY type, name HAVING c > 1"
+                )
+            ).fetchall()
+            for type_, name, _count, keep in duplicates:
+                await conn.execute(
+                    "DELETE FROM sqlite_master "
+                    "WHERE type IS ? AND name IS ? AND rowid <> ?",
+                    (type_, name, keep),
+                )
+            await conn.execute("PRAGMA writable_schema=OFF")
+            await conn.commit()
+        finally:
+            await conn.close()
+        if await _db_opens_cleanly(db_path) is None:
+            report["repaired"] = True
+            report["strategy"] = "dedup_schema"
+            logger.warning(
+                "state.db schema repaired by de-duplicating sqlite_master "
+                "(FTS index preserved): %s",
+                db_path,
+            )
+            return report
+    except sqlite3.DatabaseError as exc:
+        logger.warning("state.db dedup repair pass failed: %s", exc)
+
+    try:
+        conn = await aiosqlite.connect(db_path, isolation_level=None)
+        try:
+            await conn.execute("PRAGMA writable_schema=ON")
+            await conn.execute(
+                "DELETE FROM sqlite_master WHERE name LIKE 'messages_fts%'"
+            )
+            await conn.execute("PRAGMA writable_schema=OFF")
+            await conn.commit()
+            await conn.execute("VACUUM")
+        finally:
+            await conn.close()
+        reason = await _db_opens_cleanly(db_path)
+        if reason is None:
+            report["repaired"] = True
+            report["strategy"] = "drop_fts_rebuild"
+            logger.warning(
+                "state.db schema repaired by dropping FTS schema; indexes "
+                "will rebuild from messages on next open: %s",
+                db_path,
+            )
+            return report
+        report["error"] = reason
+    except sqlite3.DatabaseError as exc:
+        report["error"] = str(exc)
+
+    if not report["repaired"]:
+        logger.error(
+            "state.db schema repair could not recover %s automatically "
+            "(backup: %s); manual restore from backup may be required.",
+            db_path,
+            report["backup_path"],
+        )
+    return report
 
 
 async def preflight_db_writability(
@@ -1352,6 +1626,7 @@ class SessionDB:
         self._connect_lock = None
         self._write_lock = None
         self._schema_ready = False
+        self._wal_active = False
         self._closed = False
         self._fts_enabled = False
         self._trigram_available = False
@@ -1384,97 +1659,159 @@ class SessionDB:
 
             import aiofiles.os
 
-            connection = None
-            initialized = False
-            try:
-                if not self.read_only and not await aiofiles.os.path.exists(
-                    self._db_path.parent
-                ):
-                    await aiofiles.os.makedirs(
-                        self._db_path.parent,
-                        exist_ok=True,
-                    )
-                if not self.read_only:
-                    await preflight_db_writability(
-                        self._db_path,
-                        db_label="state.db",
-                    )
-                    if await is_zeroed_state_db(self._db_path):
-                        try:
-                            zeroed_size = (
-                                await aiofiles.os.stat(self._db_path)
-                            ).st_size
-                        except OSError:
-                            zeroed_size = -1
-                        quarantine_path = await quarantine_zeroed_state_db(
-                            self._db_path
+            async def _connect_and_initialize():
+                connection = None
+                initialized = False
+                try:
+                    if not self.read_only and not await aiofiles.os.path.exists(
+                        self._db_path.parent
+                    ):
+                        await aiofiles.os.makedirs(
+                            self._db_path.parent,
+                            exist_ok=True,
                         )
-                        snapshots = self._db_path.parent / "state-snapshots"
-                        message = (
-                            "state.db looks ZEROED "
-                            f"({zeroed_size} bytes, no SQLite header). "
-                            "Preserved at "
-                            f"{quarantine_path or '(quarantine failed — file left in place)'}. "
-                            f"Restore from {snapshots} via `hermes snapshot list` / "
-                            "`hermes snapshot restore <id>` if available. "
-                            "Opening a fresh empty database so the agent can start."
+                    if not self.read_only:
+                        await preflight_db_writability(
+                            self._db_path,
+                            db_label="state.db",
                         )
-                        logger.error(message)
-                        _set_last_init_error(message)
-                        if (
-                            quarantine_path is None
-                            and await aiofiles.os.path.exists(self._db_path)
-                            and await is_zeroed_state_db(self._db_path)
-                        ):
-                            raise sqlite3.DatabaseError(message)
-                database = (
-                    f"file:{os.path.abspath(self._db_path)}?mode=ro"
-                    if self.read_only
-                    else self._db_path
-                )
-                connection = await aiosqlite.connect(
-                    database,
-                    timeout=1.0,
-                    isolation_level=None,
-                    uri=self.read_only,
-                )
-                connection.row_factory = sqlite3.Row
-                await connection.execute("PRAGMA foreign_keys=ON")
-                await connection.execute("PRAGMA busy_timeout=1000")
-                await apply_database_pragmas(connection, db_label="state.db")
-                if not self.read_only:
-                    self._fts_cjk_loaded = await load_fts5_cjk_extension(
-                        connection
+                        if await is_zeroed_state_db(self._db_path):
+                            try:
+                                zeroed_size = (
+                                    await aiofiles.os.stat(self._db_path)
+                                ).st_size
+                            except OSError:
+                                zeroed_size = -1
+                            quarantine_path = await quarantine_zeroed_state_db(
+                                self._db_path
+                            )
+                            snapshots = self._db_path.parent / "state-snapshots"
+                            message = (
+                                "state.db looks ZEROED "
+                                f"({zeroed_size} bytes, no SQLite header). "
+                                "Preserved at "
+                                f"{quarantine_path or '(quarantine failed — file left in place)'}. "
+                                f"Restore from {snapshots} via `hermes snapshot list` / "
+                                "`hermes snapshot restore <id>` if available. "
+                                "Opening a fresh empty database so the agent can start."
+                            )
+                            logger.error(message)
+                            _set_last_init_error(message)
+                            if (
+                                quarantine_path is None
+                                and await aiofiles.os.path.exists(self._db_path)
+                                and await is_zeroed_state_db(self._db_path)
+                            ):
+                                raise sqlite3.DatabaseError(message)
+                    database = (
+                        f"file:{os.path.abspath(self._db_path)}?mode=ro"
+                        if self.read_only
+                        else self._db_path
                     )
-                    await apply_wal_with_fallback(
+                    connection = await aiosqlite.connect(
+                        database,
+                        timeout=1.0,
+                        isolation_level=None,
+                        uri=self.read_only,
+                    )
+                    connection.row_factory = sqlite3.Row
+                    if not self.read_only:
+                        self._wal_active = (
+                            await apply_wal_with_fallback(
+                                connection,
+                                db_label="state.db",
+                            )
+                            == "wal"
+                        )
+                    await apply_database_pragmas(
                         connection,
                         db_label="state.db",
                     )
-                    await self._ensure_schema(connection)
-                else:
-                    self._fts_enabled = (
-                        await self._fts_table_probe(connection, "messages_fts")
-                        is True
-                    )
-                    if self._fts_enabled:
-                        self._trigram_available = (
+                    await connection.execute("PRAGMA foreign_keys=ON")
+                    await connection.execute("PRAGMA busy_timeout=1000")
+                    if not self.read_only:
+                        self._fts_cjk_loaded = await load_fts5_cjk_extension(
+                            connection
+                        )
+                        await self._ensure_schema(connection)
+                    else:
+                        self._fts_enabled = (
                             await self._fts_table_probe(
-                                connection, "messages_fts_trigram"
+                                connection,
+                                "messages_fts",
                             )
                             is True
                         )
-                initialized = True
-            except Exception as exc:
-                _set_last_init_error(f"{type(exc).__name__}: {exc}")
-                raise
-            finally:
-                if not initialized and connection is not None:
-                    close_task = asyncio.create_task(connection.close())
+                        if self._fts_enabled:
+                            self._trigram_available = (
+                                await self._fts_table_probe(
+                                    connection,
+                                    "messages_fts_trigram",
+                                )
+                                is True
+                            )
+                    initialized = True
+                    return connection
+                finally:
+                    if not initialized and connection is not None:
+                        close_task = asyncio.create_task(connection.close())
+                        try:
+                            await asyncio.shield(close_task)
+                        except asyncio.CancelledError:
+                            await asyncio.shield(close_task)
+                            raise
+
+            deadline = time.monotonic() + self._WRITE_PATIENCE_S
+            while True:
+                database_error: Optional[sqlite3.DatabaseError] = None
+                try:
+                    connection = await _connect_and_initialize()
+                except sqlite3.DatabaseError as caught:
+                    database_error = caught
+                except Exception as exc:
+                    _set_last_init_error(f"{type(exc).__name__}: {exc}")
+                    raise
+
+                if database_error is None:
+                    break
+                if (
+                    not self.read_only
+                    and is_malformed_db_error(database_error)
+                    and _claim_repair_attempt(self._db_path)
+                ):
+                    logger.error(
+                        "state.db schema is malformed (%s) — attempting "
+                        "automatic repair (a backup copy is made first).",
+                        database_error,
+                    )
                     try:
-                        await asyncio.shield(close_task)
-                    except asyncio.CancelledError:
-                        await asyncio.shield(close_task)
+                        report = await repair_state_db_schema(self._db_path)
+                    except Exception as exc:
+                        _set_last_init_error(f"{type(exc).__name__}: {exc}")
                         raise
+                    if report.get("repaired"):
+                        self._schema_ready = False
+                        continue
+                message = str(database_error).lower()
+                if (
+                    isinstance(database_error, sqlite3.OperationalError)
+                    and ("locked" in message or "busy" in message)
+                    and time.monotonic() < deadline
+                ):
+                    await asyncio.sleep(
+                        min(
+                            random.uniform(
+                                self._WRITE_RETRY_MIN_S,
+                                self._WRITE_RETRY_MAX_S,
+                            ),
+                            max(deadline - time.monotonic(), 0.001),
+                        )
+                    )
+                    continue
+                _set_last_init_error(
+                    f"{type(database_error).__name__}: {database_error}"
+                )
+                raise database_error
             tracking_key = str(await _realpath(str(self._db_path)))
             _live_connection_counts[tracking_key] = (
                 _live_connection_counts.get(tracking_key, 0) + 1
