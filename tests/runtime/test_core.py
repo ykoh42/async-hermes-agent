@@ -158,6 +158,61 @@ def test_conversation_and_chat_are_coroutines():
 
 
 @pytest.mark.asyncio
+async def test_invoke_tool_preserves_upstream_arguments(monkeypatch):
+    from agent.agent_runtime_helpers import invoke_tool
+    import model_tools
+
+    dispatch = AsyncMock(return_value="ok")
+    monkeypatch.setattr(model_tools, "handle_function_call", dispatch)
+    monkeypatch.setattr(
+        registry,
+        "get_entry",
+        lambda _name: SimpleNamespace(toolset="core"),
+    )
+    agent = SimpleNamespace(
+        session_id="session",
+        _current_turn_id="turn",
+        _current_api_request_id="request",
+        _current_user_task="question",
+        valid_tool_names={"example"},
+        enabled_toolsets=["core"],
+        disabled_toolsets=["browser"],
+    )
+
+    result = await invoke_tool(
+        agent,
+        "example",
+        {"value": 1},
+        "task",
+        "call",
+        [],
+        True,
+        True,
+        [{"middleware": "seen"}],
+        True,
+    )
+
+    assert result == "ok"
+    dispatch.assert_awaited_once_with(
+        "example",
+        {"value": 1},
+        "task",
+        tool_call_id="call",
+        session_id="session",
+        turn_id="turn",
+        api_request_id="request",
+        user_task="question",
+        enabled_tools=["example"],
+        skip_pre_tool_call_hook=True,
+        skip_tool_request_middleware=True,
+        skip_tool_execution_middleware=True,
+        tool_request_middleware_trace=[{"middleware": "seen"}],
+        enabled_toolsets=["core"],
+        disabled_toolsets=["browser"],
+    )
+
+
+@pytest.mark.asyncio
 async def test_session_search_availability_does_not_block_event_loop(
     monkeypatch, tmp_path
 ):
@@ -174,6 +229,38 @@ async def test_session_search_availability_does_not_block_event_loop(
         assert await check_session_search_requirements() is True
     finally:
         blockbuster.deactivate()
+
+
+@pytest.mark.asyncio
+async def test_session_lifecycle_does_not_block_or_leak(tmp_path):
+    """Exercise real SQLite and transcript cleanup under all runtime audits."""
+    from hermes_state import SessionDB
+
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir()
+    (sessions_dir / "session.jsonl").write_text("", encoding="utf-8")
+    database = SessionDB(tmp_path / "state.db")
+
+    async with (
+        no_event_loop_blocking(action=LeakAction.RAISE, threshold=0.1),
+        no_task_leaks(action=LeakAction.RAISE),
+    ):
+        blockbuster = BlockBuster()
+        blockbuster.activate()
+        try:
+            await database.create_session("session", source="library")
+            await database.append_message(
+                "session", role="user", content="hello"
+            )
+            await database.end_session("session", "done")
+            assert await database.delete_session(
+                "session", sessions_dir=sessions_dir
+            )
+        finally:
+            await database.close()
+            blockbuster.deactivate()
+
+    assert not (sessions_dir / "session.jsonl").exists()
 
 
 @pytest.mark.asyncio
