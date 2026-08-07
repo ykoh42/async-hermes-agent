@@ -3506,7 +3506,7 @@ async def _initialize_deferred_runtime(agent: Any) -> bool:
                 build_nvidia_nim_headers,
                 build_or_headers,
             )
-            from agent.process_bootstrap import build_keepalive_http_client
+            from agent.agent_runtime_helpers import create_openai_client
 
             headers = deferred_client_kwargs.get("default_headers")
             headers = dict(headers) if isinstance(headers, dict) else {}
@@ -3542,37 +3542,13 @@ async def _initialize_deferred_runtime(agent: Any) -> bool:
                 client_kwargs["default_query"] = dict(default_query)
             if headers:
                 client_kwargs["default_headers"] = headers
-            http_client = build_keepalive_http_client(
-                agent.base_url,
-                verify=getattr(agent, "_tls_verify_by_route", {}).get(
-                    _normalize_route_base_url(agent.base_url),
-                    getattr(agent, "_default_httpx_verify", True),
-                ),
+            agent.client = await create_openai_client(
+                agent,
+                client_kwargs,
+                reason="deferred_runtime",
+                shared=True,
             )
-            if http_client is not None:
-                client_kwargs["http_client"] = http_client
-            client_error = None
-            try:
-                agent.client = _ra().OpenAI(**client_kwargs)
-            except Exception as exc:
-                client_error = exc
-            if client_error is not None:
-                if callable(api_key) and not isinstance(api_key, str):
-                    from agent.azure_identity_adapter import _release_token_provider
-
-                    await _release_token_provider(api_key)
-                raise client_error
-            if callable(api_key) and not isinstance(api_key, str):
-                agent.client._hermes_token_provider = api_key
-            # OpenAI>=2 lazily resolves the platform on the first request.
-            # The value only controls an SDK telemetry
-            # header, so use a stable conservative value and keep the agent
-            # turn entirely on the event loop.
-            agent.client._platform = "Unknown"
-            # Do not persist the owned httpx.AsyncClient in the rebuild recipe.
-            agent._client_kwargs = {
-                key: value for key, value in client_kwargs.items() if key != "http_client"
-            }
+            agent._client_kwargs = dict(client_kwargs)
             # A fallback can leave an Anthropic client attached while the
             # next selected credential uses the OpenAI wire format.
             agent._anthropic_client = None

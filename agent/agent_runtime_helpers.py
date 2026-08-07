@@ -2176,6 +2176,90 @@ def anthropic_prompt_cache_policy(
 
 
 
+async def create_openai_client(
+    agent: Any,
+    client_kwargs: dict,
+    *,
+    reason: str,
+    shared: bool,
+) -> Any:
+    """Build the primary native-async OpenAI-compatible transport."""
+    from agent.auxiliary_client import _validate_base_url, _validate_proxy_env_urls
+    from agent.process_bootstrap import build_keepalive_http_client
+    from agent.ssl_verify import resolve_httpx_verify
+
+    kwargs = dict(client_kwargs)
+    ssl_ca_cert = kwargs.pop("ssl_ca_cert", None)
+    ssl_verify = kwargs.pop("ssl_verify", None)
+    base_url = str(kwargs.get("base_url") or "")
+    _validate_proxy_env_urls()
+    _validate_base_url(base_url)
+
+    if agent.provider == "copilot-acp" or base_url.startswith("acp://copilot"):
+        from agent.copilot_acp_client import CopilotACPClient
+
+        return CopilotACPClient(**kwargs)
+
+    if agent.provider == "gemini":
+        from agent.gemini_native_adapter import (
+            GeminiNativeClient,
+            is_native_gemini_base_url,
+        )
+
+        if is_native_gemini_base_url(base_url):
+            safe_kwargs = {
+                key: value
+                for key, value in kwargs.items()
+                if key in {
+                    "api_key",
+                    "base_url",
+                    "default_headers",
+                    "timeout",
+                    "http_client",
+                }
+            }
+            return GeminiNativeClient(**safe_kwargs)
+
+    if "http_client" not in kwargs:
+        route_verify = getattr(agent, "_tls_verify_by_route", {}).get(
+            base_url.rstrip("/"),
+        )
+        if route_verify is None:
+            route_verify = resolve_httpx_verify(
+                ca_bundle=ssl_ca_cert,
+                ssl_verify=ssl_verify,
+                base_url=base_url,
+            )
+        http_client = build_keepalive_http_client(base_url, verify=route_verify)
+        if http_client is not None:
+            kwargs["http_client"] = http_client
+
+    api_key = kwargs.get("api_key")
+    client_error: Exception | None = None
+    try:
+        client = _ra().OpenAI(**kwargs)
+    except Exception as exc:
+        client_error = exc
+    if client_error is not None:
+        if callable(api_key) and not isinstance(api_key, str):
+            from agent.azure_identity_adapter import _release_token_provider
+
+            await _release_token_provider(api_key)
+        raise client_error
+
+    if callable(api_key) and not isinstance(api_key, str):
+        client._hermes_token_provider = api_key
+    client._platform = "Unknown"
+    context = getattr(agent, "_client_log_context", None)
+    logger.info(
+        "Native async client created (%s, shared=%s)%s",
+        reason,
+        shared,
+        f" {context()}" if callable(context) else "",
+    )
+    return client
+
+
 async def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mode=''):
     """Switch a live agent through the native async provider lifecycle.
 

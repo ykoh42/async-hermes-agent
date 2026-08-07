@@ -7,7 +7,7 @@ import shlex
 import sys
 import time
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from blockbuster import BlockBuster
@@ -45,6 +45,7 @@ def test_conversation_and_chat_are_coroutines():
     )
     from run_agent import main as agent_main
     from agent.agent_runtime_helpers import (
+        create_openai_client,
         invoke_tool,
         recover_with_credential_pool,
         try_recover_primary_transport,
@@ -169,10 +170,52 @@ def test_conversation_and_chat_are_coroutines():
     assert inspect.iscoroutinefunction(AIAgent._preprocess_anthropic_content)
     assert inspect.iscoroutinefunction(recover_with_credential_pool)
     assert inspect.iscoroutinefunction(try_recover_primary_transport)
+    assert inspect.iscoroutinefunction(create_openai_client)
     assert inspect.iscoroutinefunction(load_pool)
     active_entries = list(registry._tools.values())
     assert active_entries
     assert all(inspect.iscoroutinefunction(entry.handler) for entry in active_entries)
+
+
+@pytest.mark.asyncio
+async def test_create_openai_client_preserves_kwargs_and_owns_async_transport():
+    from agent.agent_runtime_helpers import create_openai_client
+
+    client = SimpleNamespace()
+    http_client = MagicMock(name="async_http_client")
+    agent = SimpleNamespace(
+        provider="openrouter",
+        _tls_verify_by_route={},
+        _client_log_context=lambda: "provider=openrouter",
+    )
+    client_kwargs = {
+        "api_key": "test-key",
+        "base_url": "https://openrouter.ai/api/v1",
+        "max_retries": 0,
+    }
+
+    with (
+        patch(
+            "agent.process_bootstrap.build_keepalive_http_client",
+            return_value=http_client,
+        ),
+        patch("run_agent.OpenAI", return_value=client) as factory,
+    ):
+        result = await create_openai_client(
+            agent,
+            client_kwargs,
+            reason="test",
+            shared=True,
+        )
+
+    assert result is client
+    assert client_kwargs == {
+        "api_key": "test-key",
+        "base_url": "https://openrouter.ai/api/v1",
+        "max_retries": 0,
+    }
+    factory.assert_called_once_with(**client_kwargs, http_client=http_client)
+    assert client._platform == "Unknown"
 
 
 @pytest.mark.asyncio
