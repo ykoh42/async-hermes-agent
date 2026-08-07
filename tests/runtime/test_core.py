@@ -310,6 +310,28 @@ async def test_session_lifecycle_does_not_block_or_leak(tmp_path):
             await database.reopen_session("session")
             assert (await database.get_session("session"))["ended_at"] is None
             await database.end_session("session", "done")
+            assert [
+                row["id"]
+                for row in await database.list_prune_candidates(
+                    older_than_days=None, title_like="native"
+                )
+            ] == ["session"]
+            assert await database.archive_sessions(
+                older_than_days=None, title_like="native"
+            ) == 1
+            assert await database.set_session_archived("session", False)
+            assert await database.archive_stale_sessions(-1) == 0
+            assert await database.maybe_auto_archive(
+                idle_days=-1, min_interval_hours=0
+            ) == {"skipped": False, "archived": 0}
+            assert await database.maybe_auto_prune_and_vacuum(
+                retention_days=10_000,
+                min_interval_hours=0,
+                vacuum=False,
+            ) == {"skipped": False, "pruned": 0, "vacuumed": False}
+            assert (await database.logical_size_bytes()) > 0
+            assert await database.optimize_fts() >= 0
+            assert await database.vacuum() >= 0
 
             await database.create_session("compression-parent", source="runtime")
             await database.end_session("compression-parent", "compression")

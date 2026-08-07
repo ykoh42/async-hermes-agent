@@ -34,6 +34,14 @@ def test_public_session_interface_is_async():
         "reopen_session",
         "finalize_orphaned_compression_sessions",
         "backfill_repo_roots",
+        "list_prune_candidates",
+        "archive_sessions",
+        "archive_stale_sessions",
+        "logical_size_bytes",
+        "optimize_fts",
+        "vacuum",
+        "maybe_auto_prune_and_vacuum",
+        "maybe_auto_archive",
         "get_session",
         "resolve_session_id",
         "session_count_ge",
@@ -984,6 +992,215 @@ async def test_prune_sessions_uses_last_activity_and_upstream_filters(db):
     assert await db.prune_sessions(title_like="batch", max_messages=1) == 1
     assert await db.get_session("stale") is None
     assert await db.get_session("active") is not None
+
+
+@pytest.mark.asyncio
+async def test_list_and_archive_sessions_preserve_filters_order_and_lineage(db):
+    now = time.time()
+    await db.create_session("old", source="library")
+    await db.set_session_title("old", "Archive old")
+    await db.append_message("old", role="user", content="old")
+    await db.end_session("old", "compression")
+    await db.create_session(
+        "tip", source="library", parent_session_id="old"
+    )
+    await db.set_session_title("tip", "Archive tip")
+    await db.append_message("tip", role="assistant", content="tip")
+    await db.end_session("tip", "done")
+    await db.create_session("recent", source="library")
+    await db.set_session_title("recent", "Archive recent")
+    await db.append_message("recent", role="user", content="recent")
+    await db.end_session("recent", "done")
+
+    connection = await db._get_connection()
+    await connection.execute(
+        "UPDATE sessions SET started_at = ? WHERE id IN ('old', 'tip')",
+        (now - 20 * 86_400,),
+    )
+    await connection.execute(
+        "UPDATE messages SET timestamp = ? WHERE session_id IN ('old', 'tip')",
+        (now - 10 * 86_400,),
+    )
+    await connection.execute(
+        "UPDATE sessions SET started_at = ? WHERE id = 'recent'",
+        (now - 2 * 86_400,),
+    )
+    await connection.execute(
+        "UPDATE messages SET timestamp = ? WHERE session_id = 'recent'",
+        (now - 86_400,),
+    )
+    await connection.commit()
+
+    rows = await db.list_prune_candidates(
+        older_than_days=5,
+        title_like="archive",
+        archived=False,
+    )
+    assert [row["id"] for row in rows] == ["old", "tip"]
+    assert set(rows[0]) == {
+        "id",
+        "source",
+        "title",
+        "model",
+        "started_at",
+        "last_active",
+        "ended_at",
+        "message_count",
+        "archived",
+    }
+
+    assert await db.archive_sessions(
+        older_than_days=5, title_like="archive", end_reason="done"
+    ) == 1
+    assert (await db.get_session("old"))["archived"] == 1
+    assert (await db.get_session("tip"))["archived"] == 1
+    assert (await db.get_session("recent"))["archived"] == 0
+    assert await db.archive_sessions(
+        older_than_days=5, title_like="archive", end_reason="done"
+    ) == 0
+
+
+@pytest.mark.asyncio
+async def test_archive_stale_sessions_honors_activity_pins_and_lineage_tips(db):
+    old = time.time() - 10 * 86_400
+    recent = time.time() - 86_400
+    for session_id in ("stale", "pinned", "root", "tip"):
+        await db.create_session(session_id, source="library")
+        await db.append_message(session_id, role="user", content=session_id)
+    await db.set_session_pinned("pinned", True)
+    await db.end_session("root", "compression")
+    connection = await db._get_connection()
+    await connection.execute(
+        "UPDATE sessions SET parent_session_id = 'root' WHERE id = 'tip'"
+    )
+    await connection.execute(
+        "UPDATE sessions SET started_at = ?", (old,)
+    )
+    await connection.execute(
+        "UPDATE messages SET timestamp = ?", (old,)
+    )
+    await connection.execute(
+        "UPDATE messages SET timestamp = ? WHERE session_id = 'tip'", (recent,)
+    )
+    await connection.commit()
+
+    assert await db.archive_stale_sessions(3) == 1
+    assert (await db.get_session("stale"))["archived"] == 1
+    assert (await db.get_session("pinned"))["archived"] == 0
+    assert (await db.get_session("root"))["archived"] == 0
+    assert (await db.get_session("tip"))["archived"] == 0
+
+    assert await db.archive_stale_sessions(3, exclude_pinned=False) == 1
+    assert (await db.get_session("pinned"))["archived"] == 1
+    assert await db.archive_stale_sessions(-1) == 0
+
+
+@pytest.mark.asyncio
+async def test_auto_archive_is_throttled_and_records_zero_result(db):
+    first = await db.maybe_auto_archive(idle_days=3, min_interval_hours=24)
+    assert first == {"skipped": False, "archived": 0}
+    assert await db.get_meta("last_auto_archive") is not None
+    second = await db.maybe_auto_archive(idle_days=3, min_interval_hours=24)
+    assert second == {"skipped": True, "archived": 0}
+
+
+@pytest.mark.asyncio
+async def test_auto_prune_removes_transcripts_and_throttles_vacuum(
+    db, tmp_path, monkeypatch
+):
+    old = time.time() - 100 * 86_400
+    await db.create_session("old", source="library")
+    await db.append_message("old", role="user", content="old")
+    await db.end_session("old", "done")
+    connection = await db._get_connection()
+    await connection.execute(
+        "UPDATE sessions SET started_at = ? WHERE id = 'old'", (old,)
+    )
+    await connection.execute(
+        "UPDATE messages SET timestamp = ? WHERE session_id = 'old'", (old,)
+    )
+    await connection.commit()
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir()
+    (sessions_dir / "old.jsonl").write_text("{}\n", encoding="utf-8")
+    (sessions_dir / "request_dump_old_1.json").write_text("{}", encoding="utf-8")
+
+    vacuum_calls = 0
+
+    async def fake_vacuum():
+        nonlocal vacuum_calls
+        vacuum_calls += 1
+        return 0
+
+    monkeypatch.setattr(db, "vacuum", fake_vacuum)
+    result = await db.maybe_auto_prune_and_vacuum(
+        retention_days=90,
+        min_interval_hours=0,
+        sessions_dir=sessions_dir,
+    )
+    assert result == {"skipped": False, "pruned": 1, "vacuumed": True}
+    assert vacuum_calls == 1
+    assert not (sessions_dir / "old.jsonl").exists()
+    assert not (sessions_dir / "request_dump_old_1.json").exists()
+    assert await db.get_meta("last_vacuum") is not None
+
+    await db.set_meta("last_auto_prune", str(time.time()))
+    skipped = await db.maybe_auto_prune_and_vacuum(min_interval_hours=24)
+    assert skipped == {"skipped": True, "pruned": 0, "vacuumed": False}
+
+
+@pytest.mark.asyncio
+async def test_auto_maintenance_preserves_best_effort_error_contracts(
+    db, monkeypatch
+):
+    async def fail_prune(**_kwargs):
+        raise RuntimeError("prune failed")
+
+    monkeypatch.setattr(db, "prune_sessions", fail_prune)
+    failed = await db.maybe_auto_prune_and_vacuum(min_interval_hours=0)
+    assert failed == {
+        "skipped": False,
+        "pruned": 0,
+        "vacuumed": False,
+        "error": "prune failed",
+    }
+    assert await db.get_meta("last_auto_prune") is None
+
+    async def one_pruned(**_kwargs):
+        return 1
+
+    async def fail_vacuum():
+        raise RuntimeError("vacuum failed")
+
+    monkeypatch.setattr(db, "prune_sessions", one_pruned)
+    monkeypatch.setattr(db, "vacuum", fail_vacuum)
+    recovered = await db.maybe_auto_prune_and_vacuum(min_interval_hours=0)
+    assert recovered == {"skipped": False, "pruned": 1, "vacuumed": False}
+    assert await db.get_meta("last_vacuum") is None
+    assert await db.get_meta("last_auto_prune") is not None
+
+
+@pytest.mark.asyncio
+async def test_logical_size_optimize_and_vacuum_use_native_async_sqlite(db):
+    await db.create_session("session", source="library")
+    await db.append_message("session", role="user", content="hello")
+    connection = await db._get_connection()
+    await connection.execute(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(content)"
+    )
+    await connection.commit()
+    cursor = await connection.execute(
+        "SELECT COUNT(*) FROM sqlite_master "
+        "WHERE type = 'table' AND name IN (?, ?, ?)",
+        db._FTS_TABLES,
+    )
+    present = await cursor.fetchone()
+    await cursor.close()
+
+    assert (await db.logical_size_bytes()) > 0
+    assert present[0] >= 1
+    assert await db.optimize_fts() == present[0]
+    assert await db.vacuum() == present[0]
 
 
 @pytest.mark.asyncio

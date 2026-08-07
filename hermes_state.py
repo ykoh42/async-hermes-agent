@@ -267,6 +267,7 @@ class SessionDB:
     _WRITE_RETRY_MAX_S = 0.15
 
     _CONTENT_JSON_PREFIX = "\x00json:"
+    _FTS_TABLES = ("messages_fts", "messages_fts_trigram", "messages_fts_cjk")
     _CONVERSATION_ROW_COLUMNS = (
         "id, role, content, tool_call_id, tool_calls, tool_name, effect_disposition, "
         "finish_reason, reasoning, reasoning_content, reasoning_details, "
@@ -2428,6 +2429,81 @@ class SessionDB:
         elif archived is False:
             clauses.append("s.archived = 0")
         return " AND ".join(clauses), params
+
+    async def list_prune_candidates(
+        self,
+        older_than_days: Optional[float] = None,
+        source: str = None,
+        **filters,
+    ) -> List[Dict[str, Any]]:
+        """Return sessions a matching prune/archive call would touch."""
+        if (
+            filters.get("last_active_before") is None
+            and filters.get("started_before") is None
+            and older_than_days is not None
+        ):
+            filters["last_active_before"] = time.time() - (
+                older_than_days * 86_400
+            )
+        where, params = self._prune_filter_where(source=source, **filters)
+        connection = await self._get_connection()
+        rows = await (
+            await connection.execute(
+                f"""SELECT s.id, s.source, s.title, s.model, s.started_at,
+                           COALESCE(
+                               (SELECT MAX(m.timestamp) FROM messages m
+                                WHERE m.session_id = s.id),
+                               s.started_at
+                           ) AS last_active,
+                           s.ended_at, s.message_count, s.archived
+                    FROM sessions s WHERE {where}
+                    ORDER BY last_active ASC, s.started_at ASC""",
+                params,
+            )
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    async def archive_sessions(
+        self,
+        older_than_days: Optional[float] = None,
+        source: str = None,
+        **filters,
+    ) -> int:
+        """Bulk-archive every session matching the prune filter surface."""
+        filters.setdefault("archived", False)
+        rows = await self.list_prune_candidates(
+            older_than_days=older_than_days, source=source, **filters
+        )
+        for row in rows:
+            await self.set_session_archived(row["id"], True)
+        return len(rows)
+
+    async def archive_stale_sessions(
+        self, idle_days: float, *, exclude_pinned: bool = True
+    ) -> int:
+        """Archive sessions untouched for at least ``idle_days`` days."""
+        if idle_days is None or idle_days < 0:
+            return 0
+        cutoff = time.time() - float(idle_days) * 86_400.0
+        pin_clause = "AND s.pinned = 0" if exclude_pinned else ""
+        connection = await self._get_connection()
+        rows = await (
+            await connection.execute(
+                f"""
+                SELECT s.id FROM sessions s
+                WHERE s.archived = 0
+                  AND COALESCE(s.end_reason, '') <> 'compression'
+                  {pin_clause}
+                  AND {_sql_session_last_active("s")} < ?
+                ORDER BY s.started_at ASC
+                """,
+                (cutoff,),
+            )
+        ).fetchall()
+        ids = [row["id"] for row in rows]
+        for session_id in ids:
+            await self.set_session_archived(session_id, True)
+        return len(ids)
 
     async def prune_sessions(
         self,
@@ -4654,6 +4730,181 @@ class SessionDB:
                 )
 
         await self._write(_publish)
+
+    async def logical_size_bytes(self) -> Optional[int]:
+        """Return SQLite's logical database size in bytes."""
+        try:
+            async with self._get_write_lock():
+                connection = await self._get_connection()
+                page_count_cursor = await connection.execute("PRAGMA page_count")
+                try:
+                    page_count_row = await page_count_cursor.fetchone()
+                finally:
+                    await page_count_cursor.close()
+                page_size_cursor = await connection.execute("PRAGMA page_size")
+                try:
+                    page_size_row = await page_size_cursor.fetchone()
+                finally:
+                    await page_size_cursor.close()
+            if page_count_row is None or page_size_row is None:
+                return None
+            return int(page_count_row[0]) * int(page_size_row[0])
+        except Exception as exc:
+            logger.debug("Could not read logical DB size: %s", exc)
+            return None
+
+    async def _fts_table_exists(self, name: str) -> bool:
+        """Return whether an FTS5 virtual table is queryable."""
+        connection = await self._get_connection()
+        try:
+            cursor = await connection.execute(f"SELECT 1 FROM {name} LIMIT 0")
+            await cursor.close()
+            return True
+        except sqlite3.DatabaseError:
+            return False
+
+    async def optimize_fts(self) -> int:
+        """Merge fragmented FTS5 b-tree segments into one per index."""
+        optimized = 0
+        async with self._get_write_lock():
+            connection = await self._get_connection()
+            for table_name in self._FTS_TABLES:
+                if not await self._fts_table_exists(table_name):
+                    continue
+                try:
+                    cursor = await connection.execute(
+                        f"INSERT INTO {table_name}({table_name}) VALUES('optimize')"
+                    )
+                    await cursor.close()
+                    optimized += 1
+                except sqlite3.OperationalError as exc:
+                    logger.warning(
+                        "FTS optimize failed for %s: %s", table_name, exc
+                    )
+        return optimized
+
+    async def vacuum(self) -> int:
+        """Run FTS optimization and VACUUM to reclaim database pages."""
+        optimized = 0
+        try:
+            optimized = await self.optimize_fts()
+        except Exception as exc:
+            logger.warning("FTS optimize before VACUUM failed: %s", exc)
+        async with self._get_write_lock():
+            connection = await self._get_connection()
+            try:
+                checkpoint = await connection.execute(
+                    "PRAGMA wal_checkpoint(TRUNCATE)"
+                )
+                try:
+                    await checkpoint.fetchall()
+                finally:
+                    await checkpoint.close()
+            except Exception as exc:
+                logger.debug(
+                    "WAL checkpoint (TRUNCATE) before VACUUM failed: %s", exc
+                )
+            vacuum_cursor = await connection.execute("VACUUM")
+            await vacuum_cursor.close()
+        return optimized
+
+    async def maybe_auto_prune_and_vacuum(
+        self,
+        retention_days: int = 90,
+        min_interval_hours: int = 24,
+        vacuum: bool = True,
+        sessions_dir: Optional[Path] = None,
+        min_vacuum_interval_days: int = 30,
+    ) -> Dict[str, Any]:
+        """Run throttled session pruning and optional VACUUM maintenance."""
+        result: Dict[str, Any] = {
+            "skipped": False,
+            "pruned": 0,
+            "vacuumed": False,
+        }
+        try:
+            last_raw = await self.get_meta("last_auto_prune")
+            now = time.time()
+            if last_raw:
+                try:
+                    last_ts = float(last_raw)
+                    if now - last_ts < min_interval_hours * 3_600:
+                        result["skipped"] = True
+                        return result
+                except (TypeError, ValueError):
+                    pass
+
+            pruned = await self.prune_sessions(
+                older_than_days=retention_days,
+                sessions_dir=sessions_dir,
+            )
+            result["pruned"] = pruned
+
+            last_vacuum_raw = await self.get_meta("last_vacuum")
+            vacuum_due = True
+            if last_vacuum_raw:
+                try:
+                    vacuum_due = (
+                        now - float(last_vacuum_raw)
+                    ) >= min_vacuum_interval_days * 86_400
+                except (TypeError, ValueError):
+                    vacuum_due = True
+            if vacuum and pruned > 0 and vacuum_due:
+                try:
+                    await self.vacuum()
+                    result["vacuumed"] = True
+                    await self.set_meta("last_vacuum", str(now))
+                except Exception as exc:
+                    logger.warning("state.db VACUUM failed: %s", exc)
+
+            await self.set_meta("last_auto_prune", str(now))
+            if pruned > 0:
+                logger.info(
+                    "state.db auto-maintenance: pruned %d session(s) inactive "
+                    "for %d days%s",
+                    pruned,
+                    retention_days,
+                    " + VACUUM" if result["vacuumed"] else "",
+                )
+        except Exception as exc:
+            logger.warning("state.db auto-maintenance failed: %s", exc)
+            result["error"] = str(exc)
+        return result
+
+    async def maybe_auto_archive(
+        self,
+        idle_days: float = 3,
+        min_interval_hours: int = 24,
+        exclude_pinned: bool = True,
+    ) -> Dict[str, Any]:
+        """Run throttled soft archival for sessions idle beyond the cutoff."""
+        result: Dict[str, Any] = {"skipped": False, "archived": 0}
+        try:
+            last_raw = await self.get_meta("last_auto_archive")
+            now = time.time()
+            if last_raw:
+                try:
+                    if now - float(last_raw) < min_interval_hours * 3_600:
+                        result["skipped"] = True
+                        return result
+                except (TypeError, ValueError):
+                    pass
+
+            archived = await self.archive_stale_sessions(
+                idle_days, exclude_pinned=exclude_pinned
+            )
+            result["archived"] = archived
+            await self.set_meta("last_auto_archive", str(now))
+            if archived > 0:
+                logger.info(
+                    "state.db auto-archive: archived %d session(s) idle >= %s days",
+                    archived,
+                    idle_days,
+                )
+        except Exception as exc:
+            logger.warning("state.db auto-archive failed: %s", exc)
+            result["error"] = str(exc)
+        return result
 
     async def flush_token_counts(self, timeout: float = 5.0) -> bool:
         """Token deltas still use their own async accounting path; no turn-blocking drain."""
