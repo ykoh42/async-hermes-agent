@@ -5,6 +5,8 @@ import json
 from types import SimpleNamespace
 
 import pytest
+from pyleak import no_task_leaks
+from pyleak.eventloop import LeakAction
 
 
 async def _reset_mcp_state(mcp_tool) -> None:
@@ -238,3 +240,40 @@ async def test_standalone_failed_connect_is_reaped_without_global_owner(monkeypa
             assert "probe-only" not in mcp_tool._server_connect_errors
     finally:
         await _cleanup_mcp_state(mcp_tool, created)
+
+
+@pytest.mark.asyncio
+async def test_standalone_failed_connect_cleanup_preserves_new_cancellation(monkeypatch):
+    """Cancellation during orphan cleanup supersedes the earlier connect error."""
+    from tools import mcp_tool
+
+    shutdown_started = asyncio.Event()
+    shutdown_cancelled = asyncio.Event()
+
+    class _StalledCleanupServer:
+        def __init__(self, name):
+            self.name = name
+
+        async def start(self, config):
+            raise ConnectionError("probe target unavailable")
+
+        async def shutdown(self):
+            shutdown_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                shutdown_cancelled.set()
+                raise
+
+    monkeypatch.setattr(mcp_tool, "MCPServerTask", _StalledCleanupServer)
+
+    async with no_task_leaks(action=LeakAction.RAISE):
+        connect = asyncio.create_task(
+            mcp_tool._connect_server("probe-only", {"command": "unused"})
+        )
+        await asyncio.wait_for(shutdown_started.wait(), timeout=1)
+        connect.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await connect
+
+    assert shutdown_cancelled.is_set()

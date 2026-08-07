@@ -4823,11 +4823,12 @@ async def browser_vision(
                     len(data_url) / (1024 * 1024),
                     _RESIZE_TARGET_BYTES / (1024 * 1024),
                 )
-                data_url = await _resize_image_for_vision(
+                # A new caller cancellation must supersede the rejected image error.
+                data_url = await _resize_image_for_vision(  # noqa: ASYNC120
                     screenshot_path, mime_type="image/png"
                 )
                 image_part["image_url"]["url"] = data_url
-                response = await _lazy_call_llm(**call_kwargs)
+                response = await _lazy_call_llm(**call_kwargs)  # noqa: ASYNC120
             else:
                 raise
 

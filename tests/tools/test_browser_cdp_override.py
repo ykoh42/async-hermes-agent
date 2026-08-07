@@ -3,6 +3,8 @@ from unittest.mock import AsyncMock, Mock, patch
 
 import httpx
 import pytest
+from pyleak import no_task_leaks
+from pyleak.eventloop import LeakAction
 
 
 HOST = "example-host"
@@ -270,6 +272,32 @@ class TestCDPSupervisorStartRedaction:
         with pytest.raises(TimeoutError) as caught:
             await supervisor.start(timeout=0.001)
         assert "127.0.0.1:9222" in str(caught.value)
+
+    async def test_start_cancellation_reaps_supervisor_task(self):
+        from tools.browser_supervisor import CDPSupervisor
+
+        supervisor = CDPSupervisor("test-task", WS_URL)
+        run_started = asyncio.Event()
+        run_cancelled = asyncio.Event()
+
+        async def never_ready():
+            run_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                run_cancelled.set()
+                raise
+
+        supervisor._run = never_ready
+        async with no_task_leaks(action=LeakAction.RAISE):
+            start = asyncio.create_task(supervisor.start(timeout=60))
+            await asyncio.wait_for(run_started.wait(), timeout=1)
+            start.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await start
+
+        assert run_cancelled.is_set()
+        assert supervisor._run_task is None
 
     @pytest.mark.parametrize(
         "raw",

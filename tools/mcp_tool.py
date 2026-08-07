@@ -2309,10 +2309,9 @@ class MCPServerTask:
             for t in (shutdown_task, reconnect_task):
                 if not t.done():
                     t.cancel()
-                    try:
-                        await t
-                    except (asyncio.CancelledError, Exception):
-                        pass
+            await asyncio.gather(
+                shutdown_task, reconnect_task, return_exceptions=True
+            )
 
         if self._shutdown_event.is_set():
             return "shutdown"
@@ -2353,10 +2352,9 @@ class MCPServerTask:
             for t in (shutdown_task, reconnect_task):
                 if not t.done():
                     t.cancel()
-                    try:
-                        await t
-                    except (asyncio.CancelledError, Exception):
-                        pass
+            await asyncio.gather(
+                shutdown_task, reconnect_task, return_exceptions=True
+            )
         if self._shutdown_event.is_set():
             return "shutdown"
         self._reconnect_event.clear()
@@ -3485,10 +3483,7 @@ class MCPServerTask:
                     self.name,
                 )
                 self._task.cancel()
-                try:
-                    await self._task
-                except asyncio.CancelledError:
-                    pass
+                await asyncio.gather(self._task, return_exceptions=True)
         if self._pending_refresh_tasks:
             for task in list(self._pending_refresh_tasks):
                 task.cancel()
@@ -3526,10 +3521,9 @@ class MCPServerTask:
             for task in (shutdown_task, reconnect_task):
                 if not task.done():
                     task.cancel()
-                    try:
-                        await task
-                    except (asyncio.CancelledError, Exception):
-                        pass
+            await asyncio.gather(
+                shutdown_task, reconnect_task, return_exceptions=True
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -4437,7 +4431,7 @@ async def _connect_server(name: str, config: dict) -> MCPServerTask:
         # no revival owner, so they must reap their failed task locally.
         if claim is None:
             try:
-                await server.shutdown()
+                await server.shutdown()  # noqa: ASYNC120 -- a new caller cancellation must supersede the connect error
             except Exception as shutdown_exc:  # noqa: BLE001 -- best-effort reap, don't mask the real error
                 logger.debug(
                     "MCP server '%s' shutdown during orphan-reap failed: %s",

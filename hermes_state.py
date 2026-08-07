@@ -1401,7 +1401,8 @@ class SessionDB:
             except Exception as exc:
                 if (
                     isinstance(exc, sqlite3.DatabaseError)
-                    and await self._try_runtime_fts_rebuild(exc)
+                    # A new caller cancellation must supersede this stale DB error.
+                    and await self._try_runtime_fts_rebuild(exc)  # noqa: ASYNC120
                 ):
                     continue
                 no_more_rows = (
@@ -4486,7 +4487,8 @@ class SessionDB:
                     and not self._is_fts_write_corruption_error(exc)
                 ):
                     return []
-                if not await self._try_runtime_fts_rebuild(exc):
+                # A new caller cancellation must supersede this stale FTS error.
+                if not await self._try_runtime_fts_rebuild(exc):  # noqa: ASYNC120
                     raise
                 cursor = await connection.execute(sql, params)
                 try:

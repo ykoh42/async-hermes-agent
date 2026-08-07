@@ -646,17 +646,26 @@ class MemoryStore:
         """Atomically write memory entries without a synchronous file call."""
         content = ENTRY_DELIMITER.join(entries) if entries else ""
         temporary = path.with_name(f".mem_{path.name}.{uuid.uuid4().hex}.tmp")
+        write_error: Optional[OSError] = None
+        replaced = False
         try:
             async with aiofiles.open(temporary, "w", encoding="utf-8") as handle:
                 await handle.write(content)
             await aiofiles.os.replace(temporary, path)
-        except (OSError, IOError) as exc:
-            try:
-                if await aiofiles.os.path.exists(temporary):
-                    await aiofiles.os.remove(temporary)
-            except OSError:
-                pass
-            raise RuntimeError(f"Failed to write memory file {path}: {exc}") from exc
+            replaced = True
+        except OSError as exc:
+            write_error = exc
+        finally:
+            if not replaced:
+                try:
+                    if await aiofiles.os.path.exists(temporary):
+                        await aiofiles.os.remove(temporary)
+                except OSError:
+                    pass
+        if write_error is not None:
+            raise RuntimeError(
+                f"Failed to write memory file {path}: {write_error}"
+            ) from write_error
 
 
 def _missing_old_text_error(store: "MemoryStore", target: str, action: str) -> str:

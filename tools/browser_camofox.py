@@ -555,7 +555,8 @@ async def camofox_navigate(url: str, task_id: Optional[str] = None) -> str:
                         session["tab_id"],
                     )
                     session["tab_id"] = None
-                    session = await _ensure_tab(task_id, browser_url)
+                    # A new caller cancellation must supersede the stale-tab error.
+                    session = await _ensure_tab(task_id, browser_url)  # noqa: ASYNC120
                     data = {"ok": True, "url": browser_url}
                 else:
                     raise

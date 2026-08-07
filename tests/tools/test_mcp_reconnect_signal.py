@@ -9,6 +9,8 @@ in isolation from the full stdio/http transport machinery.
 import asyncio
 
 import pytest
+from pyleak import no_task_leaks
+from pyleak.eventloop import LeakAction
 
 
 @pytest.mark.asyncio
@@ -31,3 +33,25 @@ async def test_wait_for_lifecycle_event_shutdown_wins_when_both_set():
     task._reconnect_event.set()
     reason = await task._wait_for_lifecycle_event()
     assert reason == "shutdown"
+
+
+@pytest.mark.parametrize(
+    "wait_method",
+    (
+        "_wait_for_lifecycle_event",
+        "_wait_for_reconnect_or_shutdown",
+        "_wait_for_lazy_reconnect",
+    ),
+)
+@pytest.mark.asyncio
+async def test_lifecycle_wait_cancellation_propagates_without_task_leaks(wait_method):
+    """External cancellation must reap both event waiters before propagating."""
+    from tools.mcp_tool import MCPServerTask
+
+    server = MCPServerTask("test")
+    async with no_task_leaks(action=LeakAction.RAISE):
+        waiter = asyncio.create_task(getattr(server, wait_method)())
+        await asyncio.sleep(0)
+        waiter.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiter

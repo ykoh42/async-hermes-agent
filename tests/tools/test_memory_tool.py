@@ -1,9 +1,13 @@
 """Tests for tools/memory_tool.py — MemoryStore, security scanning, and tool dispatcher."""
 
+import asyncio
 import json
+from pathlib import Path
+
 import pytest
 import pytest_asyncio
-from pathlib import Path
+from pyleak import no_task_leaks
+from pyleak.eventloop import LeakAction
 
 from tools.memory_tool import (
     MemoryStore,
@@ -270,6 +274,27 @@ class TestMemoryStorePersistence:
         store = MemoryStore()
         await store.load_from_disk()
         assert len(store.memory_entries) == 2
+
+    async def test_cancelled_atomic_write_removes_temporary_file(
+        self, tmp_path, monkeypatch
+    ):
+        replace_started = asyncio.Event()
+
+        async def stalled_replace(_source, _destination):
+            replace_started.set()
+            await asyncio.Event().wait()
+
+        monkeypatch.setattr("tools.memory_tool.aiofiles.os.replace", stalled_replace)
+        target = tmp_path / "MEMORY.md"
+
+        async with no_task_leaks(action=LeakAction.RAISE):
+            write = asyncio.create_task(MemoryStore._write_file(target, ["fact"]))
+            await asyncio.wait_for(replace_started.wait(), timeout=1)
+            write.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await write
+
+        assert not list(tmp_path.glob(".mem_MEMORY.md.*.tmp"))
 
 
 class TestMemoryStoreSnapshot:
