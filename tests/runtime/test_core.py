@@ -2362,6 +2362,34 @@ async def test_close_cancels_and_awaits_active_turn_without_task_leak():
 
 
 @pytest.mark.asyncio
+async def test_close_propagates_caller_cancellation_while_awaiting_active_turn():
+    agent = AIAgent.__new__(AIAgent)
+    turn_started = asyncio.Event()
+    turn_cancelling = asyncio.Event()
+
+    async def active_turn() -> None:
+        turn_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            turn_cancelling.set()
+            await asyncio.Event().wait()
+
+    turn_task = asyncio.create_task(active_turn())
+    await turn_started.wait()
+    agent._active_turn_task = turn_task
+
+    close_task = asyncio.create_task(agent.close())
+    await turn_cancelling.wait()
+    close_task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await close_task
+    assert agent._closed is False
+    assert turn_task.cancelled()
+
+
+@pytest.mark.asyncio
 async def test_close_releases_retained_mcp_lifecycle(monkeypatch):
     from tools import mcp_tool
 

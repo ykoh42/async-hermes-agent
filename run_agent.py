@@ -3799,12 +3799,9 @@ class AIAgent:
             and not active_turn.done()
         ):
             active_turn.cancel()
-            try:
-                await active_turn
-            except asyncio.CancelledError:
-                pass
-            except Exception:
-                logger.debug("Active turn failed while closing agent", exc_info=True)
+            turn_result = (await asyncio.gather(active_turn, return_exceptions=True))[0]
+            if isinstance(turn_result, Exception):
+                logger.debug("Active turn failed while closing agent: %r", turn_result)
 
         self._closed = True
 
@@ -4940,20 +4937,26 @@ class AIAgent:
                             )
                         raise
 
+                streaming_access_denied = False
                 try:
                     response = await client.converse_stream(**request)
                 except Exception as exc:
                     if is_streaming_access_denied_error(exc):
                         self._disable_streaming = True
-                        return normalize_converse_response(
-                            await client.converse(**request)
-                        )
-                    if is_stale_connection_error(exc):
+                        streaming_access_denied = True
+                    elif is_stale_connection_error(exc):
                         logger.warning(
                             "bedrock: stale connection on converse_stream; the "
                             "next request will create a fresh client"
                         )
-                    raise
+                        raise
+                    else:
+                        raise
+
+                if streaming_access_denied:
+                    return normalize_converse_response(
+                        await client.converse(**request)
+                    )
 
                 first_event = True
 
@@ -6452,6 +6455,8 @@ class AIAgent:
                         "check SessionDB health (disk / lock contention)."
                     )
 
+            from agent.auxiliary_client import AuxiliaryExplicitCancellation
+
             try:
                 result = await run_compress_context_with_progress_timeout(
                     worker=_snapshot_worker,
@@ -6484,12 +6489,8 @@ class AIAgent:
                         exc_info=True,
                     )
                 return result
-            except BaseException as exc:
-                from agent.auxiliary_client import AuxiliaryExplicitCancellation
-
-                if isinstance(exc, AuxiliaryExplicitCancellation):
-                    return messages, system_message
-                raise
+            except AuxiliaryExplicitCancellation:
+                return messages, system_message
         finally:
             # Restore whatever the caller had, so a compaction never leaks its
             # tag into the surrounding scope.

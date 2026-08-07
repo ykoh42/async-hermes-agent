@@ -577,6 +577,49 @@ class TestAIAgentBedrockDispatch:
         assert context.entered and context.exited
 
     @pytest.mark.asyncio
+    async def test_stream_access_denied_falls_back_without_holding_exception(
+        self, monkeypatch
+    ):
+        agent = self._agent()
+        response = {
+            "output": {
+                "message": {
+                    "role": "assistant",
+                    "content": [{"text": "fallback"}],
+                }
+            },
+            "stopReason": "end_turn",
+            "usage": {"inputTokens": 2, "outputTokens": 3},
+        }
+        client = SimpleNamespace(
+            converse_stream=AsyncMock(side_effect=PermissionError("denied")),
+            converse=AsyncMock(return_value=response),
+        )
+        context = _BedrockClientContext(client)
+        monkeypatch.setattr(
+            "agent.bedrock_adapter._get_bedrock_runtime_client",
+            lambda region: context,
+        )
+        monkeypatch.setattr(
+            "agent.bedrock_adapter.is_streaming_access_denied_error",
+            lambda exc: isinstance(exc, PermissionError),
+        )
+
+        result = await agent._execute_model_request(
+            {
+                "modelId": "amazon.nova-pro-v1:0",
+                "messages": [],
+                "__bedrock_region__": "us-east-1",
+            },
+            use_streaming=True,
+        )
+
+        assert result.choices[0].message.content == "fallback"
+        assert agent._disable_streaming is True
+        client.converse.assert_awaited_once()
+        assert context.entered and context.exited
+
+    @pytest.mark.asyncio
     async def test_cancellation_closes_inflight_client_context(self, monkeypatch):
         agent = self._agent()
         started = asyncio.Event()
