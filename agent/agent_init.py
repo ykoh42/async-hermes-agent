@@ -80,6 +80,10 @@ def _apply_runtime_config(agent: Any, config: Dict[str, Any]) -> None:
 
     sessions = config.get("sessions", {}) or {}
     agent._session_json_enabled = bool(sessions.get("write_json_snapshots", False))
+    if "cjk_fts" in sessions:
+        os.environ["HERMES_CJK_FTS"] = str(sessions["cjk_fts"])
+    if "search_slow_ms" in sessions:
+        os.environ["HERMES_SEARCH_SLOW_MS"] = str(sessions["search_slow_ms"])
 
     display = config.get("display", {}) or {}
     agent.show_commentary = bool(display.get("show_commentary", True))

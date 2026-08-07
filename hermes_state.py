@@ -13,7 +13,7 @@ import sqlite3
 import time
 from collections.abc import Collection
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import aiofiles.os
 
@@ -23,7 +23,11 @@ from agent.skill_commands import describe_skill_invocation
 from hermes_constants import get_hermes_home
 from hermes_state_common import (
     DEFERRED_INDEX_SQL,
+    FTS_CJK_STALE_KEY,
+    FTS_CJK_TABLE_SQL,
+    FTS_CJK_TRIGGER_SQL,
     FTS_SQL,
+    FTS_STORAGE_VERSION,
     FTS_TRIGRAM_SQL,
     LEGACY_FTS_SQL,
     LEGACY_FTS_TRIGRAM_SQL,
@@ -31,6 +35,7 @@ from hermes_state_common import (
     SCHEMA_VERSION,
     SCHEMA_SQL,
     _COMPRESSION_CHILD_SQL,
+    _FTS_CJK_TRIGGERS,
     _FTS_TRIGGERS,
     _LISTABLE_CHILD_SQL,
     _PREVIEW_RAW_SELECT,
@@ -60,6 +65,43 @@ _MALFORMED_SCHEMA_MARKERS = (
     "malformed database schema",
     "database disk image is malformed",
 )
+
+
+def fts5_cjk_so_path() -> Path:
+    """Location of the cjk_unicode61 loadable extension."""
+    env = os.getenv("HERMES_FTS5_CJK_SO")
+    if env:
+        return Path(env).expanduser()
+    return get_hermes_home() / "lib" / "libfts5_cjk.so"
+
+
+def _cjk_fts_config_enabled() -> bool:
+    """config.yaml ``sessions.cjk_fts`` (default on), via its env bridge."""
+    return os.getenv("HERMES_CJK_FTS", "1").strip().lower() not in (
+        "0",
+        "false",
+        "off",
+        "no",
+    )
+
+
+async def load_fts5_cjk_extension(connection) -> bool:
+    """Best-effort load of the cjk_unicode61 tokenizer into ``connection``."""
+    if not _cjk_fts_config_enabled():
+        return False
+    path = fts5_cjk_so_path()
+    if not await aiofiles.os.path.exists(path):
+        return False
+    try:
+        await connection.enable_load_extension(True)
+        try:
+            await connection.load_extension(str(path))
+        finally:
+            await connection.enable_load_extension(False)
+        return True
+    except Exception:
+        logger.warning("fts5_cjk extension load failed (%s)", path, exc_info=True)
+        return False
 
 
 def _system_prompt_hash(system_prompt: str) -> str:
@@ -276,6 +318,11 @@ class SessionDB:
     _COMPRESSION_BUSY_WAIT_S = 5.0
     _WRITE_RETRY_MIN_S = 0.02
     _WRITE_RETRY_MAX_S = 0.15
+
+    _FTS_REBUILD_CHUNK_ROWS = 500
+    _FTS_REBUILD_DUTY_FACTOR = 4.0
+    _FTS_REBUILD_MIN_PAUSE = 0.2
+    _FTS_TRASH_PREFIX = "fts_v22_trash_"
 
     _CONTENT_JSON_PREFIX = "\x00json:"
     _FTS_TABLES = ("messages_fts", "messages_fts_trigram", "messages_fts_cjk")
@@ -786,6 +833,7 @@ class SessionDB:
         self._closed = False
         self._fts_enabled = False
         self._trigram_available = False
+        self._fts_cjk_loaded = False
         self._fts_cjk_available = False
         self._fts_runtime_rebuild_attempted = False
         self._fts_unavailable_warned = False
@@ -832,6 +880,9 @@ class SessionDB:
                 await connection.execute("PRAGMA foreign_keys=ON")
                 await connection.execute("PRAGMA busy_timeout=1000")
                 if not self.read_only:
+                    self._fts_cjk_loaded = await load_fts5_cjk_extension(
+                        connection
+                    )
                     try:
                         cursor = await connection.execute("PRAGMA journal_mode=WAL")
                         await cursor.fetchone()
@@ -916,6 +967,7 @@ class SessionDB:
                     self._trigram_available = await self._ensure_fts_schema(
                         connection, "messages_fts_trigram", FTS_TRIGRAM_SQL
                     )
+                    await self._ensure_fts_cjk_schema(connection)
                     if triggers_need_repair:
                         await self._rebuild_fts_indexes(
                             connection,
@@ -1015,6 +1067,102 @@ class SessionDB:
             else:
                 self._warn_fts5_unavailable(exc)
             return False
+
+    async def _ensure_fts_cjk_schema(self, connection) -> None:
+        """Create, repair, or safely disable the CJK-bigram index."""
+        row = await (
+            await connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+                "AND name = 'messages_fts_cjk'"
+            )
+        ).fetchone()
+        cjk_present = row is not None
+
+        if not self._fts_cjk_loaded:
+            if cjk_present:
+                placeholders = ",".join("?" for _ in _FTS_CJK_TRIGGERS)
+                cursor = await connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'trigger' "
+                    f"AND name IN ({placeholders})",
+                    _FTS_CJK_TRIGGERS,
+                )
+                try:
+                    live = [item[0] for item in await cursor.fetchall()]
+                finally:
+                    await cursor.close()
+                if live:
+                    logger.warning(
+                        "messages_fts_cjk triggers present but the "
+                        "cjk_unicode61 tokenizer is unavailable (%s) — "
+                        "dropping the cjk triggers so message writes keep "
+                        "working. CJK search falls back to trigram/LIKE; "
+                        "run `hermes sessions optimize-storage` on a host "
+                        "with the extension to rebuild.",
+                        fts5_cjk_so_path(),
+                    )
+                    await connection.execute(
+                        "INSERT INTO state_meta (key, value) VALUES (?, '1') "
+                        "ON CONFLICT(key) DO UPDATE SET value = '1'",
+                        (FTS_CJK_STALE_KEY,),
+                    )
+                    for trigger in live:
+                        await connection.execute(
+                            f"DROP TRIGGER IF EXISTS {trigger}"
+                        )
+            self._fts_cjk_available = False
+            return
+
+        try:
+            await connection.executescript(FTS_CJK_TABLE_SQL)
+            if not cjk_present:
+                await connection.execute(
+                    "DELETE FROM state_meta WHERE key = ?",
+                    (FTS_CJK_STALE_KEY,),
+                )
+                count_row = await (
+                    await connection.execute(
+                        "SELECT COUNT(*) FROM messages WHERE role <> 'tool'"
+                    )
+                ).fetchone()
+                if count_row[0] > 0:
+                    high_water_row = await (
+                        await connection.execute(
+                            "SELECT COALESCE(MAX(id), 0) FROM messages"
+                        )
+                    ).fetchone()
+                    for key, value in (
+                        ("fts_cjk_rebuild_high_water", str(high_water_row[0])),
+                        ("fts_cjk_rebuild_progress", "0"),
+                    ):
+                        await connection.execute(
+                            "INSERT INTO state_meta (key, value) VALUES (?, ?) "
+                            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                            (key, value),
+                        )
+            stale = await (
+                await connection.execute(
+                    "SELECT 1 FROM state_meta WHERE key = ?",
+                    (FTS_CJK_STALE_KEY,),
+                )
+            ).fetchone()
+            if stale:
+                self._fts_cjk_available = False
+                return
+            await connection.executescript(FTS_CJK_TRIGGER_SQL)
+            pending = await (
+                await connection.execute(
+                    "SELECT 1 FROM state_meta "
+                    "WHERE key = 'fts_cjk_rebuild_high_water' LIMIT 1"
+                )
+            ).fetchone()
+            self._fts_cjk_available = pending is None
+        except sqlite3.OperationalError:
+            logger.warning(
+                "messages_fts_cjk ensure failed; CJK search stays on "
+                "trigram/LIKE",
+                exc_info=True,
+            )
+            self._fts_cjk_available = False
 
     @staticmethod
     async def _rebuild_fts_indexes(
@@ -3313,6 +3461,682 @@ class SessionDB:
             "indexed": indexed,
             "percent": min(100, int(100 * indexed / total)),
         }
+
+    async def _fts_rebuild_finish(self) -> None:
+        """Finalize the deferred rebuild with a boundary sweep."""
+        include_trigram = self._trigram_available
+
+        async def _finish(connection):
+            high_water_row = await (
+                await connection.execute(
+                    "SELECT value FROM state_meta "
+                    "WHERE key = 'fts_rebuild_high_water'"
+                )
+            ).fetchone()
+            if high_water_row is not None:
+                high_water = int(high_water_row[0])
+                lower, upper = high_water - 1000, high_water + 1000
+                await connection.execute(
+                    "INSERT INTO messages_fts"
+                    "(rowid, content, tool_name, tool_calls) "
+                    "SELECT m.id, m.content, m.tool_name, m.tool_calls "
+                    "FROM messages m WHERE m.id > ? AND m.id <= ? "
+                    "AND NOT EXISTS (SELECT 1 FROM messages_fts_docsize d "
+                    "WHERE d.id = m.id)",
+                    (lower, upper),
+                )
+                if include_trigram:
+                    await connection.execute(
+                        "INSERT INTO messages_fts_trigram"
+                        "(rowid, content, tool_name, tool_calls) "
+                        "SELECT m.id, m.content, m.tool_name, m.tool_calls "
+                        "FROM messages m WHERE m.id > ? AND m.id <= ? "
+                        "AND m.role <> 'tool' AND NOT EXISTS "
+                        "(SELECT 1 FROM messages_fts_trigram_docsize d "
+                        "WHERE d.id = m.id)",
+                        (lower, upper),
+                    )
+            await connection.execute(
+                "DELETE FROM state_meta WHERE key IN "
+                "('fts_rebuild_high_water', 'fts_rebuild_progress')"
+            )
+
+        await self._write(_finish)
+        logger.info("Deferred FTS rebuild complete — all messages indexed.")
+
+    async def _has_fts_trash(self, connection) -> bool:
+        cursor = await connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+            "AND name LIKE ? ESCAPE '\\' LIMIT 1",
+            (self._FTS_TRASH_PREFIX.replace("_", "\\_") + "%",),
+        )
+        try:
+            return await cursor.fetchone() is not None
+        finally:
+            await cursor.close()
+
+    async def _fts_teardown_trash_step(self) -> bool:
+        """Tear down one bounded chunk of a demoted v22 shadow table."""
+        connection = await self._get_connection()
+        cursor = await connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' "
+            "AND name LIKE ? ESCAPE '\\'",
+            (self._FTS_TRASH_PREFIX.replace("_", "\\_") + "%",),
+        )
+        try:
+            trash = [row[0] for row in await cursor.fetchall()]
+        finally:
+            await cursor.close()
+        if not trash:
+            return False
+        table = trash[0]
+
+        async def _teardown(connection):
+            info_cursor = await connection.execute(f"PRAGMA table_info({table})")
+            try:
+                primary_keys = [
+                    row[1] for row in await info_cursor.fetchall() if row[5] > 0
+                ]
+            finally:
+                await info_cursor.close()
+            key = ", ".join(primary_keys) if primary_keys else "rowid"
+            delete_cursor = await connection.execute(
+                f"DELETE FROM {table} WHERE ({key}) IN "
+                f"(SELECT {key} FROM {table} LIMIT "
+                f"{self._FTS_REBUILD_CHUNK_ROWS})"
+            )
+            try:
+                deleted = delete_cursor.rowcount
+            finally:
+                await delete_cursor.close()
+            if deleted == 0:
+                await connection.execute(f"DROP TABLE IF EXISTS {table}")
+                logger.info("Old FTS shadow table %s torn down.", table)
+            return True
+
+        try:
+            return bool(await self._write(_teardown))
+        except sqlite3.OperationalError as exc:
+            logger.debug("FTS trash teardown chunk failed (will retry): %s", exc)
+            return True
+
+    async def fts_rebuild_step(self) -> bool:
+        """Backfill one chunk of the deferred FTS rebuild."""
+        await self._get_connection()
+        if not self._fts_enabled:
+            return False
+        high_water_raw = await self.get_meta("fts_rebuild_high_water")
+        if high_water_raw is None:
+            return False
+        high_water = int(high_water_raw)
+        include_trigram = self._trigram_available
+
+        async def _backfill(connection):
+            progress_row = await (
+                await connection.execute(
+                    "SELECT value FROM state_meta "
+                    "WHERE key = 'fts_rebuild_progress'"
+                )
+            ).fetchone()
+            if progress_row is None:
+                return False
+            progress = int(progress_row[0])
+            if progress >= high_water:
+                return False
+            upper = min(progress + self._FTS_REBUILD_CHUNK_ROWS, high_water)
+            await connection.execute(
+                "INSERT INTO messages_fts"
+                "(rowid, content, tool_name, tool_calls) "
+                "SELECT id, content, tool_name, tool_calls FROM messages "
+                "WHERE id > ? AND id <= ?",
+                (progress, upper),
+            )
+            if include_trigram:
+                await connection.execute(
+                    "INSERT INTO messages_fts_trigram"
+                    "(rowid, content, tool_name, tool_calls) "
+                    "SELECT id, content, tool_name, tool_calls FROM messages "
+                    "WHERE id > ? AND id <= ? AND role <> 'tool'",
+                    (progress, upper),
+                )
+            await connection.execute(
+                "UPDATE state_meta SET value = ? "
+                "WHERE key = 'fts_rebuild_progress'",
+                (str(upper),),
+            )
+            return upper < high_water
+
+        try:
+            more = await self._write(_backfill)
+        except sqlite3.OperationalError as exc:
+            logger.debug("FTS rebuild chunk failed (will retry): %s", exc)
+            return True
+        if more is False:
+            status = await self.fts_rebuild_status()
+            if status is not None and status["indexed"] >= status["total"]:
+                await self._fts_rebuild_finish()
+            return False
+        return bool(more)
+
+    async def fts_cjk_rebuild_status(self) -> Optional[Dict[str, Any]]:
+        """CJK-index backfill progress, or None when none is pending."""
+        high_water = await self.get_meta("fts_cjk_rebuild_high_water")
+        if high_water is None:
+            return None
+        total = int(high_water)
+        indexed = int(await self.get_meta("fts_cjk_rebuild_progress") or 0)
+        if total <= 0:
+            return None
+        return {
+            "pending": True,
+            "total": total,
+            "indexed": indexed,
+            "percent": min(100, int(100 * indexed / total)),
+        }
+
+    async def fts_cjk_rebuild_step(self) -> bool:
+        """Backfill one chunk of the CJK index. True while work remains."""
+        await self._get_connection()
+        if not self._fts_enabled or not self._fts_cjk_loaded:
+            return False
+        high_water_raw = await self.get_meta("fts_cjk_rebuild_high_water")
+        if high_water_raw is None:
+            return False
+        high_water = int(high_water_raw)
+
+        async def _backfill(connection):
+            progress_row = await (
+                await connection.execute(
+                    "SELECT value FROM state_meta "
+                    "WHERE key = 'fts_cjk_rebuild_progress'"
+                )
+            ).fetchone()
+            if progress_row is None:
+                return False
+            progress = int(progress_row[0])
+            if progress >= high_water:
+                return False
+            upper = min(progress + self._FTS_REBUILD_CHUNK_ROWS, high_water)
+            await connection.execute(
+                "INSERT INTO messages_fts_cjk"
+                "(rowid, content, tool_name, tool_calls) "
+                "SELECT id, content, tool_name, tool_calls FROM messages "
+                "WHERE id > ? AND id <= ? AND role <> 'tool'",
+                (progress, upper),
+            )
+            await connection.execute(
+                "UPDATE state_meta SET value = ? "
+                "WHERE key = 'fts_cjk_rebuild_progress'",
+                (str(upper),),
+            )
+            return upper < high_water
+
+        try:
+            more = await self._write(_backfill)
+        except sqlite3.OperationalError as exc:
+            logger.debug("CJK FTS rebuild chunk failed (will retry): %s", exc)
+            return True
+        if more is False:
+            status = await self.fts_cjk_rebuild_status()
+            if status is not None and status["indexed"] >= status["total"]:
+                await self._fts_cjk_rebuild_finish()
+            return False
+        return bool(more)
+
+    async def _fts_cjk_rebuild_finish(self) -> None:
+        """Boundary sweep, clear CJK markers, and enable CJK reads."""
+
+        async def _finish(connection):
+            high_water_row = await (
+                await connection.execute(
+                    "SELECT value FROM state_meta "
+                    "WHERE key = 'fts_cjk_rebuild_high_water'"
+                )
+            ).fetchone()
+            if high_water_row is not None:
+                high_water = int(high_water_row[0])
+                lower, upper = high_water - 1000, high_water + 1000
+                await connection.execute(
+                    "INSERT INTO messages_fts_cjk"
+                    "(rowid, content, tool_name, tool_calls) "
+                    "SELECT m.id, m.content, m.tool_name, m.tool_calls "
+                    "FROM messages m WHERE m.id > ? AND m.id <= ? "
+                    "AND m.role <> 'tool' AND NOT EXISTS "
+                    "(SELECT 1 FROM messages_fts_cjk_docsize d "
+                    "WHERE d.id = m.id)",
+                    (lower, upper),
+                )
+            await connection.execute(
+                "DELETE FROM state_meta WHERE key IN "
+                "('fts_cjk_rebuild_high_water', "
+                "'fts_cjk_rebuild_progress')"
+            )
+
+        await self._write(_finish)
+        self._fts_cjk_available = True
+        logger.info("CJK FTS index backfill complete — serving CJK search.")
+
+    async def _fts_cjk_reset_if_stale(self) -> None:
+        """Reset a stale CJK index so it can be rebuilt from scratch."""
+        if not self._fts_cjk_loaded:
+            return
+
+        async def _reset(connection):
+            stale = await (
+                await connection.execute(
+                    "SELECT 1 FROM state_meta WHERE key = ?",
+                    (FTS_CJK_STALE_KEY,),
+                )
+            ).fetchone()
+            if stale is None:
+                return False
+            for trigger in _FTS_CJK_TRIGGERS:
+                await connection.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+            await connection.execute("DROP TABLE IF EXISTS messages_fts_cjk")
+            await connection.execute("DROP VIEW IF EXISTS messages_fts_cjk_src")
+            await connection.execute(
+                "DELETE FROM state_meta WHERE key IN "
+                f"('{FTS_CJK_STALE_KEY}', 'fts_cjk_rebuild_high_water', "
+                "'fts_cjk_rebuild_progress')"
+            )
+            return True
+
+        if await self._write(_reset):
+            async with self._get_write_lock():
+                connection = await self._get_connection()
+                await self._ensure_fts_cjk_schema(connection)
+                await connection.commit()
+
+    @staticmethod
+    async def _fts_external_index_empty_with_messages(connection) -> bool:
+        """Return whether a populated DB has an empty external FTS index."""
+        try:
+            has_message = await (
+                await connection.execute(
+                    "SELECT EXISTS(SELECT 1 FROM messages)"
+                )
+            ).fetchone()
+            if not has_message[0]:
+                return False
+            has_fts = await (
+                await connection.execute(
+                    "SELECT EXISTS(SELECT 1 FROM messages_fts_docsize)"
+                )
+            ).fetchone()
+            return not has_fts[0]
+        except sqlite3.OperationalError:
+            return False
+
+    @staticmethod
+    async def _fts_index_known_empty(connection) -> bool:
+        try:
+            row = await (
+                await connection.execute(
+                    "SELECT COUNT(*) FROM messages_fts_docsize"
+                )
+            ).fetchone()
+            return int(row[0]) == 0
+        except sqlite3.OperationalError:
+            return True
+
+    @staticmethod
+    async def _reset_fts_index_to_empty(connection) -> None:
+        for table in ("messages_fts", "messages_fts_trigram"):
+            try:
+                await connection.execute(
+                    f"INSERT INTO {table}({table}) VALUES('delete-all')"
+                )
+            except sqlite3.OperationalError:
+                pass
+
+    async def _seed_fts_rebuild_markers(
+        self, connection, *, force: bool = False
+    ) -> int:
+        existing = await (
+            await connection.execute(
+                "SELECT value FROM state_meta "
+                "WHERE key = 'fts_rebuild_high_water'"
+            )
+        ).fetchone()
+        if existing is not None and not force:
+            high_water = int(existing[0])
+            progress = await (
+                await connection.execute(
+                    "SELECT value FROM state_meta "
+                    "WHERE key = 'fts_rebuild_progress'"
+                )
+            ).fetchone()
+            if progress is None:
+                if not await self._fts_index_known_empty(connection):
+                    await self._reset_fts_index_to_empty(connection)
+                await connection.execute(
+                    "INSERT INTO state_meta (key, value) VALUES "
+                    "('fts_rebuild_progress', '0') "
+                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value"
+                )
+            return high_water
+
+        row = await (
+            await connection.execute(
+                "SELECT COALESCE(MAX(id), 0) FROM messages"
+            )
+        ).fetchone()
+        high_water = int(row[0])
+        for key, value in (
+            ("fts_rebuild_high_water", str(high_water)),
+            ("fts_rebuild_progress", "0"),
+        ):
+            await connection.execute(
+                "INSERT INTO state_meta (key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (key, value),
+            )
+        return high_water
+
+    async def _repair_optimize_bookkeeping(self) -> None:
+        """Heal interrupted demote/backfill bookkeeping before optimize."""
+
+        async def _repair(connection):
+            existing = await (
+                await connection.execute(
+                    "SELECT value FROM state_meta "
+                    "WHERE key = 'fts_rebuild_high_water'"
+                )
+            ).fetchone()
+            if existing is not None:
+                progress = await (
+                    await connection.execute(
+                        "SELECT 1 FROM state_meta "
+                        "WHERE key = 'fts_rebuild_progress'"
+                    )
+                ).fetchone()
+                if progress is None:
+                    if not await self._fts_index_known_empty(connection):
+                        await self._reset_fts_index_to_empty(connection)
+                    await connection.execute(
+                        "INSERT INTO state_meta (key, value) VALUES "
+                        "('fts_rebuild_progress', '0') "
+                        "ON CONFLICT(key) DO UPDATE SET value = '0'"
+                    )
+                return
+            if await self._db_has_legacy_inline_fts(connection):
+                return
+            if await self._fts_external_index_empty_with_messages(connection):
+                await connection.execute(
+                    "DELETE FROM state_meta WHERE key = 'fts_storage_version'"
+                )
+                await self._seed_fts_rebuild_markers(connection, force=True)
+
+        await self._write(_repair)
+
+    async def fts_optimize_available(self) -> bool:
+        """Return whether storage migration, backfill, or teardown is pending."""
+        connection = await self._get_connection()
+        if not self._fts_enabled or self.read_only:
+            return False
+        async with self._get_write_lock():
+            if await self._db_has_legacy_inline_fts(connection):
+                return True
+            pending = await (
+                await connection.execute(
+                    "SELECT 1 FROM state_meta "
+                    "WHERE key = 'fts_rebuild_high_water' LIMIT 1"
+                )
+            ).fetchone()
+            if pending is not None:
+                return True
+            if self._fts_cjk_loaded:
+                cjk_pending = await (
+                    await connection.execute(
+                        "SELECT 1 FROM state_meta WHERE key IN "
+                        f"('fts_cjk_rebuild_high_water', "
+                        f"'{FTS_CJK_STALE_KEY}') LIMIT 1"
+                    )
+                ).fetchone()
+                if cjk_pending is not None:
+                    return True
+            if await self._has_fts_trash(connection):
+                return True
+            return await self._fts_external_index_empty_with_messages(connection)
+
+    async def _demote_legacy_fts_to_trash(self) -> int:
+        """Demote legacy inline FTS tables and seed a resumable rebuild."""
+
+        async def _stage(connection):
+            await self._drop_fts_triggers(connection)
+            await connection.execute("DROP VIEW IF EXISTS messages_fts_trigram_src")
+            had_row = await (
+                await connection.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+                    "AND name IN ('messages_fts', 'messages_fts_trigram') "
+                    "AND sql LIKE 'CREATE VIRTUAL TABLE%' LIMIT 1"
+                )
+            ).fetchone()
+            if had_row is not None:
+                await connection.execute("PRAGMA writable_schema=ON")
+                await connection.execute(
+                    "DELETE FROM sqlite_master WHERE type = 'table' "
+                    "AND name IN ('messages_fts', 'messages_fts_trigram') "
+                    "AND sql LIKE 'CREATE VIRTUAL TABLE%'"
+                )
+                await connection.execute("PRAGMA writable_schema=RESET")
+                cursor = await connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table' "
+                    "AND (name LIKE 'messages_fts_%' ESCAPE '\\' "
+                    "OR name LIKE 'messages_fts_trigram_%' ESCAPE '\\')"
+                )
+                try:
+                    shadows = [row[0] for row in await cursor.fetchall()]
+                finally:
+                    await cursor.close()
+                for shadow in shadows:
+                    await connection.execute(
+                        f"ALTER TABLE {shadow} "
+                        f"RENAME TO fts_v22_trash_{shadow}"
+                    )
+            high_water = await self._seed_fts_rebuild_markers(
+                connection, force=True
+            )
+            await connection.execute(
+                "DELETE FROM state_meta WHERE key = 'fts_optimize_available'"
+            )
+            return high_water
+
+        high_water = int(await self._write(_stage))
+        async with self._get_write_lock():
+            connection = await self._get_connection()
+            base_ok = await self._ensure_fts_schema(
+                connection, "messages_fts", FTS_SQL
+            )
+            trigram_ok = await self._ensure_fts_schema(
+                connection, "messages_fts_trigram", FTS_TRIGRAM_SQL
+            )
+            self._trigram_available = bool(trigram_ok)
+            if not base_ok:
+                raise sqlite3.OperationalError(
+                    "failed to create v23 messages_fts during "
+                    "optimize-storage demote"
+                )
+            await connection.commit()
+        return high_water
+
+    async def optimize_fts_storage(
+        self,
+        *,
+        progress_cb: Optional[Callable[[Dict[str, Any]], None]] = None,
+        vacuum: bool = True,
+    ) -> Dict[str, Any]:
+        """Migrate legacy FTS storage and finish all resumable backfills."""
+        connection = await self._get_connection()
+        if not self._fts_enabled:
+            return {"ok": False, "reason": "fts5_unavailable"}
+        if self.read_only:
+            return {"ok": False, "reason": "read_only"}
+
+        await self._repair_optimize_bookkeeping()
+        async with self._get_write_lock():
+            legacy = await self._db_has_legacy_inline_fts(connection)
+        pending = await self.get_meta("fts_rebuild_high_water") is not None
+        if legacy and not pending:
+            await self._demote_legacy_fts_to_trash()
+        elif pending and not legacy:
+            async with self._get_write_lock():
+                base_ok = await self._ensure_fts_schema(
+                    connection, "messages_fts", FTS_SQL
+                )
+                trigram_ok = await self._ensure_fts_schema(
+                    connection, "messages_fts_trigram", FTS_TRIGRAM_SQL
+                )
+                self._trigram_available = bool(trigram_ok)
+                if not base_ok:
+                    raise sqlite3.OperationalError(
+                        "failed to re-create v23 messages_fts "
+                        "on optimize-storage resume"
+                    )
+                await connection.commit()
+
+        await self._fts_cjk_reset_if_stale()
+        if self._fts_cjk_loaded:
+            async with self._get_write_lock():
+                await self._ensure_fts_cjk_schema(connection)
+                await connection.commit()
+
+        async def _emit(phase: str) -> None:
+            if progress_cb is None:
+                return
+            status = await self.fts_rebuild_status()
+            if status is None:
+                status = await self.fts_cjk_rebuild_status()
+            progress_cb(
+                {
+                    "phase": phase,
+                    "percent": status["percent"] if status else 100,
+                    "indexed": status["indexed"] if status else 0,
+                    "total": status["total"] if status else 0,
+                }
+            )
+
+        async def _pause(chunk_seconds: float) -> None:
+            await asyncio.sleep(
+                max(
+                    self._FTS_REBUILD_MIN_PAUSE,
+                    chunk_seconds * self._FTS_REBUILD_DUTY_FACTOR,
+                )
+            )
+
+        await _emit("backfill")
+        while True:
+            started = time.monotonic()
+            if not await self.fts_rebuild_step():
+                break
+            await _emit("backfill")
+            await _pause(time.monotonic() - started)
+        await _emit("backfill")
+
+        while True:
+            started = time.monotonic()
+            if not await self.fts_cjk_rebuild_step():
+                break
+            await _emit("backfill")
+            await _pause(time.monotonic() - started)
+
+        await _emit("teardown")
+        while True:
+            started = time.monotonic()
+            if not await self._fts_teardown_trash_step():
+                break
+            await _emit("teardown")
+            await _pause(time.monotonic() - started)
+
+        async with self._get_write_lock():
+            still_pending = await (
+                await connection.execute(
+                    "SELECT 1 FROM state_meta "
+                    "WHERE key = 'fts_rebuild_high_water' LIMIT 1"
+                )
+            ).fetchone()
+            still_trash = await self._has_fts_trash(connection)
+            empty_index = await self._fts_external_index_empty_with_messages(
+                connection
+            )
+        if still_pending is not None or still_trash or empty_index:
+            reason = (
+                "backfill_incomplete"
+                if still_pending is not None or empty_index
+                else "teardown_incomplete"
+            )
+            logger.warning(
+                "FTS storage optimization did not settle (%s): "
+                "pending=%s trash=%s empty_index=%s",
+                reason,
+                still_pending is not None,
+                still_trash,
+                empty_index,
+            )
+            return {"ok": False, "reason": reason, "vacuumed": None}
+
+        vacuum_ok = None
+        if vacuum:
+            await _emit("vacuum")
+            try:
+                async with self._get_write_lock():
+                    cursor = await connection.execute("VACUUM")
+                    await cursor.close()
+                vacuum_ok = True
+            except sqlite3.OperationalError as exc:
+                logger.warning("VACUUM after FTS optimize failed: %s", exc)
+                vacuum_ok = False
+            try:
+                async with self._get_write_lock():
+                    cursor = await connection.execute(
+                        "PRAGMA wal_checkpoint(TRUNCATE)"
+                    )
+                    await cursor.close()
+            except Exception as exc:
+                logger.debug(
+                    "WAL checkpoint (TRUNCATE) after optimize VACUUM "
+                    "failed: %s",
+                    exc,
+                )
+
+        async def _settle(connection):
+            pending_row = await (
+                await connection.execute(
+                    "SELECT 1 FROM state_meta "
+                    "WHERE key = 'fts_rebuild_high_water' LIMIT 1"
+                )
+            ).fetchone()
+            if pending_row is not None:
+                return "backfill_incomplete"
+            if await self._has_fts_trash(connection):
+                return "teardown_incomplete"
+            if await self._fts_external_index_empty_with_messages(connection):
+                return "backfill_incomplete"
+            await connection.execute(
+                "INSERT INTO state_meta (key, value) VALUES "
+                "('fts_storage_version', ?) ON CONFLICT(key) "
+                "DO UPDATE SET value = excluded.value",
+                (str(FTS_STORAGE_VERSION),),
+            )
+            await connection.execute(
+                "DELETE FROM state_meta WHERE key = 'fts_optimize_available'"
+            )
+            await connection.execute(
+                "UPDATE schema_version SET version = ? WHERE version < ?",
+                (SCHEMA_VERSION, SCHEMA_VERSION),
+            )
+            return None
+
+        refusal = await self._write(_settle)
+        if refusal is not None:
+            logger.warning("FTS storage optimization settle refused (%s)", refusal)
+            return {"ok": False, "reason": refusal, "vacuumed": vacuum_ok}
+        await _emit("done")
+        logger.info(
+            "FTS storage optimization complete (layout v%d).",
+            FTS_STORAGE_VERSION,
+        )
+        return {"ok": True, "vacuumed": vacuum_ok}
 
     async def search_messages(
         self,
