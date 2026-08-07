@@ -1,7 +1,7 @@
 """Verify that terminal command timeouts preserve partial output."""
 import pytest
 
-from tools.terminal_tool import LocalEnvironment
+from tools.environments.local import LocalEnvironment
 
 
 class TestTimeoutPreservesPartialOutput:

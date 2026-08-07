@@ -10,7 +10,8 @@ from pathlib import Path
 
 # Files that must have Windows-safe process management
 GUARDED_FILES = [
-    "tools/terminal_tool.py",
+    "tools/environments/local.py",
+    "tools/process_registry.py",
 ]
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent

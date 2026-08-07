@@ -309,7 +309,11 @@ class ProcessRegistry:
             "showing": f"{len(selected)} lines",
         }
 
-    async def wait(self, session_id: str, timeout: int | None = None) -> dict[str, Any]:
+    async def wait(
+        self,
+        session_id: str,
+        timeout: int | None = None,  # noqa: ASYNC109 - upstream public API
+    ) -> dict[str, Any]:
         """Wait without blocking the event loop or stopping the process on timeout."""
         from tools.ansi_strip import strip_ansi
         from tools.interrupt import is_interrupted
@@ -395,7 +399,7 @@ class ProcessRegistry:
     ) -> dict[str, Any]:
         """Terminate a process group, await its monitor, and return captured output."""
         from tools.ansi_strip import strip_ansi
-        from tools.terminal_tool import _terminate_process
+        from tools.environments.local import _terminate_process
 
         session = self.get(session_id)
         if session is None:
