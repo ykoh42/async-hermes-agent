@@ -7,7 +7,7 @@ import time
 import pytest
 import pytest_asyncio
 
-from hermes_state import CompressionSessionClosedError, SessionDB
+from hermes_state import CompressionSessionClosedError, SessionDB, workspace_key
 
 
 @pytest_asyncio.fixture
@@ -34,6 +34,11 @@ def test_public_session_interface_is_async():
         "resolve_session_id",
         "session_count_ge",
         "count_empty_sessions",
+        "has_archived_messages",
+        "search_sessions",
+        "session_count",
+        "session_count_by_source",
+        "has_platform_message_id",
         "get_messages",
         "get_messages_as_conversation",
         "search_messages",
@@ -323,6 +328,128 @@ async def test_archive_and_pin_update_the_whole_compression_lineage(db):
     assert (await db.get_session("tip"))["archived"] == 0
     assert (await db.get_session("root"))["pinned"] == 0
     assert (await db.get_session("tip"))["pinned"] == 0
+
+
+def test_workspace_key_matches_upstream_grouping_contract():
+    assert workspace_key(
+        {
+            "git_repo_root": "/workspace/repo",
+            "cwd": "/workspace/repo/src",
+            "git_branch": "feature",
+        }
+    ) == "/workspace/repo"
+    assert workspace_key({"cwd": "/workspace/notes"}) == "/workspace/notes"
+    assert workspace_key({"git_repo_root": "", "cwd": "   "}) is None
+
+
+@pytest.mark.asyncio
+async def test_search_sessions_preserves_workspace_order_and_pagination(db):
+    await db.create_session(
+        "repo-root",
+        source="library",
+        cwd="/workspace/repo",
+        git_repo_root="/workspace/repo",
+    )
+    await db.create_session(
+        "repo-child-dir",
+        source="library",
+        cwd="/workspace/repo/src",
+    )
+    await db.create_session(
+        "other",
+        source="other",
+        cwd="/workspace/other",
+    )
+    connection = await db._get_connection()
+    await connection.execute(
+        "UPDATE sessions SET started_at = ? WHERE id = ?",
+        (1.0, "repo-root"),
+    )
+    await connection.execute(
+        "UPDATE sessions SET started_at = ? WHERE id = ?",
+        (2.0, "repo-child-dir"),
+    )
+    await connection.commit()
+
+    matches = await db.search_sessions(
+        source="library", workspace_key="/workspace/repo"
+    )
+    assert [session["id"] for session in matches] == [
+        "repo-child-dir",
+        "repo-root",
+    ]
+    assert [session["last_active"] for session in matches] == [2.0, 1.0]
+    assert [
+        session["id"]
+        for session in await db.search_sessions(
+            source="library", limit=1, offset=1
+        )
+    ] == ["repo-root"]
+
+
+@pytest.mark.asyncio
+async def test_session_counts_preserve_visibility_filters(db):
+    await db.create_session("cli-root", source="cli", cwd="/workspace/repo")
+    await db.append_message("cli-root", role="user", content="hello")
+    await db.create_session("telegram-root", source="telegram")
+    await db.create_session("archived", source="cli")
+    await db.set_session_archived("archived", True)
+    await db.end_session("cli-root", "compression")
+    await db.create_session(
+        "compression-tip",
+        source="cli",
+        parent_session_id="cli-root",
+    )
+
+    assert await db.session_count() == 3
+    assert await db.session_count(source="cli") == 2
+    assert await db.session_count(sources=["cli", "telegram"]) == 3
+    assert await db.session_count(exclude_sources=["telegram"]) == 2
+    assert await db.session_count(cwd_prefix="/workspace") == 2
+    assert await db.session_count(min_message_count=1) == 1
+    assert await db.session_count(include_archived=True) == 4
+    assert await db.session_count(archived_only=True) == 1
+    assert await db.session_count(exclude_children=True) == 2
+    assert await db.session_count_by_source() == {"cli": 2, "telegram": 1}
+    assert await db.session_count_by_source(include_archived=True) == {
+        "cli": 3,
+        "telegram": 1,
+    }
+    assert await db.session_count_by_source(exclude_children=True) == {
+        "cli": 1,
+        "telegram": 1,
+    }
+
+
+@pytest.mark.asyncio
+async def test_session_count_by_source_normalizes_empty_source_to_cli(db):
+    await db.create_session("implicit-cli", source="")
+    await db.create_session("explicit-cli", source="cli")
+
+    assert await db.session_count_by_source() == {"cli": 2}
+
+
+@pytest.mark.asyncio
+async def test_message_existence_probes_preserve_session_scope(db):
+    await db.create_session("one", source="library")
+    await db.create_session("two", source="library")
+    archived_id = await db.append_message(
+        "one",
+        role="user",
+        content="archived",
+        platform_message_id="platform-1",
+    )
+    connection = await db._get_connection()
+    await connection.execute(
+        "UPDATE messages SET active = 0 WHERE id = ?",
+        (archived_id,),
+    )
+    await connection.commit()
+
+    assert await db.has_archived_messages("one") is True
+    assert await db.has_archived_messages("two") is False
+    assert await db.has_platform_message_id("one", "platform-1") is True
+    assert await db.has_platform_message_id("two", "platform-1") is False
 
 
 @pytest.mark.asyncio

@@ -262,9 +262,22 @@ async def test_session_lifecycle_does_not_block_or_leak(tmp_path):
         try:
             await database.ensure_session("session", source="library")
             message_id = await database.append_message(
-                "session", role="user", content="hello"
+                "session",
+                role="user",
+                content="hello",
+                platform_message_id="platform-message",
             )
             assert await database.message_count("session") == 1
+            assert not await database.has_archived_messages("session")
+            assert await database.has_platform_message_id(
+                "session", "platform-message"
+            )
+            assert await database.session_count(source="library") == 1
+            assert await database.session_count_by_source() == {"library": 1}
+            assert [
+                row["id"]
+                for row in await database.search_sessions(source="library")
+            ] == ["session"]
             assert await database.latest_user_message_row_id("session") == (
                 message_id
             )

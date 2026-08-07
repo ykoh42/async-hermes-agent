@@ -96,8 +96,25 @@ def _scrub_surrogates(value: Any) -> Any:
     return _sanitize_surrogates(value) if isinstance(value, str) else value
 
 
-def _delegate_from_json(column: str = "model_config") -> str:
-    return f"json_extract(COALESCE({column}, '{{}}'), '$._delegate_from')"
+def workspace_key(row: Dict[str, Any]) -> Optional[str]:
+    """A session's workspace grouping key: its git repo root when known, else
+    its cwd.
+
+    Branch is deliberately excluded so checking out a new branch doesn't
+    fragment a workspace's session history. Returns None for cwd-less (unbound)
+    sessions. Both fields are already recorded on ``sessions`` — this just picks
+    the coarser identity for grouping/filtering.
+    """
+    root = (row.get("git_repo_root") or "").strip()
+    if root:
+        return root
+
+    cwd = (row.get("cwd") or "").strip()
+    return cwd or None
+
+
+def _delegate_from_json(col: str = "model_config") -> str:
+    return f"json_extract(COALESCE({col}, '{{}}'), '$._delegate_from')"
 
 
 async def _collect_delegate_child_ids(connection, parent_ids: List[str]) -> List[str]:
@@ -148,6 +165,25 @@ def _cwd_prefix_clause(cwd_prefix: str) -> Tuple[str, List[str]]:
         f"{prefix}/%",
         f"{prefix}\\%",
     ]
+
+
+def _workspace_key_clause(key: str) -> Tuple[str, List[str]]:
+    """Match sessions whose ``workspace_key(row)`` equals ``key``.
+
+    Mirrors :func:`workspace_key`: a session belongs to workspace ``key``
+    when its recorded ``git_repo_root`` equals ``key``, or — for rows that
+    predate per-session git metadata — when its ``cwd`` is at or under
+    ``key`` (so a session started in ``repo/src`` still groups with ``repo``).
+    Used by ``hermes -c``/``--resume`` to continue the most recent session in
+    the *current* workspace rather than the global MRU.
+    """
+    prefix = key.rstrip("/\\") or key
+    cwd_clause, cwd_params = _cwd_prefix_clause(prefix)
+    return (
+        f"(s.git_repo_root = ? OR "
+        f"(COALESCE(s.git_repo_root, '') = '' AND {cwd_clause}))",
+        [prefix, *cwd_params],
+    )
 
 
 DEFAULT_DB_PATH = get_hermes_home() / "state.db"
@@ -1371,6 +1407,23 @@ class SessionDB:
             )
 
         await self._write(_replace)
+
+    async def has_archived_messages(self, session_id: str) -> bool:
+        """Return True if the session has any soft-archived (``active = 0``) rows.
+
+        Used by callers (e.g. the ACP adapter's ``_persist``) that must decide
+        whether a full-history :meth:`replace_messages` would destroy durable
+        compaction-archived turns. Cheap existence probe — does not load rows.
+        """
+        connection = await self._get_connection()
+        row = await (
+            await connection.execute(
+                "SELECT 1 FROM messages "
+                "WHERE session_id = ? AND active = 0 LIMIT 1",
+                (session_id,),
+            )
+        ).fetchone()
+        return row is not None
 
     async def end_session(self, session_id: str, end_reason: str) -> None:
         async def _end(connection):
@@ -2860,6 +2913,194 @@ class SessionDB:
                 for item in results
             ]
         return results
+
+    async def search_sessions(
+        self,
+        source: str = None,
+        limit: int = 20,
+        offset: int = 0,
+        workspace_key: str = None,
+    ) -> List[Dict[str, Any]]:
+        """List sessions, optionally filtered by source.
+
+        Returns rows enriched with a computed ``last_active`` column
+        (freshest of ``last_activity_at`` and latest message timestamp,
+        else ``started_at``), ordered by most-recently-used first.
+
+        Pass ``workspace_key`` to scope rows to one workspace - matching
+        :func:`workspace_key` semantics (git repo root, else cwd). Used by
+        ``hermes -c``/``--resume`` so the "last" session is the last one in
+        the *current* workspace, not the global MRU.
+        """
+        select_with_last_active = (
+            "SELECT s.*, "
+            "COALESCE(sp.prompt, s.system_prompt) AS _system_prompt_resolved, "
+            f"{_sql_session_last_active('s')} AS last_active "
+            "FROM sessions s "
+            "LEFT JOIN system_prompts sp ON sp.hash = s.system_prompt_hash "
+        )
+        where_clauses = []
+        params: list = []
+        if source:
+            where_clauses.append("s.source = ?")
+            params.append(source)
+        if workspace_key:
+            ws_clause, ws_params = _workspace_key_clause(workspace_key)
+            where_clauses.append(ws_clause)
+            params.extend(ws_params)
+        where_sql = (
+            f" WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
+        )
+        params.extend([limit, offset])
+        connection = await self._get_connection()
+        rows = await (
+            await connection.execute(
+                f"{select_with_last_active}"
+                f"{where_sql} "
+                "ORDER BY last_active DESC, s.started_at DESC, "
+                "s.id DESC LIMIT ? OFFSET ?",
+                params,
+            )
+        ).fetchall()
+        return [self._session_row_dict(row) for row in rows]
+
+    async def session_count(
+        self,
+        source: str = None,
+        sources: List[str] = None,
+        cwd_prefix: str = None,
+        min_message_count: int = 0,
+        include_archived: bool = False,
+        archived_only: bool = False,
+        exclude_children: bool = False,
+        exclude_sources: List[str] = None,
+    ) -> int:
+        """Count sessions, optionally filtered by source.
+
+        Pass ``exclude_children=True`` to count only the conversations that
+        ``list_sessions_rich`` surfaces (root + branch sessions), hiding
+        sub-agent runs and compression continuations. Use it whenever the count
+        is paired with a ``list_sessions_rich`` page (e.g. sidebar "load more"
+        totals) so the total matches the number of listable rows — otherwise the
+        raw row count is inflated by children and "load more" never settles.
+
+        Pass ``exclude_sources`` to drop whole source classes from the count
+        (e.g. ``["cron"]`` so the recents "load more" total matches a
+        cron-excluded ``list_sessions_rich`` page and doesn't keep "load more"
+        stuck on for buried scheduler sessions).
+        """
+        where_clauses = []
+        params = []
+
+        if exclude_children:
+            where_clauses.append(_LISTABLE_CHILD_SQL)
+            where_clauses.append(
+                f"{_delegate_from_json('s.model_config')} IS NULL"
+            )
+        include_sources = [source] if source else list(sources or [])
+        if include_sources:
+            placeholders = ",".join("?" for _ in include_sources)
+            where_clauses.append(f"s.source IN ({placeholders})")
+            params.extend(include_sources)
+        if exclude_sources:
+            placeholders = ",".join("?" for _ in exclude_sources)
+            where_clauses.append(f"s.source NOT IN ({placeholders})")
+            params.extend(exclude_sources)
+        if cwd_prefix:
+            clause, clause_params = _cwd_prefix_clause(cwd_prefix)
+            where_clauses.append(clause)
+            params.extend(clause_params)
+        if min_message_count > 0:
+            where_clauses.append("s.message_count >= ?")
+            params.append(min_message_count)
+        if archived_only:
+            where_clauses.append("s.archived = 1")
+        elif not include_archived:
+            where_clauses.append("s.archived = 0")
+
+        where_sql = (
+            f" WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
+        )
+        connection = await self._get_connection()
+        row = await (
+            await connection.execute(
+                f"SELECT COUNT(*) FROM sessions s{where_sql}", params
+            )
+        ).fetchone()
+        return row[0]
+
+    async def session_count_by_source(
+        self,
+        *,
+        include_archived: bool = False,
+        archived_only: bool = False,
+        exclude_children: bool = False,
+    ) -> Dict[str, int]:
+        """Return a ``{source: count}`` dict via a single ``GROUP BY`` query.
+
+        Replaces the O(N) ``list_sessions_rich`` histogram loop with an
+        aggregate query. When ``exclude_children`` is False the query uses
+        ``idx_sessions_source``; when True, the child-exclusion predicates
+        require a full table scan (same as ``session_count`` and
+        ``list_sessions_rich``).
+
+        ``exclude_children=True`` mirrors ``list_sessions_rich`` visibility
+        (roots + branch sessions, excluding sub-agent runs, delegates, and
+        compression continuations) so the source counts match what the
+        Sessions page actually lists.
+        """
+        where_clauses = []
+        params: list = []
+
+        if exclude_children:
+            where_clauses.append(_LISTABLE_CHILD_SQL)
+            where_clauses.append(
+                f"{_delegate_from_json('s.model_config')} IS NULL"
+            )
+        if archived_only:
+            where_clauses.append("s.archived = 1")
+        elif not include_archived:
+            where_clauses.append("s.archived = 0")
+
+        where_sql = (
+            f" WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
+        )
+        if self._closed:
+            raise RuntimeError("SessionDB connection is closed")
+        connection = await self._get_connection()
+        rows = await (
+            await connection.execute(
+                "SELECT COALESCE(NULLIF(s.source, ''), 'cli') AS source, "
+                "COUNT(*) AS count "
+                f"FROM sessions s{where_sql} "
+                "GROUP BY COALESCE(NULLIF(s.source, ''), 'cli') "
+                "ORDER BY count DESC",
+                params,
+            )
+        ).fetchall()
+        return {
+            str(row["source"]): int(row["count"] or 0) for row in rows
+        }
+
+    async def has_platform_message_id(
+        self, session_id: str, platform_message_id: str
+    ) -> bool:
+        """Check if a message with the given platform_message_id exists.
+
+        Uses the idx_messages_platform_msg_id partial index for efficient
+        lookup. Used by the gateway's transient-failure dedupe guard (#47237)
+        to skip re-persisting a user message that was already saved on a
+        prior retry of the same inbound platform message.
+        """
+        connection = await self._get_connection()
+        row = await (
+            await connection.execute(
+                "SELECT 1 FROM messages "
+                "WHERE session_id = ? AND platform_message_id = ? LIMIT 1",
+                (session_id, platform_message_id),
+            )
+        ).fetchone()
+        return row is not None
 
     _SEARCH_MESSAGE_RESULT_FIELDS = (
         "id",
