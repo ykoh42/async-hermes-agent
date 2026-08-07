@@ -451,7 +451,6 @@ class TestResolvePreToolBlock:
     @pytest.mark.asyncio
     async def test_approve_passes_plugin_rule_key_to_gate(self, monkeypatch):
         from hermes_cli.plugins import resolve_pre_tool_block
-        from tools.terminal_tool import set_approval_callback
 
         seen = {}
 
@@ -473,13 +472,11 @@ class TestResolvePreToolBlock:
             seen["tool_name"] = tool_name
             seen["reason"] = reason
             seen["rule_key"] = kwargs.get("rule_key")
-            return True
+            return {"approved": True, "message": None}
 
-        set_approval_callback(_approve)
-        try:
-            assert await resolve_pre_tool_block("write_file", {}) is None
-        finally:
-            set_approval_callback(None)
+        monkeypatch.setattr("tools.approval.request_tool_approval", _approve)
+
+        assert await resolve_pre_tool_block("write_file", {}) is None
         assert seen == {
             "tool_name": "write_file",
             "reason": "why",
@@ -490,7 +487,6 @@ class TestResolvePreToolBlock:
     @pytest.mark.asyncio
     async def test_approve_gate_exception_fails_closed(self, monkeypatch):
         from hermes_cli.plugins import resolve_pre_tool_block
-        from tools.terminal_tool import set_approval_callback
 
         async def invoke_hook(hook_name, **kwargs):
             return [{"action": "approve", "message": "why"}]
@@ -503,12 +499,9 @@ class TestResolvePreToolBlock:
         async def _boom(*a, **k):
             raise RuntimeError("gate crashed")
 
-        set_approval_callback(_boom)
-        try:
-            msg = await resolve_pre_tool_block("terminal", {})
-        finally:
-            set_approval_callback(None)
-        assert msg is not None and "callback failed" in msg
+        monkeypatch.setattr("tools.approval.request_tool_approval", _boom)
+        msg = await resolve_pre_tool_block("terminal", {})
+        assert msg is not None and "gate failed" in msg
 
 
 class TestGetPreVerifyContinueMessage:

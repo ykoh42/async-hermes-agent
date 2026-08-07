@@ -2055,7 +2055,7 @@ async def resolve_pre_tool_block(
     api_request_id: str = "",
     middleware_trace: Optional[List[Dict[str, Any]]] = None,
 ) -> Optional[str]:
-    """Resolve a pre-tool policy directive through the async approval callback."""
+    """Resolve a pre-tool policy directive to a final block message or ``None``."""
     details = await _get_pre_tool_call_directive_details(
         tool_name,
         args,
@@ -2069,41 +2069,21 @@ async def resolve_pre_tool_block(
     if details.action == "block":
         return details.message
     if details.action == "approve":
-        from tools.terminal_tool import _get_approval_callback
-
-        callback = _get_approval_callback()
-        if callback is None:
-            return f"BLOCKED: plugin approval required for {tool_name}"
         try:
-            if not inspect.iscoroutinefunction(callback):
-                raise PluginContractError(
-                    "Async Hermes requires a coroutine approval callback"
-                )
-            decision = await callback(
-                tool_name=tool_name,
-                reason=details.message or "",
-                rule_key=details.rule_key or tool_name,
-                args=args if isinstance(args, dict) else {},
-                task_id=task_id,
-                session_id=session_id,
-            )
-        except PluginContractError:
-            raise
-        except Exception:
-            logger.exception("Plugin approval callback failed for %s", tool_name)
-            return f"BLOCKED: plugin approval callback failed for {tool_name}"
+            from tools.approval import request_tool_approval
 
-        approved = decision is True or str(decision).strip().lower() in {
-            "approve",
-            "approved",
-            "allow",
-            "yes",
-        }
-        if not approved:
+            result = await request_tool_approval(
+                tool_name,
+                details.message or "",
+                rule_key=details.rule_key or tool_name,
+            )
+        except Exception:
+            logger.exception("Plugin approval gate failed for %s", tool_name)
+            return f"BLOCKED: plugin approval gate failed for {tool_name}"
+        if not result.get("approved"):
             return str(
-                decision.get("message")
-                if isinstance(decision, dict) and decision.get("message")
-                else f"BLOCKED: plugin approval denied for {tool_name}"
+                result.get("message")
+                or f"BLOCKED: plugin approval required for {tool_name}"
             )
     return None
 

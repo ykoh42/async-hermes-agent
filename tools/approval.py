@@ -9,6 +9,7 @@ import asyncio
 import contextvars
 import fnmatch
 import functools
+import hashlib
 import inspect
 import logging
 import os
@@ -2430,6 +2431,80 @@ async def check_all_command_guards(
         "message": (
             f"BLOCKED: Command {outcome} by the user. The user has NOT consented "
             "to this action. Do NOT retry or rephrase it."
+        ),
+        "pattern_key": pattern_key,
+        "description": description,
+        "outcome": outcome,
+        "user_consent": False,
+    }
+
+
+async def request_tool_approval(
+    tool_name: str,
+    reason: str,
+    *,
+    rule_key: str = "",
+    approval_callback=None,
+) -> dict:
+    """Escalate a plugin-flagged tool call through the native async gate."""
+    await _load_approval_config_snapshot()
+
+    description = reason or f"Plugin requires approval for {tool_name}"
+    if rule_key:
+        key_suffix = rule_key
+    else:
+        reason_hash = hashlib.sha256(description.encode("utf-8")).hexdigest()[:12]
+        key_suffix = f"{tool_name}:{reason_hash}"
+    pattern_key = f"plugin_rule:{key_suffix}"
+
+    if _YOLO_MODE_FROZEN or is_current_session_yolo_enabled():
+        return {"approved": True, "message": None}
+
+    session_key = get_current_session_key()
+    if is_approved(session_key, pattern_key):
+        return {"approved": True, "message": None}
+
+    if approval_callback is None:
+        try:
+            from tools.terminal_tool import _get_approval_callback
+
+            approval_callback = _get_approval_callback()
+        except Exception:
+            approval_callback = None
+
+    if approval_callback is None:
+        return {
+            "approved": False,
+            "message": (
+                f"BLOCKED: Tool '{tool_name}' requires approval ({description}) "
+                "but no native async approval callback is registered. A plugin "
+                "flagged this action for human confirmation."
+            ),
+            "pattern_key": pattern_key,
+            "description": description,
+        }
+
+    choice = await prompt_dangerous_approval(
+        f"<{tool_name}> (plugin approval rule)",
+        description,
+        approval_callback=approval_callback,
+    )
+    normalized_choice = str(choice).strip().lower()
+    if normalized_choice in {"once", "session", "always"}:
+        if normalized_choice == "session":
+            approve_session(session_key, pattern_key)
+        elif normalized_choice == "always":
+            approve_session(session_key, pattern_key)
+            approve_permanent(pattern_key)
+            await save_permanent_allowlist(_permanent_approved)
+        return {"approved": True, "message": None}
+
+    outcome = "timeout" if normalized_choice == "timeout" else "denied"
+    return {
+        "approved": False,
+        "message": (
+            f"BLOCKED: User {outcome} this plugin-flagged tool call "
+            f"(matched '{description}'). Do NOT retry or rephrase it."
         ),
         "pattern_key": pattern_key,
         "description": description,
