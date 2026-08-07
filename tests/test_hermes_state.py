@@ -135,6 +135,27 @@ async def test_meta_cursor_and_token_flush_keep_upstream_arguments(db):
 
 
 @pytest.mark.asyncio
+async def test_compression_cooldown_raw_snapshot_round_trip(db):
+    await db.create_session("cooldown", source="library")
+    original = await db.get_compression_failure_cooldown_row("cooldown")
+    assert original == {
+        "session_exists": True,
+        "cooldown_until": None,
+        "error": None,
+    }
+
+    await db.record_compression_failure_cooldown(
+        "cooldown", time.time() + 60, "temporary"
+    )
+    assert (await db.get_compression_failure_cooldown_row("cooldown"))["error"] == (
+        "temporary"
+    )
+
+    await db.restore_compression_failure_cooldown_row("cooldown", original)
+    assert await db.get_compression_failure_cooldown_row("cooldown") == original
+
+
+@pytest.mark.asyncio
 async def test_delete_session_preserves_upstream_cascade_and_orphan_contract(
     db, tmp_path
 ):

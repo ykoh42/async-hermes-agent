@@ -1746,6 +1746,17 @@ class ContextCompressor(ContextEngine):
         # its ``finally`` block.  Never call a synchronous SessionDB method
         # from this state transition.
 
+    def record_timeout_failure(self, error: str) -> None:
+        """Record a consecutive timeout using the shared cooldown ladder."""
+        cooldown_ladder = (60, 300, 900)
+        self._consecutive_timeout_failures = (
+            getattr(self, "_consecutive_timeout_failures", 0) + 1
+        )
+        cooldown = cooldown_ladder[
+            min(self._consecutive_timeout_failures, len(cooldown_ladder)) - 1
+        ]
+        self._record_compression_failure_cooldown(float(cooldown), error)
+
     def _clear_compression_failure_cooldown(self) -> None:
         self._summary_failure_cooldown_until = 0.0
         self._last_summary_error = None

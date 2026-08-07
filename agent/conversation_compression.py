@@ -208,6 +208,130 @@ def _cached_prompt_reflects_builtin_memory(agent: Any, cached_prompt: str) -> bo
     return True
 
 
+_COMPRESSOR_ATTEMPT_STATE_FIELDS = (
+    "_previous_summary",
+    "_summary_has_user_turn",
+    "compression_count",
+    "_last_compression_savings_pct",
+    "_ineffective_compression_count",
+    "_anti_thrash_recovery_deadline",
+    "_fallback_compression_streak",
+    "_verify_compaction_cleared_threshold",
+    "_last_compression_made_progress",
+    "_summary_failure_cooldown_until",
+    "_cooldown_persist_failed",
+    "_last_summary_error",
+    "_consecutive_timeout_failures",
+    "_last_summary_dropped_count",
+    "_last_summary_fallback_used",
+    "_last_compress_aborted",
+    "_last_summary_auth_failure",
+    "_last_summary_network_failure",
+    "_last_aux_model_failure_error",
+    "_last_aux_model_failure_model",
+    "_summary_model_fallen_back",
+    "summary_model",
+    "_last_compression_telemetry",
+    "_active_compression_telemetry",
+    "_compression_telemetry_seed",
+)
+
+_COMPRESSOR_COOLDOWN_STATE_FIELDS = (
+    "_summary_failure_cooldown_until",
+    "_last_summary_error",
+    "_cooldown_persist_failed",
+)
+
+
+def _snapshot_compressor_attempt_state(compressor: Any) -> dict[str, Any]:
+    """Copy mutable bookkeeping owned by one compression attempt."""
+    try:
+        values = vars(compressor)
+    except TypeError:
+        return {}
+    selected = {
+        name: values[name]
+        for name in _COMPRESSOR_ATTEMPT_STATE_FIELDS
+        if name in values
+    }
+    return copy.deepcopy(selected)
+
+
+async def _restore_compressor_attempt_state(
+    compressor: Any,
+    snapshot: dict[str, Any],
+    *,
+    durable_cooldown_authoritative: Optional[bool] = None,
+    durable_cooldown_state: Optional[dict[str, Any]] = None,
+) -> None:
+    """Restore one cancelled attempt without retaining partial state."""
+    if durable_cooldown_authoritative is True:
+        values = vars(compressor)
+        session_db = values.get("_session_db")
+        session_id = values.get("_session_id")
+        restorer = getattr(
+            type(session_db), "restore_compression_failure_cooldown_row", None
+        )
+        if not callable(restorer) or durable_cooldown_state is None:
+            raise RuntimeError("exact compression cooldown rollback API is unavailable")
+        await restorer(
+            session_db,
+            session_id,
+            copy.deepcopy(durable_cooldown_state),
+        )
+    restored = copy.deepcopy(snapshot)
+    for name, value in restored.items():
+        setattr(compressor, name, value)
+
+
+async def _capture_authoritative_cooldown_under_lease(
+    compressor: Any,
+    attempt_snapshot: dict[str, Any],
+) -> tuple[Optional[bool], Optional[dict[str, Any]]]:
+    """Refresh and snapshot built-in durable cooldown state under its lease."""
+    try:
+        from agent.context_compressor import ContextCompressor
+
+        if not isinstance(compressor, ContextCompressor):
+            return None, None
+        values = vars(compressor)
+        session_db = values.get("_session_db")
+        session_id = values.get("_session_id")
+        raw_reader = (
+            getattr(
+                type(session_db), "get_compression_failure_cooldown_row", None
+            )
+            if session_db is not None
+            else None
+        )
+        if session_db is None or not session_id:
+            return None, None
+        if not callable(raw_reader):
+            return False, None
+        durable_state = await raw_reader(session_db, session_id)
+        if not isinstance(durable_state, dict):
+            raise TypeError("raw compression cooldown snapshot must be a mapping")
+        active = await session_db.get_compression_failure_cooldown(session_id)
+        if active:
+            compressor._summary_failure_cooldown_until = time.monotonic() + max(
+                0.0, float(active.get("remaining_seconds") or 0.0)
+            )
+            compressor._last_summary_error = active.get("error")
+        else:
+            compressor._summary_failure_cooldown_until = 0.0
+            compressor._last_summary_error = None
+        compressor._cooldown_persist_failed = False
+    except Exception as exc:
+        logger.debug("authoritative compression cooldown capture failed: %s", exc)
+        return False, None
+
+    values = vars(compressor)
+    for name in _COMPRESSOR_COOLDOWN_STATE_FIELDS:
+        if name in values:
+            attempt_snapshot[name] = copy.deepcopy(values[name])
+    return True, copy.deepcopy(durable_state)
+
+
 class CompressionCommitFence:
     """Fence cancellation against post-summary session mutation.
 
@@ -220,7 +344,9 @@ class CompressionCommitFence:
     def __init__(self) -> None:
         self._lock = asyncio.Lock()
         self._cancelled = False
+        self._admission_revoked = False
         self._commit_started = False
+        self._commit_phase = asyncio.Event()
         # Forward-progress telemetry: the compression task touches this
         # whenever the streamed summary call produces a token (see
         # ContextCompressor._call_summary_llm). Waiters use it to distinguish
@@ -239,7 +365,7 @@ class CompressionCommitFence:
         """Seconds since the worker last reported forward progress."""
         return max(0.0, time.monotonic() - self._last_progress)
 
-    async def cancel_before_commit(self) -> bool:
+    async def cancel_before_commit(self, cancel_event: Any = None) -> bool:
         """Cancel a pending commit, or wait for an active commit to finish.
 
         Returns ``True`` when cancellation won before the commit boundary.
@@ -248,40 +374,71 @@ class CompressionCommitFence:
         """
         async with self._lock:
             if self._commit_started:
+                if cancel_event is not None:
+                    cancel_event.set()
                 return False
             self._cancelled = True
+            if cancel_event is not None:
+                cancel_event.set()
             return True
 
-    async def begin_commit(self) -> bool:
-        """Enter the commit boundary unless cancellation already won."""
+    async def begin_commit(self, cancel_event: Any = None) -> bool:
+        """Atomically admit commit unless cancellation already won."""
         await self._lock.acquire()
-        if self._cancelled:
+        if (
+            self._cancelled
+            or self._admission_revoked
+            or (cancel_event is not None and bool(cancel_event.is_set()))
+        ):
+            self._cancelled = True
             self._lock.release()
             return False
         self._commit_started = True
+        self._commit_phase.set()
         return True
 
     def finish_commit(self) -> None:
         """Leave a commit boundary entered by :meth:`begin_commit`."""
+        self._commit_phase.clear()
         self._lock.release()
+
+    @property
+    def commit_in_flight(self) -> bool:
+        """Whether an admitted durable commit is currently running."""
+        return self._commit_phase.is_set()
+
+    @property
+    def is_cancelled(self) -> bool:
+        """Whether pending or future commit admission has been revoked."""
+        return self._cancelled or self._admission_revoked
+
+    async def revoke_commit_admission(self) -> bool:
+        """Prevent future commit admission, waiting out an active commit."""
+        self._admission_revoked = True
+        return await self.cancel_before_commit()
 
 
 def resolve_context_compression_timeouts(
-    compression_config: dict | None,
+    compression_cfg: Optional[dict] = None,
 ) -> tuple[float, float]:
     """Resolve the inactivity and pre-commit ceilings for compression."""
-    config = compression_config if isinstance(compression_config, dict) else {}
-    try:
-        idle = max(0.0, float(config.get("context_timeout_seconds", 120)))
-    except (TypeError, ValueError):
-        idle = 120.0
-    try:
-        ceiling = max(
-            0.0,
-            float(config.get("context_total_ceiling_seconds", 600)),
-        )
-    except (TypeError, ValueError):
-        ceiling = 600.0
+    idle = 120.0
+    ceiling = 600.0
+    if isinstance(compression_cfg, dict):
+        raw_idle = compression_cfg.get("context_timeout_seconds")
+        if raw_idle is not None:
+            try:
+                idle = float(raw_idle)
+            except (TypeError, ValueError):
+                pass
+        raw_ceiling = compression_cfg.get("context_total_ceiling_seconds")
+        if raw_ceiling is not None:
+            try:
+                parsed_ceiling = float(raw_ceiling)
+                if parsed_ceiling > 0:
+                    ceiling = parsed_ceiling
+            except (TypeError, ValueError):
+                pass
     if idle > 0:
         ceiling = max(idle, ceiling)
     return idle, ceiling
@@ -291,17 +448,50 @@ async def run_compress_context_with_progress_timeout(
     *,
     worker: Callable[[CompressionCommitFence], Awaitable[Tuple[list, str]]],
     messages: list,
-    system_prompt_fallback: str,
+    system_prompt_fallback: Any,
     idle_timeout_seconds: float,
     total_ceiling_seconds: float,
     on_timeout: Callable[[float, float, float], Any] | None = None,
+    on_commit_overrun: Callable[[float, float], Any] | None = None,
+    fence: CompressionCommitFence | None = None,
+    telemetry_agent: Any = None,
     hard_cancel_event: asyncio.Event | None = None,
 ) -> Tuple[list, str]:
-    """Run compression with native asyncio cancellation and commit fencing."""
-    if idle_timeout_seconds <= 0:
-        return await worker(CompressionCommitFence())
+    """Run compression under native async progress and commit fencing.
 
-    fence = CompressionCommitFence()
+    Timeout budgets cover only the pre-commit phase. Once durable mutation is
+    admitted, the task is awaited to completion; ceiling overruns are surfaced
+    without abandoning the commit.
+    """
+    if idle_timeout_seconds <= 0:
+        raise ValueError(
+            "run_compress_context_with_progress_timeout requires "
+            "idle_timeout_seconds > 0; call compress_context directly to disable"
+        )
+
+    async def _resolve_fallback_prompt() -> str:
+        value = (
+            system_prompt_fallback()
+            if callable(system_prompt_fallback)
+            else system_prompt_fallback
+        )
+        if inspect.isawaitable(value):
+            value = await value
+        return value
+
+    async def _notify(callback: Callable[..., Any] | None, *args: Any) -> None:
+        if callback is None:
+            return
+        try:
+            result = callback(*args)
+            if inspect.isawaitable(result):
+                await result
+        except Exception:
+            logger.debug("compression timeout callback failed", exc_info=True)
+
+    fence = fence if fence is not None else CompressionCommitFence()
+    idle = float(idle_timeout_seconds)
+    ceiling = max(float(total_ceiling_seconds), idle)
     task = asyncio.create_task(worker(fence), name="hermes-context-compression")
     cancel_task = (
         asyncio.create_task(
@@ -312,12 +502,38 @@ async def run_compress_context_with_progress_timeout(
         else None
     )
     started = time.monotonic()
+
+    async def _wait_for_commit() -> Tuple[list, str]:
+        overrun_surfaced = False
+        overrun_reports = 0
+        while True:
+            waited = time.monotonic() - started
+            remaining = ceiling - waited
+            if remaining <= 0:
+                remaining = min(30.0, max(ceiling, 0.05))
+                overrun_reports += 1
+                log = logger.warning if overrun_reports <= 2 else logger.error
+                log(
+                    "Context compression SessionDB commit still running "
+                    "%.1fs past the total ceiling (waited %.1fs, ceiling "
+                    "%.1fs); continuing to wait safely",
+                    waited - ceiling,
+                    waited,
+                    ceiling,
+                )
+                if not overrun_surfaced:
+                    overrun_surfaced = True
+                    await _notify(on_commit_overrun, waited, ceiling)
+            done, _ = await asyncio.wait({task}, timeout=remaining)
+            if task in done:
+                return await task
+
     try:
         while True:
             total_elapsed = time.monotonic() - started
             since_progress = fence.seconds_since_progress()
-            remaining_idle = idle_timeout_seconds - since_progress
-            remaining_total = total_ceiling_seconds - total_elapsed
+            remaining_idle = idle - since_progress
+            remaining_total = ceiling - total_elapsed
             remaining = min(remaining_idle, remaining_total)
             if remaining > 0:
                 waiters = {task}
@@ -331,43 +547,55 @@ async def run_compress_context_with_progress_timeout(
                 if cancel_task is not None and cancel_task in done:
                     from agent.auxiliary_client import AuxiliaryExplicitCancellation
 
-                    cancellation_won = await fence.cancel_before_commit()
+                    if fence.commit_in_flight:
+                        return await _wait_for_commit()
+                    cancellation_won = await fence.cancel_before_commit(
+                        hard_cancel_event
+                    )
                     if cancellation_won:
                         task.cancel()
-                    try:
-                        await task
-                    except asyncio.CancelledError:
-                        pass
+                        try:
+                            await task
+                        except asyncio.CancelledError:
+                            pass
+                    else:
+                        return await _wait_for_commit()
                     raise AuxiliaryExplicitCancellation()
                 if task in done:
                     return await task
                 continue
 
+            if fence.commit_in_flight:
+                return await _wait_for_commit()
             cancellation_won = await fence.cancel_before_commit()
             if not cancellation_won:
-                return await task
-            if on_timeout is not None:
-                result = on_timeout(
-                    idle_timeout_seconds,
-                    total_elapsed,
-                    since_progress,
-                )
-                if inspect.isawaitable(result):
-                    await result
+                return await _wait_for_commit()
             task.cancel()
             try:
                 await task
             except asyncio.CancelledError:
                 pass
-            return messages, system_prompt_fallback
+            await _notify(on_timeout, idle, total_elapsed, since_progress)
+            timeout_compressor = getattr(
+                telemetry_agent, "context_compressor", None
+            )
+            if timeout_compressor is not None:
+                await _persist_compression_guards(
+                    timeout_compressor,
+                    getattr(telemetry_agent, "_session_db", None),
+                    getattr(telemetry_agent, "session_id", None),
+                )
+            return messages, await _resolve_fallback_prompt()
     except asyncio.CancelledError:
-        cancellation_won = await fence.cancel_before_commit()
+        cancellation_won = await fence.revoke_commit_admission()
         if cancellation_won:
             task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        else:
+            await _wait_for_commit()
         raise
     finally:
         if cancel_task is not None:
@@ -1320,6 +1548,11 @@ async def compress_context(
         prompt — the session is NOT rotated.  Callers should detect the
         no-op via ``len(returned) == len(input)`` and stop the retry loop.
     """
+    _compressor_attempt_snapshot = _snapshot_compressor_attempt_state(
+        agent.context_compressor
+    )
+    _durable_cooldown_authoritative: Optional[bool] = None
+    _durable_cooldown_state: Optional[dict[str, Any]] = None
     if (
         defer_context_engine_notification
         and callable(getattr(agent, _PENDING_CONTEXT_ENGINE_NOTIFICATION, None))
@@ -1487,6 +1720,11 @@ async def compress_context(
             _lock_acquired = await _lock_db.try_acquire_compression_lock(
                 _lock_sid, _lock_holder, ttl_seconds=_lock_ttl
             )
+        except asyncio.CancelledError:
+            await asyncio.shield(
+                _lock_db.release_compression_lock(_lock_sid, _lock_holder)
+            )
+            raise
         except Exception as _lock_err:
             logger.warning(
                 "compression lock acquisition raised unexpectedly for "
@@ -1616,6 +1854,9 @@ async def compress_context(
                         )
                     return recovered_messages, existing_prompt
                 return messages, existing_prompt
+        except asyncio.CancelledError:
+            await _release_lock()
+            raise
         except Exception as session_error:
             logger.warning(
                 "compression session ownership lookup failed for session=%s "
@@ -1630,15 +1871,36 @@ async def compress_context(
                 existing_prompt = await agent._build_system_prompt(system_message)
             return messages, existing_prompt
 
+    try:
+        _durable_cooldown_authoritative, _durable_cooldown_state = (
+            await _capture_authoritative_cooldown_under_lease(
+                agent.context_compressor,
+                _compressor_attempt_snapshot,
+            )
+        )
+    except asyncio.CancelledError:
+        await _release_lock()
+        raise
+    if _durable_cooldown_authoritative is False:
+        await _release_lock()
+        existing_prompt = getattr(agent, "_cached_system_prompt", None)
+        if not existing_prompt:
+            existing_prompt = await agent._build_system_prompt(system_message)
+        return messages, existing_prompt
+
     # The agent may have been constructed before another path completed an
     # in-place compaction on the same session. Re-read durable breaker state
     # after acquiring the session lock so this final gate cannot act on the
     # stale snapshot loaded by bind_session_state().
     if not force:
         compressor = agent.context_compressor
-        await _hydrate_persisted_compression_guards(
-            compressor, _lock_db, _lock_sid
-        )
+        try:
+            await _hydrate_persisted_compression_guards(
+                compressor, _lock_db, _lock_sid
+            )
+        except asyncio.CancelledError:
+            await _release_lock()
+            raise
         blocked = getattr(
             type(compressor),
             "_automatic_compression_blocked",
@@ -1651,7 +1913,15 @@ async def compress_context(
                 existing_prompt = await agent._build_system_prompt(system_message)
             return messages, existing_prompt
 
+    from agent.auxiliary_client import (
+        AuxiliaryExplicitCancellation,
+        aux_interrupt_protection,
+        aux_progress_hook,
+    )
+
     _activity_heartbeat: Optional[_CompressionActivityHeartbeat] = None
+    messages_before_compression = None
+    _hard_cancel_event = getattr(agent, "_hard_interrupt_requested", None)
     try:
         if _lock_holder is not None:
             try:
@@ -1768,13 +2038,58 @@ async def compress_context(
         # provider that keeps the connection alive forever is cut off at the
         # streamed total ceiling (see _aux_stream_total_ceiling) instead of
         # outliving the SDK's inactivity timeout indefinitely.
-        from agent.auxiliary_client import aux_progress_hook
         _progress_hook = (
             commit_fence.touch_progress if commit_fence is not None
             else (lambda: None)
         )
-        with aux_progress_hook(_progress_hook):
-            compressed = await compress_fn(messages, **compress_kwargs)
+        if commit_fence is not None and commit_fence.is_cancelled:
+            logger.info(
+                "Compression cancelled before summary dispatch "
+                "(session=%s) — skipping summary work.",
+                agent.session_id or "none",
+            )
+            compressed = messages
+        else:
+            with aux_progress_hook(_progress_hook), aux_interrupt_protection(
+                cancel_event=_hard_cancel_event
+            ):
+                compressed = await compress_fn(messages, **compress_kwargs)
+                if (
+                    _hard_cancel_event is not None
+                    and _hard_cancel_event.is_set()
+                ):
+                    raise AuxiliaryExplicitCancellation()
+    except (AuxiliaryExplicitCancellation, asyncio.CancelledError) as _cancel_exc:
+        try:
+            await _restore_compressor_attempt_state(
+                agent.context_compressor,
+                _compressor_attempt_snapshot,
+                durable_cooldown_authoritative=_durable_cooldown_authoritative,
+                durable_cooldown_state=_durable_cooldown_state,
+            )
+        finally:
+            if (
+                messages_before_compression is not None
+                and messages != messages_before_compression
+            ):
+                messages[:] = copy.deepcopy(messages_before_compression)
+            if _activity_heartbeat is not None:
+                await _activity_heartbeat.stop("context compression cancelled")
+                _activity_heartbeat = None
+            await _release_lock()
+        _emit_compression_attempt_telemetry(
+            agent,
+            started_at=_attempt_started_at,
+            commit_status="aborted",
+            split_status="aborted",
+            failure_class="explicit_interrupt",
+        )
+        if isinstance(_cancel_exc, asyncio.CancelledError):
+            raise
+        _existing_sp = getattr(agent, "_cached_system_prompt", None)
+        if not _existing_sp:
+            _existing_sp = await agent._build_system_prompt(system_message)
+        return messages, _existing_sp
     except BaseException as _compress_exc:
         # ANY exception after lock acquisition — memory hook, capability
         # inspection, engine lookup, or compress() — must release the lock so
@@ -1887,8 +2202,23 @@ async def compress_context(
             return messages, _existing_sp
 
         if commit_fence is not None:
-            _commit_fence_entered = await commit_fence.begin_commit()
+            _commit_fence_entered = await commit_fence.begin_commit(
+                _hard_cancel_event
+            )
             if not _commit_fence_entered:
+                await _restore_compressor_attempt_state(
+                    agent.context_compressor,
+                    _compressor_attempt_snapshot,
+                    durable_cooldown_authoritative=(
+                        _durable_cooldown_authoritative
+                    ),
+                    durable_cooldown_state=_durable_cooldown_state,
+                )
+                if (
+                    messages_before_compression is not None
+                    and messages != messages_before_compression
+                ):
+                    messages[:] = copy.deepcopy(messages_before_compression)
                 logger.info(
                     "Compression commit cancelled before session mutation "
                     "(session=%s).",

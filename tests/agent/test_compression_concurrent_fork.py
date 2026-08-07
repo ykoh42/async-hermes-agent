@@ -296,6 +296,9 @@ async def test_fence_cancelled_compression_leaves_lock_reacquirable(tmp_path: Pa
     async def _slow_summary(*_args, **_kwargs):
         summary_started.set()
         await asyncio.wait_for(release_summary.wait(), timeout=5)
+        _args[0][0]["content"] = "mutated-before-cancel"
+        agent.context_compressor.compression_count = 99
+        agent.context_compressor._last_summary_error = "partial-attempt"
         return [
             {"role": "user", "content": "[CONTEXT COMPACTION] summary"},
             {"role": "user", "content": "tail"},
@@ -320,6 +323,9 @@ async def test_fence_cancelled_compression_leaves_lock_reacquirable(tmp_path: Pa
     # Cancelled attempt: no mutation, and — the invariant under test — the
     # per-session compression lock is fully released.
     assert result[0] is messages
+    assert messages[0]["content"] == "m0"
+    assert agent.context_compressor.compression_count == 1
+    assert agent.context_compressor._last_summary_error is None
     assert await db.get_compression_lock_holder(session_id) is None
 
     # The NEXT attempt (no fence — a manual /compress retry) must be able to
@@ -365,6 +371,36 @@ async def test_commit_fence_waits_for_an_active_commit() -> None:
     await asyncio.wait_for(waiter, timeout=2)
 
     assert result["cancelled"] is False
+
+
+@pytest.mark.asyncio
+async def test_task_cancellation_during_post_lease_read_releases_lock(
+    tmp_path: Path,
+) -> None:
+    db = SessionDB(tmp_path / "state.db")
+    session_id = "CANCEL_DURING_POST_LEASE_READ"
+    await db.create_session(session_id, source="library")
+    agent = _build_agent_with_db(db, session_id)
+    entered = asyncio.Event()
+
+    async def blocked_get_session(_session_id):
+        entered.set()
+        await asyncio.Event().wait()
+
+    db.get_session = blocked_get_session
+    running = asyncio.create_task(
+        agent._compress_context(
+            [{"role": "user", "content": "keep"}],
+            "sys",
+            approx_tokens=120_000,
+        )
+    )
+    await asyncio.wait_for(entered.wait(), timeout=2)
+    running.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await running
+    assert await db.get_compression_lock_holder(session_id) is None
 
 
 @pytest.mark.asyncio

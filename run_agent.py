@@ -6322,6 +6322,7 @@ class AIAgent:
         ``force=False``.
         """
         from agent.conversation_compression import (
+            CompressionCommitFence,
             compress_context,
             resolve_context_compression_timeouts,
             run_compress_context_with_progress_timeout,
@@ -6350,11 +6351,12 @@ class AIAgent:
             root = await self._conversation_root_id()
             if root:
                 token = set_conversation_context(root)
+        active_fence = commit_fence or CompressionCommitFence()
         try:
-            async def _compress(fence):
+            async def _compress(fence, target_messages=None):
                 return await compress_context(
                     self,
-                    messages,
+                    target_messages if target_messages is not None else messages,
                     system_message,
                     approx_tokens=approx_tokens,
                     task_id=task_id,
@@ -6365,7 +6367,7 @@ class AIAgent:
                 )
 
             if commit_fence is not None:
-                return await _compress(commit_fence)
+                return await _compress(active_fence)
 
             from hermes_cli.config import load_config_readonly
 
@@ -6376,17 +6378,112 @@ class AIAgent:
             idle_timeout, total_ceiling = resolve_context_compression_timeouts(
                 compression_config
             )
+            if idle_timeout <= 0:
+                return await _compress(active_fence)
+
+            async def _snapshot_worker(fence):
+                snapshot = copy.deepcopy(messages)
+                result_messages, result_prompt = await _compress(
+                    fence, target_messages=snapshot
+                )
+                if result_messages is snapshot:
+                    return messages, result_prompt
+                return result_messages, result_prompt
+
+            async def _fallback_prompt():
+                cached = getattr(self, "_cached_system_prompt", None)
+                if cached:
+                    return cached
+                try:
+                    return await self._build_system_prompt(system_message)
+                except Exception:
+                    logger.debug(
+                        "compress_context timeout fallback prompt rebuild "
+                        "failed; using raw system_message",
+                        exc_info=True,
+                    )
+                    return system_message or ""
+
+            def _on_timeout(idle, waited, since_progress):
+                logger.warning(
+                    "Context compression made no progress for %.1fs "
+                    "(total wait %.1fs, ceiling %.1fs); continuing without "
+                    "compression",
+                    since_progress,
+                    waited,
+                    total_ceiling,
+                )
+                touch = getattr(self, "_touch_activity", None)
+                if callable(touch):
+                    try:
+                        touch("context compression timed out")
+                    except Exception:
+                        logger.debug(
+                            "compress_context timeout activity touch failed",
+                            exc_info=True,
+                        )
+                compressor = getattr(self, "context_compressor", None)
+                record = getattr(compressor, "record_timeout_failure", None)
+                if callable(record):
+                    try:
+                        record("host compress_context timeout (no summary progress)")
+                    except Exception:
+                        logger.debug(
+                            "failed to record compress_context timeout cooldown",
+                            exc_info=True,
+                        )
+                emit = getattr(self, "_emit_warning", None)
+                if callable(emit):
+                    emit(
+                        "⚠ Context compression timed out "
+                        f"after {idle:.1f}s with no output from the summary "
+                        "model. No messages were dropped — continuing without "
+                        "compression. Run /compress to retry, /new for a clean "
+                        "session, or check auxiliary.compression."
+                    )
+
+            def _on_commit_overrun(waited, ceiling):
+                emit = getattr(self, "_emit_warning", None)
+                if callable(emit):
+                    emit(
+                        "⚠ Context compression commit is taking unusually "
+                        f"long ({waited:.0f}s, ceiling {ceiling:.0f}s). "
+                        "Waiting for it to finish safely — if this persists, "
+                        "check SessionDB health (disk / lock contention)."
+                    )
+
             try:
-                return await run_compress_context_with_progress_timeout(
-                    worker=_compress,
+                result = await run_compress_context_with_progress_timeout(
+                    worker=_snapshot_worker,
                     messages=messages,
-                    system_prompt_fallback=system_message,
+                    system_prompt_fallback=_fallback_prompt,
                     idle_timeout_seconds=idle_timeout,
                     total_ceiling_seconds=total_ceiling,
+                    on_timeout=_on_timeout,
+                    on_commit_overrun=_on_commit_overrun,
+                    fence=active_fence,
+                    telemetry_agent=self,
                     hard_cancel_event=getattr(
                         self, "_hard_interrupt_requested", None
                     ),
                 )
+                try:
+                    from hermes_logging import set_session_context
+
+                    set_session_context(self.session_id)
+                except Exception:
+                    pass
+                try:
+                    from gateway.session_context import set_current_session_id
+
+                    if self.session_id:
+                        set_current_session_id(self.session_id)
+                except Exception:
+                    logger.debug(
+                        "post-compression session ContextVar rebind failed",
+                        exc_info=True,
+                    )
+                return result
             except BaseException as exc:
                 from agent.auxiliary_client import AuxiliaryExplicitCancellation
 

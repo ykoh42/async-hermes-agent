@@ -2772,6 +2772,69 @@ class SessionDB:
             "error": row["compression_failure_error"],
         }
 
+    async def get_compression_failure_cooldown_row(
+        self, session_id: str
+    ) -> Dict[str, Any]:
+        """Return the exact stored cooldown columns without expiry filtering."""
+        if not session_id:
+            return {"session_exists": False, "cooldown_until": None, "error": None}
+        connection = await self._get_connection()
+        row = await (
+            await connection.execute(
+                "SELECT compression_failure_cooldown_until, "
+                "compression_failure_error FROM sessions WHERE id = ?",
+                (session_id,),
+            )
+        ).fetchone()
+        if row is None:
+            return {"session_exists": False, "cooldown_until": None, "error": None}
+        deadline = row["compression_failure_cooldown_until"]
+        return {
+            "session_exists": True,
+            "cooldown_until": float(deadline) if deadline is not None else None,
+            "error": row["compression_failure_error"],
+        }
+
+    async def restore_compression_failure_cooldown_row(
+        self, session_id: str, snapshot: Dict[str, Any]
+    ) -> None:
+        """Restore and verify an exact cooldown-row snapshot."""
+        expected_exists = bool(snapshot.get("session_exists", False))
+        if not expected_exists:
+            actual = await self.get_compression_failure_cooldown_row(session_id)
+            if actual.get("session_exists", False):
+                raise RuntimeError(
+                    "cannot restore absent compression cooldown row: session now exists"
+                )
+            return
+
+        deadline = snapshot.get("cooldown_until")
+        error = snapshot.get("error")
+
+        async def _restore(connection):
+            cursor = await connection.execute(
+                "UPDATE sessions SET compression_failure_cooldown_until = ?, "
+                "compression_failure_error = ? WHERE id = ?",
+                (deadline, error, session_id),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError(
+                    f"compression cooldown rollback session missing: {session_id}"
+                )
+
+        await self._write(_restore)
+        actual = await self.get_compression_failure_cooldown_row(session_id)
+        expected = {
+            "session_exists": True,
+            "cooldown_until": float(deadline) if deadline is not None else None,
+            "error": error,
+        }
+        if actual != expected:
+            raise RuntimeError(
+                "compression cooldown rollback verification failed: "
+                f"expected={expected!r}, actual={actual!r}"
+            )
+
     async def record_compression_failure_cooldown(
         self, session_id: str, cooldown_until: float, error: Optional[str] = None
     ) -> None:

@@ -66,5 +66,4 @@ async def test_hard_cancel_waits_for_started_commit():
     assert not running.done()
     release_commit.set()
 
-    with pytest.raises(AuxiliaryExplicitCancellation):
-        await running
+    assert await running == (["committed"], "system")
