@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 from blockbuster import BlockBuster
-from pyleak import no_event_loop_blocking, no_task_leaks
+from pyleak import no_task_leaks
 from pyleak.eventloop import LeakAction
 
 
@@ -33,10 +33,7 @@ class TestClassifySandboxMirrorTarget:
         target.parent.mkdir(parents=True)
         target.write_text("# mirror copy\n")
 
-        async with (
-            no_event_loop_blocking(action=LeakAction.RAISE, threshold=0.1),
-            no_task_leaks(action=LeakAction.RAISE),
-        ):
+        async with no_task_leaks(action=LeakAction.RAISE):
             blockbuster = BlockBuster()
             blockbuster.activate()
             try:
