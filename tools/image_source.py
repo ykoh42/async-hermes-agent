@@ -200,6 +200,15 @@ async def _download_to_bytes(url: str) -> bytes:
             pass
 
 
+def _is_local_terminal_backend() -> bool:
+    """True when the terminal backend runs directly on the host.
+
+    Mirrors ``tools.browser_tool._is_local_backend`` and terminal_tool's own
+    dispatch, which key off ``TERMINAL_ENV``.
+    """
+    return os.getenv("TERMINAL_ENV", "local").strip().lower() in ("local", "")
+
+
 async def _permitted_host_read_target(
     path: Path,
     _context: ResolveContext,

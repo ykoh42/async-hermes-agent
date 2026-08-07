@@ -56,7 +56,7 @@ import time
 import uuid
 from pathlib import Path  # noqa: F401 — used by test mocks
 from types import SimpleNamespace
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple, TYPE_CHECKING
 from urllib.parse import urlparse, parse_qs, urlunparse
 
 from agent.agent_runtime_helpers import UnsupportedCapabilityError
@@ -70,6 +70,9 @@ from agent.model_metadata import (
 from hermes_cli.config import get_hermes_home
 from hermes_constants import OPENROUTER_BASE_URL
 from utils import base_url_host_matches, base_url_hostname, env_float, model_forces_max_completion_tokens, normalize_proxy_env_vars
+
+if TYPE_CHECKING:
+    from openai import AsyncOpenAI as OpenAI
 
 logger = logging.getLogger(__name__)
 
@@ -5352,7 +5355,7 @@ async def resolve_provider_client(
         default_model = "google/gemini-3-flash-preview"
         final_model = _normalize_resolved_model(model or default_model, provider)
         try:
-            client = _build_async_openai_client(
+            client = _create_openai_client(
                 api_key=token,
                 base_url=base_url,
                 config=config,

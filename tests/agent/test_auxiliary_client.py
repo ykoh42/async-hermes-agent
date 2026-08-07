@@ -2516,6 +2516,42 @@ class TestAuxiliaryAuthRefreshRetry:
         assert client is None
         assert model is None
 
+    @pytest.mark.asyncio
+    async def test_resolve_provider_client_vertex_builds_native_async_client(self):
+        expected_client = MagicMock()
+        with (
+            patch(
+                "agent.vertex_adapter.has_vertex_credentials",
+                new=AsyncMock(return_value=True),
+            ),
+            patch(
+                "agent.vertex_adapter.get_vertex_config",
+                new=AsyncMock(
+                    return_value=(
+                        "vertex-token",
+                        "https://us-central1-aiplatform.googleapis.com/v1",
+                    )
+                ),
+            ),
+            patch(
+                "agent.auxiliary_client._create_openai_client",
+                return_value=expected_client,
+            ) as create_client,
+        ):
+            client, model = await resolve_provider_client(
+                "vertex",
+                "google/gemini-3-flash-preview",
+                config={},
+            )
+
+        assert client is expected_client
+        assert model == "google/gemini-3-flash-preview"
+        create_client.assert_called_once_with(
+            api_key="vertex-token",
+            base_url="https://us-central1-aiplatform.googleapis.com/v1",
+            config={},
+        )
+
 
 
 class TestAuxiliaryPoolRotationRetry:
