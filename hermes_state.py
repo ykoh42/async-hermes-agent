@@ -15,6 +15,8 @@ from collections.abc import Collection
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+import aiofiles.os
+
 from agent.memory_manager import sanitize_context
 from agent.message_sanitization import _sanitize_surrogates
 from hermes_constants import get_hermes_home
@@ -92,6 +94,47 @@ def _scrub_surrogates(value: Any) -> Any:
 
 def _delegate_from_json(column: str = "model_config") -> str:
     return f"json_extract(COALESCE({column}, '{{}}'), '$._delegate_from')"
+
+
+async def _collect_delegate_child_ids(connection, parent_ids: List[str]) -> List[str]:
+    """Return recursively discovered delegate children, excluding parents."""
+    delegate_from = _delegate_from_json()
+    seeds = {session_id for session_id in parent_ids if session_id}
+    found = set(seeds)
+    frontier = list(seeds)
+    while frontier:
+        placeholders = ",".join("?" for _ in frontier)
+        rows = await (
+            await connection.execute(
+                f"SELECT id FROM sessions WHERE {delegate_from} IN ({placeholders}) "
+                f"OR (parent_session_id IN ({placeholders}) "
+                f"AND {delegate_from} IS NOT NULL)",
+                [*frontier, *frontier],
+            )
+        ).fetchall()
+        frontier = [row["id"] for row in rows if row["id"] not in found]
+        found.update(frontier)
+    return [session_id for session_id in found if session_id not in seeds]
+
+
+async def _delete_delegate_children(connection, parent_ids: List[str]) -> List[str]:
+    session_ids = await _collect_delegate_child_ids(connection, parent_ids)
+    if session_ids:
+        placeholders = ",".join("?" for _ in session_ids)
+        await connection.execute(
+            f"DELETE FROM messages WHERE session_id IN ({placeholders})",
+            session_ids,
+        )
+        await connection.execute(
+            f"UPDATE sessions SET parent_session_id = NULL "
+            f"WHERE parent_session_id IN ({placeholders})",
+            session_ids,
+        )
+        await connection.execute(
+            f"DELETE FROM sessions WHERE id IN ({placeholders})",
+            session_ids,
+        )
+    return session_ids
 
 
 def _cwd_prefix_clause(cwd_prefix: str) -> Tuple[str, List[str]]:
@@ -335,6 +378,7 @@ class SessionDB:
         session_id: str,
         include_ancestors: bool,
         repair_alternation: bool,
+        include_row_ids: bool = False,
     ) -> List[Dict[str, Any]]:
         """Decode fetched message rows into the OpenAI conversation format.
 
@@ -349,6 +393,8 @@ class SessionDB:
             if row["role"] in {"user", "assistant"} and isinstance(content, str):
                 content = sanitize_context(content).strip()
             msg = {"role": row["role"], "content": content}
+            if include_row_ids and row["id"] is not None:
+                msg["_row_id"] = row["id"]
             # api_content is the byte-fidelity sidecar: the exact string sent
             # to the API when it differed from the clean content. Returned
             # VERBATIM — no sanitize_context, no strip — because the replay
@@ -1768,8 +1814,16 @@ class SessionDB:
         row = await cursor.fetchone()
         return row["value"] if row is not None else None
 
-    async def set_meta(self, key: str, value: str) -> None:
+    async def set_meta(self, key: str, value: str, *, cursor: Any = None) -> None:
         """Atomically upsert a value in the durable ``state_meta`` store."""
+
+        if cursor is not None:
+            await cursor.execute(
+                "INSERT INTO state_meta (key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (key, value),
+            )
+            return
 
         async def _set(connection):
             await connection.execute(
@@ -1805,89 +1859,417 @@ class SessionDB:
         ).fetchone()
         return self._session_row_dict(row) if row is not None else None
 
-    async def delete_session(self, session_id: str) -> bool:
+    @staticmethod
+    async def _remove_session_files(
+        sessions_dir: Optional[Path], session_id: str
+    ) -> None:
+        if sessions_dir is None:
+            return
+        for suffix in (".json", ".jsonl"):
+            try:
+                await aiofiles.os.remove(sessions_dir / f"{session_id}{suffix}")
+            except FileNotFoundError:
+                pass
+            except OSError:
+                pass
+        try:
+            names = await aiofiles.os.listdir(sessions_dir)
+        except OSError:
+            return
+        prefix = f"request_dump_{session_id}_"
+        for name in names:
+            if not name.startswith(prefix) or not name.endswith(".json"):
+                continue
+            try:
+                await aiofiles.os.remove(sessions_dir / name)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                pass
+
+    async def get_session_delete_targets(self, session_id: str) -> List[str]:
+        connection = await self._get_connection()
+        exists = await (
+            await connection.execute(
+                "SELECT 1 FROM sessions WHERE id = ? LIMIT 1", (session_id,)
+            )
+        ).fetchone()
+        if exists is None:
+            return []
+        delegate_ids = await _collect_delegate_child_ids(connection, [session_id])
+        return [session_id, *sorted(delegate_ids)]
+
+    async def delete_session(
+        self,
+        session_id: str,
+        sessions_dir: Optional[Path] = None,
+        expected_delete_ids: Optional[List[str]] = None,
+    ) -> bool:
+        removed_delegate_ids: List[str] = []
+        expected_ids = (
+            set(expected_delete_ids) if expected_delete_ids is not None else None
+        )
+
+        async def _delete(connection):
+            exists = await (
+                await connection.execute(
+                    "SELECT 1 FROM sessions WHERE id = ? LIMIT 1", (session_id,)
+                )
+            ).fetchone()
+            if exists is None:
+                return False
+            if expected_ids is not None:
+                actual_ids = {
+                    session_id,
+                    *(await _collect_delegate_child_ids(connection, [session_id])),
+                }
+                if actual_ids != expected_ids:
+                    return False
+            removed_delegate_ids.extend(
+                await _delete_delegate_children(connection, [session_id])
+            )
+            await connection.execute(
+                "UPDATE sessions SET parent_session_id = NULL "
+                "WHERE parent_session_id = ?",
+                (session_id,),
+            )
+            await connection.execute(
+                "DELETE FROM messages WHERE session_id = ?", (session_id,)
+            )
+            await connection.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+            await self._delete_unreferenced_system_prompts(connection)
+            return True
+
+        deleted = bool(await self._write(_delete))
+        if deleted:
+            for delegate_id in removed_delegate_ids:
+                await self._remove_session_files(sessions_dir, delegate_id)
+            await self._remove_session_files(sessions_dir, session_id)
+        return deleted
+
+    async def delete_session_if_empty(
+        self,
+        session_id: str,
+        sessions_dir: Optional[Path] = None,
+    ) -> bool:
         async def _delete(connection):
             cursor = await connection.execute(
-                "DELETE FROM sessions WHERE id = ?", (session_id,)
+                """DELETE FROM sessions
+                   WHERE id = ?
+                     AND title IS NULL
+                     AND NOT EXISTS (
+                         SELECT 1 FROM messages
+                         WHERE messages.session_id = sessions.id
+                     )
+                     AND NOT EXISTS (
+                         SELECT 1 FROM sessions child
+                         WHERE child.parent_session_id = sessions.id
+                     )""",
+                (session_id,),
             )
-            await self._delete_unreferenced_system_prompts(connection)
+            if cursor.rowcount > 0:
+                await self._delete_unreferenced_system_prompts(connection)
             return cursor.rowcount > 0
 
-        return bool(await self._write(_delete))
+        deleted = bool(await self._write(_delete))
+        if deleted:
+            await self._remove_session_files(sessions_dir, session_id)
+        return deleted
 
-    async def delete_session_if_empty(self, session_id: str) -> bool:
-        async def _delete(connection):
-            cursor = await connection.execute(
-                "DELETE FROM sessions WHERE id = ? AND NOT EXISTS ("
-                "SELECT 1 FROM messages WHERE session_id = ?)",
-                (session_id, session_id),
-            )
-            await self._delete_unreferenced_system_prompts(connection)
-            return cursor.rowcount > 0
-
-        return bool(await self._write(_delete))
-
-    async def delete_sessions(self, session_ids: List[str]) -> int:
-        ids = list(dict.fromkeys(session_id for session_id in session_ids if session_id))
+    async def delete_sessions(
+        self,
+        session_ids: List[str],
+        sessions_dir: Optional[Path] = None,
+    ) -> int:
+        ids = list(
+            {
+                session_id
+                for session_id in session_ids
+                if isinstance(session_id, str) and session_id
+            }
+        )
         if not ids:
             return 0
+        removed_ids: List[str] = []
+        removed_delegate_ids: List[str] = []
 
         async def _delete(connection):
             placeholders = ",".join("?" for _ in ids)
-            cursor = await connection.execute(
-                f"DELETE FROM sessions WHERE id IN ({placeholders})", ids
+            rows = await (
+                await connection.execute(
+                    f"SELECT id FROM sessions WHERE id IN ({placeholders})", ids
+                )
+            ).fetchall()
+            existing = [row["id"] for row in rows]
+            if not existing:
+                return 0
+            existing_placeholders = ",".join("?" for _ in existing)
+            removed_delegate_ids.extend(
+                await _delete_delegate_children(connection, existing)
+            )
+            await connection.execute(
+                f"UPDATE sessions SET parent_session_id = NULL "
+                f"WHERE parent_session_id IN ({existing_placeholders})",
+                existing,
+            )
+            await connection.execute(
+                f"DELETE FROM messages "
+                f"WHERE session_id IN ({existing_placeholders})",
+                existing,
+            )
+            await connection.execute(
+                f"DELETE FROM sessions WHERE id IN ({existing_placeholders})",
+                existing,
             )
             await self._delete_unreferenced_system_prompts(connection)
-            return cursor.rowcount
+            removed_ids.extend(existing)
+            return len(existing)
 
-        return int(await self._write(_delete))
+        count = int(await self._write(_delete))
+        for delegate_id in removed_delegate_ids:
+            await self._remove_session_files(sessions_dir, delegate_id)
+        for removed_id in removed_ids:
+            await self._remove_session_files(sessions_dir, removed_id)
+        return count
 
-    async def delete_empty_sessions(self) -> int:
+    async def delete_empty_sessions(
+        self, sessions_dir: Optional[Path] = None
+    ) -> int:
+        removed_ids: List[str] = []
+
         async def _delete(connection):
-            cursor = await connection.execute(
-                "DELETE FROM sessions WHERE ended_at IS NOT NULL AND NOT EXISTS ("
-                "SELECT 1 FROM messages WHERE messages.session_id = sessions.id)"
+            rows = await (
+                await connection.execute(
+                    "SELECT id FROM sessions WHERE message_count = 0 "
+                    "AND ended_at IS NOT NULL AND archived = 0"
+                )
+            ).fetchall()
+            session_ids = [row["id"] for row in rows]
+            if not session_ids:
+                return 0
+            placeholders = ",".join("?" for _ in session_ids)
+            await connection.execute(
+                f"UPDATE sessions SET parent_session_id = NULL "
+                f"WHERE parent_session_id IN ({placeholders})",
+                session_ids,
+            )
+            await connection.execute(
+                f"DELETE FROM messages WHERE session_id IN ({placeholders})",
+                session_ids,
+            )
+            await connection.execute(
+                f"DELETE FROM sessions WHERE id IN ({placeholders})",
+                session_ids,
             )
             await self._delete_unreferenced_system_prompts(connection)
-            return cursor.rowcount
+            removed_ids.extend(session_ids)
+            return len(session_ids)
 
-        return int(await self._write(_delete))
+        count = int(await self._write(_delete))
+        for removed_id in removed_ids:
+            await self._remove_session_files(sessions_dir, removed_id)
+        return count
+
+    @staticmethod
+    def _prune_filter_where(
+        *,
+        last_active_before: Optional[float] = None,
+        last_active_after: Optional[float] = None,
+        started_before: Optional[float] = None,
+        started_after: Optional[float] = None,
+        source: Optional[str] = None,
+        title_like: Optional[str] = None,
+        end_reason: Optional[str] = None,
+        cwd_prefix: Optional[str] = None,
+        min_messages: Optional[int] = None,
+        max_messages: Optional[int] = None,
+        archived: Optional[bool] = None,
+        model_like: Optional[str] = None,
+        provider: Optional[str] = None,
+        user_id: Optional[str] = None,
+        chat_id: Optional[str] = None,
+        chat_type: Optional[str] = None,
+        branch_like: Optional[str] = None,
+        min_tokens: Optional[int] = None,
+        max_tokens: Optional[int] = None,
+        min_cost: Optional[float] = None,
+        max_cost: Optional[float] = None,
+        min_tool_calls: Optional[int] = None,
+        max_tool_calls: Optional[int] = None,
+    ) -> Tuple[str, list]:
+        clauses = ["s.ended_at IS NOT NULL"]
+        params: list[Any] = []
+        if last_active_before is not None:
+            clauses.append(
+                "COALESCE((SELECT MAX(m.timestamp) FROM messages m "
+                "WHERE m.session_id = s.id), s.started_at) < ?"
+            )
+            params.append(last_active_before)
+        if last_active_after is not None:
+            clauses.append(
+                "COALESCE((SELECT MAX(m.timestamp) FROM messages m "
+                "WHERE m.session_id = s.id), s.started_at) >= ?"
+            )
+            params.append(last_active_after)
+        if started_before is not None:
+            clauses.append("s.started_at < ?")
+            params.append(started_before)
+        if started_after is not None:
+            clauses.append("s.started_at >= ?")
+            params.append(started_after)
+        if source:
+            clauses.append("s.source = ?")
+            params.append(source)
+        if title_like:
+            clauses.append("LOWER(COALESCE(s.title, '')) LIKE ?")
+            params.append(f"%{title_like.lower()}%")
+        if end_reason:
+            clauses.append("s.end_reason = ?")
+            params.append(end_reason)
+        if cwd_prefix:
+            clause, clause_params = _cwd_prefix_clause(cwd_prefix)
+            clauses.append(clause)
+            params.extend(clause_params)
+        if min_messages is not None:
+            clauses.append("s.message_count >= ?")
+            params.append(min_messages)
+        if max_messages is not None:
+            clauses.append("s.message_count <= ?")
+            params.append(max_messages)
+        if model_like:
+            clauses.append("LOWER(COALESCE(s.model, '')) LIKE ?")
+            params.append(f"%{model_like.lower()}%")
+        if provider:
+            clauses.append("LOWER(COALESCE(s.billing_provider, '')) = ?")
+            params.append(provider.lower())
+        if user_id:
+            clauses.append("s.user_id = ?")
+            params.append(user_id)
+        if chat_id:
+            clauses.append("s.chat_id = ?")
+            params.append(chat_id)
+        if chat_type:
+            clauses.append("s.chat_type = ?")
+            params.append(chat_type)
+        if branch_like:
+            clauses.append("LOWER(COALESCE(s.git_branch, '')) LIKE ?")
+            params.append(f"%{branch_like.lower()}%")
+        if min_tokens is not None:
+            clauses.append(
+                "(COALESCE(s.input_tokens, 0) + "
+                "COALESCE(s.output_tokens, 0)) >= ?"
+            )
+            params.append(min_tokens)
+        if max_tokens is not None:
+            clauses.append(
+                "(COALESCE(s.input_tokens, 0) + "
+                "COALESCE(s.output_tokens, 0)) <= ?"
+            )
+            params.append(max_tokens)
+        if min_cost is not None:
+            clauses.append(
+                "COALESCE(s.actual_cost_usd, s.estimated_cost_usd, 0) >= ?"
+            )
+            params.append(min_cost)
+        if max_cost is not None:
+            clauses.append(
+                "COALESCE(s.actual_cost_usd, s.estimated_cost_usd, 0) <= ?"
+            )
+            params.append(max_cost)
+        if min_tool_calls is not None:
+            clauses.append("COALESCE(s.tool_call_count, 0) >= ?")
+            params.append(min_tool_calls)
+        if max_tool_calls is not None:
+            clauses.append("COALESCE(s.tool_call_count, 0) <= ?")
+            params.append(max_tool_calls)
+        if archived is True:
+            clauses.append("s.archived = 1")
+        elif archived is False:
+            clauses.append("s.archived = 0")
+        return " AND ".join(clauses), params
 
     async def prune_sessions(
         self,
-        older_than_days: Optional[float] = None,
-        started_before: Optional[float] = None,
+        older_than_days: Optional[float] = 90,
+        source: str = None,
+        sessions_dir: Optional[Path] = None,
+        **filters,
     ) -> int:
-        cutoff = started_before
-        if cutoff is None and older_than_days is not None:
-            cutoff = time.time() - float(older_than_days) * 86_400
-        if cutoff is None:
-            return 0
+        if (
+            filters.get("last_active_before") is None
+            and filters.get("started_before") is None
+            and older_than_days is not None
+        ):
+            filters["last_active_before"] = time.time() - (
+                float(older_than_days) * 86_400
+            )
+        where, params = self._prune_filter_where(source=source, **filters)
+        removed_ids: List[str] = []
 
         async def _delete(connection):
-            cursor = await connection.execute(
-                "DELETE FROM sessions WHERE ended_at IS NOT NULL AND started_at < ?",
-                (cutoff,),
+            rows = await (
+                await connection.execute(
+                    f"SELECT s.id FROM sessions s WHERE {where}", params
+                )
+            ).fetchall()
+            session_ids = [row["id"] for row in rows]
+            if not session_ids:
+                return 0
+            placeholders = ",".join("?" for _ in session_ids)
+            await connection.execute(
+                f"UPDATE sessions SET parent_session_id = NULL "
+                f"WHERE parent_session_id IN ({placeholders})",
+                session_ids,
+            )
+            await connection.execute(
+                f"DELETE FROM messages WHERE session_id IN ({placeholders})",
+                session_ids,
+            )
+            await connection.execute(
+                f"DELETE FROM sessions WHERE id IN ({placeholders})",
+                session_ids,
             )
             await self._delete_unreferenced_system_prompts(connection)
-            return cursor.rowcount
+            removed_ids.extend(session_ids)
+            return len(session_ids)
 
-        return int(await self._write(_delete))
+        count = int(await self._write(_delete))
+        for removed_id in removed_ids:
+            await self._remove_session_files(sessions_dir, removed_id)
+        return count
 
-    async def prune_empty_ghost_sessions(self) -> int:
+    async def prune_empty_ghost_sessions(
+        self, sessions_dir: Optional[Path] = None
+    ) -> int:
         cutoff = time.time() - 86_400
+        removed_ids: List[str] = []
 
         async def _delete(connection):
-            cursor = await connection.execute(
-                "DELETE FROM sessions WHERE ended_at IS NOT NULL "
-                "AND started_at < ? AND NOT EXISTS ("
-                "SELECT 1 FROM messages WHERE messages.session_id = sessions.id)",
-                (cutoff,),
+            rows = await (
+                await connection.execute(
+                    "SELECT id FROM sessions WHERE source = 'tui' "
+                    "AND title IS NULL AND ended_at IS NOT NULL "
+                    "AND started_at < ? AND NOT EXISTS ("
+                    "SELECT 1 FROM messages "
+                    "WHERE messages.session_id = sessions.id)",
+                    (cutoff,),
+                )
+            ).fetchall()
+            session_ids = [row["id"] for row in rows]
+            if not session_ids:
+                return 0
+            placeholders = ",".join("?" for _ in session_ids)
+            await connection.execute(
+                f"DELETE FROM sessions WHERE id IN ({placeholders})", session_ids
             )
             await self._delete_unreferenced_system_prompts(connection)
-            return cursor.rowcount
+            removed_ids.extend(session_ids)
+            return len(session_ids)
 
-        return int(await self._write(_delete))
+        count = int(await self._write(_delete))
+        for removed_id in removed_ids:
+            await self._remove_session_files(sessions_dir, removed_id)
+        return count
 
     @staticmethod
     def _decode_message_row(row) -> Dict[str, Any]:
@@ -2504,6 +2886,7 @@ class SessionDB:
         include_ancestors: bool = False,
         include_inactive: bool = False,
         repair_alternation: bool = False,
+        include_row_ids: bool = False,
     ) -> List[Dict[str, Any]]:
         """Load a conversation through the native async SQLite connection."""
         if not session_id:
@@ -2542,6 +2925,7 @@ class SessionDB:
             session_id=session_id,
             include_ancestors=include_ancestors,
             repair_alternation=repair_alternation,
+            include_row_ids=include_row_ids,
         )
 
     async def find_live_compression_child(
@@ -2781,8 +3165,9 @@ class SessionDB:
 
         await self._write(_publish)
 
-    async def flush_token_counts(self) -> bool:
+    async def flush_token_counts(self, timeout: float = 5.0) -> bool:
         """Token deltas still use their own async accounting path; no turn-blocking drain."""
+        del timeout
         return True
 
     async def close(self) -> None:

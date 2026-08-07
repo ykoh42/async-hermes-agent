@@ -2,6 +2,7 @@
 
 import inspect
 import sqlite3
+import time
 
 import pytest
 import pytest_asyncio
@@ -95,6 +96,11 @@ async def test_conversation_replay_preserves_tool_order_and_reasoning(db):
     assert replay[1]["tool_calls"][0]["id"] == "call-1"
     assert replay[2]["tool_call_id"] == "call-1"
 
+    addressed = await db.get_messages_as_conversation("s1", include_row_ids=True)
+    assert [message["_row_id"] for message in addressed] == [
+        message["id"] for message in await db.get_messages("s1")
+    ]
+
 
 @pytest.mark.asyncio
 async def test_titles_meta_search_and_recent_listing(db):
@@ -115,6 +121,122 @@ async def test_titles_meta_search_and_recent_listing(db):
     assert "cobalt project" in sessions[0]["preview"].lower()
     matches = await db.search_messages("cobalt")
     assert [match["session_id"] for match in matches] == ["s1"]
+
+
+@pytest.mark.asyncio
+async def test_meta_cursor_and_token_flush_keep_upstream_arguments(db):
+    connection = await db._get_connection()
+    cursor = await connection.cursor()
+
+    await db.set_meta("inline", "ready", cursor=cursor)
+
+    assert await db.get_meta("inline") == "ready"
+    assert await db.flush_token_counts(0.01) is True
+
+
+@pytest.mark.asyncio
+async def test_delete_session_preserves_upstream_cascade_and_orphan_contract(
+    db, tmp_path
+):
+    await db.create_session("parent", source="library")
+    await db.create_session(
+        "delegate",
+        source="tool",
+        parent_session_id="parent",
+        model_config={"_delegate_from": "parent"},
+    )
+    await db.create_session(
+        "branch",
+        source="library",
+        parent_session_id="parent",
+        model_config={"_branched_from": "parent"},
+    )
+    await db.append_message("parent", role="user", content="root")
+    await db.append_message("delegate", role="assistant", content="child")
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir()
+    for name in (
+        "parent.jsonl",
+        "delegate.json",
+        "request_dump_delegate_1.json",
+    ):
+        (sessions_dir / name).write_text("{}", encoding="utf-8")
+
+    expected = await db.get_session_delete_targets("parent")
+    assert expected == ["parent", "delegate"]
+    await db.create_session(
+        "late-delegate",
+        source="tool",
+        parent_session_id="parent",
+        model_config={"_delegate_from": "parent"},
+    )
+    assert not await db.delete_session(
+        "parent", sessions_dir=sessions_dir, expected_delete_ids=expected
+    )
+
+    assert await db.delete_session("parent", sessions_dir=sessions_dir)
+    assert await db.get_session("parent") is None
+    assert await db.get_session("delegate") is None
+    assert await db.get_session("late-delegate") is None
+    assert (await db.get_session("branch"))["parent_session_id"] is None
+    assert not any(sessions_dir.iterdir())
+
+
+@pytest.mark.asyncio
+async def test_single_empty_guard_and_bulk_sweep_keep_distinct_contracts(
+    db, tmp_path
+):
+    await db.create_session("empty", source="library")
+    await db.end_session("empty", "done")
+    await db.create_session("live", source="library")
+    await db.create_session("titled", source="library")
+    await db.set_session_title("titled", "Keep")
+    await db.end_session("titled", "done")
+    await db.create_session("archived", source="library")
+    await db.end_session("archived", "done")
+    connection = await db._get_connection()
+    await connection.execute(
+        "UPDATE sessions SET archived = 1 WHERE id = 'archived'"
+    )
+    await connection.commit()
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir()
+    (sessions_dir / "empty.jsonl").write_text("", encoding="utf-8")
+
+    assert await db.delete_session_if_empty("titled", sessions_dir) is False
+    assert await db.delete_empty_sessions(sessions_dir) == 2
+    assert await db.get_session("empty") is None
+    assert await db.get_session("titled") is None
+    assert await db.get_session("live") is not None
+    assert await db.get_session("archived") is not None
+    assert not (sessions_dir / "empty.jsonl").exists()
+
+
+@pytest.mark.asyncio
+async def test_prune_sessions_uses_last_activity_and_upstream_filters(db):
+    old = time.time() - 120 * 86_400
+    recent = time.time() - 1 * 86_400
+    for session_id, title in (("stale", "Batch stale"), ("active", "Batch active")):
+        await db.create_session(session_id, source="library")
+        await db.set_session_title(session_id, title)
+        await db.append_message(session_id, role="user", content=session_id)
+        await db.end_session(session_id, "done")
+
+    connection = await db._get_connection()
+    await connection.execute(
+        "UPDATE sessions SET started_at = ? WHERE id IN ('stale', 'active')", (old,)
+    )
+    await connection.execute(
+        "UPDATE messages SET timestamp = ? WHERE session_id = 'stale'", (old,)
+    )
+    await connection.execute(
+        "UPDATE messages SET timestamp = ? WHERE session_id = 'active'", (recent,)
+    )
+    await connection.commit()
+
+    assert await db.prune_sessions(title_like="batch", max_messages=1) == 1
+    assert await db.get_session("stale") is None
+    assert await db.get_session("active") is not None
 
 
 @pytest.mark.asyncio
