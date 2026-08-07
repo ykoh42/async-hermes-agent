@@ -7,6 +7,9 @@ import shutil
 from pathlib import Path
 
 import pytest
+from blockbuster import BlockBuster
+from pyleak import no_event_loop_blocking, no_task_leaks
+from pyleak.eventloop import LeakAction
 
 from agent import coding_context as cc
 
@@ -40,6 +43,24 @@ def _git_init(path):
 # ── resolver ──────────────────────────────────────────────────────────────
 
 class TestIsCodingContext:
+
+    async def test_auto_detection_does_not_block_event_loop(self, tmp_path):
+        async with (
+            no_event_loop_blocking(action=LeakAction.RAISE, threshold=0.1),
+            no_task_leaks(action=LeakAction.RAISE),
+        ):
+            blockbuster = BlockBuster()
+            blockbuster.activate()
+            try:
+                detected = await cc.is_coding_context(
+                    platform="cli",
+                    cwd=tmp_path,
+                    config={"agent": {"coding_context": "auto"}},
+                )
+            finally:
+                blockbuster.deactivate()
+
+        assert detected is False
 
 
 

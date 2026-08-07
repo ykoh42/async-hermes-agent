@@ -65,6 +65,8 @@ import aiofiles
 import aiofiles.os
 
 logger = logging.getLogger("hermes.coding_context")
+_realpath = aiofiles.os.wrap(os.path.realpath)
+_gettempdir = aiofiles.os.wrap(tempfile.gettempdir)
 
 CODING_TOOLSET = "coding"
 
@@ -391,9 +393,9 @@ async def _resolve_cwd(cwd: Optional[str | Path]) -> Path:
 
 
 
-def _home() -> Optional[Path]:
+async def _home() -> Optional[Path]:
     try:
-        return Path.home().resolve()
+        return Path(await _realpath(Path.home()))
     except (OSError, RuntimeError):
         return None
 
@@ -417,9 +419,9 @@ async def _git_root(cwd: Path) -> Optional[Path]:
 async def _marker_root(cwd: Path) -> Optional[Path]:
     """Find the nearest project marker without blocking metadata calls."""
     current = cwd.absolute()
-    home = _home()
+    home = await _home()
     try:
-        temp_root = Path(tempfile.gettempdir()).absolute()
+        temp_root = Path(await _gettempdir()).absolute()
     except Exception:
         temp_root = None
     for depth, parent in enumerate([current, *current.parents]):
@@ -449,7 +451,7 @@ async def _detect_profile_name(mode: str, platform: str, cwd: Path) -> str:
     if await _marker_root(cwd) is not None:
         return CODING_PROFILE.name
     git_root = await _git_root(cwd)
-    if git_root is not None and git_root == _home():
+    if git_root is not None and git_root == await _home():
         git_root = None
     if git_root is not None and await _has_code_files(git_root):
         return CODING_PROFILE.name
