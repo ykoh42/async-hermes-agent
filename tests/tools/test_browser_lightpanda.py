@@ -5,6 +5,7 @@ import os
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from blockbuster import BlockBuster
 
 
 pytestmark = pytest.mark.asyncio
@@ -191,10 +192,12 @@ class TestCleanupResetsEngineCache:
         # Seed the cache
         bt._cached_browser_engine = "lightpanda"
         bt._browser_engine_resolved = True
+        bt._cached_homebrew_node_dirs = ("/opt/homebrew/opt/node@24/bin",)
         # cleanup should reset them
         await bt.cleanup_all_browsers()
         assert bt._cached_browser_engine is None
         assert bt._browser_engine_resolved is False
+        assert bt._cached_homebrew_node_dirs is None
 
 
 # ---------------------------------------------------------------------------
@@ -334,7 +337,14 @@ class TestEngineOverride:
              patch("tools.interrupt.is_interrupted", return_value=False), \
              patch("tools.browser_tool._write_owner_pid", new_callable=AsyncMock), \
              patch("tools.browser_tool._needs_chromium_sandbox_bypass", new_callable=AsyncMock, return_value=False):
-            await bt._run_browser_command("task1", "snapshot", [], _engine_override="auto")
+            blocker = BlockBuster()
+            blocker.activate()
+            try:
+                await bt._run_browser_command(
+                    "task1", "snapshot", [], _engine_override="auto"
+                )
+            finally:
+                blocker.deactivate()
 
         # Should NOT contain "--engine" since override is "auto"
         assert captured_cmds

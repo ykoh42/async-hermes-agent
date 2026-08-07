@@ -703,11 +703,10 @@ that touches the OS, assume *any* platform can hit your code path.
        ...
    ```
 
-   If you specifically need the hermes wrapper (it has a stdlib fallback
-   for scaffold-phase imports before pip install finishes), use
-   `gateway.status._pid_exists(pid)`. It calls `psutil.pid_exists` first
-   and falls back to a hand-rolled `OpenProcess + WaitForSingleObject`
-   dance on Windows only when psutil is somehow missing.
+   In an async Hermes path, use
+   `await gateway.status._pid_exists(pid)`. It checks Linux `/proc` through
+   async file I/O and retains the safe `psutil` process query on other
+   platforms.
 
    Audit grep for new callsites: `rg "os\.kill\([^,]+,\s*0\s*\)"`. Any hit
    in non-test code is presumptively a Windows silent-kill bug.

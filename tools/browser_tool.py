@@ -50,7 +50,6 @@ Usage:
 """
 
 import asyncio
-import functools
 import json
 import logging
 import os
@@ -191,30 +190,38 @@ _SANE_PATH_DIRS = (
 _SANE_PATH = os.pathsep.join(_SANE_PATH_DIRS)
 
 
-@functools.lru_cache(maxsize=1)
-def _discover_homebrew_node_dirs() -> tuple[str, ...]:
+_cached_homebrew_node_dirs: Optional[tuple[str, ...]] = None
+
+
+async def _discover_homebrew_node_dirs() -> tuple[str, ...]:
     """Find Homebrew versioned Node.js bin directories (e.g. node@20, node@24).
 
     When Node is installed via ``brew install node@24`` and NOT linked into
     /opt/homebrew/bin, agent-browser isn't discoverable on the default PATH.
     This function finds those directories so they can be prepended.
     """
+    global _cached_homebrew_node_dirs
+    if _cached_homebrew_node_dirs is not None:
+        return _cached_homebrew_node_dirs
+
     dirs: list[str] = []
     homebrew_opt = "/opt/homebrew/opt"
-    if not os.path.isdir(homebrew_opt):
-        return tuple(dirs)
+    if not await aiofiles.os.path.isdir(homebrew_opt):
+        _cached_homebrew_node_dirs = ()
+        return _cached_homebrew_node_dirs
     try:
-        for entry in os.listdir(homebrew_opt):
+        for entry in await aiofiles.os.listdir(homebrew_opt):
             if entry.startswith("node") and entry != "node":
                 bin_dir = os.path.join(homebrew_opt, entry, "bin")
-                if os.path.isdir(bin_dir):
+                if await aiofiles.os.path.isdir(bin_dir):
                     dirs.append(bin_dir)
     except OSError:
         pass
-    return tuple(dirs)
+    _cached_homebrew_node_dirs = tuple(dirs)
+    return _cached_homebrew_node_dirs
 
 
-def _browser_candidate_path_dirs() -> list[str]:
+async def _browser_candidate_path_dirs() -> list[str]:
     """Return ordered browser CLI PATH candidates shared by discovery and execution."""
     hermes_home = get_hermes_home()
     hermes_node_bin = str(hermes_home / "node" / "bin")
@@ -224,21 +231,21 @@ def _browser_candidate_path_dirs() -> list[str]:
         hermes_node_bin,
         hermes_node_root,
         hermes_nm_bin,
-        *list(_discover_homebrew_node_dirs()),
+        *list(await _discover_homebrew_node_dirs()),
         *_SANE_PATH_DIRS,
     ]
 
 
-def _merge_browser_path(existing_path: str = "") -> str:
+async def _merge_browser_path(existing_path: str = "") -> str:
     """Prepend browser-specific PATH fallbacks without reordering existing entries."""
     path_parts = [p for p in (existing_path or "").split(os.pathsep) if p]
     existing_parts = set(path_parts)
     prefix_parts: list[str] = []
 
-    for part in _browser_candidate_path_dirs():
+    for part in await _browser_candidate_path_dirs():
         if not part or part in existing_parts or part in prefix_parts:
             continue
-        if os.path.isdir(part):
+        if await aiofiles.os.path.isdir(part):
             prefix_parts.append(part)
 
     return os.pathsep.join(prefix_parts + path_parts)
@@ -1204,7 +1211,7 @@ async def _run_chrome_fallback_command(
     await aiofiles.os.makedirs(task_socket_dir, mode=0o700, exist_ok=True)
     browser_env = _build_browser_env()
     browser_env["AGENT_BROWSER_SOCKET_DIR"] = task_socket_dir
-    browser_env["PATH"] = _merge_browser_path(browser_env.get("PATH", ""))
+    browser_env["PATH"] = await _merge_browser_path(browser_env.get("PATH", ""))
 
     if "AGENT_BROWSER_IDLE_TIMEOUT_MS" not in browser_env:
         browser_env["AGENT_BROWSER_IDLE_TIMEOUT_MS"] = str(
@@ -1217,8 +1224,14 @@ async def _run_chrome_fallback_command(
         # to avoid pipe hang from agent-browser daemon inheriting fds.
         stdout_path = os.path.join(task_socket_dir, f"_stdout_{cmd}")
         stderr_path = os.path.join(task_socket_dir, f"_stderr_{cmd}")
-        stdout_fd = os.open(stdout_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        stderr_fd = os.open(stderr_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        open_file = aiofiles.os.wrap(os.open)
+        close_file = aiofiles.os.wrap(os.close)
+        stdout_fd = await open_file(
+            stdout_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600
+        )
+        stderr_fd = await open_file(
+            stderr_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600
+        )
         try:
             # On Windows, launch the child in a new process group so parent
             # console Ctrl+C doesn't kill it with STATUS_CONTROL_C_EXIT
@@ -1263,8 +1276,8 @@ async def _run_chrome_fallback_command(
                 **_popen_extra,
             )
         finally:
-            os.close(stdout_fd)
-            os.close(stderr_fd)
+            await close_file(stdout_fd)
+            await close_file(stderr_fd)
         try:
             await asyncio.wait_for(proc.wait(), timeout=timeout)
         except TimeoutError:
@@ -1976,7 +1989,7 @@ async def _reap_orphaned_browser_sessions() -> None:
                 # Use the cross-platform existence check.
                 from gateway.status import _pid_exists
 
-                owner_alive = _pid_exists(owner_pid)
+                owner_alive = await _pid_exists(owner_pid)
             except (ValueError, OSError):
                 owner_alive = None  # corrupt file — fall through
 
@@ -2008,7 +2021,7 @@ async def _reap_orphaned_browser_sessions() -> None:
         # is NOT a no-op — use the handle-based existence check.
         from gateway.status import _pid_exists
 
-        if not _pid_exists(daemon_pid):
+        if not await _pid_exists(daemon_pid):
             await _remove_tree(socket_dir)
             continue
 
@@ -2480,7 +2493,7 @@ async def _find_agent_browser(*, validate: bool = True) -> str:
 
     # Build an extended search PATH including Hermes-managed Node, macOS
     # versioned Homebrew installs, and fallback system dirs like Termux.
-    extended_path = _merge_browser_path("")
+    extended_path = await _merge_browser_path("")
     if extended_path:
         which_result = await which("agent-browser", path=extended_path)
         if which_result and (
@@ -2700,7 +2713,9 @@ async def _run_browser_command(
 
         # Ensure subprocesses inherit the same browser-specific PATH fallbacks
         # used during CLI discovery.
-        browser_env["PATH"] = _merge_browser_path(browser_env.get("PATH", ""))
+        browser_env["PATH"] = await _merge_browser_path(
+            browser_env.get("PATH", "")
+        )
         browser_env["AGENT_BROWSER_SOCKET_DIR"] = task_socket_dir
 
         # Tell the agent-browser daemon to self-terminate after being idle
@@ -2740,8 +2755,14 @@ async def _run_browser_command(
         # sees EOF and blocks until the timeout fires.
         stdout_path = os.path.join(task_socket_dir, f"_stdout_{command}")
         stderr_path = os.path.join(task_socket_dir, f"_stderr_{command}")
-        stdout_fd = os.open(stdout_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        stderr_fd = os.open(stderr_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        open_file = aiofiles.os.wrap(os.open)
+        close_file = aiofiles.os.wrap(os.close)
+        stdout_fd = await open_file(
+            stdout_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600
+        )
+        stderr_fd = await open_file(
+            stderr_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600
+        )
         try:
             # See matching comment at the other Popen site above — on
             # Windows we put agent-browser in its own process group, force
@@ -2768,8 +2789,8 @@ async def _run_browser_command(
                 **_popen_extra,
             )
         finally:
-            os.close(stdout_fd)
-            os.close(stderr_fd)
+            await close_file(stdout_fd)
+            await close_file(stderr_fd)
 
         try:
             await asyncio.wait_for(proc.wait(), timeout=timeout)
@@ -5071,9 +5092,10 @@ async def cleanup_all_browsers() -> None:
     global _cached_command_timeout, _command_timeout_resolved
     global _cached_chromium_installed
     global _cached_browser_engine, _browser_engine_resolved
+    global _cached_homebrew_node_dirs
     _cached_agent_browser = None
     _agent_browser_resolved = False
-    _discover_homebrew_node_dirs.cache_clear()
+    _cached_homebrew_node_dirs = None
     # Flip the resolved flag BEFORE nulling the cache so a concurrent
     # reader never sees ``resolved=True`` with ``cache=None`` (#14331).
     _command_timeout_resolved = False

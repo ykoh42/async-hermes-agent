@@ -22,12 +22,12 @@ pytestmark = pytest.mark.asyncio
 
 @pytest.fixture(autouse=True)
 def _clear_browser_caches():
-    """Clear lru_cache and manual caches between tests."""
-    _discover_homebrew_node_dirs.cache_clear()
+    """Clear browser discovery caches between tests."""
+    _bt._cached_homebrew_node_dirs = None
     _bt._cached_agent_browser = None
     _bt._agent_browser_resolved = False
     yield
-    _discover_homebrew_node_dirs.cache_clear()
+    _bt._cached_homebrew_node_dirs = None
     _bt._cached_agent_browser = None
     _bt._agent_browser_resolved = False
 
@@ -51,22 +51,29 @@ class TestDiscoverHomebrewNodeDirs:
 
     async def test_returns_empty_when_no_homebrew(self):
         """Non-macOS systems without /opt/homebrew/opt should return empty."""
-        with patch("os.path.isdir", return_value=False):
-            assert _discover_homebrew_node_dirs() == ()
+        with patch(
+            "aiofiles.os.path.isdir", new=AsyncMock(return_value=False)
+        ):
+            assert await _discover_homebrew_node_dirs() == ()
 
 
     async def test_excludes_plain_node(self):
         """'node' (unversioned) should be excluded — covered by /opt/homebrew/bin."""
-        with patch("os.path.isdir", return_value=True), \
-             patch("os.listdir", return_value=["node"]):
-            result = _discover_homebrew_node_dirs()
+        with patch(
+            "aiofiles.os.path.isdir", new=AsyncMock(return_value=True)
+        ), patch("aiofiles.os.listdir", new=AsyncMock(return_value=["node"])):
+            result = await _discover_homebrew_node_dirs()
         assert result == ()
 
     async def test_handles_oserror_gracefully(self):
         """Should return empty list if listdir raises OSError."""
-        with patch("os.path.isdir", return_value=True), \
-             patch("os.listdir", side_effect=OSError("Permission denied")):
-            assert _discover_homebrew_node_dirs() == ()
+        with patch(
+            "aiofiles.os.path.isdir", new=AsyncMock(return_value=True)
+        ), patch(
+            "aiofiles.os.listdir",
+            new=AsyncMock(side_effect=OSError("Permission denied")),
+        ):
+            assert await _discover_homebrew_node_dirs() == ()
 
 
 class TestFindAgentBrowser:
@@ -93,11 +100,11 @@ class TestFindAgentBrowser:
             return original_path_exists(self)
 
         with patch("shutil.which", return_value=None), \
-             patch("os.path.isdir", return_value=False), \
+             patch("aiofiles.os.path.isdir", new=AsyncMock(return_value=False)), \
              patch.object(Path, "exists", mock_path_exists), \
              patch(
                  "tools.browser_tool._discover_homebrew_node_dirs",
-                 return_value=[],
+                 new=AsyncMock(return_value=[]),
              ):
             with pytest.raises(FileNotFoundError, match="agent-browser CLI not found"):
                 await _find_agent_browser()
@@ -170,7 +177,7 @@ class TestRunBrowserCommandPathConstruction:
              patch("tools.browser_tool._is_camofox_mode", new_callable=AsyncMock, return_value=False), \
              patch("tools.browser_tool._needs_chromium_sandbox_bypass", new_callable=AsyncMock, return_value=False), \
              patch("tools.browser_tool._socket_safe_tmpdir", return_value=str(tmp_path)), \
-             patch("tools.browser_tool._discover_homebrew_node_dirs", return_value=[]), \
+             patch("tools.browser_tool._discover_homebrew_node_dirs", new=AsyncMock(return_value=[])), \
              patch("hermes_constants.Path.home", return_value=tmp_path), \
              patch("asyncio.create_subprocess_exec", side_effect=capture_popen), \
              patch("tools.interrupt.is_interrupted", return_value=False), \
@@ -233,8 +240,8 @@ class TestRunBrowserCommandPathConstruction:
              patch("tools.browser_tool._is_camofox_mode", new_callable=AsyncMock, return_value=False), \
              patch("tools.browser_tool._needs_chromium_sandbox_bypass", new_callable=AsyncMock, return_value=False), \
              patch("tools.browser_tool._socket_safe_tmpdir", return_value=str(tmp_path)), \
-             patch("tools.browser_tool._discover_homebrew_node_dirs", return_value=[]), \
-             patch("os.path.isdir", side_effect=selective_isdir), \
+             patch("tools.browser_tool._discover_homebrew_node_dirs", new=AsyncMock(return_value=[])), \
+             patch("aiofiles.os.path.isdir", new=AsyncMock(side_effect=selective_isdir)), \
              patch("asyncio.create_subprocess_exec", side_effect=capture_popen), \
              patch("tools.interrupt.is_interrupted", return_value=False), \
              patch.dict(os.environ, {"PATH": "/usr/bin:/bin", "HOME": "/home/test"}, clear=True):

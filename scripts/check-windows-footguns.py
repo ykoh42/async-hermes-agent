@@ -186,8 +186,8 @@ FOOTGUNS: list[Footgun] = [
         ),
         fix=(
             "Use psutil.pid_exists(pid) (psutil is a core dependency). "
-            "Or gateway.status._pid_exists(pid) for the hermes wrapper "
-            "with a stdlib fallback."
+            "Or await gateway.status._pid_exists(pid) for the async hermes "
+            "wrapper."
         ),
     ),
     Footgun(

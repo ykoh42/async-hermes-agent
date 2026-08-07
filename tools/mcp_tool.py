@@ -2545,7 +2545,7 @@ class MCPServerTask:
                     for pid in new_pids:
                         # ``os.kill(pid, 0)`` is NOT a no-op on Windows
                         # (bpo-14484). Use the cross-platform check.
-                        pid_alive = _pid_exists(pid)
+                        pid_alive = await _pid_exists(pid)
                         pgroup_alive = False
                         pgid = _stdio_pgids.get(pid)
                         if not pid_alive and pgid is not None and _killpg is not None:
@@ -6564,7 +6564,7 @@ async def _kill_orphaned_mcp_children(
     sigkill = getattr(_signal, "SIGKILL", _signal.SIGTERM)
     from gateway.status import _pid_exists
     for pid, owner in pids.items():
-        if not _pid_exists(pid):
+        if not await _pid_exists(pid):
             continue
         send_signal(pid, sigkill, owner)
         logger.warning(

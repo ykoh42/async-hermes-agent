@@ -22,9 +22,7 @@ def _reset_caches():
     bt._agent_browser_resolved = False
     bt._cached_command_timeout = None
     bt._command_timeout_resolved = False
-    # lru_cache for _discover_homebrew_node_dirs
-    if hasattr(bt._discover_homebrew_node_dirs, "cache_clear"):
-        bt._discover_homebrew_node_dirs.cache_clear()
+    bt._cached_homebrew_node_dirs = None
 
 
 @pytest.fixture(autouse=True)
@@ -150,10 +148,15 @@ class TestSessionInactivityTimeout:
 
 class TestHomebrewNodeDirsCache:
 
-    async def test_lru_cached(self):
+    async def test_cached(self):
         from tools.browser_tool import _discover_homebrew_node_dirs
-        assert hasattr(_discover_homebrew_node_dirs, "cache_info"), \
-            "_discover_homebrew_node_dirs should be decorated with lru_cache"
+
+        isdir = AsyncMock(return_value=False)
+        with patch("aiofiles.os.path.isdir", new=isdir):
+            assert await _discover_homebrew_node_dirs() == ()
+            assert await _discover_homebrew_node_dirs() == ()
+
+        isdir.assert_awaited_once()
 
 
 # ---------------------------------------------------------------------------

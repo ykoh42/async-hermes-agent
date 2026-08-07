@@ -87,7 +87,7 @@ class TestReapOrphanedBrowserSessions:
         def mock_terminate(pid):
             terminate_calls.append(pid)
 
-        with patch("gateway.status._pid_exists", return_value=True), \
+        with patch("gateway.status._pid_exists", new=AsyncMock(return_value=True)), \
              patch("tools.browser_tool._verify_reapable_browser_daemon", return_value=True), \
              patch("tools.browser_tool._terminate_host_pid", new_callable=AsyncMock, side_effect=mock_terminate):
             await _reap_orphaned_browser_sessions()
@@ -169,7 +169,7 @@ class TestOwnerPidCrossProcess:
 
         # Owner 22222 reported alive (PermissionError collapses to True
         # inside _pid_exists). Daemon never probed, never terminated.
-        with patch("gateway.status._pid_exists", return_value=True), \
+        with patch("gateway.status._pid_exists", new=AsyncMock(return_value=True)), \
              patch("tools.browser_tool._terminate_host_pid", new_callable=AsyncMock, side_effect=mock_terminate):
             await _reap_orphaned_browser_sessions()
 
@@ -333,7 +333,7 @@ class TestReaperIdentityGuard:
         terminate_calls = []
         proc = self._FakeProc(name="sleep", cmdline=["/bin/sleep", "600"])
 
-        with patch("gateway.status._pid_exists", return_value=True), \
+        with patch("gateway.status._pid_exists", new=AsyncMock(return_value=True)), \
              patch("psutil.Process", return_value=proc), \
              patch(
                  "tools.browser_tool._terminate_host_pid",
