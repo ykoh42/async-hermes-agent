@@ -8,6 +8,9 @@ from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
+from blockbuster import BlockBuster
+from pyleak import no_event_loop_blocking, no_task_leaks
+from pyleak.eventloop import LeakAction
 
 
 class _Credentials:
@@ -39,6 +42,7 @@ class _Request:
 
 @pytest.fixture
 def vertex_adapter(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     for var in (
         "VERTEX_CREDENTIALS_PATH",
         "GOOGLE_APPLICATION_CREDENTIALS",
@@ -56,7 +60,6 @@ def vertex_adapter(monkeypatch, tmp_path):
     va._creds_cache.clear()
     va._cache_locks.clear()
     _Request.instances.clear()
-    monkeypatch.setattr(va, "_vertex_config", lambda: {})
     monkeypatch.setattr(
         va,
         "aiohttp_requests",
@@ -191,9 +194,24 @@ def test_build_vertex_base_url_global_and_regional(vertex_adapter):
 
 
 @pytest.mark.asyncio
-async def test_has_vertex_credentials_via_config_project(vertex_adapter, monkeypatch):
-    monkeypatch.setattr(vertex_adapter, "_vertex_config", lambda: {"project_id": "p"})
-    assert await vertex_adapter.has_vertex_credentials() is True
+async def test_has_vertex_credentials_via_config_project(vertex_adapter, tmp_path):
+    (tmp_path / "config.yaml").write_text(
+        "vertex:\n  project_id: p\n",
+        encoding="utf-8",
+    )
+
+    async with (
+        no_event_loop_blocking(action=LeakAction.RAISE, threshold=0.1),
+        no_task_leaks(action=LeakAction.RAISE),
+    ):
+        blockbuster = BlockBuster()
+        blockbuster.activate()
+        try:
+            available = await vertex_adapter.has_vertex_credentials()
+        finally:
+            blockbuster.deactivate()
+
+    assert available is True
 
 
 @pytest.mark.asyncio
@@ -201,7 +219,8 @@ async def test_has_vertex_credentials_false_when_nothing_set(vertex_adapter):
     assert await vertex_adapter.has_vertex_credentials() is False
 
 
-def test_multiplex_scope_takes_precedence_over_raw_environ(
+@pytest.mark.asyncio
+async def test_multiplex_scope_takes_precedence_over_raw_environ(
     vertex_adapter, monkeypatch
 ):
     from agent import secret_scope
@@ -212,20 +231,21 @@ def test_multiplex_scope_takes_precedence_over_raw_environ(
         {"VERTEX_PROJECT_ID": "this-profile-project"}
     )
     try:
-        assert vertex_adapter._resolve_project_override() == "this-profile-project"
+        assert await vertex_adapter._resolve_project_override() == "this-profile-project"
     finally:
         secret_scope.reset_secret_scope(token)
         secret_scope.set_multiplex_active(False)
 
 
-def test_multiplex_unscoped_read_fails_closed(vertex_adapter, monkeypatch):
+@pytest.mark.asyncio
+async def test_multiplex_unscoped_read_fails_closed(vertex_adapter, monkeypatch):
     from agent import secret_scope
 
     monkeypatch.setenv("VERTEX_PROJECT_ID", "leaked-project")
     secret_scope.set_multiplex_active(True)
     try:
         with pytest.raises(secret_scope.UnscopedSecretError):
-            vertex_adapter._resolve_project_override()
+            await vertex_adapter._resolve_project_override()
     finally:
         secret_scope.set_multiplex_active(False)
 

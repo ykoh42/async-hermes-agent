@@ -60,7 +60,7 @@ def _cache_lock() -> asyncio.Lock:
     return lock
 
 
-def _vertex_config() -> dict:
+async def _vertex_config() -> dict:
     """Return the ``vertex:`` section of config.yaml, or {} on any failure.
 
     Non-secret routing settings (project_id, region) live in config.yaml per
@@ -68,26 +68,26 @@ def _vertex_config() -> dict:
     directly at the call sites below, with config.yaml as the fallback.
     """
     try:
-        from hermes_cli.config import load_config
+        from hermes_cli.config import load_config_readonly
 
-        section = load_config().get("vertex")
+        section = (await load_config_readonly()).get("vertex")
         return section if isinstance(section, dict) else {}
     except Exception:
         return {}
 
 
-def _resolve_region(explicit: Optional[str] = None) -> str:
+async def _resolve_region(explicit: Optional[str] = None) -> str:
     """Region precedence: explicit arg > VERTEX_REGION env > config.yaml > default."""
     if explicit:
         return explicit
     env_region = (_get_secret("VERTEX_REGION") or "").strip()
     if env_region:
         return env_region
-    cfg_region = str(_vertex_config().get("region") or "").strip()
+    cfg_region = str((await _vertex_config()).get("region") or "").strip()
     return cfg_region or DEFAULT_REGION
 
 
-def _resolve_project_override() -> Optional[str]:
+async def _resolve_project_override() -> Optional[str]:
     """Project-ID override precedence: VERTEX_PROJECT_ID env > config.yaml.
 
     Returns None when neither is set (the credentials' embedded project_id
@@ -96,7 +96,7 @@ def _resolve_project_override() -> Optional[str]:
     env_project = (_get_secret("VERTEX_PROJECT_ID") or "").strip()
     if env_project:
         return env_project
-    cfg_project = str(_vertex_config().get("project_id") or "").strip()
+    cfg_project = str((await _vertex_config()).get("project_id") or "").strip()
     return cfg_project or None
 
 
@@ -249,7 +249,7 @@ async def get_vertex_credentials(credentials_path: Optional[str] = None) -> Tupl
                         project_id = cached_metadata.get("project_id")
                     else:
                         token, project_id = await _metadata_credentials()
-                    override_project = _resolve_project_override()
+                    override_project = await _resolve_project_override()
                     return token, override_project or project_id
 
             cached = _creds_cache.get(cache_key)
@@ -272,7 +272,7 @@ async def get_vertex_credentials(credentials_path: Optional[str] = None) -> Tupl
             if needs_refresh:
                 await _refresh_credentials(creds)
 
-        override_project = _resolve_project_override()
+        override_project = await _resolve_project_override()
         if override_project:
             project_id = override_project
 
@@ -315,7 +315,7 @@ async def get_vertex_config(
     if not token or not project_id:
         return None, None
 
-    effective_region = _resolve_region(region)
+    effective_region = await _resolve_region(region)
     base_url = build_vertex_base_url(project_id, effective_region)
     return token, base_url
 
@@ -330,6 +330,6 @@ async def has_vertex_credentials() -> bool:
     """
     if await _resolve_credentials_path(None):
         return True
-    if _resolve_project_override():
+    if await _resolve_project_override():
         return True
     return False
