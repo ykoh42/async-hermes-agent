@@ -1367,6 +1367,9 @@ async def run_conversation(
                 )
             await agent._persist_session(messages, conversation_history)
 
+        # Reset per-turn checkpoint dedup so each iteration can take one snapshot
+        agent._checkpoint_mgr.new_turn()
+
         # Check for interrupt request (e.g., user sent new message)
         if agent._interrupt_requested:
             interrupted = True

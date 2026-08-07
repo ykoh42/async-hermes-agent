@@ -1737,6 +1737,16 @@ def init_agent(
     # Cross-session-stable prefix of the cached prompt. It remains separate
     # from the persisted string and is used only to place an early cache marker.
     agent._cached_system_prompt_static: Optional[str] = None
+
+    # Filesystem checkpoint manager (transparent — not a tool)
+    from tools.checkpoint_manager import CheckpointManager
+
+    agent._checkpoint_mgr = CheckpointManager(
+        enabled=checkpoints_enabled,
+        max_snapshots=checkpoint_max_snapshots,
+        max_total_size_mb=checkpoint_max_total_size_mb,
+        max_file_size_mb=checkpoint_max_file_size_mb,
+    )
     
     # SQLite session store (optional -- provided by the embedding runtime).
     # Only the native async implementation is accepted: silently wrapping a

@@ -1851,7 +1851,7 @@ class TestConcurrentToolExecution:
         )
         monkeypatch.setattr(
             "agent.tool_executor._begin_tool_execution",
-            lambda *_args, **_kwargs: None,
+            AsyncMock(return_value=None),
         )
 
         async def handle_function_call(*_args, **kwargs):
@@ -2008,7 +2008,11 @@ class TestConcurrentToolExecution:
         monkeypatch.setattr("hermes_cli.middleware.apply_tool_request_middleware", apply_request_middleware)
         monkeypatch.setattr("hermes_cli.middleware.run_tool_execution_middleware", invoke_twice)
         monkeypatch.setattr("hermes_cli.plugins.resolve_pre_tool_block", no_block)
-        monkeypatch.setattr(tool_executor, "_begin_tool_execution", lambda *_a, **_k: None)
+        monkeypatch.setattr(
+            tool_executor,
+            "_begin_tool_execution",
+            AsyncMock(return_value=None),
+        )
 
         async def execute(args, trace):
             assert trace == []
@@ -2062,7 +2066,11 @@ class TestConcurrentToolExecution:
         monkeypatch.setattr("hermes_cli.middleware.apply_tool_request_middleware", apply_request_middleware)
         monkeypatch.setattr("hermes_cli.middleware.run_tool_execution_middleware", invoke_concurrently)
         monkeypatch.setattr("hermes_cli.plugins.resolve_pre_tool_block", no_block)
-        monkeypatch.setattr(tool_executor, "_begin_tool_execution", lambda *_a, **_k: None)
+        monkeypatch.setattr(
+            tool_executor,
+            "_begin_tool_execution",
+            AsyncMock(return_value=None),
+        )
 
         async def execute(args, trace):
             assert trace == []

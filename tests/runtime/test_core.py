@@ -3588,7 +3588,7 @@ async def test_tool_scheduler_preserves_barriers_and_result_order(monkeypatch):
     originals = dict(active_registry._tools)
     monkeypatch.setattr(active_registry, "_tools", dict(originals))
     monkeypatch.setattr(
-        active_executor, "_begin_tool_execution", lambda *_args, **_kwargs: None
+        active_executor, "_begin_tool_execution", AsyncMock(return_value=None)
     )
 
     async def parallel_handler(args, **kwargs):

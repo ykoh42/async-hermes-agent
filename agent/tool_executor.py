@@ -19,6 +19,7 @@ from agent.display import (
     _detect_tool_failure,
 )
 from agent.tool_dispatch_helpers import (
+    _is_destructive_command,
     _is_multimodal_tool_result,
     _multimodal_text_summary,
     _append_subdir_hint_to_multimodal,
@@ -35,6 +36,36 @@ from tools.tool_result_storage import (
 from tools.budget_config import BudgetConfig, DEFAULT_BUDGET, budget_for_context_window
 
 logger = logging.getLogger(__name__)
+
+
+async def _ensure_file_checkpoint(
+    agent,
+    function_name: str,
+    function_args: dict,
+    effective_task_id: str,
+) -> None:
+    """Checkpoint the same workspace path that the file tool will mutate."""
+    file_path = function_args.get("path", "")
+    if not file_path:
+        return
+
+    # File tools resolve relative paths against the task's live/session cwd,
+    # which can differ from the Hermes process cwd (notably in Docker).  Resolve
+    # through that same path pipeline before asking the checkpoint manager to
+    # discover the project root.
+    from tools.file_tools import _resolve_path_for_task
+
+    resolved_path = await _resolve_path_for_task(
+        file_path,
+        effective_task_id or "default",
+    )
+    work_dir = await agent._checkpoint_mgr.get_working_dir_for_path(
+        str(resolved_path)
+    )
+    await agent._checkpoint_mgr.ensure_checkpoint(
+        work_dir,
+        f"before {function_name}",
+    )
 
 
 def _budget_for_agent(agent) -> BudgetConfig:
@@ -277,7 +308,7 @@ async def _run_agent_tool_execution_middleware(
         if function_name == "memory":
             agent._turns_since_memory = 0
 
-        _begin_tool_execution(
+        await _begin_tool_execution(
             agent,
             function_name=function_name,
             function_args=next_args,
@@ -342,7 +373,7 @@ async def _run_agent_tool_execution_middleware(
     )
 
 
-def _begin_tool_execution(
+async def _begin_tool_execution(
     agent,
     *,
     function_name: str,
@@ -404,6 +435,32 @@ def _begin_tool_execution(
             )
         except Exception as callback_error:
             logging.debug("Tool start callback error: %s", callback_error)
+
+    if function_name in {"write_file", "patch"} and agent._checkpoint_mgr.enabled:
+        try:
+            await _ensure_file_checkpoint(
+                agent,
+                function_name,
+                function_args,
+                effective_task_id,
+            )
+        except Exception:
+            logger.debug("File checkpoint failed", exc_info=True)
+
+    if function_name == "terminal" and agent._checkpoint_mgr.enabled:
+        try:
+            command = function_args.get("command", "")
+            if _is_destructive_command(command):
+                from tools.terminal_tool import _get_or_create_environment
+
+                environment = await _get_or_create_environment(effective_task_id)
+                cwd = function_args.get("workdir") or environment.cwd
+                await agent._checkpoint_mgr.ensure_checkpoint(
+                    cwd,
+                    f"before terminal: {command[:60]}",
+                )
+        except Exception:
+            logger.debug("Terminal checkpoint failed", exc_info=True)
 
 
 def _emit_tool_completion(

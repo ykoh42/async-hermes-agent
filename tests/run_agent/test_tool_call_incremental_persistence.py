@@ -27,6 +27,7 @@ def _agent(flush):
         _interrupt_requested=False,
         _incremental_persistence_failed=False,
         _flush_messages_to_session_db=flush,
+        _checkpoint_mgr=SimpleNamespace(enabled=False),
         _tool_guardrails=guardrails,
         _append_guardrail_observation=lambda _name, _args, result, **_kwargs: result,
         _apply_pending_steer_to_tool_results=lambda *_args: None,
