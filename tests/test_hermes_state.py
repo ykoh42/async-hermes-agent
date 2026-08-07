@@ -7,7 +7,7 @@ import time
 import pytest
 import pytest_asyncio
 
-from hermes_state import SessionDB
+from hermes_state import CompressionSessionClosedError, SessionDB
 
 
 @pytest_asyncio.fixture
@@ -20,8 +20,20 @@ async def db(tmp_path):
 def test_public_session_interface_is_async():
     for name in (
         "create_session",
+        "ensure_session",
         "append_message",
+        "replace_messages",
+        "clear_messages",
+        "message_count",
+        "latest_message_row_id",
+        "latest_user_message_row_id",
+        "get_message_role",
+        "update_session_meta",
+        "update_session_model",
         "get_session",
+        "resolve_session_id",
+        "session_count_ge",
+        "count_empty_sessions",
         "get_messages",
         "get_messages_as_conversation",
         "search_messages",
@@ -31,6 +43,127 @@ def test_public_session_interface_is_async():
         "close",
     ):
         assert inspect.iscoroutinefunction(getattr(SessionDB, name)), name
+
+
+@pytest.mark.asyncio
+async def test_session_compatibility_primitives_preserve_upstream_contract(db):
+    assert await db.ensure_session(
+        "session-alpha",
+        source="library",
+        model="model-a",
+        cwd="/workspace",
+    ) == "session-alpha"
+    assert await db.ensure_session("session-alpha", source="ignored") == (
+        "session-alpha"
+    )
+    assert (await db.get_session("session-alpha"))["source"] == "library"
+
+    first = await db.append_message(
+        "session-alpha", role="user", content="first"
+    )
+    second = await db.append_message(
+        "session-alpha", role="assistant", content="second"
+    )
+    tool_call_only = await db.append_message(
+        "session-alpha",
+        role="assistant",
+        content="",
+        tool_calls=[
+            {
+                "id": "call-1",
+                "type": "function",
+                "function": {"name": "terminal", "arguments": "{}"},
+            }
+        ],
+    )
+    assert await db.message_count("session-alpha") == 3
+    assert await db.message_count() == 3
+    assert await db.latest_user_message_row_id("session-alpha") == first
+    assert await db.latest_message_row_id(
+        "session-alpha", role="assistant"
+    ) == second
+    assert await db.latest_message_row_id(
+        "session-alpha", role="assistant", require_text=False
+    ) == tool_call_only
+    assert await db.get_message_role("session-alpha", second) == "assistant"
+
+    await db.replace_messages(
+        "session-alpha",
+        [
+            {"role": "user", "content": "replacement"},
+            {"role": "assistant", "content": "answer"},
+        ],
+    )
+    assert [
+        message["content"] for message in await db.get_messages("session-alpha")
+    ] == ["replacement", "answer"]
+    assert await db.message_count("session-alpha") == 2
+
+    await db.update_session_meta(
+        "session-alpha",
+        '{"custom":"kept","browser_model_lock":{"model":"old"}}',
+        model="model-b",
+    )
+    await db.update_session_model("session-alpha", "model-c")
+    session = await db.get_session("session-alpha")
+    assert session["model"] == "model-c"
+    assert session["model_config"] == '{"custom":"kept"}'
+
+    assert await db.resolve_session_id("session-alpha") == "session-alpha"
+    assert await db.resolve_session_id("session-al") == "session-alpha"
+    await db.ensure_session("session-alpine", source="library")
+    assert await db.resolve_session_id("session-al") is None
+    assert await db.session_count_ge(2) is True
+
+    await db.clear_messages("session-alpha")
+    assert await db.message_count("session-alpha") == 0
+    assert (await db.get_session("session-alpha"))["tool_call_count"] == 0
+    await db.end_session("session-alpha", "done")
+    assert await db.count_empty_sessions() == 1
+
+
+@pytest.mark.asyncio
+async def test_replace_active_messages_preserves_archived_transcript(db):
+    await db.ensure_session("session", source="library")
+    archived_id = await db.append_message(
+        "session", role="user", content="archived"
+    )
+    await db.append_message("session", role="assistant", content="live")
+    connection = await db._get_connection()
+    await connection.execute(
+        "UPDATE messages SET active = 0, compacted = 1 WHERE id = ?",
+        (archived_id,),
+    )
+    await connection.commit()
+
+    await db.replace_messages(
+        "session",
+        [{"role": "user", "content": "new live"}],
+        active_only=True,
+    )
+
+    all_messages = await db.get_messages("session", include_inactive=True)
+    assert [message["content"] for message in all_messages] == [
+        "archived",
+        "new live",
+    ]
+    assert (await db.get_session("session"))["message_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_replace_rejects_closed_compression_session_atomically(db):
+    await db.ensure_session("session", source="library")
+    await db.append_message("session", role="user", content="preserved")
+    await db.end_session("session", "compression")
+
+    with pytest.raises(CompressionSessionClosedError):
+        await db.replace_messages(
+            "session", [{"role": "user", "content": "replacement"}]
+        )
+
+    assert [
+        message["content"] for message in await db.get_messages("session")
+    ] == ["preserved"]
 
 
 @pytest.mark.asyncio

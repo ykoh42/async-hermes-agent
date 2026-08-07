@@ -260,10 +260,18 @@ async def test_session_lifecycle_does_not_block_or_leak(tmp_path):
         blockbuster = BlockBuster()
         blockbuster.activate()
         try:
-            await database.create_session("session", source="library")
-            await database.append_message(
+            await database.ensure_session("session", source="library")
+            message_id = await database.append_message(
                 "session", role="user", content="hello"
             )
+            assert await database.message_count("session") == 1
+            assert await database.latest_user_message_row_id("session") == (
+                message_id
+            )
+            assert await database.get_message_role(
+                "session", message_id
+            ) == "user"
+            assert await database.resolve_session_id("sess") == "session"
             await database.end_session("session", "done")
             assert [
                 row["id"]

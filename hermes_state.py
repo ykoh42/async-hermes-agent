@@ -1063,6 +1063,21 @@ class SessionDB:
         await self._write(_create)
         return session_id
 
+    async def ensure_session(
+        self,
+        session_id: str,
+        source: str = "unknown",
+        model: str = None,
+        **kwargs,
+    ) -> str:
+        """Ensure a session row exists and preserve the upstream return value."""
+        return await self.create_session(
+            session_id,
+            source,
+            model=model,
+            **kwargs,
+        )
+
     async def update_session_cwd(
         self,
         session_id: str,
@@ -1311,6 +1326,50 @@ class SessionDB:
             return inserted
 
         return await self._write(_append_batch)
+
+    async def replace_messages(
+        self,
+        session_id: str,
+        messages: List[Dict[str, Any]],
+        active_only: bool = False,
+    ) -> None:
+        """Atomically replace all or only active transcript rows."""
+        active_clause = " AND active = 1" if active_only else ""
+
+        async def _replace(connection):
+            session = await (
+                await connection.execute(
+                    "SELECT ended_at, end_reason FROM sessions WHERE id = ?",
+                    (session_id,),
+                )
+            ).fetchone()
+            if (
+                session is not None
+                and session["ended_at"] is not None
+                and session["end_reason"] == "compression"
+            ):
+                raise CompressionSessionClosedError(session_id)
+            await connection.execute(
+                f"DELETE FROM messages WHERE session_id = ?{active_clause}",
+                (session_id,),
+            )
+            await connection.execute(
+                "UPDATE sessions SET message_count = 0, tool_call_count = 0 "
+                "WHERE id = ?",
+                (session_id,),
+            )
+            total_messages, total_tool_calls = await self._insert_message_rows(
+                connection,
+                session_id,
+                messages,
+            )
+            await connection.execute(
+                "UPDATE sessions SET message_count = ?, tool_call_count = ? "
+                "WHERE id = ?",
+                (total_messages, total_tool_calls, session_id),
+            )
+
+        await self._write(_replace)
 
     async def end_session(self, session_id: str, end_reason: str) -> None:
         async def _end(connection):
@@ -1570,6 +1629,47 @@ class SessionDB:
                 "UPDATE sessions SET model_config = ?, model = COALESCE(?, model), "
                 "system_prompt = NULL, system_prompt_hash = NULL WHERE id = ?",
                 (json.dumps(config), model, session_id),
+            )
+            await self._delete_unreferenced_system_prompts(connection)
+
+        await self._write(_update)
+
+    async def update_session_meta(
+        self,
+        session_id: str,
+        model_config_json: str,
+        model: Optional[str] = None,
+    ) -> None:
+        """Update model metadata while preserving a stored model when omitted."""
+        await self.flush_token_counts()
+
+        async def _update(connection):
+            await connection.execute(
+                "UPDATE sessions SET model_config = ?, "
+                "model = COALESCE(?, model) WHERE id = ?",
+                (model_config_json, model, session_id),
+            )
+
+        await self._write(_update)
+
+    async def update_session_model(self, session_id: str, model: str) -> None:
+        """Persist a mid-session model switch and clear its stale runtime lock."""
+        await self.flush_token_counts()
+
+        async def _update(connection):
+            await connection.execute(
+                """UPDATE sessions SET
+                   model = ?,
+                   model_config = CASE
+                       WHEN model_config IS NULL THEN NULL
+                       WHEN json_valid(model_config)
+                           THEN json_remove(model_config, '$.browser_model_lock')
+                       ELSE model_config
+                   END,
+                   system_prompt = NULL,
+                   system_prompt_hash = NULL
+                   WHERE id = ?""",
+                (model, session_id),
             )
             await self._delete_unreferenced_system_prompts(connection)
 
@@ -1861,6 +1961,49 @@ class SessionDB:
             )
         ).fetchone()
         return self._session_row_dict(row) if row is not None else None
+
+    async def resolve_session_id(
+        self, session_id_or_prefix: str
+    ) -> Optional[str]:
+        """Resolve an exact or uniquely prefixed session id."""
+        exact = await self.get_session(session_id_or_prefix)
+        if exact:
+            return exact["id"]
+        escaped = (
+            session_id_or_prefix.replace("\\", "\\\\")
+            .replace("%", "\\%")
+            .replace("_", "\\_")
+        )
+        connection = await self._get_connection()
+        rows = await (
+            await connection.execute(
+                "SELECT id FROM sessions WHERE id LIKE ? ESCAPE '\\' "
+                "ORDER BY started_at DESC LIMIT 2",
+                (f"{escaped}%",),
+            )
+        ).fetchall()
+        return rows[0]["id"] if len(rows) == 1 else None
+
+    async def session_count_ge(self, n: int = 1) -> bool:
+        """Return whether at least *n* sessions exist, including archived rows."""
+        connection = await self._get_connection()
+        rows = await (
+            await connection.execute("SELECT 1 FROM sessions LIMIT ?", (n,))
+        ).fetchall()
+        return len(rows) >= n
+
+    async def count_empty_sessions(self) -> int:
+        """Count ended, non-archived sessions with no transcript rows."""
+        connection = await self._get_connection()
+        row = await (
+            await connection.execute(
+                "SELECT COUNT(*) AS count FROM sessions "
+                "WHERE message_count = 0 "
+                "AND ended_at IS NOT NULL "
+                "AND archived = 0"
+            )
+        ).fetchone()
+        return int(row["count"] if row is not None else 0)
 
     @staticmethod
     async def _remove_session_files(
@@ -2315,6 +2458,85 @@ class SessionDB:
             params.extend([-1 if limit is None else limit, offset])
         cursor = await connection.execute(query, params)
         return [self._decode_message_row(row) for row in await cursor.fetchall()]
+
+    async def message_count(self, session_id: str = None) -> int:
+        """Count messages, optionally for one session."""
+        connection = await self._get_connection()
+        if session_id:
+            cursor = await connection.execute(
+                "SELECT COUNT(*) AS count FROM messages WHERE session_id = ?",
+                (session_id,),
+            )
+        else:
+            cursor = await connection.execute(
+                "SELECT COUNT(*) AS count FROM messages"
+            )
+        row = await cursor.fetchone()
+        return int(row["count"] if row is not None else 0)
+
+    async def latest_message_row_id(
+        self,
+        session_id: str,
+        *,
+        role: str = "user",
+        offset: int = 0,
+        require_text: bool = True,
+    ) -> Optional[int]:
+        """Return the latest visible active message id for a user-facing role."""
+        if not session_id or role not in {"user", "assistant"} or offset < 0:
+            return None
+        text_filter = (
+            "AND content IS NOT NULL AND TRIM(content) != '' "
+            if require_text
+            else ""
+        )
+        connection = await self._get_connection()
+        row = await (
+            await connection.execute(
+                "SELECT id FROM messages WHERE session_id = ? AND role = ? "
+                f"AND active = 1 {text_filter}"
+                "ORDER BY id DESC LIMIT 1 OFFSET ?",
+                (session_id, role, int(offset)),
+            )
+        ).fetchone()
+        return int(row["id"]) if row is not None else None
+
+    async def latest_user_message_row_id(
+        self, session_id: str
+    ) -> Optional[int]:
+        """Return the latest active user message id."""
+        return await self.latest_message_row_id(session_id, role="user")
+
+    async def get_message_role(
+        self, session_id: str, row_id: int
+    ) -> Optional[str]:
+        """Return the role of an active message owned by *session_id*."""
+        if not session_id:
+            return None
+        connection = await self._get_connection()
+        row = await (
+            await connection.execute(
+                "SELECT role FROM messages "
+                "WHERE id = ? AND session_id = ? AND active = 1",
+                (int(row_id), session_id),
+            )
+        ).fetchone()
+        return row["role"] if row is not None else None
+
+    async def clear_messages(self, session_id: str) -> None:
+        """Delete every transcript row and reset persisted counters."""
+        async def _clear(connection):
+            await connection.execute(
+                "DELETE FROM messages WHERE session_id = ?",
+                (session_id,),
+            )
+            await connection.execute(
+                "UPDATE sessions SET message_count = 0, tool_call_count = 0 "
+                "WHERE id = ?",
+                (session_id,),
+            )
+
+        await self._write(_clear)
 
     async def rewind_to_message(
         self, session_id: str, target_message_id: int
