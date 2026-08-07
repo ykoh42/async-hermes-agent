@@ -32,7 +32,7 @@ from tools.environments.local import (
     _rewrite_real_sudo_invocations,
     _transform_sudo_command,
     build_subprocess_env,
-    set_sudo_password_callback,
+    _set_sudo_password_callback as set_sudo_password_callback,
 )
 from tools.approval import check_all_command_guards
 from tools.registry import registry

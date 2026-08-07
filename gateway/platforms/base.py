@@ -11,7 +11,6 @@ from __future__ import annotations
 import ipaddress
 import os
 import re
-import socket
 import uuid
 from pathlib import Path
 
@@ -158,15 +157,6 @@ def proxy_kwargs_for_aiohttp(*_args, **_kwargs) -> tuple[dict, dict]:
 def utf16_len(value: str) -> int:
     """Return UTF-16 code-unit length for callers preserving API semantics."""
     return len(str(value).encode("utf-16-le")) // 2
-
-
-def can_resolve_host(host: str) -> bool:
-    """Best-effort DNS probe retained for diagnostics."""
-    try:
-        socket.getaddrinfo(host, None)
-        return True
-    except OSError:
-        return False
 
 
 __all__ = [

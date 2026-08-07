@@ -263,7 +263,7 @@ def _get_sudo_password_callback() -> Callable[[], Awaitable[str | None]] | None:
     return _sudo_password_callback.get()
 
 
-def set_sudo_password_callback(cb) -> None:
+def _set_sudo_password_callback(cb) -> None:
     _sudo_password_callback.set(cb)
 
 
