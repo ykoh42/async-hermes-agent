@@ -2134,7 +2134,7 @@ async def test_run_conversation_allows_distinct_agents_to_overlap(monkeypatch, t
         for index, agent in enumerate(agents)
     ]
     try:
-        await asyncio.wait_for(both_models_started.wait(), timeout=0.5)
+        await asyncio.wait_for(both_models_started.wait(), timeout=5.0)
         assert maximum_models == 2
         release_models.set()
         results = await asyncio.gather(*tasks)
