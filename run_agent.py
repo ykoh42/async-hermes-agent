@@ -4557,10 +4557,11 @@ class AIAgent:
             or self.base_url
         )
         if not runtime_key or not runtime_base:
-            from agent.agent_runtime_helpers import UnsupportedCapabilityError
+            from hermes_cli.auth import AuthError
 
-            raise UnsupportedCapabilityError(
-                "The selected credential has no native async API key and base URL."
+            raise AuthError(
+                "The selected credential has no native async API key and base URL.",
+                provider=self.provider or "",
             )
 
         self._credential_pool_entry_id = getattr(entry, "id", None)
@@ -5443,19 +5444,19 @@ class AIAgent:
 
     async def _ensure_provider_runtime(self) -> bool:
         """Resolve a deferred provider through the native async auth boundary."""
-        from agent.agent_init import initialize_deferred_runtime
-        from agent.agent_runtime_helpers import UnsupportedCapabilityError
+        from agent.agent_init import _initialize_deferred_runtime
+        from hermes_cli.auth import AuthError
 
-        initialization_error: UnsupportedCapabilityError | None = None
+        initialization_error: AuthError | None = None
         allow_startup_fallback = False
         try:
-            return await initialize_deferred_runtime(self)
-        except UnsupportedCapabilityError as exc:
+            return await _initialize_deferred_runtime(self)
+        except AuthError as exc:
             initialization_error = exc
             pending = getattr(self, "_deferred_provider_runtime", None) or {}
             allow_startup_fallback = bool(pending.get("update_primary", True))
 
-        # Release initialize_deferred_runtime's provider lock before entering
+        # Release _initialize_deferred_runtime's provider lock before entering
         # the fallback lifecycle: fallback resolution calls this method again
         # with update_primary=False for the selected candidate.
         if allow_startup_fallback and self._has_pending_fallback():

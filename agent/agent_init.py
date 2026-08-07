@@ -1002,7 +1002,7 @@ def init_agent(
     from hermes_cli.config_defaults import DEFAULT_CONFIG
 
     # Construction is state-only. User configuration is loaded and applied at
-    # the first awaited runtime boundary by ``initialize_deferred_runtime``.
+    # the first awaited runtime boundary by ``_initialize_deferred_runtime``.
     _agent_cfg = DEFAULT_CONFIG
     _install_safe_stdio()
 
@@ -1555,7 +1555,7 @@ def init_agent(
             # The legacy provider router reads auth files and can refresh OAuth
             # synchronously.  Keep construction state-only and resolve it from
             # the first async turn instead.  The placeholder client is never
-            # dispatched: ``initialize_deferred_runtime`` replaces it before
+            # dispatched: ``_initialize_deferred_runtime`` replaces it before
             # the turn reaches the model transport.
             agent._deferred_provider_runtime = {
                 "provider": agent.provider or "auto",
@@ -2652,7 +2652,7 @@ def init_agent(
             agent._ollama_num_ctx = int(_ollama_num_ctx_override)
         except (TypeError, ValueError):
             _ra().logger.debug("Invalid ollama_num_ctx config value: %r", _ollama_num_ctx_override)
-    # Local-server metadata is probed lazily by ``initialize_deferred_runtime``
+    # Local-server metadata is probed lazily by ``_initialize_deferred_runtime``
     # with an async HTTP client.  Do not perform the historical synchronous
     # /api/show request from ``__init__``.
     # Cap auto-detected ollama_num_ctx to the user's explicit context_length.
@@ -3075,16 +3075,14 @@ async def _initialize_memory_manager(
         )
 
 
-async def initialize_deferred_runtime(agent: Any) -> bool:
+async def _initialize_deferred_runtime(agent: Any) -> bool:
     """Resolve a no-credential constructor through native async primitives.
 
     ``AIAgent.__init__`` deliberately does not call the legacy provider
     router: that router may read credential files and refresh OAuth tokens.
     This function is the first-turn counterpart.  It supports persisted
     credential-pool entries and API-key environment providers without a
-    thread fallback.  Providers whose only credential source still requires
-    a synchronous resolver fail explicitly instead of silently blocking a
-    conversation turn.
+    thread fallback.
     """
     pending = getattr(agent, "_deferred_provider_runtime", None)
 
@@ -3113,8 +3111,6 @@ async def initialize_deferred_runtime(agent: Any) -> bool:
             agent._dotenv_loaded = True
             for env_path in loaded_env_paths:
                 logger.info("Loaded environment variables from %s", env_path)
-
-        from agent.agent_runtime_helpers import UnsupportedCapabilityError
 
         if getattr(agent, "_runtime_config_loaded", False):
             config_snapshot = getattr(agent, "_runtime_config_snapshot", {})
@@ -3211,9 +3207,10 @@ async def initialize_deferred_runtime(agent: Any) -> bool:
                     target_model=model,
                 )
             except AuthError as exc:
-                raise UnsupportedCapabilityError(
+                raise AuthError(
                     f"No native async credentials are available for provider "
-                    f"{requested!r}: {exc}"
+                    f"{requested!r}: {exc}",
+                    provider=requested,
                 ) from exc
 
         provider = str(runtime.get("provider") or requested).strip().lower()
@@ -3667,4 +3664,4 @@ async def initialize_deferred_runtime(agent: Any) -> bool:
         return True
 
 
-__all__ = ["init_agent", "initialize_deferred_runtime"]
+__all__ = ["init_agent"]

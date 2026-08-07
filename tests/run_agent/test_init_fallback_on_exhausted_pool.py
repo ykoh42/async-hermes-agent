@@ -2,7 +2,7 @@
 when primary provider credentials are exhausted."""
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
-from agent.agent_runtime_helpers import UnsupportedCapabilityError
+from hermes_cli.auth import AuthError
 from run_agent import AIAgent
 
 
@@ -32,7 +32,7 @@ async def test_init_tries_fallback_when_primary_returns_none():
     """The synchronous constructor stays lazy; first await activates fallback."""
     fb = _mock_client()
 
-    with patch("agent.credential_pool.load_pool", new_callable=AsyncMock, return_value=_EmptyPool()), \
+    with patch("hermes_cli.runtime_provider.load_pool", new_callable=AsyncMock, return_value=_EmptyPool()), \
          patch("run_agent.get_tool_definitions", return_value=_make_tool_defs()), \
          patch("run_agent.check_toolset_requirements", return_value={}), \
          patch("run_agent.OpenAI", return_value=fb):
@@ -61,7 +61,7 @@ async def test_init_tries_fallback_when_primary_returns_none():
 @pytest.mark.asyncio
 async def test_init_raises_when_no_fallback_configured():
     """Missing primary credentials fail on first async initialization."""
-    with patch("agent.credential_pool.load_pool", new_callable=AsyncMock, return_value=_EmptyPool()), \
+    with patch("hermes_cli.runtime_provider.load_pool", new_callable=AsyncMock, return_value=_EmptyPool()), \
          patch("run_agent.get_tool_definitions", return_value=_make_tool_defs()), \
          patch("run_agent.check_toolset_requirements", return_value={}), \
          patch("run_agent.OpenAI", return_value=MagicMock()):
@@ -76,5 +76,5 @@ async def test_init_raises_when_no_fallback_configured():
             skip_memory=True,
             fallback_model=None,
         )
-        with pytest.raises(UnsupportedCapabilityError, match="No native async credentials"):
+        with pytest.raises(AuthError, match="No native async credentials"):
             await agent._ensure_provider_runtime()

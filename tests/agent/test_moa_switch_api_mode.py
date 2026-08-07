@@ -38,9 +38,9 @@ async def test_switch_to_moa_uses_native_async_facade():
     agent = _make_fake_agent()
 
     async def ensure_provider_runtime():
-        from agent.agent_init import initialize_deferred_runtime
+        from agent.agent_init import _initialize_deferred_runtime
 
-        return await initialize_deferred_runtime(agent)
+        return await _initialize_deferred_runtime(agent)
 
     agent._ensure_provider_runtime = ensure_provider_runtime
     await arh.switch_model(

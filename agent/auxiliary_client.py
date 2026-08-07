@@ -57,8 +57,6 @@ from types import SimpleNamespace
 from typing import Any, Callable, Dict, List, Optional, Tuple, TYPE_CHECKING
 from urllib.parse import urlparse, parse_qs, urlunparse
 
-from agent.agent_runtime_helpers import UnsupportedCapabilityError
-
 from agent.credential_pool import load_pool
 from agent.model_metadata import (
     MINIMUM_CONTEXT_LENGTH,
@@ -1616,10 +1614,9 @@ async def _maybe_wrap_anthropic(
 
     try:
         from agent.anthropic_adapter import build_anthropic_client
+        real_client = build_anthropic_client(api_key, base_url)
     except ImportError as exc:
-        from agent.agent_runtime_helpers import UnsupportedCapabilityError
-
-        raise UnsupportedCapabilityError(
+        raise ImportError(
             "This endpoint requires the Anthropic async transport, but the "
             "anthropic adapter is unavailable. Install the provider dependency "
             "instead of falling back to the incompatible OpenAI wire format."
@@ -1628,8 +1625,6 @@ async def _maybe_wrap_anthropic(
     # Provider construction is part of the async contract.  Do not hide an
     # unsupported/synchronous transport by silently sending OpenAI-wire
     # requests to an Anthropic endpoint.
-    real_client = build_anthropic_client(api_key, base_url)
-
     logger.debug(
         "Auxiliary transport: wrapping client in AnthropicAuxiliaryClient "
         "(model=%s, base_url=%s, api_mode=%s)",
@@ -3851,7 +3846,7 @@ async def _try_payment_fallback(
             continue
         try:
             client, model = await try_fn()
-        except UnsupportedCapabilityError as exc:
+        except ImportError as exc:
             logger.debug(
                 "Auxiliary fallback: skipping %s without native async support: %s",
                 label,
@@ -4557,7 +4552,7 @@ async def _resolve_auto(
             continue
         try:
             client, model = await try_fn()
-        except UnsupportedCapabilityError as exc:
+        except ImportError as exc:
             logger.debug(
                 "Auxiliary auto-detect: skipping %s without native async support: %s",
                 label,
@@ -5551,7 +5546,7 @@ async def _resolve_strict_vision_backend(
 async def _strict_vision_backend_available(provider: str) -> bool:
     try:
         return (await _resolve_strict_vision_backend(provider))[0] is not None
-    except UnsupportedCapabilityError:
+    except ImportError:
         return False
 
 

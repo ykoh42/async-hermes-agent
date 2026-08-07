@@ -925,7 +925,7 @@ async def test_plugin_lifecycle_requires_coroutine_callbacks():
 @pytest.mark.asyncio
 async def test_deferred_runtime_rejects_sync_only_context_engine_early(monkeypatch):
     """Provider construction must stop before an external legacy extension runs."""
-    from agent.agent_init import initialize_deferred_runtime
+    from agent.agent_init import _initialize_deferred_runtime
     from agent.context_engine import ContextEngine
     from hermes_cli.plugins import PluginContractError
 
@@ -959,7 +959,7 @@ async def test_deferred_runtime_rejects_sync_only_context_engine_early(monkeypat
         state.update(attributes)
         agent = SimpleNamespace(**state)
         with pytest.raises(PluginContractError, match="compress.*coroutine"):
-            await initialize_deferred_runtime(agent)
+            await _initialize_deferred_runtime(agent)
 
     await assert_rejected(
         _runtime_config_snapshot={"context": {"engine": "third-party"}}

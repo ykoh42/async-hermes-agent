@@ -47,15 +47,6 @@ from utils import base_url_host_matches, base_url_hostname, env_var_enabled
 logger = logging.getLogger(__name__)
 
 
-class UnsupportedCapabilityError(RuntimeError):
-    """Raised when a sync-only capability reaches the async agent core.
-
-    The async distribution deliberately does not hide a blocking tool behind a
-    worker thread.  Callers get a deterministic capability error instead and
-    can select an async-capable implementation.
-    """
-
-
 # Max consecutive successful credential-pool token refreshes of the SAME entry
 # on a persistent auth failure before we give up and let the fallback chain
 # activate. A single-entry OAuth pool can re-mint a fresh token indefinitely
@@ -1280,7 +1271,7 @@ async def try_recover_primary_transport(
         # Rebuild from the primary snapshot through the native async runtime.
         # The former path retired sockets and recreated a synchronous SDK
         # client in the turn coroutine; that could block the loop and race a
-        # streaming worker. ``initialize_deferred_runtime`` swaps only after
+        # streaming worker. ``_initialize_deferred_runtime`` swaps only after
         # the replacement async transport is ready and awaits its lifecycle.
         rt = agent._primary_runtime
         agent._client_kwargs = dict(rt["client_kwargs"])

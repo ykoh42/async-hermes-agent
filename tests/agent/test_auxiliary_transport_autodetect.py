@@ -77,7 +77,6 @@ def test_endpoint_speaks_anthropic_messages(url, expected, label):
 @pytest.mark.asyncio
 async def test_maybe_wrap_anthropic_sdk_missing_fails_fast():
     """A missing required transport must not silently use the wrong wire protocol."""
-    from agent.agent_runtime_helpers import UnsupportedCapabilityError
     from agent.auxiliary_client import _maybe_wrap_anthropic
 
     plain_client = MagicMock(name="plain_openai")
@@ -97,7 +96,7 @@ async def test_maybe_wrap_anthropic_sdk_missing_fails_fast():
         saved = _sys.modules.get("agent.anthropic_adapter")
         _sys.modules["agent.anthropic_adapter"] = None  # force ImportError
         try:
-            with pytest.raises(UnsupportedCapabilityError, match="Anthropic async transport"):
+            with pytest.raises(ImportError, match="Anthropic async transport"):
                 await _maybe_wrap_anthropic(
                     plain_client, "kimi-for-coding", "sk-kimi-test",
                     "https://api.kimi.com/coding", api_mode=None,
