@@ -62,34 +62,6 @@ _BUILTIN_TOOL_MODULES = tuple(
     f"tools.{module_name}" for module_name in sorted(_TRAINING_RUNTIME_TOOL_MODULES)
 )
 
-# A few legacy modules are imported for helpers (for example compression resets
-# file-read deduplication) and historically registered a synchronous model tool
-# as an import side effect. Discovery filtering alone cannot prevent that. Keep
-# the async training surface closed at the registration point, where the module
-# that owns a handler is unambiguous. This is a capability policy, not an async
-# compatibility wrapper: a tool joins the model schema only after its original
-# handler has been converted to native async and its module is added here.
-_ASYNC_RUNTIME_HANDLER_MODULES = frozenset({
-    "tools.browser_cdp_tool",
-    "tools.browser_dialog_tool",
-    "tools.browser_tool",
-    "tools.clarify_tool",
-    "tools.delegate_tool",
-    "tools.file_tools",
-    "tools.image_generation_tool",
-    "tools.mcp_tool",
-    "tools.memory_tool",
-    "tools.process_registry",
-    "tools.skills_tool",
-    "tools.session_search_tool",
-    "tools.terminal_tool",
-    "tools.todo_tool",
-    "tools.video_generation_tool",
-    "tools.vision_tools",
-    "tools.web_tools",
-})
-
-
 def discover_builtin_tools(tools_dir=None) -> List[str]:
     """Import the retained built-in tool modules and return their names.
 
@@ -452,17 +424,6 @@ class ToolRegistry:
                 f"Tool '{name}' must use an async handler in async-hermes-agent"
             )
 
-        handler_module = getattr(handler, "__module__", "") or ""
-        if (
-            handler_module.startswith("tools.")
-            and handler_module not in _ASYNC_RUNTIME_HANDLER_MODULES
-        ):
-            logger.debug(
-                "Tool %s from %s is not registered: native async migration is pending",
-                name,
-                handler_module,
-            )
-            return
         with self._lock:
             existing = self._tools.get(name)
             if existing and existing.toolset != toolset:

@@ -1042,6 +1042,16 @@ async def check_web_api_key() -> bool:
         return False
 
 
+async def _standalone_status() -> tuple[bool, str, str, Optional[str], str]:
+    """Resolve direct-module diagnostics on one event loop."""
+    web_available = await check_web_api_key()
+    firecrawl_key = await _env_value("FIRECRAWL_API_KEY")
+    firecrawl_url = await _env_value("FIRECRAWL_API_URL")
+    backend = await _get_backend() if web_available else None
+    searxng_url = await _env_value("SEARXNG_URL")
+    return web_available, firecrawl_key, firecrawl_url, backend, searxng_url
+
+
 if __name__ == "__main__":
     """
     Simple test/demo when run directly
@@ -1050,14 +1060,17 @@ if __name__ == "__main__":
     print("=" * 40)
 
     # Check if API keys are available
-    web_available = asyncio.run(check_web_api_key())
-    firecrawl_key = asyncio.run(_env_value("FIRECRAWL_API_KEY"))
-    firecrawl_url = asyncio.run(_env_value("FIRECRAWL_API_URL"))
+    (
+        web_available,
+        firecrawl_key,
+        firecrawl_url,
+        backend,
+        searxng_url,
+    ) = asyncio.run(_standalone_status())
     firecrawl_key_available = bool(firecrawl_key)
     firecrawl_url_available = bool(firecrawl_url)
 
     if web_available:
-        backend = asyncio.run(_get_backend())
         print(f"✅ Web backend: {backend}")
         if backend == "exa":
             print("   Using Exa API (https://exa.ai)")
@@ -1068,7 +1081,7 @@ if __name__ == "__main__":
         elif backend == "searxng":
             print(
                 "   Using SearXNG (search only): "
-                f"{asyncio.run(_env_value('SEARXNG_URL'))}"
+                f"{searxng_url}"
             )
         elif backend == "brave-free":
             print("   Using Brave Search free tier (search only)")
@@ -1105,11 +1118,9 @@ if __name__ == "__main__":
     print("  from web_tools import web_search_tool, web_extract_tool")
     print("  import asyncio")
     print("")
-    print("  # Search (synchronous)")
-    print("  results = web_search_tool('Python tutorials')")
-    print("")
-    print("  # Extract (asynchronous, no LLM — truncate-and-store)")
+    print("  # Search and extract are both asynchronous")
     print("  async def main():")
+    print("      results = await web_search_tool('Python tutorials')")
     print("      content = await web_extract_tool(['https://example.com'])")
     print("      # bigger budget for one call:")
     print("      content = await web_extract_tool(['https://docs.python.org'], char_limit=40000)")

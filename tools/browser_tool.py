@@ -5441,9 +5441,12 @@ async def _main() -> None:
         print(f"  🔹 {schema['name']}: {str(schema['description'])[:60]}...")
 
     print("\n💡 Usage:")
+    print("  import asyncio")
     print("  from tools.browser_tool import browser_navigate, browser_snapshot")
-    print("  result = browser_navigate('https://example.com', task_id='my_task')")
-    print("  snapshot = browser_snapshot(task_id='my_task')")
+    print("  async def main():")
+    print("      result = await browser_navigate('https://example.com', task_id='my_task')")
+    print("      snapshot = await browser_snapshot(task_id='my_task')")
+    print("  asyncio.run(main())")
 
 
 if __name__ == "__main__":

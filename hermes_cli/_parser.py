@@ -41,7 +41,7 @@ _EPILOGUE = """
 Examples:
     hermes -z "Hello"            Single core turn
     hermes -z "Hello" -t coding  Select a toolset
-    python -m run_agent           Run the synchronous core runner
+    python -m run_agent           Run the async core runner
     python batch_runner.py        Generate a batch of trajectories
 """
 

@@ -3814,8 +3814,7 @@ class AIAgent:
             task_ids.add(session_id)
 
         # 1. Terminate/reap native background terminal commands and release
-        # their local environment bookkeeping on this event loop.  The legacy
-        # ProcessRegistry is synchronous and is not used by the async runtime.
+        # their local environment bookkeeping on this event loop.
         resource_task_ids = task_ids or {"default"}
         try:
             for task_id in resource_task_ids:

@@ -39,6 +39,22 @@ class TestRegisterAndDispatch:
                 handler=lambda _args, **_kwargs: "sync",
             )
 
+    def test_accepts_async_handler_from_new_tool_module(self):
+        reg = ToolRegistry()
+
+        async def handler(_args, **_kwargs):
+            return "ok"
+
+        handler.__module__ = "tools.new_async_tool"
+        reg.register(
+            name="new_async",
+            toolset="extension",
+            schema=_make_schema("new_async"),
+            handler=handler,
+        )
+
+        assert reg.get_entry("new_async") is not None
+
     @pytest.mark.asyncio
     async def test_register_and_dispatch(self):
         reg = ToolRegistry()
