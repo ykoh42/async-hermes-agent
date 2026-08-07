@@ -3,6 +3,7 @@
 Run with:  python -m pytest tests/agent/test_file_safety.py -v
 """
 
+import inspect
 import os
 from unittest.mock import patch
 
@@ -12,8 +13,29 @@ pytestmark = pytest.mark.asyncio
 
 from agent.file_safety import (
     _BLOCKED_PROJECT_ENV_BASENAMES,
+    build_write_denied_paths,
+    build_write_denied_prefixes,
     get_read_block_error,
+    get_safe_write_roots,
+    is_write_denied,
 )
+
+
+async def test_public_write_safety_api_is_native_async(tmp_path, monkeypatch):
+    """Keep the upstream public names while making their I/O awaitable."""
+    functions = (
+        build_write_denied_paths,
+        build_write_denied_prefixes,
+        get_safe_write_roots,
+        is_write_denied,
+    )
+    assert all(inspect.iscoroutinefunction(function) for function in functions)
+
+    monkeypatch.setenv("HERMES_WRITE_SAFE_ROOT", str(tmp_path))
+    roots = await get_safe_write_roots()
+    assert str(tmp_path.resolve()) in roots
+    assert await is_write_denied(str(tmp_path / "allowed.txt")) is False
+    assert await is_write_denied(str(tmp_path.parent / "outside.txt")) is True
 
 
 # ---------------------------------------------------------------------------

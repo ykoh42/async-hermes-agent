@@ -397,7 +397,8 @@ async def build_system_prompt_parts(agent: Any, system_message: Optional[str] = 
     # for the matching tool-side guard.
     try:
         from agent.file_safety import _resolve_active_profile_name
-        active_profile = _resolve_active_profile_name()
+
+        active_profile = await _resolve_active_profile_name()
     except Exception:
         active_profile = "default"
     if active_profile == "default":

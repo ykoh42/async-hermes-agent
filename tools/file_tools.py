@@ -20,6 +20,7 @@ import aiofiles.os
 from agent.file_safety import (
     get_cross_profile_warning,
     get_read_block_error,
+    get_sandbox_mirror_warning,
     get_write_denied_error,
 )
 from tools.binary_extensions import has_binary_extension
@@ -606,13 +607,16 @@ async def _check_cross_profile_path(
     filepath: str,
     task_id: str = "default",
 ) -> str | None:
-    """Apply the retained local-runtime cross-profile soft guard."""
+    """Apply the cross-profile and host-side sandbox-mirror soft guards."""
     try:
         resolved = str(await _resolve_path_for_task(filepath, task_id))
     except (OSError, ValueError):
         resolved = filepath
 
-    return await get_cross_profile_warning(resolved)
+    warning = await get_cross_profile_warning(resolved)
+    if warning is not None:
+        return warning
+    return await get_sandbox_mirror_warning(resolved)
 
 
 

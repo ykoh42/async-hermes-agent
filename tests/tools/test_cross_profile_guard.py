@@ -158,7 +158,8 @@ class TestPatchCrossProfileGuard:
 
 
 class TestSystemPromptActiveProfile:
-    def test_default_profile_line_in_prompt(self, tmp_path, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_default_profile_line_in_prompt(self, tmp_path, monkeypatch):
         """When active profile is 'default', the prompt names it and warns
         about ~/.hermes/profiles/<name>/."""
         # Don't set HERMES_HOME — falls back to default.
@@ -167,7 +168,7 @@ class TestSystemPromptActiveProfile:
         monkeypatch.setattr(fs, "_hermes_root_path", lambda: tmp_path / "fake")
 
         from agent.file_safety import _resolve_active_profile_name
-        assert _resolve_active_profile_name() == "default"
+        assert await _resolve_active_profile_name() == "default"
         # Build the line manually to pin the contract — the prompt builder
         # is too heavy to instantiate end-to-end in a unit test.
         # See agent/system_prompt.py for the exact wording.

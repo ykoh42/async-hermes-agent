@@ -89,7 +89,7 @@ class TestResolveActiveProfileName:
     async def test_default_when_home_is_root(self, fake_hermes, monkeypatch):
         _set_active_home(monkeypatch, fake_hermes["default_home"])
         from agent.file_safety import _resolve_active_profile_name
-        assert _resolve_active_profile_name() == "default"
+        assert await _resolve_active_profile_name() == "default"
 
 
     async def test_falls_back_to_default_on_resolution_failure(self, fake_hermes, monkeypatch):
@@ -101,7 +101,7 @@ class TestResolveActiveProfileName:
 
         monkeypatch.setattr(fs, "_hermes_home_path", _boom)
         # Should not raise — falls back to "default"
-        assert fs._resolve_active_profile_name() == "default"
+        assert await fs._resolve_active_profile_name() == "default"
 
 
 # ---------------------------------------------------------------------------
