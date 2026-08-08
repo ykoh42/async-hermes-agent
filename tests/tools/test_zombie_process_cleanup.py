@@ -46,6 +46,8 @@ async def test_background_process_reaper_removes_natural_exit(tmp_path):
 @pytest.mark.asyncio
 async def test_cleanup_all_environments_reaps_every_active_task(tmp_path):
     task_ids = {"background-cleanup-all-a", "background-cleanup-all-b"}
+    with terminal._env_lock:
+        previously_active = set(terminal._active_environments)
     started = {}
     for task_id in task_ids:
         started[task_id] = (
@@ -61,7 +63,9 @@ async def test_cleanup_all_environments_reaps_every_active_task(tmp_path):
 
     try:
         cleaned = await terminal.cleanup_all_environments()
-        assert cleaned == len(task_ids)
+        assert cleaned == len(previously_active | task_ids)
+        with terminal._env_lock:
+            assert not terminal._active_environments
         assert all(
             item["session_id"] not in process_registry.snapshot_running_ids(task_id)
             for task_id, item in started.items()

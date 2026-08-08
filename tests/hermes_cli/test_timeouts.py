@@ -14,6 +14,48 @@ def _write_config(tmp_path, body: str) -> None:
     (tmp_path / "config.yaml").write_text(textwrap.dedent(body), encoding="utf-8")
 
 
+@pytest.mark.asyncio
+async def test_provider_timeout_helpers_preserve_model_and_provider_priority(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _write_config(
+        tmp_path,
+        """\
+        providers:
+          openrouter:
+            request_timeout_seconds: 77
+            stale_timeout_seconds: 88
+            models:
+              openai/gpt-4o-mini:
+                timeout_seconds: 42
+                stale_timeout_seconds: 43
+        """,
+    )
+
+    assert await get_provider_request_timeout(
+        "openrouter", "openai/gpt-4o-mini"
+    ) == 42.0
+    assert await get_provider_stale_timeout(
+        "openrouter", "openai/gpt-4o-mini"
+    ) == 43.0
+    assert await get_provider_request_timeout("openrouter", "other") == 77.0
+    assert await get_provider_stale_timeout("openrouter", "other") == 88.0
+
+
+@pytest.mark.asyncio
+async def test_provider_timeout_helpers_fail_open(monkeypatch):
+    async def fail_load():
+        raise OSError("unreadable")
+
+    monkeypatch.setattr("hermes_cli.config.load_config_readonly", fail_load)
+
+    assert await get_provider_request_timeout("openrouter") is None
+    assert await get_provider_stale_timeout("openrouter") is None
+    assert await get_provider_request_timeout("") is None
+    assert await get_provider_stale_timeout("") is None
+
+
 
 
 
@@ -108,5 +150,3 @@ async def test_resolved_api_call_timeout_priority(monkeypatch, tmp_path):
     # Case C: no config, no env → 1800.0 default
     monkeypatch.delenv("HERMES_API_TIMEOUT", raising=False)
     assert agent2._resolved_api_call_timeout() == 1800.0
-
-

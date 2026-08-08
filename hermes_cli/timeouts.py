@@ -11,7 +11,7 @@ def _coerce_timeout(raw: object) -> float | None:
     return timeout
 
 
-def get_provider_request_timeout(
+async def get_provider_request_timeout(
     provider_id: str, model: str | None = None
 ) -> float | None:
     """Return a configured provider request timeout in seconds, if any."""
@@ -19,8 +19,9 @@ def get_provider_request_timeout(
         return None
 
     try:
-        from hermes_cli.config import load_config
-        config = load_config()
+        from hermes_cli.config import load_config_readonly
+
+        config = await load_config_readonly()
     except Exception:
         return None
 
@@ -40,7 +41,7 @@ def get_provider_request_timeout(
     return _coerce_timeout(provider_config.get("request_timeout_seconds"))
 
 
-def get_provider_stale_timeout(
+async def get_provider_stale_timeout(
     provider_id: str, model: str | None = None
 ) -> float | None:
     """Return a configured non-stream stale timeout in seconds, if any."""
@@ -48,8 +49,9 @@ def get_provider_stale_timeout(
         return None
 
     try:
-        from hermes_cli.config import load_config
-        config = load_config()
+        from hermes_cli.config import load_config_readonly
+
+        config = await load_config_readonly()
     except Exception:
         return None
 

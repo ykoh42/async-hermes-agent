@@ -13,6 +13,7 @@ This module provides:
 - hermes config wizard   - Re-run setup wizard
 """
 
+import asyncio
 import copy
 import json
 import logging
@@ -25,6 +26,7 @@ import sys
 import tempfile
 import threading
 import time
+import weakref
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Any, Optional, List, Tuple, Set
@@ -152,6 +154,110 @@ def _warn_config_parse_failure(
     except Exception:
         pass
 
+
+async def _warn_config_parse_failure_from_event_loop(
+    config_path: Path, exc: Exception, *, fallback: str = "defaults"
+) -> None:
+    """Native-async form of the upstream warning and backup path."""
+    import aiofiles
+    import aiofiles.os
+
+    try:
+        stat_result = await aiofiles.os.stat(config_path)
+        key = (str(config_path), stat_result.st_mtime_ns, stat_result.st_size)
+    except OSError:
+        stat_result = None
+        key = (str(config_path), 0, 0)
+    if key in _CONFIG_PARSE_WARNED:
+        return
+    _CONFIG_PARSE_WARNED.add(key)
+
+    backup_path: Optional[Path] = None
+    candidate: Optional[Path] = None
+    candidate_created = False
+    backup_complete = False
+    try:
+        if not await aiofiles.os.path.islink(config_path) and (
+            stat_result is not None and stat_result.st_size > 0
+        ):
+            already_backed_up = False
+            prefix = f"{config_path.name}.corrupt."
+            for sibling_name in await aiofiles.os.listdir(config_path.parent):
+                if not sibling_name.startswith(prefix) or not sibling_name.endswith(".bak"):
+                    continue
+                try:
+                    sibling_stat = await aiofiles.os.stat(
+                        config_path.parent / sibling_name
+                    )
+                except OSError:
+                    continue
+                if sibling_stat.st_size == stat_result.st_size:
+                    already_backed_up = True
+                    break
+            if not already_backed_up:
+                timestamp = time.strftime("%Y%m%d-%H%M%S")
+                candidate = config_path.with_name(
+                    f"{config_path.name}.corrupt.{timestamp}.bak"
+                )
+                async with aiofiles.open(config_path, "rb") as source:
+                    payload = await source.read()
+                try:
+                    async with aiofiles.open(candidate, "xb") as destination:
+                        candidate_created = True
+                        await destination.write(payload)
+                except FileExistsError:
+                    candidate = None
+                if candidate_created:
+                    try:
+                        set_mode = aiofiles.os.wrap(os.chmod)
+                        await set_mode(candidate, stat.S_IMODE(stat_result.st_mode))
+                        set_times = aiofiles.os.wrap(os.utime)
+                        await set_times(
+                            candidate,
+                            ns=(stat_result.st_atime_ns, stat_result.st_mtime_ns),
+                        )
+                    except OSError:
+                        pass
+                    backup_path = candidate
+                    backup_complete = True
+    except asyncio.CancelledError:
+        if candidate_created and not backup_complete and candidate is not None:
+            try:
+                await aiofiles.os.remove(candidate)
+            except OSError:
+                pass
+        raise
+    except Exception:
+        if candidate_created and not backup_complete and candidate is not None:
+            try:
+                await aiofiles.os.remove(candidate)
+            except OSError:
+                pass
+        backup_path = None
+
+    if fallback == "last-known-good":
+        message = (
+            f"Failed to parse {config_path}: {exc}. "
+            f"Failed to parse {config_path}: {exc}. "
+            "Keeping the previously loaded config for this process — "
+            "edits to config.yaml are being IGNORED until the YAML is fixed."
+        )
+    else:
+        message = (
+            f"Failed to parse {config_path}: {exc}. "
+            "Falling back to default config — every user override "
+            "(auxiliary providers, fallback chain, model settings) is being "
+            "IGNORED. Fix the YAML and restart."
+        )
+    if backup_path is not None:
+        message += f" A copy of the corrupted file was saved to {backup_path}."
+    logger.warning(message)
+    try:
+        sys.stderr.write(f"⚠️  hermes config: {message}\n")
+        sys.stderr.flush()
+    except Exception:
+        pass
+
 _IS_WINDOWS = platform.system() == "Windows"
 _ENV_VAR_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
@@ -255,6 +361,22 @@ _RAW_CONFIG_CACHE: Dict[str, Tuple[int, int, Dict[str, Any]]] = {}
 # calls read_raw_config. Also covers mutation of the module-level cache
 # dicts above.
 _CONFIG_LOCK = threading.RLock()
+_ASYNC_CONFIG_LOCKS: weakref.WeakKeyDictionary[
+    asyncio.AbstractEventLoop, weakref.ReferenceType[asyncio.Lock]
+] = weakref.WeakKeyDictionary()
+
+
+def _get_async_config_lock() -> asyncio.Lock:
+    """Return the config lock owned by the active event loop."""
+    loop = asyncio.get_running_loop()
+    lock_ref = _ASYNC_CONFIG_LOCKS.get(loop)
+    lock = lock_ref() if lock_ref is not None else None
+    if lock is None:
+        lock = asyncio.Lock()
+        _ASYNC_CONFIG_LOCKS[loop] = weakref.ref(lock)
+    return lock
+
+
 # Env var names written to .env that aren't in OPTIONAL_ENV_VARS
 # (managed by setup/provider flows directly).
 _EXTRA_ENV_KEYS = frozenset({
@@ -2702,53 +2824,125 @@ def load_config() -> Dict[str, Any]:
 async def load_config_readonly() -> Dict[str, Any]:
     """Load behavioral configuration without synchronous file I/O.
 
-    This is intentionally a read-only, uncached async snapshot for the agent
-    turn. CLI/setup code may keep using :func:`load_config`, whose process-wide
-    cache and synchronous lock are useful there. Async callers must not enter
-    that lock while the event loop is serving model/tool work.
+    Preserve the upstream read-only cache contract through native async file
+    operations: file signatures and referenced environment values invalidate
+    the cache, repeat hits return the same object, managed policy wins at the
+    leaf, and malformed edits retain the last-known-good configuration.
     """
     import aiofiles
     import aiofiles.os
 
-    config_path = get_config_path()
-    config = copy.deepcopy(DEFAULT_CONFIG)
-
-    async def _read_yaml(path: Path) -> Dict[str, Any]:
+    async def _signature(
+        path: Path, *, suppress_os_error: bool = False
+    ) -> Optional[Tuple[int, int]]:
         try:
-            if not await aiofiles.os.path.isfile(path):
-                return {}
-            async with aiofiles.open(path, encoding="utf-8") as handle:
-                data = fast_safe_load(await handle.read()) or {}
-            return data if isinstance(data, dict) else {}
+            stat_result = await aiofiles.os.stat(path)
         except FileNotFoundError:
-            return {}
-        except Exception as exc:
-            logger.debug("Async config read failed for %s: %s", path, exc)
-            return {}
+            return None
+        except OSError:
+            if suppress_os_error:
+                return None
+            raise
+        return stat_result.st_mtime_ns, stat_result.st_size
 
-    user_config = await _read_yaml(config_path)
-    if "max_turns" in user_config:
-        agent_user_config = dict(user_config.get("agent") or {})
-        if agent_user_config.get("max_turns") is None:
-            agent_user_config["max_turns"] = user_config["max_turns"]
-        user_config["agent"] = agent_user_config
-        user_config.pop("max_turns", None)
-    config = _deep_merge(config, user_config)
+    async def _read_yaml(path: Path) -> Any:
+        async with aiofiles.open(path, encoding="utf-8") as handle:
+            return fast_safe_load(await handle.read()) or {}
 
-    normalized = _normalize_root_model_keys(_normalize_max_turns_config(config))
-    expanded = _expand_env_vars(normalized)
+    async with _get_async_config_lock():
+        config_path = get_config_path()
+        path_key = str(config_path)
+        user_sig = await _signature(config_path)
 
-    # Managed configuration is an optional policy overlay.  Read it through
-    # the same async helper when present; never call managed_scope's blocking
-    # loader from an active turn.
-    from hermes_cli import managed_scope
+        from hermes_cli import managed_scope
 
-    managed_dir = managed_scope._managed_dir_candidate()
-    if managed_dir:
-        managed_config = await _read_yaml(Path(managed_dir) / "config.yaml")
+        managed_dir = managed_scope._managed_dir_candidate()
+        managed_path = Path(managed_dir) / "config.yaml" if managed_dir else None
+        managed_sig = (
+            await _signature(managed_path, suppress_os_error=True)
+            if managed_path
+            else None
+        )
+        managed_cache_sig = managed_sig or (0, 0)
+
+        if user_sig is not None:
+            cache_sig: Optional[Tuple[int, int, int, int]] = (
+                user_sig[0],
+                user_sig[1],
+                managed_cache_sig[0],
+                managed_cache_sig[1],
+            )
+        elif managed_sig is not None:
+            cache_sig = (0, 0, managed_sig[0], managed_sig[1])
+        else:
+            cache_sig = None
+
+        cached = _LOAD_CONFIG_CACHE.get(path_key)
+        if cached is not None and cache_sig is not None and cached[:4] == cache_sig:
+            env_snapshot = cached[5] if len(cached) > 5 else {}
+            if all(
+                os.environ.get(key) == value
+                for key, value in env_snapshot.items()
+            ):
+                return cached[4]
+
+        config = copy.deepcopy(DEFAULT_CONFIG)
+        if user_sig is not None:
+            try:
+                user_config = await _read_yaml(config_path)
+                if "max_turns" in user_config:
+                    agent_user_config = dict(user_config.get("agent") or {})
+                    if agent_user_config.get("max_turns") is None:
+                        agent_user_config["max_turns"] = user_config["max_turns"]
+                    user_config["agent"] = agent_user_config
+                    user_config.pop("max_turns", None)
+                config = _deep_merge(config, user_config)
+            except Exception as exc:
+                last_known_good = _LAST_EXPANDED_CONFIG_BY_PATH.get(path_key)
+                await _warn_config_parse_failure_from_event_loop(
+                    config_path,
+                    exc,
+                    fallback=(
+                        "last-known-good" if last_known_good is not None else "defaults"
+                    ),
+                )
+                if last_known_good is not None:
+                    retained = _expand_env_vars(copy.deepcopy(last_known_good))
+                    if cache_sig is not None:
+                        _LOAD_CONFIG_CACHE[path_key] = (*cache_sig, retained, {})
+                    return retained
+
+        normalized = _normalize_root_model_keys(_normalize_max_turns_config(config))
+        expanded = _expand_env_vars(normalized)
+        managed_config: Dict[str, Any] = {}
+        if managed_path is not None and managed_sig is not None:
+            try:
+                parsed_managed_config = await _read_yaml(managed_path)
+                if isinstance(parsed_managed_config, dict):
+                    managed_config = parsed_managed_config
+            except Exception as exc:
+                logger.warning(
+                    "managed scope: failed to parse %s: %s — IGNORING this managed "
+                    "file. Admin policy from this file is NOT being applied. Fix "
+                    "and restart.",
+                    managed_path,
+                    exc,
+                )
         if managed_config:
-            expanded = _deep_merge(expanded, _expand_env_vars(managed_config))
-    return expanded
+            managed_expanded = _expand_env_vars(managed_config)
+            expanded = _deep_merge(expanded, managed_expanded)
+
+        _LAST_EXPANDED_CONFIG_BY_PATH[path_key] = copy.deepcopy(expanded)
+        if cache_sig is not None:
+            cached_copy = copy.deepcopy(expanded)
+            env_snapshot = _env_ref_snapshot(normalized)
+            if managed_config:
+                _env_ref_snapshot(managed_config, env_snapshot)
+            _LOAD_CONFIG_CACHE[path_key] = (*cache_sig, cached_copy, env_snapshot)
+            return cached_copy
+
+        _LOAD_CONFIG_CACHE.pop(path_key, None)
+        return expanded
 
 
 TERMINAL_CONFIG_ENV_MAP = {
