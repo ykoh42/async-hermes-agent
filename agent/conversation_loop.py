@@ -6921,6 +6921,140 @@ async def run_conversation(
                 ):
                     messages.pop()
 
+                try:
+                    from agent.verification_stop import (
+                        build_verify_on_stop_nudge,
+                        verify_on_stop_enabled,
+                    )
+
+                    if await verify_on_stop_enabled():
+                        _verify_nudge = await build_verify_on_stop_nudge(
+                            session_id=getattr(agent, "session_id", None),
+                            changed_paths=getattr(
+                                agent, "_turn_file_mutation_paths", set()
+                            ),
+                            attempts=getattr(
+                                agent, "_verification_stop_nudges", 0
+                            ),
+                        )
+                    else:
+                        _verify_nudge = None
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.debug(
+                        "verification stop-loop check failed", exc_info=True
+                    )
+                    _verify_nudge = None
+
+                if _verify_nudge:
+                    agent._verification_stop_nudges = (
+                        getattr(agent, "_verification_stop_nudges", 0) + 1
+                    )
+                    final_msg["finish_reason"] = "verification_required"
+                    agent._emit_interim_assistant_message(final_msg)
+                    messages.append(final_msg)
+                    try:
+                        await agent._flush_messages_to_session_db(
+                            messages, conversation_history
+                        )
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        logger.debug(
+                            "verify-on-stop interim flush failed", exc_info=True
+                        )
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": _verify_nudge,
+                            "_verification_stop_synthetic": True,
+                        }
+                    )
+                    agent._session_messages = messages
+                    logger.debug(
+                        "verification stop-loop nudge issued (attempt %d)",
+                        agent._verification_stop_nudges,
+                    )
+                    _pending_verification_response = final_response
+                    _pending_verification_response_previewed = (
+                        agent._interim_content_was_streamed(final_response or "")
+                    )
+                    final_response = None
+                    continue
+
+                _verify_nudge2 = None
+                _edited = sorted(
+                    getattr(agent, "_turn_file_mutation_paths", set()) or []
+                )
+                _attempt = getattr(agent, "_pre_verify_nudges", 0)
+                try:
+                    from agent.verify_hooks import max_verify_nudges
+                    from hermes_cli.lifecycle import has_hook
+                    from hermes_cli.plugins import get_pre_verify_continue_message
+
+                    if (
+                        _edited
+                        and has_hook("pre_verify")
+                        and _attempt < await max_verify_nudges()
+                    ):
+                        coding = getattr(agent, "_resolved_is_coding", None)
+                        if coding is None:
+                            from agent.coding_context import is_coding_context
+
+                            coding = await is_coding_context(
+                                platform=getattr(agent, "platform", "") or ""
+                            )
+                            agent._resolved_is_coding = coding
+                        _verify_nudge2 = await get_pre_verify_continue_message(
+                            session_id=getattr(agent, "session_id", None) or "",
+                            platform=getattr(agent, "platform", "") or "",
+                            model=getattr(agent, "model", "") or "",
+                            coding=bool(coding),
+                            attempt=_attempt,
+                            final_response=final_response or "",
+                            changed_paths=_edited,
+                        )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.debug("pre_verify hook check failed", exc_info=True)
+                    _verify_nudge2 = None
+
+                if _verify_nudge2:
+                    agent._pre_verify_nudges = _attempt + 1
+                    final_msg["finish_reason"] = "verify_hook_continue"
+                    agent._emit_interim_assistant_message(final_msg)
+                    messages.append(final_msg)
+                    try:
+                        await agent._flush_messages_to_session_db(
+                            messages, conversation_history
+                        )
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        logger.debug(
+                            "pre_verify interim flush failed", exc_info=True
+                        )
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": _verify_nudge2,
+                            "_pre_verify_synthetic": True,
+                        }
+                    )
+                    agent._session_messages = messages
+                    logger.debug(
+                        "pre_verify nudge issued (attempt %d)",
+                        agent._pre_verify_nudges,
+                    )
+                    _pending_verification_response = final_response
+                    _pending_verification_response_previewed = (
+                        agent._interim_content_was_streamed(final_response or "")
+                    )
+                    final_response = None
+                    continue
+
                 messages.append(final_msg)
                 
                 _turn_exit_reason = f"text_response(finish_reason={finish_reason})"

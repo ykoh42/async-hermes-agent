@@ -231,19 +231,6 @@ class _EngineCollector:
             )
             return
 
-        # Reject conflicts with built-in commands.
-        try:
-            from hermes_cli.commands import resolve_command
-            if resolve_command(clean) is not None:
-                logger.warning(
-                    "Context engine '%s' tried to register command '/%s' which conflicts "
-                    "with a built-in command. Skipping.",
-                    self._engine_name, clean,
-                )
-                return
-        except Exception:
-            pass
-
         try:
             from hermes_cli.plugins import get_plugin_manager
             manager = get_plugin_manager()

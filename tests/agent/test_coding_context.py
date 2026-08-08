@@ -269,7 +269,7 @@ class TestRuntimeMode:
         assert mode.is_coding is False
         assert mode.kind == "general"
         # General posture pins no toolset and injects no blocks.
-        assert mode.toolset_selection() is None
+        assert await mode.toolset_selection() is None
         assert await mode.system_blocks() == []
 
 

@@ -256,20 +256,6 @@ def _stub_runtime_main():
 
 class TestPrologueStamping:
     @pytest.mark.asyncio
-    async def test_stamps_api_content_from_gateway_context(self):
-        agent = _FakeAgent()
-        agent._gateway_turn_context_notes = "GATEWAY-NOTE"
-        ctx = await _build(agent)
-        msg = ctx.messages[ctx.current_turn_user_idx]
-        assert msg["content"] == "hello"  # clean content untouched
-        assert msg["api_content"] == compose_user_api_content(
-            "hello", ctx.ext_prefetch_cache, ctx.plugin_user_context
-        )
-        assert msg["api_content"] == "hello\n\nGATEWAY-NOTE"
-        # The early persist saw the stamped sidecar (written in one insert).
-        assert agent.api_content_at_persist == "hello\n\nGATEWAY-NOTE"
-
-    @pytest.mark.asyncio
     async def test_no_stamp_without_injections(self):
         agent = _FakeAgent()
         with patch(

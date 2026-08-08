@@ -10,7 +10,7 @@ fork inherits the cached prompt verbatim.
 Three tiers are joined with ``\\n\\n``:
 
 * ``stable``   — identity (SOUL.md or DEFAULT_AGENT_IDENTITY), tool
-  guidance, computer-use guidance, nous subscription block, tool-use
+  guidance, Nous subscription block, tool-use
   enforcement guidance + per-model operational guidance, skills prompt,
   alibaba model-name workaround, environment hints, coding guidance,
   platform hints.
@@ -25,6 +25,7 @@ Pure helpers that read the agent's state.  AIAgent keeps thin forwarders.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -34,23 +35,19 @@ from agent.prompt_builder import (
     DEFAULT_AGENT_IDENTITY,
     GOOGLE_MODEL_OPERATIONAL_GUIDANCE,
     HERMES_AGENT_HELP_GUIDANCE,
-    KANBAN_GUIDANCE,
     MEMORY_GUIDANCE,
     OPENAI_MODEL_EXECUTION_GUIDANCE,
     PARALLEL_TOOL_CALL_GUIDANCE,
-    PLATFORM_HINTS,
     SESSION_SEARCH_GUIDANCE,
     SKILLS_GUIDANCE,
     STEER_CHANNEL_NOTE,
     TASK_COMPLETION_GUIDANCE,
-    TELEGRAM_RICH_MESSAGES_HINT,
     TOOL_USE_ENFORCEMENT_GUIDANCE,
     TOOL_USE_ENFORCEMENT_MODELS,
     drain_truncation_warnings,
 )
 from agent.runtime_cwd import resolve_context_cwd
 from hermes_constants import get_hermes_home
-from utils import is_truthy_value
 
 logger = logging.getLogger(__name__)
 
@@ -117,36 +114,6 @@ def _resolve_platform_hint(agent: Any, platform_key: str, default_hint: str) -> 
     if isinstance(append_text, str) and append_text.strip():
         return f"{base}\n\n{append_text.strip()}".strip()
     return base
-
-
-_TUI_EMBEDDED_PANE_CLARIFIER = (
-    " You're in its embedded terminal pane, beside the GUI chat — the user can "
-    "select your output (Option-drag on macOS, Shift-drag elsewhere) and press "
-    "Cmd/Ctrl+L to send it to the chat composer."
-)
-
-
-def _tui_embedded_pane_clarifier(hint: str) -> str:
-    """Append the desktop-embedded-terminal-pane clarifier to a tui hint.
-
-    Triggered by ``HERMES_DESKTOP_TERMINAL=1`` (set by ``main.cjs`` only on the
-    shell env of the desktop's embedded TUI PTY — never on the chat backend).
-    This is a runtime-surface qualifier, not a config override, so it lives at
-    the resolution site rather than inside ``_resolve_platform_hint`` (which
-    is purely the config-platform_hints override applier). Byte-stable for the
-    cache: called once per session build, deterministically from env state.
-
-    Idempotent and empty-safe: re-applying on an already-augmented hint is a
-    no-op, and an empty input returns empty (we never synthesize the
-    clarifier without its tui framing).
-    """
-    if not hint:
-        return hint
-    if _TUI_EMBEDDED_PANE_CLARIFIER in hint:
-        return hint
-    if not is_truthy_value(os.getenv("HERMES_DESKTOP_TERMINAL")):
-        return hint
-    return hint + _TUI_EMBEDDED_PANE_CLARIFIER
 
 
 async def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) -> Dict[str, str]:
@@ -233,16 +200,6 @@ async def build_system_prompt_parts(agent: Any, system_message: Optional[str] = 
         tool_guidance.append(SESSION_SEARCH_GUIDANCE)
     if "skill_manage" in agent.valid_tool_names:
         tool_guidance.append(SKILLS_GUIDANCE)
-    # Kanban worker/orchestrator lifecycle — only present when the
-    # dispatcher spawned this process (kanban_show check_fn gates on
-    # HERMES_KANBAN_TASK env var). Normal chat sessions never see
-    # this block. Resolved with the first async tool snapshot.
-    _kanban_guidance = getattr(agent, "_kanban_worker_guidance", None)
-    if _kanban_guidance:
-        tool_guidance.append(_kanban_guidance)
-    elif _kanban_guidance is None and "kanban_show" in agent.valid_tool_names:
-        # Fallback for code paths that bypass agent_init (rare).
-        tool_guidance.append(KANBAN_GUIDANCE)
     if tool_guidance:
         stable_parts.append(" ".join(tool_guidance))
 
@@ -250,14 +207,6 @@ async def build_system_prompt_parts(agent: Any, system_message: Optional[str] = 
     # agent has tools. Static text → byte-stable prompt (no cache hit).
     if agent.valid_tool_names:
         stable_parts.append(STEER_CHANNEL_NOTE)
-
-    # Computer-use — goes in as its own block rather than being merged into
-    # tool_guidance because the content is multi-paragraph. The guidance is
-    # rendered for the host platform so Windows/Linux hosts don't see
-    # macOS-only wording (Mac, Space, cmd+s).
-    if "computer_use" in agent.valid_tool_names:
-        from agent.prompt_builder import computer_use_guidance
-        stable_parts.append(computer_use_guidance())
 
     # Tool-use enforcement: tells the model to actually call tools instead
     # of describing intended actions.  Controlled by config.yaml
@@ -387,6 +336,21 @@ async def build_system_prompt_parts(agent: Any, system_message: Optional[str] = 
         stable_parts.extend(coding_trailing_parts)
         post_workspace_parts = stable_parts
 
+    # The probe is deterministic for the process lifetime and is cached before
+    # this prompt is frozen. It emits nothing for a healthy local toolchain or
+    # for a remote terminal backend.
+    if getattr(agent, "_environment_probe", True):
+        try:
+            from tools.env_probe import get_environment_probe_line
+
+            probe_line = await get_environment_probe_line()
+            if probe_line:
+                post_workspace_parts.append(probe_line)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            pass
+
     # Active-profile hint — names the Hermes profile the agent is running
     # under so it doesn't conflate ~/.hermes/skills/ (default profile) with
     # ~/.hermes/profiles/<active>/skills/ (this profile's). Deterministic
@@ -404,9 +368,9 @@ async def build_system_prompt_parts(agent: Any, system_message: Optional[str] = 
         post_workspace_parts.append(
             "Active Hermes profile: default. Other profiles (if any) live "
             "under " + str(get_hermes_home()) + "/profiles/<name>/. Each profile has its own "
-            "skills/, plugins/, cron/, and memories/ that affect a different "
+            "skills/, plugins/, and memories/ that affect a different "
             "session than this one. Do not modify another profile's "
-            "skills/plugins/cron/memories unless the user explicitly directs "
+            "skills/plugins/memories unless the user explicitly directs "
             "you to."
         )
     else:
@@ -414,47 +378,16 @@ async def build_system_prompt_parts(agent: Any, system_message: Optional[str] = 
             f"Active Hermes profile: {active_profile}. This session reads "
             f"and writes {get_hermes_home()}/profiles/{active_profile}/. The default "
             f"profile's data lives at {get_hermes_home()}/skills/, {get_hermes_home()}/plugins/, "
-            f"{get_hermes_home()}/cron/, {get_hermes_home()}/memories/ — those belong to a "
+            f"{get_hermes_home()}/memories/ — those belong to a "
             f"different session run from a different shell. Do NOT modify "
-            f"another profile's skills/plugins/cron/memories unless the user "
+            f"another profile's skills/plugins/memories unless the user "
             f"explicitly directs you to. The cross-profile write guard will "
             f"refuse such writes by default; pass cross_profile=True only "
             f"after explicit direction."
         )
 
     platform_key = (agent.platform or "").lower().strip()
-    # Resolve the built-in/plugin default hint for this platform, then apply
-    # any per-platform override from config (platform_hints.<platform>).
-    _default_hint = ""
-    if platform_key in PLATFORM_HINTS:
-        _default_hint = PLATFORM_HINTS[platform_key]
-    elif platform_key:
-        # Check plugin registry for platform-specific LLM guidance
-        try:
-            from gateway.platform_registry import platform_registry
-            _entry = platform_registry.get(platform_key)
-            if _entry and _entry.platform_hint:
-                _default_hint = _entry.platform_hint
-        except Exception:
-            pass
-
-    # For Telegram: append the rich-messages extension only when the user has
-    # opted in to ``platforms.telegram.extra.rich_messages: true``.  The base
-    # hint covers MarkdownV2-compatible constructs; the extension adds Bot API
-    # 10.1 guidance (tables, task lists, math, collapsible details, etc.).
-    if platform_key == "telegram" and _default_hint:
-        try:
-            from hermes_cli.config import load_config_readonly
-            _cfg = await load_config_readonly()
-            _tg_extra = ((_cfg.get("platforms") or {}).get("telegram") or {}).get("extra") or {}
-            if _tg_extra.get("rich_messages"):
-                _default_hint = _default_hint.rstrip() + " " + TELEGRAM_RICH_MESSAGES_HINT
-        except Exception:
-            pass  # Config read failure — fall back to base hint only
-
-    _effective_hint = _resolve_platform_hint(agent, platform_key, _default_hint)
-    if platform_key == "tui" and _effective_hint:
-        _effective_hint = _tui_embedded_pane_clarifier(_effective_hint)
+    _effective_hint = _resolve_platform_hint(agent, platform_key, "")
     if _effective_hint:
         post_workspace_parts.append(_effective_hint)
 
@@ -515,7 +448,7 @@ async def build_system_prompt_parts(agent: Any, system_message: Optional[str] = 
             logger.debug("External memory system-prompt block failed", exc_info=True)
 
     from hermes_time import now as _hermes_now
-    now = _hermes_now()
+    now = await _hermes_now()
     # Date-only (not minute-precision) so the system prompt is byte-stable
     # for the full day.  Minute-precision changes invalidate prefix-cache KV
     # on every rebuild path (compression boundary, fresh-agent gateway turns,

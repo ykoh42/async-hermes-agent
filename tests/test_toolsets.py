@@ -1,6 +1,7 @@
 """Tests for toolsets.py — toolset resolution, validation, and composition."""
 
 from tools.registry import ToolRegistry
+from model_tools import get_all_tool_names
 from toolsets import (
     TOOLSETS,
     get_toolset,
@@ -30,15 +31,6 @@ class TestGetToolset:
         ts = get_toolset("web")
         assert ts is not None
         assert "web_search" in ts["tools"]
-
-    def test_x_search_toolset_marks_read_only_and_points_to_xurl(self):
-        ts = get_toolset("x_search")
-        assert ts is not None
-        assert ts["tools"] == ["x_search"]
-        description = ts["description"].lower()
-        assert "read-only" in description
-        assert "xurl" in description
-        assert "authenticated" in description
 
     def test_merges_registry_tools_into_builtin_toolset(self, monkeypatch):
         reg = ToolRegistry()
@@ -197,6 +189,16 @@ class TestToolsetConsistency:
             assert "description" in ts, f"{name} missing description"
             assert "tools" in ts, f"{name} missing tools"
             assert "includes" in ts, f"{name} missing includes"
+
+    def test_static_toolsets_only_reference_registered_tools(self):
+        registered = set(get_all_tool_names())
+        missing = {
+            tool
+            for toolset in TOOLSETS.values()
+            for tool in toolset["tools"]
+            if tool not in registered
+        }
+        assert not missing
 
 class TestPluginToolsets:
     def test_get_all_toolsets_includes_plugin_toolset(self, monkeypatch):

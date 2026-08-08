@@ -72,7 +72,11 @@ DELEGATE_BLOCKED_TOOLS = frozenset(
 # Both emit a logger.warning for audit; gateway sessions are unaffected
 # because they resolve approvals via tools/approval.py's per-session queue,
 # not through these TLS callbacks.
-async def _subagent_auto_deny(command: str, description: str, **kwargs) -> str:
+async def _subagent_auto_deny(  # noqa: ASYNC124 - async approval callback protocol
+    command: str,
+    description: str,
+    **kwargs,
+) -> str:
     """Auto-deny dangerous commands in subagent tasks (safe default).
 
     Returns 'deny' so the subagent sees a refusal it can recover from, and
@@ -86,7 +90,11 @@ async def _subagent_auto_deny(command: str, description: str, **kwargs) -> str:
     return "deny"
 
 
-async def _subagent_auto_approve(command: str, description: str, **kwargs) -> str:
+async def _subagent_auto_approve(  # noqa: ASYNC124 - async approval callback protocol
+    command: str,
+    description: str,
+    **kwargs,
+) -> str:
     """Auto-approve dangerous commands in subagent tasks (opt-in YOLO).
 
     Only installed when delegation.subagent_auto_approve=true. Returns 'once'
@@ -874,7 +882,6 @@ def _strip_blocked_tools(toolsets: List[str]) -> List[str]:
         if name in _COMPOSITE_BLOCKED_TOOLSETS
         or all(t in DELEGATE_BLOCKED_TOOLS for t in defn.get("tools", []))
     }
-    blocked_toolset_names.add("kanban")
     return [t for t in toolsets if t not in blocked_toolset_names]
 
 
@@ -1269,7 +1276,7 @@ async def _build_child_agent(
         ]
     child_disabled_toolsets = list(
         dict.fromkeys(
-            inherited_disabled + _blocked_toolsets_for_role(effective_role) + ["kanban"]
+            inherited_disabled + _blocked_toolsets_for_role(effective_role)
         )
     )
 
@@ -2416,6 +2423,37 @@ async def _run_child_lifecycle(
     return result
 
 
+def _format_background_completion(
+    delegation_id: str,
+    task_list: List[Dict[str, Any]],
+    combined: Dict[str, Any],
+) -> str:
+    """Build the self-contained completion turn used by upstream delivery."""
+    results = combined.get("results") or []
+    lines = [
+        f"[ASYNC DELEGATION BATCH COMPLETE — {delegation_id}]",
+        (
+            f"A background fan-out of {len(task_list)} subagent(s) dispatched "
+            "earlier has finished. Its consolidated results follow."
+        ),
+        "",
+    ]
+    for index, task in enumerate(task_list):
+        result = results[index] if index < len(results) else {}
+        lines.append(f"## Task {index + 1}: {task.get('goal', '')}")
+        if task.get("context"):
+            lines.append(f"Context provided: {task['context']}")
+        lines.append(f"Status: {result.get('status', 'unknown')}")
+        summary = result.get("summary") or result.get("error") or "No result returned."
+        lines.append(str(summary))
+        lines.append("")
+    lines.append(
+        f"Total duration: {combined.get('total_duration_seconds', '?')}s. "
+        "Use these results now, but verify any claimed external side effect."
+    )
+    return "\n".join(lines)
+
+
 def _recover_tasks_from_json_string(
     tasks: Any,
 ) -> tuple[Optional[List[Dict[str, Any]]], Optional[str]]:
@@ -2479,9 +2517,11 @@ async def delegate_task(
     # Normalise the top-level role once; per-task overrides re-normalise.
     top_role = _normalize_role(role)
 
-    # The argument remains in the public schema for source compatibility. In
-    # the native async library, delegation is awaited by the current turn; the
-    # event loop remains free while child agents run.
+    background = (
+        is_truthy_value(background, default=False)
+        if background is not None
+        else False
+    )
 
     # Depth limit — configurable via delegation.max_spawn_depth,
     # default 2 for parity with the original MAX_DEPTH constant.
@@ -2647,6 +2687,99 @@ async def delegate_task(
             "results": results,
             "total_duration_seconds": round(time.monotonic() - overall_start, 2),
         }
+
+    if background:
+        background_tasks = parent_agent._background_delegations
+        active_count = sum(not task.done() for task in background_tasks)
+        if active_count < max_children:
+            import uuid as _uuid
+
+            delegation_id = f"deleg_{_uuid.uuid4().hex[:12]}"
+
+            async def _run_in_background() -> None:
+                try:
+                    combined = await _execute_and_aggregate()
+                    completion = _format_background_completion(
+                        delegation_id,
+                        task_list,
+                        combined,
+                    )
+                    if getattr(parent_agent, "_closed", False):
+                        return
+                    response = await parent_agent.run_conversation(
+                        completion,
+                        persist_user_display_kind="async_delegation_complete",
+                        persist_user_display_metadata={
+                            "delegation_id": delegation_id,
+                            "count": n_tasks,
+                        },
+                    )
+                    callback = getattr(parent_agent, "event_callback", None)
+                    if callback:
+                        callback(
+                            "delegation:complete",
+                            {
+                                "delegation_id": delegation_id,
+                                "results": combined["results"],
+                                "response": response,
+                            },
+                        )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.exception(
+                        "Background delegation %s failed",
+                        delegation_id,
+                    )
+                    callback = getattr(parent_agent, "event_callback", None)
+                    if callback:
+                        try:
+                            callback(
+                                "delegation:error",
+                                {
+                                    "delegation_id": delegation_id,
+                                    "error": str(exc),
+                                },
+                            )
+                        except Exception:
+                            logger.debug(
+                                "Background delegation error callback failed",
+                                exc_info=True,
+                            )
+
+            task = asyncio.create_task(
+                _run_in_background(),
+                name=f"delegate-background-{delegation_id}",
+            )
+            background_tasks.add(task)
+            task.add_done_callback(background_tasks.discard)
+            for _index, _task_spec, child in children:
+                try:
+                    parent_agent._active_children.remove(child)
+                except ValueError:
+                    pass
+            return json.dumps(
+                {
+                    "status": "dispatched",
+                    "mode": "background",
+                    "count": n_tasks,
+                    "delegation_id": delegation_id,
+                    "goals": [task["goal"] for task in task_list],
+                    "note": (
+                        "Subagent work is running in the background. Its "
+                        "consolidated result will re-enter this agent as a "
+                        "new turn when all children finish. Do not poll."
+                    ),
+                },
+                ensure_ascii=False,
+            )
+
+        combined = await _execute_and_aggregate()
+        combined["note"] = (
+            "The background delegation limit was reached, so this work was "
+            "awaited and its result is included above."
+        )
+        return json.dumps(combined, ensure_ascii=False)
 
     return json.dumps(await _execute_and_aggregate(), ensure_ascii=False)
 
@@ -2949,9 +3082,9 @@ def _build_top_level_description() -> str:
         f"2. Batch (parallel): provide 'tasks' array with up to {max_children} "
         f"items concurrently for this user (configured via "
         f"delegation.max_concurrent_children in config.yaml). {nesting_clause}\n\n"
-        "Both modes are awaited without blocking the event loop. A batch runs "
-        "its children concurrently and returns one consolidated result after "
-        "all children finish.\n\n"
+        "Top-level model calls run in the background: dispatch returns "
+        "immediately, and one consolidated result re-enters the conversation "
+        "after all children finish. Nested orchestrators await their workers.\n\n"
         "WHEN TO USE delegate_task:\n"
         "- Reasoning-heavy subtasks (debugging, code review, research synthesis)\n"
         "- Tasks that would flood your context with intermediate data\n"
@@ -3130,8 +3263,14 @@ DELEGATE_TASK_SCHEMA = {
             "background": {
                 "type": "boolean",
                 "description": (
-                    "DEPRECATED / IGNORED. Native async delegation is awaited "
-                    "by the current turn; setting this has no effect."
+                    "DEPRECATED / IGNORED. Top-level single and batch "
+                    "delegations run in the background automatically — "
+                    "you do not need to (and cannot) opt in or out. A "
+                    "single result or consolidated batch result "
+                    "re-enters the conversation when the work finishes; "
+                    "just continue working in the meantime. Setting this "
+                    "has no effect; the parameter remains only for "
+                    "backward compatibility."
                 ),
             },
         },
@@ -3167,14 +3306,15 @@ def _strip_model_hidden_task_fields(tasks: Any) -> Any:
 
 
 async def _handle_delegate_task(args: dict, **kwargs) -> str:
+    parent_agent = kwargs.get("parent_agent")
     return await delegate_task(
         goal=args.get("goal"),
         context=args.get("context"),
         tasks=_strip_model_hidden_task_fields(args.get("tasks")),
         max_iterations=args.get("max_iterations"),
         role=args.get("role"),
-        background=args.get("background"),
-        parent_agent=kwargs.get("parent_agent"),
+        background=getattr(parent_agent, "_delegate_depth", 0) == 0,
+        parent_agent=parent_agent,
     )
 
 

@@ -3,8 +3,8 @@
 When ``compress_context`` rotates ``agent.session_id`` it updates the
 gateway/tools session context (``gateway.session_context.set_current_session_id``,
 which moves ``HERMES_SESSION_ID`` env + ContextVar). The ``[session_id]`` tag on
-log lines comes from a SEPARATE mechanism — ``hermes_logging._session_context``
-(a threading.local read by the global LogRecord factory), set once per turn in
+log lines comes from a SEPARATE mechanism — ``hermes_logging._session_id_var``
+(a ContextVar read by the global LogRecord factory), set once per turn in
 ``conversation_loop.py``. Before the fix, the rotation block never updated it, so
 log lines emitted after a mid-turn compaction carried the STALE old id while the
 message body / session DB / gateway state carried the new one (see #34089). This
@@ -13,6 +13,7 @@ asserts the logging context follows the rotation.
 
 from __future__ import annotations
 
+import asyncio
 import os
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -76,7 +77,7 @@ async def test_logging_session_context_follows_compression_rotation(tmp_path: Pa
         assert agent.session_id != parent_sid
 
         # The logging context must now match the NEW id, not the stale one.
-        current = getattr(hermes_logging._session_context, "session_id", None)
+        current = hermes_logging._session_id_var.get()
         assert current == agent.session_id, (
             "Logging session context did not follow the compaction rotation: "
             f"log tag still {current!r}, agent.session_id is {agent.session_id!r} "
@@ -86,3 +87,24 @@ async def test_logging_session_context_follows_compression_rotation(tmp_path: Pa
         hermes_logging.clear_session_context()
         await agent.close()
         await db.close()
+
+
+@pytest.mark.asyncio
+async def test_logging_session_context_is_isolated_between_tasks() -> None:
+    ready = [asyncio.Event(), asyncio.Event()]
+    release = asyncio.Event()
+
+    async def observe(index: int, session_id: str) -> str | None:
+        hermes_logging.set_session_context(session_id)
+        ready[index].set()
+        await release.wait()
+        return hermes_logging._session_id_var.get()
+
+    tasks = [
+        asyncio.create_task(observe(0, "session-a")),
+        asyncio.create_task(observe(1, "session-b")),
+    ]
+    await asyncio.gather(*(event.wait() for event in ready))
+    release.set()
+
+    assert await asyncio.gather(*tasks) == ["session-a", "session-b"]

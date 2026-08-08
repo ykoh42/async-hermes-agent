@@ -238,13 +238,8 @@ class TestPluginDiscovery:
     async def test_force_rediscover_clears_all_plugin_registries(self, monkeypatch):
         """force=True must clear every plugin-populated registry.
 
-        Regression: ``_plugin_platform_names`` was populated by
-        ``register_platform`` but omitted from the ``discover_and_load(force=True)``
-        clear block, so a platform plugin disabled between force-rediscovers
-        left a stale entry behind forever (the set diverged from the real
-        platform_registry / _plugins truth). This asserts the clear block
-        empties the full set of per-plugin registries so no future addition
-        silently leaks across a force pass either.
+        Every registry populated through ``PluginContext`` must be reset before
+        rediscovery so a disabled plugin cannot leave stale runtime state.
         """
         mgr = PluginManager()
 
@@ -255,11 +250,9 @@ class TestPluginDiscovery:
         mgr._hooks["pre_tool_call"] = [lambda **_: None]
         mgr._middleware["llm_request"] = [lambda **_: None]
         mgr._plugin_tool_names.add("some_tool")
-        mgr._plugin_platform_names.add("irc")
         mgr._plugin_commands["cmd"] = {"plugin": "p"}
         mgr._plugin_skills["p:skill"] = {}
         mgr._aux_tasks["task"] = {"plugin": "p"}
-        mgr._slack_action_handlers.append(("aid", lambda **_: None, "p"))
         mgr._discovered = True
 
         monkeypatch.setattr(
@@ -273,13 +266,9 @@ class TestPluginDiscovery:
         assert mgr._hooks == {}
         assert mgr._middleware == {}
         assert mgr._plugin_tool_names == set()
-        assert mgr._plugin_platform_names == set(), (
-            "_plugin_platform_names was not cleared on force-rediscover"
-        )
         assert mgr._plugin_commands == {}
         assert mgr._plugin_skills == {}
         assert mgr._aux_tasks == {}
-        assert mgr._slack_action_handlers == []
 
 
 # ── TestPluginLoading ──────────────────────────────────────────────────────
@@ -359,32 +348,6 @@ class TestPluginHooks:
     """Tests for lifecycle hook registration and invocation."""
 
 
-
-    @pytest.mark.asyncio
-    async def test_pre_gateway_dispatch_collects_action_dicts(self, tmp_path, monkeypatch):
-        """pre_gateway_dispatch callbacks return action dicts (skip/rewrite/allow)."""
-        plugins_dir = tmp_path / "hermes_test" / "plugins"
-        _make_plugin_dir(
-            plugins_dir, "predispatch_plugin",
-            register_body=(
-                'async def callback(**kw):\n'
-                '    return {"action": "skip", "reason": "test"}\n'
-                'ctx.register_hook("pre_gateway_dispatch", callback)'
-            ),
-        )
-        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes_test"))
-
-        mgr = PluginManager()
-        await mgr.discover_and_load()
-
-        results = await mgr.invoke_hook(
-            "pre_gateway_dispatch",
-            event=object(),
-            gateway=object(),
-            session_store=object(),
-        )
-        assert len(results) == 1
-        assert results[0] == {"action": "skip", "reason": "test"}
 
 
 
@@ -1094,12 +1057,7 @@ class TestPluginContextProfileName:
 
 
 class TestDispatchToolWithoutCliRef:
-    """ctx.dispatch_tool works in worker/hook contexts (no _cli_ref).
-
-    This pins the contract the plugin docs rely on: a plugin can drive
-    tools from a hook callback even when running in the gateway or a
-    kanban-spawned worker session, where _cli_ref is None.
-    """
+    """ctx.dispatch_tool works without an interactive orchestrator."""
 
     @pytest.mark.asyncio
     async def test_dispatch_tool_invokes_handler_without_cli_ref(self):

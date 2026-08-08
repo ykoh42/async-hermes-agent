@@ -168,39 +168,6 @@ VALID_HOOKS: Set[str] = {
     "subagent_stop",
     "pre_approval_request",
     "post_approval_response",
-    # Gateway pre-dispatch hook. Fired once per incoming MessageEvent
-    # after the internal-event guard but BEFORE auth/pairing and agent
-    # dispatch. Plugins may return a dict to influence flow:
-    #   {"action": "skip",    "reason": "..."}  -> drop message (no reply)
-    #   {"action": "rewrite", "text": "..."}    -> replace event.text, continue
-    #   {"action": "allow"}  /  None             -> normal dispatch
-    # Kwargs: event: MessageEvent, gateway: GatewayRunner, session_store.
-    "pre_gateway_dispatch",
-    # Kanban task lifecycle hooks. Fired by hermes_cli.kanban_db when a task
-    # transitions state, AFTER the change is committed to the board DB (so the
-    # hook always sees durable state and a slow plugin can never hold the
-    # SQLite write lock). Observers only: return values are ignored.
-    #
-    # WHICH PROCESS each fires in matters, because kanban workers run as
-    # separate `hermes -p <profile> chat -q` subprocesses:
-    #   - kanban_task_claimed   -> the DISPATCHER process (gateway-embedded
-    #                              dispatcher or `hermes kanban dispatch`),
-    #                              right before the worker subprocess spawns.
-    #   - kanban_task_completed -> the WORKER process, when it calls
-    #                              kanban_complete (or a CLI/manual complete).
-    #   - kanban_task_blocked   -> the WORKER process (worker-initiated block)
-    #                              or whichever process drove the block.
-    # A plugin that needs to observe every transition centrally should hook in
-    # the dispatcher; one that needs per-task in-session context should hook in
-    # the worker.
-    #
-    # Common kwargs: task_id: str, board: str | None, assignee: str | None,
-    #   run_id: int | None, profile_name: str.
-    # kanban_task_completed adds: summary: str | None.
-    # kanban_task_blocked adds:   reason: str | None.
-    "kanban_task_claimed",
-    "kanban_task_completed",
-    "kanban_task_blocked",
 }
 
 ENTRY_POINTS_GROUP = "hermes_agent.plugins"
@@ -213,7 +180,7 @@ def _env_enabled(name: str) -> bool:
     return env_var_enabled(name)
 
 
-async def _get_disabled_plugins() -> set:
+async def _get_disabled_plugins(config: Optional[dict] = None) -> set:
     """Read the disabled plugins list from config.yaml.
 
     Kept for backward compat and explicit deny-list semantics. A plugin
@@ -221,16 +188,17 @@ async def _get_disabled_plugins() -> set:
     ``plugins.enabled``.
     """
     try:
-        from hermes_cli.config import load_config_readonly
+        if config is None:
+            from hermes_cli.config import load_config_readonly
 
-        config = await load_config_readonly()
+            config = await load_config_readonly()
         disabled = cfg_get(config, "plugins", "disabled", default=[])
         return set(disabled) if isinstance(disabled, list) else set()
     except Exception:
         return set()
 
 
-async def _get_enabled_plugins() -> Optional[set]:
+async def _get_enabled_plugins(config: Optional[dict] = None) -> Optional[set]:
     """Read the enabled-plugins allow-list from config.yaml.
 
     Plugins are opt-in by default — only plugins whose name appears in
@@ -245,9 +213,10 @@ async def _get_enabled_plugins() -> Optional[set]:
     * ``set(...)`` — the concrete allow-list.
     """
     try:
-        from hermes_cli.config import load_config_readonly
+        if config is None:
+            from hermes_cli.config import load_config_readonly
 
-        config = await load_config_readonly()
+            config = await load_config_readonly()
         plugins_cfg = config.get("plugins")
         if not isinstance(plugins_cfg, dict):
             return None
@@ -291,11 +260,6 @@ class PluginManifest:
     #              Selection via ``<category>.provider`` config key; the
     #              category's own discovery system handles loading and the
     #              general scanner skips these.
-    # ``platform``: gateway messaging platform adapter (e.g. IRC). Bundled
-    #              platform plugins auto-load so every shipped platform is
-    #              available out of the box; user-installed platform plugins
-    #              in ~/.hermes/plugins/ still gated by ``plugins.enabled``
-    #              (untrusted code).
     kind: str = "standalone"
     # Registry key — path-derived, used by ``plugins.enabled``/``disabled``
     # lookups and by ``hermes plugins list``. For a flat plugin at
@@ -317,10 +281,6 @@ class LoadedPlugin:
     commands_registered: List[str] = field(default_factory=list)
     enabled: bool = False
     error: Optional[str] = None
-    # True for a bundled platform plugin recorded as a deferred (not-yet-
-    # imported) loader. The module loads on first real use via the
-    # platform_registry; see PluginManager._register_deferred_platform.
-    deferred: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -469,13 +429,7 @@ class PluginContext:
         source = getattr(self.manifest, "source", "") or ""
         if source == "bundled":
             return True
-        try:
-            from hermes_cli.config import load_config
-            cfg = load_config() or {}
-        except Exception:
-            # If we can't load config, fail closed — better to break the
-            # override than silently grant it.
-            return False
+        cfg = self._manager._config
         plugin_id = self.manifest.key or self.manifest.name
         entries = (cfg.get("plugins") or {}).get("entries") or {}
         entry = entries.get(plugin_id) or {}
@@ -747,202 +701,6 @@ class PluginContext:
                 source.name,
             )
 
-    # -- TTS provider registration -------------------------------------------
-
-    def register_tts_provider(self, provider) -> None:
-        """Register a text-to-speech backend.
-
-        ``provider`` must be an instance of
-        :class:`agent.tts_provider.TTSProvider`. The ``provider.name``
-        attribute is what ``tts.provider`` in ``config.yaml`` matches
-        against when routing ``text_to_speech`` tool calls — **but
-        only when**:
-
-        1. ``provider.name`` is NOT a built-in TTS provider name
-           (``edge``, ``openai``, ``elevenlabs``, …). Built-ins always
-           win — the registry rejects shadowing names with a warning.
-        2. There is NO ``tts.providers.<name>: type: command`` entry
-           with the same name. Command-providers (PR #17843) win on
-           name collision because config is more local than plugin
-           install.
-
-        Coexists with the command-provider registry rather than
-        replacing it — see issue #30398 for the full design rationale.
-        """
-        from agent.tts_provider import TTSProvider
-        from agent.tts_registry import register_provider as _register_tts_provider
-
-        if not isinstance(provider, TTSProvider):
-            logger.warning(
-                "Plugin '%s' tried to register a TTS provider that does "
-                "not inherit from TTSProvider. Ignoring.",
-                self.manifest.name,
-            )
-            return
-        _register_tts_provider(provider)
-        logger.info(
-            "Plugin '%s' registered TTS provider: %s",
-            self.manifest.name, provider.name,
-        )
-
-    # -- transcription (STT) provider registration ---------------------------
-
-    def register_transcription_provider(self, provider) -> None:
-        """Register a speech-to-text backend.
-
-        ``provider`` must be an instance of
-        :class:`agent.transcription_provider.TranscriptionProvider`.
-        The ``provider.name`` attribute is what ``stt.provider`` in
-        ``config.yaml`` matches against when routing
-        :func:`tools.transcription_tools.transcribe_audio` calls —
-        **but only when**:
-
-        1. ``provider.name`` is NOT a built-in STT provider name
-           (``local``, ``local_command``, ``groq``, ``openai``,
-           ``mistral``, ``xai``). Built-ins always win — the registry
-           rejects shadowing names with a warning.
-        2. There is NO ``stt.providers.<name>: type: command`` entry
-           with the same name. Command-providers win on name
-           collision because config is more local than plugin install
-           — same precedence rule as TTS.
-
-        Coexists with the in-tree dispatcher and the STT
-        command-provider registry rather than replacing them. The 6
-        built-in STT backends keep their native implementations in
-        ``tools/transcription_tools.py``; this hook is for *new* Python
-        engines (OpenRouter, SenseAudio, Gemini-STT, custom proprietary
-        backends).
-        """
-        from agent.transcription_provider import TranscriptionProvider
-        from agent.transcription_registry import register_provider as _register_stt_provider
-
-        if not isinstance(provider, TranscriptionProvider):
-            logger.warning(
-                "Plugin '%s' tried to register a transcription provider that "
-                "does not inherit from TranscriptionProvider. Ignoring.",
-                self.manifest.name,
-            )
-            return
-        _register_stt_provider(provider)
-        logger.info(
-            "Plugin '%s' registered transcription provider: %s",
-            self.manifest.name, provider.name,
-        )
-
-    # -- platform adapter registration ---------------------------------------
-
-    def register_platform(
-        self,
-        name: str,
-        label: str,
-        adapter_factory: Callable,
-        check_fn: Callable,
-        validate_config: Callable | None = None,
-        required_env: list | None = None,
-        install_hint: str = "",
-        **entry_kwargs: Any,
-    ) -> None:
-        """Register a gateway platform adapter.
-
-        The adapter_factory receives a ``PlatformConfig`` and returns a
-        ``BasePlatformAdapter`` subclass instance.  The gateway calls
-        ``check_fn()`` before instantiation to verify dependencies.
-
-        Extra keyword arguments are forwarded to ``PlatformEntry`` (e.g.
-        ``setup_fn``, ``emoji``, ``allowed_users_env``, ``platform_hint``).
-        Unknown keys raise TypeError from the dataclass constructor.
-
-        Example::
-
-            ctx.register_platform(
-                name="irc",
-                label="IRC",
-                adapter_factory=lambda cfg: IRCAdapter(cfg),
-                check_fn=lambda: True,
-                emoji="💬",
-                setup_fn=irc_interactive_setup,
-            )
-        """
-        from gateway.platform_registry import platform_registry, PlatformEntry
-
-        entry_kwargs.setdefault("plugin_name", self.manifest.name)
-        entry = PlatformEntry(
-            name=name,
-            label=label,
-            adapter_factory=adapter_factory,
-            check_fn=check_fn,
-            validate_config=validate_config,
-            required_env=required_env or [],
-            install_hint=install_hint,
-            source="plugin",
-            **entry_kwargs,
-        )
-        platform_registry.register(entry)
-        self._manager._plugin_platform_names.add(name)
-        logger.debug(
-            "Plugin %s registered platform: %s",
-            self.manifest.name,
-            name,
-        )
-
-    # -- slack action handler registration ----------------------------------
-
-    def register_slack_action_handler(
-        self,
-        action_id: Any,
-        callback: Callable,
-    ) -> None:
-        """Register a Slack Block Kit action handler from a plugin.
-
-        Hermes' Slack adapter wires registered handlers into its
-        ``slack_bolt.AsyncApp`` at connect time. The callback is invoked
-        when a user clicks a button (or interacts with another Block Kit
-        action element) whose ``action_id`` matches.
-
-        Callback signature follows the slack_bolt convention::
-
-            async def handler(ack, body, action) -> None:
-                await ack()  # required, within 3 seconds
-                ...
-
-        Args:
-            action_id: Whatever ``slack_bolt.App.action()`` accepts —
-                a literal ``action_id`` string, a compiled ``re.Pattern``
-                for matching multiple ids, or a constraint dict
-                (e.g. ``{"action_id": "...", "block_id": "..."}``).
-            callback: Async callable receiving ``(ack, body, action)``.
-
-        Raises:
-            ValueError: if ``callback`` is not callable, or ``action_id``
-                is empty/None.
-
-        Example::
-
-            async def _on_approve(ack, body, action):
-                await ack()
-                # apply some workflow keyed on action["value"]
-
-            ctx.register_slack_action_handler("inbox_sweep_approve", _on_approve)
-        """
-        if not callable(callback):
-            raise ValueError(
-                f"Plugin '{self.manifest.name}' tried to register a Slack "
-                f"action handler with a non-callable callback."
-            )
-        if action_id is None or (isinstance(action_id, str) and not action_id.strip()):
-            raise ValueError(
-                f"Plugin '{self.manifest.name}' tried to register a Slack "
-                f"action handler with an empty action_id."
-            )
-        self._manager._slack_action_handlers.append(
-            (action_id, callback, self.manifest.name)
-        )
-        logger.debug(
-            "Plugin %s registered Slack action handler: %s",
-            self.manifest.name,
-            action_id,
-        )
-
     # -- hook registration --------------------------------------------------
 
     # -- auxiliary task registration ---------------------------------------
@@ -1156,7 +914,6 @@ class PluginManager:
         self._hooks: Dict[str, List[Callable]] = {}
         self._middleware: Dict[str, List[Callable]] = {}
         self._plugin_tool_names: Set[str] = set()
-        self._plugin_platform_names: Set[str] = set()
         self._context_engine = None  # Set by a plugin via register_context_engine()
         self._plugin_commands: Dict[str, dict] = {}  # Slash commands registered by plugins
         self._discovered: bool = False
@@ -1166,13 +923,7 @@ class PluginManager:
         # Plugin-registered auxiliary tasks: key → {key, display_name,
         # description, defaults, plugin}. See PluginContext.register_auxiliary_task.
         self._aux_tasks: Dict[str, Dict[str, Any]] = {}
-        # Slack Block Kit action handlers registered by plugins. Each entry
-        # is (matcher, callback, plugin_name); the Slack adapter wires them
-        # into its slack_bolt App at connect() time. ``matcher`` is whatever
-        # ``app.action()`` accepts (a literal action_id string, a compiled
-        # ``re.Pattern``, or a constraint dict); ``callback`` is an async
-        # function with the slack_bolt signature ``(ack, body, action)``.
-        self._slack_action_handlers: List[tuple] = []
+        self._config: Dict[str, Any] = {}
         self._discovery_lock = asyncio.Lock()
 
     # -----------------------------------------------------------------------
@@ -1198,11 +949,9 @@ class PluginManager:
                 self._hooks.clear()
                 self._middleware.clear()
                 self._plugin_tool_names.clear()
-                self._plugin_platform_names.clear()
                 self._plugin_commands.clear()
                 self._plugin_skills.clear()
                 self._aux_tasks.clear()
-                self._slack_action_handlers.clear()
                 self._context_engine = None
             try:
                 await self._discover_and_load_inner()
@@ -1213,6 +962,9 @@ class PluginManager:
 
     async def _discover_and_load_inner(self) -> None:
         """The actual discovery sweep — see :meth:`discover_and_load`."""
+        from hermes_cli.config import load_config_readonly
+
+        self._config = await load_config_readonly()
         manifests: List[PluginManifest] = []
 
         # 1. Bundled plugins (<repo>/plugins/<name>/)
@@ -1225,23 +977,16 @@ class PluginManager:
         #
         # ``memory/``, ``context_engine/``, and ``model-providers/`` are
         # skipped at the top level — they have their own discovery systems
-        # (plugins/memory/__init__.py, providers/__init__.py). ``platforms/``
-        # is a category holding platform adapters (scanned one level deeper
-        # below).
+        # (plugins/memory/__init__.py, providers/__init__.py).
         repo_plugins = await get_bundled_plugins_dir()
         logger.debug("Scanning bundled plugins: %s", repo_plugins)
         bundled = await self._scan_directory(
             repo_plugins,
             source="bundled",
-            skip_names={"memory", "context_engine", "platforms", "model-providers"},
+            skip_names={"memory", "context_engine", "model-providers"},
         )
         logger.debug("  bundled (top-level): %d manifest(s)", len(bundled))
         manifests.extend(bundled)
-        bundled_platforms = await self._scan_directory(
-            repo_plugins / "platforms", source="bundled"
-        )
-        logger.debug("  bundled/platforms: %d manifest(s)", len(bundled_platforms))
-        manifests.extend(bundled_platforms)
 
         # 2. User plugins (~/.hermes/plugins/)
         user_dir = get_hermes_home() / "plugins"
@@ -1276,8 +1021,10 @@ class PluginManager:
         # winner. Keys are path-derived (``image_gen/openai``,
         # ``disk-cleanup``) so ``tts/openai`` and ``image_gen/openai``
         # don't collide even when both manifests say ``name: openai``.
-        disabled = await _get_disabled_plugins()
-        enabled = await _get_enabled_plugins()  # None = opt-in default (nothing enabled)
+        disabled = await _get_disabled_plugins(self._config)
+        enabled = await _get_enabled_plugins(
+            self._config
+        )  # None = opt-in default (nothing enabled)
         winners: Dict[str, PluginManifest] = {}
         for manifest in manifests:
             winners[manifest.key or manifest.name] = manifest
@@ -1329,21 +1076,6 @@ class PluginManager:
             # enforced by the tool wrapper.
             if manifest.source == "bundled" and manifest.kind == "backend":
                 self._load_plugin(manifest)
-                continue
-
-            # Bundled platform plugins (gateway adapters: telegram, discord,
-            # feishu, teams, ...) are registered LAZILY. Their modules import
-            # heavy, platform-specific SDKs at module level (lark_oapi,
-            # microsoft_teams, discord.py, slack_bolt, ...), so eagerly loading
-            # all ~20 of them added several seconds to every `hermes`
-            # invocation — including plain `hermes chat`, which never touches a
-            # gateway platform. Instead we register a cheap deferred loader in
-            # the platform_registry keyed on the platform name; the real module
-            # is imported only when the gateway / cron / setup / send_message
-            # path actually asks for that platform. Every platform Hermes ships
-            # remains available out of the box — it just loads on first use.
-            if manifest.source == "bundled" and manifest.kind == "platform":
-                self._register_deferred_platform(manifest)
                 continue
 
             # Everything else (standalone, user-installed backends,
@@ -1589,66 +1321,6 @@ class PluginManager:
     # Loading
     # -----------------------------------------------------------------------
 
-    def _platform_name_from_manifest(self, manifest: PluginManifest) -> str:
-        """Derive the gateway platform name (e.g. ``feishu``) for a platform plugin.
-
-        The platform name registered via ``register_platform(name=...)`` lives
-        inside the adapter module (which we are explicitly trying NOT to import
-        early). It is not carried in ``plugin.yaml``. Across every bundled
-        platform plugin the manifest name is ``<platform>-platform`` and the
-        plugin directory basename is ``<platform>``, so we derive the name
-        without importing: strip a trailing ``-platform`` from the manifest
-        name, falling back to the directory basename. This is also a sensible
-        convention for third-party platform plugins.
-        """
-        name = manifest.name or ""
-        if name.endswith("-platform"):
-            return name[: -len("-platform")]
-        if manifest.path:
-            return Path(manifest.path).name
-        return name
-
-    def _register_deferred_platform(self, manifest: PluginManifest) -> None:
-        """Register a lazy loader for a bundled platform plugin.
-
-        The platform adapter module is imported only when the gateway / cron /
-        setup / send_message path first asks the ``platform_registry`` for this
-        platform. Until then we record a lightweight ``LoadedPlugin`` so
-        ``hermes plugins list`` still shows the platform as available, and we
-        hand the registry a loader that runs the normal eager-load path.
-        """
-        lookup_key = manifest.key or manifest.name
-        platform_name = self._platform_name_from_manifest(manifest)
-
-        # Record an enabled placeholder for introspection (`hermes plugins
-        # list`). The real module load swaps in a fully-populated LoadedPlugin
-        # (tools/hooks/commands attribution) when the loader fires.
-        loaded = LoadedPlugin(manifest=manifest, enabled=True)
-        loaded.deferred = True
-        self._plugins[lookup_key] = loaded
-
-        def _loader(_manifest: PluginManifest = manifest) -> None:
-            self._load_plugin(_manifest)
-
-        try:
-            from gateway.platform_registry import platform_registry
-
-            platform_registry.register_deferred(platform_name, _loader)
-            logger.debug(
-                "Registered deferred platform loader: %s (plugin=%s)",
-                platform_name,
-                lookup_key,
-            )
-        except Exception:
-            # If the registry import fails for any reason, fall back to eager
-            # loading so the platform is never silently lost.
-            logger.debug(
-                "Deferred platform registration failed for '%s'; eager-loading",
-                lookup_key,
-                exc_info=True,
-            )
-            self._load_plugin(manifest)
-
     def _load_plugin(self, manifest: PluginManifest) -> None:
         """Import a plugin module and call its ``register(ctx)`` function."""
         loaded = LoadedPlugin(manifest=manifest)
@@ -1856,22 +1528,6 @@ class PluginManager:
                     exc,
                 )
         return results
-
-    # -----------------------------------------------------------------------
-    # Slack action handler accessor
-    # -----------------------------------------------------------------------
-
-    def get_slack_action_handlers(self) -> List[tuple]:
-        """Return the list of plugin-registered Slack action handlers.
-
-        Each entry is a ``(action_id, callback, plugin_name)`` tuple.
-        Consumed by the Slack adapter at connect time to wire callbacks
-        into its ``slack_bolt.AsyncApp``.
-
-        Plugins register handlers via
-        :meth:`PluginContext.register_slack_action_handler`.
-        """
-        return list(self._slack_action_handlers)
 
     # -----------------------------------------------------------------------
     # Introspection

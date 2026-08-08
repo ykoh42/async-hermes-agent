@@ -52,12 +52,6 @@ if str(PROJECT_ROOT) not in sys.path:
 # conftest is imported before any test module, so setting it here closes that
 # window. The per-test fixture still applies for everything after import.
 #
-# ORDER MATTERS: the kanban write guard's deny-list (further down) must know
-# the REAL Hermes root — capture it BEFORE the sandbox rewires HERMES_HOME,
-# otherwise the deny-list would point at the throwaway tempdir and the guard
-# would silently stop protecting the operator's actual ~/.hermes (#69385).
-_PRE_SANDBOX_KANBAN_OVERRIDE = os.environ.get("HERMES_KANBAN_HOME", "").strip()
-_PRE_SANDBOX_HERMES_HOME = os.environ.get("HERMES_HOME", "")
 if not os.environ.get("HERMES_HOME"):
     _SESSION_HERMES_HOME = tempfile.mkdtemp(prefix="hermes-test-home-")
     os.environ["HERMES_HOME"] = _SESSION_HERMES_HOME
@@ -209,16 +203,6 @@ def _looks_like_credential(name: str) -> bool:
 # HERMES_* vars that change test behavior by being set. Unset all of these
 # unconditionally — individual tests that need them set do so explicitly.
 _HERMES_BEHAVIORAL_VARS = frozenset({
-    # Voice/TTS runtime flags. ``tui_gateway/server.py`` reads these straight
-    # off ``os.environ`` at call time (``_voice_mode_enabled`` /
-    # ``_voice_tts_enabled``) and, on every completed turn, hands the turn's
-    # final response text to ``hermes_cli.voice.speak_text`` — real synthesis,
-    # real playback, out of the developer's speakers. Blank them per-test so a
-    # leak (from the shell, or from an earlier test that drove the
-    # ``voice.toggle`` RPC, which writes ``os.environ`` directly) cannot carry
-    # into the next test. See ``_audio_playback_guard`` for the second layer.
-    "HERMES_VOICE",
-    "HERMES_VOICE_TTS",
     "HERMES_YOLO_MODE",
     "HERMES_INTERACTIVE",
     "HERMES_QUIET",
@@ -251,23 +235,6 @@ _HERMES_BEHAVIORAL_VARS = frozenset({
     "HERMES_EXEC_ASK",
     "HERMES_HOME_MODE",
     "HERMES_AGENT_USE_LEGACY_SESSION_KEYS",
-    # Kanban path/board pins must never leak from a developer shell or
-    # dispatched worker into tests; otherwise tests can write fake tasks to
-    # the real ~/.hermes/kanban.db instead of the per-test HERMES_HOME.
-    "HERMES_KANBAN_DB",
-    "HERMES_KANBAN_BOARD",
-    "HERMES_KANBAN_HOME",
-    "HERMES_KANBAN_WORKSPACES_ROOT",
-    "HERMES_KANBAN_LOGS_ROOT",
-    "HERMES_KANBAN_TASK",
-    "HERMES_KANBAN_WORKSPACE",
-    "HERMES_KANBAN_RUN_ID",
-    "HERMES_KANBAN_CLAIM_LOCK",
-    "HERMES_KANBAN_DISPATCH_IN_GATEWAY",
-    # Pytest is routinely launched from a delegated worker.  The worker
-    # lineage marker must not make parent-state tests run as delegated
-    # children; tests that exercise child behavior set it explicitly.
-    "HERMES_DELEGATED_CHILD_CONTEXT",
     "HERMES_TENANT",
     # Honcho host selection changes which nested config block wins. A local
     # shell override leaked "myhost" into the full suite and flipped 20
@@ -551,96 +518,6 @@ def _neutralize_macos_keychain_creds(request, monkeypatch):
     return None
 
 
-# ── Kanban write guard (#69283) ─────────────────────────────────────────────
-# When hermetic isolation is bypassed (stale checkout, wrong rootdir, direct
-# invocation), kanban writes silently pollute the real ~/.hermes. This autouse
-# fixture patches ``kanban_db.connect`` to refuse writes whose resolved DB
-# path lands under the REAL kanban root (captured at import time, before any
-# fixture rewires the environment). A deny-list is used instead of an
-# allow-list because test-level fixtures legitimately move HERMES_HOME to
-# sibling directories — an allow-list captured at setup time would see the
-# stale autouse-set value and falsely reject hermetic tests (#69385 review).
-
-
-def _capture_real_kanban_root() -> Path:
-    """Resolve the REAL kanban root from the pre-test environment.
-
-    Uses the pre-sandbox environment snapshot taken at the very top of this
-    file (before the session HERMES_HOME sandbox rewired the env), so the
-    deny-list keeps pointing at the operator's actual root. Mirrors
-    ``kanban_db.kanban_home()`` resolution order:
-    1. ``HERMES_KANBAN_HOME`` env var when set and non-empty
-    2. the real (pre-sandbox) Hermes root otherwise
-    """
-    if _PRE_SANDBOX_KANBAN_OVERRIDE:
-        return Path(_PRE_SANDBOX_KANBAN_OVERRIDE).expanduser().resolve()
-    if _PRE_SANDBOX_HERMES_HOME:
-        # HERMES_HOME was genuinely set before the sandbox — honor it via the
-        # normal resolver (it may be a profile dir whose root matters).
-        from hermes_constants import get_default_hermes_root
-        return get_default_hermes_root().resolve()
-    # No pre-existing HERMES_HOME: the real root is the platform default,
-    # NOT the sandbox tempdir now sitting in the env.
-    return (Path.home() / ".hermes").resolve()
-
-
-_REAL_KANBAN_ROOT = _capture_real_kanban_root()
-
-
-@pytest.fixture(autouse=True)
-def _kanban_write_guard(_hermetic_environment, monkeypatch):
-    """Fail-closed guard: refuse kanban writes that target the REAL root.
-
-    Uses a **deny-list**: only blocks writes where the resolved DB path
-    (explicit ``db_path`` or ``kanban_db_path()``) lands under the real
-    ``~/.hermes`` captured at import time. Hermetic tests that legitimately
-    move HERMES_HOME to sibling tempdirs are unaffected.
-
-    Only patches when ``hermes_cli.kanban_db`` is *already imported* — a
-    ``sys.modules`` probe, not an import — so the guard never drags the
-    kanban module into unrelated test processes.
-
-    Uses ``monkeypatch.setattr`` so pytest restores ``connect`` automatically
-    after each test (no stacked wrappers or state leakage across tests).
-    """
-    _kdb = sys.modules.get("hermes_cli.kanban_db")
-    if _kdb is None:
-        return
-
-    # The sys.modules probe can observe the module MID-IMPORT: a fixture
-    # boundary firing while another test's lazy `import hermes_cli.kanban_db`
-    # is still executing sees a partially initialized module whose `connect`
-    # doesn't exist yet (AttributeError flake, caught in a full-suite run).
-    # A half-imported module has no callers yet either — nothing to guard
-    # this round; the next test's fixture will patch the completed module.
-    _orig_connect = getattr(_kdb, "connect", None)
-    if _orig_connect is None:
-        return
-
-    def _guarded_connect(db_path=None, *args, **kwargs):
-        if db_path is not None:
-            resolved = Path(db_path).expanduser().resolve()
-        else:
-            resolved = (
-                _kdb.kanban_db_path(board=kwargs.get("board"))
-                .expanduser()
-                .resolve()
-            )
-        try:
-            resolved.relative_to(_REAL_KANBAN_ROOT)
-        except ValueError:
-            # Resolved path is NOT under the real root — safe to write.
-            return _orig_connect(db_path, *args, **kwargs)
-        raise RuntimeError(
-            f"kanban_write_guard: kanban DB path resolved to {resolved}, "
-            f"which is under the REAL kanban root ({_REAL_KANBAN_ROOT}). "
-            f"Hermetic isolation has been bypassed — refusing to write "
-            f"to the real ~/.hermes. See #69283."
-        )
-
-    monkeypatch.setattr(_kdb, "connect", _guarded_connect)
-
-
 # ── Module-level state reset — replaced by per-file process isolation ──────
 #
 # Each test FILE runs in a freshly-spawned ``python -m pytest <file>``
@@ -706,7 +583,6 @@ def _reset_tui_gateway_server_state():
         }
 
     yield
-
     mod = sys.modules.get(_TUI_SERVER_MODULE)
     if mod is None:
         return
@@ -902,49 +778,6 @@ def _wal_is_usable() -> bool:
     return False
 
 
-# ── Audio-playback guard ───────────────────────────────────────────────────
-#
-# Same class of incident as the live-system guard above, different primitive:
-# a test run spoke the string "partial answer complete" out of the developer's
-# speakers. That string is a test fixture
-# (``tests/test_tui_gateway_server.py``'s fake ``final_response``), and the
-# route it took is fully in-process — no leaked shell variable required:
-#
-#   1. ``test_voice_toggle_tts_branch_also_carries_record_key`` drives the
-#      ``voice.toggle`` RPC with ``action="tts"``. The handler
-#      (``tui_gateway/server.py``) flips the flag by writing the *real*
-#      process environment: ``os.environ["HERMES_VOICE_TTS"] = "1"``. The
-#      test's ``monkeypatch.delenv(..., raising=False)`` records no undo entry
-#      (pytest only records an undo when the key was present), so the "1"
-#      survives teardown and persists for the rest of the pytest process.
-#   2. Any later test in that process that drives a turn to completion hits
-#      the TTS dispatch in ``prompt.submit``, which checks
-#      ``_voice_tts_enabled()`` — now true — and fires
-#      ``hermes_cli.voice.speak_text(final_response)`` on a daemon thread.
-#   3. ``speak_text`` needs no API key to be audible: ``tools/tts_tool.py``
-#      defaults to the ``edge`` provider, which is keyless.
-#
-# Because the flag is set from *inside* the process, ``scripts/run_tests.sh``'s
-# ``env -i`` does not help, and neither does env-blanking on its own — the
-# hermetic fixture blanks at test setup, and step 1 re-sets it mid-test. So we
-# also intercept the primitive that does the damage, exactly as the
-# live-system guard intercepts ``os.kill`` rather than trusting every caller
-# to mock it:
-#
-#  • ``hermes_cli.voice.speak_text`` — the synth+playback entry point both
-#    gateway call sites late-import, so patching the module attribute catches
-#    them wherever they import it from.
-#  • ``hermes_cli.voice.play_audio_file`` — the module-level binding
-#    ``speak_text`` actually plays through. Patching the binding inside
-#    ``hermes_cli.voice`` (not ``tools.voice_mode``) keeps the real function
-#    available to the tests that legitimately exercise it with a mocked
-#    audio backend (``tests/tools/test_voice_mode.py``).
-#
-# Config cannot re-open this hole: the ``tts:`` section of ``config.yaml``
-# only selects *which* provider speaks, never *whether* to speak — that gate
-# is the env var alone.
-
-_AUDIO_GUARD_BYPASS_MARK = "real_audio_playback"
 _ALLOW_MACOS_KEYCHAIN_MARK = "allow_macos_keychain"
 
 
@@ -961,12 +794,6 @@ def pytest_configure(config):  # noqa: D401 — pytest hook
         f"{_REQUIRES_WAL_MARK}: test needs the runtime to actually enable "
         "SQLite WAL mode; skipped on builds where Hermes falls back to "
         "journal_mode=DELETE for the WAL-reset bug.",
-    )
-    config.addinivalue_line(
-        "markers",
-        f"{_AUDIO_GUARD_BYPASS_MARK}: bypass the audio-playback guard (only "
-        "for tests that genuinely need real TTS synthesis and speaker "
-        "playback — there are none in the default suite).",
     )
     config.addinivalue_line(
         "markers",
@@ -1367,46 +1194,5 @@ def _live_system_guard(request, monkeypatch):
         )
     except Exception:
         pass
-
-    yield
-
-
-@pytest.fixture(autouse=True)
-def _audio_playback_guard(request, monkeypatch):
-    """Stub TTS synthesis + speaker playback for every test.
-
-    See the block comment above for the incident this closes. Defence in
-    depth behind ``_HERMES_BEHAVIORAL_VARS``: the env blanking stops the flag
-    leaking *between* tests, this stops the speakers ever opening even when a
-    test sets the flag *itself* (which the ``voice.toggle`` RPC handler does,
-    by writing ``os.environ`` directly).
-
-    Deliberately silent rather than raising: unlike a stray ``os.kill``, a
-    stray ``speak_text`` is dispatched on a daemon thread whose exception
-    nobody would ever see, so a hard failure would neither stop the test nor
-    surface. Silence is the whole point. Tests that genuinely want real audio
-    can opt out with ``@pytest.mark.real_audio_playback``.
-    """
-    if request.node.get_closest_marker(_AUDIO_GUARD_BYPASS_MARK):
-        yield
-        return
-
-    try:
-        import hermes_cli.voice as _voice
-    except Exception:
-        # Optional audio deps missing — nothing importable to speak with.
-        yield
-        return
-
-    def _blocked_speak_text(text, *args, **kwargs):
-        return None
-
-    def _blocked_play_audio_file(path, *args, **kwargs):
-        return False
-
-    if hasattr(_voice, "speak_text"):
-        monkeypatch.setattr(_voice, "speak_text", _blocked_speak_text)
-    if hasattr(_voice, "play_audio_file"):
-        monkeypatch.setattr(_voice, "play_audio_file", _blocked_play_audio_file)
 
     yield

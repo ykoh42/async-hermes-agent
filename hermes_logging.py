@@ -1,21 +1,13 @@
 """Centralized logging setup for Hermes Agent.
 
-Provides a single ``setup_logging()`` entry point that both the CLI and
-gateway call early in their startup path.  All log files live under
+Provides a single ``setup_logging()`` entry point for library consumers. All log files live under
 ``~/.hermes/logs/`` (profile-aware via ``get_hermes_home()``).
 
 Log files produced:
     agent.log   — INFO+, all agent/tool/session activity (the main log)
     errors.log  — WARNING+, errors and warnings only (quick triage)
-    gateway.log — INFO+, gateway-only events (created when mode="gateway")
-
 All files use ``RotatingFileHandler`` with ``RedactingFormatter`` so
 secrets are never written to disk.
-
-Component separation:
-    gateway.log only receives records from ``gateway.*`` loggers —
-    platform adapters, session management, slash commands, delivery.
-    agent.log remains the catch-all (everything goes there).
 
 Session context:
     Call ``set_session_context(session_id)`` at the start of a conversation
@@ -24,6 +16,7 @@ Session context:
 """
 
 import atexit
+import contextvars
 import copy
 import io
 import logging
@@ -33,7 +26,7 @@ import sys
 import threading
 from logging.handlers import QueueHandler, QueueListener
 from pathlib import Path
-from typing import Optional, Sequence
+from typing import Optional
 
 # On Windows, stdlib ``RotatingFileHandler`` calls ``os.rename()`` in
 # ``doRollover()`` and fails with ``PermissionError [WinError 32]`` whenever
@@ -72,8 +65,12 @@ from hermes_constants import get_config_path, get_hermes_home
 # unless ``force=True``.
 _logging_initialized = False
 
-# Thread-local storage for per-conversation session context.
-_session_context = threading.local()
+# Task-local storage for per-conversation session context. ContextVar keeps
+# parallel AIAgent instances isolated on the same event-loop thread and is
+# inherited by child tasks.
+_session_id_var: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
+    "hermes_log_session_id", default=None
+)
 
 # Default log format — includes timestamp, level, optional session tag,
 # logger name, and message.  The ``%(session_tag)s`` field is guaranteed to
@@ -159,17 +156,17 @@ _NOISY_LOGGERS = (
 # ---------------------------------------------------------------------------
 
 def set_session_context(session_id: str) -> None:
-    """Set the session ID for the current thread.
+    """Set the session ID for the current async context.
 
-    All subsequent log records on this thread will include ``[session_id]``
+    All subsequent log records in this context will include ``[session_id]``
     in the formatted output.  Call at the start of ``run_conversation()``.
     """
-    _session_context.session_id = session_id
+    _session_id_var.set(session_id)
 
 
 def clear_session_context() -> None:
     """Clear the session ID for the current thread."""
-    _session_context.session_id = None
+    _session_id_var.set(None)
 
 
 # ---------------------------------------------------------------------------
@@ -195,7 +192,7 @@ def _install_session_record_factory() -> None:
 
     def _session_record_factory(*args, **kwargs):
         record = current_factory(*args, **kwargs)
-        sid = getattr(_session_context, "session_id", None)
+        sid = _session_id_var.get()
         record.session_tag = f" [{sid}]" if sid else ""  # type: ignore[attr-defined]
         return record
 
@@ -209,40 +206,6 @@ _install_session_record_factory()
 
 
 # ---------------------------------------------------------------------------
-# Filters
-# ---------------------------------------------------------------------------
-
-class _ComponentFilter(logging.Filter):
-    """Only pass records whose logger name starts with one of *prefixes*.
-
-    Used to route gateway-specific records to ``gateway.log`` while
-    keeping ``agent.log`` as the catch-all.
-    """
-
-    def __init__(self, prefixes: Sequence[str]) -> None:
-        super().__init__()
-        self._prefixes = tuple(prefixes)
-
-    def filter(self, record: logging.LogRecord) -> bool:
-        return record.name.startswith(self._prefixes)
-
-
-# Logger name prefixes that belong to each component.
-# Used by _ComponentFilter and exposed for ``hermes logs --component``.
-COMPONENT_PREFIXES = {
-    # ``plugins.platforms`` covers messaging-platform adapters that migrated
-    # out of ``gateway/platforms/`` into bundled plugins (#41112) — they are
-    # still gateway components and their logs belong in gateway.log / match
-    # ``hermes logs --component gateway``.
-    "gateway": ("gateway", "hermes_plugins", "plugins.platforms"),
-    "agent": ("agent", "run_agent", "model_tools", "batch_runner"),
-    "tools": ("tools",),
-    "cli": ("hermes_cli", "cli"),
-    "cron": ("cron",),
-}
-
-
-# ---------------------------------------------------------------------------
 # Main setup
 # ---------------------------------------------------------------------------
 
@@ -252,7 +215,6 @@ def setup_logging(
     log_level: Optional[str] = None,
     max_size_mb: Optional[int] = None,
     backup_count: Optional[int] = None,
-    mode: Optional[str] = None,
     force: bool = False,
 ) -> Path:
     """Configure the Hermes logging subsystem.
@@ -275,12 +237,6 @@ def setup_logging(
     backup_count
         Number of rotated backup files to keep.
         Defaults to 3 or the value from config.yaml ``logging.backup_count``.
-    mode
-        Caller context: ``"cli"``, ``"gateway"``, ``"gui"``, ``"cron"``.
-        When ``"gateway"``, an additional ``gateway.log`` file is created
-        that receives only gateway-component records.
-        When ``"gui"``, an additional ``gui.log`` file is created that
-        receives dashboard and TUI-gateway component records.
     force
         Re-run setup even if it has already been called.
 
@@ -326,30 +282,6 @@ def setup_logging(
         backup_count=2,
         formatter=RedactingFormatter(_LOG_FORMAT),
     )
-
-    # --- gateway.log (INFO+, gateway component only) ------------------------
-    if mode == "gateway":
-        _add_rotating_handler(
-            root,
-            log_dir / "gateway.log",
-            level=logging.INFO,
-            max_bytes=5 * 1024 * 1024,
-            backup_count=3,
-            formatter=RedactingFormatter(_LOG_FORMAT),
-            log_filter=_ComponentFilter(COMPONENT_PREFIXES["gateway"]),
-        )
-
-    # --- gui.log (INFO+, dashboard/tui-gateway components) -----------------
-    if mode == "gui":
-        _add_rotating_handler(
-            root,
-            log_dir / "gui.log",
-            level=logging.INFO,
-            max_bytes=10 * 1024 * 1024,
-            backup_count=5,
-            formatter=RedactingFormatter(_LOG_FORMAT),
-            log_filter=_ComponentFilter(COMPONENT_PREFIXES["gui"]),
-        )
 
     if _logging_initialized and not force:
         return log_dir
@@ -724,8 +656,7 @@ def _add_rotating_handler(
     Parameters
     ----------
     log_filter
-        Optional filter to attach to the handler (e.g. ``_ComponentFilter``
-        for gateway.log).
+        Optional filter to attach to the handler.
     """
     resolved = path.resolve()
     for existing in _queued_file_handlers:

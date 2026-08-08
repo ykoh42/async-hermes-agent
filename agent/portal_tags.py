@@ -12,10 +12,8 @@ Tag shape (sent in OpenAI-compatible ``extra_body['tags']``):
         "client=hermes-client-v<__version__>",
     ]
 
-The version is sourced live from ``hermes_cli.__version__`` so it auto-aligns
-to whatever release is installed; the release script
-(``scripts/release.py``) regex-bumps that single string, and every Portal
-request picks up the new tag on the next process start.
+The version is sourced live from ``hermes_cli.__version__`` so every Portal
+request picks up the installed release on the next process start.
 
 Why one helper instead of inlining the literal at each site:
 * Four call sites (main loop profile, aux client, run_agent compression

@@ -326,12 +326,6 @@ async def build_bundle_invocation_message(
             disabled.append(skill_name or identifier)
             continue
 
-        try:
-            from tools.skill_usage import bump_use
-            bump_use(skill_name)
-        except Exception:
-            pass
-
         activation_note = (
             f'[Loaded as part of the "{bundle_name}" skill bundle.]'
         )

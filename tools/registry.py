@@ -49,6 +49,7 @@ _TRAINING_RUNTIME_TOOL_MODULES = frozenset({
     "image_generation_tool",
     "memory_tool",
     "process_registry",
+    "skill_manager_tool",
     "skills_tool",
     "session_search_tool",
     "terminal_tool",

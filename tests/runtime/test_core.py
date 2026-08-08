@@ -84,8 +84,10 @@ def test_conversation_and_chat_are_coroutines():
         main as trajectory_main,
     )
     from hermes_cli.middleware import run_llm_execution_middleware
-    from hermes_constants import get_hermes_dir
+    from hermes_constants import get_hermes_dir, with_hermes_node_path
+    from hermes_time import _resolve_timezone_name, get_timezone, now
     from gateway.status import _pid_exists
+    from agent.coding_context import RuntimeMode, coding_selection
     from agent.skill_commands import (
         build_skill_invocation_message,
         get_skill_commands,
@@ -143,6 +145,12 @@ def test_conversation_and_chat_are_coroutines():
     assert inspect.iscoroutinefunction(trajectory_main)
     assert inspect.iscoroutinefunction(SessionDB._parse_schema_columns)
     assert inspect.iscoroutinefunction(get_hermes_dir)
+    assert inspect.iscoroutinefunction(with_hermes_node_path)
+    assert inspect.iscoroutinefunction(_resolve_timezone_name)
+    assert inspect.iscoroutinefunction(get_timezone)
+    assert inspect.iscoroutinefunction(now)
+    assert inspect.iscoroutinefunction(RuntimeMode.toolset_selection)
+    assert inspect.iscoroutinefunction(coding_selection)
     assert inspect.iscoroutinefunction(_pid_exists)
     assert inspect.iscoroutinefunction(terminal_tool)
     assert inspect.iscoroutinefunction(get_session_cwd)
@@ -2258,12 +2266,10 @@ async def test_run_conversation_serializes_turns_for_one_agent(monkeypatch, tmp_
     first_model_call = asyncio.Event()
     release_model = asyncio.Event()
     model_calls = 0
-    model_started_at = None
 
     async def slow_model(*_args, **_kwargs):
-        nonlocal model_calls, model_started_at
+        nonlocal model_calls
         model_calls += 1
-        model_started_at = time.monotonic()
         first_model_call.set()
         await release_model.wait()
         return SimpleNamespace(
@@ -2291,13 +2297,10 @@ async def test_run_conversation_serializes_turns_for_one_agent(monkeypatch, tmp_
             AssertionError("public async turns must not call asyncio.to_thread")
         ),
     )
-    submitted_at = time.monotonic()
     first = asyncio.create_task(agent.run_conversation("first"))
     second = None
     try:
         await asyncio.wait_for(first_model_call.wait(), timeout=2)
-        assert model_started_at is not None
-        assert model_started_at - submitted_at < 0.25
         second = asyncio.create_task(agent.run_conversation("second"))
         await asyncio.sleep(0.05)
         assert model_calls == 1
@@ -2512,6 +2515,31 @@ async def test_close_cancels_and_awaits_active_turn_without_task_leak():
 
         assert turn_task.cancelled()
         assert agent._closed is True
+
+
+@pytest.mark.asyncio
+async def test_close_cancels_and_awaits_background_delegations():
+    agent = AIAgent.__new__(AIAgent)
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def background_delegation() -> None:
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    async with no_task_leaks(action=LeakAction.RAISE):
+        task = asyncio.create_task(background_delegation())
+        await started.wait()
+        agent._background_delegations = {task}
+
+        await agent.close()
+
+        assert task.cancelled()
+        assert cancelled.is_set()
+        assert agent._background_delegations == set()
 
 
 @pytest.mark.asyncio

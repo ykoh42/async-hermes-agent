@@ -170,13 +170,6 @@ async def _get_env_config() -> dict[str, Any]:
         "env_type": "local",
         "cwd": os.path.normpath(cwd),  # noqa: ASYNC240 - lexical only
         "timeout": _parse_env_var("TERMINAL_TIMEOUT", "120"),
-        "docker_forward_env": _parse_env_var(
-            "TERMINAL_DOCKER_FORWARD_ENV", "[]", json.loads, "valid JSON"
-        ),
-        "docker_image": "",
-        "singularity_image": "",
-        "modal_image": "",
-        "daytona_image": "",
         "local_persistent": _parse_env_var(
             "TERMINAL_LOCAL_PERSISTENT",
             "false",
@@ -629,6 +622,27 @@ async def terminal_tool(  # noqa: ASYNC109 - upstream public API names timeout
         exit_note = _interpret_exit_code(command, exit_code)
         if exit_note:
             payload["exit_code_meaning"] = exit_note
+        try:
+            from agent.verification_evidence import record_terminal_result
+
+            evidence = await record_terminal_result(
+                command=command,
+                cwd=cwd,
+                session_id=session_id or task_id or "default",
+                exit_code=exit_code,
+                output=output,
+            )
+            if evidence:
+                payload["verification_evidence"] = {
+                    "status": evidence.get("status"),
+                    "kind": evidence.get("kind"),
+                    "scope": evidence.get("scope"),
+                    "canonical_command": evidence.get("canonical_command"),
+                }
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.debug("verification evidence recording failed", exc_info=True)
         return json.dumps(payload, ensure_ascii=False)
     except asyncio.CancelledError:
         raise
@@ -792,8 +806,7 @@ TERMINAL_SCHEMA = {
                 "type": "boolean",
                 "description": (
                     "Run in pseudo-terminal (PTY) mode for interactive CLI tools "
-                    "like Codex, Claude Code, or Python REPL. Only works with local "
-                    "and SSH backends. Default: false."
+                    "like Codex, Claude Code, or Python REPL. Default: false."
                 ),
                 "default": False,
             },

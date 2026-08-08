@@ -857,7 +857,7 @@ READ_FILE_SCHEMA = {
 
 WRITE_FILE_SCHEMA = {
     "name": "write_file",
-    "description": "Write content to a file, completely replacing existing content. Use this instead of echo/cat heredoc in terminal. Creates parent directories automatically. OVERWRITES the entire file — use 'patch' for targeted edits. Auto-runs syntax checks on .py/.json/.yaml/.toml and other linted languages; only NEW errors introduced by this write are surfaced (pre-existing errors are filtered out).",
+    "description": "Write content to a file, completely replacing existing content. Use this instead of echo/cat heredoc in terminal. Creates parent directories automatically. OVERWRITES the entire file — use 'patch' for targeted edits. Auto-runs syntax checks on .py/.json/.yaml/.toml and other linted languages; only NEW errors introduced by this write are surfaced (pre-existing errors are filtered out). The result's verified:true means the on-disk content hash was confirmed — do NOT re-read the file to check the write landed.",
     "parameters": {
         "type": "object",
         "properties": {
@@ -865,7 +865,7 @@ WRITE_FILE_SCHEMA = {
             "content": {"type": "string", "description": "Complete content to write to the file"},
             "cross_profile": {
                 "type": "boolean",
-                "description": "Opt out of the cross-profile soft guard. Defaults to false. Set true ONLY after explicit user direction to edit another Hermes profile's skills/plugins/cron/memories — by default these writes are blocked with a warning because they affect a different profile than the one this session is running under.",
+                "description": "Opt out of the cross-profile soft guard. Defaults to false. Set true ONLY after explicit user direction to edit another Hermes profile's skills/plugins/memories — by default these writes are blocked with a warning because they affect a different profile than the one this session is running under.",
                 "default": False,
             },
         },
@@ -916,7 +916,7 @@ PATCH_SCHEMA = {
             },
             "cross_profile": {
                 "type": "boolean",
-                "description": "Opt out of the cross-profile soft guard. Defaults to false. Set true ONLY after explicit user direction to edit another Hermes profile's skills/plugins/cron/memories.",
+                "description": "Opt out of the cross-profile soft guard. Defaults to false. Set true ONLY after explicit user direction to edit another Hermes profile's skills/plugins/memories.",
                 "default": False,
             },
         },
@@ -1600,6 +1600,11 @@ async def _handle_write_file(args, **kw):
     result["resolved_path"] = str(resolved)
     if not write_result.error:
         result["files_modified"] = [str(resolved)]
+        await _mark_verification_stale(
+            task_id,
+            [str(resolved)],
+            session_id=kw.get("session_id"),
+        )
     if cross_warning or stale_warning or cwd_warning:
         result["_warning"] = cross_warning or stale_warning or cwd_warning
     return json.dumps(
@@ -1651,7 +1656,9 @@ class _V4AFileOperations:
         return await _check_lint(Path(path))
 
 
-async def _handle_v4a_patch(args: dict, task_id: str) -> str:
+async def _handle_v4a_patch(
+    args: dict, task_id: str, session_id: str | None = None
+) -> str:
     """Apply a V4A patch through the directly async-converted upstream applier."""
     patch_content = args.get("patch")
     if not isinstance(patch_content, str) or not patch_content.strip():
@@ -1743,6 +1750,11 @@ async def _handle_v4a_patch(args: dict, task_id: str) -> str:
                 await _refresh_read_timestamp(raw_path, task_id)
                 await file_state.note_write(task_id, str(resolved))
             _reset_patch_failures(task_id, resolved_modified)
+            await _mark_verification_stale(
+                task_id,
+                resolved_modified,
+                session_id=session_id,
+            )
 
     return json.dumps(result, ensure_ascii=False)
 
@@ -1752,7 +1764,9 @@ async def _handle_patch(args, **kw):
     task_id = kw.get("task_id") or "default"
     mode = args.get("mode", "replace")
     if mode == "patch":
-        return await _handle_v4a_patch(args, task_id)
+        return await _handle_v4a_patch(
+            args, task_id, session_id=kw.get("session_id")
+        )
     if mode != "replace":
         return tool_error(f"patch: unknown mode {mode!r}.")
     path = args.get("path")
@@ -1911,10 +1925,39 @@ async def _handle_patch(args, **kw):
     }
     if cross_warning or stale_warning or cwd_warning:
         result["_warning"] = cross_warning or stale_warning or cwd_warning
+    await _mark_verification_stale(
+        task_id,
+        [str(resolved)],
+        session_id=kw.get("session_id"),
+    )
     return json.dumps(
         result,
         ensure_ascii=False,
     )
+
+
+async def _mark_verification_stale(
+    task_id: str,
+    resolved_paths: list[str],
+    session_id: str | None = None,
+) -> None:
+    """Best-effort note that successful edits made prior verification stale."""
+    paths = [path for path in resolved_paths if path]
+    if not paths:
+        return
+    try:
+        from agent.verification_evidence import mark_workspace_edited
+
+        cwd = str(Path(paths[0]).parent)
+        await mark_workspace_edited(
+            session_id=session_id or task_id,
+            cwd=cwd,
+            paths=paths,
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.debug("verification stale marker failed", exc_info=True)
 
 
 _REGEX_NEWLINE_ESCAPE_RE = re.compile(r"(?<!\\)(?:\\\\)*\\n")

@@ -1961,7 +1961,7 @@ class TestAuxiliaryFallbackLayering:
             patch("agent.auxiliary_client._try_main_agent_model_fallback") as mock_main,
         ):
             result = await call_llm(
-                task="kanban_decomposer",
+                task="compression",
                 messages=[{"role": "user", "content": "decompose this"}],
             )
 

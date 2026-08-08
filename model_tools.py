@@ -10,7 +10,7 @@ environments consume.
 
 Public API (names and arguments preserved from the original 2,400-line version):
     await get_tool_definitions(enabled_toolsets, disabled_toolsets, quiet_mode) -> list
-    handle_function_call(function_name, function_args, task_id, user_task) -> str
+    await handle_function_call(function_name, function_args, task_id, user_task) -> str
     TOOL_TO_TOOLSET_MAP: dict          (for batch_runner.py)
     TOOLSET_REQUIREMENTS: dict         (for cli.py, doctor.py)
     get_all_tool_names() -> list
@@ -51,24 +51,6 @@ _TOOL_HANDLER_CONTEXT: ContextVar[Optional[Dict[str, Any]]] = ContextVar(
 # Tracks platform-bundle names already flagged in disabled_toolsets so the
 # advisory (#33924) is logged once per name, not on every tool recompute.
 _WARNED_DISABLED_BUNDLES: set = set()
-
-
-def _is_delegated_child_context() -> bool:
-    try:
-        from agent.delegation_context import is_delegated_child_context
-
-        return is_delegated_child_context()
-    except Exception:
-        return False
-
-
-# =============================================================================
-# Native async contract
-# =============================================================================
-
-
-
-
 
 # =============================================================================
 # Tool Discovery  (importing each module triggers its registry.register calls)
@@ -111,7 +93,6 @@ _LEGACY_TOOLSET_MAP = {
         "browser_vision", "browser_console"
     ],
     "file_tools": ["read_file", "write_file", "patch", "search_files"],
-    "tts_tools": ["text_to_speech"],
 }
 
 
@@ -132,12 +113,11 @@ _LEGACY_TOOLSET_MAP = {
 # daemon start/stop, env var changes, etc.) on a 30 s horizon.
 _tool_defs_cache: Dict[tuple, List[Dict[str, Any]]] = {}
 
-# Hard cap on memoized get_tool_definitions() results. A long-lived Gateway
-# process sees many distinct toolset/config fingerprints over its lifetime
-# (per-session toolset sets, config edits, kanban-task toggles); without a
+# Hard cap on memoized get_tool_definitions() results. A long-lived embedding
+# process sees many distinct toolset/config fingerprints over its lifetime;
+# without a
 # bound the cache grows unboundedly. 8 comfortably covers the warm working
-# set (the handful of distinct platform/toolset combos a gateway actually
-# serves) while keeping the cap small. (#19251)
+# set while keeping the cap small. (#19251)
 _TOOL_DEFS_CACHE_MAX = 8
 
 
@@ -193,9 +173,7 @@ async def get_tool_definitions(
                 frozenset(disabled_toolsets) if disabled_toolsets else None,
                 registry._generation,
                 cfg_fp,
-                bool(os.environ.get("HERMES_KANBAN_TASK")),
                 bool(skip_tool_search_assembly),
-                _is_delegated_child_context(),
                 profile_scope,
             )
         cached = _tool_defs_cache.get(cache_key) if cache_key is not None else None
@@ -241,19 +219,7 @@ async def _compute_tool_definitions(
     tools_to_include: set = set()
 
     if enabled_toolsets is not None:
-        effective_enabled_toolsets = list(enabled_toolsets)
-        if (
-            os.environ.get("HERMES_KANBAN_TASK")
-            and not _is_delegated_child_context()
-            and "kanban" not in effective_enabled_toolsets
-        ):
-            # Dispatcher-spawned workers are scoped by HERMES_KANBAN_TASK and
-            # must always receive the lifecycle handoff tools. Assignee
-            # profiles may intentionally restrict their normal chat toolsets
-            # (for token/cost reasons), but that should not strip the kanban
-            # worker's completion/block/heartbeat surface.
-            effective_enabled_toolsets.append("kanban")
-        for toolset_name in effective_enabled_toolsets:
+        for toolset_name in enabled_toolsets:
             if validate_toolset(toolset_name):
                 resolved = resolve_toolset(toolset_name)
                 tools_to_include.update(resolved)

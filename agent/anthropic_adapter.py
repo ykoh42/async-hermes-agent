@@ -1584,7 +1584,7 @@ def _convert_content_to_anthropic(content: Any) -> Any:
 def _content_parts_to_anthropic_blocks(parts: Any) -> List[Dict[str, Any]]:
     """Convert OpenAI-style tool-message content parts → Anthropic tool_result inner blocks.
 
-    Used for multimodal tool results (e.g. computer_use screenshots). Each
+    Used for multimodal tool results such as screenshots. Each
     part is normalized via `_convert_content_part_to_anthropic`, then
     filtered to the block types Anthropic tool_result accepts (text + image).
     """
@@ -2240,7 +2240,7 @@ def _manage_thinking_signatures(
 
 
 def _evict_old_screenshots(result: List[Dict[str, Any]]) -> None:
-    """Keep only the most recent ``_MAX_KEEP_IMAGES`` computer-use screenshots.
+    """Keep only the most recent ``_MAX_KEEP_IMAGES`` tool-result images.
 
     Base64 images cost ~1,465 tokens each and accumulate across tool calls.
     Walk backward, keep the most recent N, replace older ones with a placeholder.

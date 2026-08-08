@@ -438,7 +438,7 @@ class XAIImageGenProvider(ImageGenProvider):
             # asset is gone (#26942).  Materialise the bytes locally at
             # tool-completion time so the gateway has a stable file path to
             # upload, mirroring the b64 branch above and the audio_cache
-            # pattern used by text_to_speech.
+            # pattern used by the other media providers.
             try:
                 saved_path = await save_url_image(
                     url,

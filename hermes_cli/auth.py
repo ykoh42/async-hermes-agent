@@ -127,40 +127,16 @@ XAI_OAUTH_SCOPE = "openid profile email offline_access grok-cli:access api:acces
 XAI_OAUTH_DEVICE_CODE_URL = f"{XAI_OAUTH_ISSUER}/oauth2/device/code"
 # xAI/Grok OAuth access tokens are intentionally short-lived (about 6h in
 # current SuperGrok flows). A two-minute refresh window is too narrow for
-# gateway/cron workloads that may only touch the provider every 30 minutes,
+# long-lived workloads that may only touch the provider every 30 minutes,
 # leaving brief but noisy credential-expiry gaps. Refresh up to one hour
 # early so ordinary runtime calls keep the token warm without user reauth.
 XAI_ACCESS_TOKEN_REFRESH_SKEW_SECONDS = 3600
 QWEN_OAUTH_CLIENT_ID = "f0304373b74a44d2b584a3fb70ca9e56"
 QWEN_OAUTH_TOKEN_URL = "https://chat.qwen.ai/api/v1/oauth2/token"
 QWEN_ACCESS_TOKEN_REFRESH_SKEW_SECONDS = 120
-DEFAULT_SPOTIFY_ACCOUNTS_BASE_URL = "https://accounts.spotify.com"
-DEFAULT_SPOTIFY_API_BASE_URL = "https://api.spotify.com/v1"
-DEFAULT_SPOTIFY_REDIRECT_URI = "http://127.0.0.1:43827/spotify/callback"
-SPOTIFY_DOCS_URL = (
-    "https://hermes-agent.nousresearch.com/docs/user-guide/features/spotify"
-)
-SPOTIFY_DASHBOARD_URL = "https://developer.spotify.com/dashboard"
-SPOTIFY_ACCESS_TOKEN_REFRESH_SKEW_SECONDS = 120
-
 OAUTH_OVER_SSH_DOCS_URL = (
     "https://hermes-agent.nousresearch.com/docs/guides/oauth-over-ssh"
 )
-DEFAULT_SPOTIFY_SCOPE = " ".join((
-    "user-modify-playback-state",
-    "user-read-playback-state",
-    "user-read-currently-playing",
-    "user-read-recently-played",
-    "playlist-read-private",
-    "playlist-read-collaborative",
-    "playlist-modify-public",
-    "playlist-modify-private",
-    "user-library-read",
-    "user-library-modify",
-))
-SERVICE_PROVIDER_NAMES: Dict[str, str] = {
-    "spotify": "Spotify",
-}
 
 # LM Studio's default no-auth mode still requires *some* non-empty bearer for
 # the API-key code paths (auxiliary_client, runtime resolver) to treat the
@@ -1197,14 +1173,14 @@ def _store_provider_state(
 
 def is_known_auth_provider(provider_id: str) -> bool:
     normalized = (provider_id or "").strip().lower()
-    return normalized in PROVIDER_REGISTRY or normalized in SERVICE_PROVIDER_NAMES
+    return normalized in PROVIDER_REGISTRY
 
 
 def get_auth_provider_display_name(provider_id: str) -> str:
     normalized = (provider_id or "").strip().lower()
     if normalized in PROVIDER_REGISTRY:
         return PROVIDER_REGISTRY[normalized].name
-    return SERVICE_PROVIDER_NAMES.get(normalized, provider_id)
+    return provider_id
 
 
 async def is_runtime_provider_routable(provider_id: str) -> bool:
@@ -4062,7 +4038,7 @@ async def resolve_nous_access_token(
     ca_bundle: Optional[str] = None,
     refresh_skew_seconds: int = ACCESS_TOKEN_REFRESH_SKEW_SECONDS,
 ) -> str:
-    """Resolve a refresh-aware Nous Portal access token for managed tool gateways."""
+    """Resolve a refresh-aware Nous Portal access token for account lookup."""
     global _RESOLVE_TOKEN_CACHE
     if not insecure and ca_bundle is None and _RESOLVE_TOKEN_CACHE is not None:
         cached_at, cached_token = _RESOLVE_TOKEN_CACHE

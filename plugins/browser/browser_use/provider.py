@@ -5,25 +5,15 @@ ABC introduced in PR #25214). The legacy in-tree module
 ``tools.browser_providers.browser_use`` was removed in the same PR; this file
 is now the canonical implementation.
 
-Browser Use is the only browser backend with dual auth: a direct
-``BROWSER_USE_API_KEY`` for self-billed users, or the managed Nous tool
-gateway (which Hermes uses to bill Browser Use sessions to a Nous
-subscription). The dispatch order — direct API key first, managed gateway
-second — preserves the pre-migration behaviour in
-``tools.browser_providers.browser_use.BrowserUseProvider._get_config_or_none``.
+Browser Use authenticates directly with ``BROWSER_USE_API_KEY``.
 
 Config keys this provider responds to::
 
     browser:
       cloud_provider: "browser-use"   # explicit selection
-    tool_gateway:
-      browser: "gateway"              # optional: prefer managed gateway
-                                      #   even when BROWSER_USE_API_KEY is set
-
-Auth env vars (one of)::
+Auth env var::
 
     BROWSER_USE_API_KEY=...           # https://browser-use.com
-    # OR a managed Nous gateway entry (configured via 'hermes setup')
 """
 
 from __future__ import annotations
@@ -39,71 +29,13 @@ from agent.secret_scope import get_secret
 
 logger = logging.getLogger(__name__)
 
-# Idempotency tracking for managed-mode session creation. The managed Nous
-# gateway returns 409 "already in progress" on retried POSTs; we forward the
-# original idempotency key so the gateway can deduplicate. Cleared on
-# success or terminal failure.
-_pending_create_keys: Dict[str, str] = {}
-
 _BASE_URL = "https://api.browser-use.com/api/v3"
-_DEFAULT_MANAGED_TIMEOUT_MINUTES = 5
-_DEFAULT_MANAGED_PROXY_COUNTRY_CODE = "us"
-
-
-def _get_or_create_pending_create_key(task_id: str) -> str:
-    existing = _pending_create_keys.get(task_id)
-    if existing:
-        return existing
-
-    created = f"browser-use-session-create:{uuid.uuid4().hex}"
-    _pending_create_keys[task_id] = created
-    return created
-
-
-def _clear_pending_create_key(task_id: str) -> None:
-    _pending_create_keys.pop(task_id, None)
-
-
-def _should_preserve_pending_create_key(response: httpx.Response) -> bool:
-    """Decide whether to keep the idempotency key after a failed create.
-
-    Preserve the key when the failure looks retryable (5xx) OR when the
-    gateway reports the original request is still in flight (409 "already
-    in progress") — in either case, retrying with the same key lets the
-    gateway deduplicate.
-
-    Drop the key on any other 4xx (auth failure, bad request, etc.) — those
-    won't succeed by being retried.
-    """
-    if response.status_code >= 500:
-        return True
-
-    if response.status_code != 409:
-        return False
-
-    try:
-        payload = response.json()
-    except Exception:
-        return False
-
-    if not isinstance(payload, dict):
-        return False
-
-    error = payload.get("error")
-    if not isinstance(error, dict):
-        return False
-
-    message = str(error.get("message") or "").lower()
-    return "already in progress" in message
 
 
 class BrowserUseBrowserProvider(BrowserProvider):
     """Browser Use (https://browser-use.com) cloud browser backend.
 
-    Dual auth: prefers a direct BROWSER_USE_API_KEY when set, falling back
-    to the managed Nous tool gateway when ``tool_gateway.browser`` config
-    routes through it. Setting ``tool_gateway.browser: gateway`` flips the
-    order so managed billing wins even when BROWSER_USE_API_KEY is present.
+    Uses a direct ``BROWSER_USE_API_KEY`` credential.
     """
 
     @property
@@ -118,59 +50,27 @@ class BrowserUseBrowserProvider(BrowserProvider):
         return await self._get_config_or_none(refresh_token=False) is not None
 
     # ------------------------------------------------------------------
-    # Config resolution (direct API key OR managed Nous gateway)
+    # Config resolution
     # ------------------------------------------------------------------
 
     async def _get_config_or_none(
         self, *, refresh_token: bool = True
     ) -> Optional[Dict[str, Any]]:
-        # Import here to avoid a hard dependency at module-import time —
-        # managed_tool_gateway pulls in the Nous auth stack which can be
-        # heavy and is not needed for direct-API-key users.
-        from tools.managed_tool_gateway import (
-            peek_nous_access_token,
-            resolve_managed_tool_gateway,
-        )
-        from tools.tool_backend_helpers import prefers_gateway
-
-        # Direct API key wins unless the user has explicitly opted into the
-        # managed Nous gateway via ``tool_gateway.browser: gateway``.
+        del refresh_token
         api_key = get_secret("BROWSER_USE_API_KEY")
-        if api_key and not await prefers_gateway("browser"):
+        if api_key:
             return {
                 "api_key": api_key,
                 "base_url": _BASE_URL,
-                "managed_mode": False,
             }
-
-        # Keep availability scans off the synchronous OAuth refresh path.
-        managed = await resolve_managed_tool_gateway(
-            "browser-use",
-            token_reader=None if refresh_token else peek_nous_access_token,
-        )
-        if managed is None:
-            return None
-
-        return {
-            "api_key": managed.nous_user_token,
-            "base_url": managed.gateway_origin.rstrip("/"),
-            "managed_mode": True,
-        }
+        return None
 
     async def _get_config(self) -> Dict[str, Any]:
-        from tools.tool_backend_helpers import managed_nous_tools_enabled
-
         config = await self._get_config_or_none()
         if config is None:
-            message = (
+            raise ValueError(
                 "Browser Use requires a direct BROWSER_USE_API_KEY credential."
             )
-            if await managed_nous_tools_enabled():
-                message = (
-                    "Browser Use requires either a direct BROWSER_USE_API_KEY "
-                    "credential or a managed Browser Use gateway configuration."
-                )
-            raise ValueError(message)
         return config
 
     # ------------------------------------------------------------------
@@ -185,56 +85,28 @@ class BrowserUseBrowserProvider(BrowserProvider):
 
     async def create_session(self, task_id: str) -> Dict[str, object]:
         config = await self._get_config()
-        managed_mode = bool(config.get("managed_mode"))
-
         headers = self._headers(config)
-        if managed_mode:
-            headers["X-Idempotency-Key"] = _get_or_create_pending_create_key(task_id)
-
-        # Keep gateway-backed sessions short so billing authorization does not
-        # default to a long Browser-Use timeout when Hermes only needs a task-
-        # scoped ephemeral browser.
-        payload = (
-            {
-                "timeout": _DEFAULT_MANAGED_TIMEOUT_MINUTES,
-                "proxyCountryCode": _DEFAULT_MANAGED_PROXY_COUNTRY_CODE,
-            }
-            if managed_mode
-            else {}
-        )
 
         try:
             async with httpx.AsyncClient(timeout=30) as client:
                 response = await client.post(
                     f"{config['base_url']}/browsers",
                     headers=headers,
-                    json=payload,
+                    json={},
                 )
         except httpx.RequestError as exc:
-            # Managed mode: propagate raw so callers can retry with the
-            # preserved idempotency key. Direct mode: wrap network failures
-            # into a clean RuntimeError for end users.
-            if managed_mode:
-                raise
             raise RuntimeError(
                 f"Browser Use API connection failed: {exc}"
             ) from exc
 
         if response.status_code >= 400:
-            if managed_mode and not _should_preserve_pending_create_key(response):
-                _clear_pending_create_key(task_id)
             raise RuntimeError(
                 f"Failed to create Browser Use session: "
                 f"{response.status_code} {response.text}"
             )
 
         session_data = response.json()
-        if managed_mode:
-            _clear_pending_create_key(task_id)
         session_name = f"hermes_{task_id}_{uuid.uuid4().hex[:8]}"
-        external_call_id = (
-            response.headers.get("x-external-call-id") if managed_mode else None
-        )
 
         logger.info("Created Browser Use session %s", session_name)
 
@@ -249,7 +121,7 @@ class BrowserUseBrowserProvider(BrowserProvider):
             # expired CDP endpoint instead of reconnecting to it indefinitely.
             "expires_at": session_data.get("timeoutAt"),
             "features": {"browser_use": True},
-            "external_call_id": external_call_id,
+            "external_call_id": None,
         }
 
     async def close_session(self, session_id: str) -> bool:

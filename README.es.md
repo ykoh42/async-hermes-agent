@@ -1,220 +1,235 @@
-<p align="center">
-  <img src="assets/banner.png" alt="Hermes Agent" width="100%">
-</p>
+# Async Hermes Agent
 
-# Hermes Agent ☤
-<p align="center">
-  <a href="https://hermes-agent.nousresearch.com/">Hermes Agent</a> | <a href="https://hermes-agent.nousresearch.com/">Hermes Desktop</a>
-</p>
-<p align="center">
-  <a href="https://hermes-agent.nousresearch.com/docs/"><img src="https://img.shields.io/badge/Docs-hermes--agent.nousresearch.com-FFD700?style=for-the-badge" alt="Documentación"></a>
-  <a href="https://discord.gg/NousResearch"><img src="https://img.shields.io/badge/Discord-5865F2?style=for-the-badge&logo=discord&logoColor=white" alt="Discord"></a>
-  <a href="https://github.com/NousResearch/hermes-agent/blob/main/LICENSE"><img src="https://img.shields.io/badge/Licencia-MIT-green?style=for-the-badge" alt="Licencia: MIT"></a>
-  <a href="https://nousresearch.com"><img src="https://img.shields.io/badge/Creado%20por-Nous%20Research-blueviolet?style=for-the-badge" alt="Creado por Nous Research"></a>
-  <a href="README.md"><img src="https://img.shields.io/badge/Lang-English-blue?style=for-the-badge" alt="English"></a>
-  <a href="README.zh-CN.md"><img src="https://img.shields.io/badge/Lang-中文-red?style=for-the-badge" alt="中文"></a>
-  <a href="README.ur-pk.md"><img src="https://img.shields.io/badge/Lang-اردو-green?style=for-the-badge" alt="اردو"></a>
-</p>
+Distribución nativa asíncrona y orientada a biblioteca de
+[NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent), basada
+en la versión upstream `v2026.8.3` (`v0.20.0`).
 
-**El agente de IA con mejora continua creado por [Nous Research](https://nousresearch.com).** Es el único agente con un bucle de aprendizaje integrado: crea habilidades a partir de la experiencia, las mejora durante el uso, se impulsa a sí mismo a persistir el conocimiento, busca en sus propias conversaciones pasadas y construye un modelo cada vez más profundo de quién eres a lo largo de las sesiones. Ejecútalo en un VPS de $5, un clúster de GPUs o infraestructura sin servidor que cuesta casi nada cuando está inactivo. No está atado a tu laptop — habla con él desde Telegram mientras trabaja en una VM en la nube.
+Este repositorio conserva el bucle del agente Hermes, los proveedores de
+modelos, la ejecución de herramientas, MCP, habilidades, memoria y sesiones
+persistentes, generación de trayectorias, runner y batch runner. La CLI/TUI,
+los puentes de mensajería, el planificador, el dashboard y una aplicación
+FastAPI quedan intencionadamente fuera de este paquete.
 
-Usa cualquier modelo que quieras — [Nous Portal](https://portal.nousresearch.com), [OpenRouter](https://openrouter.ai) (más de 200 modelos), [NovitaAI](https://novita.ai), [NVIDIA NIM](https://build.nvidia.com) (Nemotron), [Xiaomi MiMo](https://platform.xiaomimimo.com), [z.ai/GLM](https://z.ai), [Kimi/Moonshot](https://platform.moonshot.ai), [MiniMax](https://www.minimax.io), [Hugging Face](https://huggingface.co), OpenAI, o tu propio endpoint. Cambia con `hermes model` — sin cambios de código, sin dependencias.
+La API pública central mantiene los nombres y rutas de módulos de upstream.
+Normalmente, una integración existente solo necesita añadir `await`:
 
-<table>
-<tr><td><b>Una interfaz de terminal real</b></td><td>TUI completa con edición multilínea, autocompletado de comandos, historial de conversaciones, interrupción y redirección, y salida de herramientas en streaming.</td></tr>
-<tr><td><b>Vive donde tú vives</b></td><td>Telegram, Discord, Slack, WhatsApp, Signal y CLI — todo desde un único proceso gateway. Transcripción de notas de voz, continuidad de conversación entre plataformas.</td></tr>
-<tr><td><b>Un bucle de aprendizaje cerrado</b></td><td>Memoria curada por el agente con recordatorios periódicos. Creación autónoma de habilidades tras tareas complejas. Las habilidades mejoran solas durante el uso. Búsqueda FTS5 de sesiones con resumención por LLM para recuperación entre sesiones. Modelado de usuario dialéctico <a href="https://github.com/plastic-labs/honcho">Honcho</a>. Compatible con el estándar abierto de <a href="https://agentskills.io">agentskills.io</a>.</td></tr>
-<tr><td><b>Automatizaciones programadas</b></td><td>Planificador cron integrado con entrega a cualquier plataforma. Informes diarios, copias de seguridad nocturnas, auditorías semanales — todo en lenguaje natural, ejecutándose de forma autónoma.</td></tr>
-<tr><td><b>Delega y paraleliza</b></td><td>Lanza subagentes aislados para flujos de trabajo paralelos. Escribe scripts de Python que llaman a herramientas vía RPC, convirtiendo pipelines de múltiples pasos en turnos de coste cero de contexto.</td></tr>
-<tr><td><b>Funciona en cualquier lugar, no solo en tu laptop</b></td><td>Seis backends de terminal — local, Docker, SSH, Singularity, Modal y Daytona. Daytona y Modal ofrecen persistencia sin servidor — el entorno de tu agente hiberna cuando está inactivo y se activa bajo demanda, costando casi nada entre sesiones. Ejecútalo en un VPS de $5 o un clúster de GPUs.</td></tr>
-<tr><td><b>Listo para investigación</b></td><td>Generación de trayectorias en lote, compresión de trayectorias para entrenar la próxima generación de modelos de llamadas a herramientas.</td></tr>
-</table>
+```python
+import asyncio
+import os
 
----
+from run_agent import AIAgent
 
-## Instalación rápida
 
-### Linux, macOS, WSL2, Termux
+async def main():
+    async with AIAgent(
+        provider="openrouter",
+        model="openrouter/auto",
+        api_key=os.environ["OPENROUTER_API_KEY"],
+    ) as agent:
+        result = await agent.run_conversation("Investiga este repositorio")
+        print(result["final_response"])
+
+
+asyncio.run(main())
+```
+
+Dentro de una función asíncrona, la interfaz compacta que devuelve texto y el
+ciclo de vida explícito son:
+
+```python
+agent = AIAgent(provider="openrouter", model="openrouter/auto")
+try:
+    answer = await agent.chat("Resume el resultado")
+finally:
+    await agent.close()
+```
+
+`AIAgent.__init__()` solo construye estado. La configuración, los clientes de
+proveedor, el almacenamiento de sesiones y las conexiones MCP se inicializan
+de forma diferida en el primer límite esperado. Los turnos de una misma
+instancia de `AIAgent` se serializan; instancias distintas pueden ejecutarse en
+paralelo.
+
+## Instalación
+
+Se admite Python 3.11 a 3.13.
 
 ```bash
-curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
+uv pip install "git+https://github.com/ykoh42/async-hermes-agent.git"
 ```
 
-### Windows (nativo, PowerShell)
-
-> **Nota:** En Windows nativo, Hermes funciona sin WSL — la CLI, el gateway, la TUI y las herramientas funcionan de forma nativa. Si prefieres usar WSL2, el comando de Linux/macOS de arriba también funciona allí. ¿Encontraste un error? Por favor [crea un issue](https://github.com/NousResearch/hermes-agent/issues).
-
-Ejecuta esto en PowerShell:
-
-```powershell
-iex (irm https://hermes-agent.nousresearch.com/install.ps1)
-```
-
-El instalador se encarga de todo: uv, Python 3.11, Node.js, ripgrep, ffmpeg, **y un Git Bash portátil** (MinGit, descomprimido en `%LOCALAPPDATA%\hermes\git` — no requiere administrador, completamente aislado de cualquier instalación de Git del sistema). Hermes usa este Git Bash incluido para ejecutar comandos de shell.
-
-Si ya tienes Git instalado, el instalador lo detecta y lo usa en su lugar. De lo contrario, una descarga de ~45MB de MinGit es todo lo que necesitas — no tocará ni interferirá con ningún Git del sistema.
-
-> **Android / Termux:** La ruta manual probada está documentada en la [guía de Termux](https://hermes-agent.nousresearch.com/docs/getting-started/termux). En Termux, Hermes instala el extra `.[termux]` curado porque el extra completo `.[all]` actualmente incluye dependencias de voz incompatibles con Android.
->
-> **Windows:** Windows nativo es totalmente compatible — el comando de PowerShell de arriba instala todo. Si prefieres usar WSL2, el comando de Linux también funciona allí. La instalación nativa de Windows se encuentra en `%LOCALAPPDATA%\hermes`; WSL2 instala en `~/.hermes` como en Linux.
-
-Después de la instalación:
+Para desarrollo:
 
 ```bash
-source ~/.bashrc    # recargar shell (o: source ~/.zshrc)
-hermes              # ¡empieza a chatear!
+git clone https://github.com/ykoh42/async-hermes-agent.git
+cd async-hermes-agent
+uv sync --extra dev
 ```
 
----
-
-## Primeros pasos
+Las dependencias específicas de proveedor siguen siendo opcionales, por
+ejemplo:
 
 ```bash
-hermes              # CLI interactiva — inicia una conversación
-hermes model        # Elige tu proveedor y modelo LLM
-hermes tools        # Configura qué herramientas están habilitadas
-hermes config set   # Establece valores de configuración individuales
-hermes gateway      # Inicia el gateway de mensajería (Telegram, Discord, etc.)
-hermes setup        # Ejecuta el asistente de configuración completo
-hermes claw migrate # Migra desde OpenClaw (si vienes de OpenClaw)
-hermes update       # Actualiza a la última versión
-hermes doctor       # Diagnostica cualquier problema
+uv sync --extra anthropic
+uv sync --extra vertex
+uv sync --extra azure-identity
 ```
 
-📖 **[Documentación completa →](https://hermes-agent.nousresearch.com/docs/)**
+## Habilidades, MCP y memoria
 
+Las habilidades siguen la estructura existente de Hermes. `HERMES_HOME` usa
+`~/.hermes` por defecto. Coloca cada habilidad activa en:
+
+```text
+$HERMES_HOME/skills/<nombre-habilidad>/SKILL.md
+```
+
+Cada `SKILL.md` es un documento normal de Hermes con frontmatter YAML:
+
+```markdown
+---
+name: code-review
+description: Revisa un cambio de código antes de integrarlo.
 ---
 
-## Evita la colección de claves API — Nous Portal
+# Revisión de código
 
-Hermes funciona con cualquier proveedor que quieras — eso no cambiará. Pero si prefieres no recopilar cinco claves API separadas para el modelo, búsqueda web, generación de imágenes, TTS y un navegador en la nube, **[Nous Portal](https://portal.nousresearch.com)** las cubre todas bajo una sola suscripción:
+Lee el cambio, ejecuta sus pruebas e informa primero de los problemas de
+corrección.
+```
 
-- **Más de 300 modelos** — elige cualquiera con `/model <nombre>`
-- **Tool Gateway** — búsqueda web (Firecrawl), generación de imágenes (FAL), texto a voz (OpenAI), navegador en la nube (Browser Use), todo enrutado a través de tu suscripción. Sin cuentas adicionales.
+Hermes upstream instala sus habilidades incluidas mediante el instalador del
+producto. Esta biblioteca no incluye ese instalador, por lo que los usuarios
+de Git o wheel deben añadir los directorios de habilidades explícitamente o
+indicar directorios compartidos en `config.yaml`:
 
-Un comando desde una instalación nueva:
+```yaml
+skills:
+  external_dirs:
+    - ~/.agents/skills
+    - /shared/team-skills
+```
+
+Las herramientas `skills_list` y `skill_view` descubren tanto los directorios
+locales como los externos configurados. El contenido de una habilidad queda
+fuera del esquema de herramientas del modelo hasta que este la selecciona y la
+lee.
+
+Los servidores MCP se configuran bajo `mcp_servers` en
+`$HERMES_HOME/config.yaml`:
+
+```yaml
+mcp_servers:
+  filesystem:
+    command: npx
+    args: ["-y", "@modelcontextprotocol/server-filesystem", "/workspace"]
+```
+
+El primer límite esperado del agente descubre los servidores configurados y
+registra sus herramientas en el toolset del servidor. Los subprocesos y
+sesiones cliente MCP se cierran mediante `await agent.close()` o el gestor de
+contexto asíncrono.
+
+La memoria basada en archivos y el perfil de usuario también conservan el home
+normal de Hermes en `~/.hermes`. Para un agente con memoria, habilita el toolset
+`memory` y sus ajustes correspondientes en `config.yaml`.
+
+## Entrenamiento y trayectorias
+
+Usa `save_trajectories=True` en `AIAgent` para conversaciones individuales. La
+secuencia guardada conserva razonamiento, llamadas a herramientas,
+observaciones y respuesta final para fine-tuning con pensamiento intercalado.
+Las muestras completadas se añaden a `trajectory_samples.jsonl` en el
+directorio de trabajo del proceso.
+
+Para datasets, importa `BatchRunner` desde el módulo conservado
+`batch_runner.py` y espera su método `run()`. Mantiene concurrencia limitada,
+checkpoints, reanudación y salida JSONL. `trajectory_compressor.py` sigue
+disponible para procesar las trayectorias generadas.
+
+```python
+import asyncio
+import os
+
+from batch_runner import BatchRunner
+
+
+async def main():
+    runner = BatchRunner(
+        dataset_file="prompts.jsonl",
+        batch_size=8,
+        run_name="tool-training",
+        distribution="terminal_only",
+        base_url="https://openrouter.ai/api/v1",
+        api_key=os.environ["OPENROUTER_API_KEY"],
+        model="openai/gpt-oss-20b:free",
+        num_workers=4,
+        reasoning_config={"enabled": True, "effort": "low"},
+    )
+    await runner.run(resume=True)
+
+
+asyncio.run(main())
+```
+
+Cada línea de entrada debe ser JSON con un campo `prompt`. Los resultados se
+escriben bajo `data/<run_name>/`: fragmentos JSONL por lote,
+`trajectories.jsonl`, `checkpoint.json` y `statistics.json`.
+
+## Integración en servicios
+
+No se incluye ningún framework web. El servicio debe controlar su ciclo de
+vida HTTP y esperar directamente a la biblioteca:
+
+```python
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI
+from run_agent import AIAgent
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    async with AIAgent(provider="openrouter", model="openrouter/auto") as agent:
+        app.state.agent = agent
+        yield
+
+
+app = FastAPI(lifespan=lifespan)
+
+
+@app.post("/chat")
+async def chat(message: str):
+    return await app.state.agent.run_conversation(message)
+```
+
+El paquete no usa `asyncio.to_thread()`, `run_in_executor()`,
+`run_until_complete()` ni `.result()` bloqueante en la ruta activa conservada.
+Los proveedores opcionales sin transporte asíncrono nativo fallan al inicio en
+lugar de ejecutar silenciosamente trabajo síncrono en un hilo.
+
+## Verificación
 
 ```bash
-hermes setup --portal
+uv run pytest -q
+uv run ruff check agent tools hermes_cli plugins providers \
+  run_agent.py model_tools.py batch_runner.py hermes_state.py \
+  trajectory_compressor.py
+uv build
 ```
 
-Esto te autentica vía OAuth, establece Nous como tu proveedor y activa el Tool Gateway. Comprueba qué está conectado en cualquier momento con `hermes portal info`. Detalles completos en la [página de documentación del Tool Gateway](https://hermes-agent.nousresearch.com/docs/user-guide/features/tool-gateway).
+## Contribuciones y seguridad
 
-Puedes seguir usando tus propias claves por herramienta cuando quieras — el gateway es por backend, no todo o nada.
+Consulta [CONTRIBUTING.es.md](CONTRIBUTING.es.md) antes de enviar cambios y
+[SECURITY.es.md](SECURITY.es.md) para comunicar vulnerabilidades de forma
+privada.
 
----
+## Relación con upstream
 
-## Referencia rápida: CLI vs Mensajería
+El repositorio conserva los nombres originales de archivos y funciones
+centrales para que futuras importaciones desde upstream sean revisables. Es una
+distribución asíncrona divergente, no una afirmación de que los cambios puedan
+integrarse directamente en el producto síncrono upstream.
 
-Hermes tiene dos puntos de entrada: inicia la interfaz de terminal con `hermes`, o ejecuta el gateway y habla con él desde Telegram, Discord, Slack, WhatsApp, Signal o Email. Una vez en una conversación, muchos comandos de barra son compartidos entre ambas interfaces.
-
-| Acción                              | CLI                                           | Plataformas de mensajería                                                         |
-| ----------------------------------- | --------------------------------------------- | --------------------------------------------------------------------------------- |
-| Empezar a chatear                   | `hermes`                                      | Ejecuta `hermes gateway setup` + `hermes gateway start`, luego envía un mensaje al bot |
-| Nueva conversación                  | `/new` o `/reset`                             | `/new` o `/reset`                                                                 |
-| Cambiar modelo                      | `/model [proveedor:modelo]`                   | `/model [proveedor:modelo]`                                                       |
-| Establecer personalidad             | `/personality [nombre]`                       | `/personality [nombre]`                                                           |
-| Reintentar o deshacer último turno  | `/retry`, `/undo`                             | `/retry`, `/undo`                                                                 |
-| Comprimir contexto / ver uso        | `/compress`, `/usage`, `/insights [--days N]` | `/compress`, `/usage`, `/insights [days]`                                         |
-| Explorar habilidades                | `/skills` o `/<nombre-habilidad>`             | `/<nombre-habilidad>`                                                             |
-| Interrumpir trabajo actual          | `Ctrl+C` o enviar un nuevo mensaje            | `/stop` o enviar un nuevo mensaje                                                 |
-| Estado específico de plataforma     | `/platforms`                                  | `/status`, `/sethome`                                                             |
-
-Para las listas de comandos completas, consulta la [guía de CLI](https://hermes-agent.nousresearch.com/docs/user-guide/cli) y la [guía del Gateway de Mensajería](https://hermes-agent.nousresearch.com/docs/user-guide/messaging).
-
----
-
-## Documentación
-
-Toda la documentación está en **[hermes-agent.nousresearch.com/docs](https://hermes-agent.nousresearch.com/docs/)**:
-
-| Sección                                                                                             | Contenido                                                    |
-| --------------------------------------------------------------------------------------------------- | ------------------------------------------------------------ |
-| [Inicio rápido](https://hermes-agent.nousresearch.com/docs/getting-started/quickstart)              | Instalar → configurar → primera conversación en 2 minutos   |
-| [Uso de CLI](https://hermes-agent.nousresearch.com/docs/user-guide/cli)                             | Comandos, atajos de teclado, personalidades, sesiones        |
-| [Configuración](https://hermes-agent.nousresearch.com/docs/user-guide/configuration)               | Archivo de configuración, proveedores, modelos, todas las opciones |
-| [Gateway de Mensajería](https://hermes-agent.nousresearch.com/docs/user-guide/messaging)           | Telegram, Discord, Slack, WhatsApp, Signal, Home Assistant   |
-| [Seguridad](https://hermes-agent.nousresearch.com/docs/user-guide/security)                        | Aprobación de comandos, emparejamiento por DM, aislamiento en contenedor |
-| [Herramientas y Toolsets](https://hermes-agent.nousresearch.com/docs/user-guide/features/tools)   | Más de 40 herramientas, sistema de toolsets, backends de terminal |
-| [Sistema de Habilidades](https://hermes-agent.nousresearch.com/docs/user-guide/features/skills)   | Memoria procedimental, Skills Hub, creación de habilidades   |
-| [Memoria](https://hermes-agent.nousresearch.com/docs/user-guide/features/memory)                   | Memoria persistente, perfiles de usuario, mejores prácticas  |
-| [Integración MCP](https://hermes-agent.nousresearch.com/docs/user-guide/features/mcp)              | Conecta cualquier servidor MCP para capacidades extendidas   |
-| [Programación Cron](https://hermes-agent.nousresearch.com/docs/user-guide/features/cron)           | Tareas programadas con entrega a plataforma                  |
-| [Archivos de Contexto](https://hermes-agent.nousresearch.com/docs/user-guide/features/context-files) | Contexto de proyecto que da forma a cada conversación      |
-| [Arquitectura](https://hermes-agent.nousresearch.com/docs/developer-guide/architecture)            | Estructura del proyecto, bucle del agente, clases principales |
-| [Contribuir](https://hermes-agent.nousresearch.com/docs/developer-guide/contributing)              | Configuración de desarrollo, proceso de PR, estilo de código |
-| [Referencia de CLI](https://hermes-agent.nousresearch.com/docs/reference/cli-commands)             | Todos los comandos y flags                                   |
-| [Variables de Entorno](https://hermes-agent.nousresearch.com/docs/reference/environment-variables) | Referencia completa de variables de entorno                  |
-
----
-
-## Migración desde OpenClaw
-
-Si vienes de OpenClaw, Hermes puede importar automáticamente tu configuración, memorias, habilidades y claves API.
-
-**Durante la configuración inicial:** El asistente de configuración (`hermes setup`) detecta automáticamente `~/.openclaw` y ofrece migrar antes de que comience la configuración.
-
-**En cualquier momento después de instalar:**
-
-```bash
-hermes claw migrate              # Migración interactiva (preset completo)
-hermes claw migrate --dry-run    # Vista previa de qué se migraría
-hermes claw migrate --preset user-data   # Migrar sin secretos
-hermes claw migrate --overwrite  # Sobreescribir conflictos existentes
-```
-
-Qué se importa:
-
-- **SOUL.md** — archivo de personalidad
-- **Memorias** — entradas de MEMORY.md y USER.md
-- **Habilidades** — habilidades creadas por el usuario → `~/.hermes/skills/openclaw-imports/`
-- **Lista de comandos permitidos** — patrones de aprobación
-- **Configuración de mensajería** — configuración de plataformas, usuarios permitidos, directorio de trabajo
-- **Claves API** — secretos en lista de permitidos (Telegram, OpenRouter, OpenAI, Anthropic, ElevenLabs)
-- **Assets de TTS** — archivos de audio del espacio de trabajo
-- **Instrucciones del espacio de trabajo** — AGENTS.md (con `--workspace-target`)
-
-Consulta `hermes claw migrate --help` para todas las opciones, o usa la habilidad `openclaw-migration` para una migración guiada interactiva por el agente con vistas previas de dry-run.
-
----
-
-## Contribuir
-
-¡Las contribuciones son bienvenidas! Consulta la [Guía de Contribución](CONTRIBUTING.es.md) para la configuración del desarrollo, el estilo de código y el proceso de PR.
-
-Inicio rápido para colaboradores — clona y comienza con `setup-hermes.sh`:
-
-```bash
-git clone https://github.com/NousResearch/hermes-agent.git
-cd hermes-agent
-./setup-hermes.sh     # instala uv, crea venv, instala .[all], enlaza ~/.local/bin/hermes
-./hermes              # detecta automáticamente el venv, no necesitas hacer `source` primero
-```
-
-Ruta manual (equivalente a lo anterior):
-
-```bash
-curl -LsSf https://astral.sh/uv/install.sh | sh
-uv venv .venv --python 3.11
-source .venv/bin/activate
-uv pip install -e ".[all,dev]"
-scripts/run_tests.sh
-```
-
----
-
-## Comunidad
-
-- 💬 [Discord](https://discord.gg/NousResearch)
-- 📚 [Skills Hub](https://agentskills.io)
-- 🐛 [Issues](https://github.com/NousResearch/hermes-agent/issues)
-- 🔌 [computer-use-linux](https://github.com/avifenesh/computer-use-linux) — Servidor MCP de control de escritorio Linux para Hermes y otros hosts MCP, con árboles de accesibilidad AT-SPI, entrada Wayland/X11, capturas de pantalla y targeting de ventanas del compositor.
-- 🔌 [HermesClaw](https://github.com/AaronWong1999/hermesclaw) — Puente WeChat comunitario: Ejecuta Hermes Agent y OpenClaw en la misma cuenta de WeChat.
-
----
-
-## Licencia
-
-MIT — ver [LICENSE](LICENSE).
-
-Creado por [Nous Research](https://nousresearch.com).
+Hermes Agent fue creado por [Nous Research](https://nousresearch.com). Esta
+distribución conserva la licencia MIT de upstream; consulta [LICENSE](LICENSE).

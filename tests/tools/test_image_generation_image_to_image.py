@@ -118,9 +118,6 @@ class TestFalRouting:
         monkeypatch.setattr(
             image_tool, "fal_key_is_configured", AsyncMock(return_value=True)
         )
-        monkeypatch.setattr(
-            image_tool, "_resolve_managed_fal_gateway", AsyncMock(return_value=None)
-        )
 
     @pytest.mark.asyncio
     async def test_text_to_image_uses_base_endpoint(self, cfg_home, monkeypatch):

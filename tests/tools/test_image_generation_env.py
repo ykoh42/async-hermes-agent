@@ -17,17 +17,10 @@ def _reset_secret_scope():
 
 @pytest.mark.asyncio
 async def test_fal_key_whitespace_is_unset(monkeypatch):
-    # Whitespace-only FAL_KEY must NOT register as configured, and the managed
-    # gateway fallback must be disabled for this assertion to be meaningful.
+    # Whitespace-only FAL_KEY must not register as configured.
     monkeypatch.setenv("FAL_KEY", "   ")
 
     from tools import image_generation_tool
-
-    monkeypatch.setattr(
-        image_generation_tool,
-        "_resolve_managed_fal_gateway",
-        AsyncMock(return_value=None),
-    )
 
     assert await image_generation_tool.check_fal_api_key() is False
 
@@ -59,22 +52,6 @@ async def test_image_generate_tool_returns_actionable_error_when_no_backend(monk
     monkeypatch.setattr(
         image_generation_tool, "fal_key_is_configured", AsyncMock(return_value=False)
     )
-    monkeypatch.setattr(
-        image_generation_tool,
-        "_resolve_managed_fal_gateway",
-        AsyncMock(return_value=None),
-    )
-    monkeypatch.setattr(
-        image_generation_tool,
-        "managed_nous_tools_enabled",
-        AsyncMock(return_value=False),
-    )
-    monkeypatch.setattr(
-        image_generation_tool,
-        "nous_tool_gateway_unavailable_message",
-        AsyncMock(return_value=""),
-    )
-
     result = json.loads(
         await image_generation_tool.image_generate_tool(prompt="a cat")
     )

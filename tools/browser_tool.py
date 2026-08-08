@@ -747,8 +747,7 @@ async def _get_cloud_provider() -> Optional[CloudBrowserProvider]:
 
     Reads ``config["browser"]["cloud_provider"]`` once and caches the result
     for the process lifetime. An explicit ``local`` provider disables cloud
-    fallback. If unset, fall back to Browser Use (managed Nous gateway or
-    direct API key) and then Browserbase (direct credentials only) — the
+    fallback. If unset, fall back to Browser Use and then Browserbase — the
     historic auto-detect order, now expressed as the
     :data:`agent.browser_registry._LEGACY_PREFERENCE` walk.
 
@@ -812,12 +811,11 @@ async def _get_cloud_provider() -> Optional[CloudBrowserProvider]:
                 return None
     except Exception as e:
         # Config file may be temporarily unreadable; still try auto-detect so
-        # env-based / managed-gateway credentials can resolve. Don't pin cache.
+        # environment-based credentials can resolve. Don't pin cache.
         logger.debug("Could not read cloud_provider from config: %s", e)
 
     if resolved is None:
-        # Auto-detect path: Browser Use first (managed Nous gateway or
-        # direct API key), then Browserbase (direct credentials). Uses
+        # Auto-detect path: Browser Use first, then Browserbase. Uses
         # the legacy class names imported at the top of this module so
         # tests that ``monkeypatch.setattr(browser_tool, "BrowserUseProvider", ...)``
         # keep driving this branch deterministically. Third-party browser
@@ -887,10 +885,8 @@ async def _is_local_backend() -> bool:
     and network access on the same machine, so the check adds no security
     value.
 
-    However, when the terminal runs in a container (docker, modal, daytona,
-    ssh, singularity), the browser on the host can access internal networks
-    that the terminal cannot.  In this case, SSRF protection should be
-    enabled even though the browser is technically "local".
+    A configured cloud provider or external CDP endpoint is still considered
+    remote and keeps the private-network guard enabled.
     """
     # A CDP override points the browser at a separate Chrome process whose
     # network position is not guaranteed to match the terminal (it may live
@@ -910,10 +906,7 @@ async def _is_local_backend() -> bool:
         return True
     if await _get_cloud_provider() is not None:
         return False
-    # When terminal runs in a container, browser on host can access
-    # internal networks the terminal can't → treat as non-local.
-    terminal_backend = os.getenv("TERMINAL_ENV", "local").strip().lower()
-    return terminal_backend in ("local", "")
+    return True
 
 
 _auto_local_for_private_urls_resolved = False

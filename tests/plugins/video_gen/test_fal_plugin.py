@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from types import SimpleNamespace
-
 import pytest
 
 from agent import video_gen_registry
@@ -89,11 +87,6 @@ class TestFamilyRouting:
         from plugins.video_gen import fal as fal_plugin
         fal_plugin._fal_client = None
         monkeypatch.setenv("FAL_KEY", "test")
-        # Force direct mode — no managed gateway
-        async def _no_gateway():
-            return None
-
-        monkeypatch.setattr(fal_plugin, "_resolve_managed_fal_video_gateway", _no_gateway)
         return captured
 
     async def test_text_to_video_routes_to_text_endpoint(self, with_fake_fal):
@@ -156,43 +149,6 @@ class TestFamilyRouting:
         assert with_fake_fal["endpoint"] == "bytedance/seedance-2.0/image-to-video"
         # Seedance uses regular image_url (not start_image_url)
         assert with_fake_fal["arguments"]["image_url"] == "https://example.com/dog.png"
-
-
-@pytest.mark.asyncio
-async def test_managed_request_closes_async_client(monkeypatch):
-    """Managed queue resources close after the result is materialized."""
-    from plugins.video_gen import fal as fal_plugin
-    import tools.fal_common as fal_common
-
-    gateway = SimpleNamespace(
-        gateway_origin="https://fal-queue-gateway.example",
-        nous_user_token="token",
-    )
-
-    async def resolve_gateway():
-        return gateway
-
-    class Handle:
-        async def get(self):
-            return {"video": {"url": "https://fake/out.mp4"}}
-
-    class Client:
-        closed = False
-
-        async def submit(self, endpoint, arguments, headers):
-            return Handle()
-
-        async def close(self):
-            self.closed = True
-
-    client = Client()
-    monkeypatch.setattr(fal_plugin, "_resolve_managed_fal_video_gateway", resolve_gateway)
-    monkeypatch.setattr(fal_common, "_ManagedFalClient", lambda *_args, **_kwargs: client)
-
-    result = await fal_plugin._submit_fal_video_request("fal-ai/test", {"prompt": "x"})
-
-    assert result["video"]["url"] == "https://fake/out.mp4"
-    assert client.closed is True
 
 
 class TestPayloadBuilder:

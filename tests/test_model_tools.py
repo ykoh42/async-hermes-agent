@@ -350,7 +350,7 @@ class TestLegacyToolsetMap:
         expected = [
             "web_tools", "terminal_tools", "vision_tools",
             "image_tools", "skills_tools", "browser_tools",
-            "file_tools", "tts_tools",
+            "file_tools",
         ]
         for name in expected:
             assert name in _LEGACY_TOOLSET_MAP, f"Missing legacy toolset: {name}"

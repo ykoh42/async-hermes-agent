@@ -16,7 +16,6 @@ crashes due to a bad timezone string.
 import logging
 import os
 from datetime import datetime
-from hermes_constants import get_config_path
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -34,11 +33,10 @@ _cached_tz_name: Optional[str] = None
 _cache_resolved: bool = False
 
 
-def _resolve_timezone_name() -> str:
+async def _resolve_timezone_name() -> str:
     """Read the configured IANA timezone string (or empty string).
 
-    This does file I/O when falling through to config.yaml, so callers
-    should cache the result rather than calling on every ``now()``.
+    Callers cache the result rather than reading config on every ``now()``.
     """
     # 1. Environment variable (highest priority — set by Supervisor, etc.)
     tz_env = os.getenv("HERMES_TIMEZONE", "").strip()
@@ -47,29 +45,10 @@ def _resolve_timezone_name() -> str:
 
     # 2. config.yaml ``timezone`` key
     try:
-        # Prefer the shared cached raw-config reader (mtime/size-keyed cache +
-        # libyaml C loader) — a direct yaml.safe_load of a large config.yaml
-        # costs ~100ms+ and this used to run inside the FIRST system prompt
-        # build, on the time-to-first-token critical path.
-        try:
-            from hermes_cli.config import read_raw_config
-            cfg = read_raw_config() or {}
-        except Exception:
-            import yaml
-            config_path = get_config_path()
-            if config_path.exists():
-                with open(config_path, encoding="utf-8") as f:
-                    cfg = yaml.safe_load(f) or {}
-            else:
-                cfg = {}
+        from hermes_cli.config import load_config_readonly
+
+        cfg = await load_config_readonly()
         if cfg:
-            # Managed scope: an administrator can pin ``timezone`` too. Overlay
-            # via the shared helper (fail-open) since this reads config.yaml directly.
-            try:
-                from hermes_cli import managed_scope
-                cfg = managed_scope.apply_managed_overlay(cfg)
-            except Exception:
-                pass
             tz_cfg = cfg.get("timezone", "")
             if isinstance(tz_cfg, str) and tz_cfg.strip():
                 return tz_cfg.strip()
@@ -93,14 +72,14 @@ def _get_zoneinfo(name: str) -> Optional[ZoneInfo]:
         return None
 
 
-def get_timezone() -> Optional[ZoneInfo]:
+async def get_timezone() -> Optional[ZoneInfo]:
     """Return the user's configured ZoneInfo, or None (meaning server-local).
 
     Resolved once and cached. Call ``reset_cache()`` after config changes.
     """
     global _cached_tz, _cached_tz_name, _cache_resolved
     if not _cache_resolved:
-        _cached_tz_name = _resolve_timezone_name()
+        _cached_tz_name = await _resolve_timezone_name()
         _cached_tz = _get_zoneinfo(_cached_tz_name)
         _cache_resolved = True
     return _cached_tz
@@ -119,17 +98,16 @@ def reset_cache() -> None:
     _cache_resolved = False
 
 
-def now() -> datetime:
+async def now() -> datetime:
     """
     Return the current time as a timezone-aware datetime.
 
     If a valid timezone is configured, returns wall-clock time in that zone.
     Otherwise returns the server's local time (via ``astimezone()``).
     """
-    tz = get_timezone()
+    tz = await get_timezone()
     if tz is not None:
         return datetime.now(tz)
     # No timezone configured — use server-local (still tz-aware)
     return datetime.now().astimezone()
-
 

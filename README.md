@@ -207,6 +207,11 @@ uv run ruff check agent tools hermes_cli plugins providers \
 uv build
 ```
 
+## Contributing and security
+
+Read [CONTRIBUTING.md](CONTRIBUTING.md) before submitting changes and
+[SECURITY.md](SECURITY.md) for private vulnerability reporting.
+
 ## Upstream relationship
 
 The repository preserves original core file and function names to keep future

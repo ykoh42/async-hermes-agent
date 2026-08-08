@@ -1,4 +1,5 @@
 import ast
+import json
 import re
 import tomllib
 from pathlib import Path
@@ -7,6 +8,39 @@ import pytest
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_release_versions_match_across_package_metadata():
+    """Every published surface must report the same release version."""
+    project_version = tomllib.loads(
+        (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    )["project"]["version"]
+    package = json.loads(
+        (REPO_ROOT / "package.json").read_text(encoding="utf-8")
+    )
+    package_lock = json.loads(
+        (REPO_ROOT / "package-lock.json").read_text(encoding="utf-8")
+    )
+
+    cli_module = ast.parse(
+        (REPO_ROOT / "hermes_cli" / "__init__.py").read_text(encoding="utf-8")
+    )
+    cli_version = next(
+        node.value.value
+        for node in cli_module.body
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == "__version__"
+            for target in node.targets
+        )
+        and isinstance(node.value, ast.Constant)
+        and isinstance(node.value.value, str)
+    )
+
+    assert package["version"] == project_version
+    assert package_lock["version"] == project_version
+    assert package_lock["packages"][""]["version"] == project_version
+    assert cli_version == project_version
 
 
 # Minimum non-vulnerable Starlette: CVE-2026-48710 ("BadHost") was fixed in

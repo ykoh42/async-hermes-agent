@@ -24,7 +24,6 @@ from hermes_cli.config import (
     save_config,
     save_env_value,
     sanitize_env_file,
-    write_platform_config_field,
     _sanitize_env_lines,
 )
 
@@ -70,9 +69,9 @@ class TestLoadConfigDefaults:
             assert config["model"] == DEFAULT_CONFIG["model"]
             assert config["agent"]["max_turns"] == DEFAULT_CONFIG["agent"]["max_turns"]
             assert "max_turns" not in config
-            assert "terminal" in config
-            assert config["terminal"]["backend"] == "local"
-            assert config["display"]["interim_assistant_messages"] is True
+            assert config["terminal"]["cwd"] == "."
+            assert config["terminal"]["local_persistent"] is False
+            assert config["display"]["show_commentary"] is True
 
     def test_legacy_root_level_max_turns_migrates_to_agent_config(self, tmp_path):
         with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
@@ -290,21 +289,21 @@ class TestSaveAndLoadRoundtrip:
         # User-typed value that already includes surrounding quotes as data.
         raw = '"/Users/me/Application Support/key"'
         with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}, clear=False):
-            os.environ.pop("TERMINAL_SSH_KEY", None)
-            save_env_value("TERMINAL_SSH_KEY", raw)
+            os.environ.pop("CUSTOM_API_KEY", None)
+            save_env_value("CUSTOM_API_KEY", raw)
             first = (tmp_path / ".env").read_text(encoding="utf-8")
-            save_env_value("TERMINAL_SSH_KEY", raw)
+            save_env_value("CUSTOM_API_KEY", raw)
             second = (tmp_path / ".env").read_text(encoding="utf-8")
             assert first == second
             # One outer wrap layer only (escaped inner quotes, not nested wraps).
             line = [
-                ln for ln in first.splitlines() if ln.startswith("TERMINAL_SSH_KEY=")
+                ln for ln in first.splitlines() if ln.startswith("CUSTOM_API_KEY=")
             ][0]
-            assert line.startswith('TERMINAL_SSH_KEY="')
+            assert line.startswith('CUSTOM_API_KEY="')
             assert line.endswith('"')
-            assert line.count('TERMINAL_SSH_KEY="') == 1
+            assert line.count('CUSTOM_API_KEY="') == 1
             # Escaping dialect end-to-end: load sees the raw input, not stripped quotes.
-            assert load_env()["TERMINAL_SSH_KEY"] == raw
+            assert load_env()["CUSTOM_API_KEY"] == raw
 
 
 class TestRemoveEnvValue:
@@ -516,10 +515,7 @@ class TestOptionalEnvVarsRegistry:
 
 
 class TestMemoryProviderEnvVarsRegistry:
-    """Every memory provider that reads an API key from the environment must
-    have that key catalogued in OPTIONAL_ENV_VARS so the dashboard Keys page
-    and `hermes setup` surface it (previously only Honcho was listed, leaving
-    Hindsight/Supermemory/Mem0/RetainDB/ByteRover/OpenViking invisible).
+    """Bundled memory-provider credentials remain in the environment catalog.
 
     This is a behavior contract, not a snapshot: it asserts each provider's
     primary credential key is present, tool-categorised, and password-masked —
@@ -528,13 +524,8 @@ class TestMemoryProviderEnvVarsRegistry:
 
     # provider primary-credential env key -> the tool-call name it powers.
     MEMORY_PROVIDER_KEYS = {
-        "HONCHO_API_KEY": "honcho_context",
-        "HINDSIGHT_API_KEY": "hindsight_recall",
-        "SUPERMEMORY_API_KEY": "supermemory_search",
         "MEM0_API_KEY": "mem0_search",
-        "RETAINDB_API_KEY": "retaindb_search",
         "BRV_API_KEY": "brv_query",
-        "OPENVIKING_API_KEY": "viking_search",
     }
 
     def test_memory_provider_keys_are_catalogued(self):
@@ -690,29 +681,19 @@ class TestConfigSupportFloor:
     _V12_FIXTURE = {
         "_config_version": 12,
         "model": {"default": "openai/gpt-5.4", "provider": "openrouter"},
-        "display": {"tool_progress_overrides": {"telegram": "verbose"}},
-        "stt": {"model": "base", "provider": "local"},
         "compression": {"summary_model": "gpt-x", "summary_provider": "auto"},
         "model_catalog": {"ttl_hours": 24},
         "memory": {"write_mode": "approve"},
         "delegation": {"max_async_children": 8},
-        "agent": {"verify_on_stop": True},
     }
     _V12_EXPECTED = {
         "_config_version": 33,
-        "agent": {"verify_on_stop": False},
         "auxiliary": {"compression": {"model": "gpt-x"}},
         "compression": {},
         "delegation": {"max_concurrent_children": 8},
-        "display": {
-            "platforms": {"telegram": {"tool_progress": "verbose"}},
-            "tool_progress_overrides": {"telegram": "verbose"},
-        },
-        "memory": {"write_approval": True},
         "model": {"default": "openai/gpt-5.4", "provider": "openrouter"},
         "model_catalog": {"ttl_hours": 1},
         "plugins": {"enabled": []},
-        "stt": {"provider": "local"},
     }
 
     _V20_FIXTURE = {
@@ -721,11 +702,9 @@ class TestConfigSupportFloor:
         "plugins": {"disabled": ["foo"]},
         "skills": {"write_mode": "on"},
         "model_catalog": {"ttl_hours": 24},
-        "agent": {},
     }
     _V20_EXPECTED = {
         "_config_version": 33,
-        "agent": {"verify_on_stop": False},
         "model": {"default": "anthropic/claude-fable-5", "provider": "nous"},
         "model_catalog": {"ttl_hours": 1},
         "plugins": {"disabled": ["foo"], "enabled": []},
@@ -931,47 +910,7 @@ class TestCustomProviderCompatibility:
         ]
 
 
-class TestInterimAssistantMessageConfig:
-    """Test the explicit gateway interim-message config gate."""
-
-    def test_default_config_enables_interim_assistant_messages(self):
-        assert DEFAULT_CONFIG["display"]["interim_assistant_messages"] is True
-
-    def test_migrate_to_v15_adds_interim_assistant_message_gate(self, tmp_path):
-        config_path = tmp_path / "config.yaml"
-        config_path.write_text(
-            yaml.safe_dump({"_config_version": 14, "display": {"tool_progress": "off"}}),
-            encoding="utf-8",
-        )
-
-        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
-            migrate_config(interactive=False, quiet=True)
-            raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
-            loaded = load_config()
-
-        from hermes_cli.config import DEFAULT_CONFIG
-        assert raw["_config_version"] == DEFAULT_CONFIG["_config_version"]
-        # The user's explicit non-default value is preserved on disk.
-        assert raw["display"]["tool_progress"] == "off"
-        # interim_assistant_messages defaults to True and merges in transparently
-        # at read time, so the migration must NOT materialise it to disk (that
-        # was the config-bloat bug). It is still effective via load_config().
-        assert "interim_assistant_messages" not in raw.get("display", {})
-        assert loaded["display"]["interim_assistant_messages"] is True
-
-
-class TestCliRefreshIntervalConfig:
-    """Test the CLI refresh_interval config default (#45592 / #48309)."""
-
-    def test_default_config_enables_cli_refresh_interval(self):
-        """cli_refresh_interval defaults to 1.0 so the idle status-bar
-        clock keeps ticking and the bottom chrome stays alive during
-        idle (#45592). Users on emulators where the periodic redraw
-        fights auto-scroll can set it to 0 (#48309)."""
-        assert DEFAULT_CONFIG["display"]["cli_refresh_interval"] == 1.0
-
-
-class TestDiscordChannelPromptsConfig:
+class TestCustomProviderMigration:
 
 
     def test_migrate_preserves_custom_providers_and_no_defaults_dump(self, tmp_path):
@@ -1013,7 +952,7 @@ class TestDiscordChannelPromptsConfig:
         # File must NOT be a defaults dump — assert specific DEFAULT_CONFIG
         # top-level keys are absent (they should only appear via load_config's
         # deep-merge, not be written to the user's file by migration).
-        for default_key in ("tts", "compression", "security", "whatsapp", "bedrock"):
+        for default_key in ("compression", "security", "browser", "bedrock"):
             assert default_key not in raw, (
                 f"{default_key} should not be in migrated config file — "
                 f"migration should use read_raw_config() to avoid defaults dump"
@@ -1025,10 +964,8 @@ class TestEnvWriteDenylist:
     influence how subprocesses execute — ``LD_PRELOAD``, ``PYTHONPATH``,
     ``PATH``, ``EDITOR``, etc. — or any ``HERMES_*`` runtime flag.
 
-    The dashboard exposes ``PUT /api/env`` to any authed caller (and
-    the session token lives in the SPA's HTML where any future plugin
-    XSS or local process could exfiltrate it). Without this gate, an
-    attacker who steals the token could plant
+    An embedding application may expose the config writer to an untrusted
+    caller. Without this gate, that caller could plant
     ``LD_PRELOAD=/tmp/evil.so`` in ``.env`` and own the next Hermes
     process on next startup via the dotenv → ``os.environ`` chain in
     ``hermes_cli/env_loader.py``.
@@ -1046,8 +983,8 @@ class TestEnvWriteDenylist:
     @pytest.mark.parametrize(
         "allowed_key",
         [
-            "HERMES_LANGFUSE_PUBLIC_KEY",
-            "HERMES_SPOTIFY_CLIENT_ID",
+            "HERMES_GEMINI_BASE_URL",
+            "HERMES_DEEPSEEK_BASE_URL",
             "HERMES_QWEN_BASE_URL",
             "HERMES_MAX_ITERATIONS",
         ],
@@ -1056,55 +993,41 @@ class TestEnvWriteDenylist:
         """``HERMES_*`` overall is NOT blocked — only the four runtime
         location names (HOME/PROFILE/CONFIG/ENV) are. Integration
         credentials following the ``HERMES_*`` convention must keep
-        working or we'd regress every provider setup wizard that
-        currently writes one of these (auth.py, Spotify, Langfuse, …)."""
+        working or provider-specific configuration would regress."""
         save_env_value(allowed_key, "test-value-123")
         env = load_env()
         assert env[allowed_key] == "test-value-123"
 
 
 
-class TestWriteApprovalMigration:
-    """Version 28→29 renames memory/skills write_mode → write_approval (bool).
-
-    Only an explicit ``approve`` carried gating intent and maps to ``True``;
-    ``on``/``off``/unset map to ``False`` (gate off). The old ``write_mode`` key
-    is removed. Only a persisted key is rewritten — never invented.
-    """
+class TestRemovedWriteGateMigration:
+    """Version 28→29 removes write gates unsupported by the library build."""
 
     def _write(self, tmp_path, body: str):
         (tmp_path / "config.yaml").write_text(body)
 
-    def test_approve_maps_to_true(self, tmp_path):
+    def test_legacy_write_modes_are_removed(self, tmp_path):
         with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
             self._write(tmp_path,
                         "_config_version: 28\nmemory:\n  write_mode: approve\n"
                         "skills:\n  write_mode: approve\n")
             migrate_config(interactive=False, quiet=True)
             raw = yaml.safe_load((tmp_path / "config.yaml").read_text())
-            assert raw["memory"]["write_approval"] is True
-            assert raw["skills"]["write_approval"] is True
-            assert "write_mode" not in raw["memory"]
-            assert "write_mode" not in raw["skills"]
+            assert "memory" not in raw
+            assert "skills" not in raw
 
-    def test_on_and_off_map_to_false(self, tmp_path):
+    def test_obsolete_approval_keys_are_removed(self, tmp_path):
         with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
-            # YAML 1.1 parses bare on/off as bools — write_mode could be either
-            # the string or the bool; both legacy "not gating" values → False.
             self._write(tmp_path,
-                        "_config_version: 28\nmemory:\n  write_mode: 'on'\n"
-                        "skills:\n  write_mode: 'off'\n")
+                        "_config_version: 28\nmemory:\n  write_approval: true\n"
+                        "skills:\n  write_approval: false\n")
             migrate_config(interactive=False, quiet=True)
             raw = yaml.safe_load((tmp_path / "config.yaml").read_text())
             loaded = load_config()
-            # write_approval=False equals the schema default, so it is NOT
-            # materialised to disk (lean-config invariant) — the legacy
-            # write_mode key is gone and the effective value resolves to False
-            # via load_config()'s deep-merge.
-            assert "write_mode" not in raw.get("memory", {})
-            assert "write_mode" not in raw.get("skills", {})
-            assert loaded["memory"]["write_approval"] is False
-            assert loaded["skills"]["write_approval"] is False
+            assert "memory" not in raw
+            assert "skills" not in raw
+            assert "write_approval" not in loaded["memory"]
+            assert "write_approval" not in loaded["skills"]
 
 
 class TestMigrationWriteInvariant:
@@ -1136,7 +1059,7 @@ class TestMigrationWriteInvariant:
             yaml.safe_dump({
                 "_config_version": start,
                 "model": {"default": "test-model", "provider": "openrouter"},
-                "matrix": {"require_mention": False},
+                "browser": {"headed": True},
             }, sort_keys=False),
             encoding="utf-8",
         )
@@ -1147,118 +1070,82 @@ class TestMigrationWriteInvariant:
 
         assert raw["_config_version"] == latest
         # User's explicit non-default value preserved (not reset to True default).
-        assert raw["matrix"]["require_mention"] is False
-        assert loaded["matrix"]["require_mention"] is False
+        assert raw["browser"]["headed"] is True
+        assert loaded["browser"]["headed"] is True
         # No default-only top-level section the user never wrote lands on disk —
         # neither from per-version seeds nor the catch-all finalizer.
         for default_key in (
-            "timezone", "auxiliary", "tts", "compression",
-            "whatsapp", "bedrock",
+            "timezone", "auxiliary", "compression",
+            "checkpoints", "bedrock",
         ):
             assert default_key not in raw, (
                 f"{default_key} was materialised into a lean config by the "
                 f"version bump — the default-dump regression returned"
             )
         # Defaults still take effect transparently via the read-time merge.
-        assert loaded["display"]["compact"] == DEFAULT_CONFIG["display"]["compact"]
+        assert loaded["display"]["show_commentary"] is True
 
 
 class TestSaveConfigPartialWritePreservation:
-    """Regression for #62723: partial migration writes must not drop unrelated sections."""
+    """Partial config writes must preserve unrelated retained sections."""
 
-    def test_merge_existing_preserves_platforms_on_partial_write(self, tmp_path):
+    def test_merge_existing_preserves_mcp_servers(self, tmp_path):
         body = """_config_version: 30
 model:
   default: deepseek-v4-pro
   provider: deepseek
 agent:
   max_turns: 60
-platforms:
-  feishu:
-    enabled: true
-    extra:
-      app_id: cli_xxx
-      app_secret: xxx
-feishu:
-  require_mention: true
+mcp_servers:
+  docs:
+    command: uvx
+    args: [docs-mcp]
 """
         (tmp_path / "config.yaml").write_text(body, encoding="utf-8")
         with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
             save_config(
                 {
                     "_config_version": 30,
-                    "model": {"default": "deepseek-v4-pro", "provider": "deepseek"},
-                    "agent": {"max_turns": 60, "verify_on_stop": False},
+                    "model": {
+                        "default": "deepseek-v4-pro",
+                        "provider": "deepseek",
+                    },
+                    "agent": {"max_turns": 75},
                 },
                 merge_existing=True,
             )
-            raw = yaml.safe_load((tmp_path / "config.yaml").read_text(encoding="utf-8"))
+            raw = yaml.safe_load(
+                (tmp_path / "config.yaml").read_text(encoding="utf-8")
+            )
 
-        assert raw["platforms"]["feishu"]["extra"]["app_id"] == "cli_xxx"
-        assert raw["feishu"]["require_mention"] is True
-        assert raw["agent"]["verify_on_stop"] is False
-
+        assert raw["mcp_servers"]["docs"]["command"] == "uvx"
+        assert raw["agent"]["max_turns"] == 75
 
     def test_persist_migration_writes_full_read_raw_config(self, tmp_path):
         from hermes_cli.config import _persist_migration, read_raw_config
 
-        body = """_config_version: 30
+        body = """_config_version: 32
 model:
   default: deepseek-v4-pro
   provider: deepseek
-agent:
-  max_turns: 60
-platforms:
-  feishu:
-    enabled: true
-    extra:
-      app_id: cli_xxx
-      app_secret: xxx
+mcp_servers:
+  docs:
+    command: uvx
+    args: [docs-mcp]
 """
         (tmp_path / "config.yaml").write_text(body, encoding="utf-8")
         with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
             config = read_raw_config()
-            config.setdefault("agent", {})["verify_on_stop"] = False
-            config["_config_version"] = 32
+            config.setdefault("agent", {})["max_turns"] = 75
+            config["_config_version"] = 33
             _persist_migration(config)
-            raw = yaml.safe_load((tmp_path / "config.yaml").read_text(encoding="utf-8"))
+            raw = yaml.safe_load(
+                (tmp_path / "config.yaml").read_text(encoding="utf-8")
+            )
 
-        assert raw["platforms"]["feishu"]["extra"]["app_id"] == "cli_xxx"
-        assert raw["agent"]["verify_on_stop"] is False
-        assert raw["agent"]["max_turns"] == 60
-        assert raw["_config_version"] == 32
-
-    def test_v30_to_latest_migration_keeps_platforms(self, tmp_path):
-        """End-to-end: reporter's v30 feishu profile survives version bump."""
-        body = """_config_version: 30
-model:
-  default: deepseek-v4-pro
-  provider: deepseek
-agent:
-  max_turns: 60
-platforms:
-  feishu:
-    enabled: true
-    extra:
-      app_id: cli_xxx
-      app_secret: xxx
-feishu:
-  require_mention: true
-"""
-        (tmp_path / "config.yaml").write_text(body, encoding="utf-8")
-        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
-            migrate_config(interactive=False, quiet=True)
-            raw = yaml.safe_load((tmp_path / "config.yaml").read_text(encoding="utf-8"))
-
-        assert raw["platforms"]["feishu"]["extra"]["app_id"] == "cli_xxx"
-        assert raw["feishu"]["require_mention"] is True
-
-
-class TestVerifyOnStopMigration:
-    """v30 → v31: switch verify_on_stop OFF once, preserving explicit choices."""
-
-    def _write(self, tmp_path, body):
-        (tmp_path / "config.yaml").write_text(body, encoding="utf-8")
+        assert raw["mcp_servers"]["docs"]["args"] == ["docs-mcp"]
+        assert raw["agent"]["max_turns"] == 75
+        assert raw["_config_version"] == 33
 
 
 class TestDelegationCapUnificationMigration:
@@ -1363,33 +1250,26 @@ class TestProviderEnabledRuntimeGate:
             await resolve_runtime_provider(requested="my-fork")
 
 
-# ---------------------------------------------------------------------------
-# DEFAULT_CONFIG must not carry a duplicate "kanban" key
-# ---------------------------------------------------------------------------
-
-def test_default_config_kanban_block_not_dropped_by_duplicate_key():
-    """DEFAULT_CONFIG previously declared ``"kanban"`` twice, so Python kept
-    only the second literal and silently dropped the first — losing the
-    ``auto_subscribe_on_create`` default. Both sets of defaults must survive.
-    """
-    kanban = DEFAULT_CONFIG["kanban"]
-    # From the first (dropped) block:
-    assert kanban.get("auto_subscribe_on_create") is True
-    # From the second block:
-    assert "dispatch_in_gateway" in kanban
-    assert "auto_decompose" in kanban
-
-
 def test_default_config_has_no_duplicate_top_level_keys():
     """Guard against any duplicate key silently shadowing a default."""
     import ast
-    import hermes_cli.config as cfg_mod
+    import hermes_cli.config_defaults as defaults_mod
 
-    src = open(cfg_mod.__file__, encoding="utf-8").read()
+    src = open(defaults_mod.__file__, encoding="utf-8").read()
     tree = ast.parse(src)
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Dict):
-            keys = [k.value for k in node.keys if isinstance(k, ast.Constant)]
-            if "model" in keys and "kanban" in keys:  # the DEFAULT_CONFIG literal
-                dupes = {k for k in keys if keys.count(k) > 1}
-                assert not dupes, f"duplicate DEFAULT_CONFIG keys: {sorted(dupes)}"
+    assignment = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == "DEFAULT_CONFIG"
+            for target in node.targets
+        )
+    )
+    keys = [
+        key.value
+        for key in assignment.value.keys
+        if isinstance(key, ast.Constant)
+    ]
+    dupes = {key for key in keys if keys.count(key) > 1}
+    assert not dupes, f"duplicate DEFAULT_CONFIG keys: {sorted(dupes)}"

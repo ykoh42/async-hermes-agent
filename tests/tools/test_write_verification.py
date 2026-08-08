@@ -8,6 +8,14 @@ import pytest
 from tools.file_tools import write_file_tool
 
 
+def test_write_schema_explains_verified_result_contract():
+    from tools.file_tools import WRITE_FILE_SCHEMA
+
+    description = WRITE_FILE_SCHEMA["description"]
+    assert "verified:true" in description
+    assert "do NOT re-read" in description
+
+
 @pytest.fixture
 def workdir(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))

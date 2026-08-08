@@ -725,17 +725,10 @@ def _make_redirect_handler(port: int, redirect_uri: str | None = None):
         """Show the authorization URL to the user.
 
         Opens the browser automatically when possible; always prints the URL
-        as a fallback for headless/SSH/gateway environments.
+        as a fallback for headless or SSH environments.
         """
-        from tools.mcp_dashboard_oauth import get_dashboard_oauth_flow
-
-        dashboard_flow = get_dashboard_oauth_flow()
-        if dashboard_flow is not None:
-            await dashboard_flow.publish_authorization_url(authorization_url)
-            return
-
         # Fail fast at the authorization boundary in non-interactive contexts
-        # (systemd gateway, cron, background MCP discovery). A cached-but-unusable
+        # (services or background MCP discovery). A cached-but-unusable
         # token (expired/revoked, refresh rejected) makes the SDK fall through to
         # the authorization-code flow even though build_oauth_auth's token-file
         # guard passed. Without this check we would print a URL and launch a
@@ -837,12 +830,6 @@ def _make_callback_waiter(port: int):
     """
 
     async def _wait() -> tuple[str, str | None]:
-        from tools.mcp_dashboard_oauth import get_dashboard_oauth_flow
-
-        dashboard_flow = get_dashboard_oauth_flow()
-        if dashboard_flow is not None:
-            return await dashboard_flow.wait_for_callback()
-
         # Reject before binding the callback listener in non-interactive
         # contexts. Reaching here means the SDK entered the authorization-code
         # flow (a valid or refreshable token would never call the callback
@@ -1090,13 +1077,6 @@ async def _configure_callback_port(
     consolidation PR.
     """
     global _oauth_port
-    from tools.mcp_dashboard_oauth import get_dashboard_oauth_flow
-
-    dashboard_flow = get_dashboard_oauth_flow()
-    if dashboard_flow is not None:
-        cfg["_resolved_port"] = 0
-        cfg["redirect_uri"] = cfg.get("redirect_uri") or dashboard_flow.redirect_uri
-        return 0
     cached_redirect_uri = await _cached_redirect_uri(storage)
     if not cfg.get("redirect_uri") and cached_redirect_uri:
         cfg["redirect_uri"] = cached_redirect_uri

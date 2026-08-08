@@ -18,13 +18,13 @@ metadata:
 There are two places a SKILL.md can live:
 
 1. **User-local:** `~/.hermes/skills/<maybe-category>/<name>/SKILL.md` — personal, not shared. Created via `skill_manage(action='create')`.
-2. **In-repo (this skill is about this case):** `/home/bb/hermes-agent/skills/<category>/<name>/SKILL.md` — committed, shipped with the package. Use `write_file` + `git add`. `skill_manage(action='create')` does NOT target this tree.
+2. **In-repo (this skill is about this case):** `skills/<category>/<name>/SKILL.md` from the repository root — committed and shipped with the source. Use `write_file` + `git add`. `skill_manage(action='create')` does NOT target this tree.
 
 ## When to Use
 
 - User asks you to add a skill "in this branch / repo / commit"
 - You're committing a reusable workflow that should ship with hermes-agent
-- You're editing an existing skill under `/home/bb/hermes-agent/skills/` (use `patch` for small edits, `write_file` for rewrites; `skill_manage` still works for patch on in-repo skills, but not for `create`)
+- You're editing an existing skill under `skills/` (use `patch` for small edits and `write_file` for rewrites; `skill_manage` can edit it only when that tree is configured as an external skills directory)
 
 ## Required Frontmatter
 
@@ -127,9 +127,7 @@ Not every section is mandatory, but `Overview` + `When to Use` + actionable body
 skills/<category>/<skill-name>/SKILL.md
 ```
 
-Categories currently in repo (confirm with `ls skills/`): `autonomous-ai-agents`, `creative`, `data-science`, `devops`, `email`, `gaming`, `github`, `leisure`, `mcp`, `media`, `mlops/*`, `note-taking`, `productivity`, `red-teaming`, `research`, `smart-home`, `social-media`, `software-development`.
-
-Pick the closest existing category. Don't invent new top-level categories casually.
+Inspect `skills/` and pick the closest existing category. Don't invent new top-level categories casually.
 
 ## Workflow
 
@@ -152,7 +150,7 @@ Pick the closest existing category. Don't invent new top-level categories casual
    assert len(content) <= 100_000
    ```
 5. **Git add + commit** on the active branch.
-6. **Note:** the CURRENT session's skill loader is cached — `skill_view` / `skills_list` will not see the new skill until a new session. This is expected, not a bug.
+6. **Verify discovery:** `skill_manage` invalidates the skill caches after a successful change, so `skill_view` / `skills_list` should see a configured skill immediately.
 
 ## Cross-Referencing Other Skills
 
@@ -181,7 +179,7 @@ Pick the closest existing category. Don't invent new top-level categories casual
 
 5. **Writing a skill that duplicates a peer.** Before creating, `ls skills/<category>/` and open 2-3 peers. Prefer extending an existing skill to creating a narrow sibling.
 
-6. **Expecting the current session to see the new skill.** It won't. The skill loader is initialized at session start. Verify in a fresh session or via `skill_view` using the exact path.
+6. **Writing outside configured skill roots.** In-repo skills are visible to `skill_view` only when the repository tree is configured as an external skills directory. Verify with `skills_list`.
 
 7. **Letting skills accumulate sediment.** A skill should get shorter or sharper over time. When adding a rule, remove the old wording it replaces; don't layer advice forever.
 
