@@ -142,7 +142,7 @@ from agent.context_compressor import (  # noqa: F401
     COMPRESSED_SUMMARY_METADATA_KEY,
     ContextCompressor,
 )
-from agent.conversation_loop import run_conversation as _run_conversation
+from agent import conversation_loop as _conversation_loop
 from agent.aux_accounting import (
     reset_accounting_context,
     set_accounting_context,
@@ -6766,7 +6766,7 @@ class AIAgent:
             # Keep the scope local instead of storing ContextVar tokens on the agent,
             # which may be observed from another task.
             with bind_subagent_parent(self), scoped_runtime_main({}):
-                return await _run_conversation(
+                return await _conversation_loop.run_conversation(
                     self,
                     user_message,
                     system_message,
