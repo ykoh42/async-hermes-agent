@@ -43,6 +43,35 @@ def test_release_versions_match_across_package_metadata():
     assert cli_version == project_version
 
 
+def test_release_workflow_installs_ripgrep_before_testing_source():
+    """Release runners must provide the binary required by search tests."""
+    workflow = (REPO_ROOT / ".github" / "workflows" / "release.yml").read_text(
+        encoding="utf-8"
+    )
+
+    install_step = workflow.index("- name: Install ripgrep")
+    test_step = workflow.index("- name: Test released source")
+
+    assert install_step < test_step
+    assert "sudo apt-get install --yes ripgrep" in workflow[install_step:test_step]
+
+
+def test_release_documentation_uses_current_pypi_version():
+    """Published install snippets must match the Python package version."""
+    project_version = tomllib.loads(
+        (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    )["project"]["version"]
+    pinned_install = f'async-hermes-agent=={project_version}'
+    release_pages = (
+        REPO_ROOT / "website" / "docs" / "index.mdx",
+        REPO_ROOT / "website" / "docs" / "getting-started" / "installation.md",
+        REPO_ROOT / "website" / "docs" / "getting-started" / "platform-support.md",
+    )
+
+    for page in release_pages:
+        assert pinned_install in page.read_text(encoding="utf-8"), page
+
+
 # Minimum non-vulnerable Starlette: CVE-2026-48710 ("BadHost") was fixed in
 # 1.0.1. Anything below that lets a malformed Host header desync
 # ``request.url.path`` from the dispatched ASGI path, bypassing path-based

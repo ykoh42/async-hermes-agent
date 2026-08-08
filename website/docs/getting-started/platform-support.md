@@ -37,15 +37,16 @@ tool → observation → final-answer turn on that target.
 
 ## Supported installation methods
 
-The documented release path is a Git tag or source checkout:
+The documented release path is PyPI. Pin the package version in production:
 
 ```bash
-uv pip install "git+https://github.com/ykoh42/async-hermes-agent.git@v0.20.3"
+uv pip install "async-hermes-agent==0.20.4"
 ```
 
-This site does not claim a PyPI, Homebrew, desktop-installer, container-image,
-or system-service distribution. A host application may package the library in
-those forms, but owns that additional support contract.
+Installing a Git tag or source checkout is also supported. This site does not
+claim a Homebrew, desktop-installer, container-image, or system-service
+distribution. A host application may package the library in those forms, but
+owns that additional support contract.
 
 Continue with [Installation](./installation.md) and the
 [Quickstart](./quickstart.md).
