@@ -180,6 +180,7 @@ from agent.tool_result_classification import (
     FILE_MUTATING_TOOL_NAMES as _FILE_MUTATING_TOOLS,
     file_mutation_result_landed,
 )
+from agent.subagent_lifecycle import bind_subagent_parent
 from agent.trajectory import (
     convert_scratchpad_to_think,
     save_trajectory as _save_trajectory_to_file,
@@ -6734,7 +6735,6 @@ class AIAgent:
             reset_conversation_context,
             set_conversation_context,
         )
-        from agent.subagent_lifecycle import bind_subagent_parent
         turn_lock = self._get_turn_lock()
         await turn_lock.acquire()
         self._active_turn_task = asyncio.current_task()
