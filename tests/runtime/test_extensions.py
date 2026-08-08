@@ -13,7 +13,7 @@ from pyleak.eventloop import LeakAction
 
 from hermes_state import SessionDB
 from run_agent import AIAgent
-from tools import mcp_tool
+from tools import env_probe, mcp_tool
 
 
 def _tool_call(call_id, name, arguments):
@@ -175,6 +175,9 @@ async def test_skill_and_stdio_mcp_calls_are_preserved_in_trajectory(
             no_task_leaks(action=LeakAction.RAISE),
             agent,
         ):
+            # Keep the cold async environment probe under pyleak while avoiding
+            # BlockBuster's stack inspection during allowed aiofiles worker startup.
+            await env_probe.warm_environment_probe_async()
             blockbuster = BlockBuster()
             blockbuster.activate()
             try:

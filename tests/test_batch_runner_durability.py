@@ -16,6 +16,7 @@ import sys
 import asyncio
 from pathlib import Path
 
+import aiofiles.os
 import pytest
 from blockbuster import BlockBuster
 from pyleak import no_event_loop_blocking, no_task_leaks
@@ -224,6 +225,9 @@ async def test_concurrent_batches_write_complete_rows_and_resume_without_duplica
         no_event_loop_blocking(action=LeakAction.RAISE, threshold=0.1),
         no_task_leaks(action=LeakAction.RAISE),
     ):
+        # Keep cold aiofiles startup under pyleak, but outside BlockBuster's
+        # stack inspection of the allowed ThreadPoolExecutor worker startup.
+        await aiofiles.os.makedirs(runner.output_dir, exist_ok=True)
         blockbuster = BlockBuster()
         blockbuster.activate()
         try:
