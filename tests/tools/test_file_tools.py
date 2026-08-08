@@ -343,15 +343,24 @@ async def test_search_cancellation_kills_and_drains_process(monkeypatch):
     from tools.file_tools import _run_rg
 
     killed = asyncio.Event()
+    communicate_started = asyncio.Event()
+    cleanup_started = asyncio.Event()
+    release_cleanup = asyncio.Event()
+    cleanup_completed = asyncio.Event()
 
     class FakeProcess:
         returncode = None
 
         async def communicate(self):
+            communicate_started.set()
             await killed.wait()
+            cleanup_started.set()
+            await release_cleanup.wait()
+            cleanup_completed.set()
             return b"", b""
 
         def kill(self):
+            self.returncode = -9
             killed.set()
 
     async def fake_create_subprocess_exec(*_args, **_kwargs):
@@ -359,11 +368,19 @@ async def test_search_cancellation_kills_and_drains_process(monkeypatch):
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
     task = asyncio.create_task(_run_rg(["needle", "."]))
-    await asyncio.sleep(0)
+    await communicate_started.wait()
     task.cancel()
+    await cleanup_started.wait()
+    task.cancel()
+    await asyncio.sleep(0)
 
-    with pytest.raises(asyncio.CancelledError):
-        await task
+    try:
+        assert task.done() is False
+    finally:
+        release_cleanup.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await asyncio.wait_for(cleanup_completed.wait(), timeout=1.0)
     assert killed.is_set()
 
 

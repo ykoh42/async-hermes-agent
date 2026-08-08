@@ -446,6 +446,9 @@ class TestErrorResilience:
         work = tmp_path / "work"
         work.mkdir()
         communicate_started = asyncio.Event()
+        wait_started = asyncio.Event()
+        release_wait = asyncio.Event()
+        wait_completed = asyncio.Event()
 
         class BlockingProcess:
             returncode = None
@@ -462,6 +465,9 @@ class TestErrorResilience:
 
             async def wait(self):
                 self.waited = True
+                wait_started.set()
+                await release_wait.wait()
+                wait_completed.set()
                 return self.returncode
 
         process = BlockingProcess()
@@ -480,8 +486,17 @@ class TestErrorResilience:
                 )
                 await communicate_started.wait()
                 task.cancel()
-                with pytest.raises(asyncio.CancelledError):
-                    await task
+                await wait_started.wait()
+                task.cancel()
+                await asyncio.sleep(0)
+
+                try:
+                    assert task.done() is False
+                finally:
+                    release_wait.set()
+                    with pytest.raises(asyncio.CancelledError):
+                        await task
+                    await asyncio.wait_for(wait_completed.wait(), timeout=1.0)
             finally:
                 blockbuster.deactivate()
 

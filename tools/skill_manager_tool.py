@@ -286,11 +286,23 @@ async def _remove_tree(path: Path) -> None:
 
 async def _remove_tree_fully(path: Path) -> None:
     """Finish an accepted delete even when the caller is cancelled mid-cleanup."""
-    try:
-        await _remove_tree(path)
-    except asyncio.CancelledError:
-        await asyncio.shield(_remove_tree(path))
-        raise
+    delete_task = asyncio.create_task(_remove_tree(path))
+    cancellation: asyncio.CancelledError | None = None
+    while True:
+        try:
+            await asyncio.shield(delete_task)
+            break
+        except asyncio.CancelledError as exc:  # noqa: ASYNC103 - re-raised below
+            if delete_task.cancelled():
+                raise
+            if cancellation is None:
+                cancellation = exc
+        except Exception as exc:
+            if cancellation is not None:
+                raise cancellation from exc
+            raise
+    if cancellation is not None:
+        raise cancellation
 
 
 async def _cleanup_empty_parent(path: Path, stop: Path) -> None:

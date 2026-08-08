@@ -360,15 +360,19 @@ class CDPSupervisor:
             await asyncio.wait_for(self._ready_event.wait(), timeout=timeout)
         except asyncio.CancelledError:
             stop_task = asyncio.create_task(self.stop())
-            try:
-                await asyncio.shield(stop_task)
-            except asyncio.CancelledError:  # noqa: ASYNC103 -- original cancellation is re-raised below
-                await asyncio.gather(stop_task, return_exceptions=True)
-            except Exception:
-                logger.debug(
-                    "CDP supervisor cleanup after start cancellation failed",
-                    exc_info=True,
-                )
+            while True:
+                try:
+                    await asyncio.shield(stop_task)
+                    break
+                except asyncio.CancelledError:  # noqa: ASYNC103 -- original cancellation is re-raised below
+                    if stop_task.cancelled():
+                        raise
+                except Exception:
+                    logger.debug(
+                        "CDP supervisor cleanup after start cancellation failed",
+                        exc_info=True,
+                    )
+                    break
             raise
         except TimeoutError:
             await self.stop()  # noqa: ASYNC120 -- a new caller cancellation supersedes the timeout

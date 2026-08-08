@@ -65,6 +65,26 @@ async def _stop_process(process: asyncio.subprocess.Process) -> None:
     await process.wait()
 
 
+async def _finish_cancelled_process_stop(
+    process: asyncio.subprocess.Process,
+) -> None:
+    """Reap an owned preprocessing child through repeated cancellation."""
+    stop_task = asyncio.create_task(_stop_process(process))
+    while True:
+        try:
+            await asyncio.shield(stop_task)
+            return
+        except asyncio.CancelledError:  # noqa: ASYNC103 - retry unless child cancelled
+            if stop_task.cancelled():
+                raise
+        except Exception:
+            logger.debug(
+                "Inline-shell cleanup after cancellation failed",
+                exc_info=True,
+            )
+            return
+
+
 async def run_inline_shell(command: str, cwd: Path | None, timeout: int) -> str:
     """Execute one trusted skill inline-shell snippet without blocking."""
     timeout = max(1, int(timeout))
@@ -92,7 +112,7 @@ async def run_inline_shell(command: str, cwd: Path | None, timeout: int) -> str:
         await _stop_process(process)
         return f"[inline-shell timeout after {timeout}s: {command}]"
     except asyncio.CancelledError:
-        await asyncio.shield(_stop_process(process))
+        await _finish_cancelled_process_stop(process)
         raise
     except Exception as exc:
         await _stop_process(process)

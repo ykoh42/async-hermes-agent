@@ -1,11 +1,64 @@
 """Native background subprocesses are reaped at the agent boundary."""
 
+import asyncio
 import json
 
 import pytest
 
 import tools.terminal_tool as terminal
+from tools.environments import local
 from tools.process_registry import process_registry
+
+
+@pytest.mark.asyncio
+async def test_repeated_cancellation_waits_for_foreground_process_cleanup(monkeypatch):
+    wait_started = asyncio.Event()
+    release_wait = asyncio.Event()
+    wait_completed = asyncio.Event()
+    reader_completed = asyncio.Event()
+
+    class ControlledProcess:
+        returncode = None
+        pid = 424242
+
+        async def wait(self):
+            wait_started.set()
+            await release_wait.wait()
+            self.returncode = -15
+            wait_completed.set()
+            return self.returncode
+
+        def terminate(self):
+            pass
+
+        def kill(self):
+            self.returncode = -9
+
+    async def reader():
+        await release_wait.wait()
+        reader_completed.set()
+
+    monkeypatch.setattr(local.os, "killpg", lambda *_args: None, raising=False)
+    task = asyncio.create_task(
+        local._finish_process_cleanup(
+            ControlledProcess(),
+            [asyncio.create_task(reader())],
+        )
+    )
+    await wait_started.wait()
+    task.cancel()
+    await asyncio.sleep(0)
+    task.cancel()
+    await asyncio.sleep(0)
+
+    try:
+        assert task.done() is False
+    finally:
+        release_wait.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await asyncio.wait_for(wait_completed.wait(), timeout=1.0)
+        await asyncio.wait_for(reader_completed.wait(), timeout=1.0)
 
 
 @pytest.mark.asyncio

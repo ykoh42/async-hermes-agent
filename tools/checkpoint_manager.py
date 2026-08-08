@@ -304,6 +304,28 @@ async def _repair_bare_repo_dirs(store: Path) -> None:
                 )
 
 
+async def _finish_process_wait(process: asyncio.subprocess.Process) -> int:
+    """Reap one owned process before propagating caller cancellation."""
+    wait_task = asyncio.create_task(process.wait())
+    cancellation: asyncio.CancelledError | None = None
+    while True:
+        try:
+            return_code = await asyncio.shield(wait_task)
+            break
+        except asyncio.CancelledError as exc:  # noqa: ASYNC103 - re-raised below
+            if wait_task.cancelled():
+                raise
+            if cancellation is None:
+                cancellation = exc
+        except Exception as exc:
+            if cancellation is not None:
+                raise cancellation from exc
+            raise
+    if cancellation is not None:
+        raise cancellation
+    return return_code
+
+
 async def _run_git(
     args: List[str],
     store: Path,
@@ -356,7 +378,12 @@ async def _run_git(
                     process.kill()
                 except ProcessLookupError:
                     pass
-            await process.wait()
+            try:
+                await _finish_process_wait(process)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.debug("Git cleanup after cancellation failed", exc_info=True)
             raise
         except TimeoutError:
             if process.returncode is None:
@@ -364,7 +391,7 @@ async def _run_git(
                     process.kill()
                 except ProcessLookupError:
                     pass
-            await process.wait()
+            await _finish_process_wait(process)
             msg = f"git timed out after {timeout}s: {' '.join(cmd)}"
             logger.error(msg)
             return False, "", msg

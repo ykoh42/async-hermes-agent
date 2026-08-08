@@ -43,6 +43,24 @@ WATCH_GLOBAL_WINDOW_SECONDS = 10
 WATCH_GLOBAL_COOLDOWN_SECONDS = 30
 
 
+async def _finish_cancelled_cleanup(
+    cleanup: asyncio.Task[Any],
+    *,
+    error_message: str,
+) -> None:
+    """Wait through repeated caller cancellation for an owned cleanup task."""
+    while True:
+        try:
+            await asyncio.shield(cleanup)
+            return
+        except asyncio.CancelledError:  # noqa: ASYNC103 - retry unless child cancelled
+            if cleanup.cancelled():
+                raise
+        except Exception:
+            logger.debug(error_message, exc_info=True)
+            return
+
+
 def format_uptime_short(seconds: int) -> str:
     """Format process uptime using the upstream compact representation."""
     normalized = max(0, int(seconds))
@@ -181,7 +199,10 @@ class ProcessRegistry:
                     consume_output=False,
                 )
             )
-            await asyncio.shield(cleanup)
+            await _finish_cancelled_cleanup(
+                cleanup,
+                error_message="Process cleanup after cancelled spawn failed",
+            )
             raise
         return session
 

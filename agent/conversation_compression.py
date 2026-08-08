@@ -51,6 +51,28 @@ from agent.model_metadata import estimate_request_tokens_rough
 
 logger = logging.getLogger(__name__)
 
+
+async def _finish_owned_cleanup(cleanup_task: asyncio.Task[Any]) -> Any:
+    """Finish an owned cleanup before propagating caller cancellation."""
+    cancellation: asyncio.CancelledError | None = None
+    while True:
+        try:
+            result = await asyncio.shield(cleanup_task)
+            break
+        except asyncio.CancelledError as exc:  # noqa: ASYNC103 - re-raised below
+            if cleanup_task.cancelled():
+                raise
+            if cancellation is None:
+                cancellation = exc
+        except Exception as exc:
+            if cancellation is not None:
+                raise cancellation from exc
+            raise
+    if cancellation is not None:
+        raise cancellation
+    return result
+
+
 # Stable marker the gateway matches on to re-tag the auto-compaction lifecycle
 # status as ``kind="compacting"`` (tui_gateway/server.py::_status_update), so
 # drivers like the desktop app can show an explicit "Summarizing…" indicator
@@ -1738,8 +1760,10 @@ async def compress_context(
                 _lock_sid, _lock_holder, ttl_seconds=_lock_ttl
             )
         except asyncio.CancelledError:
-            await asyncio.shield(
-                _lock_db.release_compression_lock(_lock_sid, _lock_holder)
+            await _finish_owned_cleanup(
+                asyncio.create_task(
+                    _lock_db.release_compression_lock(_lock_sid, _lock_holder)
+                )
             )
             raise
         except Exception as _lock_err:
@@ -1795,7 +1819,7 @@ async def compress_context(
             return messages, _existing_sp
     _lock_released = False
 
-    async def _release_lock() -> None:
+    async def _release_lock_once() -> None:
         """Release the lock keyed on the OLD session_id (before rotation)."""
         nonlocal _lock_released
         _complete_compaction_lifecycle()
@@ -1812,6 +1836,9 @@ async def compress_context(
                 await _lock_db.release_compression_lock(_lock_sid, _lock_holder)
             except Exception as _rel_err:
                 logger.debug("compression lock release failed: %s", _rel_err)
+
+    async def _release_lock() -> None:
+        await _finish_owned_cleanup(asyncio.create_task(_release_lock_once()))
 
     if _lock_holder is not None:
         agent._active_compression_lock_holder = _lock_holder
@@ -2103,10 +2130,14 @@ async def compress_context(
                 ):
                     raise AuxiliaryExplicitCancellation()
     except asyncio.CancelledError:
-        await _abort_cancelled_compression()
+        await _finish_owned_cleanup(
+            asyncio.create_task(_abort_cancelled_compression())
+        )
         raise
     except AuxiliaryExplicitCancellation:
-        await _abort_cancelled_compression()
+        await _finish_owned_cleanup(
+            asyncio.create_task(_abort_cancelled_compression())
+        )
         _existing_sp = getattr(agent, "_cached_system_prompt", None)
         if not _existing_sp:
             _existing_sp = await agent._build_system_prompt(system_message)

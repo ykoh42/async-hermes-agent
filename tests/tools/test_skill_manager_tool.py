@@ -230,6 +230,41 @@ class TestAsyncContract:
         assert entry.schema == manager.SKILL_MANAGE_SCHEMA
 
     @pytest.mark.asyncio
+    async def test_repeated_cancellation_waits_for_single_delete_task(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        delete_started = asyncio.Event()
+        release_delete = asyncio.Event()
+        delete_completed = asyncio.Event()
+        calls = 0
+
+        async def controlled_remove_tree(_path):
+            nonlocal calls
+            calls += 1
+            delete_started.set()
+            await release_delete.wait()
+            delete_completed.set()
+
+        monkeypatch.setattr(manager, "_remove_tree", controlled_remove_tree)
+        task = asyncio.create_task(manager._remove_tree_fully(tmp_path / "skill"))
+        await delete_started.wait()
+        task.cancel()
+        await asyncio.sleep(0)
+        task.cancel()
+        await asyncio.sleep(0)
+
+        try:
+            assert task.done() is False
+            assert calls == 1
+        finally:
+            release_delete.set()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            await asyncio.wait_for(delete_completed.wait(), timeout=1.0)
+
+    @pytest.mark.asyncio
     async def test_active_path_never_calls_to_thread(
         self,
         monkeypatch,

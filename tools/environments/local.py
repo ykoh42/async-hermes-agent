@@ -441,7 +441,7 @@ async def _transform_sudo_command(
     return command, None
 
 
-async def _terminate_process(process: asyncio.subprocess.Process) -> None:
+async def _terminate_and_reap(process: asyncio.subprocess.Process) -> None:
     """Terminate and reap a foreground shell process and its process group."""
     if process.returncode is not None:
         return
@@ -467,6 +467,58 @@ async def _terminate_process(process: asyncio.subprocess.Process) -> None:
             await process.wait()
     except ProcessLookupError:
         return
+
+
+async def _terminate_process(process: asyncio.subprocess.Process) -> None:
+    """Finish owned process termination before propagating cancellation."""
+    terminate_task = asyncio.create_task(_terminate_and_reap(process))
+    cancellation: asyncio.CancelledError | None = None
+    while True:
+        try:
+            await asyncio.shield(terminate_task)
+            break
+        except asyncio.CancelledError as exc:  # noqa: ASYNC103 - re-raised below
+            if terminate_task.cancelled():
+                raise
+            if cancellation is None:
+                cancellation = exc
+        except Exception as exc:
+            if cancellation is not None:
+                raise cancellation from exc
+            raise
+    if cancellation is not None:
+        raise cancellation
+
+
+async def _finish_process_cleanup(
+    process: asyncio.subprocess.Process,
+    readers: list[asyncio.Task[None]],
+) -> None:
+    """Terminate a child and collect its readers as one owned cleanup."""
+
+    async def _cleanup() -> None:
+        try:
+            await _terminate_process(process)
+        finally:
+            await _finish_stream_readers(readers)
+
+    cleanup_task = asyncio.create_task(_cleanup())
+    cancellation: asyncio.CancelledError | None = None
+    while True:
+        try:
+            await asyncio.shield(cleanup_task)
+            break
+        except asyncio.CancelledError as exc:  # noqa: ASYNC103 - re-raised below
+            if cleanup_task.cancelled():
+                raise
+            if cancellation is None:
+                cancellation = exc
+        except Exception as exc:
+            if cancellation is not None:
+                raise cancellation from exc
+            raise
+    if cancellation is not None:
+        raise cancellation
 
 
 class LocalEnvironment:
@@ -606,8 +658,7 @@ class LocalEnvironment:
             try:
                 await asyncio.wait_for(process.wait(), timeout=limit)
             except TimeoutError:
-                await _terminate_process(process)
-                await _finish_stream_readers(readers)
+                await _finish_process_cleanup(process, readers)
                 output = _decode_process_output(stdout_chunks, stderr_chunks)
                 timeout_message = f"Command timed out after {limit:g}s"
                 return {
@@ -619,8 +670,7 @@ class LocalEnvironment:
                     "returncode": 124,
                 }
             except asyncio.CancelledError:
-                await _terminate_process(process)
-                await _finish_stream_readers(readers)
+                await _finish_process_cleanup(process, readers)
                 raise
             await _finish_stream_readers(readers)
         except OSError as exc:

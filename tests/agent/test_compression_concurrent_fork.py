@@ -382,12 +382,21 @@ async def test_task_cancellation_during_post_lease_read_releases_lock(
     await db.create_session(session_id, source="library")
     agent = _build_agent_with_db(db, session_id)
     entered = asyncio.Event()
+    release_started = asyncio.Event()
+    allow_release = asyncio.Event()
+    original_release = db.release_compression_lock
 
     async def blocked_get_session(_session_id):
         entered.set()
         await asyncio.Event().wait()
 
+    async def controlled_release(lock_session_id, holder):
+        release_started.set()
+        await allow_release.wait()
+        return await original_release(lock_session_id, holder)
+
     db.get_session = blocked_get_session
+    db.release_compression_lock = controlled_release
     running = asyncio.create_task(
         agent._compress_context(
             [{"role": "user", "content": "keep"}],
@@ -397,9 +406,16 @@ async def test_task_cancellation_during_post_lease_read_releases_lock(
     )
     await asyncio.wait_for(entered.wait(), timeout=2)
     running.cancel()
+    await asyncio.wait_for(release_started.wait(), timeout=2)
+    running.cancel()
+    await asyncio.sleep(0)
 
-    with pytest.raises(asyncio.CancelledError):
-        await running
+    try:
+        assert running.done() is False
+    finally:
+        allow_release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await running
     assert await db.get_compression_lock_holder(session_id) is None
 
 

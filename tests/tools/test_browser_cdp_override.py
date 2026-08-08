@@ -279,6 +279,8 @@ class TestCDPSupervisorStartRedaction:
         supervisor = CDPSupervisor("test-task", WS_URL)
         run_started = asyncio.Event()
         run_cancelled = asyncio.Event()
+        release_run = asyncio.Event()
+        run_completed = asyncio.Event()
 
         async def never_ready():
             run_started.set()
@@ -286,6 +288,8 @@ class TestCDPSupervisorStartRedaction:
                 await asyncio.Event().wait()
             except asyncio.CancelledError:
                 run_cancelled.set()
+                await release_run.wait()
+                run_completed.set()
                 raise
 
         supervisor._run = never_ready
@@ -293,8 +297,19 @@ class TestCDPSupervisorStartRedaction:
             start = asyncio.create_task(supervisor.start(timeout=60))
             await asyncio.wait_for(run_started.wait(), timeout=1)
             start.cancel()
-            with pytest.raises(asyncio.CancelledError):
-                await start
+            await asyncio.wait_for(run_cancelled.wait(), timeout=1)
+            start.cancel()
+            await asyncio.sleep(0)
+            start.cancel()
+            await asyncio.sleep(0)
+
+            try:
+                assert start.done() is False
+            finally:
+                release_run.set()
+                with pytest.raises(asyncio.CancelledError):
+                    await start
+                await asyncio.wait_for(run_completed.wait(), timeout=1)
 
         assert run_cancelled.is_set()
         assert supervisor._run_task is None

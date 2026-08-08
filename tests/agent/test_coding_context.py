@@ -1,5 +1,6 @@
 """Tests for agent.coding_context — RuntimeMode seam, resolver, toolset, git probe."""
 
+import asyncio
 import json
 import os
 import subprocess
@@ -14,6 +15,49 @@ from pyleak.eventloop import LeakAction
 from agent import coding_context as cc
 
 pytestmark = pytest.mark.asyncio
+
+
+async def test_git_probe_repeated_cancellation_waits_for_communicate(monkeypatch):
+    communicate_started = asyncio.Event()
+    cleanup_started = asyncio.Event()
+    release_cleanup = asyncio.Event()
+    cleanup_completed = asyncio.Event()
+    killed = asyncio.Event()
+
+    class ControlledProcess:
+        returncode = None
+
+        async def communicate(self):
+            communicate_started.set()
+            await killed.wait()
+            cleanup_started.set()
+            await release_cleanup.wait()
+            cleanup_completed.set()
+            return b"", b""
+
+        def kill(self):
+            self.returncode = -9
+            killed.set()
+
+    async def create_process(*_args, **_kwargs):
+        return ControlledProcess()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create_process)
+
+    task = asyncio.create_task(cc._git(Path.cwd(), "status"))
+    await communicate_started.wait()
+    task.cancel()
+    await cleanup_started.wait()
+    task.cancel()
+    await asyncio.sleep(0)
+
+    try:
+        assert task.done() is False
+    finally:
+        release_cleanup.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await asyncio.wait_for(cleanup_completed.wait(), timeout=1.0)
 
 
 async def test_coding_guidance_advertises_persistent_terminal_state():

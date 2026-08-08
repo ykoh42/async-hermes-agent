@@ -208,6 +208,9 @@ async def test_wait_cancellation_propagates_without_killing_process(tmp_path):
 async def test_spawn_cancellation_during_checkpoint_reaps_child(tmp_path, monkeypatch):
     process_registry = ProcessRegistry()
     checkpoint_started = asyncio.Event()
+    cleanup_started = asyncio.Event()
+    release_cleanup = asyncio.Event()
+    cleanup_completed = asyncio.Event()
     calls = 0
 
     async def blocking_first_checkpoint():
@@ -222,6 +225,20 @@ async def test_spawn_cancellation_during_checkpoint_reaps_child(tmp_path, monkey
         "_write_checkpoint",
         blocking_first_checkpoint,
     )
+    original_kill_process = process_registry.kill_process
+
+    async def controlled_kill_process(session_id, **kwargs):
+        cleanup_started.set()
+        await release_cleanup.wait()
+        result = await original_kill_process(session_id, **kwargs)
+        cleanup_completed.set()
+        return result
+
+    monkeypatch.setattr(
+        process_registry,
+        "kill_process",
+        controlled_kill_process,
+    )
 
     async with no_task_leaks(action=LeakAction.RAISE):
         spawning = asyncio.create_task(
@@ -233,8 +250,17 @@ async def test_spawn_cancellation_during_checkpoint_reaps_child(tmp_path, monkey
         await checkpoint_started.wait()
         session = next(iter(process_registry._running.values()))
         spawning.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await spawning
+        await cleanup_started.wait()
+        spawning.cancel()
+        await asyncio.sleep(0)
+
+        try:
+            assert spawning.done() is False
+        finally:
+            release_cleanup.set()
+            with pytest.raises(asyncio.CancelledError):
+                await spawning
+            await asyncio.wait_for(cleanup_completed.wait(), timeout=1.0)
 
     assert session.process is not None
     assert session.process.returncode is not None
