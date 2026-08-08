@@ -167,6 +167,9 @@ async def test_skill_and_stdio_mcp_calls_are_preserved_in_trajectory(
     agent._execute_model_request = model_response
     agent.compression_enabled = False
     try:
+        # Warm the allowed aiosqlite worker before overlapping detectors; cold
+        # SessionDB startup is covered by test_session_lifecycle_does_not_block_or_leak.
+        await database.session_count()
         async with (
             no_event_loop_blocking(action=LeakAction.RAISE, threshold=0.1),
             no_task_leaks(action=LeakAction.RAISE),
