@@ -142,6 +142,15 @@ from agent.context_compressor import (  # noqa: F401
     COMPRESSED_SUMMARY_METADATA_KEY,
     ContextCompressor,
 )
+from agent.aux_accounting import (
+    reset_accounting_context,
+    set_accounting_context,
+)
+from agent.auxiliary_client import scoped_runtime_main
+from agent.portal_tags import (
+    reset_conversation_context,
+    set_conversation_context,
+)
 from agent.retry_utils import jittered_backoff  # noqa: F401
 from agent.prompt_builder import (  # noqa: F401  # re-exported via _ra() / mock.patch("run_agent.<name>") / from run_agent import <name>
     DEFAULT_AGENT_IDENTITY,
@@ -6726,15 +6735,7 @@ class AIAgent:
         moa_config: Optional[dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Forwarder — see ``agent.conversation_loop.run_conversation``."""
-        from agent.aux_accounting import (
-            reset_accounting_context,
-            set_accounting_context,
-        )
         from agent.conversation_loop import run_conversation
-        from agent.portal_tags import (
-            reset_conversation_context,
-            set_conversation_context,
-        )
         turn_lock = self._get_turn_lock()
         await turn_lock.acquire()
         self._active_turn_task = asyncio.current_task()
@@ -6760,8 +6761,6 @@ class AIAgent:
                 else None,
                 getattr(self, "session_id", None),
             )
-            from agent.auxiliary_client import scoped_runtime_main
-
             # The outer token restores the caller's Context even though turn setup
             # replaces the value with the live runtime after fallback restoration.
             # Keep the scope local instead of storing ContextVar tokens on the agent,
