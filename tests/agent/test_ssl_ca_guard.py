@@ -22,6 +22,7 @@ async def test_healthy_bundle_passes(monkeypatch):
     for key in (
         "HERMES_CA_BUNDLE",
         "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
         "REQUESTS_CA_BUNDLE",
         "CURL_CA_BUNDLE",
     ):
@@ -38,12 +39,18 @@ async def test_healthy_bundle_does_not_read_files_on_event_loop(monkeypatch):
         monkeypatch.delenv(key, raising=False)
     event_loop_thread = threading.get_ident()
     create_default_context = ssl.create_default_context
+    certifi_where = certifi.where
 
     def tracked_create_default_context(*args, **kwargs):
         assert threading.get_ident() != event_loop_thread
         return create_default_context(*args, **kwargs)
 
+    def tracked_certifi_where():
+        assert threading.get_ident() != event_loop_thread
+        return certifi_where()
+
     monkeypatch.setattr(ssl, "create_default_context", tracked_create_default_context)
+    monkeypatch.setattr(certifi, "where", tracked_certifi_where)
     blocker = BlockBuster()
     blocker.activate()
     try:
@@ -65,6 +72,7 @@ async def test_empty_certifi_bundle_raises_ssl_error(monkeypatch, tmp_path):
     [
         "HERMES_CA_BUNDLE",
         "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
         "REQUESTS_CA_BUNDLE",
         "CURL_CA_BUNDLE",
     ],

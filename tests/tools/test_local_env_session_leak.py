@@ -71,7 +71,8 @@ def _engage():
 # Foreground path (build_subprocess_env)
 # --------------------------------------------------------------------------- #
 
-def test_engaged_unset_contextvar_strips_foreign_session_key(monkeypatch):
+@pytest.mark.asyncio
+async def test_engaged_unset_contextvar_strips_foreign_session_key(monkeypatch):
     """Engaged host + UNSET ContextVar must NOT inherit a foreign global.
 
     This is the production hijack: a concurrent session wrote
@@ -84,7 +85,7 @@ def test_engaged_unset_contextvar_strips_foreign_session_key(monkeypatch):
         "agent:main:discord:thread:FOREIGN_CONCURRENT:FOREIGN_CONCURRENT",
     )
 
-    env = build_subprocess_env()
+    env = await build_subprocess_env()
 
     assert "HERMES_SESSION_KEY" not in env, (
         "Foreign concurrent session key leaked into subprocess env: "
@@ -92,7 +93,8 @@ def test_engaged_unset_contextvar_strips_foreign_session_key(monkeypatch):
     )
 
 
-def test_set_session_vars_engages_and_overrides_foreign_global(monkeypatch):
+@pytest.mark.asyncio
+async def test_set_session_vars_engages_and_overrides_foreign_global(monkeypatch):
     """set_session_vars itself engages the latch and the bound value wins.
 
     Mirrors a real host: calling set_session_vars both marks the process engaged
@@ -110,14 +112,15 @@ def test_set_session_vars_engages_and_overrides_foreign_global(monkeypatch):
     )
     try:
         assert sc.session_context_engaged() is True
-        env = build_subprocess_env()
+        env = await build_subprocess_env()
     finally:
         clear_session_vars(tokens)
 
     assert env.get("HERMES_SESSION_KEY") == "agent:main:discord:group:MY_BUGS_ROOT:111"
 
 
-def test_unengaged_process_preserves_os_environ_fallback(monkeypatch):
+@pytest.mark.asyncio
+async def test_unengaged_process_preserves_os_environ_fallback(monkeypatch):
     """A process that never engaged the session-context system keeps the fallback.
 
     Pure single-process CLI/one-shot sets HERMES_SESSION_* directly in os.environ
@@ -128,13 +131,14 @@ def test_unengaged_process_preserves_os_environ_fallback(monkeypatch):
     monkeypatch.setenv("HERMES_SESSION_KEY", "cli-session-key")
     monkeypatch.setenv("HERMES_SESSION_ID", "cli-session-id")
 
-    env = build_subprocess_env()
+    env = await build_subprocess_env()
 
     assert env.get("HERMES_SESSION_KEY") == "cli-session-key"
     assert env.get("HERMES_SESSION_ID") == "cli-session-id"
 
 
-def test_explicit_empty_thread_id_overrides_stale_value(monkeypatch):
+@pytest.mark.asyncio
+async def test_explicit_empty_thread_id_overrides_stale_value(monkeypatch):
     """A bound-but-empty thread id must override a stale inherited value.
 
     This is the complementary case (the #38507 scenario): a top-level post with
@@ -150,7 +154,7 @@ def test_explicit_empty_thread_id_overrides_stale_value(monkeypatch):
         thread_id="",  # explicitly no thread
     )
     try:
-        env = build_subprocess_env()
+        env = await build_subprocess_env()
     finally:
         clear_session_vars(tokens)
 
@@ -165,7 +169,8 @@ def test_explicit_empty_thread_id_overrides_stale_value(monkeypatch):
 # Background / PTY path (_sanitize_subprocess_env via process_registry)
 # --------------------------------------------------------------------------- #
 
-def test_sanitize_subprocess_env_strips_foreign_session_key_when_engaged(monkeypatch):
+@pytest.mark.asyncio
+async def test_sanitize_subprocess_env_strips_foreign_session_key_when_engaged(monkeypatch):
     """The background/PTY spawn path gets the same cross-session strip.
 
     process_registry.spawn_local() builds its env via _sanitize_subprocess_env(
@@ -179,7 +184,7 @@ def test_sanitize_subprocess_env_strips_foreign_session_key_when_engaged(monkeyp
         "HERMES_SESSION_THREAD_ID": "FOREIGN_BG",
     }
 
-    sanitized = _sanitize_subprocess_env(stale_base)
+    sanitized = await _sanitize_subprocess_env(stale_base)
 
     assert "HERMES_SESSION_KEY" not in sanitized, (
         f"Background subprocess inherited foreign key: {sanitized.get('HERMES_SESSION_KEY')!r}"
@@ -187,7 +192,8 @@ def test_sanitize_subprocess_env_strips_foreign_session_key_when_engaged(monkeyp
     assert "HERMES_SESSION_THREAD_ID" not in sanitized
 
 
-def test_sanitize_subprocess_env_set_contextvar_wins_when_engaged():
+@pytest.mark.asyncio
+async def test_sanitize_subprocess_env_set_contextvar_wins_when_engaged():
     """Background path: a SET ContextVar overrides the foreign global base."""
     stale_base = {
         "PATH": "/usr/bin:/bin",
@@ -199,7 +205,7 @@ def test_sanitize_subprocess_env_set_contextvar_wins_when_engaged():
         chat_id="REAL_BG",
     )
     try:
-        sanitized = _sanitize_subprocess_env(stale_base)
+        sanitized = await _sanitize_subprocess_env(stale_base)
     finally:
         clear_session_vars(tokens)
 
@@ -210,7 +216,8 @@ def test_sanitize_subprocess_env_set_contextvar_wins_when_engaged():
 # Non-terminal spawn surface (hermes_subprocess_env) — sibling path
 # --------------------------------------------------------------------------- #
 
-def test_hermes_subprocess_env_strips_foreign_session_key_when_engaged(monkeypatch):
+@pytest.mark.asyncio
+async def test_hermes_subprocess_env_strips_foreign_session_key_when_engaged(monkeypatch):
     """hermes_subprocess_env (browser/ACP/CLI/TUI-host spawns) must not leak a
     foreign session key either. cli.exec spawns via this helper WITHOUT re-binding
     the session identity, so an UNSET ContextVar under an engaged host must strip
@@ -222,7 +229,7 @@ def test_hermes_subprocess_env_strips_foreign_session_key_when_engaged(monkeypat
         "agent:main:discord:thread:FOREIGN_CONCURRENT:FOREIGN_CONCURRENT",
     )
 
-    env = hermes_subprocess_env()
+    env = await hermes_subprocess_env()
 
     assert "HERMES_SESSION_KEY" not in env, (
         "Foreign concurrent session key leaked into non-terminal spawn env: "
@@ -230,11 +237,12 @@ def test_hermes_subprocess_env_strips_foreign_session_key_when_engaged(monkeypat
     )
 
 
-def test_hermes_subprocess_env_unengaged_preserves_fallback(monkeypatch):
+@pytest.mark.asyncio
+async def test_hermes_subprocess_env_unengaged_preserves_fallback(monkeypatch):
     """A pure single-process CLI (never engaged) keeps the inherited fallback."""
     monkeypatch.setenv("HERMES_SESSION_KEY", "cli-fallback-key")
     # not engaged (autouse fixture leaves _session_context_engaged False)
-    env = hermes_subprocess_env()
+    env = await hermes_subprocess_env()
     assert env.get("HERMES_SESSION_KEY") == "cli-fallback-key"
 
 

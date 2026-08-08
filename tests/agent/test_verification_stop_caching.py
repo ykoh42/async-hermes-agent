@@ -19,6 +19,52 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _restore_runtime_modules():
+    """Keep fresh-import coverage from contaminating later test modules."""
+    runtime_roots = {
+        "agent",
+        "batch_runner",
+        "gateway",
+        "hermes_bootstrap",
+        "hermes_cli",
+        "hermes_constants",
+        "hermes_logging",
+        "hermes_plugins",
+        "hermes_state",
+        "hermes_state_common",
+        "hermes_time",
+        "model_tools",
+        "plugins",
+        "providers",
+        "run_agent",
+        "tools",
+        "toolset_distributions",
+        "toolsets",
+        "trajectory_compressor",
+        "utils",
+    }
+
+    def selected(name):
+        return name.partition(".")[0] in runtime_roots
+
+    snapshot = {name: module for name, module in sys.modules.items() if selected(name)}
+    yield
+    for name in tuple(sys.modules):
+        if selected(name) and name not in snapshot:
+            module = sys.modules.pop(name, None)
+            parent_name, separator, child_name = name.rpartition(".")
+            parent = sys.modules.get(parent_name) if separator else None
+            if parent is not None and getattr(parent, child_name, None) is module:
+                delattr(parent, child_name)
+    sys.modules.update(snapshot)
+    for name, module in snapshot.items():
+        parent_name, separator, child_name = name.rpartition(".")
+        parent = sys.modules.get(parent_name) if separator else None
+        if parent is not None:
+            setattr(parent, child_name, module)
+
+
 def _fresh_run_agent(hermes_home):
     for mod in list(sys.modules):
         if mod == "run_agent" or mod.startswith("agent.") or mod.startswith("tools.") or mod.startswith("hermes_"):

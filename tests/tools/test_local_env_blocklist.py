@@ -12,8 +12,9 @@ from tools.environments.local import (
 )
 
 
-def test_provider_credentials_are_removed():
-    result = _sanitize_subprocess_env(
+@pytest.mark.asyncio
+async def test_provider_credentials_are_removed():
+    result = await _sanitize_subprocess_env(
         {"PATH": "/bin", "OPENAI_API_KEY": "secret", "USER_VALUE": "ok"}
     )
     assert result["PATH"] == "/bin"
@@ -21,10 +22,11 @@ def test_provider_credentials_are_removed():
     assert "OPENAI_API_KEY" not in result
 
 
-def test_dynamic_auxiliary_and_relay_secrets_are_removed():
+@pytest.mark.asyncio
+async def test_dynamic_auxiliary_and_relay_secrets_are_removed():
     assert _is_hermes_internal_secret("AUXILIARY_VISION_API_KEY")
     assert _is_hermes_internal_secret("GATEWAY_RELAY_MAIN_SECRET")
-    result = _sanitize_subprocess_env(
+    result = await _sanitize_subprocess_env(
         {
             "AUXILIARY_VISION_API_KEY": "secret",
             "GATEWAY_RELAY_MAIN_SECRET": "secret",
@@ -68,9 +70,14 @@ async def test_local_environment_preserves_public_constructor_and_native_async_i
     assert "OPENAI_API_KEY" not in environment.env
 
 
-def test_local_environment_keeps_upstream_defaults(monkeypatch, tmp_path):
+@pytest.mark.asyncio
+async def test_local_environment_keeps_upstream_defaults(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
     environment = LocalEnvironment()
+
+    assert environment.cwd == ""
+    assert environment._initialized is False
+    await environment._ensure_initialized()
 
     assert environment.cwd == os.path.normpath(str(tmp_path))
     assert environment.timeout == 60

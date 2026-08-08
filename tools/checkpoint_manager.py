@@ -265,7 +265,9 @@ async def _git_env(
     # git child with hand-isolated config env; exact preservation — a HOME
     # rewrite would change which ~/.gitconfig the isolation vars are hiding.
     from tools.environments.local import build_subprocess_env
-    env = build_subprocess_env(scrub_secrets=False, inherit_profile_home=False)
+    env = await build_subprocess_env(
+        scrub_secrets=False, inherit_profile_home=False
+    )
     env["GIT_DIR"] = str(store)
     env["GIT_WORK_TREE"] = str(normalized_working_dir)
     env.pop("GIT_NAMESPACE", None)
@@ -469,7 +471,9 @@ async def _init_store(store: Path, working_dir: str) -> Optional[str]:
     # here (which always sets GIT_DIR + GIT_WORK_TREE).  Use a raw
     # subprocess with just the config-isolation env vars.
     from tools.environments.local import build_subprocess_env
-    init_env = build_subprocess_env(scrub_secrets=False, inherit_profile_home=False)
+    init_env = await build_subprocess_env(
+        scrub_secrets=False, inherit_profile_home=False
+    )
     init_env["GIT_CONFIG_GLOBAL"] = os.devnull
     init_env["GIT_CONFIG_SYSTEM"] = os.devnull
     init_env["GIT_CONFIG_NOSYSTEM"] = "1"

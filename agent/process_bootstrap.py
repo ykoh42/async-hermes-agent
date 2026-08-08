@@ -118,12 +118,12 @@ def _get_proxy_for_base_url(base_url: Optional[str]) -> Optional[str]:
     return proxy
 
 
-def build_keepalive_http_client(
+async def build_keepalive_http_client(
     base_url: str = "",
     *,
     async_mode: bool = False,
     verify: Any = True,
-) -> Optional[Any]:
+) -> Any:
     """Build the native async httpx client for OpenAI SDK calls.
 
     The Hermes runtime always returns the native async transport. The
@@ -147,39 +147,53 @@ def build_keepalive_http_client(
     ``verify`` is forwarded to httpx so auxiliary-client calls (compression,
     vision, web_extract, title generation, etc.) honor the same per-provider
     ``ssl_ca_cert`` / ``ssl_verify`` and ``HERMES_CA_BUNDLE`` settings the main
-    client uses. It is passed on the client AND on the plain no-proxy mounts
-    (a mounted transport owns the SSL context for its scheme).
+    client uses. HTTPS proxies receive their own default context; the
+    provider-specific context is used only for the target connection.
     """
+    import ssl
+
+    import httpx
+
+    from agent.ssl_verify import resolve_httpx_verify
+
+    if verify is True:
+        target_verify = await resolve_httpx_verify()
+    elif isinstance(verify, str):
+        target_verify = await resolve_httpx_verify(ca_bundle=verify)
+    elif verify is False or isinstance(verify, ssl.SSLContext):
+        target_verify = verify
+    else:
+        raise TypeError("verify must be a bool, path, or ssl.SSLContext")
+
+    proxy_url = _get_proxy_for_base_url(base_url)
+    proxy: Any = proxy_url
+    if proxy_url and httpx.URL(proxy_url).scheme == "https":
+        proxy = httpx.Proxy(
+            proxy_url,
+            ssl_context=await resolve_httpx_verify(),
+        )
+
+    limits = httpx.Limits(
+        max_keepalive_connections=20,
+        max_connections=100,
+        keepalive_expiry=20.0,
+    )
+    # Generous read=None for SSE streaming endpoints.
+    timeout = httpx.Timeout(connect=15.0, read=None, write=15.0, pool=10.0)
+    transport = httpx.AsyncHTTPTransport(
+        verify=target_verify,
+        limits=limits,
+        proxy=proxy,
+    )
     try:
-        import httpx
-
-        proxy = _get_proxy_for_base_url(base_url)
-
-        limits = httpx.Limits(
-            max_keepalive_connections=20,
-            max_connections=100,
-            keepalive_expiry=20.0,
-        )
-        # Generous read=None for SSE streaming endpoints.
-        timeout = httpx.Timeout(connect=15.0, read=None, write=15.0, pool=10.0)
-
-        transport_cls = httpx.AsyncHTTPTransport
-        client_cls = httpx.AsyncClient
-        mounts = {}
-        if proxy is None:
-            mounts = {
-                "http://": transport_cls(verify=verify),
-                "https://": transport_cls(verify=verify),
-            }
-        return client_cls(
-            limits=limits,
+        return httpx.AsyncClient(
+            transport=transport,
             timeout=timeout,
-            proxy=proxy,
-            mounts=mounts or None,
-            verify=verify,
+            trust_env=False,
         )
-    except Exception:
-        return None
+    except BaseException:
+        await transport.aclose()
+        raise
 
 
 def _install_safe_stdio() -> None:

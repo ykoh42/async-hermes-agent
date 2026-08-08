@@ -30,14 +30,15 @@ def _fake_process() -> SimpleNamespace:
     return SimpleNamespace(stdin=_Writer())
 
 
-def test_acp_child_inherits_provider_key_but_not_tier_one_secrets(monkeypatch):
+@pytest.mark.asyncio
+async def test_acp_child_inherits_provider_key_but_not_tier_one_secrets(monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "provider-key")
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "bot-secret")
     monkeypatch.setenv("GH_TOKEN", "github-secret")
     monkeypatch.setenv("AUXILIARY_VISION_API_KEY", "aux-secret")
     monkeypatch.setenv("VIRTUAL_ENV", "/tmp/foreign-venv")
 
-    env = _build_subprocess_env()
+    env = await _build_subprocess_env()
 
     assert env["OPENAI_API_KEY"] == "provider-key"
     assert "TELEGRAM_BOT_TOKEN" not in env
@@ -284,7 +285,9 @@ async def test_run_prompt_preserves_real_home(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
     monkeypatch.delenv("HERMES_REAL_HOME", raising=False)
     monkeypatch.delenv("TERMINAL_HOME_MODE", raising=False)
-    monkeypatch.setattr("hermes_constants.is_container", lambda: False)
+    monkeypatch.setattr(
+        "hermes_constants.is_container", AsyncMock(return_value=False)
+    )
     client = CopilotACPClient(acp_cwd=str(tmp_path))
 
     with patch(

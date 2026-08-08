@@ -41,8 +41,9 @@ def _get_allowed() -> set[str]:
         return val
 
 
-# Cache for the config-based allowlist (loaded once per process).
-_config_passthrough: frozenset[str] | None = None
+# Cache config allowlists per profile home. Multiplexed tasks carry their home
+# in a ContextVar, so one profile's allowlist must never become process-global.
+_config_passthrough: dict[str, frozenset[str]] | None = None
 
 
 def _is_hermes_provider_credential(name: str) -> bool:
@@ -124,8 +125,14 @@ def register_env_passthrough(var_names: Iterable[str]) -> None:
 async def _load_config_passthrough() -> frozenset[str]:
     """Load ``tools.env_passthrough`` from config.yaml (cached)."""
     global _config_passthrough
-    if _config_passthrough is not None:
-        return _config_passthrough
+    from hermes_constants import get_hermes_home
+
+    home_key = str(get_hermes_home())
+    if _config_passthrough is None:
+        _config_passthrough = {}
+    cached = _config_passthrough.get(home_key)
+    if cached is not None:
+        return cached
 
     result: set[str] = set()
     try:
@@ -158,8 +165,9 @@ async def _load_config_passthrough() -> frozenset[str]:
     except Exception as e:
         logger.debug("Could not read tools.env_passthrough from config: %s", e)
 
-    _config_passthrough = frozenset(result)
-    return _config_passthrough
+    loaded = frozenset(result)
+    _config_passthrough[home_key] = loaded
+    return loaded
 
 
 async def is_env_passthrough(var_name: str) -> bool:

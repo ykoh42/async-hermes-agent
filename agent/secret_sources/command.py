@@ -187,7 +187,9 @@ async def _run_helper(
         # helper contract, which may rely on the user's full environment.
         from tools.environments.local import build_subprocess_env
 
-        env = build_subprocess_env(scrub_secrets=False, inherit_profile_home=False)
+        env = await build_subprocess_env(
+            scrub_secrets=False, inherit_profile_home=False
+        )
     else:
         # A multiplex profile must never inherit sibling secrets from the
         # process-global environment.  hydrate_profile_secret_sources seeds

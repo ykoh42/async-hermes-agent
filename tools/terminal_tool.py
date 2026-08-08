@@ -157,15 +157,8 @@ def _parse_env_var(
 async def _get_env_config() -> dict[str, Any]:
     """Read local terminal configuration without synchronous filesystem I/O."""
     raw_cwd = os.getenv("TERMINAL_CWD", "").strip()
-    expanded_cwd = os.path.expanduser(raw_cwd) if raw_cwd else ""
-    if expanded_cwd and os.path.isabs(expanded_cwd):
-        cwd = (
-            expanded_cwd
-            if await aiofiles.os.path.isdir(expanded_cwd)
-            else await aiofiles.os.getcwd()
-        )
-    else:
-        cwd = await aiofiles.os.getcwd()
+    expanduser = aiofiles.os.wrap(os.path.expanduser)
+    cwd = await expanduser(raw_cwd) if raw_cwd else await aiofiles.os.getcwd()
     return {
         "env_type": "local",
         "cwd": os.path.normpath(cwd),  # noqa: ASYNC240 - lexical only
@@ -350,7 +343,7 @@ def _create_environment(
 ) -> LocalEnvironment:
     """Construct the local environment without performing external I/O."""
     return LocalEnvironment(
-        cwd or os.getcwd(),
+        cwd or "",
         int(timeout or _parse_env_var("TERMINAL_TIMEOUT", "120")),
     )
 
@@ -392,6 +385,7 @@ async def _get_or_create_environment(
         config = await _get_env_config()
         cwd = overrides.get("cwd") or await get_session_cwd(raw_key)
         env = LocalEnvironment(cwd or config["cwd"], int(config["timeout"]))
+        await env._ensure_initialized()
         env._persistent = bool(config.get("local_persistent", False))
         with _env_lock:
             # Another turn may have created the environment while async config
@@ -522,10 +516,11 @@ async def terminal_tool(  # noqa: ASYNC109 - upstream public API names timeout
     try:
         env = await _get_or_create_environment(task_id)
         cwd = workdir or env.cwd
+        expanduser = aiofiles.os.wrap(os.path.expanduser)
         cwd = os.path.normpath(  # noqa: ASYNC240 - lexical only
-            os.path.expanduser(str(cwd))
+            await expanduser(str(cwd))
         )
-        if workdir and not os.path.isabs(os.path.expanduser(workdir)):
+        if workdir and not os.path.isabs(await expanduser(workdir)):
             return json.dumps(
                 {
                     "output": "",

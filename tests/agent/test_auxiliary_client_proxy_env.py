@@ -16,11 +16,15 @@ from agent.process_bootstrap import _get_proxy_for_base_url
 
 
 def _pool_types(http_client) -> list:
-    return [
-        type(mount._pool).__name__
-        for mount in http_client._mounts.values()
-        if mount is not None and hasattr(mount, "_pool")
-    ]
+    pools = [type(http_client._transport._pool).__name__]
+    pools.extend(
+        [
+            type(mount._pool).__name__
+            for mount in http_client._mounts.values()
+            if mount is not None and hasattr(mount, "_pool")
+        ]
+    )
+    return pools
 
 
 @pytest.mark.asyncio
@@ -31,7 +35,7 @@ async def test_create_openai_client_routes_via_env_proxy(mock_openai, monkeypatc
         monkeypatch.delenv(key, raising=False)
     monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:7897")
 
-    _create_openai_client(
+    await _create_openai_client(
         api_key="test-key",
         base_url="https://litellm.internal.example.com/v1",
     )

@@ -41,7 +41,6 @@ from agent.model_metadata import (
     is_local_endpoint,
 )
 from agent.process_bootstrap import _install_safe_stdio
-from agent.ssl_verify import resolve_httpx_verify
 from agent.subdirectory_hints import SubdirectoryHintTracker
 from agent.think_scrubber import StreamingThinkScrubber
 from agent.tool_guardrails import (
@@ -1051,11 +1050,6 @@ def init_agent(
     agent._credential_pool = credential_pool
     agent._credential_pool_entry_id = None
     agent._provider_timeout_settings: dict[str, Any] = {}
-    # TLS configuration is resolved while constructing immutable agent state,
-    # then reused by the native async client initializer.  A conversation turn
-    # must not reopen config.yaml or synchronously inspect CA-bundle paths.
-    agent._default_httpx_verify = resolve_httpx_verify()
-    agent._tls_verify_by_route: dict[str, Any] = {}
     # A missing credential is resolved only when the async runtime starts.
     # ``init_agent`` must not open auth.json or invoke an OAuth refresher.
     agent._deferred_provider_runtime = None
@@ -3279,7 +3273,6 @@ async def _initialize_deferred_runtime(agent: Any) -> bool:
             from hermes_cli.config import (
                 apply_custom_provider_extra_headers_to_client_kwargs,
                 apply_custom_provider_tls_to_client_kwargs,
-                get_custom_provider_tls_settings,
                 get_compatible_custom_providers,
             )
 
@@ -3309,31 +3302,6 @@ async def _initialize_deferred_runtime(agent: Any) -> bool:
                 agent.base_url,
                 custom_providers,
             )
-            for custom_provider in custom_providers:
-                route = _normalize_route_base_url(
-                    custom_provider.get("base_url")
-                    if isinstance(custom_provider, dict)
-                    else ""
-                )
-                if not route:
-                    continue
-                tls = get_custom_provider_tls_settings(
-                    route,
-                    custom_providers=custom_providers,
-                )
-                if tls:
-                    agent._tls_verify_by_route[route] = resolve_httpx_verify(
-                        ca_bundle=tls.get("ssl_ca_cert"),
-                        ssl_verify=tls.get("ssl_verify"),
-                        base_url=route,
-                    )
-            selected_route = _normalize_route_base_url(agent.base_url)
-            if selected_route:
-                agent._tls_verify_by_route[selected_route] = resolve_httpx_verify(
-                    ca_bundle=deferred_client_kwargs.get("ssl_ca_cert"),
-                    ssl_verify=deferred_client_kwargs.get("ssl_verify"),
-                    base_url=selected_route,
-                )
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -3524,6 +3492,9 @@ async def _initialize_deferred_runtime(agent: Any) -> bool:
                 client_kwargs["default_query"] = dict(default_query)
             if headers:
                 client_kwargs["default_headers"] = headers
+            for tls_key in ("ssl_ca_cert", "ssl_verify"):
+                if tls_key in deferred_client_kwargs:
+                    client_kwargs[tls_key] = deferred_client_kwargs[tls_key]
             from agent.ssl_guard import verify_ca_bundle_with_fallback
 
             await verify_ca_bundle_with_fallback()

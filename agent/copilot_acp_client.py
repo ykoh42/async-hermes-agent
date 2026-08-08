@@ -66,18 +66,19 @@ def _resolve_args() -> list[str]:
     return shlex.split(raw)
 
 
-def _resolve_home_dir() -> str:
+async def _resolve_home_dir() -> str:
     """Return a stable HOME for child ACP processes."""
     home = os.environ.get("HOME", "").strip()
     if home:
         return home
-    expanded = os.path.expanduser("~")
+    expanded = await aiofiles.os.wrap(os.path.expanduser)("~")
     if expanded and expanded != "~":
         return expanded
     try:
         import pwd
 
-        resolved = pwd.getpwuid(os.getuid()).pw_dir.strip()
+        get_home = aiofiles.os.wrap(lambda: pwd.getpwuid(os.getuid()).pw_dir)
+        resolved = (await get_home()).strip()
         if resolved:
             return resolved
     except Exception:
@@ -85,12 +86,12 @@ def _resolve_home_dir() -> str:
     return "/tmp"
 
 
-def _build_subprocess_env() -> dict[str, str]:
-    env = hermes_subprocess_env(inherit_credentials=True)
-    env["HOME"] = _resolve_home_dir()
+async def _build_subprocess_env() -> dict[str, str]:
+    env = await hermes_subprocess_env(inherit_credentials=True)
+    env["HOME"] = await _resolve_home_dir()
     from hermes_constants import apply_subprocess_home_env
 
-    apply_subprocess_home_env(env)
+    await apply_subprocess_home_env(env)
     return env
 
 
@@ -476,7 +477,7 @@ class CopilotACPClient:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=self._acp_cwd,
-                env=_build_subprocess_env(),
+                env=await _build_subprocess_env(),
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
         except FileNotFoundError as exc:

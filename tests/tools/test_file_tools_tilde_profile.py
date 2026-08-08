@@ -16,7 +16,7 @@ See: https://github.com/NousResearch/hermes-agent/issues/48552
 
 import os
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -31,17 +31,25 @@ import tools.terminal_tool as terminal_tool
 class TestExpandTilde:
     """Verify the _expand_tilde() helper resolves ~ to the profile home."""
 
-    def test_tilde_expands_to_profile_home(self):
+    @pytest.mark.asyncio
+    async def test_tilde_expands_to_profile_home(self):
         """When get_subprocess_home returns a value, ~/path uses it."""
-        with patch("hermes_constants.get_subprocess_home", return_value="/opt/data/profiles/coder/home"):
-            result = ft._expand_tilde("~/scratch/file.txt")
+        with patch(
+            "hermes_constants.get_subprocess_home",
+            new=AsyncMock(return_value="/opt/data/profiles/coder/home"),
+        ):
+            result = await ft._expand_tilde("~/scratch/file.txt")
         assert result == "/opt/data/profiles/coder/home/scratch/file.txt"
 
 
-    def test_empty_path_unchanged(self):
+    @pytest.mark.asyncio
+    async def test_empty_path_unchanged(self):
         """Empty string returns empty."""
-        with patch("hermes_constants.get_subprocess_home", return_value="/opt/data/profiles/coder/home"):
-            assert ft._expand_tilde("") == ""
+        with patch(
+            "hermes_constants.get_subprocess_home",
+            new=AsyncMock(return_value="/opt/data/profiles/coder/home"),
+        ):
+            assert await ft._expand_tilde("") == ""
 
 
 # ---------------------------------------------------------------------------
@@ -64,7 +72,10 @@ class TestResolvePathUsesProfileHome:
         monkeypatch.setenv("HOME", str(process_home))
         monkeypatch.setattr(terminal_tool, "_session_cwds", {})
 
-        with patch("hermes_constants.get_subprocess_home", return_value=str(profile_home)):
+        with patch(
+            "hermes_constants.get_subprocess_home",
+            new=AsyncMock(return_value=str(profile_home)),
+        ):
             resolved = await ft._resolve_path_for_task(
                 "~/test_file.txt", task_id="test"
             )
@@ -83,7 +94,10 @@ class TestResolvePathUsesProfileHome:
         monkeypatch.setenv("HOME", str(process_home))
         monkeypatch.setattr(terminal_tool, "_session_cwds", {})
 
-        with patch("hermes_constants.get_subprocess_home", return_value=str(profile_home)):
+        with patch(
+            "hermes_constants.get_subprocess_home",
+            new=AsyncMock(return_value=str(profile_home)),
+        ):
             # _resolve_base_dir uses the workspace root from config; if it contains ~,
             # it should resolve to profile home
             resolved = await ft._resolve_path_for_task(

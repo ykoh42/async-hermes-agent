@@ -42,16 +42,34 @@ def _msys_to_windows_path(path: str) -> str:
     return f"{drive}:{tail or chr(92)}"
 
 
-def _resolve_local_initial_cwd(cwd: str) -> str:
-    """Resolve the initial cwd lexically; async validation happens on execute."""
-    expanded = os.path.expanduser(cwd) if cwd else os.getcwd()
+async def _resolve_local_initial_cwd(cwd: str) -> str:
+    """Resolve the local backend's initial cwd to an absolute host path."""
+    if cwd:
+        expanduser = aiofiles.os.wrap(os.path.expanduser)
+        expanded = await expanduser(cwd)
+    else:
+        expanded = await aiofiles.os.getcwd()
     if _IS_WINDOWS:
         expanded = _msys_to_windows_path(expanded)
         if ntpath.isabs(expanded):
             return expanded
     if os.path.isabs(expanded):
         return expanded
-    return os.path.abspath(expanded)
+
+    candidate = await aiofiles.os.path.abspath(expanded)
+    current = await aiofiles.os.getcwd()
+
+    # Recover config values such as ``hermes-agent`` when Hermes was launched
+    # from that directory already. The lexical absolute path would otherwise
+    # point at a missing nested ``./hermes-agent``.
+    if not await aiofiles.os.path.isdir(candidate):
+        wanted_parts = Path(expanded).parts
+        current_parts = Path(current).parts
+        if wanted_parts and len(wanted_parts) <= len(current_parts):
+            if current_parts[-len(wanted_parts) :] == wanted_parts:
+                return current
+
+    return candidate
 
 
 def _build_provider_env_blocklist() -> frozenset[str]:
@@ -148,34 +166,65 @@ def _inject_session_context_env(env: dict) -> None:
             env.pop(variable_name, None)
 
 
-def _sanitize_subprocess_env(
+async def _sanitize_subprocess_env(
     base_env: Mapping[str, str] | None,
     extra_env: Mapping[str, str] | None = None,
 ) -> dict[str, str]:
     """Strip Hermes inference credentials from a model-driven subprocess."""
+    try:
+        from tools.env_passthrough import (
+            get_all_passthrough,
+            resolve_passthrough_value,
+        )
+    except Exception:
+        passthrough_names: frozenset[str] = frozenset()
+
+        def resolve_passthrough_value(
+            _name: str,
+            fallback: str | None = None,
+        ) -> str | None:
+            return fallback
+
+    else:
+        passthrough_names = await get_all_passthrough()
+
     sanitized: dict[str, str] = {}
     for key, value in dict(base_env or {}).items():
         if key.startswith(_HERMES_PROVIDER_ENV_FORCE_PREFIX):
             continue
         if _is_hermes_internal_secret(key):
             continue
-        if key not in _HERMES_PROVIDER_ENV_BLOCKLIST:
-            sanitized[key] = value
+        passthrough = key in passthrough_names
+        if key in _HERMES_PROVIDER_ENV_BLOCKLIST and not passthrough:
+            continue
+        resolved = resolve_passthrough_value(key, value) if passthrough else value
+        if resolved is not None:
+            sanitized[key] = resolved
     for key, value in dict(extra_env or {}).items():
         if key.startswith(_HERMES_PROVIDER_ENV_FORCE_PREFIX):
-            key = key[len(_HERMES_PROVIDER_ENV_FORCE_PREFIX):]
+            real_key = key[len(_HERMES_PROVIDER_ENV_FORCE_PREFIX) :]
+            if not _is_hermes_internal_secret(real_key):
+                sanitized[real_key] = value
+            continue
         if _is_hermes_internal_secret(key):
             continue
-        if key not in _HERMES_PROVIDER_ENV_BLOCKLIST:
-            sanitized[key] = value
+        passthrough = key in passthrough_names
+        if key in _HERMES_PROVIDER_ENV_BLOCKLIST and not passthrough:
+            continue
+        resolved = resolve_passthrough_value(key, value) if passthrough else value
+        if resolved is not None:
+            sanitized[key] = resolved
 
     try:
-        from hermes_constants import apply_subprocess_home_env, get_hermes_home_override
+        from hermes_constants import (
+            apply_subprocess_home_env,
+            get_hermes_home_override,
+        )
 
         override = get_hermes_home_override()
         if override:
             sanitized["HERMES_HOME"] = override
-        apply_subprocess_home_env(sanitized)
+        await apply_subprocess_home_env(sanitized)
     except Exception:
         pass
     _inject_session_context_env(sanitized)
@@ -186,7 +235,7 @@ def _sanitize_subprocess_env(
     return sanitized
 
 
-def build_subprocess_env(
+async def build_subprocess_env(
     base: Mapping[str, str] | None = None,
     *,
     inherit_profile_home: bool = True,
@@ -196,7 +245,7 @@ def build_subprocess_env(
     """Build the environment for ``asyncio.create_subprocess_exec``."""
     source = dict(base) if base is not None else os.environ.copy()
     if scrub_secrets:
-        return _sanitize_subprocess_env(source, extra)
+        return await _sanitize_subprocess_env(source, extra)
     if inherit_profile_home:
         try:
             from hermes_constants import (
@@ -207,7 +256,7 @@ def build_subprocess_env(
             override = get_hermes_home_override()
             if override:
                 source["HERMES_HOME"] = override
-            apply_subprocess_home_env(source)
+            await apply_subprocess_home_env(source)
         except Exception:
             pass
     if extra:
@@ -215,7 +264,7 @@ def build_subprocess_env(
     return source
 
 
-def hermes_subprocess_env(*, inherit_credentials: bool = False) -> dict[str, str]:
+async def hermes_subprocess_env(*, inherit_credentials: bool = False) -> dict[str, str]:
     """Build a sanitized environment for a non-terminal child process.
 
     Tier-1 gateway, GitHub, and infrastructure credentials are always removed.
@@ -234,12 +283,15 @@ def hermes_subprocess_env(*, inherit_credentials: bool = False) -> dict[str, str
             env.pop(key, None)
     env.setdefault("PYTHONUTF8", "1")
     try:
-        from hermes_constants import apply_subprocess_home_env, get_hermes_home_override
+        from hermes_constants import (
+            apply_subprocess_home_env,
+            get_hermes_home_override,
+        )
 
         override = get_hermes_home_override()
         if override:
             env["HERMES_HOME"] = override
-        apply_subprocess_home_env(env)
+        await apply_subprocess_home_env(env)
     except Exception:
         pass
     _inject_session_context_env(env)
@@ -421,14 +473,30 @@ class LocalEnvironment:
     """Small shell-backed environment implementing the file-op protocol."""
 
     def __init__(self, cwd: str = "", timeout: int = 60, env: dict = None):
-        self.cwd = os.path.normpath(_resolve_local_initial_cwd(cwd))
+        self.cwd = cwd
         self.timeout = timeout
         initial_env = os.environ.copy()
         if env:
             initial_env.update(env)
-        self.env = build_subprocess_env(base=initial_env, scrub_secrets=True)
+        self.env = initial_env
         self._persistent = False
+        self._initialized = False
         self._lock = asyncio.Lock()
+
+    async def _ensure_initialized(self) -> None:
+        """Resolve filesystem-backed state lazily on first async use."""
+        if self._initialized:
+            return
+        async with self._lock:
+            if self._initialized:
+                return
+            cwd = os.path.normpath(  # noqa: ASYNC240 - lexical only
+                await _resolve_local_initial_cwd(self.cwd)
+            )
+            env = await build_subprocess_env(base=self.env, scrub_secrets=True)
+            self.cwd = cwd
+            self.env = env
+            self._initialized = True
 
     async def execute(  # noqa: ASYNC109 - upstream public API names timeout
         self,
@@ -439,13 +507,15 @@ class LocalEnvironment:
         **_kwargs: Any,
     ) -> dict[str, Any]:
         """Run a local shell command without blocking the agent event loop."""
+        await self._ensure_initialized()
         prepared_command, sudo_stdin = await _transform_sudo_command(command)
         if prepared_command is None:
             return {"output": "Command must be a string", "returncode": 1}
         if sudo_stdin is not None:
             stdin_data = sudo_stdin + (stdin_data or "")
+        expanduser = aiofiles.os.wrap(os.path.expanduser)
         workdir = os.path.normpath(  # noqa: ASYNC240 - lexical only
-            os.path.expanduser(cwd or self.cwd)
+            await expanduser(cwd or self.cwd)
         )
         if not await _cwd_usable(workdir):
             recovered = await _resolve_safe_cwd(workdir)
@@ -478,7 +548,7 @@ class LocalEnvironment:
                 stdin=asyncio.subprocess.PIPE if stdin_data is not None else None,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                env=build_subprocess_env(base=self.env, scrub_secrets=False),
+                env=await build_subprocess_env(base=self.env, scrub_secrets=False),
             )
             stdout_chunks: list[bytes] = []
             stderr_chunks: list[bytes] = []
@@ -589,7 +659,8 @@ async def _resolve_safe_cwd(path: str) -> str:
     """Return the closest existing, accessible directory at or above *path*."""
     if not path:
         return await aiofiles.os.wrap(tempfile.gettempdir)()
-    expanded = os.path.expanduser(path)
+    expanduser = aiofiles.os.wrap(os.path.expanduser)
+    expanded = await expanduser(path)
     if not os.path.isabs(expanded):
         expanded = os.path.join(await aiofiles.os.getcwd(), expanded)
     candidate = Path(os.path.normpath(expanded))  # noqa: ASYNC240 - lexical only

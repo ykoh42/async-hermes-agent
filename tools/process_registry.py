@@ -19,6 +19,8 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
+import aiofiles.os
+
 from tools.environments.local import build_subprocess_env
 from tools.registry import registry, tool_error
 
@@ -72,9 +74,11 @@ class ProcessRegistry:
         from tools.terminal_tool import _rewrite_compound_background
 
         safe_command = _rewrite_compound_background(command)
-        workdir = os.path.abspath(os.path.expanduser(cwd or os.getcwd()))
+        raw_workdir = cwd or await aiofiles.os.getcwd()
+        expanduser = aiofiles.os.wrap(os.path.expanduser)
+        workdir = await aiofiles.os.path.abspath(await expanduser(raw_workdir))
         shell = os.environ.get("SHELL") or "/bin/sh"
-        env = build_subprocess_env(scrub_secrets=True, extra=env_vars)
+        env = await build_subprocess_env(scrub_secrets=True, extra=env_vars)
         env["PYTHONUNBUFFERED"] = "1"
         session = ProcessSession(
             id=f"proc_{uuid.uuid4().hex[:12]}",

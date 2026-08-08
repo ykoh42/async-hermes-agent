@@ -22,6 +22,7 @@ import yaml
 
 from utils import base_url_host_matches, base_url_hostname
 
+from agent.ssl_verify import resolve_httpx_verify
 from hermes_constants import OPENROUTER_MODELS_URL
 
 logger = logging.getLogger(__name__)
@@ -939,7 +940,11 @@ async def detect_local_server_type(base_url: str, api_key: str = "") -> Optional
 
     result: Optional[str] = None
     try:
-        async with httpx.AsyncClient(timeout=2.0, headers=headers) as client:
+        async with httpx.AsyncClient(
+            timeout=2.0,
+            headers=headers,
+            verify=await resolve_httpx_verify(),
+        ) as client:
             # LM Studio exposes /api/v1/models — check first (most specific)
             try:
                 r = await client.get(f"{lmstudio_url}/api/v1/models")
@@ -1118,7 +1123,10 @@ async def fetch_model_metadata(
     import httpx
 
     try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=5.0)) as client:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(10.0, connect=5.0),
+            verify=await resolve_httpx_verify(),
+        ) as client:
             response = await client.get(OPENROUTER_MODELS_URL)
             response.raise_for_status()
             payload = response.json()
@@ -1193,7 +1201,9 @@ async def fetch_endpoint_model_metadata(
     headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
     payload = None
     async with httpx.AsyncClient(
-        timeout=httpx.Timeout(10.0, connect=5.0), headers=headers
+        timeout=httpx.Timeout(10.0, connect=5.0),
+        headers=headers,
+        verify=await resolve_httpx_verify(),
     ) as client:
         if (
             is_local_endpoint(normalized)
@@ -1290,7 +1300,9 @@ async def fetch_endpoint_model_metadata(
     ):
         root = normalized.removesuffix("/v1")
         async with httpx.AsyncClient(
-            timeout=5.0, headers=headers
+            timeout=5.0,
+            headers=headers,
+            verify=await resolve_httpx_verify(),
         ) as client:
             try:
                 response = await client.get(root + "/v1/props")
@@ -1741,7 +1753,11 @@ async def query_ollama_num_ctx(
 
     headers = _auth_headers(api_key)
     try:
-        async with httpx.AsyncClient(timeout=3.0, headers=headers) as client:
+        async with httpx.AsyncClient(
+            timeout=3.0,
+            headers=headers,
+            verify=await resolve_httpx_verify(),
+        ) as client:
             response = await client.post(
                 f"{server_url}/api/show", json={"name": bare_model}
             )
@@ -1802,7 +1818,11 @@ async def query_ollama_supports_vision(
     headers = _auth_headers(api_key)
 
     try:
-        async with httpx.AsyncClient(timeout=3.0, headers=headers) as client:
+        async with httpx.AsyncClient(
+            timeout=3.0,
+            headers=headers,
+            verify=await resolve_httpx_verify(),
+        ) as client:
             response = await client.post(
                 f"{server_url}/api/show", json={"name": bare_model}
             )
@@ -1891,7 +1911,11 @@ async def _query_ollama_api_show_uncached(
     headers = _auth_headers(api_key)
 
     try:
-        async with httpx.AsyncClient(timeout=5.0, headers=headers) as client:
+        async with httpx.AsyncClient(
+            timeout=5.0,
+            headers=headers,
+            verify=await resolve_httpx_verify(),
+        ) as client:
             resp = await client.post(
                 f"{server_url}/api/show", json={"name": model}
             )
@@ -2028,7 +2052,11 @@ async def _query_local_context_length_uncached(
         server_type = None
 
     try:
-        async with httpx.AsyncClient(timeout=3.0, headers=headers) as client:
+        async with httpx.AsyncClient(
+            timeout=3.0,
+            headers=headers,
+            verify=await resolve_httpx_verify(),
+        ) as client:
             # Ollama: /api/show returns model details with context info
             if server_type == "ollama":
                 resp = await client.post(
@@ -2136,7 +2164,9 @@ async def _query_anthropic_context_length(
         import httpx
 
         async with httpx.AsyncClient(
-            timeout=httpx.Timeout(10.0, connect=5.0), headers=headers
+            timeout=httpx.Timeout(10.0, connect=5.0),
+            headers=headers,
+            verify=await resolve_httpx_verify(),
         ) as client:
             resp = await client.get(url)
         if resp.status_code != 200:
@@ -2248,7 +2278,9 @@ async def _fetch_codex_oauth_context_lengths_with_source(
         import httpx
 
         async with httpx.AsyncClient(
-            timeout=httpx.Timeout(10.0, connect=5.0), headers=headers
+            timeout=httpx.Timeout(10.0, connect=5.0),
+            headers=headers,
+            verify=await resolve_httpx_verify(),
         ) as client:
             resp = await client.get(
                 "https://chatgpt.com/backend-api/codex/models?client_version=1.0.0"

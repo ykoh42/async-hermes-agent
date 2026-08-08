@@ -95,7 +95,7 @@ async def test_auxiliary_client_close_releases_credential_lease(adapter):
     from agent.auxiliary_client import _close_cached_client, _create_openai_client
 
     provider = await module.build_token_provider()
-    client = _create_openai_client(
+    client = await _create_openai_client(
         api_key=provider,
         base_url="https://foundry.invalid/v1",
         config={},

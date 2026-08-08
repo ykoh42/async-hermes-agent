@@ -76,23 +76,18 @@ class CodexAppServerClient:
         # centralized helper so Tier-1 + dynamic-internal secrets are always
         # stripped while provider creds still flow, matching copilot_acp_client
         # (#29157 sibling spawn-site gap).
-        spawn_env = hermes_subprocess_env(inherit_credentials=True)
-        if env:
-            spawn_env.update(env)
-        if codex_home:
-            spawn_env["CODEX_HOME"] = codex_home
+        self._env_overrides = dict(env or {})
+        self._codex_home = codex_home
 
         app_server_args = list(extra_args or [])
         cmd = [codex_bin, "app-server"] + app_server_args
         # Codex emits tracing to stderr; default WARN keeps it quiet for users.
-        spawn_env.setdefault("RUST_LOG", "warn")
-
         # Hide the console the codex child would otherwise flash on Windows
         # (#56747). Hide-only — stdio pipes stay intact for the app-server wire.
         from hermes_cli._subprocess_compat import windows_hide_flags
 
         self._cmd = cmd
-        self._spawn_env = spawn_env
+        self._spawn_env: dict[str, str] | None = None
         self._creationflags = windows_hide_flags()
         self._proc: Optional[asyncio.subprocess.Process] = None
         self._next_id = 1
@@ -279,6 +274,15 @@ class CodexAppServerClient:
         self._next_id += 1
         return rid
 
+    async def _build_spawn_env(self) -> dict[str, str]:
+        spawn_env = await hermes_subprocess_env(inherit_credentials=True)
+        spawn_env.update(self._env_overrides)
+        if self._codex_home:
+            spawn_env["CODEX_HOME"] = self._codex_home
+        spawn_env.setdefault("RUST_LOG", "warn")
+        self._spawn_env = spawn_env
+        return spawn_env
+
     async def _start(self) -> None:
         if self._proc is not None:
             return
@@ -287,12 +291,13 @@ class CodexAppServerClient:
         async with self._start_lock:
             if self._proc is not None:
                 return
+            spawn_env = await self._build_spawn_env()
             self._proc = await asyncio.create_subprocess_exec(
                 *self._cmd,
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                env=self._spawn_env,
+                env=spawn_env,
                 creationflags=self._creationflags,
             )
             self._reader = asyncio.create_task(self._read_stdout())
