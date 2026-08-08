@@ -1267,28 +1267,107 @@ async def run_conversation(
     # ``build_turn_context``.  It mutates ``agent`` exactly as the inline code
     # did and returns the locals the loop below reads back.  See
     # ``agent/turn_context.py``.
-    _ctx = await build_turn_context(
-        agent,
-        user_message,
-        system_message,
-        conversation_history,
-        task_id,
-        stream_callback,
-        persist_user_message,
-        persist_user_timestamp,
-        persist_user_display_kind=persist_user_display_kind,
-        persist_user_display_metadata=persist_user_display_metadata,
-        restore_or_build_system_prompt=_restore_or_build_system_prompt,
-        install_safe_stdio=_install_safe_stdio,
-        sanitize_surrogates=_sanitize_surrogates,
-        summarize_user_message_for_log=_summarize_user_message_for_log,
-        set_session_context=set_session_context,
-        set_current_write_origin=set_current_write_origin,
-        ra=_ra,
-        # MoA turns append per-call aggregated context to the API copy of the
-        # user message, so no byte-stable api_content sidecar can be stamped.
-        moa_active=bool(moa_config),
-    )
+    try:
+        _ctx = await build_turn_context(
+            agent,
+            user_message,
+            system_message,
+            conversation_history,
+            task_id,
+            stream_callback,
+            persist_user_message,
+            persist_user_timestamp,
+            persist_user_display_kind=persist_user_display_kind,
+            persist_user_display_metadata=persist_user_display_metadata,
+            restore_or_build_system_prompt=_restore_or_build_system_prompt,
+            install_safe_stdio=_install_safe_stdio,
+            sanitize_surrogates=_sanitize_surrogates,
+            summarize_user_message_for_log=_summarize_user_message_for_log,
+            set_session_context=set_session_context,
+            set_current_write_origin=set_current_write_origin,
+            ra=_ra,
+            # MoA turns append per-call aggregated context to the API copy of the
+            # user message, so no byte-stable api_content sidecar can be stamped.
+            moa_active=bool(moa_config),
+        )
+    except asyncio.CancelledError:
+        # Cancellation can land after note_turn_start() but before the
+        # prologue's crash-safe persist.  The main-loop cancellation handler
+        # does not exist yet at that point, so finalize the partial turn here
+        # before re-raising.  The in-flight marker distinguishes this case from
+        # cancellation before a turn was officially staged.
+        turn_id = getattr(agent, "_current_turn_id", None)
+        if turn_id and getattr(agent, "_inflight_turn_id", None) == turn_id:
+            finalizer_user_message = (
+                _sanitize_surrogates(user_message)
+                if isinstance(user_message, str)
+                else user_message
+            )
+            partial_messages = getattr(agent, "_session_messages", None)
+            current_idx = getattr(agent, "_persist_user_message_idx", None)
+            current_row_is_staged = (
+                isinstance(partial_messages, list)
+                and isinstance(current_idx, int)
+                and 0 <= current_idx < len(partial_messages)
+                and isinstance(partial_messages[current_idx], dict)
+                and partial_messages[current_idx].get("role") == "user"
+            )
+            if not current_row_is_staged:
+                partial_messages = list(conversation_history or [])
+                user_row: Dict[str, Any] = {
+                    "role": "user",
+                    "content": finalizer_user_message,
+                }
+                if persist_user_timestamp is not None:
+                    user_row["timestamp"] = persist_user_timestamp
+                if persist_user_display_kind:
+                    user_row["display_kind"] = persist_user_display_kind
+                    if persist_user_display_metadata:
+                        user_row["display_metadata"] = persist_user_display_metadata
+                partial_messages.append(user_row)
+                agent._persist_user_message_idx = len(partial_messages) - 1
+                agent._session_messages = partial_messages
+
+            clean_user_message = (
+                persist_user_message
+                if persist_user_message is not None
+                else user_message
+            )
+            if isinstance(clean_user_message, str):
+                clean_user_message = _sanitize_surrogates(clean_user_message)
+            finalizer_task = asyncio.create_task(
+                _turn_finalizer.finalize_turn(
+                    agent,
+                    final_response=None,
+                    api_call_count=0,
+                    interrupted=True,
+                    failed=False,
+                    messages=partial_messages,
+                    conversation_history=conversation_history,
+                    effective_task_id=(
+                        getattr(agent, "_current_task_id", None) or task_id
+                    ),
+                    turn_id=turn_id,
+                    user_message=finalizer_user_message,
+                    original_user_message=clean_user_message,
+                    _should_review_memory=False,
+                    _turn_exit_reason="cancelled",
+                    _pending_verification_response=None,
+                    _pending_verification_response_previewed=False,
+                )
+            )
+            try:
+                await asyncio.shield(finalizer_task)
+            except asyncio.CancelledError:  # noqa: ASYNC103 - re-raised below
+                try:
+                    await asyncio.shield(finalizer_task)
+                except Exception:
+                    logger.error(
+                        "Cancelled prologue finalization failed", exc_info=True
+                    )
+            except Exception:
+                logger.error("Cancelled prologue finalization failed", exc_info=True)
+        raise
     user_message = _ctx.user_message
     original_user_message = _ctx.original_user_message
     messages = _ctx.messages

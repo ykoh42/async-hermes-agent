@@ -551,6 +551,12 @@ async def build_turn_context(
     messages.append(user_msg)
     current_turn_user_idx = len(messages) - 1
     agent._persist_user_message_idx = current_turn_user_idx
+    # Publish the live list as soon as the current user row exists.  If the
+    # task is cancelled later in the prologue (prompt construction, memory
+    # prefetch, plugin hooks, or the crash-safe flush), the outer cancellation
+    # finalizer can persist this exact partially prepared transcript instead
+    # of falling back to stale messages from the previous turn.
+    agent._session_messages = messages
 
     # Track user turns for memory flush and periodic nudge logic.
     agent._user_turn_count += 1

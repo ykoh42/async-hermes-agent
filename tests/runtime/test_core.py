@@ -3663,6 +3663,70 @@ async def test_cancelled_turn_persists_partial_session_and_reraises(monkeypatch,
 
 
 @pytest.mark.asyncio
+async def test_cancelled_turn_during_prologue_persists_before_reraising(
+    monkeypatch,
+    tmp_path,
+):
+    """Cancellation before the model loop still closes the staged turn."""
+    database = SessionDB(tmp_path / "state.db")
+    with (
+        patch("run_agent.get_tool_definitions", return_value=[]),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI"),
+    ):
+        agent = AIAgent(
+            api_key="test-key",
+            base_url="https://example.invalid/v1",
+            model="test-model",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+            save_trajectories=False,
+        )
+    agent._session_db = database
+    agent._session_db_created = False
+    agent.compression_enabled = False
+    agent._tool_snapshot_initialized = True
+    agent._mcp_discovery_started = True
+    agent._skip_mcp_refresh = True
+    prologue_started = asyncio.Event()
+
+    class BlockingMemoryStore:
+        def reset_consolidation_failures(self):
+            return None
+
+        async def load_from_disk(self):
+            prologue_started.set()
+            await asyncio.Event().wait()
+
+    agent._memory_store = BlockingMemoryStore()
+    agent._memory_loaded = False
+    monkeypatch.setattr("hermes_cli.plugins.discover_plugins", AsyncMock())
+
+    turn_task = asyncio.create_task(
+        agent.run_conversation("persist this prologue cancellation")
+    )
+    try:
+        await asyncio.wait_for(prologue_started.wait(), timeout=1)
+        turn_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await turn_task
+
+        assert agent._inflight_turn_id is None
+        assert [
+            message["content"]
+            for message in await database.get_messages(agent.session_id)
+        ] == ["persist this prologue cancellation"]
+    finally:
+        if not turn_task.done():
+            turn_task.cancel()
+            await asyncio.gather(turn_task, return_exceptions=True)
+        agent._memory_store = None
+        await agent.close()
+        await database.close()
+
+
+@pytest.mark.asyncio
 async def test_repeated_cancellation_waits_for_turn_finalizer_then_reraises(
     monkeypatch,
 ):
