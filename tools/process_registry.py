@@ -1193,34 +1193,186 @@ class ProcessRegistry:
 process_registry = ProcessRegistry()
 
 
-def format_process_notification(event: dict[str, Any]) -> str | None:
+def _format_age(seconds: float) -> str:
+    """Human-friendly elapsed string ('18m', '2h3m', '45s')."""
+    try:
+        normalized = int(max(0, seconds))
+    except (TypeError, ValueError):
+        return "?"
+    if normalized < 60:
+        return f"{normalized}s"
+    minutes, normalized = divmod(normalized, 60)
+    if minutes < 60:
+        return f"{minutes}m" if normalized == 0 else f"{minutes}m{normalized}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h" if minutes == 0 else f"{hours}h{minutes}m"
+
+
+def _format_async_delegation(evt: dict[str, Any]) -> str:
+    """Format an async-delegation completion into a self-contained re-injection.
+
+    Carries the FULL original task source (goal, the context the parent
+    supplied, toolsets, role, model) plus dispatch time, status, and the
+    complete result summary. When this re-enters the conversation the agent
+    may be deep in unrelated context and won't remember why the subagent
+    existed, so the block is written to stand entirely on its own — enough to
+    use the result OR re-dispatch if the world has moved on.
+    """
+    deleg_id = evt.get("delegation_id", "unknown")
+    goal = evt.get("goal", "") or ""
+    context = evt.get("context")
+    toolsets = evt.get("toolsets")
+    role = evt.get("role") or "leaf"
+    model = evt.get("model") or "?"
+    status = evt.get("status") or "completed"
+    summary = evt.get("summary")
+    error = evt.get("error")
+    api_calls = evt.get("api_calls", 0)
+    duration = evt.get("duration_seconds", "?")
+    dispatched_at = evt.get("dispatched_at")
+    completed_at = evt.get("completed_at") or time.time()
+
+    batch_results = evt.get("results")
+    if evt.get("is_batch") or isinstance(batch_results, list):
+        results = batch_results or []
+        goals = evt.get("goals") or []
+        count = len(results) if results else len(goals)
+        total_duration = evt.get("total_duration_seconds", duration)
+        lines = [
+            f"[ASYNC DELEGATION BATCH COMPLETE — {deleg_id}]",
+            f"A background fan-out of {count} subagent(s) you dispatched earlier "
+            "has finished. All ran in parallel and waited on each other; their "
+            "consolidated results are below. You may have moved on since "
+            "dispatching — act on these or re-dispatch if things have changed.",
+            "",
+        ]
+        if isinstance(dispatched_at, (int, float)):
+            timestamp = time.strftime(
+                "%Y-%m-%d %H:%M:%S", time.localtime(dispatched_at)
+            )
+            age = f" ({_format_age(completed_at - dispatched_at)} ago)"
+            lines.append(f"Dispatched: {timestamp}{age}")
+        if context:
+            lines.append(f"Context you provided: {context}")
+        if toolsets:
+            lines.append(f"Toolsets: {', '.join(toolsets)}")
+        lines.append(
+            f"Role: {role}   Model: {model}   Total duration: {total_duration}s"
+        )
+        if error and not results:
+            lines.append("--- ERROR ---")
+            lines.append(f"The batch did not complete successfully: {error}")
+            return "\n".join(lines)
+        for result in sorted(results, key=lambda item: item.get("task_index", 0)):
+            index = result.get("task_index", 0)
+            result_status = result.get("status", "?")
+            result_summary = result.get("summary")
+            result_error = result.get("error")
+            result_goal = (
+                goals[index] if index < len(goals) else result.get("goal", "")
+            )
+            icon = "✓" if result_status in ("completed", "success") else "✗"
+            lines.append("")
+            header = f"--- {icon} TASK {index + 1}/{count}"
+            if result_goal:
+                header += f": {result_goal}"
+            header += f"  (status={result_status}"
+            if result.get("api_calls"):
+                header += f", api_calls={result['api_calls']}"
+            if result.get("duration_seconds") is not None:
+                header += f", {result['duration_seconds']}s"
+            header += ") ---"
+            lines.append(header)
+            if result_status in ("completed", "success") and result_summary:
+                lines.append(result_summary)
+            elif result_summary:
+                if result_error:
+                    lines.append(f"({result_status}: {result_error})")
+                lines.append("Partial output:")
+                lines.append(result_summary)
+            else:
+                lines.append(
+                    f"(no summary — status={result_status}"
+                    + (f": {result_error}" if result_error else "")
+                    + ")"
+                )
+            live_transcript = result.get("live_transcript")
+            if live_transcript:
+                lines.append(
+                    "Full live transcript (complete tool/assistant trace): "
+                    f"{live_transcript}"
+                )
+        return "\n".join(lines)
+
+    age = ""
+    if isinstance(dispatched_at, (int, float)):
+        age = f" ({_format_age(completed_at - dispatched_at)} ago)"
+
+    lines = [
+        f"[ASYNC DELEGATION COMPLETE — {deleg_id}]",
+        "A background subagent you dispatched earlier has finished. You may "
+        "have moved on since dispatching it; the full task source is below so "
+        "you can act on the result or re-dispatch if things have changed.",
+        "",
+    ]
+    if isinstance(dispatched_at, (int, float)):
+        timestamp = time.strftime(
+            "%Y-%m-%d %H:%M:%S", time.localtime(dispatched_at)
+        )
+        lines.append(f"Dispatched: {timestamp}{age}")
+    lines.append(f"Original goal: {goal}")
+    if context:
+        lines.append(f"Context you provided: {context}")
+    if toolsets:
+        lines.append(f"Toolsets: {', '.join(toolsets)}")
+    lines.append(f"Role: {role}   Model: {model}")
+    lines.append(f"Status: {status}   API calls: {api_calls}   Duration: {duration}s")
+    lines.append("--- RESULT ---")
+    if status in ("completed", "success") and summary:
+        lines.append(summary)
+    elif status == "interrupted":
+        lines.append(
+            "The subagent was interrupted before completing"
+            + (f": {error}" if error else ".")
+        )
+        if summary:
+            lines.append("Partial output:")
+            lines.append(summary)
+    else:
+        lines.append(
+            f"The subagent did not complete successfully (status={status})."
+            + (f"\n{error}" if error else "")
+        )
+        if summary:
+            lines.append("Partial output:")
+            lines.append(summary)
+    return "\n".join(lines)
+
+
+def format_process_notification(evt: dict[str, Any]) -> str | None:
     """Format a queued process event using the upstream reinjection shape."""
-    event_type = event.get("type", "completion")
-    session_id = event.get("session_id", "unknown")
-    command = event.get("command", "unknown")
-    if event_type in {
-        "watch_disabled",
-        "watch_overflow_tripped",
-        "watch_overflow_released",
-    }:
-        return f"[IMPORTANT: {event.get('message', '')}]"
+    event_type = evt.get("type", "completion")
+    session_id = evt.get("session_id", "unknown")
+    command = evt.get("command", "unknown")
+    if event_type == "watch_disabled":
+        return f"[IMPORTANT: {evt.get('message', '')}]"
     if event_type == "watch_match":
         text = (
             f"[IMPORTANT: Background process {session_id} matched watch pattern "
-            f"\"{event.get('pattern', '?')}\".\n"
+            f"\"{evt.get('pattern', '?')}\".\n"
             f"Command: {command}\n"
-            f"Matched output:\n{event.get('output', '')}"
+            f"Matched output:\n{evt.get('output', '')}"
         )
-        suppressed = event.get("suppressed", 0)
+        suppressed = evt.get("suppressed", 0)
         if suppressed:
             text += f"\n({suppressed} earlier matches were suppressed by rate limit)"
         return text + "]"
-    if event_type != "completion":
-        return None
+    if event_type == "async_delegation":
+        return _format_async_delegation(evt)
 
-    exit_code = event.get("exit_code", "?")
-    reason = event.get("completion_reason") or "exited"
-    source = event.get("termination_source") or ""
+    exit_code = evt.get("exit_code", "?")
+    reason = evt.get("completion_reason") or "exited"
+    source = evt.get("termination_source") or ""
     signal_note = ", SIGTERM" if exit_code in {-15, 143, "-15", "143"} else ""
     if reason == "killed":
         status = f"terminated by {source or 'Hermes'}"
@@ -1236,7 +1388,7 @@ def format_process_notification(event: dict[str, Any]) -> str | None:
         f"[IMPORTANT: Background process {session_id} {status} "
         f"(exit code {exit_code}{signal_note}).\n"
         f"Command: {command}\n"
-        f"Output:\n{event.get('output', '')}]"
+        f"Output:\n{evt.get('output', '')}]"
     )
 
 

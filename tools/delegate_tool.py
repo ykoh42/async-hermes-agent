@@ -2434,31 +2434,56 @@ def _format_background_completion(
     delegation_id: str,
     task_list: List[Dict[str, Any]],
     combined: Dict[str, Any],
+    *,
+    context: Optional[str],
+    role: str,
+    model: Optional[str],
+    dispatched_at: float,
 ) -> str:
     """Build the self-contained completion turn used by upstream delivery."""
+    from tools.process_registry import format_process_notification
+
     results = combined.get("results") or []
-    lines = [
-        f"[ASYNC DELEGATION BATCH COMPLETE — {delegation_id}]",
-        (
-            f"A background fan-out of {len(task_list)} subagent(s) dispatched "
-            "earlier has finished. Its consolidated results follow."
-        ),
-        "",
-    ]
-    for index, task in enumerate(task_list):
-        result = results[index] if index < len(results) else {}
-        lines.append(f"## Task {index + 1}: {task.get('goal', '')}")
-        if task.get("context"):
-            lines.append(f"Context provided: {task['context']}")
-        lines.append(f"Status: {result.get('status', 'unknown')}")
-        summary = result.get("summary") or result.get("error") or "No result returned."
-        lines.append(str(summary))
-        lines.append("")
-    lines.append(
-        f"Total duration: {combined.get('total_duration_seconds', '?')}s. "
-        "Use these results now, but verify any claimed external side effect."
+    status = (
+        "error"
+        if (combined.get("error") and not results)
+        or (
+            results
+            and all(
+                result.get("status") not in ("completed", "success")
+                for result in results
+            )
+        )
+        else "completed"
     )
-    return "\n".join(lines)
+    goals = [task["goal"] for task in task_list]
+    combined_goal = (
+        goals[0]
+        if len(goals) == 1
+        else f"{len(goals)} parallel subagents: "
+        + "; ".join(goal[:40] for goal in goals)
+    )
+    completion = format_process_notification(
+        {
+            "type": "async_delegation",
+            "delegation_id": delegation_id,
+            "goal": combined_goal,
+            "goals": goals,
+            "context": context,
+            "toolsets": None,
+            "role": role,
+            "model": model,
+            "status": status,
+            "is_batch": True,
+            "results": results,
+            "error": combined.get("error"),
+            "total_duration_seconds": combined.get("total_duration_seconds", "?"),
+            "dispatched_at": dispatched_at,
+            "completed_at": time.time(),
+        }
+    )
+    assert completion is not None
+    return completion
 
 
 def _recover_tasks_from_json_string(
@@ -2702,17 +2727,41 @@ async def delegate_task(
             import uuid as _uuid
 
             delegation_id = f"deleg_{_uuid.uuid4().hex[:12]}"
+            dispatched_at = time.time()
 
             async def _run_in_background() -> None:
+                execution_error: Exception | None = None
                 try:
                     combined = await _execute_and_aggregate()
-                    completion = _format_background_completion(
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    execution_error = exc
+                    logger.exception(
+                        "Background delegation %s failed",
                         delegation_id,
-                        task_list,
-                        combined,
                     )
-                    if getattr(parent_agent, "_closed", False):
-                        return
+                    combined = {
+                        "results": [],
+                        "error": f"{type(exc).__name__}: {exc}",
+                        "total_duration_seconds": round(
+                            time.time() - dispatched_at,
+                            2,
+                        ),
+                    }
+
+                completion = _format_background_completion(
+                    delegation_id,
+                    task_list,
+                    combined,
+                    context=context,
+                    role=top_role,
+                    model=creds["model"],
+                    dispatched_at=dispatched_at,
+                )
+                if getattr(parent_agent, "_closed", False):
+                    return
+                try:
                     response = await parent_agent.run_conversation(
                         completion,
                         persist_user_display_kind="async_delegation_complete",
@@ -2721,21 +2770,11 @@ async def delegate_task(
                             "count": n_tasks,
                         },
                     )
-                    callback = getattr(parent_agent, "event_callback", None)
-                    if callback:
-                        callback(
-                            "delegation:complete",
-                            {
-                                "delegation_id": delegation_id,
-                                "results": combined["results"],
-                                "response": response,
-                            },
-                        )
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
                     logger.exception(
-                        "Background delegation %s failed",
+                        "Background delegation %s completion delivery failed",
                         delegation_id,
                     )
                     callback = getattr(parent_agent, "event_callback", None)
@@ -2753,6 +2792,28 @@ async def delegate_task(
                                 "Background delegation error callback failed",
                                 exc_info=True,
                             )
+                    return
+
+                callback = getattr(parent_agent, "event_callback", None)
+                if not callback:
+                    return
+                if execution_error is not None:
+                    callback(
+                        "delegation:error",
+                        {
+                            "delegation_id": delegation_id,
+                            "error": str(execution_error),
+                        },
+                    )
+                else:
+                    callback(
+                        "delegation:complete",
+                        {
+                            "delegation_id": delegation_id,
+                            "results": combined["results"],
+                            "response": response,
+                        },
+                    )
 
             task = asyncio.create_task(
                 _run_in_background(),
@@ -2773,9 +2834,16 @@ async def delegate_task(
                     "delegation_id": delegation_id,
                     "goals": [task["goal"] for task in task_list],
                     "note": (
-                        "Subagent work is running in the background. Its "
-                        "consolidated result will re-enter this agent as a "
-                        "new turn when all children finish. Do not poll."
+                        "Subagent is running in the background. You and the user can "
+                        "keep working; its full result re-enters the conversation as a "
+                        "new message when it finishes. Do not wait or poll — just "
+                        "continue."
+                        if n_tasks == 1
+                        else f"{n_tasks} subagents are running in parallel in the "
+                        f"background. You and the user can keep working; they wait on "
+                        f"each other and their consolidated results re-enter the "
+                        f"conversation as a single message once ALL of them finish. "
+                        f"Do not wait or poll — just continue."
                     ),
                 },
                 ensure_ascii=False,

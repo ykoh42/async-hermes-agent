@@ -1635,6 +1635,12 @@ class TestBackgroundDelegation(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(output["status"], "dispatched")
         self.assertEqual(output["mode"], "background")
+        self.assertEqual(
+            output["note"],
+            "Subagent is running in the background. You and the user can "
+            "keep working; its full result re-enters the conversation as a "
+            "new message when it finishes. Do not wait or poll — just continue.",
+        )
         self.assertEqual(len(self.parent._background_delegations), 1)
         await asyncio.wait_for(started.wait(), timeout=1)
         self.parent.run_conversation.assert_not_awaited()
@@ -1646,9 +1652,23 @@ class TestBackgroundDelegation(unittest.IsolatedAsyncioTestCase):
 
         message = self.parent.run_conversation.await_args.args[0]
         kwargs = self.parent.run_conversation.await_args.kwargs
-        self.assertIn("ASYNC DELEGATION BATCH COMPLETE", message)
-        self.assertIn("inspect the migration", message)
-        self.assertIn("migration verified", message)
+        self.assertIn(
+            "[ASYNC DELEGATION BATCH COMPLETE — " + output["delegation_id"] + "]",
+            message,
+        )
+        self.assertIn(
+            "A background fan-out of 1 subagent(s) you dispatched earlier has "
+            "finished. All ran in parallel and waited on each other; their "
+            "consolidated results are below.",
+            message,
+        )
+        self.assertIn("Role: leaf   Model: ?   Total duration:", message)
+        self.assertIn(
+            "--- ✓ TASK 1/1: inspect the migration  "
+            "(status=completed, 0.1s) ---\n"
+            "migration verified",
+            message,
+        )
         self.assertEqual(
             kwargs["persist_user_display_kind"],
             "async_delegation_complete",
@@ -1676,6 +1696,39 @@ class TestBackgroundDelegation(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(output["results"][0]["summary"], "nested result")
         self.assertFalse(self.parent._background_delegations)
         self.parent.run_conversation.assert_not_awaited()
+
+    async def test_background_execution_error_reenters_as_upstream_completion(self):
+        async def run_child(*_args, **_kwargs):
+            raise RuntimeError("child lifecycle crashed")
+
+        output = json.loads(await self._dispatch(run_child))
+        (task,) = self.parent._background_delegations
+        await task
+
+        message = self.parent.run_conversation.await_args.args[0]
+        self.assertIn(
+            "[ASYNC DELEGATION BATCH COMPLETE — " + output["delegation_id"] + "]",
+            message,
+        )
+        self.assertIn("--- ERROR ---", message)
+        self.assertIn(
+            "The batch did not complete successfully: "
+            "RuntimeError: child lifecycle crashed",
+            message,
+        )
+        self.assertEqual(
+            self.parent.run_conversation.await_args.kwargs[
+                "persist_user_display_kind"
+            ],
+            "async_delegation_complete",
+        )
+        self.parent.event_callback.assert_called_once_with(
+            "delegation:error",
+            {
+                "delegation_id": output["delegation_id"],
+                "error": "child lifecycle crashed",
+            },
+        )
 
     async def test_cancelling_background_owner_cancels_child_work(self):
         started = asyncio.Event()

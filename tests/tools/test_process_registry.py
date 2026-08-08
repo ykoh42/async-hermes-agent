@@ -16,6 +16,7 @@ from tools.process_registry import (
     ProcessRegistry,
     ProcessSession,
     _handle_process,
+    format_process_notification,
     format_uptime_short,
 )
 
@@ -36,6 +37,68 @@ def test_process_session_upstream_public_defaults_and_uptime_format():
     assert format_uptime_short(59) == "59s"
     assert format_uptime_short(61) == "1m 1s"
     assert format_uptime_short(3660) == "1h 1m"
+
+
+def test_process_notification_preserves_upstream_keyword_name():
+    text = format_process_notification(
+        evt={
+            "type": "completion",
+            "session_id": "proc_contract",
+            "command": "echo contract",
+            "exit_code": 0,
+            "output": "contract",
+        }
+    )
+
+    assert text is not None
+    assert "completed normally" in text
+
+
+def test_async_delegation_notification_preserves_upstream_batch_shape():
+    text = format_process_notification(
+        evt={
+            "type": "async_delegation",
+            "delegation_id": "deleg_contract",
+            "goals": ["inspect", "verify"],
+            "context": "Preserve behavior",
+            "role": "leaf",
+            "model": "provider/model",
+            "is_batch": True,
+            "results": [
+                {
+                    "task_index": 1,
+                    "status": "error",
+                    "summary": "partial trace",
+                    "error": "provider failed",
+                    "duration_seconds": 0.2,
+                },
+                {
+                    "task_index": 0,
+                    "status": "completed",
+                    "summary": "inspection complete",
+                    "api_calls": 2,
+                    "duration_seconds": 0.1,
+                },
+            ],
+            "total_duration_seconds": 0.3,
+        }
+    )
+
+    assert text == (
+        "[ASYNC DELEGATION BATCH COMPLETE — deleg_contract]\n"
+        "A background fan-out of 2 subagent(s) you dispatched earlier has "
+        "finished. All ran in parallel and waited on each other; their "
+        "consolidated results are below. You may have moved on since "
+        "dispatching — act on these or re-dispatch if things have changed.\n\n"
+        "Context you provided: Preserve behavior\n"
+        "Role: leaf   Model: provider/model   Total duration: 0.3s\n\n"
+        "--- ✓ TASK 1/2: inspect  (status=completed, api_calls=2, 0.1s) ---\n"
+        "inspection complete\n\n"
+        "--- ✗ TASK 2/2: verify  (status=error, 0.2s) ---\n"
+        "(error: provider failed)\n"
+        "Partial output:\n"
+        "partial trace"
+    )
 
 
 @pytest.fixture(autouse=True)

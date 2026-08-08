@@ -1679,9 +1679,11 @@ async def cleanup_task_resources(agent, task_id: str) -> None:
 
 
 __all__ = [
+    "interruptible_api_call",
     "build_api_kwargs",
     "build_assistant_message",
     "try_activate_fallback",
     "handle_max_iterations",
     "cleanup_task_resources",
+    "interruptible_streaming_api_call",
 ]
