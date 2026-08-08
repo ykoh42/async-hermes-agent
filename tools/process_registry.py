@@ -1051,7 +1051,11 @@ class ProcessRegistry:
                         process.kill()
                     except ProcessLookupError:
                         pass
-                await asyncio.shield(process.wait())
+                cleanup = asyncio.create_task(process.wait())
+                await _finish_cancelled_cleanup(
+                    cleanup,
+                    error_message="Recovered host process cleanup failed",
+                )
                 raise
         else:
             pgid: int | None

@@ -400,6 +400,26 @@ class CDPSupervisor:
 
     async def stop(self, timeout: float = 5.0) -> None:
         """Close the WebSocket, cancel the supervisor task, and await it."""
+        stop_task = asyncio.create_task(self._stop_once(timeout))
+        cancellation: asyncio.CancelledError | None = None
+        while True:
+            try:
+                await asyncio.shield(stop_task)
+                break
+            except asyncio.CancelledError as exc:  # noqa: ASYNC103 - re-raised below
+                if stop_task.cancelled():
+                    raise
+                if cancellation is None:
+                    cancellation = exc
+            except Exception as exc:
+                if cancellation is not None:
+                    raise cancellation from exc
+                raise
+        if cancellation is not None:
+            raise cancellation
+
+    async def _stop_once(self, timeout: float) -> None:
+        """Run the supervisor shutdown sequence exactly once."""
         self._stop_requested = True
         background_tasks = tuple(self._background_tasks)
         for background_task in background_tasks:

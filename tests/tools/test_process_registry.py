@@ -7,11 +7,13 @@ import json
 import os
 import shlex
 import sys
+from types import SimpleNamespace
 
 import pytest
 from pyleak import no_event_loop_blocking, no_task_leaks
 from pyleak.eventloop import LeakAction
 
+import tools.process_registry as process_registry_module
 from tools.process_registry import (
     ProcessRegistry,
     ProcessSession,
@@ -267,6 +269,66 @@ async def test_spawn_cancellation_during_checkpoint_reaps_child(tmp_path, monkey
     assert session.id not in process_registry._running
     assert session._monitor_task is not None
     assert session._monitor_task.done()
+
+
+@pytest.mark.asyncio
+async def test_windows_host_termination_repeated_cancellation_waits_for_reap(
+    monkeypatch,
+):
+    first_wait_started = asyncio.Event()
+    cleanup_wait_started = asyncio.Event()
+    release_cleanup = asyncio.Event()
+    cleanup_completed = asyncio.Event()
+
+    class ControlledProcess:
+        returncode = None
+        wait_calls = 0
+
+        async def wait(self):
+            self.wait_calls += 1
+            if self.wait_calls == 1:
+                first_wait_started.set()
+                await asyncio.Event().wait()
+            cleanup_wait_started.set()
+            await release_cleanup.wait()
+            cleanup_completed.set()
+            return self.returncode
+
+        def kill(self):
+            self.returncode = -9
+
+    process = ControlledProcess()
+
+    async def create_process(*_args, **_kwargs):
+        return process
+
+    async def host_pid_is_ours(_cls, _pid, _expected_start=None):
+        return True
+
+    monkeypatch.setattr(process_registry_module, "os", SimpleNamespace(name="nt"))
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create_process)
+    monkeypatch.setattr(
+        ProcessRegistry,
+        "_host_pid_is_ours",
+        classmethod(host_pid_is_ours),
+    )
+
+    terminating = asyncio.create_task(ProcessRegistry._terminate_host_pid(42))
+    await first_wait_started.wait()
+    terminating.cancel()
+    await cleanup_wait_started.wait()
+    terminating.cancel()
+    await asyncio.sleep(0)
+
+    try:
+        assert terminating.done() is False
+    finally:
+        release_cleanup.set()
+        with pytest.raises(asyncio.CancelledError):
+            await terminating
+        await asyncio.wait_for(cleanup_completed.wait(), timeout=1.0)
+
+    assert process.wait_calls == 2
 
 
 @pytest.mark.asyncio
