@@ -406,6 +406,89 @@ async def test_close_is_idempotent(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_run_prompt_repeated_cancellation_reaps_process_and_stderr(
+    monkeypatch,
+    tmp_path,
+):
+    prompt_read_started = asyncio.Event()
+    wait_started = asyncio.Event()
+    release_wait = asyncio.Event()
+    wait_completed = asyncio.Event()
+    process_completed = asyncio.Event()
+    stderr_completed = asyncio.Event()
+
+    class ControlledStdin:
+        def write(self, _payload):
+            pass
+
+        async def drain(self):
+            pass
+
+    class ControlledStdout:
+        async def readline(self):
+            prompt_read_started.set()
+            await asyncio.Event().wait()
+
+    class ControlledStderr:
+        async def readline(self):
+            await process_completed.wait()
+            stderr_completed.set()
+            return b""
+
+    class ControlledProcess:
+        returncode = None
+
+        def __init__(self):
+            self.stdin = ControlledStdin()
+            self.stdout = ControlledStdout()
+            self.stderr = ControlledStderr()
+
+        def terminate(self):
+            pass
+
+        def kill(self):
+            self.returncode = -9
+            process_completed.set()
+
+        async def wait(self):
+            wait_started.set()
+            await release_wait.wait()
+            if self.returncode is None:
+                self.returncode = -15
+            process_completed.set()
+            wait_completed.set()
+            return self.returncode
+
+    process = ControlledProcess()
+
+    async def create_process(*_args, **_kwargs):
+        return process
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create_process)
+    client = CopilotACPClient(acp_cwd=str(tmp_path))
+    prompting = asyncio.create_task(
+        client._run_prompt("hello", timeout_seconds=60)
+    )
+    await prompt_read_started.wait()
+    prompting.cancel()
+    await wait_started.wait()
+    prompting.cancel()
+    await asyncio.sleep(0)
+
+    try:
+        assert prompting.done() is False
+    finally:
+        release_wait.set()
+        with pytest.raises(asyncio.CancelledError):
+            await prompting
+        await asyncio.wait_for(wait_completed.wait(), timeout=1.0)
+        await asyncio.wait_for(stderr_completed.wait(), timeout=1.0)
+
+    assert client._active_process is None
+    assert client.is_closed is True
+
+
+@pytest.mark.asyncio
 async def test_external_process_credentials_resolve_without_blocking(monkeypatch):
     from hermes_cli import auth
 

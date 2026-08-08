@@ -79,6 +79,29 @@ DEFAULT_FETCH_TIMEOUT_SECONDS = 120.0
 DEFAULT_CLI_TIMEOUT_SECONDS = 30.0
 
 
+async def _finish_subprocess_communicate(
+    communicate_task: asyncio.Task[tuple[bytes, bytes]],
+) -> tuple[bytes, bytes]:
+    """Drain and reap one owned child before propagating cancellation."""
+    cancellation: asyncio.CancelledError | None = None
+    while True:
+        try:
+            result = await asyncio.shield(communicate_task)
+            break
+        except asyncio.CancelledError as exc:  # noqa: ASYNC103 - re-raised below
+            if communicate_task.cancelled():
+                raise
+            if cancellation is None:
+                cancellation = exc
+        except Exception as exc:
+            if cancellation is not None:
+                raise cancellation from exc
+            raise
+    if cancellation is not None:
+        raise cancellation
+    return result
+
+
 async def communicate_subprocess(
     process: asyncio.subprocess.Process,
     *,
@@ -92,19 +115,22 @@ async def communicate_subprocess(
     chaining while external cancellation at the cleanup checkpoint continues
     to propagate as ``CancelledError``.
     """
+    communicate_task = asyncio.create_task(process.communicate())
     timeout_error: TimeoutError | None = None
     try:
         async with asyncio.timeout(timeout):
-            return await process.communicate()
+            return await asyncio.shield(communicate_task)
     except TimeoutError as exc:
         timeout_error = exc
     except asyncio.CancelledError:
-        process.kill()
-        await process.wait()
+        if process.returncode is None:
+            process.kill()
+        await _finish_subprocess_communicate(communicate_task)
         raise
 
-    process.kill()
-    await process.wait()
+    if process.returncode is None:
+        process.kill()
+    await _finish_subprocess_communicate(communicate_task)
     raise RuntimeError(timeout_message) from timeout_error
 
 

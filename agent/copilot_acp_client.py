@@ -359,6 +359,27 @@ class _ACPChatNamespace:
         self.completions = _ACPChatCompletions(client)
 
 
+async def _finish_owned_task(task: asyncio.Task[Any]) -> Any:
+    """Finish one owned ACP cleanup task before propagating cancellation."""
+    cancellation: asyncio.CancelledError | None = None
+    while True:
+        try:
+            result = await asyncio.shield(task)
+            break
+        except asyncio.CancelledError as exc:  # noqa: ASYNC103 - re-raised below
+            if task.cancelled():
+                raise
+            if cancellation is None:
+                cancellation = exc
+        except Exception as exc:
+            if cancellation is not None:
+                raise cancellation from exc
+            raise
+    if cancellation is not None:
+        raise cancellation
+    return result
+
+
 class CopilotACPClient:
     """Minimal native-async OpenAI-client-compatible facade for Copilot ACP."""
 
@@ -402,12 +423,12 @@ class CopilotACPClient:
         except asyncio.CancelledError:
             if process.returncode is None:
                 process.kill()
-            await process.wait()
+            await _finish_owned_task(asyncio.create_task(process.wait()))
             raise
         except asyncio.TimeoutError:
             if process.returncode is None:
                 process.kill()
-            await process.wait()
+            await _finish_owned_task(asyncio.create_task(process.wait()))
 
     async def _create_chat_completion(
         self,
@@ -631,8 +652,13 @@ class CopilotACPClient:
             )
             return "".join(text_parts), "".join(reasoning_parts)
         finally:
-            await self.close()
-            await stderr_task
+            async def _cleanup_prompt() -> None:
+                try:
+                    await self.close()
+                finally:
+                    await asyncio.gather(stderr_task, return_exceptions=True)
+
+            await _finish_owned_task(asyncio.create_task(_cleanup_prompt()))
 
     async def _handle_server_message(
         self,
