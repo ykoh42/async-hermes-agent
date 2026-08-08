@@ -2948,7 +2948,7 @@ async def try_shrink_image_parts_in_messages(
             ) as tmp:
                 await tmp.write(raw)
                 await tmp.flush()
-                resized = _resize_image_for_vision(
+                resized = await _resize_image_for_vision(
                     Path(tmp.name),
                     mime_type=mime,
                     max_base64_bytes=target_bytes,

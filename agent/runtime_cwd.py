@@ -31,12 +31,12 @@ _SESSION_CWD: ContextVar = ContextVar("HERMES_SESSION_CWD", default=_UNSET)
 _PACKAGE_ROOT = Path(__file__).resolve().parent.parent
 
 
-def _is_install_tree(p: Path) -> bool:
+async def _is_install_tree(p: Path) -> bool:
     # True only when p IS the package root or sits inside it. Ancestors of the
     # package root (a user home that happens to contain the checkout, a --user
     # site-packages parent) are legitimate workspaces and must not be blocked.
     try:
-        p = p.resolve()
+        p = await aiofiles.os.wrap(Path.resolve)(p)
     except Exception:
         return False
     return p == _PACKAGE_ROOT or _PACKAGE_ROOT in p.parents
@@ -62,13 +62,13 @@ async def resolve_agent_cwd() -> Path:
     """Resolve the agent cwd without synchronous filesystem probes."""
     override = _session_cwd_override()
     if override:
-        p = Path(override).expanduser()
+        p = await aiofiles.os.wrap(Path.expanduser)(Path(override))
         if await aiofiles.os.path.isdir(p):
             return p
         logger.warning("configured working directory does not exist: %s", override)
     raw = os.environ.get("TERMINAL_CWD", "").strip()
     if raw:
-        p = Path(raw).expanduser()
+        p = await aiofiles.os.wrap(Path.expanduser)(Path(raw))
         if await aiofiles.os.path.isdir(p):
             return p
         logger.warning("TERMINAL_CWD does not exist: %s", raw)
@@ -79,7 +79,7 @@ async def resolve_context_cwd() -> Path | None:
     """Resolve an explicitly configured context cwd, if one is valid."""
     override = _session_cwd_override()
     if override:
-        p = Path(override).expanduser()
+        p = await aiofiles.os.wrap(Path.expanduser)(Path(override))
         if not await aiofiles.os.path.isdir(p):
             logger.warning("configured working directory does not exist: %s", override)
         else:
@@ -87,7 +87,7 @@ async def resolve_context_cwd() -> Path | None:
         return None
     raw = os.environ.get("TERMINAL_CWD", "").strip()
     if raw:
-        p = Path(raw).expanduser()
+        p = await aiofiles.os.wrap(Path.expanduser)(Path(raw))
         if not await aiofiles.os.path.isdir(p):
             logger.warning("TERMINAL_CWD does not exist: %s", raw)
         else:

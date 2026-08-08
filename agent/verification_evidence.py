@@ -269,18 +269,21 @@ def _scope_for_args(args: list[str]) -> str:
 
 async def _resolved_path(value: str | Path) -> Path:
     realpath = aiofiles.os.wrap(os.path.realpath)
-    return Path(await realpath(Path(value).expanduser()))
+    path = await aiofiles.os.wrap(Path.expanduser)(Path(value))
+    return Path(await realpath(path))
 
 
 async def _is_under_temp_dir(token: str) -> bool:
     if not token or token.startswith("-"):
         return False
     try:
-        path = Path(token).expanduser()
+        path = await aiofiles.os.wrap(Path.expanduser)(Path(token))
         if not path.is_absolute():
             return False
         resolved = await _resolved_path(path)
-        temp_root = await _resolved_path(tempfile.gettempdir())
+        temp_root = await _resolved_path(
+            await aiofiles.os.wrap(tempfile.gettempdir)()
+        )
         return resolved == temp_root or temp_root in resolved.parents
     except Exception:
         return False
@@ -299,7 +302,7 @@ async def _is_under_root(token: str, root: str | Path | None) -> bool:
 
 async def _is_temp_script_path(token: str, root: str | Path | None) -> bool:
     try:
-        name = Path(token).expanduser().name
+        name = (await aiofiles.os.wrap(Path.expanduser)(Path(token))).name
     except Exception:
         return False
     return (

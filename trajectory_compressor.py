@@ -32,12 +32,14 @@ Usage:
 
 import json
 import os
+import random
 import time
 import yaml
 import logging
 import asyncio
 import aiofiles
 import aiofiles.os
+import aiofiles.tempfile
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
 from dataclasses import dataclass, field
@@ -1161,9 +1163,6 @@ async def main(
         # Compress 10% sample with custom output
         python trajectory_compressor.py --input=data/trajectories.jsonl --sample_percent=10 --output=data/sampled_compressed.jsonl
     """
-    import random
-    import tempfile
-    
     print("🗜️  Trajectory Compressor")
     print("=" * 60)
     
@@ -1236,7 +1235,7 @@ async def main(
             return
         
         # Create a temporary directory for processing
-        with tempfile.TemporaryDirectory() as temp_dir:
+        async with aiofiles.tempfile.TemporaryDirectory() as temp_dir:
             temp_input_dir = Path(temp_dir) / "input"
             temp_output_dir = Path(temp_dir) / "output"
             await aiofiles.os.makedirs(temp_input_dir)
@@ -1297,7 +1296,7 @@ async def main(
             print(f"\n⚠️  Sampling from directory: will sample {sample_percent}% from each file")
             
             # Create a temp directory with sampled files
-            with tempfile.TemporaryDirectory() as temp_dir:
+            async with aiofiles.tempfile.TemporaryDirectory() as temp_dir:
                 temp_input_dir = Path(temp_dir) / "input"
                 await aiofiles.os.makedirs(temp_input_dir)
                 

@@ -21,6 +21,7 @@ from pathlib import Path
 
 import pytest
 import pytest_asyncio
+from blockbuster import BlockBuster
 
 import tools.file_tools as ft
 import tools.terminal_tool as terminal_tool
@@ -57,7 +58,12 @@ async def test_relative_terminal_cwd_anchors_to_absolute_not_process_cwd(
     # Poison config: literal relative '.'
     monkeypatch.setenv("TERMINAL_CWD", ".")
 
-    resolved = await ft._resolve_path_for_task("target.py", task_id="default")
+    blocker = BlockBuster()
+    blocker.activate()
+    try:
+        resolved = await ft._resolve_path_for_task("target.py", task_id="default")
+    finally:
+        blocker.deactivate()
 
     assert resolved.is_absolute(), f"resolution base leaked a relative path: {resolved}"
     # The exact anchor for a bare '.' is the process cwd resolved to absolute —

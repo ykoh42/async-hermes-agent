@@ -1014,7 +1014,7 @@ class PluginManager:
 
         # 3. Project plugins (./.hermes/plugins/)
         if _env_enabled("HERMES_ENABLE_PROJECT_PLUGINS"):
-            project_dir = Path.cwd() / ".hermes" / "plugins"
+            project_dir = Path(await aiofiles.os.getcwd()) / ".hermes" / "plugins"
             logger.debug("Scanning project plugins: %s", project_dir)
             project_manifests = await self._scan_directory(
                 project_dir, source="project"
@@ -1027,7 +1027,7 @@ class PluginManager:
             )
 
         # 4. Pip / entry-point plugins
-        ep_manifests = self._scan_entry_points()
+        ep_manifests = await self._scan_entry_points()
         logger.debug("  entrypoints: %d manifest(s)", len(ep_manifests))
         manifests.extend(ep_manifests)
 
@@ -1092,7 +1092,7 @@ class PluginManager:
             # services calls) is driven by ``<category>.provider`` config,
             # enforced by the tool wrapper.
             if manifest.source == "bundled" and manifest.kind == "backend":
-                self._load_plugin(manifest)
+                await self._load_plugin(manifest)
                 continue
 
             # Everything else (standalone, user-installed backends,
@@ -1114,7 +1114,7 @@ class PluginManager:
                     "Skipping '%s' (not in plugins.enabled)", lookup_key
                 )
                 continue
-            self._load_plugin(manifest)
+            await self._load_plugin(manifest)
 
         if manifests:
             logger.info(
@@ -1308,11 +1308,11 @@ class PluginManager:
     # Entry-point scanning
     # -----------------------------------------------------------------------
 
-    def _scan_entry_points(self) -> List[PluginManifest]:
+    async def _scan_entry_points(self) -> List[PluginManifest]:
         """Check ``importlib.metadata`` for pip-installed plugins."""
         manifests: List[PluginManifest] = []
         try:
-            eps = importlib.metadata.entry_points()
+            eps = await aiofiles.os.wrap(importlib.metadata.entry_points)()
             # Python 3.12+ returns a SelectableGroups; earlier returns dict
             if hasattr(eps, "select"):
                 group_eps = eps.select(group=ENTRY_POINTS_GROUP)
@@ -1338,7 +1338,7 @@ class PluginManager:
     # Loading
     # -----------------------------------------------------------------------
 
-    def _load_plugin(self, manifest: PluginManifest) -> None:
+    async def _load_plugin(self, manifest: PluginManifest) -> None:
         """Import a plugin module and call its ``register(ctx)`` function."""
         loaded = LoadedPlugin(manifest=manifest)
         logger.debug(
@@ -1361,7 +1361,7 @@ class PluginManager:
             if manifest.source in {"user", "project", "bundled"}:
                 module = self._load_directory_module(manifest)
             else:
-                module = self._load_entrypoint_module(manifest)
+                module = await self._load_entrypoint_module(manifest)
 
             loaded.module = module
 
@@ -1468,9 +1468,12 @@ class PluginManager:
             raise FileNotFoundError(f"No __init__.py in {plugin_dir}") from exc
         return module
 
-    def _load_entrypoint_module(self, manifest: PluginManifest) -> types.ModuleType:
+    async def _load_entrypoint_module(
+        self,
+        manifest: PluginManifest,
+    ) -> types.ModuleType:
         """Load a pip-installed plugin via its entry-point reference."""
-        eps = importlib.metadata.entry_points()
+        eps = await aiofiles.os.wrap(importlib.metadata.entry_points)()
         if hasattr(eps, "select"):
             group_eps = eps.select(group=ENTRY_POINTS_GROUP)
         elif isinstance(eps, dict):

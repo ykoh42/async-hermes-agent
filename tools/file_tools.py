@@ -407,10 +407,10 @@ async def _resolve_base_dir(
     if root:
         base_text = _expand_tilde(root)
     else:
-        base_text = os.getcwd()
+        base_text = await aiofiles.os.getcwd()
     if container_paths:
         if not posixpath.isabs(base_text):
-            base_text = posixpath.join(os.getcwd(), base_text)
+            base_text = posixpath.join(await aiofiles.os.getcwd(), base_text)
         return _normalize_without_host_deref(base_text)
     # Git Bash ``pwd -P`` reports ``/c/Users/...``; translate before Path so
     # relative file-tool paths don't anchor under a nonexistent ``\\c\\Users``.
@@ -421,7 +421,7 @@ async def _resolve_base_dir(
         import ntpath
 
         if not ntpath.isabs(base_text):
-            base_text = ntpath.join(os.getcwd(), base_text)
+            base_text = ntpath.join(await aiofiles.os.getcwd(), base_text)
         return Path(ntpath.normpath(base_text))
     base = Path(base_text)
     if not base.is_absolute():

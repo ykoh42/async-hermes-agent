@@ -17,6 +17,9 @@ import types
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
+from blockbuster import BlockBuster
+
 from tools.delegate_tool import (
     DELEGATE_BLOCKED_TOOLS,
     DELEGATE_TASK_SCHEMA,
@@ -189,6 +192,72 @@ class TestStripBlockedTools(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(
             (DELEGATE_BLOCKED_TOOLS - {"delegate_task"}).isdisjoint(names)
         )
+
+    async def test_acp_command_probe_runs_off_the_event_loop(self):
+        parent = _make_mock_parent()
+
+        def which_with_filesystem_probe(command):
+            with open(__file__):
+                pass
+            return f"/usr/bin/{command}"
+
+        with (
+            patch("run_agent.AIAgent") as MockAgent,
+            patch(
+                "tools.delegate_tool.shutil.which",
+                side_effect=which_with_filesystem_probe,
+            ),
+        ):
+            MockAgent.return_value = MagicMock()
+            blocker = BlockBuster()
+            blocker.activate()
+            try:
+                await _build_child_agent(
+                    task_index=0,
+                    goal="Use the configured ACP transport",
+                    context=None,
+                    toolsets=None,
+                    model=None,
+                    max_iterations=10,
+                    parent_agent=parent,
+                    task_count=1,
+                    override_acp_command="codex-acp",
+                )
+            finally:
+                blocker.deactivate()
+
+        _, kwargs = MockAgent.call_args
+        self.assertEqual(kwargs["acp_command"], "codex-acp")
+
+
+@pytest.mark.asyncio
+async def test_first_delegate_uses_lazy_tracker_workspace(
+    tmp_path, monkeypatch,
+):
+    from agent.subdirectory_hints import SubdirectoryHintTracker
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("TERMINAL_CWD", raising=False)
+    parent = _make_mock_parent()
+    parent._subdirectory_hints = SubdirectoryHintTracker()
+    parent.terminal_cwd = None
+    parent.cwd = None
+
+    with patch("run_agent.AIAgent") as MockAgent:
+        MockAgent.return_value = MagicMock()
+        await _build_child_agent(
+            task_index=0,
+            goal="Inspect the current workspace",
+            context=None,
+            toolsets=None,
+            model=None,
+            max_iterations=10,
+            parent_agent=parent,
+            task_count=1,
+        )
+
+    _, kwargs = MockAgent.call_args
+    assert str(tmp_path) in kwargs["ephemeral_system_prompt"]
 
 
 class TestDelegateTask(unittest.IsolatedAsyncioTestCase):

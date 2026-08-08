@@ -470,7 +470,8 @@ async def build_environment_hints() -> str:
         host_lines.append(f"Host: macOS ({mac_ver or platform.release()})")
     else:
         host_lines.append(f"Host: {platform.system()} ({platform.release()})")
-    host_lines.append(f"User home directory: {os.path.expanduser('~')}")
+    user_home = await aiofiles.os.wrap(os.path.expanduser)("~")
+    host_lines.append(f"User home directory: {user_home}")
     try:
         host_lines.append(f"Current working directory: {await resolve_agent_cwd()}")
     except OSError:
@@ -1323,12 +1324,12 @@ async def build_context_files_prompt(
     loaded via ``load_soul_md()`` for the identity slot).
     """
     if cwd is None:
-        cwd = os.getcwd()
+        cwd = await aiofiles.os.wrap(os.getcwd)()
         cwd_is_fallback = True
     else:
         cwd_is_fallback = False
 
-    cwd_path = Path(cwd).absolute()
+    cwd_path = await aiofiles.os.wrap(Path.absolute)(Path(cwd))
     sections = []
     max_chars = await _get_context_file_max_chars(context_length)
 
@@ -1345,7 +1346,7 @@ async def build_context_files_prompt(
     if (
         cwd_is_fallback
         and not allow_install_tree_fallback
-        and _is_install_tree(cwd_path)
+        and await _is_install_tree(cwd_path)
     ):
         logger.warning(
             "skipping project-context discovery: working-directory resolution "

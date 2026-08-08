@@ -3,6 +3,7 @@ import tempfile
 from pathlib import Path
 
 import pytest
+from blockbuster import BlockBuster
 
 from agent.verification_evidence import (
     mark_workspace_edited,
@@ -155,10 +156,15 @@ async def test_no_suite_nudge_uses_canonical_temp_dir(tmp_path, monkeypatch):
     linked_temp.symlink_to(real_temp, target_is_directory=True)
     monkeypatch.setattr(tempfile, "gettempdir", lambda: str(linked_temp))
 
-    nudge = await build_verify_on_stop_nudge(
-        session_id="s1",
-        changed_paths=[str(project / "src" / "app.ts")],
-    )
+    blocker = BlockBuster()
+    blocker.activate()
+    try:
+        nudge = await build_verify_on_stop_nudge(
+            session_id="s1",
+            changed_paths=[str(project / "src" / "app.ts")],
+        )
+    finally:
+        blocker.deactivate()
 
     assert nudge is not None
     assert str(real_temp) in nudge

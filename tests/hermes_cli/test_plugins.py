@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import yaml
+from blockbuster import BlockBuster
 
 from hermes_cli.plugins import (
     ENTRY_POINTS_GROUP,
@@ -95,6 +96,92 @@ def _make_plugin_dir(base: Path, name: str, *, register_body: str = "pass",
 
 class TestPluginDiscovery:
     """Tests for plugin discovery from directories and entry points."""
+
+    @pytest.mark.asyncio
+    async def test_entry_point_metadata_is_scanned_off_event_loop(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        home = tmp_path / "hermes-home"
+        home.mkdir()
+        (home / "config.yaml").write_text(
+            yaml.safe_dump({"plugins": {"enabled": ["pip-plugin"]}}),
+            encoding="utf-8",
+        )
+        metadata_file = tmp_path / "entry-points.txt"
+        metadata_file.write_text("present", encoding="utf-8")
+        registered = False
+
+        def register(_ctx):
+            nonlocal registered
+            registered = True
+
+        module = types.SimpleNamespace(register=register)
+
+        class EntryPoint:
+            name = "pip-plugin"
+            value = "example_plugin:register"
+            group = ENTRY_POINTS_GROUP
+
+            def load(self):
+                return module
+
+        class EntryPoints(list):
+            def select(self, *, group):
+                return [entry for entry in self if entry.group == group]
+
+        def entry_points():
+            metadata_file.stat()
+            return EntryPoints([EntryPoint()])
+
+        async def reject_to_thread(*_args, **_kwargs):
+            raise AssertionError("asyncio.to_thread is not allowed")
+
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setattr("importlib.metadata.entry_points", entry_points)
+        monkeypatch.setattr(asyncio, "to_thread", reject_to_thread)
+        manager = PluginManager()
+        monkeypatch.setattr(manager, "_scan_directory", AsyncMock(return_value=[]))
+        blocker = BlockBuster()
+        blocker.activate()
+        try:
+            await manager.discover_and_load()
+        finally:
+            blocker.deactivate()
+
+        assert registered is True
+        assert manager._plugins["pip-plugin"].enabled is True
+
+    @pytest.mark.asyncio
+    async def test_project_plugin_cwd_is_resolved_off_event_loop(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        home = tmp_path / "hermes-home"
+        project = tmp_path / "project"
+        home.mkdir()
+        project.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setenv("HERMES_ENABLE_PROJECT_PLUGINS", "1")
+        monkeypatch.chdir(project)
+        manager = PluginManager()
+        scan = AsyncMock(return_value=[])
+        monkeypatch.setattr(manager, "_scan_directory", scan)
+        monkeypatch.setattr(manager, "_scan_entry_points", AsyncMock(return_value=[]))
+        blocker = BlockBuster()
+        blocker.activate()
+        try:
+            await manager.discover_and_load()
+        finally:
+            blocker.deactivate()
+
+        assert any(
+            call.args == (project / ".hermes" / "plugins",)
+            and call.kwargs.get("source") == "project"
+            for call in scan.await_args_list
+        )
 
 
     @pytest.mark.asyncio
@@ -1143,7 +1230,7 @@ class TestPluginContextProfileName:
         monkeypatch.delenv("HERMES_ENABLE_PROJECT_PLUGINS", raising=False)
         manager = PluginManager()
         monkeypatch.setattr(manager, "_scan_directory", AsyncMock(return_value=[]))
-        monkeypatch.setattr(manager, "_scan_entry_points", lambda: [])
+        monkeypatch.setattr(manager, "_scan_entry_points", AsyncMock(return_value=[]))
 
         await manager.discover_and_load()
 

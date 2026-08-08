@@ -75,10 +75,18 @@ class SubdirectoryHintTracker:
     """
 
     def __init__(self, working_dir: Optional[str] = None):
-        self.working_dir = Path(working_dir or os.getcwd()).resolve()
+        self.working_dir = Path(working_dir) if working_dir else None
         self._loaded_dirs: Set[Path] = set()
         self._lock = asyncio.Lock()
-        # Pre-mark the working dir as loaded (startup context handles it)
+
+    async def _ensure_initialized(self) -> None:
+        if self.working_dir is not None and self._loaded_dirs:
+            return
+        working_dir = self.working_dir
+        if working_dir is None:
+            working_dir = Path(await aiofiles.os.getcwd())
+        self.working_dir = Path(await _realpath(working_dir))
+        # Pre-mark the working dir as loaded (startup context handles it).
         self._loaded_dirs.add(self.working_dir)
 
     async def check_tool_call(
@@ -91,6 +99,7 @@ class SubdirectoryHintTracker:
         Returns formatted hint text to append to the tool result, or None.
         """
         async with self._lock:
+            await self._ensure_initialized()
             dirs = await self._extract_directories(tool_name, tool_args)
             if not dirs:
                 return None
@@ -135,8 +144,10 @@ class SubdirectoryHintTracker:
         ``project/src/main.py`` discovers ``project/AGENTS.md`` even when
         ``project/src/`` has no hint files of its own.
         """
+        await self._ensure_initialized()
+        assert self.working_dir is not None
         try:
-            p = Path(raw_path).expanduser()
+            p = await aiofiles.os.wrap(Path.expanduser)(Path(raw_path))
             if not p.is_absolute():
                 p = self.working_dir / p
             p = Path(await _realpath(p))
@@ -188,6 +199,8 @@ class SubdirectoryHintTracker:
         (e.g. ~/.codex/AGENTS.md, ~/.claude/CLAUDE.md), which causes
         cross-agent context contamination and instruction mixup.
         """
+        await self._ensure_initialized()
+        assert self.working_dir is not None
         try:
             if not await aiofiles.os.path.isdir(path):
                 return False
@@ -216,6 +229,8 @@ class SubdirectoryHintTracker:
 
         Only loads hints from directories within the working directory tree.
         """
+        await self._ensure_initialized()
+        assert self.working_dir is not None
         self._loaded_dirs.add(directory)
 
         # Reject paths outside the working directory tree.

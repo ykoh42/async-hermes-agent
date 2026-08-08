@@ -857,11 +857,11 @@ async def quarantine_zeroed_state_db(path: Path) -> Optional[Path]:
             await _os_close(descriptor)
 
 
-def fts5_cjk_so_path() -> Path:
+async def fts5_cjk_so_path() -> Path:
     """Location of the cjk_unicode61 loadable extension."""
     env = os.getenv("HERMES_FTS5_CJK_SO")
     if env:
-        return Path(env).expanduser()
+        return await aiofiles.os.wrap(Path.expanduser)(Path(env))
     return get_hermes_home() / "lib" / "libfts5_cjk.so"
 
 
@@ -879,7 +879,7 @@ async def load_fts5_cjk_extension(conn) -> bool:
     """Best-effort load of the cjk_unicode61 tokenizer into ``connection``."""
     if not _cjk_fts_config_enabled():
         return False
-    path = fts5_cjk_so_path()
+    path = await fts5_cjk_so_path()
     if not await aiofiles.os.path.exists(path):
         return False
     try:
@@ -1692,11 +1692,13 @@ class SessionDB:
                                 and await is_zeroed_state_db(self._db_path)
                             ):
                                 raise sqlite3.DatabaseError(message)
-                    database = (
-                        f"file:{os.path.abspath(self._db_path)}?mode=ro"
-                        if self.read_only
-                        else self._db_path
-                    )
+                    if self.read_only:
+                        absolute_path = await aiofiles.os.wrap(os.path.abspath)(
+                            self._db_path
+                        )
+                        database = f"file:{absolute_path}?mode=ro"
+                    else:
+                        database = self._db_path
                     connection = await aiosqlite.connect(
                         database,
                         timeout=1.0,
@@ -1997,7 +1999,7 @@ class SessionDB:
                         "working. CJK search falls back to trigram/LIKE; "
                         "run `hermes sessions optimize-storage` on a host "
                         "with the extension to rebuild.",
-                        fts5_cjk_so_path(),
+                        await fts5_cjk_so_path(),
                     )
                     await connection.execute(
                         "INSERT INTO state_meta (key, value) VALUES (?, '1') "

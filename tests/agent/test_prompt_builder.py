@@ -6,6 +6,7 @@ import logging
 import sys
 
 import pytest
+from blockbuster import BlockBuster
 
 from agent.prompt_builder import (
     _scan_context_content,
@@ -406,7 +407,12 @@ class TestBuildContextFilesPrompt:
         monkeypatch.setattr(rt, "_PACKAGE_ROOT", tmp_path.resolve())
         (tmp_path / "AGENTS.md").write_text("Never give up on the right solution.")
         monkeypatch.chdir(tmp_path)
-        result = await build_context_files_prompt(cwd=None, skip_soul=True)
+        blocker = BlockBuster()
+        blocker.activate()
+        try:
+            result = await build_context_files_prompt(cwd=None, skip_soul=True)
+        finally:
+            blocker.deactivate()
         assert "Never give up" not in result
         assert result == ""
 
@@ -585,7 +591,13 @@ class TestEnvironmentHints:
         monkeypatch.delenv("TERMINAL_ENV", raising=False)
         monkeypatch.delenv("TERMINAL_CWD", raising=False)
         monkeypatch.chdir(tmp_path)
-        assert f"Current working directory: {tmp_path}" in await _pb.build_environment_hints()
+        blocker = BlockBuster()
+        blocker.activate()
+        try:
+            hints = await _pb.build_environment_hints()
+        finally:
+            blocker.deactivate()
+        assert f"Current working directory: {tmp_path}" in hints
 
 
     @pytest.mark.asyncio

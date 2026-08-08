@@ -1,6 +1,7 @@
 """Tests for progressive subdirectory hint discovery."""
 
 import pytest
+from blockbuster import BlockBuster
 from unittest.mock import patch
 
 from agent.subdirectory_hints import SubdirectoryHintTracker
@@ -41,6 +42,22 @@ def project(tmp_path):
 @pytest.mark.asyncio
 class TestSubdirectoryHintTracker:
     """Unit tests for SubdirectoryHintTracker."""
+
+    async def test_constructor_is_state_only_and_cwd_resolves_lazily(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        monkeypatch.chdir(tmp_path)
+        blocker = BlockBuster()
+        blocker.activate()
+        try:
+            tracker = SubdirectoryHintTracker()
+            assert await tracker.check_tool_call("read_file", {}) is None
+        finally:
+            blocker.deactivate()
+
+        assert tracker.working_dir == tmp_path
 
 
 

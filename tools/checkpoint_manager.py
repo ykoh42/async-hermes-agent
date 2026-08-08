@@ -844,7 +844,8 @@ class CheckpointManager:
         abs_dir = str(await _normalize_path(working_dir))
 
         # Skip root, home, and other overly broad directories
-        if abs_dir in {"/", str(Path.home())}:
+        home_dir = await aiofiles.os.wrap(Path.home)()
+        if abs_dir in {"/", str(home_dir)}:
             logger.debug("Checkpoint skipped: directory too broad (%s)", abs_dir)
             return False
 

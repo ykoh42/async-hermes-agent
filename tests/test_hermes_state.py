@@ -6,6 +6,7 @@ import time
 
 import pytest
 import pytest_asyncio
+from blockbuster import BlockBuster
 
 from hermes_state import CompressionSessionClosedError, SessionDB, workspace_key
 
@@ -1532,7 +1533,10 @@ async def test_close_is_idempotent_and_rejects_new_io(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_read_only_connection_uses_the_same_async_interface(tmp_path):
+async def test_read_only_connection_uses_the_same_async_interface(
+    tmp_path,
+    monkeypatch,
+):
     path = tmp_path / "state.db"
     writer = SessionDB(path)
     await writer.create_session("s1", source="library")
@@ -1541,7 +1545,10 @@ async def test_read_only_connection_uses_the_same_async_interface(tmp_path):
     )
     await writer.close()
 
-    reader = SessionDB(path, read_only=True)
+    monkeypatch.chdir(tmp_path)
+    reader = SessionDB("state.db", read_only=True)
+    blocker = BlockBuster()
+    blocker.activate()
     try:
         assert (await reader.get_session("s1"))["id"] == "s1"
         assert reader._fts_enabled is True
@@ -1553,4 +1560,5 @@ async def test_read_only_connection_uses_the_same_async_interface(tmp_path):
         with pytest.raises(sqlite3.OperationalError):
             await reader.set_meta("forbidden", "write")
     finally:
+        blocker.deactivate()
         await reader.close()

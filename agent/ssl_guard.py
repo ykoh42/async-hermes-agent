@@ -43,7 +43,7 @@ async def _validate_bundle_path(
     *,
     require_substantial: bool = False,
 ) -> None:
-    path = Path(value).expanduser()
+    path = await aiofiles.os.wrap(Path.expanduser)(Path(value))
     if not await aiofiles.os.path.exists(path):
         raise _ssl_err(f"{label} points to a missing CA bundle: {value}")
     if not await aiofiles.os.path.isfile(path):
@@ -51,7 +51,9 @@ async def _validate_bundle_path(
     if require_substantial and (await aiofiles.os.stat(path)).st_size < 1024:
         raise _ssl_err(f"{label} at {value} appears corrupted (too small)")
     try:
-        context = ssl.create_default_context(cafile=str(path))
+        context = await aiofiles.os.wrap(ssl.create_default_context)(
+            cafile=str(path)
+        )
     except Exception as exc:
         raise _ssl_err(
             f"{label} CA bundle at {value} cannot be loaded: {exc}"

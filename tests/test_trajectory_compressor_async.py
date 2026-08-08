@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from blockbuster import BlockBuster
 
 
 class TestAsyncClientLazyCreation:
@@ -87,6 +88,31 @@ class TestAsyncClientLazyCreation:
 
         client.close.assert_awaited_once_with()
         assert comp.client is None
+
+
+@pytest.mark.asyncio
+async def test_single_file_temp_workspace_is_non_blocking(tmp_path):
+    from trajectory_compressor import TrajectoryCompressor, main
+
+    source = tmp_path / "input.jsonl"
+    source.write_text('{"messages": []}\n', encoding="utf-8")
+    output = tmp_path / "output.jsonl"
+    blocker = BlockBuster()
+    blocker.activate()
+    try:
+        with (
+            patch.object(TrajectoryCompressor, "process_directory", AsyncMock()),
+            patch.object(TrajectoryCompressor, "close", AsyncMock()),
+        ):
+            await main(
+                input=str(source),
+                output=str(output),
+                config=str(tmp_path / "missing.yaml"),
+            )
+    finally:
+        blocker.deactivate()
+
+    assert output.read_text(encoding="utf-8") == ""
 
 
 class TestSourceLineVerification:

@@ -5,6 +5,7 @@ from pathlib import Path
 
 import aiosqlite
 import pytest
+from blockbuster import BlockBuster
 
 from agent.verification_evidence import (
     classify_verification_command,
@@ -94,13 +95,18 @@ async def test_temp_script_records_ad_hoc_evidence_without_canonical_suite(tmp_p
     script = Path(tempfile.gettempdir()) / f"hermes-ad-hoc-{tmp_path.name}.py"
     script.write_text("print('ok')\n", encoding="utf-8")
     try:
-        evidence = await classify_verification_command(
-            f"python {script}",
-            cwd=tmp_path,
-            session_id="s1",
-            exit_code=0,
-            output="ok",
-        )
+        blocker = BlockBuster()
+        blocker.activate()
+        try:
+            evidence = await classify_verification_command(
+                f"python {script}",
+                cwd=tmp_path,
+                session_id="s1",
+                exit_code=0,
+                output="ok",
+            )
+        finally:
+            blocker.deactivate()
     finally:
         script.unlink(missing_ok=True)
 

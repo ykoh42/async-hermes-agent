@@ -231,7 +231,7 @@ async def build_verify_on_stop_nudge(
         )
     else:
         realpath = aiofiles.os.wrap(os.path.realpath)
-        temp_dir = await realpath(tempfile.gettempdir())
+        temp_dir = await realpath(await aiofiles.os.wrap(tempfile.gettempdir)())
         command_instruction = (
             "No canonical test/lint/build command was detected. Create a focused "
             f"temporary verification script under `{temp_dir}` using an OS-safe "

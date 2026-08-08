@@ -25,6 +25,7 @@ Or as a pytest smoke test (skipped automatically when Pillow is absent):
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import io
 import sys
@@ -91,7 +92,7 @@ def _decode_dims(data_url: str) -> tuple[int, int]:
         return img.size
 
 
-def run_proof(verbose: bool = False) -> list[dict]:
+async def run_proof(verbose: bool = False) -> list[dict]:
     """Run the recovery against every case; return per-case results."""
     results: list[dict] = []
     for width, height in CASES:
@@ -106,7 +107,7 @@ def run_proof(verbose: bool = False) -> list[dict]:
             "role": "user",
             "content": [{"type": "image_url", "image_url": {"url": url}}],
         }]
-        changed = try_shrink_image_parts_in_messages(
+        changed = await try_shrink_image_parts_in_messages(
             msgs, max_dimension=MANY_IMAGE_CAP,
         )
         out_url = msgs[0]["content"][0]["image_url"]["url"]
@@ -133,9 +134,10 @@ def run_proof(verbose: bool = False) -> list[dict]:
     return results
 
 
-def test_issue_48013_dimension_shrink_does_not_brick():
+@pytest.mark.asyncio
+async def test_issue_48013_dimension_shrink_does_not_brick():
     """Every dimension-oversized screenshot must be brought under the cap."""
-    results = run_proof()
+    results = await run_proof()
     assert results, "no cases ran"
     for r in results:
         # Precondition: we really are on the dimension path.
@@ -155,11 +157,11 @@ def test_issue_48013_dimension_shrink_does_not_brick():
         )
 
 
-def main() -> int:
+async def main() -> int:
     print("Issue #48013 proof — image-dimension shrink must not brick sessions")
     print(f"(many-image per-side cap = {MANY_IMAGE_CAP}px, byte budget = "
           f"{BYTE_BUDGET // (1024 * 1024)} MB)\n")
-    results = run_proof(verbose=True)
+    results = await run_proof(verbose=True)
     bricked = [r for r in results if not r["under_cap_after"]]
     no_progress = [r for r in results if r["under_cap_after"] and not r["changed"]]
     print()
@@ -176,4 +178,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(asyncio.run(main()))

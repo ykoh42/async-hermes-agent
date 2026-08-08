@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 
 import pytest
+from blockbuster import BlockBuster
 
 import agent.runtime_cwd as rt
 from agent.runtime_cwd import (
@@ -52,7 +53,13 @@ class TestResolveContextCwd:
     @pytest.mark.asyncio
     async def test_expands_leading_tilde(self, monkeypatch):
         monkeypatch.setenv("TERMINAL_CWD", "~")
-        assert await resolve_context_cwd() == Path(os.path.expanduser("~"))
+        expected = Path(os.path.expanduser("~"))
+        blocker = BlockBuster()
+        blocker.activate()
+        try:
+            assert await resolve_context_cwd() == expected
+        finally:
+            blocker.deactivate()
 
 
 

@@ -29,6 +29,7 @@ _delegation_config_snapshot: contextvars.ContextVar[dict] = contextvars.ContextV
     default={},
 )
 import os
+import shutil
 import time
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlsplit, urlunsplit
@@ -845,11 +846,18 @@ async def _resolve_workspace_hint(parent_agent) -> Optional[str]:
     teaching subagents a fake container path while still helping them avoid
     guessing `/workspace/...` for local repo tasks.
     """
+    tracker = getattr(parent_agent, "_subdirectory_hints", None)
+    if tracker is not None:
+        try:
+            await tracker._ensure_initialized()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            pass
+
     candidates = [
         os.getenv("TERMINAL_CWD"),
-        getattr(
-            getattr(parent_agent, "_subdirectory_hints", None), "working_dir", None
-        ),
+        getattr(tracker, "working_dir", None),
         getattr(parent_agent, "terminal_cwd", None),
         getattr(parent_agent, "cwd", None),
     ]
@@ -857,7 +865,8 @@ async def _resolve_workspace_hint(parent_agent) -> Optional[str]:
         if not candidate:
             continue
         try:
-            text = os.path.abspath(os.path.expanduser(str(candidate)))
+            text = await aiofiles.os.wrap(os.path.expanduser)(str(candidate))
+            text = await aiofiles.os.wrap(os.path.abspath)(text)
         except Exception:
             continue
         if os.path.isabs(text) and await aiofiles.os.path.isdir(text):
@@ -1373,9 +1382,7 @@ async def _build_child_agent(
     # honoring it. Stale config should not force a child onto the ACP transport
     # and then fail at subprocess startup.
     if override_acp_command:
-        import shutil as _shutil
-
-        if not _shutil.which(override_acp_command):
+        if not await aiofiles.os.wrap(shutil.which)(override_acp_command):
             logger.warning(
                 "Ignoring acp_command=%r: binary not found on PATH; "
                 "falling back to default transport.",

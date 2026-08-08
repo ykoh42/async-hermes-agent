@@ -164,6 +164,25 @@ class TestTakeCheckpoint:
         assert await mgr.ensure_checkpoint("/", "root") is False
         assert await mgr.ensure_checkpoint(str(Path.home()), "home") is False
 
+    async def test_home_guard_resolves_home_off_the_event_loop(
+        self, mgr, tmp_path, monkeypatch,
+    ):
+        home = tmp_path / "home"
+        home.mkdir()
+
+        def home_with_filesystem_probe(cls):
+            home.stat()
+            return home
+
+        monkeypatch.setattr(Path, "home", classmethod(home_with_filesystem_probe))
+
+        blocker = BlockBuster()
+        blocker.activate()
+        try:
+            assert await mgr.ensure_checkpoint(str(home), "home") is False
+        finally:
+            blocker.deactivate()
+
     async def test_new_turn_resets_dedup_but_needs_changes(self, mgr, work_dir):
         assert await mgr.ensure_checkpoint(str(work_dir), "turn 1") is True
         mgr.new_turn()
