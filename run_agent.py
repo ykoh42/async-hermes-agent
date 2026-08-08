@@ -142,6 +142,7 @@ from agent.context_compressor import (  # noqa: F401
     COMPRESSED_SUMMARY_METADATA_KEY,
     ContextCompressor,
 )
+from agent.conversation_loop import run_conversation as _run_conversation
 from agent.aux_accounting import (
     reset_accounting_context,
     set_accounting_context,
@@ -6735,7 +6736,6 @@ class AIAgent:
         moa_config: Optional[dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Forwarder — see ``agent.conversation_loop.run_conversation``."""
-        from agent.conversation_loop import run_conversation
         turn_lock = self._get_turn_lock()
         await turn_lock.acquire()
         self._active_turn_task = asyncio.current_task()
@@ -6766,7 +6766,7 @@ class AIAgent:
             # Keep the scope local instead of storing ContextVar tokens on the agent,
             # which may be observed from another task.
             with bind_subagent_parent(self), scoped_runtime_main({}):
-                return await run_conversation(
+                return await _run_conversation(
                     self,
                     user_message,
                     system_message,
