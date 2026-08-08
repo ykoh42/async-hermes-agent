@@ -81,6 +81,8 @@ from typing import Dict, Any, List, Optional, Set, Tuple
 import aiofiles
 import aiofiles.os
 
+from agent import skill_preprocessing as _skill_preprocessing
+from tools import path_security as _path_security
 from tools.registry import registry, tool_error
 from hermes_cli.config import cfg_get
 from agent.skill_utils import (
@@ -210,8 +212,6 @@ def _skill_lookup_path_error(name: str) -> Optional[str]:
     drive paths (e.g. ``C:\\skills``), whose ``:`` would otherwise be misread as
     a plugin namespace separator.
     """
-    from tools.path_security import has_traversal_component
-
     if not isinstance(name, str):
         return "Skill name must be a string."
     candidate = name.strip()
@@ -221,7 +221,7 @@ def _skill_lookup_path_error(name: str) -> Optional[str]:
         or PureWindowsPath(candidate).drive
     ):
         return "Skill name must be a relative path within the skills directory."
-    if has_traversal_component(candidate):
+    if _path_security.has_traversal_component(candidate):
         return "Skill name cannot contain '..' path traversal components."
     return None
 
@@ -706,9 +706,7 @@ async def _serve_plugin_skill(
     rendered_content = content
     if preprocess:
         try:
-            from agent.skill_preprocessing import preprocess_skill_content
-
-            rendered_content = await preprocess_skill_content(
+            rendered_content = await _skill_preprocessing.preprocess_skill_content(
                 content,
                 skill_md.parent,
                 session_id=session_id,
@@ -859,9 +857,7 @@ async def skill_view(
         if file_path:
             if skill_dir is None:
                 return tool_error("This legacy flat skill has no linked files.", success=False)
-            from tools.path_security import has_traversal_component
-
-            if has_traversal_component(file_path):
+            if _path_security.has_traversal_component(file_path):
                 return tool_error("Path traversal ('..') is not allowed.", success=False)
             target = skill_dir / file_path
             try:
@@ -946,9 +942,7 @@ async def skill_view(
         rendered_content = content
         if preprocess:
             try:
-                from agent.skill_preprocessing import preprocess_skill_content
-
-                rendered_content = await preprocess_skill_content(
+                rendered_content = await _skill_preprocessing.preprocess_skill_content(
                     content,
                     skill_dir,
                     session_id=task_id,

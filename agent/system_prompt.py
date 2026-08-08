@@ -31,6 +31,9 @@ import logging
 import os
 from typing import Any, Dict, List, Optional
 
+import hermes_time as _hermes_time
+
+from agent import coding_context as _coding_context
 from agent.prompt_builder import (
     DEFAULT_AGENT_IDENTITY,
     GOOGLE_MODEL_OPERATIONAL_GUIDANCE,
@@ -48,6 +51,7 @@ from agent.prompt_builder import (
 )
 from agent.runtime_cwd import resolve_context_cwd
 from hermes_constants import get_hermes_home
+from tools import env_probe as _env_probe
 
 logger = logging.getLogger(__name__)
 
@@ -259,13 +263,11 @@ async def build_system_prompt_parts(agent: Any, system_message: Optional[str] = 
         # default coding posture leaves the index untouched.
         _compact_cats = frozenset()
         try:
-            from agent.coding_context import coding_compact_skill_categories
-
             if _coding_config is None:
                 from hermes_cli.config import load_config_readonly
 
                 _coding_config = await load_config_readonly()
-            _compact_cats = await coding_compact_skill_categories(
+            _compact_cats = await _coding_context.coding_compact_skill_categories(
                 platform=agent.platform, cwd=_context_cwd, config=_coding_config
             )
         except Exception:
@@ -310,13 +312,15 @@ async def build_system_prompt_parts(agent: Any, system_message: Optional[str] = 
     coding_trailing_parts: List[str] = []
     if agent.valid_tool_names:
         try:
-            from agent.coding_context import coding_system_prompt_parts
-
             if _coding_config is None:
                 from hermes_cli.config import load_config_readonly
 
                 _coding_config = await load_config_readonly()
-            coding_prefix_parts, coding_workspace_parts, coding_trailing_parts = await coding_system_prompt_parts(
+            (
+                coding_prefix_parts,
+                coding_workspace_parts,
+                coding_trailing_parts,
+            ) = await _coding_context.coding_system_prompt_parts(
                 platform=agent.platform,
                 cwd=_context_cwd,
                 config=_coding_config,
@@ -341,9 +345,7 @@ async def build_system_prompt_parts(agent: Any, system_message: Optional[str] = 
     # for a remote terminal backend.
     if getattr(agent, "_environment_probe", True):
         try:
-            from tools.env_probe import get_environment_probe_line
-
-            probe_line = await get_environment_probe_line()
+            probe_line = await _env_probe.get_environment_probe_line()
             if probe_line:
                 post_workspace_parts.append(probe_line)
         except asyncio.CancelledError:
@@ -447,8 +449,7 @@ async def build_system_prompt_parts(agent: Any, system_message: Optional[str] = 
         except Exception:
             logger.debug("External memory system-prompt block failed", exc_info=True)
 
-    from hermes_time import now as _hermes_now
-    now = await _hermes_now()
+    now = await _hermes_time.now()
     # Date-only (not minute-precision) so the system prompt is byte-stable
     # for the full day.  Minute-precision changes invalidate prefix-cache KV
     # on every rebuild path (compression boundary, fresh-agent gateway turns,
