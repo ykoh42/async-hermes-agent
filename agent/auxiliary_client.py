@@ -97,7 +97,7 @@ _LOGGED_UNSUPPORTED_EXTPROC_KEYS: set = set()
 _LOGGED_UNSUPPORTED_OAUTH_KEYS: set = set()
 
 
-def _resolve_aux_verify(
+async def _resolve_aux_verify(
     base_url: Optional[str],
     *,
     config: Optional[Dict[str, Any]] = None,
@@ -107,38 +107,35 @@ def _resolve_aux_verify(
     Mirrors the main client's TLS resolution so auxiliary calls (compression,
     vision, web_extract, title generation, etc.) honor per-provider
     ``ssl_ca_cert`` / ``ssl_verify`` config and the ``HERMES_CA_BUNDLE`` /
-    ``SSL_CERT_FILE`` env conventions. Best-effort: any failure falls back to
-    the httpx/certifi default (``True``).
+    ``SSL_CERT_FILE`` env conventions.
     """
-    try:
-        from agent.ssl_verify import resolve_httpx_verify
-        from hermes_cli.config import get_custom_provider_tls_settings
+    from agent.ssl_verify import resolve_httpx_verify
+    from hermes_cli.config import get_custom_provider_tls_settings
 
-        tls = get_custom_provider_tls_settings(str(base_url or ""), config=config or {})
-        return resolve_httpx_verify(
-            ca_bundle=tls.get("ssl_ca_cert"),
-            ssl_verify=tls.get("ssl_verify"),
-            base_url=str(base_url or ""),
-        )
-    except Exception:
-        return True
+    tls = get_custom_provider_tls_settings(str(base_url or ""), config=config or {})
+    return await resolve_httpx_verify(
+        ca_bundle=tls.get("ssl_ca_cert"),
+        ssl_verify=tls.get("ssl_verify"),
+        base_url=str(base_url or ""),
+    )
 
 
 _WARNED_KEEPALIVE_IMPORT_SKEW = False
 
 
-def _openai_http_client_kwargs(
+async def _openai_http_client_kwargs(
     base_url: Optional[str],
     *,
     config: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Inject keepalive httpx client with env-only proxy (not macOS system proxy)."""
+    verify = await _resolve_aux_verify(base_url, config=config)
     try:
         from agent.process_bootstrap import build_keepalive_http_client
 
-        client = build_keepalive_http_client(
+        client = await build_keepalive_http_client(
             str(base_url or ""),
-            verify=_resolve_aux_verify(base_url, config=config),
+            verify=verify,
         )
     except (ImportError, AttributeError):
         # Version-skewed installs (#64333): a process whose sys.path resolves
@@ -146,27 +143,31 @@ def _openai_http_client_kwargs(
         # the Desktop app's bundled runtime lags a git-installed source tree
         # that newer callers (cron scheduler) were written against. Every cron
         # job died on this ImportError before any agent logic ran. Degrade
-        # gracefully to the OpenAI SDK's default httpx client (respects macOS
-        # system proxy, no pool-level keepalive expiry) instead of failing the
-        # whole job, and say so once — silent version skew is how this bug
-        # went unnoticed until jobs were already dead on arrival.
+        # gracefully to an explicit native async httpx client (respects proxy
+        # environment variables, without pool-level keepalive expiry) instead
+        # of failing the whole job, and say so once — silent version skew is
+        # how this bug went unnoticed until jobs were already dead on arrival.
         global _WARNED_KEEPALIVE_IMPORT_SKEW
         if not _WARNED_KEEPALIVE_IMPORT_SKEW:
             _WARNED_KEEPALIVE_IMPORT_SKEW = True
             logger.warning(
                 "agent.process_bootstrap.build_keepalive_http_client is "
                 "unavailable — mixed/stale install detected (#64333). Falling "
-                "back to the SDK default HTTP client. Run `hermes update` (or "
+                "back to a native async HTTP client. Run `hermes update` (or "
                 "reinstall the Desktop app) to resync the runtime."
             )
-        client = None
+        import httpx
+
+        client = httpx.AsyncClient(verify=verify)
 
     if client is None:
-        return {}
+        import httpx
+
+        client = httpx.AsyncClient(verify=verify)
     return {"http_client": client}
 
 
-def _create_openai_client(
+async def _create_openai_client(
     *,
     api_key: str,
     base_url: str,
@@ -176,7 +177,12 @@ def _create_openai_client(
     """Create the native async OpenAI-compatible transport for an aux route."""
     from openai import AsyncOpenAI
 
-    kwargs = {**_openai_http_client_kwargs(base_url, config=config), **kwargs}
+    if kwargs.get("http_client") is None:
+        kwargs.pop("http_client", None)
+        http_client_kwargs = await _openai_http_client_kwargs(base_url, config=config)
+    else:
+        http_client_kwargs = {}
+    kwargs = {**http_client_kwargs, **kwargs}
     # Hermes owns auxiliary retry + provider/model fallback policy (the
     # same-provider transient retry in call_llm plus the except-chain
     # fallback). The OpenAI SDK's own default (max_retries=2 → up to 3
@@ -186,7 +192,15 @@ def _create_openai_client(
     # by default and let Hermes control the budget; explicit callers can still
     # override via kwargs.
     kwargs.setdefault("max_retries", 0)
-    client = AsyncOpenAI(api_key=api_key, base_url=base_url, **kwargs)
+    owned_http_client = http_client_kwargs.get("http_client")
+    if kwargs.get("http_client") is not owned_http_client:
+        owned_http_client = None
+    try:
+        client = AsyncOpenAI(api_key=api_key, base_url=base_url, **kwargs)
+    except BaseException:
+        if owned_http_client is not None:
+            await owned_http_client.aclose()
+        raise
     if callable(api_key) and not isinstance(api_key, str):
         client._hermes_token_provider = api_key
     client._platform = "Unknown"
@@ -2032,7 +2046,7 @@ async def _resolve_api_key_provider(
             )
             if _merged_aux:
                 extra["default_headers"] = _merged_aux
-            _client = _create_openai_client(
+            _client = await _create_openai_client(
                 api_key=api_key, base_url=base_url, config=config, **extra
             )
             _client = await _maybe_wrap_anthropic(_client, model, api_key, raw_base_url)
@@ -2091,7 +2105,7 @@ async def _resolve_api_key_provider(
         )
         if _merged_aux2:
             extra["default_headers"] = _merged_aux2
-        _client = _create_openai_client(
+        _client = await _create_openai_client(
             api_key=api_key, base_url=base_url, config=config, **extra
         )
         _client = await _maybe_wrap_anthropic(_client, model, api_key, raw_base_url)
@@ -2121,7 +2135,7 @@ async def _try_openrouter(
     # only to discard its selected entry.
     if explicit_api_key:
         logger.debug("Auxiliary client: OpenRouter via explicit credential")
-        return _create_openai_client(
+        return await _create_openai_client(
             api_key=explicit_api_key,
             base_url=OPENROUTER_BASE_URL,
             config=config,
@@ -2137,7 +2151,7 @@ async def _try_openrouter(
                 or OPENROUTER_BASE_URL
             )
             logger.debug("Auxiliary client: OpenRouter via pool")
-            return _create_openai_client(
+            return await _create_openai_client(
                 api_key=or_key,
                 base_url=base_url,
                 config=config,
@@ -2154,7 +2168,7 @@ async def _try_openrouter(
         _mark_provider_unhealthy("openrouter", ttl=60)
         return None, None
     logger.debug("Auxiliary client: OpenRouter")
-    return _create_openai_client(
+    return await _create_openai_client(
         api_key=or_key,
         base_url=OPENROUTER_BASE_URL,
         config=config,
@@ -2262,7 +2276,7 @@ async def _try_nous(
             (nous or {}).get("inference_base_url") or _nous_base_url()
         ).rstrip("/")
     return (
-        _create_openai_client(
+        await _create_openai_client(
             api_key=api_key,
             base_url=base_url,
             config=config,
@@ -2687,7 +2701,7 @@ async def _try_custom_endpoint(
     if _custom_headers:
         _extra["default_headers"] = _custom_headers
     if custom_mode == "codex_responses":
-        real_client = _create_openai_client(
+        real_client = await _create_openai_client(
             api_key=custom_key, base_url=_clean_base, config=config, **_extra
         )
         return CodexAuxiliaryClient(real_client, model), model
@@ -2704,7 +2718,7 @@ async def _try_custom_endpoint(
                 "Custom endpoint declares api_mode=anthropic_messages but the "
                 "anthropic SDK is not installed — falling back to OpenAI-wire."
             )
-            return _create_openai_client(
+            return await _create_openai_client(
                 api_key=custom_key, base_url=_clean_base, config=config, **_extra
             ), model
         return (
@@ -2715,7 +2729,7 @@ async def _try_custom_endpoint(
         )
     # URL-based anthropic detection for custom endpoints that didn't set
     # api_mode explicitly (e.g. kimi.com/coding reached via custom config).
-    _fallback_client = _create_openai_client(
+    _fallback_client = await _create_openai_client(
         api_key=custom_key, base_url=_clean_base, config=config, **_extra
     )
     _fallback_client = await _maybe_wrap_anthropic(
@@ -2756,7 +2770,7 @@ async def _build_xai_oauth_aux_client(
     logger.debug("Auxiliary client: xAI OAuth (%s via Responses API)", model)
     from tools.xai_http import hermes_xai_default_headers
 
-    real_client = _create_openai_client(
+    real_client = await _create_openai_client(
         api_key=api_key,
         base_url=base_url,
         config=config,
@@ -2805,7 +2819,7 @@ async def _build_codex_client(
             return None, None
         base_url = _CODEX_AUX_BASE_URL
     logger.debug("Auxiliary client: Codex OAuth (%s via Responses API)", model)
-    real_client = _create_openai_client(
+    real_client = await _create_openai_client(
         api_key=codex_token,
         base_url=base_url,
         config=config,
@@ -2925,7 +2939,7 @@ async def _try_azure_foundry(
             raise
 
     try:
-        client = _create_openai_client(
+        client = await _create_openai_client(
             api_key=api_key, base_url=_clean_base, config=config, **extra
         )
     except Exception:
@@ -5236,7 +5250,7 @@ async def resolve_provider_client(
                 )
                 return None, None
             final_model = _normalize_resolved_model(model, provider)
-            raw_client = _create_openai_client(
+            raw_client = await _create_openai_client(
                 api_key=codex_token,
                 base_url=_CODEX_AUX_BASE_URL,
                 config=config,
@@ -5366,7 +5380,7 @@ async def resolve_provider_client(
             )
             if _merged_custom:
                 extra["default_headers"] = _merged_custom
-            client = _create_openai_client(
+            client = await _create_openai_client(
                 api_key=custom_key, base_url=_clean_base, config=config, **extra
             )
             client = await _wrap_if_needed(client, final_model, custom_base, custom_key)
@@ -5493,7 +5507,7 @@ async def resolve_provider_client(
                         )
                         if _fb_headers:
                             _fb_extra["default_headers"] = _fb_headers
-                        client = _create_openai_client(
+                        client = await _create_openai_client(
                             api_key=custom_key,
                             base_url=_fb_clean,
                             config=config,
@@ -5508,7 +5522,7 @@ async def resolve_provider_client(
                         is_oauth=False,
                     )
                     return sync_anthropic, final_model
-                client = _create_openai_client(
+                client = await _create_openai_client(
                     api_key=custom_key,
                     base_url=_clean_base2,
                     config=config,
@@ -5680,7 +5694,7 @@ async def resolve_provider_client(
         _merged_main = _apply_user_default_headers(headers, config=config)
         if _merged_main:
             headers = _merged_main
-        client = _create_openai_client(
+        client = await _create_openai_client(
             api_key=api_key,
             base_url=base_url,
             config=config,
@@ -5773,7 +5787,7 @@ async def resolve_provider_client(
         default_model = "google/gemini-3-flash-preview"
         final_model = _normalize_resolved_model(model or default_model, provider)
         try:
-            client = _create_openai_client(
+            client = await _create_openai_client(
                 api_key=token,
                 base_url=base_url,
                 config=config,
@@ -6475,7 +6489,7 @@ async def _refresh_nous_auxiliary_client(
         return None, model
 
     fresh_key, fresh_base_url = runtime
-    client = _create_openai_client(
+    client = await _create_openai_client(
         api_key=fresh_key, base_url=fresh_base_url, config=config
     )
     final_model = model

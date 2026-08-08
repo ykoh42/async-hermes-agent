@@ -196,22 +196,25 @@ class TestSpawnEnvIsolation:
     RUST_LOG on top of os.environ.copy().
     """
 
-    def test_spawn_env_preserves_HOME(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_spawn_env_preserves_HOME(self, monkeypatch):
         """The spawn env must contain the parent process's HOME unchanged.
         Verifies the immutable spawn state built before lazy startup."""
         from agent.transports import codex_app_server as cas
         monkeypatch.setenv("HOME", "/users/alice")
 
         client = cas.CodexAppServerClient(codex_bin="codex")
+        spawn_env = await client._build_spawn_env()
 
         # The spawn env must have HOME=/users/alice unchanged
-        assert client._spawn_env.get("HOME") == "/users/alice", (
+        assert spawn_env.get("HOME") == "/users/alice", (
             f"HOME got rewritten in codex spawn env: "
-            f"{client._spawn_env.get('HOME')!r}. Codex's shell tool's "
+            f"{spawn_env.get('HOME')!r}. Codex's shell tool's "
             "subprocesses (gh, git, aws, npm) need the user's real HOME."
         )
 
-    def test_spawn_env_sets_CODEX_HOME_when_provided(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_spawn_env_sets_CODEX_HOME_when_provided(self, monkeypatch):
         """CODEX_HOME isolation must still work — that's the whole point
         of the codex_home arg."""
         from agent.transports import codex_app_server as cas
@@ -220,9 +223,10 @@ class TestSpawnEnvIsolation:
         client = cas.CodexAppServerClient(
             codex_bin="codex", codex_home="/tmp/profile/codex"
         )
-        assert client._spawn_env.get("CODEX_HOME") == "/tmp/profile/codex"
+        spawn_env = await client._build_spawn_env()
+        assert spawn_env.get("CODEX_HOME") == "/tmp/profile/codex"
         # And HOME still passes through unchanged
-        assert client._spawn_env.get("HOME") == "/users/alice"
+        assert spawn_env.get("HOME") == "/users/alice"
 
 class TestSpawnEnvSecretStripping:
     """codex app-server routes its spawn env through hermes_subprocess_env(
@@ -239,12 +243,13 @@ class TestSpawnEnvSecretStripping:
     """
 
     @staticmethod
-    def _capture_spawn_env(monkeypatch):
+    async def _capture_spawn_env(monkeypatch):
         from agent.transports import codex_app_server as cas
         client = cas.CodexAppServerClient(codex_bin="codex")
-        return client._spawn_env
+        return await client._build_spawn_env()
 
-    def test_tier1_and_internal_secrets_stripped_from_spawn_env(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_tier1_and_internal_secrets_stripped_from_spawn_env(self, monkeypatch):
         for var, val in {
             "GH_TOKEN": "ghp-secret",
             "TELEGRAM_BOT_TOKEN": "bot-secret",
@@ -257,7 +262,7 @@ class TestSpawnEnvSecretStripping:
         }.items():
             monkeypatch.setenv(var, val)
 
-        env = self._capture_spawn_env(monkeypatch)
+        env = await self._capture_spawn_env(monkeypatch)
         for var in (
             "GH_TOKEN", "TELEGRAM_BOT_TOKEN", "MODAL_TOKEN_SECRET",
             "HERMES_DASHBOARD_SESSION_TOKEN", "AUXILIARY_VISION_API_KEY",
@@ -265,9 +270,10 @@ class TestSpawnEnvSecretStripping:
         ):
             assert var not in env, f"{var} leaked into codex app-server spawn env"
 
-    def test_provider_credentials_still_reach_codex(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_provider_credentials_still_reach_codex(self, monkeypatch):
         """codex authenticates against the model endpoint — provider keys must
         still flow through (inherit_credentials=True)."""
         monkeypatch.setenv("OPENAI_API_KEY", "sk-codex-needs-this")
-        env = self._capture_spawn_env(monkeypatch)
+        env = await self._capture_spawn_env(monkeypatch)
         assert env.get("OPENAI_API_KEY") == "sk-codex-needs-this"

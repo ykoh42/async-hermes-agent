@@ -10,34 +10,39 @@ See: https://github.com/NousResearch/hermes-agent/issues/36144
 See: https://github.com/NousResearch/hermes-agent/issues/29015
 """
 
-import os
-import threading
-from pathlib import Path
+import pytest
 
 import hermes_constants
-
 
 
 # ---------------------------------------------------------------------------
 # get_subprocess_home()
 # ---------------------------------------------------------------------------
 
+
 class TestGetSubprocessHome:
     """Unit tests for hermes_constants.get_subprocess_home()."""
 
     def _host_mode(self, monkeypatch):
-        monkeypatch.setattr(hermes_constants, "is_container", lambda: False)
+        async def not_container():
+            return False
+
+        monkeypatch.setattr(hermes_constants, "is_container", not_container)
         monkeypatch.delenv("TERMINAL_HOME_MODE", raising=False)
         monkeypatch.delenv("HERMES_REAL_HOME", raising=False)
 
     def _container_mode(self, monkeypatch):
-        monkeypatch.setattr(hermes_constants, "is_container", lambda: True)
+        async def container():
+            return True
+
+        monkeypatch.setattr(hermes_constants, "is_container", container)
         monkeypatch.delenv("TERMINAL_HOME_MODE", raising=False)
         monkeypatch.delenv("HERMES_REAL_HOME", raising=False)
 
-
-
-    def test_host_auto_keeps_real_home_when_profile_home_exists(self, tmp_path, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_host_auto_keeps_real_home_when_profile_home_exists(
+        self, tmp_path, monkeypatch
+    ):
         """Host installs should not hide real ~/.ssh, ~/.gitconfig, ~/.azure, etc."""
         self._host_mode(monkeypatch)
         real_home = tmp_path / "real-home"
@@ -47,18 +52,24 @@ class TestGetSubprocessHome:
         monkeypatch.setenv("HOME", str(real_home))
         monkeypatch.setenv("HERMES_HOME", str(hermes_home))
         from hermes_constants import get_subprocess_home
-        assert get_subprocess_home() is None
 
-    def test_container_auto_uses_profile_home_when_home_dir_exists(self, tmp_path, monkeypatch):
+        assert await get_subprocess_home() is None
+
+    @pytest.mark.asyncio
+    async def test_container_auto_uses_profile_home_when_home_dir_exists(
+        self, tmp_path, monkeypatch
+    ):
         self._container_mode(monkeypatch)
         hermes_home = tmp_path / ".hermes"
         profile_home = hermes_home / "home"
         profile_home.mkdir(parents=True)
         monkeypatch.setenv("HERMES_HOME", str(hermes_home))
         from hermes_constants import get_subprocess_home
-        assert get_subprocess_home() == str(profile_home)
 
-    def test_returns_profile_specific_path(self, tmp_path, monkeypatch):
+        assert await get_subprocess_home() == str(profile_home)
+
+    @pytest.mark.asyncio
+    async def test_returns_profile_specific_path(self, tmp_path, monkeypatch):
         """Explicit profile mode keeps the old per-profile HOME behavior."""
         self._host_mode(monkeypatch)
         profile_dir = tmp_path / ".hermes" / "profiles" / "coder"
@@ -68,9 +79,13 @@ class TestGetSubprocessHome:
         monkeypatch.setenv("TERMINAL_HOME_MODE", "profile")
         monkeypatch.setenv("HERMES_HOME", str(profile_dir))
         from hermes_constants import get_subprocess_home
-        assert get_subprocess_home() == str(profile_home)
 
-    def test_real_mode_repairs_parent_home_already_pointing_at_profile(self, tmp_path, monkeypatch):
+        assert await get_subprocess_home() == str(profile_home)
+
+    @pytest.mark.asyncio
+    async def test_real_mode_repairs_parent_home_already_pointing_at_profile(
+        self, tmp_path, monkeypatch
+    ):
         self._host_mode(monkeypatch)
         profile_dir = tmp_path / ".hermes" / "profiles" / "coder"
         profile_home = profile_dir / "home"
@@ -84,11 +99,11 @@ class TestGetSubprocessHome:
 
         from hermes_constants import get_subprocess_home, get_real_home
 
-        assert get_real_home() == str(real_home)
-        assert get_subprocess_home() == str(real_home)
+        assert await get_real_home() == str(real_home)
+        assert await get_subprocess_home() == str(real_home)
 
-
-    def test_two_profiles_get_different_homes(self, tmp_path, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_two_profiles_get_different_homes(self, tmp_path, monkeypatch):
         self._container_mode(monkeypatch)
         base = tmp_path / ".hermes" / "profiles"
         for name in ("alpha", "beta"):
@@ -99,10 +114,10 @@ class TestGetSubprocessHome:
         from hermes_constants import get_subprocess_home
 
         monkeypatch.setenv("HERMES_HOME", str(base / "alpha"))
-        home_a = get_subprocess_home()
+        home_a = await get_subprocess_home()
 
         monkeypatch.setenv("HERMES_HOME", str(base / "beta"))
-        home_b = get_subprocess_home()
+        home_b = await get_subprocess_home()
 
         assert home_a is not None
         assert home_b is not None
@@ -111,58 +126,75 @@ class TestGetSubprocessHome:
         assert home_b.endswith("beta/home")
 
 
-
 # ---------------------------------------------------------------------------
 # _sanitize_subprocess_env() injection
 # ---------------------------------------------------------------------------
 
+
 class TestSanitizeSubprocessEnvHomeInjection:
     """Verify _sanitize_subprocess_env() applies the subprocess HOME policy."""
 
-    def test_host_auto_preserves_real_home_when_profile_home_exists(self, tmp_path, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_host_auto_preserves_real_home_when_profile_home_exists(
+        self, tmp_path, monkeypatch
+    ):
         hermes_home = tmp_path / "hermes"
         hermes_home.mkdir()
         (hermes_home / "home").mkdir()
         real_home = tmp_path / "real-home"
         real_home.mkdir()
-        monkeypatch.setattr(hermes_constants, "is_container", lambda: False)
+
+        async def not_container():
+            return False
+
+        monkeypatch.setattr(hermes_constants, "is_container", not_container)
         monkeypatch.setenv("HERMES_HOME", str(hermes_home))
 
         base_env = {"HOME": str(real_home), "PATH": "/usr/bin", "USER": "root"}
         from tools.environments.local import _sanitize_subprocess_env
-        result = _sanitize_subprocess_env(base_env)
+
+        result = await _sanitize_subprocess_env(base_env)
 
         assert result["HOME"] == str(real_home)
         assert result["HERMES_REAL_HOME"] == str(real_home)
 
-    def test_profile_mode_injects_profile_home_when_profile_home_exists(self, tmp_path, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_profile_mode_injects_profile_home_when_profile_home_exists(
+        self, tmp_path, monkeypatch
+    ):
         hermes_home = tmp_path / "hermes"
         hermes_home.mkdir()
         (hermes_home / "home").mkdir()
         real_home = tmp_path / "real-home"
         real_home.mkdir()
-        monkeypatch.setattr(hermes_constants, "is_container", lambda: False)
+
+        async def not_container():
+            return False
+
+        monkeypatch.setattr(hermes_constants, "is_container", not_container)
         monkeypatch.setenv("TERMINAL_HOME_MODE", "profile")
         monkeypatch.setenv("HERMES_HOME", str(hermes_home))
 
         base_env = {"HOME": str(real_home), "PATH": "/usr/bin", "USER": "root"}
         from tools.environments.local import _sanitize_subprocess_env
-        result = _sanitize_subprocess_env(base_env)
+
+        result = await _sanitize_subprocess_env(base_env)
 
         assert result["HOME"] == str(hermes_home / "home")
         assert result["HERMES_REAL_HOME"] == str(real_home)
 
-    def test_no_injection_when_home_dir_missing(self, tmp_path, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_no_injection_when_home_dir_missing(self, tmp_path, monkeypatch):
         hermes_home = tmp_path / "hermes"
         hermes_home.mkdir()
         monkeypatch.setenv("HERMES_HOME", str(hermes_home))
 
         base_env = {"HOME": "/root", "PATH": "/usr/bin"}
         from tools.environments.local import _sanitize_subprocess_env
-        result = _sanitize_subprocess_env(base_env)
+
+        result = await _sanitize_subprocess_env(base_env)
 
         assert result["HOME"] == "/root"
-
 
 
 # ---------------------------------------------------------------------------

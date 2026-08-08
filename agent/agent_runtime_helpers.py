@@ -2220,32 +2220,46 @@ async def create_openai_client(
             }
             return GeminiNativeClient(**safe_kwargs)
 
+    owned_http_client = None
     if "http_client" not in kwargs:
-        route_verify = getattr(agent, "_tls_verify_by_route", {}).get(
-            base_url.rstrip("/"),
+        route_verify = await resolve_httpx_verify(
+            ca_bundle=ssl_ca_cert,
+            ssl_verify=ssl_verify,
+            base_url=base_url,
         )
-        if route_verify is None:
-            route_verify = resolve_httpx_verify(
-                ca_bundle=ssl_ca_cert,
-                ssl_verify=ssl_verify,
-                base_url=base_url,
-            )
-        http_client = build_keepalive_http_client(base_url, verify=route_verify)
-        if http_client is not None:
-            kwargs["http_client"] = http_client
+        owned_http_client = await build_keepalive_http_client(
+            base_url,
+            verify=route_verify,
+        )
+        kwargs["http_client"] = owned_http_client
 
     api_key = kwargs.get("api_key")
-    client_error: Exception | None = None
     try:
         client = _ra().OpenAI(**kwargs)
-    except Exception as exc:
-        client_error = exc
-    if client_error is not None:
+    except BaseException:
+        if owned_http_client is not None:
+            try:
+                await owned_http_client.aclose()
+            except asyncio.CancelledError:
+                raise
+            except BaseException:
+                logger.debug(
+                    "Failed to close HTTP transport after client construction error",
+                    exc_info=True,
+                )
         if callable(api_key) and not isinstance(api_key, str):
             from agent.azure_identity_adapter import _release_token_provider
 
-            await _release_token_provider(api_key)
-        raise client_error
+            try:
+                await _release_token_provider(api_key)
+            except asyncio.CancelledError:
+                raise
+            except BaseException:
+                logger.debug(
+                    "Failed to release token provider after client construction error",
+                    exc_info=True,
+                )
+        raise
 
     if callable(api_key) and not isinstance(api_key, str):
         client._hermes_token_provider = api_key

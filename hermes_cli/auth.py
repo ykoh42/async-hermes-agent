@@ -27,7 +27,6 @@ import shutil
 import shlex
 import ssl
 import stat
-import sys
 import base64
 import hashlib
 import subprocess
@@ -64,6 +63,7 @@ from hermes_cli.config import (
 )
 from hermes_constants import OPENROUTER_BASE_URL, secure_parent_dir
 from agent.credential_persistence import sanitize_borrowed_credential_payload
+from agent.ssl_verify import resolve_httpx_verify
 from utils import env_float, is_truthy_value
 
 logger = logging.getLogger(__name__)
@@ -743,7 +743,10 @@ async def detect_zai_endpoint(
     first working endpoint, or None if all fail.  For endpoints with multiple
     candidate models, tries each in order and returns the first that succeeds.
     """
-    async with httpx.AsyncClient(timeout=timeout) as client:
+    async with httpx.AsyncClient(
+        timeout=timeout,
+        verify=await resolve_httpx_verify(),
+    ) as client:
         for ep_id, base_url, probe_models, label in ZAI_ENDPOINTS:
             for model in probe_models:
                 try:
@@ -2295,6 +2298,7 @@ async def _refresh_qwen_cli_tokens(
                 "Content-Type": "application/x-www-form-urlencoded",
                 "Accept": "application/json",
             },
+            verify=await resolve_httpx_verify(),
         ) as client:
             response = await client.post(
                 QWEN_OAUTH_TOKEN_URL,
@@ -2427,6 +2431,7 @@ async def refresh_codex_oauth_pure(
             "Accept": "application/json",
             "User-Agent": CODEX_OAUTH_USER_AGENT,
         },
+        verify=await resolve_httpx_verify(),
     ) as client:
         response = await client.post(
             CODEX_OAUTH_TOKEN_URL,
@@ -2632,7 +2637,10 @@ async def _probe_codex_quota_restored(
         )
         if isinstance(account_id, str) and account_id.strip():
             headers["ChatGPT-Account-Id"] = account_id.strip()
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        async with httpx.AsyncClient(
+            timeout=10.0,
+            verify=await resolve_httpx_verify(),
+        ) as client:
             response = await client.get(
                 _codex_usage_probe_url(base_url),
                 headers=headers,
@@ -3058,6 +3066,7 @@ async def _xai_oauth_discovery(timeout_seconds: float = 15.0) -> Dict[str, str]:
         async with httpx.AsyncClient(
             timeout=httpx.Timeout(timeout_seconds),
             headers={"Accept": "application/json"},
+            verify=await resolve_httpx_verify(),
         ) as client:
             response = await client.get(XAI_OAUTH_DISCOVERY_URL)
     except Exception as exc:
@@ -3130,6 +3139,7 @@ async def refresh_xai_oauth_pure(
     async with httpx.AsyncClient(
         timeout=timeout,
         headers={"Accept": "application/json"},
+        verify=await resolve_httpx_verify(),
     ) as client:
         response = await client.post(
             endpoint,
@@ -3295,18 +3305,11 @@ async def resolve_xai_oauth_runtime_credentials(
 # =============================================================================
 
 
-def _default_verify() -> bool | ssl.SSLContext:
-    if sys.platform == "darwin":
-        try:
-            import certifi
-
-            return ssl.create_default_context(cafile=certifi.where())
-        except ImportError:
-            pass
-    return True
+async def _default_verify() -> bool | ssl.SSLContext:
+    return await resolve_httpx_verify()
 
 
-def _resolve_verify(
+async def _resolve_verify(
     *,
     insecure: Optional[bool] = None,
     ca_bundle: Optional[str] = None,
@@ -3326,18 +3329,10 @@ def _resolve_verify(
         or os.getenv("SSL_CERT_FILE")
         or os.getenv("REQUESTS_CA_BUNDLE")
     )
-    if effective_insecure:
-        return False
-    if effective_ca:
-        ca_path = str(effective_ca)
-        if not os.path.isfile(ca_path):
-            logger.warning(
-                "CA bundle path does not exist: %s — falling back to default certificates",
-                ca_path,
-            )
-            return _default_verify()
-        return ssl.create_default_context(cafile=ca_path)
-    return _default_verify()
+    return await resolve_httpx_verify(
+        ca_bundle=str(effective_ca) if effective_ca else None,
+        ssl_verify=False if effective_insecure else None,
+    )
 
 
 # =============================================================================
@@ -3720,7 +3715,7 @@ async def refresh_nous_oauth_pure(
         "agent_key_expires_at": agent_key_expires_at,
         "tls": {"insecure": bool(insecure), "ca_bundle": ca_bundle},
     }
-    verify = _resolve_verify(
+    verify = await _resolve_verify(
         insecure=insecure,
         ca_bundle=ca_bundle,
         auth_state=state,
@@ -3976,7 +3971,7 @@ async def resolve_nous_runtime_credentials(
             state["portal_base_url"] = portal_url
             state["inference_base_url"] = stored_inference
             state["client_id"] = client_id
-            verify = _resolve_verify(
+            verify = await _resolve_verify(
                 insecure=effective_insecure,
                 ca_bundle=effective_ca,
                 auth_state=state,
@@ -4125,7 +4120,7 @@ async def resolve_nous_access_token(
                 insecure if insecure is not None else tls.get("insecure")
             )
             effective_ca = ca_bundle or tls.get("ca_bundle")
-            verify = _resolve_verify(
+            verify = await _resolve_verify(
                 insecure=effective_insecure,
                 ca_bundle=effective_ca,
                 auth_state=state,
@@ -4412,6 +4407,7 @@ async def _refresh_minimax_oauth_state(
         async with httpx.AsyncClient(
             timeout=httpx.Timeout(timeout_seconds),
             follow_redirects=True,
+            verify=await resolve_httpx_verify(),
         ) as client:
             response = await _minimax_post_form(
                 client,

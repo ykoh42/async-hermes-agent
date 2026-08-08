@@ -10,11 +10,14 @@ ImportError before any agent logic ran.
 import builtins
 import logging
 
+import pytest
+
 import agent.auxiliary_client as aux
 
 
-def test_missing_bootstrap_helper_degrades_instead_of_raising(monkeypatch, caplog):
-    """ImportError from process_bootstrap → empty kwargs + one-time warning."""
+@pytest.mark.asyncio
+async def test_missing_bootstrap_helper_degrades_instead_of_raising(monkeypatch, caplog):
+    """ImportError from process_bootstrap uses explicit native async clients."""
     real_import = builtins.__import__
 
     def _fail_bootstrap(name, *args, **kwargs):
@@ -29,19 +32,23 @@ def test_missing_bootstrap_helper_degrades_instead_of_raising(monkeypatch, caplo
     monkeypatch.setattr(aux, "_WARNED_KEEPALIVE_IMPORT_SKEW", False)
 
     with caplog.at_level(logging.WARNING, logger="agent.auxiliary_client"):
-        result = aux._openai_http_client_kwargs("https://api.example.com/v1")
-        again = aux._openai_http_client_kwargs("https://api.example.com/v1")
+        result = await aux._openai_http_client_kwargs("https://api.example.com/v1")
+        again = await aux._openai_http_client_kwargs("https://api.example.com/v1")
 
-    assert result == {}
-    assert again == {}
+    assert result["http_client"] is not None
+    assert again["http_client"] is not None
     skew_warnings = [
         r for r in caplog.records if "mixed/stale install" in r.getMessage()
     ]
     assert len(skew_warnings) == 1  # warned once, not per call
+    await result["http_client"].aclose()
+    await again["http_client"].aclose()
 
 
-def test_healthy_bootstrap_still_injects_keepalive_client():
+@pytest.mark.asyncio
+async def test_healthy_bootstrap_still_injects_keepalive_client():
     """With the helper present, the keepalive http_client is injected."""
-    result = aux._openai_http_client_kwargs("https://api.example.com/v1")
+    result = await aux._openai_http_client_kwargs("https://api.example.com/v1")
     assert "http_client" in result
     assert result["http_client"] is not None
+    await result["http_client"].aclose()

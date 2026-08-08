@@ -330,37 +330,54 @@ async def secure_parent_dir(path: Path) -> None:
         pass
 
 
-def _norm_home_path(path: str | None) -> str:
+async def _norm_home_path(path: str | None) -> str:
     """Return a comparable absolute path string, or ``""`` for empty input."""
     raw = (path or "").strip()
     if not raw:
         return ""
     try:
-        return os.path.normcase(os.path.abspath(os.path.expanduser(raw)))
+        expanduser = aiofiles.os.wrap(os.path.expanduser)
+        expanded = await expanduser(raw)
+        return os.path.normcase(await aiofiles.os.path.abspath(expanded))
     except Exception:
         return os.path.normcase(raw)
 
 
-def _profile_home_path(env: dict[str, str] | None = None) -> str | None:
+async def _profile_home_path(env: dict[str, str] | None = None) -> str | None:
     """Return ``{HERMES_HOME}/home`` when the profile-home directory exists."""
-    hermes_home = get_hermes_home_override() or (env or {}).get("HERMES_HOME") or os.getenv("HERMES_HOME")
+    hermes_home = (
+        get_hermes_home_override()
+        or (env or {}).get("HERMES_HOME")
+        or os.getenv("HERMES_HOME")
+    )
     if not hermes_home:
         return None
     profile_home = os.path.join(hermes_home, "home")
-    if os.path.isdir(profile_home):
+    if await aiofiles.os.path.isdir(profile_home):
         return profile_home
     return None
 
 
-def _is_profile_home(candidate: str | None, profile_home: str | None) -> bool:
-    return bool(candidate and profile_home and _norm_home_path(candidate) == _norm_home_path(profile_home))
+async def _is_profile_home(
+    candidate: str | None,
+    profile_home: str | None,
+) -> bool:
+    return bool(
+        candidate
+        and profile_home
+        and await _norm_home_path(candidate) == await _norm_home_path(profile_home)
+    )
 
 
-def _iter_real_home_candidates(env: dict[str, str] | None = None) -> list[str]:
+async def _iter_real_home_candidates(
+    env: dict[str, str] | None = None,
+) -> list[str]:
     """Return likely OS-user home candidates in trust order."""
     env = env or {}
     candidates: list[str] = []
-    explicit = str(env.get("HERMES_REAL_HOME") or os.getenv("HERMES_REAL_HOME", "")).strip()
+    explicit = str(
+        env.get("HERMES_REAL_HOME") or os.getenv("HERMES_REAL_HOME", "")
+    ).strip()
     if explicit:
         candidates.append(explicit)
     home = str(env.get("HOME") or os.getenv("HOME", "")).strip()
@@ -369,7 +386,8 @@ def _iter_real_home_candidates(env: dict[str, str] | None = None) -> list[str]:
     try:
         import pwd
 
-        pw_home = pwd.getpwuid(os.getuid()).pw_dir.strip()  # windows-footgun: ok — POSIX-only module inside try/except
+        get_pw_home = aiofiles.os.wrap(lambda: pwd.getpwuid(os.getuid()).pw_dir)
+        pw_home = (await get_pw_home()).strip()
         if pw_home:
             candidates.append(pw_home)
     except Exception:
@@ -380,14 +398,19 @@ def _iter_real_home_candidates(env: dict[str, str] | None = None) -> list[str]:
     drive = str(env.get("HOMEDRIVE") or os.getenv("HOMEDRIVE", "")).strip()
     path = str(env.get("HOMEPATH") or os.getenv("HOMEPATH", "")).strip()
     if drive and path:
-        candidates.append(f"{drive}{path}" if path.startswith(("\\", "/")) else os.path.join(drive, path))
-    expanded = os.path.expanduser("~")
+        candidates.append(
+            f"{drive}{path}"
+            if path.startswith(("\\", "/"))
+            else os.path.join(drive, path)
+        )
+    expanduser = aiofiles.os.wrap(os.path.expanduser)
+    expanded = await expanduser("~")
     if expanded and expanded != "~":
         candidates.append(expanded)
     return candidates
 
 
-def get_real_home(env: dict[str, str] | None = None) -> str:
+async def get_real_home(env: dict[str, str] | None = None) -> str:
     """Return the OS user's real home directory, avoiding Hermes profile HOME.
 
     ``HERMES_HOME`` scopes Hermes state. ``HOME`` is reserved for the OS/user
@@ -395,19 +418,21 @@ def get_real_home(env: dict[str, str] | None = None) -> str:
     If a parent process is already running with ``HOME={HERMES_HOME}/home``,
     this helper repairs back to the account home when possible.
     """
-    profile_home = _profile_home_path(env)
+    profile_home = await _profile_home_path(env)
     seen: set[str] = set()
-    for candidate in _iter_real_home_candidates(env):
-        key = _norm_home_path(candidate)
+    for candidate in await _iter_real_home_candidates(env):
+        key = await _norm_home_path(candidate)
         if not key or key in seen:
             continue
         seen.add(key)
-        if not _is_profile_home(candidate, profile_home):
+        if not await _is_profile_home(candidate, profile_home):
             return candidate
     return "/tmp"
 
 
-def get_subprocess_home(env: dict[str, str] | None = None) -> str | None:
+async def get_subprocess_home(
+    env: dict[str, str] | None = None,
+) -> str | None:
     """Return a subprocess ``HOME`` override, if one should be applied.
 
     Policy is controlled by ``terminal.home_mode`` (bridged to
@@ -421,8 +446,13 @@ def get_subprocess_home(env: dict[str, str] | None = None) -> str | None:
       older strict per-profile tool-config isolation.
     """
     env = env or {}
-    profile_home = _profile_home_path(env)
-    mode = str(env.get("TERMINAL_HOME_MODE") or os.getenv("TERMINAL_HOME_MODE", "auto")).strip().lower() or "auto"
+    profile_home = await _profile_home_path(env)
+    mode = (
+        str(env.get("TERMINAL_HOME_MODE") or os.getenv("TERMINAL_HOME_MODE", "auto"))
+        .strip()
+        .lower()
+        or "auto"
+    )
     if mode in {"isolated", "profile_home", "profile-home"}:
         mode = "profile"
     if mode in {"host", "user", "real_home", "real-home"}:
@@ -431,24 +461,32 @@ def get_subprocess_home(env: dict[str, str] | None = None) -> str | None:
     if mode == "profile":
         return profile_home
 
-    real_home = get_real_home(env)
+    real_home = await get_real_home(env)
     current_home = str(env.get("HOME") or os.getenv("HOME", "")).strip()
     if mode == "real":
-        return real_home if _norm_home_path(real_home) != _norm_home_path(current_home) else None
+        return (
+            real_home
+            if await _norm_home_path(real_home) != await _norm_home_path(current_home)
+            else None
+        )
 
-    if profile_home and is_container():
+    if profile_home and await is_container():
         return profile_home
-    if _is_profile_home(current_home, profile_home):
-        return real_home if _norm_home_path(real_home) != _norm_home_path(current_home) else None
+    if await _is_profile_home(current_home, profile_home):
+        return (
+            real_home
+            if await _norm_home_path(real_home) != await _norm_home_path(current_home)
+            else None
+        )
     return None
 
 
-def apply_subprocess_home_env(env: dict[str, str]) -> None:
+async def apply_subprocess_home_env(env: dict[str, str]) -> None:
     """Apply Hermes' subprocess HOME contract to *env* in-place."""
-    real_home = get_real_home(env)
+    real_home = await get_real_home(env)
     if real_home:
         env["HERMES_REAL_HOME"] = real_home
-    home = get_subprocess_home(env)
+    home = await get_subprocess_home(env)
     if home:
         env["HOME"] = home
 
@@ -747,7 +785,7 @@ def translate_cwd_for_wsl_backend(cwd: str) -> str:
 _container_detected: bool | None = None
 
 
-def is_container() -> bool:
+async def is_container() -> bool:
     """Return True when running inside a container.
 
     Recognizes Docker (``/.dockerenv``), Podman (``/run/.containerenv``),
@@ -767,10 +805,10 @@ def is_container() -> bool:
     global _container_detected
     if _container_detected is not None:
         return _container_detected
-    if os.path.exists("/.dockerenv"):
+    if await aiofiles.os.path.exists("/.dockerenv"):
         _container_detected = True
         return True
-    if os.path.exists("/run/.containerenv"):
+    if await aiofiles.os.path.exists("/run/.containerenv"):
         _container_detected = True
         return True
     # Kubernetes always injects this into pod containers; absent on hosts.
@@ -779,8 +817,8 @@ def is_container() -> bool:
         return True
     _CGROUP_MARKERS = ("docker", "podman", "/lxc/", "kubepods", "containerd", "crio")
     try:
-        with open("/proc/1/cgroup", "r", encoding="utf-8") as f:
-            cgroup = f.read()
+        async with aiofiles.open("/proc/1/cgroup", "r", encoding="utf-8") as f:
+            cgroup = await f.read()
             if any(marker in cgroup for marker in _CGROUP_MARKERS):
                 _container_detected = True
                 return True
@@ -790,9 +828,11 @@ def is_container() -> bool:
     # runtime still shows up in the mount table (overlay rootfs, runtime mount
     # paths), so scan mountinfo as a last resort.
     try:
-        with open("/proc/self/mountinfo", "r", encoding="utf-8") as f:
-            mountinfo = f.read()
-            if any(marker in mountinfo for marker in ("kubepods", "containerd", "crio")):
+        async with aiofiles.open("/proc/self/mountinfo", "r", encoding="utf-8") as f:
+            mountinfo = await f.read()
+            if any(
+                marker in mountinfo for marker in ("kubepods", "containerd", "crio")
+            ):
                 _container_detected = True
                 return True
     except OSError:
@@ -884,6 +924,7 @@ AI_GATEWAY_BASE_URL = "https://ai-gateway.vercel.sh/v1"
 
 
 # ─── Venv layout ─────────────────────────────────────────────────────────────
+
 
 def venv_bin_dir(venv_dir, *, windows: bool | None = None) -> Path:
     """Directory holding a venv's executables (``Scripts`` / ``bin``).

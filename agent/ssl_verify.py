@@ -6,7 +6,10 @@ import logging
 import os
 import ssl
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Literal, Optional
+
+import aiofiles.os
+import certifi
 
 logger = logging.getLogger(__name__)
 
@@ -19,20 +22,20 @@ def _coerce_insecure(ssl_verify: Any) -> bool:
     return False
 
 
-def resolve_httpx_verify(
+async def resolve_httpx_verify(
     *,
     ca_bundle: Optional[str] = None,
     ssl_verify: Any = None,
     base_url: str = "",
-) -> bool | ssl.SSLContext:
+) -> ssl.SSLContext | Literal[False]:
     """Resolve httpx ``verify`` for provider HTTP clients.
 
     Priority:
     1. ``ssl_verify: false`` — disable verification (local dev only)
     2. explicit ``ca_bundle`` (per-provider ``ssl_ca_cert`` config field)
-    3. ``HERMES_CA_BUNDLE``, ``SSL_CERT_FILE``, ``REQUESTS_CA_BUNDLE``,
-       ``CURL_CA_BUNDLE`` env vars
-    4. ``True`` (httpx/certifi default)
+    3. ``HERMES_CA_BUNDLE``, ``SSL_CERT_FILE``, ``SSL_CERT_DIR``,
+       ``REQUESTS_CA_BUNDLE``, ``CURL_CA_BUNDLE`` env vars
+    4. a fresh httpx/certifi-compatible default context
 
     ``base_url`` is used only for the insecure-mode warning message.
     """
@@ -49,15 +52,24 @@ def resolve_httpx_verify(
         (ca_bundle or "").strip()
         or os.getenv("HERMES_CA_BUNDLE", "").strip()
         or os.getenv("SSL_CERT_FILE", "").strip()
+        or os.getenv("SSL_CERT_DIR", "").strip()
         or os.getenv("REQUESTS_CA_BUNDLE", "").strip()
         or os.getenv("CURL_CA_BUNDLE", "").strip()
     )
     if effective_ca:
-        ca_path = str(Path(effective_ca).expanduser())
-        if os.path.isfile(ca_path):
-            return ssl.create_default_context(cafile=ca_path)
+        ca_path = await aiofiles.os.wrap(Path.expanduser)(Path(effective_ca))
+        if await aiofiles.os.path.isfile(ca_path):
+            return await aiofiles.os.wrap(ssl.create_default_context)(
+                cafile=str(ca_path)
+            )
+        if await aiofiles.os.path.isdir(ca_path):
+            return await aiofiles.os.wrap(ssl.create_default_context)(
+                capath=str(ca_path)
+            )
         logger.warning(
             "CA bundle path does not exist: %s — falling back to default certificates",
             effective_ca,
         )
-    return True
+
+    default_ca = await aiofiles.os.wrap(certifi.where)()
+    return await aiofiles.os.wrap(ssl.create_default_context)(cafile=default_ca)

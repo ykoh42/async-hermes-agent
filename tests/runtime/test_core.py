@@ -248,9 +248,9 @@ async def test_create_openai_client_preserves_kwargs_and_owns_async_transport():
 
     client = SimpleNamespace()
     http_client = MagicMock(name="async_http_client")
+    tls_context = object()
     agent = SimpleNamespace(
         provider="openrouter",
-        _tls_verify_by_route={},
         _client_log_context=lambda: "provider=openrouter",
     )
     client_kwargs = {
@@ -262,8 +262,12 @@ async def test_create_openai_client_preserves_kwargs_and_owns_async_transport():
     with (
         patch(
             "agent.process_bootstrap.build_keepalive_http_client",
-            return_value=http_client,
-        ),
+            AsyncMock(return_value=http_client),
+        ) as build_http_client,
+        patch(
+            "agent.ssl_verify.resolve_httpx_verify",
+            AsyncMock(return_value=tls_context),
+        ) as resolve_verify,
         patch("run_agent.OpenAI", return_value=client) as factory,
     ):
         result = await create_openai_client(
@@ -280,7 +284,51 @@ async def test_create_openai_client_preserves_kwargs_and_owns_async_transport():
         "max_retries": 0,
     }
     factory.assert_called_once_with(**client_kwargs, http_client=http_client)
+    resolve_verify.assert_awaited_once_with(
+        ca_bundle=None,
+        ssl_verify=None,
+        base_url="https://openrouter.ai/api/v1",
+    )
+    build_http_client.assert_awaited_once_with(
+        "https://openrouter.ai/api/v1",
+        verify=tls_context,
+    )
     assert client._platform == "Unknown"
+
+
+@pytest.mark.parametrize("error", [RuntimeError("boom"), asyncio.CancelledError()])
+@pytest.mark.asyncio
+async def test_create_openai_client_closes_owned_transport_on_constructor_failure(
+    error,
+):
+    from agent.agent_runtime_helpers import create_openai_client
+
+    http_client = SimpleNamespace(aclose=AsyncMock())
+    agent = SimpleNamespace(provider="openrouter")
+
+    with (
+        patch(
+            "agent.ssl_verify.resolve_httpx_verify",
+            AsyncMock(return_value=object()),
+        ),
+        patch(
+            "agent.process_bootstrap.build_keepalive_http_client",
+            AsyncMock(return_value=http_client),
+        ),
+        patch("run_agent.OpenAI", side_effect=error),
+        pytest.raises(type(error)),
+    ):
+        await create_openai_client(
+            agent,
+            {
+                "api_key": "test-key",
+                "base_url": "https://openrouter.ai/api/v1",
+            },
+            reason="test",
+            shared=True,
+        )
+
+    http_client.aclose.assert_awaited_once_with()
 
 
 def _client_with_pool_socket(sock):
@@ -1587,17 +1635,23 @@ async def test_custom_env_key_preserves_constructor_route_and_tls_snapshot(
         patch("run_agent.get_tool_definitions", return_value=[]),
         patch("run_agent.check_toolset_requirements", return_value={}),
         patch("run_agent.OpenAI", return_value=native_client) as openai_factory,
-        patch("hermes_cli.config.load_config", return_value={
-            "custom_providers": [{
-                "name": "Local endpoint",
-                "base_url": "https://custom.example/v1",
-                "ssl_verify": False,
-            }],
-        }),
-        patch("agent.agent_init.resolve_httpx_verify", return_value=tls_snapshot),
+        patch(
+            "hermes_cli.config.load_config_readonly",
+            AsyncMock(return_value={
+                "custom_providers": [{
+                    "name": "Local endpoint",
+                    "base_url": "https://custom.example/v1",
+                    "ssl_verify": False,
+                }],
+            }),
+        ),
+        patch(
+            "agent.ssl_verify.resolve_httpx_verify",
+            AsyncMock(return_value=tls_snapshot),
+        ) as resolve_verify,
         patch(
             "agent.process_bootstrap.build_keepalive_http_client",
-            return_value=transport,
+            AsyncMock(return_value=transport),
         ) as build_http_client,
     ):
         agent = AIAgent(
@@ -1609,6 +1663,7 @@ async def test_custom_env_key_preserves_constructor_route_and_tls_snapshot(
             skip_memory=True,
         )
         openai_factory.assert_not_called()
+        resolve_verify.assert_not_awaited()
         monkeypatch.setattr(
             asyncio,
             "to_thread",
@@ -1621,7 +1676,12 @@ async def test_custom_env_key_preserves_constructor_route_and_tls_snapshot(
 
     assert agent.api_key == "environment-key"
     assert agent.base_url == "https://custom.example/v1"
-    build_http_client.assert_called_once_with(
+    resolve_verify.assert_awaited_once_with(
+        ca_bundle=None,
+        ssl_verify=False,
+        base_url="https://custom.example/v1",
+    )
+    build_http_client.assert_awaited_once_with(
         "https://custom.example/v1",
         verify=tls_snapshot,
     )

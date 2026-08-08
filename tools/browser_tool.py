@@ -119,7 +119,7 @@ _BROWSER_PASSTHROUGH_KEYS: tuple[str, ...] = (
 )
 
 
-def _build_browser_env() -> dict:
+async def _build_browser_env() -> dict:
     """Credential-scrubbed env for an agent-browser subprocess.
 
     Strips Hermes-managed secrets (provider keys, gateway tokens, GitHub auth,
@@ -130,7 +130,7 @@ def _build_browser_env() -> dict:
     """
     from tools.environments.local import hermes_subprocess_env
 
-    env = hermes_subprocess_env(inherit_credentials=False)
+    env = await hermes_subprocess_env(inherit_credentials=False)
     for _key in _BROWSER_PASSTHROUGH_KEYS:
         if _key in os.environ:
             env[_key] = os.environ[_key]
@@ -1202,7 +1202,7 @@ async def _run_chrome_fallback_command(
         _socket_safe_tmpdir(), f"agent-browser-{tmp_session}"
     )
     await aiofiles.os.makedirs(task_socket_dir, mode=0o700, exist_ok=True)
-    browser_env = _build_browser_env()
+    browser_env = await _build_browser_env()
     browser_env["AGENT_BROWSER_SOCKET_DIR"] = task_socket_dir
     browser_env["PATH"] = await _merge_browser_path(browser_env.get("PATH", ""))
 
@@ -2702,7 +2702,7 @@ async def _run_browser_command(
             len(task_socket_dir),
         )
 
-        browser_env = _build_browser_env()
+        browser_env = await _build_browser_env()
 
         # Ensure subprocesses inherit the same browser-specific PATH fallbacks
         # used during CLI discovery.
@@ -5259,7 +5259,7 @@ async def _maybe_autoinstall_chromium() -> bool:
             *install_cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            env=_build_browser_env(),
+            env=await _build_browser_env(),
         )
         stdout_bytes, stderr_bytes = await asyncio.wait_for(
             proc.communicate(), timeout=600

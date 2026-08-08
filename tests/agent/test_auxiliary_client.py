@@ -2372,7 +2372,8 @@ class TestAuxClientNoSdkRetries:
     time of every aux call against a slow/hung endpoint.
     """
 
-    def test_native_async_client_disables_sdk_retries(self):
+    @pytest.mark.asyncio
+    async def test_native_async_client_disables_sdk_retries(self):
         from agent import auxiliary_client as ac
 
         captured = {}
@@ -2383,12 +2384,18 @@ class TestAuxClientNoSdkRetries:
 
         with (
             patch("openai.AsyncOpenAI", _FakeOpenAI),
-            patch.object(ac, "_openai_http_client_kwargs", return_value={}),
+            patch.object(
+                ac,
+                "_openai_http_client_kwargs",
+                new_callable=AsyncMock,
+                return_value={},
+            ),
         ):
-            ac._create_openai_client(api_key="k", base_url="https://x/v1")
+            await ac._create_openai_client(api_key="k", base_url="https://x/v1")
         assert captured.get("max_retries") == 0
 
-    def test_explicit_max_retries_override_wins(self):
+    @pytest.mark.asyncio
+    async def test_explicit_max_retries_override_wins(self):
         from agent import auxiliary_client as ac
 
         captured = {}
@@ -2399,12 +2406,57 @@ class TestAuxClientNoSdkRetries:
 
         with (
             patch("openai.AsyncOpenAI", _FakeOpenAI),
-            patch.object(ac, "_openai_http_client_kwargs", return_value={}),
+            patch.object(
+                ac,
+                "_openai_http_client_kwargs",
+                new_callable=AsyncMock,
+                return_value={},
+            ),
         ):
-            ac._create_openai_client(
+            await ac._create_openai_client(
                 api_key="k", base_url="https://x/v1", max_retries=5
             )
         assert captured.get("max_retries") == 5
+
+    @pytest.mark.asyncio
+    async def test_sdk_constructor_failure_closes_owned_http_client(self):
+        from agent import auxiliary_client as ac
+
+        http_client = MagicMock()
+        http_client.aclose = AsyncMock()
+        with (
+            patch("openai.AsyncOpenAI", side_effect=RuntimeError("broken sdk")),
+            patch.object(
+                ac,
+                "_openai_http_client_kwargs",
+                new=AsyncMock(return_value={"http_client": http_client}),
+            ),
+            pytest.raises(RuntimeError, match="broken sdk"),
+        ):
+            await ac._create_openai_client(api_key="k", base_url="https://x/v1")
+
+        http_client.aclose.assert_awaited_once_with()
+
+    @pytest.mark.asyncio
+    async def test_sdk_constructor_failure_does_not_close_caller_http_client(self):
+        from agent import auxiliary_client as ac
+
+        http_client = MagicMock()
+        http_client.aclose = AsyncMock()
+        build_client = AsyncMock()
+        with (
+            patch("openai.AsyncOpenAI", side_effect=RuntimeError("broken sdk")),
+            patch.object(ac, "_openai_http_client_kwargs", new=build_client),
+            pytest.raises(RuntimeError, match="broken sdk"),
+        ):
+            await ac._create_openai_client(
+                api_key="k",
+                base_url="https://x/v1",
+                http_client=http_client,
+            )
+
+        build_client.assert_not_awaited()
+        http_client.aclose.assert_not_awaited()
 
 
 class TestIsTimeoutError:
@@ -4185,7 +4237,7 @@ class TestNvidiaBillingHeaders:
     ):
         monkeypatch.setenv("NVIDIA_API_KEY", "nvidia-key")
         monkeypatch.delenv("NVIDIA_BASE_URL", raising=False)
-        mock_create = MagicMock(return_value=MagicMock(name="nvidia-client"))
+        mock_create = AsyncMock(return_value=MagicMock(name="nvidia-client"))
 
         with patch("agent.auxiliary_client._create_openai_client", mock_create):
             client, model = await resolve_provider_client(
@@ -4205,7 +4257,7 @@ class TestNvidiaBillingHeaders:
     ):
         monkeypatch.setenv("NVIDIA_API_KEY", "nvidia-key")
         monkeypatch.setenv("NVIDIA_BASE_URL", "http://localhost:8000/v1")
-        mock_create = MagicMock(return_value=MagicMock(name="nvidia-local-client"))
+        mock_create = AsyncMock(return_value=MagicMock(name="nvidia-local-client"))
 
         with patch("agent.auxiliary_client._create_openai_client", mock_create):
             client, model = await resolve_provider_client(
@@ -4236,7 +4288,7 @@ class TestOpenRouterExplicitApiKey:
         monkeypatch.setenv("OPENROUTER_API_KEY", "env-fallback-key")
 
         # Mock OpenAI to capture the api_key used
-        mock_create = MagicMock(return_value=MagicMock(name="openrouter-client"))
+        mock_create = AsyncMock(return_value=MagicMock(name="openrouter-client"))
 
         with patch("agent.auxiliary_client._create_openai_client", mock_create):
             client, model = await resolve_provider_client(
@@ -4268,7 +4320,7 @@ class TestOpenRouterExplicitApiKey:
         monkeypatch.setenv("OPENROUTER_API_KEY", "env-fallback-key")
 
         # Mock OpenAI to capture the api_key used
-        mock_create = MagicMock(return_value=MagicMock(name="openrouter-client"))
+        mock_create = AsyncMock(return_value=MagicMock(name="openrouter-client"))
 
         with patch("agent.auxiliary_client._create_openai_client", mock_create):
             client, model = await resolve_provider_client(

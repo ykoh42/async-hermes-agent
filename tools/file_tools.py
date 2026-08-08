@@ -112,7 +112,7 @@ def _reset_patch_failures(task_id: str, resolved_paths: list[str]) -> None:
                 failures.pop(path, None)
 
 
-def _expand_tilde(path: str) -> str:
+async def _expand_tilde(path: str) -> str:
     """Expand ``~`` using the effective profile home when available.
 
     In-process file tools share the gateway process's HOME, which may differ
@@ -126,12 +126,13 @@ def _expand_tilde(path: str) -> str:
     try:
         from hermes_constants import get_subprocess_home
 
-        home = get_subprocess_home()
+        home = await get_subprocess_home()
     except Exception:
         home = None
     if home and (path == "~" or path.startswith("~/")):
         return home if path == "~" else os.path.join(home, path[2:])
-    return os.path.expanduser(path)
+    expanduser = aiofiles.os.wrap(os.path.expanduser)
+    return await expanduser(path)
 
 
 # ---------------------------------------------------------------------------
@@ -293,7 +294,7 @@ def _normalize_without_host_deref(path: str | Path | PurePosixPath) -> PurePosix
     return PurePosixPath(posixpath.normpath(str(path)))
 
 
-def _sentinel_free_abs_cwd(raw: str | None) -> str | None:
+async def _sentinel_free_abs_cwd(raw: str | None) -> str | None:
     """Normalize a cwd candidate to an absolute, sentinel-free anchor.
 
     Returns the expanded path only when *raw* is non-empty, not a sentinel (see
@@ -304,13 +305,13 @@ def _sentinel_free_abs_cwd(raw: str | None) -> str | None:
     raw = str(raw or "").strip()
     if raw.lower() in _TERMINAL_CWD_SENTINELS:
         return None
-    expanded = _expand_tilde(raw)
+    expanded = await _expand_tilde(raw)
     if not os.path.isabs(expanded):
         return None
     return expanded
 
 
-def _configured_terminal_cwd() -> str | None:
+async def _configured_terminal_cwd() -> str | None:
     """Return ``$TERMINAL_CWD`` only when it names a real directory anchor.
 
     Sentinel values (see ``_TERMINAL_CWD_SENTINELS``) and relative paths are
@@ -318,10 +319,10 @@ def _configured_terminal_cwd() -> str | None:
     relative to, which is exactly the ambiguity that misroutes worktree edits.
     Only an absolute, sentinel-free value is honored.
     """
-    return _sentinel_free_abs_cwd(os.environ.get("TERMINAL_CWD"))
+    return await _sentinel_free_abs_cwd(os.environ.get("TERMINAL_CWD"))
 
 
-def _registered_task_cwd_override(task_id: str = "default") -> str | None:
+async def _registered_task_cwd_override(task_id: str = "default") -> str | None:
     """Return a registered cwd override for the raw task id, when available.
 
     ``terminal_tool`` intentionally collapses CWD-only task overrides to the
@@ -337,7 +338,7 @@ def _registered_task_cwd_override(task_id: str = "default") -> str | None:
     except Exception:
         return None
 
-    return _sentinel_free_abs_cwd(overrides.get("cwd"))
+    return await _sentinel_free_abs_cwd(overrides.get("cwd"))
 
 
 async def _authoritative_workspace_root(task_id: str = "default") -> str | None:
@@ -368,10 +369,10 @@ async def _authoritative_workspace_root(task_id: str = "default") -> str | None:
         recorded = None
     if recorded:
         return recorded
-    registered = _registered_task_cwd_override(task_id)
+    registered = await _registered_task_cwd_override(task_id)
     if registered:
         return registered
-    return _configured_terminal_cwd()
+    return await _configured_terminal_cwd()
 
 
 async def _resolve_base_dir(
@@ -405,7 +406,7 @@ async def _resolve_base_dir(
     if container_paths is None:
         container_paths = _uses_container_paths(task_id)
     if root:
-        base_text = _expand_tilde(root)
+        base_text = await _expand_tilde(root)
     else:
         base_text = await aiofiles.os.getcwd()
     if container_paths:
@@ -447,7 +448,7 @@ async def _resolve_path_for_task(
     """
     container_paths = _uses_container_paths(task_id)
     if container_paths:
-        expanded = _expand_tilde(filepath)
+        expanded = await _expand_tilde(filepath)
         if posixpath.isabs(expanded):
             return _normalize_without_host_deref(expanded)
         resolved = await _resolve_base_dir(task_id, container_paths=True) / expanded
@@ -456,7 +457,7 @@ async def _resolve_path_for_task(
     # Host paths only — never rewrite Linux paths inside a container/WSL env.
     from tools.environments.local import _msys_to_windows_path
 
-    expanded = _expand_tilde(_msys_to_windows_path(filepath))
+    expanded = await _expand_tilde(_msys_to_windows_path(filepath))
     realpath = aiofiles.os.wrap(os.path.realpath)
     if sys.platform == "win32":
         import ntpath
@@ -482,13 +483,13 @@ async def _path_resolution_warning(
 ) -> str | None:
     """Warn when a relative path resolves outside the active workspace."""
     try:
-        if Path(_expand_tilde(filepath)).is_absolute():
+        if Path(await _expand_tilde(filepath)).is_absolute():
             return None
         workspace_root = await _authoritative_workspace_root(task_id)
         if not workspace_root:
             return None
         realpath = aiofiles.os.wrap(os.path.realpath)
-        root = Path(await realpath(_expand_tilde(workspace_root)))
+        root = Path(await realpath(await _expand_tilde(workspace_root)))
         target = Path(await realpath(resolved))
         try:
             target.relative_to(root)
@@ -507,7 +508,7 @@ async def _path_resolution_warning(
 
 def _is_blocked_device_path(path: str) -> bool:
     """Return True for concrete device/fd paths that can hang reads."""
-    normalized = os.path.normpath(_expand_tilde(path))
+    normalized = os.path.normpath(path)
     if normalized in _BLOCKED_DEVICE_PATHS:
         return True
     # /proc/self/fd/0-2 and /proc/<pid>/fd/0-2 are Linux aliases for stdio
@@ -548,7 +549,7 @@ async def _is_blocked_device(filepath: str, base_dir: str | Path | None = None) 
     they resolve to terminal-specific paths. Then check each symlink hop before
     the final resolved path so aliases to devices cannot bypass the guard.
     """
-    expanded = _expand_tilde(filepath)
+    expanded = await _expand_tilde(filepath)
     if base_dir is not None and not os.path.isabs(expanded):
         expanded = os.path.join(os.fspath(base_dir), expanded)
     normalized = os.path.normpath(expanded)  # noqa: ASYNC240 - lexical only
@@ -600,7 +601,7 @@ _hermes_config_resolved: str | None = None
 _hermes_config_resolved_loaded = False
 
 
-def _get_hermes_config_path() -> str | None:
+async def _get_hermes_config_path() -> str | None:
     """Return the absolute Hermes config path without filesystem access."""
     global _hermes_config_resolved, _hermes_config_resolved_loaded
     if _hermes_config_resolved_loaded:
@@ -608,11 +609,11 @@ def _get_hermes_config_path() -> str | None:
     _hermes_config_resolved_loaded = True
     try:
         from hermes_cli.config import get_config_path
-        _hermes_config_resolved = os.path.abspath(get_config_path())
+        _hermes_config_resolved = await aiofiles.os.path.abspath(get_config_path())
     except Exception:
         try:
-            _hermes_config_resolved = os.path.abspath(
-                _expand_tilde("~/.hermes/config.yaml")
+            _hermes_config_resolved = await aiofiles.os.path.abspath(
+                await _expand_tilde("~/.hermes/config.yaml")
             )
         except Exception:
             _hermes_config_resolved = None
@@ -626,7 +627,7 @@ async def _check_sensitive_path(filepath: str, task_id: str = "default") -> str 
     except (OSError, ValueError):
         resolved = filepath
     normalized = os.path.normpath(  # noqa: ASYNC240 - lexical only
-        _expand_tilde(filepath)
+        await _expand_tilde(filepath)
     )
     _err = (
         f"Refusing to write to sensitive system path: {filepath}\n"
@@ -641,7 +642,7 @@ async def _check_sensitive_path(filepath: str, task_id: str = "default") -> str 
     # approvals.mode and other security settings live here; a malicious or
     # prompt-injected agent could silently disable exec approval by writing to
     # this file.
-    hermes_config = _get_hermes_config_path()
+    hermes_config = await _get_hermes_config_path()
     # macOS resolves ``/tmp`` through the ``/private`` symlink.  Canonicalize
     # both values so the config guard is stable regardless of the spelling the
     # caller used.
@@ -1059,7 +1060,7 @@ async def _handle_read_file(args, **kw):
     offset, limit = normalize_read_pagination(args.get("offset", 1), args.get("limit", 500))
     device_base = (
         None
-        if Path(_expand_tilde(path)).is_absolute()
+        if Path(await _expand_tilde(path)).is_absolute()
         else await _resolve_base_dir(task_id)
     )
     if await _is_blocked_device(path, base_dir=device_base):

@@ -1,19 +1,35 @@
 """Regression tests for local terminal initial cwd normalization."""
 
 import pytest
+from blockbuster import BlockBuster
+from pyleak import no_event_loop_blocking, no_task_leaks
+from pyleak.eventloop import LeakAction
 
 from tools.environments.local import LocalEnvironment, _resolve_local_initial_cwd
 
 
-def test_relative_initial_cwd_resolves_from_parent(tmp_path, monkeypatch):
+@pytest.mark.asyncio
+async def test_relative_initial_cwd_resolves_from_parent(tmp_path, monkeypatch):
     project = tmp_path / "hermes-agent"
     project.mkdir()
     monkeypatch.chdir(tmp_path)
 
-    assert _resolve_local_initial_cwd("hermes-agent") == str(project)
+    async with (
+        no_event_loop_blocking(action=LeakAction.RAISE, threshold=0.1),
+        no_task_leaks(action=LeakAction.RAISE),
+    ):
+        blocker = BlockBuster()
+        blocker.activate()
+        try:
+            resolved = await _resolve_local_initial_cwd("hermes-agent")
+        finally:
+            blocker.deactivate()
+
+    assert resolved == str(project)
 
 
-def test_relative_initial_cwd_does_not_skip_existing_nested_directory(
+@pytest.mark.asyncio
+async def test_relative_initial_cwd_does_not_skip_existing_nested_directory(
     tmp_path, monkeypatch
 ):
     project = tmp_path / "hermes-agent"
@@ -21,7 +37,7 @@ def test_relative_initial_cwd_does_not_skip_existing_nested_directory(
     nested.mkdir(parents=True)
     monkeypatch.chdir(project)
 
-    assert _resolve_local_initial_cwd("hermes-agent") == str(nested)
+    assert await _resolve_local_initial_cwd("hermes-agent") == str(nested)
 
 
 @pytest.mark.asyncio

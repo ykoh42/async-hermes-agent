@@ -1,3 +1,5 @@
+import pytest
+
 from unittest.mock import patch
 
 from tools.environments.local import _msys_to_windows_path, _resolve_local_initial_cwd
@@ -15,6 +17,7 @@ def test_non_windows_path_is_unchanged():
         assert _msys_to_windows_path("/c/Users/test") == "/c/Users/test"
 
 
-def test_initial_cwd_keeps_native_windows_absolute_path():
+@pytest.mark.asyncio
+async def test_initial_cwd_keeps_native_windows_absolute_path():
     with patch("tools.environments.local._IS_WINDOWS", True):
-        assert _resolve_local_initial_cwd(r"C:\Users\test") == r"C:\Users\test"
+        assert await _resolve_local_initial_cwd(r"C:\Users\test") == r"C:\Users\test"
