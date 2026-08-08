@@ -276,6 +276,56 @@ async def test_real_async_subprocess_round_trip(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_completed_process_drains_buffered_stdout(monkeypatch, tmp_path):
+    """A fast child exit cannot hide JSON-RPC responses already in the pipe."""
+    stdout = asyncio.StreamReader()
+    for payload in (
+        {"jsonrpc": "2.0", "id": 1, "result": {}},
+        {"jsonrpc": "2.0", "id": 2, "result": {"sessionId": "session-1"}},
+        {
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {"text": "buffered answer"},
+                }
+            },
+        },
+        {"jsonrpc": "2.0", "id": 3, "result": {}},
+    ):
+        stdout.feed_data((json.dumps(payload) + "\n").encode())
+    stdout.feed_eof()
+    stderr = asyncio.StreamReader()
+    stderr.feed_eof()
+
+    process = SimpleNamespace(
+        stdin=_Writer(),
+        stdout=stdout,
+        stderr=stderr,
+        returncode=0,
+    )
+    monkeypatch.setattr(
+        asyncio,
+        "create_subprocess_exec",
+        AsyncMock(return_value=process),
+    )
+    client = CopilotACPClient(
+        acp_command="fast-acp",
+        acp_cwd=str(tmp_path),
+    )
+
+    completion = await client.chat.completions.create(
+        model="copilot-acp",
+        messages=[{"role": "user", "content": "hello"}],
+    )
+
+    assert completion.choices[0].message.content == "buffered answer"
+    assert client.is_closed is True
+    assert client._active_process is None
+
+
+@pytest.mark.asyncio
 async def test_run_prompt_preserves_real_home(monkeypatch, tmp_path):
     hermes_home = tmp_path / "hermes"
     (hermes_home / "home").mkdir(parents=True)

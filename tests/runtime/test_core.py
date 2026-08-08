@@ -3727,6 +3727,197 @@ async def test_cancelled_turn_during_prologue_persists_before_reraising(
 
 
 @pytest.mark.asyncio
+async def test_cancelled_turn_during_pre_api_selection_persists_before_reraising(
+    monkeypatch,
+    tmp_path,
+):
+    """The public boundary covers awaited work outside narrow loop handlers."""
+    database = SessionDB(tmp_path / "state.db")
+    with (
+        patch("run_agent.get_tool_definitions", return_value=[]),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI"),
+    ):
+        agent = AIAgent(
+            api_key="test-key",
+            base_url="https://example.invalid/v1",
+            model="test-model",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+            save_trajectories=False,
+        )
+    agent._session_db = database
+    agent._session_db_created = False
+    agent.compression_enabled = False
+    agent._tool_snapshot_initialized = True
+    agent._mcp_discovery_started = True
+    agent._skip_mcp_refresh = True
+    selection_started = asyncio.Event()
+
+    async def blocking_selection(*_args, **_kwargs):
+        selection_started.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(
+        "agent.conversation_loop._apply_context_engine_selection",
+        blocking_selection,
+    )
+    monkeypatch.setattr("hermes_cli.plugins.discover_plugins", AsyncMock())
+
+    turn_task = asyncio.create_task(
+        agent.run_conversation("persist this pre-api cancellation")
+    )
+    try:
+        async with (
+            no_event_loop_blocking(action=LeakAction.RAISE, threshold=0.1),
+            no_task_leaks(action=LeakAction.RAISE),
+        ):
+            await asyncio.wait_for(selection_started.wait(), timeout=1)
+            turn_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await turn_task
+
+        assert agent._inflight_turn_id is None
+        assert [
+            message["content"]
+            for message in await database.get_messages(agent.session_id)
+        ] == ["persist this pre-api cancellation"]
+    finally:
+        if not turn_task.done():
+            turn_task.cancel()
+            await asyncio.gather(turn_task, return_exceptions=True)
+        await agent.close()
+        await database.close()
+
+
+@pytest.mark.asyncio
+async def test_cancel_before_new_turn_does_not_finalize_stale_marker(monkeypatch):
+    """Cancellation before turn setup cannot attach new input to an old marker."""
+    with (
+        patch("run_agent.get_tool_definitions", return_value=[]),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI"),
+    ):
+        agent = AIAgent(
+            api_key="test-key",
+            base_url="https://example.invalid/v1",
+            model="test-model",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+    root_lookup_started = asyncio.Event()
+
+    async def blocking_root_lookup():
+        root_lookup_started.set()
+        await asyncio.Event().wait()
+
+    agent._current_turn_id = "stale-turn"
+    agent._inflight_turn_id = "stale-turn"
+    agent._conversation_root_id = blocking_root_lookup
+    finalizer = AsyncMock()
+    monkeypatch.setattr("agent.turn_finalizer.finalize_turn", finalizer)
+
+    turn_task = asyncio.create_task(agent.run_conversation("new input"))
+    try:
+        await asyncio.wait_for(root_lookup_started.wait(), timeout=1)
+        turn_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await turn_task
+        finalizer.assert_not_awaited()
+    finally:
+        if not turn_task.done():
+            turn_task.cancel()
+            await asyncio.gather(turn_task, return_exceptions=True)
+        agent._inflight_turn_id = None
+        await agent.close()
+
+
+@pytest.mark.asyncio
+async def test_cancellation_during_normal_finalizer_finishes_same_task_once(
+    monkeypatch,
+    tmp_path,
+):
+    """Late cancellation cannot duplicate trajectory/finalizer side effects."""
+    database = SessionDB(tmp_path / "state.db")
+    with (
+        patch("run_agent.get_tool_definitions", return_value=[]),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI"),
+    ):
+        agent = AIAgent(
+            api_key="test-key",
+            base_url="https://example.invalid/v1",
+            model="test-model",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+            save_trajectories=False,
+        )
+    agent._session_db = database
+    agent._session_db_created = False
+    agent.compression_enabled = False
+    agent._tool_snapshot_initialized = True
+    agent._mcp_discovery_started = True
+    agent._skip_mcp_refresh = True
+
+    async def model_response(*_args, **_kwargs):
+        return SimpleNamespace(
+            id="synthetic-response",
+            choices=[
+                SimpleNamespace(
+                    finish_reason="stop",
+                    message=SimpleNamespace(
+                        role="assistant",
+                        content="durable answer",
+                        tool_calls=None,
+                        reasoning=None,
+                        reasoning_content=None,
+                    ),
+                )
+            ],
+            usage=None,
+        )
+
+    finalizer_started = asyncio.Event()
+    release_finalizer = asyncio.Event()
+    trajectory_calls = 0
+
+    async def controlled_trajectory(*_args, **_kwargs):
+        nonlocal trajectory_calls
+        trajectory_calls += 1
+        finalizer_started.set()
+        await release_finalizer.wait()
+
+    agent._execute_model_request = model_response
+    agent._save_trajectory = controlled_trajectory
+    monkeypatch.setattr("hermes_cli.plugins.discover_plugins", AsyncMock())
+
+    turn_task = asyncio.create_task(agent.run_conversation("durable question"))
+    try:
+        await asyncio.wait_for(finalizer_started.wait(), timeout=1)
+        turn_task.cancel()
+        release_finalizer.set()
+        with pytest.raises(asyncio.CancelledError):
+            await turn_task
+
+        assert trajectory_calls == 1
+        assert agent._inflight_turn_id is None
+        assert [
+            message["content"]
+            for message in await database.get_messages(agent.session_id)
+        ] == ["durable question", "durable answer"]
+    finally:
+        release_finalizer.set()
+        if not turn_task.done():
+            turn_task.cancel()
+            await asyncio.gather(turn_task, return_exceptions=True)
+        await agent.close()
+        await database.close()
+
+
+@pytest.mark.asyncio
 async def test_repeated_cancellation_waits_for_turn_finalizer_then_reraises(
     monkeypatch,
 ):

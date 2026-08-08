@@ -442,6 +442,10 @@ async def build_turn_context(
     # interleave transcript writes. Cleared in _persist_session.
     from agent.agent_runtime_helpers import note_turn_start
     note_turn_start(agent, turn_id)
+    # This diagnostic/accounting field is turn-scoped.  Reset it at the same
+    # boundary as the in-flight marker so a cancellation later in the
+    # prologue cannot report the previous turn's provider-call count.
+    agent._api_call_count = 0
 
     # Reset retry counters and iteration budget at the start of each turn.
     agent._invalid_tool_retries = 0

@@ -536,8 +536,6 @@ class CopilotACPClient:
 
             deadline = asyncio.get_running_loop().time() + timeout_seconds
             while asyncio.get_running_loop().time() < deadline:
-                if process.returncode is not None:
-                    break
                 remaining = deadline - asyncio.get_running_loop().time()
                 try:
                     raw_line = await asyncio.wait_for(

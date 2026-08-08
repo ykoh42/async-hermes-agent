@@ -1198,6 +1198,97 @@ async def _notify_context_engine_turn_complete(
         )
 
 
+async def _finalize_boundary_cancellation(
+    agent: Any,
+    *,
+    user_message: Any,
+    conversation_history: Optional[List[Dict[str, Any]]],
+    task_id: Optional[str],
+    persist_user_message: Optional[Any],
+    persist_user_timestamp: Optional[float],
+    persist_user_display_kind: Optional[str],
+    persist_user_display_metadata: Optional[Dict[str, Any]],
+) -> None:
+    """Finalize a cancellation that escaped a narrower loop handler.
+
+    Turn setup and the pre-API pressure/middleware path contain awaited
+    boundaries outside the provider/post-processing cancellation handlers.
+    The public ``AIAgent.run_conversation`` boundary calls this helper as a
+    final safety net.  The in-flight marker makes it a no-op when a narrower
+    handler already finalized the turn or cancellation arrived before the
+    user turn was officially staged.
+    """
+    turn_id = getattr(agent, "_current_turn_id", None)
+    if not turn_id or getattr(agent, "_inflight_turn_id", None) != turn_id:
+        return
+
+    finalizer_user_message = (
+        _sanitize_surrogates(user_message)
+        if isinstance(user_message, str)
+        else user_message
+    )
+    partial_messages = getattr(agent, "_session_messages", None)
+    current_idx = getattr(agent, "_persist_user_message_idx", None)
+    current_row_is_staged = (
+        isinstance(partial_messages, list)
+        and isinstance(current_idx, int)
+        and 0 <= current_idx < len(partial_messages)
+        and isinstance(partial_messages[current_idx], dict)
+        and partial_messages[current_idx].get("role") == "user"
+    )
+    if not current_row_is_staged:
+        partial_messages = list(conversation_history or [])
+        user_row: Dict[str, Any] = {
+            "role": "user",
+            "content": finalizer_user_message,
+        }
+        if persist_user_timestamp is not None:
+            user_row["timestamp"] = persist_user_timestamp
+        if persist_user_display_kind:
+            user_row["display_kind"] = persist_user_display_kind
+            if persist_user_display_metadata:
+                user_row["display_metadata"] = persist_user_display_metadata
+        partial_messages.append(user_row)
+        agent._persist_user_message_idx = len(partial_messages) - 1
+        agent._session_messages = partial_messages
+
+    clean_user_message = (
+        persist_user_message
+        if persist_user_message is not None
+        else user_message
+    )
+    if isinstance(clean_user_message, str):
+        clean_user_message = _sanitize_surrogates(clean_user_message)
+    finalizer_task = asyncio.create_task(
+        _turn_finalizer.finalize_turn(
+            agent,
+            final_response=None,
+            api_call_count=int(getattr(agent, "_api_call_count", 0) or 0),
+            interrupted=True,
+            failed=False,
+            messages=partial_messages,
+            conversation_history=conversation_history,
+            effective_task_id=(getattr(agent, "_current_task_id", None) or task_id),
+            turn_id=turn_id,
+            user_message=finalizer_user_message,
+            original_user_message=clean_user_message,
+            _should_review_memory=False,
+            _turn_exit_reason="cancelled",
+            _pending_verification_response=None,
+            _pending_verification_response_previewed=False,
+        )
+    )
+    try:
+        await asyncio.shield(finalizer_task)
+    except asyncio.CancelledError:  # noqa: ASYNC103 - caller re-raises below
+        try:
+            await asyncio.shield(finalizer_task)
+        except Exception:
+            logger.error("Cancelled boundary finalization failed", exc_info=True)
+    except Exception:
+        logger.error("Cancelled boundary finalization failed", exc_info=True)
+
+
 async def run_conversation(
     agent,
     user_message: Any,
@@ -1291,82 +1382,16 @@ async def run_conversation(
             moa_active=bool(moa_config),
         )
     except asyncio.CancelledError:
-        # Cancellation can land after note_turn_start() but before the
-        # prologue's crash-safe persist.  The main-loop cancellation handler
-        # does not exist yet at that point, so finalize the partial turn here
-        # before re-raising.  The in-flight marker distinguishes this case from
-        # cancellation before a turn was officially staged.
-        turn_id = getattr(agent, "_current_turn_id", None)
-        if turn_id and getattr(agent, "_inflight_turn_id", None) == turn_id:
-            finalizer_user_message = (
-                _sanitize_surrogates(user_message)
-                if isinstance(user_message, str)
-                else user_message
-            )
-            partial_messages = getattr(agent, "_session_messages", None)
-            current_idx = getattr(agent, "_persist_user_message_idx", None)
-            current_row_is_staged = (
-                isinstance(partial_messages, list)
-                and isinstance(current_idx, int)
-                and 0 <= current_idx < len(partial_messages)
-                and isinstance(partial_messages[current_idx], dict)
-                and partial_messages[current_idx].get("role") == "user"
-            )
-            if not current_row_is_staged:
-                partial_messages = list(conversation_history or [])
-                user_row: Dict[str, Any] = {
-                    "role": "user",
-                    "content": finalizer_user_message,
-                }
-                if persist_user_timestamp is not None:
-                    user_row["timestamp"] = persist_user_timestamp
-                if persist_user_display_kind:
-                    user_row["display_kind"] = persist_user_display_kind
-                    if persist_user_display_metadata:
-                        user_row["display_metadata"] = persist_user_display_metadata
-                partial_messages.append(user_row)
-                agent._persist_user_message_idx = len(partial_messages) - 1
-                agent._session_messages = partial_messages
-
-            clean_user_message = (
-                persist_user_message
-                if persist_user_message is not None
-                else user_message
-            )
-            if isinstance(clean_user_message, str):
-                clean_user_message = _sanitize_surrogates(clean_user_message)
-            finalizer_task = asyncio.create_task(
-                _turn_finalizer.finalize_turn(
-                    agent,
-                    final_response=None,
-                    api_call_count=0,
-                    interrupted=True,
-                    failed=False,
-                    messages=partial_messages,
-                    conversation_history=conversation_history,
-                    effective_task_id=(
-                        getattr(agent, "_current_task_id", None) or task_id
-                    ),
-                    turn_id=turn_id,
-                    user_message=finalizer_user_message,
-                    original_user_message=clean_user_message,
-                    _should_review_memory=False,
-                    _turn_exit_reason="cancelled",
-                    _pending_verification_response=None,
-                    _pending_verification_response_previewed=False,
-                )
-            )
-            try:
-                await asyncio.shield(finalizer_task)
-            except asyncio.CancelledError:  # noqa: ASYNC103 - re-raised below
-                try:
-                    await asyncio.shield(finalizer_task)
-                except Exception:
-                    logger.error(
-                        "Cancelled prologue finalization failed", exc_info=True
-                    )
-            except Exception:
-                logger.error("Cancelled prologue finalization failed", exc_info=True)
+        await _finalize_boundary_cancellation(
+            agent,
+            user_message=user_message,
+            conversation_history=conversation_history,
+            task_id=task_id,
+            persist_user_message=persist_user_message,
+            persist_user_timestamp=persist_user_timestamp,
+            persist_user_display_kind=persist_user_display_kind,
+            persist_user_display_metadata=persist_user_display_metadata,
+        )
         raise
     user_message = _ctx.user_message
     original_user_message = _ctx.original_user_message
@@ -7236,23 +7261,35 @@ async def run_conversation(
     # Post-loop turn finalization extracted to agent/turn_finalizer.finalize_turn
     # (god-file decomposition Phase 1 step 4). Behavior-neutral: the assembled
     # result dict is returned exactly as before.
-    return await _turn_finalizer.finalize_turn(
-        agent,
-        final_response=final_response,
-        api_call_count=api_call_count,
-        interrupted=interrupted,
-        failed=failed,
-        messages=messages,
-        conversation_history=conversation_history,
-        effective_task_id=effective_task_id,
-        turn_id=turn_id,
-        user_message=user_message,
-        original_user_message=original_user_message,
-        _should_review_memory=_should_review_memory,
-        _turn_exit_reason=_turn_exit_reason,
-        _pending_verification_response=_pending_verification_response,
-        _pending_verification_response_previewed=_pending_verification_response_previewed,
+    turn_finalizer_task = asyncio.create_task(
+        _turn_finalizer.finalize_turn(
+            agent,
+            final_response=final_response,
+            api_call_count=api_call_count,
+            interrupted=interrupted,
+            failed=failed,
+            messages=messages,
+            conversation_history=conversation_history,
+            effective_task_id=effective_task_id,
+            turn_id=turn_id,
+            user_message=user_message,
+            original_user_message=original_user_message,
+            _should_review_memory=_should_review_memory,
+            _turn_exit_reason=_turn_exit_reason,
+            _pending_verification_response=_pending_verification_response,
+            _pending_verification_response_previewed=(
+                _pending_verification_response_previewed
+            ),
+        )
     )
+    try:
+        return await asyncio.shield(turn_finalizer_task)
+    except asyncio.CancelledError:  # noqa: ASYNC103 - re-raised after cleanup
+        try:
+            await asyncio.shield(turn_finalizer_task)
+        except Exception:
+            logger.error("Cancelled turn finalization failed", exc_info=True)
+        raise
 
 
 

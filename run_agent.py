@@ -6733,6 +6733,7 @@ class AIAgent:
         await turn_lock.acquire()
         self._active_turn_task = asyncio.current_task()
         effective_task_id = task_id or str(uuid.uuid4())
+        previous_turn_id = getattr(self, "_current_turn_id", None)
         session_id = str(getattr(self, "session_id", None) or "")
         token = None
         acct_token = None
@@ -6772,6 +6773,24 @@ class AIAgent:
                     persist_user_display_metadata=persist_user_display_metadata,
                     moa_config=moa_config,
                 )
+        except asyncio.CancelledError:
+            # Some awaited turn boundaries intentionally live outside the
+            # provider/post-processing cancellation handlers (context
+            # selection, pre-API compression, middleware, and Codex runtime).
+            # Finalize only when the turn marker is still owned here; narrower
+            # handlers clear it through the normal persistence funnel.
+            if getattr(self, "_current_turn_id", None) != previous_turn_id:
+                await _conversation_loop._finalize_boundary_cancellation(
+                    self,
+                    user_message=user_message,
+                    conversation_history=conversation_history,
+                    task_id=effective_task_id,
+                    persist_user_message=persist_user_message,
+                    persist_user_timestamp=persist_user_timestamp,
+                    persist_user_display_kind=persist_user_display_kind,
+                    persist_user_display_metadata=persist_user_display_metadata,
+                )
+            raise
         finally:
             _reset_interrupt_event(interrupt_token)
             if acct_token is not None:
