@@ -1,0 +1,8 @@
+{
+  "label": "User Guide",
+  "position": 2,
+  "link": {
+    "type": "generated-index",
+    "description": "Configure and use the retained Async Hermes Agent library features."
+  }
+}

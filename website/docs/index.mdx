@@ -1,0 +1,138 @@
+---
+slug: /
+sidebar_position: 0
+title: "Async Hermes Agent Documentation"
+description: "Native-async Hermes Agent library for agent turns, tools, MCP, skills, memory, sessions, and trajectory generation."
+hide_table_of_contents: true
+displayed_sidebar: docs
+---
+
+import Link from "@docusaurus/Link";
+import useBaseUrl from "@docusaurus/useBaseUrl";
+
+# Async Hermes Agent
+
+A native-async, library-focused distribution derived from
+[NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent) at
+upstream release `v2026.8.3`.
+
+It preserves the upstream `AIAgent`, runner, batch runner, provider, tool,
+MCP, skill, memory, session, and trajectory surfaces while making the active
+library path awaitable end to end.
+
+<div
+  style={{
+    display: "flex",
+    gap: "1rem",
+    marginBottom: "2rem",
+    flexWrap: "wrap",
+  }}
+>
+  <Link
+    to="/getting-started/installation"
+    style={{
+      display: "inline-block",
+      padding: "0.6rem 1.2rem",
+      backgroundColor: "#FFD700",
+      color: "#07070d",
+      borderRadius: "8px",
+      fontWeight: 600,
+      textDecoration: "none",
+    }}
+  >
+    Get Started →
+  </Link>
+  <Link
+    to="/getting-started/quickstart"
+    style={{
+      display: "inline-block",
+      padding: "0.6rem 1.2rem",
+      border: "1px solid rgba(255,215,0,0.2)",
+      borderRadius: "8px",
+      textDecoration: "none",
+    }}
+  >
+    Quickstart
+  </Link>
+  <a
+    href="https://github.com/ykoh42/async-hermes-agent"
+    style={{
+      display: "inline-block",
+      padding: "0.6rem 1.2rem",
+      border: "1px solid rgba(255,215,0,0.2)",
+      borderRadius: "8px",
+      textDecoration: "none",
+    }}
+  >
+    View on GitHub
+  </a>
+</div>
+
+## Install
+
+Python 3.11 through 3.13 is supported. Install the library directly from the
+release tag:
+
+```bash
+uv pip install "git+https://github.com/ykoh42/async-hermes-agent.git@v0.20.2"
+```
+
+See the full **[Installation Guide](/getting-started/installation)** for a
+development checkout, optional provider dependencies, and release artifacts.
+
+:::tip Fastest path to a working agent
+Choose a current tool-capable model, provide its credential, then follow the
+[Quickstart](/getting-started/quickstart). Existing upstream library call sites
+normally keep their imports and add `await` at I/O-bearing calls.
+:::
+
+## What is Async Hermes Agent?
+
+It is the retained Hermes agent harness as an async-only Python library. The
+conversation loop, providers, tools, MCP, skills, memory, sessions, delegation,
+trajectories, runner, and batch runner remain available under their familiar
+module paths. A host application owns its own HTTP, authentication, UI, and
+deployment lifecycle and awaits `AIAgent` directly.
+
+## Quick Links
+
+|                                                               |                                                                            |
+| ------------------------------------------------------------- | -------------------------------------------------------------------------- |
+| 🚀 **[Installation](/getting-started/installation)**          | Install a tagged release or create a development checkout                  |
+| 📖 **[Quickstart Tutorial](/getting-started/quickstart)**     | Run your first awaited conversation                                       |
+| 🐍 **[Python Library](/guides/python-library)**               | Lifecycle, return values, concurrency, cancellation, and service ownership |
+| ⚙️ **[Configuration](/user-guide/configuration)**             | Providers, models, toolsets, skills, MCP, memory, and sessions             |
+| 🔧 **[Tools & Toolsets](/user-guide/features/tools)**         | Retained tools and model-facing toolset control                            |
+| 📚 **[Skills System](/user-guide/features/skills)**           | Discover, read, and manage reusable skill documents                        |
+| 🔌 **[MCP Integration](/user-guide/features/mcp)**            | Connect stdio, Streamable HTTP, and SSE servers                            |
+| 🧠 **[Memory System](/user-guide/features/memory)**           | Persistent memory and user-profile context                                |
+| 💾 **[Sessions](/user-guide/sessions)**                       | Async SQLite persistence and resume                                        |
+| 🧪 **[Batch Processing](/user-guide/features/batch-processing)** | Generate resumable interleaved-thinking trajectories                     |
+| 🏗️ **[Architecture](/developer-guide/architecture)**          | Understand the native-async narrow waist                                   |
+| ❓ **[FAQ & Troubleshooting](/reference/faq)**                | Common integration and migration questions                                |
+
+## Key Features
+
+- **Native async end to end** — Model, tool, MCP, session, trajectory, runner,
+  and batch-runner I/O is awaited without a thread-pool compatibility fallback
+- **Familiar upstream surface** — Core file locations, import paths, public
+  names, arguments, and return shapes stay recognizable; I/O calls add `await`
+- **Extensible tool use** — Retained terminal, file, web, browser, vision,
+  skills, memory, session-search, clarification, delegation, and plugin tools
+- **MCP support** — Dynamic stdio, Streamable HTTP, and SSE server discovery
+  with ordered tool observations and explicit async lifecycle cleanup
+- **Persistent context** — SQLite sessions, memory, user-profile context, FTS
+  history search, checkpoints, and resume
+- **Training-data harness** — Preserve reasoning, tool calls, observations, and
+  final answers; generate JSONL trajectories with bounded batch concurrency
+- **Service-ready library** — Embed the agent in FastAPI or another async host
+  without bundling a second service framework or HTTP contract
+- **Upstream-traceable** — Derived from Hermes Agent `v2026.8.3` with original
+  source paths retained to make later migrations reviewable
+
+## For LLMs and coding agents
+
+- <a href={useBaseUrl('/llms.txt')}><code>llms.txt</code></a> provides a compact documentation index.
+- <a href={useBaseUrl('/llms-full.txt')}><code>llms-full.txt</code></a> concatenates the maintained documentation.
+
+Both files are generated from this site during the documentation build.
