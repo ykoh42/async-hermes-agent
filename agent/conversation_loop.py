@@ -25,7 +25,12 @@ import re
 import ssl
 import time
 from typing import Any, Dict, List, Optional
+from unittest.mock import Mock as _Mock
 
+from agent import system_prompt as _system_prompt
+from agent import turn_finalizer as _turn_finalizer
+from agent import verification_stop as _verification_stop
+from agent import verify_hooks as _verify_hooks
 from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.conversation_compression import (
     COMPRESSION_RETRY_CONTEXT_REDUCED_STATUS_TEMPLATE,
@@ -85,6 +90,8 @@ from agent.usage_pricing import (
     estimate_usage_cost,
     normalize_usage,
 )
+from hermes_cli import lifecycle as _lifecycle
+from hermes_cli import moa_config as _moa_config
 from hermes_constants import PARTIAL_STREAM_STUB_ID
 from hermes_logging import set_session_context
 from tools.skill_provenance import set_current_write_origin
@@ -520,9 +527,9 @@ async def _restore_or_build_system_prompt(agent, system_message, conversation_hi
         # non-Anthropic routes skip the rebuild), applies the startswith
         # safety gate (stored prompt bytes are never rewritten), and
         # fails open to the legacy cache layout.
-        from agent.system_prompt import reconstruct_static_prefix
-
-        await reconstruct_static_prefix(agent, system_message=system_message)
+        await _system_prompt.reconstruct_static_prefix(
+            agent, system_message=system_message
+        )
         return
     if stored_prompt:
         stored_state = "stale_runtime"
@@ -555,8 +562,7 @@ async def _restore_or_build_system_prompt(agent, system_message, conversation_hi
     # session is created (not on continuation).  Plugins can use this
     # to initialise session-scoped state (e.g. warm a memory cache).
     try:
-        from hermes_cli.lifecycle import invoke_hook as _invoke_hook
-        await _invoke_hook(
+        await _lifecycle.invoke_hook(
             "on_session_start",
             session_id=agent.session_id,
             model=agent.model,
@@ -973,9 +979,7 @@ async def _ensure_cached_system_prompt_static(agent, system_message=None) -> Non
     which memoizes failed rebuilds so this stays cheap on the retry-loop hot
     path (it runs at the top of every attempt).
     """
-    from agent.system_prompt import reconstruct_static_prefix
-
-    await reconstruct_static_prefix(
+    await _system_prompt.reconstruct_static_prefix(
         agent, system_message=system_message, log_label="failover redecoration"
     )
 
@@ -1237,9 +1241,9 @@ async def run_conversation(
     """
     if moa_config is None:
         try:
-            from hermes_cli.moa_config import decode_moa_turn
-
-            _decoded_message, _decoded_moa_config = decode_moa_turn(user_message)
+            _decoded_message, _decoded_moa_config = _moa_config.decode_moa_turn(
+                user_message
+            )
             if _decoded_moa_config is not None:
                 user_message = _decoded_message
                 moa_config = _decoded_moa_config
@@ -1346,10 +1350,8 @@ async def run_conversation(
         interrupted = True
         _turn_exit_reason = "cancelled"
         agent._session_messages = messages
-        from agent.turn_finalizer import finalize_turn
-
         finalizer_task = asyncio.create_task(
-            finalize_turn(
+            _turn_finalizer.finalize_turn(
                 agent,
                 final_response=final_response,
                 api_call_count=api_call_count,
@@ -2238,11 +2240,7 @@ async def run_conversation(
                     _llm_middleware_trace = []
 
                 try:
-                    from hermes_cli.lifecycle import (
-                        has_hook,
-                        invoke_hook as _invoke_hook,
-                    )
-                    if has_hook("pre_api_request"):
+                    if _lifecycle.has_hook("pre_api_request"):
                         request_messages = api_kwargs.get("messages")
                         if not isinstance(request_messages, list):
                             request_messages = api_kwargs.get("input")
@@ -2265,7 +2263,7 @@ async def run_conversation(
                         # provider client.  New consumers should read the
                         # sanitised view from ``request["body"]["messages"]``.
                         _request_payload = agent._api_request_payload_for_hook(api_kwargs)
-                        await _invoke_hook(
+                        await _lifecycle.invoke_hook(
                             "pre_api_request",
                             task_id=effective_task_id,
                             turn_id=turn_id,
@@ -2335,8 +2333,7 @@ async def run_conversation(
                     # No display/TTS consumer. Still prefer streaming for
                     # health checking, but skip for Mock clients in tests
                     # (mocks return SimpleNamespace, not stream iterators).
-                    from unittest.mock import Mock
-                    if isinstance(getattr(agent, "client", None), Mock):
+                    if isinstance(getattr(agent, "client", None), _Mock):
                         _use_streaming = False
 
                 async def _perform_api_call(next_api_kwargs):
@@ -5627,17 +5624,13 @@ async def run_conversation(
                     assistant_message.content = str(raw)
 
             try:
-                from hermes_cli.lifecycle import (
-                    has_hook,
-                    invoke_hook as _invoke_hook,
-                )
-                if has_hook("post_api_request"):
+                if _lifecycle.has_hook("post_api_request"):
                     _assistant_tool_calls = (
                         getattr(assistant_message, "tool_calls", None) or []
                     )
                     _assistant_text = assistant_message.content or ""
                     _api_ended_at = api_start_time + api_duration
-                    await _invoke_hook(
+                    await _lifecycle.invoke_hook(
                         "post_api_request",
                         task_id=effective_task_id,
                         turn_id=turn_id,
@@ -6922,20 +6915,17 @@ async def run_conversation(
                     messages.pop()
 
                 try:
-                    from agent.verification_stop import (
-                        build_verify_on_stop_nudge,
-                        verify_on_stop_enabled,
-                    )
-
-                    if await verify_on_stop_enabled():
-                        _verify_nudge = await build_verify_on_stop_nudge(
-                            session_id=getattr(agent, "session_id", None),
-                            changed_paths=getattr(
-                                agent, "_turn_file_mutation_paths", set()
-                            ),
-                            attempts=getattr(
-                                agent, "_verification_stop_nudges", 0
-                            ),
+                    if await _verification_stop.verify_on_stop_enabled():
+                        _verify_nudge = (
+                            await _verification_stop.build_verify_on_stop_nudge(
+                                session_id=getattr(agent, "session_id", None),
+                                changed_paths=getattr(
+                                    agent, "_turn_file_mutation_paths", set()
+                                ),
+                                attempts=getattr(
+                                    agent, "_verification_stop_nudges", 0
+                                ),
+                            )
                         )
                     else:
                         _verify_nudge = None
@@ -6989,14 +6979,12 @@ async def run_conversation(
                 )
                 _attempt = getattr(agent, "_pre_verify_nudges", 0)
                 try:
-                    from agent.verify_hooks import max_verify_nudges
-                    from hermes_cli.lifecycle import has_hook
                     from hermes_cli.plugins import get_pre_verify_continue_message
 
                     if (
                         _edited
-                        and has_hook("pre_verify")
-                        and _attempt < await max_verify_nudges()
+                        and _lifecycle.has_hook("pre_verify")
+                        and _attempt < await _verify_hooks.max_verify_nudges()
                     ):
                         coding = getattr(agent, "_resolved_is_coding", None)
                         if coding is None:
@@ -7169,8 +7157,7 @@ async def run_conversation(
     # Post-loop turn finalization extracted to agent/turn_finalizer.finalize_turn
     # (god-file decomposition Phase 1 step 4). Behavior-neutral: the assembled
     # result dict is returned exactly as before.
-    from agent.turn_finalizer import finalize_turn
-    return await finalize_turn(
+    return await _turn_finalizer.finalize_turn(
         agent,
         final_response=final_response,
         api_call_count=api_call_count,

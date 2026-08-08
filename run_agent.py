@@ -119,6 +119,11 @@ from model_tools import (
     get_toolset_for_tool,
     check_toolset_requirements,  # noqa: F401  # re-exported for tests that mock.patch("run_agent.check_toolset_requirements")
 )
+from agent import chat_completion_helpers as _chat_completion_helpers
+from agent import tool_executor as _tool_executor
+from hermes_cli import plugins as _plugins
+from hermes_cli import profiles as _profiles
+from tools import mcp_tool as _mcp_tool
 from tools.terminal_tool import cleanup_vm
 from tools.interrupt import (
     _bind_interrupt_event,
@@ -600,30 +605,21 @@ class AIAgent:
     async def __aenter__(self):
         """Support ``async with AIAgent(...)`` without a separate start API."""
         await self._ensure_provider_runtime()
-        from hermes_cli.plugins import discover_plugins
-
-        await discover_plugins()
+        await _plugins.discover_plugins()
         if not getattr(self, "_mcp_discovery_started", False):
-            from tools.mcp_tool import (
-                discover_mcp_tools,
-                _release_mcp_lifecycle,
-                refresh_agent_mcp_tools,
-                _retain_mcp_lifecycle,
-            )
-
             self._mcp_discovery_started = True
             try:
-                await _retain_mcp_lifecycle(self)
+                await _mcp_tool._retain_mcp_lifecycle(self)
                 self._mcp_lifecycle_retained = True
-                await discover_mcp_tools()
+                await _mcp_tool.discover_mcp_tools()
                 if not getattr(self, "_tool_snapshot_initialized", False):
-                    await refresh_agent_mcp_tools(
+                    await _mcp_tool.refresh_agent_mcp_tools(
                         self, quiet_mode=getattr(self, "quiet_mode", False)
                     )
                     self._tool_snapshot_initialized = True
             except BaseException:
                 if self._mcp_lifecycle_retained:
-                    await _release_mcp_lifecycle(self)
+                    await _mcp_tool._release_mcp_lifecycle(self)
                     self._mcp_lifecycle_retained = False
                 self._mcp_discovery_started = False
                 raise
@@ -642,8 +638,7 @@ class AIAgent:
         source = _session_source_for_agent(self.platform)
         try:
             try:
-                from hermes_cli.profiles import get_active_profile_name
-                _profile_for_session = get_active_profile_name()
+                _profile_for_session = _profiles.get_active_profile_name()
                 if _profile_for_session == "default":
                     _profile_for_session = None
             except Exception:
@@ -1464,8 +1459,9 @@ class AIAgent:
         if uses_implicit_default and base_url and is_local_endpoint(base_url):
             return float("inf")
 
-        from agent.chat_completion_helpers import estimate_request_context_tokens
-        est_tokens = estimate_request_context_tokens(api_payload)
+        est_tokens = _chat_completion_helpers.estimate_request_context_tokens(
+            api_payload
+        )
         if est_tokens > 100_000:
             return max(stale_base, 240.0)
         if est_tokens > 50_000:
@@ -1759,8 +1755,7 @@ class AIAgent:
 
     async def _cleanup_task_resources(self, task_id: str) -> None:
         """Forwarder — see ``agent.chat_completion_helpers.cleanup_task_resources``."""
-        from agent.chat_completion_helpers import cleanup_task_resources
-        await cleanup_task_resources(self, task_id)
+        await _chat_completion_helpers.cleanup_task_resources(self, task_id)
 
     def _build_memory_write_metadata(
         self,
@@ -4008,9 +4003,7 @@ class AIAgent:
         # this instance's lease and close them only after the final consumer.
         if getattr(self, "_mcp_lifecycle_retained", False):
             try:
-                from tools.mcp_tool import _release_mcp_lifecycle
-
-                await _release_mcp_lifecycle(self)
+                await _mcp_tool._release_mcp_lifecycle(self)
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -5472,8 +5465,7 @@ class AIAgent:
 
     async def _try_activate_fallback(self, reason: "FailoverReason | None" = None) -> bool:
         """Forwarder — see ``agent.chat_completion_helpers.try_activate_fallback``."""
-        from agent.chat_completion_helpers import try_activate_fallback
-        return await try_activate_fallback(self, reason)
+        return await _chat_completion_helpers.try_activate_fallback(self, reason)
 
     def _has_pending_fallback(self) -> bool:
         """Whether a fallback provider is actually available to switch to.
@@ -6080,8 +6072,7 @@ class AIAgent:
         tools_for_api: Optional[list] = None,
     ) -> dict:
         """Forwarder — see ``agent.chat_completion_helpers.build_api_kwargs``."""
-        from agent.chat_completion_helpers import build_api_kwargs
-        return await build_api_kwargs(
+        return await _chat_completion_helpers.build_api_kwargs(
             self,
             api_messages,
             tools_for_api=tools_for_api,
@@ -6269,8 +6260,9 @@ class AIAgent:
 
     def _build_assistant_message(self, assistant_message, finish_reason: str) -> dict:
         """Forwarder — see ``agent.chat_completion_helpers.build_assistant_message``."""
-        from agent.chat_completion_helpers import build_assistant_message
-        return build_assistant_message(self, assistant_message, finish_reason)
+        return _chat_completion_helpers.build_assistant_message(
+            self, assistant_message, finish_reason
+        )
 
     def _needs_thinking_reasoning_pad(self) -> bool:
         """Return True when the active provider enforces reasoning_content echo-back.
@@ -6682,16 +6674,15 @@ class AIAgent:
         api_call_count: int = 0,
     ) -> None:
         """Execute the model tool batch through native async handlers."""
-        from agent.tool_executor import execute_tool_calls_segmented
-
-        return await execute_tool_calls_segmented(
+        return await _tool_executor.execute_tool_calls_segmented(
             self, assistant_message, messages, effective_task_id, api_call_count
         )
 
     async def _handle_max_iterations(self, messages: list, api_call_count: int) -> str:
         """Forwarder — see ``agent.chat_completion_helpers.handle_max_iterations``."""
-        from agent.chat_completion_helpers import handle_max_iterations
-        return await handle_max_iterations(self, messages, api_call_count)
+        return await _chat_completion_helpers.handle_max_iterations(
+            self, messages, api_call_count
+        )
 
     async def _conversation_root_id(self) -> Optional[str]:
         """Resolve the stable conversation id for Portal usage attribution.

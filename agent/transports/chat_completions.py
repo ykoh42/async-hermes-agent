@@ -12,6 +12,7 @@ reasoning configuration, temperature handling, and extra_body assembly.
 import json
 from typing import Any, Dict
 
+from agent import gemini_native_adapter as _gemini_native_adapter
 from agent.lmstudio_reasoning import resolve_lmstudio_effort
 from agent.moonshot_schema import is_moonshot_model, sanitize_moonshot_tools
 from agent.prompt_builder import DEVELOPER_ROLE_MODELS
@@ -716,8 +717,9 @@ class ChatCompletionsTransport(ProviderTransport):
             # a fallback/aux call lands on Gemini. The native client only reads
             # thinking_config from extra_body, so drop everything else here.
             try:
-                from agent.gemini_native_adapter import is_native_gemini_base_url
-                _native_gemini = is_native_gemini_base_url(params.get("base_url"))
+                _native_gemini = _gemini_native_adapter.is_native_gemini_base_url(
+                    params.get("base_url")
+                )
             except Exception:
                 _native_gemini = False
             if _native_gemini:

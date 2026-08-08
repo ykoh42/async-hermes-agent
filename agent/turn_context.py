@@ -47,6 +47,9 @@ from agent.model_metadata import (
     estimate_messages_tokens_rough,
     estimate_request_tokens_rough,
 )
+from hermes_cli import plugins as _plugins
+from tools import hook_output_spill as _hook_output_spill
+from tools import mcp_tool as _mcp_tool
 
 logger = logging.getLogger(__name__)
 
@@ -374,27 +377,18 @@ async def build_turn_context(
         agent, "_tool_snapshot_initialized", False
     )
     try:
-        from hermes_cli.plugins import discover_plugins
-
-        await discover_plugins()
+        await _plugins.discover_plugins()
         if not getattr(agent, "_skip_mcp_refresh", False):
             # The first discovery is intentionally lazy: ``AIAgent.__init__``
             # must not open an MCP transport or synchronously wait on a remote
             # server.  Subsequent turns only refresh the in-memory snapshot.
-            from tools.mcp_tool import (
-                discover_mcp_tools,
-                has_registered_mcp_tools,
-                refresh_agent_mcp_tools,
-                _retain_mcp_lifecycle,
-            )
-
             if not getattr(agent, "_mcp_discovery_started", False):
                 agent._mcp_discovery_started = True
-                await _retain_mcp_lifecycle(agent)
+                await _mcp_tool._retain_mcp_lifecycle(agent)
                 agent._mcp_lifecycle_retained = True
-                await discover_mcp_tools()
-            if initial_tool_snapshot or has_registered_mcp_tools():
-                await refresh_agent_mcp_tools(
+                await _mcp_tool.discover_mcp_tools()
+            if initial_tool_snapshot or _mcp_tool.has_registered_mcp_tools():
+                await _mcp_tool.refresh_agent_mcp_tools(
                     agent,
                     quiet_mode=(
                         True
@@ -406,18 +400,14 @@ async def build_turn_context(
     except asyncio.CancelledError:
         if initial_tool_snapshot:
             if getattr(agent, "_mcp_lifecycle_retained", False):
-                from tools.mcp_tool import _release_mcp_lifecycle
-
-                await _release_mcp_lifecycle(agent)  # noqa: ASYNC120
+                await _mcp_tool._release_mcp_lifecycle(agent)  # noqa: ASYNC120
                 agent._mcp_lifecycle_retained = False
             agent._mcp_discovery_started = False
         raise
     except Exception:
         if initial_tool_snapshot:
             if getattr(agent, "_mcp_lifecycle_retained", False):
-                from tools.mcp_tool import _release_mcp_lifecycle
-
-                await _release_mcp_lifecycle(agent)  # noqa: ASYNC120
+                await _mcp_tool._release_mcp_lifecycle(agent)  # noqa: ASYNC120
                 agent._mcp_lifecycle_retained = False
             agent._mcp_discovery_started = False
             raise
@@ -1053,9 +1043,7 @@ async def build_turn_context(
         logger.warning("pre_llm_call hook failed: %s", exc)
     else:
         context_parts = []
-        from tools.hook_output_spill import get_spill_config, spill_if_oversized
-
-        spill_config = await get_spill_config()
+        spill_config = await _hook_output_spill.get_spill_config()
         for result in pre_llm_results:
             piece = ""
             if isinstance(result, dict) and result.get("context"):
@@ -1064,7 +1052,7 @@ async def build_turn_context(
                 piece = result
             if piece:
                 context_parts.append(
-                    await spill_if_oversized(
+                    await _hook_output_spill.spill_if_oversized(
                         piece,
                         session_id=agent.session_id,
                         source="plugin hook",
