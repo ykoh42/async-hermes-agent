@@ -98,14 +98,22 @@ async def _append_jsonl_line(path: Path, payload: Dict[str, Any]) -> None:
             await aiofiles.os.wrap(os.fsync)(output.fileno())
 
     write_task = asyncio.create_task(_append())
-    try:
-        await asyncio.shield(write_task)
-    except asyncio.CancelledError:
-        # Complete the already-started row before the worker is cancelled.
-        # ``shield`` preserves the write task while this coroutine receives
-        # cancellation, and this await also surfaces an actual write error.
-        await asyncio.shield(write_task)
-        raise
+    cancellation: asyncio.CancelledError | None = None
+    while True:
+        try:
+            await asyncio.shield(write_task)
+            break
+        except asyncio.CancelledError as exc:  # noqa: ASYNC103 - re-raised below
+            # Complete the already-started row before the worker is cancelled.
+            # Keep waiting through repeated caller cancellation; otherwise the
+            # owned write task can outlive BatchRunner.run().  A cancellation
+            # of the write task itself is different and must still propagate.
+            if write_task.cancelled():
+                raise
+            if cancellation is None:
+                cancellation = exc
+    if cancellation is not None:
+        raise cancellation
 
 
 async def _list_batch_files(directory: Path) -> List[Path]:

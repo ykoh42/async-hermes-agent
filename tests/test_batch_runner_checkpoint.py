@@ -92,6 +92,62 @@ async def test_jsonl_append_completes_current_row_before_cancellation(tmp_path):
         assert json.loads(rows[0]) == {"prompt_index": 7}
 
 
+@pytest.mark.asyncio
+async def test_jsonl_append_repeated_cancellation_waits_for_owned_write(
+    tmp_path,
+    monkeypatch,
+):
+    """Repeated cancellation cannot detach the shielded row-write task."""
+    write_started = asyncio.Event()
+    release_write = asyncio.Event()
+    write_completed = asyncio.Event()
+
+    class ControlledFile:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def write(self, _line):
+            write_started.set()
+            await release_write.wait()
+            write_completed.set()
+
+        async def flush(self):
+            return None
+
+        def fileno(self):
+            return 1
+
+    def fake_wrap(_function):
+        async def wrapped(*_args, **_kwargs):
+            return None
+
+        return wrapped
+
+    monkeypatch.setattr(
+        "batch_runner.aiofiles.open",
+        lambda *_args, **_kwargs: ControlledFile(),
+    )
+    monkeypatch.setattr("batch_runner.aiofiles.os.wrap", fake_wrap)
+
+    task = asyncio.create_task(
+        _append_jsonl_line(tmp_path / "batch_0.jsonl", {"prompt_index": 8})
+    )
+    await write_started.wait()
+    task.cancel()
+    await asyncio.sleep(0)
+    task.cancel()
+    await asyncio.sleep(0)
+
+    assert task.done() is False
+    release_write.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert write_completed.is_set()
+
+
 class TestLoadCheckpoint:
     """Verify _load_checkpoint reads existing data or returns defaults."""
 
