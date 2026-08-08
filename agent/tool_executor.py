@@ -698,6 +698,13 @@ async def _execute_tool_calls_native(
                     )
                     if key in dispatch_kwargs
                 }
+                if name == "delegate_task":
+                    # Upstream dispatch passes the live AIAgent only into
+                    # delegate_task so children inherit provider, tool,
+                    # session, and lifecycle state. Keep it context-local
+                    # rather than widening handle_function_call's public
+                    # signature or exposing the agent to unrelated tools.
+                    handler_context["parent_agent"] = agent
                 context_token = _TOOL_HANDLER_CONTEXT.set(handler_context)
                 try:
                     return await handle_function_call(

@@ -1264,6 +1264,7 @@ class TestOrchestratorRoleSchema(unittest.IsolatedAsyncioTestCase):
     async def test_default_role_is_leaf(self):
         child = await self._run_with_mock_child(_SENTINEL)
         self.assertEqual(child._delegate_role, "leaf")
+        self.assertFalse(child._close_session_db_on_close)
 
 
     def test_schema_omits_acp_transport_fields(self):

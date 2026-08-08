@@ -1768,6 +1768,11 @@ def init_agent(
                 f"got {type(session_db).__name__}"
             )
     agent._session_db = session_db
+    # Publicly supplied SessionDB instances transfer ownership to a normal
+    # AIAgent. Internal child agents may explicitly borrow the parent's live
+    # connection after construction; their builder flips this flag before the
+    # child can run.
+    agent._close_session_db_on_close = True
     # ``switch_model()`` remains a synchronous state mutation; its billing
     # route is durably recorded by the next native async turn boundary.
     agent._pending_billing_route = None

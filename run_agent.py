@@ -4050,9 +4050,13 @@ class AIAgent:
             pass
         try:
             session_db = getattr(self, "_session_db", None)
-            if session_db is not None:
+            if session_db is not None and getattr(
+                self,
+                "_close_session_db_on_close",
+                True,
+            ):
                 await session_db.close()
-                self._session_db = None
+            self._session_db = None
         except Exception:
             logger.debug("Async session DB close failed", exc_info=True)
 

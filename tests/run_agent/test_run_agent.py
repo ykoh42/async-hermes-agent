@@ -1405,8 +1405,33 @@ class TestExecuteToolCalls:
             await agent._execute_tool_calls(mock_msg, messages, "task-1")
 
         assert captured_context["store"] is agent._memory_store
+        assert "parent_agent" not in captured_context
         assert dispatch.await_args.args[1]["old_text"] == old_text
         assert messages[-1]["tool_call_id"] == "mem-1"
+
+    @pytest.mark.asyncio
+    async def test_delegate_tool_receives_the_parent_agent(self, agent):
+        tc = _mock_tool_call(
+            name="delegate_task",
+            arguments=json.dumps({"goal": "inspect the async runtime"}),
+            call_id="delegate-1",
+        )
+        mock_msg = _mock_assistant_msg(content="", tool_calls=[tc])
+        messages = []
+        agent._flush_messages_to_session_db = AsyncMock(return_value=True)
+
+        with patch(
+            "tools.delegate_tool.delegate_task",
+            new_callable=AsyncMock,
+            return_value=json.dumps({"status": "dispatched"}),
+        ) as delegate:
+            await agent._execute_tool_calls(mock_msg, messages, "task-1")
+
+        delegate.assert_awaited_once()
+        assert delegate.await_args.kwargs["parent_agent"] is agent
+        assert delegate.await_args.kwargs["background"] is True
+        assert messages[-1]["tool_call_id"] == "delegate-1"
+        assert json.loads(messages[-1]["content"])["status"] == "dispatched"
 
     @pytest.mark.asyncio
     async def test_cancellation_emits_cancelled_post_tool_hook(self, agent, monkeypatch):

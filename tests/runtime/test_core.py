@@ -2623,6 +2623,24 @@ async def test_close_cancels_and_awaits_background_delegations():
 
 
 @pytest.mark.asyncio
+async def test_close_detaches_borrowed_session_db_without_closing_it(tmp_path):
+    agent = AIAgent.__new__(AIAgent)
+    database = SessionDB(tmp_path / "borrowed.db")
+    await database.create_session("before-child-close", "test")
+    agent._session_db = database
+    agent._close_session_db_on_close = False
+    agent._end_session_on_close = False
+
+    await agent.close()
+
+    assert agent._session_db is None
+    assert agent._closed is True
+    await database.create_session("after-child-close", "test")
+    assert await database.get_session("after-child-close") is not None
+    await database.close()
+
+
+@pytest.mark.asyncio
 async def test_close_propagates_caller_cancellation_while_awaiting_active_turn():
     agent = AIAgent.__new__(AIAgent)
     turn_started = asyncio.Event()

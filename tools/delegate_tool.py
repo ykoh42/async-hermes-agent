@@ -1523,6 +1523,10 @@ async def _build_child_agent(
             iteration_budget=None,  # fresh budget per subagent
             **child_optional_kwargs,
         )
+    # The child persists its own linked session through the parent's database,
+    # but it only borrows that connection. Closing a child must not invalidate
+    # the parent turn that receives the background completion.
+    child._close_session_db_on_close = False
     child._print_fn = getattr(parent_agent, "_print_fn", None)
     # Now the child exists, its session id can ride on every relayed event
     # (including the spawn_requested below — first emit happens after this).

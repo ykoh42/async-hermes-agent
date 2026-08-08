@@ -158,13 +158,17 @@ HERMES_LIVE_TESTS=1 HERMES_LIVE_PROVIDER=copilot \
     tests/e2e/test_live_provider_extensions_path.py \
     tests/e2e/test_live_provider_state_path.py \
     tests/e2e/test_live_provider_timeout_path.py \
+    tests/e2e/test_live_provider_concurrency_path.py \
+    tests/e2e/test_live_provider_subagent_path.py \
     tests/e2e/test_live_batch_runner_path.py
 ```
 
 These tests cover provider-to-tool observations and trajectory ordering, a real
 stdio MCP server and skill loading, persistent memory and cross-instance
 session resume, timeout cleanup and next-turn recovery, and batch checkpoint
-resume. They also fail on event-loop blocking or leaked tasks. Set
+resume. They also verify overlapping requests across agent instances,
+per-agent turn serialization, and background subagent reinjection and cleanup.
+Every path fails on event-loop blocking or leaked tasks. Set
 `HERMES_LIVE_MODEL` to override the provider's test default; OpenRouter runs
 also require `OPENROUTER_API_KEY`.
 
