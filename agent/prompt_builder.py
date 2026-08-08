@@ -8,9 +8,9 @@ import json
 import logging
 import os
 import sys
-import threading
 import contextvars
 import asyncio
+import weakref
 import aiofiles
 import aiofiles.os
 from collections import OrderedDict
@@ -594,7 +594,9 @@ def drain_truncation_warnings() -> list:
 
 _SKILLS_PROMPT_CACHE_MAX = 8
 _SKILLS_PROMPT_CACHE: OrderedDict[tuple, str] = OrderedDict()
-_SKILLS_PROMPT_CACHE_LOCK = threading.Lock()
+_SKILLS_PROMPT_CACHE_LOCKS: weakref.WeakKeyDictionary[
+    asyncio.AbstractEventLoop, weakref.ReferenceType[asyncio.Lock]
+] = weakref.WeakKeyDictionary()
 # v2: entries gained org provenance fields (org_id/org_author/rel_dir) for M2
 # org-shared skills; older snapshots are discarded and rebuilt.
 _SKILLS_SNAPSHOT_VERSION = 2
@@ -604,30 +606,29 @@ def _skills_prompt_snapshot_path() -> Path:
     return get_hermes_home() / ".skills_prompt_snapshot.json"
 
 
-def clear_skills_system_prompt_cache(*, clear_snapshot: bool = False) -> None:
+def _get_skills_prompt_cache_lock() -> asyncio.Lock:
+    loop = asyncio.get_running_loop()
+    lock_ref = _SKILLS_PROMPT_CACHE_LOCKS.get(loop)
+    lock = lock_ref() if lock_ref is not None else None
+    if lock is None:
+        lock = asyncio.Lock()
+        _SKILLS_PROMPT_CACHE_LOCKS[loop] = weakref.ref(lock)
+    return lock
+
+
+async def clear_skills_system_prompt_cache(
+    *, clear_snapshot: bool = False
+) -> None:
     """Drop the in-process skills prompt cache (and optionally the disk snapshot)."""
-    with _SKILLS_PROMPT_CACHE_LOCK:
+    async with _get_skills_prompt_cache_lock():
         _SKILLS_PROMPT_CACHE.clear()
     if clear_snapshot:
         try:
-            _skills_prompt_snapshot_path().unlink(missing_ok=True)
-        except OSError as e:
-            logger.debug("Could not remove skills prompt snapshot: %s", e)
-
-
-async def _clear_skills_prompt_snapshot() -> None:
-    """Remove the on-disk skills snapshot at an awaited lifecycle boundary.
-
-    ``clear_skills_system_prompt_cache`` remains synchronous for setup and
-    compatibility callers.  Runtime tool mutation uses this coroutine so a
-    successful skill edit never performs a blocking unlink on the event loop.
-    """
-    try:
-        await aiofiles.os.remove(_skills_prompt_snapshot_path())
-    except FileNotFoundError:
-        return
-    except OSError as exc:
-        logger.debug("Could not remove skills prompt snapshot: %s", exc)
+            await aiofiles.os.remove(_skills_prompt_snapshot_path())
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            logger.debug("Could not remove skills prompt snapshot: %s", exc)
 
 
 
@@ -870,7 +871,7 @@ async def build_skills_system_prompt(
         tuple(sorted(disabled)),
         tuple(sorted(compact_categories or ())),
     )
-    with _SKILLS_PROMPT_CACHE_LOCK:
+    async with _get_skills_prompt_cache_lock():
         cached = _SKILLS_PROMPT_CACHE.get(cache_key)
         if cached is not None:
             _SKILLS_PROMPT_CACHE.move_to_end(cache_key)
@@ -1105,7 +1106,7 @@ async def build_skills_system_prompt(
         )
 
     # ── Store in LRU cache ────────────────────────────────────────────
-    with _SKILLS_PROMPT_CACHE_LOCK:
+    async with _get_skills_prompt_cache_lock():
         _SKILLS_PROMPT_CACHE[cache_key] = result
         _SKILLS_PROMPT_CACHE.move_to_end(cache_key)
         while len(_SKILLS_PROMPT_CACHE) > _SKILLS_PROMPT_CACHE_MAX:

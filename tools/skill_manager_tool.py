@@ -669,14 +669,10 @@ async def skill_manage(
             }
 
         if result.get("success"):
-            from agent.prompt_builder import (
-                _clear_skills_prompt_snapshot,
-                clear_skills_system_prompt_cache,
-            )
+            from agent.prompt_builder import clear_skills_system_prompt_cache
             from tools.skills_tool import _SKILLS_CACHE
 
-            clear_skills_system_prompt_cache()
-            await _clear_skills_prompt_snapshot()
+            await clear_skills_system_prompt_cache(clear_snapshot=True)
             _SKILLS_CACHE.clear()
         return json.dumps(result, ensure_ascii=False)
 

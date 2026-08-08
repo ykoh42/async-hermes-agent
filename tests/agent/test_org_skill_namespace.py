@@ -117,7 +117,7 @@ class TestSnapshotEntryProvenance:
 
 
 class TestListingCollisionsAndLabels:
-    def _render(self, tmp_path, monkeypatch):
+    async def _render(self, tmp_path, monkeypatch):
         from agent import prompt_builder as pb
 
         skills = tmp_path / "skills"
@@ -136,12 +136,12 @@ class TestListingCollisionsAndLabels:
         monkeypatch.setattr(
             pb, "_skills_prompt_snapshot_path", lambda: tmp_path / "snap.json"
         )
-        pb.clear_skills_system_prompt_cache()
+        await pb.clear_skills_system_prompt_cache()
         return skills, pb
 
     @pytest.mark.asyncio
     async def test_org_skill_listed_with_provenance_tag(self, tmp_path, monkeypatch):
-        skills, pb = self._render(tmp_path, monkeypatch)
+        skills, pb = await self._render(tmp_path, monkeypatch)
         _mk_skill(skills, "personal-a")
         _mk_skill(skills, f"{sku.ORG_MIRROR_DIR_NAME}/org-1/shared-x", name="shared-x")
         (skills / sku.ORG_MIRROR_DIR_NAME / "org-1" / sku.ORG_PROVENANCE_FILE).write_text(
@@ -155,7 +155,7 @@ class TestListingCollisionsAndLabels:
 
     @pytest.mark.asyncio
     async def test_collision_flags_both_sides(self, tmp_path, monkeypatch):
-        skills, pb = self._render(tmp_path, monkeypatch)
+        skills, pb = await self._render(tmp_path, monkeypatch)
         _mk_skill(skills, "k8s-debug", body="personal version\n")
         _mk_skill(
             skills, f"{sku.ORG_MIRROR_DIR_NAME}/org-1/k8s-debug", name="k8s-debug"
@@ -167,7 +167,7 @@ class TestListingCollisionsAndLabels:
 
     @pytest.mark.asyncio
     async def test_no_collision_flag_when_unique(self, tmp_path, monkeypatch):
-        skills, pb = self._render(tmp_path, monkeypatch)
+        skills, pb = await self._render(tmp_path, monkeypatch)
         _mk_skill(skills, "personal-a")
         _mk_skill(skills, f"{sku.ORG_MIRROR_DIR_NAME}/org-1/shared-x", name="shared-x")
         _mark_active(skills, "org-1")

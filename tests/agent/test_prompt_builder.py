@@ -267,14 +267,39 @@ class TestPromptBuilderImports:
 # =========================================================================
 
 
+@pytest.mark.asyncio
+async def test_clear_skills_cache_removes_snapshot_without_blocking(
+    monkeypatch, tmp_path
+):
+    from agent import prompt_builder
+
+    snapshot = tmp_path / "skills-snapshot.json"
+    snapshot.write_text("{}", encoding="utf-8")
+    prompt_builder._SKILLS_PROMPT_CACHE[("test",)] = "cached"
+    monkeypatch.setattr(prompt_builder, "_skills_prompt_snapshot_path", lambda: snapshot)
+
+    blocker = BlockBuster()
+    blocker.activate()
+    try:
+        await prompt_builder.clear_skills_system_prompt_cache(clear_snapshot=True)
+    finally:
+        blocker.deactivate()
+
+    assert not prompt_builder._SKILLS_PROMPT_CACHE
+    assert not snapshot.exists()
+
+
 class TestBuildSkillsSystemPrompt:
     @pytest.fixture(autouse=True)
     def _clear_skills_cache(self):
         """Ensure the in-process skills prompt cache doesn't leak between tests."""
-        from agent.prompt_builder import clear_skills_system_prompt_cache
-        clear_skills_system_prompt_cache(clear_snapshot=True)
+        from agent import prompt_builder
+
+        prompt_builder._SKILLS_PROMPT_CACHE.clear()
+        prompt_builder._skills_prompt_snapshot_path().unlink(missing_ok=True)
         yield
-        clear_skills_system_prompt_cache(clear_snapshot=True)
+        prompt_builder._SKILLS_PROMPT_CACHE.clear()
+        prompt_builder._skills_prompt_snapshot_path().unlink(missing_ok=True)
 
     def test_help_guidance_does_not_route_to_removed_skill_or_cli(self):
         from agent.prompt_builder import HERMES_AGENT_HELP_GUIDANCE
@@ -642,10 +667,13 @@ class TestSkillShouldShow:
 class TestBuildSkillsSystemPromptConditional:
     @pytest.fixture(autouse=True)
     def _clear_skills_cache(self):
-        from agent.prompt_builder import clear_skills_system_prompt_cache
-        clear_skills_system_prompt_cache(clear_snapshot=True)
+        from agent import prompt_builder
+
+        prompt_builder._SKILLS_PROMPT_CACHE.clear()
+        prompt_builder._skills_prompt_snapshot_path().unlink(missing_ok=True)
         yield
-        clear_skills_system_prompt_cache(clear_snapshot=True)
+        prompt_builder._SKILLS_PROMPT_CACHE.clear()
+        prompt_builder._skills_prompt_snapshot_path().unlink(missing_ok=True)
 
 
 
