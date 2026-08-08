@@ -49,7 +49,36 @@ def test_session_source_ignores_process_global_legacy_value(monkeypatch):
     assert _session_source_for_agent("web") == "web"
 
 
-def test_clear_session_vars_restores_nested_context():
+def test_set_session_vars_preserves_upstream_positional_order(tmp_path):
+    tokens = set_session_vars(
+        "platform",
+        "source",
+        "chat-id",
+        "chat-type",
+        "chat-name",
+        "thread-id",
+        "user-id",
+        "user-name",
+        "session-key",
+        "session-id",
+        "message-id",
+        "profile-name",
+        str(tmp_path),
+        False,
+        "ui-session-id",
+        "1",
+    )
+    try:
+        assert get_session_env("HERMES_SESSION_MESSAGE_ID") == "message-id"
+        assert get_session_env("HERMES_SESSION_PROFILE") == "profile-name"
+        assert get_session_env("HERMES_UI_SESSION_ID") == "ui-session-id"
+        assert get_session_env("HERMES_CRON_SESSION") == "1"
+        assert async_delivery_supported() is False
+    finally:
+        clear_session_vars(tokens)
+
+
+def test_clear_session_vars_preserves_upstream_non_nestable_semantics():
     outer = set_session_vars(session_key="outer", async_delivery=False)
     try:
         inner = set_session_vars(session_key="inner", async_delivery=True)
@@ -59,8 +88,8 @@ def test_clear_session_vars_restores_nested_context():
         finally:
             clear_session_vars(inner)
 
-        assert get_session_env("HERMES_SESSION_KEY") == "outer"
-        assert async_delivery_supported() is False
+        assert get_session_env("HERMES_SESSION_KEY") == ""
+        assert async_delivery_supported() is True
     finally:
         clear_session_vars(outer)
 

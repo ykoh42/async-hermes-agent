@@ -87,14 +87,14 @@ def set_session_vars(
     user_name: str = "",
     session_key: str = "",
     session_id: str = "",
+    message_id: str = "",
     profile: str = "",
     cwd: str = "",
-    message_id: str = "",
     async_delivery: bool = True,
     ui_session_id: str = "",
     cron_session: Any = _UNSET,
 ) -> list[Token]:
-    """Bind request-scoped metadata and return tokens for restoration."""
+    """Bind request-scoped metadata and return compatibility tokens."""
     global _session_context_engaged
     _session_context_engaged = True
     values = (
@@ -125,16 +125,15 @@ def set_session_vars(
 
 
 def clear_session_vars(tokens: list[Token]) -> None:
-    """Restore metadata previously bound by :func:`set_session_vars`.
+    """Mark session metadata explicitly cleared, matching upstream semantics.
 
-    Keep the token-reset contract from the upstream helper.  Assigning empty
-    strings here would hide an outer request's context in nested scopes and
-    would leave the process-global fallback permanently shadowed.
+    ``tokens`` is retained for API compatibility.  The upstream helper is
+    intentionally not nestable: clearing suppresses stale process-global
+    fallbacks instead of restoring values from an outer binding.
     """
-    for variable, token in zip(_SESSION_VARS, tokens):
-        variable.reset(token)
-    if len(tokens) > len(_SESSION_VARS):
-        _SESSION_ASYNC_DELIVERY.reset(tokens[len(_SESSION_VARS)])
+    for variable in _SESSION_VARS:
+        variable.set("")
+    _SESSION_ASYNC_DELIVERY.set(_UNSET)
     try:
         from agent.runtime_cwd import clear_session_cwd
 
