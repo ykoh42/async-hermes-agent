@@ -1198,6 +1198,24 @@ async def _notify_context_engine_turn_complete(
         )
 
 
+async def _finish_cancelled_finalizer(
+    finalizer_task: asyncio.Task[Any],
+    *,
+    error_message: str,
+) -> None:
+    """Wait through repeated caller cancellation for an owned finalizer."""
+    while True:
+        try:
+            await asyncio.shield(finalizer_task)
+            return
+        except asyncio.CancelledError:  # noqa: ASYNC103 - retry unless child cancelled
+            if finalizer_task.cancelled():
+                raise
+        except Exception:
+            logger.error(error_message, exc_info=True)
+            return
+
+
 async def _finalize_boundary_cancellation(
     agent: Any,
     *,
@@ -1281,10 +1299,10 @@ async def _finalize_boundary_cancellation(
     try:
         await asyncio.shield(finalizer_task)
     except asyncio.CancelledError:  # noqa: ASYNC103 - caller re-raises below
-        try:
-            await asyncio.shield(finalizer_task)
-        except Exception:
-            logger.error("Cancelled boundary finalization failed", exc_info=True)
+        await _finish_cancelled_finalizer(
+            finalizer_task,
+            error_message="Cancelled boundary finalization failed",
+        )
     except Exception:
         logger.error("Cancelled boundary finalization failed", exc_info=True)
 
@@ -1478,10 +1496,10 @@ async def run_conversation(
         try:
             await asyncio.shield(finalizer_task)
         except asyncio.CancelledError:  # noqa: ASYNC103 - caller cancellation below
-            try:
-                await asyncio.shield(finalizer_task)
-            except Exception:
-                logger.error("Cancelled turn finalization failed", exc_info=True)
+            await _finish_cancelled_finalizer(
+                finalizer_task,
+                error_message="Cancelled turn finalization failed",
+            )
         except Exception:
             logger.error("Cancelled turn finalization failed", exc_info=True)
 
@@ -7285,10 +7303,10 @@ async def run_conversation(
     try:
         return await asyncio.shield(turn_finalizer_task)
     except asyncio.CancelledError:  # noqa: ASYNC103 - re-raised after cleanup
-        try:
-            await asyncio.shield(turn_finalizer_task)
-        except Exception:
-            logger.error("Cancelled turn finalization failed", exc_info=True)
+        await _finish_cancelled_finalizer(
+            turn_finalizer_task,
+            error_message="Cancelled turn finalization failed",
+        )
         raise
 
 

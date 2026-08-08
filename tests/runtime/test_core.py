@@ -3982,6 +3982,14 @@ async def test_repeated_cancellation_waits_for_turn_finalizer_then_reraises(
         turn_task.cancel()
         await asyncio.wait_for(finalizer_started.wait(), timeout=5)
         turn_task.cancel()
+        await asyncio.sleep(0)
+        turn_task.cancel()
+
+        # Repeated cancellation must not detach the still-running finalizer.
+        await asyncio.sleep(0)
+        assert turn_task.done() is False
+        assert finalizer_completed is False
+
         release_finalizer.set()
 
         with pytest.raises(asyncio.CancelledError):

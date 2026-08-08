@@ -408,6 +408,27 @@ def is_malformed_db_error(exc: BaseException) -> bool:
     )
 
 
+async def _close_owned_connection(connection: Any) -> None:
+    """Finish closing one owned connection before propagating cancellation."""
+    close_task = asyncio.create_task(connection.close())
+    cancellation: asyncio.CancelledError | None = None
+    while True:
+        try:
+            await asyncio.shield(close_task)
+            break
+        except asyncio.CancelledError as exc:  # noqa: ASYNC103 - re-raised below
+            if close_task.cancelled():
+                raise
+            if cancellation is None:
+                cancellation = exc
+        except Exception as exc:
+            if cancellation is not None:
+                raise cancellation from exc
+            raise
+    if cancellation is not None:
+        raise cancellation
+
+
 def _claim_repair_attempt(db_path: Path) -> bool:
     """Claim the process-local one-shot repair attempt for ``db_path``."""
     key = str(db_path)
@@ -1745,12 +1766,7 @@ class SessionDB:
                     return connection
                 finally:
                     if not initialized and connection is not None:
-                        close_task = asyncio.create_task(connection.close())
-                        try:
-                            await asyncio.shield(close_task)
-                        except asyncio.CancelledError:
-                            await asyncio.shield(close_task)
-                            raise
+                        await _close_owned_connection(connection)
 
             deadline = time.monotonic() + self._WRITE_PATIENCE_S
             while True:
@@ -7508,12 +7524,8 @@ class SessionDB:
         self._connection_tracking_key = None
         if connection is None:
             return
-        close_task = asyncio.create_task(connection.close())
         try:
-            await asyncio.shield(close_task)
-        except asyncio.CancelledError:
-            await asyncio.shield(close_task)
-            raise
+            await _close_owned_connection(connection)
         finally:
             if tracking_key is not None:
                 remaining = _live_connection_counts.get(tracking_key, 1) - 1
