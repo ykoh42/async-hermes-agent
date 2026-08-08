@@ -8,6 +8,7 @@ from tools.budget_config import (
     DEFAULT_PREVIEW_SIZE_CHARS,
     BudgetConfig,
 )
+from tools.environments.local import LocalEnvironment
 from tools.tool_result_storage import (
     PERSISTED_OUTPUT_TAG,
     PERSISTED_OUTPUT_CLOSING_TAG,
@@ -102,13 +103,28 @@ class TestWriteToSandbox:
 
 
 class TestResolveStorageDir:
-    def test_defaults_to_storage_dir_without_env(self):
-        assert _resolve_storage_dir(None) == STORAGE_DIR
+    @pytest.mark.asyncio
+    async def test_defaults_to_storage_dir_without_env(self):
+        assert await _resolve_storage_dir(None) == STORAGE_DIR
 
-    def test_uses_env_temp_dir_when_available(self):
+    @pytest.mark.asyncio
+    async def test_uses_env_temp_dir_when_available(self):
         env = MagicMock()
-        env.get_temp_dir.return_value = "/data/data/com.termux/files/usr/tmp"
-        assert _resolve_storage_dir(env) == "/data/data/com.termux/files/usr/tmp/hermes-results"
+        env.get_temp_dir = AsyncMock(
+            return_value="/data/data/com.termux/files/usr/tmp"
+        )
+        assert await _resolve_storage_dir(env) == (
+            "/data/data/com.termux/files/usr/tmp/hermes-results"
+        )
+
+    @pytest.mark.asyncio
+    async def test_local_environment_preserves_upstream_tmpdir_selection(self):
+        env = LocalEnvironment(env={"TMPDIR": "/private/custom-tmp/"})
+
+        assert await env.get_temp_dir() == "/private/custom-tmp"
+        assert await _resolve_storage_dir(env) == (
+            "/private/custom-tmp/hermes-results"
+        )
 
 
 class TestSafeResultFilename:

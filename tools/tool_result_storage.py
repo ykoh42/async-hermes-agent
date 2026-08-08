@@ -45,13 +45,13 @@ _UNSAFE_RESULT_FILENAME_CHARS = re.compile(r"[^A-Za-z0-9_.-]+")
 _MAX_RESULT_FILENAME_STEM = 120
 
 
-def _resolve_storage_dir(env) -> str:
+async def _resolve_storage_dir(env) -> str:
     """Return the best temp-backed storage dir for this environment."""
     if env is not None:
         get_temp_dir = getattr(env, "get_temp_dir", None)
-        if callable(get_temp_dir):
+        if inspect.iscoroutinefunction(get_temp_dir):
             try:
-                temp_dir = get_temp_dir()
+                temp_dir = await get_temp_dir()
             except Exception as exc:
                 logger.debug("Could not resolve env temp dir: %s", exc)
             else:
@@ -169,7 +169,7 @@ async def maybe_persist_tool_result(
     if len(content) <= effective_threshold:
         return content
 
-    storage_dir = _resolve_storage_dir(env)
+    storage_dir = await _resolve_storage_dir(env)
     remote_path = f"{storage_dir}/{_safe_result_filename(tool_use_id)}"
     preview, has_more = generate_preview(content, max_chars=config.preview_size)
 

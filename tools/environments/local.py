@@ -483,6 +483,35 @@ class LocalEnvironment:
         self._initialized = False
         self._lock = asyncio.Lock()
 
+    async def get_temp_dir(self) -> str:
+        """Return a shell-safe writable temp dir for local execution."""
+        if _IS_WINDOWS:
+            try:
+                from hermes_constants import get_hermes_home
+
+                cache_dir = get_hermes_home() / "cache" / "terminal"
+            except Exception:
+                gettempdir = aiofiles.os.wrap(tempfile.gettempdir)
+                cache_dir = Path(await gettempdir()) / "hermes_terminal"
+            await aiofiles.os.makedirs(cache_dir, exist_ok=True)
+            return str(cache_dir).replace("\\", "/")
+
+        for env_var in ("TMPDIR", "TMP", "TEMP"):
+            candidate = self.env.get(env_var) or os.environ.get(env_var)
+            if candidate and candidate.startswith("/"):
+                return candidate.rstrip("/") or "/"
+
+        if await aiofiles.os.path.isdir("/tmp") and await aiofiles.os.access(
+            "/tmp", os.W_OK | os.X_OK
+        ):
+            return "/tmp"
+
+        gettempdir = aiofiles.os.wrap(tempfile.gettempdir)
+        candidate = await gettempdir()
+        if candidate.startswith("/"):
+            return candidate.rstrip("/") or "/"
+        return "/tmp"
+
     async def _ensure_initialized(self) -> None:
         """Resolve filesystem-backed state lazily on first async use."""
         if self._initialized:
