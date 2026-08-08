@@ -14,9 +14,9 @@ import json
 import os
 import sys
 import asyncio
+from contextlib import asynccontextmanager
 from pathlib import Path
 
-import aiofiles.os
 import pytest
 from blockbuster import BlockBuster
 from pyleak import no_event_loop_blocking, no_task_leaks
@@ -28,6 +28,26 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import batch_runner
 from batch_runner import BatchRunner, _process_batch_worker
+
+
+@asynccontextmanager
+async def _batch_runtime_audit(detector: str):
+    """Run each audit without cross-instrumenting allowed aiofiles workers."""
+    if detector == "pyleak":
+        async with (
+            no_event_loop_blocking(action=LeakAction.RAISE, threshold=0.1),
+            no_task_leaks(action=LeakAction.RAISE),
+        ):
+            yield
+        return
+
+    async with no_task_leaks(action=LeakAction.RAISE):
+        blockbuster = BlockBuster()
+        blockbuster.activate()
+        try:
+            yield
+        finally:
+            blockbuster.deactivate()
 
 
 # =========================================================================
@@ -170,8 +190,9 @@ class TestTaskCleanupOnInterruption:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("runtime_audit", ("pyleak", "blockbuster"))
 async def test_concurrent_batches_write_complete_rows_and_resume_without_duplicates(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, runtime_audit
 ):
     prompts = [f"prompt-{index}" for index in range(4)]
     dataset = tmp_path / "dataset.jsonl"
@@ -221,19 +242,8 @@ async def test_concurrent_batches_write_complete_rows_and_resume_without_duplica
 
     monkeypatch.setattr(batch_runner, "_process_single_prompt", process_prompt)
 
-    async with (
-        no_event_loop_blocking(action=LeakAction.RAISE, threshold=0.1),
-        no_task_leaks(action=LeakAction.RAISE),
-    ):
-        # Keep cold aiofiles startup under pyleak, but outside BlockBuster's
-        # stack inspection of the allowed ThreadPoolExecutor worker startup.
-        await aiofiles.os.makedirs(runner.output_dir, exist_ok=True)
-        blockbuster = BlockBuster()
-        blockbuster.activate()
-        try:
-            await runner.run()
-        finally:
-            blockbuster.deactivate()
+    async with _batch_runtime_audit(runtime_audit):
+        await runner.run()
 
     combined_file = runner.output_dir / "trajectories.jsonl"
     rows = [
@@ -246,16 +256,8 @@ async def test_concurrent_batches_write_complete_rows_and_resume_without_duplica
     assert sorted(row["prompt_index"] for row in rows) == [0, 1, 2, 3]
     assert checkpoint["completed_prompts"] == [0, 1, 2, 3]
 
-    async with (
-        no_event_loop_blocking(action=LeakAction.RAISE, threshold=0.1),
-        no_task_leaks(action=LeakAction.RAISE),
-    ):
-        blockbuster = BlockBuster()
-        blockbuster.activate()
-        try:
-            await runner.run(resume=True)
-        finally:
-            blockbuster.deactivate()
+    async with _batch_runtime_audit(runtime_audit):
+        await runner.run(resume=True)
 
     resumed_rows = [
         json.loads(line)
