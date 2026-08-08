@@ -10,6 +10,7 @@ Covers:
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import sys
 import time
@@ -178,6 +179,61 @@ def _assert_worker_reaped(prov) -> None:
 
 @pytest.mark.live_system_guard_bypass
 class TestDDGSProcessIsolation:
+    @pytest.mark.asyncio
+    async def test_repeated_cancellation_waits_for_worker_reap(self, monkeypatch):
+        import plugins.web.ddgs.provider as prov
+
+        communicate_started = asyncio.Event()
+        wait_started = asyncio.Event()
+        release_wait = asyncio.Event()
+        wait_completed = asyncio.Event()
+        communicate_completed = asyncio.Event()
+
+        class ControlledProcess:
+            returncode = None
+            pid = 424242
+
+            async def communicate(self, _request):
+                communicate_started.set()
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    communicate_completed.set()
+
+            def terminate(self):
+                self.returncode = -15
+
+            def kill(self):
+                self.returncode = -9
+
+            async def wait(self):
+                wait_started.set()
+                await release_wait.wait()
+                wait_completed.set()
+                return self.returncode
+
+        process = ControlledProcess()
+
+        async def create_process(*_args, **_kwargs):
+            return process
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", create_process)
+        search = asyncio.create_task(prov._run_ddgs_search_bounded("query", 1))
+        await communicate_started.wait()
+        search.cancel()
+        await wait_started.wait()
+        search.cancel()
+        await asyncio.sleep(0)
+
+        try:
+            assert search.done() is False
+        finally:
+            release_wait.set()
+            with pytest.raises(asyncio.CancelledError):
+                await search
+            await asyncio.wait_for(wait_completed.wait(), timeout=1.0)
+            await asyncio.wait_for(communicate_completed.wait(), timeout=1.0)
+
     @pytest.mark.asyncio
     async def test_gil_holding_worker_times_out_and_is_reaped(self, monkeypatch):
         """#68096: parent deadline still fires when the child holds its GIL."""

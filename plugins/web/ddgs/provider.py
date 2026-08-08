@@ -84,6 +84,53 @@ _test_hook: Optional[str] = None
 _last_worker_proc: Optional[Any] = None
 
 
+async def _finish_worker_cleanup(
+    proc: asyncio.subprocess.Process,
+    communicate_task: asyncio.Task[tuple[bytes, bytes | None]],
+) -> None:
+    """Reap one owned DDGS worker before propagating caller cancellation."""
+
+    async def _cleanup() -> None:
+        if proc.returncode is None:
+            proc.terminate()
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=_TERMINATE_GRACE_SECS)
+        except asyncio.TimeoutError:
+            if proc.returncode is None:
+                proc.kill()
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=_TERMINATE_GRACE_SECS)
+            except asyncio.TimeoutError:
+                logger.warning("DDGS worker pid=%s did not exit after kill", proc.pid)
+        if not communicate_task.done():
+            communicate_task.cancel()
+            (communicate_result,) = await asyncio.gather(
+                communicate_task, return_exceptions=True
+            )
+            if isinstance(communicate_result, BaseException) and not isinstance(
+                communicate_result, asyncio.CancelledError
+            ):
+                raise communicate_result
+
+    cleanup_task = asyncio.create_task(_cleanup())
+    cancellation: asyncio.CancelledError | None = None
+    while True:
+        try:
+            await asyncio.shield(cleanup_task)
+            break
+        except asyncio.CancelledError as exc:  # noqa: ASYNC103 - re-raised below
+            if cleanup_task.cancelled():
+                raise
+            if cancellation is None:
+                cancellation = exc
+        except Exception as exc:
+            if cancellation is not None:
+                raise cancellation from exc
+            raise
+    if cancellation is not None:
+        raise cancellation
+
+
 def _plugins_path_entry() -> str:
     """Return the ``sys.path`` entry that makes ``import plugins`` work.
 
@@ -184,26 +231,7 @@ async def _run_ddgs_search_bounded(query: str, safe_limit: int) -> list[dict[str
                 raw = (out or b"").decode("utf-8", errors="replace")
                 break
     finally:
-        if proc.returncode is None:
-            proc.terminate()
-        try:
-            await asyncio.wait_for(proc.wait(), timeout=_TERMINATE_GRACE_SECS)
-        except asyncio.TimeoutError:
-            if proc.returncode is None:
-                proc.kill()
-            try:
-                await asyncio.wait_for(proc.wait(), timeout=_TERMINATE_GRACE_SECS)
-            except asyncio.TimeoutError:
-                logger.warning("DDGS worker pid=%s did not exit after kill", proc.pid)
-        if not communicate_task.done():
-            communicate_task.cancel()
-            (communicate_result,) = await asyncio.gather(
-                communicate_task, return_exceptions=True
-            )
-            if isinstance(communicate_result, BaseException) and not isinstance(
-                communicate_result, asyncio.CancelledError
-            ):
-                raise communicate_result
+        await _finish_worker_cleanup(proc, communicate_task)
 
     if interrupted:
         raise _SearchInterrupted("DuckDuckGo search interrupted")

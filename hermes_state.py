@@ -429,6 +429,27 @@ async def _close_owned_connection(connection: Any) -> None:
         raise cancellation
 
 
+async def _finish_connection_rollback(connection: Any) -> None:
+    """Finish rolling back one owned transaction through repeated cancellation."""
+    rollback_task = asyncio.create_task(connection.rollback())
+    cancellation: asyncio.CancelledError | None = None
+    while True:
+        try:
+            await asyncio.shield(rollback_task)
+            break
+        except asyncio.CancelledError as exc:  # noqa: ASYNC103 - re-raised below
+            if rollback_task.cancelled():
+                raise
+            if cancellation is None:
+                cancellation = exc
+        except Exception as exc:
+            if cancellation is not None:
+                raise cancellation from exc
+            raise
+    if cancellation is not None:
+        raise cancellation
+
+
 def _claim_repair_attempt(db_path: Path) -> bool:
     """Claim the process-local one-shot repair attempt for ``db_path``."""
     key = str(db_path)
@@ -2294,13 +2315,13 @@ class SessionDB:
             try:
                 async with self._get_write_lock():
                     connection = await self._get_connection()
-                    await connection.execute("BEGIN IMMEDIATE")
                     try:
+                        await connection.execute("BEGIN IMMEDIATE")
                         result = await operation(connection)
                         await connection.commit()
                         return result
                     except BaseException:
-                        await connection.rollback()
+                        await _finish_connection_rollback(connection)
                         raise
             except asyncio.CancelledError:
                 raise
