@@ -5,8 +5,10 @@ without importing run_agent (which would cause xdist worker contamination).
 """
 
 import pytest
+
+pytestmark = pytest.mark.usefixtures("provider_profiles_loaded")
 from agent.transports.chat_completions import ChatCompletionsTransport
-from providers import get_provider_profile
+from providers import _get_provider_profile_cached as get_provider_profile
 
 
 @pytest.fixture

@@ -1555,23 +1555,6 @@ def init_agent(
                 from tools.xai_http import hermes_xai_default_headers
 
                 client_kwargs["default_headers"] = hermes_xai_default_headers()
-            elif "default_headers" not in client_kwargs:
-                # Preserve the upstream profile-declared header policy for
-                # synchronous callers while keeping async construction
-                # state-only.  The provider registry rejects an uninitialised
-                # synchronous lookup from an active loop, so that case simply
-                # waits for _initialize_deferred_runtime to apply the same
-                # policy after its awaited discovery boundary.
-                try:
-                    from providers import get_provider_profile as _gpf
-
-                    _ph = _gpf(agent.provider)
-                    if _ph and _ph.default_headers:
-                        client_kwargs["default_headers"] = dict(_ph.default_headers)
-                except RuntimeError:
-                    pass
-                except Exception:
-                    pass
         else:
             # Credential lookup may read auth files or refresh OAuth tokens.
             # Keep construction state-only and resolve it at the first awaited
@@ -3528,7 +3511,7 @@ async def _initialize_deferred_runtime(agent: Any) -> bool:
                 try:
                     from providers import get_provider_profile
 
-                    profile = get_provider_profile(provider)
+                    profile = await get_provider_profile(provider)
                     if profile and profile.default_headers:
                         headers = dict(profile.default_headers)
                 except Exception:

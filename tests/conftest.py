@@ -29,6 +29,7 @@ import tempfile
 from pathlib import Path
 
 import pytest
+import pytest_asyncio
 
 # Ensure project root is importable
 PROJECT_ROOT = Path(__file__).parent.parent
@@ -64,6 +65,14 @@ if not os.environ.get("HERMES_HOME"):
 #: `_isolate_env` fixture has sandboxed it by then, so the check would pass
 #: even with this block removed.
 HERMES_HOME_AT_CONFTEST_IMPORT = os.environ.get("HERMES_HOME", "")
+
+
+@pytest_asyncio.fixture(scope="module")
+async def provider_profiles_loaded():
+    """Discover provider plugins before sync profile-policy unit tests run."""
+    import providers
+
+    await providers._ensure_provider_profiles_loaded()
 
 
 # ── Per-file process isolation ──────────────────────────────────────────────

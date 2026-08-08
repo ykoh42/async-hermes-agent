@@ -20,6 +20,8 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+
+pytestmark = pytest.mark.usefixtures("provider_profiles_loaded")
 from agent.codex_responses_adapter import _normalize_codex_response
 
 import run_agent
@@ -1179,7 +1181,7 @@ class TestBuildApiKwargs:
     def test_reasoning_sent_for_copilot_gpt5(self, agent):
         """Copilot/GitHub Models: GPT-5 reasoning goes in extra_body.reasoning."""
         from agent.transports import get_transport
-        from providers import get_provider_profile
+        from providers import _get_provider_profile_cached as get_provider_profile
 
         transport = get_transport("chat_completions")
         profile = get_provider_profile("copilot")

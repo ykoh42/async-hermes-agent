@@ -5,6 +5,8 @@ import os
 import pytest
 from unittest.mock import AsyncMock
 
+pytestmark = pytest.mark.usefixtures("provider_profiles_loaded")
+
 from hermes_cli.auth import (
     PROVIDER_REGISTRY,
     resolve_provider,
@@ -673,8 +675,9 @@ class TestNovitaProvider:
     """Tests for NovitaAI — an OpenAI-compatible multi-model aggregator."""
 
     def test_novita_profile_loads(self):
-        from providers import get_provider_profile
-        profile = get_provider_profile("novita")
+        from providers import _get_provider_profile_cached
+
+        profile = _get_provider_profile_cached("novita")
         assert profile is not None
         assert profile.name == "novita"
         assert profile.display_name == "NovitaAI"
@@ -709,7 +712,7 @@ class TestMinimaxOAuthProvider:
         import model_tools  # noqa: F401  -- triggers plugin discovery
         import providers
 
-        profile = providers.get_provider_profile("minimax-oauth")
+        profile = providers._get_provider_profile_cached("minimax-oauth")
         assert profile is not None, "minimax-oauth provider profile must be registered"
         assert profile.default_aux_model, (
             "minimax-oauth profile must advertise a non-empty default_aux_model "
@@ -739,12 +742,12 @@ class TestDeepInfraProviderProfile:
         from hermes_cli.config import OPTIONAL_ENV_VARS
         from hermes_cli.models import CANONICAL_PROVIDERS
 
-        profile = get_provider_profile("deepinfra")
+        profile = await get_provider_profile("deepinfra")
         assert profile is not None
         assert profile.name == "deepinfra"
         assert profile.auth_type == "api_key"
         # Alias resolves to the same profile.
-        assert get_provider_profile("deep-infra") is profile
+        assert await get_provider_profile("deep-infra") is profile
         assert await resolve_provider("deep-infra") == "deepinfra"
         assert PROVIDER_REGISTRY["deepinfra"].inference_base_url == profile.base_url
         assert any(entry.slug == "deepinfra" for entry in CANONICAL_PROVIDERS)

@@ -4454,8 +4454,9 @@ class AIAgent:
             # No URL-specific headers — check profile.default_headers before clearing.
             _ph_headers = None
             try:
-                from providers import get_provider_profile as _gpf2
-                _ph2 = _gpf2(self.provider)
+                from providers import _get_provider_profile_cached
+
+                _ph2 = _get_provider_profile_cached(self.provider)
                 if _ph2 and _ph2.default_headers:
                     _ph_headers = dict(_ph2.default_headers)
             except Exception:
@@ -5685,9 +5686,9 @@ class AIAgent:
         checks the provider profile's ``supports_vision_tool_messages`` field.
         """
         try:
-            from providers import get_provider_profile
+            from providers import _get_provider_profile_cached
             provider = (getattr(self, "provider", "") or "").strip()
-            profile = get_provider_profile(provider)
+            profile = _get_provider_profile_cached(provider)
             if profile is not None:
                 return getattr(profile, "supports_vision_tool_messages", True)
         except Exception:
@@ -5841,6 +5842,9 @@ class AIAgent:
             # tool content (e.g. Xiaomi MiMo's 400 "text is not set"), or if
             # we've already learned this lesson in-session, short-circuit to
             # a text summary so we don't burn a round-trip relearning it.
+            from providers import _ensure_provider_profiles_loaded
+
+            await _ensure_provider_profiles_loaded()
             if not self._provider_supports_vision_tool_messages():
                 logger.debug(
                     "Tool %s: provider %s does not accept list-type tool "

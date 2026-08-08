@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import pytest
 
+pytestmark = pytest.mark.usefixtures("provider_profiles_loaded")
+
 
 @pytest.fixture
 def upstage_profile():
@@ -22,7 +24,7 @@ def upstage_profile():
     import model_tools  # noqa: F401
     import providers
 
-    profile = providers.get_provider_profile("upstage")
+    profile = providers._get_provider_profile_cached("upstage")
     assert profile is not None, "upstage provider profile must be registered"
     return profile
 
@@ -39,7 +41,7 @@ class TestUpstageProfile:
         import model_tools  # noqa: F401
         import providers
 
-        assert providers.get_provider_profile("solar") is upstage_profile_singleton()
+        assert providers._get_provider_profile_cached("solar") is upstage_profile_singleton()
 
     def test_env_vars(self, upstage_profile):
         # API key first, optional base-url override second (priority order).
@@ -129,4 +131,4 @@ class TestUpstageReasoning:
 def upstage_profile_singleton():
     import providers
 
-    return providers.get_provider_profile("upstage")
+    return providers._get_provider_profile_cached("upstage")

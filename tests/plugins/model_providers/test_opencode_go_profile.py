@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import pytest
 
+pytestmark = pytest.mark.usefixtures("provider_profiles_loaded")
+
 
 @pytest.fixture
 def opencode_go_profile():
@@ -11,7 +13,7 @@ def opencode_go_profile():
     import model_tools  # noqa: F401
     import providers
 
-    profile = providers.get_provider_profile("opencode-go")
+    profile = providers._get_provider_profile_cached("opencode-go")
     assert profile is not None, "opencode-go provider profile must be registered"
     return profile
 

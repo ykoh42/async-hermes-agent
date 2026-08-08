@@ -4,13 +4,15 @@ from __future__ import annotations
 
 import pytest
 
+pytestmark = pytest.mark.usefixtures("provider_profiles_loaded")
+
 
 @pytest.fixture
 def gemini_profile():
     import model_tools  # noqa: F401
     import providers
 
-    profile = providers.get_provider_profile("gemini")
+    profile = providers._get_provider_profile_cached("gemini")
     assert profile is not None, "gemini provider profile must be registered"
     return profile
 

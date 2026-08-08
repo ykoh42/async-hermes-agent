@@ -68,6 +68,19 @@ KiloCode, Novita, Ollama Cloud, OpenCode, Qwen OAuth, StepFun, Upstage, and
 Xiaomi. The source of truth is `plugins/model-providers/`; this page groups
 routes by contract instead of ranking vendors.
 
+Applications that inspect the registry directly use the retained upstream
+names with an awaited first-use discovery boundary:
+
+```python
+from providers import get_provider_profile, list_providers
+
+profile = await get_provider_profile("openrouter")
+profiles = await list_providers()
+```
+
+Both calls perform native-async plugin discovery when needed. There is no
+synchronous discovery fallback; subsequent calls reuse the in-memory registry.
+
 ## Retained transport families
 
 The retained runtime has native async paths for these families:

@@ -14,12 +14,14 @@ from __future__ import annotations
 
 import pytest
 
+pytestmark = pytest.mark.usefixtures("provider_profiles_loaded")
+
 
 @pytest.fixture
 def deepseek_profile():
     """Resolve the registered DeepSeek profile.
 
-    Going through ``providers.get_provider_profile`` keeps the test honest —
+    Going through ``providers._get_provider_profile_cached`` keeps the test honest —
     if someone later replaces the registered class with a plain
     ``ProviderProfile``, every assertion below collapses.
     """
@@ -28,7 +30,7 @@ def deepseek_profile():
     import model_tools  # noqa: F401
     import providers
 
-    profile = providers.get_provider_profile("deepseek")
+    profile = providers._get_provider_profile_cached("deepseek")
     assert profile is not None, "deepseek provider profile must be registered"
     return profile
 

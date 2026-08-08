@@ -14,6 +14,7 @@ lookup ``github_model_reasoning_efforts``.
 from __future__ import annotations
 
 import pytest
+pytestmark = pytest.mark.usefixtures("provider_profiles_loaded")
 
 
 @pytest.fixture
@@ -28,7 +29,7 @@ def copilot_profile():
     import model_tools  # noqa: F401
     import providers
 
-    profile = providers.get_provider_profile("copilot")
+    profile = providers._get_provider_profile_cached("copilot")
     assert profile is not None, "copilot provider profile must be registered"
     return profile
 

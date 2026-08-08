@@ -5,6 +5,8 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
+
+pytestmark = pytest.mark.usefixtures("provider_profiles_loaded")
 from openai import OpenAI
 
 from agent.transports import get_transport
@@ -23,7 +25,7 @@ class TestChatCompletionsBasic:
 
     @pytest.mark.parametrize("provider", ["nous", "openrouter"])
     def test_gpt56_ultra_uses_max_wire_effort(self, transport, provider):
-        from providers import get_provider_profile
+        from providers import _get_provider_profile_cached as get_provider_profile
 
         profile = get_provider_profile(provider)
         kw = transport.build_kwargs(
@@ -169,7 +171,7 @@ class TestChatCompletionsBuildKwargs:
         assert kw["tools"] == tools
 
     def test_openrouter_provider_prefs(self, transport):
-        from providers import get_provider_profile
+        from providers import _get_provider_profile_cached as get_provider_profile
         profile = get_provider_profile("openrouter")
         msgs = [{"role": "user", "content": "Hi"}]
         kw = transport.build_kwargs(
@@ -186,7 +188,7 @@ class TestChatCompletionsBuildKwargs:
 
     def test_nous_tags(self, transport):
         from agent.portal_tags import nous_portal_tags
-        from providers import get_provider_profile
+        from providers import _get_provider_profile_cached as get_provider_profile
         profile = get_provider_profile("nous")
         msgs = [{"role": "user", "content": "Hi"}]
         kw = transport.build_kwargs(model="gpt-4o", messages=msgs, provider_profile=profile)
@@ -201,7 +203,7 @@ class TestChatCompletionsBuildKwargs:
         assert kw["extra_body"]["reasoning"] == {"enabled": True, "effort": "medium"}
 
     def test_nous_omits_disabled_reasoning(self, transport):
-        from providers import get_provider_profile
+        from providers import _get_provider_profile_cached as get_provider_profile
         profile = get_provider_profile("nous")
         msgs = [{"role": "user", "content": "Hi"}]
         kw = transport.build_kwargs(
@@ -214,7 +216,7 @@ class TestChatCompletionsBuildKwargs:
         assert "reasoning" not in kw.get("extra_body", {})
 
     def test_ollama_num_ctx(self, transport):
-        from providers import get_provider_profile
+        from providers import _get_provider_profile_cached as get_provider_profile
         profile = get_provider_profile("custom")
         msgs = [{"role": "user", "content": "Hi"}]
         kw = transport.build_kwargs(
@@ -225,7 +227,7 @@ class TestChatCompletionsBuildKwargs:
         assert kw["extra_body"]["options"]["num_ctx"] == 32768
 
     def test_custom_think_false(self, transport):
-        from providers import get_provider_profile
+        from providers import _get_provider_profile_cached as get_provider_profile
         profile = get_provider_profile("custom")
         msgs = [{"role": "user", "content": "Hi"}]
         kw = transport.build_kwargs(
@@ -512,7 +514,7 @@ class TestChatCompletionsGeminiNativeExtraBodyStrip:
     """
 
     def _nous_profile(self):
-        from providers import get_provider_profile
+        from providers import _get_provider_profile_cached as get_provider_profile
         return get_provider_profile("nous")
 
     def test_tags_stripped_when_endpoint_is_native_gemini(self, transport):
@@ -680,7 +682,7 @@ class TestPromptCacheKeyCapability:
 
     @pytest.mark.parametrize("provider", [None, "anthropic", "custom"])
     def test_default_off_never_leaks_unknown_body_field(self, transport, provider):
-        from providers import get_provider_profile
+        from providers import _get_provider_profile_cached as get_provider_profile
 
         kwargs = transport.build_kwargs(
             model="strict-model",

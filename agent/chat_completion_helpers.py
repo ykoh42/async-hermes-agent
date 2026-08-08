@@ -173,9 +173,9 @@ def _merge_nous_portal_messages_extra_body(agent, anthropic_kwargs: dict) -> dic
     if getattr(agent, "provider", None) not in {"nous", "nous-portal", "nousresearch"}:
         return anthropic_kwargs
     try:
-        from providers import get_provider_profile
+        from providers import _get_provider_profile_cached
 
-        nous_profile = get_provider_profile("nous")
+        nous_profile = _get_provider_profile_cached("nous")
         if nous_profile is not None:
             anthropic_kwargs.setdefault("extra_body", {}).update(
                 nous_profile.build_extra_body(
@@ -456,6 +456,9 @@ async def build_api_kwargs(
     providers.  Keep this helper on the native async request path instead of
     reintroducing a synchronous adapter at the API boundary.
     """
+    from providers import _ensure_provider_profiles_loaded
+
+    await _ensure_provider_profiles_loaded()
     if tools_for_api is None:
         tools_for_api = agent.tools
 
@@ -636,8 +639,9 @@ async def build_api_kwargs(
     # Profiles handle per-provider quirks via hooks. When a profile is
     # found, delegate fully; otherwise fall through to the legacy flag path.
     try:
-        from providers import get_provider_profile
-        _profile = get_provider_profile(agent.provider)
+        from providers import _get_provider_profile_cached
+
+        _profile = _get_provider_profile_cached(agent.provider)
     except Exception:
         _profile = None
 
@@ -1486,9 +1490,9 @@ async def handle_max_iterations(agent, messages: list, api_call_count: int) -> s
             provider_preferences = _provider_preferences_for_agent(agent)
             profile_extra_body = {}
             try:
-                from providers import get_provider_profile
+                from providers import _get_provider_profile_cached
 
-                provider_profile = get_provider_profile(agent.provider)
+                provider_profile = _get_provider_profile_cached(agent.provider)
                 if provider_profile is not None:
                     profile_extra_body = provider_profile.build_extra_body(
                         session_id=getattr(agent, "session_id", None),

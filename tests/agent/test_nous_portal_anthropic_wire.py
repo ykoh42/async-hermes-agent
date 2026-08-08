@@ -500,7 +500,7 @@ class TestAuxiliaryDualWire:
             # Alias spelling + profile stubbed out so the fallback path is the
             # one under test (profile success already covers session_id).
             with patch(
-                "providers.get_provider_profile",
+                "providers._get_provider_profile_cached",
                 side_effect=ImportError("no profile"),
             ):
                 kwargs = _build_call_kwargs(

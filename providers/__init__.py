@@ -9,10 +9,9 @@ Each plugin directory contains:
   - ``__init__.py`` — calls ``register_provider(profile)`` at import
   - ``plugin.yaml`` — manifest (name, kind: model-provider, version, description)
 
-Discovery is lazy: the first synchronous call to ``get_provider_profile()`` or
-``list_providers()`` outside an event loop scans both locations and imports
-every plugin. The retained async agent awaits the discovery boundary before
-using these in-memory getters. User
+Discovery is lazy: the first awaited call to ``get_provider_profile()`` or
+``list_providers()`` scans both locations and imports every plugin through
+native async file I/O. User
 plugins override bundled plugins on name collision (last-writer-wins), so
 third parties can monkey-patch or replace any built-in profile without
 editing the repo.
@@ -26,21 +25,18 @@ plugin layout.
 Usage::
 
     from providers import get_provider_profile
-    profile = get_provider_profile("nvidia")   # ProviderProfile or None
-    profile = get_provider_profile("kimi")     # checks name + aliases
+    profile = await get_provider_profile("nvidia")   # ProviderProfile or None
+    profile = await get_provider_profile("kimi")     # checks name + aliases
 """
 
 from __future__ import annotations
 
 import asyncio
-import importlib
-import importlib.util
 import logging
 import sys
 import types
 from pathlib import Path
 
-import aiofiles
 import aiofiles.os
 
 from providers.base import OMIT_TEMPERATURE, ProviderProfile  # noqa: F401
@@ -66,26 +62,6 @@ _BUNDLED_PLUGINS_DIR = (
 _PROVIDERS_DIR = Path(__file__).resolve().parent
 
 
-def _require_sync_discovery_boundary() -> None:
-    """Reject synchronous discovery while an event loop is running.
-
-    The legacy getters remain synchronous for callers that use the registry
-    outside the agent runtime.  Starting a directory scan from an async
-    request, however, would synchronously read and execute every provider
-    module.  The retained async runtime calls ``_ensure_provider_profiles_loaded``
-    before any getter, so this guard only affects an uninitialised direct call
-    and gives it an actionable failure instead of blocking the loop.
-    """
-    try:
-        asyncio.get_running_loop()
-    except RuntimeError:
-        return
-    raise RuntimeError(
-        "Provider profiles are not loaded; await the agent runtime boundary "
-        "before using the synchronous provider registry"
-    )
-
-
 def register_provider(profile: ProviderProfile) -> None:
     """Register a provider profile by name and aliases.
 
@@ -100,24 +76,15 @@ def register_provider(profile: ProviderProfile) -> None:
     _PROVIDER_LIST_CACHE = None
 
 
-def get_provider_profile(name: str) -> ProviderProfile | None:
-    """Look up a provider profile by name or alias.
-
-    Returns None if the provider has no profile (falls back to generic).
-    """
-    if not _discovered:
-        _require_sync_discovery_boundary()
-        _discover_providers()
+def _get_provider_profile_cached(name: str) -> ProviderProfile | None:
+    """Look up one already-discovered profile without performing I/O."""
     canonical = _ALIASES.get(name, name)
     return _REGISTRY.get(canonical)
 
 
-def list_providers() -> list[ProviderProfile]:
-    """Return all registered provider profiles (one per canonical name)."""
+def _list_providers_cached() -> list[ProviderProfile]:
+    """Return an in-memory snapshot of already-discovered profiles."""
     global _PROVIDER_LIST_CACHE
-    if not _discovered:
-        _require_sync_discovery_boundary()
-        _discover_providers()
     if _PROVIDER_LIST_CACHE is not None:
         return list(_PROVIDER_LIST_CACHE)
     # Deduplicate: _REGISTRY has canonical names; _ALIASES points to same objects
@@ -130,122 +97,6 @@ def list_providers() -> list[ProviderProfile]:
             result.append(profile)
     _PROVIDER_LIST_CACHE = result
     return list(result)
-
-
-def _user_plugins_dir() -> Path | None:
-    """Return ``$HERMES_HOME/plugins/model-providers/`` if it exists."""
-    try:
-        from hermes_constants import get_hermes_home
-
-        d = get_hermes_home() / "plugins" / "model-providers"
-        return d if d.is_dir() else None
-    except Exception:
-        return None
-
-
-def _import_plugin_dir(plugin_dir: Path, source: str) -> None:
-    """Import a single plugin directory so it self-registers.
-
-    ``source`` is "bundled" or "user", used only for log messages.
-    """
-    init_file = plugin_dir / "__init__.py"
-    if not init_file.exists():
-        return
-
-    # Give bundled plugins a stable import path (``plugins.model_providers.<name>``)
-    # so relative imports within the plugin work. User plugins load via
-    # ``importlib.util.spec_from_file_location`` with a unique module name so
-    # multiple HERMES_HOME profiles don't alias each other.
-    safe_name = plugin_dir.name.replace("-", "_")
-    if source == "bundled":
-        module_name = f"plugins.model_providers.{safe_name}"
-    else:
-        module_name = f"_hermes_user_provider_{safe_name}"
-
-    if module_name in sys.modules:
-        return  # already imported
-
-    try:
-        spec = importlib.util.spec_from_file_location(
-            module_name, init_file, submodule_search_locations=[str(plugin_dir)]
-        )
-        if spec is None or spec.loader is None:
-            return
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[module_name] = module
-        # This branch is retained for synchronous setup/compatibility callers;
-        # the agent runtime uses ``_import_plugin_dir_async`` above.  Keep the
-        # same PEP 263 decoding as SourceFileLoader without invoking its
-        # synchronous file-reading method in the native path.
-        source = importlib.util.decode_source(init_file.read_bytes())
-        exec(compile(source, str(init_file), "exec"), module.__dict__)
-    except Exception as exc:
-        logger.warning(
-            "Failed to load %s provider plugin %s: %s", source, plugin_dir.name, exc
-        )
-        sys.modules.pop(module_name, None)
-
-
-def _discover_providers() -> None:
-    """Populate the registry by importing every provider plugin.
-
-    Order:
-      1. Bundled plugins at ``<repo>/plugins/model-providers/<name>/``
-      2. User plugins at ``$HERMES_HOME/plugins/model-providers/<name>/``
-      3. Legacy per-file modules at ``providers/<name>.py`` (back-compat)
-
-    Each step imports its plugins, which call ``register_provider()`` at
-    module-level. Later steps win on name collision.
-    """
-    global _discovered
-    if _discovered:
-        return
-    _discovered = True
-
-    # 1. Bundled plugins — shipped with hermes-agent.
-    if _BUNDLED_PLUGINS_DIR.is_dir():
-        for child in sorted(_BUNDLED_PLUGINS_DIR.iterdir()):
-            if not child.is_dir() or child.name.startswith(("_", ".")):
-                continue
-            _import_plugin_dir(child, "bundled")
-
-    # 2. User plugins — under $HERMES_HOME/plugins/model-providers/<name>/.
-    #    These can override any bundled profile of the same name (last-writer-wins
-    #    in register_provider()).
-    user_dir = _user_plugins_dir()
-    if user_dir is not None:
-        for child in sorted(user_dir.iterdir()):
-            if not child.is_dir() or child.name.startswith(("_", ".")):
-                continue
-            _import_plugin_dir(child, "user")
-
-    # 3. Legacy single-file profiles at providers/<name>.py. Kept for
-    #    back-compat — if someone drops a ``providers/foo.py`` into an
-    #    editable install, it still works without the plugin layout.
-    try:
-        import pkgutil
-
-        import providers as _pkg
-
-        for _importer, modname, _ispkg in pkgutil.iter_modules(_pkg.__path__):
-            if modname.startswith("_") or modname == "base":
-                continue
-            try:
-                importlib.import_module(f"providers.{modname}")
-            except ImportError as exc:
-                logger.warning(
-                    "Failed to import legacy provider module %s: %s", modname, exc
-                )
-    except Exception:
-        pass
-
-
-async def _exec_source_module(module: types.ModuleType, source_path: Path) -> None:
-    """Execute a provider source module after asynchronously reading it."""
-    async with aiofiles.open(source_path, mode="rb") as handle:
-        source_bytes = await handle.read()
-    source = importlib.util.decode_source(source_bytes)
-    exec(compile(source, str(source_path), "exec"), module.__dict__)
 
 
 async def _user_plugins_dir_async() -> Path | None:
@@ -353,12 +204,7 @@ async def _discover_providers_async() -> None:
 
 
 async def _discover_providers_async_impl() -> None:
-    """Populate provider profiles through native async discovery.
-
-    The synchronous getter remains available for setup/compatibility callers,
-    while the retained agent runtime calls this awaited boundary before any
-    profile lookup can trigger filesystem access.
-    """
+    """Populate provider profiles through native async discovery."""
     global _discovered
     if _discovered:
         return
@@ -428,3 +274,32 @@ async def _ensure_provider_profiles_loaded() -> None:
     async with _ASYNC_DISCOVERY_LOCK:
         if not _discovered:
             await _discover_providers_async()
+    _refresh_loaded_profile_projections()
+
+
+def _refresh_loaded_profile_projections() -> None:
+    """Refresh upstream registries already imported before async discovery."""
+    for module_name, function_name in (
+        ("hermes_cli.auth", "_inject_profile_provider_registry"),
+        ("hermes_cli.config", "_inject_profile_env_vars"),
+        ("hermes_cli.models", "_inject_profile_canonical_providers"),
+    ):
+        module = sys.modules.get(module_name)
+        refresh = getattr(module, function_name, None) if module is not None else None
+        if callable(refresh):
+            refresh()
+
+
+async def get_provider_profile(name: str) -> ProviderProfile | None:
+    """Look up a provider profile by name or alias.
+
+    Returns None if the provider has no profile (falls back to generic).
+    """
+    await _ensure_provider_profiles_loaded()
+    return _get_provider_profile_cached(name)
+
+
+async def list_providers() -> list[ProviderProfile]:
+    """Return all registered provider profiles (one per canonical name)."""
+    await _ensure_provider_profiles_loaded()
+    return _list_providers_cached()

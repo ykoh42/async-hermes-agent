@@ -1,12 +1,16 @@
 """Tests for the provider module registry and profiles."""
 
+import pytest
+
 from providers import get_provider_profile, _REGISTRY
 from providers.base import ProviderProfile, OMIT_TEMPERATURE
 
+pytestmark = pytest.mark.asyncio
+
 
 class TestRegistry:
-    def test_discovery_populates_registry(self):
-        p = get_provider_profile("nvidia")
+    async def test_discovery_populates_registry(self):
+        p = await get_provider_profile("nvidia")
         assert p is not None
         assert p.name == "nvidia"
 
@@ -15,29 +19,29 @@ class TestRegistry:
 
 
 class TestNvidiaProfile:
-    def test_max_tokens(self):
-        p = get_provider_profile("nvidia")
+    async def test_max_tokens(self):
+        p = await get_provider_profile("nvidia")
         assert p.default_max_tokens == 16384
 
 
-    def test_base_url(self):
-        p = get_provider_profile("nvidia")
+    async def test_base_url(self):
+        p = await get_provider_profile("nvidia")
         assert "nvidia.com" in p.base_url
 
 
 
 class TestKimiProfile:
-    def test_temperature_omit(self):
-        p = get_provider_profile("kimi")
+    async def test_temperature_omit(self):
+        p = await get_provider_profile("kimi")
         assert p.fixed_temperature is OMIT_TEMPERATURE
 
 
 
 
-    def test_thinking_enabled(self):
+    async def test_thinking_enabled(self):
         # xor contract (fix ce4e74b3): an explicit recognized effort sends
         # reasoning_effort ONLY — never paired with extra_body.thinking.
-        p = get_provider_profile("kimi")
+        p = await get_provider_profile("kimi")
         eb, tl = p.build_api_kwargs_extras(reasoning_config={"enabled": True, "effort": "high"})
         assert tl["reasoning_effort"] == "high"
         assert "thinking" not in eb
@@ -47,8 +51,8 @@ class TestKimiProfile:
 
 
 class TestOpenRouterProfile:
-    def test_extra_body_with_prefs(self):
-        p = get_provider_profile("openrouter")
+    async def test_extra_body_with_prefs(self):
+        p = await get_provider_profile("openrouter")
         body = p.build_extra_body(provider_preferences={"allow": ["anthropic"]})
         assert body["provider"] == {"allow": ["anthropic"]}
 
@@ -56,9 +60,9 @@ class TestOpenRouterProfile:
 
 
 
-    def test_pareto_min_coding_score_emitted_for_pareto_model(self):
+    async def test_pareto_min_coding_score_emitted_for_pareto_model(self):
         """min_coding_score → plugins block when model is openrouter/pareto-code."""
-        p = get_provider_profile("openrouter")
+        p = await get_provider_profile("openrouter")
         body = p.build_extra_body(
             model="openrouter/pareto-code",
             openrouter_min_coding_score=0.65,
@@ -77,9 +81,9 @@ class TestOpenRouterProfile:
 
 
 
-    def test_grok_session_id_sets_cache_affinity_header(self):
+    async def test_grok_session_id_sets_cache_affinity_header(self):
         """OpenRouter + Grok model + session_id => x-grok-conv-id header."""
-        p = get_provider_profile("openrouter")
+        p = await get_provider_profile("openrouter")
         _, tl = p.build_api_kwargs_extras(
             model="x-ai/grok-4",
             session_id="sess-abc123",
@@ -100,23 +104,11 @@ class TestOpenRouterProfile:
     # ``reasoning`` field (which would 400 — see #42991). Gate every fixture on
     # the real predicate so this stays a behavior contract, not a name snapshot.
 
-    @staticmethod
-    def _is_mandatory(model):
-        import inspect
-        p = get_provider_profile("openrouter")
-        mod = inspect.getmodule(type(p))
-        return mod._anthropic_reasoning_is_mandatory(model)
-
-
-
-
-
-
-    def test_mandatory_anthropic_verbosity_coexists_with_grok_header(self):
+    async def test_mandatory_anthropic_verbosity_coexists_with_grok_header(self):
         """A reasoning-mandatory Anthropic model is never a Grok model, but the
         top-level dict must remain a single merged dict — verify the verbosity
         path doesn't clobber the extra_headers slot used by Grok affinity."""
-        p = get_provider_profile("openrouter")
+        p = await get_provider_profile("openrouter")
         # mandatory anthropic + effort → verbosity, no extra_headers
         _, tl = p.build_api_kwargs_extras(
             reasoning_config={"enabled": True, "effort": "high"},
@@ -127,9 +119,9 @@ class TestOpenRouterProfile:
 
 
 class TestNousProfile:
-    def test_tags(self):
+    async def test_tags(self):
         from agent.portal_tags import nous_portal_tags
-        p = get_provider_profile("nous")
+        p = await get_provider_profile("nous")
         body = p.build_extra_body()
         assert body["tags"] == nous_portal_tags()
 
@@ -137,8 +129,8 @@ class TestNousProfile:
 
 
 
-    def test_auth_type(self):
-        p = get_provider_profile("nous")
+    async def test_auth_type(self):
+        p = await get_provider_profile("nous")
         assert p.auth_type == "oauth_device_code"
 
 
@@ -151,8 +143,8 @@ class TestQwenProfile:
 
 
 
-    def test_prepare_messages_protects_nested_image_url_retry_mutation(self):
-        qwen = get_provider_profile("qwen-oauth")
+    async def test_prepare_messages_protects_nested_image_url_retry_mutation(self):
+        qwen = await get_provider_profile("qwen-oauth")
         image_url = {"url": "data:image/png;base64,original"}
         msgs = [
             {"role": "system", "content": "Be helpful"},
@@ -179,13 +171,12 @@ class TestQwenProfile:
             "data:image/png;base64,original"
         )
 
-    def test_metadata_top_level(self):
-        p = get_provider_profile("qwen-oauth")
+    async def test_metadata_top_level(self):
+        p = await get_provider_profile("qwen-oauth")
         meta = {"sessionId": "s123", "promptId": "p456"}
         eb, tl = p.build_api_kwargs_extras(qwen_session_metadata=meta)
         assert tl["metadata"] == meta
         assert "metadata" not in eb
-
 
 
 

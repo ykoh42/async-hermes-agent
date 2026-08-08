@@ -3901,8 +3901,11 @@ def _inject_profile_env_vars() -> None:
     if _profile_env_vars_injected:
         return
     try:
-        from providers import list_providers
-        for _pp in list_providers():
+        from providers import _discovered, _list_providers_cached
+
+        if not _discovered:
+            return
+        for _pp in _list_providers_cached():
             if _pp.auth_type not in {"api_key",}:
                 continue
             for _var in _pp.env_vars:
@@ -3919,9 +3922,9 @@ def _inject_profile_env_vars() -> None:
                 }
         _profile_env_vars_injected = True
     except Exception:
-        # Provider discovery is an awaited runtime boundary.  When this
-        # module is imported from an active event loop, leave the sentinel
-        # unset so the deferred runtime can retry after discovery completes.
+        # Provider discovery is an awaited runtime boundary. Leave the
+        # sentinel unset so deferred runtime initialization can retry after
+        # discovery completes.
         return
 
 

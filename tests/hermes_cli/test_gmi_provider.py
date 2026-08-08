@@ -157,7 +157,7 @@ class TestGmiAuxiliary:
         """The GMI plugin sets a HermesAgent/<ver> User-Agent on its profile."""
         from providers import get_provider_profile
 
-        profile = get_provider_profile("gmi")
+        profile = await get_provider_profile("gmi")
         assert profile is not None
         ua = profile.default_headers.get("User-Agent", "")
         assert ua.startswith("HermesAgent/"), (

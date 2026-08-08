@@ -11,6 +11,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import pytest
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -45,7 +46,8 @@ def test_bundled_plugins_discovered():
         assert (child / "plugin.yaml").exists(), f"{child.name} missing plugin.yaml"
 
 
-def test_all_profiles_register():
+@pytest.mark.asyncio
+async def test_all_profiles_register():
     """After discovery, the registry must contain every bundled provider directory.
 
     This is an invariant — the number of profiles matches the number of plugin
@@ -58,7 +60,7 @@ def test_all_profiles_register():
     plugins_dir = REPO_ROOT / "plugins" / "model-providers"
     plugin_dir_count = sum(1 for c in plugins_dir.iterdir() if c.is_dir())
 
-    profiles = list_providers()
+    profiles = await list_providers()
     names = sorted(p.name for p in profiles)
     # Some plugin __init__.py files register multiple profiles, so the registry
     # count is >= the directory count (never less).
@@ -74,7 +76,8 @@ def test_all_profiles_register():
         assert required in names, f"Missing profile: {required}"
 
 
-def test_user_plugin_overrides_bundled(tmp_path, monkeypatch):
+@pytest.mark.asyncio
+async def test_user_plugin_overrides_bundled(tmp_path, monkeypatch):
     """A user plugin with the same name must override the bundled profile."""
     # Point HERMES_HOME at a fresh temp dir
     hermes_home = tmp_path / ".hermes"
@@ -109,7 +112,7 @@ def test_user_plugin_overrides_bundled(tmp_path, monkeypatch):
     _clear_provider_caches()
     from providers import get_provider_profile
 
-    gmi = get_provider_profile("gmi")
+    gmi = await get_provider_profile("gmi")
     assert gmi is not None
     assert gmi.base_url == "https://user-override.example.com/v1", (
         f"User override not applied; got base_url={gmi.base_url!r}"

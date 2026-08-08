@@ -15,6 +15,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+pytestmark = pytest.mark.usefixtures("provider_profiles_loaded")
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -161,7 +163,7 @@ class TestProviderProfileField:
             assert getattr(ProviderProfile, "supports_vision_tool_messages", True) is True
 
     def test_xiaomi_profile_has_false(self):
-        from providers import get_provider_profile
+        from providers import _get_provider_profile_cached as get_provider_profile
         profile = get_provider_profile("xiaomi")
         assert profile is not None
         assert profile.supports_vision_tool_messages is False

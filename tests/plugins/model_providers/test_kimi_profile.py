@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import pytest
 
+pytestmark = pytest.mark.usefixtures("provider_profiles_loaded")
+
 
 @pytest.fixture
 def kimi_profile():
@@ -26,7 +28,7 @@ def kimi_profile():
     import model_tools  # noqa: F401
     import providers
 
-    profile = providers.get_provider_profile("kimi-coding")
+    profile = providers._get_provider_profile_cached("kimi-coding")
     assert profile is not None, "kimi-coding provider profile must be registered"
     return profile
 

@@ -6,6 +6,8 @@ import asyncio
 
 import pytest
 
+pytestmark = pytest.mark.usefixtures("provider_profiles_loaded")
+
 
 
 
@@ -122,7 +124,7 @@ def test_nous_sticky_key_matches_conversation_tag():
         reset_conversation_context,
         set_conversation_context,
     )
-    from providers import get_provider_profile
+    from providers import _get_provider_profile_cached as get_provider_profile
 
     profile = get_provider_profile("nous")
     token = set_conversation_context("root-conversation")

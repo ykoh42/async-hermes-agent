@@ -310,7 +310,7 @@ async def test_vertex_default_model_estimates_cached_usage(monkeypatch):
     monkeypatch.setattr(
         "agent.usage_pricing.fetch_endpoint_model_metadata", _empty_metadata
     )
-    vertex = get_provider_profile("vertex")
+    vertex = await get_provider_profile("vertex")
     result = await estimate_usage_cost(
         vertex.default_aux_model,
         CanonicalUsage(input_tokens=100, output_tokens=100, cache_read_tokens=100),

@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import pytest
 
+pytestmark = pytest.mark.usefixtures("provider_profiles_loaded")
+
 
 @pytest.fixture
 def fireworks_profile():
@@ -17,7 +19,7 @@ def fireworks_profile():
     import model_tools  # noqa: F401
     import providers
 
-    profile = providers.get_provider_profile("fireworks")
+    profile = providers._get_provider_profile_cached("fireworks")
     assert profile is not None, "fireworks provider profile must be registered"
     return profile
 
@@ -50,7 +52,7 @@ class TestFireworksAliases:
     def test_alias_resolves_via_registry(self, fireworks_profile, alias):
         import providers
 
-        resolved = providers.get_provider_profile(alias)
+        resolved = providers._get_provider_profile_cached(alias)
         assert resolved is not None
         assert resolved.name == "fireworks"
 

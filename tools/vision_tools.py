@@ -748,8 +748,9 @@ def _supports_media_in_tool_results(provider: str, model: str) -> bool:
     # This covers vision-capable providers like xiaomi, minimax, etc. that
     # aren't in the hardcoded list above.
     try:
-        from providers import get_provider_profile
-        profile = get_provider_profile(p)
+        from providers import _get_provider_profile_cached
+
+        profile = _get_provider_profile_cached(p)
         if profile is not None and profile.supports_vision:
             return True
     except Exception:
@@ -779,9 +780,11 @@ async def _should_use_native_vision_fast_path() -> bool:
         )
         from agent.image_routing import decide_image_input_mode, _lookup_supports_vision
         from hermes_cli.config import get_config_path
+        from providers import _ensure_provider_profiles_loaded
         import aiofiles
         from utils import fast_safe_load
 
+        await _ensure_provider_profiles_loaded()
         provider = await _read_main_provider()
         model = await _read_main_model()
         try:

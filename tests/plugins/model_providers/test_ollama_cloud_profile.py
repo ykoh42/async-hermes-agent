@@ -14,12 +14,14 @@ from __future__ import annotations
 
 import pytest
 
+pytestmark = pytest.mark.usefixtures("provider_profiles_loaded")
+
 
 @pytest.fixture
 def ollama_cloud_profile():
     """Resolve the registered Ollama Cloud profile.
 
-    Going through ``providers.get_provider_profile`` keeps the test
+    Going through ``providers._get_provider_profile_cached`` keeps the test
     honest — if someone replaces the registered class with a plain
     ``ProviderProfile``, every assertion below collapses.
     """
@@ -28,7 +30,7 @@ def ollama_cloud_profile():
     import model_tools  # noqa: F401
     import providers
 
-    profile = providers.get_provider_profile("ollama-cloud")
+    profile = providers._get_provider_profile_cached("ollama-cloud")
     assert profile is not None, "ollama-cloud provider profile must be registered"
     return profile
 

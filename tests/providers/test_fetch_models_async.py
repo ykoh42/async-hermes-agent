@@ -167,7 +167,7 @@ async def test_fetch_models_only_forwards_credentials_within_original_origin(
 async def test_provider_specific_fetch_models_contracts(monkeypatch):
     profiles: dict[str, ProviderProfile] = {}
     for name in ("anthropic", "bedrock", "custom", "kimi", "openrouter", "vertex"):
-        profile = get_provider_profile(name)
+        profile = await get_provider_profile(name)
         assert isinstance(profile, ProviderProfile)
         profiles[name] = profile
 
@@ -205,7 +205,7 @@ async def test_anthropic_fetch_models_preserves_native_catalog_contract(monkeypa
     monkeypatch.setattr(
         "hermes_cli.urllib_security.open_credentialed_url", open_catalog
     )
-    profile = get_provider_profile("anthropic")
+    profile = await get_provider_profile("anthropic")
     assert isinstance(profile, ProviderProfile)
 
     assert await profile.fetch_models(api_key="anthropic-secret", timeout=3.0) == [
@@ -222,7 +222,7 @@ async def test_anthropic_fetch_models_preserves_native_catalog_contract(monkeypa
 
 @pytest.mark.asyncio
 async def test_openrouter_fetch_models_uses_public_catalog_and_cache(monkeypatch):
-    profile = get_provider_profile("openrouter")
+    profile = await get_provider_profile("openrouter")
     assert isinstance(profile, ProviderProfile)
     module = inspect.getmodule(type(profile))
     assert module is not None

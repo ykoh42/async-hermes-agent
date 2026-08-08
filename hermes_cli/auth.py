@@ -470,16 +470,15 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
 def _inject_profile_provider_registry() -> None:
     """Register API-key provider profiles after async discovery.
 
-    The legacy module-level injection is still attempted for synchronous
-    imports, but ``providers`` refuses to start filesystem discovery while an
-    event loop is active.  The agent calls this helper again immediately after
-    awaiting provider discovery so dynamic profiles retain their upstream
-    registry behavior without blocking import-time async callers.
+    The module-level call only projects profiles already present in memory.
+    The agent calls this helper again immediately after awaited discovery so
+    dynamic profiles retain their upstream registry behavior without blocking
+    import-time callers.
     """
     try:
-        from providers import list_providers as _list_providers_for_registry
+        from providers import _list_providers_cached
 
-        for _pp in _list_providers_for_registry():
+        for _pp in _list_providers_cached():
             if _pp.name in PROVIDER_REGISTRY:
                 continue
             if _pp.auth_type != "api_key" or not _pp.env_vars:
@@ -614,6 +613,9 @@ async def resolve_api_key_provider_credentials(
     provider_id: str,
 ) -> Dict[str, Any]:
     """Async counterpart used by native provider/client resolution."""
+    from providers import _ensure_provider_profiles_loaded
+
+    await _ensure_provider_profiles_loaded()
     pconfig = PROVIDER_REGISTRY.get(provider_id)
     if not pconfig or pconfig.auth_type != "api_key":
         raise AuthError(
@@ -1732,7 +1734,7 @@ async def resolve_provider(
     try:
         from providers import list_providers as _lp
 
-        for _pp in _lp():
+        for _pp in await _lp():
             for _alias in _pp.aliases:
                 if _alias not in _PROVIDER_ALIASES:
                     _PROVIDER_ALIASES[_alias] = _pp.name

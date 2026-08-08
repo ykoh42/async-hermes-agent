@@ -22,19 +22,21 @@ from __future__ import annotations
 
 import pytest
 
+pytestmark = pytest.mark.usefixtures("provider_profiles_loaded")
+
 
 @pytest.fixture(params=["minimax", "minimax-cn", "minimax-oauth"])
 def minimax_profile(request):
     """Resolve each registered MiniMax profile.
 
-    Going through ``providers.get_provider_profile`` keeps the test honest —
+    Going through ``providers._get_provider_profile_cached`` keeps the test honest —
     if someone later replaces the registered class with a plain
     ``ProviderProfile``, every assertion below collapses.
     """
     import model_tools  # noqa: F401  -- triggers plugin discovery
     import providers
 
-    profile = providers.get_provider_profile(request.param)
+    profile = providers._get_provider_profile_cached(request.param)
     assert profile is not None, f"{request.param} provider profile must be registered"
     return profile, request.param
 
@@ -72,7 +74,7 @@ class TestMinimaxAuxModelM3:
         import model_tools  # noqa: F401
         import providers
 
-        profile = providers.get_provider_profile(provider_id)
+        profile = providers._get_provider_profile_cached(provider_id)
         assert profile is not None
         assert profile.default_aux_model == expected, (
             f"{provider_id} default_aux_model drifted to "
@@ -111,7 +113,7 @@ class TestMinimaxAuxModelNotHighspeed:
         import model_tools  # noqa: F401
         import providers
 
-        profile = providers.get_provider_profile(provider_id)
+        profile = providers._get_provider_profile_cached(provider_id)
         assert profile is not None
         assert "highspeed" not in profile.default_aux_model.lower(), (
             f"{provider_id} default_aux_model={profile.default_aux_model!r} "
@@ -127,7 +129,7 @@ class TestMinimaxM3OpenAIReasoningWireShape:
         import model_tools  # noqa: F401
         import providers
 
-        profile = providers.get_provider_profile("minimax")
+        profile = providers._get_provider_profile_cached("minimax")
         assert profile is not None
         extra_body, top_level = profile.build_api_kwargs_extras(
             reasoning_config=None,
@@ -152,7 +154,7 @@ class TestMinimaxM3OpenAIReasoningWireShape:
         import model_tools  # noqa: F401
         import providers
 
-        profile = providers.get_provider_profile("minimax")
+        profile = providers._get_provider_profile_cached("minimax")
         assert profile is not None
         extra_body, top_level = profile.build_api_kwargs_extras(
             reasoning_config={"enabled": True, "effort": "high"},
@@ -167,7 +169,7 @@ class TestMinimaxM3OpenAIReasoningWireShape:
         import providers
         from agent.transports.chat_completions import ChatCompletionsTransport
 
-        profile = providers.get_provider_profile("minimax")
+        profile = providers._get_provider_profile_cached("minimax")
         assert profile is not None
         kwargs = ChatCompletionsTransport().build_kwargs(
             model="MiniMax-M3",

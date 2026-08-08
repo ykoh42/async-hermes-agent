@@ -548,9 +548,9 @@ def _get_aux_model_for_provider(provider_id: str) -> str:
     legacy hardcoded dict for providers that predate the profiles system.
     """
     try:
-        from providers import get_provider_profile
+        from providers import _get_provider_profile_cached
 
-        _p = get_provider_profile(provider_id)
+        _p = _get_provider_profile_cached(provider_id)
         if _p and _p.default_aux_model:
             return _p.default_aux_model
     except Exception:
@@ -610,9 +610,9 @@ def _resolve_provider_vision_default(provider: str) -> Optional[str]:
     if static:
         return static
     try:
-        from providers import get_provider_profile
+        from providers import _get_provider_profile_cached
 
-        profile = get_provider_profile(provider)
+        profile = _get_provider_profile_cached(provider)
     except Exception:
         return None
     if profile is None:
@@ -2041,9 +2041,9 @@ async def _resolve_api_key_provider(
                 extra["default_headers"] = build_nvidia_nim_headers(base_url)
             else:
                 try:
-                    from providers import get_provider_profile as _gpf_aux
+                    from providers import _get_provider_profile_cached
 
-                    _ph_aux = _gpf_aux(provider_id)
+                    _ph_aux = _get_provider_profile_cached(provider_id)
                     if _ph_aux and _ph_aux.default_headers:
                         extra["default_headers"] = dict(_ph_aux.default_headers)
                 except Exception:
@@ -2100,9 +2100,9 @@ async def _resolve_api_key_provider(
             extra["default_headers"] = build_nvidia_nim_headers(base_url)
         else:
             try:
-                from providers import get_provider_profile as _gpf_aux2
+                from providers import _get_provider_profile_cached
 
-                _ph_aux2 = _gpf_aux2(provider_id)
+                _ph_aux2 = _get_provider_profile_cached(provider_id)
                 if _ph_aux2 and _ph_aux2.default_headers:
                     extra["default_headers"] = dict(_ph_aux2.default_headers)
             except Exception:
@@ -5040,7 +5040,9 @@ async def resolve_provider_client(
         (client, resolved_model) or (None, None) if auth is unavailable.
     """
     from hermes_cli.config import load_config_readonly
+    from providers import _ensure_provider_profiles_loaded
 
+    await _ensure_provider_profiles_loaded()
     config = await load_config_readonly()
     _validate_proxy_env_urls()
     # Preserve the original provider name before alias normalization so a
@@ -5397,9 +5399,9 @@ async def resolve_provider_client(
                 # Fall back to profile.default_headers for providers that
                 # declare client-level attribution headers on their profile.
                 try:
-                    from providers import get_provider_profile as _gpf_custom
+                    from providers import _get_provider_profile_cached
 
-                    _ph_custom = _gpf_custom(provider)
+                    _ph_custom = _get_provider_profile_cached(provider)
                     if _ph_custom and _ph_custom.default_headers:
                         extra["default_headers"] = dict(_ph_custom.default_headers)
                 except Exception:
@@ -5701,9 +5703,9 @@ async def resolve_provider_client(
             # User-Agent for traffic identification, Vercel AI Gateway
             # Referer/Title for analytics).
             try:
-                from providers import get_provider_profile as _gpf_main
+                from providers import _get_provider_profile_cached
 
-                _ph_main = _gpf_main(provider)
+                _ph_main = _get_provider_profile_cached(provider)
                 if _ph_main and _ph_main.default_headers:
                     headers.update(_ph_main.default_headers)
             except Exception:
@@ -6066,7 +6068,9 @@ async def resolve_vision_provider_client(
     """
     runtime = _normalize_main_runtime(main_runtime)
     from hermes_cli.config import load_config_readonly
+    from providers import _ensure_provider_profiles_loaded
 
+    await _ensure_provider_profiles_loaded()
     config = await load_config_readonly()
     (
         requested,
@@ -7399,10 +7403,10 @@ def _build_call_kwargs(
     profile_top_level: Dict[str, Any] = {}
     profile_handles_reasoning = False
     try:
-        from providers import get_provider_profile
+        from providers import _get_provider_profile_cached
         from providers.base import ProviderProfile
 
-        profile = get_provider_profile(str(provider or "").strip().lower())
+        profile = _get_provider_profile_cached(str(provider or "").strip().lower())
         if profile is not None:
             profile_body = (
                 profile.build_extra_body(
@@ -8022,7 +8026,9 @@ async def call_llm(
     main_runtime = _normalize_main_runtime(main_runtime)
     from hermes_cli.config import load_config_readonly
     from hermes_cli.plugins import discover_plugins
+    from providers import _ensure_provider_profiles_loaded
 
+    await _ensure_provider_profiles_loaded()
     await discover_plugins()
     config_snapshot = await load_config_readonly()
     (

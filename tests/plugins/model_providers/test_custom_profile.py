@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import pytest
 
+pytestmark = pytest.mark.usefixtures("provider_profiles_loaded")
+
 
 @pytest.fixture
 def custom_profile():
@@ -32,7 +34,7 @@ def custom_profile():
     import model_tools  # noqa: F401
     import providers
 
-    profile = providers.get_provider_profile("custom")
+    profile = providers._get_provider_profile_cached("custom")
     assert profile is not None, "custom provider profile must be registered"
     return profile
 

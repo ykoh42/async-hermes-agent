@@ -972,9 +972,9 @@ def _inject_profile_canonical_providers() -> None:
     scan.
     """
     try:
-        from providers import list_providers as _list_providers_for_canonical
+        from providers import _list_providers_cached
 
-        for _pp in _list_providers_for_canonical():
+        for _pp in _list_providers_cached():
             if _pp.name in _canonical_slugs:
                 continue
             if _pp.auth_type in {
