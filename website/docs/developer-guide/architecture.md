@@ -145,6 +145,29 @@ The async conversion keeps these upstream invariants:
 - Hermes' internal interrupt path returns a partial result rather than being
   confused with task cancellation.
 
+## Live acceptance verification
+
+The default test suite is hermetic. Before a release, run the opt-in acceptance
+paths with an authenticated provider to exercise the real async chain rather
+than only mocked transports:
+
+```bash
+HERMES_LIVE_TESTS=1 HERMES_LIVE_PROVIDER=copilot \
+  uv run pytest -q \
+    tests/e2e/test_live_provider_tool_path.py \
+    tests/e2e/test_live_provider_extensions_path.py \
+    tests/e2e/test_live_provider_state_path.py \
+    tests/e2e/test_live_provider_timeout_path.py \
+    tests/e2e/test_live_batch_runner_path.py
+```
+
+These tests cover provider-to-tool observations and trajectory ordering, a real
+stdio MCP server and skill loading, persistent memory and cross-instance
+session resume, timeout cleanup and next-turn recovery, and batch checkpoint
+resume. They also fail on event-loop blocking or leaked tasks. Set
+`HERMES_LIVE_MODEL` to override the provider's test default; OpenRouter runs
+also require `OPENROUTER_API_KEY`.
+
 ## Persistence and ownership
 
 `SessionDB` uses one lazily opened `aiosqlite` connection and async locks for
