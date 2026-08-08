@@ -13,9 +13,8 @@ Python on Windows has two long-standing text-encoding footguns:
    cp1252 defaults and hits the same UnicodeEncodeError.
 
 This module fixes both on Windows *only* — POSIX is untouched.  It
-should be imported at the very top of every Hermes entry point
-(``hermes``, ``hermes-agent``, ``hermes-acp``, ``python -m gateway.run``,
-``batch_runner.py``, ``cron/scheduler.py``) before any other imports
+should be imported at the very top of every retained Hermes entry point
+(``run_agent.py`` and ``batch_runner.py``) before any other imports
 that might do file I/O or print to stdout.
 
 What this module does on Windows:
@@ -130,8 +129,8 @@ def suppress_platform_ver_console() -> None:
     platform headers) shells out ``cmd /c ver``. Two failure modes:
 
     - **Console flash**: the ``check_output(..., shell=True)`` call has no
-      ``CREATE_NO_WINDOW``, so a windowless parent (pythonw gateway, slash
-      workers, kanban workers) flashes a visible console per call.
+      ``CREATE_NO_WINDOW``, so a windowless parent flashes a visible console
+      per call.
     - **UnicodeDecodeError on Python 3.11.0/3.11.1**: those micros lack
       CPython's ``encoding="locale"`` fix (added 3.11.2), so under PEP 540
       UTF-8 mode (which we enable above) the ``ver`` output — OEM code page
@@ -142,12 +141,7 @@ def suppress_platform_ver_console() -> None:
     Stubbing ``_syscmd_ver`` to return its inputs makes ``win32_ver()`` hit
     its documented fallback and read the version from
     ``sys.getwindowsversion()`` — same data, in-process, no subprocess.
-    Mirrors ``hermes_cli._subprocess_compat.suppress_platform_ver_console``
-    (kept there for callers that don't import bootstrap); double
-    application is harmless. Lives here so EVERY entry point gets it —
-    ``tui_gateway/slash_worker.py``, ``tui_gateway/entry.py``,
-    ``run_agent.py``, ``batch_runner.py``, and ``cli.py`` import only
-    ``hermes_bootstrap``, never ``hermes_cli.main``.
+    Applied here so both retained entry points get the guard before SDK import.
     """
     if not _IS_WINDOWS:
         return
@@ -201,39 +195,9 @@ def harden_import_path(src_root: str | None = None) -> None:
     sys.path.insert(0, root)
 
 
-def activate_durable_lazy_target() -> None:
-    """Put the durable lazy-install dir on ``sys.path`` if one is configured.
-
-    On immutable Docker images the agent venv is sealed and lazy installs
-    are redirected to a writable dir on the data volume
-    (``HERMES_LAZY_INSTALL_TARGET``, e.g. ``/opt/data/lazy-packages``).
-    Packages installed there on a previous run must be importable on this
-    run, so we activate the dir here — at the very first import, before any
-    backend module imports its SDK.
-
-    The activation appends to the END of ``sys.path`` so the core venv
-    always wins name collisions (see ``tools.lazy_deps`` for the full
-    security rationale). Never raises; a missing/empty target is a no-op.
-    """
-    if not os.environ.get("HERMES_LAZY_INSTALL_TARGET", "").strip():
-        return
-    try:
-        from tools import lazy_deps
-        lazy_deps.activate_durable_lazy_target()
-    except Exception:
-        # Bootstrap must never crash an entry point. If activation fails the
-        # backend simply reports itself unavailable, exactly as before.
-        pass
-
-
 # Apply on import — entry points just need ``import hermes_bootstrap``
 # (or ``from hermes_bootstrap import apply_windows_utf8_bootstrap``) at
 # the very top of their module, before importing anything else.  The
 # import side effect does the right thing.
 apply_windows_utf8_bootstrap()
 suppress_platform_ver_console()
-
-# Activate the durable lazy-install target (immutable Docker images) so
-# packages installed into the data volume on a previous run are importable
-# this run, before any backend module imports its SDK. No-op when unset.
-activate_durable_lazy_target()

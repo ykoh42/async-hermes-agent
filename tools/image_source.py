@@ -132,14 +132,7 @@ async def resolve_image_source(
         async with aiofiles.open(host_target, "rb") as image_file:
             data = await image_file.read()
         return _finalize(data, "", "file", s, permitted)
-    if _is_local_terminal_backend():
-        # Local backend: any path was host-readable, so a miss simply means
-        # the file doesn't exist — no sandbox to fall back to.
-        raise SourceNotFound(f"media file not found: '{p}'", src=s, origin="file")
-    # Not a permitted host read (or the host file is absent) -> read the
-    # bytes inside the sandbox. Under a sandbox this reads the container's
-    # filesystem, never the host's.
-    return await _resolve_container_fallback(p, ctx, s, permitted)
+    raise SourceNotFound(f"media file not found: '{p}'", src=s, origin="file")
 
 
 def _resolve_data_url(s: str) -> tuple[bytes, str]:
@@ -199,15 +192,6 @@ async def _download_to_bytes(url: str) -> bytes:
             pass
 
 
-def _is_local_terminal_backend() -> bool:
-    """True when the terminal backend runs directly on the host.
-
-    Mirrors ``tools.browser_tool._is_local_backend`` and terminal_tool's own
-    dispatch, which key off ``TERMINAL_ENV``.
-    """
-    return os.getenv("TERMINAL_ENV", "local").strip().lower() in ("local", "")
-
-
 async def _permitted_host_read_target(
     path: Path,
     _context: ResolveContext,
@@ -217,70 +201,6 @@ async def _permitted_host_read_target(
         return Path(await _realpath(path))
     except OSError:
         return path
-
-
-def _get_active_env(task_id: Optional[str]):
-    if not task_id:
-        return None
-    try:
-        from tools.terminal_tool import get_active_env
-
-        return get_active_env(task_id)
-    except Exception:
-        return None
-
-
-async def _resolve_container_fallback(
-    p: Path, ctx: ResolveContext, src: str, permitted: tuple = ("image",)
-) -> ResolvedImage:
-    """Read the image bytes inside the sandbox (fail-closed when none exists).
-
-    Reached when a host read is not permitted or the host file is absent. The
-    agent can already ``cat`` any container file (file_operations.py reads
-    root-owned mode-600 files this way), so this stays within the same sandbox
-    boundary and never touches the host filesystem. ``--`` stops a leading-dash
-    path from being parsed as a ``base64`` option; ``base64 -w0`` is GNU-only,
-    so pipe through ``tr -d`` for BusyBox.
-
-    Fail-closed: if there is no active sandbox env we refuse rather than falling
-    back to a host read, so a non-cache host path under a sandbox never leaks.
-    """
-    import shlex
-
-    env = _get_active_env(ctx.task_id)
-    if env is None:
-        raise SourceNotFound(
-            f"'{p}' is not reachable inside the sandbox and no active sandbox "
-            f"session is available to read it",
-            src=src, origin="container")
-
-    # Bound the read INSIDE the sandbox: head -c caps at ingest-limit+1 bytes
-    # so a huge file (or /dev/zero) can't stream unbounded base64 into host
-    # memory — the +1 byte lets us distinguish "exactly at the cap" from
-    # "over the cap" after decode. The input redirect (< path) avoids argv
-    # entirely, so leading-dash paths can't be parsed as options; base64
-    # -w0 is GNU-only, so pipe through tr -d for BusyBox.
-    qp = shlex.quote(str(p))
-    async_execute = getattr(env, "aexecute", None)
-    if not callable(async_execute):
-        raise UnsupportedScheme(
-            "The selected terminal backend does not expose native async "
-            "file reads; image resolution cannot fall back to a worker thread.",
-            src=src,
-            origin="container",
-        )
-    res = await async_execute(
-        f"head -c {_MAX_INGEST_BYTES + 1} < {qp} | base64 | tr -d '\\n'"
-    )
-    if res.get("returncode", 1) != 0:
-        raise SourceNotFound(f"could not read '{p}' inside the sandbox", src=src, origin="container")
-    try:
-        data = base64.b64decode(res.get("output", ""), validate=True)
-    except Exception as exc:
-        raise NotAnImage(f"sandbox returned non-image data for '{p}': {exc}", src=src)
-    if len(data) > _MAX_INGEST_BYTES:
-        raise SourceTooLarge("media exceeds size limit", src=src, origin="container")
-    return _finalize(data, "", "container", src, permitted)
 
 
 def _finalize(

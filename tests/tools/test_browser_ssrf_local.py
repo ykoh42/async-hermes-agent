@@ -179,15 +179,6 @@ class TestIsLocalBackend:
         assert await browser_tool._is_local_backend() is True
 
 
-    async def test_camofox_overrides_container_backend(self, monkeypatch):
-        """Camofox mode always counts as local, even with container terminal."""
-        monkeypatch.setattr(browser_tool, "_is_camofox_mode", AsyncMock(return_value=True))
-        monkeypatch.setattr(browser_tool, "_get_cloud_provider", AsyncMock(return_value=None))
-        monkeypatch.setenv("TERMINAL_ENV", "docker")
-
-        assert await browser_tool._is_local_backend() is True
-
-
 # ---------------------------------------------------------------------------
 # Post-redirect SSRF check
 # ---------------------------------------------------------------------------

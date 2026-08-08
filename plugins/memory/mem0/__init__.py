@@ -13,16 +13,14 @@ Secret (lives in $HERMES_HOME/.env or the environment):
                        plugin talks to that server directly over HTTP
                        (X-API-Key auth) instead of the cloud API.
 
-Behavioral settings (live in $HERMES_HOME/mem0.json, set via `hermes memory
-setup`):
+Behavioral settings (live in $HERMES_HOME/mem0.json):
   mode               — Backend mode: "platform" (default) or "oss"
   host               — Self-hosted Mem0 server URL (alt: MEM0_HOST env var).
                        When set, routes to the self-hosted HTTP backend.
   user_id            — Canonical user identifier. When set, it is applied
-                       uniformly across every gateway (CLI, Telegram, Slack,
-                       Discord, …) so the same human gets one merged memory
-                       store. When unset, the gateway-native id (e.g. Telegram
-                       numeric id, Discord snowflake) is used instead.
+                       uniformly across sessions so the same user gets one
+                       merged memory store. When unset, a caller-provided
+                       session identity may be used instead.
   agent_id           — Agent identifier (default: hermes)
 
 The matching MEM0_MODE / MEM0_USER_ID / MEM0_AGENT_ID environment variables are
@@ -59,11 +57,10 @@ _PREFETCH_WAIT_SECS = 3
 
 _CLIENT_ERROR_TYPES = ("MemoryNotFoundError", "ValidationError")
 
-# Sentinel returned when neither MEM0_USER_ID nor a gateway-native id is
+# Sentinel returned when neither MEM0_USER_ID nor a caller-provided identity is
 # available. Treated as "no operator-configured user_id" by initialize() so
-# that legacy mem0.json files written by the setup wizard (which historically
-# wrote this exact placeholder) still allow gateway-native ids to flow
-# through instead of silently overriding them with the placeholder.
+# legacy mem0.json files written by the upstream setup wizard (which used this
+# placeholder) still allow caller-provided identities to flow through.
 _DEFAULT_USER_ID = "hermes-user"
 
 
@@ -98,7 +95,7 @@ async def _load_config() -> dict:
     }
     # Only carry user_id when the operator explicitly configured one (env or
     # mem0.json). An absent key tells initialize() to fall back to the
-    # gateway-native id from kwargs instead of overriding it with a placeholder.
+    # caller-provided id from kwargs instead of overriding it with a placeholder.
     env_user_id = os.environ.get("MEM0_USER_ID")
     if env_user_id:
         config["user_id"] = env_user_id
@@ -343,21 +340,19 @@ class Mem0MemoryProvider(MemoryProvider):
         self._host = self._config.get("host", "")
         # Resolution order for user_id:
         #   1. Operator-configured MEM0_USER_ID (env or $HERMES_HOME/mem0.json) —
-        #      the canonical principal, applied across every gateway so the same
-        #      human gets one merged memory store.
-        #   2. Gateway-native id from kwargs (Telegram numeric id, Discord
-        #      snowflake, etc.) — preserves per-platform isolation when no
-        #      override is configured.
-        #   3. Hardcoded fallback _DEFAULT_USER_ID (CLI with no auth).
+        #      the canonical principal across sessions.
+        #   2. Caller-provided user_id from kwargs — preserves application-level
+        #      identity isolation when no override is configured.
+        #   3. Hardcoded fallback _DEFAULT_USER_ID for callers with no identity.
         # The literal _DEFAULT_USER_ID string is treated as unset so users who
-        # ran the setup wizard with the suggested default still get gateway-
-        # native ids instead of being silently bucketed together.
+        # used the upstream setup wizard's suggested default still get
+        # caller-provided ids instead of being silently bucketed together.
         configured = self._config.get("user_id")
         if configured == _DEFAULT_USER_ID:
             configured = None
         self._user_id = configured or kwargs.get("user_id") or _DEFAULT_USER_ID
         self._agent_id = self._config.get("agent_id", "hermes")
-        # Persisted rerank preference (setup wizard / mem0.json). Used as the
+        # Persisted rerank preference from mem0.json. Used as the
         # DEFAULT for mem0_search when the model doesn't pass ``rerank``
         # explicitly; per-call args still win. Platform-only feature — other
         # backends accept-and-ignore the flag.

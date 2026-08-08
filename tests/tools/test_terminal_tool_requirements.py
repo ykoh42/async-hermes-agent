@@ -34,9 +34,8 @@ class TestTerminalRequirements:
 class TestCheckFnTransientFailureSuppression:
     """The check_fn TTL cache should absorb transient probe failures.
 
-    Regression coverage for #21658 / #5304: a single flaky
-    ``check_terminal_requirements()`` (Docker daemon busy, probe timeout)
-    must not silently strip the terminal/file toolset from a subagent. After
+    A single flaky optional-tool probe must not silently strip its toolset
+    from a subagent. After
     a recent success, a transient False is treated as a flake; a failure with
     no recent success — or past the grace window — is honored.
     """
@@ -242,8 +241,8 @@ class TestCheckFnTransientFailureSuppression:
         assert len(reg._check_fn_last_good) <= reg._CHECK_FN_CACHE_MAX
 
     @pytest.mark.asyncio
-    async def test_subagent_keeps_file_tools_through_docker_flake(self, monkeypatch):
-        """End-to-end: a docker probe that flakes on the 2nd build keeps the
+    async def test_subagent_keeps_file_tools_through_probe_flake(self, monkeypatch):
+        """End-to-end: a tool probe that flakes on the 2nd build keeps the
         file/terminal toolset available for the subagent being constructed."""
         import tools.registry as reg
 

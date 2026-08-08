@@ -1,41 +1,46 @@
 # ByteRover Memory Provider
 
-Persistent memory via the `brv` CLI — hierarchical knowledge tree with tiered retrieval (fuzzy text → LLM-driven search).
+Persistent memory through the `brv` CLI, using a hierarchical knowledge tree
+with tiered retrieval.
 
 ## Requirements
 
 Install the ByteRover CLI:
+
 ```bash
 curl -fsSL https://byterover.dev/install.sh | sh
 # or
 npm install -g byterover-cli
 ```
 
-## Setup
+## Configuration
 
-```bash
-hermes memory setup    # select "byterover"
+Enable the `memory` toolset when constructing `AIAgent` and select ByteRover in
+`$HERMES_HOME/config.yaml`:
+
+```yaml
+memory:
+  provider: byterover
+  byterover:
+    auto_extract: false
 ```
 
-Or manually:
-```bash
-hermes config set memory.provider byterover
-# Optional cloud sync:
-echo "BRV_API_KEY=your-key" >> ~/.hermes/.env
+`HERMES_HOME` defaults to `~/.hermes`. The provider stores its profile-scoped
+working tree under `$HERMES_HOME/byterover/`.
+
+For optional cloud synchronization, put the secret in
+`$HERMES_HOME/.env` or the process environment:
+
+```dotenv
+BRV_API_KEY=your-key
 ```
-
-## Config
-
-| Env Var | Required | Description |
-|---------|----------|-------------|
-| `BRV_API_KEY` | No | Cloud sync key (optional, local-first by default) |
-
-Working directory: `$HERMES_HOME/byterover/` (profile-scoped).
 
 ## Tools
 
 | Tool | Description |
 |------|-------------|
 | `brv_query` | Search the knowledge tree |
-| `brv_curate` | Store facts, decisions, patterns |
-| `brv_status` | CLI version, tree stats, sync state |
+| `brv_curate` | Store facts, decisions, and patterns |
+| `brv_status` | Report CLI version, tree statistics, and sync state |
+
+The provider resolves and invokes the `brv` subprocess asynchronously.

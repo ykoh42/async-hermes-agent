@@ -183,9 +183,8 @@ _ENV_VAR_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 #   ``.env`` would relocate state in ways the user did not request from
 #   the dashboard. ``config.yaml`` is the supported surface for these.
 #
-# IMPORTANT: ``HERMES_*`` overall is NOT blocked. Many legitimate
-# integration credentials follow that prefix (HERMES_LANGFUSE_PUBLIC_KEY,
-# HERMES_SPOTIFY_CLIENT_ID, ...). The
+# IMPORTANT: ``HERMES_*`` overall is NOT blocked. Many legitimate provider
+# credentials and endpoint overrides follow that prefix. The
 # denylist is name-by-name on purpose so the gate stays narrow and
 # doesn't accidentally break provider setup wizards.
 #
@@ -208,8 +207,8 @@ _ENV_VAR_NAME_DENYLIST: frozenset[str] = frozenset({
     # Git
     "GIT_SSH_COMMAND", "GIT_EXEC_PATH", "GIT_SHELL",
     # Hermes runtime location — never via dashboard env writer.
-    # NOT a HERMES_* blanket: integration credentials (HERMES_GEMINI_*,
-    # HERMES_LANGFUSE_*, HERMES_SPOTIFY_*, ...) ARE allowed.
+    # NOT a HERMES_* blanket: provider credentials and endpoint overrides are
+    # allowed.
     "HERMES_HOME", "HERMES_PROFILE", "HERMES_CONFIG", "HERMES_ENV",
 })
 
@@ -259,59 +258,10 @@ _CONFIG_LOCK = threading.RLock()
 # Env var names written to .env that aren't in OPTIONAL_ENV_VARS
 # (managed by setup/provider flows directly).
 _EXTRA_ENV_KEYS = frozenset({
-    "OPENAI_API_KEY", "OPENAI_BASE_URL",
-    "ANTHROPIC_API_KEY", "ANTHROPIC_TOKEN",
-    "DISCORD_HOME_CHANNEL", "DISCORD_HOME_CHANNEL_NAME",
-    "TELEGRAM_HOME_CHANNEL", "TELEGRAM_HOME_CHANNEL_NAME",
-    "SLACK_HOME_CHANNEL", "SLACK_HOME_CHANNEL_NAME",
-    "SIGNAL_ACCOUNT", "SIGNAL_HTTP_URL",
-    "SIGNAL_ALLOWED_USERS", "SIGNAL_GROUP_ALLOWED_USERS",
-    "SIGNAL_HOME_CHANNEL", "SIGNAL_HOME_CHANNEL_NAME",
-    "SMS_HOME_CHANNEL", "SMS_HOME_CHANNEL_NAME",
-    "FEISHU_APP_ID", "FEISHU_APP_SECRET", "FEISHU_ENCRYPT_KEY", "FEISHU_VERIFICATION_TOKEN",
-    "FEISHU_HOME_CHANNEL", "FEISHU_HOME_CHANNEL_NAME",
-    "YUANBAO_HOME_CHANNEL", "YUANBAO_HOME_CHANNEL_NAME",
-    "WECOM_BOT_ID", "WECOM_SECRET",
-    "WECOM_CALLBACK_CORP_ID", "WECOM_CALLBACK_CORP_SECRET", "WECOM_CALLBACK_AGENT_ID",
-    "WECOM_CALLBACK_TOKEN", "WECOM_CALLBACK_ENCODING_AES_KEY",
-    "WECOM_CALLBACK_HOST", "WECOM_CALLBACK_PORT",
-    "WECOM_HOME_CHANNEL", "WECOM_HOME_CHANNEL_NAME",
-    "WEIXIN_ACCOUNT_ID", "WEIXIN_TOKEN", "WEIXIN_BASE_URL", "WEIXIN_CDN_BASE_URL",
-    "WEIXIN_HOME_CHANNEL", "WEIXIN_HOME_CHANNEL_NAME", "WEIXIN_DM_POLICY", "WEIXIN_GROUP_POLICY",
-    "WEIXIN_ALLOWED_USERS", "WEIXIN_GROUP_ALLOWED_USERS", "WEIXIN_ALLOW_ALL_USERS",
-    "BLUEBUBBLES_SERVER_URL", "BLUEBUBBLES_PASSWORD",
-    "BLUEBUBBLES_HOME_CHANNEL", "BLUEBUBBLES_HOME_CHANNEL_NAME",
-    "QQ_APP_ID", "QQ_CLIENT_SECRET", "QQBOT_HOME_CHANNEL", "QQBOT_HOME_CHANNEL_NAME",
-    "QQ_HOME_CHANNEL", "QQ_HOME_CHANNEL_NAME",  # legacy aliases (pre-rename, still read for back-compat)
-    "QQ_ALLOWED_USERS", "QQ_GROUP_ALLOWED_USERS", "QQ_ALLOW_ALL_USERS", "QQ_MARKDOWN_SUPPORT",
-    "QQ_STT_API_KEY", "QQ_STT_BASE_URL", "QQ_STT_MODEL",
-    "IRC_SERVER", "IRC_PORT", "IRC_NICKNAME", "IRC_CHANNEL",
-    "IRC_USE_TLS", "IRC_SERVER_PASSWORD", "IRC_NICKSERV_PASSWORD",
-    "TERMINAL_ENV", "TERMINAL_SSH_KEY", "TERMINAL_SSH_PORT",
-    # HERMES_TOOL_PROGRESS_MODE is deprecated (replaced by display.tool_progress
-    # in config.yaml) but STILL READ at runtime by the gateway as a back-compat
-    # fallback, so it must stay known to reload/compat paths. The boolean
-    # HERMES_TOOL_PROGRESS variant is fully unsupported since the v12 config
-    # support floor retired its only consumer (the v3→4 migration): it is no
-    # longer listed here and doctor flags it as ignored.
-    "HERMES_TOOL_PROGRESS_MODE",
-    "WHATSAPP_MODE", "WHATSAPP_ENABLED",
-    "MATTERMOST_HOME_CHANNEL", "MATTERMOST_HOME_CHANNEL_NAME", "MATTERMOST_REPLY_MODE",
-    "MATRIX_PASSWORD", "MATRIX_ENCRYPTION", "MATRIX_DEVICE_ID", "MATRIX_HOME_ROOM",
-    "MATRIX_REQUIRE_MENTION", "MATRIX_FREE_RESPONSE_ROOMS", "MATRIX_AUTO_THREAD", "MATRIX_DM_AUTO_THREAD",
-    "MATRIX_RECOVERY_KEY",
-    # Langfuse observability plugin — optional tuning keys + standard SDK vars.
-    # Activation is via plugins.enabled (opt-in through `hermes plugins enable
-    # observability/langfuse` or `hermes tools → Langfuse`); credentials gate
-    # the plugin at runtime.
-    "HERMES_LANGFUSE_ENV",
-    "HERMES_LANGFUSE_RELEASE",
-    "HERMES_LANGFUSE_SAMPLE_RATE",
-    "HERMES_LANGFUSE_MAX_CHARS",
-    "HERMES_LANGFUSE_DEBUG",
-    "LANGFUSE_PUBLIC_KEY",
-    "LANGFUSE_SECRET_KEY",
-    "LANGFUSE_BASE_URL",
+    "OPENAI_API_KEY",
+    "OPENAI_BASE_URL",
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_TOKEN",
 })
 import yaml
 
@@ -328,11 +278,6 @@ _MANAGED_SYSTEM_NAMES = {
     "nix": "NixOS",
     "nixos": "NixOS",
 }
-# The Nix store root. Used by detect_install_method to identify installs
-# from `nix run` / `nix profile install` (which don't set HERMES_MANAGED).
-# A module-level constant so tests can patch it without creating files
-# under the real /nix/store.
-_NIX_STORE = Path("/nix/store")
 # Values that used to signal a Homebrew-managed install. Homebrew is no
 # longer a supported distribution method, so these are explicitly ignored
 # rather than treated as a managed system — they fall through to git/unknown
@@ -367,237 +312,6 @@ def is_managed() -> bool:
     return get_managed_system() is not None
 
 
-_NIX_UPDATE_MSG = (
-    "Update Hermes through the Nix source that installed it "
-    "(e.g. nix profile upgrade, or update your flake input and rebuild with nixos-rebuild or home-manager switch)"
-)
-
-
-def get_managed_update_command() -> Optional[str]:
-    """Return the preferred upgrade command for a managed install."""
-    managed_system = get_managed_system()
-    if managed_system == "NixOS":
-        return _NIX_UPDATE_MSG
-    return None
-
-
-def _install_method_project_root(project_root: Optional[Path] = None) -> Path:
-    """Resolve the directory that holds the *running code* (the install tree).
-
-    This is the parent of ``hermes_cli/`` — i.e. the git checkout for source
-    installs, ``/opt/hermes`` inside the published image. It is a property of
-    the running interpreter, NOT of ``$HERMES_HOME``, which is why a
-    code-scoped stamp here is immune to two installs sharing one data
-    directory.
-    """
-    if project_root is not None:
-        return project_root
-    return Path(__file__).parent.parent.resolve()
-
-
-def detect_install_method(project_root: Optional[Path] = None) -> str:
-    """Detect how Hermes was installed: 'docker', 'nix', 'nixos', 'git', or 'unknown'.
-
-    Resolution order:
-    1. Code-scoped stamp ``<install tree>/.install_method`` (next to the
-       running code) — the authoritative marker.
-    2. Legacy home-scoped stamp ``$HERMES_HOME/.install_method`` — read for
-       backward compatibility, but a ``docker`` value is IGNORED when we are
-       not actually running inside a container (see below).
-    3. HERMES_MANAGED env / .managed marker (NixOS managed mode)
-    4. /nix/store/ path detection -> 'nix' (nix run / nix profile install)
-    5. .git directory presence -> 'git'
-    6. Fallback -> 'unknown'
-
-    Why the stamp is code-scoped, not home-scoped (issue: shared ``~/.hermes``)
-    --------------------------------------------------------------------------
-    The install method describes *the binary that is running*, but
-    ``$HERMES_HOME`` is a shared DATA directory — the Docker docs deliberately
-    bind-mount it (``~/.hermes:/opt/data``) so config/sessions/memory persist
-    and can be shared with a host-side Desktop/CLI install. When a
-    containerised gateway and a host install share one ``$HERMES_HOME``, a
-    home-scoped stamp is a single slot describing two different installs:
-    the container stamps ``docker`` on every boot, the host install then reads
-    ``docker`` and ``hermes update`` refuses to run ("doesn't apply inside the
-    Docker container") even though the host binary is a perfectly updatable
-    git/pip install. Scoping the stamp to the install tree gives each install
-    its own truthful marker.
-
-    Self-healing for already-poisoned homes: a legacy ``docker`` value in the
-    home-scoped stamp is only honoured when we are genuinely in a container.
-    On a host install that read a contaminating ``docker`` stamp, we fall
-    through to managed/.git detection instead — so existing shared-home
-    setups recover without the user touching anything.
-
-    Note: running inside a container is NOT treated as "docker" on its own.
-    The supported installs self-identify via the code-scoped stamp:
-      - the curl installer (scripts/install.sh, the README/website install
-        command) git-clones the repo and stamps ``git`` next to the code;
-      - the published ``nousresearch/hermes-agent`` image bakes a ``docker``
-        stamp into ``/opt/hermes`` at build time.
-    An unsupported manual install dropped into a container (no stamp) falls
-    through to the ``.git`` checks and behaves like any off-path install.
-    See issue #34397.
-    """
-    root = _install_method_project_root(project_root)
-    supported_methods = {"docker", "nix", "nixos", "git", "unknown"}
-
-    # 1. Code-scoped stamp — authoritative, immune to shared $HERMES_HOME.
-    try:
-        method = (root / ".install_method").read_text(encoding="utf-8").strip().lower()
-        if method in supported_methods:
-            return method
-    except OSError:
-        pass
-
-    # 2. Legacy home-scoped stamp — back-compat. Ignore a ``docker`` value
-    #    when we are not actually containerised: that is the signature of a
-    #    host install whose shared $HERMES_HOME was stamped by a co-located
-    #    container, and honouring it wrongly blocks ``hermes update``.
-    try:
-        method = (
-            (get_hermes_home() / ".install_method")
-            .read_text(encoding="utf-8")
-            .strip()
-            .lower()
-        )
-        if method in supported_methods and not (method == "docker" and not _running_in_container()):
-            return method
-    except OSError:
-        pass
-
-    managed = get_managed_system()
-    if managed:
-        return managed.lower().replace(" ", "-")
-
-    # detect Nix installs that don't set HERMES_MANAGED (e.g. ``nix run``,
-    # ``nix profile install``). The code lives under /nix/store/ which is the
-    # hallmark of a nix-built install — no other supported install path puts
-    # code there.
-    try:
-        resolved = root.resolve()
-        if resolved != _NIX_STORE and _NIX_STORE in resolved.parents:
-            return "nix"
-    except OSError:
-        pass
-
-    # detect git repo installs (normal installer, development env)
-    git_path = root / ".git"
-    if git_path.is_dir():
-        return "git"
-
-    # detect git repo installs from worktrees
-    if git_path.is_file():
-        try:
-            content = git_path.read_text(encoding="utf-8").strip()
-            if content.startswith("gitdir:"):
-                return "git"
-        except OSError:
-            pass
-    return "unknown"
-
-
-def _running_in_container() -> bool:
-    """Thin wrapper around ``hermes_constants.is_container`` (import-safe)."""
-    try:
-        from hermes_constants import is_container
-
-        return is_container()
-    except Exception:
-        return False
-
-
-def stamp_install_method(method: str, project_root: Optional[Path] = None) -> None:
-    """Write the install method next to the running code (code-scoped stamp).
-
-    The stamp lives in the install tree (``<install tree>/.install_method``),
-    not in ``$HERMES_HOME``, so that two installs sharing one data directory
-    do not overwrite each other's marker. See ``detect_install_method`` for
-    the full rationale.
-
-    Best-effort: if the install tree is read-only (e.g. the immutable
-    ``/opt/hermes`` in the published image, which instead bakes the stamp at
-    build time) the write silently no-ops and detection falls back to its
-    other signals.
-    """
-    root = _install_method_project_root(project_root)
-    try:
-        root.mkdir(parents=True, exist_ok=True)
-        (root / ".install_method").write_text(method + "\n", encoding="utf-8")
-    except OSError:
-        pass
-
-
-def recommended_update_command_for_method(method: str) -> str:
-    """Return the update command or guidance for a given install method."""
-    if method in {"nix", "nixos"}:
-        return _NIX_UPDATE_MSG
-    if method == "docker":
-        return "docker pull nousresearch/hermes-agent:latest"
-    return "hermes update"
-
-
-def recommended_update_command() -> str:
-    """Return the best update command for the current installation."""
-    managed_cmd = get_managed_update_command()
-    if managed_cmd:
-        return managed_cmd
-    method = detect_install_method(get_project_root())
-    return recommended_update_command_for_method(method)
-
-
-# Long-form text for ``hermes update`` / ``--check`` when running inside the
-# Docker image.  Surfaced by ``cmd_update`` and ``_cmd_update_check`` in
-# hermes_cli/main.py; lives here so the wording stays consistent and we
-# don't grow two slightly-different copies.
-#
-# Why this matters:
-#   - The published image excludes ``.git`` (see .dockerignore), so the
-#     git-based update path can never succeed inside the container.
-#   - The pre-existing fallback message ("✗ Not a git repository. Please
-#     reinstall: curl ... install.sh") is actively misleading inside Docker
-#     — that script installs a *new* host-side Hermes, it doesn't update
-#     the running container.
-#   - The right action is ``docker pull`` + restart the container; this
-#     helper spells that out, with notes on tag pinning and config
-#     persistence so users don't get blindsided.
-_DOCKER_UPDATE_MESSAGE = """\
-✗ ``hermes update`` doesn't apply inside the Docker container.
-
-Hermes Agent runs as a published image (nousresearch/hermes-agent), not a
-git checkout — the container has no working tree to pull into.  Update by
-pulling a fresh image and restarting your container instead:
-
-  docker pull nousresearch/hermes-agent:latest
-  # then restart whatever started the container, e.g.:
-  docker compose up -d --force-recreate hermes-agent
-  # or, for ad-hoc runs, exit the current container and `docker run` again
-
-Verify the new version after restart:
-  docker run --rm nousresearch/hermes-agent:latest --version
-
-Notes:
-  • If you pinned a specific tag (e.g. ``:v0.14.0``) the ``:latest`` tag
-    won't move your container — pull the newer tag you actually want, or
-    switch to ``:latest`` / ``:main`` for rolling updates.  See available
-    tags at https://hub.docker.com/r/nousresearch/hermes-agent/tags
-  • Your config and session history live under ``$HERMES_HOME`` (``/opt/data``
-    in the container, typically bind-mounted from the host) and persist
-    across image upgrades — re-pulling doesn't lose any state.
-  • Running a fork?  Build your own image with this repo's ``Dockerfile``
-    and replace the ``docker pull`` step with your build/push pipeline."""
-
-
-def format_docker_update_message() -> str:
-    """Return the user-facing message for ``hermes update`` inside Docker.
-
-    Centralised so ``cmd_update`` (the apply path) and ``_cmd_update_check``
-    (the dry-run path) share the same wording.  See ``_DOCKER_UPDATE_MESSAGE``
-    above for the full rationale.
-    """
-    return _DOCKER_UPDATE_MESSAGE
-
-
 def format_managed_message(action: str = "modify this Hermes installation") -> str:
     """Build a user-facing error for managed installs."""
     managed_system = get_managed_system() or "a package manager"
@@ -623,55 +337,6 @@ def managed_error(action: str = "modify configuration"):
 
 
 # =============================================================================
-# Container-aware CLI (NixOS container mode)
-# =============================================================================
-
-def get_container_exec_info() -> Optional[dict]:
-    """Read container mode metadata from HERMES_HOME/.container-mode.
-
-    Returns a dict with keys: backend, container_name, exec_user, hermes_bin
-    or None if container mode is not active, we're already inside the
-    container, or HERMES_DEV=1 is set.
-
-    The .container-mode file is written by the NixOS activation script when
-    container.enable = true. It tells the host CLI to exec into the container
-    instead of running locally.
-    """
-    if os.environ.get("HERMES_DEV") == "1":
-        return None
-
-    from hermes_constants import is_container
-    if is_container():
-        return None
-
-    container_mode_file = get_hermes_home() / ".container-mode"
-
-    try:
-        info = {}
-        with open(container_mode_file, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if "=" in line and not line.startswith("#"):
-                    key, _, value = line.partition("=")
-                    info[key.strip()] = value.strip()
-    except FileNotFoundError:
-        return None
-    # All other exceptions (PermissionError, malformed data, etc.) propagate
-
-    backend = info.get("backend", "docker")
-    container_name = info.get("container_name", "hermes-agent")
-    exec_user = info.get("exec_user", "hermes")
-    hermes_bin = info.get("hermes_bin", "/data/current-package/bin/hermes")
-
-    return {
-        "backend": backend,
-        "container_name": container_name,
-        "exec_user": exec_user,
-        "hermes_bin": hermes_bin,
-    }
-
-
-# =============================================================================
 # Config paths
 # =============================================================================
 
@@ -686,10 +351,6 @@ def get_config_path() -> Path:
 def get_env_path() -> Path:
     """Get the .env file path (for API keys)."""
     return get_hermes_home() / ".env"
-
-def get_project_root() -> Path:
-    """Get the project installation directory."""
-    return Path(__file__).parent.parent.resolve()
 
 def _resolve_hermes_uid_gid() -> tuple[Optional[int], Optional[int]]:
     """Read the HERMES_UID / HERMES_GID env vars set by Docker deployments.
@@ -891,8 +552,7 @@ def ensure_hermes_home():
         home.mkdir(parents=True, exist_ok=True)
         _secure_dir(home)
         for subdir in (
-            "cron", "sessions", "logs", "logs/curator", "memories",
-            "pairing", "hooks", "image_cache", "audio_cache", "skills",
+            "sessions", "logs", "memories", "hooks", "image_cache", "skills",
         ):
             d = home / subdir
             d.mkdir(parents=True, exist_ok=True)
@@ -909,17 +569,13 @@ def _ensure_hermes_home_managed(home: Path):
             f"HERMES_HOME {home} does not exist. "
             "Run 'sudo nixos-rebuild switch' first."
         )
-    for subdir in ("cron", "sessions", "logs", "memories"):
+    for subdir in ("sessions", "logs", "memories"):
         d = home / subdir
         if not d.is_dir():
             raise RuntimeError(
                 f"{d} does not exist. "
                 "Run 'sudo nixos-rebuild switch' first."
             )
-    # Curator reports dir is a sub-path of logs/; create it if missing.
-    # In managed mode the activation script may not know about this subdir,
-    # so we mkdir it ourselves (it's inside an already-secured logs/ dir).
-    (home / "logs" / "curator").mkdir(parents=True, exist_ok=True)
     # Inside umask(0o007) scope — SOUL.md will be created as 0660
     _ensure_default_soul_md(home)
 
@@ -938,11 +594,7 @@ from hermes_cli.config_defaults import DEFAULT_CONFIG, OPTIONAL_ENV_VARS  # noqa
 # Migration only mentions vars new since the user's previous version.
 ENV_VARS_BY_VERSION: Dict[int, List[str]] = {
     3: ["FIRECRAWL_API_KEY", "BROWSERBASE_API_KEY", "BROWSERBASE_PROJECT_ID", "FAL_KEY"],
-    4: ["VOICE_TOOLS_OPENAI_KEY", "ELEVENLABS_API_KEY"],
-    5: ["WHATSAPP_ENABLED", "WHATSAPP_MODE", "WHATSAPP_ALLOWED_USERS",
-        "SLACK_BOT_TOKEN", "SLACK_APP_TOKEN", "SLACK_ALLOWED_USERS"],
     10: ["TAVILY_API_KEY"],
-    11: ["TERMINAL_MODAL_MODE"],
 }
 
 # Required environment variables with metadata for migration prompts.
@@ -950,10 +602,6 @@ ENV_VARS_BY_VERSION: Dict[int, List[str]] = {
 # selection step (Nous Portal / OpenRouter / Custom endpoint), so this
 # dict is intentionally empty — no single env var is universally required.
 REQUIRED_ENV_VARS = {}
-
-# Tool Gateway env vars are always visible — they're useful for
-# self-hosted / custom gateway setups regardless of subscription state.
-
 
 def get_missing_env_vars(required_only: bool = False) -> List[Dict[str, Any]]:
     """
@@ -1143,19 +791,16 @@ def _is_env_config_key(key: str) -> bool:
         return False
     key_upper = key.upper()
     api_keys = [
-        'OPENROUTER_API_KEY', 'OPENAI_API_KEY', 'ANTHROPIC_API_KEY', 'VOICE_TOOLS_OPENAI_KEY',
+        'OPENROUTER_API_KEY', 'OPENAI_API_KEY', 'ANTHROPIC_API_KEY',
         'EXA_API_KEY', 'PARALLEL_API_KEY', 'FIRECRAWL_API_KEY', 'FIRECRAWL_API_URL',
         'TAVILY_API_KEY',
         'BROWSERBASE_API_KEY', 'BROWSERBASE_PROJECT_ID', 'BROWSER_USE_API_KEY',
-        'FAL_KEY', 'TELEGRAM_BOT_TOKEN', 'DISCORD_BOT_TOKEN',
-        'TERMINAL_SSH_HOST', 'TERMINAL_SSH_USER', 'TERMINAL_SSH_KEY',
-        'SUDO_PASSWORD', 'SLACK_BOT_TOKEN', 'SLACK_APP_TOKEN',
-        'GITHUB_TOKEN', 'HONCHO_API_KEY',
+        'FAL_KEY', 'SUDO_PASSWORD',
+        'GITHUB_TOKEN',
     ]
     return (
         key_upper in api_keys
         or key_upper.endswith(('_API_KEY', '_TOKEN'))
-        or key_upper.startswith('TERMINAL_SSH')
     )
 
 
@@ -1715,9 +1360,6 @@ def get_custom_provider_context_length(
     This is the single source of truth for custom-provider context overrides,
     used by:
       * ``AIAgent.__init__`` (startup resolution)
-      * ``AIAgent.switch_model`` (mid-session ``/model`` switch)
-      * ``hermes_cli.model_switch.resolve_display_context_length`` (``/model`` confirmation display)
-      * ``gateway.run._format_session_info`` (``/info`` display)
       * ``agent.model_metadata.get_model_context_length`` (when custom_providers is threaded through)
 
     Before this helper existed, the lookup was duplicated in ``run_agent.py``'s
@@ -1845,23 +1487,6 @@ _EXTRA_KNOWN_ROOT_KEYS = {
     "image_gen",         # image-generation provider config (agent/image_gen_registry.py)
     "video_gen",         # video-generation provider config (agent/video_gen_registry.py)
     "plugins",           # plugin enable/disable lists (hermes_cli/plugins_cmd.py)
-    "smart_model_routing",   # written by the setup wizard (hermes_cli/setup.py)
-    "platform_toolsets",     # written by the setup wizard (hermes_cli/setup.py)
-    "known_plugin_toolsets", # written/read by hermes_cli/tools_config.py toolset-save flow
-    "known_builtin_toolsets",  # ditto — which builtin toolsets a platform's checklist has offered
-    "session_reset",         # top-level form read by gateway/config.py + setup
-    "group_sessions_per_user",   # top-level form bridged by gateway/config.py
-    "thread_sessions_per_user",  # top-level form bridged by gateway/config.py
-    "stt_echo_transcripts",      # top-level form bridged by gateway/config.py
-    "reset_triggers",            # top-level form bridged by gateway/config.py
-    "always_log_local",          # top-level form bridged by gateway/config.py
-    "filter_silence_narration",  # top-level form bridged by gateway/config.py
-    "multiplex_profiles",    # top-level form accepted alongside gateway.multiplex_profiles
-    "profile_routes",        # top-level form accepted alongside gateway.profile_routes
-    "platforms",             # top-level per-platform map merged by gateway/config.py
-    "require_mention",       # top-level convenience form honored by the gateway (#3979)
-    "unauthorized_dm_behavior",  # top-level form read by gateway/config.py
-    "signal",            # Signal settings bridged to env vars by gateway/config.py
 }
 _KNOWN_ROOT_KEYS = frozenset(DEFAULT_CONFIG.keys()) | _EXTRA_KNOWN_ROOT_KEYS
 
@@ -2378,8 +2003,8 @@ def _deep_merge(base: dict, override: dict) -> dict:
     """Recursively merge *override* into *base*, preserving nested defaults.
 
     Keys in *override* take precedence. If both values are dicts the merge
-    recurses, so a user who overrides only ``tts.elevenlabs.voice_id`` will
-    keep the default ``tts.elevenlabs.model_id`` intact.
+    recurses, so a user who overrides one provider field keeps its sibling
+    defaults intact.
 
     An empty section key in config.yaml (``terminal:`` with no value) parses
     as YAML ``None``; treating that as an override would replace the entire
@@ -2795,7 +2420,10 @@ def _normalize_max_turns_config(config: Dict[str, Any]) -> Dict[str, Any]:
     elif "max_turns" not in agent_config:
         agent_config["max_turns"] = DEFAULT_CONFIG["agent"]["max_turns"]
 
-    config["agent"] = agent_config
+    if agent_config:
+        config["agent"] = agent_config
+    else:
+        config.pop("agent", None)
     config.pop("max_turns", None)
     return config
 
@@ -3075,9 +2703,9 @@ async def load_config_readonly() -> Dict[str, Any]:
     """Load behavioral configuration without synchronous file I/O.
 
     This is intentionally a read-only, uncached async snapshot for the agent
-    turn.  CLI/setup code keeps using :func:`load_config_readonly`, whose
-    process-wide cache and synchronous lock are useful there.  Async callers
-    must not enter that lock while the event loop is serving model/tool work.
+    turn. CLI/setup code may keep using :func:`load_config`, whose process-wide
+    cache and synchronous lock are useful there. Async callers must not enter
+    that lock while the event loop is serving model/tool work.
     """
     import aiofiles
     import aiofiles.os
@@ -3126,64 +2754,10 @@ async def load_config_readonly() -> Dict[str, Any]:
     return expanded
 
 
-def write_platform_config_field(
-    platform_key: str,
-    field_key: str,
-    value: Any,
-    *,
-    raw: bool = False,
-) -> None:
-    """Persist one scalar field under ``platforms.<platform_key>``.
-
-    ``raw=True`` preserves CLI setup flows that intentionally edit only the
-    user's raw config file. Dashboard routes use the default loaded-config path
-    so they retain their existing profile-scoped ``load_config`` behavior.
-    """
-    config = read_raw_config() if raw else load_config()
-    platforms = config.setdefault("platforms", {})
-    if not isinstance(platforms, dict):
-        platforms = {}
-        config["platforms"] = platforms
-
-    platform_config = platforms.setdefault(platform_key, {})
-    if not isinstance(platform_config, dict):
-        platform_config = {}
-        platforms[platform_key] = platform_config
-
-    platform_config[field_key] = value
-    save_config(config)
-
-
 TERMINAL_CONFIG_ENV_MAP = {
-    "backend": "TERMINAL_ENV",
-    "modal_mode": "TERMINAL_MODAL_MODE",
     "cwd": "TERMINAL_CWD",
     "timeout": "TERMINAL_TIMEOUT",
-    "lifetime_seconds": "TERMINAL_LIFETIME_SECONDS",
-    "docker_image": "TERMINAL_DOCKER_IMAGE",
-    "docker_forward_env": "TERMINAL_DOCKER_FORWARD_ENV",
-    "singularity_image": "TERMINAL_SINGULARITY_IMAGE",
-    "modal_image": "TERMINAL_MODAL_IMAGE",
-    "daytona_image": "TERMINAL_DAYTONA_IMAGE",
-    "vercel_runtime": "TERMINAL_VERCEL_RUNTIME",
-    "ssh_host": "TERMINAL_SSH_HOST",
-    "ssh_user": "TERMINAL_SSH_USER",
-    "ssh_port": "TERMINAL_SSH_PORT",
-    "ssh_key": "TERMINAL_SSH_KEY",
-    "container_cpu": "TERMINAL_CONTAINER_CPU",
-    "container_memory": "TERMINAL_CONTAINER_MEMORY",
-    "container_disk": "TERMINAL_CONTAINER_DISK",
-    "container_persistent": "TERMINAL_CONTAINER_PERSISTENT",
-    "docker_volumes": "TERMINAL_DOCKER_VOLUMES",
-    "docker_env": "TERMINAL_DOCKER_ENV",
-    "docker_mount_cwd_to_workspace": "TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE",
-    "docker_network": "TERMINAL_DOCKER_NETWORK",
-    "docker_extra_args": "TERMINAL_DOCKER_EXTRA_ARGS",
-    "docker_run_as_host_user": "TERMINAL_DOCKER_RUN_AS_HOST_USER",
-    "docker_persist_across_processes": "TERMINAL_DOCKER_PERSIST_ACROSS_PROCESSES",
-    "docker_orphan_reaper": "TERMINAL_DOCKER_ORPHAN_REAPER",
-    "sandbox_dir": "TERMINAL_SANDBOX_DIR",
-    "persistent_shell": "TERMINAL_PERSISTENT_SHELL",
+    "local_persistent": "TERMINAL_LOCAL_PERSISTENT",
 }
 
 
@@ -4119,586 +3693,6 @@ async def get_env_value_prefer_dotenv(key: str) -> Optional[str]:
         return os.environ.get(key)
 
 
-# =============================================================================
-# Config display
-# =============================================================================
-
-def redact_key(key: str) -> str:
-    """Redact an API key for display.
-
-    Thin wrapper over :func:`agent.redact.mask_secret` — preserves the
-    "(not set)" placeholder in dim color for the empty case.
-    """
-    from agent.redact import mask_secret
-    return mask_secret(key, empty=color("(not set)", Colors.DIM))
-
-
-# Key names (case-insensitive, exact match) whose VALUE is a credential and
-# must be masked before printing any config dict to the terminal. Covers the
-# fields a custom provider stuffs into the `model`/`custom_providers` blocks
-# (`api_key`) plus the usual token/secret/password shapes. Exact-match only so
-# benign keys like `token_count` or `secret_santa` don't get masked.
-_SECRET_CONFIG_KEYS = frozenset({
-    "api_key",
-    "apikey",
-    "key",
-    "token",
-    "access_token",
-    "refresh_token",
-    "id_token",
-    "secret",
-    "client_secret",
-    "password",
-    "passwd",
-    "auth",
-    "authorization",
-    "private_key",
-    "bearer",
-    "jwt",
-})
-
-
-def redact_config_value(value: Any, _depth: int = 0) -> Any:
-    """Return a copy of ``value`` with credential-shaped keys masked for display.
-
-    Recursively walks dicts/lists and replaces the value of any key in
-    ``_SECRET_CONFIG_KEYS`` (case-insensitive) with a masked form via
-    :func:`agent.redact.mask_secret`. Non-secret keys and scalar values pass
-    through unchanged. Use this before ``print``-ing any config sub-tree that
-    might carry a custom-provider ``api_key`` — ``print`` bypasses the logging
-    redactor, and opaque tokens (e.g. Cloudflare ``cfut_...``) don't match the
-    vendor-prefix regexes either, so structural key-name masking is required.
-    """
-    from agent.redact import mask_secret
-
-    # Defensive bound on recursion depth for pathological/cyclic configs.
-    if _depth > 20:
-        return value
-    if isinstance(value, dict):
-        out = {}
-        for k, v in value.items():
-            if isinstance(k, str) and k.lower() in _SECRET_CONFIG_KEYS and isinstance(v, str) and v:
-                out[k] = mask_secret(v)
-            else:
-                out[k] = redact_config_value(v, _depth + 1)
-        return out
-    if isinstance(value, list):
-        return [redact_config_value(v, _depth + 1) for v in value]
-    return value
-
-
-def show_config():
-    """Display current configuration."""
-    config = load_config()
-
-    print()
-    print(color("┌─────────────────────────────────────────────────────────┐", Colors.CYAN))
-    print(color("│              ⚕ Hermes Configuration                    │", Colors.CYAN))
-    print(color("└─────────────────────────────────────────────────────────┘", Colors.CYAN))
-
-    # Managed scope: surface that some settings are administrator-pinned so the
-    # user understands why their config.yaml value may not be the effective one.
-    from hermes_cli import managed_scope
-
-    _managed_keys = managed_scope.managed_config_keys()
-    _managed_env = managed_scope.load_managed_env()
-    if _managed_keys or _managed_env:
-        _managed_dir = managed_scope.get_managed_dir()
-        print()
-        print(color(
-            f"  ⚷ Some settings are managed by your administrator ({_managed_dir}) "
-            f"and cannot be changed",
-            Colors.YELLOW,
-            Colors.BOLD,
-        ))
-        if _managed_keys:
-            print(color(
-                f"    Managed config keys: {', '.join(sorted(_managed_keys))}",
-                Colors.YELLOW,
-            ))
-        if _managed_env:
-            print(color(
-                f"    Managed env keys: {', '.join(sorted(_managed_env))}",
-                Colors.YELLOW,
-            ))
-
-    # Paths
-    print()
-    print(color("◆ Paths", Colors.CYAN, Colors.BOLD))
-    print(f"  Config:       {get_config_path()}")
-    print(f"  Secrets:      {get_env_path()}")
-    print(f"  Install:      {get_project_root()}")
-    
-    # API Keys
-    print()
-    print(color("◆ API Keys", Colors.CYAN, Colors.BOLD))
-    
-    keys = [
-        ("OPENROUTER_API_KEY", "OpenRouter"),
-        ("VOICE_TOOLS_OPENAI_KEY", "OpenAI (STT/TTS)"),
-        ("EXA_API_KEY", "Exa"),
-        ("PARALLEL_API_KEY", "Parallel"),
-        ("FIRECRAWL_API_KEY", "Firecrawl"),
-        ("TAVILY_API_KEY", "Tavily"),
-        ("BROWSERBASE_API_KEY", "Browserbase"),
-        ("BROWSER_USE_API_KEY", "Browser Use"),
-        ("FAL_KEY", "FAL"),
-    ]
-    
-    for env_key, name in keys:
-        value = get_env_value(env_key)
-        print(f"  {name:<14} {redact_key(value)}")
-    # Model settings
-    print()
-    print(color("◆ Model", Colors.CYAN, Colors.BOLD))
-    print(f"  Model:        {redact_config_value(config.get('model', 'not set'))}")
-    _cfg_max_turns = config.get('agent', {}).get('max_turns', DEFAULT_CONFIG['agent']['max_turns'])
-    print(f"  Max turns:    {_cfg_max_turns}")
-    # Warn on stale HERMES_MAX_ITERATIONS ghost in .env that disagrees with
-    # config.yaml (issue #17534). Read the .env FILE directly so we catch the
-    # ghost even when the gateway bridge already overrode os.environ.
-    try:
-        _env_ghost = load_env().get("HERMES_MAX_ITERATIONS")
-        if _env_ghost is not None and str(_env_ghost).strip() != str(_cfg_max_turns).strip():
-            print(color(
-                f"                ⚠ .env has stale HERMES_MAX_ITERATIONS={_env_ghost} "
-                f"(run 'hermes doctor --fix' to remove)",
-                Colors.YELLOW,
-            ))
-    except Exception:
-        pass
-    
-    # Display
-    print()
-    print(color("◆ Display", Colors.CYAN, Colors.BOLD))
-    display = config.get('display', {})
-    print(f"  Personality:  {display.get('personality') or 'none'}")
-    print(f"  Reasoning:    {'on' if display.get('show_reasoning', True) else 'off'}")
-    print(f"  Bell:         {'on' if display.get('bell_on_complete', False) else 'off'}")
-    ump = display.get('user_message_preview', {}) if isinstance(display.get('user_message_preview', {}), dict) else {}
-    ump_first = ump.get('first_lines', 2)
-    ump_last = ump.get('last_lines', 2)
-    print(f"  User preview: first {ump_first} line(s), last {ump_last} line(s)")
-
-    # Terminal
-    print()
-    print(color("◆ Terminal", Colors.CYAN, Colors.BOLD))
-    terminal = config.get('terminal', {})
-    print(f"  Backend:      {terminal.get('backend', 'local')}")
-    print(f"  Working dir:  {terminal.get('cwd', '.')}")
-    print(f"  Timeout:      {terminal.get('timeout', 60)}s")
-    
-    if terminal.get('backend') == 'docker':
-        print(f"  Docker image: {terminal.get('docker_image', 'nikolaik/python-nodejs:python3.11-nodejs20')}")
-    elif terminal.get('backend') == 'singularity':
-        print(f"  Image:        {terminal.get('singularity_image', 'docker://nikolaik/python-nodejs:python3.11-nodejs20')}")
-    elif terminal.get('backend') == 'modal':
-        print(f"  Modal image:  {terminal.get('modal_image', 'nikolaik/python-nodejs:python3.11-nodejs20')}")
-        modal_token = get_env_value('MODAL_TOKEN_ID')
-        print(f"  Modal token:  {'configured' if modal_token else '(not set)'}")
-    elif terminal.get('backend') == 'daytona':
-        print(f"  Daytona image: {terminal.get('daytona_image', 'nikolaik/python-nodejs:python3.11-nodejs20')}")
-        daytona_key = get_env_value('DAYTONA_API_KEY')
-        print(f"  API key:      {'configured' if daytona_key else '(not set)'}")
-    elif terminal.get('backend') == 'vercel_sandbox':
-        print(f"  Vercel runtime: {terminal.get('vercel_runtime', 'node24')}")
-        print(f"  Vercel auth:    {'configured' if get_env_value('VERCEL_OIDC_TOKEN') or (get_env_value('VERCEL_TOKEN') and get_env_value('VERCEL_PROJECT_ID') and get_env_value('VERCEL_TEAM_ID')) else '(not set)'}")
-    elif terminal.get('backend') == 'ssh':
-        ssh_host = get_env_value('TERMINAL_SSH_HOST')
-        ssh_user = get_env_value('TERMINAL_SSH_USER')
-        print(f"  SSH host:     {ssh_host or '(not set)'}")
-        print(f"  SSH user:     {ssh_user or '(not set)'}")
-    
-    # Timezone
-    print()
-    print(color("◆ Timezone", Colors.CYAN, Colors.BOLD))
-    tz = config.get('timezone', '')
-    if tz:
-        print(f"  Timezone:     {tz}")
-    else:
-        print(f"  Timezone:     {color('(server-local)', Colors.DIM)}")
-
-    # Compression
-    print()
-    print(color("◆ Context Compression", Colors.CYAN, Colors.BOLD))
-    compression = config.get('compression', {})
-    enabled = compression.get('enabled', True)
-    print(f"  Enabled:      {'yes' if enabled else 'no'}")
-    if enabled:
-        print(f"  Threshold:    {compression.get('threshold', 0.50) * 100:.0f}%")
-        _tt = compression.get('threshold_tokens')
-        if _tt is not None:
-            try:
-                _tt = int(_tt)
-                if _tt > 0:
-                    print(f"  Token cap:    {_tt:,} tokens (takes lower of ratio vs absolute)")
-            except (TypeError, ValueError):
-                pass
-        print(f"  Target ratio: {compression.get('target_ratio', 0.20) * 100:.0f}% of threshold preserved")
-        print(f"  Protect last: {compression.get('protect_last_n', 20)} messages")
-        print(f"  Protect first: {compression.get('protect_first_n', 3)} non-system head messages")
-        _aux_comp = config.get('auxiliary', {}).get('compression', {})
-        _sm = _aux_comp.get('model', '') or '(auto)'
-        print(f"  Model:        {_sm}")
-        comp_provider = _aux_comp.get('provider', 'auto')
-        if comp_provider and comp_provider != 'auto':
-            print(f"  Provider:     {comp_provider}")
-    
-    # Auxiliary models
-    auxiliary = config.get('auxiliary', {})
-    aux_tasks = {
-        "Vision":      auxiliary.get('vision', {}),
-        "Web extract": auxiliary.get('web_extract', {}),
-    }
-    has_overrides = any(
-        t.get('provider', 'auto') != 'auto' or t.get('model', '')
-        for t in aux_tasks.values()
-    )
-    if has_overrides:
-        print()
-        print(color("◆ Auxiliary Models (overrides)", Colors.CYAN, Colors.BOLD))
-        for label, task_cfg in aux_tasks.items():
-            prov = task_cfg.get('provider', 'auto')
-            mdl = task_cfg.get('model', '')
-            if prov != 'auto' or mdl:
-                parts = [f"provider={prov}"]
-                if mdl:
-                    parts.append(f"model={mdl}")
-                print(f"  {label:12s}  {', '.join(parts)}")
-    
-    # Messaging
-    print()
-    print(color("◆ Messaging Platforms", Colors.CYAN, Colors.BOLD))
-    
-    telegram_token = get_env_value('TELEGRAM_BOT_TOKEN')
-    discord_token = get_env_value('DISCORD_BOT_TOKEN')
-    
-    print(f"  Telegram:     {'configured' if telegram_token else color('not configured', Colors.DIM)}")
-    print(f"  Discord:      {'configured' if discord_token else color('not configured', Colors.DIM)}")
-    
-    print()
-    print(color("─" * 60, Colors.DIM))
-    print(color("  hermes config set <key> <value>", Colors.DIM))
-    print()
-
-
-def _cron_model_drift_axis_for_config_key(key: str) -> Optional[str]:
-    """Return the cron drift guard axis affected by a config key, if any."""
-    normalized = str(key or "").strip().lower()
-    if normalized in {"model", "model.default", "model.model", "model.name"}:
-        return "model"
-    if normalized in {"model.provider", "provider"}:
-        return "provider"
-    return None
-
-
-def cron_model_drift_guard_enabled(
-    config: Optional[Dict[str, Any]] = None,
-) -> bool:
-    """Return whether cron must fail closed on unpinned inference drift.
-
-    Only the literal YAML boolean ``false`` disables this spend-safety guard.
-    Missing, malformed, or non-boolean values stay fail-closed. When *config*
-    is omitted, load the active merged configuration so CLI warnings honor the
-    same user/managed setting as the scheduler.
-    """
-    if config is None:
-        try:
-            config = load_config()
-        except Exception:
-            return True
-    if not isinstance(config, dict):
-        return True
-    cron_config = config.get("cron")
-    if not isinstance(cron_config, dict):
-        return True
-    return cron_config.get("model_drift_guard", True) is not False
-
-
-def _cron_fleet_default_covers_axis(
-    axis: str,
-    config: Optional[Dict[str, Any]] = None,
-) -> bool:
-    """True when cron.model / cron.model_provider covers *axis*.
-
-    An axis covered by the explicit cron-fleet default no longer follows the
-    global model/provider at fire time, so the drift guard never engages for
-    it and switch-time warnings would be false alarms.
-    """
-    if config is None:
-        try:
-            config = load_config()
-        except Exception:
-            return False
-    if not isinstance(config, dict):
-        return False
-    cron_config = config.get("cron")
-    if not isinstance(cron_config, dict):
-        return False
-    key = "model" if axis == "model" else "model_provider"
-    value = cron_config.get(key)
-    return isinstance(value, str) and bool(value.strip())
-
-
-def _load_cron_jobs_for_config_warning() -> List[Dict[str, Any]]:
-    """Best-effort read of the active profile's cron jobs database.
-
-    Delegates to ``cron.jobs.load_jobs`` to reuse its BOM handling, corruption
-    repair, and context-local store resolution (tests, embedders). Falls back
-    to an empty list on any failure so config writes never break.
-    """
-    try:
-        from cron.jobs import load_jobs
-        return load_jobs()
-    except Exception:
-        return []
-
-
-def warn_unpinned_cron_jobs_after_model_config_change(
-    key: str,
-    value: Any,
-    config: Optional[Dict[str, Any]] = None,
-) -> None:
-    """Warn when a global model/provider change will trip cron's drift guard.
-
-    Cron intentionally fails closed when an unpinned agent job's current global
-    model/provider differs from its creation-time snapshot. Surface that outcome
-    when the operator changes the global axis instead of letting the next tick
-    be the first visible signal.
-    """
-    axis = _cron_model_drift_axis_for_config_key(key)
-    if axis is None:
-        return
-    if not cron_model_drift_guard_enabled(config):
-        return
-    # A cron-fleet default covering this axis (cron.model /
-    # cron.model_provider) means unpinned jobs no longer follow the global
-    # value at all — the drift guard will not engage, so warning here would
-    # be a false alarm.
-    if _cron_fleet_default_covers_axis(axis, config):
-        return
-
-    new_value = str(value or "").strip().lower()
-    if not new_value:
-        return
-
-    pinned_field = axis
-    snapshot_field = f"{axis}_snapshot"
-    affected = 0
-    for job in _load_cron_jobs_for_config_warning():
-        if not job.get("enabled", True):
-            continue
-        if job.get("no_agent"):
-            continue
-        if str(job.get(pinned_field) or "").strip():
-            continue
-        snapshot = str(job.get(snapshot_field) or "").strip().lower()
-        if snapshot and snapshot != new_value:
-            affected += 1
-
-    if affected <= 0:
-        return
-
-    noun = "job" if affected == 1 else "jobs"
-    verb = "has" if affected == 1 else "have"
-    print(
-        f"⚠️  {affected} enabled unpinned cron {noun} {verb} stored "
-        f"{snapshot_field} values that differ from the new global {axis}. "
-        "They will fail closed on their next run instead of silently using the "
-        "changed model/provider. Inspect with `hermes cron list`, then pin the "
-        "intended values with `cronjob action=update job_id=<job_id> "
-        "provider=<provider> model=<model>`."
-    )
-
-
-def _default_value_for_key(dotted_key: str):
-    """Return the leaf value declared for *dotted_key* in ``DEFAULT_CONFIG``.
-
-    Unknown keys and non-leaf paths return ``None`` so they retain the legacy
-    best-effort coercion used by ``config set``.
-    """
-    node = DEFAULT_CONFIG
-    for part in dotted_key.split("."):
-        if not isinstance(node, dict) or part not in node:
-            return None
-        node = node[part]
-    return node if not isinstance(node, dict) else None
-
-
-# Known top-level config keys that intentionally accept arbitrary user-supplied
-# child keys ("dictionary-shaped" config: the schema declares the dict but the
-# user populates its keys). Schema validation accepts ANY path below these
-# without deep checking, so users can set e.g. ``mcp_servers.my-server.command``
-# or ``providers.openrouter.api_key`` without us needing to know server names.
-_OPEN_DICT_TOP_LEVEL_KEYS = frozenset({
-    "providers",
-    "credential_pool_strategies",
-    "mcp_servers",
-    "hooks",
-    "quick_commands",
-    "personalities",
-    "command_allowlist",
-    "model_catalog",
-    "channel_prompts",
-    "server_actions",
-    "secrets",
-    "goals",
-})
-
-# Top-level keys whose sub-keys are partially schema-defined (e.g. on a
-# PlatformConfig dataclass) but where users may legitimately add fields
-# that DEFAULT_CONFIG doesn't enumerate (extras, per-channel overrides,
-# etc.). For these we validate the FIRST segment but accept anything below.
-_SCHEMA_DEFINED_DICT_KEYS = frozenset({
-    # Platform configs — PlatformConfig dataclass + dynamic extras
-    "discord", "telegram", "slack", "whatsapp", "signal", "mattermost",
-    "matrix", "feishu", "wecom", "weixin", "bluebubbles", "qqbot", "yuanbao",
-    "email", "sms",
-    # MCP server template / dynamic auth dicts
-    "sessions", "checkpoints",
-})
-
-# Top-level keys that can be ANY user-supplied name (platform/provider dict
-# shapes where the outer key IS user-defined).
-_DYNAMIC_TOP_LEVEL_KEYS = frozenset({
-    "custom_providers",  # list-shaped, but indexed by position
-})
-
-# Container keys whose immediate child IS a user-supplied platform name
-# (``platforms.<name>.<field>``).  These appear both at the top level and
-# nested under ``gateway`` — current docs configure platforms under
-# ``gateway.platforms.<name>`` (website/docs/developer-guide/
-# adding-platform-adapters.md) and ``gateway/config.py`` also resolves a
-# top-level ``platforms`` map.  Anything below the platform-name segment is
-# accepted because ``PlatformConfig`` carries an open ``extra`` mapping.
-_PLATFORM_CONTAINER_KEYS = frozenset({"platforms"})
-
-
-def _known_top_level_keys() -> set[str]:
-    """Return the union of known top-level config keys for validation.
-
-    Combines :data:`DEFAULT_CONFIG` with the dynamic categories that
-    accept user-supplied child keys.  Used by :func:`_validate_config_key`
-    to decide whether a ``hermes config set`` invocation is targeting a
-    known shape.
-    """
-    keys = set(DEFAULT_CONFIG.keys())
-    keys.update(_OPEN_DICT_TOP_LEVEL_KEYS)
-    keys.update(_DYNAMIC_TOP_LEVEL_KEYS)
-    keys.update(_SCHEMA_DEFINED_DICT_KEYS)
-    return keys
-
-
-def _suggest_closest_key(key: str, candidates: set[str], cutoff: float = 0.6) -> Optional[str]:
-    """Return the closest valid key name from ``candidates`` if any are
-    similar enough to ``key``, else None.  Used by ``hermes config set``
-    to point users at the right path when they've typo'd a top-level key.
-
-    Uses :func:`difflib.get_close_matches` with a conservative cutoff so
-    we only suggest when there's a strong match — we'd rather say nothing
-    than mislead a user toward a wrong-but-similar key.
-    """
-    import difflib
-    matches = difflib.get_close_matches(key, sorted(candidates), n=1, cutoff=cutoff)
-    return matches[0] if matches else None
-
-
-def _validate_config_key(key: str) -> tuple[bool, Optional[str]]:
-    """Validate a dotted config-key path against the known schema.
-
-    Returns ``(is_known, suggested_alternative_or_None)``.  Known keys
-    return ``(True, None)``.  Unknown keys return ``(False, <suggestion>)``
-    where ``<suggestion>`` may be ``None`` if no close match was found.
-
-    Validates as deep as DEFAULT_CONFIG can be safely walked, then stops
-    at any segment that hits an open-dict container (mcp_servers,
-    providers, hooks, etc.) where users define the inner keys themselves.
-
-    Headline case from #34067: ``gateway.discord.gateway_restart_notification``
-    was silently written, even though ``gateway`` only has 4 known sub-keys
-    (``strict``, ``media_delivery_allow_dirs``, ``trust_recent_files``,
-    ``trust_recent_files_seconds``). The correct path is
-    ``discord.gateway_restart_notification`` (platform configs live at the
-    top level, not under a ``platforms`` namespace).
-    """
-    if not key:
-        return False, None
-
-    segments = key.split(".")
-    top = segments[0]
-
-    # ── Underscore-prefixed keys are internal/test markers ───────────
-    # A leading underscore on the top-level segment (e.g. ``_test.shim_marker``)
-    # signals an intentionally non-schema, internal key. Test harnesses and
-    # tooling use these to write a deterministic marker into config.yaml
-    # without polluting the user-facing schema (see the Docker privilege-drop
-    # shim test, which writes ``_test.shim_marker`` to probe file ownership).
-    # Python's own convention treats a leading underscore as "private"; we
-    # honour that here so schema validation never blocks deliberately-internal
-    # keys. This is narrow: only the FIRST segment is checked, so a real typo
-    # like ``agent._max_turns`` still gets caught at the sub-key level.
-    if top.startswith("_"):
-        return True, None
-
-    known = _known_top_level_keys()
-
-    # ── First-segment validation ─────────────────────────────────────
-    # Top-level ``platforms.<name>.<field>`` is a valid current shape:
-    # ``gateway/config.py`` resolves a top-level ``platforms`` map in
-    # addition to ``gateway.platforms``.  Accept anything below it.
-    if top in _PLATFORM_CONTAINER_KEYS:
-        return True, None
-
-    if top not in known:
-        suggestion = _suggest_closest_key(top, known)
-        if suggestion is not None:
-            rest = ".".join(segments[1:])
-            suggested_full = f"{suggestion}.{rest}" if rest else suggestion
-            return False, suggested_full
-
-        return False, None
-
-    # ── Deeper validation ────────────────────────────────────────────
-    # Walk DEFAULT_CONFIG along the user's segments. Stop at:
-    #   - An open-dict container (user-defined inner keys are OK below it)
-    #   - A schema-defined-but-extensible dict (accept anything below)
-    #   - A leaf scalar (the user's key is fully consumed and valid)
-    #   - An unknown sub-key (return False with a same-level suggestion)
-    if top in _OPEN_DICT_TOP_LEVEL_KEYS or top in _DYNAMIC_TOP_LEVEL_KEYS or top in _SCHEMA_DEFINED_DICT_KEYS:
-        # Any path below these is accepted — the user defines the inner
-        # shape themselves (mcp_servers.<name>.command, discord.<extras>,
-        # providers.<name>.api_key, etc.).
-        return True, None
-
-    node: Any = DEFAULT_CONFIG.get(top)
-    consumed = [top]
-    for seg in segments[1:]:
-        # ``gateway.platforms.<name>.<field>`` (and any other nested
-        # ``platforms`` container) — the segment after ``platforms`` is a
-        # user-supplied platform name, so accept everything below it.
-        if seg in _PLATFORM_CONTAINER_KEYS:
-            return True, None
-        if not isinstance(node, dict):
-            # We hit a scalar leaf before consuming the user's full path —
-            # they're trying to set ``foo.bar`` where ``foo`` is a string.
-            # Accept it (set_config_value's coercion will replace the
-            # leaf with a dict, matching pre-existing behavior).
-            return True, None
-        if seg not in node:
-            # Suggest the closest sibling at this depth.
-            sibling_suggestion = _suggest_closest_key(seg, set(node.keys()))
-            if sibling_suggestion is not None:
-                fixed_path = ".".join(consumed + [sibling_suggestion])
-                return False, fixed_path
-            return False, None
-        consumed.append(seg)
-        node = node[seg]
-
-    # Walked the entire user-supplied path without hitting an unknown
-    # segment — it's known.
-    return True, None
-
-
 # ── Profile-driven env var injection ─────────────────────────────────────────
 # Any provider registered in providers/ with auth_type="api_key" automatically
 # gets its env_vars exposed in OPTIONAL_ENV_VARS without editing this file.
@@ -4739,100 +3733,3 @@ def _inject_profile_env_vars() -> None:
 
 # Eagerly inject so that OPTIONAL_ENV_VARS is fully populated at import time.
 _inject_profile_env_vars()
-
-
-# ── Platform-plugin env var injection ────────────────────────────────────────
-# Bundled platform plugins under ``plugins/platforms/*/plugin.yaml`` declare
-# their required env vars via ``requires_env``.  This mirror of
-# ``_inject_profile_env_vars`` surfaces them in ``hermes config`` UI so users
-# can configure Teams / IRC / Google Chat without the core repo ever needing
-# to know they exist.
-#
-# Each ``requires_env`` entry may be a bare string (name only) or a dict:
-#
-#   requires_env:
-#     - TEAMS_CLIENT_ID                          # minimal
-#     - name: TEAMS_CLIENT_SECRET                # rich
-#       description: "Teams bot client secret"
-#       url: "https://portal.azure.com/"
-#       password: true
-#       prompt: "Teams client secret"
-#
-# An optional ``optional_env`` block surfaces non-required vars the same way
-# (e.g. allowlist, home channel).
-
-_platform_plugin_env_vars_injected = False
-
-
-def _inject_platform_plugin_env_vars() -> None:
-    """Populate OPTIONAL_ENV_VARS from bundled platform plugin manifests.
-
-    Called once at module load time. Idempotent — repeated calls are no-ops.
-    Failures are swallowed so a malformed plugin.yaml can't break CLI import.
-    """
-    global _platform_plugin_env_vars_injected
-    if _platform_plugin_env_vars_injected:
-        return
-    _platform_plugin_env_vars_injected = True
-    try:
-        import yaml  # type: ignore
-
-        # Resolve the bundled plugins dir from this file's location so the
-        # injector works regardless of CWD.
-        repo_root = Path(__file__).resolve().parents[1]
-        platforms_dir = repo_root / "plugins" / "platforms"
-        if not platforms_dir.is_dir():
-            return
-        for child in platforms_dir.iterdir():
-            if not child.is_dir():
-                continue
-            manifest_path = child / "plugin.yaml"
-            if not manifest_path.exists():
-                manifest_path = child / "plugin.yml"
-            if not manifest_path.exists():
-                continue
-            try:
-                with open(manifest_path, "r", encoding="utf-8") as f:
-                    manifest = fast_safe_load(f) or {}
-            except Exception:
-                continue
-            label = manifest.get("label") or manifest.get("name") or child.name
-            # Merge required + optional env var declarations.
-            entries = list(manifest.get("requires_env") or [])
-            entries.extend(manifest.get("optional_env") or [])
-            for entry in entries:
-                if isinstance(entry, str):
-                    name = entry
-                    meta: dict = {}
-                elif isinstance(entry, dict) and entry.get("name"):
-                    name = entry["name"]
-                    meta = entry
-                else:
-                    continue
-                if name in OPTIONAL_ENV_VARS:
-                    continue  # hardcoded entry wins (back-compat)
-                # Heuristic: anything named *TOKEN, *SECRET, *KEY, *PASSWORD
-                # is a password field unless explicitly overridden.
-                name_upper = name.upper()
-                is_secret = bool(meta.get("password") or meta.get("secret"))
-                if not is_secret and not meta.get("password") is False:
-                    is_secret = any(
-                        name_upper.endswith(suf)
-                        for suf in ("_TOKEN", "_SECRET", "_KEY", "_PASSWORD", "_JSON")
-                    )
-                OPTIONAL_ENV_VARS[name] = {
-                    "description": (
-                        meta.get("description")
-                        or f"{label} configuration"
-                    ),
-                    "prompt": meta.get("prompt") or name,
-                    "url": meta.get("url") or None,
-                    "password": is_secret,
-                    "category": meta.get("category") or "messaging",
-                }
-    except Exception:
-        pass
-
-
-# Eagerly inject so that platform plugin env vars show up in the setup wizard.
-_inject_platform_plugin_env_vars()

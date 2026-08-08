@@ -15,8 +15,8 @@ The active provider is chosen by configuration with this precedence:
 2. Legacy preference order — ``browser-use`` → ``browserbase`` — filtered by
    availability. Matches the historic auto-detect order in
    :func:`tools.browser_tool._get_cloud_provider` (Browser Use checked first
-   because it covers both the managed Nous gateway and direct API key path;
-   Browserbase as the older direct-credentials fallback). ``firecrawl`` is
+   because it is the preferred direct-credential backend; Browserbase is the
+   older direct-credentials fallback). ``firecrawl`` is
    intentionally NOT in the legacy walk — users only get Firecrawl as a
    cloud browser when they explicitly set ``browser.cloud_provider:
    firecrawl``, matching pre-migration behaviour where Firecrawl was never

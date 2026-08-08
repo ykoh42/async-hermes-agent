@@ -886,7 +886,7 @@ def _strip_image_parts_from_parts(parts: Any) -> Any:
     Returns a new list with image_url / image / input_image parts replaced
     by a text placeholder, or None if the list had no images (callers
     skip the replacement in that case). Used by the compressor to prune
-    old computer_use screenshots.
+    old tool-result screenshots.
     """
     if not isinstance(parts, list):
         return None
@@ -1233,9 +1233,6 @@ def _summarize_tool_result_unguarded(tool_name: str, tool_args: str, tool_conten
 
     if tool_name == "clarify":
         return "[clarify] asked user a question"
-
-    if tool_name == "text_to_speech":
-        return f"[text_to_speech] generated audio ({content_len:,} chars)"
 
     if tool_name == "process":
         action = args.get("action", "?")
@@ -3320,7 +3317,7 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         try:
             from hermes_time import now as _hermes_now
 
-            _today_str = _hermes_now().strftime("%Y-%m-%d")
+            _today_str = (await _hermes_now()).strftime("%Y-%m-%d")
         except Exception:  # pragma: no cover - clock resolution is best-effort
             _today_str = ""
 

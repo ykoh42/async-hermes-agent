@@ -544,7 +544,7 @@ class XAIWebSearchProvider(WebSearchProvider):
 
     def get_setup_schema(self) -> Dict[str, Any]:
         # Auth resolution is delegated to the shared ``xai_grok`` post_setup
-        # hook (same one image_gen.xai and tts.xai use) so users see the
+        # hook (same one image_gen.xai uses) so users see the
         # familiar OAuth-or-API-key prompt for every xAI service.
         return {
             "name": "xAI Web Search (Grok)",

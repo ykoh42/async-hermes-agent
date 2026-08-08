@@ -1,187 +1,102 @@
 # Mem0 Memory Provider
 
-Server-side LLM fact extraction with semantic search and hybrid multi-signal retrieval via the Mem0 Platform v3 API.
+Mem0-backed fact extraction and semantic retrieval for the retained async
+memory-provider interface. It supports Mem0 Platform, a self-hosted Mem0 HTTP
+server, and the in-process Mem0 OSS SDK.
 
-## Requirements
+## Select the provider
 
-- `pip install mem0ai`
-- Mem0 API key from [app.mem0.ai](https://app.mem0.ai)
+Enable the `memory` toolset when constructing `AIAgent` and select Mem0 in
+`$HERMES_HOME/config.yaml`:
 
-## Setup
-
-```bash
-hermes memory setup    # select "mem0"
+```yaml
+memory:
+  provider: mem0
 ```
 
-Or manually:
-```bash
-hermes config set memory.provider mem0
-echo "MEM0_API_KEY=your-key" >> ~/.hermes/.env
+`HERMES_HOME` defaults to `~/.hermes`.
+
+## Platform mode
+
+Put the secret in `$HERMES_HOME/.env` or the process environment:
+
+```dotenv
+MEM0_API_KEY=your-key
 ```
 
-## Config
+Optional behavioral settings belong in `$HERMES_HOME/mem0.json`:
 
-Behavioral settings live in `$HERMES_HOME/mem0.json` (set them via `hermes memory setup`). Only the secret `MEM0_API_KEY` belongs in `~/.hermes/.env`.
-
-| Key | Default | Description |
-|-----|---------|-------------|
-| `mode` | `platform` | `platform` (Mem0 Cloud) or `oss` (self-managed, in-process) |
-| `host` | — | Self-hosted Mem0 server URL (the Docker dashboard). When set, connects over HTTP with `X-API-Key`. Don't combine with `mode: oss` |
-| `user_id` | `hermes-user` | User identifier on Mem0 |
-| `agent_id` | `hermes` | Agent identifier |
-| `rerank` | `false` | Rerank search results for relevance (platform mode only) |
-
-The plugin has three connection modes:
-
-- **Platform** — Mem0's hosted cloud (`api.mem0.ai`). Set `MEM0_API_KEY`. (default)
-- **Self-hosted dashboard** — a Mem0 server you run yourself via Docker. Set `host`. See below.
-- **OSS** — run Mem0 in-process with your own LLM + vector store. Set `mode: oss`. See below.
-
-## Self-Hosted Dashboard (Server) Mode
-
-Connect the plugin to a standalone Mem0 server you run yourself — the Docker-shipped Mem0 dashboard/server with its own REST API. Unlike OSS mode (which runs `mem0ai` in-process with your own vector store), here the plugin just talks HTTP to your server.
-
-1. Run the Mem0 server (FastAPI + pgvector) from its Docker image and note its URL and `ADMIN_API_KEY`.
-2. Point the plugin at it — via the setup wizard:
-   ```bash
-   hermes memory setup    # select "mem0" → "Self-hosted server"
-   # Or non-interactive:
-   hermes memory setup mem0 --mode selfhosted --host http://localhost:8888 --api-key your-admin-api-key
-   ```
-   or via env vars:
-   ```bash
-   echo "MEM0_HOST=http://localhost:8888" >> ~/.hermes/.env
-   echo "MEM0_API_KEY=your-admin-api-key" >> ~/.hermes/.env
-   ```
-   or in `$HERMES_HOME/mem0.json`:
-   ```json
-   {
-     "host": "http://localhost:8888",
-     "api_key": "your-admin-api-key"
-   }
-   ```
-3. Start a fresh Hermes session and call `mem0_search` — it connects to your server.
-
-The plugin authenticates with `X-API-Key` and uses the server's `/search` and `/memories` routes. `api_key` is optional — omit it only for servers running with `AUTH_DISABLED`.
-
-> Setting `host` routes to the self-hosted server automatically. Don't set `mode: oss` — OSS takes precedence and ignores `host`.
-
-## OSS (Self-Hosted) Mode
-
-Run Mem0 locally with your own LLM, embedder, and vector store. This is the in-process SDK mode. To instead connect to a Mem0 server you run via Docker, see [Self-Hosted Dashboard (Server) Mode](#self-hosted-dashboard-server-mode) above.
-
-### Interactive Setup
-
-```bash
-hermes memory setup
-# Select "mem0" → "Open Source (self-hosted)"
-# Follow prompts for LLM, embedder, and vector store
+```json
+{
+  "mode": "platform",
+  "user_id": "user-123",
+  "agent_id": "hermes",
+  "rerank": false
+}
 ```
 
-### Agent-Driven Setup (Flags)
+## Self-hosted HTTP mode
 
-```bash
-hermes memory setup mem0 --mode oss \
-  --oss-llm openai --oss-llm-key sk-... \
-  --oss-vector qdrant
+Point the plugin at a running Mem0 HTTP server:
+
+```json
+{
+  "host": "http://localhost:8888",
+  "user_id": "user-123",
+  "agent_id": "hermes"
+}
 ```
 
-### Supported Providers
+Set `MEM0_API_KEY` to the server's API key when authentication is enabled.
+Do not combine `host` with `mode: "oss"`; OSS mode takes precedence.
 
-| Component | Providers |
-|-----------|-----------|
-| LLM | openai, ollama |
-| Embedder | openai, ollama |
-| Vector Store | qdrant (local/server), pgvector |
+## OSS mode
 
-### Flags Reference
-
-| Flag | Description |
-|------|-------------|
-| `--mode` | `platform` or `oss` |
-| `--oss-llm` | LLM provider (default: openai) |
-| `--oss-llm-key` | LLM API key |
-| `--oss-embedder` | Embedder provider (default: openai) |
-| `--oss-vector` | Vector store (default: qdrant) |
-| `--oss-vector-path` | Qdrant local path |
-| `--user-id` | User identifier |
-
-## Switching Modes
-
-### Platform to OSS
+The in-process SDK requires the optional dependency:
 
 ```bash
-hermes memory setup mem0 --mode oss --oss-llm-key sk-...
+uv sync --extra mem0
 ```
 
-Or edit `$HERMES_HOME/mem0.json` directly:
+Configure its LLM, embedder, and vector store in
+`$HERMES_HOME/mem0.json`. For example:
+
 ```json
 {
   "mode": "oss",
+  "user_id": "user-123",
+  "agent_id": "hermes",
   "oss": {
-    "llm": {"provider": "openai", "config": {"model": "gpt-5-mini"}},
-    "embedder": {"provider": "openai", "config": {"model": "text-embedding-3-small"}},
-    "vector_store": {"provider": "qdrant", "config": {"path": "~/.hermes/mem0_qdrant"}}
+    "llm": {
+      "provider": "openai",
+      "config": {"model": "gpt-5-mini"}
+    },
+    "embedder": {
+      "provider": "openai",
+      "config": {"model": "text-embedding-3-small"}
+    },
+    "vector_store": {
+      "provider": "qdrant",
+      "config": {"path": "~/.hermes/mem0_qdrant"}
+    }
   }
 }
 ```
 
-### OSS to Platform
+Provider credentials referenced by the OSS configuration remain secrets and
+belong in the environment or `$HERMES_HOME/.env`.
 
-```bash
-hermes memory setup mem0 --mode platform --api-key sk-...
-```
+## Configuration fields
 
-### Dry Run (preview without writing)
+| Key | Default | Description |
+|-----|---------|-------------|
+| `mode` | `platform` | `platform` or `oss` |
+| `host` | empty | Self-hosted Mem0 HTTP base URL |
+| `user_id` | session identity | Stable user identifier |
+| `agent_id` | `hermes` | Stable agent identifier |
+| `rerank` | `false` | Enable reranking in supported backends |
+| `oss` | `{}` | Mem0 OSS backend configuration |
 
-```bash
-hermes memory setup mem0 --mode oss --oss-llm-key sk-... --dry-run
-```
-
-## Tools
-
-| Tool | Description |
-|------|-------------|
-| `mem0_search` | Semantic search by meaning |
-| `mem0_add` | Store a fact verbatim (no LLM extraction) |
-| `mem0_update` | Update a memory's text by ID |
-| `mem0_delete` | Delete a memory by ID |
-
-## Troubleshooting
-
-### "Mem0 temporarily unavailable"
-
-Circuit breaker tripped after 5 consecutive failures. Resets after 2 minutes.
-
-- **Platform mode**: Check API key and internet connectivity.
-- **OSS mode**: Check that your vector store (qdrant/pgvector) is running.
-
-### OSS: Qdrant connection refused
-
-```bash
-# If using local Qdrant, check the storage path is writable:
-ls -la ~/.hermes/mem0_qdrant
-
-# If using Qdrant server, check it's reachable:
-curl http://localhost:6333/healthz
-```
-
-### OSS: PGVector connection refused
-
-```bash
-# Verify PostgreSQL is running and accepting connections:
-pg_isready -h localhost -p 5432
-```
-
-### OSS: Ollama not reachable
-
-```bash
-# Check Ollama is running:
-curl http://localhost:11434/api/tags
-```
-
-### Memories not appearing
-
-- `mem0_add` stores verbatim (no extraction). Use `sync_turn` for LLM extraction.
-- Search uses semantic matching — try broader queries.
-- Check `user_id` matches between sessions (`$HERMES_HOME/mem0.json`).
+The plugin exposes `mem0_search`, `mem0_add`, `mem0_update`, and
+`mem0_delete` through the memory-provider tool surface. Configuration is loaded
+asynchronously when the provider initializes.

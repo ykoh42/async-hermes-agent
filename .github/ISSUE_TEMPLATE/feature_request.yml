@@ -1,85 +1,60 @@
-name: "✨ Feature Request"
-description: Suggest a new feature or improvement.
+name: "Feature Request"
+description: Propose an improvement to the retained async library.
 title: "[Feature]: "
 labels: ["enhancement"]
 body:
   - type: markdown
     attributes:
       value: |
-        Thanks for the suggestion! Before submitting, please consider:
-
-        - **Is this a new skill?** Most capabilities should be [skills, not tools](https://github.com/NousResearch/hermes-agent/blob/main/CONTRIBUTING.md#should-it-be-a-skill-or-a-tool). If it's a specialized integration (crypto, NFT, niche SaaS), it belongs on the Skills Hub, not bundled.
-        - **Search [existing issues](https://github.com/NousResearch/hermes-agent/issues)** — someone may have already proposed this.
+        This repository intentionally keeps a narrow library surface. New product UIs, messaging adapters, schedulers, and web applications should not be added incidentally. Prefer an existing tool, skill, plugin, or MCP server over expanding the core tool schema.
 
   - type: textarea
     id: problem
     attributes:
-      label: Problem or Use Case
-      description: What problem does this solve? What are you trying to do that you can't today?
-      placeholder: |
-        I'm trying to use Hermes with [provider/platform/workflow] but currently
-        there's no way to...
+      label: Problem or use case
+      description: What retained workflow cannot be implemented correctly today?
     validations:
       required: true
 
   - type: textarea
-    id: solution
+    id: proposal
     attributes:
-      label: Proposed Solution
-      description: How do you think this should work? Be as specific as you can — CLI flags, config options, UI behavior.
-      placeholder: |
-        Add a `--foo` flag to `hermes chat` that enables...
-        Or: Add a config key `bar.baz` that controls...
+      label: Proposed solution
+      description: Explain the public API, behavior, and native-async lifecycle implications.
     validations:
       required: true
 
   - type: textarea
-    id: alternatives
+    id: upstream
     attributes:
-      label: Alternatives Considered
-      description: What other approaches did you consider? Why is the proposed solution better?
+      label: Upstream relationship
+      description: Does upstream Hermes already implement this? Link the relevant release, commit, issue, or diff.
 
   - type: dropdown
-    id: type
+    id: component
     attributes:
-      label: Feature Type
+      label: Component
       options:
-        - New tool
-        - New bundled skill
-        - CLI improvement
-        - Gateway / messaging improvement
-        - Configuration option
-        - Performance / reliability
-        - Developer experience (tests, docs, CI)
+        - Agent loop / model transport
+        - Tool / MCP / skill
+        - Memory / session
+        - Trajectory / batch runner
+        - Provider / plugin
+        - Packaging / developer experience
+        - Deliberate restoration of an upstream surface
         - Other
     validations:
       required: true
 
-  - type: dropdown
-    id: scope
+  - type: textarea
+    id: parity
     attributes:
-      label: Scope
-      description: How big is this change?
-      options:
-        - Small (single file, < 50 lines)
-        - Medium (few files, < 300 lines)
-        - Large (new module or significant refactor)
+      label: Behavior and verification
+      description: How will prompt caching, ordering, cancellation, concurrency, and upstream parity be tested?
 
   - type: checkboxes
-    id: pr-ready
+    id: contribution
     attributes:
       label: Contribution
       options:
-        - label: I'd like to implement this myself and submit a PR
-
-  - type: textarea
-    id: debug-report
-    attributes:
-      label: Debug Report (optional)
-      description: |
-        If this feature request is related to a problem you're experiencing, run `hermes debug share` and paste the links here.
-        In an interactive chat session, you can use `/debug` instead.
-        This helps us understand your environment and any related logs.
-      placeholder: |
-        Report   https://paste.rs/abc123
-      render: shell
+        - label: I would like to implement this and submit a PR.

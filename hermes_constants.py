@@ -191,13 +191,16 @@ def iter_hermes_node_dirs(home: Path | None = None) -> list[Path]:
     return [bin_dir, node_dir]
 
 
-def with_hermes_node_path(env: dict[str, str] | None = None) -> dict[str, str]:
+async def with_hermes_node_path(
+    env: dict[str, str] | None = None,
+) -> dict[str, str]:
     """Return *env* with Hermes-managed Node directories prepended to PATH."""
     merged = dict(os.environ if env is None else env)
     parts = [part for part in merged.get("PATH", "").split(os.pathsep) if part]
-    managed = [
-        str(directory) for directory in iter_hermes_node_dirs() if directory.is_dir()
-    ]
+    managed = []
+    for directory in iter_hermes_node_dirs():
+        if await aiofiles.os.path.isdir(directory):
+            managed.append(str(directory))
     for entry in reversed(managed):
         if entry not in parts:
             parts.insert(0, entry)
@@ -224,7 +227,7 @@ async def agent_browser_runnable(path: str | None) -> bool:
             "--version",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            env=with_hermes_node_path(),
+            env=await with_hermes_node_path(),
         )
         await asyncio.wait_for(process.communicate(), timeout=10)
     except (OSError, TimeoutError, ValueError):

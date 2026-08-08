@@ -754,12 +754,9 @@ async def _adopt_live_compression_child(
         return None
 
     agent.session_id = child_session_id
-    try:
-        from gateway.session_context import set_current_session_id
+    from gateway.session_context import set_current_session_id
 
-        set_current_session_id(child_session_id)
-    except Exception:
-        os.environ["HERMES_SESSION_ID"] = child_session_id
+    set_current_session_id(child_session_id)
     try:
         from hermes_logging import set_session_context
 
@@ -2475,8 +2472,7 @@ async def compress_context(
                     await _lock_db.publish_compression_child(
                         parent_session_id=old_session_id,
                         child_session_id=new_session_id,
-                        source=agent.platform
-                        or os.environ.get("HERMES_SESSION_SOURCE", "cli"),
+                        source=agent.platform or "cli",
                         model=agent.model,
                         model_config=agent._session_init_model_config,
                         system_prompt=new_system_prompt,
@@ -2487,12 +2483,9 @@ async def compress_context(
                         require_compression_lease=_lock_holder is not None,
                     )
                     agent.session_id = new_session_id
-                    try:
-                        from gateway.session_context import set_current_session_id
+                    from gateway.session_context import set_current_session_id
 
-                        set_current_session_id(agent.session_id)
-                    except Exception:
-                        os.environ["HERMES_SESSION_ID"] = agent.session_id
+                    set_current_session_id(agent.session_id)
                     try:
                         from hermes_logging import set_session_context
 

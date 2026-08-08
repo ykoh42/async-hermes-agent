@@ -52,5 +52,6 @@ class TestBuildLearnPrompt:
         # #2 Hermes-tool framing names the wrapped tools, not shell utilities.
         for tool in ("read_file", "search_files", "patch", "write_file"):
             assert tool in std
+        assert "text_to_speech" not in std
         # #6 scripts/references/templates layout.
         assert "scripts/" in _AUTHORING_STANDARDS

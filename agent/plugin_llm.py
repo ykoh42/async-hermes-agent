@@ -9,7 +9,7 @@ that summarises a paste, a scheduled job that scores yesterday's
 activity into a single line on a status board.
 
 Today the only stable plugin surfaces extend an existing Hermes
-subsystem: ``register_tool``, ``register_platform``,
+subsystem: ``register_tool``,
 ``register_memory_provider``, etc. None of those help when the
 plugin's job is to make its own model call. This module is the
 supported lane for that case.

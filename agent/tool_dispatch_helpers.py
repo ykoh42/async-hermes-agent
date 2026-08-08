@@ -11,7 +11,7 @@ Pure module-level utilities extracted from ``run_agent.py``:
 * ``_is_multimodal_tool_result`` / ``_multimodal_text_summary`` /
   ``_append_subdir_hint_to_multimodal`` — envelope helpers for the
   ``{"_multimodal": True, "content": [...], "text_summary": ...}`` dict
-  shape returned by tools like ``computer_use``.
+  shape returned by image-producing tools.
 * ``_extract_file_mutation_targets`` / ``_extract_landed_file_mutation_paths`` /
   ``_extract_error_preview`` —
   per-turn file-mutation verifier inputs.
@@ -347,7 +347,7 @@ def _paths_overlap(left: Path, right: Path) -> bool:
 def _is_multimodal_tool_result(value: Any) -> bool:
     """True if the value is a multimodal tool result envelope.
 
-    Multimodal handlers (e.g. tools/computer_use) return a dict with
+    Multimodal handlers return a dict with
     `_multimodal=True`, a `content` key holding OpenAI-style content
     parts, and an optional `text_summary` for string-only fallbacks.
     """

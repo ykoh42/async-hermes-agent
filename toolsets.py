@@ -49,11 +49,6 @@ _HERMES_CORE_TOOLS = [
     # Planning state + persistent memory.  Both are part of the harness
     # trajectory: todo survives context compression while memory spans turns.
     "todo", "memory",
-    # NOTE: the desktop Project tools (project_list/create/switch) are
-    # deliberately NOT here. They only make sense where a GUI can follow the
-    # move, so they live in the `project` toolset and are enabled solely by the
-    # GUI gateway (tui_gateway/server.py::_load_enabled_toolsets) — keeping them
-    # off every CLI/messaging/cron schema (narrow waist).
     # Session history search
     "session_search",
     # Clarifying questions
@@ -61,17 +56,6 @@ _HERMES_CORE_TOOLS = [
     # Delegation
     "delegate_task",
 ]
-
-# Webhook events may originate from untrusted third-party content (for example,
-# public PR titles/comments). Keep the default webhook toolset intentionally
-# constrained to avoid local file/system execution by prompt injection.
-_HERMES_WEBHOOK_SAFE_TOOLS = [
-    "web_search",
-    "web_extract",
-    "vision_analyze",
-    "clarify",
-]
-
 
 # Core toolset definitions
 # These can include individual tools or reference other toolsets
@@ -89,19 +73,6 @@ TOOLSETS = {
         "includes": []
     },
 
-    "x_search": {
-        "description": (
-            "Search X (Twitter) posts and threads via xAI's built-in "
-            "x_search Responses tool. Read-only public X discovery; use the "
-            "xurl skill for authenticated X API reads and account actions. "
-            "Available when xAI credentials are configured (SuperGrok OAuth "
-            "or XAI_API_KEY). Off by default; enable in `hermes tools` → "
-            "X (Twitter) Search."
-        ),
-        "tools": ["x_search"],
-        "includes": []
-    },
-    
     "vision": {
         "description": "Image analysis and vision tools",
         "tools": ["vision_analyze"],
@@ -128,36 +99,7 @@ TOOLSETS = {
             "extend workflows may appear as separate tools. Configure via "
             "``hermes tools`` → Video Generation."
         ),
-        "tools": ["video_generate", "xai_video_edit", "xai_video_extend"],
-        "includes": []
-    },
-
-    "bfl": {
-        "description": (
-            "Black Forest Labs FLUX 3 video generation through the Nous tool "
-            "gateway: per-mode submit tools (text, image, keyframes, "
-            "continuation), a poll tool, and a prompting guide. Generations "
-            "take minutes, so submit returns a job id and the model polls for "
-            "the result."
-        ),
-        "tools": [
-            "bfl_flux3_text_to_video",
-            "bfl_flux3_image_to_video",
-            "bfl_flux3_keyframes_to_video",
-            "bfl_flux3_video_continuation",
-            "bfl_flux3_get_result",
-            "bfl_flux3_prompting_guide",
-        ],
-        "includes": []
-    },
-
-    "computer_use": {
-        "description": (
-            "Background desktop control via cua-driver (macOS/Windows/Linux) — "
-            "screenshots, mouse, keyboard, scroll, drag. Does NOT steal the "
-            "user's cursor or keyboard focus. Works with any tool-capable model."
-        ),
-        "tools": ["computer_use"],
+        "tools": ["video_generate"],
         "includes": []
     },
 
@@ -192,12 +134,6 @@ TOOLSETS = {
         "includes": []
     },
     
-    "tts": {
-        "description": "Text-to-speech: convert text to audio with Edge TTS (free), ElevenLabs, OpenAI, or xAI",
-        "tools": ["text_to_speech"],
-        "includes": []
-    },
-    
     "todo": {
         "description": "Task planning and tracking for multi-step work",
         "tools": ["todo"],
@@ -222,12 +158,6 @@ TOOLSETS = {
         "includes": []
     },
 
-    "project": {
-        "description": "Desktop Projects — create/switch named workspaces (GUI sessions only)",
-        "tools": ["project_list", "project_create", "project_switch"],
-        "includes": []
-    },
-    
     "clarify": {
         "description": "Ask the user clarifying questions (multiple-choice or open-ended)",
         "tools": ["clarify"],
@@ -239,42 +169,6 @@ TOOLSETS = {
         "tools": ["delegate_task"],
         "includes": []
     },
-
-    "homeassistant": {
-        "description": "Home Assistant smart home control and monitoring",
-        "tools": ["ha_list_entities", "ha_get_state", "ha_list_services", "ha_call_service"],
-        "includes": []
-    },
-
-    "kanban": {
-        "description": (
-            "Kanban multi-agent coordination — only active when the agent "
-            "is spawned by the kanban dispatcher (HERMES_KANBAN_TASK env "
-            "set). The dispatcher runs inside the gateway by default; see "
-            "`kanban.dispatch_in_gateway` in config.yaml. Lets workers mark "
-            "tasks done with structured handoffs, block for human input, "
-            "heartbeat during long ops, comment on threads, attach files, and "
-            "(for orchestrators) list, unblock, and fan out tasks."
-        ),
-        "tools": [
-            "kanban_show", "kanban_list", "kanban_complete", "kanban_block",
-            "kanban_heartbeat", "kanban_comment",
-            "kanban_create", "kanban_link",
-            "kanban_unblock",
-            "kanban_attach", "kanban_attach_url", "kanban_attachments",
-        ],
-        "includes": [],
-    },
-
-    "spotify": {
-        "description": "Native Spotify playback, search, playlist, album, and library tools",
-        "tools": [
-            "spotify_playback", "spotify_devices", "spotify_queue", "spotify_search",
-            "spotify_playlists", "spotify_albums", "spotify_library",
-        ],
-        "includes": []
-    },
-
 
     # Scenario-specific toolsets
     
@@ -290,15 +184,14 @@ TOOLSETS = {
         "includes": ["web", "vision", "image_gen"]
     },
 
-    # Coding posture (base Hermes — CLI/TUI/desktop/ACP). Auto-selected in a
+    # Coding posture. Auto-selected in a
     # code workspace; see agent/coding_context.py. Keeps everything you reach
-    # for while pairing on code and drops the rest (messaging, tts, image_gen,
-    # spotify, home-assistant, cron, computer-use).
+    # for while pairing on code and drops the rest.
     "coding": {
         "description": "Coding-focused toolset: files, terminal, search, web docs, skills, todo, delegate, vision, browser",
         "tools": [
             "web_search", "web_extract",
-            "terminal", "process", "read_terminal", "close_terminal",
+            "terminal", "process",
             "read_file", "write_file", "patch", "search_files",
             "vision_analyze",
             "skills_list", "skill_view", "skill_manage",
@@ -317,87 +210,12 @@ TOOLSETS = {
         "posture": True,
     },
     
-    # ==========================================================================
-    # Full Hermes toolsets (CLI + messaging platforms)
-    #
-    # All platforms share the same core tools. Note: agents do NOT get an
-    # agent-callable send_message tool — outbound platform messaging is handled
-    # outside the agent loop (cron delivery, the gateway kanban notifier, and
-    # the `hermes send` CLI), not by the model deciding to send on its own.
-    # ==========================================================================
-
-    "hermes-acp": {
-        "description": "Editor integration (VS Code, Zed, JetBrains) — coding-focused tools without messaging, audio, or clarify UI",
-        "tools": [
-            "web_search", "web_extract",
-            "terminal", "process",
-            "read_file", "write_file", "patch", "search_files",
-            "vision_analyze",
-            "skills_list", "skill_view", "skill_manage",
-            "browser_navigate", "browser_snapshot", "browser_click",
-            "browser_type", "browser_scroll", "browser_back",
-            "browser_press", "browser_get_images",
-            "browser_vision", "browser_console", "browser_cdp", "browser_dialog",
-            "todo", "memory",
-            "session_search",
-            "delegate_task",
-        ],
-        "includes": []
-    },
-
-    "hermes-api-server": {
-        "description": "OpenAI-compatible API server — full agent tools accessible via HTTP (no interactive UI tools like clarify or send_message)",
-        "tools": [
-            # Web
-            "web_search", "web_extract",
-            # Terminal + process management
-            "terminal", "process",
-            # File manipulation
-            "read_file", "write_file", "patch", "search_files",
-            # Vision + image generation
-            "vision_analyze", "image_generate",
-            # BFL FLUX 3 video generation
-            "bfl_flux3_text_to_video", "bfl_flux3_image_to_video",
-            "bfl_flux3_keyframes_to_video", "bfl_flux3_video_continuation",
-            "bfl_flux3_get_result", "bfl_flux3_prompting_guide",
-            # Skills
-            "skills_list", "skill_view", "skill_manage",
-            # Browser automation
-            "browser_navigate", "browser_snapshot", "browser_click",
-            "browser_type", "browser_scroll", "browser_back",
-            "browser_press", "browser_get_images",
-            "browser_vision", "browser_console", "browser_cdp", "browser_dialog",
-            # Planning & memory
-            "todo", "memory",
-            # Session history search
-            "session_search",
-            # Code execution + delegation
-            "delegate_task",
-            # Home Assistant smart home control (gated on HASS_TOKEN via check_fn)
-            "ha_list_entities", "ha_get_state", "ha_list_services", "ha_call_service",
-
-        ],
-        "includes": []
-    },
-    
+    # Default library surface retained under the upstream public name.
     "hermes-cli": {
-        "description": "Full interactive CLI toolset",
+        "description": "Full Hermes agent toolset",
         "tools": _HERMES_CORE_TOOLS,
         "includes": []
     },
-
-    "hermes-homeassistant": {
-        "description": "Home Assistant bot toolset - smart home event monitoring and control",
-        "tools": _HERMES_CORE_TOOLS,
-        "includes": []
-    },
-
-    "hermes-webhook": {
-        "description": "Webhook toolset - receive and process external webhook events",
-        "tools": _HERMES_WEBHOOK_SAFE_TOOLS,
-        "includes": []
-    },
-
 }
 
 
@@ -547,29 +365,6 @@ def resolve_toolset(name: str, visited: Set[str] = None, *, include_registry: bo
     # Get toolset definition
     toolset = get_toolset(name, include_registry=include_registry)
     if not toolset:
-        # Auto-generate a toolset for plugin platforms (hermes-<name>).
-        # Gives them _HERMES_CORE_TOOLS plus any tools the plugin registered
-        # into a toolset matching the platform name. This is a registry-derived
-        # view, so it only applies when registry tools are requested; the static
-        # view (include_registry=False) has no plugin-platform definition.
-        if include_registry and name.startswith("hermes-"):
-            platform_name = name[len("hermes-"):]
-            try:
-                from gateway.platform_registry import platform_registry
-                if platform_registry.is_registered(platform_name):
-                    plugin_tools = set(_HERMES_CORE_TOOLS)
-                    try:
-                        from tools.registry import registry
-                        plugin_tools.update(
-                            e.name for e in registry._tools.values()
-                            if e.toolset == platform_name
-                        )
-                    except Exception:
-                        pass
-                    return list(plugin_tools)
-            except Exception:
-                pass
-
         return []
 
     # Collect direct tools

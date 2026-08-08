@@ -13,13 +13,18 @@ gets stripped from the durable transcript. This test file verifies:
 """
 
 import json
+import sys
+from unittest.mock import AsyncMock, MagicMock
+
 import pytest
 
 
 def _fresh_run_agent(hermes_home):
-    import run_agent
-
-    return run_agent
+    for mod in list(sys.modules):
+        if mod == "run_agent" or mod.startswith("agent.") or mod.startswith("tools.") or mod.startswith("hermes_"):
+            del sys.modules[mod]
+    import run_agent  # noqa: F401
+    return sys.modules["run_agent"]
 
 
 def test_verification_flags_registered_as_ephemeral(tmp_path, monkeypatch):
@@ -42,8 +47,6 @@ def test_verification_flags_registered_as_ephemeral(tmp_path, monkeypatch):
 
 
 def _make_agent(ra, session_id, tmp_path):
-    from hermes_state import SessionDB
-
     agent = ra.AIAgent(
         session_id=session_id,
         api_key="test-key",
@@ -54,8 +57,9 @@ def _make_agent(ra, session_id, tmp_path):
         skip_context_files=True,
         skip_memory=True,
     )
-    agent._session_db = SessionDB(tmp_path / "state.db")
-    agent._session_db_created = False
+    agent._session_db = MagicMock()
+    agent._session_db.append_message = AsyncMock()
+    agent._session_db_created = True
     agent._session_json_enabled = True
     agent.logs_dir = tmp_path / "logs"
     agent.logs_dir.mkdir(parents=True, exist_ok=True)
@@ -79,21 +83,18 @@ async def test_db_flush_drops_only_nudge_keeps_candidate(tmp_path, monkeypatch):
         {"role": "assistant", "content": "verified and clean"},
     ]
 
-    try:
-        await agent._flush_messages_to_session_db(messages, conversation_history=[])
-        persisted = await agent._session_db.get_messages_as_conversation(
-            agent.session_id
-        )
-    finally:
-        await agent.close()
+    await agent._flush_messages_to_session_db(messages, conversation_history=[])
 
-    contents = [message.get("content") for message in persisted]
-    assert "hi" in contents
-    assert "verified and clean" in contents
+    persisted = [
+        kwargs.get("content")
+        for _args, kwargs in agent._session_db.append_message.call_args_list
+    ]
+    assert "hi" in persisted
+    assert "verified and clean" in persisted
     # The assistant candidate persists — it is real content.
-    assert "premature done" in contents
+    assert "premature done" in persisted
     # Only the nudge is dropped.
-    assert "[System: run tests]" not in contents
+    assert "[System: run tests]" not in persisted
 
 
 @pytest.mark.asyncio

@@ -73,7 +73,7 @@ jobs:
             plugins/memory/mem0/__init__.py
 
       - name: Test
-        run: uv run pytest -q -W error::pytest.PytestUnhandledThreadExceptionWarning
+        run: scripts/run_tests.sh -j 4 -- -q -W error::pytest.PytestUnhandledThreadExceptionWarning
         env:
           OPENROUTER_API_KEY: ""
           OPENAI_API_KEY: ""

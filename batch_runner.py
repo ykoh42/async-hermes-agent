@@ -126,20 +126,6 @@ async def _list_batch_files(directory: Path) -> List[Path]:
     return sorted(paths)
 
 
-async def _communicate_with_timeout(
-    process: asyncio.subprocess.Process,
-    timeout: float,
-) -> tuple[bytes, bytes]:
-    """Communicate with an optional batch subprocess without leaking it."""
-    try:
-        return await asyncio.wait_for(process.communicate(), timeout=timeout)
-    except (TimeoutError, asyncio.CancelledError):
-        if process.returncode is None:
-            process.kill()
-        await process.wait()
-        raise
-
-
 def _normalize_tool_stats(tool_stats: Dict[str, Dict[str, int]]) -> Dict[str, Dict[str, int]]:
     """
     Normalize tool_stats to include all possible tools with consistent schema.
@@ -313,61 +299,6 @@ def _extract_reasoning_stats(messages: List[Dict[str, Any]]) -> Dict[str, int]:
     }
 
 
-async def _check_container_image(container_image: str, prompt_index: int, config: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """Check/pull a Docker image without blocking the event loop.
-
-    The batch scheduler is asyncio-native, so even the optional preflight
-    subprocess must use the asynchronous subprocess API.  ``None`` means the
-    image is ready (or the configured backend does not need a local check).
-    A result dictionary is returned only for a terminal preflight failure.
-    """
-    if os.getenv("TERMINAL_ENV", "local") != "docker":
-        return None
-
-    try:
-        probe = await asyncio.wait_for(
-            asyncio.create_subprocess_exec(
-                "docker", "image", "inspect", container_image,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            ),
-            timeout=10,
-        )
-        _, _ = await _communicate_with_timeout(probe, timeout=10)
-        if probe.returncode == 0:
-            return None
-
-        if config.get("verbose"):
-            print(f"   Prompt {prompt_index}: Pulling docker image {container_image}...", flush=True)
-        pull = await asyncio.wait_for(
-            asyncio.create_subprocess_exec(
-                "docker", "pull", container_image,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            ),
-            timeout=600,
-        )
-        _, stderr = await _communicate_with_timeout(pull, timeout=600)
-        if pull.returncode != 0:
-            error_text = stderr.decode("utf-8", errors="replace")[:500]
-            return {
-                "success": False,
-                "prompt_index": prompt_index,
-                "error": f"Docker image not available: {container_image}\n{error_text}",
-                "trajectory": None,
-                "tool_stats": {},
-                "toolsets_used": [],
-                "metadata": {"timestamp": datetime.now().isoformat()},
-            }
-    except FileNotFoundError:
-        # Docker CLI is optional (for example when the backend is Modal).
-        return None
-    except Exception as img_err:
-        if config.get("verbose"):
-            print(f"   Prompt {prompt_index}: Docker image check failed: {img_err}", flush=True)
-    return None
-
-
 async def _process_single_prompt(
     prompt_index: int,
     prompt_data: Dict[str, Any],
@@ -388,31 +319,6 @@ async def _process_single_prompt(
     """
     prompt = prompt_data["prompt"]
     task_id = f"task_{prompt_index}"
-    
-    # Per-prompt container image override: if the dataset row has an 'image' field,
-    # register it for this task's sandbox. Works with Docker, Modal, Singularity, and Daytona.
-    container_image = prompt_data.get("image") or prompt_data.get("docker_image")
-    if container_image:
-        # Verify the image is accessible before spending tokens on the agent loop.
-        # For Docker: check local cache, then try pulling.
-        # For Modal: skip local check (Modal pulls server-side).
-        preflight_failure = await _check_container_image(container_image, prompt_index, config)
-        if preflight_failure is not None:
-            preflight_failure["metadata"]["batch_num"] = batch_num
-            return preflight_failure
-
-        from tools.terminal_tool import register_task_env_overrides
-        overrides = {
-            "docker_image": container_image,
-            "modal_image": container_image,
-            "singularity_image": f"docker://{container_image}",
-            "daytona_image": container_image,
-        }
-        if prompt_data.get("cwd"):
-            overrides["cwd"] = prompt_data["cwd"]
-        await register_task_env_overrides(task_id, overrides)
-        if config.get("verbose"):
-            print(f"   Prompt {prompt_index}: Using container image {container_image}")
     
     agent = None
     try:

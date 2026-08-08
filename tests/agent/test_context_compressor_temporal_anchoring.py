@@ -59,7 +59,7 @@ def _fixed_now():
 async def test_clock_failure_omits_rule_but_compaction_still_runs():
     compressor = _compressor()
 
-    def _boom():
+    async def _boom():
         raise RuntimeError("clock unavailable")
 
     with patch.object(hermes_time, "now", _boom), patch(
@@ -82,7 +82,7 @@ async def test_anchoring_rule_uses_date_from_hermes_time_now():
     """The date is taken from hermes_time.now(), which respects the user's TZ."""
     compressor = _compressor()
     fixed = datetime(2025, 12, 31, 23, 30, tzinfo=timezone.utc)
-    with patch.object(hermes_time, "now", lambda: fixed), patch(
+    with patch.object(hermes_time, "now", AsyncMock(return_value=fixed)), patch(
         "agent.context_compressor.call_llm",
         new=AsyncMock(return_value=_response("summary")),
     ) as mock_call:

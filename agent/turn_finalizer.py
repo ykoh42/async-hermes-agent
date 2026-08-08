@@ -141,29 +141,6 @@ async def finalize_turn(
         final_response = await agent._handle_max_iterations(messages, api_call_count)
         iteration_limit_fallback = True
 
-    if iteration_limit_fallback:
-        # If running as a kanban worker, signal the dispatcher that the
-        # worker could not complete (rather than treating it as a
-        # protocol violation). This applies whether the user-facing fallback
-        # came from the summary call or an explicitly pending continuation;
-        # both exhausted the task budget and must advance the failure circuit.
-        #
-        # We route through ``_record_task_failure(outcome="timed_out")``
-        # rather than ``kanban_block`` so this counts toward the dispatcher's
-        # consecutive-failure circuit breaker (#29747 gap 2).
-        _kanban_task = os.environ.get("HERMES_KANBAN_TASK")
-        if _kanban_task:
-            # Kanban's optional SQLite coordinator is a synchronous plugin
-            # boundary.  Calling it here would block the native turn on a
-            # database connection and violate the async waist.  The kanban
-            # worker owns its failure accounting; the core only reports the
-            # exhausted turn and keeps returning the model's partial result.
-            logger.warning(
-                "Skipping synchronous kanban failure accounting for task %s "
-                "in async-hermes-agent",
-                _kanban_task,
-            )
-
     # Determine if conversation completed successfully
     normal_text_response = str(_turn_exit_reason).startswith("text_response(")
     completed = (

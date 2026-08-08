@@ -163,109 +163,6 @@ def _migrate_to_13(results: Dict[str, Any], quiet: bool) -> None:
             pass
 
 
-def _migrate_to_14(results: Dict[str, Any], quiet: bool) -> None:
-    # ── Version 13 → 14: migrate legacy flat stt.model to provider section ──
-    # Old configs (and cli-config.yaml.example) had a flat `stt.model` key
-    # that was provider-agnostic.  When the provider was "local" this caused
-    # OpenAI model names (e.g. "whisper-1") to be fed to faster-whisper,
-    # crashing with "Invalid model size".  Move the value into the correct
-    # provider-specific section and remove the flat key.
-    _c = _cfg()
-    read_raw_config = _c.read_raw_config
-    _persist_migration = _c._persist_migration
-
-    # Read raw config (no defaults merged) to check what the user actually
-    # wrote, then apply changes to the merged config for saving.
-    raw = read_raw_config()
-    raw_stt = raw.get("stt", {})
-    if isinstance(raw_stt, dict) and "model" in raw_stt:
-        legacy_model = raw_stt["model"]
-        provider = raw_stt.get("provider", "local")
-        config = read_raw_config()
-        stt = config.get("stt", {})
-        # Remove the legacy flat key
-        stt.pop("model", None)
-        # Place it in the appropriate provider section only if the
-        # user didn't already set a model there
-        if provider in {"local", "local_command"}:
-            # Don't migrate an OpenAI model name into the local section
-            _local_models = {
-                "tiny.en", "tiny", "base.en", "base", "small.en", "small",
-                "medium.en", "medium", "large-v1", "large-v2", "large-v3",
-                "large", "distil-large-v2", "distil-medium.en",
-                "distil-small.en", "distil-large-v3", "distil-large-v3.5",
-                "large-v3-turbo", "turbo",
-            }
-            if legacy_model in _local_models:
-                # Check raw config — only set if user didn't already
-                # have a nested local.model
-                raw_local = raw_stt.get("local", {})
-                if not isinstance(raw_local, dict) or "model" not in raw_local:
-                    local_cfg = stt.setdefault("local", {})
-                    local_cfg["model"] = legacy_model
-            # else: drop it — it was an OpenAI model name, local section
-            # already defaults to "base" via DEFAULT_CONFIG
-        else:
-            # Cloud provider — put it in that provider's section only
-            # if user didn't already set a nested model
-            raw_provider = raw_stt.get(provider, {})
-            if not isinstance(raw_provider, dict) or "model" not in raw_provider:
-                provider_cfg = stt.setdefault(provider, {})
-                provider_cfg["model"] = legacy_model
-        config["stt"] = stt
-        _persist_migration(config)
-        if not quiet:
-            print("  ✓ Migrated legacy stt.model to provider-specific config")
-
-
-def _migrate_to_15(results: Dict[str, Any], quiet: bool) -> None:
-    # ── Version 14 → 15: add explicit gateway interim-message gate ──
-    _c = _cfg()
-    read_raw_config = _c.read_raw_config
-    _persist_migration = _c._persist_migration
-
-    config = read_raw_config()
-    display = config.get("display", {})
-    if not isinstance(display, dict):
-        display = {}
-    if "interim_assistant_messages" not in display:
-        display["interim_assistant_messages"] = True
-        config["display"] = display
-        results["config_added"].append("display.interim_assistant_messages=true (default)")
-        _persist_migration(config)
-        if not quiet:
-            print("  ✓ Added display.interim_assistant_messages=true")
-
-
-def _migrate_to_16(results: Dict[str, Any], quiet: bool) -> None:
-    # ── Version 15 → 16: migrate tool_progress_overrides into display.platforms ──
-    _c = _cfg()
-    read_raw_config = _c.read_raw_config
-    _persist_migration = _c._persist_migration
-
-    config = read_raw_config()
-    display = config.get("display", {})
-    if not isinstance(display, dict):
-        display = {}
-    old_overrides = display.get("tool_progress_overrides")
-    if isinstance(old_overrides, dict) and old_overrides:
-        platforms = display.get("platforms", {})
-        if not isinstance(platforms, dict):
-            platforms = {}
-        for plat, mode in old_overrides.items():
-            if plat not in platforms:
-                platforms[plat] = {}
-            if "tool_progress" not in platforms[plat]:
-                platforms[plat]["tool_progress"] = mode
-        display["platforms"] = platforms
-        config["display"] = display
-        _persist_migration(config)
-        if not quiet:
-            migrated = ", ".join(f"{p}={m}" for p, m in old_overrides.items())
-            print(f"  ✓ Migrated tool_progress_overrides → display.platforms: {migrated}")
-        results["config_added"].append("display.platforms (migrated from tool_progress_overrides)")
-
-
 def _migrate_to_17(results: Dict[str, Any], quiet: bool) -> None:
     # ── Version 16 → 17: remove legacy compression.summary_* keys ──
     _c = _cfg()
@@ -380,15 +277,6 @@ def _migrate_to_21(results: Dict[str, Any], quiet: bool) -> None:
                 )
 
 
-def _migrate_to_23(results: Dict[str, Any], quiet: bool) -> None:
-    """Preserve the historical migration number after deferring curation.
-
-    Existing installations may retain their old ``curator`` settings; they are
-    intentionally ignored by the lean training runtime and are not rewritten.
-    """
-    del results, quiet
-
-
 def _migrate_to_25(results: Dict[str, Any], quiet: bool) -> None:
     # ── Version 24 → 25: lower model_catalog TTL 24h → 1h ──
     # The model picker now refreshes its curated list hourly so freshly
@@ -411,14 +299,10 @@ def _migrate_to_25(results: Dict[str, Any], quiet: bool) -> None:
 
 
 def _migrate_to_29(results: Dict[str, Any], quiet: bool) -> None:
-    # ── Version 28 → 29: rename memory/skills write_mode → write_approval ──
-    # The tri-state write_mode (on|off|approve) was replaced by a clear boolean
-    # write_approval (default false = gate off, writes flow freely; true =
-    # require approval). Only an explicit "approve" carried gating intent, so
-    # it maps to true; everything else (on/off/unset) → false. The old
-    # "off = block all writes" mode is dropped — memory_enabled: false disables
-    # memory entirely. Only rewrite a key the user actually persisted; never
-    # invent one.
+    # ── Version 28 → 29: retire the removed write-mode gates ──
+    # The library build has no curator/CLI approval queue. Remove the historical
+    # keys instead of migrating them into configuration that no runtime path
+    # consumes.
     _c = _cfg()
     read_raw_config = _c.read_raw_config
     _persist_migration = _c._persist_migration
@@ -427,88 +311,22 @@ def _migrate_to_29(results: Dict[str, Any], quiet: bool) -> None:
     touched = False
     for subsystem in ("memory", "skills"):
         sub = config.get(subsystem)
-        if not isinstance(sub, dict) or "write_mode" not in sub:
+        if not isinstance(sub, dict):
             continue
-        old = sub.pop("write_mode")
-        old_norm = old.strip().lower() if isinstance(old, str) else old
-        sub["write_approval"] = (old_norm == "approve")
-        config[subsystem] = sub
+        if "write_mode" not in sub and "write_approval" not in sub:
+            continue
+        sub.pop("write_mode", None)
+        sub.pop("write_approval", None)
+        if sub:
+            config[subsystem] = sub
+        else:
+            config.pop(subsystem, None)
         touched = True
-        results["config_added"].append(
-            f"{subsystem}.write_mode → write_approval={sub['write_approval']}"
-        )
+        results["config_added"].append(f"removed obsolete {subsystem} write gate")
     if touched:
         _persist_migration(config)
         if not quiet:
-            print("  ✓ Renamed write_mode → write_approval (boolean gate)")
-
-
-def _migrate_to_31(results: Dict[str, Any], quiet: bool) -> None:
-    # ── Version 30 → 31: switch verify_on_stop OFF (one-time) ──
-    # verify_on_stop defaulted to the "auto" sentinel (surface-aware: on for
-    # interactive coding surfaces). In practice the verification narrative was
-    # more noise than signal — it even fired on doc/markdown/skill edits with
-    # nothing to verify. The new default is OFF. This migration switches
-    # existing installs off ONCE, but only when the user never expressed an
-    # explicit preference: we rewrite the value only if it's missing or still
-    # the "auto" sentinel. An explicit true/false the user set is preserved.
-    _c = _cfg()
-    read_raw_config = _c.read_raw_config
-    _persist_migration = _c._persist_migration
-
-    config = read_raw_config()
-    raw_agent = config.get("agent")
-    if not isinstance(raw_agent, dict):
-        raw_agent = {}
-    cur = raw_agent.get("verify_on_stop")
-    is_auto_sentinel = (
-        isinstance(cur, str) and cur.strip().lower() == "auto"
-    )
-    # Only flip the non-committal states; leave explicit bool/on/off alone.
-    if cur is None or is_auto_sentinel:
-        raw_agent["verify_on_stop"] = False
-        config["agent"] = raw_agent
-        _persist_migration(config)
-        results["config_added"].append("agent.verify_on_stop=false")
-        if not quiet:
-            print(
-                "  ✓ Turned off verify-on-stop (agent.verify_on_stop: false). "
-                "Set it to true to re-enable, or \"auto\" for the legacy "
-                "surface-aware behavior."
-            )
-
-
-def _migrate_to_32(results: Dict[str, Any], quiet: bool) -> None:
-    # ── Version 31 → 32: flip the BAKED-IN literal true to OFF (one-time) ──
-    # The v30→v31 flip above only caught missing/"auto" values. But the very
-    # first ship of verify-on-stop (config v30, commit 2f1a47b90) defaulted
-    # DEFAULT_CONFIG["agent"]["verify_on_stop"] to a literal True, and
-    # migrate_config persists defaults with strip_defaults=False — so every
-    # install that updated through v30 got `verify_on_stop: true` written into
-    # config.yaml as a literal. v31's guard deliberately preserves an explicit
-    # bool, so it skipped that whole population and left them ON. That literal
-    # true was never a user choice: the feature had no off-switch worth setting
-    # it against until v31 introduced one, so a true persisted before v32 is
-    # always the old machine default. Flip it off once here. A true the user
-    # sets AFTER v32 (config already at version 32) is never touched.
-    _c = _cfg()
-    read_raw_config = _c.read_raw_config
-    _persist_migration = _c._persist_migration
-
-    config = read_raw_config()
-    raw_agent = config.get("agent")
-    if isinstance(raw_agent, dict) and raw_agent.get("verify_on_stop") is True:
-        raw_agent["verify_on_stop"] = False
-        config["agent"] = raw_agent
-        _persist_migration(config)
-        results["config_added"].append("agent.verify_on_stop=false")
-        if not quiet:
-            print(
-                "  ✓ Turned off verify-on-stop (agent.verify_on_stop: false) — "
-                "the old default was written into your config as a literal "
-                "true. Set it to true again to re-enable, or \"auto\" for the "
-                "legacy surface-aware behavior."
-            )
+            print("  ✓ Removed obsolete memory/skills write gates")
 
 
 def _migrate_to_33(results: Dict[str, Any], quiet: bool) -> None:
@@ -561,16 +379,10 @@ MIGRATIONS: Tuple[Tuple[int, Callable[[Dict[str, Any], bool], None]], ...] = (
     # floor gate in run_migrations().
     (12, _migrate_to_12),
     (13, _migrate_to_13),
-    (14, _migrate_to_14),
-    (15, _migrate_to_15),
-    (16, _migrate_to_16),
     (17, _migrate_to_17),
     (21, _migrate_to_21),
-    (23, _migrate_to_23),
     (25, _migrate_to_25),
     (29, _migrate_to_29),
-    (31, _migrate_to_31),
-    (32, _migrate_to_32),
     (33, _migrate_to_33),
 )
 

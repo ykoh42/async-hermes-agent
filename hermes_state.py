@@ -21,6 +21,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import aiofiles
 import aiofiles.os
+import aiosqlite
 
 from agent.memory_manager import sanitize_context
 from agent.message_sanitization import _sanitize_surrogates
@@ -174,8 +175,6 @@ def is_sqlite_wal_reset_vulnerable(
 
 async def sqlite_source_id() -> str:
     """Return ``sqlite_source_id()``, or an empty string when unavailable."""
-    import aiosqlite
-
     try:
         connection = await aiosqlite.connect(":memory:")
         try:
@@ -467,8 +466,6 @@ async def _backup_db_file(db_path: Path) -> Optional[Path]:
 
 async def _db_opens_cleanly(db_path: Path) -> Optional[str]:
     """Probe database integrity plus the FTS read and write paths."""
-    import aiosqlite
-
     conn = await aiosqlite.connect(db_path, isolation_level=None)
     try:
         await load_fts5_cjk_extension(conn)
@@ -545,8 +542,6 @@ async def repair_state_db_schema(
     backup: bool = True,
 ) -> Dict[str, Any]:
     """Repair malformed schema, FTS, and stale B-tree index damage."""
-    import aiosqlite
-
     report: Dict[str, Any] = {
         "repaired": False,
         "strategy": None,
@@ -1579,8 +1574,6 @@ class SessionDB:
         Adding a column to SCHEMA_SQL is all that's needed; the
         reconciliation loop picks it up automatically.
         """
-        import aiosqlite
-
         ref = await aiosqlite.connect(":memory:")
         try:
             await ref.executescript(schema_sql)
@@ -1655,10 +1648,6 @@ class SessionDB:
         async with self._get_connect_lock():
             if self._connection is not None:
                 return self._connection
-            import aiosqlite
-
-            import aiofiles.os
-
             async def _connect_and_initialize():
                 connection = None
                 initialized = False

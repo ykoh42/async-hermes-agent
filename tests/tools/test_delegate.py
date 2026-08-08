@@ -22,6 +22,7 @@ from tools.delegate_tool import (
     DELEGATE_TASK_SCHEMA,
     DelegateEvent,
     _get_max_concurrent_children,
+    _handle_delegate_task,
     _load_config,
     _refresh_config,
     delegate_task,
@@ -1486,6 +1487,147 @@ class TestFallbackModelInheritance(unittest.IsolatedAsyncioTestCase):
 
         _, kwargs = MockAgent.call_args
         self.assertIsNone(kwargs["fallback_model"])
+
+
+class TestBackgroundDelegation(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.parent = _make_mock_parent(depth=0)
+        self.parent._background_delegations = set()
+        self.parent._closed = False
+        self.parent.event_callback = MagicMock()
+        self.parent.run_conversation = AsyncMock(
+            return_value={"final_response": "parent handled completion"}
+        )
+        self.child = _make_child_mock()
+        self.child._delegate_role = "leaf"
+        self.credentials = {
+            "provider": None,
+            "base_url": None,
+            "api_key": None,
+            "api_mode": None,
+            "model": None,
+            "request_overrides": None,
+            "max_output_tokens": None,
+            "command": None,
+            "args": None,
+        }
+
+    async def _dispatch(self, run_child):
+        self.enterContext(
+            patch(
+                "tools.delegate_tool._resolve_delegation_credentials",
+                AsyncMock(return_value=self.credentials),
+            )
+        )
+        self.enterContext(
+            patch(
+                "tools.delegate_tool._build_child_agent",
+                AsyncMock(return_value=self.child),
+            )
+        )
+        self.enterContext(
+            patch("tools.delegate_tool._get_max_spawn_depth", return_value=2)
+        )
+        self.enterContext(
+            patch("tools.delegate_tool._run_single_child", run_child)
+        )
+        self.enterContext(
+            patch(
+                "tools.delegate_tool._finalize_child_results",
+                AsyncMock(),
+            )
+        )
+        return await _handle_delegate_task(
+            {"goal": "inspect the migration"},
+            parent_agent=self.parent,
+        )
+
+    async def test_top_level_model_dispatch_returns_before_child_finishes(self):
+        started = asyncio.Event()
+        release = asyncio.Event()
+        reinjected = asyncio.Event()
+
+        async def run_child(*_args, **_kwargs):
+            started.set()
+            await release.wait()
+            return {
+                "task_index": 0,
+                "status": "completed",
+                "summary": "migration verified",
+                "duration_seconds": 0.1,
+            }
+
+        async def run_parent(message, **kwargs):
+            reinjected.set()
+            return {"final_response": "used the child result"}
+
+        self.parent.run_conversation.side_effect = run_parent
+        output = json.loads(await self._dispatch(run_child))
+
+        self.assertEqual(output["status"], "dispatched")
+        self.assertEqual(output["mode"], "background")
+        self.assertEqual(len(self.parent._background_delegations), 1)
+        await asyncio.wait_for(started.wait(), timeout=1)
+        self.parent.run_conversation.assert_not_awaited()
+
+        release.set()
+        await asyncio.wait_for(reinjected.wait(), timeout=1)
+        tasks = tuple(self.parent._background_delegations)
+        await asyncio.gather(*tasks)
+
+        message = self.parent.run_conversation.await_args.args[0]
+        kwargs = self.parent.run_conversation.await_args.kwargs
+        self.assertIn("ASYNC DELEGATION BATCH COMPLETE", message)
+        self.assertIn("inspect the migration", message)
+        self.assertIn("migration verified", message)
+        self.assertEqual(
+            kwargs["persist_user_display_kind"],
+            "async_delegation_complete",
+        )
+        self.parent.event_callback.assert_called_once()
+
+    async def test_nested_orchestrator_awaits_its_worker(self):
+        self.parent._delegate_depth = 1
+        finished = False
+
+        async def run_child(*_args, **_kwargs):
+            nonlocal finished
+            await asyncio.sleep(0)
+            finished = True
+            return {
+                "task_index": 0,
+                "status": "completed",
+                "summary": "nested result",
+                "duration_seconds": 0.1,
+            }
+
+        output = json.loads(await self._dispatch(run_child))
+
+        self.assertTrue(finished)
+        self.assertEqual(output["results"][0]["summary"], "nested result")
+        self.assertFalse(self.parent._background_delegations)
+        self.parent.run_conversation.assert_not_awaited()
+
+    async def test_cancelling_background_owner_cancels_child_work(self):
+        started = asyncio.Event()
+        cancelled = asyncio.Event()
+
+        async def run_child(*_args, **_kwargs):
+            started.set()
+            try:
+                await asyncio.Future()
+            finally:
+                cancelled.set()
+
+        output = json.loads(await self._dispatch(run_child))
+        self.assertEqual(output["status"], "dispatched")
+        await asyncio.wait_for(started.wait(), timeout=1)
+        (task,) = self.parent._background_delegations
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+        await asyncio.wait_for(cancelled.wait(), timeout=1)
+        self.parent.run_conversation.assert_not_awaited()
 
 
 if __name__ == "__main__":

@@ -492,7 +492,9 @@ class RuntimeMode:
     def is_coding(self) -> bool:
         return self.profile.name == CODING_PROFILE.name
 
-    def toolset_selection(self, config: Optional[dict[str, Any]] = None) -> Optional[list[str]]:
+    async def toolset_selection(
+        self, config: Optional[dict[str, Any]] = None
+    ) -> Optional[list[str]]:
         """Toolset list for this posture, or ``None`` to keep the platform default.
 
         Non-``None`` only under the opt-in ``focus`` mode. The default posture
@@ -508,7 +510,7 @@ class RuntimeMode:
             return None
         if self.profile.toolset is None:
             return None
-        return [self.profile.toolset, *_enabled_mcp_servers(config)]
+        return [self.profile.toolset, *await _enabled_mcp_servers(config)]
 
 
     async def system_prompt_parts(self) -> tuple[list[str], list[str], list[str]]:
@@ -617,7 +619,7 @@ async def coding_selection(
     mode = await resolve_runtime_mode(
         platform=platform, cwd=cwd, config=config
     )
-    return mode.toolset_selection(config)
+    return await mode.toolset_selection(config)
 
 
 async def coding_system_blocks(
@@ -673,17 +675,18 @@ async def coding_system_prompt_parts(
     return await mode.system_prompt_parts()
 
 
-def _enabled_mcp_servers(config: Optional[dict[str, Any]]) -> list[str]:
+async def _enabled_mcp_servers(config: Optional[dict[str, Any]]) -> list[str]:
     """Names of MCP servers the user has enabled — kept in the coding posture.
 
     MCP servers (figma, browser, tophat, …) are explicitly configured and part
     of the coding workflow, not noise to strip.
     """
     try:
-        from hermes_cli.config import read_raw_config
+        from hermes_cli.config import load_config_readonly
         from hermes_cli.tools_config import _parse_enabled_flag
 
-        servers = read_raw_config().get("mcp_servers") or {}
+        resolved_config = config if config is not None else await load_config_readonly()
+        servers = resolved_config.get("mcp_servers") or {}
         return [
             str(name)
             for name, cfg in servers.items()

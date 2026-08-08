@@ -7,14 +7,10 @@ import pytest
 from agent import (
     browser_registry,
     image_gen_registry,
-    transcription_registry,
-    tts_registry,
     video_gen_registry,
 )
 from agent.browser_provider import BrowserProvider
 from agent.image_gen_provider import ImageGenProvider, save_b64_image
-from agent.transcription_provider import TranscriptionProvider
-from agent.tts_provider import TTSProvider
 from agent.video_gen_provider import VideoGenProvider, save_b64_video
 from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
 
@@ -31,20 +27,6 @@ class _VideoProvider(VideoGenProvider):
 
     async def generate(self, prompt, **kwargs):
         return {"success": True, "video": prompt}
-
-
-class _TTSProvider(TTSProvider):
-    name = "test-tts"
-
-    async def synthesize(self, text, output_path, **kwargs):
-        return output_path
-
-
-class _TranscriptionProvider(TranscriptionProvider):
-    name = "test-stt"
-
-    async def transcribe(self, file_path, **kwargs):
-        return {"success": True, "transcript": file_path, "provider": self.name}
 
 
 class _BrowserProvider(BrowserProvider):
@@ -69,8 +51,6 @@ def _reset_registries():
         browser_registry,
         image_gen_registry,
         video_gen_registry,
-        tts_registry,
-        transcription_registry,
     )
     for registry in registries:
         registry._reset_for_tests()
@@ -91,9 +71,6 @@ def test_media_and_browser_provider_io_contracts_are_native_async():
     assert inspect.iscoroutinefunction(VideoGenProvider.list_models)
     assert inspect.iscoroutinefunction(VideoGenProvider.default_model)
     assert inspect.iscoroutinefunction(VideoGenProvider.get_setup_schema)
-    assert inspect.iscoroutinefunction(TTSProvider.synthesize)
-    assert inspect.isasyncgenfunction(TTSProvider.stream)
-    assert inspect.iscoroutinefunction(TranscriptionProvider.transcribe)
     assert inspect.iscoroutinefunction(BrowserProvider.is_available)
     assert inspect.iscoroutinefunction(BrowserProvider.get_setup_schema)
     assert inspect.iscoroutinefunction(BrowserProvider.create_session)
@@ -105,8 +82,6 @@ def test_native_async_provider_instances_register_on_original_boundaries():
     providers = (
         (image_gen_registry, _ImageProvider()),
         (video_gen_registry, _VideoProvider()),
-        (tts_registry, _TTSProvider()),
-        (transcription_registry, _TranscriptionProvider()),
         (browser_registry, _BrowserProvider()),
     )
 
@@ -123,12 +98,6 @@ def test_plugin_context_original_registration_methods_are_operational():
     providers = (
         (context.register_image_gen_provider, image_gen_registry, _ImageProvider()),
         (context.register_video_gen_provider, video_gen_registry, _VideoProvider()),
-        (context.register_tts_provider, tts_registry, _TTSProvider()),
-        (
-            context.register_transcription_provider,
-            transcription_registry,
-            _TranscriptionProvider(),
-        ),
         (context.register_browser_provider, browser_registry, _BrowserProvider()),
     )
 

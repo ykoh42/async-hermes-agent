@@ -15,11 +15,9 @@ that instructs the live agent to:
      skill-authoring standards (description <=60 chars, the modern section
      order, Hermes-tool framing, no invented commands).
 
-There is no separate distillation engine and no model-tool footprint: the
-agent does the work with its existing toolset, so this works identically on
-local, Docker, and remote terminal backends. Every surface (CLI ``/learn``,
-gateway ``/learn``, the dashboard "Learn a skill" panel) calls
-:func:`build_learn_prompt` and feeds the result to the agent as a normal turn.
+There is no separate distillation engine and no additional model-tool
+footprint: the agent does the work with its existing toolset. Call
+:func:`build_learn_prompt` and feed the result to the agent as a normal turn.
 """
 
 from __future__ import annotations
@@ -75,7 +73,7 @@ Hermes-tool framing (this is what makes it a skill, not shell docs):
 - Reference Hermes tools by name in backticks: `terminal`, `read_file`,
   `write_file`, `search_files`, `patch`, `web_extract`, `web_search`,
   `vision_analyze`, `browser_navigate`, `delegate_task`, `image_generate`,
-  `text_to_speech`, `memory`, `skill_view`.
+  `memory`, `skill_view`.
 - Do NOT name shell utilities the agent already has wrapped: say `read_file`
   not cat/head/tail, `search_files` not grep/rg/find/ls, `patch` not sed/awk,
   `web_extract` not curl-to-scrape, `write_file` not echo>file or heredocs.

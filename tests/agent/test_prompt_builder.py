@@ -30,7 +30,6 @@ from agent.prompt_builder import (
     GOOGLE_MODEL_OPERATIONAL_GUIDANCE,
     MEMORY_GUIDANCE,
     SESSION_SEARCH_GUIDANCE,
-    PLATFORM_HINTS,
     WSL_ENVIRONMENT_HINT,
 )
 
@@ -275,6 +274,12 @@ class TestBuildSkillsSystemPrompt:
         clear_skills_system_prompt_cache(clear_snapshot=True)
         yield
         clear_skills_system_prompt_cache(clear_snapshot=True)
+
+    def test_help_guidance_does_not_route_to_removed_skill_or_cli(self):
+        from agent.prompt_builder import HERMES_AGENT_HELP_GUIDANCE
+
+        assert "skill_view(name='hermes-agent')" not in HERMES_AGENT_HELP_GUIDANCE
+        assert "hermes setup" not in HERMES_AGENT_HELP_GUIDANCE
 
 
 
@@ -552,63 +557,6 @@ class TestStripYamlFrontmatter:
 # =========================================================================
 # Constants sanity checks
 # =========================================================================
-
-
-class TestPromptBuilderConstants:
-    def test_api_server_hint_scopes_media_tag_guidance(self):
-        """api_server MEDIA: interception is partial (#68402, corrected):
-        _resolve_media_to_data_urls (gateway/platforms/api_server.py) inlines
-        small image MEDIA: tags as base64 data URLs on the chat, completions,
-        and responses endpoints — but non-image files are never resolved
-        (_MEDIA_IMG_EXT is image-only) and the /v1/runs handler never calls
-        the resolver at all. The hint must teach BOTH halves: images work via
-        MEDIA:, everything else needs a plain path in the response text."""
-        hint = PLATFORM_HINTS["api_server"]
-        # Images ARE intercepted: inlined as data URLs.
-        assert "MEDIA:" in hint
-        assert "inlined" in hint.lower()
-        assert "data" in hint.lower()  # data URLs
-        # The gaps: non-image files and the runs endpoint.
-        assert "non-image" in hint.lower()
-        assert "runs" in hint.lower()
-        # Fallback guidance: plain file path in the response text.
-        assert "plain" in hint.lower()
-
-    def test_markdown_converting_platform_hints_do_not_forbid_markdown(self):
-        """#12224 — WhatsApp (Baileys) and Signal adapters actively convert
-        markdown to native formatting (gateway/platforms/whatsapp_common.py
-        format_message + signal_format.markdown_to_signal: bold, italic,
-        strikethrough, headers, bullets). Their hints previously told the
-        agent "do not use markdown", which made it strip bullets/bold the
-        adapter would have rendered. The hint must affirm markdown, not
-        forbid it."""
-        for key in ("whatsapp", "signal"):
-            hint = PLATFORM_HINTS[key]
-            assert "do not use markdown" not in hint.lower()
-            assert "markdown" in hint.lower()
-
-    def test_cli_hint_does_not_suggest_media_tags(self):
-        # Regression: MEDIA:/path tags are intercepted only by messaging
-        # gateway platforms. On the CLI they render as literal text and
-        # confuse users. The CLI hint must steer the agent away from them.
-        cli_hint = PLATFORM_HINTS["cli"]
-        assert "MEDIA:" in cli_hint, (
-            "CLI hint should mention MEDIA: in order to tell the agent "
-            "NOT to use it (negative guidance)."
-        )
-        # Must contain explicit "don't" language near the MEDIA reference.
-        assert any(
-            marker in cli_hint.lower()
-            for marker in ("do not emit media", "not intercepted", "do not", "don't")
-        ), "CLI hint should explicitly discourage MEDIA: tags."
-        # Messaging hints should still advertise MEDIA: positively (sanity
-        # check that this test is calibrated correctly).
-        assert "include MEDIA:" in PLATFORM_HINTS["telegram"]
-
-
-
-
-
 
 
 # =========================================================================

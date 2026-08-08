@@ -44,12 +44,9 @@ def _clear_browser_env(monkeypatch: pytest.MonkeyPatch) -> None:
         "BROWSERBASE_PROJECT_ID",
         "BROWSERBASE_BASE_URL",
         "BROWSER_USE_API_KEY",
-        "BROWSER_USE_GATEWAY_URL",
         "FIRECRAWL_API_KEY",
         "FIRECRAWL_API_URL",
         "FIRECRAWL_BROWSER_TTL",
-        "TOOL_GATEWAY_DOMAIN",
-        "TOOL_GATEWAY_USER_TOKEN",
     ):
         monkeypatch.delenv(k, raising=False)
 

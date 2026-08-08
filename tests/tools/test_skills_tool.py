@@ -559,8 +559,7 @@ class TestFindAllSkillsPlatformFiltering:
 @pytest.mark.asyncio
 class TestFindAllSkillsSecureSetup:
     async def test_listing_shape_independent_of_env_var_prereqs(self, tmp_path, monkeypatch):
-        # A remote backend must not be probed just to build the listing.
-        monkeypatch.setenv("TERMINAL_ENV", "docker")
+        # Environment prerequisites must not be probed just to build the listing.
         monkeypatch.delenv("NONEXISTENT_API_KEY_XYZ", raising=False)
         monkeypatch.setenv("MY_PRESENT_KEY", "val")
 
@@ -609,11 +608,9 @@ class TestSkillViewPrerequisites:
         ]
 
 
-    async def test_remote_backend_treats_persisted_env_as_available(
+    async def test_persisted_env_is_available(
         self, tmp_path, monkeypatch
     ):
-        monkeypatch.setenv("TERMINAL_ENV", "docker")
-
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
             _make_skill(
                 tmp_path,
@@ -641,11 +638,9 @@ class TestSkillViewPrerequisites:
         assert result["setup_needed"] is False
         assert result["required_environment_variables"] == []
 
-    async def test_skill_view_treats_backend_only_env_as_setup_needed(
+    async def test_skill_view_treats_missing_env_as_setup_needed(
         self, tmp_path, monkeypatch
     ):
-        monkeypatch.setenv("TERMINAL_ENV", "docker")
-
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
             _make_skill(
                 tmp_path,
@@ -659,7 +654,6 @@ class TestSkillViewPrerequisites:
         assert result["missing_required_environment_variables"] == ["BACKEND_ONLY_KEY"]
 
     async def test_local_env_missing_keeps_setup_needed(self, tmp_path, monkeypatch):
-        monkeypatch.setenv("TERMINAL_ENV", "local")
         monkeypatch.delenv("SHELL_ONLY_KEY", raising=False)
 
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
@@ -675,35 +669,6 @@ class TestSkillViewPrerequisites:
         assert result["setup_needed"] is True
         assert result["missing_required_environment_variables"] == ["SHELL_ONLY_KEY"]
         assert result["readiness_status"] == "setup_needed"
-
-    @pytest.mark.parametrize(
-        "backend",
-        ["ssh", "daytona", "docker", "singularity", "modal", "vercel_sandbox"],
-    )
-    async def test_remote_backend_reports_missing_environment(
-        self, tmp_path, monkeypatch, backend
-    ):
-        monkeypatch.setenv("TERMINAL_ENV", backend)
-        monkeypatch.delenv("TENOR_API_KEY", raising=False)
-
-        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
-            _make_skill(
-                tmp_path,
-                "gif-search",
-                frontmatter_extra=(
-                    "required_environment_variables:\n"
-                    "  - name: TENOR_API_KEY\n"
-                    "    prompt: Tenor API key\n"
-                ),
-            )
-            raw = await skill_view("gif-search")
-
-        result = json.loads(raw)
-        assert result["success"] is True
-        assert result["setup_needed"] is True
-        assert result["readiness_status"] == "setup_needed"
-        assert result["missing_required_environment_variables"] == ["TENOR_API_KEY"]
-
 
     async def test_legacy_flat_md_skill_preserves_frontmatter_metadata(self, tmp_path):
         flat_skill = tmp_path / "legacy-skill.md"

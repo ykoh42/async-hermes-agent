@@ -1,6 +1,6 @@
 [project]
 name = "async-hermes-agent"
-version = "0.20.1"
+version = "0.20.2"
 description = "A native-async AI agent harness for tools, MCP, skills, memory, and trajectory generation"
 readme = "README.md"
 # Upper bound is load-bearing, not cosmetic. uv resolves the project's
@@ -71,16 +71,14 @@ dependencies = [
   # (>5 MB or >8000px) at embed time; without it the byte AND pixel-dimension
   # shrink paths no-op, so an oversized image bakes into immutable history and
   # bricks the session on Anthropic's non-retryable 400. Pure-wheel, no system
-  # libs required for the codecs we use, so it's safe to ship in the base
-  # install rather than gating it behind an extra + a mid-session lazy install
-  # (which deadlocked the CLI under prompt_toolkit — see #40490).
+  # libs required for the codecs we use, so it is safe to ship in the base
+  # install rather than requiring a mid-session install.
   "Pillow==12.3.0",
   # Windows log rotation. Stdlib ``RotatingFileHandler.doRollover()`` uses
   # ``os.rename()`` which fails with ``PermissionError [WinError 32]`` on
   # Windows whenever any other process holds an append-mode handle on
-  # ``agent.log`` (always the case in Hermes — TUI, gateway, ``hy_memory``
-  # server, MCP servers, and on-demand CLI commands all log from separate
-  # processes), pinning ``agent.log`` at the 5 MiB threshold and spamming
+  # ``agent.log`` (for example, concurrent agents or MCP servers may log from
+  # separate processes), pinning ``agent.log`` at the 5 MiB threshold and spamming
   # stderr on every emit (see #44873). ``concurrent-log-handler`` wraps the
   # rename in a cross-process file lock (via ``portalocker``: pywin32 on
   # Windows) so only one process rotates at a time. ``hermes_logging.py``
@@ -90,6 +88,11 @@ dependencies = [
   # / pywin32 tree) ships only where it's actually used.
   "concurrent-log-handler==0.9.29; sys_platform == 'win32'",
 ]
+
+[project.urls]
+Documentation = "https://ykoh42.github.io/async-hermes-agent/"
+Issues = "https://github.com/ykoh42/async-hermes-agent/issues"
+Repository = "https://github.com/ykoh42/async-hermes-agent"
 
 [project.optional-dependencies]
 # Native Anthropic provider — only needed when provider=anthropic (not via
@@ -102,8 +105,7 @@ vertex = ["google-auth[aiohttp]==2.56.2"]
 # Microsoft Entra ID uses azure.identity.aio; aiohttp is its documented async
 # transport and remains provider-specific.
 azure-identity = ["azure-identity==1.25.3", "aiohttp==3.14.3"]
-# Web search backends — each only loaded when the user picks it as their
-# search provider (configured via `hermes tools` or config.yaml).
+# Web search backends — each only loaded when selected in config.yaml.
 parallel-web = ["parallel-web==0.4.2"]
 # FAL video generation backend; loaded only when that plugin is selected.
 fal = ["fal-client==0.13.1"]
@@ -160,7 +162,6 @@ testpaths = ["tests"]
 markers = [
     "integration: marks tests requiring external services (API keys, Modal, etc.)",
     "real_concurrent_gate: opt out of the autouse stub that disables _detect_concurrent_hermes_instances",
-    "real_agent_prewarm: opt out of the autouse stub that disables the tui_gateway deferred agent pre-warm timer",
     "requires_wal: needs the runtime to actually enable SQLite WAL mode (skipped where Hermes falls back to journal_mode=DELETE)",
     "no_isolate: opt out of per-file subprocess isolation (tests share mutable module-level state)",
     "ssh: marks tests requiring a reachable SSH server (skipped in normal CI)",
@@ -193,5 +194,4 @@ select = ["PLW1514"]
 "tests/**" = ["PLW1514"]
 # Skills and plugins are partially user-authored — their own conventions.
 "skills/**" = ["PLW1514"]
-"optional-skills/**" = ["PLW1514"]
 "plugins/**" = ["PLW1514"]

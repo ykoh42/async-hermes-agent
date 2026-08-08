@@ -26,8 +26,7 @@ Selection precedence for the active family:
     4. ``video_gen.model`` in ``config.yaml`` (when it's one of our family IDs)
     5. ``DEFAULT_MODEL``
 
-Authentication via ``FAL_KEY`` or the managed Nous gateway. Output is an
-HTTPS URL from FAL's CDN; the gateway downloads and delivers it.
+Authentication uses ``FAL_KEY``. Output is an HTTPS URL from FAL's CDN.
 """
 
 from __future__ import annotations
@@ -314,80 +313,30 @@ def _load_fal_client() -> Any:
 
 
 # ---------------------------------------------------------------------------
-# Managed FAL gateway (Nous Subscription)
-# ---------------------------------------------------------------------------
-
-async def _resolve_managed_fal_video_gateway():
-    """Return managed fal-queue gateway config when the user prefers the gateway
-    or direct FAL credentials are absent."""
-    from tools.tool_backend_helpers import fal_key_is_configured, prefers_gateway
-
-    if await fal_key_is_configured() and not await prefers_gateway("video_gen"):
-        return None
-    from tools.managed_tool_gateway import resolve_managed_tool_gateway
-
-    return await resolve_managed_tool_gateway("fal-queue")
-
-
 async def _submit_fal_video_request(endpoint: str, arguments: Dict[str, Any]):
-    """Submit a FAL video request using direct credentials or the managed queue gateway.
+    """Submit a FAL video request using direct credentials.
 
     Returns the completed queue result without blocking the event loop.
     """
     _load_fal_client()
     request_headers = {"x-idempotency-key": str(uuid.uuid4())}
-    managed_gateway = await _resolve_managed_fal_video_gateway()
-    if managed_gateway is None:
-        client = _fal_client.AsyncClient()
-        try:
-            handle = await client.submit(
-                endpoint,
-                arguments=arguments,
-                headers=request_headers,
-            )
-            return await handle.get()
-        finally:
-            await client._client.aclose()
-
-    from tools.fal_common import _ManagedFalClient
-
-    managed_client = _ManagedFalClient(
-        _fal_client,
-        key=managed_gateway.nous_user_token,
-        queue_run_origin=managed_gateway.gateway_origin,
-    )
+    client = _fal_client.AsyncClient()
     try:
-        try:
-            handle = await managed_client.submit(
-                endpoint,
-                arguments=arguments,
-                headers=request_headers,
-            )
-            return await handle.get()
-        finally:
-            await managed_client.close()
-    except Exception as exc:
-        from tools.fal_common import _extract_http_status
-
-        status = _extract_http_status(exc)
-        if status is not None and 400 <= status < 500:
-            raise ValueError(
-                f"Nous Subscription gateway rejected endpoint '{endpoint}' "
-                f"(HTTP {status}). This model may not yet be enabled on "
-                f"the Nous Portal's FAL proxy. Either:\n"
-                f"  • Set FAL_KEY in your environment to use FAL.ai directly, or\n"
-                f"  • Pick a different model via `hermes tools` → Video Generation."
-            ) from exc
-        raise
+        handle = await client.submit(
+            endpoint,
+            arguments=arguments,
+            headers=request_headers,
+        )
+        return await handle.get()
+    finally:
+        await client._client.aclose()
 
 
 async def _check_fal_video_available() -> bool:
-    """True if the FAL.ai video backend is reachable (direct key or managed gateway)."""
+    """True if the direct FAL.ai credential is configured."""
     from tools.tool_backend_helpers import fal_key_is_configured
 
-    if await fal_key_is_configured():
-        return True
-    return await _resolve_managed_fal_video_gateway() is not None
+    return await fal_key_is_configured()
 
 
 # ---------------------------------------------------------------------------
@@ -482,9 +431,7 @@ class FALVideoGenProvider(VideoGenProvider):
         if not await _check_fal_video_available():
             return error_response(
                 error=(
-                    "No FAL backend available. Either set FAL_KEY "
-                    "(run `hermes tools` → Video Generation → FAL to configure) "
-                    "or sign in to Nous (`hermes setup`) for managed gateway access."
+                    "No FAL backend available. Set FAL_KEY to use FAL.ai."
                 ),
                 error_type="auth_required",
                 provider="fal",

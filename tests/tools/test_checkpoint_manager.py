@@ -801,42 +801,6 @@ class TestPruneCheckpointsOrphanAllowlist:
         assert not previewed_repo.exists()
         assert newly_gone_repo.exists()
 
-    @pytest.mark.skip(reason="classic CLI is outside the async library scope")
-    async def test_end_to_end_timing_change_during_confirmation_prompt(self, tmp_path, monkeypatch):
-        """Reproduces the exact PR #69141 review scenario end-to-end through
-        `hermes checkpoints prune`: the preview shows one pre-v2 orphan; a
-        second project's workdir is removed by the input() callback while
-        the human is "answering" the prompt. Only the previewed orphan may
-        be deleted.
-        """
-        import hermes_cli.checkpoints as checkpoints_cli
-
-        base = tmp_path / "checkpoints"
-        monkeypatch.setattr("tools.checkpoint_manager.CHECKPOINT_BASE", base)
-
-        previewed_work = tmp_path / "was-deleted-before-preview"
-        still_alive_work = tmp_path / "still-alive-during-preview"
-        still_alive_work.mkdir()
-        _seed_legacy_repo(base, "eeee" * 4, previewed_work)
-        second_repo = _seed_legacy_repo(base, "ffff" * 4, still_alive_work)
-
-        def _confirm_and_go_stale(_prompt):
-            # Simulate the workdir disappearing after the preview was shown
-            # but before the human's answer is processed.
-            shutil.rmtree(still_alive_work)
-            return "y"
-
-        monkeypatch.setattr("builtins.input", _confirm_and_go_stale)
-
-        rc = checkpoints_cli.cmd_prune(None)
-
-        assert rc == 0
-        # The orphan shown in the preview is gone.
-        assert not (base / ("eeee" * 4)).exists()
-        # The one that only went orphan mid-confirmation must survive.
-        assert second_repo.exists()
-
-
 class TestMaybeAutoPruneCheckpoints:
     async def test_prunes_once_then_skips_within_interval(self, tmp_path):
         base = tmp_path / "checkpoints"

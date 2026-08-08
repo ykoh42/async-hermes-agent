@@ -112,6 +112,7 @@ def _apply_runtime_config(agent: Any, config: Dict[str, Any]) -> None:
     agent._parallel_tool_call_guidance = bool(
         agent_config.get("parallel_tool_call_guidance", True)
     )
+    agent._environment_probe = bool(agent_config.get("environment_probe", True))
     try:
         agent._api_max_retries = max(1, int(agent_config.get("api_max_retries", 3)))
     except (TypeError, ValueError):
@@ -1225,6 +1226,7 @@ def init_agent(
     # Subagent delegation state
     agent._delegate_depth = 0        # 0 = top-level agent, incremented for children
     agent._active_children = []      # Running child AIAgents (for interrupt propagation)
+    agent._background_delegations: set[asyncio.Task] = set()
     # Async-first runtime ownership. The lock binds to the event loop on first
     # use, keeping construction itself synchronous and side-effect free.
     agent._turn_lock = None
@@ -1672,9 +1674,6 @@ def init_agent(
     agent.valid_tool_names = set()
     agent._tool_snapshot_initialized = False
 
-    # Populated with the first async tool snapshot before prompt construction.
-    agent._kanban_worker_guidance = ""
-
     # Show trajectory saving status
     if agent.save_trajectories and not agent.quiet_mode:
         print("📝 Trajectory saving enabled")
@@ -1705,16 +1704,10 @@ def init_agent(
         short_uuid = uuid.uuid4().hex[:6]
         agent.session_id = f"{timestamp_str}_{short_uuid}"
 
-    # Expose session ID to tools (terminal, files) so agents can
-    # reference their own session for --resume commands, cross-session
-    # coordination, and logging. Keep the ContextVar and os.environ
-    # fallback synchronized because different tool paths still read both.
-    try:
-        from gateway.session_context import set_current_session_id
+    # Expose the task-local session ID to tools and logging helpers.
+    from gateway.session_context import set_current_session_id
 
-        set_current_session_id(agent.session_id)
-    except Exception:
-        os.environ["HERMES_SESSION_ID"] = agent.session_id
+    set_current_session_id(agent.session_id)
 
     # Session logs go into ~/.hermes/sessions/ alongside gateway sessions
     hermes_home = get_hermes_home()
@@ -1909,14 +1902,9 @@ def init_agent(
     # single turn; the runtime already executes such batches concurrently.
     agent._parallel_tool_call_guidance = bool(_agent_section.get("parallel_tool_call_guidance", True))
 
-    # Local Python toolchain probe toggle.  Default True.  When False,
-    # the probe is skipped entirely (no subprocess calls, no system-prompt
-    # line).  Useful for users on exotic setups where the probe heuristics
-    # are noisy.
-    # Do not warm the local toolchain probe here. ``__init__`` is state-only
-    # in the async package; launching subprocess work here would violate the
-    # lazy lifecycle contract. The prompt may use an already-cached result,
-    # but never starts or waits for this optional diagnostic on a turn path.
+    # Local Python toolchain probe toggle. Subprocess work starts only after
+    # the first awaited runtime boundary, never inside AIAgent.__init__.
+    agent._environment_probe = bool(_agent_section.get("environment_probe", True))
 
     # Per-platform prompt-hint overrides (config.yaml → platform_hints).
     # Lets an enterprise admin append to or replace Hermes' built-in
@@ -2559,40 +2547,17 @@ def init_agent(
     # gated off by the `not agent.quiet_mode` check above; this guard's active
     # job is the CLI dedup, and it leaves the door open for any non-quiet
     # non-CLI surface to still surface the warning.)
-    if not agent.quiet_mode and (agent.platform or "cli") != "cli":
-        try:
-            from hermes_cli.model_switch import _check_hermes_model_warning
-
-            _hermes_warn = _check_hermes_model_warning(agent.model or "")
-            if _hermes_warn:
-                _user_msg = (
-                    "⚠ Nous Research Hermes 3 & 4 models are NOT agentic — they "
-                    "lack reliable tool-calling for agent workflows (delegation, "
-                    "cron, proactive tools). Consider an agentic model instead "
-                    "(Claude, GPT, Gemini, Qwen-Coder, etc.)."
-                )
-                if hasattr(agent, "_emit_warning"):
-                    agent._emit_warning(_user_msg)
-                else:
-                    print(f"\n{_user_msg}\n", file=sys.stderr)
-                _ra().logger.warning(_hermes_warn)
-        except Exception:
-            pass
-
     # Inject context engine tool schemas (e.g. lcm_grep, lcm_describe, lcm_expand).
     # Skip names that are already present — the _ra().get_tool_definitions()
     # quiet_mode cache returned a shared list pre-#17335, so a stray
     # mutation here would poison subsequent agent inits in the same
-    # Gateway process and trip provider-side 'duplicate tool name'
+    # embedding process and trip provider-side 'duplicate tool name'
     # errors. Even with the cache fix, dedup is the right defense
     # against plugin paths that may register the same schemas via
     # ctx.register_tool(). Mirrors the memory tools dedup above.
     #
-    # Respect the platform's enabled_toolsets configuration (#5544):
-    # context engine tools follow the same gating pattern as memory
-    # provider tools — without the gate, `platform_toolsets: telegram: []`
-    # would still leak lcm_* tools into the tool surface and incur the
-    # same local-model latency penalty.
+    # Respect enabled_toolsets: context-engine tools follow the same gating
+    # pattern as memory-provider tools.
     agent._context_engine_tool_names: set = set()
     if (
         hasattr(agent, "context_compressor")
@@ -3559,6 +3524,9 @@ async def _initialize_deferred_runtime(agent: Any) -> bool:
                 client_kwargs["default_query"] = dict(default_query)
             if headers:
                 client_kwargs["default_headers"] = headers
+            from agent.ssl_guard import verify_ca_bundle_with_fallback
+
+            await verify_ca_bundle_with_fallback()
             agent.client = await create_openai_client(
                 agent,
                 client_kwargs,

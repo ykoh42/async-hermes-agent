@@ -44,7 +44,8 @@ def _seed(home, managed, *, user, mgd):
 
 
 
-def test_timezone_honors_managed(homes, monkeypatch):
+@pytest.mark.asyncio
+async def test_timezone_honors_managed(homes, monkeypatch):
     home, managed = homes
     # hermes_time checks an env override first; ensure it's unset so config wins.
     monkeypatch.delenv("HERMES_TIMEZONE", raising=False)
@@ -52,7 +53,7 @@ def test_timezone_honors_managed(homes, monkeypatch):
     _seed(home, managed, user="timezone: America/New_York\n", mgd="timezone: Asia/Tokyo\n")
     import hermes_time
 
-    assert hermes_time._resolve_timezone_name() == "Asia/Tokyo"
+    assert await hermes_time._resolve_timezone_name() == "Asia/Tokyo"
 
 
 def test_gateway_env_bridge_honors_managed(homes, monkeypatch):

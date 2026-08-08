@@ -121,56 +121,6 @@ def drop_stale_api_content(msg: Dict[str, Any]) -> None:
     msg.pop("api_content", None)
 
 
-def extract_api_content_sidecar(msg: Mapping[str, Any]) -> Optional[str]:
-    """Extract the ``api_content`` sidecar from a message dict for persistence.
-
-    Shared by the gateway/branch forwarding sites that copy the sidecar into a
-    new row. Returns the string sidecar or ``None`` when absent/non-string.
-    """
-    v = msg.get("api_content")
-    return v if isinstance(v, str) else None
-
-
-def consume_gateway_turn_context_notes(agent: Any) -> str:
-    """Pop the gateway's per-turn must-deliver notes off the agent (one-shot).
-
-    The gateway relocates volatile per-turn facts OUT of the ephemeral system
-    prompt (auto-reset notes, the first-contact intro, voice-channel changes)
-    and delivers them on the current user message via the api_content sidecar
-    instead, so the composed system prompt stays byte-stable turn-over-turn.
-    It stages the rendered notes on ``agent._gateway_turn_context_notes``
-    right before ``run_conversation``; this consumes them so a cached agent
-    can never replay a stale note on a later turn.
-    """
-    notes = getattr(agent, "_gateway_turn_context_notes", "") or ""
-    if hasattr(agent, "_gateway_turn_context_notes"):
-        try:
-            agent._gateway_turn_context_notes = ""
-        except Exception:
-            pass
-    return notes if isinstance(notes, str) else ""
-
-
-def append_notes_to_multimodal_content(content: Any, notes: str) -> bool:
-    """Deliver must-deliver notes on a multimodal (list) user message.
-
-    ``compose_user_api_content`` returns ``None`` for non-string content, so
-    sidecar-borne facts would silently drop on image/attachment turns.  For
-    gateway must-deliver notes we instead append a text part to the content
-    list in place — the part becomes durable message content (persisted and
-    replayed as-is), which keeps the wire and the transcript byte-identical.
-
-    Returns ``True`` when a part was appended.
-    """
-    if not notes or not isinstance(content, list):
-        return False
-    try:
-        content.append({"type": "text", "text": notes})
-        return True
-    except Exception:
-        return False
-
-
 def reanchor_current_turn_user_idx(messages: List[Any], user_message: Any) -> int:
     """Locate this turn's user message after compaction rebuilt ``messages``.
 
@@ -373,7 +323,12 @@ async def build_turn_context(
     # null; rebuilding from scratch" warning and a needless first-turn prefix
     # cache miss. (Issue #45499.)
 
-    # Tag log records in this context with the session ID for ``hermes logs``.
+    # Bind task-local session identity before any provider or tool work.
+    from gateway.session_context import set_current_session_id
+
+    set_current_session_id(agent.session_id)
+
+    # Tag log records in this context with the session ID for logging.
     set_session_context(agent.session_id)
 
     # Bind the skill write-origin ContextVar for this task.
@@ -448,13 +403,6 @@ async def build_turn_context(
                     ),
                 )
                 agent._tool_snapshot_initialized = True
-                from agent.prompt_builder import KANBAN_GUIDANCE
-
-                agent._kanban_worker_guidance = (
-                    KANBAN_GUIDANCE
-                    if "kanban_show" in agent.valid_tool_names
-                    else ""
-                )
     except asyncio.CancelledError:
         if initial_tool_snapshot:
             if getattr(agent, "_mcp_lifecycle_retained", False):
@@ -1089,11 +1037,15 @@ async def build_turn_context(
         pre_llm_results = await invoke_hook(
             "pre_llm_call",
             session_id=agent.session_id,
+            task_id=effective_task_id,
+            turn_id=turn_id,
             user_message=original_user_message,
             conversation_history=list(messages),
             is_first_turn=not bool(conversation_history),
             model=agent.model,
             platform=getattr(agent, "platform", None) or "",
+            parent_session_id=getattr(agent, "_parent_session_id", None) or "",
+            sender_id=getattr(agent, "_user_id", None) or "",
         )
     except _PluginContractError:
         raise
@@ -1101,36 +1053,26 @@ async def build_turn_context(
         logger.warning("pre_llm_call hook failed: %s", exc)
     else:
         context_parts = []
+        from tools.hook_output_spill import get_spill_config, spill_if_oversized
+
+        spill_config = await get_spill_config()
         for result in pre_llm_results:
+            piece = ""
             if isinstance(result, dict) and result.get("context"):
-                context_parts.append(str(result["context"]))
+                piece = str(result["context"])
             elif isinstance(result, str) and result.strip():
-                context_parts.append(result)
+                piece = result
+            if piece:
+                context_parts.append(
+                    await spill_if_oversized(
+                        piece,
+                        session_id=agent.session_id,
+                        source="plugin hook",
+                        config=spill_config,
+                    )
+                )
         if context_parts:
             plugin_user_context = "\n\n".join(context_parts)
-
-    # Gateway must-deliver notes (auto-reset note, first-contact intro,
-    # voice-channel change) ride the same user-message injection channel as
-    # plugin context so the ephemeral system prompt can stay byte-stable.
-    # One-shot: staged by the gateway right before this turn, consumed here.
-    # Multimodal (list) content can't take the string sidecar — append a
-    # durable text part instead of dropping the fact.
-    _gateway_notes = consume_gateway_turn_context_notes(agent)
-    if _gateway_notes:
-        _gw_turn_content = (
-            messages[current_turn_user_idx].get("content")
-            if 0 <= current_turn_user_idx < len(messages)
-            and isinstance(messages[current_turn_user_idx], dict)
-            else None
-        )
-        if isinstance(_gw_turn_content, list):
-            append_notes_to_multimodal_content(_gw_turn_content, _gateway_notes)
-        else:
-            plugin_user_context = (
-                plugin_user_context + "\n\n" + _gateway_notes
-                if plugin_user_context
-                else _gateway_notes
-            )
 
     # Per-turn file-mutation verifier state.
     agent._turn_failed_file_mutations = {}

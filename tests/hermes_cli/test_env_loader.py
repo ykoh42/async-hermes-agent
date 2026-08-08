@@ -180,13 +180,9 @@ async def test_cp1252_env_regression_does_not_crash(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# config.yaml terminal.* re-apply after dotenv loads (#29186 / #67323)
-#
-# load_hermes_dotenv loads .env with override=True, so a stale
-# TERMINAL_ENV=docker in .env used to silently beat config.yaml's
-# terminal.backend on every reload (gateway per-turn reload, cron standalone
-# runs). The bridge re-applies config.yaml's EXPLICIT terminal keys last via
-# the shared hermes_cli.config.apply_terminal_config_to_env helper.
+# config.yaml terminal.* re-apply after dotenv loads.
+# Explicit local terminal settings in config.yaml remain authoritative over
+# stale values in .env or the parent shell.
 # ---------------------------------------------------------------------------
 
 
@@ -197,45 +193,39 @@ def _seed_terminal_home(tmp_path, monkeypatch, *, config_yaml=None, env_text=Non
         (home / "config.yaml").write_text(config_yaml, encoding="utf-8")
     if env_text is not None:
         (home / ".env").write_text(env_text, encoding="utf-8")
-    # The bridge is scoped to the process HERMES_HOME (a different profile's
-    # load must not bridge this process's config), so point the process at
-    # the seeded home like a real gateway/cron process would be.
+    # The bridge is scoped to the process HERMES_HOME, so point the process at
+    # the seeded home.
     monkeypatch.setenv("HERMES_HOME", str(home))
     return home
 
 
 @pytest.mark.asyncio
-async def test_config_yaml_terminal_backend_overrides_stale_env(tmp_path, monkeypatch):
-    """Regression for #29186: a leftover TERMINAL_ENV=docker in ~/.hermes/.env
-    must not silently override the user's choice in config.yaml. config.yaml
-    is the documented source of truth, so its value must win after load."""
+async def test_config_yaml_terminal_cwd_overrides_stale_env(tmp_path, monkeypatch):
     home = _seed_terminal_home(
         tmp_path, monkeypatch,
-        config_yaml="terminal:\n  backend: local\n",
-        env_text="TERMINAL_ENV=docker\n",
+        config_yaml="terminal:\n  cwd: /configured/workspace\n",
+        env_text="TERMINAL_CWD=/stale/workspace\n",
     )
 
-    monkeypatch.delenv("TERMINAL_ENV", raising=False)
+    monkeypatch.delenv("TERMINAL_CWD", raising=False)
 
     await load_hermes_dotenv(hermes_home=home)
 
-    assert os.getenv("TERMINAL_ENV") == "local"
+    assert os.getenv("TERMINAL_CWD") == "/configured/workspace"
 
 
 @pytest.mark.asyncio
-async def test_config_yaml_terminal_backend_overrides_stale_shell(tmp_path, monkeypatch):
-    """config.yaml must also beat a stale TERMINAL_ENV exported in the shell
-    (e.g. set in ~/.zshrc when the user was experimenting with docker)."""
+async def test_config_yaml_terminal_timeout_overrides_stale_shell(tmp_path, monkeypatch):
     home = _seed_terminal_home(
         tmp_path, monkeypatch,
-        config_yaml="terminal:\n  backend: local\n",
+        config_yaml="terminal:\n  timeout: 600\n",
     )
 
-    monkeypatch.setenv("TERMINAL_ENV", "docker")
+    monkeypatch.setenv("TERMINAL_TIMEOUT", "30")
 
     await load_hermes_dotenv(hermes_home=home)
 
-    assert os.getenv("TERMINAL_ENV") == "local"
+    assert os.getenv("TERMINAL_TIMEOUT") == "600"
 
 
 @pytest.mark.asyncio
@@ -245,35 +235,35 @@ async def test_no_terminal_section_leaves_env_value_alone(tmp_path, monkeypatch)
     defaults."""
     home = _seed_terminal_home(
         tmp_path, monkeypatch,
-        config_yaml="display:\n  streaming: true\n",
-        env_text="TERMINAL_ENV=docker\n",
+        config_yaml="display:\n  show_commentary: true\n",
+        env_text="TERMINAL_TIMEOUT=45\n",
     )
 
-    monkeypatch.delenv("TERMINAL_ENV", raising=False)
+    monkeypatch.delenv("TERMINAL_TIMEOUT", raising=False)
 
     await load_hermes_dotenv(hermes_home=home)
 
-    assert os.getenv("TERMINAL_ENV") == "docker"
+    assert os.getenv("TERMINAL_TIMEOUT") == "45"
 
 
 @pytest.mark.asyncio
 async def test_config_yaml_terminal_omitted_key_does_not_clear_env(
     tmp_path, monkeypatch
 ):
-    """If config.yaml has a terminal block but no `backend`, the .env value
+    """If config.yaml has a terminal block but omits a key, the .env value
     must survive (only explicit config keys override env)."""
     home = _seed_terminal_home(
         tmp_path, monkeypatch,
-        config_yaml="terminal:\n  timeout: 600\n",
-        env_text="TERMINAL_ENV=docker\n",
+        config_yaml="terminal:\n  cwd: /configured/workspace\n",
+        env_text="TERMINAL_TIMEOUT=45\n",
     )
 
-    monkeypatch.delenv("TERMINAL_ENV", raising=False)
+    monkeypatch.delenv("TERMINAL_TIMEOUT", raising=False)
 
     await load_hermes_dotenv(hermes_home=home)
 
-    assert os.getenv("TERMINAL_ENV") == "docker"
-    assert os.getenv("TERMINAL_TIMEOUT") == "600"
+    assert os.getenv("TERMINAL_TIMEOUT") == "45"
+    assert os.getenv("TERMINAL_CWD") == "/configured/workspace"
 
 
 @pytest.mark.asyncio
@@ -287,17 +277,17 @@ async def test_other_profile_home_does_not_bridge_process_config(
     process_home = tmp_path / "process-home"
     process_home.mkdir()
     (process_home / "config.yaml").write_text(
-        "terminal:\n  backend: local\n", encoding="utf-8"
+        "terminal:\n  timeout: 600\n", encoding="utf-8"
     )
     monkeypatch.setenv("HERMES_HOME", str(process_home))
 
     other_home = tmp_path / "other-profile"
     other_home.mkdir()
-    (other_home / ".env").write_text("TERMINAL_ENV=docker\n", encoding="utf-8")
+    (other_home / ".env").write_text("TERMINAL_TIMEOUT=45\n", encoding="utf-8")
 
-    monkeypatch.delenv("TERMINAL_ENV", raising=False)
+    monkeypatch.delenv("TERMINAL_TIMEOUT", raising=False)
 
     await load_hermes_dotenv(hermes_home=other_home)
 
     # The other profile's .env value stands; the process config was not applied.
-    assert os.getenv("TERMINAL_ENV") == "docker"
+    assert os.getenv("TERMINAL_TIMEOUT") == "45"

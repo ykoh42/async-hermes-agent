@@ -3,7 +3,7 @@
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -82,6 +82,14 @@ async def _prompt_parts(agent):
         return await build_system_prompt_parts(agent)
 
 
+@pytest.mark.asyncio
+async def test_configured_platform_hint_is_included():
+    agent = _make_agent(platform="custom")
+    agent._platform_hint_overrides = {"custom": "Custom service guidance"}
+
+    assert "Custom service guidance" in await _stable_prompt(agent)
+
+
 def _init_code_repo(path):
     """A git repo that actually holds code — the coding posture requires a source
     file (or manifest), not a bare ``.git`` (a prose/notes repo stays general)."""
@@ -150,8 +158,8 @@ async def test_coding_prompt_preserves_legacy_workspace_order(monkeypatch):
     expected_profile = (
         "Active Hermes profile: default. Other profiles (if any) live "
         "under /hermes/profiles/<name>/. Each profile has its own skills/, "
-        "plugins/, cron/, and memories/ that affect a different session than "
-        "this one. Do not modify another profile's skills/plugins/cron/memories "
+        "plugins/, and memories/ that affect a different session than "
+        "this one. Do not modify another profile's skills/plugins/memories "
         "unless the user explicitly directs you to."
     )
     expected = "\n\n".join((
@@ -180,55 +188,13 @@ async def test_coding_prompt_preserves_legacy_workspace_order(monkeypatch):
             ),
         ),
         patch("agent.file_safety._resolve_active_profile_name", return_value="default"),
-        patch("hermes_time.now", return_value=datetime(2026, 1, 2)),
+        patch(
+            "hermes_time.now",
+            new_callable=AsyncMock,
+            return_value=datetime(2026, 1, 2),
+        ),
     ):
         prompt = await build_system_prompt(agent, system_message="SYSTEM_MESSAGE")
 
     assert prompt == expected
     assert agent._cached_system_prompt_static == "\n\n".join(expected.split("\n\n")[:4])
-
-
-class TestTelegramRichMessagesHint:
-    """Verify that TELEGRAM_RICH_MESSAGES_HINT is conditionally included."""
-
-    @pytest.mark.asyncio
-    async def test_base_hint_without_rich_messages(self, monkeypatch):
-        """When rich_messages is False (default), only the base hint is used."""
-        agent = _make_agent(platform="telegram")
-        # Mock config to return rich_messages: false (default)
-        with patch("hermes_cli.config.load_config_readonly") as mock_cfg:
-            mock_cfg.return_value = {
-                "platforms": {"telegram": {"extra": {"rich_messages": False}}}
-            }
-            stable = await _stable_prompt(agent)
-        # Base hint should be present
-        assert "Standard Markdown is automatically converted" in stable
-        # Rich-messages extension should NOT be present
-        assert "lean into it" not in stable
-        assert "task lists" not in stable
-
-    @pytest.mark.asyncio
-    async def test_rich_hint_with_rich_messages_enabled(self, monkeypatch):
-        """When rich_messages is True, the rich-messages extension is appended."""
-        agent = _make_agent(platform="telegram")
-        with patch("hermes_cli.config.load_config_readonly") as mock_cfg:
-            mock_cfg.return_value = {
-                "platforms": {"telegram": {"extra": {"rich_messages": True}}}
-            }
-            stable = await _stable_prompt(agent)
-        # Base hint should be present
-        assert "Standard Markdown is automatically converted" in stable
-        # Rich-messages extension should be present
-        assert "lean into it" in stable
-        assert "task lists" in stable
-        assert "math/formulas" in stable
-
-    @pytest.mark.asyncio
-    async def test_base_hint_without_config(self, monkeypatch):
-        """When config has no telegram section, only base hint is used."""
-        agent = _make_agent(platform="telegram")
-        with patch("hermes_cli.config.load_config_readonly") as mock_cfg:
-            mock_cfg.return_value = {}
-            stable = await _stable_prompt(agent)
-        assert "Standard Markdown is automatically converted" in stable
-        assert "lean into it" not in stable

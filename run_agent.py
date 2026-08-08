@@ -82,12 +82,9 @@ async def _launch_cwd_for_session(source: str) -> Optional[str]:
 
 
 def _session_source_for_agent(platform: Optional[str]) -> str:
-    try:
-        from gateway.session_context import get_session_env
+    from gateway.session_context import get_session_env
 
-        source = get_session_env("HERMES_SESSION_SOURCE", "")
-    except Exception:
-        source = os.environ.get("HERMES_SESSION_SOURCE", "")
+    source = get_session_env("HERMES_SESSION_SOURCE", "")
     source = str(source or "").strip()
     if source:
         return source
@@ -145,6 +142,16 @@ from agent.context_compressor import (  # noqa: F401
     COMPRESSED_SUMMARY_METADATA_KEY,
     ContextCompressor,
 )
+from agent import conversation_loop as _conversation_loop
+from agent.aux_accounting import (
+    reset_accounting_context,
+    set_accounting_context,
+)
+from agent.auxiliary_client import scoped_runtime_main
+from agent.portal_tags import (
+    reset_conversation_context,
+    set_conversation_context,
+)
 from agent.retry_utils import jittered_backoff  # noqa: F401
 from agent.prompt_builder import (  # noqa: F401  # re-exported via _ra() / mock.patch("run_agent.<name>") / from run_agent import <name>
     DEFAULT_AGENT_IDENTITY,
@@ -183,6 +190,7 @@ from agent.tool_result_classification import (
     FILE_MUTATING_TOOL_NAMES as _FILE_MUTATING_TOOLS,
     file_mutation_result_landed,
 )
+from agent.subagent_lifecycle import bind_subagent_parent
 from agent.trajectory import (
     convert_scratchpad_to_think,
     save_trajectory as _save_trajectory_to_file,
@@ -613,13 +621,6 @@ class AIAgent:
                         self, quiet_mode=getattr(self, "quiet_mode", False)
                     )
                     self._tool_snapshot_initialized = True
-                    from agent.prompt_builder import KANBAN_GUIDANCE
-
-                    self._kanban_worker_guidance = (
-                        KANBAN_GUIDANCE
-                        if "kanban_show" in self.valid_tool_names
-                        else ""
-                    )
             except BaseException:
                 if self._mcp_lifecycle_retained:
                     await _release_mcp_lifecycle(self)
@@ -1779,7 +1780,7 @@ class AIAgent:
             ),
             "session_id": self.session_id or "",
             "parent_session_id": self._parent_session_id or "",
-            "platform": self.platform or os.environ.get("HERMES_SESSION_SOURCE", "cli"),
+            "platform": _session_source_for_agent(self.platform),
             "tool_name": "memory",
         }
         if task_id:
@@ -3433,26 +3434,9 @@ class AIAgent:
         return apply_pending_steer_to_tool_results(self, messages, num_tool_msgs)
 
     def _touch_activity(self, desc: str) -> None:
-        """Update the last-activity timestamp and description.
-
-        Also bridges to the kanban board's heartbeat fields when this
-        process is a dispatcher-spawned worker (HERMES_KANBAN_TASK set),
-        so the dispatcher watchdog doesn't reclaim an actively-running
-        worker as stale (#31752). Bridge is rate-limited (60s) and
-        best-effort — it never raises into the agent loop.
-        """
+        """Update the last-activity timestamp and description."""
         self._last_activity_ts = time.time()
         self._last_activity_desc = desc
-        if os.environ.get("HERMES_KANBAN_TASK"):
-            try:
-                from tools.kanban_tools import heartbeat_current_worker_from_env
-                heartbeat_current_worker_from_env()
-            except Exception:
-                # Never let the bridge break the agent loop.  The function
-                # already swallows exceptions internally; this outer guard
-                # covers import-time failures (kanban_tools unavailable,
-                # etc.) on niche deployment surfaces.
-                pass
 
     def _capture_rate_limits(self, http_response: Any) -> None:
         """Parse x-ratelimit-* headers from an HTTP response and cache the state.
@@ -3874,7 +3858,6 @@ class AIAgent:
         - Background processes tracked in ProcessRegistry
         - Terminal sandbox environments
         - Browser daemon sessions
-        - Computer-use backend sessions and target/ref state
         - Active child agents (subagent delegation)
         - OpenAI/httpx client connections
 
@@ -3899,6 +3882,23 @@ class AIAgent:
             turn_result = (await asyncio.gather(active_turn, return_exceptions=True))[0]
             if isinstance(turn_result, Exception):
                 logger.debug("Active turn failed while closing agent: %r", turn_result)
+
+        background_delegation_set = getattr(
+            self,
+            "_background_delegations",
+            None,
+        )
+        background_delegations = tuple(
+            task
+            for task in background_delegation_set or ()
+            if task is not current_task and not task.done()
+        )
+        for task in background_delegations:
+            task.cancel()
+        if background_delegations:
+            await asyncio.gather(*background_delegations, return_exceptions=True)
+        if background_delegation_set is not None:
+            background_delegation_set.clear()
 
         self._closed = True
 
@@ -5865,17 +5865,6 @@ class AIAgent:
             return content
 
         summary = _multimodal_text_summary(result)
-        if tool_name == "computer_use":
-            return json.dumps({
-                "error": (
-                    "computer_use returned screenshot/image content, but the active "
-                    "model/provider does not support image input. Switch to a "
-                    "vision-capable model for desktop computer use, or use browser "
-                    "tools for browser tasks."
-                ),
-                "text_summary": summary,
-            })
-
         logger.warning(
             "Tool %s returned image content for non-vision model %s/%s; "
             "falling back to text summary",
@@ -6747,16 +6736,6 @@ class AIAgent:
         moa_config: Optional[dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Forwarder — see ``agent.conversation_loop.run_conversation``."""
-        from agent.aux_accounting import (
-            reset_accounting_context,
-            set_accounting_context,
-        )
-        from agent.conversation_loop import run_conversation
-        from agent.portal_tags import (
-            reset_conversation_context,
-            set_conversation_context,
-        )
-        from agent.subagent_lifecycle import bind_subagent_parent
         turn_lock = self._get_turn_lock()
         await turn_lock.acquire()
         self._active_turn_task = asyncio.current_task()
@@ -6782,14 +6761,12 @@ class AIAgent:
                 else None,
                 getattr(self, "session_id", None),
             )
-            from agent.auxiliary_client import scoped_runtime_main
-
             # The outer token restores the caller's Context even though turn setup
             # replaces the value with the live runtime after fallback restoration.
             # Keep the scope local instead of storing ContextVar tokens on the agent,
             # which may be observed from another task.
             with bind_subagent_parent(self), scoped_runtime_main({}):
-                return await run_conversation(
+                return await _conversation_loop.run_conversation(
                     self,
                     user_message,
                     system_message,
