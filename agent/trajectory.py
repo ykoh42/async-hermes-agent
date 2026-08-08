@@ -57,16 +57,30 @@ async def save_trajectory(trajectory: List[Dict[str, Any]], model: str,
             await handle.write(line)
             await handle.flush()
 
+    cancellation: asyncio.CancelledError | None = None
     try:
         # Keep one JSONL record intact when the owning turn is cancelled. The
         # write task is short and remains shielded long enough to close the
-        # file before cancellation is propagated to the caller.
+        # file before cancellation is propagated to the caller. Keep waiting
+        # through repeated caller cancellation so the owned task cannot leak.
         write_task = asyncio.create_task(_append())
-        try:
-            await asyncio.shield(write_task)
-        except asyncio.CancelledError:
-            await asyncio.shield(write_task)
-            raise
-        logger.info("Trajectory saved to %s", filename)
+        while True:
+            try:
+                await asyncio.shield(write_task)
+                break
+            except asyncio.CancelledError as exc:  # noqa: ASYNC103 - re-raised below
+                if write_task.cancelled():
+                    raise
+                if cancellation is None:
+                    cancellation = exc
+    except asyncio.CancelledError:
+        raise
     except Exception as e:
         logger.warning("Failed to save trajectory: %s", e)
+        if cancellation is not None:
+            raise cancellation
+        return
+
+    if cancellation is not None:
+        raise cancellation
+    logger.info("Trajectory saved to %s", filename)

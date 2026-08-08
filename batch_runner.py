@@ -988,10 +988,6 @@ class BatchRunner:
                             logger.error(
                                 "Async batch worker failed: %s", exc, exc_info=True
                             )
-                        for pending in batch_tasks:
-                            if not pending.done():
-                                pending.cancel()
-                        await asyncio.gather(*batch_tasks, return_exceptions=True)
                         raise
 
                     results.append(result)
@@ -1020,6 +1016,18 @@ class BatchRunner:
                         print(f"⚠️  Warning: Failed to save incremental checkpoint: {ckpt_err}")
             finally:
                 root_logger.setLevel(original_level)
+                pending_tasks = [task for task in batch_tasks if not task.done()]
+                for pending in pending_tasks:
+                    pending.cancel()
+                if pending_tasks:
+                    cleanup = asyncio.gather(*batch_tasks, return_exceptions=True)
+                    while True:
+                        try:
+                            await asyncio.shield(cleanup)
+                            break
+                        except asyncio.CancelledError:  # noqa: ASYNC103 - active cancellation propagates after cleanup
+                            if cleanup.cancelled():
+                                raise
         
         # Aggregate all batch statistics and update checkpoint
         total_reasoning_stats = {"total_assistant_turns": 0, "turns_with_reasoning": 0, "turns_without_reasoning": 0}

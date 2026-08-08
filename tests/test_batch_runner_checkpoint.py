@@ -148,6 +148,90 @@ async def test_jsonl_append_repeated_cancellation_waits_for_owned_write(
     assert write_completed.is_set()
 
 
+@pytest.mark.asyncio
+async def test_run_cancellation_during_checkpoint_reaps_other_batches(
+    tmp_path,
+    monkeypatch,
+):
+    """Checkpoint cancellation must not detach still-running batch tasks."""
+    checkpoint_started = asyncio.Event()
+    release_worker = asyncio.Event()
+    release_worker_cleanup = asyncio.Event()
+    worker_finished = asyncio.Event()
+    worker_cancelled = asyncio.Event()
+    worker_cleanup_started = asyncio.Event()
+
+    async def process_batch(args):
+        batch_num = args[0]
+        if batch_num == 0:
+            return {
+                "batch_num": 0,
+                "processed": 1,
+                "skipped": 0,
+                "tool_stats": {},
+                "reasoning_stats": {},
+                "completed_prompts": [0],
+            }
+        try:
+            await release_worker.wait()
+        except asyncio.CancelledError:
+            worker_cancelled.set()
+            worker_cleanup_started.set()
+            await release_worker_cleanup.wait()
+            raise
+        finally:
+            worker_finished.set()
+
+    async def load_checkpoint():
+        return {
+            "run_name": "cancel-run",
+            "completed_prompts": [],
+            "batch_stats": {},
+        }
+
+    async def block_checkpoint(_checkpoint_data):
+        checkpoint_started.set()
+        await asyncio.Event().wait()
+
+    runner = BatchRunner(
+        dataset_file=str(tmp_path / "dataset.jsonl"),
+        batch_size=1,
+        run_name="cancel-run",
+        distribution="terminal_only",
+        num_workers=2,
+    )
+    runner.output_dir = tmp_path / "output"
+    runner.checkpoint_file = runner.output_dir / "checkpoint.json"
+    runner.stats_file = runner.output_dir / "statistics.json"
+    runner.dataset = [{"prompt": "first"}, {"prompt": "second"}]
+    runner.batches = [[(0, runner.dataset[0])], [(1, runner.dataset[1])]]
+    runner._initialized = True
+
+    monkeypatch.setattr("batch_runner._process_batch_worker", process_batch)
+    monkeypatch.setattr(runner, "_load_checkpoint", load_checkpoint)
+    monkeypatch.setattr(runner, "_save_checkpoint", block_checkpoint)
+
+    task = asyncio.create_task(runner.run())
+    await checkpoint_started.wait()
+    task.cancel()
+    await worker_cleanup_started.wait()
+    task.cancel()
+    await asyncio.sleep(0)
+
+    assert task.done() is False
+    release_worker_cleanup.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    try:
+        assert worker_cancelled.is_set()
+        assert worker_finished.is_set()
+    finally:
+        release_worker.set()
+        release_worker_cleanup.set()
+        await asyncio.wait_for(worker_finished.wait(), timeout=1.0)
+
+
 class TestLoadCheckpoint:
     """Verify _load_checkpoint reads existing data or returns defaults."""
 
