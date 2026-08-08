@@ -193,16 +193,18 @@ _HARDLINE_ALLOW = [
 ]
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("command", _HARDLINE_BLOCK)
-def test_hardline_detection_blocks(command):
-    is_hl, desc = detect_hardline_command(command)
+async def test_hardline_detection_blocks(command):
+    is_hl, desc = await detect_hardline_command(command)
     assert is_hl, f"expected hardline to match {command!r}"
     assert desc, "hardline match must provide a description"
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("command", _HARDLINE_ALLOW)
-def test_hardline_detection_allows(command):
-    is_hl, desc = detect_hardline_command(command)
+async def test_hardline_detection_allows(command):
+    is_hl, desc = await detect_hardline_command(command)
     assert not is_hl, f"expected hardline NOT to match {command!r} (got: {desc})"
     assert desc is None
 
@@ -222,10 +224,11 @@ _QUOTED_BRACE_BYPASS = [
 ]
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("command", _QUOTED_BRACE_BYPASS)
-def test_quoted_and_brace_paths_are_hardline_blocked(command):
+async def test_quoted_and_brace_paths_are_hardline_blocked(command):
     """Quoted paths and ${HOME} must hit the floor (was a silent bypass)."""
-    is_hl, desc = detect_hardline_command(command)
+    is_hl, desc = await detect_hardline_command(command)
     assert is_hl, f"quoting/brace bypass leaked through hardline floor: {command!r}"
     assert desc
 
@@ -269,20 +272,22 @@ _QUOTED_NEWLINE_THREATS_BLOCK = [
 ]
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("command", _QUOTED_NEWLINE_DATA_ALLOW)
-def test_quoted_newline_data_not_blocked(command):
+async def test_quoted_newline_data_not_blocked(command):
     """Newlines inside quoted arguments are data, not command starts."""
-    is_hl, desc = detect_hardline_command(command)
+    is_hl, desc = await detect_hardline_command(command)
     assert not is_hl, (
         f"multi-line quoted data false-positived the hardline floor: "
         f"{command!r} (got: {desc})"
     )
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("command", _QUOTED_NEWLINE_THREATS_BLOCK)
-def test_real_newline_separated_threats_still_blocked(command):
+async def test_real_newline_separated_threats_still_blocked(command):
     """Unquoted newlines / $() / backticks remain real command boundaries."""
-    is_hl, desc = detect_hardline_command(command)
+    is_hl, desc = await detect_hardline_command(command)
     assert is_hl, f"real threat leaked through hardline floor: {command!r}"
     assert desc
 
@@ -348,10 +353,11 @@ _COMMAND_POSITION_ROOT_WIPES = [
 ]
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("command", _COMMAND_POSITION_ROOT_WIPES)
-def test_root_wipe_at_command_position_is_hardline(command):
+async def test_root_wipe_at_command_position_is_hardline(command):
     """A real `rm -rf /` at any command position stays hardline-blocked."""
-    is_hl, desc = detect_hardline_command(command)
+    is_hl, desc = await detect_hardline_command(command)
     assert is_hl, f"real root wipe leaked past the floor: {command!r}"
     assert desc
 
@@ -378,9 +384,10 @@ _HARDLINE_LINE_CONTINUATION = [
 ]
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("command,desc_substr", _HARDLINE_LINE_CONTINUATION)
-def test_hardline_blocks_line_continuation(command, desc_substr):
-    is_hl, desc = detect_hardline_command(command)
+async def test_hardline_blocks_line_continuation(command, desc_substr):
+    is_hl, desc = await detect_hardline_command(command)
     assert is_hl, f"line-continuation bypassed hardline detection: {command!r}"
     assert desc and desc_substr in desc.lower(), (
         f"unexpected description {desc!r} for {command!r}"
@@ -424,11 +431,12 @@ _SUDO_STDIN_BLOCK_YOLO = [
 ]
 
 
-def test_sudo_stdin_guard_detects_without_password():
+@pytest.mark.asyncio
+async def test_sudo_stdin_guard_detects_without_password():
     """sudo -S is dangerous when SUDO_PASSWORD is not configured."""
     import tools.approval as approval_mod
 
     for cmd in _SUDO_STDIN_BLOCK:
-        is_blocked, desc = approval_mod._check_sudo_stdin_guard(cmd)
+        is_blocked, desc = await approval_mod._check_sudo_stdin_guard(cmd)
         assert is_blocked, f"expected sudo stdin guard to block {cmd!r}"
         assert "sudo" in desc.lower()

@@ -3030,7 +3030,7 @@ async def _initialize_memory_manager(
         try:
             from hermes_cli.profiles import get_active_profile_name
 
-            init_kwargs["agent_identity"] = get_active_profile_name()
+            init_kwargs["agent_identity"] = await get_active_profile_name()
             init_kwargs["agent_workspace"] = "hermes"
         except Exception:
             logger.debug("Memory provider profile lookup failed", exc_info=True)

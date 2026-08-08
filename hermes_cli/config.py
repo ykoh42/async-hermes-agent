@@ -2741,12 +2741,9 @@ async def load_config_readonly() -> Dict[str, Any]:
     # Managed configuration is an optional policy overlay.  Read it through
     # the same async helper when present; never call managed_scope's blocking
     # loader from an active turn.
-    try:
-        from hermes_cli import managed_scope
+    from hermes_cli import managed_scope
 
-        managed_dir = managed_scope.get_managed_dir()
-    except Exception:
-        managed_dir = None
+    managed_dir = managed_scope._managed_dir_candidate()
     if managed_dir:
         managed_config = await _read_yaml(Path(managed_dir) / "config.yaml")
         if managed_config:

@@ -1,7 +1,9 @@
 """Unit tests for hermes_cli.managed_scope (resolver + loaders + key helpers)."""
 import textwrap
+from pathlib import Path
 
 import pytest
+from blockbuster import BlockBuster
 
 
 # ── Directory resolver ───────────────────────────────────────────────────────
@@ -54,3 +56,37 @@ def test_managed_dir_env_scrubbed_by_default():
     import os
 
     assert "HERMES_MANAGED_DIR" not in os.environ
+
+
+@pytest.mark.asyncio
+async def test_readonly_config_load_avoids_sync_managed_directory_probe(
+    tmp_path, monkeypatch
+):
+    from hermes_cli.config import load_config_readonly
+
+    home = tmp_path / "home"
+    managed = tmp_path / "managed"
+    home.mkdir()
+    managed.mkdir()
+    (managed / "config.yaml").write_text(
+        "approvals:\n  deny:\n    - 'curl *'\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed))
+    monkeypatch.setattr(
+        Path,
+        "is_dir",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("load_config_readonly must not probe directories synchronously")
+        ),
+    )
+
+    blockbuster = BlockBuster()
+    blockbuster.activate()
+    try:
+        config = await load_config_readonly()
+    finally:
+        blockbuster.deactivate()
+
+    assert config["approvals"]["deny"] == ["curl *"]

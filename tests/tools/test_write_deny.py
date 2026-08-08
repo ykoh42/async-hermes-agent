@@ -38,7 +38,10 @@ async def test_profile_mode_still_denies_root_env(tmp_path, monkeypatch):
     import agent.file_safety as safety
 
     monkeypatch.setattr(safety, "_hermes_home_path", lambda: profile)
-    monkeypatch.setattr(safety, "_hermes_root_path", lambda: root)
+    async def get_root():
+        return root
+
+    monkeypatch.setattr(safety, "_hermes_root_path", get_root)
     assert await get_write_denied_error(str(root_env)) is not None
 
 

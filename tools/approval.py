@@ -526,7 +526,7 @@ _SUDO_STDIN_RE = re.compile(
     re.IGNORECASE)
 
 
-def _check_sudo_stdin_guard(command: str) -> tuple:
+async def _check_sudo_stdin_guard(command: str) -> tuple:
     """Detect ``sudo -S`` (stdin password) without configured SUDO_PASSWORD.
 
     When SUDO_PASSWORD is set, ``_transform_sudo_command`` injects ``-S``
@@ -539,13 +539,13 @@ def _check_sudo_stdin_guard(command: str) -> tuple:
     """
     if "SUDO_PASSWORD" in os.environ:
         return (False, None)
-    normalized = _normalize_command_for_detection(command).lower()
+    normalized = (await _normalize_command_for_detection(command)).lower()
     if _SUDO_STDIN_RE.search(normalized):
         return (True, "sudo password guessing via stdin (sudo -S)")
     return (False, None)
 
 
-def detect_hardline_command(command: str) -> tuple:
+async def detect_hardline_command(command: str) -> tuple:
     """Check if a command matches hardline blocklist patterns.
 
     Hardline patterns are NEVER bypassable, even in YOLO mode.
@@ -555,11 +555,11 @@ def detect_hardline_command(command: str) -> tuple:
     """
     if _command_parser_limit_exceeded(command):
         return (True, _PARSER_LIMIT_DESCRIPTION)
-    normalized = _normalize_command_for_detection(command)
+    normalized = await _normalize_command_for_detection(command)
     _, malformed_grep = _grep_safe_detection_variant(normalized)
     if malformed_grep:
         return (True, _MALFORMED_EXEC_DESCRIPTION)
-    for command_variant in _command_detection_variants(command):
+    async for command_variant in _command_detection_variants(command):
         variant_lower = command_variant.lower()
         for pattern_re, description in HARDLINE_PATTERNS_COMPILED:
             if pattern_re.search(variant_lower):
@@ -567,7 +567,7 @@ def detect_hardline_command(command: str) -> tuple:
     return (False, None)
 
 
-def _match_user_deny_rule(command: str) -> str | None:
+async def _match_user_deny_rule(command: str) -> str | None:
     """Return the matching ``approvals.deny`` glob, or None.
 
     ``approvals.deny`` in config.yaml is a user-defined list of fnmatch
@@ -591,7 +591,7 @@ def _match_user_deny_rule(command: str) -> str | None:
              if isinstance(p, str) and p.strip()]
     if not globs:
         return None
-    for command_variant in _command_detection_variants(command):
+    async for command_variant in _command_detection_variants(command):
         candidate = command_variant.lower().strip()
         for pattern in globs:
             if fnmatch.fnmatchcase(candidate, pattern.lower()):
@@ -1002,7 +1002,7 @@ def _approval_key_aliases(pattern_key: str) -> set[str]:
 
 
 
-def _normalize_command_for_detection(command: str) -> str:
+async def _normalize_command_for_detection(command: str) -> str:
     """Normalize a command string before dangerous-pattern matching.
 
     Strips ANSI escape sequences (full ECMA-48 via tools.ansi_strip),
@@ -1042,8 +1042,8 @@ def _normalize_command_for_detection(command: str) -> str:
     # Fold the (more specific) Hermes home first: on Windows it nests under the
     # user home (C:\Users\alice\AppData\...\hermes), so folding the user home
     # first would eat the prefix the Hermes-home fold needs.
-    command = _rewrite_resolved_hermes_home(command)
-    command = _rewrite_resolved_user_home(command)
+    command = await _rewrite_resolved_hermes_home(command)
+    command = await _rewrite_resolved_user_home(command)
     # Strip shell backslash-escapes: r\m → rm. Prevents \-injection bypass.
     command = re.sub(r'\\([^\n])', r'\1', command)
     # Strip empty-string literals that split tokens: r''m → rm, r"\"m → rm.
@@ -1126,7 +1126,7 @@ def _fold_home_prefixes(
     return command
 
 
-def _rewrite_resolved_user_home(command: str) -> str:
+async def _rewrite_resolved_user_home(command: str) -> str:
     """Rewrite the current user's absolute home prefix to ``~/``.
 
     Resolves the home at detection time — its expanduser form, symlink-resolved
@@ -1138,10 +1138,10 @@ def _rewrite_resolved_user_home(command: str) -> str:
     separators. No-op when the home is unset or degenerate.
     """
     try:
-        home = os.path.expanduser("~")
+        home = await aiofiles.os.wrap(os.path.expanduser)("~")
         candidates = [
             home,
-            os.path.realpath(home),
+            await aiofiles.os.wrap(os.path.realpath)(home),
             os.environ.get("HOME", ""),
         ]
     except Exception:
@@ -1149,7 +1149,7 @@ def _rewrite_resolved_user_home(command: str) -> str:
     return _fold_home_prefixes(command, candidates, "~")
 
 
-def _rewrite_resolved_hermes_home(command: str) -> str:
+async def _rewrite_resolved_hermes_home(command: str) -> str:
     """Rewrite the resolved absolute Hermes home prefix to ``~/.hermes/``.
 
     Resolves the active ``HERMES_HOME`` at call time (and its symlink-resolved
@@ -1163,10 +1163,10 @@ def _rewrite_resolved_hermes_home(command: str) -> str:
     """
     try:
         from hermes_constants import get_hermes_home
-        home = get_hermes_home().expanduser()
+        home = await aiofiles.os.wrap(Path.expanduser)(get_hermes_home())
         candidates = [
             str(home),
-            str(home.resolve(strict=False)),
+            await aiofiles.os.wrap(os.path.realpath)(home),
         ]
     except Exception:
         return command
@@ -2081,8 +2081,8 @@ def _mask_quoted_newlines(command: str) -> str:
     return "".join(output)
 
 
-def _command_detection_variants(command: str):
-    normalized = _normalize_command_for_detection(_mask_quoted_newlines(command))
+async def _command_detection_variants(command: str):
+    normalized = await _normalize_command_for_detection(_mask_quoted_newlines(command))
     # Quote-aware grep parsing hides only structurally identified pattern
     # operands. Malformed/ambiguous input remains byte-for-byte intact.
     grep_safe, _ = _grep_safe_detection_variant(normalized)
@@ -2136,7 +2136,7 @@ def _command_detection_variants(command: str):
 
 
 
-def _is_verification_artifact_cleanup(command: str) -> bool:
+async def _is_verification_artifact_cleanup(command: str) -> bool:
     """Return whether *command* only removes one Hermes ad-hoc temp script."""
     try:
         argv = shlex.split(command, posix=True)
@@ -2146,18 +2146,22 @@ def _is_verification_artifact_cleanup(command: str) -> bool:
         return False
 
     operand = argv[2]
-    temp_dir = os.path.realpath(tempfile.gettempdir())
+    temp_dir = await aiofiles.os.wrap(os.path.realpath)(
+        await aiofiles.os.wrap(tempfile.gettempdir)()
+    )
     basename = os.path.basename(operand)
     if operand != os.path.join(temp_dir, basename):
         return False
 
-    target = os.path.realpath(operand)
+    target = await aiofiles.os.wrap(os.path.realpath)(operand)
     if os.path.dirname(target) != temp_dir:
         return False
-    return re.fullmatch(r"hermes-(?:verify|ad-hoc)-[A-Za-z0-9_.-]+", basename) is not None
+    return (
+        re.fullmatch(r"hermes-(?:verify|ad-hoc)-[A-Za-z0-9_.-]+", basename) is not None
+    )
 
 
-def detect_dangerous_command(command: str) -> tuple:
+async def detect_dangerous_command(command: str) -> tuple:
     """Check if a command matches any dangerous patterns.
 
     Returns:
@@ -2165,16 +2169,16 @@ def detect_dangerous_command(command: str) -> tuple:
     """
     if _command_parser_limit_exceeded(command):
         return (True, _PARSER_LIMIT_DESCRIPTION, _PARSER_LIMIT_DESCRIPTION)
-    if _is_verification_artifact_cleanup(command):
+    if await _is_verification_artifact_cleanup(command):
         return (False, None, None)
 
-    for command_variant in _command_detection_variants(command):
+    async for command_variant in _command_detection_variants(command):
         command_lower = command_variant.lower()
         for pattern_re, description in DANGEROUS_PATTERNS_COMPILED:
             if pattern_re.search(command_lower):
                 pattern_key = description
                 return (True, pattern_key, description)
-    normalized = _normalize_command_for_detection(command)
+    normalized = await _normalize_command_for_detection(command)
     for description, _ in _execution_flag_findings(normalized):
         return (True, description, description)
     return (False, None, None)
@@ -2463,11 +2467,11 @@ async def check_dangerous_command(
     if _should_skip_container_guards(env_type, has_host_access):
         return {"approved": True, "message": None}
 
-    is_hardline, description = detect_hardline_command(command)
+    is_hardline, description = await detect_hardline_command(command)
     if is_hardline:
         return await _hardline_block_result(description, command)
 
-    deny_pattern = _match_user_deny_rule(command)
+    deny_pattern = await _match_user_deny_rule(command)
     if deny_pattern is not None:
         return _user_deny_block_result(deny_pattern)
 
@@ -2480,7 +2484,7 @@ async def check_dangerous_command(
     if _command_matches_permanent_allowlist(command):
         return {"approved": True, "message": None}
 
-    is_dangerous, pattern_key, description = detect_dangerous_command(command)
+    is_dangerous, pattern_key, description = await detect_dangerous_command(command)
     if not is_dangerous:
         return {"approved": True, "message": None}
     session_key = get_current_session_key()
@@ -2591,15 +2595,15 @@ async def check_all_command_guards(
     if _should_skip_container_guards(env_type, has_host_access):
         return {"approved": True, "message": None}
 
-    is_hardline, description = detect_hardline_command(command)
+    is_hardline, description = await detect_hardline_command(command)
     if is_hardline:
         return await _hardline_block_result(description, command)
 
-    is_sudo_guess, description = _check_sudo_stdin_guard(command)
+    is_sudo_guess, description = await _check_sudo_stdin_guard(command)
     if is_sudo_guess:
         return _sudo_stdin_block_result(description)
 
-    deny_pattern = _match_user_deny_rule(command)
+    deny_pattern = await _match_user_deny_rule(command)
     if deny_pattern is not None:
         return _user_deny_block_result(deny_pattern)
 
@@ -2631,7 +2635,7 @@ async def check_all_command_guards(
     from tools.tirith_security import check_command_security
 
     tirith_result = await check_command_security(command)
-    is_dangerous, pattern_key, description = detect_dangerous_command(command)
+    is_dangerous, pattern_key, description = await detect_dangerous_command(command)
     session_key = get_current_session_key()
     warnings: list[tuple[str, str, bool]] = []
     if tirith_result.get("action") in {"block", "warn"}:

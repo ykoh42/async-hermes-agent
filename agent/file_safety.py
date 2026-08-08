@@ -32,12 +32,12 @@ def _hermes_home_path() -> Path:
         return Path(os.path.expanduser("~/.hermes"))
 
 
-def _hermes_root_path() -> Path:
+async def _hermes_root_path() -> Path:
     """Return the profile-independent Hermes root without import cycles."""
     try:
         from hermes_constants import get_default_hermes_root
 
-        return get_default_hermes_root()
+        return await get_default_hermes_root()
     except Exception:
         return Path(os.path.expanduser("~/.hermes"))
 
@@ -55,7 +55,7 @@ def _is_within(path: str, root: str) -> bool:
 
 async def _hermes_dirs() -> list[str]:
     directories: list[str] = []
-    for base in (_hermes_home_path(), _hermes_root_path()):
+    for base in (_hermes_home_path(), await _hermes_root_path()):
         try:
             resolved = await _canonical(base)
         except Exception:
@@ -81,7 +81,7 @@ async def build_write_denied_paths(home: str) -> set[str]:
         "/etc/passwd",
         "/etc/shadow",
     ]
-    for base in (_hermes_home_path(), _hermes_root_path()):
+    for base in (_hermes_home_path(), await _hermes_root_path()):
         paths.extend(
             str(base / name)
             for name in (
@@ -246,7 +246,7 @@ async def _resolve_active_profile_name() -> str:
     """Return the active profile name derived from ``HERMES_HOME``."""
     try:
         home = Path(await _canonical(_hermes_home_path()))
-        root = Path(await _canonical(_hermes_root_path()))
+        root = Path(await _canonical(await _hermes_root_path()))
     except (OSError, RuntimeError):
         return "default"
     try:
@@ -260,7 +260,7 @@ async def classify_cross_profile_target(path: str) -> dict | None:
     """Describe a write into another profile's scoped state, if any."""
     try:
         target = Path(await _canonical(path))
-        root = Path(await _canonical(_hermes_root_path()))
+        root = Path(await _canonical(await _hermes_root_path()))
     except (OSError, RuntimeError):
         return None
     try:

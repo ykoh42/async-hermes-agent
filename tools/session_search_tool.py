@@ -314,9 +314,9 @@ async def _resolve_profile_db(profile: str):
     canon = profiles_mod.normalize_profile_name(profile)
     profiles_mod.validate_profile_name(canon)
     if canon == "default":
-        profile_dir = profiles_mod.get_profile_dir(canon)
+        profile_dir = await profiles_mod.get_profile_dir(canon)
     else:
-        profile_dir = profiles_mod.get_profile_dir(canon)
+        profile_dir = await profiles_mod.get_profile_dir(canon)
         if not await aiofiles.os.path.isdir(profile_dir):
             raise ValueError(f"profile '{canon}' does not exist")
     return SessionDB(profile_dir / "state.db", read_only=True)
@@ -335,7 +335,7 @@ async def _session_link(session_id: str, profile: str = None) -> str:
         try:
             from hermes_cli.profiles import get_active_profile_name
 
-            resolved = get_active_profile_name()
+            resolved = await get_active_profile_name()
             name = "" if resolved == "custom" else resolved
         except Exception:
             logging.debug("get_active_profile_name failed for session link", exc_info=True)
@@ -360,9 +360,9 @@ async def _locate_session_db(session_id: str):
     except Exception:
         return None, None
 
-    targets = [("default", profiles_mod.get_profile_dir("default"))]
+    targets = [("default", await profiles_mod.get_profile_dir("default"))]
     try:
-        profiles_root = profiles_mod._get_profiles_root()
+        profiles_root = await profiles_mod._get_profiles_root()
         if await aiofiles.os.path.isdir(profiles_root):
             candidate_names = sorted(
                 name
@@ -374,9 +374,8 @@ async def _locate_session_db(session_id: str):
                 for name in candidate_names
                 if await aiofiles.os.path.isdir(profiles_root / name)
             ]
-            targets.extend(
-                (name, profiles_mod.get_profile_dir(name)) for name in names
-            )
+            for name in names:
+                targets.append((name, await profiles_mod.get_profile_dir(name)))
     except Exception:
         logging.debug("async profile scan failed during session locate", exc_info=True)
 

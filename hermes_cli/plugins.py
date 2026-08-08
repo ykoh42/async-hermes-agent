@@ -290,9 +290,16 @@ class LoadedPlugin:
 class PluginContext:
     """Facade given to plugins so they can register tools and hooks."""
 
-    def __init__(self, manifest: PluginManifest, manager: "PluginManager"):
+    def __init__(
+        self,
+        manifest: PluginManifest,
+        manager: "PluginManager",
+        *,
+        _profile_context: tuple[Path | None, Path | None] | None = None,
+    ):
         self.manifest = manifest
         self._manager = manager
+        self._profile_context = _profile_context
         # Lazy-built host-owned LLM facade — see ctx.llm property below.
         self._llm: Any = None
         self._subagent_lifecycle: Any = None
@@ -340,19 +347,22 @@ class PluginContext:
     def profile_name(self) -> str:
         """Return the active Hermes profile name (e.g. ``"default"``).
 
-        Derived from ``HERMES_HOME`` via
-        :func:`hermes_cli.profiles.get_active_profile_name`, so it works in
-        every execution context — interactive CLI, gateway, and
-        kanban-spawned worker sessions alike — without depending on
-        ``_cli_ref`` (which is ``None`` outside an interactive CLI run).
+        The async discovery boundary resolves the process root once; each
+        access classifies the current context-local ``HERMES_HOME`` without
+        filesystem I/O. This keeps the property synchronous and dynamic in
+        interactive, gateway, and worker sessions.
 
         Returns ``"default"`` for the default profile, the profile id when
         running under ``~/.hermes/profiles/<name>``, or ``"custom"`` when
         ``HERMES_HOME`` points somewhere unrecognized.
         """
+        if self._profile_context is None:
+            raise RuntimeError("PluginContext profile resolution is not initialized")
+        from hermes_cli.profiles import _profile_name_from_context
+
+        default_root, cwd = self._profile_context
         try:
-            from hermes_cli.profiles import get_active_profile_name
-            return get_active_profile_name()
+            return _profile_name_from_context(get_hermes_home(), default_root, cwd)
         except Exception:
             return "default"
 
@@ -924,6 +934,7 @@ class PluginManager:
         # description, defaults, plugin}. See PluginContext.register_auxiliary_task.
         self._aux_tasks: Dict[str, Dict[str, Any]] = {}
         self._config: Dict[str, Any] = {}
+        self._profile_context: tuple[Path | None, Path | None] | None = None
         self._discovery_lock = asyncio.Lock()
 
     # -----------------------------------------------------------------------
@@ -963,7 +974,13 @@ class PluginManager:
     async def _discover_and_load_inner(self) -> None:
         """The actual discovery sweep — see :meth:`discover_and_load`."""
         from hermes_cli.config import load_config_readonly
+        from hermes_cli.profiles import _resolve_profile_context
 
+        try:
+            self._profile_context = await _resolve_profile_context()
+        except Exception:
+            logger.debug("Plugin profile resolution failed", exc_info=True)
+            self._profile_context = (None, None)
         self._config = await load_config_readonly()
         manifests: List[PluginManifest] = []
 
@@ -1334,7 +1351,11 @@ class PluginManager:
         _slug = _plugin_id.replace("/", "__").replace("-", "_")
         _registry.register_plugin_override_policy(
             f"{_NS_PARENT}.{_slug}",
-            PluginContext(manifest, self)._tool_override_allowed(""),
+            PluginContext(
+                manifest,
+                self,
+                _profile_context=self._profile_context,
+            )._tool_override_allowed(""),
         )
         try:
             if manifest.source in {"user", "project", "bundled"}:
@@ -1350,7 +1371,11 @@ class PluginManager:
                 loaded.error = "no register() function"
                 logger.warning("Plugin '%s' has no register() function", manifest.name)
             else:
-                ctx = PluginContext(manifest, self)
+                ctx = PluginContext(
+                    manifest,
+                    self,
+                    _profile_context=self._profile_context,
+                )
                 # Snapshot registry state BEFORE register() so each registry's
                 # attribution counts only what THIS plugin actually added.
                 # The previous approach diffed names against all already-loaded

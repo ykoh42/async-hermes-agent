@@ -49,6 +49,16 @@ def _under_pytest() -> bool:
     return "PYTEST_CURRENT_TEST" in os.environ
 
 
+def _managed_dir_candidate() -> Optional[Path]:
+    """Choose the managed-scope path without touching the filesystem."""
+    override = os.environ.get("HERMES_MANAGED_DIR", "").strip()
+    if override:
+        return Path(override)
+    if _under_pytest():
+        return None
+    return _DEFAULT_MANAGED_DIR
+
+
 def get_managed_dir() -> Optional[Path]:
     """Resolve the managed-scope directory, or None when no scope is present.
 
@@ -62,13 +72,8 @@ def get_managed_dir() -> Optional[Path]:
     A non-existent directory at either tier resolves to None (no managed scope),
     which is the common case and must be cheap + side-effect-free.
     """
-    override = os.environ.get("HERMES_MANAGED_DIR", "").strip()
-    if override:
-        p = Path(override)
-        return p if p.is_dir() else None
-    if _under_pytest():
-        return None
-    return _DEFAULT_MANAGED_DIR if _DEFAULT_MANAGED_DIR.is_dir() else None
+    candidate = _managed_dir_candidate()
+    return candidate if candidate is not None and candidate.is_dir() else None
 
 
 def invalidate_managed_cache() -> None:

@@ -84,7 +84,12 @@ def test_conversation_and_chat_are_coroutines():
         main as trajectory_main,
     )
     from hermes_cli.middleware import run_llm_execution_middleware
-    from hermes_constants import get_hermes_dir, with_hermes_node_path
+    from hermes_cli.profiles import _get_profiles_root, get_profile_dir
+    from hermes_constants import (
+        get_default_hermes_root,
+        get_hermes_dir,
+        with_hermes_node_path,
+    )
     from hermes_time import _resolve_timezone_name, get_timezone, now
     from gateway.status import _pid_exists
     from agent.coding_context import RuntimeMode, coding_selection
@@ -95,6 +100,13 @@ def test_conversation_and_chat_are_coroutines():
         scan_skill_commands,
     )
     from agent.skill_utils import normalize_skill_lookup_name
+    from tools.approval import (
+        _check_sudo_stdin_guard,
+        _command_detection_variants,
+        _normalize_command_for_detection,
+        detect_dangerous_command,
+        detect_hardline_command,
+    )
 
     assert inspect.iscoroutinefunction(AIAgent.run_conversation)
     assert inspect.iscoroutinefunction(AIAgent.chat)
@@ -144,6 +156,9 @@ def test_conversation_and_chat_are_coroutines():
     assert inspect.iscoroutinefunction(TrajectoryCompressor.close)
     assert inspect.iscoroutinefunction(trajectory_main)
     assert inspect.iscoroutinefunction(SessionDB._parse_schema_columns)
+    assert inspect.iscoroutinefunction(get_default_hermes_root)
+    assert inspect.iscoroutinefunction(_get_profiles_root)
+    assert inspect.iscoroutinefunction(get_profile_dir)
     assert inspect.iscoroutinefunction(get_hermes_dir)
     assert inspect.iscoroutinefunction(with_hermes_node_path)
     assert inspect.iscoroutinefunction(_resolve_timezone_name)
@@ -153,6 +168,11 @@ def test_conversation_and_chat_are_coroutines():
     assert inspect.iscoroutinefunction(coding_selection)
     assert inspect.iscoroutinefunction(_pid_exists)
     assert inspect.iscoroutinefunction(terminal_tool)
+    assert inspect.iscoroutinefunction(_check_sudo_stdin_guard)
+    assert inspect.iscoroutinefunction(_normalize_command_for_detection)
+    assert inspect.isasyncgenfunction(_command_detection_variants)
+    assert inspect.iscoroutinefunction(detect_hardline_command)
+    assert inspect.iscoroutinefunction(detect_dangerous_command)
     assert inspect.iscoroutinefunction(get_session_cwd)
     assert inspect.iscoroutinefunction(record_session_cwd)
     assert inspect.iscoroutinefunction(register_task_env_overrides)

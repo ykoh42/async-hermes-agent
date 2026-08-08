@@ -1048,7 +1048,7 @@ async def _global_auth_file_path() -> Optional[Path]:
     try:
         from hermes_constants import get_default_hermes_root
 
-        global_root = get_default_hermes_root()
+        global_root = await get_default_hermes_root()
     except Exception:
         return None
     profile_home = get_hermes_home()
@@ -3371,24 +3371,25 @@ def _resolve_verify(
 NOUS_SHARED_STORE_FILENAME = "nous_auth.json"
 
 
-def _nous_shared_auth_dir() -> Path:
+async def _nous_shared_auth_dir() -> Path:
     override = os.getenv("HERMES_SHARED_AUTH_DIR", "").strip()
     if override:
-        return Path(override).expanduser()
+        return await aiofiles.os.wrap(Path.expanduser)(Path(override))
     from hermes_constants import get_default_hermes_root
 
-    return get_default_hermes_root() / "shared"
+    return (await get_default_hermes_root()) / "shared"
 
 
 async def _nous_shared_store_path() -> Path:
-    path = _nous_shared_auth_dir() / NOUS_SHARED_STORE_FILENAME
+    path = (await _nous_shared_auth_dir()) / NOUS_SHARED_STORE_FILENAME
     if os.environ.get("PYTEST_CURRENT_TEST"):
         from hermes_constants import get_default_hermes_root
 
         realpath = aiofiles.os.wrap(os.path.realpath)
+        default_root = await get_default_hermes_root()
         real_store = Path(
             await realpath(
-                get_default_hermes_root() / "shared" / NOUS_SHARED_STORE_FILENAME
+                default_root / "shared" / NOUS_SHARED_STORE_FILENAME
             )
         )
         try:

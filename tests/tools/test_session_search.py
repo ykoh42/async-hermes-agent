@@ -454,9 +454,13 @@ class TestSessionLink:
 class TestCrossProfileRead:
     def _patch_profiles(self, monkeypatch, home):
         from hermes_cli import profiles as profiles_mod
+
+        async def get_profile_dir(_name):
+            return home
+
         monkeypatch.setattr(profiles_mod, "normalize_profile_name", lambda n: n)
         monkeypatch.setattr(profiles_mod, "validate_profile_name", lambda n: None)
-        monkeypatch.setattr(profiles_mod, "get_profile_dir", lambda n: home)
+        monkeypatch.setattr(profiles_mod, "get_profile_dir", get_profile_dir)
 
     @pytest.mark.asyncio
     async def test_bare_id_locates_across_profiles(self, db, tmp_path, monkeypatch):
@@ -471,11 +475,18 @@ class TestCrossProfileRead:
         await other.close()
 
         from hermes_cli import profiles as profiles_mod
-        monkeypatch.setattr(profiles_mod, "_get_profiles_root", lambda: profiles_root)
+
+        async def get_profiles_root():
+            return profiles_root
+
+        async def get_profile_dir(name):
+            return other_home if name == "asdf" else tmp_path / "default_home"
+
+        monkeypatch.setattr(profiles_mod, "_get_profiles_root", get_profiles_root)
         monkeypatch.setattr(
             profiles_mod,
             "get_profile_dir",
-            lambda name: other_home if name == "asdf" else tmp_path / "default_home",
+            get_profile_dir,
         )
 
         # `db` (current profile) lacks s_far; no profile passed → scan finds it.

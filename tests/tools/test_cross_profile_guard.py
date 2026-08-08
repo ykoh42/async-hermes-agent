@@ -35,11 +35,14 @@ def fake_hermes(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(sec_home))
 
     import hermes_constants
-    monkeypatch.setattr(hermes_constants, "get_default_hermes_root", lambda: root)
+    async def get_root():
+        return root
+
+    monkeypatch.setattr(hermes_constants, "get_default_hermes_root", get_root)
 
     import agent.file_safety as fs
     monkeypatch.setattr(fs, "_hermes_home_path", lambda: sec_home)
-    monkeypatch.setattr(fs, "_hermes_root_path", lambda: root)
+    monkeypatch.setattr(fs, "_hermes_root_path", get_root)
 
     return {
         "root": root,
@@ -165,7 +168,10 @@ class TestSystemPromptActiveProfile:
         # Don't set HERMES_HOME — falls back to default.
         import agent.file_safety as fs
         monkeypatch.setattr(fs, "_hermes_home_path", lambda: tmp_path / "fake")
-        monkeypatch.setattr(fs, "_hermes_root_path", lambda: tmp_path / "fake")
+        async def get_root():
+            return tmp_path / "fake"
+
+        monkeypatch.setattr(fs, "_hermes_root_path", get_root)
 
         from agent.file_safety import _resolve_active_profile_name
         assert await _resolve_active_profile_name() == "default"

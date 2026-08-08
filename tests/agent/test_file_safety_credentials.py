@@ -212,7 +212,10 @@ async def test_profile_mode_blocks_root_credentials(tmp_path, monkeypatch):
     profile = root / "profiles" / "coder"
     profile.mkdir(parents=True)
     monkeypatch.setattr(fs, "_hermes_home_path", lambda: profile)
-    monkeypatch.setattr(fs, "_hermes_root_path", lambda: root)
+    async def get_root():
+        return root
+
+    monkeypatch.setattr(fs, "_hermes_root_path", get_root)
 
     from agent.file_safety import get_read_block_error
 

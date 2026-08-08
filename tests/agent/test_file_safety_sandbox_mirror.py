@@ -139,7 +139,10 @@ class TestSandboxMirrorIsOrthogonalToCrossProfile:
     async def test_same_profile_mirror_still_flagged(self, tmp_path, monkeypatch):
         import agent.file_safety as fs
 
-        monkeypatch.setattr(fs, "_hermes_root_path", lambda: tmp_path)
+        async def get_root():
+            return tmp_path
+
+        monkeypatch.setattr(fs, "_hermes_root_path", get_root)
         monkeypatch.setattr(
             fs, "_hermes_home_path", lambda: tmp_path / "profiles" / "group1"
         )

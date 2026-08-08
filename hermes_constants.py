@@ -103,7 +103,7 @@ def get_process_hermes_home() -> Path:
     return _hermes_home_from_env()
 
 
-def get_default_hermes_root() -> Path:
+async def get_default_hermes_root() -> Path:
     """Return the root Hermes directory for profile-level operations.
 
     In standard deployments this is the platform-native Hermes home
@@ -118,7 +118,8 @@ def get_default_hermes_root() -> Path:
     Works both for standard (``~/.hermes/profiles/coder``) and Docker
     (``/opt/data/profiles/coder``) layouts.
 
-    Import-safe — no dependencies beyond stdlib.
+    Import-safe: filesystem canonicalization runs only when this coroutine is
+    awaited and is delegated to ``aiofiles``.
     """
     native_home = _get_platform_default_hermes_home()
     env_home = os.environ.get("HERMES_HOME", "")
@@ -126,7 +127,10 @@ def get_default_hermes_root() -> Path:
         return native_home
     env_path = Path(env_home)
     try:
-        env_path.resolve().relative_to(native_home.resolve())
+        realpath = aiofiles.os.wrap(os.path.realpath)
+        resolved_env = Path(await realpath(env_path))
+        resolved_native = Path(await realpath(native_home))
+        resolved_env.relative_to(resolved_native)
         # HERMES_HOME is under ~/.hermes (normal or profile mode)
         return native_home
     except ValueError:

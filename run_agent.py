@@ -638,7 +638,7 @@ class AIAgent:
         source = _session_source_for_agent(self.platform)
         try:
             try:
-                _profile_for_session = _profiles.get_active_profile_name()
+                _profile_for_session = await _profiles.get_active_profile_name()
                 if _profile_for_session == "default":
                     _profile_for_session = None
             except Exception:

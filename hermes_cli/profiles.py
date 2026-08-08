@@ -6,6 +6,8 @@ import os
 import re
 from pathlib import Path
 
+import aiofiles.os
+
 from hermes_constants import get_default_hermes_root, get_hermes_home
 
 
@@ -13,9 +15,9 @@ _PROFILE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 _RESERVED_NAMES = frozenset({"hermes", "default", "test", "tmp", "root", "sudo"})
 
 
-def _get_profiles_root() -> Path:
+async def _get_profiles_root() -> Path:
     """Return the profile directory rooted at the default Hermes home."""
-    return get_default_hermes_root() / "profiles"
+    return (await get_default_hermes_root()) / "profiles"
 
 
 def normalize_profile_name(name: str) -> str:
@@ -41,22 +43,34 @@ def validate_profile_name(name: str) -> None:
         raise ValueError(f"Profile name {name!r} is reserved")
 
 
-def get_profile_dir(name: str) -> Path:
+async def get_profile_dir(name: str) -> Path:
     """Resolve a profile name to its isolated Hermes home."""
     canonical = normalize_profile_name(name)
     if canonical == "default":
-        return get_default_hermes_root()
-    return _get_profiles_root() / canonical
+        return await get_default_hermes_root()
+    return (await _get_profiles_root()) / canonical
 
 
-def get_active_profile_name() -> str:
-    """Infer the current profile name from ``HERMES_HOME``.
+def _absolute_path(path: Path, cwd: Path | None) -> Path:
+    """Apply ``abspath`` semantics using an already-resolved working directory."""
+    value = os.fspath(path)
+    if not os.path.isabs(value):
+        if cwd is None:
+            raise RuntimeError("working directory is unavailable")
+        value = os.path.join(cwd, value)
+    return Path(os.path.normpath(value))
 
-    Path normalization is lexical and does not touch the filesystem, so this
-    helper remains synchronous even though agent I/O is fully asynchronous.
-    """
-    resolved = Path(os.path.abspath(get_hermes_home()))
-    default_root = Path(os.path.abspath(get_default_hermes_root()))
+
+def _profile_name_from_context(
+    active_home: Path,
+    default_root: Path | None,
+    cwd: Path | None,
+) -> str:
+    """Classify a profile without performing filesystem I/O."""
+    if default_root is None:
+        raise RuntimeError("default Hermes root is unavailable")
+    resolved = _absolute_path(active_home, cwd)
+    default_root = _absolute_path(default_root, cwd)
     if resolved == default_root:
         return "default"
 
@@ -69,3 +83,23 @@ def get_active_profile_name() -> str:
     if len(parts) == 1 and _PROFILE_ID_RE.fullmatch(parts[0]):
         return parts[0]
     return "custom"
+
+
+async def _resolve_profile_context() -> tuple[Path, Path | None]:
+    """Resolve the process root and cwd used for synchronous profile lookups."""
+    default_root = await get_default_hermes_root()
+    try:
+        cwd = Path(await aiofiles.os.wrap(os.getcwd)())
+    except OSError:
+        cwd = None
+    return default_root, cwd
+
+
+async def get_active_profile_name() -> str:
+    """Infer the current profile name from ``HERMES_HOME``.
+
+    Preserve Hermes' canonical-root handling without resolving paths on the
+    event-loop thread.
+    """
+    default_root, cwd = await _resolve_profile_context()
+    return _profile_name_from_context(get_hermes_home(), default_root, cwd)

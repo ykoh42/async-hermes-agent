@@ -21,21 +21,22 @@ from hermes_constants import (
 )
 
 
+@pytest.mark.asyncio
 class TestGetDefaultHermesRoot:
     """Tests for get_default_hermes_root() — Docker/custom deployment awareness."""
 
-    def test_no_hermes_home_returns_native(self, tmp_path, monkeypatch):
+    async def test_no_hermes_home_returns_native(self, tmp_path, monkeypatch):
         """When HERMES_HOME is not set, returns ~/.hermes."""
         monkeypatch.delenv("HERMES_HOME", raising=False)
         monkeypatch.setattr(Path, "home", lambda: tmp_path)
 
-        assert get_default_hermes_root() == tmp_path / ".hermes"
+        assert await get_default_hermes_root() == tmp_path / ".hermes"
 
 
 
 
 
-    def test_docker_profile_active(self, tmp_path, monkeypatch):
+    async def test_docker_profile_active(self, tmp_path, monkeypatch):
         """When a Docker profile is active (HERMES_HOME=<root>/profiles/<name>),
         returns the Docker root, not the profile dir."""
         docker_root = tmp_path / "opt" / "data"
@@ -43,9 +44,50 @@ class TestGetDefaultHermesRoot:
         profile.mkdir(parents=True)
         monkeypatch.setattr(Path, "home", lambda: tmp_path)
         monkeypatch.setenv("HERMES_HOME", str(profile))
-        assert get_default_hermes_root() == docker_root
+        monkeypatch.setattr(
+            Path,
+            "resolve",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("get_default_hermes_root must not call Path.resolve")
+            ),
+        )
+        root = await get_default_hermes_root()
+        assert root == docker_root
 
-    def test_no_hermes_home_returns_localappdata_root_on_windows(self, tmp_path, monkeypatch):
+    async def test_native_alias_to_external_root_stays_custom(
+        self, tmp_path, monkeypatch
+    ):
+        native = tmp_path / ".hermes"
+        external = tmp_path / "external"
+        native.mkdir()
+        external.mkdir()
+        alias = native / "custom"
+        try:
+            alias.symlink_to(external, target_is_directory=True)
+        except OSError as exc:
+            pytest.skip(f"directory symlinks unavailable: {exc}")
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        monkeypatch.setenv("HERMES_HOME", str(alias))
+
+        assert await get_default_hermes_root() == alias
+
+    async def test_external_alias_to_native_profile_uses_native_root(
+        self, tmp_path, monkeypatch
+    ):
+        native = tmp_path / ".hermes"
+        profile = native / "profiles" / "coder"
+        profile.mkdir(parents=True)
+        alias = tmp_path / "profile-alias"
+        try:
+            alias.symlink_to(profile, target_is_directory=True)
+        except OSError as exc:
+            pytest.skip(f"directory symlinks unavailable: {exc}")
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        monkeypatch.setenv("HERMES_HOME", str(alias))
+
+        assert await get_default_hermes_root() == native
+
+    async def test_no_hermes_home_returns_localappdata_root_on_windows(self, tmp_path, monkeypatch):
         """Native Windows falls back to %LOCALAPPDATA%\\hermes, not ~/.hermes."""
         local_appdata = tmp_path / "LocalAppData"
         monkeypatch.delenv("HERMES_HOME", raising=False)
@@ -53,7 +95,7 @@ class TestGetDefaultHermesRoot:
         monkeypatch.setattr(Path, "home", lambda: tmp_path / "Home")
         monkeypatch.setattr(hermes_constants.sys, "platform", "win32")
 
-        assert get_default_hermes_root() == local_appdata / "hermes"
+        assert await get_default_hermes_root() == local_appdata / "hermes"
 
 
 

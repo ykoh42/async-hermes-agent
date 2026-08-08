@@ -2458,7 +2458,7 @@ async def compress_context(
                     try:
                         from hermes_cli.profiles import get_active_profile_name
 
-                        _profile_for_child = get_active_profile_name()
+                        _profile_for_child = await get_active_profile_name()
                         if _profile_for_child == "default":
                             _profile_for_child = None
                     except Exception:

@@ -1034,26 +1034,156 @@ class TestPluginDebugLogging:
 class TestPluginContextProfileName:
     """ctx.profile_name resolves from HERMES_HOME in every context."""
 
-    def _ctx(self):
+    def _ctx(self, profile_context=None):
         mgr = PluginManager()
         manifest = PluginManifest(name="test-plugin", source="user")
-        return PluginContext(manifest, mgr)
+        return PluginContext(
+            manifest,
+            mgr,
+            _profile_context=profile_context,
+        )
 
-    def test_default_profile(self, tmp_path, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_default_profile(self, tmp_path, monkeypatch):
         """HERMES_HOME at the root resolves to 'default'."""
         home = tmp_path / ".hermes"
         home.mkdir()
         monkeypatch.setattr(Path, "home", lambda: tmp_path)
         monkeypatch.setenv("HERMES_HOME", str(home))
-        assert self._ctx().profile_name == "default"
+        from hermes_cli.profiles import _resolve_profile_context
 
-    def test_named_profile(self, tmp_path, monkeypatch):
+        context = self._ctx(await _resolve_profile_context())
+        assert context.profile_name == "default"
+
+    @pytest.mark.asyncio
+    async def test_named_profile(self, tmp_path, monkeypatch):
         """HERMES_HOME under profiles/<name> resolves to that name."""
         prof = tmp_path / ".hermes" / "profiles" / "coder"
         prof.mkdir(parents=True)
         monkeypatch.setattr(Path, "home", lambda: tmp_path)
         monkeypatch.setenv("HERMES_HOME", str(prof))
-        assert self._ctx().profile_name == "coder"
+        from hermes_cli.profiles import _resolve_profile_context
+
+        context = self._ctx(await _resolve_profile_context())
+        assert context.profile_name == "coder"
+
+    @pytest.mark.asyncio
+    async def test_discovery_injects_profile_context_into_register(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        profile_home = tmp_path / ".hermes" / "profiles" / "coder"
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        monkeypatch.setenv("HERMES_HOME", str(profile_home))
+        _make_plugin_dir(
+            profile_home / "plugins",
+            "profile-reader",
+            register_body="globals()['PROFILE_NAME'] = ctx.profile_name",
+        )
+        manager = PluginManager()
+
+        await manager.discover_and_load()
+
+        assert manager._plugins["profile-reader"].module.PROFILE_NAME == "coder"
+
+    @pytest.mark.asyncio
+    async def test_profile_name_is_context_local(self, tmp_path, monkeypatch):
+        from hermes_constants import (
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+
+        root = tmp_path / ".hermes"
+        coder = root / "profiles" / "coder"
+        reviewer = root / "profiles" / "reviewer"
+        coder.mkdir(parents=True)
+        reviewer.mkdir(parents=True)
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        monkeypatch.setenv("HERMES_HOME", str(root))
+        from hermes_cli.profiles import _resolve_profile_context
+
+        context = self._ctx(await _resolve_profile_context())
+
+        async def resolve(path):
+            token = set_hermes_home_override(path)
+            try:
+                await asyncio.sleep(0)
+                return context.profile_name
+            finally:
+                reset_hermes_home_override(token)
+
+        assert await asyncio.gather(resolve(coder), resolve(reviewer)) == [
+            "coder",
+            "reviewer",
+        ]
+
+    def test_uninitialized_profile_context_fails_loudly(self):
+        with pytest.raises(RuntimeError, match="profile resolution"):
+            _ = self._ctx().profile_name
+
+    def test_relative_profile_without_cwd_fails_soft(self, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", "relative-home")
+
+        assert self._ctx((Path("/resolved/root"), None)).profile_name == "default"
+
+    @pytest.mark.asyncio
+    async def test_profile_resolution_failure_does_not_abort_discovery(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        from hermes_cli import profiles
+
+        async def fail_resolution():
+            raise OSError("working directory disappeared")
+
+        monkeypatch.setattr(profiles, "_resolve_profile_context", fail_resolution)
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
+        monkeypatch.delenv("HERMES_ENABLE_PROJECT_PLUGINS", raising=False)
+        manager = PluginManager()
+        monkeypatch.setattr(manager, "_scan_directory", AsyncMock(return_value=[]))
+        monkeypatch.setattr(manager, "_scan_entry_points", lambda: [])
+
+        await manager.discover_and_load()
+
+        assert manager._discovered is True
+        assert manager._profile_context == (None, None)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("alias_location", "expected"),
+        [("external", "custom"), ("native", "default")],
+    )
+    async def test_profile_property_preserves_symlink_classification(
+        self,
+        tmp_path,
+        monkeypatch,
+        alias_location,
+        expected,
+    ):
+        from hermes_cli.profiles import _resolve_profile_context
+
+        native_root = tmp_path / ".hermes"
+        external = tmp_path / "external"
+        native_root.mkdir()
+        external.mkdir()
+        if alias_location == "external":
+            alias = tmp_path / "native-alias"
+            target = native_root
+        else:
+            alias = native_root / "custom-alias"
+            target = external
+        try:
+            alias.symlink_to(target, target_is_directory=True)
+        except OSError as exc:
+            pytest.skip(f"directory symlinks unavailable: {exc}")
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        monkeypatch.setenv("HERMES_HOME", str(alias))
+
+        context = self._ctx(await _resolve_profile_context())
+
+        assert context.profile_name == expected
 
 
 class TestDispatchToolWithoutCliRef:
