@@ -390,6 +390,38 @@ class TestExplicitOverrides:
         assert (should, native) == (True, False)
 
 
+class TestMoAConfigBoundary:
+    def test_moa_policy_does_not_read_sync_config_before_runtime(self, monkeypatch):
+        agent = _make_agent(
+            provider="moa",
+            base_url="moa://local",
+            api_mode="chat_completions",
+            model="review",
+        )
+
+        def fail_sync_config_read():
+            raise AssertionError("MoA cache policy read config synchronously")
+
+        monkeypatch.setattr("hermes_cli.config.load_config", fail_sync_config_read)
+        assert agent._anthropic_prompt_cache_policy() == (False, False)
+
+        # After the awaited runtime boundary, the policy uses the immutable
+        # snapshot and preserves the aggregator's cache behavior.
+        agent._runtime_config_snapshot = {
+            "moa": {
+                "default_preset": "review",
+                "presets": {
+                    "review": {
+                        "aggregator": {
+                            "provider": "opencode",
+                            "model": "qwen3.6-plus",
+                        }
+                    }
+                }
+            }
+        }
+        assert agent._anthropic_prompt_cache_policy() == (True, False)
+
 # ─────────────────────────────────────────────────────────────────────
 # Long-lived prefix cache policy (cross-session 1h tier)
 # ─────────────────────────────────────────────────────────────────────

@@ -648,7 +648,10 @@ async def _resolve_for_skill_ownership(path) -> Path:
     try:
         return Path(await _realpath(path_obj.expanduser()))
     except (OSError, RuntimeError):
-        return path_obj.expanduser().absolute()
+        expanded = path_obj.expanduser()
+        if expanded.is_absolute():
+            return expanded
+        return Path(await aiofiles.os.getcwd()) / expanded
 
 
 async def is_external_skill_path(path) -> bool:

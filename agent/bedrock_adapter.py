@@ -1088,10 +1088,14 @@ async def call_converse_stream(
     )
 
     async with _get_bedrock_runtime_client(region) as client:
+        stream_error: Exception | None = None
         try:
             response = await client.converse_stream(**kwargs)
         except Exception as exc:
-            if is_streaming_access_denied_error(exc):
+            stream_error = exc
+
+        if stream_error is not None:
+            if is_streaming_access_denied_error(stream_error):
                 # IAM allows bedrock:InvokeModel but not
                 # InvokeModelWithResponseStream — permanent for this request.
                 logger.info(
@@ -1101,15 +1105,15 @@ async def call_converse_stream(
                     model,
                 )
                 return normalize_converse_response(await client.converse(**kwargs))
-            if is_stale_connection_error(exc):
+            if is_stale_connection_error(stream_error):
                 logger.warning(
                     "bedrock: stale-connection error on converse_stream(region=%s, "
                     "model=%s): %s — the next call will create a fresh client.",
                     region,
                     model,
-                    type(exc).__name__,
+                    type(stream_error).__name__,
                 )
-            raise
+            raise stream_error
         return await normalize_converse_stream_events(response)
 
 

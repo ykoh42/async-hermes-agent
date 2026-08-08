@@ -307,8 +307,8 @@ async def test_public_terminal_pty_session_is_managed_by_process_tool(tmp_path):
         await process_registry.kill_all("pty-integration")
 
     assert started["output"] == "Background process started"
-    assert started["notify_on_complete"] is False
-    assert "process(action='poll')" in started["notify_unsupported"]
+    assert started["notify_on_complete"] is True
+    assert "notify_unsupported" not in started
     assert submitted["status"] == "ok"
     assert finished["status"] == "exited"
     assert "from-terminal" in finished["output"]

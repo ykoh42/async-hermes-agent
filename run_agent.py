@@ -4997,6 +4997,7 @@ class AIAgent:
                 from agent.anthropic_adapter import (
                     build_anthropic_client,
                     create_anthropic_message,
+                    ensure_claude_code_version,
                 )
 
                 client_source = (
@@ -5005,6 +5006,7 @@ class AIAgent:
                     bool(getattr(self, "_oauth_1m_beta_disabled", False)),
                 )
                 if getattr(self, "_anthropic_client_source", None) != client_source:
+                    await ensure_claude_code_version()
                     self._anthropic_client = build_anthropic_client(
                         anthropic_key,
                         getattr(self, "_anthropic_base_url", None),

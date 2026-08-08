@@ -380,7 +380,10 @@ class CopilotACPClient:
         self._default_headers = dict(default_headers or {})
         self._acp_command = acp_command or command or _resolve_command()
         self._acp_args = list(acp_args or args or _resolve_args())
-        self._acp_cwd = str(Path(acp_cwd or os.getcwd()).absolute())
+        # CWD resolution is a filesystem boundary.  Keep construction
+        # state-only and resolve it at the first awaited subprocess boundary
+        # instead of calling ``os.getcwd()`` from an async request.
+        self._acp_cwd = str(acp_cwd) if acp_cwd else None
         self.chat = _ACPChatNamespace(self)
         self.is_closed = False
         self._active_process: asyncio.subprocess.Process | None = None
@@ -396,8 +399,14 @@ class CopilotACPClient:
         process.terminate()
         try:
             await asyncio.wait_for(process.wait(), timeout=2)
+        except asyncio.CancelledError:
+            if process.returncode is None:
+                process.kill()
+            await process.wait()
+            raise
         except asyncio.TimeoutError:
-            process.kill()
+            if process.returncode is None:
+                process.kill()
             await process.wait()
 
     async def _create_chat_completion(
@@ -467,7 +476,8 @@ class CopilotACPClient:
     async def _run_prompt(
         self, prompt_text: str, *, timeout_seconds: float
     ) -> tuple[str, str]:
-        resolved_cwd = await aiofiles.os.wrap(Path(self._acp_cwd).resolve)()
+        cwd = self._acp_cwd or await aiofiles.os.getcwd()
+        resolved_cwd = await aiofiles.os.wrap(Path(cwd).resolve)()
         self._acp_cwd = str(resolved_cwd)
         try:
             process = await asyncio.create_subprocess_exec(

@@ -21,7 +21,15 @@ _SESSION_USER_ID: ContextVar = ContextVar("HERMES_SESSION_USER_ID", default=_UNS
 _SESSION_USER_NAME: ContextVar = ContextVar("HERMES_SESSION_USER_NAME", default=_UNSET)
 _SESSION_KEY: ContextVar = ContextVar("HERMES_SESSION_KEY", default=_UNSET)
 _SESSION_ID: ContextVar = ContextVar("HERMES_SESSION_ID", default=_UNSET)
+_SESSION_UI_SESSION_ID: ContextVar = ContextVar("HERMES_UI_SESSION_ID", default=_UNSET)
+_SESSION_MESSAGE_ID: ContextVar = ContextVar(
+    "HERMES_SESSION_MESSAGE_ID", default=_UNSET
+)
 _SESSION_PROFILE: ContextVar = ContextVar("HERMES_SESSION_PROFILE", default=_UNSET)
+_CRON_SESSION: ContextVar = ContextVar("HERMES_CRON_SESSION", default=_UNSET)
+_SESSION_ASYNC_DELIVERY: ContextVar = ContextVar(
+    "HERMES_SESSION_ASYNC_DELIVERY", default=_UNSET
+)
 
 _VAR_MAP = {
     "HERMES_SESSION_PLATFORM": _SESSION_PLATFORM,
@@ -34,7 +42,10 @@ _VAR_MAP = {
     "HERMES_SESSION_USER_NAME": _SESSION_USER_NAME,
     "HERMES_SESSION_KEY": _SESSION_KEY,
     "HERMES_SESSION_ID": _SESSION_ID,
+    "HERMES_UI_SESSION_ID": _SESSION_UI_SESSION_ID,
+    "HERMES_SESSION_MESSAGE_ID": _SESSION_MESSAGE_ID,
     "HERMES_SESSION_PROFILE": _SESSION_PROFILE,
+    "HERMES_CRON_SESSION": _CRON_SESSION,
 }
 _SESSION_VARS = tuple(_VAR_MAP.values())
 _session_context_engaged = False
@@ -78,6 +89,10 @@ def set_session_vars(
     session_id: str = "",
     profile: str = "",
     cwd: str = "",
+    message_id: str = "",
+    async_delivery: bool = True,
+    ui_session_id: str = "",
+    cron_session: Any = _UNSET,
 ) -> list[Token]:
     """Bind request-scoped metadata and return tokens for restoration."""
     global _session_context_engaged
@@ -93,9 +108,13 @@ def set_session_vars(
         user_name,
         session_key,
         session_id,
+        ui_session_id,
+        message_id,
         profile,
+        cron_session,
     )
     tokens = [var.set(value) for var, value in zip(_SESSION_VARS, values)]
+    tokens.append(_SESSION_ASYNC_DELIVERY.set(bool(async_delivery)))
     try:
         from agent.runtime_cwd import set_session_cwd
 
@@ -106,9 +125,16 @@ def set_session_vars(
 
 
 def clear_session_vars(tokens: list[Token]) -> None:
-    """Restore metadata previously bound by set_session_vars."""
+    """Restore metadata previously bound by :func:`set_session_vars`.
+
+    Keep the token-reset contract from the upstream helper.  Assigning empty
+    strings here would hide an outer request's context in nested scopes and
+    would leave the process-global fallback permanently shadowed.
+    """
     for variable, token in zip(_SESSION_VARS, tokens):
         variable.reset(token)
+    if len(tokens) > len(_SESSION_VARS):
+        _SESSION_ASYNC_DELIVERY.reset(tokens[len(_SESSION_VARS)])
     try:
         from agent.runtime_cwd import clear_session_cwd
 
@@ -121,6 +147,7 @@ def reset_session_vars() -> None:
     """Reset all session metadata in the current task."""
     for variable in _SESSION_VARS:
         variable.set(_UNSET)
+    _SESSION_ASYNC_DELIVERY.set(_UNSET)
     try:
         from agent.runtime_cwd import clear_session_cwd
 
@@ -136,3 +163,50 @@ def get_session_env(name: str, default: str = "") -> str:
         return default
     value = variable.get()
     return default if value is _UNSET else str(value)
+
+
+NON_MESSAGING_SESSION_SURFACES = frozenset(
+    {
+        "",
+        "api_server",
+        "cli",
+        "codex",
+        "desktop",
+        "gateway",
+        "kanban",
+        "local",
+        "msgraph_webhook",
+        "tool",
+        "tui",
+        "webhook",
+    }
+)
+
+
+def session_is_messaging_surface() -> bool:
+    """Return whether the current turn belongs to a human chat channel."""
+    import os
+
+    platform = os.getenv("HERMES_PLATFORM") or get_session_env(
+        "HERMES_SESSION_PLATFORM", ""
+    )
+    source = get_session_env("HERMES_SESSION_SOURCE", "")
+    return any(
+        identity and identity not in NON_MESSAGING_SESSION_SURFACES
+        for identity in (str(platform or "").strip().lower(), str(source or "").strip().lower())
+    )
+
+
+def declare_stateless_channel() -> None:
+    """Declare that the current session cannot receive late completion events."""
+    _SESSION_ASYNC_DELIVERY.set(False)
+
+
+def async_delivery_supported() -> bool:
+    """Return whether the current session can receive a late completion."""
+    import os
+
+    if os.environ.get("HERMES_KANBAN_TASK"):
+        return False
+    value = _SESSION_ASYNC_DELIVERY.get()
+    return True if value is _UNSET else bool(value)

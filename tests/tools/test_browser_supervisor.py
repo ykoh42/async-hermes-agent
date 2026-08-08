@@ -7,22 +7,19 @@ works, since mock-CDP unit tests can only prove the happy paths we
 thought to model.
 
 These tests spawn a **real Chrome process** on the machine running them.
-They are therefore opt-in, twice over:
-
-* ``@pytest.mark.integration`` — excluded by the default
-  ``addopts = "-m 'not integration'"`` in ``pyproject.toml``, so a bare
-  ``pytest`` cannot launch a browser on a developer's desktop by accident.
-* ``HERMES_E2E_BROWSER=1`` — the env gate this docstring has always claimed.
-  It previously existed only in this prose: nothing read the variable, and
-  the sole real gate was "is a Chrome binary on PATH", which is true on most
-  desktops and on ``ubuntu-latest``. Now it is enforced.
+They are therefore opt-in through ``HERMES_E2E_BROWSER=1``.  The environment
+gate prevents a bare test run from launching a browser on a developer's
+desktop even though hermetic ``@pytest.mark.integration`` tests now run by
+default.  The gate previously existed only in this prose: nothing read the
+variable, and the sole real gate was "is a Chrome binary on PATH", which is
+true on most desktops and on ``ubuntu-latest``. Now it is enforced.
 
 Run manually:
     HERMES_E2E_BROWSER=1 scripts/run_tests.sh -m integration \\
         tests/tools/test_browser_supervisor.py
 
 (``scripts/run_tests.sh`` runs under ``env -i`` and forwards
-``HERMES_E2E_BROWSER`` explicitly; ``-m integration`` overrides the default
+``HERMES_E2E_BROWSER`` explicitly; ``-m integration`` selects this group
 marker filter.)
 """
 

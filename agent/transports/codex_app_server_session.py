@@ -37,6 +37,7 @@ from agent.transports.codex_app_server import (
     CodexAppServerError,
 )
 from agent.transports.codex_event_projector import CodexEventProjector
+import aiofiles.os
 
 logger = logging.getLogger(__name__)
 
@@ -281,7 +282,10 @@ class CodexAppServerSession:
         request_routing: Optional[_ServerRequestRouting] = None,
         client_factory: Optional[Callable[..., CodexAppServerClient]] = None,
     ) -> None:
-        self._cwd = cwd or os.getcwd()
+        # Resolve the process cwd only once the async subprocess boundary is
+        # entered.  Constructor state must not perform filesystem syscalls on
+        # an active application event loop.
+        self._cwd = cwd
         self._codex_bin = codex_bin
         self._codex_home = codex_home
         self._permission_profile = (
@@ -316,6 +320,8 @@ class CodexAppServerSession:
         return the same thread id."""
         if self._thread_id is not None:
             return self._thread_id
+        if self._cwd is None:
+            self._cwd = await aiofiles.os.getcwd()
         if self._client is None:
             self._client = self._client_factory(
                 codex_bin=self._codex_bin, codex_home=self._codex_home

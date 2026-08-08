@@ -26,7 +26,35 @@ import sys
 import urllib.request
 from typing import Any, Optional
 
+# ``AsyncOpenAI.chat`` lazily imports the complete OpenAI resources package on
+# first access.  If that import is deferred until the first model request, the
+# importlib filesystem walk runs inside the event loop and can pause every
+# concurrent request (the SDK's lazy property is synchronous).  Load the
+# resource module alongside the stable client alias, before any turn starts;
+# this keeps the actual provider→model chain free of first-use import stalls.
 from openai import AsyncOpenAI as OpenAI
+from openai.resources.chat import AsyncChat as _AsyncChatBootstrap  # noqa: F401
+
+# Anthropic's SDK also performs a sizeable lazy import graph.  The retained
+# runtime reaches ``build_anthropic_client`` from an awaited turn, so loading
+# the optional SDK here keeps that first-use import out of the event loop.
+# Missing optional dependencies remain a normal provider-level ImportError.
+try:
+    import anthropic as _AnthropicBootstrap  # noqa: F401
+except ImportError:
+    _AnthropicBootstrap = None
+
+# MCP OAuth is optional, but its SDK auth modules are imported lazily by the
+# OAuth storage/manager.  Resolve those imports beside the other provider SDK
+# bootstraps so the first OAuth-backed MCP connection cannot perform an
+# importlib filesystem walk from inside an active request loop.  The helper
+# keeps the optional dependency fail-open exactly as before.
+try:
+    from tools import mcp_oauth as _McpOAuthBootstrap
+
+    _McpOAuthBootstrap._ensure_sdk_loaded()
+except (ImportError, AttributeError):
+    _McpOAuthBootstrap = None
 
 from utils import base_url_hostname, normalize_proxy_url
 

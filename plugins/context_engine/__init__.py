@@ -12,17 +12,23 @@ The default engine is ``"compressor"`` (the built-in ContextCompressor).
 Usage:
     from plugins.context_engine import discover_context_engines, load_context_engine
 
-    available = discover_context_engines()   # [(name, desc, available), ...]
-    engine = load_context_engine("lcm")      # ContextEngine instance
+    available = await discover_context_engines()   # [(name, desc, available), ...]
+    engine = await load_context_engine("lcm")      # ContextEngine instance
 """
 
 from __future__ import annotations
 
+import asyncio
 import importlib.util
+import inspect
 import logging
 import sys
 from pathlib import Path
 from typing import List, Optional, Tuple, TYPE_CHECKING
+
+import aiofiles
+import aiofiles.os
+from hermes_cli.async_source_loader import load_source_package
 
 if TYPE_CHECKING:
     from agent.context_engine import ContextEngine
@@ -32,7 +38,21 @@ logger = logging.getLogger(__name__)
 _CONTEXT_ENGINE_PLUGINS_DIR = Path(__file__).parent
 
 
-def discover_context_engines() -> List[Tuple[str, str, bool]]:
+async def _exec_source_module(module: object, source_path: Path) -> None:
+    """Execute a source module after asynchronously reading its file.
+
+    ``SourceFileLoader.exec_module`` performs a synchronous file read.  The
+    loader is still used to create the normal module spec (including package
+    metadata), but source acquisition is kept on the async path so plugin
+    discovery does not block on disk I/O.
+    """
+    async with aiofiles.open(source_path, mode="rb") as handle:
+        source_bytes = await handle.read()
+    source = importlib.util.decode_source(source_bytes)
+    exec(compile(source, str(source_path), "exec"), module.__dict__)
+
+
+async def discover_context_engines() -> List[Tuple[str, str, bool]]:
     """Scan plugins/context_engine/ for available engines.
 
     Returns list of (name, description, is_available) tuples.
@@ -40,24 +60,27 @@ def discover_context_engines() -> List[Tuple[str, str, bool]]:
     and does a lightweight availability check.
     """
     results = []
-    if not _CONTEXT_ENGINE_PLUGINS_DIR.is_dir():
+    if not await aiofiles.os.path.isdir(_CONTEXT_ENGINE_PLUGINS_DIR):
         return results
 
-    for child in sorted(_CONTEXT_ENGINE_PLUGINS_DIR.iterdir()):
-        if not child.is_dir() or child.name.startswith(("_", ".")):
+    for child_name in sorted(
+        await aiofiles.os.listdir(_CONTEXT_ENGINE_PLUGINS_DIR)
+    ):
+        child = _CONTEXT_ENGINE_PLUGINS_DIR / child_name
+        if not await aiofiles.os.path.isdir(child) or child.name.startswith(("_", ".")):
             continue
         init_file = child / "__init__.py"
-        if not init_file.exists():
+        if not await aiofiles.os.path.exists(init_file):
             continue
 
         # Read description from plugin.yaml if available
         desc = ""
         yaml_file = child / "plugin.yaml"
-        if yaml_file.exists():
+        if await aiofiles.os.path.exists(yaml_file):
             try:
                 import yaml
-                with open(yaml_file, encoding="utf-8-sig") as f:
-                    meta = yaml.safe_load(f) or {}
+                async with aiofiles.open(yaml_file, encoding="utf-8-sig") as f:
+                    meta = yaml.safe_load(await f.read()) or {}
                 desc = meta.get("description", "")
             except Exception:
                 pass
@@ -65,11 +88,14 @@ def discover_context_engines() -> List[Tuple[str, str, bool]]:
         # Quick availability check — try loading and calling is_available()
         available = True
         try:
-            engine = _load_engine_from_dir(child)
+            engine = await _load_engine_from_dir(child)
             if engine is None:
                 available = False
             elif hasattr(engine, "is_available"):
-                available = engine.is_available()
+                available_result = engine.is_available()
+                if inspect.isawaitable(available_result):
+                    available_result = await available_result
+                available = bool(available_result)
         except Exception:
             available = False
 
@@ -78,18 +104,18 @@ def discover_context_engines() -> List[Tuple[str, str, bool]]:
     return results
 
 
-def load_context_engine(name: str) -> Optional["ContextEngine"]:
+async def load_context_engine(name: str) -> Optional["ContextEngine"]:
     """Load and return a ContextEngine instance by name.
 
     Returns None if the engine is not found or fails to load.
     """
     engine_dir = _CONTEXT_ENGINE_PLUGINS_DIR / name
-    if not engine_dir.is_dir():
+    if not await aiofiles.os.path.isdir(engine_dir):
         logger.debug("Context engine '%s' not found in %s", name, _CONTEXT_ENGINE_PLUGINS_DIR)
         return None
 
     try:
-        engine = _load_engine_from_dir(engine_dir)
+        engine = await _load_engine_from_dir(engine_dir)
         if engine:
             return engine
         logger.warning("Context engine '%s' loaded but no engine instance found", name)
@@ -99,7 +125,7 @@ def load_context_engine(name: str) -> Optional["ContextEngine"]:
         return None
 
 
-def _load_engine_from_dir(engine_dir: Path) -> Optional["ContextEngine"]:
+async def _load_engine_from_dir(engine_dir: Path) -> Optional["ContextEngine"]:
     """Import an engine module and extract the ContextEngine instance.
 
     The module must have either:
@@ -110,7 +136,7 @@ def _load_engine_from_dir(engine_dir: Path) -> Optional["ContextEngine"]:
     module_name = f"plugins.context_engine.{name}"
     init_file = engine_dir / "__init__.py"
 
-    if not init_file.exists():
+    if not await aiofiles.os.path.exists(init_file):
         return None
 
     # Check if already loaded
@@ -125,7 +151,7 @@ def _load_engine_from_dir(engine_dir: Path) -> Optional["ContextEngine"]:
                 if parent == "plugins":
                     parent_path = parent_path.parent
                 parent_init = parent_path / "__init__.py"
-                if parent_init.exists():
+                if await aiofiles.os.path.exists(parent_init):
                     spec = importlib.util.spec_from_file_location(
                         parent, str(parent_init),
                         submodule_search_locations=[str(parent_path)]
@@ -134,51 +160,36 @@ def _load_engine_from_dir(engine_dir: Path) -> Optional["ContextEngine"]:
                         parent_mod = importlib.util.module_from_spec(spec)
                         sys.modules[parent] = parent_mod
                         try:
-                            spec.loader.exec_module(parent_mod)
+                            await _exec_source_module(parent_mod, parent_init)
+                        except asyncio.CancelledError:
+                            sys.modules.pop(parent, None)
+                            raise
                         except Exception:
                             pass
 
-        # Now load the engine module
-        spec = importlib.util.spec_from_file_location(
-            module_name, str(init_file),
-            submodule_search_locations=[str(engine_dir)]
-        )
-        if not spec:
-            return None
-
-        mod = importlib.util.module_from_spec(spec)
-        sys.modules[module_name] = mod
-
-        # Register submodules so relative imports work
-        for sub_file in engine_dir.glob("*.py"):
-            if sub_file.name == "__init__.py":
-                continue
-            sub_name = sub_file.stem
-            full_sub_name = f"{module_name}.{sub_name}"
-            if full_sub_name not in sys.modules:
-                sub_spec = importlib.util.spec_from_file_location(
-                    full_sub_name, str(sub_file)
-                )
-                if sub_spec:
-                    sub_mod = importlib.util.module_from_spec(sub_spec)
-                    sys.modules[full_sub_name] = sub_mod
-                    try:
-                        sub_spec.loader.exec_module(sub_mod)
-                    except Exception as e:
-                        logger.debug("Failed to load submodule %s: %s", full_sub_name, e)
-
         try:
-            spec.loader.exec_module(mod)
-        except Exception as e:
-            logger.debug("Failed to exec_module %s: %s", module_name, e)
+            mod = await load_source_package(module_name, init_file)
+        except asyncio.CancelledError:
             sys.modules.pop(module_name, None)
+            for loaded_name in tuple(sys.modules):
+                if loaded_name.startswith(f"{module_name}."):
+                    sys.modules.pop(loaded_name, None)
+            raise
+        except Exception as e:
+            logger.debug("Failed to execute source module %s: %s", module_name, e)
+            sys.modules.pop(module_name, None)
+            for loaded_name in tuple(sys.modules):
+                if loaded_name.startswith(f"{module_name}."):
+                    sys.modules.pop(loaded_name, None)
             return None
 
     # Try register(ctx) pattern first (how plugins are written)
     if hasattr(mod, "register"):
         collector = _EngineCollector(engine_name=name)
         try:
-            mod.register(collector)
+            registration = mod.register(collector)
+            if inspect.isawaitable(registration):
+                await registration
             if collector.engine:
                 return collector.engine
         except Exception as e:

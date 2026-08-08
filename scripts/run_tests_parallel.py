@@ -2,7 +2,7 @@
 """Per-file parallel test runner.
 
 The minimum-viable replacement for pytest-xdist + a subprocess-isolation
-plugin. Discovers test files under ``tests/`` (excluding integration/e2e
+plugin. Discovers test files under ``tests/`` (excluding external e2e/docker
 unless explicitly requested), then runs one ``python -m pytest <file>``
 subprocess per file, with bounded parallelism (default: ``os.cpu_count()``).
 
@@ -42,8 +42,10 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, Future
@@ -54,12 +56,11 @@ from typing import Dict, List, Tuple
 # Default test discovery roots.
 _DEFAULT_ROOTS = ["tests"]
 
-# Directories to skip during discovery — these suites require real
-# external services (a model gateway, a docker daemon with a prebuilt
-# image, etc.) and are run in their own dedicated CI jobs:
+# Directories to skip during discovery — these suites require real external
+# services and are run separately.  ``tests/integration`` is deliberately not
+# skipped: those tests are hermetic and are part of the canonical full suite.
 #
 #   tests/e2e/         — .github/workflows/tests.yml :: e2e job
-#   tests/integration/ — historical; legacy --ignore flags
 #   tests/docker/      — .github/workflows/docker.yml ::
 #                        build-amd64 job (runs against the freshly-loaded
 #                        nousresearch/hermes-agent:test image, via
@@ -70,7 +71,7 @@ _DEFAULT_ROOTS = ["tests"]
 #                        ``docker build``,
 #                        so the build is guaranteed to die in fixture
 #                        setup. The dedicated job sidesteps both costs.
-_SKIP_PARTS = {"integration", "e2e", "docker"}
+_SKIP_PARTS = {"e2e", "docker"}
 
 # Per-file wall-clock cap. Override
 # via --file-timeout or HERMES_TEST_FILE_TIMEOUT.
@@ -305,23 +306,49 @@ def _run_one_file_once(
     file_timeout: float,
 ) -> Tuple[Path, int, str, dict[str, int], float]:
     """Single attempt of a per-file pytest subprocess (see _run_one_file)."""
-    cmd = [sys.executable, "-m", "pytest", str(file), *pytest_args]
+    # Pytest's default ``tmp_path`` root is process-shared.  The per-file
+    # runner intentionally launches many independent pytest processes at once;
+    # they can otherwise race while creating/removing the shared
+    # ``pytest-current`` symlink during session teardown.  Give every child a
+    # private basetemp unless the caller explicitly supplied one.
+    basetemp: str | None = None
+    if not any(
+        arg == "--basetemp" or arg.startswith("--basetemp=")
+        for arg in pytest_args
+    ):
+        basetemp = tempfile.mkdtemp(prefix="hermes-pytest-")
+        cmd = [
+            sys.executable,
+            "-m",
+            "pytest",
+            str(file),
+            "--basetemp",
+            basetemp,
+            *pytest_args,
+        ]
+    else:
+        cmd = [sys.executable, "-m", "pytest", str(file), *pytest_args]
     
     subproc_start = time.monotonic()
     # launch the pytest process
-    proc = subprocess.Popen(
-        cmd,
-        cwd=repo_root,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True, encoding="utf-8", errors="replace",
-        env=os.environ,
-        # POSIX: place the child at the head of its own process group so
-        # _kill_tree can SIGKILL the group atomically.
-        # Windows: this maps to CREATE_NEW_PROCESS_GROUP in CPython 3.12+;
-        # _kill_tree handles the Windows path via taskkill /F /T.
-        start_new_session=True,
-    )
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            cwd=repo_root,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True, encoding="utf-8", errors="replace",
+            env=os.environ,
+            # POSIX: place the child at the head of its own process group so
+            # _kill_tree can SIGKILL the group atomically.
+            # Windows: this maps to CREATE_NEW_PROCESS_GROUP in CPython 3.12+;
+            # _kill_tree handles the Windows path via taskkill /F /T.
+            start_new_session=True,
+        )
+    except BaseException:
+        if basetemp is not None:
+            shutil.rmtree(basetemp, ignore_errors=True)
+        raise
 
     # Capture the pgid NOW, before the leader can exit and be reaped. Once
     # the leader is reaped, os.getpgid(proc.pid) raises ProcessLookupError
@@ -359,6 +386,9 @@ def _run_one_file_once(
         _kill_tree(proc, pgid=pgid)
 
         output +=  "\n"
+    finally:
+        if basetemp is not None:
+            shutil.rmtree(basetemp, ignore_errors=True)
 
     if rc == 5:
         # No tests collected in THIS file — legitimate per-file: a
@@ -694,7 +724,7 @@ def main() -> int:
     parser.add_argument(
         "--include-integration",
         action="store_true",
-        help="Don't skip integration/ e2e/ during discovery",
+        help="Also include external e2e/ and docker/ suites during discovery",
     )
     parser.add_argument(
         "--file-timeout",
@@ -896,7 +926,9 @@ def main() -> int:
             roots = [repo_root / p for p in args.paths.split(":") if p]
 
         if args.include_integration:
-            # Caller takes responsibility — typically used via explicit -k filter.
+            # Historical option name retained for callers. Integration tests
+            # are now always included; this additionally enables the external
+            # e2e/docker suites, normally with an explicit -k filter.
             global _SKIP_PARTS  # noqa: PLW0603 — config knob
             _SKIP_PARTS = set()
 

@@ -35,7 +35,6 @@ from __future__ import annotations
 
 import asyncio
 import importlib.metadata
-import importlib.util
 import inspect
 import logging
 import os
@@ -52,6 +51,12 @@ from hermes_constants import get_hermes_home
 from utils import env_var_enabled, fast_safe_load
 from hermes_cli.config import cfg_get
 from hermes_cli.middleware import OBSERVER_SCHEMA_VERSION, VALID_MIDDLEWARE
+from hermes_cli.async_source_loader import (
+    load_source_module,
+    load_source_package,
+    locate_source_module,
+    unload_source_finder,
+)
 
 
 async def get_bundled_plugins_dir() -> Path:
@@ -296,10 +301,18 @@ class PluginContext:
         manager: "PluginManager",
         *,
         _profile_context: tuple[Path | None, Path | None] | None = None,
+        _defer_skill_validation: bool = False,
     ):
         self.manifest = manifest
         self._manager = manager
         self._profile_context = _profile_context
+        # ``register_skill`` is intentionally kept synchronous for the public
+        # plugin contract.  The manager marks its async discovery contexts so
+        # validation can cross an awaited filesystem boundary after the
+        # callback returns; direct compatibility callers retain the upstream
+        # immediate validation behaviour.
+        self._defer_skill_validation = _defer_skill_validation
+        self._deferred_skill_paths: list[tuple[str, Path]] = []
         # Lazy-built host-owned LLM facade — see ctx.llm property below.
         self._llm: Any = None
         self._subagent_lifecycle: Any = None
@@ -896,10 +909,12 @@ class PluginContext:
             raise ValueError(
                 f"Invalid skill name '{name}'. Must match [a-zA-Z0-9_-]+."
             )
-        if not path.exists():
+        qualified = f"{self.manifest.name}:{name}"
+        if self._defer_skill_validation:
+            self._deferred_skill_paths.append((qualified, path))
+        elif not path.exists():
             raise FileNotFoundError(f"SKILL.md not found at {path}")
 
-        qualified = f"{self.manifest.name}:{name}"
         self._manager._plugin_skills[qualified] = {
             "path": path,
             "plugin": self.manifest.name,
@@ -937,6 +952,13 @@ class PluginManager:
         self._profile_context: tuple[Path | None, Path | None] | None = None
         self._discovery_lock = asyncio.Lock()
 
+    def _unload_source_finders(self) -> None:
+        """Release import finders retained by the previous discovery sweep."""
+        for loaded in self._plugins.values():
+            module = loaded.module
+            if module is not None:
+                unload_source_finder(module)
+
     # -----------------------------------------------------------------------
     # Public
     # -----------------------------------------------------------------------
@@ -956,6 +978,7 @@ class PluginManager:
                 self._discovered = True
                 return
             if force:
+                self._unload_source_finders()
                 self._plugins.clear()
                 self._hooks.clear()
                 self._middleware.clear()
@@ -967,6 +990,7 @@ class PluginManager:
             try:
                 await self._discover_and_load_inner()
             except BaseException:
+                self._unload_source_finders()
                 self._discovered = False
                 raise
             self._discovered = True
@@ -1349,24 +1373,25 @@ class PluginManager:
         from tools.registry import registry as _registry
         _plugin_id = manifest.key or manifest.name
         _slug = _plugin_id.replace("/", "__").replace("-", "_")
+        override_context = PluginContext(
+            manifest,
+            self,
+            _profile_context=self._profile_context,
+        )
         _registry.register_plugin_override_policy(
             f"{_NS_PARENT}.{_slug}",
-            PluginContext(
-                manifest,
-                self,
-                _profile_context=self._profile_context,
-            )._tool_override_allowed(""),
+            override_context._tool_override_allowed(""),
         )
         try:
             if manifest.source in {"user", "project", "bundled"}:
-                module = self._load_directory_module(manifest)
+                module = await self._load_directory_module(manifest)
             else:
                 module = await self._load_entrypoint_module(manifest)
 
             loaded.module = module
 
             # Call register()
-            register_fn = getattr(module, "register", None)
+            register_fn = module if callable(module) else getattr(module, "register", None)
             if register_fn is None:
                 loaded.error = "no register() function"
                 logger.warning("Plugin '%s' has no register() function", manifest.name)
@@ -1375,6 +1400,7 @@ class PluginManager:
                     manifest,
                     self,
                     _profile_context=self._profile_context,
+                    _defer_skill_validation=True,
                 )
                 # Snapshot registry state BEFORE register() so each registry's
                 # attribution counts only what THIS plugin actually added.
@@ -1390,7 +1416,15 @@ class PluginManager:
                 _mw_counts_before = {
                     kind: len(cbs) for kind, cbs in self._middleware.items()
                 }
-                register_fn(ctx)
+                registration = register_fn(ctx)
+                if inspect.isawaitable(registration):
+                    await registration
+                for qualified, skill_path in ctx._deferred_skill_paths:
+                    if not await aiofiles.os.path.exists(skill_path):
+                        self._plugin_skills.pop(qualified, None)
+                        raise FileNotFoundError(
+                            f"SKILL.md not found at {skill_path}"
+                        )
                 loaded.tools_registered = [
                     t for t in self._plugin_tool_names
                     if t not in _tools_before
@@ -1426,7 +1460,7 @@ class PluginManager:
             )
         self._plugins[manifest.key or manifest.name] = loaded
 
-    def _load_directory_module(self, manifest: PluginManifest) -> types.ModuleType:
+    async def _load_directory_module(self, manifest: PluginManifest) -> types.ModuleType:
         """Import a directory-based plugin as ``hermes_plugins.<slug>``.
 
         The module slug is derived from ``manifest.key`` so category-namespaced
@@ -1447,32 +1481,40 @@ class PluginManager:
         key = manifest.key or manifest.name
         slug = key.replace("/", "__").replace("-", "_")
         module_name = f"{_NS_PARENT}.{slug}"
-        spec = importlib.util.spec_from_file_location(
-            module_name,
-            init_file,
-            submodule_search_locations=[str(plugin_dir)],
-        )
-        if spec is None or spec.loader is None:
-            raise ImportError(f"Cannot create module spec for {init_file}")
-
-        module = importlib.util.module_from_spec(spec)
-        module.__package__ = module_name
-        module.__path__ = [str(plugin_dir)]  # type: ignore[attr-defined]
-        sys.modules[module_name] = module
         try:
-            spec.loader.exec_module(module)
+            module = await load_source_package(module_name, init_file)
+        except asyncio.CancelledError:
+            for loaded_name in tuple(sys.modules):
+                if loaded_name == module_name or loaded_name.startswith(f"{module_name}."):
+                    sys.modules.pop(loaded_name, None)
+            raise
         except FileNotFoundError as exc:
             if exc.filename != str(init_file):
                 raise
-            sys.modules.pop(module_name, None)
+            for loaded_name in tuple(sys.modules):
+                if loaded_name == module_name or loaded_name.startswith(f"{module_name}."):
+                    sys.modules.pop(loaded_name, None)
             raise FileNotFoundError(f"No __init__.py in {plugin_dir}") from exc
+        except Exception:
+            for loaded_name in tuple(sys.modules):
+                if loaded_name == module_name or loaded_name.startswith(f"{module_name}."):
+                    sys.modules.pop(loaded_name, None)
+            raise
         return module
 
     async def _load_entrypoint_module(
         self,
         manifest: PluginManifest,
     ) -> types.ModuleType:
-        """Load a pip-installed plugin via its entry-point reference."""
+        """Load a pip-installed plugin via its entry-point reference.
+
+        ``EntryPoint.load()`` delegates to Python's synchronous source
+        importer.  Real metadata entry points are therefore resolved to their
+        module source and executed only after the source bytes have crossed an
+        awaited file boundary.  A small in-memory fallback is retained for
+        test/host adapters that intentionally expose only ``load()`` and have
+        no importable module metadata; it cannot perform source discovery.
+        """
         eps = await aiofiles.os.wrap(importlib.metadata.entry_points)()
         if hasattr(eps, "select"):
             group_eps = eps.select(group=ENTRY_POINTS_GROUP)
@@ -1483,7 +1525,77 @@ class PluginManager:
 
         for ep in group_eps:
             if ep.name == manifest.name:
-                return ep.load()
+                module_name = str(getattr(ep, "module", "") or "").strip()
+                attr_path = str(getattr(ep, "attr", "") or "").strip()
+                if not module_name:
+                    value = str(getattr(ep, "value", "") or "")
+                    module_name, separator, attr_path = value.partition(":")
+                    if not separator:
+                        attr_path = ""
+                    module_name = module_name.strip()
+
+                module = sys.modules.get(module_name) if module_name else None
+                if module is None and module_name:
+                    source_info = await locate_source_module(
+                        module_name,
+                        distribution=getattr(ep, "dist", None),
+                    )
+                    if source_info is not None:
+                        source_path, is_package = source_info
+                        try:
+                            if is_package:
+                                module = await load_source_package(module_name, source_path)
+                            else:
+                                parent_name, _, _ = module_name.rpartition(".")
+                                parent_init = source_path.parent / "__init__.py"
+                                if (
+                                    parent_name
+                                    and parent_name not in sys.modules
+                                    and await aiofiles.os.path.isfile(parent_init)
+                                ):
+                                    await load_source_package(parent_name, parent_init)
+                                module = await load_source_module(
+                                    module_name,
+                                    source_path,
+                                    package_dir=source_path.parent,
+                                )
+                        except asyncio.CancelledError:
+                            for loaded_name in tuple(sys.modules):
+                                if loaded_name == module_name or loaded_name.startswith(
+                                    f"{module_name}."
+                                ):
+                                    sys.modules.pop(loaded_name, None)
+                            raise
+                        except Exception:
+                            for loaded_name in tuple(sys.modules):
+                                if loaded_name == module_name or loaded_name.startswith(
+                                    f"{module_name}."
+                                ):
+                                    sys.modules.pop(loaded_name, None)
+                            raise
+
+                # Non-standard in-memory entry-point adapters (used by host
+                # applications and tests) may intentionally omit ``module`` /
+                # ``value`` metadata.  Preserve that contract without using
+                # it as a fallback for real package imports.
+                if module is None:
+                    load_fn = getattr(ep, "load", None)
+                    if callable(load_fn) and type(ep).__module__ != "importlib.metadata":
+                        loaded = load_fn()
+                        if inspect.isawaitable(loaded):
+                            loaded = await loaded
+                        module = loaded
+
+                if module is None:
+                    raise ImportError(
+                        f"Entrypoint '{manifest.name}' has no importable native "
+                        "async source module"
+                    )
+
+                target: Any = module
+                for attr_name in filter(None, attr_path.split(".")):
+                    target = getattr(target, attr_name)
+                return target
 
         raise ImportError(
             f"Entry point '{manifest.name}' not found in group '{ENTRY_POINTS_GROUP}'"

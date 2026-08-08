@@ -80,13 +80,17 @@ async def _connect() -> aiosqlite.Connection:
     await aiofiles.os.makedirs(path.parent, exist_ok=True)
     conn = await aiosqlite.connect(path)
     conn.row_factory = aiosqlite.Row
+    initialization_error: Exception | None = None
     try:
         await apply_wal_with_fallback(conn, db_label="verification_evidence.db")
         await conn.execute("PRAGMA busy_timeout=5000")
         await _ensure_schema(conn)
-    except Exception:
+    except Exception as exc:
+        initialization_error = exc
+
+    if initialization_error is not None:
         await conn.close()
-        raise
+        raise initialization_error
     return conn
 
 

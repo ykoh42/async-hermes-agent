@@ -4159,6 +4159,7 @@ async def _snapshot_child_pids() -> set:
     # Portable fallback: query the process table through an async subprocess.
     # The old psutil branch performed a synchronous process enumeration on
     # macOS/Windows while an MCP server was starting or shutting down.
+    process = None
     try:
         process = await asyncio.create_subprocess_exec(
             "ps",
@@ -4167,7 +4168,13 @@ async def _snapshot_child_pids() -> set:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
         )
-        stdout, _ = await asyncio.wait_for(process.communicate(), timeout=2.0)
+        try:
+            stdout, _ = await asyncio.wait_for(process.communicate(), timeout=2.0)
+        except (asyncio.CancelledError, TimeoutError):
+            if process.returncode is None:
+                process.kill()
+            await process.wait()
+            raise
         children_by_parent: dict[int, set[int]] = {}
         for line in stdout.decode("utf-8", errors="replace").splitlines():
             fields = line.split()

@@ -15,25 +15,19 @@ application supplies its own service or UI boundary.
 - Git
 - A model provider credential, unless you use a local endpoint
 
-## 1. Install the current release
+## 1. Install the current verified release
 
-Install the pinned release from PyPI with `uv`:
-
-```bash
-uv pip install "async-hermes-agent==0.20.4"
-```
-
-The equivalent `pip` command is:
-
-```bash
-python -m pip install "async-hermes-agent==0.20.4"
-```
-
-To install the same release directly from Git instead:
+The v0.20.4 GitHub release has a verified source tag. Install it directly
+until the PyPI Trusted Publisher is configured for this repository:
 
 ```bash
 uv pip install "git+https://github.com/ykoh42/async-hermes-agent.git@v0.20.4"
 ```
+
+The package metadata for this release is `async-hermes-agent==0.20.4`.
+PyPI publication is intentionally not presented as complete until the package
+is visible at `pypi.org/project/async-hermes-agent/` and a clean install has
+been verified there.
 
 ## 2. Or install from a checkout
 

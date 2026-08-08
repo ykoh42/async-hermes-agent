@@ -1273,8 +1273,14 @@ async def _run_chrome_fallback_command(
             await close_file(stderr_fd)
         try:
             await asyncio.wait_for(proc.wait(), timeout=timeout)
+        except asyncio.CancelledError:
+            if proc.returncode is None:
+                proc.kill()
+            await proc.wait()
+            raise
         except TimeoutError:
-            proc.kill()
+            if proc.returncode is None:
+                proc.kill()
             await proc.wait()
             return {"success": False, "error": f"Chrome fallback '{cmd}' timed out"}
         try:
@@ -2787,8 +2793,14 @@ async def _run_browser_command(
 
         try:
             await asyncio.wait_for(proc.wait(), timeout=timeout)
+        except asyncio.CancelledError:
+            if proc.returncode is None:
+                proc.kill()
+            await proc.wait()
+            raise
         except TimeoutError:
-            proc.kill()
+            if proc.returncode is None:
+                proc.kill()
             await proc.wait()
             stdout, stderr = await _read_command_output_files(stdout_path, stderr_path)
             await _unlink_command_output_files(stdout_path, stderr_path)
@@ -5264,6 +5276,12 @@ async def _maybe_autoinstall_chromium() -> bool:
         stdout_bytes, stderr_bytes = await asyncio.wait_for(
             proc.communicate(), timeout=600
         )
+    except asyncio.CancelledError:
+        if "proc" in locals() and proc.returncode is None:
+            proc.kill()
+        if "proc" in locals():
+            await proc.wait()
+        raise
     except (OSError, TimeoutError) as e:
         if "proc" in locals() and proc.returncode is None:
             proc.kill()

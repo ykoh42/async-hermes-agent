@@ -960,32 +960,43 @@ CANONICAL_PROVIDERS: list[ProviderEntry] = [
     ),
 ]
 
-# Auto-extend CANONICAL_PROVIDERS with any provider registered in providers/
-# that is not already in the list above.  Adding plugins/model-providers/<name>/
-# is sufficient to expose a new provider in the model picker, /model, and all
-# downstream consumers — no edits to this file needed.
 _canonical_slugs = {p.slug for p in CANONICAL_PROVIDERS}
-try:
-    from providers import list_providers as _list_providers_for_canonical
 
-    for _pp in _list_providers_for_canonical():
-        if _pp.name in _canonical_slugs:
-            continue
-        if _pp.auth_type in {
-            "oauth_device_code",
-            "oauth_external",
-            "external_process",
-            "aws_sdk",
-            "copilot",
-            "vertex",
-        }:
-            continue  # non-api-key flows need bespoke picker UX; skip auto-inject
-        _label = _pp.display_name or _pp.name
-        _desc = _pp.description or f"{_label} (direct API)"
-        CANONICAL_PROVIDERS.append(ProviderEntry(_pp.name, _label, _desc))
-        _canonical_slugs.add(_pp.name)
-except Exception:
-    pass
+
+def _inject_profile_canonical_providers() -> None:
+    """Add discovered API-key profiles to the model-picker registry.
+
+    Provider discovery is I/O and is awaited by the agent before runtime
+    resolution.  Keeping this helper callable lets the deferred boundary
+    refresh the same dynamic picker surface without a synchronous import-time
+    scan.
+    """
+    try:
+        from providers import list_providers as _list_providers_for_canonical
+
+        for _pp in _list_providers_for_canonical():
+            if _pp.name in _canonical_slugs:
+                continue
+            if _pp.auth_type in {
+                "oauth_device_code",
+                "oauth_external",
+                "external_process",
+                "aws_sdk",
+                "copilot",
+                "vertex",
+            }:
+                continue
+            _label = _pp.display_name or _pp.name
+            _desc = _pp.description or f"{_label} (direct API)"
+            CANONICAL_PROVIDERS.append(ProviderEntry(_pp.name, _label, _desc))
+            _canonical_slugs.add(_pp.name)
+            if "_PROVIDER_LABELS" in globals():
+                _PROVIDER_LABELS[_pp.name] = _label
+    except Exception:
+        return
+
+
+_inject_profile_canonical_providers()
 
 # Derived dicts — used throughout the codebase
 _PROVIDER_LABELS = {p.slug: p.label for p in CANONICAL_PROVIDERS}

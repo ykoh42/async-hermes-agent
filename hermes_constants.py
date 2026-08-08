@@ -234,9 +234,21 @@ async def agent_browser_runnable(path: str | None) -> bool:
             env=await with_hermes_node_path(),
         )
         await asyncio.wait_for(process.communicate(), timeout=10)
+    except asyncio.CancelledError:
+        if process is not None and process.returncode is None:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+        if process is not None:
+            await process.wait()
+        raise
     except (OSError, TimeoutError, ValueError):
         if process is not None and process.returncode is None:
-            process.kill()
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
             await process.wait()
         return False
     return process.returncode == 0

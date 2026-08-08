@@ -6,7 +6,7 @@ import hashlib
 import json
 import asyncio
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Literal, Optional
 from weakref import WeakKeyDictionary
@@ -15,6 +15,20 @@ import httpx
 
 
 NousAccountInfoSource = Literal["jwt", "account_api", "inference_key", "none", "error"]
+
+# Free tool-pool coverage categories. Kept byte-for-byte aligned with the
+# Portal's TOOL_COVERAGE_CATEGORIES (nous-account-service
+# src/server/tool-pool-eligibility.ts). The Portal mints these into the
+# `tool_access.coverage` map on the JWT and /api/oauth/account; FAL video gen
+# (`fal-video`) is intentionally excluded from the pool.
+TOOL_COVERAGE_CATEGORIES = (
+    "firecrawl",
+    "fal",
+    "fal-video",
+    "openai-audio",
+    "browser-use",
+    "modal",
+)
 
 _ACCOUNT_INFO_CACHE_TTL = 60
 _account_info_cache: tuple[str, float, "NousPortalAccountInfo"] | None = None
@@ -58,6 +72,14 @@ class NousPaidServiceAccessInfo:
 
 
 @dataclass(frozen=True)
+class NousToolAccessInfo:
+    """Free tool-pool entitlement, decoupled from paid/billing access."""
+
+    enabled: bool = False
+    coverage: dict[str, bool] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
 class NousPortalAccountInfo:
     logged_in: bool
     source: NousAccountInfoSource
@@ -79,6 +101,7 @@ class NousPortalAccountInfo:
     subscription: Optional[NousPortalSubscriptionInfo] = None
     paid_service_access: Optional[bool] = None
     paid_service_access_info: Optional[NousPaidServiceAccessInfo] = None
+    tool_access: Optional[NousToolAccessInfo] = None
     raw_claims: Optional[dict[str, Any]] = None
     raw_account: Optional[dict[str, Any]] = None
     error: Optional[str] = None
@@ -90,6 +113,24 @@ class NousPortalAccountInfo:
     @property
     def is_free_tier(self) -> bool:
         return self.paid_service_access is False
+
+    @property
+    def tool_gateway_entitled(self) -> bool:
+        """Whether paid access or a live free tool pool funds any tool."""
+        if self.paid_service_access is True:
+            return True
+        return self.tool_access is not None and self.tool_access.enabled
+
+    def tool_gateway_entitled_for(self, category: str) -> bool:
+        """Whether paid access or the free pool funds ``category``."""
+        if self.paid_service_access is True:
+            return True
+        tool_access = self.tool_access
+        return bool(
+            tool_access
+            and tool_access.enabled
+            and tool_access.coverage.get(category) is True
+        )
 
 def nous_portal_billing_url(account_info: Optional[NousPortalAccountInfo] = None) -> str:
     """Return the billing URL for a normalized Nous account snapshot."""
@@ -134,18 +175,25 @@ def format_nous_portal_entitlement_message(
     *,
     capability: str = "this feature",
     include_refresh_hint: bool = True,
+    coverage_category: Optional[str] = None,
 ) -> Optional[str]:
-    """Return guidance when a Nous account lacks paid model access.
+    """Return user-facing guidance for a missing Nous tool entitlement.
 
-    ``None`` means the account is entitled to use the capability. The message
-    works from normalized entitlement fields rather than subscription price alone:
-    purchased credits without a subscription still count as paid access, while a
-    paid subscription with exhausted usable credits does not.
+    ``coverage_category`` preserves the upstream category-specific pool gate;
+    paid access remains entitled for every category.
     """
     billing_url = nous_portal_billing_url(account_info)
 
     if account_info is not None:
-        if account_info.paid_service_access is True:
+        if coverage_category is not None:
+            if account_info.tool_gateway_entitled_for(coverage_category):
+                return None
+            if account_info.tool_gateway_entitled:
+                return (
+                    f"{capability} isn't included with your current Nous Portal "
+                    f"access. Add credits or a subscription to enable it at {billing_url}."
+                )
+        elif account_info.tool_gateway_entitled:
             return None
 
     if account_info is None:
@@ -160,7 +208,7 @@ def format_nous_portal_entitlement_message(
             return (
                 f"Nous inference credentials are configured, but Hermes cannot verify "
                 f"your Nous Portal paid access for {capability}. Log in with "
-                f"`hermes model` to enable Nous model access. Billing and "
+                f"`hermes model` to enable Portal-managed features. Billing and "
                 f"credits are managed at {billing_url}."
             )
         return (
@@ -567,6 +615,7 @@ def _info_from_valid_jwt(
         expires_at=datetime.fromtimestamp(exp, tz=timezone.utc),
         paid_service_access=paid_access,
         paid_service_access_info=access_info,
+        tool_access=_tool_access_from_value(claims.get("tool_access")),
         raw_claims=dict(claims),
     )
 
@@ -604,8 +653,23 @@ def _info_from_account_payload(
         subscription=subscription,
         paid_service_access=paid_access,
         paid_service_access_info=access,
+        tool_access=_tool_access_from_value(payload.get("tool_access")),
         raw_account=dict(payload),
     )
+
+
+def _tool_access_from_value(value: Any) -> Optional[NousToolAccessInfo]:
+    """Parse the Portal's JWT/account ``tool_access`` object, failing closed."""
+    if not isinstance(value, dict):
+        return None
+    enabled = _coerce_bool(value.get("enabled")) is True
+    raw_coverage = value.get("coverage")
+    coverage: dict[str, bool] = {}
+    if isinstance(raw_coverage, dict):
+        for key, item in raw_coverage.items():
+            if isinstance(key, str):
+                coverage[key] = item is True
+    return NousToolAccessInfo(enabled=enabled, coverage=coverage)
 
 
 def _subscription_from_payload(value: Any) -> Optional[NousPortalSubscriptionInfo]:

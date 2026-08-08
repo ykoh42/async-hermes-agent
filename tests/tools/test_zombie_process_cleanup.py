@@ -17,7 +17,7 @@ async def test_cleanup_vm_terminates_background_process(tmp_path):
         )
     )
     pid = result["pid"]
-    session = process_registry.get(result["session_id"])
+    session = await process_registry.get(result["session_id"])
     assert session is not None
     assert session.pid == pid
     assert session.process is not None
@@ -41,3 +41,31 @@ async def test_background_process_reaper_removes_natural_exit(tmp_path):
     assert finished["status"] == "exited"
     assert result["session_id"] not in process_registry.snapshot_running_ids(task_id)
     await terminal.cleanup_vm(task_id)
+
+
+@pytest.mark.asyncio
+async def test_cleanup_all_environments_reaps_every_active_task(tmp_path):
+    task_ids = {"background-cleanup-all-a", "background-cleanup-all-b"}
+    started = {}
+    for task_id in task_ids:
+        started[task_id] = (
+            json.loads(
+                await terminal.terminal_tool(
+                    "sleep 30",
+                    background=True,
+                    workdir=str(tmp_path),
+                    task_id=task_id,
+                )
+            )
+        )
+
+    try:
+        cleaned = await terminal.cleanup_all_environments()
+        assert cleaned == len(task_ids)
+        assert all(
+            item["session_id"] not in process_registry.snapshot_running_ids(task_id)
+            for task_id, item in started.items()
+        )
+    finally:
+        for task_id in task_ids:
+            await terminal.cleanup_vm(task_id)

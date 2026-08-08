@@ -173,6 +173,42 @@ async def test_memory_manager_timeout_does_not_block_event_loop():
 
 
 @pytest.mark.asyncio
+async def test_prefetch_timeout_does_not_overlap_uncancellable_provider():
+    started = asyncio.Event()
+    release = asyncio.Event()
+    finished = asyncio.Event()
+
+    class _UncooperativeProvider(_Provider):
+        async def prefetch(self, query, *, session_id=""):
+            started.set()
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                # A real provider may be in a cancellation boundary that
+                # cannot finish immediately.  The manager must still return
+                # at its timeout and suppress overlapping calls.
+                await release.wait()
+            self.events.append(("prefetch", query, session_id))
+            finished.set()
+            return "late"
+
+    manager = MemoryManager(external_prefetch_timeout=0.01)
+    provider = _UncooperativeProvider()
+    manager.add_provider(provider)
+
+    first = asyncio.create_task(manager.prefetch_all("first"))
+    await started.wait()
+    await asyncio.wait_for(first, timeout=0.2)
+    assert first.result() == ""
+    assert await manager.prefetch_all("second") == ""
+    assert [event[1] for event in provider.events if event[0] == "prefetch"] == []
+
+    release.set()
+    await asyncio.wait_for(finished.wait(), timeout=0.2)
+    assert await manager.prefetch_all("third") == "late"
+
+
+@pytest.mark.asyncio
 async def test_memory_manager_shutdown_drains_then_closes_provider():
     manager = MemoryManager()
     provider = _Provider()

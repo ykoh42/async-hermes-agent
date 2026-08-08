@@ -79,6 +79,35 @@ DEFAULT_FETCH_TIMEOUT_SECONDS = 120.0
 DEFAULT_CLI_TIMEOUT_SECONDS = 30.0
 
 
+async def communicate_subprocess(
+    process: asyncio.subprocess.Process,
+    *,
+    timeout: float,
+    timeout_message: str,
+) -> tuple[bytes, bytes]:
+    """Drain a child process and reap it on timeout or cancellation.
+
+    Timeout handling deliberately leaves the ``except`` block before awaiting
+    ``wait()``.  That keeps the original timeout available for exception
+    chaining while external cancellation at the cleanup checkpoint continues
+    to propagate as ``CancelledError``.
+    """
+    timeout_error: TimeoutError | None = None
+    try:
+        async with asyncio.timeout(timeout):
+            return await process.communicate()
+    except TimeoutError as exc:
+        timeout_error = exc
+    except asyncio.CancelledError:
+        process.kill()
+        await process.wait()
+        raise
+
+    process.kill()
+    await process.wait()
+    raise RuntimeError(timeout_message) from timeout_error
+
+
 class ErrorKind(str, Enum):
     """Machine-readable failure taxonomy for :class:`FetchResult.error`.
 
@@ -339,19 +368,13 @@ async def run_secret_cli(
             f"failed to invoke {Path(str(argv[0])).name}: {exc}"
         ) from exc
 
-    try:
-        async with asyncio.timeout(timeout):
-            stdout_bytes, stderr_bytes = await proc.communicate()
-    except TimeoutError as exc:
-        proc.kill()
-        await proc.wait()
-        raise RuntimeError(
+    stdout_bytes, stderr_bytes = await communicate_subprocess(
+        proc,
+        timeout=timeout,
+        timeout_message=(
             f"{Path(str(argv[0])).name} timed out after {timeout:.0f}s"
-        ) from exc
-    except asyncio.CancelledError:
-        proc.kill()
-        await proc.wait()
-        raise
+        ),
+    )
 
     stdout = stdout_bytes.decode("utf-8", errors="replace")
     stderr = scrub_ansi(stderr_bytes.decode("utf-8", errors="replace"))

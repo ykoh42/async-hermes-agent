@@ -227,7 +227,7 @@ async def load_website_blocklist(config_path: Optional[Path] = None) -> Dict[str
             continue
         path = Path(shared_file).expanduser()
         if not path.is_absolute():
-            path = Path(os.path.abspath(get_hermes_home() / path))
+            path = get_hermes_home() / path
         try:
             async with aiofiles.open(path, encoding="utf-8") as handle:
                 raw_rules = (await handle.read()).splitlines()

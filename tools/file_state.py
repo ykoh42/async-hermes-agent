@@ -242,6 +242,10 @@ class FileStateRegistry:
         self._last_writer.clear()
         self._path_locks.clear()
 
+    def clear_task(self, task_id: str) -> None:
+        """Drop read stamps owned by a task whose environment was closed."""
+        self._reads.pop(task_id, None)
+
 
 # ── Module-level singleton + helpers ─────────────────────────────────
 _registry = FileStateRegistry()

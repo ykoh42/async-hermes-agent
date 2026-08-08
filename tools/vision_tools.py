@@ -203,8 +203,14 @@ async def _rasterize_svg_to_png(svg_path: Path, out_path: Path) -> bool:
             )
             try:
                 await asyncio.wait_for(process.communicate(), timeout=30)
+            except asyncio.CancelledError:
+                if process.returncode is None:
+                    process.kill()
+                await process.wait()
+                raise
             except TimeoutError:
-                process.kill()
+                if process.returncode is None:
+                    process.kill()
                 await process.wait()
                 continue
             if process.returncode == 0 and bool(
@@ -1173,10 +1179,13 @@ async def vision_analyze_tool(
             call_kwargs["model"] = model
         _load_auxiliary_client()
         # Try full-size image first; on size-related rejection, downscale and retry.
+        api_error: Exception | None = None
         try:
             response = await call_llm(**call_kwargs)
         except Exception as _api_err:
-            if (_is_image_size_error(_api_err)
+            api_error = _api_err
+        if api_error is not None:
+            if (_is_image_size_error(api_error)
                     and len(image_data_url) > _RESIZE_TARGET_BYTES):
                 logger.info(
                     "API rejected image (%.1f MB, likely too large); "
@@ -1189,7 +1198,7 @@ async def vision_analyze_tool(
                 messages[0]["content"][1]["image_url"]["url"] = image_data_url
                 response = await call_llm(**call_kwargs)
             else:
-                raise
+                raise api_error
         
         # Extract the analysis — fall back to reasoning if content is empty
         analysis = extract_content_or_reasoning(response)

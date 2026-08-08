@@ -37,11 +37,16 @@ tool → observation → final-answer turn on that target.
 
 ## Supported installation methods
 
-The documented release path is PyPI. Pin the package version in production:
+The currently verified release path is the immutable GitHub tag. Pin the
+package version in production:
 
 ```bash
-uv pip install "async-hermes-agent==0.20.4"
+uv pip install "git+https://github.com/ykoh42/async-hermes-agent.git@v0.20.4"
 ```
+
+The package metadata for this release is `async-hermes-agent==0.20.4`.
+Use the PyPI path only after `async-hermes-agent` is visible on PyPI and the
+clean-install check has passed.
 
 Installing a Git tag or source checkout is also supported. This site does not
 claim a Homebrew, desktop-installer, container-image, or system-service

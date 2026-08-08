@@ -85,7 +85,7 @@ async def _find_git_root(start: Path) -> Optional[Path]:
     # ``Path.resolve()`` may stat each path component.  The async existence
     # checks below must own filesystem access, so keep path normalization
     # lexical here.
-    current = start.absolute()
+    current = start if start.is_absolute() else Path(await aiofiles.os.getcwd()) / start
     for parent in [current, *current.parents]:
         if await aiofiles.os.path.exists(parent / ".git"):
             return parent
@@ -103,7 +103,7 @@ async def _find_hermes_md(cwd: Path) -> Optional[Path]:
     ``None`` if nothing is found.
     """
     stop_at = await _find_git_root(cwd)
-    current = cwd.absolute()
+    current = cwd if cwd.is_absolute() else Path(await aiofiles.os.getcwd()) / cwd
 
     # When there is no git root, only check cwd itself – walking parents
     # could pick up a .hermes.md planted in /tmp, /home, etc.
@@ -613,6 +613,21 @@ def clear_skills_system_prompt_cache(*, clear_snapshot: bool = False) -> None:
             _skills_prompt_snapshot_path().unlink(missing_ok=True)
         except OSError as e:
             logger.debug("Could not remove skills prompt snapshot: %s", e)
+
+
+async def _clear_skills_prompt_snapshot() -> None:
+    """Remove the on-disk skills snapshot at an awaited lifecycle boundary.
+
+    ``clear_skills_system_prompt_cache`` remains synchronous for setup and
+    compatibility callers.  Runtime tool mutation uses this coroutine so a
+    successful skill edit never performs a blocking unlink on the event loop.
+    """
+    try:
+        await aiofiles.os.remove(_skills_prompt_snapshot_path())
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        logger.debug("Could not remove skills prompt snapshot: %s", exc)
 
 
 

@@ -1216,6 +1216,7 @@ class _CodexCompletionsAdapter:
             )
             return await run_codex_stream(sink, resp_kwargs, client=self._client)
 
+        timeout_error: TimeoutError | None = None
         try:
             if total_timeout is None:
                 final = await _consume()
@@ -1225,6 +1226,9 @@ class _CodexCompletionsAdapter:
                 async with asyncio.timeout(float(total_timeout)):
                     final = await _consume()
         except TimeoutError as exc:
+            timeout_error = exc
+
+        if timeout_error is not None:
             close = getattr(self._client, "aclose", None) or getattr(
                 self._client, "close", None
             )
@@ -1233,7 +1237,7 @@ class _CodexCompletionsAdapter:
             await _evict_cached_client_instance(self._client)
             raise TimeoutError(
                 f"Codex auxiliary Responses stream exceeded {float(total_timeout):.1f}s total timeout"
-            ) from exc
+            ) from timeout_error
 
         if final is None:
             raise RuntimeError(
@@ -1654,7 +1658,7 @@ async def _maybe_wrap_anthropic(
     - It's already an Anthropic/Codex/Gemini/CopilotACP wrapper.
     - The endpoint is an OpenAI-wire endpoint.
     - ``api_mode`` is explicitly set to a non-Anthropic transport.
-    - The ``anthropic`` SDK is not installed (falls back to OpenAI wire).
+    - The native Anthropic SDK is unavailable (raises a clear ImportError).
     """
     # Already wrapped — don't double-wrap.
     if _safe_isinstance(client_obj, AnthropicAuxiliaryClient):
@@ -1683,8 +1687,12 @@ async def _maybe_wrap_anthropic(
         return client_obj
 
     try:
-        from agent.anthropic_adapter import build_anthropic_client
+        from agent.anthropic_adapter import (
+            build_anthropic_client,
+            ensure_claude_code_version,
+        )
 
+        await ensure_claude_code_version()
         real_client = build_anthropic_client(api_key, base_url)
     except ImportError as exc:
         raise ImportError(
@@ -2710,17 +2718,20 @@ async def _try_custom_endpoint(
         # LiteLLM proxies, etc.).  Must NEVER be treated as OAuth —
         # Anthropic OAuth claims only apply to api.anthropic.com.
         try:
-            from agent.anthropic_adapter import build_anthropic_client
-
-            real_client = build_anthropic_client(custom_key, custom_base)
-        except ImportError:
-            logger.warning(
-                "Custom endpoint declares api_mode=anthropic_messages but the "
-                "anthropic SDK is not installed — falling back to OpenAI-wire."
+            from agent.anthropic_adapter import (
+                build_anthropic_client,
+                ensure_claude_code_version,
             )
-            return await _create_openai_client(
-                api_key=custom_key, base_url=_clean_base, config=config, **_extra
-            ), model
+
+            await ensure_claude_code_version()
+            real_client = build_anthropic_client(custom_key, custom_base)
+        except ImportError as exc:
+            raise ImportError(
+                "Custom endpoint declares api_mode=anthropic_messages, but the "
+                "native async Anthropic transport is unavailable. Install "
+                "async-hermes-agent[anthropic] instead of falling back to the "
+                "incompatible OpenAI wire format."
+            ) from exc
         return (
             AnthropicAuxiliaryClient(
                 real_client, model, custom_key, custom_base, is_oauth=False
@@ -2923,31 +2934,38 @@ async def _try_azure_foundry(
         extra["default_query"] = _dq
 
     if runtime_api_mode == "anthropic_messages":
+        client_error: Exception | None = None
         try:
-            return await _maybe_wrap_anthropic(
+            anthropic_client = await _maybe_wrap_anthropic(
                 None,
                 final_model,
                 api_key,
                 base_url,
                 runtime_api_mode,
-            ), final_model
-        except Exception:
+            )
+        except Exception as exc:
+            client_error = exc
+        if client_error is not None:
             if callable(api_key) and not isinstance(api_key, str):
                 from agent.azure_identity_adapter import _release_token_provider
 
                 await _release_token_provider(api_key)
-            raise
+            raise client_error
+        return anthropic_client, final_model
 
+    client_error = None
     try:
         client = await _create_openai_client(
             api_key=api_key, base_url=_clean_base, config=config, **extra
         )
-    except Exception:
+    except Exception as exc:
+        client_error = exc
+    if client_error is not None:
         if callable(api_key) and not isinstance(api_key, str):
             from agent.azure_identity_adapter import _release_token_provider
 
             await _release_token_provider(api_key)
-        raise
+        raise client_error
 
     if runtime_api_mode == "codex_responses":
         # GPT-5.x / o-series / codex models on Azure Foundry are
@@ -2969,11 +2987,15 @@ async def _try_anthropic(
         from agent.anthropic_adapter import (
             _is_oauth_token,
             build_anthropic_client,
+            ensure_claude_code_version,
             resolve_anthropic_token,
         )
         from agent.credential_pool import load_pool
-    except ImportError:
-        return None, None
+    except ImportError as exc:
+        raise ImportError(
+            "The Anthropic provider requires the native async transport. "
+            "Install async-hermes-agent[anthropic]."
+        ) from exc
 
     entry = None
     try:
@@ -2999,9 +3021,13 @@ async def _try_anthropic(
         model or _get_aux_model_for_provider("anthropic") or "claude-haiku-4-5-20251001"
     )
     try:
+        await ensure_claude_code_version()
         real_client = build_anthropic_client(token, resolved_base_url)
-    except ImportError:
-        return None, None
+    except ImportError as exc:
+        raise ImportError(
+            "The Anthropic provider requires the native async transport. "
+            "Install async-hermes-agent[anthropic]."
+        ) from exc
     return (
         AnthropicAuxiliaryClient(
             real_client,
@@ -5288,7 +5314,10 @@ async def resolve_provider_client(
         return client, final_model
 
     if provider == "minimax-oauth":
-        from agent.anthropic_adapter import build_anthropic_client
+        from agent.anthropic_adapter import (
+            build_anthropic_client,
+            ensure_claude_code_version,
+        )
         from hermes_cli.auth import resolve_minimax_oauth_runtime_credentials
 
         credentials = await resolve_minimax_oauth_runtime_credentials()
@@ -5298,6 +5327,7 @@ async def resolve_provider_client(
             model or _get_aux_model_for_provider(provider),
             provider,
         )
+        await ensure_claude_code_version()
         real_client = build_anthropic_client(token, base_url)
         return (
             AnthropicAuxiliaryClient(
@@ -5486,34 +5516,21 @@ async def resolve_provider_client(
                 # branch in _try_custom_endpoint(). See #15033.
                 if entry_api_mode == "anthropic_messages":
                     try:
-                        from agent.anthropic_adapter import build_anthropic_client
+                        from agent.anthropic_adapter import (
+                            build_anthropic_client,
+                            ensure_claude_code_version,
+                        )
 
+                        await ensure_claude_code_version()
                         real_client = build_anthropic_client(custom_key, custom_base)
-                    except ImportError:
-                        logger.warning(
-                            "Named custom provider %r declares api_mode="
-                            "anthropic_messages but the anthropic SDK is not "
-                            "installed — falling back to OpenAI-wire.",
-                            provider,
-                        )
-                        # Fallback went OpenAI-wire after all — redo the query
-                        # extraction against the rewritten /v1 URL.
-                        _fallback_base = _to_openai_base_url(custom_base)
-                        _fb_clean, _fb_dq = _extract_url_query_params(_fallback_base)
-                        _fb_extra = {"default_query": _fb_dq} if _fb_dq else {}
-                        _fb_headers = _apply_user_default_headers(
-                            _fb_extra.get("default_headers"),
-                            config=config,
-                        )
-                        if _fb_headers:
-                            _fb_extra["default_headers"] = _fb_headers
-                        client = await _create_openai_client(
-                            api_key=custom_key,
-                            base_url=_fb_clean,
-                            config=config,
-                            **_fb_extra,
-                        )
-                        return client, final_model
+                    except ImportError as exc:
+                        raise ImportError(
+                            f"Named custom provider {provider!r} declares "
+                            "api_mode=anthropic_messages, but the native async "
+                            "Anthropic transport is unavailable. Install "
+                            "async-hermes-agent[anthropic] instead of falling "
+                            "back to the incompatible OpenAI wire format."
+                        ) from exc
                     sync_anthropic = AnthropicAuxiliaryClient(
                         real_client,
                         final_model,
@@ -8155,6 +8172,7 @@ async def call_llm(
             kwargs["stream_options"] = dict(stream_options)
         return await client.chat.completions.create(**kwargs)
 
+    first_err: Exception | None = None
     try:
         # Retry ONCE on the same provider for a transient transport blip
         # before the except-chain escalates to fallback — see call_llm()
@@ -8197,7 +8215,10 @@ async def call_llm(
                 transient_err,
             )
             return await _validate_llm_response(await _create(kwargs), task)
-    except Exception as first_err:
+    except Exception as caught:
+        first_err = caught
+
+    if first_err is not None:
         if "temperature" in kwargs and _is_unsupported_temperature_error(first_err):
             retry_kwargs = dict(kwargs)
             retry_kwargs.pop("temperature", None)
@@ -8414,6 +8435,7 @@ async def call_llm(
                     pool_provider,
                     type(recovery_err).__name__,
                 )
+                retry2_err: Exception | None = None
                 try:
                     return await _retry_same_provider(
                         task=task,
@@ -8432,7 +8454,9 @@ async def call_llm(
                         reasoning_config=reasoning_config,
                         config=config_snapshot,
                     )
-                except Exception as retry2_err:
+                except Exception as caught_retry2:
+                    retry2_err = caught_retry2
+                if retry2_err is not None:
                     if (
                         _is_payment_error(retry2_err)
                         or _is_auth_error(retry2_err)
@@ -8441,7 +8465,7 @@ async def call_llm(
                         await _recover_provider_pool(pool_provider, retry2_err)
                         first_err = retry2_err
                     else:
-                        raise
+                        raise retry2_err
 
         # ── Payment / connection / rate-limit fallback ───────────────
         # Auth error fallback (#21165): a 401 that survived the refresh path
@@ -8608,4 +8632,4 @@ async def call_llm(
                     "Auxiliary (async): cache eviction after connection error failed",
                     exc_info=True,
                 )
-        raise
+        raise first_err

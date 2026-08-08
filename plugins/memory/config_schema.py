@@ -25,6 +25,8 @@ import importlib.util
 import logging
 from dataclasses import dataclass, field as dataclass_field
 
+import aiofiles
+
 _log = logging.getLogger(__name__)
 
 # Field kinds understood by the generic renderer.
@@ -137,7 +139,10 @@ async def get_provider_config_schema(name: str) -> ProviderConfigSchema | None:
     try:
         spec = importlib.util.spec_from_file_location(f"_hermes_memory_config_schema.{name}", path)
         module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
+        async with aiofiles.open(path, mode="rb") as handle:
+            source_bytes = await handle.read()
+        source = importlib.util.decode_source(source_bytes)
+        exec(compile(source, str(path), "exec"), module.__dict__)
         schema = getattr(module, "CONFIG_SCHEMA", None)
     except Exception:
         # Never cache a failed load: it would pin an empty panel until restart.

@@ -707,7 +707,11 @@ class BatchRunner:
                 "last_updated": None
             }
     
-    async def _save_checkpoint(self, checkpoint_data: Dict[str, Any]):
+    async def _save_checkpoint(
+        self,
+        checkpoint_data: Dict[str, Any],
+        lock: Optional[asyncio.Lock] = None,
+    ):
         """
         Save checkpoint data.
         
@@ -715,7 +719,13 @@ class BatchRunner:
             checkpoint_data (Dict): Checkpoint data to save
         """
         checkpoint_data["last_updated"] = datetime.now().isoformat()
-        await _atomic_json_write(self.checkpoint_file, checkpoint_data)
+        if lock is None:
+            await _atomic_json_write(self.checkpoint_file, checkpoint_data)
+            return
+        if not isinstance(lock, asyncio.Lock):
+            raise TypeError("checkpoint lock must be an asyncio.Lock")
+        async with lock:
+            await _atomic_json_write(self.checkpoint_file, checkpoint_data)
     
     async def _scan_completed_prompts_by_content(self) -> set:
         """

@@ -31,7 +31,6 @@ home for these non-secret settings.
 from __future__ import annotations
 
 import asyncio
-import importlib.util
 import json
 import logging
 import os
@@ -45,6 +44,7 @@ import aiofiles.os
 
 from agent.memory_provider import MemoryProvider
 from agent.secret_scope import get_secret
+from hermes_cli.async_source_loader import locate_source_module
 from tools.registry import tool_error
 
 logger = logging.getLogger(__name__)
@@ -227,7 +227,7 @@ class Mem0MemoryProvider(MemoryProvider):
         if mode == "oss":
             return bool(
                 cfg.get("oss", {}).get("vector_store")
-                and importlib.util.find_spec("mem0")
+                and await locate_source_module("mem0")
             )
         # Platform needs an api_key; self-hosted needs a host (api_key optional
         # when the server runs with AUTH_DISABLED).

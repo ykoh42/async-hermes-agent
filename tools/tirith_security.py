@@ -851,6 +851,7 @@ async def check_command_security(command: str) -> dict:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
+        timed_out = False
         try:
             stdout_bytes, _ = await asyncio.wait_for(
                 process.communicate(),
@@ -861,9 +862,12 @@ async def check_command_security(command: str) -> dict:
             await process.wait()
             raise
         except TimeoutError:
+            timed_out = True
+
+        if timed_out:
             process.kill()
             await process.wait()
-            raise
+            raise TimeoutError
     except OSError as exc:
         # Covers FileNotFoundError, PermissionError, exec format error.
         # Dedupe by ``(errno, exc class)`` so a transient failure mode

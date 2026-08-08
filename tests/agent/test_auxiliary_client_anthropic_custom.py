@@ -64,8 +64,8 @@ async def test_custom_endpoint_anthropic_messages_builds_anthropic_wrapper():
 
 
 @pytest.mark.asyncio
-async def test_custom_endpoint_anthropic_messages_falls_back_when_sdk_missing():
-    """Graceful degradation when anthropic SDK is unavailable."""
+async def test_custom_endpoint_anthropic_messages_fails_when_sdk_missing():
+    """A missing native transport must not send the wrong wire format."""
     from agent.auxiliary_client import _try_custom_endpoint
 
     import_error = ImportError("anthropic package not installed")
@@ -84,15 +84,8 @@ async def test_custom_endpoint_anthropic_messages_falls_back_when_sdk_missing():
         "agent.anthropic_adapter.build_anthropic_client",
         side_effect=import_error,
     ):
-        client, model = await _try_custom_endpoint()
-
-    # Should fall back to an OpenAI-wire client rather than returning
-    # (None, None) — the tool still needs to do *something*.
-    assert client is not None
-    assert model == "claude-sonnet-4-6"
-    # OpenAI client, not AnthropicAuxiliaryClient.
-    from agent.auxiliary_client import AnthropicAuxiliaryClient
-    assert not isinstance(client, AnthropicAuxiliaryClient)
+        with pytest.raises(ImportError, match="native async Anthropic transport"):
+            await _try_custom_endpoint()
 
 
 @pytest.mark.asyncio

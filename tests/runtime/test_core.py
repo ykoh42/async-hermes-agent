@@ -3913,7 +3913,7 @@ async def test_native_background_terminal_process_is_reaped_at_cleanup():
         await terminal_module.terminal_tool(command, background=True, task_id=task_id)
     )
     assert started["output"] == "Background process started"
-    session = process_module.process_registry.get(started["session_id"])
+    session = await process_module.process_registry.get(started["session_id"])
     assert session is not None
     assert session.process is not None
 

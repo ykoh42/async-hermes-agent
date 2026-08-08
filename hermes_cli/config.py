@@ -3706,7 +3706,6 @@ def _inject_profile_env_vars() -> None:
     global _profile_env_vars_injected
     if _profile_env_vars_injected:
         return
-    _profile_env_vars_injected = True
     try:
         from providers import list_providers
         for _pp in list_providers():
@@ -3724,9 +3723,15 @@ def _inject_profile_env_vars() -> None:
                     "category": "provider",
                     "advanced": True,
                 }
+        _profile_env_vars_injected = True
     except Exception:
-        pass
+        # Provider discovery is an awaited runtime boundary.  When this
+        # module is imported from an active event loop, leave the sentinel
+        # unset so the deferred runtime can retry after discovery completes.
+        return
 
 
-# Eagerly inject so that OPTIONAL_ENV_VARS is fully populated at import time.
+# Populate immediately for synchronous CLI/config callers.  Async agent
+# construction may defer this until provider discovery has crossed its
+# awaited boundary.
 _inject_profile_env_vars()

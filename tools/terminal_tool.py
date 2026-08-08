@@ -414,18 +414,33 @@ async def cleanup_vm(task_id: str, *, force_remove: bool = False) -> None:
     with _env_lock:
         env = _active_environments.pop(key, None)
         _last_activity.pop(key, None)
+    with _creation_locks_lock:
+        for per_loop in list(_creation_locks.values()):
+            per_loop.pop(key, None)
     if env is not None:
         await record_session_cwd(key, env.cwd)
+    try:
+        from tools.file_tools import clear_file_ops_cache
+
+        clear_file_ops_cache(key)
+    except Exception:
+        logger.debug("Unable to clear file-operations cache for %s", key, exc_info=True)
 
 
-async def cleanup_all_environments() -> None:  # noqa: ASYNC124 - lifecycle API
+async def cleanup_all_environments() -> int:  # noqa: ASYNC124 - lifecycle API
+    """Clean up every active local environment and its tracked processes."""
     with _env_lock:
-        for key, env in list(_active_environments.items()):
-            _session_cwds[key] = os.path.normpath(  # noqa: ASYNC240 - lexical only
-                env.cwd
-            )
-        _active_environments.clear()
-        _last_activity.clear()
+        task_ids = tuple(_active_environments)
+    cleaned = 0
+    for task_id in task_ids:
+        try:
+            await cleanup_vm(task_id)
+            cleaned += 1
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.error("Error cleaning %s", task_id, exc_info=True)
+    return cleaned
 
 
 
@@ -580,13 +595,38 @@ async def terminal_tool(  # noqa: ASYNC109 - upstream public API names timeout
                 payload["pty_note"] = (
                     "PTY disabled for this command because it expects piped stdin/EOF."
                 )
-            if notify_on_complete or watch_patterns:
-                payload["notify_on_complete"] = False
-                payload["notify_unsupported"] = (
-                    "notify_on_complete / watch_patterns are not available in this "
-                    "library session. The process is running; retrieve its result "
-                    "with process(action='poll') or process(action='wait')."
+            if notify_on_complete and watch_patterns:
+                watch_patterns = None
+                payload["watch_patterns_ignored"] = (
+                    "watch_patterns ignored because notify_on_complete=True; "
+                    "the two notification modes are mutually exclusive."
                 )
+            if notify_on_complete:
+                process_session.notify_on_complete = True
+                payload["notify_on_complete"] = True
+                payload["hint"] = (
+                    "Hermes will queue exactly one notification when this process "
+                    "finishes. You can continue with other work."
+                )
+                process_registry.pending_watchers.append(
+                    {
+                        "session_id": process_session.id,
+                        "check_interval": 5,
+                        "session_key": process_session.session_key,
+                        "notify_on_complete": True,
+                    }
+                )
+            elif watch_patterns:
+                process_session.watch_patterns = [
+                    str(pattern)
+                    for pattern in watch_patterns
+                    if isinstance(pattern, str) and pattern
+                ]
+                payload["watch_patterns"] = process_session.watch_patterns
+            if notify_on_complete or process_session.watch_patterns:
+                if process_session.exited and notify_on_complete:
+                    process_registry._enqueue_completion(process_session)
+                await process_registry._write_checkpoint()
             return json.dumps(payload, ensure_ascii=False)
 
         starting_cwd = env.cwd

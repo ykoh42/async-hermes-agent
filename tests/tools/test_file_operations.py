@@ -5,6 +5,8 @@ import os
 
 import pytest
 
+from agent.file_safety import is_write_denied
+
 from tools.file_operations import (
     LintResult,
     PatchResult,
@@ -47,6 +49,52 @@ def test_read_pagination_clamps_invalid_values():
     offset, limit = normalize_read_pagination("bad", -5)
     assert offset == 1
     assert limit == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "relative_path",
+    [
+        ".ssh/authorized_keys",
+        ".netrc",
+        ".pgpass",
+        ".npmrc",
+        ".pypirc",
+        ".aws/credentials",
+    ],
+)
+async def test_upstream_sensitive_home_paths_are_write_denied(
+    tmp_path, monkeypatch, relative_path
+):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    assert await is_write_denied(str(tmp_path / relative_path))
+
+
+@pytest.mark.asyncio
+async def test_upstream_oauth_path_is_write_denied(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    assert await is_write_denied(str(tmp_path / ".anthropic_oauth.json"))
+
+
+@pytest.mark.asyncio
+async def test_upstream_profile_and_root_token_pairing_paths_are_denied(
+    tmp_path, monkeypatch
+):
+    root = tmp_path / "hermes"
+    profile = root / "profiles" / "coder"
+    profile.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+
+    for path in (
+        profile / "mcp-tokens" / "tok.json",
+        root / "mcp-tokens" / "tok.json",
+        root / "mcp-tokens",
+        profile / "pairing" / "telegram-approved.json",
+        profile / "pairing",
+        root / "pairing" / "telegram-approved.json",
+        root / "pairing",
+    ):
+        assert await is_write_denied(str(path)), path
 
 
 @pytest.mark.asyncio
@@ -98,6 +146,20 @@ async def test_atomic_write_through_broken_symlink_creates_target(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_overwrite_preserves_existing_mode(tmp_path):
+    from tools.file_tools import write_file_tool
+
+    target = tmp_path / "executable.sh"
+    target.write_text("old\n")
+    target.chmod(0o751)
+
+    result = json.loads(await write_file_tool(str(target), "new\n"))
+
+    assert "error" not in result
+    assert target.stat().st_mode & 0o777 == 0o751
+
+
+@pytest.mark.asyncio
 async def test_non_utf8_content_is_reported_as_binary(tmp_path):
     from tools.file_tools import read_file_tool
 
@@ -108,3 +170,17 @@ async def test_non_utf8_content_is_reported_as_binary(tmp_path):
 
     assert result["is_binary"] is True
     assert "Binary file" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_plain_utf8_content_is_not_reported_as_binary(tmp_path):
+    from tools.file_tools import read_file_tool
+
+    target = tmp_path / "utf8.txt"
+    target.write_text("café résumé\n")
+
+    result = json.loads(await read_file_tool(str(target)))
+
+    assert "error" not in result
+    assert result.get("is_binary") is not True
+    assert result["content"] == "1|café résumé"

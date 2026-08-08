@@ -364,6 +364,134 @@ class TestPluginDiscovery:
 class TestPluginLoading:
     """Tests for plugin module loading."""
 
+    @pytest.mark.asyncio
+    async def test_relative_imports_use_async_source_loader(self, tmp_path, monkeypatch):
+        """A plugin's lazy relative import must not invoke SourceFileLoader."""
+        from importlib._bootstrap_external import SourceFileLoader
+        from hermes_cli.async_source_loader import unload_source_finder
+
+        plugin_dir = tmp_path / "relative_plugin"
+        plugin_dir.mkdir()
+        (plugin_dir / "helper.py").write_text("VALUE = 'from-helper'\n")
+        (plugin_dir / "__init__.py").write_text(
+            "from .helper import VALUE\n"
+            "def register(ctx):\n"
+            "    ctx.register_hook('pre_llm_call', lambda **kwargs: VALUE)\n"
+        )
+        manifest = PluginManifest(
+            name="relative-plugin",
+            source="user",
+            path=str(plugin_dir),
+            kind="standalone",
+            key="relative-plugin",
+        )
+
+        original_get_data = SourceFileLoader.get_data
+
+        def reject_plugin_sync_reads(loader, path):
+            if str(path).startswith(str(plugin_dir)):
+                raise AssertionError(f"synchronous plugin read: {path}")
+            return original_get_data(loader, path)
+
+        monkeypatch.setattr(SourceFileLoader, "get_data", reject_plugin_sync_reads)
+        manager = PluginManager()
+        module = await manager._load_directory_module(manifest)
+        try:
+            assert module.VALUE == "from-helper"
+            assert "hermes_plugins.relative_plugin.helper" in sys.modules
+        finally:
+            unload_source_finder(module)
+            for name in tuple(sys.modules):
+                if name.startswith("hermes_plugins.relative_plugin"):
+                    sys.modules.pop(name, None)
+
+    @pytest.mark.asyncio
+    async def test_nested_relative_imports_use_async_source_loader(
+        self, tmp_path, monkeypatch
+    ):
+        """Nested plugin packages must not fall back to synchronous source I/O."""
+        from importlib._bootstrap_external import SourceFileLoader
+        from hermes_cli.async_source_loader import unload_source_finder
+
+        plugin_dir = tmp_path / "nested_relative_plugin"
+        nested_dir = plugin_dir / "subpkg"
+        nested_dir.mkdir(parents=True)
+        (nested_dir / "helper.py").write_text("VALUE = 'from-nested-helper'\n")
+        (nested_dir / "__init__.py").write_text(
+            "from .helper import VALUE\n"
+        )
+        (plugin_dir / "__init__.py").write_text(
+            "from .subpkg import VALUE\n"
+            "def register(ctx):\n"
+            "    ctx.register_hook('pre_llm_call', lambda **kwargs: VALUE)\n"
+        )
+        manifest = PluginManifest(
+            name="nested-relative-plugin",
+            source="user",
+            path=str(plugin_dir),
+            kind="standalone",
+            key="nested-relative-plugin",
+        )
+
+        original_get_data = SourceFileLoader.get_data
+
+        def reject_plugin_sync_reads(loader, path):
+            if str(path).startswith(str(plugin_dir)):
+                raise AssertionError(f"synchronous plugin read: {path}")
+            return original_get_data(loader, path)
+
+        monkeypatch.setattr(SourceFileLoader, "get_data", reject_plugin_sync_reads)
+        manager = PluginManager()
+        module = await manager._load_directory_module(manifest)
+        try:
+            assert module.VALUE == "from-nested-helper"
+            assert "hermes_plugins.nested_relative_plugin.subpkg" in sys.modules
+            assert "hermes_plugins.nested_relative_plugin.subpkg.helper" in sys.modules
+        finally:
+            unload_source_finder(module)
+            for name in tuple(sys.modules):
+                if name.startswith("hermes_plugins.nested_relative_plugin"):
+                    sys.modules.pop(name, None)
+
+    @pytest.mark.asyncio
+    async def test_async_skill_registration_validates_path_after_register(
+        self, tmp_path, monkeypatch
+    ):
+        """Skill validation must not call synchronous Path.exists on the loop."""
+        missing = tmp_path / "missing" / "SKILL.md"
+        manager = PluginManager()
+        manifest = PluginManifest(
+            name="async-skill-plugin",
+            source="user",
+            kind="standalone",
+            key="async-skill-plugin",
+        )
+        module = types.ModuleType("hermes_plugins.async_skill_plugin")
+
+        def register(ctx):
+            ctx.register_skill("missing", missing)
+
+        module.register = register
+
+        async def load_module(_manifest):
+            return module
+
+        monkeypatch.setattr(manager, "_load_directory_module", load_module)
+        original_exists = Path.exists
+
+        def reject_sync_exists(path):
+            if path == missing:
+                raise AssertionError("synchronous skill path probe")
+            return original_exists(path)
+
+        monkeypatch.setattr(Path, "exists", reject_sync_exists)
+        await manager._load_plugin(manifest)
+
+        loaded = manager._plugins[manifest.key]
+        assert loaded.enabled is False
+        assert "SKILL.md not found" in (loaded.error or "")
+        assert "async-skill-plugin:missing" not in manager._plugin_skills
+
 
 
     @pytest.mark.asyncio
@@ -1124,11 +1252,9 @@ class TestPluginContextProfileName:
     def _ctx(self, profile_context=None):
         mgr = PluginManager()
         manifest = PluginManifest(name="test-plugin", source="user")
-        return PluginContext(
-            manifest,
-            mgr,
-            _profile_context=profile_context,
-        )
+        context = PluginContext(manifest, mgr)
+        context._profile_context = profile_context
+        return context
 
     @pytest.mark.asyncio
     async def test_default_profile(self, tmp_path, monkeypatch):

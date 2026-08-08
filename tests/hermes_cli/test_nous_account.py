@@ -296,12 +296,88 @@ async def test_pool_oauth_entry_force_fresh_uses_account_api(monkeypatch):
     assert info.credential_source == "pool:dashboard device_code"
 
 
+@pytest.mark.asyncio
+async def test_jwt_free_tool_pool_entitlement_preserves_upstream_categories(
+    monkeypatch,
+):
+    token = _jwt(
+        {
+            "sub": "user_123",
+            "org_id": "org_123",
+            "exp": int(time.time()) + 900,
+            "paid_access": False,
+            "tool_access": {
+                "enabled": True,
+                "coverage": {"fal": True, "fal-video": False},
+            },
+        }
+    )
+    monkeypatch.setattr(
+        "hermes_cli.auth.get_provider_auth_state",
+        AsyncMock(return_value=_state(token)),
+    )
+
+    info = await get_nous_portal_account_info()
+
+    assert info.paid_service_access is False
+    assert info.tool_gateway_entitled is True
+    assert info.tool_gateway_entitled_for("fal") is True
+    assert info.tool_gateway_entitled_for("fal-video") is False
+    assert (
+        format_nous_portal_entitlement_message(
+            info,
+            capability="image generation",
+            coverage_category="fal",
+        )
+        is None
+    )
+    uncovered = format_nous_portal_entitlement_message(
+        info,
+        capability="video generation",
+        coverage_category="fal-video",
+    )
+    assert uncovered is not None
+    assert "isn't included with your current Nous Portal access" in uncovered
+
+
+@pytest.mark.asyncio
+async def test_account_api_tool_access_parser_fails_closed(monkeypatch):
+    token = _jwt({"sub": "user_123", "exp": int(time.time()) + 900})
+    payload = _account_payload(
+        allowed=False,
+        subscription=None,
+        subscription_credits=0,
+        purchased_credits=0,
+    )
+    payload["tool_access"] = {
+        "enabled": True,
+        "coverage": {"fal": True, "fal-video": 1, 7: True},
+    }
+    monkeypatch.setattr(
+        "hermes_cli.auth.get_provider_auth_state",
+        AsyncMock(return_value=_state(token)),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.auth.resolve_nous_access_token",
+        AsyncMock(return_value="fresh-token"),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.nous_account._fetch_nous_account_info",
+        AsyncMock(return_value=payload),
+    )
+
+    info = await get_nous_portal_account_info(force_fresh=True)
+
+    assert info.tool_access is not None
+    assert info.tool_access.enabled is True
+    assert info.tool_access.coverage == {"fal": True, "fal-video": False}
+
+
 
 
 
 
 # ── org slug/name parsing + top-up URL builder ──────────────────────────────
-
 
 
 

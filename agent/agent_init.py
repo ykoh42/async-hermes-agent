@@ -508,9 +508,12 @@ def _provider_default_routes(provider: str) -> set[str]:
         pass
 
     try:
-        from providers import get_provider_profile
+        # Constructor state is synchronous and must not trigger plugin
+        # discovery.  The async runtime preloads the registry before profile
+        # lookups; consult only the already-populated maps here.
+        from providers import _ALIASES, _REGISTRY
 
-        profile = get_provider_profile(provider)
+        profile = _REGISTRY.get(_ALIASES.get(provider, provider))
         route = _normalize_route_base_url(
             getattr(profile, "base_url", "")
         )
@@ -1553,14 +1556,20 @@ def init_agent(
 
                 client_kwargs["default_headers"] = hermes_xai_default_headers()
             elif "default_headers" not in client_kwargs:
-                # Fall back to profile.default_headers for providers that
-                # declare custom headers (e.g. Vercel AI Gateway attribution,
-                # Kimi User-Agent on non-kimi.com endpoints).
+                # Preserve the upstream profile-declared header policy for
+                # synchronous callers while keeping async construction
+                # state-only.  The provider registry rejects an uninitialised
+                # synchronous lookup from an active loop, so that case simply
+                # waits for _initialize_deferred_runtime to apply the same
+                # policy after its awaited discovery boundary.
                 try:
                     from providers import get_provider_profile as _gpf
+
                     _ph = _gpf(agent.provider)
                     if _ph and _ph.default_headers:
                         client_kwargs["default_headers"] = dict(_ph.default_headers)
+                except RuntimeError:
+                    pass
                 except Exception:
                     pass
         else:
@@ -2770,7 +2779,7 @@ async def _select_context_engine(
         try:
             from plugins.context_engine import load_context_engine
 
-            selected_engine = load_context_engine(engine_name)
+            selected_engine = await load_context_engine(engine_name)
         except Exception as exc:
             logger.debug(
                 "Context engine load from plugins/context_engine/: %s",
@@ -3060,6 +3069,30 @@ async def _initialize_deferred_runtime(agent: Any) -> bool:
     ``AIAgent.__init__`` deliberately avoids credential file access and OAuth
     refresh. This function performs that work at the first awaited boundary.
     """
+    # Provider profile discovery scans plugin directories and executes their
+    # registration modules.  Keep that first filesystem boundary awaited so
+    # subsequent profile lookups are in-memory and cannot block this turn.
+    from providers import _ensure_provider_profiles_loaded
+
+    await _ensure_provider_profiles_loaded()
+
+    # Several historical helper registries derive their optional provider
+    # entries at import time.  Imports from an active event loop intentionally
+    # skip synchronous provider discovery; refresh those in-memory projections
+    # now that the awaited registry boundary has completed.
+    try:
+        from hermes_cli.config import _inject_profile_env_vars
+        from hermes_cli.auth import _inject_profile_provider_registry
+        from hermes_cli.models import _inject_profile_canonical_providers
+
+        _inject_profile_env_vars()
+        _inject_profile_provider_registry()
+        _inject_profile_canonical_providers()
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.debug("Dynamic provider registry refresh skipped", exc_info=True)
+
     pending = getattr(agent, "_deferred_provider_runtime", None)
 
     lock = getattr(agent, "_provider_init_lock", None)
@@ -3082,7 +3115,7 @@ async def _initialize_deferred_runtime(agent: Any) -> bool:
 
             loaded_env_paths = await load_hermes_dotenv(
                 hermes_home=get_hermes_home(),
-                project_env=Path(__file__).absolute().parent.parent / ".env",
+                project_env=Path(__file__).parent.parent / ".env",
             )
             agent._dotenv_loaded = True
             for env_path in loaded_env_paths:
@@ -3406,12 +3439,17 @@ async def _initialize_deferred_runtime(agent: Any) -> bool:
             agent._anthropic_client = None
             agent._anthropic_client_source = None
         elif agent.api_mode == "anthropic_messages":
-            from agent.anthropic_adapter import _is_oauth_token, build_anthropic_client
+            from agent.anthropic_adapter import (
+                _is_oauth_token,
+                build_anthropic_client,
+                ensure_claude_code_version,
+            )
 
             agent._anthropic_api_key = api_key
             agent._anthropic_base_url = agent.base_url
             client_error = None
             try:
+                await ensure_claude_code_version()
                 agent._anthropic_client = build_anthropic_client(
                     api_key,
                     agent.base_url,
@@ -3476,6 +3514,20 @@ async def _initialize_deferred_runtime(agent: Any) -> bool:
                 headers = {"User-Agent": "claude-code/0.1.0"}
             elif base_url_host_matches(agent.base_url, "portal.qwen.ai"):
                 headers = _ra()._qwen_portal_headers()
+
+            # Provider profile discovery is an awaited runtime concern.  The
+            # registry has been preloaded at the top of this function, so this
+            # lookup is now an in-memory policy read rather than a filesystem
+            # import from the synchronous constructor.
+            if not headers:
+                try:
+                    from providers import get_provider_profile
+
+                    profile = get_provider_profile(provider)
+                    if profile and profile.default_headers:
+                        headers = dict(profile.default_headers)
+                except Exception:
+                    pass
 
             client_kwargs: dict[str, Any] = {
                 "api_key": api_key,

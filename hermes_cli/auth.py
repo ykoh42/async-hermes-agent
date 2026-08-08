@@ -467,54 +467,63 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
     ),
 }
 
-# Auto-extend PROVIDER_REGISTRY with any api-key provider registered in
-# providers/ that is not already declared above.  New providers only need a
-# plugins/model-providers/<name>/ plugin — no edits to this file required.
-try:
-    from providers import list_providers as _list_providers_for_registry
+def _inject_profile_provider_registry() -> None:
+    """Register API-key provider profiles after async discovery.
 
-    for _pp in _list_providers_for_registry():
-        if _pp.name in PROVIDER_REGISTRY:
-            continue
-        if _pp.auth_type != "api_key" or not _pp.env_vars:
-            continue
-        # Skip providers that need custom token resolution or are special-cased
-        # in resolve_provider() (copilot/kimi/zai have bespoke token refresh;
-        # openrouter/custom are aggregator/user-supplied and handled outside
-        # the registry — adding them here breaks runtime_provider resolution
-        # that relies on `openrouter not in PROVIDER_REGISTRY`).
-        if _pp.name in {
-            "copilot",
-            "kimi-coding",
-            "kimi-coding-cn",
-            "zai",
-            "openrouter",
-            "custom",
-        }:
-            continue
-        _api_key_vars = tuple(
-            v
-            for v in _pp.env_vars
-            if not v.endswith("_BASE_URL") and not v.endswith("_URL")
-        )
-        _base_url_var = next(
-            (v for v in _pp.env_vars if v.endswith("_BASE_URL") or v.endswith("_URL")),
-            None,
-        )
-        PROVIDER_REGISTRY[_pp.name] = ProviderConfig(
-            id=_pp.name,
-            name=_pp.display_name or _pp.name,
-            auth_type="api_key",
-            inference_base_url=_pp.base_url,
-            api_key_env_vars=_api_key_vars or _pp.env_vars,
-            base_url_env_var=_base_url_var or "",
-        )
-        # Also register aliases so resolve_provider() resolves them
-        for _alias in _pp.aliases:
-            if _alias not in PROVIDER_REGISTRY:
-                PROVIDER_REGISTRY[_alias] = PROVIDER_REGISTRY[_pp.name]
-except Exception:
-    pass
+    The legacy module-level injection is still attempted for synchronous
+    imports, but ``providers`` refuses to start filesystem discovery while an
+    event loop is active.  The agent calls this helper again immediately after
+    awaiting provider discovery so dynamic profiles retain their upstream
+    registry behavior without blocking import-time async callers.
+    """
+    try:
+        from providers import list_providers as _list_providers_for_registry
+
+        for _pp in _list_providers_for_registry():
+            if _pp.name in PROVIDER_REGISTRY:
+                continue
+            if _pp.auth_type != "api_key" or not _pp.env_vars:
+                continue
+            # Skip providers that need custom token resolution or are
+            # special-cased in resolve_provider().
+            if _pp.name in {
+                "copilot",
+                "kimi-coding",
+                "kimi-coding-cn",
+                "zai",
+                "openrouter",
+                "custom",
+            }:
+                continue
+            _api_key_vars = tuple(
+                v
+                for v in _pp.env_vars
+                if not v.endswith("_BASE_URL") and not v.endswith("_URL")
+            )
+            _base_url_var = next(
+                (
+                    v
+                    for v in _pp.env_vars
+                    if v.endswith("_BASE_URL") or v.endswith("_URL")
+                ),
+                None,
+            )
+            PROVIDER_REGISTRY[_pp.name] = ProviderConfig(
+                id=_pp.name,
+                name=_pp.display_name or _pp.name,
+                auth_type="api_key",
+                inference_base_url=_pp.base_url,
+                api_key_env_vars=_api_key_vars or _pp.env_vars,
+                base_url_env_var=_base_url_var or "",
+            )
+            for _alias in _pp.aliases:
+                if _alias not in PROVIDER_REGISTRY:
+                    PROVIDER_REGISTRY[_alias] = PROVIDER_REGISTRY[_pp.name]
+    except Exception:
+        return
+
+
+_inject_profile_provider_registry()
 
 
 # =============================================================================
@@ -1288,7 +1297,10 @@ async def _load_global_auth_store() -> Dict[str, Any]:
         if real_home_env:
             real_root = Path(real_home_env) / ".hermes" / "auth.json"
             try:
-                if os.path.abspath(global_path) == os.path.abspath(real_root):
+                if (
+                    await aiofiles.os.path.abspath(global_path)
+                    == await aiofiles.os.path.abspath(real_root)
+                ):
                     return {}
             except Exception:
                 pass
@@ -3930,6 +3942,7 @@ async def resolve_nous_runtime_credentials(
                     except Exception as exc:
                         logger.debug("Failed to mirror refreshed Nous state: %s", exc)
 
+            refresh_error: AuthError | None = None
             try:
                 refreshed = await refresh_nous_oauth_from_state(
                     state,
@@ -3938,19 +3951,22 @@ async def resolve_nous_runtime_credentials(
                     on_state_update=persist_refresh,
                 )
             except AuthError as exc:
-                if _is_terminal_nous_refresh_error(exc):
+                refresh_error = exc
+
+            if refresh_error is not None:
+                if _is_terminal_nous_refresh_error(refresh_error):
                     failed_refresh = str(state.get("refresh_token") or "")
                     current = _load_provider_state(auth_store, "nous") or {}
                     current_refresh = str(current.get("refresh_token") or "")
                     if not current_refresh or current_refresh == failed_refresh:
                         _quarantine_nous_oauth_state(
                             state,
-                            exc,
+                            refresh_error,
                             reason="runtime_access_refresh_failure",
                         )
                         _quarantine_nous_pool_entries(
                             auth_store,
-                            exc,
+                            refresh_error,
                             reason="runtime_access_refresh_failure",
                         )
                         _save_provider_state(auth_store, "nous", state)
@@ -3965,7 +3981,7 @@ async def resolve_nous_runtime_credentials(
                                     "Failed to clear shared Nous auth store: %s",
                                     remove_exc,
                                 )
-                raise
+                raise refresh_error
 
             state.update(refreshed)
             state["portal_base_url"] = portal_url
@@ -4147,6 +4163,7 @@ async def resolve_nous_access_token(
                     headers={"Accept": "application/json"},
                     verify=verify,
                 ) as client:
+                    refresh_error: AuthError | None = None
                     try:
                         refreshed = await _refresh_access_token(
                             client=client,
@@ -4155,15 +4172,18 @@ async def resolve_nous_access_token(
                             refresh_token=refresh_token,
                         )
                     except AuthError as exc:
-                        if _is_terminal_nous_refresh_error(exc):
+                        refresh_error = exc
+
+                    if refresh_error is not None:
+                        if _is_terminal_nous_refresh_error(refresh_error):
                             _quarantine_nous_oauth_state(
                                 state,
-                                exc,
+                                refresh_error,
                                 reason="managed_access_token_refresh_failure",
                             )
                             _quarantine_nous_pool_entries(
                                 auth_store,
-                                exc,
+                                refresh_error,
                                 reason="managed_access_token_refresh_failure",
                             )
                             _save_provider_state(auth_store, "nous", state)
@@ -4178,7 +4198,7 @@ async def resolve_nous_access_token(
                                         "Failed to clear shared Nous auth store: %s",
                                         remove_exc,
                                     )
-                        raise
+                        raise refresh_error
 
                 now = datetime.now(timezone.utc)
                 access_ttl = _coerce_ttl_seconds(refreshed.get("expires_in"))
@@ -4531,14 +4551,17 @@ async def _resolve_minimax_oauth_runtime_credentials(
             code="not_logged_in",
             relogin_required=True,
         )
+    refresh_error: AuthError | None = None
     try:
         state = await _refresh_minimax_oauth_state(
             state,
             force=force_refresh,
         )
     except AuthError as exc:
-        await _minimax_oauth_quarantine_on_terminal_refresh(state, exc)
-        raise
+        refresh_error = exc
+    if refresh_error is not None:
+        await _minimax_oauth_quarantine_on_terminal_refresh(state, refresh_error)
+        raise refresh_error
 
     api_key: Any
     if as_token_provider:

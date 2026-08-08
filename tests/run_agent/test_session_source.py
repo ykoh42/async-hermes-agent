@@ -5,7 +5,9 @@ import pytest
 
 from gateway.session_context import (
     _UNSET,
+    _SESSION_ASYNC_DELIVERY,
     _VAR_MAP,
+    async_delivery_supported,
     clear_session_vars,
     get_session_env,
     set_current_session_id,
@@ -18,9 +20,11 @@ from run_agent import _session_source_for_agent
 def _reset_contextvars():
     for var in _VAR_MAP.values():
         var.set(_UNSET)
+    _SESSION_ASYNC_DELIVERY.set(_UNSET)
     yield
     for var in _VAR_MAP.values():
         var.set(_UNSET)
+    _SESSION_ASYNC_DELIVERY.set(_UNSET)
 
 
 def test_session_source_context_overrides_platform(monkeypatch):
@@ -43,6 +47,25 @@ def test_session_source_ignores_process_global_legacy_value(monkeypatch):
     monkeypatch.setenv("HERMES_SESSION_SOURCE", "legacy-global")
 
     assert _session_source_for_agent("web") == "web"
+
+
+def test_clear_session_vars_restores_nested_context():
+    outer = set_session_vars(session_key="outer", async_delivery=False)
+    try:
+        inner = set_session_vars(session_key="inner", async_delivery=True)
+        try:
+            assert get_session_env("HERMES_SESSION_KEY") == "inner"
+            assert async_delivery_supported() is True
+        finally:
+            clear_session_vars(inner)
+
+        assert get_session_env("HERMES_SESSION_KEY") == "outer"
+        assert async_delivery_supported() is False
+    finally:
+        clear_session_vars(outer)
+
+    assert get_session_env("HERMES_SESSION_KEY") == ""
+    assert async_delivery_supported() is True
 
 
 @pytest.mark.asyncio
@@ -68,4 +91,3 @@ async def test_concurrent_tasks_keep_distinct_session_ids(monkeypatch):
         "two",
     ]
     assert os.environ["HERMES_SESSION_ID"] == "process-global"
-

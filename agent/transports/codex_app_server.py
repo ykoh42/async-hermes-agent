@@ -407,6 +407,12 @@ async def check_codex_binary(
             f"codex CLI not found at {codex_bin!r}. Install with: "
             f"npm i -g @openai/codex"
         )
+    except asyncio.CancelledError:
+        if "proc" in locals() and proc.returncode is None:
+            proc.kill()
+        if "proc" in locals():
+            await proc.wait()
+        raise
     except TimeoutError:
         if "proc" in locals() and proc.returncode is None:
             proc.kill()

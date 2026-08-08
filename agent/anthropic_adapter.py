@@ -19,6 +19,7 @@ import platform
 import secrets
 import stat
 import subprocess  # noqa: F401  # upstream test patch point for keychain isolation
+import sys
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -37,19 +38,28 @@ def _getenv(name: str, default: str = "") -> str:
     value = _get_secret(name, default)
     return value if value is not None else default
 
-# NOTE: `import anthropic` is deliberately NOT at module top — the SDK pulls
-# ~220 ms of imports (anthropic.types, anthropic.lib.tools._beta_runner, etc.)
-# and the 3 usage sites (build_anthropic_client, build_anthropic_bedrock_client,
-# read_claude_code_credentials_from_keychain) are all on cold user-triggered
-# paths. Access via the `_get_anthropic_sdk()` accessor below, which caches
-# the module after the first call and returns None on ImportError.
+# The process bootstrap preloads the optional SDK before the agent event loop
+# starts. The accessor still supports direct synchronous compatibility calls,
+# but it refuses to import the SDK from inside a running loop: Python's import
+# machinery performs synchronous filesystem traversal and would otherwise make
+# the first Anthropic turn a hidden blocking boundary.
 _anthropic_sdk: Any = ...  # sentinel — None means "tried and missing"
 
 
 def _get_anthropic_sdk():
-    """Return the ``anthropic`` SDK module, importing lazily. None if not installed."""
+    """Return the SDK without a first-use import on the event loop."""
     global _anthropic_sdk
     if _anthropic_sdk is ...:
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            pass
+        else:
+            # process_bootstrap imports the optional SDK before any loop
+            # starts. If a caller bypasses that bootstrap, fail at the
+            # provider boundary instead of importing synchronously in a turn.
+            _anthropic_sdk = sys.modules.get("anthropic")
+            return _anthropic_sdk
         try:
             import anthropic as _sdk
             _anthropic_sdk = _sdk
@@ -359,28 +369,43 @@ _CLAUDE_CODE_VERSION_FALLBACK = "2.1.74"
 _claude_code_version_cache: Optional[str] = None
 
 
-def _detect_claude_code_version() -> str:
-    """Detect the installed Claude Code version, fall back to a static constant.
+async def _detect_claude_code_version() -> str:
+    """Detect the installed Claude Code version through async subprocess I/O.
 
-    Anthropic's OAuth infrastructure validates the user-agent version and may
-    reject requests with a version that's too old.  Detecting dynamically means
-    users who keep Claude Code updated never hit stale-version 400s.
+    This lookup runs on the OAuth client construction path.  Keeping it on
+    ``asyncio.create_subprocess_exec`` is important: a synchronous process
+    invocation here would pause every request on the event loop the first
+    time an OAuth Anthropic client is built.
     """
-    import subprocess as _sp
+    import shutil
 
-    for cmd in ("claude", "claude-code"):
+    for command in ("claude", "claude-code"):
+        process = None
         try:
-            result = _sp.run(
-                [cmd, "--version"],
-                capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=5,
+            executable = await aiofiles.os.wrap(shutil.which)(command)
+            if not executable:
+                continue
+            process = await asyncio.create_subprocess_exec(
+                executable,
+                "--version",
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
             )
-            if result.returncode == 0 and result.stdout.strip():
-                # Output is like "2.1.74 (Claude Code)" or just "2.1.74"
-                version = result.stdout.strip().split()[0]
+            try:
+                stdout, _ = await asyncio.wait_for(process.communicate(), timeout=5)
+            except (asyncio.CancelledError, TimeoutError):
+                if process.returncode is None:
+                    process.kill()
+                await process.wait()
+                raise
+            if process.returncode == 0 and stdout.strip():
+                # Output is like "2.1.74 (Claude Code)" or just "2.1.74".
+                version = stdout.decode("utf-8", errors="replace").strip().split()[0]
                 if version and version[0].isdigit():
                     return version
-        except Exception:
-            pass
+        except (OSError, TimeoutError, UnicodeError, ValueError):
+            continue
     return _CLAUDE_CODE_VERSION_FALLBACK
 
 
@@ -389,10 +414,21 @@ _MCP_TOOL_PREFIX = "mcp__"
 
 
 def _get_claude_code_version() -> str:
-    """Lazily detect the installed Claude Code version when OAuth headers need it."""
+    """Return the cached version without performing blocking I/O.
+
+    ``build_anthropic_client`` intentionally remains a state-only constructor
+    for compatibility with the upstream helper.  Async runtime boundaries
+    call :func:`ensure_claude_code_version` first; direct synchronous callers
+    use the conservative fallback rather than running a blocking subprocess.
+    """
+    return _claude_code_version_cache or _CLAUDE_CODE_VERSION_FALLBACK
+
+
+async def ensure_claude_code_version() -> str:
+    """Populate and return the Claude Code version using native async I/O."""
     global _claude_code_version_cache
     if _claude_code_version_cache is None:
-        _claude_code_version_cache = _detect_claude_code_version()
+        _claude_code_version_cache = await _detect_claude_code_version()
     return _claude_code_version_cache
 
 
@@ -960,6 +996,7 @@ async def _read_claude_code_credentials_from_keychain() -> Optional[Dict[str, An
     """Read Claude Code OAuth credentials from macOS Keychain asynchronously."""
     if platform.system() != "Darwin":
         return None
+    process = None
     try:
         process = await asyncio.create_subprocess_exec(
             "security",
@@ -970,7 +1007,13 @@ async def _read_claude_code_credentials_from_keychain() -> Optional[Dict[str, An
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
         )
-        stdout, _ = await asyncio.wait_for(process.communicate(), timeout=5)
+        try:
+            stdout, _ = await asyncio.wait_for(process.communicate(), timeout=5)
+        except (asyncio.CancelledError, TimeoutError):
+            if process.returncode is None:
+                process.kill()
+            await process.wait()
+            raise
     except (OSError, TimeoutError):
         logger.debug("Keychain: security command not available or timed out")
         return None
@@ -1231,9 +1274,15 @@ async def run_oauth_setup_token() -> Optional[str]:
     # complete the OAuth login prompt. Must keep inherited stdin; the TUI-EOF
     # concern does not apply to an interactive login the user explicitly
     # invokes.  noqa: subprocess-stdin
+    process = None
     try:
         process = await asyncio.create_subprocess_exec(claude_path, "setup-token")
         await process.wait()
+    except asyncio.CancelledError:
+        if process is not None and process.returncode is None:
+            process.kill()
+            await process.wait()
+        raise
     except (KeyboardInterrupt, EOFError):
         return None
 

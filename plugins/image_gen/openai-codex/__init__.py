@@ -442,14 +442,18 @@ async def _collect_image_b64(
             f"{_CODEX_BASE_URL}/responses",
             json=payload,
         ) as response:
+            status_error: httpx.HTTPStatusError | None = None
             try:
                 response.raise_for_status()
             except httpx.HTTPStatusError as exc:
-                await exc.response.aread()
+                status_error = exc
+            if status_error is not None:
+                await status_error.response.aread()
                 raise RuntimeError(
-                    f"Codex Responses API returned HTTP {exc.response.status_code}: "
-                    f"{_summarize_error_body(exc.response.text)}"
-                ) from exc
+                    "Codex Responses API returned HTTP "
+                    f"{status_error.response.status_code}: "
+                    f"{_summarize_error_body(status_error.response.text)}"
+                ) from status_error
             async for event in _iter_sse_json(response):
                 found = _extract_image_b64(event)
                 if found:

@@ -3,7 +3,7 @@
 import asyncio
 import os
 import signal
-from unittest.mock import patch, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -34,6 +34,65 @@ class TestStdioPidTracking:
         # All elements should be ints
         for pid in result:
             assert isinstance(pid, int)
+
+    @pytest.mark.asyncio
+    async def test_kill_orphaned_handles_dead_pids(self):
+        from tools.mcp_tool import (
+            _kill_orphaned_mcp_children,
+            _lock,
+            _orphan_stdio_pid_servers,
+            _orphan_stdio_pids,
+        )
+
+        fake_pid = 999_999_999
+        with _lock:
+            _orphan_stdio_pids.add(fake_pid)
+            _orphan_stdio_pid_servers[fake_pid] = "orphan"
+
+        with (
+            patch("tools.mcp_tool.os.kill"),
+            patch("tools.mcp_tool.asyncio.sleep", new=AsyncMock()),
+            patch("gateway.status._pid_exists", new=AsyncMock(return_value=False)),
+        ):
+            await _kill_orphaned_mcp_children()
+
+        with _lock:
+            assert fake_pid not in _orphan_stdio_pids
+            assert fake_pid not in _orphan_stdio_pid_servers
+
+    @pytest.mark.asyncio
+    async def test_kill_orphaned_can_filter_by_server_name(self):
+        from tools.mcp_tool import (
+            _kill_orphaned_mcp_children,
+            _lock,
+            _orphan_stdio_pid_servers,
+            _orphan_stdio_pids,
+        )
+
+        target_pid = 454_545
+        other_pid = 464_646
+        with _lock:
+            _orphan_stdio_pids.update({target_pid, other_pid})
+            _orphan_stdio_pid_servers[target_pid] = "feishu"
+            _orphan_stdio_pid_servers[other_pid] = "mimir"
+
+        with (
+            patch("tools.mcp_tool.os.kill") as mock_kill,
+            patch("tools.mcp_tool.asyncio.sleep", new=AsyncMock()),
+            patch("gateway.status._pid_exists", new=AsyncMock(return_value=False)),
+        ):
+            await _kill_orphaned_mcp_children(server_name="feishu")
+
+        mock_kill.assert_called_once_with(target_pid, signal.SIGTERM)
+        with _lock:
+            assert target_pid not in _orphan_stdio_pids
+            assert target_pid not in _orphan_stdio_pid_servers
+            assert other_pid in _orphan_stdio_pids
+            assert _orphan_stdio_pid_servers[other_pid] == "mimir"
+
+        with _lock:
+            _orphan_stdio_pids.discard(other_pid)
+            _orphan_stdio_pid_servers.pop(other_pid, None)
 
 
 
@@ -67,6 +126,86 @@ class TestStdioPgroupReaping:
             _orphan_stdio_pids.clear()
             _orphan_stdio_pid_servers.clear()
             _stdio_pgids.clear()
+
+    @pytest.mark.asyncio
+    async def test_killpg_used_when_pgid_tracked(self):
+        from tools.mcp_tool import (
+            _kill_orphaned_mcp_children,
+            _lock,
+            _orphan_stdio_pids,
+            _stdio_pgids,
+        )
+
+        self._reset_state()
+        fake_pid = 525_252
+        fake_pgid = 525_252
+        with _lock:
+            _orphan_stdio_pids.add(fake_pid)
+            _stdio_pgids[fake_pid] = fake_pgid
+
+        with (
+            patch("tools.mcp_tool.os.getpgrp", return_value=111_111),
+            patch("tools.mcp_tool.os.killpg") as mock_killpg,
+            patch("tools.mcp_tool.os.kill") as mock_kill,
+            patch("tools.mcp_tool.asyncio.sleep", new=AsyncMock()),
+            patch("gateway.status._pid_exists", new=AsyncMock(return_value=True)),
+        ):
+            await _kill_orphaned_mcp_children()
+
+        mock_killpg.assert_any_call(fake_pgid, signal.SIGTERM)
+        mock_killpg.assert_any_call(fake_pgid, signal.SIGKILL)
+        mock_kill.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_gateway_process_group_uses_per_pid_signals(self):
+        from tools.mcp_tool import (
+            _kill_orphaned_mcp_children,
+            _lock,
+            _orphan_stdio_pids,
+            _stdio_pgids,
+        )
+
+        self._reset_state()
+        own_pgid = 424_242
+        fake_pid = 717_171
+        with _lock:
+            _orphan_stdio_pids.add(fake_pid)
+            _stdio_pgids[fake_pid] = own_pgid
+
+        with (
+            patch("tools.mcp_tool.os.getpgrp", return_value=own_pgid),
+            patch("tools.mcp_tool.os.killpg") as mock_killpg,
+            patch("tools.mcp_tool.os.kill") as mock_kill,
+            patch("tools.mcp_tool.asyncio.sleep", new=AsyncMock()),
+            patch("gateway.status._pid_exists", new=AsyncMock(return_value=True)),
+        ):
+            await _kill_orphaned_mcp_children()
+
+        mock_killpg.assert_not_called()
+        mock_kill.assert_any_call(fake_pid, signal.SIGTERM)
+        mock_kill.assert_any_call(fake_pid, signal.SIGKILL)
+
+    @pytest.mark.asyncio
+    async def test_no_pgid_uses_per_pid_signal(self):
+        from tools.mcp_tool import (
+            _kill_orphaned_mcp_children,
+            _lock,
+            _orphan_stdio_pids,
+        )
+
+        self._reset_state()
+        fake_pid = 747_474
+        with _lock:
+            _orphan_stdio_pids.add(fake_pid)
+
+        with (
+            patch("tools.mcp_tool.os.kill") as mock_kill,
+            patch("tools.mcp_tool.asyncio.sleep", new=AsyncMock()),
+            patch("gateway.status._pid_exists", new=AsyncMock(return_value=False)),
+        ):
+            await _kill_orphaned_mcp_children()
+
+        mock_kill.assert_called_once_with(fake_pid, signal.SIGTERM)
 
 
 

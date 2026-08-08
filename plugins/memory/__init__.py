@@ -21,8 +21,10 @@ Usage:
 
 from __future__ import annotations
 
+import asyncio
 import importlib.machinery
 import importlib.util
+import inspect
 import logging
 import sys
 from pathlib import Path
@@ -32,6 +34,7 @@ import aiofiles
 import aiofiles.os
 
 from hermes_cli.config import cfg_get
+from hermes_cli.async_source_loader import load_source_package
 
 if TYPE_CHECKING:
     from agent.memory_provider import MemoryProvider
@@ -43,6 +46,14 @@ _MEMORY_PLUGINS_DIR = Path(__file__).parent
 # Synthetic parent package for user-installed providers, so they don't
 # collide with bundled providers in sys.modules.
 _USER_NAMESPACE = "_hermes_user_memory"
+
+
+async def _exec_source_module(module: object, source_path: Path) -> None:
+    """Execute a source module after asynchronously reading its file."""
+    async with aiofiles.open(source_path, mode="rb") as handle:
+        source_bytes = await handle.read()
+    source = importlib.util.decode_source(source_bytes)
+    exec(compile(source, str(source_path), "exec"), module.__dict__)
 
 
 def _register_synthetic_package(name: str, search_locations: List[str]) -> None:
@@ -270,7 +281,10 @@ async def _load_provider_from_dir(provider_dir: Path) -> Optional["MemoryProvide
                         parent_mod = importlib.util.module_from_spec(spec)
                         sys.modules[parent] = parent_mod
                         try:
-                            spec.loader.exec_module(parent_mod)
+                            await _exec_source_module(parent_mod, parent_init)
+                        except asyncio.CancelledError:
+                            sys.modules.pop(parent, None)
+                            raise
                         except Exception:
                             pass
 
@@ -279,51 +293,29 @@ async def _load_provider_from_dir(provider_dir: Path) -> Optional["MemoryProvide
         if not _is_bundled:
             _register_synthetic_package(_USER_NAMESPACE, [])
 
-        # Now load the provider module
-        spec = importlib.util.spec_from_file_location(
-            module_name, str(init_file),
-            submodule_search_locations=[str(provider_dir)]
-        )
-        if not spec or not spec.loader:
-            return None
-
-        mod = importlib.util.module_from_spec(spec)
-        sys.modules[module_name] = mod
-
-        # Register submodules so relative imports work
-        # e.g., "from .store import MemoryStore" in holographic plugin
-        for child_name in await aiofiles.os.listdir(provider_dir):
-            sub_file = provider_dir / child_name
-            if sub_file.suffix != ".py":
-                continue
-            if sub_file.name == "__init__.py":
-                continue
-            sub_name = sub_file.stem
-            full_sub_name = f"{module_name}.{sub_name}"
-            if full_sub_name not in sys.modules:
-                sub_spec = importlib.util.spec_from_file_location(
-                    full_sub_name, str(sub_file)
-                )
-                if sub_spec and sub_spec.loader:
-                    sub_mod = importlib.util.module_from_spec(sub_spec)
-                    sys.modules[full_sub_name] = sub_mod
-                    try:
-                        sub_spec.loader.exec_module(sub_mod)
-                    except Exception as e:
-                        logger.debug("Failed to load submodule %s: %s", full_sub_name, e)
-
         try:
-            spec.loader.exec_module(mod)
-        except Exception as e:
-            logger.debug("Failed to exec_module %s: %s", module_name, e)
+            mod = await load_source_package(module_name, init_file)
+        except asyncio.CancelledError:
             sys.modules.pop(module_name, None)
+            for loaded_name in tuple(sys.modules):
+                if loaded_name.startswith(f"{module_name}."):
+                    sys.modules.pop(loaded_name, None)
+            raise
+        except Exception as e:
+            logger.debug("Failed to execute source module %s: %s", module_name, e)
+            sys.modules.pop(module_name, None)
+            for loaded_name in tuple(sys.modules):
+                if loaded_name.startswith(f"{module_name}."):
+                    sys.modules.pop(loaded_name, None)
             return None
 
     # Try register(ctx) pattern first (how our plugins are written)
     if hasattr(mod, "register"):
         collector = _ProviderCollector()
         try:
-            mod.register(collector)
+            registration = mod.register(collector)
+            if inspect.isawaitable(registration):
+                await registration
             if collector.provider:
                 return collector.provider
         except Exception as e:
@@ -439,7 +431,11 @@ async def discover_plugin_cli_commands() -> List[dict]:
                 return results
             cli_mod = importlib.util.module_from_spec(spec)
             sys.modules[module_name] = cli_mod
-            spec.loader.exec_module(cli_mod)
+            try:
+                await _exec_source_module(cli_mod, cli_file)
+            except asyncio.CancelledError:
+                sys.modules.pop(module_name, None)
+                raise
 
         register_cli = getattr(cli_mod, "register_cli", None)
         if not callable(register_cli):

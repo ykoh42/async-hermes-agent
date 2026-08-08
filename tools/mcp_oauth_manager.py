@@ -36,10 +36,15 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import ntpath
+import os
+import posixpath
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
+
+import aiofiles.os
 
 logger = logging.getLogger(__name__)
 
@@ -471,7 +476,7 @@ class MCPOAuthManager:
         synchronous method remains for CLI/setup callers, while this method
         owns the active runtime path and serializes construction per server.
         """
-        key = self._key(server_name)
+        key = await self._resolve_key(server_name)
         async with self._entries_lock:
             entry = self._entries.get(key)
             if entry is not None and entry.server_url != server_url:
@@ -503,6 +508,30 @@ class MCPOAuthManager:
 
         home = Path(hermes_home) if hermes_home is not None else get_hermes_home()
         return (str(home.expanduser().absolute()), server_name)
+
+    @staticmethod
+    async def _resolve_key(
+        server_name: str,
+        hermes_home: str | Path | None = None,
+    ) -> tuple[str, str]:
+        """Resolve a cache key without synchronous cwd access.
+
+        ``_key`` remains the historical synchronous helper used by setup and
+        compatibility callers.  The live MCP runtime uses this awaited
+        boundary so an explicitly relative ``hermes_home`` cannot make
+        ``Path.absolute()`` call ``getcwd()`` on the event loop.
+        """
+        from hermes_constants import get_hermes_home
+
+        home = Path(hermes_home) if hermes_home is not None else get_hermes_home()
+        expanded = home.expanduser()
+        if not expanded.is_absolute():
+            cwd = Path(await aiofiles.os.getcwd())
+            # ``Path.absolute()`` also normalises ``..`` components.  Keep
+            # that key shape without reintroducing a synchronous cwd lookup.
+            normalizer = ntpath.normpath if os.name == "nt" else posixpath.normpath
+            expanded = Path(normalizer(str(cwd / expanded)))
+        return (str(expanded), server_name)
 
     async def _build_provider(
         self,
@@ -581,7 +610,9 @@ class MCPOAuthManager:
         ``hermes mcp login <name>`` during forced re-auth.
         """
         async with self._entries_lock:
-            entry = self._entries.pop(self._key(server_name, hermes_home), None)
+            entry = self._entries.pop(
+                await self._resolve_key(server_name, hermes_home), None
+            )
 
         from tools.mcp_oauth import remove_oauth_tokens
         await remove_oauth_tokens(server_name, hermes_home=hermes_home)
@@ -602,7 +633,9 @@ class MCPOAuthManager:
         if entry is None:
             return
         async with self._entries_lock:
-            self._entries.setdefault(self._key(server_name, hermes_home), entry)
+            self._entries.setdefault(
+                await self._resolve_key(server_name, hermes_home), entry
+            )
 
     async def evict(
         self,
@@ -612,7 +645,9 @@ class MCPOAuthManager:
     ) -> None:
         """Drop only the in-process provider, preserving persisted OAuth state."""
         async with self._entries_lock:
-            self._entries.pop(self._key(server_name, hermes_home), None)
+            self._entries.pop(
+                await self._resolve_key(server_name, hermes_home), None
+            )
 
     # -- Disk watch ----------------------------------------------------------
 
@@ -633,7 +668,9 @@ class MCPOAuthManager:
         from tools.mcp_oauth import _get_token_dir, _safe_filename
         import aiofiles.os
 
-        entry = self._entries.get(self._key(server_name, hermes_home))
+        entry = self._entries.get(
+            await self._resolve_key(server_name, hermes_home)
+        )
         if entry is None or entry.provider is None:
             return False
 
@@ -680,7 +717,7 @@ class MCPOAuthManager:
         the same ``failed_access_token``, only one recovery attempt fires.
         Others await the same future.
         """
-        entry = self._entries.get(self._key(server_name))
+        entry = self._entries.get(await self._resolve_key(server_name))
         if entry is None or entry.provider is None:
             return False
 

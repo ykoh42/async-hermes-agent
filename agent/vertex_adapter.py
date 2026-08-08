@@ -164,7 +164,18 @@ async def _gcloud_project_id() -> Optional[str]:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
         )
-        stdout, _ = await process.communicate()
+        try:
+            stdout, _ = await asyncio.wait_for(process.communicate(), timeout=5.0)
+        except asyncio.CancelledError:
+            if process.returncode is None:
+                process.kill()
+            await process.wait()
+            raise
+        except TimeoutError:
+            if process.returncode is None:
+                process.kill()
+            await process.wait()
+            return None
     except (FileNotFoundError, OSError):
         return None
     if process.returncode != 0:

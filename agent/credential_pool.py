@@ -577,7 +577,10 @@ async def _write_through_provider_state_to_global_root(
         if real_home_env:
             real_root = Path(real_home_env) / ".hermes" / "auth.json"
             try:
-                if os.path.abspath(global_path) == os.path.abspath(real_root):
+                if (
+                    await aiofiles.os.path.abspath(global_path)
+                    == await aiofiles.os.path.abspath(real_root)
+                ):
                     return
             except Exception:
                 return

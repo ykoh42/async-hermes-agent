@@ -388,7 +388,7 @@ async def _resolve_cwd(cwd: Optional[str | Path]) -> Path:
 
         return await resolve_agent_cwd()
     except Exception:
-        return Path(os.getcwd())
+        return Path(await aiofiles.os.getcwd())
 
 
 
@@ -402,7 +402,7 @@ async def _home() -> Optional[Path]:
 
 async def _git_root(cwd: Path) -> Optional[Path]:
     """Find a git root using awaitable metadata checks."""
-    current = cwd.absolute()
+    current = cwd if cwd.is_absolute() else Path(await aiofiles.os.getcwd()) / cwd
     for parent in [current, *current.parents]:
         try:
             if await aiofiles.os.path.exists(parent / ".git"):
@@ -418,10 +418,10 @@ async def _git_root(cwd: Path) -> Optional[Path]:
 
 async def _marker_root(cwd: Path) -> Optional[Path]:
     """Find the nearest project marker without blocking metadata calls."""
-    current = cwd.absolute()
+    current = cwd if cwd.is_absolute() else Path(await aiofiles.os.getcwd()) / cwd
     home = await _home()
     try:
-        temp_root = Path(await _gettempdir()).absolute()
+        temp_root = Path(await _gettempdir())
     except Exception:
         temp_root = None
     for depth, parent in enumerate([current, *current.parents]):
@@ -787,15 +787,24 @@ async def _git(cwd: Path, *args: str) -> str:
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.DEVNULL,
     )
+    communicate = asyncio.create_task(process.communicate())
     try:
-        stdout, _ = await asyncio.wait_for(process.communicate(), timeout=_GIT_TIMEOUT)
+        stdout, _ = await asyncio.wait_for(
+            asyncio.shield(communicate), timeout=_GIT_TIMEOUT
+        )
     except asyncio.TimeoutError:
-        process.kill()
-        await process.communicate()
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
+        await asyncio.shield(communicate)
         return ""
     except asyncio.CancelledError:
-        process.kill()
-        await process.communicate()
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
+        await asyncio.shield(communicate)
         raise
     return stdout.decode("utf-8", errors="replace").strip()
 
@@ -940,7 +949,7 @@ async def build_coding_workspace_block(cwd: Optional[str | Path] = None) -> str:
 
         def _git_path(value: str) -> Path:
             path = Path(value)
-            return (root / path if not path.is_absolute() else path).absolute()
+            return root / path if not path.is_absolute() else path
 
         if git_dir and common_dir and _git_path(git_dir) != _git_path(common_dir):
             lines.append("- Worktree: linked (git state shared with primary tree)")

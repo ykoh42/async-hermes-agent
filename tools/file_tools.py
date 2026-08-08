@@ -750,6 +750,29 @@ def reset_file_dedup(task_id: str | None = None) -> None:
                 state.setdefault("dedup_hits", {}).clear()
 
 
+def clear_file_ops_cache(task_id: str | None = None) -> None:
+    """Release per-task file-tool state when a terminal environment closes.
+
+    The async fork no longer keeps the upstream shell-backed ``FileOperations``
+    object cache, but it still owns equivalent per-task read-loop and patch
+    failure state.  Keep the upstream cleanup entry point so lifecycle code
+    and integrations can release that state without knowing the backend
+    implementation.
+    """
+    with _read_tracker_lock:
+        if task_id is None:
+            _read_tracker.clear()
+        else:
+            _read_tracker.pop(task_id, None)
+    with _patch_failure_lock:
+        if task_id is None:
+            _patch_failure_tracker.clear()
+        else:
+            _patch_failure_tracker.pop(task_id, None)
+    if task_id is not None:
+        file_state.get_registry().clear_task(task_id)
+
+
 def notify_other_tool_call(task_id: str = "default") -> None:
     """Break a consecutive read/stub loop after another tool runs."""
     with _read_tracker_lock:
@@ -1416,7 +1439,11 @@ async def _check_lint(path: Path, content: str | None = None) -> LintResult:
             process.kill()
         except ProcessLookupError:
             pass
-        stdout, _ = await communicate
+        # The communicate task is deliberately kept alive after the timeout
+        # so its pipe readers can drain and reap the child.  Shield cleanup
+        # from a second caller cancellation; otherwise the killed process can
+        # still leave a detached communicate task behind.
+        stdout, _ = await asyncio.shield(communicate)
         output = stdout.decode(errors="replace").strip()
         return LintResult(
             success=False,
@@ -1984,7 +2011,7 @@ async def _run_rg(arguments: list[str]) -> tuple[int, str, str]:
             process.kill()
         except ProcessLookupError:
             pass
-        stdout, stderr = await communicate
+        stdout, stderr = await asyncio.shield(communicate)
         return 124, stdout.decode(errors="replace"), stderr.decode(errors="replace")
     except asyncio.CancelledError:
         try:

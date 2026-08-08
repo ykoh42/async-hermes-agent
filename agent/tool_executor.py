@@ -10,6 +10,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
+import aiofiles.os
+
 from agent.display import (
     build_tool_preview as _build_tool_preview,
     redact_tool_args_for_display as _redact_tool_args_for_display,
@@ -803,7 +805,18 @@ async def _execute_tool_calls_native(
 
     execution_cwd = None
     if active_env is not None and getattr(active_env, "cwd", None):
-        execution_cwd = Path(active_env.cwd)
+        raw_execution_cwd = Path(active_env.cwd)
+        execution_cwd = (
+            raw_execution_cwd
+            if raw_execution_cwd.is_absolute()
+            else Path(await aiofiles.os.getcwd()) / raw_execution_cwd
+        )
+    else:
+        # The planner is a synchronous, CPU-only path helper, but its
+        # historical default resolves relative paths against the process cwd.
+        # Resolve that cwd at the async boundary so an environment-less turn
+        # never calls ``Path.cwd()`` while the event loop is running.
+        execution_cwd = Path(await aiofiles.os.getcwd())
 
     # Preserve the established barrier semantics: a later call must never
     # cross an interactive/mutating/conflicting call, while independent

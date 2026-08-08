@@ -55,8 +55,12 @@ from agent.secret_sources._cache import (
     FetchResult,
     is_valid_env_name,
 )
-from agent.secret_sources.base import ErrorKind, SecretSource
-from agent.secret_sources.base import get_source_environment
+from agent.secret_sources.base import (
+    ErrorKind,
+    SecretSource,
+    communicate_subprocess,
+    get_source_environment,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -301,19 +305,13 @@ async def _run_op_read(
     except OSError as exc:
         raise RuntimeError(f"failed to invoke op: {exc}") from exc
 
-    try:
-        async with asyncio.timeout(_OP_RUN_TIMEOUT):
-            stdout_bytes, stderr_bytes = await proc.communicate()
-    except TimeoutError as exc:
-        proc.kill()
-        await proc.wait()
-        raise RuntimeError(
+    stdout_bytes, stderr_bytes = await communicate_subprocess(
+        proc,
+        timeout=_OP_RUN_TIMEOUT,
+        timeout_message=(
             f"op read timed out after {_OP_RUN_TIMEOUT}s for {reference!r}"
-        ) from exc
-    except asyncio.CancelledError:
-        proc.kill()
-        await proc.wait()
-        raise
+        ),
+    )
 
     if proc.returncode != 0:
         err = _scrub(stderr_bytes.decode("utf-8", errors="replace"))[:200]

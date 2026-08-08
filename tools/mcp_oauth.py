@@ -61,16 +61,12 @@ _chmod = aiofiles.os.wrap(os.chmod)
 # Lazy imports -- MCP SDK with OAuth support is optional
 # ---------------------------------------------------------------------------
 
-# Availability is detected WITHOUT importing the mcp SDK (which costs
-# ~170 ms at module load). The actual classes are imported lazily on first
-# use via _ensure_sdk_loaded(); the module-level names below are kept as
-# placeholders so tests can patch them (patch.object requires the attribute
-# to exist on the module).
-import importlib.util as _importlib_util
-
-_OAUTH_AVAILABLE = _importlib_util.find_spec("mcp") is not None
-if not _OAUTH_AVAILABLE:
-    logger.debug("MCP OAuth types not available -- OAuth MCP auth disabled")
+# Do not probe the filesystem with ``importlib.util.find_spec`` at module
+# import.  MCP discovery can happen from an active agent loop, and that probe
+# performs synchronous importer work.  The optional SDK is still imported
+# lazily by ``_ensure_sdk_loaded`` at the OAuth request boundary; a missing
+# dependency is handled there without changing the public return contract.
+_OAUTH_AVAILABLE = True
 
 # Lazily-bound SDK names (rebound by _ensure_sdk_loaded on first use).
 # Annotated ``Any`` so quoted type annotations elsewhere in the file remain

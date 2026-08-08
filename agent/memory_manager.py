@@ -581,12 +581,27 @@ class MemoryManager:
             name=f"memory-prefetch-{provider.name}",
         )
         self._external_prefetch_tasks[provider.name] = task
+        task.add_done_callback(
+            lambda completed, provider_name=provider.name: self._forget_external_prefetch(
+                provider_name, completed
+            )
+        )
         try:
             async with asyncio.timeout(self._external_prefetch_timeout):
-                return await task or ""
+                # Shield the provider task so the timeout cancels only this
+                # bounded wait.  Otherwise a provider that suppresses
+                # CancelledError can keep the caller suspended indefinitely
+                # while asyncio propagates cancellation through ``await``.
+                return await asyncio.shield(task) or ""
         except TimeoutError:
+            # ``asyncio.timeout`` has already requested cancellation of the
+            # awaited task.  Do not await an uncooperative provider here: a
+            # coroutine that suppresses CancelledError must not turn a bounded
+            # provider timeout into an unbounded agent turn.  Keep the task in
+            # the per-provider map until its done callback runs, preserving the
+            # upstream contract that a still-stuck prefetch suppresses the next
+            # turn rather than overlapping provider calls.
             task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
             logger.warning(
                 "Memory provider '%s' prefetch timed out after %.1fs",
                 provider.name,
@@ -594,8 +609,27 @@ class MemoryManager:
             )
             return ""
         finally:
-            if self._external_prefetch_tasks.get(provider.name) is task:
+            if task.done() and self._external_prefetch_tasks.get(provider.name) is task:
                 self._external_prefetch_tasks.pop(provider.name, None)
+
+    def _forget_external_prefetch(
+        self,
+        provider_name: str,
+        task: asyncio.Task[str],
+    ) -> None:
+        """Remove a completed external prefetch and consume its exception."""
+        if self._external_prefetch_tasks.get(provider_name) is task:
+            self._external_prefetch_tasks.pop(provider_name, None)
+        if task.cancelled():
+            return
+        try:
+            task.exception()
+        except Exception:
+            logger.debug(
+                "Memory provider '%s' prefetch task failed",
+                provider_name,
+                exc_info=True,
+            )
 
     async def queue_prefetch_all(
         self,
@@ -735,7 +769,9 @@ class MemoryManager:
                 exc_info=(type(error), error, error.__traceback__),
             )
 
-    async def flush_pending(self, timeout: Optional[float] = None) -> bool:
+    async def flush_pending(  # noqa: ASYNC109 - upstream public argument
+        self, timeout: Optional[float] = None  # noqa: ASYNC109
+    ) -> bool:
         """Wait for all work queued before this call to finish."""
         pending = tuple(self._background_tasks)
         if not pending:

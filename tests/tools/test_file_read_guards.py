@@ -14,6 +14,67 @@ def clean_read_state(monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/dev/zero",
+        "/dev/random",
+        "/dev/urandom",
+        "/dev/stdin",
+        "/dev/tty",
+        "/dev/console",
+        "/dev/stdout",
+        "/dev/stderr",
+        "/dev/fd/0",
+        "/dev/fd/1",
+        "/dev/fd/2",
+        "/proc/self/fd/0",
+        "/proc/12345/fd/2",
+        "/proc/self/environ",
+        "/proc/12345/cmdline",
+        "/proc/self/maps",
+        "/proc/1/smaps",
+        "/proc/self/smaps_rollup",
+        "/proc/99/numa_maps",
+        "/proc/self/mem",
+        "/proc/1/auxv",
+        "/proc/99/pagemap",
+        "/proc/self/task/1234/maps",
+        "/proc/self/task/1234/smaps",
+        "/proc/self/task/1234/auxv",
+        "/proc/self/task/1234/pagemap",
+        "/proc/self/task/1234/environ",
+        "/dev/../dev/zero",
+        "/dev/./urandom",
+    ],
+)
+async def test_upstream_blocked_device_matrix(path):
+    assert await file_tools._is_blocked_device(path), path
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/dev/null",
+        "/dev/sda1",
+        "/proc/cpuinfo",
+        "/proc/meminfo",
+        "/proc/uptime",
+        "/proc/version",
+        "/tmp/test.py",
+        "/home/user/.bashrc",
+    ],
+)
+async def test_upstream_safe_device_matrix(path):
+    assert not await file_tools._is_blocked_device(path), path
+
+
+def test_upstream_proc_fd_other_is_not_pattern_blocked():
+    assert not file_tools._is_blocked_device_path("/proc/self/fd/3")
+
+
+@pytest.mark.asyncio
 async def test_device_file_is_rejected():
     result = json.loads(await file_tools.read_file_tool("/dev/zero"))
     assert "device" in result["error"].lower()
@@ -25,6 +86,16 @@ async def test_device_symlink_is_rejected(tmp_path):
     alias.symlink_to("/dev/zero")
     result = json.loads(await file_tools.read_file_tool(str(alias)))
     assert "device" in result["error"].lower()
+
+
+@pytest.mark.asyncio
+async def test_regular_file_symlink_is_not_blocked(tmp_path):
+    target = tmp_path / "regular.txt"
+    target.write_text("safe\n")
+    alias = tmp_path / "regular-link"
+    alias.symlink_to(target)
+
+    assert not await file_tools._is_blocked_device(str(alias))
 
 
 @pytest.mark.asyncio
@@ -91,6 +162,83 @@ async def test_unchanged_read_returns_stub_then_blocks(tmp_path):
     assert "alpha" in first["content"]
     assert second["status"] == "unchanged"
     assert third["error"].startswith("BLOCKED:")
+
+
+@pytest.mark.asyncio
+async def test_block_persists_until_file_changes(tmp_path):
+    target = tmp_path / "data.txt"
+    target.write_text("alpha\n")
+
+    await file_tools.read_file_tool(str(target), task_id="task")
+    await file_tools.read_file_tool(str(target), task_id="task")
+    assert "error" in json.loads(
+        await file_tools.read_file_tool(str(target), task_id="task")
+    )
+    for _ in range(3):
+        blocked = json.loads(
+            await file_tools.read_file_tool(str(target), task_id="task")
+        )
+        assert blocked["error"].startswith("BLOCKED:")
+
+    target.write_text("changed and longer\n")
+    fresh = json.loads(await file_tools.read_file_tool(str(target), task_id="task"))
+    assert fresh["content"] == "1|changed and longer"
+
+
+@pytest.mark.asyncio
+async def test_other_tool_call_resets_stub_hit_counter(tmp_path):
+    target = tmp_path / "data.txt"
+    target.write_text("alpha\n")
+    await file_tools.read_file_tool(str(target), task_id="task")
+    first_stub = json.loads(
+        await file_tools.read_file_tool(str(target), task_id="task")
+    )
+    assert first_stub["status"] == "unchanged"
+
+    file_tools.notify_other_tool_call("task")
+    next_stub = json.loads(
+        await file_tools.read_file_tool(str(target), task_id="task")
+    )
+    assert next_stub["status"] == "unchanged"
+    assert "error" not in next_stub
+
+
+@pytest.mark.asyncio
+async def test_different_read_ranges_are_independent(tmp_path):
+    target = tmp_path / "data.txt"
+    target.write_text("one\ntwo\nthree\n")
+    await file_tools.read_file_tool(
+        str(target), offset=1, limit=1, task_id="task"
+    )
+    await file_tools.read_file_tool(
+        str(target), offset=1, limit=1, task_id="task"
+    )
+    assert "error" in json.loads(
+        await file_tools.read_file_tool(
+            str(target), offset=1, limit=1, task_id="task"
+        )
+    )
+
+    other = json.loads(
+        await file_tools.read_file_tool(
+            str(target), offset=2, limit=1, task_id="task"
+        )
+    )
+    assert other["content"] == "2|two"
+
+
+@pytest.mark.asyncio
+async def test_reset_file_dedup_restores_full_read(tmp_path):
+    target = tmp_path / "data.txt"
+    target.write_text("alpha\n")
+    await file_tools.read_file_tool(str(target), task_id="task")
+    assert json.loads(
+        await file_tools.read_file_tool(str(target), task_id="task")
+    )["status"] == "unchanged"
+
+    file_tools.reset_file_dedup("task")
+    fresh = json.loads(await file_tools.read_file_tool(str(target), task_id="task"))
+    assert fresh["content"] == "1|alpha"
 
 
 @pytest.mark.asyncio

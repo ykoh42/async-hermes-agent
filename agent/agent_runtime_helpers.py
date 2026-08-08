@@ -2065,10 +2065,19 @@ def anthropic_prompt_cache_policy(
     # the policy from the preset's real aggregator slot instead.
     if eff_provider.strip().lower() == "moa":
         try:
-            from hermes_cli.config import load_config as _load_moa_cfg
             from hermes_cli.moa_config import resolve_moa_preset
+            # Configuration is loaded once by the awaited runtime boundary.
+            # This helper is also called from ``AIAgent.__init__`` and must
+            # remain a pure policy calculation there; synchronously opening
+            # config.yaml would violate the state-only construction contract
+            # and block an embedding event loop.  A missing snapshot simply
+            # leaves caching disabled until deferred runtime initialization
+            # reevaluates the policy with the loaded snapshot.
+            config_snapshot = getattr(agent, "_runtime_config_snapshot", None)
+            if not isinstance(config_snapshot, dict):
+                return False, False
             _preset = resolve_moa_preset(
-                _load_moa_cfg().get("moa") or {}, eff_model or None
+                config_snapshot.get("moa") or {}, eff_model or None
             )
             _agg = _preset.get("aggregator") or {}
             _agg_provider = str(_agg.get("provider") or "").strip()

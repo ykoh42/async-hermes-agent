@@ -59,8 +59,12 @@ from agent.secret_sources._cache import (
     FetchResult,
     is_valid_env_name as _is_valid_env_name,
 )
-from agent.secret_sources.base import ErrorKind, SecretSource
-from agent.secret_sources.base import get_source_environment
+from agent.secret_sources.base import (
+    ErrorKind,
+    SecretSource,
+    communicate_subprocess,
+    get_source_environment,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -602,11 +606,15 @@ async def fetch_bitwarden_secrets(
             "`hermes secrets bitwarden setup`."
         )
 
+    fetch_error: RuntimeError | None = None
     try:
         secrets, warnings = await _run_bws_list(
             bws, access_token, project_id, server_url
         )
     except RuntimeError as exc:
+        fetch_error = exc
+
+    if fetch_error is not None:
         # Live fetch failed. Fall back to a stale disk cache ONLY for
         # transport-level failures (network down, DNS error, transient BWS
         # outage / timeout) — never for AUTH_FAILED or a malformed-output
@@ -627,7 +635,7 @@ async def fetch_bitwarden_secrets(
         #   honor that on the fallback path too.  `ttl_seconds=inf` on the
         #   read bypasses freshness (we explicitly want a stale hit); the
         #   caller's real TTL gates whether we even attempt the read.
-        kind = _classify_bws_error(str(exc))
+        kind = _classify_bws_error(str(fetch_error))
         if use_cache and kind in (ErrorKind.NETWORK, ErrorKind.TIMEOUT):
             if encrypted_cache_enabled:
                 stale = await _read_encrypted_disk_cache(
@@ -640,7 +648,7 @@ async def fetch_bitwarden_secrets(
                     age = max(0.0, time.time() - stale.fetched_at)
                     _CACHE[cache_key] = stale
                     return stale.secrets, [
-                        f"bws live fetch failed ({exc}); falling back to "
+                        f"bws live fetch failed ({fetch_error}); falling back to "
                         f"stale ENCRYPTED disk cache ({int(age)}s old)"
                     ]
             elif cache_ttl_seconds > 0:
@@ -649,10 +657,10 @@ async def fetch_bitwarden_secrets(
                     age = max(0.0, time.time() - stale.fetched_at)
                     _CACHE[cache_key] = stale
                     return stale.secrets, [
-                        f"bws live fetch failed ({exc}); "
+                        f"bws live fetch failed ({fetch_error}); "
                         f"falling back to stale disk cache ({int(age)}s old)"
                     ]
-        raise
+        raise fetch_error
     entry = _CachedFetch(secrets=secrets, fetched_at=time.time())
     if use_cache:
         if cache_ttl_seconds > 0:
@@ -742,19 +750,13 @@ async def _run_bws_list(
     except OSError as exc:
         raise RuntimeError(f"failed to invoke bws: {exc}") from exc
 
-    try:
-        async with asyncio.timeout(_BWS_RUN_TIMEOUT):
-            stdout_bytes, stderr_bytes = await proc.communicate()
-    except TimeoutError as exc:
-        proc.kill()
-        await proc.wait()
-        raise RuntimeError(
+    stdout_bytes, stderr_bytes = await communicate_subprocess(
+        proc,
+        timeout=_BWS_RUN_TIMEOUT,
+        timeout_message=(
             f"bws timed out after {_BWS_RUN_TIMEOUT}s fetching secrets"
-        ) from exc
-    except asyncio.CancelledError:
-        proc.kill()
-        await proc.wait()
-        raise
+        ),
+    )
 
     stdout = stdout_bytes.decode("utf-8", errors="replace")
     stderr = stderr_bytes.decode("utf-8", errors="replace")

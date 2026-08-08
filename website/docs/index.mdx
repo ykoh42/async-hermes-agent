@@ -66,11 +66,17 @@ trajectories, runner, and batch runner while making I/O awaitable end to end.
 
 ## Install
 
-Python 3.11 through 3.13 is supported. Install the current release from PyPI:
+Python 3.11 through 3.13 is supported. Install the currently verified release
+from its GitHub tag:
 
 ```bash
-uv pip install "async-hermes-agent==0.20.4"
+uv pip install "git+https://github.com/ykoh42/async-hermes-agent.git@v0.20.4"
 ```
+
+The package metadata for this release is `async-hermes-agent==0.20.4`. PyPI
+publication is still pending Trusted Publisher configuration; do not use that
+specifier until the package is visible on PyPI and a clean install has been
+verified.
 
 Then follow the **[Installation Guide](/getting-started/installation)** to
 verify the package and choose only the provider dependencies your application

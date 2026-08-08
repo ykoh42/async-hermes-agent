@@ -599,16 +599,40 @@ _URL_TO_PROVIDER: Dict[str, str] = {
     "ollama.com": "ollama-cloud",
 }
 
-# Auto-extend with hostnames derived from provider profiles.
-# Any provider with a base_url not already in the map gets added automatically.
-try:
-    from providers import list_providers as _list_providers
-    for _pp in _list_providers():
-        _host = _pp.get_hostname()
-        if _host and _host not in _URL_TO_PROVIDER:
-            _URL_TO_PROVIDER[_host] = _pp.name
-except Exception:
-    pass
+def _extend_provider_url_map_from_loaded_profiles() -> None:
+    """Add routes from profiles that are already in memory.
+
+    Provider discovery performs filesystem reads and source execution.  It is
+    therefore deliberately not triggered while this module is imported:
+    model metadata is imported from several async request paths, and the old
+    module-level ``list_providers()`` call could synchronously scan every
+    provider directory on the event loop.  The awaited context-length entry
+    point preloads profiles before calling this helper.
+    """
+    try:
+        from providers import _REGISTRY
+
+        for profile in _REGISTRY.values():
+            hostname = profile.get_hostname()
+            if hostname and hostname not in _URL_TO_PROVIDER:
+                _URL_TO_PROVIDER[hostname] = profile.name
+    except Exception:
+        # Provider metadata is an optional routing enhancement.  The static
+        # map above remains authoritative when a profile is unavailable.
+        return
+
+
+async def _ensure_provider_url_map() -> None:
+    """Populate profile-derived routes at an awaited runtime boundary."""
+    try:
+        from providers import _ensure_provider_profiles_loaded
+
+        await _ensure_provider_profiles_loaded()
+    except Exception:
+        # Keep the existing inference fallbacks when an optional plugin fails
+        # to load; the provider registry reports that failure independently.
+        pass
+    _extend_provider_url_map_from_loaded_profiles()
 
 
 def _infer_provider_from_url(base_url: str) -> Optional[str]:
@@ -2461,6 +2485,10 @@ async def get_model_context_length(
     7. Local server query (before hardcoded defaults for local endpoints)
     8. Hardcoded defaults (broad family patterns, longest-key-first)
     9. Default fallback (256K)"""
+    # Provider-derived URL routes are populated only after an awaited
+    # discovery boundary.  Importing this module must remain state-only.
+    await _ensure_provider_url_map()
+
     # 0. Explicit config override — user knows best
     if config_context_length is not None and isinstance(config_context_length, int) and config_context_length > 0:
         return config_context_length

@@ -24,6 +24,7 @@ import os
 import subprocess
 import sys
 import time
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 from agent.web_search_provider import WebSearchProvider
@@ -94,14 +95,10 @@ def _plugins_path_entry() -> str:
 
         pkg_file = getattr(plugins_pkg, "__file__", None)
         if pkg_file:
-            return os.path.dirname(os.path.dirname(os.path.abspath(pkg_file)))
+            return str(Path(pkg_file).parent.parent)
     except Exception:  # noqa: BLE001 — fall through to path-walk fallback
         pass
-    return os.path.dirname(
-        os.path.dirname(
-            os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        )
-    )
+    return str(Path(__file__).parent.parent.parent.parent)
 
 
 async def _run_ddgs_search_bounded(query: str, safe_limit: int) -> list[dict[str, Any]]:
@@ -137,7 +134,7 @@ async def _run_ddgs_search_bounded(query: str, safe_limit: int) -> list[dict[str
             path_entry + os.pathsep + child_pythonpath if child_pythonpath else path_entry
         )
 
-    worker_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_search_worker.py")
+    worker_path = str(Path(__file__).parent / "_search_worker.py")
     # Platform-only spawn knobs — stdin/stdout/stderr must stay as explicit
     # keyword args on the Popen call so scripts/check_subprocess_stdin.py can
     # see them (TUI gateway inherits stdin; #14036).

@@ -35,6 +35,31 @@ async def _no_claude_code_credentials(*_args, **_kwargs):
     return None
 
 
+async def test_claude_code_version_probe_uses_async_subprocess(monkeypatch):
+    import agent.anthropic_adapter as adapter
+
+    class _Process:
+        returncode = 0
+
+        async def communicate(self):
+            return b"2.2.3 (Claude Code)\n", b""
+
+    async def _which(_command):
+        return "/usr/local/bin/claude"
+
+    async def _spawn(*_args, **_kwargs):
+        return _Process()
+
+    monkeypatch.setattr(adapter.aiofiles.os, "wrap", lambda _fn: _which)
+    monkeypatch.setattr(adapter.asyncio, "create_subprocess_exec", _spawn)
+    adapter._claude_code_version_cache = None
+
+    try:
+        assert await adapter.ensure_claude_code_version() == "2.2.3"
+    finally:
+        adapter._claude_code_version_cache = None
+
+
 # ---------------------------------------------------------------------------
 # Auth helpers
 # ---------------------------------------------------------------------------
