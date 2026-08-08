@@ -32,6 +32,11 @@ jobs:
       - name: Install Python
         run: uv python install 3.11
 
+      - name: Install ripgrep
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes ripgrep
+
       - name: Verify release identity
         env:
           RELEASE_TAG: ${{ github.event.release.tag_name }}

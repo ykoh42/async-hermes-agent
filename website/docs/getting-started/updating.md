@@ -9,7 +9,18 @@ description: "Move between Async Hermes Agent releases while keeping application
 Async Hermes Agent does not include the upstream interactive updater. The host
 application controls dependency upgrades, rollout, and rollback.
 
-## Update a tagged installation
+## Update a PyPI installation
+
+Replace `<version>` with the release you have reviewed:
+
+```bash
+uv pip install --upgrade "async-hermes-agent==<version>"
+```
+
+Pinning the version keeps the agent harness reproducible alongside your model,
+prompt, and dataset versions.
+
+## Update a tagged Git installation
 
 Replace `<release>` with the tag you have reviewed:
 
@@ -18,8 +29,7 @@ uv pip install --upgrade \
   "git+https://github.com/ykoh42/async-hermes-agent.git@<release>"
 ```
 
-Do not track `main` implicitly in production. Pinning a tag or commit keeps the
-agent harness reproducible alongside your model, prompt, and dataset versions.
+Do not track `main` implicitly in production. Pin a tag or commit.
 
 ## Update a source checkout
 

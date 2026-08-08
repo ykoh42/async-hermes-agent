@@ -17,22 +17,22 @@ application supplies its own service or UI boundary.
 
 ## 1. Install the current release
 
-Install directly from Git with `uv`:
+Install the pinned release from PyPI with `uv`:
 
 ```bash
-uv pip install "git+https://github.com/ykoh42/async-hermes-agent.git@v0.20.3"
+uv pip install "async-hermes-agent==0.20.4"
 ```
 
 The equivalent `pip` command is:
 
 ```bash
-python -m pip install "git+https://github.com/ykoh42/async-hermes-agent.git@v0.20.3"
+python -m pip install "async-hermes-agent==0.20.4"
 ```
 
-Pin a release tag or commit in production so deployments remain reproducible:
+To install the same release directly from Git instead:
 
 ```bash
-uv pip install "git+https://github.com/ykoh42/async-hermes-agent.git@<tag-or-commit>"
+uv pip install "git+https://github.com/ykoh42/async-hermes-agent.git@v0.20.4"
 ```
 
 ## 2. Or install from a checkout
