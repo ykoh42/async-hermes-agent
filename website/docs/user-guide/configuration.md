@@ -38,10 +38,10 @@ Service code is easiest to reason about when model routing is explicit:
 
 ```python
 agent = AIAgent(
-    provider="openrouter",
-    base_url="https://openrouter.ai/api/v1",
-    api_key=os.environ["OPENROUTER_API_KEY"],
-    model=os.environ["OPENROUTER_MODEL"],
+    provider=os.environ["MODEL_PROVIDER"],
+    base_url=os.getenv("MODEL_BASE_URL") or None,
+    api_key=os.getenv("MODEL_API_KEY") or None,
+    model=os.environ["MODEL_ID"],
     enabled_toolsets=["file", "terminal", "skills"],
 )
 ```
@@ -54,8 +54,9 @@ recommended replacement for upstream interface-specific toolset configuration.
 Use the process environment or `$HERMES_HOME/.env` for credentials:
 
 ```dotenv
-OPENROUTER_API_KEY=...
 ANTHROPIC_API_KEY=...
+GOOGLE_API_KEY=...
+DEEPSEEK_API_KEY=...
 TEAM_MCP_TOKEN=...
 ```
 
@@ -79,9 +80,9 @@ Only include sections your application uses:
 
 ```yaml
 model:
-  provider: openrouter
-  default: "your/model-id"
-  base_url: "https://openrouter.ai/api/v1"
+  provider: "<provider-profile>"
+  default: "<model-id>"
+  # base_url: "<custom-or-overridden-endpoint>"
 
 memory:
   memory_enabled: true

@@ -1,29 +1,50 @@
 ---
 sidebar_position: 1
 title: Quickstart
-description: Run a first awaited conversation with the native-async Hermes agent library.
+description: Choose any supported provider and run your first awaited Hermes Agent conversation.
 ---
 
 # Quickstart
 
-The public API keeps the upstream module and method names. Library users add
-`await`; there is no separate `arun_*` API and no synchronous wrapper.
+This guide starts after installation, lets you choose any supported provider,
+and runs one complete conversation. The public API keeps the upstream module
+and method names: add `await`; there is no separate `arun_*` API.
 
-## 1. Install
+## 1. Install and verify
 
-Follow the [Installation guide](./installation.md), then provide credentials in
-the process environment or `$HERMES_HOME/.env`. The following example uses an
-OpenRouter-compatible endpoint, but deliberately leaves model selection to you:
+Follow the [Installation guide](./installation.md) and run its async API check
+before configuring a provider.
+
+## 2. Choose a provider and model
+
+Pick the route that matches your deployment. No bundled provider profile is
+the default or the assumed path.
+
+| Route | Use it when | What the host supplies |
+| --- | --- | --- |
+| Bundled provider profile | You use one of the provider profiles shipped with the library | Provider name, model ID, and that provider's credential or identity |
+| Custom OpenAI-compatible endpoint | You operate vLLM, SGLang, Ollama, LM Studio, or another compatible server | `custom`, base URL, model ID, and any required key |
+| File-backed defaults | Several agent instances share one route | Non-secret model settings in `$HERMES_HOME/config.yaml`; credentials in `.env` |
+
+See the complete [Provider catalog](../integrations/providers.md) before picking
+a credential or optional dependency.
+
+For a provider-neutral runnable example, let the host application expose four
+ordinary application variables:
 
 ```bash
-export OPENROUTER_API_KEY="..."
-export OPENROUTER_MODEL="<a-current-tool-capable-model>"
+export MODEL_PROVIDER="<provider-profile>"
+export MODEL_ID="<tool-capable-model-id>"
+export MODEL_API_KEY="<credential-if-required>"
+# Only custom or overridden routes need this:
+export MODEL_BASE_URL="<optional-base-url>"
 ```
 
-Provider catalogs and free-model availability change over time, so examples do
-not pin a free model name.
+These are example variables owned by your host application, not additional
+Hermes configuration keys. Provider catalogs, aliases, availability, and prices
+change over time, so this guide does not pin a vendor or model name.
 
-## 2. Run one conversation
+## 3. Run one conversation
 
 ```python
 import asyncio
@@ -34,10 +55,10 @@ from run_agent import AIAgent
 
 async def main() -> None:
     async with AIAgent(
-        provider="openrouter",
-        base_url="https://openrouter.ai/api/v1",
-        api_key=os.environ["OPENROUTER_API_KEY"],
-        model=os.environ["OPENROUTER_MODEL"],
+        provider=os.environ["MODEL_PROVIDER"],
+        base_url=os.getenv("MODEL_BASE_URL") or None,
+        api_key=os.getenv("MODEL_API_KEY") or None,
+        model=os.environ["MODEL_ID"],
         enabled_toolsets=["file", "terminal"],
     ) as agent:
         result = await agent.run_conversation(
@@ -52,7 +73,7 @@ asyncio.run(main())
 `AIAgent.__init__()` performs state-only construction. The async context manager
 initializes provider, plugin, and MCP resources and always awaits `close()`.
 
-## 3. Choose the return shape
+## 4. Choose the return shape
 
 `run_conversation()` returns the full turn result. Its stable core fields are the
 final response, message history, and completion state. Normal completed turns
@@ -89,6 +110,7 @@ cannot corrupt a shared conversation. Separate instances can overlap I/O-bound
 work. Use one instance for an ordered conversation and separate instances for
 independent requests.
 
-Next, see the [Python library guide](../guides/python-library.md),
-[tools](../user-guide/features/tools.md), and
-[sessions](../user-guide/sessions.md).
+Next, see [Configuration](../user-guide/configuration.md), the
+[Python library guide](../guides/python-library.md),
+[Tools](../user-guide/features/tools.md), and
+[Sessions](../user-guide/sessions.md).

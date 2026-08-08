@@ -12,8 +12,7 @@ availability checks still apply after resolution.
 
 ```python
 agent = AIAgent(
-    provider="openrouter",
-    model="openrouter/auto",
+    ...,
     enabled_toolsets=["file", "terminal", "skills"],
 )
 ```

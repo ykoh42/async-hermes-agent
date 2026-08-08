@@ -2,7 +2,7 @@
 slug: /
 sidebar_position: 0
 title: "Async Hermes Agent Documentation"
-description: "Native-async Hermes Agent library for agent turns, tools, MCP, skills, memory, sessions, and trajectory generation."
+description: "Hermes Agent's complete agent harness, converted to a native-async Python library."
 hide_table_of_contents: true
 displayed_sidebar: docs
 ---
@@ -12,13 +12,9 @@ import useBaseUrl from "@docusaurus/useBaseUrl";
 
 # Async Hermes Agent
 
-A native-async, library-focused distribution derived from
-[NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent) at
-upstream release `v2026.8.3`.
-
-It preserves the upstream `AIAgent`, runner, batch runner, provider, tool,
-MCP, skill, memory, session, and trajectory surfaces while making the active
-library path awaitable end to end.
+The Hermes Agent harness, converted to a native-async Python library. It keeps
+the upstream agent loop, tools, providers, MCP, skills, memory, sessions,
+trajectories, runner, and batch runner while making I/O awaitable end to end.
 
 <div
   style={{
@@ -42,8 +38,8 @@ library path awaitable end to end.
   >
     Get Started →
   </Link>
-  <a
-    href={useBaseUrl("/getting-started/quickstart")}
+  <Link
+    to="/guides/python-library"
     style={{
       display: "inline-block",
       padding: "0.6rem 1.2rem",
@@ -52,8 +48,8 @@ library path awaitable end to end.
       textDecoration: "none",
     }}
   >
-    Quickstart Guide
-  </a>
+    Python Library
+  </Link>
   <a
     href="https://github.com/ykoh42/async-hermes-agent"
     style={{
@@ -70,29 +66,31 @@ library path awaitable end to end.
 
 ## Install
 
-Python 3.11 through 3.13 is supported. Install the library directly from the
-release tag:
+Python 3.11 through 3.13 is supported. Install the current release directly
+from GitHub:
 
 ```bash
 uv pip install "git+https://github.com/ykoh42/async-hermes-agent.git@v0.20.3"
 ```
 
-See the full **[Installation Guide](/getting-started/installation)** for a
-development checkout, optional provider dependencies, and release artifacts.
+Then follow the **[Installation Guide](/getting-started/installation)** to
+verify the package and choose only the provider dependencies your application
+needs.
 
 :::tip Fastest path to a working agent
-Choose a current tool-capable model, provide its credential, then follow the
-[Quickstart](/getting-started/quickstart). Existing upstream library call sites
-normally keep their imports and add `await` at I/O-bearing calls.
+Choose any supported provider and a current tool-capable model, then follow the
+[Quickstart](/getting-started/quickstart). No provider is privileged by the
+library or by this documentation.
 :::
 
 ## What is Async Hermes Agent?
 
-It is the retained Hermes agent harness as an async-only Python library. The
-conversation loop, providers, tools, MCP, skills, memory, sessions, delegation,
-trajectories, runner, and batch runner remain available under their familiar
-module paths. A host application owns its own HTTP, authentication, UI, and
-deployment lifecycle and awaits `AIAgent` directly.
+Async Hermes Agent is an async-only distribution of the upstream
+[NousResearch/Hermes Agent](https://github.com/NousResearch/hermes-agent), based
+on release `v2026.8.3`. Existing library integrations keep familiar module
+paths and public names; I/O-bearing calls are awaited. The host application
+owns its HTTP service or UI and the agent remains the reusable harness beneath
+it.
 
 ## Quick Links
 

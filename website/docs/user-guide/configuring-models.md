@@ -17,10 +17,10 @@ import os
 from run_agent import AIAgent
 
 agent = AIAgent(
-    provider="openrouter",
-    base_url="https://openrouter.ai/api/v1",
-    api_key=os.environ["OPENROUTER_API_KEY"],
-    model=os.environ["OPENROUTER_MODEL"],
+    provider=os.environ["MODEL_PROVIDER"],
+    base_url=os.getenv("MODEL_BASE_URL") or None,
+    api_key=os.getenv("MODEL_API_KEY") or None,
+    model=os.environ["MODEL_ID"],
     max_iterations=30,
 )
 ```
@@ -34,19 +34,20 @@ For shared defaults, write `$HERMES_HOME/config.yaml`:
 
 ```yaml
 model:
-  provider: openrouter
-  default: "your/model-id"
-  base_url: "https://openrouter.ai/api/v1"
+  provider: "<provider-profile>"
+  default: "<model-id>"
+  # base_url: "<custom-or-overridden-endpoint>"
 ```
 
 Put the credential in `$HERMES_HOME/.env`:
 
 ```dotenv
-OPENROUTER_API_KEY=...
+<PROVIDER_CREDENTIAL_VARIABLE>=...
 ```
 
 Explicit constructor values override defaults for that instance. Keep API keys
-out of `config.yaml` even when a provider accepts them there.
+out of `config.yaml` even when a provider accepts them there. The exact
+credential variable is listed in the [Provider catalog](../integrations/providers.md).
 
 ## Native providers and extras
 

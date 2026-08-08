@@ -26,8 +26,7 @@ Construct an agent with `save_trajectories=True`:
 
 ```python
 async with AIAgent(
-    provider="openrouter",
-    model="openrouter/auto",
+    ...,
     save_trajectories=True,
 ) as agent:
     await agent.run_conversation("Research the issue")

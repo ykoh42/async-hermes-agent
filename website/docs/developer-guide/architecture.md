@@ -47,7 +47,7 @@ connection. The external lifecycle starts at the first awaited operation:
 from run_agent import AIAgent
 
 
-async with AIAgent(provider="openrouter", model="openrouter/auto") as agent:
+async with AIAgent(...) as agent:
     result = await agent.run_conversation("Review this change")
 ```
 

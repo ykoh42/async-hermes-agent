@@ -18,10 +18,7 @@ from run_agent import AIAgent
 
 
 async def answer(message: str) -> str:
-    async with AIAgent(
-        provider="openrouter",
-        model="openrouter/auto",
-    ) as agent:
+    async with AIAgent(...) as agent:
         return await agent.chat(message)
 ```
 
@@ -49,7 +46,7 @@ from run_agent import AIAgent
 
 stack = AsyncExitStack()
 agent = await stack.enter_async_context(
-    AIAgent(provider="openrouter", model="openrouter/auto")
+    AIAgent(...)
 )
 
 try:
@@ -76,10 +73,7 @@ from run_agent import AIAgent
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    async with AIAgent(
-        provider="openrouter",
-        model="openrouter/auto",
-    ) as agent:
+    async with AIAgent(...) as agent:
         app.state.agent = agent
         yield
 

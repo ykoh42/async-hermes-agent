@@ -7,13 +7,16 @@ const sidebars: SidebarsConfig = {
       label: 'Getting Started',
       collapsed: false,
       items: [
-        'getting-started/quickstart',
         'getting-started/installation',
+        'getting-started/quickstart',
+        'getting-started/platform-support',
+        'getting-started/updating',
+        'getting-started/learning-path',
       ],
     },
     {
       type: 'category',
-      label: 'Using Async Hermes Agent',
+      label: 'Using Hermes',
       collapsed: true,
       items: [
         'user-guide/configuration',
@@ -28,12 +31,29 @@ const sidebars: SidebarsConfig = {
       collapsed: true,
       items: [
         'user-guide/features/overview',
-        'user-guide/features/tools',
-        'user-guide/features/skills',
-        'user-guide/features/mcp',
-        'user-guide/features/memory',
-        'user-guide/features/browser',
-        'user-guide/features/batch-processing',
+        {
+          type: 'category',
+          label: 'Core',
+          items: [
+            'user-guide/features/tools',
+            'user-guide/features/skills',
+            'user-guide/features/memory',
+          ],
+        },
+        {
+          type: 'category',
+          label: 'Automation',
+          items: [
+            'user-guide/features/batch-processing',
+          ],
+        },
+        {
+          type: 'category',
+          label: 'Media & Web',
+          items: [
+            'user-guide/features/browser',
+          ],
+        },
       ],
     },
     {
@@ -43,11 +63,12 @@ const sidebars: SidebarsConfig = {
       items: [
         'integrations/index',
         'integrations/providers',
+        'user-guide/features/mcp',
       ],
     },
     {
       type: 'category',
-      label: 'Guides',
+      label: 'Guides & Tutorials',
       collapsed: true,
       items: [
         'guides/python-library',
@@ -60,11 +81,29 @@ const sidebars: SidebarsConfig = {
       label: 'Developer Guide',
       collapsed: true,
       items: [
-        'developer-guide/architecture',
-        'developer-guide/agent-loop',
-        'developer-guide/programmatic-integration',
-        'developer-guide/session-storage',
-        'developer-guide/trajectory-format',
+        {
+          type: 'category',
+          label: 'Architecture',
+          items: [
+            'developer-guide/architecture',
+            'developer-guide/agent-loop',
+            'developer-guide/session-storage',
+          ],
+        },
+        {
+          type: 'category',
+          label: 'Extending',
+          items: [
+            'developer-guide/programmatic-integration',
+          ],
+        },
+        {
+          type: 'category',
+          label: 'Internals',
+          items: [
+            'developer-guide/trajectory-format',
+          ],
+        },
       ],
     },
     {
@@ -72,10 +111,22 @@ const sidebars: SidebarsConfig = {
       label: 'Reference',
       collapsed: true,
       items: [
-        'reference/environment-variables',
-        'reference/mcp-config-reference',
-        'reference/tools-reference',
-        'reference/toolsets-reference',
+        {
+          type: 'category',
+          label: 'Configuration Reference',
+          items: [
+            'reference/environment-variables',
+            'reference/mcp-config-reference',
+          ],
+        },
+        {
+          type: 'category',
+          label: 'Tools & Skills Reference',
+          items: [
+            'reference/tools-reference',
+            'reference/toolsets-reference',
+          ],
+        },
         'reference/faq',
       ],
     },

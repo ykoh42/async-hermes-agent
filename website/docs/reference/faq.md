@@ -57,9 +57,9 @@ tool limits still determine performance.
 
 ## Which providers work?
 
-The retained provider registry includes OpenRouter, OpenAI-compatible custom
-endpoints, Anthropic, Gemini, Vertex, Bedrock, Azure Foundry, and other upstream
-provider plugins. Some require an optional dependency extra. See
+The retained registry includes native Anthropic, Gemini, Vertex and Bedrock
+routes, Codex and cloud-identity routes, many OpenAI-compatible profiles, and
+custom/local endpoints. Some require an optional dependency extra. See
 [Providers](/integrations/providers) and the provider's plugin manifest.
 
 ## A provider says the key is missing
@@ -78,8 +78,8 @@ Do not send `OPENAI_API_KEY` to an unrelated custom endpoint. See
 
 Rate limits belong to the selected provider/account. The library retains
 provider retry and credential-pool behavior, but it does not invent a local
-OpenRouter-specific quota. Reduce concurrency, wait for the provider window,
-or use an account/model with suitable limits.
+quota. Reduce concurrency, wait for the provider window, or use an
+account/model with suitable limits.
 
 ## MCP tools do not appear
 

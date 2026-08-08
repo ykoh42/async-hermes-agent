@@ -1,13 +1,13 @@
 ---
 sidebar_position: 2
 title: Installation
-description: Install the native-async Hermes agent library from Git or a source checkout.
+description: Install Async Hermes Agent, verify the async API, and add only the provider dependencies you need.
 ---
 
 # Installation
 
-Async Hermes Agent is a Python library. It does not install the upstream Hermes
-CLI, TUI, desktop application, messaging gateway, scheduler, or web service.
+Start here. Async Hermes Agent is distributed as a Python library; your
+application supplies its own service or UI boundary.
 
 ## Requirements
 
@@ -15,28 +15,27 @@ CLI, TUI, desktop application, messaging gateway, scheduler, or web service.
 - Git
 - A model provider credential, unless you use a local endpoint
 
-## Install the current repository
+## 1. Install the current release
 
 Install directly from Git with `uv`:
 
 ```bash
-uv pip install "git+https://github.com/ykoh42/async-hermes-agent.git"
+uv pip install "git+https://github.com/ykoh42/async-hermes-agent.git@v0.20.3"
 ```
 
 The equivalent `pip` command is:
 
 ```bash
-python -m pip install "git+https://github.com/ykoh42/async-hermes-agent.git"
+python -m pip install "git+https://github.com/ykoh42/async-hermes-agent.git@v0.20.3"
 ```
 
-This documentation does not assume that a PyPI release exists. Pin a commit or
-tag in production so deployments remain reproducible:
+Pin a release tag or commit in production so deployments remain reproducible:
 
 ```bash
 uv pip install "git+https://github.com/ykoh42/async-hermes-agent.git@<tag-or-commit>"
 ```
 
-## Install from a checkout
+## 2. Or install from a checkout
 
 ```bash
 git clone https://github.com/ykoh42/async-hermes-agent.git
@@ -51,11 +50,12 @@ uv sync --extra dev
 uv run pytest -q
 ```
 
-## Provider-specific extras
+## 3. Add provider-specific extras
 
 The base installation includes the OpenAI-compatible async transport, MCP,
-SQLite session storage, and the core tool runtime. Install only the extras
-needed by the providers you select:
+SQLite session storage, and the core tool runtime. Provider selection is a
+separate decision: install only the extras required by the provider family you
+choose.
 
 | Extra | Use |
 | --- | --- |
@@ -77,7 +77,7 @@ uv sync --extra bedrock
 Missing provider dependencies fail with an installation hint; the library does
 not silently move synchronous provider code into a worker thread.
 
-## Verify the API
+## 4. Verify the async API
 
 ```bash
 python - <<'PY'
@@ -92,6 +92,5 @@ PY
 ```
 
 This verifies the installed interface without making a paid model request.
-Continue with the [Quickstart](./quickstart.md), then review
-[configuration](../user-guide/configuration.md) and
-[provider selection](../integrations/providers.md).
+Continue with the [Quickstart](./quickstart.md). It begins with a neutral
+provider-selection step, then runs the same awaited agent API for every route.
