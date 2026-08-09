@@ -1751,6 +1751,28 @@ class TestConcurrentToolExecution:
         assert "gamma" in messages[2]["content"]
 
     @pytest.mark.asyncio
+    async def test_preflight_interrupt_skips_entire_parallel_batch(self, agent):
+        agent._interrupt_requested = True
+        tc1 = _mock_tool_call(name="web_search", arguments="{}", call_id="c1")
+        tc2 = _mock_tool_call(name="web_search", arguments="{}", call_id="c2")
+        mock_msg = _mock_assistant_msg(content="", tool_calls=[tc1, tc2])
+        messages = []
+
+        with patch(
+            "model_tools.handle_function_call",
+            new_callable=AsyncMock,
+            side_effect=AssertionError("interrupted tools must not execute"),
+        ) as dispatch:
+            await agent._execute_tool_calls(mock_msg, messages, "task-1")
+
+        dispatch.assert_not_awaited()
+        assert [message["tool_call_id"] for message in messages] == ["c1", "c2"]
+        assert all(
+            "skipped due to user interrupt" in message["content"]
+            for message in messages
+        )
+
+    @pytest.mark.asyncio
     async def test_concurrent_none_args_rejected_without_crash(self, agent):
         """Concurrent executor must not crash on arguments=None. Current
         contract (_parse_tool_arguments): non-object args are rejected with

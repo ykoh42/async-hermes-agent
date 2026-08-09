@@ -3,6 +3,7 @@
 import asyncio
 import json
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 from blockbuster import BlockBuster
@@ -130,6 +131,27 @@ async def test_memory_manager_preserves_background_write_order():
     assert await manager.flush_pending(timeout=1.0)
 
     assert [event[0] for event in provider.events] == ["sync", "queue"]
+
+
+@pytest.mark.asyncio
+async def test_interrupted_turn_does_not_sync_external_memory():
+    from run_agent import AIAgent
+
+    agent = AIAgent.__new__(AIAgent)
+    agent._memory_manager = SimpleNamespace(
+        sync_all=AsyncMock(),
+        queue_prefetch_all=AsyncMock(),
+    )
+    agent.session_id = "test-session"
+
+    await agent._sync_external_memory_for_turn(
+        original_user_message="What time is it?",
+        final_response="It is 3pm.",
+        interrupted=True,
+    )
+
+    agent._memory_manager.sync_all.assert_not_awaited()
+    agent._memory_manager.queue_prefetch_all.assert_not_awaited()
 
 
 @pytest.mark.asyncio
