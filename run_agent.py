@@ -5161,6 +5161,13 @@ class AIAgent:
         native transport fail before the request rather than using a worker.
         """
         if self.api_mode == "codex_responses":
+            request_client = await self._ensure_primary_openai_client(
+                reason=(
+                    "codex_stream_request"
+                    if use_streaming
+                    else "codex_request"
+                ),
+            )
             if use_streaming:
                 from agent.codex_runtime import run_codex_stream
 
@@ -5181,7 +5188,7 @@ class AIAgent:
                 return await run_codex_stream(
                     self,
                     api_kwargs,
-                    client=self.client,
+                    client=request_client,
                     on_first_delta=on_first_delta,
                     on_stream_event=_on_codex_event,
                     on_stream_text=_on_stream_text,
@@ -5189,7 +5196,7 @@ class AIAgent:
 
             request = dict(api_kwargs)
             request.pop("stream", None)
-            return await self.client.responses.create(**request)
+            return await request_client.responses.create(**request)
 
         if self.api_mode == "anthropic_messages":
             anthropic_key = getattr(self, "_anthropic_api_key", None)

@@ -978,6 +978,66 @@ async def test_closed_openai_client_rebuild_failure_matches_upstream_error():
 
 
 @pytest.mark.asyncio
+async def test_closed_openai_client_is_rebuilt_before_codex_request():
+    agent = AIAgent.__new__(AIAgent)
+    stale_create = AsyncMock(side_effect=AssertionError("closed client was used"))
+    agent.client = SimpleNamespace(
+        _client=SimpleNamespace(is_closed=True),
+        responses=SimpleNamespace(create=stale_create),
+    )
+    response = object()
+    fresh_create = AsyncMock(return_value=response)
+    fresh_client = SimpleNamespace(
+        _client=SimpleNamespace(is_closed=False),
+        responses=SimpleNamespace(create=fresh_create),
+    )
+    agent.api_mode = "codex_responses"
+    agent.provider = "openai-codex"
+
+    async def replace_primary(*, reason):
+        assert reason == "codex_request"
+        agent.client = fresh_client
+        return True
+
+    agent._replace_primary_openai_client = AsyncMock(side_effect=replace_primary)
+
+    assert await agent._execute_model_request(
+        {"model": "gpt-5-codex", "stream": False}
+    ) is response
+    fresh_create.assert_awaited_once_with(model="gpt-5-codex")
+    stale_create.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_closed_openai_client_is_rebuilt_before_codex_stream():
+    agent = AIAgent.__new__(AIAgent)
+    agent.client = SimpleNamespace(_client=SimpleNamespace(is_closed=True))
+    fresh_client = SimpleNamespace(_client=SimpleNamespace(is_closed=False))
+    response = object()
+    agent.api_mode = "codex_responses"
+    agent.provider = "openai-codex"
+
+    async def replace_primary(*, reason):
+        assert reason == "codex_stream_request"
+        agent.client = fresh_client
+        return True
+
+    agent._replace_primary_openai_client = AsyncMock(side_effect=replace_primary)
+
+    with patch(
+        "agent.codex_runtime.run_codex_stream",
+        new_callable=AsyncMock,
+        return_value=response,
+    ) as stream:
+        assert await agent._execute_model_request(
+            {"model": "gpt-5-codex"},
+            use_streaming=True,
+        ) is response
+
+    assert stream.await_args.kwargs["client"] is fresh_client
+
+
+@pytest.mark.asyncio
 async def test_async_context_manager_initializes_provider_mcp_and_tools():
     agent = AIAgent(
         api_key="test-key",

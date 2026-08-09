@@ -419,3 +419,52 @@ async def test_tool_call_bridge_cannot_escape_session_toolset_scope():
 
     handler.assert_not_awaited()
     assert "not available in this session" in messages[0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_parallel_tool_batches_preserve_approval_context_isolation():
+    """Native TaskGroup workers inherit each caller's approval session."""
+    from tools.approval import (
+        get_current_session_key,
+        reset_current_session_key,
+        set_current_session_key,
+    )
+
+    observed: dict[str, list[str]] = {}
+
+    async def handle(_name, _args, task_id, **_kwargs):
+        await asyncio.sleep(0)
+        observed.setdefault(task_id, []).append(
+            get_current_session_key(default="FALLBACK")
+        )
+        return json.dumps({"ok": True})
+
+    async def run_batch(label: str):
+        token = set_current_session_key(f"session-{label}")
+        try:
+            agent = _agent(AsyncMock(return_value=True))
+            calls = [
+                _tool_call("read_file", f"{label}-1"),
+                _tool_call("read_file", f"{label}-2"),
+            ]
+            await execute_tool_calls_concurrent(
+                agent,
+                SimpleNamespace(tool_calls=calls),
+                [],
+                f"task-{label}",
+                finalize=False,
+            )
+        finally:
+            reset_current_session_key(token)
+
+    with (
+        patch("model_tools.handle_function_call", side_effect=handle),
+        _native_tool_entry(),
+        _native_policy_path(),
+    ):
+        await asyncio.gather(run_batch("A"), run_batch("B"))
+
+    assert observed == {
+        "task-A": ["session-A", "session-A"],
+        "task-B": ["session-B", "session-B"],
+    }
