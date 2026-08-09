@@ -4,13 +4,14 @@
 This is the retained library form of Hermes' ``skill_manage`` tool.  It keeps
 the upstream public name, arguments, action names, result shape, and file
 location while performing every filesystem operation through an awaited I/O
-boundary.  Product-specific curator, CLI approval, and organization-sync
-workflows are intentionally outside this module.
+boundary.  CLI approval and organization-sync workflows remain outside this
+module.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import json
 import logging
 import os
@@ -54,6 +55,230 @@ _is_junction = aiofiles.os.wrap(
     lambda path: bool(getattr(path, "is_junction", lambda: False)())
 )
 _skill_write_lock = asyncio.Lock()
+_background_review_read_paths: contextvars.ContextVar[frozenset[str]] = (
+    contextvars.ContextVar("background_review_read_paths", default=frozenset())
+)
+
+
+async def mark_background_review_skill_read(path: Path) -> None:
+    """Record that the active review fork loaded one exact skill file."""
+    try:
+        from tools.skill_provenance import is_background_review
+
+        if not is_background_review():
+            return
+    except Exception:
+        return
+    try:
+        resolved = str(await _realpath(path.expanduser()))
+    except (OSError, ValueError):
+        resolved = str(path)
+    paths = set(_background_review_read_paths.get())
+    paths.add(resolved)
+    _background_review_read_paths.set(frozenset(paths))
+
+
+async def _background_review_has_read(path: Path) -> bool:
+    try:
+        resolved = str(await _realpath(path.expanduser()))
+    except (OSError, ValueError):
+        resolved = str(path)
+    return resolved in _background_review_read_paths.get()
+
+
+def _reset_background_review_read_marks() -> None:
+    """Clear read-before-write marks for the current review context."""
+    _background_review_read_paths.set(frozenset())
+
+
+async def _pinned_guard(name: str) -> Optional[str]:
+    """Refuse only irreversible foreground deletion of a pinned skill."""
+    try:
+        from tools import skill_usage
+
+        if (await skill_usage.get_record(name)).get("pinned"):
+            return (
+                f"Skill '{name}' is pinned and cannot be deleted by "
+                "skill_manage. Unpin it explicitly before deletion. Patches "
+                "and edits remain allowed; only deletion is blocked."
+            )
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.debug("pinned-skill lookup failed for %s", name, exc_info=True)
+    return None
+
+
+async def _background_review_write_guard(
+    name: str,
+    skill_dir: Path,
+    action: str,
+) -> Optional[Dict[str, Any]]:
+    """Restrict autonomous writes to local, curator-managed skills."""
+    try:
+        from tools.skill_provenance import is_background_review
+
+        if not is_background_review():
+            return None
+    except Exception:
+        return None
+
+    try:
+        from tools import skill_usage
+
+        if (await skill_usage.get_record(name)).get("pinned"):
+            return {
+                "success": False,
+                "error": (
+                    f"Refusing background curator {action} for pinned skill "
+                    f"'{name}': pinned skills are off-limits to autonomous "
+                    "maintenance."
+                ),
+            }
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.debug("pinned skill guard lookup failed for %s", name, exc_info=True)
+
+    try:
+        from agent.skill_utils import is_external_skill_path
+
+        if await is_external_skill_path(skill_dir):
+            return {
+                "success": False,
+                "error": (
+                    f"Refusing background curator {action} for skill '{name}': "
+                    "the skill lives in skills.external_dirs, which are "
+                    "externally owned and read-only to autonomous curation."
+                ),
+            }
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.debug("external skill guard lookup failed for %s", name, exc_info=True)
+
+    try:
+        from tools import skill_usage
+
+        if skill_usage.is_protected_builtin(name):
+            return {
+                "success": False,
+                "error": (
+                    f"Refusing background curator {action} for protected "
+                    f"built-in skill '{name}'."
+                ),
+            }
+        if await skill_usage.is_hub_installed(name):
+            return {
+                "success": False,
+                "error": (
+                    f"Refusing background curator {action} for hub-installed "
+                    f"skill '{name}'."
+                ),
+            }
+        if await skill_usage.is_bundled(name):
+            return {
+                "success": False,
+                "error": (
+                    f"Refusing background curator {action} for bundled "
+                    f"skill '{name}'."
+                ),
+            }
+        usage_record = (await skill_usage.load_usage()).get(name)
+        if not skill_usage._is_curator_managed_record(usage_record):
+            detail = (
+                f"created_by={usage_record.get('created_by')!r}"
+                if isinstance(usage_record, dict)
+                else "no usage record"
+            )
+            return {
+                "success": False,
+                "error": (
+                    f"Refusing background curator {action} for skill '{name}': "
+                    f"the skill is not curator-managed ({detail}). User-owned "
+                    "skills are off-limits to autonomous curation. Explicitly "
+                    "adopt the skill before autonomous maintenance."
+                ),
+            }
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.warning("owned skill guard lookup failed for %s", name, exc_info=True)
+        return {
+            "success": False,
+            "error": (
+                f"Refusing background curator {action} for skill '{name}': "
+                "agent ownership could not be verified because the provenance "
+                "record is unavailable or unreadable."
+            ),
+        }
+    return None
+
+
+async def _background_review_read_before_write_guard(
+    name: str,
+    target: Path,
+    action: str,
+    file_label: str,
+) -> Optional[Dict[str, Any]]:
+    try:
+        from tools.skill_provenance import is_background_review
+
+        if not is_background_review():
+            return None
+    except Exception:
+        return None
+    if await _background_review_has_read(target):
+        return None
+    return {
+        "success": False,
+        "error": (
+            f"Refusing background curator {action} for skill '{name}': the "
+            f"current {file_label} content has not been loaded in this review "
+            "turn. Call skill_view(name) for SKILL.md, or skill_view(name, "
+            "file_path=...) for a supporting file, then retry the write using "
+            "the content just returned."
+        ),
+        "_read_before_write_required": True,
+    }
+
+
+async def _background_review_preflight(
+    action: str,
+    name: str,
+) -> Optional[Dict[str, Any]]:
+    """Run the upstream ownership guard before validating write arguments."""
+    if action not in {"edit", "patch", "delete", "write_file", "remove_file"}:
+        return None
+    existing = await _find_skill(name)
+    if not existing:
+        return None
+    return await _background_review_write_guard(name, existing["path"], action)
+
+
+def _curator_consolidation_delete_guard(
+    name: str,
+    absorbed_into: Optional[str],
+) -> Optional[Dict[str, Any]]:
+    from tools.skill_provenance import is_background_review
+
+    if not is_background_review() or (
+        isinstance(absorbed_into, str) and absorbed_into.strip()
+    ):
+        return None
+    return {
+        "success": False,
+        "error": (
+            f"Refusing background curator delete of skill '{name}': the "
+            "consolidation pass may only archive a skill it has absorbed into "
+            "an umbrella. Pass absorbed_into=<umbrella> (the umbrella must "
+            "already exist) to record a verified consolidation. Pruning a "
+            "skill with no forwarding target is not permitted here — the "
+            "deterministic inactivity prune handles staleness archival "
+            f"separately. Keeping '{name}' active."
+        ),
+        "_fail_closed": True,
+    }
 
 
 def _skills_dir() -> Path:
@@ -284,16 +509,15 @@ async def _remove_tree(path: Path) -> None:
     await aiofiles.os.rmdir(path)
 
 
-async def _remove_tree_fully(path: Path) -> None:
-    """Finish an accepted delete even when the caller is cancelled mid-cleanup."""
-    delete_task = asyncio.create_task(_remove_tree(path))
+async def _finish_owned_task(task: asyncio.Task[Any]) -> Any:
+    """Finish one accepted mutation before propagating caller cancellation."""
     cancellation: asyncio.CancelledError | None = None
     while True:
         try:
-            await asyncio.shield(delete_task)
+            result = await asyncio.shield(task)
             break
         except asyncio.CancelledError as exc:  # noqa: ASYNC103 - re-raised below
-            if delete_task.cancelled():
+            if task.cancelled():
                 raise
             if cancellation is None:
                 cancellation = exc
@@ -303,6 +527,12 @@ async def _remove_tree_fully(path: Path) -> None:
             raise
     if cancellation is not None:
         raise cancellation
+    return result
+
+
+async def _remove_tree_fully(path: Path) -> None:
+    """Finish an accepted delete even when the caller is cancelled mid-cleanup."""
+    await _finish_owned_task(asyncio.create_task(_remove_tree(path)))
 
 
 async def _cleanup_empty_parent(path: Path, stop: Path) -> None:
@@ -390,7 +620,20 @@ async def _edit_skill(name: str, content: str) -> Dict[str, Any]:
     existing = await _find_skill(name)
     if not existing:
         return {"success": False, "error": _skill_not_found_error(name)}
+    if guard := await _background_review_write_guard(
+        name,
+        existing["path"],
+        "edit",
+    ):
+        return guard
     skill_md = existing["path"] / "SKILL.md"
+    if guard := await _background_review_read_before_write_guard(
+        name,
+        skill_md,
+        "edit",
+        "SKILL.md",
+    ):
+        return guard
     await _atomic_write_text(skill_md, content)
 
     description = ""
@@ -423,6 +666,8 @@ async def _patch_skill(
     if not existing:
         return {"success": False, "error": _skill_not_found_error(name)}
     skill_dir = existing["path"]
+    if guard := await _background_review_write_guard(name, skill_dir, "patch"):
+        return guard
     if file_path:
         if error := _validate_file_path(file_path):
             return {"success": False, "error": error}
@@ -437,6 +682,13 @@ async def _patch_skill(
             "success": False,
             "error": f"File not found: {target.relative_to(skill_dir)}",
         }
+    if guard := await _background_review_read_before_write_guard(
+        name,
+        target,
+        "patch",
+        file_path or "SKILL.md",
+    ):
+        return guard
 
     content = await _read_text(target)
     from tools.fuzzy_match import format_no_match_hint, fuzzy_find_and_replace
@@ -483,6 +735,16 @@ async def _delete_skill(
     existing = await _find_skill(name)
     if not existing:
         return {"success": False, "error": _skill_not_found_error(name)}
+    if guard := await _background_review_write_guard(
+        name,
+        existing["path"],
+        "delete",
+    ):
+        return guard
+    if guard := _curator_consolidation_delete_guard(name, absorbed_into):
+        return guard
+    if pinned_error := await _pinned_guard(name):
+        return {"success": False, "error": pinned_error}
     absorbed_target = absorbed_into.strip() if isinstance(absorbed_into, str) else ""
     if absorbed_target:
         if absorbed_target == name:
@@ -503,6 +765,27 @@ async def _delete_skill(
             }
 
     skill_dir = existing["path"]
+    from tools.skill_provenance import is_background_review
+
+    if is_background_review():
+        from tools.skill_usage import archive_skill
+
+        try:
+            archived, archive_message = await archive_skill(name)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            return {
+                "success": False,
+                "error": f"failed to archive '{name}': {exc}",
+            }
+        if not archived:
+            return {"success": False, "error": archive_message}
+        message = f"Skill '{name}' archived ({archive_message})."
+        if absorbed_target:
+            message += f" Content absorbed into '{absorbed_target}'."
+        return {"success": True, "message": message, "_archived": True}
+
     skills_root, error = await _validate_delete_target(skill_dir)
     if error:
         return {"success": False, "error": error}
@@ -544,10 +827,24 @@ async def _write_file(
                 " Create it first with action='create'.",
             ),
         }
+    if guard := await _background_review_write_guard(
+        name,
+        existing["path"],
+        "write_file",
+    ):
+        return guard
     target, error = await _resolve_skill_target(existing["path"], file_path)
     if error:
         return {"success": False, "error": error}
     assert target is not None
+    if await aiofiles.os.path.exists(target):
+        if guard := await _background_review_read_before_write_guard(
+            name,
+            target,
+            "write_file",
+            file_path,
+        ):
+            return guard
     await _atomic_write_text(target, file_content)
     return {
         "success": True,
@@ -581,6 +878,8 @@ async def _remove_file(name: str, file_path: str) -> Dict[str, Any]:
     if not existing:
         return {"success": False, "error": _skill_not_found_error(name)}
     skill_dir = existing["path"]
+    if guard := await _background_review_write_guard(name, skill_dir, "remove_file"):
+        return guard
     target, error = await _resolve_skill_target(skill_dir, file_path)
     if error:
         return {"success": False, "error": error}
@@ -592,6 +891,13 @@ async def _remove_file(name: str, file_path: str) -> Dict[str, Any]:
             "error": f"File '{file_path}' not found in skill '{name}'.",
             "available_files": available or None,
         }
+    if guard := await _background_review_read_before_write_guard(
+        name,
+        target,
+        "remove_file",
+        file_path,
+    ):
+        return guard
     await aiofiles.os.remove(target)
     await _cleanup_empty_parent(target.parent, skill_dir)
     return {
@@ -613,6 +919,10 @@ async def skill_manage(
     absorbed_into: str = None,
 ) -> str:
     """Manage user skills and return the upstream JSON result shape."""
+    preflight = await _background_review_preflight(action, name)
+    if preflight is not None:
+        return json.dumps(preflight, ensure_ascii=False)
+
     async with _skill_write_lock:
         if action == "create":
             if not content:
@@ -686,22 +996,64 @@ async def skill_manage(
 
             await clear_skills_system_prompt_cache(clear_snapshot=True)
             _SKILLS_CACHE.clear()
+            try:
+                from tools import skill_usage
+                from tools.skill_provenance import is_background_review
+
+                if action == "create":
+                    if is_background_review():
+                        await skill_usage.mark_agent_created(name)
+                elif action in {"patch", "edit", "write_file", "remove_file"}:
+                    await skill_usage.bump_patch(name)
+                elif action == "delete" and not result.get("_archived"):
+                    await skill_usage.forget(name)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.debug(
+                    "skill usage telemetry failed for %s",
+                    name,
+                    exc_info=True,
+                )
         return json.dumps(result, ensure_ascii=False)
 
 
 SKILL_MANAGE_SCHEMA = {
     "name": "skill_manage",
     "description": (
-        "Manage skills (create, update, delete). Skills are procedural memory "
-        "for reusable approaches. "
-        f"New skills go to {display_hermes_home()}/skills/; existing local or "
-        "configured external skills are modified in place.\n\n"
+        "Manage skills (create, update, delete). Skills are your procedural "
+        "memory — reusable approaches for recurring task types. "
+        f"New skills go to {display_hermes_home()}/skills/; existing skills "
+        "can be modified wherever they live.\n\n"
         "Actions: create (full SKILL.md + optional category), patch "
         "(old_string/new_string — preferred for fixes), edit (full SKILL.md "
         "rewrite — major overhauls only), delete, write_file, remove_file.\n\n"
-        "Create after a difficult workflow succeeds or when the user asks to "
-        "save a procedure. Patch a loaded skill when its instructions are "
-        "stale or incomplete. Confirm with the user before creating or deleting."
+        "On delete, pass `absorbed_into=<umbrella>` when you're merging this "
+        "skill's content into another one, or `absorbed_into=\"\"` when you're "
+        "pruning it with no forwarding target. This lets the curator tell "
+        "consolidation from pruning without guessing so lifecycle consumers "
+        "retain the declared intent. The target you name in `absorbed_into` "
+        "must already exist — create/patch the umbrella first, then delete.\n\n"
+        "Create when: complex task succeeded (5+ calls), errors overcome, "
+        "user-corrected approach worked, non-trivial workflow discovered, "
+        "or user asks you to remember a procedure.\n"
+        "Update when: instructions stale/wrong, OS-specific failures, "
+        "missing steps or pitfalls found during use. If you used a skill and "
+        "hit issues not covered by it, patch it immediately.\n\n"
+        "After difficult/iterative tasks, offer to save as a skill. Skip for "
+        "simple one-offs. Confirm with user before creating/deleting.\n\n"
+        "Good skills: trigger conditions, numbered steps with exact commands, "
+        "pitfalls section, verification steps. Use skill_view() to see format "
+        "examples.\n\n"
+        "Description: long descriptions are truncated to the first 57 chars "
+        "plus '...' in the system prompt skill index; longer text is visible "
+        "via skills_list/skill_view. Keep the trigger self-contained in that "
+        "first 57-char window: 'Use when <trigger>. <one-line behavior>.'\n\n"
+        "Pinned skills are protected from deletion only — "
+        "skill_manage(action='delete') will refuse until the skill is "
+        "explicitly unpinned. Patches and edits go through on pinned skills so "
+        "you can still improve them as pitfalls come up; pin only guards "
+        "against irrecoverable loss."
     ),
     "parameters": {
         "type": "object",
@@ -722,47 +1074,73 @@ SKILL_MANAGE_SCHEMA = {
                 "type": "string",
                 "description": (
                     "Skill name (lowercase, hyphens/underscores, max 64 chars). "
-                    "Must match an existing skill except for create."
+                    "Must match an existing skill for patch/edit/delete/"
+                    "write_file/remove_file."
                 ),
             },
             "content": {
                 "type": "string",
                 "description": (
-                    "Full SKILL.md content. Required for create and edit."
+                    "Full SKILL.md content (YAML frontmatter + markdown body). "
+                    "Required for 'create' and 'edit'. For 'edit', read the "
+                    "skill first with skill_view() and provide the complete "
+                    "updated text."
                 ),
             },
             "old_string": {
                 "type": "string",
-                "description": "Text to find for patch.",
+                "description": (
+                    "Text to find in the file (required for 'patch'). Must be "
+                    "unique unless replace_all=true. Include enough "
+                    "surrounding context to ensure uniqueness."
+                ),
             },
             "new_string": {
                 "type": "string",
-                "description": "Replacement text for patch; may be empty.",
+                "description": (
+                    "Replacement text (required for 'patch'). Can be empty "
+                    "string to delete the matched text."
+                ),
             },
             "replace_all": {
                 "type": "boolean",
-                "description": "Replace every match instead of requiring one.",
+                "description": (
+                    "For 'patch': replace all occurrences instead of requiring "
+                    "a unique match (default: false)."
+                ),
             },
             "category": {
                 "type": "string",
-                "description": "Optional category for create.",
+                "description": (
+                    "Optional category/domain for organizing the skill (e.g., "
+                    "'devops', 'data-science', 'mlops'). Creates a subdirectory "
+                    "grouping. Only used with 'create'."
+                ),
             },
             "file_path": {
                 "type": "string",
                 "description": (
-                    "Supporting file path under references/, templates/, "
-                    "scripts/, or assets/. Patch may also target SKILL.md."
+                    "Path to a supporting file within the skill directory. For "
+                    "'write_file'/'remove_file': required, must be under "
+                    "references/, templates/, scripts/, or assets/. For "
+                    "'patch': optional, defaults to SKILL.md if omitted."
                 ),
             },
             "file_content": {
                 "type": "string",
-                "description": "Content required by write_file.",
+                "description": "Content for the file. Required for 'write_file'.",
             },
             "absorbed_into": {
                 "type": "string",
                 "description": (
-                    "For delete, optionally record the existing umbrella skill "
-                    "that absorbed this skill's content."
+                    "For 'delete' only — declares intent so the curator can "
+                    "tell consolidation from pruning without guessing. Pass "
+                    "the umbrella skill name when this skill's content was "
+                    "merged into another (the target must already exist). Pass "
+                    "an empty string when the skill is truly stale and being "
+                    "pruned with no forwarding target. Omitting the arg on "
+                    "delete is supported for backward compatibility; lifecycle "
+                    "consumers then have to infer intent."
                 ),
             },
         },

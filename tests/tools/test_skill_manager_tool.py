@@ -11,7 +11,14 @@ from pathlib import Path
 import pytest
 
 import tools.skill_manager_tool as manager
+import tools.skill_usage as skill_usage
+import tools.skills_tool as skills_tool
 from tools.registry import registry
+from tools.skill_provenance import (
+    BACKGROUND_REVIEW,
+    reset_current_write_origin,
+    set_current_write_origin,
+)
 
 
 VALID_SKILL = """\
@@ -51,6 +58,15 @@ async def isolated_skills(monkeypatch: pytest.MonkeyPatch, root: Path):
 
 async def result_of(*args, **kwargs) -> dict:
     return json.loads(await manager.skill_manage(*args, **kwargs))
+
+
+@asynccontextmanager
+async def background_review_origin():
+    token = set_current_write_origin(BACKGROUND_REVIEW)
+    try:
+        yield
+    finally:
+        reset_current_write_origin(token)
 
 
 class TestValidation:
@@ -219,6 +235,308 @@ class TestSupportingFiles:
         assert result["success"] is False
         assert "symlink/junction" in result["error"]
         assert (outside / "SKILL.md").exists()
+
+
+class TestBackgroundReviewOwnership:
+    @pytest.mark.asyncio
+    async def test_background_ownership_preflight_precedes_argument_validation(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        monkeypatch.setattr(skill_usage, "_skills_dir", lambda: tmp_path)
+        async with isolated_skills(monkeypatch, tmp_path):
+            created = await result_of("create", "test-skill", VALID_SKILL)
+            assert created["success"] is True
+
+            async with background_review_origin():
+                result = await result_of("edit", "test-skill")
+
+        assert result["success"] is False
+        assert "not curator-managed" in result["error"]
+        assert "content is required" not in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_user_owned_skill_is_off_limits_to_background_review(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        monkeypatch.setattr(skill_usage, "_skills_dir", lambda: tmp_path)
+        async with isolated_skills(monkeypatch, tmp_path):
+            created = await result_of("create", "test-skill", VALID_SKILL)
+            assert created["success"] is True
+
+            async with background_review_origin():
+                result = await result_of(
+                    "patch",
+                    "test-skill",
+                    old_string="original procedure",
+                    new_string="autonomous rewrite",
+                )
+
+        assert result["success"] is False
+        assert "not curator-managed" in result["error"]
+        assert "no usage record" in result["error"]
+        assert "original procedure" in (
+            tmp_path / "test-skill" / "SKILL.md"
+        ).read_text(encoding="utf-8")
+
+    @pytest.mark.asyncio
+    async def test_background_created_skill_requires_exact_file_read(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        monkeypatch.setattr(skill_usage, "_skills_dir", lambda: tmp_path)
+        async with isolated_skills(monkeypatch, tmp_path):
+            async with background_review_origin():
+                created = await result_of("create", "test-skill", VALID_SKILL)
+                assert created["success"] is True
+                assert await skill_usage.is_curator_managed("test-skill") is True
+
+                blocked = await result_of(
+                    "patch",
+                    "test-skill",
+                    old_string="original procedure",
+                    new_string="verified procedure",
+                )
+                assert blocked["success"] is False
+                assert blocked["_read_before_write_required"] is True
+
+                await manager.mark_background_review_skill_read(
+                    tmp_path / "test-skill" / "SKILL.md"
+                )
+                patched = await result_of(
+                    "patch",
+                    "test-skill",
+                    old_string="original procedure",
+                    new_string="verified procedure",
+                )
+
+        assert patched["success"] is True
+        assert "verified procedure" in (
+            tmp_path / "test-skill" / "SKILL.md"
+        ).read_text(encoding="utf-8")
+
+    @pytest.mark.asyncio
+    async def test_read_mark_path_resolution_failure_uses_upstream_fallback(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        async def unavailable_realpath(_path):
+            raise OSError("realpath unavailable")
+
+        monkeypatch.setattr(manager, "_realpath", unavailable_realpath)
+        target = tmp_path / "test-skill" / "SKILL.md"
+        async with background_review_origin():
+            await manager.mark_background_review_skill_read(target)
+            assert await manager._background_review_has_read(target) is True
+
+    @pytest.mark.asyncio
+    async def test_skill_view_marks_read_and_records_usage(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        monkeypatch.setattr(skill_usage, "_skills_dir", lambda: tmp_path)
+        monkeypatch.setattr(skills_tool, "SKILLS_DIR", tmp_path)
+
+        async def roots() -> list[Path]:
+            return [tmp_path]
+
+        async def no_external_roots() -> list[Path]:
+            return []
+
+        monkeypatch.setattr(manager, "get_all_skills_dirs", roots)
+        monkeypatch.setattr(skills_tool, "_external_skills_dirs", no_external_roots)
+        monkeypatch.setattr(
+            "agent.skill_utils.get_external_skills_dirs",
+            no_external_roots,
+        )
+
+        async with background_review_origin():
+            created = await result_of("create", "test-skill", VALID_SKILL)
+            assert created["success"] is True
+            manager._reset_background_review_read_marks()
+
+            viewed = json.loads(
+                await registry.dispatch(
+                    "skill_view",
+                    {"name": "test-skill"},
+                    task_id="review-turn",
+                )
+            )
+            assert viewed["success"] is True
+            patched = await result_of(
+                "patch",
+                "test-skill",
+                old_string="original procedure",
+                new_string="verified procedure",
+            )
+
+        assert patched["success"] is True
+        record = await skill_usage.get_record("test-skill")
+        assert record["view_count"] == 1
+        assert record["use_count"] == 1
+        assert record["patch_count"] == 1
+
+    @pytest.mark.asyncio
+    async def test_support_file_overwrite_requires_that_exact_file_read(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        monkeypatch.setattr(skill_usage, "_skills_dir", lambda: tmp_path)
+        async with isolated_skills(monkeypatch, tmp_path):
+            async with background_review_origin():
+                assert (await result_of("create", "test-skill", VALID_SKILL))["success"]
+                assert (
+                    await result_of(
+                        "write_file",
+                        "test-skill",
+                        file_path="references/workflow.md",
+                        file_content="old workflow\n",
+                    )
+                )["success"]
+                manager._reset_background_review_read_marks()
+                await manager.mark_background_review_skill_read(
+                    tmp_path / "test-skill" / "SKILL.md"
+                )
+
+                blocked = await result_of(
+                    "write_file",
+                    "test-skill",
+                    file_path="references/workflow.md",
+                    file_content="new workflow\n",
+                )
+                assert blocked["success"] is False
+                assert blocked["_read_before_write_required"] is True
+
+                await manager.mark_background_review_skill_read(
+                    tmp_path / "test-skill" / "references" / "workflow.md"
+                )
+                allowed = await result_of(
+                    "write_file",
+                    "test-skill",
+                    file_path="references/workflow.md",
+                    file_content="new workflow\n",
+                )
+
+        assert allowed["success"] is True
+        assert (
+            tmp_path / "test-skill" / "references" / "workflow.md"
+        ).read_text(encoding="utf-8") == "new workflow\n"
+
+    @pytest.mark.asyncio
+    async def test_background_review_cannot_mutate_external_skill(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        local_root = tmp_path / "local"
+        external_root = tmp_path / "external"
+        external_skill = external_root / "test-skill" / "SKILL.md"
+        external_skill.parent.mkdir(parents=True)
+        external_skill.write_text(VALID_SKILL, encoding="utf-8")
+        monkeypatch.setattr(manager, "SKILLS_DIR", local_root)
+        monkeypatch.setattr(skill_usage, "_skills_dir", lambda: local_root)
+
+        async def get_roots() -> list[Path]:
+            return [local_root, external_root]
+
+        async def get_external_roots() -> list[Path]:
+            return [external_root]
+
+        monkeypatch.setattr(manager, "get_all_skills_dirs", get_roots)
+        monkeypatch.setattr(
+            "agent.skill_utils.get_external_skills_dirs",
+            get_external_roots,
+        )
+
+        async with background_review_origin():
+            result = await result_of(
+                "patch",
+                "test-skill",
+                old_string="original procedure",
+                new_string="autonomous rewrite",
+            )
+
+        assert result["success"] is False
+        assert "external_dirs" in result["error"]
+        assert "original procedure" in external_skill.read_text(encoding="utf-8")
+
+    @pytest.mark.asyncio
+    async def test_pinned_skill_cannot_be_deleted(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        monkeypatch.setattr(skill_usage, "_skills_dir", lambda: tmp_path)
+        async with isolated_skills(monkeypatch, tmp_path):
+            assert (await result_of("create", "test-skill", VALID_SKILL))["success"]
+            await skill_usage.set_pinned("test-skill", True)
+            result = await result_of("delete", "test-skill")
+
+        assert result["success"] is False
+        assert "pinned" in result["error"]
+        assert (tmp_path / "test-skill" / "SKILL.md").exists()
+
+    @pytest.mark.asyncio
+    async def test_verified_background_consolidation_is_recoverably_archived(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        monkeypatch.setattr(skill_usage, "_skills_dir", lambda: tmp_path)
+        async with isolated_skills(monkeypatch, tmp_path):
+            async with background_review_origin():
+                assert (await result_of("create", "test-skill", VALID_SKILL))["success"]
+                umbrella = VALID_SKILL.replace("test-skill", "umbrella")
+                assert (await result_of("create", "umbrella", umbrella))["success"]
+
+                result = await result_of(
+                    "delete",
+                    "test-skill",
+                    absorbed_into="umbrella",
+                )
+
+        assert result["success"] is True
+        assert result["_archived"] is True
+        assert not (tmp_path / "test-skill").exists()
+        assert (tmp_path / ".archive" / "test-skill" / "SKILL.md").exists()
+        record = await skill_usage.get_record("test-skill")
+        assert record["state"] == skill_usage.STATE_ARCHIVED
+        assert record["archived_at"]
+
+    @pytest.mark.asyncio
+    async def test_background_archive_failure_keeps_tool_error_shape(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        monkeypatch.setattr(skill_usage, "_skills_dir", lambda: tmp_path)
+        async with isolated_skills(monkeypatch, tmp_path):
+            async with background_review_origin():
+                assert (await result_of("create", "test-skill", VALID_SKILL))["success"]
+                umbrella = VALID_SKILL.replace("test-skill", "umbrella")
+                assert (await result_of("create", "umbrella", umbrella))["success"]
+
+                async def fail_archive(_name):
+                    raise OSError("disk unavailable")
+
+                monkeypatch.setattr(skill_usage, "archive_skill", fail_archive)
+                result = await result_of(
+                    "delete",
+                    "test-skill",
+                    absorbed_into="umbrella",
+                )
+
+        assert result == {
+            "success": False,
+            "error": "failed to archive 'test-skill': disk unavailable",
+        }
 
 
 class TestAsyncContract:

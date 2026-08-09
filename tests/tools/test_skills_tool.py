@@ -1,11 +1,13 @@
 """Tests for tools/skills_tool.py — skill discovery and viewing."""
 
+import asyncio
 import json
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 from tools.skills_tool import (
     _get_required_environment_variables,
     _parse_frontmatter,
@@ -13,10 +15,13 @@ from tools.skills_tool import (
     _get_category_from_path,
     _find_all_skills,
     skill_matches_platform,
+    set_secret_capture_callback,
     skills_list,
     skill_view,
+    reset_skill_view_dedup,
     MAX_DESCRIPTION_LENGTH,
 )
+from tools.registry import registry
 
 
 def _make_skill(
@@ -430,6 +435,154 @@ class TestSkillView:
 
 @pytest.mark.asyncio
 class TestSkillViewSecureSetupOnLoad:
+    async def test_secret_capture_callback_must_be_native_async(self):
+        with pytest.raises(TypeError, match="must be async"):
+            set_secret_capture_callback(lambda *_args: {})
+
+    async def test_native_async_secret_capture_refreshes_readiness(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        monkeypatch.delenv("CAPTURED_KEY", raising=False)
+        calls = []
+
+        async def capture(name, prompt, metadata):
+            calls.append((name, prompt, metadata))
+            monkeypatch.setenv(name, "captured")
+            return {"success": True, "skipped": False}
+
+        set_secret_capture_callback(capture)
+        try:
+            with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+                _make_skill(
+                    tmp_path,
+                    "capture-skill",
+                    frontmatter_extra=(
+                        "required_environment_variables:\n"
+                        "  - name: CAPTURED_KEY\n"
+                        "    prompt: Enter captured key\n"
+                        "    required_for: test workflow\n"
+                    ),
+                )
+                result = json.loads(await skill_view("capture-skill"))
+        finally:
+            set_secret_capture_callback(None)
+
+        assert result["setup_needed"] is False
+        assert result["missing_required_environment_variables"] == []
+        assert result["setup_skipped"] is False
+        assert calls == [
+            (
+                "CAPTURED_KEY",
+                "Enter captured key",
+                {
+                    "skill_name": "capture-skill",
+                    "required_for": "test workflow",
+                },
+            )
+        ]
+
+    async def test_secret_capture_cancellation_propagates(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        monkeypatch.delenv("CANCELLED_KEY", raising=False)
+
+        async def cancelled(*_args):
+            raise asyncio.CancelledError
+
+        set_secret_capture_callback(cancelled)
+        try:
+            with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+                _make_skill(
+                    tmp_path,
+                    "cancelled-capture",
+                    frontmatter_extra=(
+                        "required_environment_variables:\n"
+                        "  - name: CANCELLED_KEY\n"
+                    ),
+                )
+                with pytest.raises(asyncio.CancelledError):
+                    await skill_view("cancelled-capture")
+        finally:
+            set_secret_capture_callback(None)
+
+    async def test_registry_observation_preserves_upstream_setup_contract(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        monkeypatch.delenv("MISSING_KEY", raising=False)
+        (tmp_path / "present.json").write_text("{}", encoding="utf-8")
+        (tmp_path / "auth.json").write_text("{}", encoding="utf-8")
+        task_id = "skill-contract"
+        reset_skill_view_dedup(task_id)
+
+        home_token = set_hermes_home_override(tmp_path)
+        try:
+            with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+                skill_dir = _make_skill(
+                    tmp_path,
+                    "contract-skill",
+                    frontmatter_extra=(
+                        "compatibility: Requires local test\n"
+                        "metadata:\n"
+                        "  hermes:\n"
+                        "    tags: [one, two]\n"
+                        "    related_skills: [other]\n"
+                        "required_environment_variables:\n"
+                        "  - name: MISSING_KEY\n"
+                        "    help: https://example.test/setup\n"
+                        "required_credential_files:\n"
+                        "  - present.json\n"
+                        "  - missing.json\n"
+                        "  - auth.json\n"
+                        "prerequisites:\n"
+                        "  commands: [curl]\n"
+                    ),
+                )
+                references = skill_dir / "references"
+                references.mkdir()
+                (references / "x.md").write_text("reference", encoding="utf-8")
+
+                first = json.loads(
+                    await registry.dispatch(
+                        "skill_view",
+                        {"name": "contract-skill"},
+                        task_id=task_id,
+                    )
+                )
+                second = json.loads(
+                    await registry.dispatch(
+                        "skill_view",
+                        {"name": "contract-skill"},
+                        task_id=task_id,
+                    )
+                )
+        finally:
+            reset_hermes_home_override(home_token)
+
+        assert first["org_provenance"] is None
+        assert first["required_commands"] == []
+        assert first["missing_required_commands"] == []
+        assert first["missing_credential_files"] == ["missing.json", "auth.json"]
+        assert first["setup_skipped"] is False
+        assert first["compatibility"] == "Requires local test"
+        assert first["metadata"]["hermes"]["tags"] == ["one", "two"]
+        assert first["_source_path"] == str(skill_dir / "SKILL.md")
+        assert first["usage_hint"] == (
+            "To view linked files, call skill_view(name, file_path) where "
+            "file_path is e.g. 'references/api.md' or 'assets/config.yaml'"
+        )
+        assert first["setup_note"] == (
+            "Setup needed before using this skill: missing env $MISSING_KEY, "
+            "file missing.json, file auth.json. https://example.test/setup"
+        )
+        assert second["setup_needed"] is True
+        assert second.get("dedup") is None
+
     async def test_reports_missing_required_environment(self, tmp_path, monkeypatch):
         monkeypatch.delenv("TENOR_API_KEY", raising=False)
 

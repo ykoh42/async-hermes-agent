@@ -67,6 +67,7 @@ Usage:
 """
 
 import asyncio
+import inspect
 import json
 import logging
 import time
@@ -94,6 +95,7 @@ from agent.skill_utils import (
 
 logger = logging.getLogger(__name__)
 _realpath = aiofiles.os.wrap(os.path.realpath)
+_secret_capture_callback = None
 
 # Per-session skill discovery cache.  _find_all_skills() re-reads every
 # SKILL.md on every call; with hundreds of skills this is wasteful.
@@ -251,6 +253,17 @@ class SkillReadinessStatus(str, Enum):
     AVAILABLE = "available"
     SETUP_NEEDED = "setup_needed"
     UNSUPPORTED = "unsupported"
+
+
+def set_secret_capture_callback(callback) -> None:
+    """Register a native-async host callback for required skill secrets."""
+    global _secret_capture_callback
+    if callback is not None and not (
+        inspect.iscoroutinefunction(callback)
+        or inspect.iscoroutinefunction(getattr(callback, "__call__", None))
+    ):
+        raise TypeError("skill secret capture callback must be async")
+    _secret_capture_callback = callback
 
 
 _INJECTION_PATTERNS = (
@@ -434,6 +447,143 @@ def _build_setup_note(
             return f"{note} {setup_help}"
         return note
     return None
+
+
+def _is_gateway_surface() -> bool:
+    from gateway.session_context import get_session_env
+    from utils import env_var_enabled
+
+    return env_var_enabled("HERMES_GATEWAY_SESSION") or bool(
+        get_session_env("HERMES_SESSION_PLATFORM")
+    )
+
+
+def _gateway_setup_hint() -> str:
+    from gateway.platforms.base import GATEWAY_SECRET_CAPTURE_UNSUPPORTED_MESSAGE
+
+    return GATEWAY_SECRET_CAPTURE_UNSUPPORTED_MESSAGE
+
+
+async def _capture_required_environment_variables(
+    skill_name: str,
+    missing_entries: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    if not missing_entries:
+        return {
+            "missing_names": [],
+            "setup_skipped": False,
+            "gateway_setup_hint": None,
+        }
+    missing_names = [entry["name"] for entry in missing_entries]
+    from utils import env_var_enabled
+
+    if _is_gateway_surface() and not env_var_enabled("HERMES_INTERACTIVE"):
+        return {
+            "missing_names": missing_names,
+            "setup_skipped": False,
+            "gateway_setup_hint": _gateway_setup_hint(),
+        }
+    if _secret_capture_callback is None:
+        return {
+            "missing_names": missing_names,
+            "setup_skipped": False,
+            "gateway_setup_hint": None,
+        }
+
+    setup_skipped = False
+    remaining_names: List[str] = []
+    for entry in missing_entries:
+        metadata = {"skill_name": skill_name}
+        if entry.get("help"):
+            metadata["help"] = entry["help"]
+        if entry.get("required_for"):
+            metadata["required_for"] = entry["required_for"]
+        try:
+            callback_result = await _secret_capture_callback(
+                entry["name"],
+                entry["prompt"],
+                metadata,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning(
+                "Secret capture callback failed for %s",
+                entry["name"],
+                exc_info=True,
+            )
+            callback_result = {
+                "success": False,
+                "stored_as": entry["name"],
+                "validated": False,
+                "skipped": True,
+            }
+        success = isinstance(callback_result, dict) and bool(
+            callback_result.get("success")
+        )
+        skipped = isinstance(callback_result, dict) and bool(
+            callback_result.get("skipped")
+        )
+        if success and not skipped:
+            continue
+        setup_skipped = True
+        remaining_names.append(entry["name"])
+    return {
+        "missing_names": remaining_names,
+        "setup_skipped": setup_skipped,
+        "gateway_setup_hint": None,
+    }
+
+
+async def _missing_required_credential_files(
+    frontmatter: Dict[str, Any],
+) -> List[str]:
+    """Return unavailable/refused skill credential paths without remote mounts."""
+    entries = frontmatter.get("required_credential_files", [])
+    if not isinstance(entries, list):
+        return []
+
+    hermes_home = get_hermes_home()
+    try:
+        resolved_home = Path(await _realpath(hermes_home))
+    except OSError:
+        resolved_home = hermes_home
+    missing: List[str] = []
+    for entry in entries:
+        if isinstance(entry, str):
+            relative_path = entry.strip()
+        elif isinstance(entry, dict):
+            relative_path = str(entry.get("path") or entry.get("name") or "").strip()
+        else:
+            continue
+        if not relative_path:
+            continue
+        if os.path.isabs(relative_path):
+            missing.append(relative_path)
+            continue
+        candidate = hermes_home / relative_path
+        try:
+            resolved = Path(await _realpath(candidate))
+            resolved.relative_to(resolved_home)
+        except (OSError, ValueError):
+            missing.append(relative_path)
+            continue
+        if not await aiofiles.os.path.isfile(resolved):
+            missing.append(relative_path)
+            continue
+        try:
+            from agent.file_safety import get_read_block_error
+
+            denied = await get_read_block_error(str(resolved))
+        except Exception:
+            logger.exception(
+                "credential_files: refusing %r because the read guard failed",
+                relative_path,
+            )
+            denied = "read guard unavailable"
+        if denied:
+            missing.append(relative_path)
+    return missing
 
 
 def check_skills_requirements() -> bool:
@@ -885,6 +1035,18 @@ async def skill_view(
             }, ensure_ascii=False)
 
         if file_path:
+            try:
+                from tools.skill_manager_tool import (
+                    mark_background_review_skill_read,
+                )
+
+                await mark_background_review_skill_read(target)
+            except Exception:
+                logger.debug(
+                    "Could not record background-review skill read for %s",
+                    target,
+                    exc_info=True,
+                )
             return json.dumps({
                 "success": True,
                 "name": name,
@@ -919,12 +1081,34 @@ async def skill_view(
             hermes_metadata = {}
         required_environment_variables = _get_required_environment_variables(frontmatter)
         env_snapshot = await load_env()
-        missing_environment_variables = [
+        missing_environment_entries = [
             entry["name"]
             for entry in required_environment_variables
             if not entry.get("optional")
             and not bool(env_snapshot.get(entry["name"]) or os.getenv(entry["name"]))
         ]
+        missing_entry_names = set(missing_environment_entries)
+        capture_result = await _capture_required_environment_variables(
+            skill_name,
+            [
+                entry
+                for entry in required_environment_variables
+                if entry["name"] in missing_entry_names
+            ],
+        )
+        if missing_environment_entries:
+            env_snapshot = await load_env()
+        callback_missing = set(capture_result["missing_names"])
+        missing_environment_variables = [
+            entry["name"]
+            for entry in required_environment_variables
+            if not entry.get("optional")
+            and (
+                entry["name"] in callback_missing
+                or not bool(env_snapshot.get(entry["name"]) or os.getenv(entry["name"]))
+            )
+        ]
+        missing_credential_files = await _missing_required_credential_files(frontmatter)
         available_environment_variables = [
             entry["name"]
             for entry in required_environment_variables
@@ -936,7 +1120,7 @@ async def skill_view(
             register_env_passthrough(available_environment_variables)
         readiness_status = (
             SkillReadinessStatus.SETUP_NEEDED
-            if missing_environment_variables
+            if missing_environment_variables or missing_credential_files
             else SkillReadinessStatus.AVAILABLE
         )
         rendered_content = content
@@ -956,7 +1140,18 @@ async def skill_view(
                     exc_info=True,
                 )
 
-        return json.dumps({
+        try:
+            from tools.skill_manager_tool import mark_background_review_skill_read
+
+            await mark_background_review_skill_read(skill_md)
+        except Exception:
+            logger.debug(
+                "Could not record background-review skill read for %s",
+                skill_md,
+                exc_info=True,
+            )
+
+        result = {
             "success": True,
             "name": skill_name,
             "description": frontmatter.get("description", ""),
@@ -967,18 +1162,52 @@ async def skill_view(
             "content": rendered_content,
             "path": str(skill_md.relative_to(skill_root)),
             "skill_dir": str(skill_dir) if skill_dir else None,
+            "org_provenance": None,
             "linked_files": linked_files or None,
-            "usage_hint": "Use skill_view(name, file_path) to load linked files." if linked_files else None,
-            "required_environment_variables": required_environment_variables,
-            "missing_required_environment_variables": missing_environment_variables,
-            "setup_needed": readiness_status == SkillReadinessStatus.SETUP_NEEDED,
-            "setup_note": _build_setup_note(
-                readiness_status,
-                missing_environment_variables,
+            "usage_hint": (
+                "To view linked files, call skill_view(name, file_path) where "
+                "file_path is e.g. 'references/api.md' or 'assets/config.yaml'"
+                if linked_files
+                else None
             ),
+            "required_environment_variables": required_environment_variables,
+            "required_commands": [],
+            "missing_required_environment_variables": missing_environment_variables,
+            "missing_credential_files": missing_credential_files,
+            "missing_required_commands": [],
+            "setup_needed": readiness_status == SkillReadinessStatus.SETUP_NEEDED,
+            "setup_skipped": capture_result["setup_skipped"],
             "readiness_status": readiness_status.value,
             "_source_path": str(skill_md),
-        }, ensure_ascii=False)
+        }
+        setup_help = next(
+            (
+                entry["help"]
+                for entry in required_environment_variables
+                if entry.get("help")
+            ),
+            None,
+        )
+        if setup_help:
+            result["setup_help"] = setup_help
+        if capture_result["gateway_setup_hint"]:
+            result["gateway_setup_hint"] = capture_result["gateway_setup_hint"]
+        if readiness_status == SkillReadinessStatus.SETUP_NEEDED:
+            missing_items = [
+                f"env ${name}" for name in missing_environment_variables
+            ] + [f"file {path}" for path in missing_credential_files]
+            setup_note = _build_setup_note(
+                readiness_status,
+                missing_items,
+                setup_help,
+            )
+            if setup_note:
+                result["setup_note"] = setup_note
+        if frontmatter.get("compatibility"):
+            result["compatibility"] = frontmatter["compatibility"]
+        if isinstance(metadata, dict):
+            result["metadata"] = metadata
+        return json.dumps(result, ensure_ascii=False)
     except Exception as exc:
         return tool_error(str(exc), success=False)
 
@@ -1030,8 +1259,10 @@ async def _handle_skills_list(args: dict, **kwargs) -> str:
 _skill_view_tracker: dict[str, dict[tuple[str, str], tuple[str, int, int]]] = {}
 _SKILL_VIEW_DEDUP_CAP = 200
 _SKILL_VIEW_DEDUP_MESSAGE = (
-    "Skill content unchanged since it was loaded earlier in this conversation; "
-    "refer to the earlier complete skill_view result."
+    "Skill content unchanged since it was loaded earlier in this "
+    "conversation — refer to the earlier skill_view result; it is still "
+    "current and complete. (Re-issued after context compression, this "
+    "returns the full content again.)"
 )
 
 
@@ -1133,7 +1364,26 @@ async def _handle_skill_view(args: dict, **kwargs) -> str:
         return result
     if isinstance(payload, dict) and payload.get("success"):
         await _record_skill_view(task_id, name, file_path, payload)
-        payload.pop("_source_path", None)
+        resolved_name = str(payload.get("name") or name)
+        source_path = payload.get("_source_path")
+        if source_path:
+            from tools.skill_manager_tool import mark_background_review_skill_read
+
+            await mark_background_review_skill_read(Path(source_path))
+        if resolved_name:
+            try:
+                from tools.skill_usage import bump_use, bump_view
+
+                await bump_view(resolved_name)
+                await bump_use(resolved_name)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.debug(
+                    "skill usage telemetry failed for %s",
+                    resolved_name,
+                    exc_info=True,
+                )
         return json.dumps(payload, ensure_ascii=False)
     return result
 

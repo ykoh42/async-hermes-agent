@@ -51,7 +51,12 @@ class TestSkillViewDedup:
         assert r2["success"] is True
         assert r2.get("dedup") is True
         assert r2.get("content_returned") is False
-        assert "unchanged" in r2["message"]
+        assert r2["message"] == (
+            "Skill content unchanged since it was loaded earlier in this "
+            "conversation — refer to the earlier skill_view result; it is still "
+            "current and complete. (Re-issued after context compression, this "
+            "returns the full content again.)"
+        )
         assert "content" not in r2
 
     async def test_modified_skill_returns_full_content(self, skills_home):
