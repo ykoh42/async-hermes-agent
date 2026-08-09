@@ -70,6 +70,21 @@ async def _finish_owned_task(task: asyncio.Task[Any]) -> Any:
     return result
 
 
+async def _finish_process_communicate(
+    process: asyncio.subprocess.Process,
+    communicate_task: asyncio.Task[tuple[bytes | None, bytes | None]],
+) -> tuple[bytes | None, bytes | None]:
+    """Drain and reap one owned Codex helper process."""
+    async def drain_or_wait() -> tuple[bytes | None, bytes | None]:
+        try:
+            return await communicate_task
+        except BaseException:
+            await process.wait()
+            raise
+
+    return await _finish_owned_task(asyncio.create_task(drain_or_wait()))
+
+
 class CodexAppServerClient:
     """Minimal JSON-RPC 2.0 client for `codex app-server` over stdio.
 
@@ -179,10 +194,7 @@ class CodexAppServerClient:
                     await asyncio.wait_for(proc.wait(), timeout=timeout)
                 except TimeoutError:
                     proc.kill()
-                    try:
-                        await asyncio.wait_for(proc.wait(), timeout=1.0)
-                    except TimeoutError:  # pragma: no cover - OS-level failure
-                        pass
+                    await proc.wait()
 
         tasks = [task for task in (self._reader, self._stderr_reader) if task]
         for task in tasks:
@@ -420,6 +432,7 @@ async def check_codex_binary(
     Returns (ok, message). Used by setup wizard and runtime startup."""
     proc: asyncio.subprocess.Process | None = None
     communicate_task: asyncio.Task[tuple[bytes, bytes]] | None = None
+    communication_error: Exception | None = None
     try:
         proc = await asyncio.create_subprocess_exec(
             codex_bin,
@@ -441,14 +454,27 @@ async def check_codex_binary(
         if proc is not None and proc.returncode is None:
             proc.kill()
         if communicate_task is not None:
-            await _finish_owned_task(communicate_task)
+            await _finish_process_communicate(proc, communicate_task)
         raise
     except TimeoutError:
         if proc is not None and proc.returncode is None:
             proc.kill()
         if communicate_task is not None:
-            await _finish_owned_task(communicate_task)
+            await _finish_process_communicate(proc, communicate_task)
         return False, "codex --version timed out"
+    except Exception as exc:
+        communication_error = exc
+    if communication_error is not None:
+        if proc is not None and proc.returncode is None:
+            proc.kill()
+        if proc is not None and communicate_task is not None:
+            try:
+                await _finish_process_communicate(proc, communicate_task)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                pass
+        raise communication_error
     assert proc is not None
     if proc.returncode != 0:
         stderr_text = stderr.decode("utf-8", "replace").strip()

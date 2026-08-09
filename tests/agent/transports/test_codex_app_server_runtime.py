@@ -155,6 +155,41 @@ class TestCodexAppServerModule:
         assert communicate_completed.is_set()
 
     @pytest.mark.asyncio
+    async def test_check_binary_communicate_failure_reaps_process(
+        self, monkeypatch
+    ) -> None:
+        from agent.transports.codex_app_server import check_codex_binary
+
+        waited = asyncio.Event()
+
+        class FailedProcess:
+            returncode = None
+            killed = False
+
+            async def communicate(self):
+                raise RuntimeError("pipe failed")
+
+            async def wait(self):
+                waited.set()
+                return self.returncode
+
+            def kill(self):
+                self.killed = True
+                self.returncode = -9
+
+        process = FailedProcess()
+
+        async def create_process(*_args, **_kwargs):
+            return process
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", create_process)
+
+        with pytest.raises(RuntimeError, match="pipe failed"):
+            await check_codex_binary("unused")
+        assert process.killed is True
+        assert waited.is_set()
+
+    @pytest.mark.asyncio
     async def test_close_finishes_cleanup_through_repeated_cancellation(
         self, monkeypatch
     ) -> None:
@@ -185,6 +220,57 @@ class TestCodexAppServerModule:
             await task
         assert cleanup_completed.is_set()
         assert client._closed is True
+
+    @pytest.mark.asyncio
+    async def test_close_reaps_process_after_kill_through_repeated_cancellation(
+        self,
+    ) -> None:
+        from agent.transports.codex_app_server import CodexAppServerClient
+
+        kill_wait_started = asyncio.Event()
+        release_kill_wait = asyncio.Event()
+        kill_wait_completed = asyncio.Event()
+
+        class BlockingProcess:
+            stdin = None
+            returncode = None
+            wait_calls = 0
+            killed = False
+
+            def terminate(self):
+                pass
+
+            def kill(self):
+                self.killed = True
+                self.returncode = -9
+
+            async def wait(self):
+                self.wait_calls += 1
+                if self.wait_calls == 1:
+                    await asyncio.Event().wait()
+                kill_wait_started.set()
+                await release_kill_wait.wait()
+                kill_wait_completed.set()
+                return self.returncode
+
+        process = BlockingProcess()
+        client = CodexAppServerClient(codex_bin="unused")
+        client._proc = process
+
+        task = asyncio.create_task(client.close(timeout=0.01))
+        await kill_wait_started.wait()
+        task.cancel()
+        await asyncio.sleep(0)
+        task.cancel()
+        await asyncio.sleep(0)
+
+        assert task.done() is False
+        release_kill_wait.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert process.killed is True
+        assert kill_wait_completed.is_set()
+        assert client._proc is None
 
     def test_codex_error_class_is_runtimeerror(self) -> None:
         from agent.transports.codex_app_server import CodexAppServerError
