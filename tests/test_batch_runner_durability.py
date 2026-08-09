@@ -188,6 +188,45 @@ class TestTaskCleanupOnInterruption:
                 await run_task
         assert cancelled == 2
 
+    @pytest.mark.asyncio
+    async def test_caller_cancellation_wins_during_worker_error_cleanup(
+        self, tmp_path, monkeypatch
+    ):
+        runner = _make_runner(tmp_path, monkeypatch)
+        both_started = asyncio.Event()
+        sibling_cleanup_started = asyncio.Event()
+        release_sibling_cleanup = asyncio.Event()
+        sibling_finished = asyncio.Event()
+
+        async def worker(args):
+            batch_num = args[0]
+            if batch_num == 0:
+                await both_started.wait()
+                raise RuntimeError("worker failed first")
+            both_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                sibling_cleanup_started.set()
+                await release_sibling_cleanup.wait()
+                raise
+            finally:
+                sibling_finished.set()
+
+        monkeypatch.setattr(batch_runner, "_process_batch_worker", worker)
+        async with no_task_leaks(action=LeakAction.RAISE):
+            run_task = asyncio.create_task(runner.run())
+            await sibling_cleanup_started.wait()
+            run_task.cancel()
+            await asyncio.sleep(0)
+
+            assert run_task.done() is False
+            release_sibling_cleanup.set()
+            with pytest.raises(asyncio.CancelledError):
+                await run_task
+
+        assert sibling_finished.is_set()
+
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("runtime_audit", ("pyleak", "blockbuster"))

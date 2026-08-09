@@ -1021,13 +1021,18 @@ class BatchRunner:
                     pending.cancel()
                 if pending_tasks:
                     cleanup = asyncio.gather(*batch_tasks, return_exceptions=True)
+                    cleanup_cancellation: asyncio.CancelledError | None = None
                     while True:
                         try:
                             await asyncio.shield(cleanup)
                             break
-                        except asyncio.CancelledError:  # noqa: ASYNC103 - active cancellation propagates after cleanup
+                        except asyncio.CancelledError as exc:  # noqa: ASYNC103 - re-raised after cleanup
                             if cleanup.cancelled():
                                 raise
+                            if cleanup_cancellation is None:
+                                cleanup_cancellation = exc
+                    if cleanup_cancellation is not None:
+                        raise cleanup_cancellation
         
         # Aggregate all batch statistics and update checkpoint
         total_reasoning_stats = {"total_assistant_turns": 0, "turns_with_reasoning": 0, "turns_without_reasoning": 0}
