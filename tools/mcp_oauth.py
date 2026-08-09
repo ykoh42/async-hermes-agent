@@ -57,6 +57,28 @@ logger = logging.getLogger(__name__)
 _realpath = aiofiles.os.wrap(os.path.realpath)
 _chmod = aiofiles.os.wrap(os.chmod)
 
+
+async def _finish_owned_task(task: asyncio.Task[Any]) -> Any:
+    """Finish one OAuth resource task through repeated caller cancellation."""
+    cancellation: asyncio.CancelledError | None = None
+    while True:
+        try:
+            result = await asyncio.shield(task)
+            break
+        except asyncio.CancelledError as exc:  # noqa: ASYNC103 - re-raised below
+            if task.cancelled():
+                raise
+            if cancellation is None:
+                cancellation = exc
+        except Exception as exc:
+            if cancellation is not None:
+                raise cancellation from exc
+            raise
+    if cancellation is not None:
+        raise cancellation
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Lazy imports -- MCP SDK with OAuth support is optional
 # ---------------------------------------------------------------------------
@@ -892,11 +914,21 @@ def _make_callback_waiter(port: int):
         except asyncio.TimeoutError:
             pass
         finally:
-            server.close()
-            await server.wait_closed()
-            if paste_task is not None:
-                paste_task.cancel()
-                await asyncio.gather(paste_task, return_exceptions=True)
+            async def _cleanup_callback_resources() -> None:
+                server.close()
+                try:
+                    await server.wait_closed()
+                finally:
+                    if paste_task is not None:
+                        paste_task.cancel()
+                        await asyncio.gather(paste_task, return_exceptions=True)
+
+            await _finish_owned_task(
+                asyncio.create_task(
+                    _cleanup_callback_resources(),
+                    name="mcp-oauth-callback-cleanup",
+                )
+            )
 
         if result["error"] == _USER_SKIPPED_SENTINEL:
             raise OAuthNonInteractiveError("user_skipped")

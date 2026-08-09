@@ -714,6 +714,56 @@ class TestWaitForCallbackPasteIntegration:
         assert "paste the redirect URL" not in err
         mock_stdin.readline.assert_not_called()
 
+    @pytest.mark.asyncio
+    async def test_repeated_cancellation_finishes_callback_cleanup(
+        self,
+        monkeypatch,
+    ):
+        import tools.mcp_oauth as mod
+
+        paste_started = asyncio.Event()
+        paste_cancelled = asyncio.Event()
+        release_paste = asyncio.Event()
+        paste_finished = asyncio.Event()
+
+        async def uncooperative_paste(_result):
+            paste_started.set()
+            try:
+                while not release_paste.is_set():
+                    try:
+                        await release_paste.wait()
+                    except asyncio.CancelledError:  # noqa: ASYNC103 - test stub
+                        paste_cancelled.set()
+            finally:
+                paste_finished.set()
+
+        server = MagicMock()
+        server.wait_closed = AsyncMock()
+        monkeypatch.setattr(mod, "_is_interactive", lambda: True)
+        monkeypatch.setattr(mod, "_raise_if_non_interactive", lambda _message: None)
+        monkeypatch.setattr(mod, "_wait_for_pasted_callback", uncooperative_paste)
+        monkeypatch.setattr(
+            mod.asyncio,
+            "start_server",
+            AsyncMock(return_value=server),
+        )
+
+        waiter = asyncio.create_task(mod._make_callback_waiter(54321)())
+        await paste_started.wait()
+        waiter.cancel()
+        await paste_cancelled.wait()
+        waiter.cancel()
+        await asyncio.sleep(0)
+
+        assert waiter.done() is False
+        release_paste.set()
+        with pytest.raises(asyncio.CancelledError):
+            await waiter
+
+        assert paste_finished.is_set()
+        server.close.assert_called_once_with()
+        server.wait_closed.assert_awaited_once_with()
+
 
 class TestPasteCallbackSkipToken:
     """User can type `skip` (or similar) at the paste prompt to bail out."""
