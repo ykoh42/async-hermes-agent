@@ -437,12 +437,7 @@ class CDPSupervisor:
         self._run_task = None
         if task is not None and task is not asyncio.current_task():
             task.cancel()
-            try:
-                await asyncio.wait_for(
-                    asyncio.gather(task, return_exceptions=True), timeout=timeout
-                )
-            except TimeoutError:
-                pass
+            await asyncio.gather(task, return_exceptions=True)
         self._active = False
 
     def _start_background_task(

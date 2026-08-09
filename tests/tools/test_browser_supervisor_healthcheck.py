@@ -134,4 +134,39 @@ async def test_stop_repeated_cancellation_waits_for_websocket_close():
             await stopping
         await asyncio.wait_for(close_completed.wait(), timeout=1.0)
 
+
+@pytest.mark.asyncio
+async def test_stop_waits_for_cancelled_run_task_through_repeated_cancellation():
+    supervisor = supervisor_module.CDPSupervisor(
+        task_id="run-stop-cancellation-test", cdp_url="ws://127.0.0.1:1"
+    )
+    cancellation_started = asyncio.Event()
+    release_cancellation = asyncio.Event()
+    cancellation_completed = asyncio.Event()
+
+    async def run_task():
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancellation_started.set()
+            await release_cancellation.wait()
+            cancellation_completed.set()
+
+    supervisor._run_task = asyncio.create_task(run_task())
+    supervisor._active = True
+    await asyncio.sleep(0)
+    stopping = asyncio.create_task(supervisor.stop(timeout=0.01))
+    await cancellation_started.wait()
+    stopping.cancel()
+    await asyncio.sleep(0)
+    stopping.cancel()
+    await asyncio.sleep(0)
+
+    assert stopping.done() is False
+    release_cancellation.set()
+    with pytest.raises(asyncio.CancelledError):
+        await stopping
+    assert cancellation_completed.is_set()
+    assert supervisor._run_task is None
+
     assert supervisor._active is False
