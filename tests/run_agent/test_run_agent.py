@@ -1830,6 +1830,111 @@ class TestConcurrentToolExecution:
         assert messages[1]["tool_call_id"] == "c2"
         assert "result_fast" in messages[1]["content"]
 
+    @pytest.mark.asyncio
+    async def test_concurrent_batches_keep_approval_context_isolated(self, agent):
+        from tools.approval import (
+            _approval_session_key,
+            get_current_session_key,
+        )
+
+        observed = {}
+
+        async def fake_handle(_name, _args, _task_id, **kwargs):
+            observed[kwargs["tool_call_id"]] = get_current_session_key(
+                default="FALLBACK"
+            )
+            await asyncio.sleep(0)
+            return "ok"
+
+        async def run_batch(label):
+            token = _approval_session_key.set(f"session-{label}")
+            try:
+                tool_calls = [
+                    _mock_tool_call(
+                        name="web_search",
+                        arguments="{}",
+                        call_id=f"{label}-{index}",
+                    )
+                    for index in range(2)
+                ]
+                message = _mock_assistant_msg(
+                    content="",
+                    tool_calls=tool_calls,
+                )
+                await agent._execute_tool_calls(
+                    message,
+                    [],
+                    f"task-{label}",
+                )
+            finally:
+                _approval_session_key.reset(token)
+
+        with (
+            patch("model_tools.handle_function_call", side_effect=fake_handle),
+            patch(
+                "tools.registry.registry.get_entry",
+                return_value=SimpleNamespace(
+                    is_async=True,
+                    max_result_size_chars=None,
+                ),
+            ),
+        ):
+            await asyncio.gather(run_batch("A"), run_batch("B"))
+
+        assert observed == {
+            "A-0": "session-A",
+            "A-1": "session-A",
+            "B-0": "session-B",
+            "B-1": "session-B",
+        }
+
+    @pytest.mark.asyncio
+    async def test_parallel_batch_cancellation_reaps_tools_in_emission_order(
+        self,
+        agent,
+    ):
+        started = {"c1": asyncio.Event(), "c2": asyncio.Event()}
+        cancelled = {"c1": asyncio.Event(), "c2": asyncio.Event()}
+        messages = []
+        tool_calls = [
+            _mock_tool_call(name="web_search", arguments="{}", call_id="c1"),
+            _mock_tool_call(name="web_search", arguments="{}", call_id="c2"),
+        ]
+        message = _mock_assistant_msg(content="", tool_calls=tool_calls)
+
+        async def slow_handle(_name, _args, _task_id, **kwargs):
+            call_id = kwargs["tool_call_id"]
+            started[call_id].set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled[call_id].set()
+
+        with (
+            patch("model_tools.handle_function_call", side_effect=slow_handle),
+            patch(
+                "tools.registry.registry.get_entry",
+                return_value=SimpleNamespace(
+                    is_async=True,
+                    max_result_size_chars=None,
+                ),
+            ),
+        ):
+            batch = asyncio.create_task(
+                agent._execute_tool_calls(message, messages, "task-1")
+            )
+            await asyncio.gather(*(event.wait() for event in started.values()))
+            batch.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await batch
+
+        assert all(event.is_set() for event in cancelled.values())
+        assert [result["tool_call_id"] for result in messages] == ["c1", "c2"]
+        assert all(
+            "cancelled before a result was available" in result["content"]
+            for result in messages
+        )
+
 
 
     @pytest.mark.asyncio
