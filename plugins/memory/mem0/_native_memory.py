@@ -29,6 +29,7 @@ from ._native_oss import (
 from ._native_prompts import (
     ADDITIVE_EXTRACTION_PROMPT,
     AGENT_CONTEXT_SUFFIX,
+    PROCEDURAL_MEMORY_SYSTEM_PROMPT,
     generate_additive_extraction_prompt,
 )
 from ._native_scoring import get_bm25_params, normalize_bm25, score_and_rank
@@ -394,6 +395,58 @@ class Memory:
         )
         return memory_id
 
+    async def _create_procedural_memory(
+        self,
+        messages: list[dict[str, Any]],
+        metadata: dict[str, Any] | None = None,
+        prompt: str | None = None,
+    ) -> dict[str, list[dict[str, str]]]:
+        logger.info("Creating procedural memory")
+        parsed_messages = [
+            {
+                "role": "system",
+                "content": prompt or PROCEDURAL_MEMORY_SYSTEM_PROMPT,
+            },
+            *messages,
+            {
+                "role": "user",
+                "content": "Create procedural memory of the above conversation.",
+            },
+        ]
+        try:
+            procedural_memory = await self.llm.generate_response(
+                messages=parsed_messages
+            )
+            procedural_memory = _remove_code_blocks(procedural_memory)
+        except Exception as exc:
+            logger.error("Error generating procedural memory summary: %s", exc)
+            raise
+
+        if metadata is None:
+            raise ValueError("Metadata cannot be done for procedural memory.")
+        procedural_metadata = {
+            **metadata,
+            "memory_type": "procedural_memory",
+        }
+        embedding = await self.embedding_model.embed(
+            procedural_memory,
+            memory_action="add",
+        )
+        memory_id = await self._create_memory(
+            procedural_memory,
+            embedding,
+            procedural_metadata,
+        )
+        return {
+            "results": [
+                {
+                    "id": memory_id,
+                    "memory": procedural_memory,
+                    "event": "ADD",
+                }
+            ]
+        }
+
     async def _infer_memories(
         self,
         messages: list[dict[str, Any]],
@@ -631,18 +684,6 @@ class Memory:
         else:
             raise ValueError("messages must be str, dict, or list[dict]")
 
-        if memory_type == "procedural_memory":
-            raise RuntimeError(
-                "Mem0 OSS procedural memory pipeline is not native async yet; "
-                "no memory was written."
-            )
-        llm_config = (self.config.get("llm") or {}).get("config") or {}
-        vision_llm = self.llm if llm_config.get("enable_vision") else None
-        normalized_messages = await _parse_vision_messages(
-            normalized_messages,
-            vision_llm,
-            llm_config.get("vision_details", "auto"),
-        )
         base_metadata = deepcopy(metadata) if metadata else {}
         if normalized_expiration_date is not None:
             base_metadata["expiration_date"] = normalized_expiration_date
@@ -653,6 +694,20 @@ class Memory:
         ):
             if value:
                 base_metadata[key] = value
+
+        if agent_id is not None and memory_type == "procedural_memory":
+            return await self._create_procedural_memory(
+                normalized_messages,
+                metadata=base_metadata,
+                prompt=prompt,
+            )
+        llm_config = (self.config.get("llm") or {}).get("config") or {}
+        vision_llm = self.llm if llm_config.get("enable_vision") else None
+        normalized_messages = await _parse_vision_messages(
+            normalized_messages,
+            vision_llm,
+            llm_config.get("vision_details", "auto"),
+        )
 
         if infer:
             return {

@@ -38,6 +38,9 @@ class _LLM:
     def __init__(self, config):
         self.closed = False
 
+    async def generate_response(self, **kwargs):
+        return "```markdown\n## Procedure\nOpened the project.\n```"
+
     async def close(self):
         self.closed = True
 
@@ -290,6 +293,57 @@ async def test_memory_add_search_delete_runs_on_default_embedded_store(
     assert found["results"][0]["id"] == memory_id
     assert found["results"][0]["memory"] == "green tea"
     assert deleted == {"message": "Memory deleted successfully!"}
+    await memory.close()
+
+
+@pytest.mark.asyncio
+async def test_procedural_memory_runs_through_embedded_qdrant_and_history(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setattr(_native_memory, "OpenAIEmbedding", _Embedding)
+    monkeypatch.setattr(_native_memory, "OpenAILLM", _LLM)
+    memory = Memory(
+        {
+            "embedder": {"provider": "openai", "config": {}},
+            "llm": {"provider": "openai", "config": {}},
+            "vector_store": {
+                "provider": "qdrant",
+                "config": {
+                    "path": str(tmp_path / "qdrant"),
+                    "collection_name": "mem0",
+                    "embedding_model_dims": 2,
+                },
+            },
+            "history_db_path": str(tmp_path / "history.db"),
+            "version": "v1.1",
+        }
+    )
+
+    added = await memory.add(
+        [
+            {"role": "user", "content": "Open the project."},
+            {"role": "assistant", "content": "Opened it."},
+        ],
+        agent_id="a1",
+        memory_type="procedural_memory",
+    )
+    memory_id = added["results"][0]["id"]
+    found = await memory.search(
+        "opened project",
+        filters={"agent_id": "a1"},
+    )
+    history = await memory.db.get_history(memory_id)
+
+    assert added["results"][0]["memory"] == (
+        "## Procedure\nOpened the project."
+    )
+    assert found["results"][0]["id"] == memory_id
+    assert found["results"][0]["memory"] == (
+        "## Procedure\nOpened the project."
+    )
+    assert history[0]["new_memory"] == "## Procedure\nOpened the project."
+    assert history[0]["event"] == "ADD"
     await memory.close()
 
 

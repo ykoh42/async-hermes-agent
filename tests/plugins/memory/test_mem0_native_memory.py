@@ -16,6 +16,7 @@ from plugins.memory.mem0._native_oss import SQLiteManager as NativeSQLiteManager
 from plugins.memory.mem0._native_prompts import (
     ADDITIVE_EXTRACTION_PROMPT,
     AGENT_CONTEXT_SUFFIX,
+    PROCEDURAL_MEMORY_SYSTEM_PROMPT,
 )
 
 
@@ -806,14 +807,6 @@ async def test_memory_add_preserves_temporal_and_memory_type_validation(tmp_path
             memory_type="semantic",
             infer=False,
         )
-    with pytest.raises(RuntimeError, match="procedural memory pipeline"):
-        await memory.add(
-            "fact",
-            agent_id="a1",
-            memory_type="procedural_memory",
-            infer=False,
-        )
-
     result = await memory.add(
         "fact",
         user_id="u1",
@@ -822,6 +815,136 @@ async def test_memory_add_preserves_temporal_and_memory_type_validation(tmp_path
     )
     payload = _FakeVector.instances[0].rows[result["results"][0]["id"]].payload
     assert payload["expiration_date"] == "2026-08-10"
+    await memory.close()
+
+
+@pytest.mark.asyncio
+async def test_memory_add_creates_procedural_memory_with_upstream_contract(
+    tmp_path,
+):
+    memory = Memory(_config(tmp_path))
+    metadata = {"source": "trajectory"}
+    messages = [
+        {"role": "user", "content": "Open the project."},
+        {"role": "assistant", "content": "Opened /workspace."},
+    ]
+    _FakeLLM.response = "```markdown\n## Summary\nOpened /workspace.\n```"
+
+    result = await memory.add(
+        messages,
+        agent_id="a1",
+        metadata=metadata,
+        expiration_date="2026-08-10",
+        infer=False,
+        memory_type="procedural_memory",
+    )
+
+    memory_id = result["results"][0]["id"]
+    assert result == {
+        "results": [
+            {
+                "id": memory_id,
+                "memory": "## Summary\nOpened /workspace.",
+                "event": "ADD",
+            }
+        ]
+    }
+    assert _FakeLLM.instances[0].calls == [
+        {
+            "messages": [
+                {
+                    "role": "system",
+                    "content": PROCEDURAL_MEMORY_SYSTEM_PROMPT,
+                },
+                *messages,
+                {
+                    "role": "user",
+                    "content": (
+                        "Create procedural memory of the above conversation."
+                    ),
+                },
+            ]
+        }
+    ]
+    assert _FakeEmbedder.instances[0].calls == [
+        ("## Summary\nOpened /workspace.", "add")
+    ]
+    payload = _FakeVector.instances[0].rows[memory_id].payload
+    assert payload["data"] == "## Summary\nOpened /workspace."
+    assert payload["source"] == "trajectory"
+    assert payload["agent_id"] == "a1"
+    assert payload["expiration_date"] == "2026-08-10"
+    assert payload["memory_type"] == "procedural_memory"
+    assert payload["hash"] == hashlib.md5(
+        b"## Summary\nOpened /workspace."
+    ).hexdigest()
+    assert payload["text_lemmatized"] == "## Summary\nOpened /workspace."
+    history = _FakeDB.instances[0].history[-1]
+    assert history[0:4] == (
+        memory_id,
+        None,
+        "## Summary\nOpened /workspace.",
+        "ADD",
+    )
+    assert _FakeDB.instances[0].saved_messages == []
+    assert metadata == {"source": "trajectory"}
+    await memory.close()
+
+
+@pytest.mark.asyncio
+async def test_procedural_memory_without_agent_id_follows_normal_add_path(
+    tmp_path,
+):
+    memory = Memory(_config(tmp_path))
+
+    result = await memory.add(
+        "ordinary fact",
+        user_id="u1",
+        infer=False,
+        memory_type="procedural_memory",
+    )
+
+    memory_id = result["results"][0]["id"]
+    payload = _FakeVector.instances[0].rows[memory_id].payload
+    assert result["results"][0]["memory"] == "ordinary fact"
+    assert "memory_type" not in payload
+    assert _FakeLLM.instances[0].calls == []
+    await memory.close()
+
+
+@pytest.mark.asyncio
+async def test_procedural_memory_uses_custom_prompt(tmp_path):
+    memory = Memory(_config(tmp_path))
+    _FakeLLM.response = "custom summary"
+
+    await memory.add(
+        "step",
+        agent_id="a1",
+        memory_type="procedural_memory",
+        prompt="Custom procedural prompt",
+    )
+
+    assert _FakeLLM.instances[0].calls[0]["messages"][0] == {
+        "role": "system",
+        "content": "Custom procedural prompt",
+    }
+    await memory.close()
+
+
+@pytest.mark.asyncio
+async def test_procedural_memory_preserves_cancellation_without_write(tmp_path):
+    memory = Memory(_config(tmp_path))
+
+    _FakeLLM.exception = asyncio.CancelledError()
+    with pytest.raises(asyncio.CancelledError):
+        await memory.add(
+            "cancelled step",
+            agent_id="a1",
+            memory_type="procedural_memory",
+        )
+
+    assert _FakeVector.instances[0].rows == {}
+    assert _FakeDB.instances[0].history == [("initialize",)]
     await memory.close()
 
 

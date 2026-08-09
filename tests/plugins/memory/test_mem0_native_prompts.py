@@ -6,6 +6,7 @@ import hashlib
 
 from plugins.memory.mem0._native_prompts import (
     ADDITIVE_EXTRACTION_PROMPT,
+    PROCEDURAL_MEMORY_SYSTEM_PROMPT,
     generate_additive_extraction_prompt,
 )
 
@@ -13,6 +14,14 @@ from plugins.memory.mem0._native_prompts import (
 def test_additive_prompt_matches_pinned_upstream_bytes():
     assert hashlib.sha256(ADDITIVE_EXTRACTION_PROMPT.encode()).hexdigest() == (
         "ad19187a37813ef77ee156e714c0650e6ec749e0264bdc07d499bc9b24115155"
+    )
+
+
+def test_procedural_prompt_matches_pinned_upstream_bytes():
+    assert hashlib.sha256(
+        PROCEDURAL_MEMORY_SYSTEM_PROMPT.encode()
+    ).hexdigest() == (
+        "9ed026ae3bcc12e1e9986e5964edfc25e52a350ad80023462eadfdcfe8e1df2a"
     )
 
 
