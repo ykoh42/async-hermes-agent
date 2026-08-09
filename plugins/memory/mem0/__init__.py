@@ -400,6 +400,36 @@ class Mem0MemoryProvider(MemoryProvider):
         )
         self._channel = kwargs.get("platform") or "cli"
         self._backend = self._create_backend()
+        if self._backend is not None and self._mode != "oss" and not self._host:
+            from ._backend import PlatformBackend
+
+            if isinstance(self._backend, PlatformBackend):
+                try:
+                    await self._backend._initialize()
+                except asyncio.CancelledError:
+                    backend = self._backend
+                    self._backend = None
+                    await _finish_owned_task(
+                        asyncio.create_task(backend.close())
+                    )
+                    raise
+                except Exception as exc:
+                    backend = self._backend
+                    self._backend = None
+                    try:
+                        await _finish_owned_task(
+                            asyncio.create_task(backend.close())
+                        )
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        pass
+                    logger.error(
+                        "Mem0 backend failed to initialize (%s mode): %s",
+                        self._mode,
+                        exc,
+                    )
+                    self._init_error = str(exc)
 
     def _read_filters(self) -> Dict[str, Any]:
         # Scoped to user_id only — by design — so recall surfaces memories

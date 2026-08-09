@@ -7,7 +7,13 @@ import json
 import httpx
 import pytest
 
-from plugins.memory.mem0._backend import OSSBackend, PlatformBackend, SelfHostedBackend
+from plugins.memory.mem0._backend import (
+    MemoryError,
+    MemoryNotFoundError,
+    OSSBackend,
+    PlatformBackend,
+    SelfHostedBackend,
+)
 
 
 class _StubServer:
@@ -17,6 +23,15 @@ class _StubServer:
     async def handler(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(request)
         path, method = request.url.path, request.method
+        if path == "/v1/ping/" and method == "GET":
+            return httpx.Response(
+                200,
+                json={
+                    "user_email": "user@example.com",
+                    "org_id": "org-1",
+                    "project_id": "project-1",
+                },
+            )
         if path.endswith("/search/") and method == "POST":
             return httpx.Response(
                 200,
@@ -75,23 +90,138 @@ async def test_platform_backend_preserves_cloud_request_contract(monkeypatch):
     assert results == [{"id": "m1", "memory": "tea", "score": 0.9}]
     assert added["event_id"] == "evt-1"
     assert [request.url.path for request in server.requests] == [
+        "/v1/ping/",
         "/v3/memories/search/",
         "/v3/memories/add/",
         "/v1/memories/m1/",
         "/v1/memories/m1/",
     ]
-    search_payload = json.loads(server.requests[0].content)
+    search_payload = json.loads(server.requests[1].content)
     assert search_payload == {
         "query": "test query",
         "filters": {"user_id": "u1"},
         "top_k": 5,
         "rerank": True,
     }
-    add_payload = json.loads(server.requests[1].content)
+    add_payload = json.loads(server.requests[2].content)
     assert add_payload["infer"] is False
     assert "metadata" not in add_payload
     assert server.requests[0].headers["authorization"] == "Token secret"
     assert server.requests[0].headers["mem0-user-id"]
+    assert backend.org_id == "org-1"
+    assert backend.project_id == "project-1"
+    assert backend.user_email == "user@example.com"
+
+
+@pytest.mark.asyncio
+async def test_platform_search_trims_and_validates_like_memory_client(monkeypatch):
+    server = _StubServer()
+    async_client = httpx.AsyncClient
+
+    def build_client(*args, **kwargs):
+        return async_client(
+            *args,
+            **kwargs,
+            transport=httpx.MockTransport(server.handler),
+        )
+
+    monkeypatch.setattr(httpx, "AsyncClient", build_client)
+    backend = PlatformBackend("secret")
+    try:
+        await backend.search("  trimmed query  ", filters={"user_id": "u1"})
+        with pytest.raises(ValueError, match="cannot be empty"):
+            await backend.search("   ", filters={"user_id": "u1"})
+    finally:
+        await backend.close()
+
+    payload = json.loads(server.requests[1].content)
+    assert payload["query"] == "trimmed query"
+    assert [request.url.path for request in server.requests].count("/v1/ping/") == 1
+
+
+@pytest.mark.asyncio
+async def test_platform_404_uses_mem0_client_exception_contract(monkeypatch):
+    async def handler(request):
+        if request.url.path == "/v1/ping/":
+            return httpx.Response(200, json={})
+        return httpx.Response(404, json={"detail": "Memory not found"})
+
+    async_client = httpx.AsyncClient
+
+    def build_client(*args, **kwargs):
+        return async_client(
+            *args,
+            **kwargs,
+            transport=httpx.MockTransport(handler),
+        )
+
+    monkeypatch.setattr(httpx, "AsyncClient", build_client)
+    backend = PlatformBackend("secret")
+    try:
+        with pytest.raises(MemoryNotFoundError) as raised:
+            await backend.update("missing", "new")
+    finally:
+        await backend.close()
+
+    assert str(raised.value) == "Memory not found"
+    assert raised.value.error_code == "HTTP_404"
+
+
+@pytest.mark.asyncio
+async def test_platform_generic_http_error_matches_mem0_base_exception(monkeypatch):
+    async def handler(request):
+        if request.url.path == "/v1/ping/":
+            return httpx.Response(200, json={})
+        return httpx.Response(500, text="server failed")
+
+    async_client = httpx.AsyncClient
+
+    def build_client(*args, **kwargs):
+        return async_client(
+            *args,
+            **kwargs,
+            transport=httpx.MockTransport(handler),
+        )
+
+    monkeypatch.setattr(httpx, "AsyncClient", build_client)
+    backend = PlatformBackend("secret")
+    try:
+        with pytest.raises(MemoryError) as raised:
+            await backend.delete("m1")
+    finally:
+        await backend.close()
+
+    assert type(raised.value).__name__ == "MemoryError"
+    assert repr(raised.value).startswith("MemoryError(message='server failed'")
+
+
+@pytest.mark.asyncio
+async def test_platform_ping_requires_complete_org_project_pair(monkeypatch):
+    async def handler(request):
+        return httpx.Response(
+            200,
+            json={"org_id": "org-only", "user_email": "user@example.com"},
+        )
+
+    async_client = httpx.AsyncClient
+
+    def build_client(*args, **kwargs):
+        return async_client(
+            *args,
+            **kwargs,
+            transport=httpx.MockTransport(handler),
+        )
+
+    monkeypatch.setattr(httpx, "AsyncClient", build_client)
+    backend = PlatformBackend("secret")
+    try:
+        await backend._initialize()
+    finally:
+        await backend.close()
+
+    assert backend.org_id is None
+    assert backend.project_id is None
+    assert backend.user_email == "user@example.com"
 
 
 @pytest.mark.asyncio

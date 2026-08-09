@@ -3,10 +3,12 @@
 import asyncio
 import json
 
+import httpx
 import pytest
 
 import plugins.memory.mem0 as mem0_plugin
 from plugins.memory.mem0 import Mem0MemoryProvider
+from plugins.memory.mem0._backend import MemoryNotFoundError, PlatformBackend
 
 
 class FakeBackend:
@@ -94,6 +96,30 @@ async def test_mem0_tool_contract_and_result_shapes(monkeypatch, tmp_path):
     }
     assert backend.captured[1][2]["infer"] is False
     assert backend.captured[1][2]["metadata"] == {"channel": "cli"}
+
+
+@pytest.mark.asyncio
+async def test_memory_not_found_does_not_increment_provider_breaker(
+    monkeypatch, tmp_path
+):
+    class MissingBackend(FakeBackend):
+        async def update(self, memory_id, text):
+            raise MemoryNotFoundError(
+                "Memory not found",
+                "HTTP_404",
+            )
+
+    provider = await _provider(monkeypatch, tmp_path, MissingBackend())
+
+    result = json.loads(
+        await provider.handle_tool_call(
+            "mem0_update",
+            {"memory_id": "missing", "text": "new"},
+        )
+    )
+
+    assert result == {"error": "Memory not found: missing"}
+    assert provider._consecutive_failures == 0
 
 
 @pytest.mark.asyncio
@@ -241,6 +267,115 @@ async def test_backend_initialization_failure_preserves_provider_contract(
             "Check that vector store is running and reachable."
         )
     }
+
+
+@pytest.mark.asyncio
+async def test_platform_validation_failure_closes_backend_and_preserves_error(
+    monkeypatch, tmp_path
+):
+    async_client = httpx.AsyncClient
+    requests = []
+
+    async def handler(request):
+        requests.append(request)
+        return httpx.Response(401, json={"detail": "Invalid API key"})
+
+    def build_client(*args, **kwargs):
+        return async_client(
+            *args,
+            **kwargs,
+            transport=httpx.MockTransport(handler),
+        )
+
+    monkeypatch.setattr(httpx, "AsyncClient", build_client)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("MEM0_API_KEY", "invalid-key")
+    provider = Mem0MemoryProvider()
+
+    await provider.initialize("test-session")
+
+    assert [request.url.path for request in requests] == ["/v1/ping/"]
+    assert provider._backend is None
+    assert provider._init_error == "Error: Invalid API key"
+
+
+@pytest.mark.asyncio
+async def test_platform_validation_cancellation_closes_backend_and_propagates(
+    monkeypatch, tmp_path
+):
+    entered = asyncio.Event()
+    closed = asyncio.Event()
+
+    class Client:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def get(self, path):
+            entered.set()
+            await asyncio.Event().wait()
+
+        async def aclose(self):
+            closed.set()
+
+    monkeypatch.setattr(httpx, "AsyncClient", Client)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("MEM0_API_KEY", "test-key")
+    provider = Mem0MemoryProvider()
+
+    initialize = asyncio.create_task(provider.initialize("test-session"))
+    await entered.wait()
+    initialize.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await initialize
+    assert closed.is_set()
+    assert provider._backend is None
+
+
+@pytest.mark.asyncio
+async def test_platform_failure_cleanup_survives_repeated_cancellation(
+    monkeypatch, tmp_path
+):
+    close_started = asyncio.Event()
+    release_close = asyncio.Event()
+    close_finished = asyncio.Event()
+    async_client = httpx.AsyncClient
+
+    async def handler(request):
+        return httpx.Response(401, json={"detail": "Invalid API key"})
+
+    def build_client(*args, **kwargs):
+        return async_client(
+            *args,
+            **kwargs,
+            transport=httpx.MockTransport(handler),
+        )
+
+    async def slow_close(self):
+        close_started.set()
+        await release_close.wait()
+        await self._client.aclose()
+        close_finished.set()
+
+    monkeypatch.setattr(httpx, "AsyncClient", build_client)
+    monkeypatch.setattr(PlatformBackend, "close", slow_close)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("MEM0_API_KEY", "invalid-key")
+    provider = Mem0MemoryProvider()
+
+    initialize = asyncio.create_task(provider.initialize("test-session"))
+    await close_started.wait()
+    initialize.cancel()
+    await asyncio.sleep(0)
+    initialize.cancel()
+    await asyncio.sleep(0)
+
+    assert initialize.done() is False
+    release_close.set()
+    with pytest.raises(asyncio.CancelledError):
+        await initialize
+    assert close_finished.is_set()
+    assert provider._backend is None
 
 
 @pytest.mark.asyncio

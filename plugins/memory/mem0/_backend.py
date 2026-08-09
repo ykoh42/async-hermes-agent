@@ -3,9 +3,176 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+import asyncio
 import hashlib
 import importlib
 from typing import Any
+
+import httpx
+
+# Mirrors mem0ai 2.0.10's ``mem0.exceptions`` and ``client.utils`` behavior.
+# Importing that package would also import its blocking client/OSS runtime, so
+# the native HTTP backend keeps only the exception contract locally.
+
+class MemoryError(Exception):
+    """Structured Platform error matching the Mem0 SDK exception surface."""
+
+    def __init__(
+        self,
+        message: str,
+        error_code: str,
+        *,
+        details: dict[str, Any] | None = None,
+        suggestion: str | None = None,
+        debug_info: dict[str, Any] | None = None,
+    ) -> None:
+        self.message = message
+        self.error_code = error_code
+        self.details = details or {}
+        self.suggestion = suggestion
+        self.debug_info = debug_info or {}
+        super().__init__(message)
+
+    def __repr__(self) -> str:
+        return (
+            f"{self.__class__.__name__}("
+            f"message={self.message!r}, "
+            f"error_code={self.error_code!r}, "
+            f"details={self.details!r}, "
+            f"suggestion={self.suggestion!r}, "
+            f"debug_info={self.debug_info!r})"
+        )
+
+
+class AuthenticationError(MemoryError):
+    pass
+
+
+class RateLimitError(MemoryError):
+    pass
+
+
+class ValidationError(MemoryError):
+    pass
+
+
+class MemoryNotFoundError(MemoryError):
+    pass
+
+
+class NetworkError(MemoryError):
+    pass
+
+
+class MemoryQuotaExceededError(MemoryError):
+    pass
+
+
+_HTTP_ERROR_TYPES = {
+    400: ValidationError,
+    401: AuthenticationError,
+    403: AuthenticationError,
+    404: MemoryNotFoundError,
+    408: NetworkError,
+    409: ValidationError,
+    413: MemoryQuotaExceededError,
+    422: ValidationError,
+    429: RateLimitError,
+    500: MemoryError,
+    502: NetworkError,
+    503: NetworkError,
+    504: NetworkError,
+}
+
+_HTTP_ERROR_SUGGESTIONS = {
+    400: "Please check your request parameters and try again",
+    401: "Please check your API key and authentication credentials",
+    403: "You don't have permission to perform this operation",
+    404: "The requested resource was not found",
+    408: "Request timed out. Please try again",
+    409: "Resource conflict. Please check your request",
+    413: "Request too large. Please reduce the size of your request",
+    422: "Invalid request data. Please check your input",
+    429: "Rate limit exceeded. Please wait before making more requests",
+    500: "Internal server error. Please try again later",
+    502: "Service temporarily unavailable. Please try again later",
+    503: "Service unavailable. Please try again later",
+    504: "Gateway timeout. Please try again later",
+}
+
+
+def _platform_http_error(exc: httpx.HTTPStatusError) -> MemoryError:
+    response = exc.response
+    details: dict[str, Any] = {}
+    message = response.text
+    if response.headers.get("content-type", "").startswith("application/json"):
+        try:
+            decoded = response.json()
+        except ValueError:
+            decoded = None
+        if isinstance(decoded, dict):
+            details = decoded
+            message = decoded.get("detail", message)
+    debug_info: dict[str, Any] = {
+        "status_code": response.status_code,
+        "url": str(exc.request.url),
+        "method": exc.request.method,
+    }
+    if response.status_code == 429:
+        retry_after = response.headers.get("Retry-After")
+        if retry_after:
+            try:
+                debug_info["retry_after"] = int(retry_after)
+            except ValueError:
+                pass
+        for header in (
+            "X-RateLimit-Limit",
+            "X-RateLimit-Remaining",
+            "X-RateLimit-Reset",
+        ):
+            value = response.headers.get(header)
+            if value:
+                debug_info[header.lower().replace("-", "_")] = value
+    error_type = _HTTP_ERROR_TYPES.get(response.status_code, MemoryError)
+    return error_type(
+        message or f"HTTP {response.status_code} error",
+        f"HTTP_{response.status_code}",
+        details=details,
+        suggestion=_HTTP_ERROR_SUGGESTIONS.get(
+            response.status_code, "Please try again later"
+        ),
+        debug_info=debug_info,
+    )
+
+
+def _platform_network_error(exc: httpx.RequestError) -> NetworkError:
+    if isinstance(exc, httpx.TimeoutException):
+        message = f"Request timed out: {exc}"
+        code = "NET_TIMEOUT"
+        error_type = "timeout"
+    elif isinstance(exc, httpx.ConnectError):
+        message = f"Connection failed: {exc}"
+        code = "NET_CONNECT"
+        error_type = "connection"
+    else:
+        message = f"Network request failed: {exc}"
+        code = "NET_GENERIC"
+        error_type = "request"
+    return NetworkError(
+        message,
+        code,
+        suggestion="Please check your internet connection and try again",
+        debug_info={"error_type": error_type, "original_error": str(exc)},
+    )
+
+
+def _validate_search_query(query: str) -> str:
+    if not isinstance(query, str):
+        raise ValueError("Invalid query: must be a non-empty string.")
+    trimmed = query.strip()
+    if not trimmed:
+        raise ValueError("Invalid query: cannot be empty or whitespace-only.")
+    return trimmed
 
 
 class Mem0Backend(ABC):
@@ -52,7 +219,10 @@ class PlatformBackend(Mem0Backend):
     """Native-async client for the Mem0 Platform API."""
 
     def __init__(self, api_key: str):
-        import httpx
+        if not api_key:
+            raise ValueError(
+                "Mem0 API Key not provided. Please provide an API Key."
+            )
 
         user_id = hashlib.md5(api_key.encode(), usedforsecurity=False).hexdigest()
         headers = {
@@ -64,13 +234,50 @@ class PlatformBackend(Mem0Backend):
             headers=headers,
             timeout=300.0,
         )
+        self._initialize_lock = asyncio.Lock()
+        self._initialized = False
+        self.org_id: str | None = None
+        self.project_id: str | None = None
+        self.user_email: str | None = None
+
+    async def _initialize(self) -> None:
+        """Validate the API key at the same lifecycle boundary as the SDK."""
+        if self._initialized:
+            return
+        async with self._initialize_lock:
+            if self._initialized:
+                return
+            try:
+                response = await self._client.get("/v1/ping/")
+                response.raise_for_status()
+                data = response.json()
+            except httpx.HTTPStatusError as exc:
+                try:
+                    error_data = exc.response.json()
+                    detail = error_data.get("detail", str(exc))
+                except Exception:
+                    detail = str(exc)
+                raise ValueError(f"Error: {detail}") from exc
+            if isinstance(data, dict):
+                if data.get("org_id") and data.get("project_id"):
+                    self.org_id = data.get("org_id")
+                    self.project_id = data.get("project_id")
+                self.user_email = data.get("user_email")
+            self._initialized = True
 
     async def _json(self, method: str, path: str, **kwargs) -> Any:
-        response = await self._client.request(method, path, **kwargs)
-        response.raise_for_status()
-        return response.json() if response.content else {}
+        try:
+            response = await self._client.request(method, path, **kwargs)
+            response.raise_for_status()
+            return response.json() if response.content else {}
+        except httpx.HTTPStatusError as exc:
+            raise _platform_http_error(exc) from exc
+        except httpx.RequestError as exc:
+            raise _platform_network_error(exc) from exc
 
     async def search(self, query: str, *, filters: dict, top_k: int = 10, rerank: bool = False) -> list[dict]:
+        await self._initialize()
+        query = _validate_search_query(query)
         response = await self._json(
             "POST",
             "/v3/memories/search/",
@@ -92,6 +299,7 @@ class PlatformBackend(Mem0Backend):
         infer: bool = False,
         metadata: dict | None = None,
     ) -> dict:
+        await self._initialize()
         body: dict[str, Any] = {
             "messages": messages,
             "user_id": user_id,
@@ -103,6 +311,7 @@ class PlatformBackend(Mem0Backend):
         return await self._json("POST", "/v3/memories/add/", json=body)
 
     async def update(self, memory_id: str, text: str) -> dict:
+        await self._initialize()
         await self._json(
             "PUT",
             f"/v1/memories/{memory_id}/",
@@ -111,6 +320,7 @@ class PlatformBackend(Mem0Backend):
         return {"result": "Memory updated.", "memory_id": memory_id}
 
     async def delete(self, memory_id: str) -> dict:
+        await self._initialize()
         await self._json("DELETE", f"/v1/memories/{memory_id}/")
         return {"result": "Memory deleted.", "memory_id": memory_id}
 
