@@ -8,7 +8,11 @@ from types import ModuleType, SimpleNamespace
 
 import pytest
 
-from plugins.memory.mem0._native_oss import OllamaEmbedding, OpenAIEmbedding
+from plugins.memory.mem0._native_oss import (
+    OllamaEmbedding,
+    OpenAIEmbedding,
+    OpenAILLM,
+)
 
 
 class _FakeEmbeddings:
@@ -27,14 +31,32 @@ class _FakeEmbeddings:
         return SimpleNamespace(data=data)
 
 
+class _FakeCompletions:
+    def __init__(self, owner):
+        self.owner = owner
+
+    async def create(self, **kwargs):
+        self.owner.completion_calls.append(kwargs)
+        return self.owner.completion_response
+
+
 class _FakeAsyncOpenAI:
     instances = []
 
     def __init__(self, **kwargs):
         self.kwargs = kwargs
         self.calls = []
+        self.completion_calls = []
+        self.completion_response = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(content="answer", tool_calls=None)
+                )
+            ]
+        )
         self.close_calls = 0
         self.embeddings = _FakeEmbeddings(self)
+        self.chat = SimpleNamespace(completions=_FakeCompletions(self))
         self.instances.append(self)
 
     async def close(self):
@@ -366,3 +388,169 @@ async def test_ollama_embedder_initialization_cancellation_cleans_up():
 
     assert _FakeAsyncOllama.instances[0].close_calls == 1
     await embedder.close()
+
+
+@pytest.mark.asyncio
+async def test_openai_llm_uses_gpt5_completion_token_contract(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "key")
+    llm = OpenAILLM(
+        {
+            "model": "gpt-5-mini",
+            "temperature": 0.2,
+            "top_p": 0.3,
+            "max_tokens": 321,
+        }
+    )
+    messages = [{"role": "user", "content": "question"}]
+
+    assert await llm.generate_response(messages) == "answer"
+
+    client = _FakeAsyncOpenAI.instances[0]
+    assert client.completion_calls == [
+        {
+            "model": "gpt-5-mini",
+            "messages": messages,
+            "temperature": 0.2,
+            "top_p": 0.3,
+            "max_completion_tokens": 321,
+        }
+    ]
+    await llm.close()
+
+
+@pytest.mark.asyncio
+async def test_openai_llm_reasoning_model_drops_sampling_and_token_limit(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "key")
+    llm = OpenAILLM(
+        {
+            "model": "o3",
+            "temperature": 0.8,
+            "top_p": 0.9,
+            "max_tokens": 999,
+            "reasoning_effort": "high",
+        }
+    )
+
+    await llm.generate_response([{"role": "user", "content": "question"}])
+
+    assert _FakeAsyncOpenAI.instances[0].completion_calls[0] == {
+        "model": "o3",
+        "messages": [{"role": "user", "content": "question"}],
+        "reasoning_effort": "high",
+    }
+    await llm.close()
+
+
+@pytest.mark.asyncio
+async def test_openai_llm_forwards_json_tools_store_and_parses_tool_calls(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "key")
+    llm = OpenAILLM({"model": "gpt-4.1-mini", "store": False})
+    await llm._get_client()
+    client = _FakeAsyncOpenAI.instances[0]
+    client.completion_response = SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(
+                    content=None,
+                    tool_calls=[
+                        SimpleNamespace(
+                            function=SimpleNamespace(
+                                name="remember",
+                                arguments='```json\n{"fact": "tea"}\n```',
+                            )
+                        )
+                    ],
+                )
+            )
+        ]
+    )
+    tools = [{"type": "function", "function": {"name": "remember"}}]
+    response_format = {"type": "json_object"}
+
+    result = await llm.generate_response(
+        [{"role": "user", "content": "question"}],
+        response_format=response_format,
+        tools=tools,
+        tool_choice="required",
+    )
+
+    assert result == {
+        "content": None,
+        "tool_calls": [{"name": "remember", "arguments": {"fact": "tea"}}],
+    }
+    request = client.completion_calls[0]
+    assert request["response_format"] is response_format
+    assert request["tools"] is tools
+    assert request["tool_choice"] == "required"
+    assert request["store"] is False
+    await llm.close()
+
+
+@pytest.mark.asyncio
+async def test_openai_llm_preserves_openrouter_routing(monkeypatch):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "router-key")
+    llm = OpenAILLM(
+        {
+            "model": "primary",
+            "models": ["fallback-one", "fallback-two"],
+            "route": "fallback",
+            "openrouter_base_url": "https://router.test/api/v1",
+            "site_url": "https://app.test",
+            "app_name": "Hermes",
+        }
+    )
+
+    await llm.generate_response([{"role": "user", "content": "question"}])
+
+    client = _FakeAsyncOpenAI.instances[0]
+    assert client.kwargs == {
+        "api_key": "router-key",
+        "base_url": "https://router.test/api/v1",
+    }
+    request = client.completion_calls[0]
+    assert "model" not in request
+    assert request["models"] == ["fallback-one", "fallback-two"]
+    assert request["route"] == "fallback"
+    assert request["extra_headers"] == {
+        "HTTP-Referer": "https://app.test",
+        "X-Title": "Hermes",
+    }
+    await llm.close()
+
+
+@pytest.mark.asyncio
+async def test_openai_llm_awaits_native_response_callback(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "key")
+    captured = []
+
+    async def callback(llm, response, params):
+        captured.append((llm, response, params))
+
+    llm = OpenAILLM({"response_callback": callback})
+    assert await llm.generate_response(
+        [{"role": "user", "content": "question"}]
+    ) == "answer"
+
+    assert captured[0][0] is llm
+    assert captured[0][1] is _FakeAsyncOpenAI.instances[0].completion_response
+    assert captured[0][2] == _FakeAsyncOpenAI.instances[0].completion_calls[0]
+    await llm.close()
+
+
+@pytest.mark.asyncio
+async def test_openai_llm_rejects_sync_response_callback_without_calling_it(
+    monkeypatch,
+):
+    monkeypatch.setenv("OPENAI_API_KEY", "key")
+    called = False
+
+    def callback(*args):
+        nonlocal called
+        called = True
+
+    llm = OpenAILLM({"response_callback": callback})
+
+    with pytest.raises(RuntimeError, match="native-async response_callback"):
+        await llm.generate_response([{"role": "user", "content": "question"}])
+    assert called is False
+    await llm.close()

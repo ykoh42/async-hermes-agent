@@ -9,8 +9,11 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timezone
+import inspect
+import json
 import logging
 import os
+import re
 from typing import Any, Coroutine
 import uuid
 import warnings
@@ -33,6 +36,19 @@ async def _finish_cleanup(
         except Exception:
             logger.exception(error_message)
         raise
+
+
+def _extract_json(text: str) -> str:
+    """Mirror ``mem0.memory.utils.extract_json`` without importing sync runtime."""
+    text = text.strip()
+    match = re.search(r"```(?:json)?\s*(.*?)\s*```", text, re.DOTALL)
+    if match:
+        return match.group(1)
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end > start:
+        return text[start : end + 1]
+    return text
 
 _HISTORY_COLUMNS = (
     "id",
@@ -272,6 +288,168 @@ class OllamaEmbedding:
                 await _finish_cleanup(
                     client.close(),
                     error_message="Mem0 Ollama embedder cleanup failed during cancellation",
+                )
+
+
+class OpenAILLM:
+    """Native-async equivalent of Mem0 2.0.10's OpenAI LLM."""
+
+    def __init__(self, config: dict[str, Any] | None = None) -> None:
+        self.config = dict(config or {})
+        self.model = self.config.get("model") or "gpt-5-mini"
+        self.temperature = self.config.get("temperature", 0.1)
+        self.max_tokens = self.config.get("max_tokens", 2000)
+        self.top_p = self.config.get("top_p", 0.1)
+        self._client: Any = None
+        self._initialize_lock = asyncio.Lock()
+        self._closed = False
+
+    def _is_reasoning_model(self) -> bool:
+        explicit = self.config.get("is_reasoning_model")
+        if explicit is not None:
+            return bool(explicit)
+        base_model = self.model.lower().rsplit("/", 1)[-1]
+        if base_model in {
+            "o1",
+            "o1-preview",
+            "o3-mini",
+            "o3",
+            "gpt-5",
+            "gpt-5o",
+            "gpt-5o-mini",
+            "gpt-5o-micro",
+        }:
+            return True
+        return any(
+            base_model.startswith(prefix)
+            for prefix in ("o1-", "o1.", "o3-", "o3.")
+        )
+
+    def _supported_params(
+        self, messages: list[dict[str, Any]], **kwargs: Any
+    ) -> dict[str, Any]:
+        if self._is_reasoning_model():
+            params: dict[str, Any] = {"messages": messages}
+            reasoning_effort = self.config.get("reasoning_effort")
+            if reasoning_effort:
+                params["reasoning_effort"] = reasoning_effort
+            return params
+        params = {
+            "temperature": self.temperature,
+            "top_p": self.top_p,
+            (
+                "max_completion_tokens"
+                if self.model.lower().rsplit("/", 1)[-1].startswith("gpt-5")
+                else "max_tokens"
+            ): self.max_tokens,
+        }
+        params.update(kwargs)
+        params["messages"] = messages
+        return params
+
+    async def _get_client(self) -> Any:
+        if self._client is not None:
+            return self._client
+        async with self._initialize_lock:
+            if self._client is not None:
+                return self._client
+            if self._closed:
+                raise RuntimeError("Cannot use a closed OpenAILLM")
+
+            from openai import AsyncOpenAI
+
+            openrouter_key = os.getenv("OPENROUTER_API_KEY")
+            if openrouter_key:
+                api_key = openrouter_key
+                base_url = (
+                    self.config.get("openrouter_base_url")
+                    or os.getenv("OPENROUTER_API_BASE")
+                    or "https://openrouter.ai/api/v1"
+                )
+            else:
+                api_key = self.config.get("api_key") or os.getenv("OPENAI_API_KEY")
+                base_url = (
+                    self.config.get("openai_base_url")
+                    or os.getenv("OPENAI_BASE_URL")
+                    or "https://api.openai.com/v1"
+                )
+            self._client = AsyncOpenAI(api_key=api_key, base_url=base_url)
+            return self._client
+
+    @staticmethod
+    def _parse_response(response: Any, tools: list[dict[str, Any]] | None) -> Any:
+        message = response.choices[0].message
+        if not tools:
+            return message.content
+        parsed = {"content": message.content, "tool_calls": []}
+        for tool_call in message.tool_calls or []:
+            parsed["tool_calls"].append(
+                {
+                    "name": tool_call.function.name,
+                    "arguments": json.loads(
+                        _extract_json(tool_call.function.arguments)
+                    ),
+                }
+            )
+        return parsed
+
+    async def generate_response(
+        self,
+        messages: list[dict[str, Any]],
+        response_format: Any = None,
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: str = "auto",
+        **kwargs: Any,
+    ) -> Any:
+        callback = self.config.get("response_callback")
+        if callback is not None and not inspect.iscoroutinefunction(callback):
+            raise RuntimeError(
+                "Mem0 OpenAI LLM response_callback must provide a native-async "
+                "response_callback."
+            )
+
+        params = self._supported_params(messages, **kwargs)
+        params.update({"model": self.model, "messages": messages})
+        if os.getenv("OPENROUTER_API_KEY"):
+            models = self.config.get("models")
+            if models:
+                params["models"] = models
+                params["route"] = self.config.get("route", "fallback")
+                params.pop("model")
+            if self.config.get("site_url") and self.config.get("app_name"):
+                params["extra_headers"] = {
+                    "HTTP-Referer": self.config["site_url"],
+                    "X-Title": self.config["app_name"],
+                }
+        elif self.config.get("store") is not None:
+            params["store"] = self.config["store"]
+        if response_format:
+            params["response_format"] = response_format
+        if tools:
+            params["tools"] = tools
+            params["tool_choice"] = tool_choice
+
+        client = await self._get_client()
+        response = await client.chat.completions.create(**params)
+        parsed = self._parse_response(response, tools)
+        if callback is not None:
+            try:
+                await callback(self, response, params)
+            except Exception:
+                logger.exception("Error in Mem0 OpenAI LLM response callback")
+        return parsed
+
+    async def close(self) -> None:
+        async with self._initialize_lock:
+            if self._closed:
+                return
+            self._closed = True
+            client = self._client
+            self._client = None
+            if client is not None:
+                await _finish_cleanup(
+                    client.close(),
+                    error_message="Mem0 OpenAI LLM cleanup failed during cancellation",
                 )
 
 
