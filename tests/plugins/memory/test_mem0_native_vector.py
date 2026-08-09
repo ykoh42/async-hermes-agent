@@ -205,7 +205,7 @@ async def test_qdrant_uses_configured_native_async_client():
     assert store._client is client
     assert client.kwargs == {"source": "configured"}
     await store.close()
-    assert client.close_calls == 1
+    assert client.close_calls == 0
 
 
 @pytest.mark.asyncio
@@ -359,4 +359,17 @@ async def test_qdrant_initialization_failure_closes_owned_client():
         await store.get("m1")
 
     assert _FakeAsyncQdrantClient.instances[0].close_calls == 1
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_qdrant_initialization_failure_does_not_close_configured_client():
+    client = _FakeAsyncQdrantClient(source="configured")
+    client.collections_exception = RuntimeError("probe failed")
+    store = Qdrant({"client": client})
+
+    with pytest.raises(RuntimeError, match="probe failed"):
+        await store.get("m1")
+
+    assert client.close_calls == 0
     await store.close()

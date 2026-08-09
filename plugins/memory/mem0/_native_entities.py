@@ -39,12 +39,14 @@ class NativeEntities:
         embedding_model: Any,
         nlp: Any,
         store_classes: dict[str, Any],
+        main_store: Any = None,
     ) -> None:
         self._provider = provider
         self._vector_config = dict(vector_config)
         self._embedding_model = embedding_model
         self._nlp = nlp
         self._store_classes = store_classes
+        self._main_store = main_store
         self._store: Any = None
         self._initialize_lock = asyncio.Lock()
         self._closed = False
@@ -67,6 +69,8 @@ class NativeEntities:
             collection = config.get("collection_name", "mem0")
             separator = "-" if self._provider == "s3_vectors" else "_"
             config["collection_name"] = f"{collection}{separator}entities"
+            if self._provider == "qdrant" and self._main_store is not None:
+                config["client"] = await self._main_store._get_client()
             store_class = self._store_classes.get(self._provider)
             if store_class is None:
                 raise ValueError(

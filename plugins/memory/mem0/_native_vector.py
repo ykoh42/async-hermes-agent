@@ -189,6 +189,7 @@ class Qdrant:
         self._has_bm25_slot = False
         self._bm25_encoder = NativeSparseEncoder()
         self._configured_client = self.config.get("client")
+        self._owns_client = self._configured_client is None
         self._remote_options: dict[str, Any] = {}
         if self.config.get("api_key"):
             self._remote_options["api_key"] = self.config["api_key"]
@@ -242,16 +243,17 @@ class Qdrant:
             try:
                 await self._initialize_collection(client, models)
             except BaseException:
-                try:
-                    await _finish_cleanup(
-                        client.close(),
-                        error_message=(
-                            "Mem0 Qdrant cleanup failed during initialization "
-                            "cancellation"
-                        ),
-                    )
-                except Exception:
-                    logger.exception("Failed to close Mem0 Qdrant client")
+                if self._owns_client:
+                    try:
+                        await _finish_cleanup(
+                            client.close(),
+                            error_message=(
+                                "Mem0 Qdrant cleanup failed during "
+                                "initialization cancellation"
+                            ),
+                        )
+                    except Exception:
+                        logger.exception("Failed to close Mem0 Qdrant client")
                 raise
             self._models = models
             self._client = client
@@ -717,7 +719,7 @@ class Qdrant:
             self._client = None
             self._models = None
             close_tasks = [asyncio.create_task(encoder.close())]
-            if client is not None:
+            if client is not None and self._owns_client:
                 close_tasks.append(asyncio.create_task(client.close()))
             close_group = asyncio.gather(*close_tasks, return_exceptions=True)
             try:

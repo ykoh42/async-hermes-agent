@@ -546,6 +546,7 @@ async def test_memory_infer_true_batch_links_entities_like_upstream(tmp_path):
 
     main_store, entity_store = _FakeVector.instances
     assert entity_store.config["collection_name"] == "mem0_entities"
+    assert entity_store.config["client"] is main_store
     assert len(entity_store.rows) == 2
     result_ids = {item["id"] for item in result["results"]}
     seoul = next(

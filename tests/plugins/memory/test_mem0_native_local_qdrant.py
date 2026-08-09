@@ -45,6 +45,23 @@ class _LLM:
         self.closed = True
 
 
+class _EntityNLP:
+    def __init__(self):
+        self.closed = False
+
+    async def lemmatize(self, text):
+        return text.lower()
+
+    async def extract(self, text):
+        return [("PROPER", "Seoul")] if "Seoul" in text else []
+
+    async def extract_batch(self, texts):
+        return [await self.extract(text) for text in texts]
+
+    async def close(self):
+        self.closed = True
+
+
 @pytest.mark.asyncio
 async def test_embedded_qdrant_crud_runs_through_owned_subprocess(tmp_path):
     path = tmp_path / "qdrant"
@@ -422,6 +439,59 @@ async def test_memory_management_operations_run_through_embedded_qdrant(
         assert await memory.history(retained_id) == []
         after = await memory.add("after reset", user_id="u2", infer=False)
         assert await memory.get(after["results"][0]["id"])
+    finally:
+        blocker.deactivate()
+        await memory.close()
+
+
+@pytest.mark.asyncio
+async def test_entity_store_shares_embedded_qdrant_client_without_locking(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setattr(_native_memory, "OpenAIEmbedding", _Embedding)
+    monkeypatch.setattr(_native_memory, "OpenAILLM", _LLM)
+    monkeypatch.setattr(_native_memory, "NativeNLP", _EntityNLP)
+    memory = Memory(
+        {
+            "embedder": {"provider": "openai", "config": {}},
+            "llm": {"provider": "openai", "config": {}},
+            "vector_store": {
+                "provider": "qdrant",
+                "config": {
+                    "path": str(tmp_path / "qdrant"),
+                    "collection_name": "mem0",
+                    "embedding_model_dims": 2,
+                },
+            },
+            "history_db_path": str(tmp_path / "history.db"),
+            "version": "v1.1",
+        }
+    )
+    blocker = BlockBuster()
+    blocker.activate()
+    try:
+        added = await memory.add("old topic", user_id="u1", infer=False)
+        memory_id = added["results"][0]["id"]
+        await memory.update(memory_id, data="visited Seoul")
+        entity_store = await memory._get_entity_store()
+        listed = await entity_store.list(filters={"user_id": "u1"})
+
+        assert entity_store._configured_client is memory.vector_store._client
+        assert len(listed[0]) == 1
+        assert listed[0][0].payload["data"] == "Seoul"
+        assert listed[0][0].payload["linked_memory_ids"] == [memory_id]
+
+        await memory.reset()
+        after = await memory.add("after reset", user_id="u1", infer=False)
+        after_id = after["results"][0]["id"]
+        await memory.update(after_id, data="returned to Seoul")
+        replacement_store = await memory._get_entity_store()
+        replacement_rows = await replacement_store.list(
+            filters={"user_id": "u1"}
+        )
+        assert replacement_store._configured_client is memory.vector_store._client
+        assert replacement_rows[0][0].payload["linked_memory_ids"] == [after_id]
     finally:
         blocker.deactivate()
         await memory.close()

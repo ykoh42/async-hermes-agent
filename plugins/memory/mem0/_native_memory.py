@@ -432,6 +432,7 @@ class Memory:
                 embedding_model,
                 nlp,
                 {"qdrant": Qdrant, "pgvector": PGVector},
+                main_store=vector_store,
             )
             try:
                 await vector_store._initialize()
