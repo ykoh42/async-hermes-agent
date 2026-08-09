@@ -2752,6 +2752,51 @@ async def test_release_clients_preserves_session_resources():
 
 
 @pytest.mark.asyncio
+async def test_release_clients_finishes_through_repeated_caller_cancellation():
+    agent = AIAgent.__new__(AIAgent)
+    release_started = asyncio.Event()
+    allow_release = asyncio.Event()
+    released = []
+
+    class ChildAgent:
+        async def release_clients(self):
+            release_started.set()
+            await allow_release.wait()
+            released.append("child")
+
+    class NativeClient:
+        async def aclose(self):
+            released.append("client")
+
+    child = ChildAgent()
+    agent._active_children = [child]
+    agent.client = NativeClient()
+    agent._anthropic_client = None
+    session_db = object()
+    agent._session_db = session_db
+    agent._mcp_lifecycle_retained = True
+
+    release_task = asyncio.create_task(agent.release_clients())
+    await release_started.wait()
+    release_task.cancel()
+    await asyncio.sleep(0)
+    release_task.cancel()
+
+    await asyncio.sleep(0)
+    assert release_task.done() is False
+
+    allow_release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await release_task
+
+    assert released == ["child", "client"]
+    assert agent._active_children == []
+    assert agent.client is None
+    assert agent._mcp_lifecycle_retained is True
+    assert agent._session_db is session_db
+
+
+@pytest.mark.asyncio
 async def test_trajectory_writer_is_awaitable(tmp_path):
     filename = tmp_path / "trajectory.jsonl"
     await save_trajectory(

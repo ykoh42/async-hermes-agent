@@ -3775,6 +3775,14 @@ class AIAgent:
         agents and model transports are per-agent resources, while terminal,
         MCP, memory, and session state remain available for a later turn.
         """
+        cleanup_task = asyncio.create_task(
+            self._release_clients_owned(),
+            name="hermes-agent-release-clients",
+        )
+        await _finish_owned_task(cleanup_task)
+
+    async def _release_clients_owned(self) -> None:
+        """Release owned clients as one cancellation-safe operation."""
         children = list(getattr(self, "_active_children", ()) or ())
         try:
             self._active_children.clear()
