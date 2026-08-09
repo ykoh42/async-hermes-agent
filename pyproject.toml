@@ -40,6 +40,10 @@ dependencies = [
   "aiofiles==24.1.0",
   "python-dotenv==1.2.2",
   "httpx[socks]==0.28.1",
+  # The retained trajectory compressor's default Kimi tokenizer publishes a
+  # tiktoken BPE. We download its assets with httpx/aiofiles and construct the
+  # CPU-only encoder directly, avoiding Transformers' synchronous Hub/file I/O.
+  "tiktoken==0.13.0",
   # Native CDP transport for browser_cdp and the persistent supervisor.
   "websockets==15.0.1",
   "rich==14.3.3",

@@ -30,16 +30,20 @@ Usage:
     python trajectory_compressor.py --input=data/my_run --sample_percent=10
 """
 
+import base64
+import hashlib
 import json
 import os
 import random
 import time
+import uuid
 import yaml
 import logging
 import asyncio
 import aiofiles
 import aiofiles.os
 import aiofiles.tempfile
+import httpx
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
 from dataclasses import dataclass, field
@@ -48,8 +52,236 @@ from datetime import datetime
 from utils import base_url_host_matches, base_url_hostname
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn, TimeElapsedColumn, TimeRemainingColumn
 from rich.console import Console
-from hermes_constants import OPENROUTER_BASE_URL
+from hermes_constants import OPENROUTER_BASE_URL, get_hermes_home
 from agent.retry_utils import jittered_backoff
+
+
+_KIMI_TOKENIZER_NAME = "moonshotai/Kimi-K2-Thinking"
+_KIMI_TOKENIZER_REVISION = "main"
+_KIMI_TOKENIZER_FILES = ("tokenizer_config.json", "tiktoken.model")
+_KIMI_NUM_RESERVED_SPECIAL_TOKENS = 256
+_KIMI_PAT_STR = "|".join(
+    [
+        r"[\p{Han}]+",
+        r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]*[\p{Ll}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?",
+        r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]+[\p{Ll}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?",
+        r"\p{N}{1,3}",
+        r" ?[^\s\p{L}\p{N}]+[\r\n]*",
+        r"\s*[\r\n]+",
+        r"\s+(?!\S)",
+        r"\s+",
+    ]
+)
+
+
+class _KimiTokenizer:
+    """CPU-only implementation of Kimi's published tokenizer ``encode`` API."""
+
+    def __init__(self, encoding: Any) -> None:
+        self._encoding = encoding
+
+    @staticmethod
+    def _split_whitespace_runs(text: str, max_run: int):
+        current_length = 0
+        current_is_space = text[0].isspace() if text else False
+        start = 0
+        for index, character in enumerate(text):
+            is_space = character.isspace()
+            if current_is_space ^ is_space:
+                current_length = 1
+                current_is_space = is_space
+            else:
+                current_length += 1
+                if current_length > max_run:
+                    yield text[start:index]
+                    start = index
+                    current_length = 1
+        yield text[start:]
+
+    def encode(self, text: str) -> List[int]:
+        if type(text) is not str:
+            raise TypeError("Kimi tokenizer input must be str")
+        token_ids: List[int] = []
+        for chunk_start in range(0, len(text), 400_000):
+            chunk = text[chunk_start : chunk_start + 400_000]
+            for substring in self._split_whitespace_runs(chunk, 25_000):
+                token_ids.extend(
+                    self._encoding.encode(substring, allowed_special="all")
+                )
+        return token_ids
+
+
+def _parse_tiktoken_ranks(model_bytes: bytes) -> Dict[bytes, int]:
+    """Parse the public ``tiktoken.model`` format without synchronous I/O."""
+    ranks: Dict[bytes, int] = {}
+    for raw_line in model_bytes.splitlines():
+        if not raw_line:
+            continue
+        token, rank = raw_line.split()
+        ranks[base64.b64decode(token)] = int(rank)
+    return ranks
+
+
+def _build_kimi_tokenizer(config_bytes: bytes, model_bytes: bytes) -> _KimiTokenizer:
+    """Construct the official Kimi BPE from already-loaded bytes."""
+    try:
+        import tiktoken
+    except ImportError as exc:  # pragma: no cover - pinned core dependency
+        raise RuntimeError(
+            "Trajectory compression requires tiktoken. Reinstall "
+            "async-hermes-agent to restore its pinned dependencies."
+        ) from exc
+
+    tokenizer_config = json.loads(config_bytes)
+    added_tokens = tokenizer_config.get("added_tokens_decoder") or {}
+    token_names = {
+        int(token_id): token_data["content"]
+        for token_id, token_data in added_tokens.items()
+        if isinstance(token_data, dict) and isinstance(token_data.get("content"), str)
+    }
+    mergeable_ranks = _parse_tiktoken_ranks(model_bytes)
+    base_token_count = len(mergeable_ranks)
+    special_tokens = {
+        token_names.get(token_id, f"<|reserved_token_{token_id}|>"): token_id
+        for token_id in range(
+            base_token_count,
+            base_token_count + _KIMI_NUM_RESERVED_SPECIAL_TOKENS,
+        )
+    }
+    encoding = tiktoken.Encoding(
+        name="tiktoken.model",
+        pat_str=_KIMI_PAT_STR,
+        mergeable_ranks=mergeable_ranks,
+        special_tokens=special_tokens,
+    )
+    return _KimiTokenizer(encoding)
+
+
+def _tokenizer_cache_directory(tokenizer_name: str) -> Path:
+    digest = hashlib.sha256(tokenizer_name.encode("utf-8")).hexdigest()[:24]
+    return get_hermes_home() / "cache" / "tokenizers" / digest
+
+
+async def _read_optional_bytes(path: Path) -> bytes | None:
+    try:
+        async with aiofiles.open(path, "rb") as source:
+            return await source.read()
+    except FileNotFoundError:
+        return None
+
+
+async def _atomic_write_bytes(path: Path, content: bytes) -> None:
+    await aiofiles.os.makedirs(path.parent, exist_ok=True)
+    temporary = path.parent / f".{path.name}.{uuid.uuid4().hex}.tmp"
+    try:
+        async with aiofiles.open(temporary, "wb") as destination:
+            await destination.write(content)
+        await aiofiles.os.replace(temporary, path)
+    finally:
+        try:
+            await aiofiles.os.remove(temporary)
+        except FileNotFoundError:
+            pass
+
+
+def _offline_mode_enabled() -> bool:
+    return os.getenv("HF_HUB_OFFLINE", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _complete_cached_assets(
+    cached: Dict[str, bytes | None],
+) -> Tuple[bytes, bytes] | None:
+    config_bytes = cached.get("tokenizer_config.json")
+    model_bytes = cached.get("tiktoken.model")
+    if config_bytes is None or model_bytes is None:
+        return None
+    return config_bytes, model_bytes
+
+
+async def _load_kimi_tokenizer_assets() -> Tuple[bytes, bytes]:
+    """Load Kimi tokenizer files through an async, conditional HTTP cache."""
+    cache_directory = _tokenizer_cache_directory(_KIMI_TOKENIZER_NAME)
+    cached = {
+        name: await _read_optional_bytes(cache_directory / name)
+        for name in _KIMI_TOKENIZER_FILES
+    }
+    metadata_path = cache_directory / "metadata.json"
+    metadata_bytes = await _read_optional_bytes(metadata_path)
+    try:
+        metadata = json.loads(metadata_bytes) if metadata_bytes else {}
+    except (TypeError, ValueError):
+        metadata = {}
+
+    cached_assets = _complete_cached_assets(cached)
+    if _offline_mode_enabled():
+        if cached_assets is not None:
+            return cached_assets
+        raise RuntimeError(
+            "Kimi tokenizer is not cached and HF_HUB_OFFLINE is enabled."
+        )
+
+    token = os.getenv("HF_TOKEN") or os.getenv("HUGGING_FACE_HUB_TOKEN")
+    common_headers = {"User-Agent": "async-hermes-agent/trajectory-compressor"}
+    if token:
+        common_headers["Authorization"] = f"Bearer {token}"
+
+    refreshed: Dict[str, bytes] = {}
+    etags: Dict[str, str] = {}
+    try:
+        async with httpx.AsyncClient(
+            follow_redirects=True,
+            timeout=httpx.Timeout(60.0),
+            headers=common_headers,
+        ) as client:
+            for name in _KIMI_TOKENIZER_FILES:
+                headers = {}
+                previous_etag = (metadata.get("etags") or {}).get(name)
+                if cached[name] is not None and isinstance(previous_etag, str):
+                    headers["If-None-Match"] = previous_etag
+                url = (
+                    f"https://huggingface.co/{_KIMI_TOKENIZER_NAME}/resolve/"
+                    f"{_KIMI_TOKENIZER_REVISION}/{name}"
+                )
+                response = await client.get(url, headers=headers)
+                if response.status_code == 304:
+                    cached_content = cached[name]
+                    if cached_content is None or not isinstance(previous_etag, str):
+                        raise RuntimeError(
+                            f"Invalid conditional response for tokenizer asset {name}"
+                        )
+                    refreshed[name] = cached_content
+                    etags[name] = previous_etag
+                    continue
+                response.raise_for_status()
+                refreshed[name] = response.content
+                response_etag = response.headers.get("etag")
+                if response_etag:
+                    etags[name] = response_etag
+    except httpx.TransportError:
+        if cached_assets is not None:
+            return cached_assets
+        raise
+
+    for name, content in refreshed.items():
+        if content != cached[name]:
+            await _atomic_write_bytes(cache_directory / name, content)
+    await _atomic_write_bytes(
+        metadata_path,
+        json.dumps(
+            {
+                "tokenizer": _KIMI_TOKENIZER_NAME,
+                "revision": _KIMI_TOKENIZER_REVISION,
+                "etags": etags,
+            },
+            sort_keys=True,
+        ).encode("utf-8"),
+    )
+    return refreshed["tokenizer_config.json"], refreshed["tiktoken.model"]
 
 
 async def _finish_owned_task(task: asyncio.Task[Any]) -> Any:
@@ -376,16 +608,52 @@ class TrajectoryCompressor:
         """Initialize the compressor."""
         self.config = config
         self.aggregate_metrics = AggregateMetrics()
-        # Token counting defaults to the existing deterministic character
-        # estimate. Callers may inject a CPU-only tokenizer object with an
-        # ``encode`` method; construction never performs model downloads or
-        # synchronous disk I/O.
         self.tokenizer = None
-        
-        # Initialize OpenRouter client
-        self._init_summarizer()
-        
+        self._tokenizer_init_lock = asyncio.Lock()
+        self._initialization_lock = asyncio.Lock()
+        self._summarizer_initialized = False
+        self.client = None
         self.logger = logging.getLogger(__name__)
+
+    async def _initialize(self) -> None:
+        """Initialize retained resources in their upstream order."""
+        if self.tokenizer is not None and self._summarizer_initialized:
+            return
+        async with self._initialization_lock:
+            if self.tokenizer is None:
+                await self._init_tokenizer()
+            if not self._summarizer_initialized:
+                self._init_summarizer()
+                self._summarizer_initialized = True
+
+    async def _init_tokenizer(self) -> None:
+        """Load the configured tokenizer without blocking the event loop."""
+        if self.tokenizer is not None:
+            return
+        async with self._tokenizer_init_lock:
+            if self.tokenizer is not None:
+                return
+            try:
+                tokenizer_name = self.config.tokenizer_name.strip().rstrip("/")
+                if tokenizer_name != _KIMI_TOKENIZER_NAME:
+                    raise ValueError(
+                        "no native-async loader is available; supported "
+                        f"tokenizer: '{_KIMI_TOKENIZER_NAME}'"
+                    )
+                if not self.config.trust_remote_code:
+                    raise ValueError(
+                        "trust_remote_code=true is required by the published "
+                        "Kimi tokenizer contract"
+                    )
+                config_bytes, model_bytes = await _load_kimi_tokenizer_assets()
+                self.tokenizer = _build_kimi_tokenizer(config_bytes, model_bytes)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Failed to load tokenizer '{self.config.tokenizer_name}': {exc}"
+                ) from exc
+            print(f"✅ Loaded tokenizer: {self.config.tokenizer_name}")
     
     def _init_summarizer(self):
         """Initialize async-only LLM routing metadata for summarization.
@@ -475,25 +743,42 @@ class TrajectoryCompressor:
         # Unknown base_url — not a known provider
         return ""
     
-    def count_tokens(self, text: str) -> int:
-        """Count tokens with an injected tokenizer or deterministic estimate."""
+    def _count_tokens_initialized(self, text: str) -> int:
         if not text:
             return 0
         tokenizer = self.tokenizer
-        if tokenizer is not None:
-            try:
-                return len(tokenizer.encode(text))
-            except Exception:
-                pass
+        if tokenizer is None:
+            raise RuntimeError("Tokenizer initialization invariant violated")
+        try:
+            return len(tokenizer.encode(text))
+        except Exception:
+            pass
         return len(text) // 4
-    
-    def count_trajectory_tokens(self, trajectory: List[Dict[str, str]]) -> int:
+
+    async def count_tokens(self, text: str) -> int:
+        """Count tokens with the configured tokenizer."""
+        await self._initialize()
+        return self._count_tokens_initialized(text)
+
+    async def count_trajectory_tokens(
+        self, trajectory: List[Dict[str, str]]
+    ) -> int:
         """Count total tokens in a trajectory."""
-        return sum(self.count_tokens(turn.get("value", "")) for turn in trajectory)
-    
-    def count_turn_tokens(self, trajectory: List[Dict[str, str]]) -> List[int]:
+        await self._initialize()
+        return sum(
+            self._count_tokens_initialized(turn.get("value", ""))
+            for turn in trajectory
+        )
+
+    async def count_turn_tokens(
+        self, trajectory: List[Dict[str, str]]
+    ) -> List[int]:
         """Count tokens for each turn in a trajectory."""
-        return [self.count_tokens(turn.get("value", "")) for turn in trajectory]
+        await self._initialize()
+        return [
+            self._count_tokens_initialized(turn.get("value", ""))
+            for turn in trajectory
+        ]
     
     def _find_protected_indices(self, trajectory: List[Dict[str, str]]) -> Tuple[set, int, int]:
         """
@@ -703,7 +988,7 @@ Write only the summary, starting with "[CONTEXT SUMMARY]:" prefix."""
         metrics.original_turns = len(trajectory)
         
         # Count tokens per turn
-        turn_tokens = self.count_turn_tokens(trajectory)
+        turn_tokens = await self.count_turn_tokens(trajectory)
         total_tokens = sum(turn_tokens)
         metrics.original_tokens = total_tokens
         
@@ -807,7 +1092,7 @@ Write only the summary, starting with "[CONTEXT SUMMARY]:" prefix."""
         
         # Calculate final metrics
         metrics.compressed_turns = len(compressed)
-        metrics.compressed_tokens = self.count_trajectory_tokens(compressed)
+        metrics.compressed_tokens = await self.count_trajectory_tokens(compressed)
         metrics.turns_removed = metrics.original_turns - metrics.compressed_turns
         metrics.tokens_saved = metrics.original_tokens - metrics.compressed_tokens
         metrics.compression_ratio = metrics.compressed_tokens / max(metrics.original_tokens, 1)

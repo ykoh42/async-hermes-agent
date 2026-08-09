@@ -1,19 +1,114 @@
 """Tests for trajectory_compressor.py — config, metrics, and compression logic."""
 
+import base64
+import asyncio
 import importlib
+import json
 import os
 import sys
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch, MagicMock
 
+import httpx
 import pytest
 
+import trajectory_compressor as trajectory_compressor_module
 from trajectory_compressor import (
     CompressionConfig,
     TrajectoryMetrics,
     AggregateMetrics,
     TrajectoryCompressor,
 )
+
+
+def _minimal_kimi_assets():
+    model = b"\n".join(
+        base64.b64encode(bytes([value])) + b" " + str(value).encode("ascii")
+        for value in range(256)
+    )
+    config = json.dumps(
+        {
+            "added_tokens_decoder": {
+                "256": {"content": "[BOS]"},
+                "257": {"content": "[EOS]"},
+                "258": {"content": "<|im_end|>"},
+            }
+        }
+    ).encode("utf-8")
+    return config, model
+
+
+@pytest.mark.asyncio
+async def test_kimi_tokenizer_assets_use_conditional_async_cache(
+    tmp_path, monkeypatch
+):
+    config_bytes, model_bytes = _minimal_kimi_assets()
+    etags = {
+        "tokenizer_config.json": '"config-v1"',
+        "tiktoken.model": '"model-v1"',
+    }
+    requests = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        name = request.url.path.rsplit("/", 1)[-1]
+        if request.headers.get("if-none-match") == etags[name]:
+            return httpx.Response(304, request=request)
+        content = config_bytes if name == "tokenizer_config.json" else model_bytes
+        return httpx.Response(
+            200,
+            content=content,
+            headers={"etag": etags[name]},
+            request=request,
+        )
+
+    real_async_client = httpx.AsyncClient
+
+    def client_factory(**kwargs):
+        return real_async_client(
+            transport=httpx.MockTransport(handler),
+            follow_redirects=kwargs.get("follow_redirects", False),
+            timeout=kwargs.get("timeout"),
+            headers=kwargs.get("headers"),
+        )
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(
+        trajectory_compressor_module.httpx,
+        "AsyncClient",
+        client_factory,
+    )
+
+    assert await trajectory_compressor_module._load_kimi_tokenizer_assets() == (
+        config_bytes,
+        model_bytes,
+    )
+    assert await trajectory_compressor_module._load_kimi_tokenizer_assets() == (
+        config_bytes,
+        model_bytes,
+    )
+
+    assert len(requests) == 4
+    assert all("if-none-match" not in request.headers for request in requests[:2])
+    assert [request.headers.get("if-none-match") for request in requests[2:]] == [
+        etags["tokenizer_config.json"],
+        etags["tiktoken.model"],
+    ]
+
+
+@pytest.mark.asyncio
+async def test_kimi_tokenizer_offline_cache_miss_fails_without_network(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+    client = MagicMock(side_effect=AssertionError("network must not be used"))
+    monkeypatch.setattr(trajectory_compressor_module.httpx, "AsyncClient", client)
+
+    with pytest.raises(RuntimeError, match="HF_HUB_OFFLINE"):
+        await trajectory_compressor_module._load_kimi_tokenizer_assets()
+
+    client.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -184,6 +279,7 @@ def _make_compressor(config=None):
         config = CompressionConfig()
     with patch.object(TrajectoryCompressor, '_init_summarizer'):
         compressor = TrajectoryCompressor(config)
+    compressor._summarizer_initialized = True
     # Provide a simple token counter for tests (1 token per 4 chars)
     compressor.tokenizer = MagicMock()
     compressor.tokenizer.encode = lambda text: [0] * (len(text) // 4)
@@ -296,25 +392,91 @@ class TestExtractTurnContent:
 
 class TestTokenCounting:
 
-    def test_count_tokens_basic(self):
+    @pytest.mark.asyncio
+    async def test_default_tokenizer_is_loaded_lazily_once(self):
+        config_bytes, model_bytes = _minimal_kimi_assets()
+        with (
+            patch.object(TrajectoryCompressor, "_init_summarizer"),
+            patch(
+                "trajectory_compressor._load_kimi_tokenizer_assets",
+                new=AsyncMock(return_value=(config_bytes, model_bytes)),
+            ) as load_assets,
+        ):
+            tc = TrajectoryCompressor(CompressionConfig())
+
+            assert tc.tokenizer is None
+            counts = await asyncio.gather(
+                tc.count_tokens("<|im_end|>"),
+                tc.count_tokens("<|im_end|>"),
+            )
+            assert counts == [1, 1]
+
+        load_assets.assert_awaited_once_with()
+
+    @pytest.mark.asyncio
+    async def test_unsupported_custom_tokenizer_fails_clearly(self):
+        with patch.object(TrajectoryCompressor, "_init_summarizer"):
+            tc = TrajectoryCompressor(
+                CompressionConfig(tokenizer_name="org/custom-tokenizer")
+            )
+
+        with pytest.raises(RuntimeError, match="no native-async loader is available"):
+            await tc.count_tokens("hello")
+
+    @pytest.mark.asyncio
+    async def test_tokenizer_initialization_preserves_cancellation_and_retries(self):
+        config_bytes, model_bytes = _minimal_kimi_assets()
+        started = asyncio.Event()
+        calls = 0
+
+        async def load_assets():
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                started.set()
+                await asyncio.Event().wait()
+            return config_bytes, model_bytes
+
+        with (
+            patch.object(TrajectoryCompressor, "_init_summarizer"),
+            patch(
+                "trajectory_compressor._load_kimi_tokenizer_assets",
+                side_effect=load_assets,
+            ),
+        ):
+            tc = TrajectoryCompressor(CompressionConfig())
+            first = asyncio.create_task(tc.count_tokens("hello"))
+            await started.wait()
+            first.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await first
+
+            assert await tc.count_tokens("<|im_end|>") == 1
+
+        assert calls == 2
+
+    @pytest.mark.asyncio
+    async def test_count_tokens_basic(self):
         tc = _make_compressor()
         # Our mock: 1 token per 4 chars
-        assert tc.count_tokens("12345678") == 2
+        assert await tc.count_tokens("12345678") == 2
 
-    def test_count_trajectory_tokens(self):
+    @pytest.mark.asyncio
+    async def test_count_trajectory_tokens(self):
         tc = _make_compressor()
         trajectory = [
             {"from": "system", "value": "12345678"},   # 2 tokens
             {"from": "human", "value": "1234567890ab"}, # 3 tokens
         ]
-        assert tc.count_trajectory_tokens(trajectory) == 5
+        assert await tc.count_trajectory_tokens(trajectory) == 5
 
 
-    def test_count_tokens_fallback_on_error(self):
+    @pytest.mark.asyncio
+    async def test_count_tokens_fallback_on_error(self):
         tc = _make_compressor()
         tc.tokenizer.encode = MagicMock(side_effect=Exception("fail"))
         # Should fallback to len(text) // 4
-        assert tc.count_tokens("12345678") == 2
+        assert await tc.count_tokens("12345678") == 2
 
 
 class TestGenerateSummary:
@@ -380,9 +542,9 @@ def _paired_trajectory():
     ]
 
 
-def _target_that_splits_after_index_4(tc, trajectory):
+async def _target_that_splits_after_index_4(tc, trajectory):
     """Pick a target so token accumulation breaks right after index 4 (a gpt)."""
-    turn_tokens = tc.count_turn_tokens(trajectory)
+    turn_tokens = await tc.count_turn_tokens(trajectory)
     total = sum(turn_tokens)
     # threshold == turn_tokens[4] makes the loop break at compress_until = 5,
     # which lands on the tool turn paired with gpt#1.
@@ -403,7 +565,9 @@ class TestCompressionToolPairIntegrity:
             return_value="[CONTEXT SUMMARY]: middle turns summarized."
         )
         trajectory = _paired_trajectory()
-        tc.config.target_max_tokens = _target_that_splits_after_index_4(tc, trajectory)
+        tc.config.target_max_tokens = await _target_that_splits_after_index_4(
+            tc, trajectory
+        )
 
         compressed, metrics = await tc.compress_trajectory(trajectory)
 
@@ -477,11 +641,11 @@ class TestCompressionNetSavingsGuard:
             return_value="[CONTEXT SUMMARY]: " + "blah " * 30
         )
         trajectory = self._tiny_middle_trajectory()
-        before = sum(tc.count_turn_tokens(trajectory))
+        before = sum(await tc.count_turn_tokens(trajectory))
 
         compressed, metrics = await tc.compress_trajectory(trajectory)
 
         assert metrics.was_compressed is False
         assert compressed == trajectory
-        assert sum(tc.count_turn_tokens(compressed)) == before
+        assert sum(await tc.count_turn_tokens(compressed)) == before
         tc._generate_summary.assert_not_called()
