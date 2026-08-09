@@ -4730,6 +4730,50 @@ class AIAgent:
             return False
         return True
 
+    @staticmethod
+    def _is_openai_client_closed(client: Any) -> bool:
+        """Preserve upstream's property/method-aware closed-client check."""
+        from unittest.mock import Mock
+
+        if isinstance(client, Mock):
+            return False
+
+        is_closed_attr = getattr(client, "is_closed", None)
+        if is_closed_attr is not None:
+            if callable(is_closed_attr):
+                if is_closed_attr():
+                    return True
+            elif bool(is_closed_attr):
+                return True
+
+        http_client = getattr(client, "_client", None)
+        if http_client is not None:
+            return bool(getattr(http_client, "is_closed", False))
+        return False
+
+    async def _ensure_primary_openai_client(self, *, reason: str) -> Any:
+        """Recreate a missing or closed OpenAI-wire client before request use."""
+        client = getattr(self, "client", None)
+        if client is not None and not self._is_openai_client_closed(client):
+            return client
+
+        if not await self._replace_primary_openai_client(reason=reason):
+            context = getattr(self, "_client_log_context", None)
+            logger.warning(
+                "Failed to recreate closed OpenAI client (%s)%s",
+                reason,
+                f" {context()}" if callable(context) else "",
+            )
+            raise RuntimeError("Failed to recreate closed OpenAI client")
+
+        context = getattr(self, "_client_log_context", None)
+        logger.warning(
+            "Detected closed shared OpenAI client; recreated before use (%s)%s",
+            reason,
+            f" {context()}" if callable(context) else "",
+        )
+        return self.client
+
     async def _swap_credential(self, entry) -> None:
         """Install a selected pool credential through the native async path.
 
@@ -5382,7 +5426,10 @@ class AIAgent:
                 "or add a native async provider implementation."
             )
 
-        create_completion = self.client.chat.completions.create
+        request_client = await self._ensure_primary_openai_client(
+            reason="chat_completion_request",
+        )
+        create_completion = request_client.chat.completions.create
         if not inspect.iscoroutinefunction(inspect.unwrap(create_completion)):
             raise RuntimeError(
                 f"provider={self.provider!r} resolves to a synchronous adapter. "

@@ -297,6 +297,51 @@ async def test_create_openai_client_preserves_kwargs_and_owns_async_transport():
     assert client._platform == "Unknown"
 
 
+@pytest.mark.parametrize(
+    ("explicit_retries", "expected_retries"),
+    [(None, 0), (5, 5)],
+)
+@pytest.mark.asyncio
+async def test_create_openai_client_preserves_upstream_sdk_retry_policy(
+    explicit_retries,
+    expected_retries,
+):
+    from agent.agent_runtime_helpers import create_openai_client
+
+    token_calls = 0
+
+    def token_provider():
+        nonlocal token_calls
+        token_calls += 1
+        return "fresh-token"
+
+    agent = SimpleNamespace(provider="azure-foundry")
+    client = SimpleNamespace()
+    http_client = SimpleNamespace()
+    client_kwargs = {
+        "api_key": token_provider,
+        "base_url": "https://resource.openai.azure.com/openai/v1",
+        "http_client": http_client,
+    }
+    if explicit_retries is not None:
+        client_kwargs["max_retries"] = explicit_retries
+    snapshot = dict(client_kwargs)
+
+    with patch("run_agent.OpenAI", return_value=client) as factory:
+        assert await create_openai_client(
+            agent,
+            client_kwargs,
+            reason="retry-policy-test",
+            shared=True,
+        ) is client
+
+    assert client_kwargs == snapshot
+    assert factory.call_args.kwargs["max_retries"] == expected_retries
+    assert factory.call_args.kwargs["api_key"] is token_provider
+    assert client._hermes_token_provider is token_provider
+    assert token_calls == 0
+
+
 @pytest.mark.parametrize("error", [RuntimeError("boom"), asyncio.CancelledError()])
 @pytest.mark.asyncio
 async def test_create_openai_client_closes_owned_transport_on_constructor_failure(
@@ -887,6 +932,49 @@ async def test_openai_client_rebuild_reuses_native_async_runtime_recipe():
         "client_kwargs": agent._client_kwargs,
         "update_primary": False,
     }
+
+
+@pytest.mark.asyncio
+async def test_closed_openai_client_is_rebuilt_before_chat_request():
+    agent = AIAgent.__new__(AIAgent)
+    stale_create = AsyncMock(side_effect=AssertionError("closed client was used"))
+    agent.client = SimpleNamespace(
+        _client=SimpleNamespace(is_closed=True),
+        chat=SimpleNamespace(completions=SimpleNamespace(create=stale_create)),
+    )
+    fresh_response = object()
+    fresh_create = AsyncMock(return_value=fresh_response)
+    fresh_client = SimpleNamespace(
+        _client=SimpleNamespace(is_closed=False),
+        chat=SimpleNamespace(completions=SimpleNamespace(create=fresh_create)),
+    )
+    agent.api_mode = "chat_completions"
+    agent.provider = "openrouter"
+    agent.base_url = "https://openrouter.ai/api/v1"
+
+    async def replace_primary(*, reason):
+        assert reason == "chat_completion_request"
+        agent.client = fresh_client
+        return True
+
+    agent._replace_primary_openai_client = AsyncMock(side_effect=replace_primary)
+
+    assert await agent._execute_model_request({"model": "test-model"}) is fresh_response
+    agent._replace_primary_openai_client.assert_awaited_once_with(
+        reason="chat_completion_request",
+    )
+    fresh_create.assert_awaited_once_with(model="test-model")
+    stale_create.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_closed_openai_client_rebuild_failure_matches_upstream_error():
+    agent = AIAgent.__new__(AIAgent)
+    agent.client = SimpleNamespace(_client=SimpleNamespace(is_closed=True))
+    agent._replace_primary_openai_client = AsyncMock(return_value=False)
+
+    with pytest.raises(RuntimeError, match="Failed to recreate closed OpenAI client"):
+        await agent._ensure_primary_openai_client(reason="test")
 
 
 @pytest.mark.asyncio

@@ -2242,6 +2242,10 @@ async def create_openai_client(
         )
         kwargs["http_client"] = owned_http_client
 
+    # Hermes owns retry classification and Retry-After backoff in the outer
+    # conversation loop. Preserve upstream's default while allowing an
+    # explicit caller override.
+    kwargs.setdefault("max_retries", 0)
     api_key = kwargs.get("api_key")
     try:
         client = _ra().OpenAI(**kwargs)
