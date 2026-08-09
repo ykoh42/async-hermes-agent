@@ -99,6 +99,52 @@ async def test_provider_timeout_does_not_increment_stale_watchdog_streak():
 
 
 @pytest.mark.asyncio
+async def test_non_streaming_wait_notice_heartbeat_is_owned(monkeypatch):
+    from agent import chat_completion_helpers as helpers
+
+    monkeypatch.setattr(helpers, "_STREAM_HEARTBEAT_INTERVAL", 0.01)
+    response = object()
+
+    async def execute(_payload):
+        await asyncio.sleep(0.025)
+        return response
+
+    agent = _native_request_agent(execute, stale_timeout=1.0)
+    agent._emit_wait_notice = MagicMock()
+
+    assert await helpers.interruptible_api_call(
+        agent, {"model": "heartbeat-model"}
+    ) is response
+    assert agent._emit_wait_notice.call_count >= 1
+    assert "waiting on heartbeat-model" in (
+        agent._emit_wait_notice.call_args_list[0].args[0]
+    )
+    assert not [
+        task
+        for task in asyncio.all_tasks()
+        if task.get_name() == "provider-nonstream-heartbeat"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_non_streaming_wait_notice_failure_is_fail_open(monkeypatch):
+    from agent import chat_completion_helpers as helpers
+
+    monkeypatch.setattr(helpers, "_STREAM_HEARTBEAT_INTERVAL", 0.01)
+    response = object()
+
+    async def execute(_payload):
+        await asyncio.sleep(0.025)
+        return response
+
+    agent = _native_request_agent(execute, stale_timeout=1.0)
+    agent._emit_wait_notice = MagicMock(side_effect=ValueError("bad display state"))
+
+    assert await helpers.interruptible_api_call(agent, {}) is response
+    assert agent._emit_wait_notice.call_count >= 1
+
+
+@pytest.mark.asyncio
 async def test_stream_activity_reschedules_idle_timeout():
     from agent.chat_completion_helpers import interruptible_streaming_api_call
 

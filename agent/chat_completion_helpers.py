@@ -331,9 +331,281 @@ async def direct_api_call(agent: Any, api_kwargs: dict) -> Any:
     return await interruptible_api_call(agent, api_kwargs)
 
 
+async def _interruptible_codex_api_call(agent: Any, api_kwargs: dict) -> Any:
+    """Run the upstream Codex internal stream with its three watchdogs."""
+    compute_timeout = getattr(agent, "_compute_non_stream_stale_timeout", None)
+    stale_timeout = (
+        compute_timeout(api_kwargs) if callable(compute_timeout) else float("inf")
+    )
+    estimated_tokens = estimate_request_context_tokens(api_kwargs)
+    openai_codex_backend = _is_openai_codex_backend(agent)
+    if openai_codex_backend:
+        stale_timeout = max(
+            stale_timeout,
+            openai_codex_stale_timeout_floor(estimated_tokens),
+        )
+        hard_timeout = env_float("HERMES_CODEX_HARD_TIMEOUT_SECONDS", 1500.0)
+        if hard_timeout > 0:
+            stale_timeout = min(stale_timeout, hard_timeout)
+
+    if estimated_tokens > 100_000:
+        idle_timeout_default = 180.0
+    elif estimated_tokens > 50_000:
+        idle_timeout_default = 120.0
+    elif estimated_tokens > 10_000:
+        idle_timeout_default = 60.0
+    else:
+        idle_timeout_default = 12.0
+
+    ttfb_timeout = env_float("HERMES_CODEX_TTFB_TIMEOUT_SECONDS", 120.0)
+    ttfb_enabled = ttfb_timeout > 0
+    if ttfb_enabled and openai_codex_backend:
+        disable_above = env_float(
+            "HERMES_CODEX_TTFB_DISABLE_ABOVE_TOKENS", 10_000.0
+        )
+        strict = os.environ.get("HERMES_CODEX_TTFB_STRICT", "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        if (
+            not strict
+            and disable_above > 0
+            and estimated_tokens >= disable_above
+            and ttfb_timeout < idle_timeout_default
+        ):
+            logger.info(
+                "Scaling openai-codex no-byte TTFB watchdog from %.0fs to %.0fs "
+                "for large request (context=~%s tokens >= %.0f). Set "
+                "HERMES_CODEX_TTFB_STRICT=1 to keep the smaller cutoff.",
+                ttfb_timeout,
+                idle_timeout_default,
+                f"{estimated_tokens:,}",
+                disable_above,
+            )
+            ttfb_timeout = idle_timeout_default
+        ttfb_cap = env_float("HERMES_CODEX_TTFB_MAX_SECONDS", 120.0)
+        if ttfb_cap > 0 and ttfb_timeout > ttfb_cap:
+            logger.info(
+                "Capping openai-codex no-byte TTFB timeout from %.0fs to %.0fs "
+                "(context=~%s tokens). Set HERMES_CODEX_TTFB_MAX_SECONDS to tune.",
+                ttfb_timeout,
+                ttfb_cap,
+                f"{estimated_tokens:,}",
+            )
+            ttfb_timeout = ttfb_cap
+
+    idle_timeout = env_float(
+        "HERMES_CODEX_EVENT_STALE_TIMEOUT_SECONDS",
+        idle_timeout_default,
+    )
+    idle_enabled = idle_timeout > 0
+
+    agent._codex_stream_last_event_ts = None
+    agent._codex_stream_last_progress_ts = None
+    loop = asyncio.get_running_loop()
+    started_at = loop.time()
+    stale_deadline = (
+        started_at + stale_timeout if math.isfinite(stale_timeout) else math.inf
+    )
+    deadline_kind = "stale"
+    initial_deadline = stale_deadline
+    if ttfb_enabled and started_at + ttfb_timeout <= initial_deadline:
+        initial_deadline = started_at + ttfb_timeout
+        deadline_kind = "ttfb"
+    timeout_scope = asyncio.timeout_at(
+        initial_deadline if math.isfinite(initial_deadline) else None
+    )
+
+    def _note_codex_event() -> None:
+        nonlocal deadline_kind
+        now_wall = time.time()
+        agent._codex_stream_last_event_ts = now_wall
+        agent._codex_stream_last_progress_ts = now_wall
+        next_deadline = stale_deadline
+        deadline_kind = "stale"
+        if idle_enabled and loop.time() + idle_timeout < next_deadline:
+            next_deadline = loop.time() + idle_timeout
+            deadline_kind = "idle"
+        timeout_scope.reschedule(
+            next_deadline if math.isfinite(next_deadline) else None
+        )
+
+    touch_activity = getattr(agent, "_touch_activity", None)
+    if callable(touch_activity):
+        touch_activity("waiting for non-streaming API response")
+
+    heartbeat_stop = asyncio.Event()
+
+    async def _heartbeat() -> None:
+        while not heartbeat_stop.is_set():
+            try:
+                async with asyncio.timeout(_STREAM_HEARTBEAT_INTERVAL):
+                    await heartbeat_stop.wait()
+                return
+            except TimeoutError:
+                elapsed = loop.time() - started_at
+                try:
+                    recovery = _codex_wait_notice_recovery(
+                        stale_timeout=stale_timeout,
+                        ttfb_enabled=ttfb_enabled,
+                        ttfb_timeout=ttfb_timeout,
+                        last_event_ts=getattr(
+                            agent, "_codex_stream_last_event_ts", None
+                        ),
+                        call_start=time.time() - elapsed,
+                        idle_enabled=idle_enabled,
+                        idle_timeout=idle_timeout,
+                        elapsed=elapsed,
+                    )
+                    emit_wait = getattr(agent, "_emit_wait_notice", None)
+                    if callable(emit_wait):
+                        emit_wait(
+                            "⏳ waiting on "
+                            f"{api_kwargs.get('model', 'the provider')} — "
+                            f"{int(elapsed)}s with no response yet (provider may "
+                            f"be slow or overloaded{recovery})"
+                        )
+                except Exception:
+                    logger.debug(
+                        "wait-notice construction failed", exc_info=True
+                    )
+
+    heartbeat_task = asyncio.create_task(
+        _heartbeat(), name="codex-nonstream-heartbeat"
+    )
+    try:
+        try:
+            async with timeout_scope:
+                response = await agent._execute_model_request(
+                    api_kwargs,
+                    use_streaming=True,
+                    on_first_delta=getattr(agent, "_codex_on_first_delta", None),
+                    on_stream_activity=_note_codex_event,
+                )
+        finally:
+            heartbeat_stop.set()
+            await _finish_stream_heartbeat(heartbeat_task)
+    except TimeoutError:
+        if not timeout_scope.expired():
+            raise
+        elapsed = loop.time() - started_at
+        model = api_kwargs.get("model", "unknown")
+        buffer_status = getattr(agent, "_buffer_status", None)
+        emit_wait = getattr(agent, "_emit_wait_notice", None)
+        silent_hint = None
+        hint = getattr(agent, "_codex_silent_hang_hint", None)
+        if callable(hint):
+            try:
+                silent_hint = hint(model=api_kwargs.get("model"))
+            except Exception:
+                pass
+
+        if deadline_kind == "ttfb":
+            logger.warning(
+                "Codex stream produced no bytes within TTFB cutoff "
+                "(%.0fs > %.0fs, model=%s). Backend accepted the connection "
+                "but sent no stream events. Killing connection so the retry "
+                "loop can reconnect.",
+                elapsed,
+                ttfb_timeout,
+                model,
+            )
+            message = (
+                f"⚠️ No first byte from provider in {int(elapsed)}s "
+                f"(codex stream, model: {model}). Reconnecting."
+            )
+            if silent_hint:
+                message += f" {silent_hint}"
+            if callable(buffer_status):
+                buffer_status(message)
+            if callable(emit_wait):
+                emit_wait(
+                    f"⚠ no response from provider in {int(elapsed)}s — "
+                    "reconnecting..."
+                )
+            if callable(touch_activity):
+                touch_activity(
+                    f"codex stream killed after {int(elapsed)}s with no first byte"
+                )
+            error = (
+                f"Codex stream produced no bytes within {int(elapsed)}s "
+                f"(TTFB threshold: {int(ttfb_timeout)}s)"
+            )
+            if silent_hint:
+                error += f". {silent_hint}"
+            raise TimeoutError(error) from None
+
+        if deadline_kind == "idle":
+            last_event = getattr(agent, "_codex_stream_last_event_ts", None)
+            idle_elapsed = (
+                max(0.0, time.time() - last_event)
+                if isinstance(last_event, (int, float))
+                else idle_timeout
+            )
+            logger.warning(
+                "Codex stream produced no SSE events for %.0fs after first byte "
+                "(threshold %.0fs, model=%s, context=~%s tokens). Killing "
+                "connection so the retry loop can reconnect.",
+                idle_elapsed,
+                idle_timeout,
+                model,
+                f"{estimated_tokens:,}",
+            )
+            if callable(buffer_status):
+                buffer_status(
+                    f"⚠️ Codex stream sent no events for {int(idle_elapsed)}s "
+                    f"after first byte (model: {model}). Reconnecting."
+                )
+            if callable(touch_activity):
+                touch_activity(
+                    "codex stream killed after "
+                    f"{int(idle_elapsed)}s with no SSE events"
+                )
+            raise TimeoutError(
+                "Codex stream produced no SSE events for "
+                f"{int(idle_elapsed)}s after first byte "
+                f"(threshold: {int(idle_timeout)}s)"
+            ) from None
+
+        _bump_stale_streak(agent)
+        logger.warning(
+            "Non-streaming API call stale for %.0fs (threshold %.0fs). "
+            "model=%s context=~%s tokens. Killing connection.",
+            elapsed,
+            stale_timeout,
+            model,
+            f"{estimated_tokens:,}",
+        )
+        message = (
+            f"⚠️ No response from provider for {int(elapsed)}s "
+            f"(non-streaming, model: {model})."
+        )
+        message += f" {silent_hint}" if silent_hint else " Aborting call."
+        if callable(buffer_status):
+            buffer_status(message)
+        if callable(touch_activity):
+            touch_activity(
+                f"stale non-streaming call killed after {int(elapsed)}s"
+            )
+        error = (
+            f"Non-streaming API call timed out after {int(elapsed)}s "
+            f"with no response (threshold: {int(stale_timeout)}s)"
+        )
+        if silent_hint:
+            error += f". {silent_hint}"
+        raise TimeoutError(error) from None
+
+    _reset_stale_streak(agent)
+    return response
+
+
 async def interruptible_api_call(agent: Any, api_kwargs: dict) -> Any:
     """Execute a bounded native-async non-streaming provider request."""
     _check_stale_giveup(agent)
+    if getattr(agent, "api_mode", None) == "codex_responses":
+        return await _interruptible_codex_api_call(agent, api_kwargs)
     touch_activity = getattr(agent, "_touch_activity", None)
     if callable(touch_activity):
         touch_activity("waiting for non-streaming API response")
@@ -342,9 +614,42 @@ async def interruptible_api_call(agent: Any, api_kwargs: dict) -> Any:
     timeout_scope = asyncio.timeout(
         timeout if timeout is not None and math.isfinite(timeout) else None
     )
+    loop = asyncio.get_running_loop()
+    started_at = loop.time()
+    heartbeat_stop = asyncio.Event()
+
+    async def _heartbeat() -> None:
+        while not heartbeat_stop.is_set():
+            try:
+                async with asyncio.timeout(_STREAM_HEARTBEAT_INTERVAL):
+                    await heartbeat_stop.wait()
+                return
+            except TimeoutError:
+                elapsed = loop.time() - started_at
+                try:
+                    emit_wait = getattr(agent, "_emit_wait_notice", None)
+                    if callable(emit_wait):
+                        emit_wait(
+                            "⏳ waiting on "
+                            f"{api_kwargs.get('model', 'the provider')} — "
+                            f"{int(elapsed)}s with no response yet (provider may "
+                            "be slow or overloaded)"
+                        )
+                except Exception:
+                    logger.debug(
+                        "wait-notice construction failed", exc_info=True
+                    )
+
+    heartbeat_task = asyncio.create_task(
+        _heartbeat(), name="provider-nonstream-heartbeat"
+    )
     try:
-        async with timeout_scope:
-            response = await agent._execute_model_request(api_kwargs)
+        try:
+            async with timeout_scope:
+                response = await agent._execute_model_request(api_kwargs)
+        finally:
+            heartbeat_stop.set()
+            await _finish_stream_heartbeat(heartbeat_task)
     except TimeoutError:
         if not timeout_scope.expired():
             raise
