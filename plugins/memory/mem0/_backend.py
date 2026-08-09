@@ -471,15 +471,19 @@ class OSSBackend(Mem0Backend):
         """Delete stale vector collection when embedding dimensions change."""
         collection_name = vs_config.get("collection_name", "mem0")
         if provider == "qdrant":
+            if vs_config.get("path"):
+                raise RuntimeError(
+                    "Mem0 OSS embedded Qdrant is not native async: "
+                    "qdrant-client performs blocking file I/O in local mode."
+                )
             try:
                 from qdrant_client import AsyncQdrantClient
-                path = vs_config.get("path")
                 url = vs_config.get("url")
-                if path:
-                    client = AsyncQdrantClient(path=path)
-                elif url:
+                if url:
                     client = AsyncQdrantClient(
-                        url=url, api_key=vs_config.get("api_key")
+                        url=url,
+                        api_key=vs_config.get("api_key"),
+                        check_compatibility=False,
                     )
                 else:
                     return

@@ -3,6 +3,8 @@
 import asyncio
 import copy
 import json
+import sys
+import types
 
 import httpx
 import pytest
@@ -318,6 +320,57 @@ async def test_oss_backend_fails_before_mem0_thread_fallback():
         await backend._initialize()
 
     assert backend._memory is None
+
+
+@pytest.mark.asyncio
+async def test_oss_qdrant_dimension_probe_disables_client_thread(monkeypatch):
+    captured = {}
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        async def collection_exists(self, collection_name):
+            assert collection_name == "mem0"
+            return False
+
+        async def close(self):
+            captured["closed"] = True
+
+    qdrant_client = types.ModuleType("qdrant_client")
+    qdrant_client.AsyncQdrantClient = FakeClient
+    monkeypatch.setitem(sys.modules, "qdrant_client", qdrant_client)
+
+    await OSSBackend._recreate_collection_if_dims_changed(
+        "qdrant",
+        {"url": "https://qdrant.test", "api_key": "secret"},
+        1536,
+    )
+
+    assert captured == {
+        "url": "https://qdrant.test",
+        "api_key": "secret",
+        "check_compatibility": False,
+        "closed": True,
+    }
+
+
+@pytest.mark.asyncio
+async def test_oss_qdrant_dimension_probe_rejects_blocking_local_mode(monkeypatch):
+    class ForbiddenClient:
+        def __init__(self, **kwargs):
+            raise AssertionError("local AsyncQdrantClient must not be constructed")
+
+    qdrant_client = types.ModuleType("qdrant_client")
+    qdrant_client.AsyncQdrantClient = ForbiddenClient
+    monkeypatch.setitem(sys.modules, "qdrant_client", qdrant_client)
+
+    with pytest.raises(RuntimeError, match="embedded Qdrant"):
+        await OSSBackend._recreate_collection_if_dims_changed(
+            "qdrant",
+            {"path": "/tmp/mem0-test"},
+            1536,
+        )
 
 
 @pytest.mark.asyncio
