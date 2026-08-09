@@ -35,6 +35,7 @@ from agent.redact import redact_sensitive_text
 from agent.transports.codex_app_server import (
     CodexAppServerClient,
     CodexAppServerError,
+    _finish_owned_task,
 )
 from agent.transports.codex_event_projector import CodexEventProjector
 import aiofiles.os
@@ -377,6 +378,16 @@ class CodexAppServerSession:
         return self._thread_id
 
     async def close(self) -> None:
+        if self._closed:
+            return
+        cleanup_task = asyncio.create_task(
+            self._close_owned(),
+            name="codex-app-server-session-close",
+        )
+        await _finish_owned_task(cleanup_task)
+
+    async def _close_owned(self) -> None:
+        """Close the session-owned client as one cancellation-safe operation."""
         if self._closed:
             return
         self._closed = True

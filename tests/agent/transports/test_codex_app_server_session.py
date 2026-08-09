@@ -185,6 +185,38 @@ class TestLifecycle:
         await s.close()
         assert client._closed is True
 
+    async def test_close_finishes_through_repeated_caller_cancellation(self):
+        close_started = asyncio.Event()
+        allow_close = asyncio.Event()
+
+        class BlockingClient(FakeClient):
+            async def close(self):
+                close_started.set()
+                await allow_close.wait()
+                self._closed = True
+
+        client = BlockingClient()
+        s = make_session(client)
+        await s.ensure_started()
+
+        close_task = asyncio.create_task(s.close())
+        await close_started.wait()
+        close_task.cancel()
+        await asyncio.sleep(0)
+        close_task.cancel()
+
+        await asyncio.sleep(0)
+        assert close_task.done() is False
+
+        allow_close.set()
+        with pytest.raises(asyncio.CancelledError):
+            await close_task
+
+        assert client._closed is True
+        assert s._client is None
+        assert s._thread_id is None
+        assert s._closed is True
+
 
 # ---- turn loop ----
 
