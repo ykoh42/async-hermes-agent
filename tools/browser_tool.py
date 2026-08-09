@@ -103,6 +103,42 @@ async def _lazy_call_llm(*args, **kwargs):
     return await fn(*args, **kwargs)
 
 
+async def _finish_owned_task(task: asyncio.Task[Any]) -> Any:
+    """Finish one owned browser subprocess task through repeated cancellation."""
+    cancellation: asyncio.CancelledError | None = None
+    while True:
+        try:
+            result = await asyncio.shield(task)
+            break
+        except asyncio.CancelledError as exc:  # noqa: ASYNC103 - re-raised below
+            if task.cancelled():
+                raise
+            if cancellation is None:
+                cancellation = exc
+        except Exception as exc:
+            if cancellation is not None:
+                raise cancellation from exc
+            raise
+    if cancellation is not None:
+        raise cancellation
+    return result
+
+
+async def _finish_process_communicate(
+    process: asyncio.subprocess.Process,
+    communicate_task: asyncio.Task[tuple[bytes, bytes]],
+) -> tuple[bytes, bytes]:
+    """Drain pipes and reap one browser subprocess, including pipe failures."""
+    async def drain_or_wait() -> tuple[bytes, bytes]:
+        try:
+            return await communicate_task
+        except BaseException:
+            await process.wait()
+            raise
+
+    return await _finish_owned_task(asyncio.create_task(drain_or_wait()))
+
+
 # Browser-specific tool keys passed through to the agent-browser subprocess
 # AFTER credential stripping.  agent-browser is a Node process loading npm
 # deps; handing it the full operator keyring (#29157 / GHSA-m4m8-xjp4-5rmm)
@@ -383,6 +419,17 @@ async def _unlink_command_output_files(*paths: str) -> None:
             await aiofiles.os.remove(path)
         except OSError:
             pass
+
+
+async def _wait_read_and_unlink_command_output(
+    wait_task: asyncio.Task[int], stdout_path: str, stderr_path: str
+) -> tuple[str, str]:
+    """Reap a browser CLI and always remove its temp output files."""
+    try:
+        await wait_task
+        return await _read_command_output_files(stdout_path, stderr_path)
+    finally:
+        await _unlink_command_output_files(stdout_path, stderr_path)
 
 
 async def _format_browser_timeout_error(
@@ -1271,17 +1318,40 @@ async def _run_chrome_fallback_command(
         finally:
             await close_file(stdout_fd)
             await close_file(stderr_fd)
+        wait_task = asyncio.create_task(proc.wait())
+        timeout_error: TimeoutError | None = None
         try:
-            await asyncio.wait_for(proc.wait(), timeout=timeout)
+            await asyncio.wait_for(asyncio.shield(wait_task), timeout=timeout)
         except asyncio.CancelledError:
             if proc.returncode is None:
                 proc.kill()
-            await proc.wait()
+            cleanup_task = asyncio.create_task(
+                _wait_read_and_unlink_command_output(
+                    wait_task, stdout_path, stderr_path
+                )
+            )
+            try:
+                await _finish_owned_task(cleanup_task)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.debug(
+                    "Chrome fallback cleanup after cancellation failed",
+                    exc_info=True,
+                )
             raise
-        except TimeoutError:
+        except TimeoutError as exc:
+            timeout_error = exc
+
+        if timeout_error is not None:
             if proc.returncode is None:
                 proc.kill()
-            await proc.wait()
+            cleanup_task = asyncio.create_task(
+                _wait_read_and_unlink_command_output(
+                    wait_task, stdout_path, stderr_path
+                )
+            )
+            await _finish_owned_task(cleanup_task)
             return {"success": False, "error": f"Chrome fallback '{cmd}' timed out"}
         try:
             async with aiofiles.open(stdout_path, "r", encoding="utf-8") as f:
@@ -2791,19 +2861,40 @@ async def _run_browser_command(
             await close_file(stdout_fd)
             await close_file(stderr_fd)
 
+        wait_task = asyncio.create_task(proc.wait())
+        timeout_error: TimeoutError | None = None
         try:
-            await asyncio.wait_for(proc.wait(), timeout=timeout)
+            await asyncio.wait_for(asyncio.shield(wait_task), timeout=timeout)
         except asyncio.CancelledError:
             if proc.returncode is None:
                 proc.kill()
-            await proc.wait()
+            cleanup_task = asyncio.create_task(
+                _wait_read_and_unlink_command_output(
+                    wait_task, stdout_path, stderr_path
+                )
+            )
+            try:
+                await _finish_owned_task(cleanup_task)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.debug(
+                    "Browser command cleanup after cancellation failed",
+                    exc_info=True,
+                )
             raise
-        except TimeoutError:
+        except TimeoutError as exc:
+            timeout_error = exc
+
+        if timeout_error is not None:
             if proc.returncode is None:
                 proc.kill()
-            await proc.wait()
-            stdout, stderr = await _read_command_output_files(stdout_path, stderr_path)
-            await _unlink_command_output_files(stdout_path, stderr_path)
+            cleanup_task = asyncio.create_task(
+                _wait_read_and_unlink_command_output(
+                    wait_task, stdout_path, stderr_path
+                )
+            )
+            stdout, stderr = await _finish_owned_task(cleanup_task)
             if stderr and stderr.strip():
                 logger.warning(
                     "browser '%s' stderr after timeout: %s",
@@ -5266,6 +5357,9 @@ async def _maybe_autoinstall_chromium() -> bool:
         "browser: Chromium missing — auto-installing the browser binary "
         "(one-time ~170MB; disable via security.allow_lazy_installs)"
     )
+    proc: asyncio.subprocess.Process | None = None
+    communicate_task: asyncio.Task[tuple[bytes, bytes]] | None = None
+    failure: OSError | TimeoutError | None = None
     try:
         proc = await asyncio.create_subprocess_exec(
             *install_cmd,
@@ -5273,22 +5367,41 @@ async def _maybe_autoinstall_chromium() -> bool:
             stderr=asyncio.subprocess.PIPE,
             env=await _build_browser_env(),
         )
+        communicate_task = asyncio.create_task(proc.communicate())
         stdout_bytes, stderr_bytes = await asyncio.wait_for(
-            proc.communicate(), timeout=600
+            asyncio.shield(communicate_task), timeout=600
         )
     except asyncio.CancelledError:
-        if "proc" in locals() and proc.returncode is None:
+        if proc is not None and proc.returncode is None:
             proc.kill()
-        if "proc" in locals():
-            await proc.wait()
+        if proc is not None and communicate_task is not None:
+            try:
+                await _finish_process_communicate(proc, communicate_task)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.debug(
+                    "Chromium install cleanup after cancellation failed",
+                    exc_info=True,
+                )
         raise
     except (OSError, TimeoutError) as e:
-        if "proc" in locals() and proc.returncode is None:
+        failure = e
+
+    if failure is not None:
+        if proc is not None and proc.returncode is None:
             proc.kill()
-            await proc.wait()
-        logger.warning("browser: Chromium auto-install failed to start: %s", e)
+        if proc is not None and communicate_task is not None:
+            try:
+                await _finish_process_communicate(proc, communicate_task)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.debug("Chromium install cleanup failed", exc_info=True)
+        logger.warning("browser: Chromium auto-install failed to start: %s", failure)
         return False
 
+    assert proc is not None
     if proc.returncode != 0:
         tail = (
             (stderr_bytes or stdout_bytes or b"")

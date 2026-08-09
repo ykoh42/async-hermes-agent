@@ -1,5 +1,6 @@
 """Tests for gated native-async Chromium auto-install."""
 
+import asyncio
 from unittest.mock import AsyncMock
 
 import pytest
@@ -103,6 +104,60 @@ class TestInstall:
             AsyncMock(return_value=_Process(returncode=1, stderr=b"boom")),
         )
         assert await browser_tool._maybe_autoinstall_chromium() is False
+
+    async def test_repeated_cancellation_drains_installer_process(self, monkeypatch):
+        communicate_started = asyncio.Event()
+        release_communicate = asyncio.Event()
+        communicate_completed = asyncio.Event()
+
+        class BlockingProcess:
+            returncode = None
+            killed = False
+
+            async def communicate(self):
+                communicate_started.set()
+                await release_communicate.wait()
+                communicate_completed.set()
+                return b"", b""
+
+            async def wait(self):
+                return self.returncode
+
+            def kill(self):
+                self.killed = True
+                self.returncode = -9
+
+        process = BlockingProcess()
+        monkeypatch.setattr(
+            browser_tool, "_running_in_docker", AsyncMock(return_value=False)
+        )
+        monkeypatch.setattr(
+            browser_tool, "load_config_readonly", AsyncMock(return_value={})
+        )
+        monkeypatch.setattr(
+            browser_tool,
+            "_find_agent_browser",
+            AsyncMock(return_value="/x/agent-browser"),
+        )
+        monkeypatch.setattr(
+            browser_tool.asyncio,
+            "create_subprocess_exec",
+            AsyncMock(return_value=process),
+        )
+
+        task = asyncio.create_task(browser_tool._maybe_autoinstall_chromium())
+        await communicate_started.wait()
+        task.cancel()
+        while not process.killed:
+            await asyncio.sleep(0)
+        task.cancel()
+        await asyncio.sleep(0)
+
+        assert task.done() is False
+        release_communicate.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert communicate_completed.is_set()
 
 
 class TestOneShot:

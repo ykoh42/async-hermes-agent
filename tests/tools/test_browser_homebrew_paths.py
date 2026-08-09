@@ -1,5 +1,6 @@
 """Tests for macOS Homebrew PATH discovery in browser_tool.py."""
 
+import asyncio
 import json
 import os
 from pathlib import Path
@@ -143,6 +144,81 @@ class TestRunBrowserCommandTermuxFallback:
         assert result["success"] is False
         assert "bare npx fallback" in result["error"]
         assert "agent-browser install" in result["error"]
+
+
+async def test_run_browser_command_repeated_cancellation_reaps_and_unlinks(
+    tmp_path, monkeypatch
+):
+    wait_started = asyncio.Event()
+    release_wait = asyncio.Event()
+    wait_completed = asyncio.Event()
+
+    class BlockingProcess:
+        returncode = None
+        killed = False
+
+        async def wait(self):
+            wait_started.set()
+            await release_wait.wait()
+            wait_completed.set()
+            return self.returncode
+
+        def kill(self):
+            self.killed = True
+            self.returncode = -9
+
+    process = BlockingProcess()
+
+    async def create_process(*_args, **_kwargs):
+        return process
+
+    monkeypatch.setattr(
+        _bt, "_find_agent_browser", AsyncMock(return_value="/x/agent-browser")
+    )
+    monkeypatch.setattr(
+        _bt, "_requires_real_termux_browser_install", AsyncMock(return_value=False)
+    )
+    monkeypatch.setattr(_bt, "_is_local_mode", AsyncMock(return_value=False))
+    monkeypatch.setattr(
+        _bt,
+        "_get_session_info",
+        AsyncMock(return_value={"session_name": "cancel-session"}),
+    )
+    monkeypatch.setattr(_bt, "_is_headed_mode", AsyncMock(return_value=False))
+    monkeypatch.setattr(_bt, "_get_browser_engine", AsyncMock(return_value="auto"))
+    monkeypatch.setattr(_bt, "_is_camofox_mode", AsyncMock(return_value=False))
+    monkeypatch.setattr(_bt, "_write_owner_pid", AsyncMock())
+    monkeypatch.setattr(
+        _bt, "_build_browser_env", AsyncMock(return_value={"PATH": "/usr/bin"})
+    )
+    monkeypatch.setattr(
+        _bt, "_merge_browser_path", AsyncMock(return_value="/usr/bin")
+    )
+    monkeypatch.setattr(
+        _bt, "_needs_chromium_sandbox_bypass", AsyncMock(return_value=False)
+    )
+    monkeypatch.setattr(_bt, "_socket_safe_tmpdir", lambda: str(tmp_path))
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create_process)
+    monkeypatch.setattr("tools.interrupt.is_interrupted", lambda: False)
+
+    task = asyncio.create_task(
+        _run_browser_command("cancel-task", "snapshot", [], timeout=60)
+    )
+    await wait_started.wait()
+    task.cancel()
+    while not process.killed:
+        await asyncio.sleep(0)
+    task.cancel()
+    await asyncio.sleep(0)
+
+    assert task.done() is False
+    release_wait.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert wait_completed.is_set()
+    output_dir = tmp_path / "agent-browser-cancel-session"
+    assert not (output_dir / "_stdout_snapshot").exists()
+    assert not (output_dir / "_stderr_snapshot").exists()
 
 
 class TestRunBrowserCommandPathConstruction:
