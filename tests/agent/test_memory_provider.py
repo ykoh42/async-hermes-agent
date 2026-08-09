@@ -221,6 +221,94 @@ async def test_memory_manager_shutdown_drains_then_closes_provider():
     assert manager.shutdown_drain_state["status"] == "drained"
 
 
+@pytest.mark.asyncio
+async def test_memory_manager_shutdown_collects_tasks_after_drain_timeout(
+    monkeypatch,
+):
+    from agent import memory_manager as memory_module
+
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+    release = asyncio.Event()
+    finished = asyncio.Event()
+
+    async def uncooperative_write():
+        started.set()
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            await release.wait()
+        finished.set()
+
+    monkeypatch.setattr(memory_module, "_SYNC_DRAIN_TIMEOUT_S", 0.01)
+    manager = MemoryManager()
+    provider = _Provider()
+    manager.add_provider(provider)
+    write_task = asyncio.create_task(uncooperative_write())
+    manager._background_tasks[write_task] = "sync"
+    await started.wait()
+
+    shutdown = asyncio.create_task(manager.shutdown_all())
+    await cancelled.wait()
+    assert shutdown.done() is False
+    release.set()
+    await shutdown
+
+    assert finished.is_set()
+    assert manager.shutdown_drain_state == {
+        "status": "timed_out",
+        "abandoned_writes": 1,
+        "abandoned_prefetches": 0,
+        "active_tasks": 0,
+    }
+    assert provider.events == [("shutdown",)]
+
+
+@pytest.mark.asyncio
+async def test_memory_manager_shutdown_survives_repeated_cancellation(
+    monkeypatch,
+):
+    from agent import memory_manager as memory_module
+
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+    release = asyncio.Event()
+    finished = asyncio.Event()
+
+    async def uncooperative_prefetch():
+        started.set()
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            await release.wait()
+        finished.set()
+
+    monkeypatch.setattr(memory_module, "_SYNC_DRAIN_TIMEOUT_S", 0.01)
+    manager = MemoryManager()
+    provider = _Provider()
+    manager.add_provider(provider)
+    prefetch_task = asyncio.create_task(uncooperative_prefetch())
+    manager._external_prefetch_tasks[provider.name] = prefetch_task
+    await started.wait()
+
+    shutdown = asyncio.create_task(manager.shutdown_all())
+    await cancelled.wait()
+    shutdown.cancel()
+    await asyncio.sleep(0)
+    shutdown.cancel()
+    await asyncio.sleep(0)
+
+    assert shutdown.done() is False
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await shutdown
+    assert finished.is_set()
+    assert manager.shutdown_drain_state["active_tasks"] == 0
+    assert provider.events == [("shutdown",)]
+
+
 def test_memory_manager_rejects_sync_provider_contract():
     class _SyncProvider(_Provider):
         def prefetch(self, query, *, session_id=""):

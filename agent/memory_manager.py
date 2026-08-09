@@ -43,6 +43,27 @@ _SYNC_DRAIN_TIMEOUT_S = 5.0
 _EXTERNAL_PREFETCH_TIMEOUT_S = 8.0
 
 
+async def _finish_owned_task(task: asyncio.Task[Any]) -> Any:
+    """Finish one owned memory cleanup task through repeated cancellation."""
+    cancellation: asyncio.CancelledError | None = None
+    while True:
+        try:
+            result = await asyncio.shield(task)
+            break
+        except asyncio.CancelledError as exc:  # noqa: ASYNC103 - re-raised below
+            if task.cancelled():
+                raise
+            if cancellation is None:
+                cancellation = exc
+        except Exception as exc:
+            if cancellation is not None:
+                raise cancellation from exc
+            raise
+    if cancellation is not None:
+        raise cancellation
+    return result
+
+
 def normalize_tool_schema(schema: Any) -> Optional[Dict[str, Any]]:
     """Return a function-tool dict with a resolvable top-level ``name``.
 
@@ -1158,6 +1179,11 @@ class MemoryManager:
         ``_SYNC_DRAIN_TIMEOUT_S``) so a turn's final sync has a chance to
         land before providers are torn down.
         """
+        cleanup_task = asyncio.create_task(self._shutdown_all_owned())
+        await _finish_owned_task(cleanup_task)
+
+    async def _shutdown_all_owned(self) -> None:
+        """Drain tasks and close providers as one cancellation-safe unit."""
         await self._drain_background_tasks()
         for provider in reversed(self._providers):
             try:
@@ -1174,7 +1200,7 @@ class MemoryManager:
         return dict(self._shutdown_drain_state)
 
     async def _drain_background_tasks(self) -> None:
-        """Give queued FIFO work a bounded chance, then abandon explicitly."""
+        """Give queued FIFO work a bounded chance, then cancel and collect it."""
         self._shutting_down = True
         tracked: Dict[asyncio.Task[Any], str] = {
             task: kind
@@ -1210,22 +1236,20 @@ class MemoryManager:
         )
         for task in pending:
             task.cancel()
-        _, active = await asyncio.wait(pending, timeout=1.0)
-        active_tasks = len(active)
+        await asyncio.gather(*pending, return_exceptions=True)
 
         self._shutdown_drain_state.update(
             status="timed_out",
             abandoned_writes=abandoned_writes,
             abandoned_prefetches=abandoned_prefetches,
-            active_tasks=active_tasks,
+            active_tasks=0,
         )
         logger.warning(
-            "Memory shutdown drain timed out after %.2fs; abandoning %d queued "
-            "memory write(s) and %d queued prefetch(es); %d active task(s) remain",
+            "Memory shutdown drain timed out after %.2fs; cancelled and "
+            "collected %d queued memory write(s) and %d queued prefetch(es)",
             _SYNC_DRAIN_TIMEOUT_S,
             abandoned_writes,
             abandoned_prefetches,
-            active_tasks,
         )
 
     async def initialize_all(self, session_id: str, **kwargs) -> None:
