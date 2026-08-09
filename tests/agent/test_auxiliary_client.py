@@ -1,5 +1,6 @@
 """Tests for agent.auxiliary_client resolution chain, provider overrides, and model overrides."""
 
+import asyncio
 import base64
 import json
 import logging
@@ -870,6 +871,85 @@ class TestBuildCodexClient:
         client, model = await _build_codex_client("")
         assert client is None
         assert model is None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("client_kind", ["codex", "anthropic"])
+    async def test_auxiliary_close_finishes_through_repeated_cancellation(
+        self,
+        client_kind,
+    ):
+        from agent.auxiliary_client import (
+            AnthropicAuxiliaryClient,
+            CodexAuxiliaryClient,
+        )
+
+        close_started = asyncio.Event()
+        allow_close = asyncio.Event()
+
+        class RealClient:
+            api_key = "test"
+            base_url = "https://chatgpt.com/backend-api/codex"
+
+            async def aclose(self):
+                close_started.set()
+                await allow_close.wait()
+
+        real_client = RealClient()
+        if client_kind == "codex":
+            client = CodexAuxiliaryClient(real_client, "gpt-5.4")
+        else:
+            client = AnthropicAuxiliaryClient(
+                real_client,
+                "claude-sonnet-4",
+                "test",
+                "https://api.anthropic.com",
+            )
+        close_task = asyncio.create_task(client.close())
+        await close_started.wait()
+        close_task.cancel()
+        await asyncio.sleep(0)
+        close_task.cancel()
+
+        await asyncio.sleep(0)
+        assert close_task.done() is False
+
+        allow_close.set()
+        with pytest.raises(asyncio.CancelledError):
+            await close_task
+
+    @pytest.mark.asyncio
+    async def test_cache_shutdown_finishes_through_repeated_cancellation(self):
+        import agent.auxiliary_client as aux
+
+        await aux.shutdown_cached_clients()
+        close_started = asyncio.Event()
+        allow_close = asyncio.Event()
+
+        class CachedClient:
+            async def aclose(self):
+                close_started.set()
+                await allow_close.wait()
+
+        aux._client_cache[("owned",)] = (
+            CachedClient(),
+            "test-model",
+            asyncio.get_running_loop(),
+        )
+
+        shutdown_task = asyncio.create_task(aux.shutdown_cached_clients())
+        await close_started.wait()
+        shutdown_task.cancel()
+        await asyncio.sleep(0)
+        shutdown_task.cancel()
+
+        await asyncio.sleep(0)
+        assert shutdown_task.done() is False
+
+        allow_close.set()
+        with pytest.raises(asyncio.CancelledError):
+            await shutdown_task
+
+        assert aux._client_cache == {}
 
     @pytest.mark.asyncio
     async def test_cached_codex_client_rebuilds_when_pool_entry_changes(self):

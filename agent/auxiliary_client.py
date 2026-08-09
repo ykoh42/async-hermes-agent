@@ -79,6 +79,27 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+async def _finish_owned_task(task: asyncio.Task[Any]) -> Any:
+    """Finish one auxiliary-client task through repeated cancellation."""
+    cancellation: asyncio.CancelledError | None = None
+    while True:
+        try:
+            result = await asyncio.shield(task)
+            break
+        except asyncio.CancelledError as exc:  # noqa: ASYNC103 - re-raised below
+            if task.cancelled():
+                raise
+            if cancellation is None:
+                cancellation = exc
+        except Exception as exc:
+            if cancellation is not None:
+                raise cancellation from exc
+            raise
+    if cancellation is not None:
+        raise cancellation
+    return result
+
+
 # ── resolve_provider_client fall-through dedup ───────────────────────────
 # Both fall-through warning sites in resolve_provider_client (the "unknown
 # provider" and "unhandled auth_type" branches) fire on every retry of a
@@ -1341,7 +1362,11 @@ class CodexAuxiliaryClient:
             self._real_client, "close", None
         )
         if inspect.iscoroutinefunction(close_fn):
-            await close_fn()
+            close_task = asyncio.create_task(
+                close_fn(),
+                name="codex-auxiliary-client-close",
+            )
+            await _finish_owned_task(close_task)
 
 
 class _AnthropicCompletionsAdapter:
@@ -1559,7 +1584,11 @@ class AnthropicAuxiliaryClient:
             self._real_client, "close", None
         )
         if inspect.iscoroutinefunction(close_fn):
-            await close_fn()
+            close_task = asyncio.create_task(
+                close_fn(),
+                name="anthropic-auxiliary-client-close",
+            )
+            await _finish_owned_task(close_task)
 
 
 class _BedrockCompletionsAdapter:
@@ -6588,6 +6617,15 @@ async def shutdown_cached_clients() -> None:
 
     Call this during agent shutdown, while the event loop is still running.
     """
+    cleanup_task = asyncio.create_task(
+        _shutdown_cached_clients_owned(),
+        name="auxiliary-client-cache-shutdown",
+    )
+    await _finish_owned_task(cleanup_task)
+
+
+async def _shutdown_cached_clients_owned() -> None:
+    """Close the cached client snapshot as one cancellation-safe operation."""
     async with _client_cache_lock:
         clients = [entry[0] for entry in _client_cache.values()]
         _client_cache.clear()
