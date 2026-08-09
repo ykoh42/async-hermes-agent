@@ -60,6 +60,10 @@ _KIMI_TOKENIZER_NAME = "moonshotai/Kimi-K2-Thinking"
 _KIMI_TOKENIZER_REVISION = "main"
 _KIMI_TOKENIZER_FILES = ("tokenizer_config.json", "tiktoken.model")
 _FAST_TOKENIZER_FILES = ("tokenizer_config.json", "tokenizer.json")
+_SENTENCEPIECE_TOKENIZER_FILES = (
+    ("tokenizer_config.json", "tokenizer.model"),
+    ("tokenizer_config.json", "spiece.model"),
+)
 _KIMI_NUM_RESERVED_SPECIAL_TOKENS = 256
 _KIMI_PAT_STR = "|".join(
     [
@@ -120,6 +124,28 @@ class _FastTokenizer:
 
     def encode(self, text: str) -> List[int]:
         return self._tokenizer.encode(text, add_special_tokens=True).ids
+
+
+def _generate_sentencepiece_bpe_merges(
+    vocab: Dict[str, int],
+    scores: Dict[str, float],
+) -> List[Tuple[str, str]]:
+    """Reconstruct the BPE merge order encoded by a SentencePiece model."""
+    ranked: List[Tuple[str, str, float]] = []
+    for merged_piece, score in scores.items():
+        candidates: List[Tuple[str, str, float]] = []
+        for index in range(1, len(merged_piece)):
+            left = merged_piece[:index]
+            right = merged_piece[index:]
+            if left in vocab and right in vocab:
+                candidates.append((left, right, score))
+        candidates.sort(key=lambda value: (vocab[value[0]], vocab[value[1]]))
+        ranked.extend(candidates)
+    ranked.sort(
+        key=lambda value: (value[2], len(value[0]), len(value[1])),
+        reverse=True,
+    )
+    return [(left, right) for left, right, _score in ranked]
 
 
 def _parse_tiktoken_ranks(model_bytes: bytes) -> Dict[bytes, int]:
@@ -365,6 +391,47 @@ async def _load_fast_tokenizer_assets(
     return assets["tokenizer_config.json"], assets["tokenizer.json"]
 
 
+def _is_missing_tokenizer_asset(exc: BaseException) -> bool:
+    if isinstance(exc, FileNotFoundError):
+        return True
+    return (
+        isinstance(exc, httpx.HTTPStatusError)
+        and exc.response.status_code == 404
+    )
+
+
+async def _load_custom_tokenizer_assets(
+    tokenizer_name: str,
+) -> Tuple[str, bytes, bytes]:
+    """Load a tokenizer.json pipeline or a supported SentencePiece model."""
+    try:
+        config_bytes, tokenizer_bytes = await _load_fast_tokenizer_assets(
+            tokenizer_name
+        )
+        return "fast", config_bytes, tokenizer_bytes
+    except (FileNotFoundError, httpx.HTTPStatusError) as exc:
+        if not _is_missing_tokenizer_asset(exc):
+            raise
+
+    last_missing: BaseException | None = None
+    for filenames in _SENTENCEPIECE_TOKENIZER_FILES:
+        try:
+            assets = await _load_hf_tokenizer_assets(
+                tokenizer_name,
+                filenames,
+            )
+            return "sentencepiece", assets["tokenizer_config.json"], assets[
+                filenames[1]
+            ]
+        except (FileNotFoundError, httpx.HTTPStatusError) as exc:
+            if not _is_missing_tokenizer_asset(exc):
+                raise
+            last_missing = exc
+    if last_missing is not None:
+        raise last_missing
+    raise RuntimeError(f"No tokenizer assets found for {tokenizer_name!r}")
+
+
 def _build_fast_tokenizer(
     config_bytes: bytes,
     tokenizer_bytes: bytes,
@@ -384,6 +451,208 @@ def _build_fast_tokenizer(
             "async-hermes-agent to restore its pinned dependencies."
         ) from exc
     return _FastTokenizer(Tokenizer.from_str(tokenizer_bytes.decode("utf-8")))
+
+
+def _build_sentencepiece_tokenizer(
+    config_bytes: bytes,
+    model_bytes: bytes,
+) -> _FastTokenizer:
+    """Build verified Llama/T5 SentencePiece families without file I/O."""
+    tokenizer_config = json.loads(config_bytes)
+    if tokenizer_config.get("auto_map", {}).get("AutoTokenizer"):
+        raise ValueError(
+            "the configured tokenizer requires Python remote code, which has "
+            "no native-async file-loading contract"
+        )
+    tokenizer_class = str(tokenizer_config.get("tokenizer_class") or "")
+    normalized_class = tokenizer_class.removesuffix("Fast")
+    if normalized_class.endswith("LlamaTokenizer"):
+        add_bos_token = bool(tokenizer_config.get("add_bos_token", True))
+        add_eos_token = bool(tokenizer_config.get("add_eos_token", False))
+        tokenizer_family = "llama"
+    elif normalized_class in {"T5Tokenizer", "MT5Tokenizer"} or (
+        not normalized_class and "extra_ids" in tokenizer_config
+    ):
+        add_bos_token = False
+        add_eos_token = True
+        tokenizer_family = "t5"
+    else:
+        raise ValueError(
+            "unsupported SentencePiece tokenizer family: "
+            f"{tokenizer_class or 'unknown'}"
+        )
+
+    try:
+        from sentencepiece import sentencepiece_model_pb2
+    except ImportError as exc:  # pragma: no cover - pinned core dependency
+        raise RuntimeError(
+            "Trajectory compression requires sentencepiece. Reinstall "
+            "async-hermes-agent to restore its pinned dependencies."
+        ) from exc
+    try:
+        model_proto_type = getattr(sentencepiece_model_pb2, "ModelProto")
+        model_proto = model_proto_type.FromString(model_bytes)
+    except Exception as exc:
+        raise ValueError("invalid serialized SentencePiece model") from exc
+    trainer_spec = model_proto.trainer_spec
+    if add_bos_token and trainer_spec.bos_id < 0:
+        raise ValueError("SentencePiece tokenizer requires a BOS token")
+    if add_eos_token and trainer_spec.eos_id < 0:
+        raise ValueError("SentencePiece tokenizer requires an EOS token")
+    try:
+        from tokenizers import (
+            AddedToken,
+            Tokenizer,
+            decoders,
+            models,
+            pre_tokenizers,
+            processors,
+        )
+    except ImportError as exc:  # pragma: no cover - pinned core dependency
+        raise RuntimeError(
+            "Trajectory compression requires tokenizers. Reinstall "
+            "async-hermes-agent to restore its pinned dependencies."
+        ) from exc
+    vocab_scores = [
+        (piece.piece, piece.score)
+        for piece in model_proto.pieces
+    ]
+    vocab = {
+        piece: index
+        for index, (piece, _score) in enumerate(vocab_scores)
+    }
+
+    if tokenizer_family == "llama":
+        scores = {
+            piece: score for piece, score in vocab_scores
+        }
+        tokenizer = Tokenizer(
+            models.BPE(
+                vocab=vocab,
+                merges=_generate_sentencepiece_bpe_merges(vocab, scores),
+                fuse_unk=True,
+                byte_fallback=True,
+                dropout=None,
+            )
+        )
+        tokenizer.pre_tokenizer = pre_tokenizers.Metaspace(
+            replacement="▁",
+            prepend_scheme="first",
+            split=False,
+        )
+        decoder_steps: List[Any] = [
+            decoders.Replace("▁", " "),
+            decoders.ByteFallback(),
+            decoders.Fuse(),
+        ]
+        if bool(tokenizer_config.get("add_prefix_space", True)):
+            decoder_steps.append(decoders.Strip(content=" ", left=1))
+        tokenizer.decoder = decoders.Sequence(decoder_steps)
+
+        special_tokens: List[AddedToken] = []
+        template_tokens: List[Tuple[str, int]] = []
+        for key, fallback in (
+            ("unk_token", "<unk>"),
+            ("bos_token", "<s>"),
+            ("eos_token", "</s>"),
+        ):
+            value = tokenizer_config.get(key, fallback)
+            if isinstance(value, dict):
+                content = str(value.get("content") or fallback)
+                normalized = bool(value.get("normalized", key == "unk_token"))
+            else:
+                content = str(value or fallback)
+                normalized = key == "unk_token"
+            token_id = vocab.get(content)
+            if token_id is None:
+                raise ValueError(f"SentencePiece model is missing {key}")
+            special_tokens.append(
+                AddedToken(content, special=True, normalized=normalized)
+            )
+            if key != "unk_token":
+                template_tokens.append((content, token_id))
+        tokenizer.add_special_tokens(special_tokens)
+
+        bos_content, bos_id = template_tokens[0]
+        eos_content, eos_id = template_tokens[1]
+        single_parts = ["$A"]
+        pair_parts = ["$A"]
+        post_specials: List[Tuple[str, int]] = []
+        if add_bos_token:
+            single_parts.insert(0, bos_content)
+            pair_parts.insert(0, bos_content)
+            post_specials.append((bos_content, bos_id))
+        if add_eos_token:
+            single_parts.append(eos_content)
+            pair_parts.append(eos_content)
+            post_specials.append((eos_content, eos_id))
+        if add_bos_token:
+            pair_parts.extend((f"{bos_content}:1", "$B:1"))
+        else:
+            pair_parts.append("$B:1")
+        if add_eos_token:
+            pair_parts.append(f"{eos_content}:1")
+        if post_specials:
+            tokenizer.post_processor = processors.TemplateProcessing(
+                single=" ".join(single_parts),
+                pair=" ".join(pair_parts),
+                special_tokens=post_specials,
+            )
+        return _FastTokenizer(tokenizer)
+
+    tokenizer = Tokenizer(
+        models.Unigram(
+            vocab=vocab_scores,
+            unk_id=trainer_spec.unk_id,
+            byte_fallback=False,
+        )
+    )
+    precompiled_charsmap = model_proto.normalizer_spec.precompiled_charsmap
+    if precompiled_charsmap:
+        from tokenizers import normalizers
+
+        tokenizer.normalizer = normalizers.Precompiled(precompiled_charsmap)
+    tokenizer.pre_tokenizer = pre_tokenizers.Sequence(
+        [
+            pre_tokenizers.WhitespaceSplit(),
+            pre_tokenizers.Metaspace(
+                replacement="▁",
+                prepend_scheme="always",
+                split=True,
+            ),
+        ]
+    )
+    tokenizer.decoder = decoders.Metaspace(
+        replacement="▁",
+        prepend_scheme="always",
+        split=True,
+    )
+    for key, fallback in (
+        ("unk_token", "<unk>"),
+        ("eos_token", "</s>"),
+        ("pad_token", "<pad>"),
+    ):
+        value = tokenizer_config.get(key, fallback)
+        content = str(value.get("content") or fallback) if isinstance(
+            value, dict
+        ) else str(value or fallback)
+        if content in vocab:
+            tokenizer.add_special_tokens(
+                [AddedToken(content, special=True, normalized=False)]
+            )
+    eos_value = tokenizer_config.get("eos_token", "</s>")
+    eos_content = str(eos_value.get("content") or "</s>") if isinstance(
+        eos_value, dict
+    ) else str(eos_value or "</s>")
+    eos_id = vocab.get(eos_content)
+    if eos_id is None:
+        raise ValueError("SentencePiece model is missing eos_token")
+    tokenizer.post_processor = processors.TemplateProcessing(
+        single=f"$A {eos_content}",
+        pair=f"$A {eos_content} $B {eos_content}",
+        special_tokens=[(eos_content, eos_id)],
+    )
+    return _FastTokenizer(tokenizer)
 
 
 async def _finish_owned_task(task: asyncio.Task[Any]) -> Any:
@@ -749,13 +1018,19 @@ class TrajectoryCompressor:
                         model_bytes,
                     )
                 else:
-                    config_bytes, tokenizer_bytes = (
-                        await _load_fast_tokenizer_assets(tokenizer_name)
+                    tokenizer_kind, config_bytes, tokenizer_bytes = (
+                        await _load_custom_tokenizer_assets(tokenizer_name)
                     )
-                    self.tokenizer = _build_fast_tokenizer(
-                        config_bytes,
-                        tokenizer_bytes,
-                    )
+                    if tokenizer_kind == "fast":
+                        self.tokenizer = _build_fast_tokenizer(
+                            config_bytes,
+                            tokenizer_bytes,
+                        )
+                    else:
+                        self.tokenizer = _build_sentencepiece_tokenizer(
+                            config_bytes,
+                            tokenizer_bytes,
+                        )
             except asyncio.CancelledError:
                 raise
             except Exception as exc:

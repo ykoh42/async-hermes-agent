@@ -3,6 +3,7 @@
 import base64
 import asyncio
 import importlib
+import io
 import json
 import os
 import sys
@@ -52,6 +53,167 @@ def _minimal_fast_tokenizer_assets():
         special_tokens=[("[BOS]", 1)],
     )
     return b"{}", tokenizer.to_str().encode("utf-8")
+
+
+def _minimal_sentencepiece_model(*, model_type="unigram"):
+    import sentencepiece as spm
+
+    destination = io.BytesIO()
+    spm.SentencePieceTrainer.train(
+        sentence_iterator=iter(
+            [
+                "hello world",
+                "hello native async tokenizer",
+                "world of agent trajectories",
+            ]
+        ),
+        model_writer=destination,
+        model_type=model_type,
+        vocab_size=24,
+        bos_id=1,
+        eos_id=2,
+        unk_id=0,
+        pad_id=-1,
+        hard_vocab_limit=False,
+    )
+    return destination.getvalue()
+
+
+@pytest.mark.asyncio
+async def test_custom_tokenizer_falls_back_to_sentencepiece_on_missing_json(
+    monkeypatch,
+):
+    missing_request = httpx.Request(
+        "GET", "https://huggingface.co/org/model/resolve/main/tokenizer.json"
+    )
+    missing_response = httpx.Response(404, request=missing_request)
+    missing = httpx.HTTPStatusError(
+        "not found",
+        request=missing_request,
+        response=missing_response,
+    )
+    model_bytes = b"serialized-sentencepiece"
+    load = AsyncMock(
+        side_effect=[
+            missing,
+            {
+                "tokenizer_config.json": b'{"tokenizer_class":"LlamaTokenizer"}',
+                "tokenizer.model": model_bytes,
+            },
+        ]
+    )
+    monkeypatch.setattr(
+        trajectory_compressor_module, "_load_hf_tokenizer_assets", load
+    )
+
+    kind, config_bytes, loaded_model = (
+        await trajectory_compressor_module._load_custom_tokenizer_assets(
+            "org/model"
+        )
+    )
+
+    assert kind == "sentencepiece"
+    assert json.loads(config_bytes) == {"tokenizer_class": "LlamaTokenizer"}
+    assert loaded_model == model_bytes
+    assert load.await_args_list == [
+        (("org/model", ("tokenizer_config.json", "tokenizer.json")),),
+        (("org/model", ("tokenizer_config.json", "tokenizer.model")),),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_custom_tokenizer_fallback_does_not_hide_auth_errors(monkeypatch):
+    request = httpx.Request(
+        "GET", "https://huggingface.co/private/model/resolve/main/tokenizer.json"
+    )
+    response = httpx.Response(401, request=request)
+    unauthorized = httpx.HTTPStatusError(
+        "unauthorized",
+        request=request,
+        response=response,
+    )
+    load = AsyncMock(side_effect=unauthorized)
+    monkeypatch.setattr(
+        trajectory_compressor_module, "_load_hf_tokenizer_assets", load
+    )
+
+    with pytest.raises(httpx.HTTPStatusError) as exc_info:
+        await trajectory_compressor_module._load_custom_tokenizer_assets(
+            "private/model"
+        )
+
+    assert exc_info.value is unauthorized
+    assert load.await_count == 1
+
+
+def test_sentencepiece_llama_encode_adds_upstream_bos_only():
+    import sentencepiece as spm
+
+    model_bytes = _minimal_sentencepiece_model(model_type="bpe")
+    processor = spm.SentencePieceProcessor()
+    assert processor.LoadFromSerializedProto(model_bytes)
+    tokenizer = trajectory_compressor_module._build_sentencepiece_tokenizer(
+        json.dumps(
+            {
+                "tokenizer_class": "LlamaTokenizer",
+                "add_bos_token": True,
+                "add_eos_token": False,
+            }
+        ).encode(),
+        model_bytes,
+    )
+
+    assert tokenizer.encode("hello world") == [
+        processor.bos_id(),
+        *processor.encode("hello world", out_type=int),
+    ]
+
+
+def test_sentencepiece_llama_preserves_repeated_spaces():
+    model_bytes = _minimal_sentencepiece_model(model_type="bpe")
+    tokenizer = trajectory_compressor_module._build_sentencepiece_tokenizer(
+        b'{"tokenizer_class":"LlamaTokenizer","add_bos_token":true}',
+        model_bytes,
+    )
+
+    single_spaces = tokenizer.encode("hello world")
+    repeated_spaces = tokenizer.encode("  hello  world")
+
+    assert repeated_spaces != single_spaces
+    assert len(repeated_spaces) > len(single_spaces)
+
+
+def test_sentencepiece_t5_encode_adds_upstream_eos_only():
+    import sentencepiece as spm
+
+    model_bytes = _minimal_sentencepiece_model()
+    processor = spm.SentencePieceProcessor()
+    assert processor.LoadFromSerializedProto(model_bytes)
+    tokenizer = trajectory_compressor_module._build_sentencepiece_tokenizer(
+        json.dumps(
+            {
+                "tokenizer_class": "T5Tokenizer",
+                "eos_token": "</s>",
+                "extra_ids": 100,
+            }
+        ).encode(),
+        model_bytes,
+    )
+
+    assert tokenizer.encode("hello world") == [
+        *processor.encode("hello world", out_type=int),
+        processor.eos_id(),
+    ]
+
+
+def test_sentencepiece_unknown_family_fails_instead_of_guessing():
+    model_bytes = _minimal_sentencepiece_model()
+
+    with pytest.raises(ValueError, match="unsupported SentencePiece tokenizer"):
+        trajectory_compressor_module._build_sentencepiece_tokenizer(
+            b'{"tokenizer_class":"UnknownTokenizer"}',
+            model_bytes,
+        )
 
 
 @pytest.mark.asyncio
@@ -147,6 +309,44 @@ async def test_custom_fast_tokenizer_loads_local_directory_without_network(
             )
         )
         assert await compressor.count_tokens("hello world") == 3
+
+    client.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_custom_sentencepiece_tokenizer_loads_local_directory(
+    tmp_path, monkeypatch
+):
+    model_bytes = _minimal_sentencepiece_model()
+    tokenizer_directory = tmp_path / "custom-sentencepiece"
+    tokenizer_directory.mkdir()
+    (tokenizer_directory / "tokenizer_config.json").write_text(
+        json.dumps(
+            {
+                "tokenizer_class": "T5Tokenizer",
+                "eos_token": "</s>",
+                "extra_ids": 100,
+            }
+        )
+    )
+    (tokenizer_directory / "spiece.model").write_bytes(model_bytes)
+    client = MagicMock(side_effect=AssertionError("network must not be used"))
+    monkeypatch.setattr(trajectory_compressor_module.httpx, "AsyncClient", client)
+
+    with patch.object(TrajectoryCompressor, "_init_summarizer"):
+        compressor = TrajectoryCompressor(
+            CompressionConfig(
+                tokenizer_name=str(tokenizer_directory),
+                trust_remote_code=False,
+            )
+        )
+        expected = trajectory_compressor_module._build_sentencepiece_tokenizer(
+            (tokenizer_directory / "tokenizer_config.json").read_bytes(),
+            model_bytes,
+        )
+        assert await compressor.count_tokens("hello world") == len(
+            expected.encode("hello world")
+        )
 
     client.assert_not_called()
 
