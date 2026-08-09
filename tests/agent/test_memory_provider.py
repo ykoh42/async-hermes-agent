@@ -297,7 +297,7 @@ async def test_memory_manager_shutdown_drains_then_closes_provider():
 
 
 @pytest.mark.asyncio
-async def test_memory_manager_shutdown_collects_tasks_after_drain_timeout(
+async def test_memory_manager_shutdown_returns_at_drain_timeout(
     monkeypatch,
 ):
     from agent import memory_manager as memory_module
@@ -326,18 +326,21 @@ async def test_memory_manager_shutdown_collects_tasks_after_drain_timeout(
 
     shutdown = asyncio.create_task(manager.shutdown_all())
     await cancelled.wait()
-    assert shutdown.done() is False
-    release.set()
-    await shutdown
+    await asyncio.wait_for(shutdown, timeout=0.2)
 
-    assert finished.is_set()
+    assert finished.is_set() is False
     assert manager.shutdown_drain_state == {
         "status": "timed_out",
-        "abandoned_writes": 1,
+        "abandoned_writes": 0,
         "abandoned_prefetches": 0,
-        "active_tasks": 0,
+        "active_tasks": 1,
     }
     assert provider.events == [("shutdown",)]
+
+    release.set()
+    await write_task
+
+    assert finished.is_set()
 
 
 @pytest.mark.asyncio
@@ -349,27 +352,36 @@ async def test_memory_manager_shutdown_survives_repeated_cancellation(
     started = asyncio.Event()
     cancelled = asyncio.Event()
     release = asyncio.Event()
-    finished = asyncio.Event()
 
-    async def uncooperative_prefetch():
+    shutdown_started = asyncio.Event()
+    shutdown_finished = asyncio.Event()
+
+    async def cooperative_prefetch():
         started.set()
+
         try:
-            await release.wait()
-        except asyncio.CancelledError:
+            await asyncio.Event().wait()
+        finally:
             cancelled.set()
+
+    class SlowShutdownProvider(_Provider):
+        async def shutdown(self):
+            shutdown_started.set()
             await release.wait()
-        finished.set()
+            shutdown_finished.set()
+            self.events.append(("shutdown",))
 
     monkeypatch.setattr(memory_module, "_SYNC_DRAIN_TIMEOUT_S", 0.01)
     manager = MemoryManager()
-    provider = _Provider()
+    provider = SlowShutdownProvider()
     manager.add_provider(provider)
-    prefetch_task = asyncio.create_task(uncooperative_prefetch())
+    prefetch_task = asyncio.create_task(cooperative_prefetch())
     manager._external_prefetch_tasks[provider.name] = prefetch_task
     await started.wait()
 
     shutdown = asyncio.create_task(manager.shutdown_all())
     await cancelled.wait()
+    await shutdown_started.wait()
     shutdown.cancel()
     await asyncio.sleep(0)
     shutdown.cancel()
@@ -379,7 +391,8 @@ async def test_memory_manager_shutdown_survives_repeated_cancellation(
     release.set()
     with pytest.raises(asyncio.CancelledError):
         await shutdown
-    assert finished.is_set()
+    assert prefetch_task.cancelled()
+    assert shutdown_finished.is_set()
     assert manager.shutdown_drain_state["active_tasks"] == 0
     assert provider.events == [("shutdown",)]
 

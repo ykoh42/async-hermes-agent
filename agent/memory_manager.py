@@ -1200,7 +1200,7 @@ class MemoryManager:
         return dict(self._shutdown_drain_state)
 
     async def _drain_background_tasks(self) -> None:
-        """Give queued FIFO work a bounded chance, then cancel and collect it."""
+        """Give queued FIFO work a bounded chance, then abandon explicitly."""
         self._shutting_down = True
         tracked: Dict[asyncio.Task[Any], str] = {
             task: kind
@@ -1228,28 +1228,42 @@ class MemoryManager:
             self._shutdown_drain_state.update(status="drained", active_tasks=0)
             return
 
-        abandoned_writes = sum(
-            tracked[task] != "prefetch" for task in pending
-        )
-        abandoned_prefetches = sum(
-            tracked[task] == "prefetch" for task in pending
-        )
         for task in pending:
             task.cancel()
-        await asyncio.gather(*pending, return_exceptions=True)
+
+        # Give cooperative providers one scheduling turn to observe the
+        # cancellation. A provider that suppresses cancellation must not turn
+        # the bounded shutdown deadline into an unbounded gather. This is the
+        # native-task equivalent of upstream's daemon-worker behavior: report
+        # still-running work truthfully and let its existing done callback
+        # collect it if it eventually returns.
+        await asyncio.sleep(0)
+        completed = {task for task in pending if task.done()}
+        if completed:
+            await asyncio.gather(*completed, return_exceptions=True)
+        cancelled = {task for task in completed if task.cancelled()}
+        abandoned_writes = sum(
+            tracked[task] != "prefetch" for task in cancelled
+        )
+        abandoned_prefetches = sum(
+            tracked[task] == "prefetch" for task in cancelled
+        )
+        active_tasks = len(pending - completed)
 
         self._shutdown_drain_state.update(
             status="timed_out",
             abandoned_writes=abandoned_writes,
             abandoned_prefetches=abandoned_prefetches,
-            active_tasks=0,
+            active_tasks=active_tasks,
         )
         logger.warning(
-            "Memory shutdown drain timed out after %.2fs; cancelled and "
-            "collected %d queued memory write(s) and %d queued prefetch(es)",
+            "Memory shutdown drain timed out after %.2fs; abandoning %d queued "
+            "memory write(s) and %d queued prefetch(es); %d active task(s) "
+            "remain detached",
             _SYNC_DRAIN_TIMEOUT_S,
             abandoned_writes,
             abandoned_prefetches,
+            active_tasks,
         )
 
     async def initialize_all(self, session_id: str, **kwargs) -> None:
