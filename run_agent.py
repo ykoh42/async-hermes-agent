@@ -57,6 +57,27 @@ from types import SimpleNamespace
 from hermes_constants import get_hermes_home
 
 
+async def _finish_owned_task(task: asyncio.Task[Any]) -> Any:
+    """Finish one agent-owned task through repeated caller cancellation."""
+    cancellation: asyncio.CancelledError | None = None
+    while True:
+        try:
+            result = await asyncio.shield(task)
+            break
+        except asyncio.CancelledError as exc:  # noqa: ASYNC103 - re-raised below
+            if task.cancelled():
+                raise
+            if cancellation is None:
+                cancellation = exc
+        except Exception as exc:
+            if cancellation is not None:
+                raise cancellation from exc
+            raise
+    if cancellation is not None:
+        raise cancellation
+    return result
+
+
 async def _launch_cwd_for_session(source: str) -> Optional[str]:
     """Working directory to stamp on a new session row, or None.
 
@@ -3835,13 +3856,18 @@ class AIAgent:
         """
         close_lock = self._get_close_lock()
         await close_lock.acquire()
+        cleanup_task = asyncio.create_task(
+            self._close_unlocked(),
+            name="hermes-agent-close",
+        )
         try:
-            await self._close_unlocked()
+            await _finish_owned_task(cleanup_task)
         except asyncio.CancelledError:
-            # Teardown may have completed only partially.  Allow a later
-            # close attempt to finish the remaining resources instead of
-            # treating the cancelled attempt as a successful idempotent close.
-            self._closed = False
+            # An internally cancelled teardown may have completed only
+            # partially. External caller cancellation is delayed until the
+            # owned teardown finishes, leaving ``_closed`` true.
+            if cleanup_task.cancelled():
+                self._closed = False
             raise
         finally:
             close_lock.release()

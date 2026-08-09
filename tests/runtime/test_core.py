@@ -2641,10 +2641,11 @@ async def test_close_detaches_borrowed_session_db_without_closing_it(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_close_propagates_caller_cancellation_while_awaiting_active_turn():
+async def test_close_finishes_through_repeated_caller_cancellation():
     agent = AIAgent.__new__(AIAgent)
     turn_started = asyncio.Event()
     turn_cancelling = asyncio.Event()
+    allow_turn_cleanup = asyncio.Event()
 
     async def active_turn() -> None:
         turn_started.set()
@@ -2652,7 +2653,8 @@ async def test_close_propagates_caller_cancellation_while_awaiting_active_turn()
             await asyncio.Event().wait()
         except asyncio.CancelledError:
             turn_cancelling.set()
-            await asyncio.Event().wait()
+            await allow_turn_cleanup.wait()
+            raise
 
     turn_task = asyncio.create_task(active_turn())
     await turn_started.wait()
@@ -2661,10 +2663,18 @@ async def test_close_propagates_caller_cancellation_while_awaiting_active_turn()
     close_task = asyncio.create_task(agent.close())
     await turn_cancelling.wait()
     close_task.cancel()
+    await asyncio.sleep(0)
+    close_task.cancel()
+
+    await asyncio.sleep(0)
+    assert close_task.done() is False
+    assert getattr(agent, "_closed", False) is False
+
+    allow_turn_cleanup.set()
 
     with pytest.raises(asyncio.CancelledError):
         await close_task
-    assert agent._closed is False
+    assert agent._closed is True
     assert turn_task.cancelled()
 
 
