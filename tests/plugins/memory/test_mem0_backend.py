@@ -298,7 +298,7 @@ def test_oss_legacy_base_urls_are_normalized_without_mutating_input():
 
 
 @pytest.mark.asyncio
-async def test_oss_backend_fails_before_mem0_thread_fallback():
+async def test_oss_backend_rejects_blocking_local_qdrant():
     backend = OSSBackend(
         {
             "llm": {
@@ -316,10 +316,156 @@ async def test_oss_backend_fails_before_mem0_thread_fallback():
         }
     )
 
-    with pytest.raises(RuntimeError, match="has no native-async runtime"):
+    with pytest.raises(RuntimeError, match="embedded Qdrant"):
         await backend._initialize()
 
     assert backend._memory is None
+
+
+@pytest.mark.asyncio
+async def test_oss_backend_initializes_native_memory_once(monkeypatch):
+    initialized = asyncio.Event()
+
+    class FakeMemory:
+        instances = []
+
+        def __init__(self, config):
+            self.config = config
+            self.closed = False
+            self.instances.append(self)
+
+        async def initialize(self):
+            initialized.set()
+            await asyncio.sleep(0)
+
+        async def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(
+        "plugins.memory.mem0._native_memory.Memory",
+        FakeMemory,
+    )
+    backend = OSSBackend(
+        {
+            "llm": {
+                "provider": "openai",
+                "config": {"model": "gpt-5-mini"},
+            },
+            "embedder": {
+                "provider": "openai",
+                "config": {"model": "unknown-dim-model"},
+            },
+            "vector_store": {
+                "provider": "qdrant",
+                "config": {"url": "https://qdrant.test"},
+            },
+        }
+    )
+
+    await asyncio.gather(backend._initialize(), backend._initialize())
+
+    assert initialized.is_set()
+    assert len(FakeMemory.instances) == 1
+    assert backend._memory is FakeMemory.instances[0]
+    assert FakeMemory.instances[0].config == backend._config
+    await backend.close()
+
+
+@pytest.mark.asyncio
+async def test_oss_backend_closes_memory_when_initialization_fails(monkeypatch):
+    class FakeMemory:
+        instance = None
+
+        def __init__(self, config):
+            self.config = config
+            self.closed = False
+            type(self).instance = self
+
+        async def initialize(self):
+            raise RuntimeError("initialization failed")
+
+        async def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(
+        "plugins.memory.mem0._native_memory.Memory",
+        FakeMemory,
+    )
+    backend = OSSBackend(
+        {
+            "llm": {
+                "provider": "openai",
+                "config": {"model": "gpt-5-mini"},
+            },
+            "embedder": {
+                "provider": "openai",
+                "config": {"model": "unknown-dim-model"},
+            },
+            "vector_store": {
+                "provider": "qdrant",
+                "config": {"url": "https://qdrant.test"},
+            },
+        }
+    )
+
+    with pytest.raises(RuntimeError, match="initialization failed"):
+        await backend._initialize()
+
+    assert backend._memory is None
+    assert FakeMemory.instance.closed is True
+
+
+@pytest.mark.asyncio
+async def test_oss_backend_close_waits_for_concurrent_initialization(monkeypatch):
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    class FakeMemory:
+        instance = None
+
+        def __init__(self, config):
+            self.config = config
+            self.closed = False
+            type(self).instance = self
+
+        async def initialize(self):
+            entered.set()
+            await release.wait()
+
+        async def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(
+        "plugins.memory.mem0._native_memory.Memory",
+        FakeMemory,
+    )
+    backend = OSSBackend(
+        {
+            "llm": {
+                "provider": "openai",
+                "config": {"model": "gpt-5-mini"},
+            },
+            "embedder": {
+                "provider": "openai",
+                "config": {"model": "unknown-dim-model"},
+            },
+            "vector_store": {
+                "provider": "qdrant",
+                "config": {"url": "https://qdrant.test"},
+            },
+        }
+    )
+    initialize_task = asyncio.create_task(backend._initialize())
+    await entered.wait()
+    close_task = asyncio.create_task(backend.close())
+    await asyncio.sleep(0)
+
+    assert close_task.done() is False
+    release.set()
+    await asyncio.gather(initialize_task, close_task)
+
+    assert backend._memory is None
+    assert FakeMemory.instance.closed is True
 
 
 @pytest.mark.asyncio
@@ -397,6 +543,7 @@ async def test_oss_backend_uses_async_memory_v2_signatures():
     backend = OSSBackend.__new__(OSSBackend)
     backend._memory = memory
     backend._collection_check = None
+    backend._initialize_lock = asyncio.Lock()
 
     assert await backend.search("query", filters={"user_id": "u1"}, top_k=4) == [
         {"id": "m1", "memory": "fact"}
@@ -428,6 +575,7 @@ async def test_oss_backend_close_delegates_to_native_memory_close():
     memory = FakeMemory()
     backend = OSSBackend.__new__(OSSBackend)
     backend._memory = memory
+    backend._initialize_lock = asyncio.Lock()
 
     await backend.close()
 
@@ -447,6 +595,7 @@ async def test_oss_backend_close_rejects_sync_memory_close_without_calling_it():
     memory = SyncMemory()
     backend = OSSBackend.__new__(OSSBackend)
     backend._memory = memory
+    backend._initialize_lock = asyncio.Lock()
 
     with pytest.raises(RuntimeError, match="native-async close"):
         await backend.close()
@@ -466,6 +615,7 @@ async def test_oss_backend_close_preserves_cancellation():
 
     backend = OSSBackend.__new__(OSSBackend)
     backend._memory = FakeMemory()
+    backend._initialize_lock = asyncio.Lock()
     task = asyncio.create_task(backend.close())
     await entered.wait()
 

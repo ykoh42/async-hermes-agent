@@ -108,6 +108,8 @@ class _FakeAsyncOllama:
 @pytest.fixture(autouse=True)
 def _reset_fake_openai(monkeypatch):
     _FakeAsyncOpenAI.instances.clear()
+    monkeypatch.delenv("OPENAI_API_BASE", raising=False)
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
     monkeypatch.setattr("openai.AsyncOpenAI", _FakeAsyncOpenAI)
 
 

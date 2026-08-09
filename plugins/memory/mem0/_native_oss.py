@@ -590,6 +590,10 @@ class SQLiteManager:
             raise
         return connection
 
+    async def _initialize(self) -> None:
+        async with self._lock:
+            await self._connection_locked()
+
     async def _migrate_history_table_locked(
         self, connection: aiosqlite.Connection
     ) -> None:

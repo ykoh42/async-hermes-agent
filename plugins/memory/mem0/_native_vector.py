@@ -80,6 +80,9 @@ class Qdrant:
             self._client = client
             return client
 
+    async def _initialize(self) -> None:
+        await self._get_client()
+
     async def _initialize_collection(self, client: Any, models: Any) -> None:
         collections = await client.get_collections()
         exists = any(

@@ -457,15 +457,29 @@ class OSSBackend(Mem0Backend):
         }
         self._config = config
         self._memory = None
+        self._initialize_lock = asyncio.Lock()
 
     async def _initialize(self) -> None:
         if self._memory is not None:
             return
-        raise RuntimeError(
-            "Mem0 OSS mode has no native-async runtime: mem0ai==2.0.10 "
-            "AsyncMemory uses asyncio.to_thread internally. Configure MEM0_HOST "
-            "to use the native-async self-hosted HTTP backend."
-        )
+        async with self._initialize_lock:
+            if self._memory is not None:
+                return
+            if self._collection_check is not None:
+                await self._recreate_collection_if_dims_changed(
+                    *self._collection_check
+                )
+                self._collection_check = None
+
+            from ._native_memory import Memory
+
+            memory = Memory(self._config)
+            try:
+                await memory.initialize()
+            except BaseException:
+                await memory.close()
+                raise
+            self._memory = memory
 
     @staticmethod
     async def _recreate_collection_if_dims_changed(provider: str, vs_config: dict, expected_dims: int) -> None:
@@ -574,10 +588,11 @@ class OSSBackend(Mem0Backend):
         return {"result": "Memory deleted.", "memory_id": memory_id}
 
     async def close(self):
-        if self._memory is None:
-            return
-        memory = self._memory
-        self._memory = None
+        async with self._initialize_lock:
+            if self._memory is None:
+                return
+            memory = self._memory
+            self._memory = None
         close = getattr(memory, "close", None)
         if callable(close):
             if not inspect.iscoroutinefunction(close):
