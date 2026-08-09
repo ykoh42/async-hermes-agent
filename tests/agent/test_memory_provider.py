@@ -171,6 +171,59 @@ async def test_memory_manager_session_boundary_orders_end_before_switch():
 
 
 @pytest.mark.asyncio
+async def test_memory_manager_session_switch_fans_out_exact_upstream_kwargs():
+    manager = MemoryManager()
+    builtin = _Provider("builtin")
+    external = _Provider("external")
+    manager.add_provider(builtin)
+    manager.add_provider(external)
+
+    await manager.on_session_switch(
+        "new-sid",
+        parent_session_id="old-sid",
+        reset=False,
+        reason="resume",
+    )
+
+    for provider in (builtin, external):
+        assert provider.events == [
+            (
+                "switch",
+                "new-sid",
+                {
+                    "parent_session_id": "old-sid",
+                    "reset": False,
+                    "reason": "resume",
+                },
+            )
+        ]
+
+
+@pytest.mark.asyncio
+async def test_memory_manager_session_switch_isolates_provider_failure():
+    class _BrokenProvider(_Provider):
+        async def on_session_switch(self, new_session_id, **kwargs):
+            raise RuntimeError("boom")
+
+    manager = MemoryManager()
+    manager.add_provider(_BrokenProvider("builtin"))
+    good = _Provider("external")
+    manager.add_provider(good)
+
+    await manager.on_session_switch(
+        "new-sid", parent_session_id="old-sid"
+    )
+
+    assert good.events == [
+        (
+            "switch",
+            "new-sid",
+            {"parent_session_id": "old-sid", "reset": False},
+        )
+    ]
+
+
+@pytest.mark.asyncio
 async def test_memory_manager_timeout_does_not_block_event_loop():
     manager = MemoryManager(external_prefetch_timeout=0.01)
     provider = _Provider(delay=0.2)

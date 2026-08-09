@@ -517,6 +517,30 @@ async def test_resume_resolution_walks_from_the_middle_of_a_plain_chain(db):
 
 
 @pytest.mark.asyncio
+async def test_resume_resolution_prefers_most_recent_plain_child(db):
+    await db.create_session("parent", source="library")
+    await db.create_session(
+        "older-fork", source="library", parent_session_id="parent"
+    )
+    await db.create_session(
+        "newer-fork", source="library", parent_session_id="parent"
+    )
+    connection = await db._get_connection()
+    await connection.execute(
+        "UPDATE sessions SET started_at = ? WHERE id = ?",
+        (1.0, "older-fork"),
+    )
+    await connection.execute(
+        "UPDATE sessions SET started_at = ? WHERE id = ?",
+        (2.0, "newer-fork"),
+    )
+    await connection.commit()
+    await db.append_message("newer-fork", role="user", content="latest")
+
+    assert await db.resolve_resume_session_id("parent") == "newer-fork"
+
+
+@pytest.mark.asyncio
 async def test_resume_resolution_keeps_message_bearing_parent(db):
     await db.create_session("root", source="library")
     await db.append_message("root", role="user", content="only message")

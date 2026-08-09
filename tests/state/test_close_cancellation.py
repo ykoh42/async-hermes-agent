@@ -21,8 +21,7 @@ async def test_repeated_cancellation_waits_for_connection_close():
             close_completed.set()
 
     tracking_key = "repeated-cancel-close"
-    database = SessionDB.__new__(SessionDB)
-    database._closed = False
+    database = SessionDB("unused-state.db")
     database._connection = ControlledConnection()
     database._connection_tracking_key = tracking_key
     _live_connection_counts[tracking_key] = 1

@@ -16,6 +16,7 @@ import stat
 import sys
 import time
 from collections.abc import Collection
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -1153,6 +1154,14 @@ class SessionDB:
     _WRITE_RETRY_MIN_S = 0.02
     _WRITE_RETRY_MAX_S = 0.15
 
+    # Keep upstream's bounded maintenance cadence. PASSIVE checkpoints do
+    # not require the exclusive lock that TRUNCATE does, while incremental
+    # FTS merges cap the amount of segment work performed after one write.
+    _CHECKPOINT_EVERY_N_WRITES = 50
+    _FTS_MERGE_EVERY_N_WRITES = 1000
+    _FTS_MERGE_MAX_PAGES_PER_INDEX = 500
+    _FTS_MERGE_COMMANDS_PER_PASS = 4
+
     _FTS_REBUILD_CHUNK_ROWS = 500
     _FTS_REBUILD_DUTY_FACTOR = 4.0
     _FTS_REBUILD_MIN_PAUSE = 0.2
@@ -1660,10 +1669,17 @@ class SessionDB:
         self.read_only = bool(read_only)
         self._connection = None
         self._connection_tracking_key = None
+        self._read_connection = None
+        self._read_connection_tracking_key = None
         self._connect_lock = None
+        self._read_connect_lock = None
+        self._read_lock = None
         self._write_lock = None
+        self._read_connection_failed = False
         self._schema_ready = False
         self._wal_active = False
+        self._write_count = 0
+        self._fts_usermerge_floor_applied = False
         self._closed = False
         self._fts_enabled = False
         self._trigram_available = False
@@ -1682,6 +1698,16 @@ class SessionDB:
         if self._write_lock is None:
             self._write_lock = asyncio.Lock()
         return self._write_lock
+
+    def _get_read_connect_lock(self) -> asyncio.Lock:
+        if self._read_connect_lock is None:
+            self._read_connect_lock = asyncio.Lock()
+        return self._read_connect_lock
+
+    def _get_read_lock(self) -> asyncio.Lock:
+        if self._read_lock is None:
+            self._read_lock = asyncio.Lock()
+        return self._read_lock
 
     async def _get_connection(self):
         if self._closed:
@@ -1849,6 +1875,81 @@ class SessionDB:
             self._connection_tracking_key = tracking_key
             self._connection = connection
             return connection
+
+    async def _get_read_conn(self):
+        """Return the native read-only WAL connection, or ``None`` fallback."""
+        await self._get_connection()
+        if not self._wal_active or self.read_only:
+            return None
+        if self._read_connection is not None:
+            return self._read_connection
+        if self._read_connection_failed:
+            return None
+
+        async with self._get_read_connect_lock():
+            if self._read_connection is not None:
+                return self._read_connection
+            if self._read_connection_failed:
+                return None
+            connection = None
+            try:
+                database = f"file:{self._db_path}?mode=ro"
+                connection = await aiosqlite.connect(
+                    database,
+                    timeout=5.0,
+                    isolation_level=None,
+                    uri=True,
+                )
+                connection.row_factory = sqlite3.Row
+                await apply_database_pragmas(connection, db_label="state.db")
+                await connection.execute("PRAGMA foreign_keys=ON")
+                await connection.execute("PRAGMA busy_timeout=5000")
+                if self._fts_cjk_loaded:
+                    await load_fts5_cjk_extension(connection)
+                if self._closed:
+                    await _close_owned_connection(connection)
+                    self._read_connection_failed = True
+                    return None
+                tracking_key = str(await _realpath(str(self._db_path)))
+                _live_connection_counts[tracking_key] = (
+                    _live_connection_counts.get(tracking_key, 0) + 1
+                )
+                self._read_connection_tracking_key = tracking_key
+                self._read_connection = connection
+                return connection
+            except sqlite3.Error:
+                if connection is not None:
+                    await _close_owned_connection(connection)
+                self._read_connection_failed = True
+                logger.debug(
+                    "read-only connection open failed for %s",
+                    self.db_path,
+                    exc_info=True,
+                )
+                return None
+            except BaseException:
+                if connection is not None:
+                    await _close_owned_connection(connection)
+                raise
+
+    @asynccontextmanager
+    async def _read_ctx(self):
+        """Yield a WAL reader, falling back to the locked writer connection."""
+        connection = await self._get_read_conn()
+        if connection is not None:
+            async with self._get_read_lock():
+                yield connection
+            return
+        async with self._get_write_lock():
+            yield await self._get_connection()
+
+    async def _read_fetchall(self, sql: str, params=()):
+        async with self._read_ctx() as connection:
+            cursor = await connection.execute(sql, params)
+            try:
+                return await cursor.fetchall()
+            finally:
+                await cursor.close()
 
     async def _ensure_schema(self, connection) -> None:
         """Create/reconcile the transcript tables without a sync DB hop.
@@ -2323,10 +2424,15 @@ class SessionDB:
                         await connection.execute("BEGIN IMMEDIATE")
                         result = await operation(connection)
                         await connection.commit()
-                        return result
                     except BaseException:
                         await _finish_connection_rollback(connection)
                         raise
+                self._write_count += 1
+                if self._write_count % self._CHECKPOINT_EVERY_N_WRITES == 0:
+                    await self._try_wal_checkpoint()
+                if self._write_count % self._FTS_MERGE_EVERY_N_WRITES == 0:
+                    await self._try_incremental_merge_fts()
+                return result
             except asyncio.CancelledError:
                 raise
             except SessionCompressionInProgressError:
@@ -2363,6 +2469,82 @@ class SessionDB:
                     ) from exc
                 await asyncio.sleep(random.uniform(delay / 2, delay))
                 delay = min(delay * 2, self._WRITE_RETRY_MAX_S)
+
+    async def _try_wal_checkpoint(self) -> None:
+        """Best-effort PASSIVE WAL checkpoint matching upstream cadence."""
+        try:
+            async with self._get_write_lock():
+                connection = await self._get_connection()
+                cursor = await connection.execute(
+                    "PRAGMA wal_checkpoint(PASSIVE)"
+                )
+                try:
+                    result = await cursor.fetchone()
+                finally:
+                    await cursor.close()
+            if result and result[1] > 0:
+                logger.debug(
+                    "WAL checkpoint: %d/%d pages checkpointed",
+                    result[2],
+                    result[1],
+                )
+        except Exception as exc:
+            logger.warning("WAL checkpoint (PASSIVE) failed: %s", exc)
+
+    async def _try_incremental_merge_fts(self) -> None:
+        """Run one bounded FTS5 merge pass after a completed write."""
+        if not self._fts_enabled:
+            return
+        try:
+            await self._merge_fts_incrementally(
+                max_pages=self._FTS_MERGE_MAX_PAGES_PER_INDEX
+            )
+        except sqlite3.Error as exc:
+            logger.warning("FTS incremental merge failed: %s", exc)
+
+    async def _merge_fts_incrementally(
+        self,
+        *,
+        max_pages: int,
+        max_commands: Optional[int] = None,
+    ) -> int:
+        """Run upstream's bounded FTS5 ``'merge'`` protocol natively."""
+        if isinstance(max_pages, bool) or not isinstance(max_pages, int):
+            raise TypeError("max_pages must be an integer")
+        if max_pages <= 0:
+            raise ValueError("max_pages must be greater than zero")
+        if max_commands is None:
+            max_commands = self._FTS_MERGE_COMMANDS_PER_PASS
+        if isinstance(max_commands, bool) or not isinstance(max_commands, int):
+            raise TypeError("max_commands must be an integer")
+        if max_commands <= 0:
+            raise ValueError("max_commands must be greater than zero")
+
+        executed = 0
+        async with self._get_write_lock():
+            connection = await self._get_connection()
+            for table_name in self._FTS_TABLES:
+                if not await self._fts_table_exists(table_name):
+                    continue
+                if not self._fts_usermerge_floor_applied:
+                    cursor = await connection.execute(
+                        f"INSERT INTO {table_name}({table_name}, rank) "
+                        "VALUES('usermerge', 2)"
+                    )
+                    await cursor.close()
+                for _ in range(max_commands):
+                    before = connection.total_changes
+                    cursor = await connection.execute(
+                        f"INSERT INTO {table_name}({table_name}, rank) "
+                        "VALUES('merge', ?)",
+                        (max_pages,),
+                    )
+                    await cursor.close()
+                    executed += 1
+                    if connection.total_changes - before < 2:
+                        break
+            self._fts_usermerge_floor_applied = True
+        return executed
 
     async def _check_transcript_write_guards(
         self,
@@ -3540,16 +3722,16 @@ class SessionDB:
 
     async def get_session(self, session_id: str) -> Optional[Dict[str, Any]]:
         """Return one session row through the adapter's async connection."""
-        connection = await self._get_connection()
-        row = await (
-            await connection.execute(
-                "SELECT s.*, COALESCE(sp.prompt, s.system_prompt) "
-                "AS _system_prompt_resolved "
-                "FROM sessions s LEFT JOIN system_prompts sp "
-                "ON sp.hash = s.system_prompt_hash WHERE s.id = ?",
-                (session_id,),
-            )
-        ).fetchone()
+        async with self._read_ctx() as connection:
+            row = await (
+                await connection.execute(
+                    "SELECT s.*, COALESCE(sp.prompt, s.system_prompt) "
+                    "AS _system_prompt_resolved "
+                    "FROM sessions s LEFT JOIN system_prompts sp "
+                    "ON sp.hash = s.system_prompt_hash WHERE s.id = ?",
+                    (session_id,),
+                )
+            ).fetchone()
         return self._session_row_dict(row) if row is not None else None
 
     async def resolve_session_id(
@@ -4150,7 +4332,6 @@ class SessionDB:
         offset: int = 0,
     ) -> List[Dict[str, Any]]:
         """Load a session's messages through the native async connection."""
-        connection = await self._get_connection()
         active_clause = "" if include_inactive else " AND active = 1"
         query = (
             "SELECT * FROM messages WHERE session_id = ?"
@@ -4160,8 +4341,10 @@ class SessionDB:
         if limit is not None or offset:
             query += " LIMIT ? OFFSET ?"
             params.extend([-1 if limit is None else limit, offset])
-        cursor = await connection.execute(query, params)
-        return [self._decode_message_row(row) for row in await cursor.fetchall()]
+        async with self._read_ctx() as connection:
+            cursor = await connection.execute(query, params)
+            rows = await cursor.fetchall()
+        return [self._decode_message_row(row) for row in rows]
 
     async def message_count(self, session_id: str = None) -> int:
         """Count messages, optionally for one session."""
@@ -4333,30 +4516,35 @@ class SessionDB:
         window: int = 5,
     ) -> Dict[str, Any]:
         """Return an async anchored message window with boundary counts."""
-        connection = await self._get_connection()
         window = max(0, int(window))
-        anchor = await (
-            await connection.execute(
-                "SELECT 1 FROM messages WHERE id = ? AND session_id = ? LIMIT 1",
-                (around_message_id, session_id),
-            )
-        ).fetchone()
-        if anchor is None:
-            return {"window": [], "messages_before": 0, "messages_after": 0}
-        before = await (
-            await connection.execute(
-                "SELECT * FROM messages WHERE session_id = ? AND id <= ? "
-                "ORDER BY id DESC LIMIT ?",
-                (session_id, around_message_id, window + 1),
-            )
-        ).fetchall()
-        after = await (
-            await connection.execute(
-                "SELECT * FROM messages WHERE session_id = ? AND id > ? "
-                "ORDER BY id ASC LIMIT ?",
-                (session_id, around_message_id, window),
-            )
-        ).fetchall()
+        async with self._read_ctx() as connection:
+            anchor = await (
+                await connection.execute(
+                    "SELECT 1 FROM messages "
+                    "WHERE id = ? AND session_id = ? LIMIT 1",
+                    (around_message_id, session_id),
+                )
+            ).fetchone()
+            if anchor is None:
+                return {
+                    "window": [],
+                    "messages_before": 0,
+                    "messages_after": 0,
+                }
+            before = await (
+                await connection.execute(
+                    "SELECT * FROM messages WHERE session_id = ? AND id <= ? "
+                    "ORDER BY id DESC LIMIT ?",
+                    (session_id, around_message_id, window + 1),
+                )
+            ).fetchall()
+            after = await (
+                await connection.execute(
+                    "SELECT * FROM messages WHERE session_id = ? AND id > ? "
+                    "ORDER BY id ASC LIMIT ?",
+                    (session_id, around_message_id, window),
+                )
+            ).fetchall()
         rows = list(reversed(before)) + list(after)
         return {
             "window": [self._decode_message_row(row) for row in rows],
@@ -4412,26 +4600,30 @@ class SessionDB:
         starts: list[Dict[str, Any]] = []
         ends: list[Dict[str, Any]] = []
         if bookend:
-            connection = await self._get_connection()
             role_sql = ""
             role_params: list[Any] = []
             if keep_roles is not None:
                 role_sql = " AND role IN (" + ",".join("?" for _ in keep_roles) + ")"
                 role_params = list(keep_roles)
-            start_rows = await (
-                await connection.execute(
-                    "SELECT * FROM messages WHERE session_id = ? AND id < ?"
-                    f"{role_sql} AND length(content) > 0 ORDER BY id ASC LIMIT ?",
-                    (session_id, rows[0]["id"], *role_params, bookend),
-                )
-            ).fetchall()
-            end_rows = await (
-                await connection.execute(
-                    "SELECT * FROM messages WHERE session_id = ? AND id > ?"
-                    f"{role_sql} AND length(content) > 0 ORDER BY id DESC LIMIT ?",
-                    (session_id, rows[-1]["id"], *role_params, bookend),
-                )
-            ).fetchall()
+            async with self._read_ctx() as connection:
+                start_rows = await (
+                    await connection.execute(
+                        "SELECT * FROM messages "
+                        "WHERE session_id = ? AND id < ?"
+                        f"{role_sql} AND length(content) > 0 "
+                        "ORDER BY id ASC LIMIT ?",
+                        (session_id, rows[0]["id"], *role_params, bookend),
+                    )
+                ).fetchall()
+                end_rows = await (
+                    await connection.execute(
+                        "SELECT * FROM messages "
+                        "WHERE session_id = ? AND id > ?"
+                        f"{role_sql} AND length(content) > 0 "
+                        "ORDER BY id DESC LIMIT ?",
+                        (session_id, rows[-1]["id"], *role_params, bookend),
+                    )
+                ).fetchall()
             starts = [self._decode_message_row(row) for row in start_rows]
             ends = [self._decode_message_row(row) for row in reversed(end_rows)]
         return {
@@ -4444,42 +4636,47 @@ class SessionDB:
 
     async def get_session_by_title(self, title: str) -> Optional[Dict[str, Any]]:
         """Look up a session title through the async connection."""
-        connection = await self._get_connection()
-        row = await (
-            await connection.execute(
-                "SELECT s.*, COALESCE(sp.prompt, s.system_prompt) "
-                "AS _system_prompt_resolved "
-                "FROM sessions s LEFT JOIN system_prompts sp "
-                "ON sp.hash = s.system_prompt_hash WHERE s.title = ?",
-                (title,),
-            )
-        ).fetchone()
+        async with self._read_ctx() as connection:
+            row = await (
+                await connection.execute(
+                    "SELECT s.*, COALESCE(sp.prompt, s.system_prompt) "
+                    "AS _system_prompt_resolved "
+                    "FROM sessions s LEFT JOIN system_prompts sp "
+                    "ON sp.hash = s.system_prompt_hash WHERE s.title = ?",
+                    (title,),
+                )
+            ).fetchone()
         return self._session_row_dict(row) if row is not None else None
 
     async def resolve_session_by_title(self, title: str) -> Optional[str]:
         """Resolve an exact or numbered continuation title asynchronously."""
         exact = await self.get_session_by_title(title)
         escaped = title.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-        connection = await self._get_connection()
-        rows = await (
-            await connection.execute(
-                "SELECT id FROM sessions WHERE title LIKE ? ESCAPE '\\' "
-                "ORDER BY started_at DESC",
-                (f"{escaped} #%",),
-            )
-        ).fetchall()
+        async with self._read_ctx() as connection:
+            rows = await (
+                await connection.execute(
+                    "SELECT id FROM sessions WHERE title LIKE ? ESCAPE '\\' "
+                    "ORDER BY started_at DESC",
+                    (f"{escaped} #%",),
+                )
+            ).fetchall()
         if rows:
             return rows[0]["id"]
         return exact["id"] if exact else None
 
     async def fts_rebuild_status(self) -> Optional[Dict[str, Any]]:
         """Return deferred FTS rebuild progress without sync metadata access."""
-        high_water = await self.get_meta("fts_rebuild_high_water")
+        rows = await self._read_fetchall(
+            "SELECT key, value FROM state_meta WHERE key IN (?, ?)",
+            ("fts_rebuild_high_water", "fts_rebuild_progress"),
+        )
+        meta = {row["key"]: row["value"] for row in rows}
+        high_water = meta.get("fts_rebuild_high_water")
         if high_water is None:
             return None
         try:
             total = int(high_water)
-            indexed = int(await self.get_meta("fts_rebuild_progress") or 0)
+            indexed = int(meta.get("fts_rebuild_progress") or 0)
         except (TypeError, ValueError):
             return None
         if total <= 0:
@@ -4649,11 +4846,16 @@ class SessionDB:
 
     async def fts_cjk_rebuild_status(self) -> Optional[Dict[str, Any]]:
         """CJK-index backfill progress, or None when none is pending."""
-        high_water = await self.get_meta("fts_cjk_rebuild_high_water")
+        rows = await self._read_fetchall(
+            "SELECT key, value FROM state_meta WHERE key IN (?, ?)",
+            ("fts_cjk_rebuild_high_water", "fts_cjk_rebuild_progress"),
+        )
+        meta = {row["key"]: row["value"] for row in rows}
+        high_water = meta.get("fts_cjk_rebuild_high_water")
         if high_water is None:
             return None
         total = int(high_water)
-        indexed = int(await self.get_meta("fts_cjk_rebuild_progress") or 0)
+        indexed = int(meta.get("fts_cjk_rebuild_progress") or 0)
         if total <= 0:
             return None
         return {
@@ -5294,22 +5496,18 @@ class SessionDB:
             LIMIT ? OFFSET ?
         """
         params.extend([limit, offset])
-        connection = await self._get_connection()
         try:
-            cursor = await connection.execute(sql, params)
-            try:
-                return [dict(row) for row in await cursor.fetchall()]
-            finally:
-                await cursor.close()
+            return [
+                dict(row) for row in await self._read_fetchall(sql, params)
+            ]
         except sqlite3.DatabaseError as exc:
             if not await self._try_runtime_fts_rebuild(exc):
                 return None
             try:
-                cursor = await connection.execute(sql, params)
-                try:
-                    return [dict(row) for row in await cursor.fetchall()]
-                finally:
-                    await cursor.close()
+                return [
+                    dict(row)
+                    for row in await self._read_fetchall(sql, params)
+                ]
             except sqlite3.DatabaseError:
                 logger.warning(
                     "%s search still failing after in-place rebuild; "
@@ -5332,7 +5530,7 @@ class SessionDB:
     ) -> List[Dict[str, Any]]:
         """Full-text search with v2026.8.3 routing and result semantics."""
         result_fields = self._search_message_fields(fields)
-        connection = await self._get_connection()
+        await self._get_connection()
         if not self._fts_enabled or not query or not query.strip():
             return []
         query = self._sanitize_fts5_query(query)
@@ -5494,21 +5692,19 @@ class SessionDB:
                     ORDER BY m.timestamp DESC
                     LIMIT ? OFFSET ?
                 """
-                cursor = await connection.execute(
-                    like_sql,
-                    [tokens[0], *like_params, limit, offset],
-                )
-                try:
-                    matches = [dict(row) for row in await cursor.fetchall()]
-                finally:
-                    await cursor.close()
+                matches = [
+                    dict(row)
+                    for row in await self._read_fetchall(
+                        like_sql,
+                        [tokens[0], *like_params, limit, offset],
+                    )
+                ]
         else:
             try:
-                cursor = await connection.execute(sql, params)
-                try:
-                    matches = [dict(row) for row in await cursor.fetchall()]
-                finally:
-                    await cursor.close()
+                matches = [
+                    dict(row)
+                    for row in await self._read_fetchall(sql, params)
+                ]
             except sqlite3.DatabaseError as exc:
                 if (
                     isinstance(exc, sqlite3.OperationalError)
@@ -5518,11 +5714,10 @@ class SessionDB:
                 # A new caller cancellation must supersede this stale FTS error.
                 if not await self._try_runtime_fts_rebuild(exc):  # noqa: ASYNC120
                     raise
-                cursor = await connection.execute(sql, params)
-                try:
-                    matches = [dict(row) for row in await cursor.fetchall()]
-                finally:
-                    await cursor.close()
+                matches = [
+                    dict(row)
+                    for row in await self._read_fetchall(sql, params)
+                ]
 
         rebuild_status = await self.fts_rebuild_status()
         if not used_like and rebuild_status is not None and len(matches) < limit:
@@ -5585,7 +5780,7 @@ class SessionDB:
         )
         for match in context_matches:
             try:
-                cursor = await connection.execute(
+                context_rows = await self._read_fetchall(
                     """WITH target AS (
                            SELECT session_id, timestamp, id
                            FROM messages WHERE id = ?
@@ -5611,10 +5806,6 @@ class SessionDB:
                        )""",
                     (match["id"], match["id"]),
                 )
-                try:
-                    context_rows = await cursor.fetchall()
-                finally:
-                    await cursor.close()
                 context = []
                 for row in context_rows:
                     decoded = self._decode_content(row["content"])
@@ -5745,12 +5936,12 @@ class SessionDB:
             ORDER BY m.timestamp DESC
             LIMIT ?
         """
-        connection = await self._get_connection()
-        cursor = await connection.execute(sql, [terms[0], *params, limit])
-        try:
-            return [dict(row) for row in await cursor.fetchall()]
-        finally:
-            await cursor.close()
+        return [
+            dict(row)
+            for row in await self._read_fetchall(
+                sql, [terms[0], *params, limit]
+            )
+        ]
 
     async def search_sessions(
         self,
@@ -6284,8 +6475,7 @@ class SessionDB:
             {prompt_join}
             WHERE s.id IN ({placeholders})
         """
-        connection = await self._get_connection()
-        rows = await (await connection.execute(query, ids)).fetchall()
+        rows = await self._read_fetchall(query, ids)
         result = {}
         for row in rows:
             session = self._session_row_dict(row)
@@ -6487,8 +6677,7 @@ class SessionDB:
             """
             params.extend([limit, offset])
 
-        connection = await self._get_connection()
-        rows = await (await connection.execute(query, params)).fetchall()
+        rows = await self._read_fetchall(query, params)
         sessions = []
         for row in rows:
             session = self._session_row_dict(row)
@@ -6521,9 +6710,9 @@ class SessionDB:
                 {pinned_where}
                 ORDER BY s.started_at DESC
             """
-            pinned_rows = await (
-                await connection.execute(pinned_query, base_where_params)
-            ).fetchall()
+            pinned_rows = await self._read_fetchall(
+                pinned_query, base_where_params
+            )
             for row in pinned_rows:
                 session = self._session_row_dict(row)
                 if session["id"] in seen_ids:
@@ -6788,35 +6977,38 @@ class SessionDB:
         """Load a conversation through the native async SQLite connection."""
         if not session_id:
             return []
-        connection = await self._get_connection()
         session_ids = [session_id]
-        if include_ancestors:
-            current = session_id
-            seen = set()
-            while current and current not in seen:
-                seen.add(current)
-                row = await (
-                    await connection.execute(
-                        "SELECT parent_session_id FROM sessions WHERE id = ?",
-                        (current,),
+        async with self._read_ctx() as connection:
+            if include_ancestors:
+                current = session_id
+                seen = set()
+                while current and current not in seen:
+                    seen.add(current)
+                    row = await (
+                        await connection.execute(
+                            "SELECT parent_session_id FROM sessions "
+                            "WHERE id = ?",
+                            (current,),
+                        )
+                    ).fetchone()
+                    parent = (
+                        row["parent_session_id"] if row is not None else None
                     )
-                ).fetchone()
-                parent = row["parent_session_id"] if row is not None else None
-                if not parent:
-                    break
-                session_ids.insert(0, parent)
-                current = parent
+                    if not parent:
+                        break
+                    session_ids.insert(0, parent)
+                    current = parent
 
-        placeholders = ",".join("?" for _ in session_ids)
-        active_clause = "" if include_inactive else " AND active = 1"
-        rows = await (
-            await connection.execute(
-                f"SELECT {self._CONVERSATION_ROW_COLUMNS} "
-                f"FROM messages WHERE session_id IN ({placeholders})"
-                f"{active_clause} ORDER BY id",
-                tuple(session_ids),
-            )
-        ).fetchall()
+            placeholders = ",".join("?" for _ in session_ids)
+            active_clause = "" if include_inactive else " AND active = 1"
+            rows = await (
+                await connection.execute(
+                    f"SELECT {self._CONVERSATION_ROW_COLUMNS} "
+                    f"FROM messages WHERE session_id IN ({placeholders})"
+                    f"{active_clause} ORDER BY id",
+                    tuple(session_ids),
+                )
+            ).fetchall()
         return self._rows_to_conversation(
             rows,
             session_id=session_id,
@@ -6845,19 +7037,20 @@ class SessionDB:
         output (see test_get_resume_conversations_matches_separate_reads).
         """
         session_ids = await self._session_lineage_root_to_tip(session_id)
-        connection = await self._get_connection()
-        placeholders = ",".join("?" for _ in session_ids)
-        rows = await (
-            await connection.execute(
-                f"SELECT session_id, {self._CONVERSATION_ROW_COLUMNS} "
-                f"FROM messages WHERE session_id IN ({placeholders}) "
-                "AND active = 1 "
-                # ORDER BY id (insertion order) — see get_messages_as_conversation
-                # for why timestamp ordering is unsafe.
-                "ORDER BY id",
-                tuple(session_ids),
-            )
-        ).fetchall()
+        async with self._read_ctx() as connection:
+            placeholders = ",".join("?" for _ in session_ids)
+            rows = await (
+                await connection.execute(
+                    f"SELECT session_id, {self._CONVERSATION_ROW_COLUMNS} "
+                    f"FROM messages WHERE session_id IN ({placeholders}) "
+                    "AND active = 1 "
+                    # ORDER BY id (insertion order) — see
+                    # get_messages_as_conversation for why timestamp ordering
+                    # is unsafe.
+                    "ORDER BY id",
+                    tuple(session_ids),
+                )
+            ).fetchall()
 
         # Tip rows are exactly the model-fed set (get_messages_as_conversation
         # with session_ids=[session_id]); filtering the lineage fetch preserves
@@ -6904,16 +7097,16 @@ class SessionDB:
         session_ids = await self._session_lineage_root_to_tip(session_id)
         if len(session_ids) <= 1:
             return []
-        connection = await self._get_connection()
-        placeholders = ",".join("?" for _ in session_ids)
-        rows = await (
-            await connection.execute(
-                f"SELECT session_id, {self._CONVERSATION_ROW_COLUMNS} "
-                f"FROM messages WHERE session_id IN ({placeholders}) "
-                "AND active = 1 ORDER BY id",
-                tuple(session_ids),
-            )
-        ).fetchall()
+        async with self._read_ctx() as connection:
+            placeholders = ",".join("?" for _ in session_ids)
+            rows = await (
+                await connection.execute(
+                    f"SELECT session_id, {self._CONVERSATION_ROW_COLUMNS} "
+                    f"FROM messages WHERE session_id IN ({placeholders}) "
+                    "AND active = 1 ORDER BY id",
+                    tuple(session_ids),
+                )
+            ).fetchall()
         ancestor_rows = [r for r in rows if r["session_id"] != session_id]
         if not ancestor_rows:
             return []
@@ -6933,25 +7126,25 @@ class SessionDB:
         chain = []
         current = session_id
         seen = set()
-        connection = await self._get_connection()
-        for _ in range(100):
-            if not current or current in seen:
-                break
-            seen.add(current)
-            chain.append(current)
-            row = await (
-                await connection.execute(
-                    "SELECT parent_session_id FROM sessions WHERE id = ?",
-                    (current,),
+        async with self._read_ctx() as connection:
+            for _ in range(100):
+                if not current or current in seen:
+                    break
+                seen.add(current)
+                chain.append(current)
+                row = await (
+                    await connection.execute(
+                        "SELECT parent_session_id FROM sessions WHERE id = ?",
+                        (current,),
+                    )
+                ).fetchone()
+                if row is None:
+                    break
+                current = (
+                    row["parent_session_id"]
+                    if hasattr(row, "keys")
+                    else row[0]
                 )
-            ).fetchone()
-            if row is None:
-                break
-            current = (
-                row["parent_session_id"]
-                if hasattr(row, "keys")
-                else row[0]
-            )
         return list(reversed(chain)) or [session_id]
 
     async def find_live_compression_child(
@@ -7629,18 +7822,85 @@ class SessionDB:
 
     async def close(self) -> None:
         self._closed = True
-        connection = self._connection
-        self._connection = None
-        tracking_key = self._connection_tracking_key
-        self._connection_tracking_key = None
-        if connection is None:
-            return
-        try:
-            await _close_owned_connection(connection)
-        finally:
-            if tracking_key is not None:
-                remaining = _live_connection_counts.get(tracking_key, 1) - 1
-                if remaining > 0:
-                    _live_connection_counts[tracking_key] = remaining
-                else:
-                    _live_connection_counts.pop(tracking_key, None)
+        cleanup_task = asyncio.create_task(
+            self._close_owned(), name="session-db-close"
+        )
+        cancellation: asyncio.CancelledError | None = None
+        while True:
+            try:
+                await asyncio.shield(cleanup_task)
+                break
+            except asyncio.CancelledError as exc:  # noqa: ASYNC103
+                if cleanup_task.cancelled():
+                    raise
+                if cancellation is None:
+                    cancellation = exc
+            except Exception as exc:
+                if cancellation is not None:
+                    raise cancellation from exc
+                raise
+        if cancellation is not None:
+            raise cancellation
+
+    async def _close_owned(self) -> None:
+        async with self._get_write_lock():
+            async with self._get_read_connect_lock():
+                async with self._get_read_lock():
+                    read_connection = self._read_connection
+                    self._read_connection = None
+                    read_tracking_key = self._read_connection_tracking_key
+                    self._read_connection_tracking_key = None
+                    if read_connection is not None:
+                        try:
+                            await _close_owned_connection(read_connection)
+                        except Exception:
+                            logger.debug(
+                                "Read-only state.db connection close failed",
+                                exc_info=True,
+                            )
+                        finally:
+                            if read_tracking_key is not None:
+                                remaining = (
+                                    _live_connection_counts.get(
+                                        read_tracking_key, 1
+                                    )
+                                    - 1
+                                )
+                                if remaining > 0:
+                                    _live_connection_counts[
+                                        read_tracking_key
+                                    ] = remaining
+                                else:
+                                    _live_connection_counts.pop(
+                                        read_tracking_key, None
+                                    )
+
+            connection = self._connection
+            self._connection = None
+            tracking_key = self._connection_tracking_key
+            self._connection_tracking_key = None
+            if connection is None:
+                return
+            try:
+                if not self.read_only:
+                    try:
+                        cursor = await connection.execute(
+                            "PRAGMA wal_checkpoint(TRUNCATE)"
+                        )
+                        try:
+                            await cursor.fetchall()
+                        finally:
+                            await cursor.close()
+                    except Exception as exc:
+                        logger.debug(
+                            "WAL checkpoint (TRUNCATE) at close failed: %s",
+                            exc,
+                        )
+                await _close_owned_connection(connection)
+            finally:
+                if tracking_key is not None:
+                    remaining = _live_connection_counts.get(tracking_key, 1) - 1
+                    if remaining > 0:
+                        _live_connection_counts[tracking_key] = remaining
+                    else:
+                        _live_connection_counts.pop(tracking_key, None)
