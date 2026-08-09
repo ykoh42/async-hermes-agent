@@ -273,3 +273,22 @@ class TestFalKreaCatalog:
     def test_fal_krea_models_in_fal_catalog(self, image_tool):
         assert "fal-ai/krea/v2/medium/text-to-image" in image_tool.FAL_MODELS
         assert "fal-ai/krea/v2/large/text-to-image" in image_tool.FAL_MODELS
+
+    @pytest.mark.parametrize(
+        "model_id",
+        [
+            "krea-2-medium",
+            "krea-2-large",
+            "krea-2-medium-turbo",
+            " krea-2-medium ",
+        ],
+    )
+    def test_native_krea_model_detection(self, image_tool, model_id):
+        assert image_tool.is_krea_model(model_id) is True
+
+    @pytest.mark.parametrize(
+        "model_id",
+        [None, "", "fal-ai/krea/v2/medium/text-to-image"],
+    )
+    def test_non_native_krea_model_detection(self, image_tool, model_id):
+        assert image_tool.is_krea_model(model_id) is False

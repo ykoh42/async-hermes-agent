@@ -61,6 +61,18 @@ from tools.tool_backend_helpers import fal_key_is_configured
 logger = logging.getLogger(__name__)
 
 
+_KREA_NATIVE_MODELS = {
+    "krea-2-medium",
+    "krea-2-large",
+    "krea-2-medium-turbo",
+}
+
+
+def is_krea_model(model_id: Optional[str]) -> bool:
+    """Return whether *model_id* is a native Krea provider model."""
+    return isinstance(model_id, str) and model_id.strip() in _KREA_NATIVE_MODELS
+
+
 # ---------------------------------------------------------------------------
 # FAL model catalog
 # ---------------------------------------------------------------------------
