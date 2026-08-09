@@ -6,6 +6,7 @@ import asyncio
 from copy import deepcopy
 from datetime import date, datetime, timezone
 import hashlib
+import inspect
 import json
 import logging
 import os
@@ -173,6 +174,81 @@ def _build_session_scope(filters: dict[str, Any]) -> str:
     return "&".join(parts)
 
 
+def _vector_rows(listed: Any) -> list[Any]:
+    if (
+        isinstance(listed, (list, tuple))
+        and listed
+        and isinstance(listed[0], (list, tuple))
+    ):
+        return list(listed[0])
+    if isinstance(listed, (list, tuple)):
+        return list(listed)
+    return []
+
+
+def _validate_top_k(top_k: Any) -> int:
+    if not isinstance(top_k, int) or isinstance(top_k, bool):
+        raise ValueError("top_k must be a valid integer")
+    if top_k < 0:
+        raise ValueError(
+            f"Invalid top_k: {top_k}. Must be a non-negative integer."
+        )
+    return top_k
+
+
+def _reject_top_level_entity_parameters(
+    kwargs: dict[str, Any],
+    method_name: str,
+) -> None:
+    invalid = {"user_id", "agent_id", "run_id"} & kwargs.keys()
+    if invalid:
+        raise ValueError(
+            f"Top-level entity parameters {invalid} are not supported in "
+            f"{method_name}(). Use filters={{'user_id': '...'}} instead."
+        )
+
+
+def _memory_item(memory: Any, *, include_score: bool) -> dict[str, Any]:
+    payload = memory.payload
+    item: dict[str, Any] = {
+        "id": str(memory.id),
+        "memory": payload.get("data", ""),
+        "hash": payload.get("hash"),
+        "metadata": None,
+    }
+    if include_score:
+        item["score"] = None
+    item["created_at"] = payload.get("created_at")
+    item["updated_at"] = payload.get("updated_at")
+    for key in _PROMOTED_PAYLOAD_KEYS:
+        if key in payload:
+            item[key] = payload[key]
+    additional_metadata = {
+        key: value
+        for key, value in payload.items()
+        if key not in _CORE_PAYLOAD_KEYS
+    }
+    if additional_metadata:
+        item["metadata"] = additional_metadata
+    return item
+
+
+class _NativeOSSProject:
+    async def update(
+        self,
+        custom_instructions: str | None = None,  # noqa: ARG002
+        custom_categories: list[Any] | None = None,  # noqa: ARG002
+        retrieval_criteria: list[Any] | None = None,  # noqa: ARG002
+        multilingual: bool | None = None,  # noqa: ARG002
+        decay: bool | None = None,
+    ) -> None:
+        if decay is True:
+            raise ValueError(
+                "The decay parameter is not supported by the OSS Memory SDK."
+            )
+        raise ValueError("Project updates are not supported by the OSS Memory SDK.")
+
+
 async def _describe_image(
     image: str | dict[str, Any],
     llm: Any,
@@ -275,6 +351,20 @@ class Memory:
         self._closed = False
         self.api_version = self.config.get("version", "v1.1")
         self.custom_instructions = self.config.get("custom_instructions")
+
+    @property
+    def project(self) -> _NativeOSSProject:
+        return _NativeOSSProject()
+
+    @classmethod
+    async def from_config(cls, config_dict: dict[str, Any]) -> Memory:
+        memory = cls(config_dict)
+        try:
+            await memory.initialize()
+        except BaseException:
+            await memory.close()
+            raise
+        return memory
 
     async def initialize(self) -> None:
         if self._closed:
@@ -399,6 +489,7 @@ class Memory:
         self,
         messages: list[dict[str, Any]],
         metadata: dict[str, Any] | None = None,
+        llm: Any = None,
         prompt: str | None = None,
     ) -> dict[str, list[dict[str, str]]]:
         logger.info("Creating procedural memory")
@@ -414,9 +505,19 @@ class Memory:
             },
         ]
         try:
-            procedural_memory = await self.llm.generate_response(
-                messages=parsed_messages
-            )
+            if llm is None:
+                procedural_memory = await self.llm.generate_response(
+                    messages=parsed_messages
+                )
+            else:
+                ainvoke = getattr(llm, "ainvoke", None)
+                if not inspect.iscoroutinefunction(ainvoke):
+                    raise TypeError(
+                        "Procedural memory LLM override must provide native "
+                        "async ainvoke()."
+                    )
+                response = await ainvoke(input=parsed_messages)
+                procedural_memory = response.content
             procedural_memory = _remove_code_blocks(procedural_memory)
         except Exception as exc:
             logger.error("Error generating procedural memory summary: %s", exc)
@@ -656,6 +757,7 @@ class Memory:
         infer: bool = True,
         memory_type: str | None = None,
         prompt: str | None = None,
+        llm: Any = None,
     ) -> dict[str, Any]:
         await self.initialize()
         if timestamp is not None:
@@ -699,6 +801,7 @@ class Memory:
             return await self._create_procedural_memory(
                 normalized_messages,
                 metadata=base_metadata,
+                llm=llm,
                 prompt=prompt,
             )
         llm_config = (self.config.get("llm") or {}).get("config") or {}
@@ -759,6 +862,54 @@ class Memory:
             )
         return {"results": returned_memories}
 
+    async def get(self, memory_id: str) -> dict[str, Any] | None:
+        await self.initialize()
+        memory = await self.vector_store.get(memory_id)
+        if memory is None:
+            return None
+        return _memory_item(memory, include_score=True)
+
+    async def get_all(
+        self,
+        *,
+        filters: dict[str, Any] | None = None,
+        top_k: int = 20,
+        show_expired: bool = False,
+        **kwargs: Any,
+    ) -> dict[str, list[dict[str, Any]]]:
+        await self.initialize()
+        _reject_top_level_entity_parameters(kwargs, "get_all")
+        limit = _validate_top_k(top_k)
+        effective_filters = dict(filters) if filters else {}
+        for key in ("user_id", "agent_id", "run_id"):
+            if key in effective_filters:
+                effective_filters[key] = _validate_entity_id(
+                    effective_filters[key],
+                    key,
+                )
+        if not any(
+            key in effective_filters
+            for key in ("user_id", "agent_id", "run_id")
+        ):
+            raise ValueError(
+                "filters must contain at least one of: user_id, agent_id, "
+                "run_id. Example: filters={'user_id': 'u1'}"
+            )
+
+        fetch_limit = limit if show_expired else max(limit * 4, 60)
+        listed = await self.vector_store.list(
+            filters=effective_filters,
+            top_k=fetch_limit,
+        )
+        results = []
+        for memory in _vector_rows(listed):
+            if not show_expired and _is_expired(memory.payload):
+                continue
+            results.append(_memory_item(memory, include_score=False))
+            if len(results) >= limit:
+                break
+        return {"results": results}
+
     async def search(
         self,
         query: str,
@@ -777,12 +928,7 @@ class Memory:
             raise ValueError(
                 "The reference_date parameter is not supported by the OSS Memory SDK."
             )
-        invalid_entity_parameters = {"user_id", "agent_id", "run_id"} & kwargs.keys()
-        if invalid_entity_parameters:
-            raise ValueError(
-                f"Top-level entity parameters {invalid_entity_parameters} are not "
-                "supported in search(). Use filters={'user_id': '...'} instead."
-            )
+        _reject_top_level_entity_parameters(kwargs, "search")
         if threshold is not None:
             if not isinstance(threshold, (int, float)):
                 raise ValueError("threshold must be a valid number")
@@ -791,12 +937,7 @@ class Memory:
                     f"Invalid threshold: {threshold}. Must be between 0 and 1 "
                     "(inclusive)."
                 )
-        if not isinstance(top_k, int) or isinstance(top_k, bool):
-            raise ValueError("top_k must be a valid integer")
-        if top_k < 0:
-            raise ValueError(
-                f"Invalid top_k: {top_k}. Must be a non-negative integer."
-            )
+        top_k = _validate_top_k(top_k)
         query = _validate_query(query)
         if threshold is None:
             threshold = 0.1
@@ -966,11 +1107,20 @@ class Memory:
             await self.entities.link_memory(memory_id, data, session_filters)
         return {"message": "Memory updated successfully!"}
 
-    async def delete(self, memory_id: str) -> dict[str, str]:
-        await self.initialize()
-        existing = await self.vector_store.get(memory_id)
+    async def _delete_memory(
+        self,
+        memory_id: str,
+        existing: Any = None,
+        *,
+        skip_entity_cleanup: bool = False,
+    ) -> str:
         if existing is None:
-            raise ValueError(f"Memory with id {memory_id} not found")
+            existing = await self.vector_store.get(memory_id)
+        if existing is None:
+            raise ValueError(
+                f"Memory with id {memory_id} not found. Please provide a "
+                "valid 'memory_id'"
+            )
         payload = existing.payload or {}
         await self.vector_store.delete(memory_id)
         await self.db.add_history(
@@ -989,8 +1139,99 @@ class Memory:
             for key in ("user_id", "agent_id", "run_id")
             if payload.get(key)
         }
-        await self.entities.remove_memory(memory_id, session_filters)
+        if not skip_entity_cleanup:
+            await self.entities.remove_memory(memory_id, session_filters)
+        return memory_id
+
+    async def delete(self, memory_id: str) -> dict[str, str]:
+        await self.initialize()
+        await self._delete_memory(memory_id)
         return {"message": "Memory deleted successfully!"}
+
+    async def delete_all(
+        self,
+        user_id: str | None = None,
+        agent_id: str | None = None,
+        run_id: str | None = None,
+    ) -> dict[str, str]:
+        await self.initialize()
+        user_id = _validate_entity_id(user_id, "user_id")
+        agent_id = _validate_entity_id(agent_id, "agent_id")
+        run_id = _validate_entity_id(run_id, "run_id")
+        filters = {
+            key: value
+            for key, value in (
+                ("user_id", user_id),
+                ("agent_id", agent_id),
+                ("run_id", run_id),
+            )
+            if value
+        }
+        if not filters:
+            raise ValueError(
+                "At least one filter is required to delete all memories. If "
+                "you want to delete all memories, use the `reset()` method."
+            )
+
+        listed = await self.vector_store.list(filters=filters)
+        rows = _vector_rows(listed)
+        results = await asyncio.gather(
+            *(
+                self._delete_memory(
+                    str(memory.id),
+                    skip_entity_cleanup=True,
+                )
+                for memory in rows
+            ),
+            return_exceptions=True,
+        )
+        await self.entities.clear_scope(filters)
+        errors = [result for result in results if isinstance(result, BaseException)]
+        if errors:
+            logger.warning(
+                "Failed to delete %d out of %d memories",
+                len(errors),
+                len(results),
+            )
+            for error in errors:
+                logger.warning("Delete error: %s", error)
+        logger.info("Deleted %d memories", len(results) - len(errors))
+        return {"message": "Memories deleted successfully!"}
+
+    async def history(self, memory_id: str) -> list[dict[str, Any]]:
+        await self.initialize()
+        return await self.db.get_history(memory_id)
+
+    async def reset(self) -> None:
+        await self.initialize()
+        logger.warning("Resetting all memories")
+        await self.vector_store.reset()
+
+        database = self.db
+        await database.reset()
+        await database.close()
+        history_path = self.config.get("history_db_path")
+        if not history_path:
+            mem0_dir = os.getenv("MEM0_DIR") or os.path.join(
+                os.path.expanduser("~"),
+                ".mem0",
+            )
+            history_path = os.path.join(mem0_dir, "history.db")
+        replacement = SQLiteManager(os.path.expanduser(str(history_path)))
+        try:
+            await replacement._initialize()
+        except BaseException:
+            await replacement.close()
+            raise
+        self.db = replacement
+
+        try:
+            await self.entities.reset()
+        except Exception as exc:
+            logger.warning("Failed to reset entity store: %s", exc)
+
+    async def chat(self, query: Any) -> None:  # noqa: ARG002
+        raise NotImplementedError("Chat function not implemented yet.")
 
     async def _get_entity_store(self) -> Any:
         await self.initialize()

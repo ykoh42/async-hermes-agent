@@ -106,6 +106,9 @@ class _FakeVector:
     async def _initialize(self):
         self.calls.append(("initialize",))
 
+    async def _get_client(self):
+        return self
+
     async def insert(self, vectors, payloads=None, ids=None):
         self.calls.append(("insert", vectors, payloads, ids))
         if self.insert_failures:
@@ -166,6 +169,10 @@ class _FakeVector:
         self.calls.append(("delete", vector_id))
         self.rows.pop(vector_id)
 
+    async def reset(self):
+        self.calls.append(("reset",))
+        self.rows.clear()
+
     async def close(self):
         self.closed = True
 
@@ -196,12 +203,20 @@ class _FakeDB:
         if self.batch_history_exception is not None:
             raise self.batch_history_exception
 
+    async def get_history(self, memory_id):
+        return [row for row in self.history if row[0] == memory_id]
+
     async def get_last_messages(self, session_scope, limit=10):
         assert limit == 10
         return list(self.last_messages)
 
     async def save_messages(self, messages, session_scope):
         self.saved_messages.append((messages, session_scope))
+
+    async def reset(self):
+        self.history.clear()
+        self.last_messages.clear()
+        self.saved_messages.clear()
 
     async def close(self):
         self.closed = True
@@ -945,6 +960,242 @@ async def test_procedural_memory_preserves_cancellation_without_write(tmp_path):
 
     assert _FakeVector.instances[0].rows == {}
     assert _FakeDB.instances[0].history == [("initialize",)]
+    await memory.close()
+
+
+@pytest.mark.asyncio
+async def test_memory_get_and_get_all_preserve_upstream_shapes(tmp_path):
+    memory = Memory(_config(tmp_path))
+    active = await memory.add(
+        "active memory",
+        user_id="u1",
+        metadata={"source": "trajectory"},
+        infer=False,
+    )
+    expired = await memory.add(
+        "expired memory",
+        user_id="u1",
+        expiration_date="2020-01-01",
+        infer=False,
+    )
+    active_id = active["results"][0]["id"]
+    expired_id = expired["results"][0]["id"]
+    payload = _FakeVector.instances[0].rows[active_id].payload
+
+    result = await memory.get(active_id)
+    missing = await memory.get("missing")
+    visible = await memory.get_all(filters={"user_id": " u1 "})
+    all_results = await memory.get_all(
+        filters={"user_id": "u1"},
+        show_expired=True,
+    )
+
+    assert result == {
+        "id": active_id,
+        "memory": "active memory",
+        "hash": payload["hash"],
+        "metadata": {"source": "trajectory"},
+        "score": None,
+        "created_at": payload["created_at"],
+        "updated_at": payload["updated_at"],
+        "user_id": "u1",
+        "role": "user",
+    }
+    assert missing is None
+    assert [item["id"] for item in visible["results"]] == [active_id]
+    assert "score" not in visible["results"][0]
+    assert {item["id"] for item in all_results["results"]} == {
+        active_id,
+        expired_id,
+    }
+    assert _FakeVector.instances[0].calls[-2:] == [
+        ("list", {"user_id": "u1"}, 80),
+        ("list", {"user_id": "u1"}, 20),
+    ]
+    await memory.close()
+
+
+@pytest.mark.asyncio
+async def test_memory_get_all_preserves_upstream_validation(tmp_path):
+    memory = Memory(_config(tmp_path))
+
+    with pytest.raises(ValueError, match="Top-level entity parameters"):
+        await memory.get_all(filters={"user_id": "u1"}, agent_id="a1")
+    with pytest.raises(ValueError, match="top_k must be a valid integer"):
+        await memory.get_all(filters={"user_id": "u1"}, top_k=True)
+    with pytest.raises(ValueError, match="Must be a non-negative integer"):
+        await memory.get_all(filters={"user_id": "u1"}, top_k=-1)
+    with pytest.raises(ValueError, match="filters must contain at least one"):
+        await memory.get_all(filters={"source": "trajectory"})
+
+    await memory.close()
+
+
+@pytest.mark.asyncio
+async def test_memory_delete_all_and_history_preserve_upstream_contract(tmp_path):
+    memory = Memory(_config(tmp_path))
+    first = await memory.add("first", user_id="u1", infer=False)
+    second = await memory.add("second", user_id="u1", infer=False)
+    retained = await memory.add("retained", user_id="u2", infer=False)
+    first_id = first["results"][0]["id"]
+    second_id = second["results"][0]["id"]
+    retained_id = retained["results"][0]["id"]
+
+    result = await memory.delete_all(user_id=" u1 ")
+
+    assert result == {"message": "Memories deleted successfully!"}
+    assert set(_FakeVector.instances[0].rows) == {retained_id}
+    assert [entry[3] for entry in await memory.history(first_id)] == [
+        "ADD",
+        "DELETE",
+    ]
+    assert [entry[3] for entry in await memory.history(second_id)] == [
+        "ADD",
+        "DELETE",
+    ]
+    with pytest.raises(ValueError, match="At least one filter is required"):
+        await memory.delete_all()
+
+    await memory.close()
+
+
+@pytest.mark.asyncio
+async def test_memory_delete_all_preserves_external_cancellation(tmp_path):
+    memory = Memory(_config(tmp_path))
+    await memory.add("first", user_id="u1", infer=False)
+    await memory.add("second", user_id="u1", infer=False)
+    vector = _FakeVector.instances[0]
+    started = asyncio.Event()
+
+    async def cancelled_delete(vector_id):
+        started.set()
+        await asyncio.Future()
+
+    vector.delete = cancelled_delete
+    task = asyncio.create_task(memory.delete_all(user_id="u1"))
+    await started.wait()
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert len(vector.rows) == 2
+    assert not any(
+        len(row) > 3 and row[3] == "DELETE"
+        for row in _FakeDB.instances[0].history
+    )
+    await memory.close()
+
+
+@pytest.mark.asyncio
+async def test_memory_reset_clears_all_stores_and_remains_usable(tmp_path):
+    memory = Memory(_config(tmp_path))
+    await memory.add("before reset", user_id="u1", infer=False)
+    entity_store = await memory._get_entity_store()
+    entity_store.rows["entity"] = SimpleNamespace(
+        id="entity",
+        payload={"data": "before", "user_id": "u1"},
+    )
+    original_db = _FakeDB.instances[0]
+
+    result = await memory.reset()
+    after = await memory.add("after reset", user_id="u1", infer=False)
+
+    assert result is None
+    assert original_db.closed is True
+    assert memory.db is _FakeDB.instances[1]
+    assert _FakeVector.instances[0].calls.count(("reset",)) == 1
+    assert entity_store.calls.count(("reset",)) == 1
+    assert entity_store.closed is True
+    assert after["results"][0]["memory"] == "after reset"
+    assert len(_FakeVector.instances[0].rows) == 1
+    assert await memory.history(after["results"][0]["id"])
+    await memory.close()
+
+
+@pytest.mark.asyncio
+async def test_memory_reset_cancellation_closes_partial_replacement(
+    monkeypatch,
+    tmp_path,
+):
+    memory = Memory(_config(tmp_path))
+    await memory.initialize()
+    original_db = _FakeDB.instances[0]
+    replacement_started = asyncio.Event()
+
+    async def cancelled_initialize(database):
+        replacement_started.set()
+        await asyncio.Future()
+
+    monkeypatch.setattr(_FakeDB, "_initialize", cancelled_initialize)
+    task = asyncio.create_task(memory.reset())
+    await replacement_started.wait()
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert original_db.closed is True
+    assert _FakeDB.instances[1].closed is True
+    await memory.close()
+
+
+@pytest.mark.asyncio
+async def test_memory_project_chat_and_from_config_match_async_surface(tmp_path):
+    memory = await Memory.from_config(_config(tmp_path))
+
+    assert memory._initialized is True
+
+    with pytest.raises(
+        ValueError,
+        match="Project updates are not supported by the OSS Memory SDK",
+    ):
+        await memory.project.update()
+    with pytest.raises(
+        ValueError,
+        match="decay parameter is not supported by the OSS Memory SDK",
+    ):
+        await memory.project.update(decay=True)
+    with pytest.raises(NotImplementedError, match="Chat function not implemented"):
+        await memory.chat("hello")
+
+    await memory.close()
+
+
+@pytest.mark.asyncio
+async def test_procedural_memory_accepts_only_native_async_llm_override(tmp_path):
+    class _ExternalLLM:
+        def __init__(self):
+            self.calls = []
+
+        async def ainvoke(self, **kwargs):
+            self.calls.append(kwargs)
+            return SimpleNamespace(content="```markdown\nexternal summary\n```")
+
+    external = _ExternalLLM()
+    memory = Memory(_config(tmp_path))
+
+    result = await memory.add(
+        "step",
+        agent_id="a1",
+        memory_type="procedural_memory",
+        llm=external,
+    )
+
+    assert result["results"][0]["memory"] == "external summary"
+    assert external.calls[0]["input"][-1] == {
+        "role": "user",
+        "content": "Create procedural memory of the above conversation.",
+    }
+    assert _FakeLLM.instances[0].calls == []
+
+    with pytest.raises(TypeError, match="native async ainvoke"):
+        await memory.add(
+            "sync step",
+            agent_id="a1",
+            memory_type="procedural_memory",
+            llm=SimpleNamespace(invoke=lambda **kwargs: None),
+        )
     await memory.close()
 
 

@@ -347,6 +347,86 @@ async def test_procedural_memory_runs_through_embedded_qdrant_and_history(
     await memory.close()
 
 
+@pytest.mark.asyncio
+async def test_memory_management_operations_run_through_embedded_qdrant(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setattr(_native_memory, "OpenAIEmbedding", _Embedding)
+    monkeypatch.setattr(_native_memory, "OpenAILLM", _LLM)
+    memory = Memory(
+        {
+            "embedder": {"provider": "openai", "config": {}},
+            "llm": {"provider": "openai", "config": {}},
+            "vector_store": {
+                "provider": "qdrant",
+                "config": {
+                    "path": str(tmp_path / "qdrant"),
+                    "collection_name": "mem0",
+                    "embedding_model_dims": 2,
+                },
+            },
+            "history_db_path": str(tmp_path / "history.db"),
+            "version": "v1.1",
+        }
+    )
+    blocker = BlockBuster()
+    blocker.activate()
+    try:
+        active = await memory.add(
+            "active",
+            user_id="u1",
+            metadata={"source": "trajectory"},
+            infer=False,
+        )
+        expired = await memory.add(
+            "expired",
+            user_id="u1",
+            expiration_date="2020-01-01",
+            infer=False,
+        )
+        retained = await memory.add("retained", user_id="u2", infer=False)
+        active_id = active["results"][0]["id"]
+        expired_id = expired["results"][0]["id"]
+        retained_id = retained["results"][0]["id"]
+
+        assert (await memory.get(active_id))["metadata"] == {
+            "source": "trajectory"
+        }
+        assert [
+            item["id"]
+            for item in (
+                await memory.get_all(filters={"user_id": "u1"})
+            )["results"]
+        ] == [active_id]
+        assert {
+            item["id"]
+            for item in (
+                await memory.get_all(
+                    filters={"user_id": "u1"},
+                    show_expired=True,
+                )
+            )["results"]
+        } == {active_id, expired_id}
+        assert (await memory.history(active_id))[0]["event"] == "ADD"
+
+        assert await memory.delete_all(user_id="u1") == {
+            "message": "Memories deleted successfully!"
+        }
+        assert await memory.get(active_id) is None
+        assert await memory.get(expired_id) is None
+        assert await memory.get(retained_id) is not None
+
+        await memory.reset()
+        assert await memory.get(retained_id) is None
+        assert await memory.history(retained_id) == []
+        after = await memory.add("after reset", user_id="u2", infer=False)
+        assert await memory.get(after["results"][0]["id"])
+    finally:
+        blocker.deactivate()
+        await memory.close()
+
+
 def test_embedded_qdrant_worker_path_is_installed_and_absolute():
     worker = Path(_native_local_qdrant.__file__).with_name(
         "_local_qdrant_worker.py"

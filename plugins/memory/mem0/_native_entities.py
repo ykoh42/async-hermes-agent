@@ -340,6 +340,27 @@ class NativeEntities:
                 exc,
             )
 
+    async def clear_scope(self, filters: dict[str, Any]) -> None:
+        """Delete entity records for one upstream identity scope."""
+        if self._store is None:
+            return
+        try:
+            listed = await self._store.list(
+                filters=_scope(filters),
+                top_k=10000,
+            )
+            for row in _rows(listed):
+                try:
+                    await self._store.delete(row.id)
+                except Exception as exc:
+                    logger.debug(
+                        "Bulk entity delete failed for id=%s: %s",
+                        row.id,
+                        exc,
+                    )
+        except Exception as exc:
+            logger.warning("Bulk entity store cleanup failed: %s", exc)
+
     async def boosts(
         self,
         query_entities: list[tuple[str, str]],
@@ -423,3 +444,16 @@ class NativeEntities:
             self._store = None
             if store is not None:
                 await store.close()
+
+    async def reset(self) -> None:
+        async with self._initialize_lock:
+            if self._closed:
+                raise RuntimeError("Cannot reset a closed Mem0 entity store")
+            store = self._store
+            self._store = None
+        if store is None:
+            return
+        try:
+            await store.reset()
+        finally:
+            await store.close()
