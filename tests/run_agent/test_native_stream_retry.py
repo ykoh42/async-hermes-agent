@@ -18,7 +18,9 @@ from hermes_constants import PARTIAL_STREAM_STUB_ID
 def _retry_agent(execute):
     return SimpleNamespace(
         _execute_model_request=execute,
+        api_mode="chat_completions",
         _provider_stale_timeout=0.1,
+        _provider_request_timeout=None,
         _consecutive_stale_streams=0,
         _current_streamed_assistant_text="",
         _current_stream_partial_tool_names=[],
@@ -404,3 +406,96 @@ async def test_stale_watchdog_preserves_upstream_status_diagnostics(monkeypatch)
         "stale stream detected" in call.args[0]
         for call in agent._touch_activity.call_args_list
     )
+
+
+@pytest.mark.asyncio
+async def test_chat_stream_applies_upstream_split_timeout_policy(monkeypatch, caplog):
+    monkeypatch.delenv("HERMES_API_TIMEOUT", raising=False)
+    monkeypatch.delenv("HERMES_STREAM_READ_TIMEOUT", raising=False)
+    caplog.set_level("DEBUG", logger="agent.chat_completion_helpers")
+    response = object()
+    execute = AsyncMock(return_value=response)
+    agent = _retry_agent(execute)
+    agent._provider_stale_timeout = 180.0
+    payload = {"model": "test-model", "timeout": 7.0}
+
+    assert await interruptible_streaming_api_call(agent, payload) is response
+
+    request = execute.await_args.args[0]
+    timeout = request["timeout"]
+    assert timeout.connect == 30.0
+    assert timeout.read == 180.0
+    assert timeout.write == 1800.0
+    assert timeout.pool == 30.0
+    assert payload["timeout"] == 7.0
+    assert (
+        "Cloud reasoning stream — read timeout raised to 180s to match "
+        "stale-stream detector" in caplog.messages
+    )
+
+
+@pytest.mark.asyncio
+async def test_provider_timeout_wins_for_all_stream_timeout_axes(monkeypatch):
+    monkeypatch.setenv("HERMES_STREAM_READ_TIMEOUT", "12")
+    response = object()
+    execute = AsyncMock(return_value=response)
+    agent = _retry_agent(execute)
+    agent._provider_request_timeout = 77.0
+    agent._provider_stale_timeout = 180.0
+
+    assert await interruptible_streaming_api_call(agent, {}) is response
+
+    timeout = execute.await_args.args[0]["timeout"]
+    assert timeout.connect == 60.0
+    assert timeout.read == 77.0
+    assert timeout.write == 77.0
+    assert timeout.pool == 60.0
+
+
+@pytest.mark.asyncio
+async def test_explicit_stream_read_timeout_is_not_floored(monkeypatch):
+    monkeypatch.setenv("HERMES_STREAM_READ_TIMEOUT", "90")
+    response = object()
+    execute = AsyncMock(return_value=response)
+    agent = _retry_agent(execute)
+    agent._provider_stale_timeout = 180.0
+
+    assert await interruptible_streaming_api_call(agent, {}) is response
+
+    timeout = execute.await_args.args[0]["timeout"]
+    assert timeout.read == 90.0
+
+
+@pytest.mark.asyncio
+async def test_local_stream_read_timeout_uses_api_timeout(monkeypatch, caplog):
+    monkeypatch.setenv("HERMES_API_TIMEOUT", "321")
+    monkeypatch.delenv("HERMES_STREAM_READ_TIMEOUT", raising=False)
+    caplog.set_level("DEBUG", logger="agent.chat_completion_helpers")
+    response = object()
+    execute = AsyncMock(return_value=response)
+    agent = _retry_agent(execute)
+    agent.base_url = "http://127.0.0.1:11434/v1"
+    agent._provider_stale_timeout = 900.0
+
+    assert await interruptible_streaming_api_call(agent, {}) is response
+
+    timeout = execute.await_args.args[0]["timeout"]
+    assert timeout.read == 321.0
+    assert timeout.write == 321.0
+    assert (
+        "Local provider detected (http://127.0.0.1:11434/v1) — stream read "
+        "timeout raised to 321s" in caplog.messages
+    )
+
+
+@pytest.mark.asyncio
+async def test_non_openai_stream_keeps_transport_timeout_payload():
+    response = object()
+    execute = AsyncMock(return_value=response)
+    agent = _retry_agent(execute)
+    agent.api_mode = "anthropic_messages"
+    payload = {"timeout": "transport-owned"}
+
+    assert await interruptible_streaming_api_call(agent, payload) is response
+
+    assert execute.await_args.args[0] is payload

@@ -566,6 +566,51 @@ async def _finish_stream_heartbeat(task: asyncio.Task[Any]) -> None:
         raise cancellation
 
 
+def _stream_request_timeout(agent: Any, stale_timeout: float) -> Any:
+    """Build upstream's OpenAI-wire connect/read/write/pool timeout policy."""
+    import httpx
+
+    configured_timeout = getattr(agent, "_provider_request_timeout", None)
+    base_timeout = (
+        configured_timeout
+        if configured_timeout is not None
+        else env_float("HERMES_API_TIMEOUT", 1800.0)
+    )
+    if configured_timeout is not None:
+        read_timeout = configured_timeout
+        connection_timeout = min(base_timeout, 60.0)
+    else:
+        read_timeout = env_float("HERMES_STREAM_READ_TIMEOUT", 120.0)
+        if read_timeout == 120.0 and getattr(agent, "base_url", None):
+            from agent.model_metadata import is_local_endpoint
+
+            if is_local_endpoint(agent.base_url):
+                read_timeout = base_timeout
+                logger.debug(
+                    "Local provider detected (%s) — stream read timeout raised to %.0fs",
+                    agent.base_url,
+                    read_timeout,
+                )
+        if (
+            read_timeout == 120.0
+            and math.isfinite(stale_timeout)
+            and stale_timeout > read_timeout
+        ):
+            read_timeout = stale_timeout
+            logger.debug(
+                "Cloud reasoning stream — read timeout raised to %.0fs to "
+                "match stale-stream detector",
+                read_timeout,
+            )
+        connection_timeout = 30.0
+    return httpx.Timeout(
+        connect=connection_timeout,
+        read=read_timeout,
+        write=base_timeout,
+        pool=connection_timeout,
+    )
+
+
 async def interruptible_streaming_api_call(
     agent: Any,
     api_kwargs: dict,
@@ -636,11 +681,18 @@ async def interruptible_streaming_api_call(
             _heartbeat(),
             name=f"provider-stream-heartbeat-{stream_attempt + 1}",
         )
+        attempt_api_kwargs = api_kwargs
+        if getattr(agent, "api_mode", None) == "chat_completions":
+            attempt_api_kwargs = dict(api_kwargs)
+            attempt_api_kwargs["timeout"] = _stream_request_timeout(
+                agent,
+                timeout,
+            )
         try:
             try:
                 async with timeout_scope:
                     response = await agent._execute_model_request(
-                        api_kwargs,
+                        attempt_api_kwargs,
                         use_streaming=True,
                         on_first_delta=on_first_delta,
                         on_stream_activity=_note_stream_activity,
