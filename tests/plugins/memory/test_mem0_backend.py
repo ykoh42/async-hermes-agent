@@ -417,6 +417,66 @@ async def test_oss_backend_uses_async_memory_v2_signatures():
 
 
 @pytest.mark.asyncio
+async def test_oss_backend_close_delegates_to_native_memory_close():
+    class FakeMemory:
+        def __init__(self):
+            self.closed = False
+
+        async def close(self):
+            self.closed = True
+
+    memory = FakeMemory()
+    backend = OSSBackend.__new__(OSSBackend)
+    backend._memory = memory
+
+    await backend.close()
+
+    assert memory.closed is True
+    assert backend._memory is None
+
+
+@pytest.mark.asyncio
+async def test_oss_backend_close_rejects_sync_memory_close_without_calling_it():
+    class SyncMemory:
+        def __init__(self):
+            self.close_called = False
+
+        def close(self):
+            self.close_called = True
+
+    memory = SyncMemory()
+    backend = OSSBackend.__new__(OSSBackend)
+    backend._memory = memory
+
+    with pytest.raises(RuntimeError, match="native-async close"):
+        await backend.close()
+
+    assert memory.close_called is False
+    assert backend._memory is None
+
+
+@pytest.mark.asyncio
+async def test_oss_backend_close_preserves_cancellation():
+    entered = asyncio.Event()
+
+    class FakeMemory:
+        async def close(self):
+            entered.set()
+            await asyncio.Event().wait()
+
+    backend = OSSBackend.__new__(OSSBackend)
+    backend._memory = FakeMemory()
+    task = asyncio.create_task(backend.close())
+    await entered.wait()
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert backend._memory is None
+
+
+@pytest.mark.asyncio
 async def test_http_backends_never_call_asyncio_to_thread(monkeypatch):
     async def forbidden(*args, **kwargs):
         raise AssertionError("asyncio.to_thread must not be used")

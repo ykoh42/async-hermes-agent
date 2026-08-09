@@ -6,6 +6,7 @@ from abc import ABC, abstractmethod
 import asyncio
 import hashlib
 import importlib
+import inspect
 from typing import Any
 
 import httpx
@@ -577,6 +578,14 @@ class OSSBackend(Mem0Backend):
             return
         memory = self._memory
         self._memory = None
+        close = getattr(memory, "close", None)
+        if callable(close):
+            if not inspect.iscoroutinefunction(close):
+                raise RuntimeError(
+                    "Mem0 OSS runtime does not provide a native-async close()."
+                )
+            await close()
+            return
         vector_store = getattr(memory, "vector_store", None)
         client = getattr(vector_store, "client", None)
         aclose = getattr(client, "aclose", None)
