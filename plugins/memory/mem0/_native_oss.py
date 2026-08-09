@@ -166,6 +166,115 @@ class OpenAIEmbedding:
                 )
 
 
+class OllamaEmbedding:
+    """Native-async equivalent of Mem0 2.0.10's Ollama embedder."""
+
+    def __init__(self, config: dict[str, Any] | None = None) -> None:
+        self.config = dict(config or {})
+        self.model = self.config.get("model") or "nomic-embed-text"
+        self.embedding_dims = self.config.get("embedding_dims") or 512
+        self._client: Any = None
+        self._initialize_lock = asyncio.Lock()
+        self._closed = False
+
+    @staticmethod
+    def _normalize_model_name(name: str) -> str:
+        return name if ":" in name else f"{name}:latest"
+
+    @staticmethod
+    def _response_value(response: Any, key: str, default: Any = None) -> Any:
+        if isinstance(response, dict):
+            return response.get(key, default)
+        return getattr(response, key, default)
+
+    async def _get_client(self) -> Any:
+        if self._client is not None:
+            return self._client
+        async with self._initialize_lock:
+            if self._client is not None:
+                return self._client
+            if self._closed:
+                raise RuntimeError("Cannot use a closed OllamaEmbedding")
+
+            try:
+                from ollama import AsyncClient
+            except ImportError as exc:
+                raise ImportError(
+                    "The 'ollama' library is required. Install the mem0 extra."
+                ) from exc
+
+            client = AsyncClient(host=self.config.get("ollama_base_url"))
+            try:
+                response = await client.list()
+                models = self._response_value(response, "models", []) or []
+                target = self._normalize_model_name(self.model)
+                found = False
+                for model in models:
+                    name = self._response_value(model, "name", "") or self._response_value(
+                        model, "model", ""
+                    )
+                    if name and self._normalize_model_name(name) == target:
+                        found = True
+                        break
+                if not found:
+                    await client.pull(self.model)
+            except BaseException:
+                try:
+                    await _finish_cleanup(
+                        client.close(),
+                        error_message=(
+                            "Mem0 Ollama embedder cleanup failed during initialization "
+                            "cancellation"
+                        ),
+                    )
+                except Exception:
+                    logger.exception("Failed to close Mem0 Ollama embedder client")
+                raise
+
+            self._client = client
+            return client
+
+    async def embed(
+        self, text: str, memory_action: str | None = None  # noqa: ARG002
+    ) -> list[float]:
+        client = await self._get_client()
+        response = await client.embed(model=self.model, input=text)
+        embeddings = self._response_value(response, "embeddings", []) or []
+        if not embeddings:
+            raise ValueError(
+                f"Ollama embed() returned no embeddings for model '{self.model}'"
+            )
+        return embeddings[0]
+
+    async def embed_batch(
+        self, texts: list[str], memory_action: str = "add"  # noqa: ARG002
+    ) -> list[list[float]]:
+        if not texts:
+            return []
+        client = await self._get_client()
+        response = await client.embed(model=self.model, input=texts)
+        embeddings = self._response_value(response, "embeddings", []) or []
+        if len(embeddings) != len(texts):
+            raise ValueError(
+                f"Ollama embed() returned {len(embeddings)} embeddings for "
+                f"{len(texts)} texts using model '{self.model}'"
+            )
+        return embeddings
+
+    async def close(self) -> None:
+        async with self._initialize_lock:
+            if self._closed:
+                return
+            self._closed = True
+            client = self._client
+            self._client = None
+            if client is not None:
+                await _finish_cleanup(
+                    client.close(),
+                    error_message="Mem0 Ollama embedder cleanup failed during cancellation",
+                )
+
+
 class SQLiteManager:
     """Async equivalent of ``mem0.memory.storage.SQLiteManager``.
 
