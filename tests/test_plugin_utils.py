@@ -1,139 +1,168 @@
-"""Tests for plugins/plugin_utils.py — thread-safe lazy singleton helpers.
+"""Tests for native-async plugin singleton helpers."""
 
-These exercise the actual concurrency guarantee with real threads (not mocks):
-a barrier releases N threads simultaneously into the accessor, and we assert
-the factory ran exactly once.
-"""
-
-import threading
+import asyncio
 
 import pytest
 
 from plugins.plugin_utils import SingletonSlot, lazy_singleton
 
 
-# --- lazy_singleton -------------------------------------------------------
-
-
-def test_lazy_singleton_builds_once_and_returns_same_instance():
+@pytest.mark.asyncio
+async def test_lazy_singleton_builds_once_and_returns_same_instance():
     calls = []
 
     @lazy_singleton
-    def get():
+    async def get():
         calls.append(1)
         return object()
 
-    a = get()
-    b = get()
-    assert a is b
+    first = await get()
+    second = await get()
+    assert first is second
     assert len(calls) == 1
 
 
-def test_lazy_singleton_reset_rebuilds():
+@pytest.mark.asyncio
+async def test_lazy_singleton_reset_rebuilds():
     counter = {"n": 0}
 
     @lazy_singleton
-    def get():
+    async def get():
         counter["n"] += 1
         return counter["n"]
 
-    assert get() == 1
-    assert get() == 1
-    get.reset()
-    assert get() == 2
+    assert await get() == 1
+    assert await get() == 1
+    await get.reset()
+    assert await get() == 2
 
 
-
-
-def test_lazy_singleton_concurrent_first_call_builds_once():
-    build_count = {"n": 0}
-    build_lock = threading.Lock()
-    barrier = threading.Barrier(16)
-    results = []
-    results_lock = threading.Lock()
+@pytest.mark.asyncio
+async def test_lazy_singleton_concurrent_first_call_builds_once():
+    build_count = 0
+    release_build = asyncio.Event()
 
     @lazy_singleton
-    def get():
-        # Count builds under a lock so the assertion is exact even if the
-        # double-checked lock had a bug and let two through.
-        with build_lock:
-            build_count["n"] += 1
-        # Simulate an expensive build so threads genuinely overlap.
-        import time
-        time.sleep(0.01)
+    async def get():
+        nonlocal build_count
+        build_count += 1
+        await release_build.wait()
         return object()
 
-    def worker():
-        barrier.wait()  # release all threads at once
-        obj = get()
-        with results_lock:
-            results.append(obj)
+    tasks = [asyncio.create_task(get()) for _ in range(16)]
+    await asyncio.sleep(0)
+    release_build.set()
+    results = await asyncio.gather(*tasks)
 
-    threads = [threading.Thread(target=worker) for _ in range(16)]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
-
-    assert build_count["n"] == 1, "factory must run exactly once under race"
-    assert len(results) == 16
-    assert all(r is results[0] for r in results), "all callers share one instance"
+    assert build_count == 1
+    assert all(result is results[0] for result in results)
 
 
-# --- SingletonSlot --------------------------------------------------------
+def test_lazy_singleton_rejects_sync_factory():
+    with pytest.raises(TypeError, match="must be async"):
+
+        @lazy_singleton
+        def get():
+            return object()
 
 
-def test_slot_caches_first_value():
-    slot: SingletonSlot = SingletonSlot()
+@pytest.mark.asyncio
+async def test_slot_caches_first_value():
+    slot: SingletonSlot[str] = SingletonSlot()
     assert slot.peek() is None
-    v1 = slot.get(lambda: "first")
+
+    async def first():
+        return "first"
+
+    first_value = await slot.get(first)
     assert slot.peek() == "first"
-    # Subsequent factory is ignored — first value wins.
-    v2 = slot.get(lambda: "second")
-    assert v1 == v2 == "first"
+
+    async def second():
+        return "second"
+
+    second_value = await slot.get(second)
+    assert first_value == second_value == "first"
 
 
+@pytest.mark.asyncio
+async def test_slot_factory_exception_not_cached():
+    slot: SingletonSlot[str] = SingletonSlot()
 
-
-def test_slot_factory_exception_not_cached():
-    slot: SingletonSlot = SingletonSlot()
-
-    def boom():
+    async def boom():
         raise ValueError("nope")
 
-    with pytest.raises(ValueError):
-        slot.get(boom)
+    with pytest.raises(ValueError, match="nope"):
+        await slot.get(boom)
     assert slot.peek() is None
-    assert slot.get(lambda: "recovered") == "recovered"
+
+    async def recovered():
+        return "recovered"
+
+    assert await slot.get(recovered) == "recovered"
 
 
-def test_slot_concurrent_first_call_builds_once():
-    build_count = {"n": 0}
-    build_lock = threading.Lock()
-    barrier = threading.Barrier(16)
-    slot: SingletonSlot = SingletonSlot()
-    results = []
-    results_lock = threading.Lock()
+@pytest.mark.asyncio
+async def test_slot_factory_cancellation_not_cached():
+    slot: SingletonSlot[str] = SingletonSlot()
+    started = asyncio.Event()
 
-    def factory():
-        with build_lock:
-            build_count["n"] += 1
-        import time
-        time.sleep(0.01)
+    async def wait_forever():
+        started.set()
+        await asyncio.Event().wait()
+        return "unreachable"
+
+    task = asyncio.create_task(slot.get(wait_forever))
+    await started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert slot.peek() is None
+
+    async def recovered():
+        return "recovered"
+
+    assert await slot.get(recovered) == "recovered"
+
+
+@pytest.mark.asyncio
+async def test_slot_concurrent_first_call_builds_once():
+    build_count = 0
+    release_build = asyncio.Event()
+    slot: SingletonSlot[object] = SingletonSlot()
+
+    async def factory():
+        nonlocal build_count
+        build_count += 1
+        await release_build.wait()
         return object()
 
-    def worker():
-        barrier.wait()
-        obj = slot.get(factory)
-        with results_lock:
-            results.append(obj)
+    tasks = [asyncio.create_task(slot.get(factory)) for _ in range(16)]
+    await asyncio.sleep(0)
+    release_build.set()
+    results = await asyncio.gather(*tasks)
 
-    threads = [threading.Thread(target=worker) for _ in range(16)]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
+    assert build_count == 1
+    assert all(result is results[0] for result in results)
 
-    assert build_count["n"] == 1
-    assert len(results) == 16
-    assert all(r is results[0] for r in results)
+
+@pytest.mark.asyncio
+async def test_slot_reset_waits_for_inflight_build():
+    slot: SingletonSlot[str] = SingletonSlot()
+    started = asyncio.Event()
+    release_build = asyncio.Event()
+
+    async def factory():
+        started.set()
+        await release_build.wait()
+        return "built"
+
+    build_task = asyncio.create_task(slot.get(factory))
+    await started.wait()
+    reset_task = asyncio.create_task(slot.reset())
+    await asyncio.sleep(0)
+    assert reset_task.done() is False
+
+    release_build.set()
+    assert await build_task == "built"
+    await reset_task
+    assert slot.peek() is None
