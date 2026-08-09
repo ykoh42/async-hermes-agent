@@ -4,12 +4,162 @@ from __future__ import annotations
 
 import asyncio
 import builtins
+from contextlib import asynccontextmanager
+import json
 import logging
 from typing import Any
+
+from pydantic import BaseModel
 
 from ._native_oss import _finish_cleanup
 
 logger = logging.getLogger(__name__)
+
+_PGVECTOR_OPERATOR_SQL = {
+    "eq": ("payload->>%s = %s", False),
+    "ne": ("payload->>%s != %s", False),
+    "gt": ("(payload->>%s)::numeric > %s", True),
+    "gte": ("(payload->>%s)::numeric >= %s", True),
+    "lt": ("(payload->>%s)::numeric < %s", True),
+    "lte": ("(payload->>%s)::numeric <= %s", True),
+    "in": ("payload->>%s = ANY(%s)", False),
+    "nin": ("NOT (payload->>%s = ANY(%s))", False),
+    "contains": ("payload->>%s LIKE %s", False),
+    "icontains": ("payload->>%s ILIKE %s", False),
+}
+
+_PGVECTOR_CONFIG_FIELDS = {
+    "dbname",
+    "collection_name",
+    "embedding_model_dims",
+    "user",
+    "password",
+    "host",
+    "port",
+    "diskann",
+    "hnsw",
+    "minconn",
+    "maxconn",
+    "sslmode",
+    "connection_string",
+    "connection_pool",
+}
+
+
+def _validate_pgvector_config(config: dict[str, Any]) -> None:
+    """Match Mem0 2.0.10's PGVectorConfig validation."""
+    extra_fields = set(config) - _PGVECTOR_CONFIG_FIELDS
+    if extra_fields:
+        extras = ", ".join(extra_fields)
+        allowed = ", ".join(_PGVECTOR_CONFIG_FIELDS)
+        raise ValueError(
+            f"Extra fields not allowed: {extras}. Please input only the "
+            f"following fields: {allowed}"
+        )
+    if config.get("connection_pool") is not None:
+        return
+    if config.get("connection_string") is not None:
+        return
+    if not config.get("user") and not config.get("password"):
+        raise ValueError(
+            "Both 'user' and 'password' must be provided when not using "
+            "connection_string."
+        )
+    if not config.get("host") and not config.get("port"):
+        raise ValueError(
+            "Both 'host' and 'port' must be provided when not using "
+            "connection_string."
+        )
+
+
+def _build_filter_conditions(
+    filters: dict[str, Any] | None,
+) -> tuple[builtins.list[str], builtins.list[Any]]:
+    """Translate Mem0's processed metadata filters to parameterized SQL."""
+    conditions: builtins.list[str] = []
+    params: builtins.list[Any] = []
+    if not filters:
+        return conditions, params
+
+    for key, value in filters.items():
+        if key == "$or":
+            groups = []
+            for nested_filter in value:
+                nested_conditions, nested_params = _build_filter_conditions(
+                    nested_filter
+                )
+                if nested_conditions:
+                    groups.append("(" + " AND ".join(nested_conditions) + ")")
+                    params.extend(nested_params)
+            if groups:
+                conditions.append("(" + " OR ".join(groups) + ")")
+            continue
+        if key == "$not":
+            groups = []
+            for nested_filter in value:
+                nested_conditions, nested_params = _build_filter_conditions(
+                    nested_filter
+                )
+                if nested_conditions:
+                    groups.append("(" + " AND ".join(nested_conditions) + ")")
+                    params.extend(nested_params)
+            if groups:
+                conditions.append("NOT (" + " OR ".join(groups) + ")")
+            continue
+        if value == "*":
+            conditions.append("payload ? %s")
+            params.append(key)
+            continue
+        if isinstance(value, dict):
+            for operator, operator_value in value.items():
+                if operator not in _PGVECTOR_OPERATOR_SQL:
+                    raise ValueError(
+                        f"Unsupported filter operator: {operator}"
+                    )
+                template, numeric = _PGVECTOR_OPERATOR_SQL[operator]
+                if operator in {"in", "nin"}:
+                    conditions.append(template)
+                    params.extend([key, [str(item) for item in operator_value]])
+                elif operator in {"contains", "icontains"}:
+                    escaped = (
+                        str(operator_value)
+                        .replace("\\", "\\\\")
+                        .replace("%", "\\%")
+                        .replace("_", "\\_")
+                    )
+                    conditions.append(template + " ESCAPE '\\'")
+                    params.extend([key, f"%{escaped}%"])
+                else:
+                    conditions.append(template)
+                    params.extend(
+                        [key, float(operator_value) if numeric else str(operator_value)]
+                    )
+        elif isinstance(value, builtins.list):
+            conditions.append("payload->>%s = ANY(%s)")
+            params.extend([key, [str(item) for item in value]])
+        else:
+            conditions.append("payload->>%s = %s")
+            params.extend(
+                [key, json.dumps(value) if isinstance(value, bool) else str(value)]
+            )
+    return conditions, params
+
+
+class OutputData(BaseModel):
+    id: str | None
+    score: float | None
+    payload: dict[str, Any] | None
+
+
+@asynccontextmanager
+async def _pool_cursor(pool: Any):
+    async with pool.connection() as connection:
+        async with connection.cursor() as cursor:
+            yield cursor
+
+
+def _vector_literal(vector: builtins.list[float]) -> str:
+    return json.dumps(vector, separators=(",", ":"))
 
 
 class Qdrant:
@@ -301,4 +451,468 @@ class Qdrant:
                 await _finish_cleanup(
                     client.close(),
                     error_message="Mem0 Qdrant cleanup failed during cancellation",
+                )
+
+
+class PGVector:
+    """Native-async psycopg 3 adapter matching Mem0 2.0.10 PGVector."""
+
+    def __init__(self, config: dict[str, Any]) -> None:
+        _validate_pgvector_config(config)
+        self.config = dict(config)
+        self.collection_name = self.config.get("collection_name", "mem0")
+        self.embedding_model_dims = self.config.get(
+            "embedding_model_dims",
+            1536,
+        )
+        self.use_diskann = bool(self.config.get("diskann", False))
+        self.use_hnsw = bool(self.config.get("hnsw", True))
+        self._pool: Any = None
+        self._sql: Any = None
+        self._json_adapter: Any = None
+        self._initialize_lock = asyncio.Lock()
+        self._collection_lock = asyncio.Lock()
+        self._collection_ensured = False
+        self._closed = False
+        self._owns_pool = self.config.get("connection_pool") is None
+
+    async def _initialize(self) -> None:
+        await self._get_pool()
+
+    async def _get_pool(self) -> Any:
+        if self._closed:
+            raise RuntimeError("Cannot use a closed PGVector")
+        if self._pool is not None:
+            return self._pool
+        async with self._initialize_lock:
+            if self._closed:
+                raise RuntimeError("Cannot use a closed PGVector")
+            if self._pool is not None:
+                return self._pool
+
+            from psycopg import capabilities, conninfo, sql
+            from psycopg.types.json import Json
+            from psycopg_pool import AsyncConnectionPool
+
+            if not capabilities.has_cancel_safe(check=True):
+                raise RuntimeError(
+                    "Mem0 PGVector requires libpq 17 or newer for native-async "
+                    "query cancellation. Install the pinned "
+                    "psycopg[binary,pool] extra."
+                )
+
+            configured_pool = self.config.get("connection_pool")
+            if configured_pool is not None:
+                if not isinstance(configured_pool, AsyncConnectionPool):
+                    raise RuntimeError(
+                        "Mem0 PGVector connection_pool must be a native-async "
+                        "psycopg_pool.AsyncConnectionPool."
+                    )
+                pool = configured_pool
+            else:
+                connection_string = self.config.get("connection_string")
+                sslmode = self.config.get("sslmode")
+                if connection_string:
+                    connection_options = {"sslmode": sslmode} if sslmode else {}
+                    connection_string = conninfo.make_conninfo(
+                        connection_string,
+                        **connection_options,
+                    )
+                else:
+                    connection_options = {
+                        key: self.config.get(key)
+                        for key in (
+                            "dbname",
+                            "user",
+                            "password",
+                            "host",
+                            "port",
+                            "sslmode",
+                        )
+                        if self.config.get(key) is not None
+                    }
+                    connection_options.setdefault("dbname", "postgres")
+                    connection_string = conninfo.make_conninfo(
+                        "",
+                        **connection_options,
+                    )
+                pool = AsyncConnectionPool(
+                    conninfo=connection_string,
+                    min_size=self.config.get("minconn", 1),
+                    max_size=self.config.get("maxconn", 5),
+                    open=False,
+                )
+
+            try:
+                if self._owns_pool:
+                    await pool.open(wait=True)
+                await self._ensure_collection_with_pool(pool, sql)
+            except BaseException:
+                if self._owns_pool:
+                    try:
+                        await _finish_cleanup(
+                            pool.close(),
+                            error_message=(
+                                "Mem0 PGVector cleanup failed during "
+                                "initialization cancellation"
+                            ),
+                        )
+                    except Exception:
+                        logger.exception("Failed to close Mem0 PGVector pool")
+                raise
+
+            self._sql = sql
+            self._json_adapter = Json
+            self._pool = pool
+            return pool
+
+    def _collection(self) -> Any:
+        return self._sql.Identifier(self.collection_name)
+
+    async def _list_cols_with_pool(self, pool: Any, sql: Any) -> builtins.list[str]:
+        async with _pool_cursor(pool) as cursor:
+            await cursor.execute(
+                "SELECT table_name FROM information_schema.tables "
+                "WHERE table_schema = 'public'"
+            )
+            return [row[0] for row in await cursor.fetchall()]
+
+    async def _ensure_collection_with_pool(self, pool: Any, sql: Any) -> None:
+        async with self._collection_lock:
+            if self._collection_ensured:
+                return
+            collections = await self._list_cols_with_pool(pool, sql)
+            if self.collection_name in collections:
+                async with _pool_cursor(pool) as cursor:
+                    await cursor.execute(
+                        "SELECT atttypmod FROM pg_attribute "
+                        "WHERE attrelid = %s::regclass AND attname = 'vector'",
+                        (self.collection_name,),
+                    )
+                    dimension = await cursor.fetchone()
+                if (
+                    dimension
+                    and dimension[0] > 0
+                    and dimension[0] != self.embedding_model_dims
+                ):
+                    async with _pool_cursor(pool) as cursor:
+                        await cursor.execute(
+                            sql.SQL("DROP TABLE IF EXISTS {}").format(
+                                sql.Identifier(self.collection_name)
+                            )
+                        )
+                    await self._create_col_with_pool(pool, sql)
+            else:
+                await self._create_col_with_pool(pool, sql)
+            self._collection_ensured = True
+
+    async def _ensure_collection(self) -> Any:
+        pool = await self._get_pool()
+        if not self._collection_ensured:
+            await self._ensure_collection_with_pool(pool, self._sql)
+        return pool
+
+    async def _create_col_with_pool(self, pool: Any, sql: Any) -> None:
+        collection = sql.Identifier(self.collection_name)
+        async with _pool_cursor(pool) as cursor:
+            await cursor.execute("CREATE EXTENSION IF NOT EXISTS vector")
+            await cursor.execute(
+                sql.SQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS {} (
+                        id UUID PRIMARY KEY,
+                        vector vector({}),
+                        payload JSONB
+                    );
+                    """
+                ).format(
+                    collection,
+                    sql.Literal(self.embedding_model_dims),
+                )
+            )
+            if self.use_diskann and self.embedding_model_dims < 2000:
+                await cursor.execute(
+                    "SELECT * FROM pg_extension WHERE extname = 'vectorscale'"
+                )
+                if await cursor.fetchone():
+                    await cursor.execute(
+                        sql.SQL(
+                            """
+                            CREATE INDEX IF NOT EXISTS {} ON {}
+                            USING diskann (vector);
+                            """
+                        ).format(
+                            sql.Identifier(
+                                f"{self.collection_name}_diskann_idx"
+                            ),
+                            collection,
+                        )
+                    )
+            elif self.use_hnsw:
+                await cursor.execute(
+                    sql.SQL(
+                        """
+                        CREATE INDEX IF NOT EXISTS {} ON {}
+                        USING hnsw (vector vector_cosine_ops)
+                        """
+                    ).format(
+                        sql.Identifier(f"{self.collection_name}_hnsw_idx"),
+                        collection,
+                    )
+                )
+            await cursor.execute(
+                sql.SQL(
+                    """
+                    CREATE INDEX IF NOT EXISTS {} ON {}
+                    USING gin(to_tsvector(
+                        'simple', payload->>'text_lemmatized'
+                    ));
+                    """
+                ).format(
+                    sql.Identifier(
+                        f"{self.collection_name}_text_lemmatized_idx"
+                    ),
+                    collection,
+                )
+            )
+
+    async def create_col(self) -> None:
+        pool = await self._get_pool()
+        await self._create_col_with_pool(pool, self._sql)
+
+    async def insert(
+        self,
+        vectors: builtins.list[builtins.list[float]],
+        payloads: builtins.list[dict[str, Any]] | None = None,
+        ids: builtins.list[Any] | None = None,
+    ) -> None:
+        pool = await self._ensure_collection()
+        if payloads is None or ids is None:
+            raise TypeError("'NoneType' object is not iterable")
+        json_payloads = [json.dumps(payload) for payload in payloads]
+        rows = [
+            (vector_id, _vector_literal(vector), payload)
+            for vector_id, vector, payload in zip(
+                ids,
+                vectors,
+                json_payloads,
+                strict=False,
+            )
+        ]
+        async with _pool_cursor(pool) as cursor:
+            await cursor.executemany(
+                self._sql.SQL(
+                    "INSERT INTO {} (id, vector, payload) VALUES (%s, %s, %s)"
+                ).format(self._collection()),
+                rows,
+            )
+
+    async def search(
+        self,
+        query: str,  # noqa: ARG002
+        vectors: builtins.list[float],
+        top_k: int | None = 5,
+        filters: dict[str, Any] | None = None,
+    ) -> builtins.list[OutputData]:
+        pool = await self._ensure_collection()
+        conditions, filter_params = _build_filter_conditions(filters)
+        filter_clause = self._sql.SQL(
+            "WHERE " + " AND ".join(conditions) if conditions else ""
+        )
+        async with _pool_cursor(pool) as cursor:
+            await cursor.execute(
+                self._sql.SQL(
+                    """
+                    SELECT id, vector <=> %s::vector AS distance, payload
+                    FROM {}
+                    {}
+                    ORDER BY distance
+                    LIMIT %s
+                    """
+                ).format(self._collection(), filter_clause),
+                (_vector_literal(vectors), *filter_params, top_k),
+            )
+            rows = await cursor.fetchall()
+        return [
+            OutputData(
+                id=str(row[0]),
+                score=max(0.0, 1.0 - float(row[1])),
+                payload=row[2],
+            )
+            for row in rows
+        ]
+
+    async def keyword_search(
+        self,
+        query: str,
+        top_k: int = 5,
+        filters: dict[str, Any] | None = None,
+    ) -> builtins.list[OutputData] | None:
+        pool = await self._ensure_collection()
+        conditions, filter_params = _build_filter_conditions(filters)
+        filter_clause = self._sql.SQL(
+            "AND " + " AND ".join(conditions) if conditions else ""
+        )
+        try:
+            async with _pool_cursor(pool) as cursor:
+                await cursor.execute(
+                    self._sql.SQL(
+                        """
+                        SELECT id, ts_rank_cd(
+                            to_tsvector('simple', payload->>'text_lemmatized'),
+                            plainto_tsquery('simple', %s)
+                        ) AS score, payload
+                        FROM {}
+                        WHERE to_tsvector(
+                            'simple', payload->>'text_lemmatized'
+                        ) @@ plainto_tsquery('simple', %s)
+                        {}
+                        ORDER BY score DESC
+                        LIMIT %s
+                        """
+                    ).format(self._collection(), filter_clause),
+                    (query, query, *filter_params, top_k),
+                )
+                rows = await cursor.fetchall()
+            return [
+                OutputData(
+                    id=str(row[0]),
+                    score=float(row[1]),
+                    payload=row[2],
+                )
+                for row in rows
+            ]
+        except Exception as exc:
+            logger.debug("Keyword search failed: %s", exc)
+            return None
+
+    async def delete(self, vector_id: str) -> None:
+        pool = await self._ensure_collection()
+        async with _pool_cursor(pool) as cursor:
+            await cursor.execute(
+                self._sql.SQL("DELETE FROM {} WHERE id = %s").format(
+                    self._collection()
+                ),
+                (vector_id,),
+            )
+
+    async def update(
+        self,
+        vector_id: str,
+        vector: builtins.list[float] | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> None:
+        pool = await self._ensure_collection()
+        async with _pool_cursor(pool) as cursor:
+            if vector is not None:
+                await cursor.execute(
+                    self._sql.SQL(
+                        "UPDATE {} SET vector = %s WHERE id = %s"
+                    ).format(self._collection()),
+                    (_vector_literal(vector), vector_id),
+                )
+            if payload is not None:
+                await cursor.execute(
+                    self._sql.SQL(
+                        "UPDATE {} SET payload = %s WHERE id = %s"
+                    ).format(self._collection()),
+                    (self._json_adapter(payload), vector_id),
+                )
+
+    async def get(self, vector_id: str) -> OutputData | None:
+        pool = await self._ensure_collection()
+        async with _pool_cursor(pool) as cursor:
+            await cursor.execute(
+                self._sql.SQL(
+                    "SELECT id, vector, payload FROM {} WHERE id = %s"
+                ).format(self._collection()),
+                (vector_id,),
+            )
+            row = await cursor.fetchone()
+        if row is None:
+            return None
+        return OutputData(id=str(row[0]), score=None, payload=row[2])
+
+    async def list_cols(self) -> builtins.list[str]:
+        pool = await self._get_pool()
+        return await self._list_cols_with_pool(pool, self._sql)
+
+    async def delete_col(self) -> None:
+        pool = await self._get_pool()
+        async with _pool_cursor(pool) as cursor:
+            await cursor.execute(
+                self._sql.SQL("DROP TABLE IF EXISTS {}").format(
+                    self._collection()
+                )
+            )
+
+    async def col_info(self) -> dict[str, Any]:
+        pool = await self._ensure_collection()
+        async with _pool_cursor(pool) as cursor:
+            await cursor.execute(
+                self._sql.SQL(
+                    """
+                    SELECT table_name,
+                        (SELECT COUNT(*) FROM {}) AS row_count,
+                        (SELECT pg_size_pretty(
+                            pg_total_relation_size({}::regclass)
+                        )) AS total_size
+                    FROM information_schema.tables
+                    WHERE table_schema = 'public' AND table_name = %s
+                    """
+                ).format(
+                    self._collection(),
+                    self._sql.Literal(self.collection_name),
+                ),
+                (self.collection_name,),
+            )
+            row = await cursor.fetchone()
+        return {"name": row[0], "count": row[1], "size": row[2]}
+
+    async def list(
+        self,
+        filters: dict[str, Any] | None = None,
+        top_k: int | None = 100,
+    ) -> builtins.list[builtins.list[OutputData]]:
+        pool = await self._ensure_collection()
+        conditions, filter_params = _build_filter_conditions(filters)
+        filter_clause = self._sql.SQL(
+            "WHERE " + " AND ".join(conditions) if conditions else ""
+        )
+        async with _pool_cursor(pool) as cursor:
+            await cursor.execute(
+                self._sql.SQL(
+                    "SELECT id, vector, payload FROM {} {} LIMIT %s"
+                ).format(self._collection(), filter_clause),
+                (*filter_params, top_k),
+            )
+            rows = await cursor.fetchall()
+        return [
+            [
+                OutputData(id=str(row[0]), score=None, payload=row[2])
+                for row in rows
+            ]
+        ]
+
+    async def reset(self) -> None:
+        await self._ensure_collection()
+        logger.warning("Resetting index %s...", self.collection_name)
+        await self.delete_col()
+        await self.create_col()
+
+    async def close(self) -> None:
+        async with self._initialize_lock:
+            if self._closed:
+                return
+            self._closed = True
+            pool = self._pool
+            self._pool = None
+            self._sql = None
+            self._json_adapter = None
+            if pool is not None and self._owns_pool:
+                await _finish_cleanup(
+                    pool.close(),
+                    error_message=(
+                        "Mem0 PGVector cleanup failed during cancellation"
+                    ),
                 )

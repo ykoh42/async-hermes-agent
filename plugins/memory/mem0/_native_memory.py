@@ -29,7 +29,7 @@ from ._native_prompts import (
     AGENT_CONTEXT_SUFFIX,
     generate_additive_extraction_prompt,
 )
-from ._native_vector import Qdrant
+from ._native_vector import PGVector, Qdrant
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +53,24 @@ _CORE_PAYLOAD_KEYS = {
     *_PROMOTED_PAYLOAD_KEYS,
 }
 _UNSET = object()
+
+
+def _copy_config(config: dict[str, Any]) -> dict[str, Any]:
+    """Copy mutable config blocks while preserving runtime client objects."""
+    copied: dict[str, Any] = {}
+    for key, value in config.items():
+        if key in {"embedder", "llm", "vector_store"} and isinstance(value, dict):
+            block = dict(value)
+            provider_config = value.get("config")
+            if isinstance(provider_config, dict):
+                block["config"] = dict(provider_config)
+            copied[key] = block
+            continue
+        try:
+            copied[key] = deepcopy(value)
+        except Exception:
+            copied[key] = value
+    return copied
 
 
 def _validate_entity_id(value: str | None, name: str) -> str | None:
@@ -241,7 +259,7 @@ class Memory:
     """Retained Mem0 OSS runtime with native coroutine boundaries."""
 
     def __init__(self, config: dict[str, Any]) -> None:
-        self.config = deepcopy(config)
+        self.config = _copy_config(config)
         self.embedding_model: Any = None
         self.llm: Any = None
         self.vector_store: Any = None
@@ -298,9 +316,7 @@ class Memory:
                     )
                 vector_store = Qdrant(vector_config)
             elif vector_provider == "pgvector":
-                raise RuntimeError(
-                    "Mem0 OSS PGVector native-async runtime is not implemented yet."
-                )
+                vector_store = PGVector(vector_config)
             else:
                 raise ValueError(
                     f"Unsupported native Mem0 vector provider: {vector_provider}"

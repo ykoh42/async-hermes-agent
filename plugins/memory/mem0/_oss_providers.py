@@ -52,7 +52,7 @@ VECTOR_PROVIDERS: dict[str, dict[str, Any]] = {
     "pgvector": {
         "label": "PGVector",
         "default_config": {"host": "localhost", "port": 5432, "user": os.getenv("USER", "postgres"), "dbname": "postgres"},
-        "pip_dep": "psycopg2-binary",
+        "pip_dep": "psycopg[binary,pool]",
     },
 }
 

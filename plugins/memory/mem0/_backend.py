@@ -5,7 +5,6 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 import asyncio
 import hashlib
-import importlib
 import inspect
 from typing import Any
 
@@ -520,34 +519,9 @@ class OSSBackend(Mem0Backend):
             except Exception:
                 pass
         elif provider == "pgvector":
-            try:
-                psycopg = importlib.import_module("psycopg")
-                pgsql = importlib.import_module("psycopg.sql")
-                conn_params = {}
-                for k in ("host", "port", "user", "password", "dbname"):
-                    if vs_config.get(k):
-                        conn_params[k] = vs_config[k]
-                if vs_config.get("sslmode"):
-                    conn_params["sslmode"] = vs_config["sslmode"]
-                async with await psycopg.AsyncConnection.connect(
-                    **conn_params,
-                    autocommit=True,
-                ) as conn:
-                    async with conn.cursor() as cur:
-                        await cur.execute(
-                            "SELECT atttypmod FROM pg_attribute "
-                            "WHERE attrelid = %s::regclass AND attname = 'vector'",
-                            (collection_name,),
-                        )
-                        row = await cur.fetchone()
-                        if row and row[0] > 0 and row[0] != expected_dims:
-                            await cur.execute(
-                                pgsql.SQL("DROP TABLE IF EXISTS {}").format(
-                                    pgsql.Identifier(collection_name)
-                                )
-                            )
-            except Exception:
-                pass
+            # Native PGVector validates dimensions through its configured
+            # async pool. Probing here would ignore connection_string/pool.
+            return
 
     async def search(self, query: str, *, filters: dict, top_k: int = 10, rerank: bool = False) -> list[dict]:
         await self._initialize()

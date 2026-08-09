@@ -172,6 +172,7 @@ def _fake_components(monkeypatch):
     monkeypatch.setattr(_native_memory, "OpenAILLM", _FakeLLM)
     monkeypatch.setattr(_native_memory, "OllamaLLM", _FakeLLM)
     monkeypatch.setattr(_native_memory, "Qdrant", _FakeVector)
+    monkeypatch.setattr(_native_memory, "PGVector", _FakeVector)
     monkeypatch.setattr(_native_memory, "SQLiteManager", _FakeDB)
 
 
@@ -212,6 +213,50 @@ async def test_memory_constructor_is_state_only(tmp_path):
     assert len(_FakeDB.instances) == 1
     assert _FakeVector.instances[0].calls == [("initialize",)]
     assert _FakeDB.instances[0].history == [("initialize",)]
+    await memory.close()
+
+
+@pytest.mark.asyncio
+async def test_memory_initializes_native_pgvector_provider(tmp_path):
+    config = _config(tmp_path)
+    config["vector_store"] = {
+        "provider": "pgvector",
+        "config": {
+            "connection_string": "postgresql://db.test/memory",
+            "collection_name": "mem0",
+            "embedding_model_dims": 2,
+        },
+    }
+    memory = Memory(config)
+
+    await memory.initialize()
+
+    assert _FakeVector.instances[0].config == config["vector_store"]["config"]
+    assert _FakeVector.instances[0].calls == [("initialize",)]
+    await memory.close()
+
+
+@pytest.mark.asyncio
+async def test_memory_preserves_injected_pgvector_pool_without_deepcopy(tmp_path):
+    class NonCopyablePool:
+        def __deepcopy__(self, memo):
+            raise TypeError("pool contains event-loop locks")
+
+    pool = NonCopyablePool()
+    config = _config(tmp_path)
+    config["vector_store"] = {
+        "provider": "pgvector",
+        "config": {
+            "connection_pool": pool,
+            "collection_name": "mem0",
+            "embedding_model_dims": 2,
+        },
+    }
+    memory = Memory(config)
+
+    await memory.initialize()
+
+    assert _FakeVector.instances[0].config["connection_pool"] is pool
     await memory.close()
 
 

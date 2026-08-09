@@ -136,7 +136,11 @@ bedrock = [
 ]
 # Mem0 Platform/OSS memory provider. Self-hosted HTTP mode uses the core
 # httpx dependency and does not require this extra.
-mem0 = ["mem0ai==2.0.10", "ollama==0.6.2"]
+mem0 = [
+    "mem0ai==2.0.10",
+    "ollama==0.6.2",
+    "psycopg[binary,pool]==3.3.4",
+]
 
 [build-system]
 requires = ["setuptools>=77.0,<83"]
