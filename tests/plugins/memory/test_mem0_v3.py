@@ -218,6 +218,32 @@ async def test_availability_uses_async_profile_config(monkeypatch, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_backend_initialization_failure_preserves_provider_contract(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "mem0.json").write_text(
+        '{"mode": "oss", "oss": {}}',
+        encoding="utf-8",
+    )
+    provider = Mem0MemoryProvider()
+
+    await provider.initialize("test-session")
+
+    assert provider._backend is None
+    assert provider._init_error == "'vector_store'"
+    result = json.loads(
+        await provider.handle_tool_call("mem0_search", {"query": "anything"})
+    )
+    assert result == {
+        "error": (
+            "Mem0 backend not initialized: 'vector_store'. "
+            "Check that vector store is running and reachable."
+        )
+    }
+
+
+@pytest.mark.asyncio
 async def test_shutdown_cancels_prefetch_and_closes_backend(monkeypatch, tmp_path):
     release = asyncio.Event()
 
@@ -234,6 +260,19 @@ async def test_shutdown_cancels_prefetch_and_closes_backend(monkeypatch, tmp_pat
 
     assert backend.closed is True
     assert provider._prefetch_task is None
+
+
+@pytest.mark.asyncio
+async def test_shutdown_ignores_backend_close_failure(monkeypatch, tmp_path):
+    class FailingCloseBackend(FakeBackend):
+        async def close(self):
+            raise RuntimeError("close failed")
+
+    provider = await _provider(monkeypatch, tmp_path, FailingCloseBackend())
+
+    await provider.shutdown()
+
+    assert provider._backend is None
 
 
 @pytest.mark.asyncio

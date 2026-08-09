@@ -310,17 +310,26 @@ class Mem0MemoryProvider(MemoryProvider):
         ]
 
     def _create_backend(self):
-        if self._mode == "oss":
-            from ._backend import OSSBackend
+        try:
+            if self._mode == "oss":
+                from ._backend import OSSBackend
 
-            return OSSBackend(self._config.get("oss", {}))
-        if self._host:
-            from ._backend import SelfHostedBackend
+                return OSSBackend(self._config.get("oss", {}))
+            if self._host:
+                from ._backend import SelfHostedBackend
 
-            return SelfHostedBackend(self._api_key, self._host)
-        from ._backend import PlatformBackend
+                return SelfHostedBackend(self._api_key, self._host)
+            from ._backend import PlatformBackend
 
-        return PlatformBackend(self._api_key)
+            return PlatformBackend(self._api_key)
+        except Exception as exc:
+            logger.error(
+                "Mem0 backend failed to initialize (%s mode): %s",
+                self._mode,
+                exc,
+            )
+            self._init_error = str(exc)
+            return None
 
     def _is_breaker_open(self) -> bool:
         """Return True if the circuit breaker is tripped (too many failures)."""
@@ -638,8 +647,12 @@ class Mem0MemoryProvider(MemoryProvider):
             await _collect_owned_task(self._prefetch_task)
             self._prefetch_task = None
         if self._backend is not None:
-            await self._backend.close()
+            backend = self._backend
             self._backend = None
+            try:
+                await backend.close()
+            except Exception:
+                pass
 
 
 def register(ctx) -> None:

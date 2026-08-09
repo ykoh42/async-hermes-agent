@@ -147,3 +147,45 @@ async def test_run_brv_repeated_cancellation_drains_process(tmp_path, monkeypatc
     with pytest.raises(asyncio.CancelledError):
         await task
     assert communicate_completed.is_set()
+
+
+@pytest.mark.asyncio
+async def test_run_brv_cancellation_survives_process_exit_before_kill(
+    tmp_path, monkeypatch
+):
+    communicate_started = asyncio.Event()
+    release_communicate = asyncio.Event()
+
+    class ExitedProcess:
+        returncode = None
+
+        async def communicate(self):
+            communicate_started.set()
+            await release_communicate.wait()
+            self.returncode = 0
+            return b"", b""
+
+        async def wait(self):
+            return self.returncode
+
+        def kill(self):
+            self.returncode = 0
+            raise ProcessLookupError
+
+    process = ExitedProcess()
+
+    async def create_process(*_args, **_kwargs):
+        return process
+
+    monkeypatch.setattr("plugins.memory.byterover._cached_brv_path", "brv")
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create_process)
+
+    task = asyncio.create_task(_run_brv(["status"], cwd=str(tmp_path)))
+    await communicate_started.wait()
+    task.cancel()
+    await asyncio.sleep(0)
+
+    assert task.done() is False
+    release_communicate.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task

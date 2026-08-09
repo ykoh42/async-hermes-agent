@@ -188,7 +188,10 @@ async def _run_brv(
             timeout_error = exc
         except asyncio.CancelledError:
             if process.returncode is None:
-                process.kill()
+                try:
+                    process.kill()
+                except ProcessLookupError:
+                    pass
             try:
                 await _finish_process_communicate(process, communicate_task)
             except asyncio.CancelledError:
@@ -199,7 +202,10 @@ async def _run_brv(
 
         if timeout_error is not None:
             if process.returncode is None:
-                process.kill()
+                try:
+                    process.kill()
+                except ProcessLookupError:
+                    pass
             await _finish_process_communicate(process, communicate_task)
             return {"success": False, "error": f"brv timed out after {timeout}s"}
 
