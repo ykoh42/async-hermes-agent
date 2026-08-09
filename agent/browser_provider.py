@@ -155,3 +155,15 @@ class BrowserProvider(abc.ABC):
             "tag": "",
             "env_vars": [],
         }
+
+    # ------------------------------------------------------------------
+    # Backward-compatible CloudBrowserProvider API retained from upstream
+    # ------------------------------------------------------------------
+
+    async def is_configured(self) -> bool:
+        """Return :meth:`is_available` under the legacy public name."""
+        return await self.is_available()
+
+    def provider_name(self) -> str:
+        """Return :attr:`display_name` under the legacy public name."""
+        return self.display_name

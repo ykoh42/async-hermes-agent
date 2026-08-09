@@ -24,6 +24,7 @@ PR #25182.
 from __future__ import annotations
 
 import json
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
@@ -140,7 +141,6 @@ class TestIsAvailable:
         monkeypatch.setenv("BROWSERBASE_PROJECT_ID", "proj")
         assert await p.is_available() is True
 
-
     async def test_browser_use_satisfied_by_api_key(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -162,6 +162,42 @@ class TestIsAvailable:
         assert await p.is_available() is False
         monkeypatch.setenv("FIRECRAWL_API_KEY", "key")
         assert await p.is_available() is True
+
+
+@pytest.mark.parametrize(
+    ("provider_module", "provider_class", "expected_name"),
+    [
+        (
+            "plugins.browser.browserbase.provider",
+            "BrowserbaseBrowserProvider",
+            "Browserbase",
+        ),
+        (
+            "plugins.browser.browser_use.provider",
+            "BrowserUseBrowserProvider",
+            "Browser Use",
+        ),
+        (
+            "plugins.browser.firecrawl.provider",
+            "FirecrawlBrowserProvider",
+            "Firecrawl",
+        ),
+    ],
+)
+async def test_legacy_browser_provider_names_preserve_upstream_contract(
+    provider_module: str,
+    provider_class: str,
+    expected_name: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = __import__(provider_module, fromlist=[provider_class])
+    provider = getattr(module, provider_class)()
+    available = AsyncMock(return_value=True)
+    monkeypatch.setattr(provider, "is_available", available)
+
+    assert await provider.is_configured() is True
+    available.assert_awaited_once_with()
+    assert provider.provider_name() == expected_name
 
 
 # ---------------------------------------------------------------------------
