@@ -14,11 +14,204 @@ provider would keep short-circuiting forever:
 
 """
 
+import asyncio
+from types import SimpleNamespace
+
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from run_agent import AIAgent
+
+
+def _native_request_agent(execute, *, stale_timeout=0.05):
+    return SimpleNamespace(
+        _execute_model_request=execute,
+        _compute_non_stream_stale_timeout=lambda _payload: stale_timeout,
+        _provider_stale_timeout=stale_timeout,
+        _consecutive_stale_streams=0,
+        _current_streamed_assistant_text="",
+        _touch_activity=MagicMock(),
+        base_url="https://api.example.test/v1",
+        model="test-model",
+    )
+
+
+@pytest.mark.asyncio
+async def test_non_streaming_short_circuits_at_threshold(monkeypatch):
+    from agent.chat_completion_helpers import interruptible_api_call
+
+    monkeypatch.setenv("HERMES_STREAM_STALE_GIVEUP", "3")
+    execute = AsyncMock()
+    agent = _native_request_agent(execute)
+    agent._consecutive_stale_streams = 3
+
+    with pytest.raises(RuntimeError, match="unresponsive"):
+        await interruptible_api_call(agent, {})
+
+    execute.assert_not_awaited()
+    assert agent._consecutive_stale_streams == 3
+
+
+@pytest.mark.asyncio
+async def test_non_streaming_timeout_increments_stale_streak():
+    from agent.chat_completion_helpers import interruptible_api_call
+
+    cancelled = asyncio.Event()
+
+    async def execute(_payload):
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    agent = _native_request_agent(execute, stale_timeout=0.01)
+
+    with pytest.raises(TimeoutError, match="Non-streaming API call timed out"):
+        await interruptible_api_call(agent, {})
+
+    assert cancelled.is_set()
+    assert agent._consecutive_stale_streams == 1
+
+
+@pytest.mark.asyncio
+async def test_provider_timeout_does_not_increment_stale_watchdog_streak():
+    from agent.chat_completion_helpers import (
+        interruptible_api_call,
+        interruptible_streaming_api_call,
+    )
+
+    async def non_stream_timeout(_payload):
+        raise TimeoutError("provider timeout")
+
+    non_stream_agent = _native_request_agent(non_stream_timeout)
+    with pytest.raises(TimeoutError, match="provider timeout"):
+        await interruptible_api_call(non_stream_agent, {})
+    assert non_stream_agent._consecutive_stale_streams == 0
+
+    async def stream_timeout(_payload, **_kwargs):
+        raise TimeoutError("provider stream timeout")
+
+    stream_agent = _native_request_agent(stream_timeout)
+    with pytest.raises(TimeoutError, match="provider stream timeout"):
+        await interruptible_streaming_api_call(stream_agent, {})
+    assert stream_agent._consecutive_stale_streams == 0
+
+
+@pytest.mark.asyncio
+async def test_stream_activity_reschedules_idle_timeout():
+    from agent.chat_completion_helpers import interruptible_streaming_api_call
+
+    response = object()
+
+    async def execute(_payload, **kwargs):
+        note_activity = kwargs["on_stream_activity"]
+        await asyncio.sleep(0.03)
+        note_activity()
+        await asyncio.sleep(0.03)
+        return response
+
+    agent = _native_request_agent(execute, stale_timeout=0.05)
+    agent._consecutive_stale_streams = 2
+
+    assert await interruptible_streaming_api_call(agent, {}) is response
+    assert agent._consecutive_stale_streams == 0
+
+
+@pytest.mark.asyncio
+async def test_stream_idle_timeout_cancels_request_and_increments_streak():
+    from agent.chat_completion_helpers import interruptible_streaming_api_call
+
+    cancelled = asyncio.Event()
+
+    async def execute(_payload, **_kwargs):
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    agent = _native_request_agent(execute, stale_timeout=0.01)
+
+    with pytest.raises(TimeoutError, match="produced no chunks"):
+        await interruptible_streaming_api_call(agent, {})
+
+    assert cancelled.is_set()
+    assert agent._consecutive_stale_streams == 1
+
+
+@pytest.mark.asyncio
+async def test_chat_stream_stale_returns_partial_stub_and_closes_stream():
+    from agent.chat_completion_helpers import interruptible_streaming_api_call
+    from hermes_constants import PARTIAL_STREAM_STUB_ID
+
+    stream_closed = asyncio.Event()
+
+    class StalledStream:
+        def __init__(self):
+            self._sent = False
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if not self._sent:
+                self._sent = True
+                return SimpleNamespace(
+                    id="stream-id",
+                    model="test-model",
+                    usage=None,
+                    choices=[
+                        SimpleNamespace(
+                            finish_reason=None,
+                            delta=SimpleNamespace(
+                                content="partial answer",
+                                reasoning=None,
+                                reasoning_content=None,
+                                tool_calls=None,
+                            ),
+                        )
+                    ],
+                )
+            await asyncio.Event().wait()
+            raise StopAsyncIteration
+
+        async def aclose(self):
+            stream_closed.set()
+
+    stream = StalledStream()
+
+    class Completions:
+        async def create(self, **_kwargs):
+            return stream
+
+    agent = AIAgent.__new__(AIAgent)
+    agent.api_mode = "chat_completions"
+    agent.provider = "test-provider"
+    agent.model = "test-model"
+    agent.base_url = "https://api.example.test/v1"
+    agent.client = SimpleNamespace(
+        chat=SimpleNamespace(completions=Completions())
+    )
+    agent._provider_stale_timeout = 0.01
+    agent._consecutive_stale_streams = 0
+    agent._current_streamed_assistant_text = ""
+    agent._touch_activity = MagicMock()
+
+    def record_delta(text):
+        agent._current_streamed_assistant_text += text
+
+    agent._fire_stream_delta = record_delta
+
+    response = await interruptible_streaming_api_call(
+        agent,
+        {"model": "test-model", "messages": []},
+    )
+
+    assert response.id == PARTIAL_STREAM_STUB_ID
+    assert response.choices[0].message.content == "partial answer"
+    assert response.choices[0].finish_reason == "length"
+    assert stream_closed.is_set()
+    assert agent._consecutive_stale_streams == 0
 
 
 def _make_agent_openrouter():

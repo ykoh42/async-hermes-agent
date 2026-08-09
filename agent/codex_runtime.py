@@ -19,6 +19,27 @@ _TERMINAL_EVENT_TYPES = frozenset({
 })
 
 
+async def _finish_owned_task(task: asyncio.Task[Any]) -> Any:
+    """Finish one owned Codex stream task through repeated cancellation."""
+    cancellation: asyncio.CancelledError | None = None
+    while True:
+        try:
+            result = await asyncio.shield(task)
+            break
+        except asyncio.CancelledError as exc:  # noqa: ASYNC103 - re-raised below
+            if task.cancelled():
+                raise
+            if cancellation is None:
+                cancellation = exc
+        except Exception as exc:
+            if cancellation is not None:
+                raise cancellation from exc
+            raise
+    if cancellation is not None:
+        raise cancellation
+    return result
+
+
 def _coerce_usage_int(value: Any) -> int:
     if isinstance(value, bool):
         return 0
@@ -1166,6 +1187,7 @@ async def run_codex_stream(
     api_kwargs: dict,
     client: Any = None,
     on_first_delta=None,
+    on_stream_event=None,
 ):
     """Consume an OpenAI Responses stream through an async client.
 
@@ -1191,6 +1213,8 @@ async def run_codex_stream(
     commentary_text_deltas: list[str] = []
     try:
         async for event in stream:
+            if on_stream_event is not None:
+                on_stream_event()
             events.append(event)
             event_type = _event_field(event, "type", "")
             if event_type == "response.output_item.added":
@@ -1258,7 +1282,12 @@ async def run_codex_stream(
     finally:
         close = getattr(stream, "aclose", None) or getattr(stream, "close", None)
         if inspect.iscoroutinefunction(close):
-            await close()
+            await _finish_owned_task(
+                asyncio.create_task(
+                    close(),
+                    name="codex-response-stream-close",
+                )
+            )
 
     return _consume_codex_event_stream(events, model=request.get("model"))
 

@@ -2465,11 +2465,18 @@ async def run_conversation(
                             allow_stream=False,
                             is_github_responses=agent._is_copilot_url(),
                         )
-                    return await agent._execute_model_request(
-                        next_api_kwargs,
-                        use_streaming=_use_streaming,
-                        on_first_delta=_stop_thinking,
+                    from agent.chat_completion_helpers import (
+                        interruptible_api_call,
+                        interruptible_streaming_api_call,
                     )
+
+                    if _use_streaming:
+                        return await interruptible_streaming_api_call(
+                            agent,
+                            next_api_kwargs,
+                            on_first_delta=_stop_thinking,
+                        )
+                    return await interruptible_api_call(agent, next_api_kwargs)
 
                 _model_request_active = getattr(agent, "_model_request_active", None)
                 if _model_request_active is not None:

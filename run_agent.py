@@ -5105,6 +5105,7 @@ class AIAgent:
         *,
         use_streaming: bool = False,
         on_first_delta: Optional[Callable[[], None]] = None,
+        on_stream_activity: Optional[Callable[[], None]] = None,
     ):
         """Execute one model request without blocking the event loop.
 
@@ -5122,6 +5123,7 @@ class AIAgent:
                     api_kwargs,
                     client=self.client,
                     on_first_delta=on_first_delta,
+                    on_stream_event=on_stream_activity,
                 )
 
             request = dict(api_kwargs)
@@ -5191,6 +5193,8 @@ class AIAgent:
 
                 def _on_anthropic_event(_event: Any) -> None:
                     nonlocal first_event
+                    if on_stream_activity is not None:
+                        on_stream_activity()
                     if first_event:
                         first_event = False
                         if on_first_delta is not None:
@@ -5256,6 +5260,8 @@ class AIAgent:
 
                 def _on_event() -> None:
                     nonlocal first_event
+                    if on_stream_activity is not None:
+                        on_stream_activity()
                     if first_event:
                         first_event = False
                         if on_first_delta is not None:
@@ -5301,26 +5307,42 @@ class AIAgent:
             model=str(request.get("model") or self.model or "")
         )
         first_delta = True
-        async for chunk in result:
-            if first_delta:
-                first_delta = False
-                if on_first_delta is not None:
-                    on_first_delta()
-            # Preserve the existing streaming display contract while the
-            # accumulator reconstructs tool calls/reasoning for the loop.
-            try:
-                choices = getattr(chunk, "choices", None) or []
-                delta = getattr(choices[0], "delta", None) if choices else None
-                text = getattr(delta, "content", None) if delta is not None else None
-                if isinstance(text, str) and text:
-                    self._fire_stream_delta(text)
-            except Exception:
-                pass
-            accumulator.feed(chunk)
-
-        close = getattr(result, "aclose", None) or getattr(result, "close", None)
-        if inspect.iscoroutinefunction(close):
-            await close()
+        try:
+            async for chunk in result:
+                if on_stream_activity is not None:
+                    on_stream_activity()
+                if first_delta:
+                    first_delta = False
+                    if on_first_delta is not None:
+                        on_first_delta()
+                # Preserve the existing streaming display contract while the
+                # accumulator reconstructs tool calls/reasoning for the loop.
+                try:
+                    choices = getattr(chunk, "choices", None) or []
+                    delta = (
+                        getattr(choices[0], "delta", None) if choices else None
+                    )
+                    text = (
+                        getattr(delta, "content", None)
+                        if delta is not None
+                        else None
+                    )
+                    if isinstance(text, str) and text:
+                        self._fire_stream_delta(text)
+                except Exception:
+                    pass
+                accumulator.feed(chunk)
+        finally:
+            close = getattr(result, "aclose", None) or getattr(
+                result, "close", None
+            )
+            if inspect.iscoroutinefunction(close):
+                await _finish_owned_task(
+                    asyncio.create_task(
+                        close(),
+                        name="chat-completion-stream-close",
+                    )
+                )
         return accumulator.finish()
 
     # ── Unified streaming API call ─────────────────────────────────────────

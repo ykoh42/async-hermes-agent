@@ -232,14 +232,15 @@ async def test_legacy_model_call_names_route_to_native_async_transport():
         payload,
         on_first_delta=first_delta,
     ) is response
-    assert execute.await_args_list == [
+    assert execute.await_args_list[:2] == [
         ((payload,), {}),
         ((payload,), {}),
-        (
-            (payload,),
-            {"use_streaming": True, "on_first_delta": first_delta},
-        ),
     ]
+    stream_call = execute.await_args_list[2]
+    assert stream_call.args == (payload,)
+    assert stream_call.kwargs["use_streaming"] is True
+    assert stream_call.kwargs["on_first_delta"] is first_delta
+    assert callable(stream_call.kwargs["on_stream_activity"])
 
 
 @pytest.mark.asyncio

@@ -12,18 +12,21 @@ sites remain unchanged.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import math
 import os
 import re
 import time
 import uuid
+from types import SimpleNamespace
 from typing import Any, Dict, Optional
 
-from agent.error_classifier import FailoverReason
+from agent.error_classifier import FailoverReason, classify_api_error
 from agent.turn_context import substitute_api_content
 from agent.message_content import flatten_message_text
 from agent.message_sanitization import _sanitize_surrogates
+from hermes_constants import PARTIAL_STREAM_STUB_ID
 from tools.terminal_tool import cleanup_vm, is_persistent_env
 from utils import base_url_host_matches, base_url_hostname, env_float, env_int
 
@@ -320,12 +323,76 @@ def should_use_direct_api_call(agent: Any) -> bool:
 
 async def direct_api_call(agent: Any, api_kwargs: dict) -> Any:
     """Execute a non-streaming provider request directly on the event loop."""
-    return await agent._execute_model_request(api_kwargs)
+    return await interruptible_api_call(agent, api_kwargs)
 
 
 async def interruptible_api_call(agent: Any, api_kwargs: dict) -> Any:
-    """Execute an interruptible native-async non-streaming provider request."""
-    return await agent._execute_model_request(api_kwargs)
+    """Execute a bounded native-async non-streaming provider request."""
+    _check_stale_giveup(agent)
+    touch_activity = getattr(agent, "_touch_activity", None)
+    if callable(touch_activity):
+        touch_activity("waiting for non-streaming API response")
+    compute_timeout = getattr(agent, "_compute_non_stream_stale_timeout", None)
+    timeout = compute_timeout(api_kwargs) if callable(compute_timeout) else None
+    timeout_scope = asyncio.timeout(
+        timeout if timeout is not None and math.isfinite(timeout) else None
+    )
+    try:
+        async with timeout_scope:
+            response = await agent._execute_model_request(api_kwargs)
+    except TimeoutError:
+        if not timeout_scope.expired():
+            raise
+        _bump_stale_streak(agent)
+        if callable(touch_activity):
+            touch_activity(
+                f"stale non-streaming call killed after {int(timeout or 0)}s"
+            )
+        raise TimeoutError(
+            f"Non-streaming API call timed out after {int(timeout or 0)}s "
+            f"with no response (threshold: {int(timeout or 0)}s)."
+        ) from None
+    _reset_stale_streak(agent)
+    return response
+
+
+def _partial_stream_stub(agent: Any, error: Exception | None = None) -> Any | None:
+    """Return upstream's length-truncated stub after visible streamed text."""
+    content = str(
+        getattr(agent, "_current_streamed_assistant_text", "") or ""
+    ).strip()
+    if not content:
+        return None
+    stub = SimpleNamespace(
+        id=PARTIAL_STREAM_STUB_ID,
+        model=getattr(agent, "model", "unknown"),
+        choices=[
+            SimpleNamespace(
+                index=0,
+                message=SimpleNamespace(
+                    role="assistant",
+                    content=content,
+                    tool_calls=None,
+                    reasoning_content=None,
+                ),
+                finish_reason="length",
+            )
+        ],
+        usage=None,
+        _dropped_tool_names=None,
+    )
+    if error is not None:
+        try:
+            classified = classify_api_error(
+                error,
+                provider=str(getattr(agent, "provider", "") or ""),
+                model=str(getattr(agent, "model", "") or ""),
+            )
+            if classified.reason == FailoverReason.content_policy_blocked:
+                stub._content_filter_terminated = True
+        except Exception:
+            pass
+    return stub
 
 
 async def interruptible_streaming_api_call(
@@ -334,29 +401,90 @@ async def interruptible_streaming_api_call(
     *,
     on_first_delta=None,
 ) -> Any:
-    """Execute an interruptible native-async streaming provider request."""
-    return await agent._execute_model_request(
-        api_kwargs,
-        use_streaming=True,
-        on_first_delta=on_first_delta,
+    """Execute a native stream with upstream's idle-stale circuit breaker."""
+    _check_stale_giveup(agent)
+    timeout = await _derive_stream_stale_timeout(agent, api_kwargs)
+    loop = asyncio.get_running_loop()
+    timeout_scope = asyncio.timeout(
+        timeout if math.isfinite(timeout) else None
     )
 
+    def _note_stream_activity() -> None:
+        if math.isfinite(timeout):
+            timeout_scope.reschedule(loop.time() + timeout)
 
-def _derive_stream_stale_timeout(agent, api_kwargs: dict) -> float:
-    """Stale-stream patience for a provider that is never a local endpoint.
+    try:
+        async with timeout_scope:
+            response = await agent._execute_model_request(
+                api_kwargs,
+                use_streaming=True,
+                on_first_delta=on_first_delta,
+                on_stream_activity=_note_stream_activity,
+            )
+    except TimeoutError as exc:
+        if not timeout_scope.expired():
+            partial = _partial_stream_stub(agent, exc)
+            if partial is not None:
+                _reset_stale_streak(agent)
+                return partial
+            raise
+        _bump_stale_streak(agent)
+        touch_activity = getattr(agent, "_touch_activity", None)
+        if callable(touch_activity):
+            touch_activity(
+                f"stale stream detected after {int(timeout)}s, reconnecting"
+            )
+        partial = _partial_stream_stub(agent, exc)
+        if partial is not None:
+            _reset_stale_streak(agent)
+            return partial
+        raise TimeoutError(
+            f"Streaming API call produced no chunks for {int(timeout)}s "
+            f"(threshold: {int(timeout)}s)."
+        ) from None
+    except Exception as exc:
+        partial = _partial_stream_stub(agent, exc)
+        if partial is not None:
+            _reset_stale_streak(agent)
+            return partial
+        raise
+    _reset_stale_streak(agent)
+    return response
+
+
+async def _derive_stream_stale_timeout(agent, api_kwargs: dict) -> float:
+    """Resolve upstream's provider/context-aware stream idle timeout.
 
     Mirrors the main streaming path's derivation — provider config → env base
-    → context-size scaling → reasoning-model floor — minus the local-endpoint
-    ``float('inf')``/900s disable branch, which cannot apply to Bedrock (its
-    endpoint is always the AWS cloud). Factored so the Bedrock streaming
-    watchdog shares the exact same patience budget as the OpenAI/Anthropic
-    stale-stream detector below.
+    → local-endpoint allowance → context-size scaling → reasoning-model floor.
+    Every native async provider shares the same patience budget.
     """
     _cfg_stale = getattr(agent, "_provider_stale_timeout", None)
     if _cfg_stale is not None:
         _base = _cfg_stale
     else:
         _base = env_float("HERMES_STREAM_STALE_TIMEOUT", 180.0)
+    if _base == 180.0 and getattr(agent, "base_url", None):
+        from agent.model_metadata import is_local_endpoint
+
+        if is_local_endpoint(agent.base_url):
+            local_default = 900.0
+            try:
+                from hermes_cli.config import load_config_readonly
+
+                config = await load_config_readonly()
+                agent_config = config.get("agent") if isinstance(config, dict) else None
+                configured = (
+                    agent_config.get("local_stream_stale_timeout")
+                    if isinstance(agent_config, dict)
+                    else None
+                )
+                if isinstance(configured, (int, float)):
+                    local_default = float(configured)
+            except Exception:
+                pass
+            return env_float("HERMES_LOCAL_STREAM_STALE_TIMEOUT", local_default)
+
     _est_tokens = estimate_request_context_tokens(api_kwargs)
     if _est_tokens > 100_000:
         _timeout = max(_base, 300.0)
