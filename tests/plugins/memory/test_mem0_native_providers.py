@@ -10,6 +10,7 @@ import pytest
 
 from plugins.memory.mem0._native_oss import (
     OllamaEmbedding,
+    OllamaLLM,
     OpenAIEmbedding,
     OpenAILLM,
 )
@@ -67,6 +68,7 @@ class _FakeAsyncOllama:
     instances = []
     models = []
     embeddings = [[1.0, 2.0]]
+    chat_response = {"message": {"content": "answer", "tool_calls": []}}
     list_exception = None
     list_entered = None
     list_release = None
@@ -95,6 +97,10 @@ class _FakeAsyncOllama:
         self.calls.append(("embed", kwargs))
         return {"embeddings": list(self.embeddings)}
 
+    async def chat(self, **kwargs):
+        self.calls.append(("chat", kwargs))
+        return self.chat_response
+
     async def close(self):
         self.close_calls += 1
 
@@ -110,6 +116,9 @@ def _reset_fake_ollama(monkeypatch):
     _FakeAsyncOllama.instances.clear()
     _FakeAsyncOllama.models = []
     _FakeAsyncOllama.embeddings = [[1.0, 2.0]]
+    _FakeAsyncOllama.chat_response = {
+        "message": {"content": "answer", "tool_calls": []}
+    }
     _FakeAsyncOllama.list_exception = None
     _FakeAsyncOllama.list_entered = None
     _FakeAsyncOllama.list_release = None
@@ -553,4 +562,102 @@ async def test_openai_llm_rejects_sync_response_callback_without_calling_it(
     with pytest.raises(RuntimeError, match="native-async response_callback"):
         await llm.generate_response([{"role": "user", "content": "question"}])
     assert called is False
+    await llm.close()
+
+
+@pytest.mark.asyncio
+async def test_ollama_llm_preserves_default_request_contract():
+    llm = OllamaLLM(
+        {
+            "model": "llama3.1:8b",
+            "temperature": 0.2,
+            "max_tokens": 321,
+            "top_p": 0.3,
+            "ollama_base_url": "http://ollama.test:11434",
+        }
+    )
+    messages = [{"role": "user", "content": "question"}]
+
+    assert _FakeAsyncOllama.instances == []
+    assert await llm.generate_response(messages) == "answer"
+
+    client = _FakeAsyncOllama.instances[0]
+    assert client.kwargs == {"host": "http://ollama.test:11434"}
+    assert client.calls == [
+        (
+            "chat",
+            {
+                "model": "llama3.1:8b",
+                "messages": messages,
+                "options": {
+                    "temperature": 0.2,
+                    "num_predict": 321,
+                    "top_p": 0.3,
+                },
+            },
+        )
+    ]
+    await llm.close()
+
+
+@pytest.mark.asyncio
+async def test_ollama_llm_json_format_copies_and_extends_messages():
+    llm = OllamaLLM({})
+    messages = [{"role": "user", "content": "extract memories"}]
+
+    await llm.generate_response(messages, response_format={"type": "json_object"})
+
+    assert messages == [{"role": "user", "content": "extract memories"}]
+    request = _FakeAsyncOllama.instances[0].calls[0][1]
+    assert request["model"] == "llama3.1:70b"
+    assert request["format"] == "json"
+    assert request["messages"] == [
+        {
+            "role": "user",
+            "content": "extract memories\n\nPlease respond with valid JSON only.",
+        }
+    ]
+    await llm.close()
+
+
+@pytest.mark.asyncio
+async def test_ollama_llm_parses_string_and_mapping_tool_arguments():
+    _FakeAsyncOllama.chat_response = {
+        "message": {
+            "content": None,
+            "tool_calls": [
+                {
+                    "function": {
+                        "name": "remember",
+                        "arguments": 'prefix {"fact": "tea"} suffix',
+                    }
+                },
+                {
+                    "function": {
+                        "name": "forget",
+                        "arguments": {"id": "m1"},
+                    }
+                },
+            ],
+        }
+    }
+    llm = OllamaLLM({})
+    tools = [{"type": "function", "function": {"name": "remember"}}]
+
+    result = await llm.generate_response(
+        [{"role": "user", "content": "question"}],
+        tools=tools,
+        tool_choice="required",
+    )
+
+    assert result == {
+        "content": None,
+        "tool_calls": [
+            {"name": "remember", "arguments": {"fact": "tea"}},
+            {"name": "forget", "arguments": {"id": "m1"}},
+        ],
+    }
+    request = _FakeAsyncOllama.instances[0].calls[0][1]
+    assert request["tools"] is tools
+    assert "tool_choice" not in request
     await llm.close()

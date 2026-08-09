@@ -50,6 +50,12 @@ def _extract_json(text: str) -> str:
         return text[start : end + 1]
     return text
 
+
+def _response_value(response: Any, key: str, default: Any = None) -> Any:
+    if isinstance(response, dict):
+        return response.get(key, default)
+    return getattr(response, key, default)
+
 _HISTORY_COLUMNS = (
     "id",
     "memory_id",
@@ -197,12 +203,6 @@ class OllamaEmbedding:
     def _normalize_model_name(name: str) -> str:
         return name if ":" in name else f"{name}:latest"
 
-    @staticmethod
-    def _response_value(response: Any, key: str, default: Any = None) -> Any:
-        if isinstance(response, dict):
-            return response.get(key, default)
-        return getattr(response, key, default)
-
     async def _get_client(self) -> Any:
         if self._client is not None:
             return self._client
@@ -222,11 +222,11 @@ class OllamaEmbedding:
             client = AsyncClient(host=self.config.get("ollama_base_url"))
             try:
                 response = await client.list()
-                models = self._response_value(response, "models", []) or []
+                models = _response_value(response, "models", []) or []
                 target = self._normalize_model_name(self.model)
                 found = False
                 for model in models:
-                    name = self._response_value(model, "name", "") or self._response_value(
+                    name = _response_value(model, "name", "") or _response_value(
                         model, "model", ""
                     )
                     if name and self._normalize_model_name(name) == target:
@@ -255,7 +255,7 @@ class OllamaEmbedding:
     ) -> list[float]:
         client = await self._get_client()
         response = await client.embed(model=self.model, input=text)
-        embeddings = self._response_value(response, "embeddings", []) or []
+        embeddings = _response_value(response, "embeddings", []) or []
         if not embeddings:
             raise ValueError(
                 f"Ollama embed() returned no embeddings for model '{self.model}'"
@@ -269,7 +269,7 @@ class OllamaEmbedding:
             return []
         client = await self._get_client()
         response = await client.embed(model=self.model, input=texts)
-        embeddings = self._response_value(response, "embeddings", []) or []
+        embeddings = _response_value(response, "embeddings", []) or []
         if len(embeddings) != len(texts):
             raise ValueError(
                 f"Ollama embed() returned {len(embeddings)} embeddings for "
@@ -450,6 +450,110 @@ class OpenAILLM:
                 await _finish_cleanup(
                     client.close(),
                     error_message="Mem0 OpenAI LLM cleanup failed during cancellation",
+                )
+
+
+class OllamaLLM:
+    """Native-async equivalent of Mem0 2.0.10's Ollama LLM."""
+
+    def __init__(self, config: dict[str, Any] | None = None) -> None:
+        self.config = dict(config or {})
+        self.model = self.config.get("model") or "llama3.1:70b"
+        self.temperature = self.config.get("temperature", 0.1)
+        self.max_tokens = self.config.get("max_tokens", 2000)
+        self.top_p = self.config.get("top_p", 0.1)
+        self._client: Any = None
+        self._initialize_lock = asyncio.Lock()
+        self._closed = False
+
+    async def _get_client(self) -> Any:
+        if self._client is not None:
+            return self._client
+        async with self._initialize_lock:
+            if self._client is not None:
+                return self._client
+            if self._closed:
+                raise RuntimeError("Cannot use a closed OllamaLLM")
+            try:
+                from ollama import AsyncClient
+            except ImportError as exc:
+                raise ImportError(
+                    "The 'ollama' library is required. Install the mem0 extra."
+                ) from exc
+            self._client = AsyncClient(host=self.config.get("ollama_base_url"))
+            return self._client
+
+    @staticmethod
+    def _parse_response(response: Any, tools: list[dict[str, Any]] | None) -> Any:
+        message = _response_value(response, "message", {})
+        content = _response_value(message, "content")
+        if not tools:
+            return content
+        parsed = {"content": content, "tool_calls": []}
+        for tool_call in _response_value(message, "tool_calls", []) or []:
+            function = _response_value(tool_call, "function", {})
+            arguments = _response_value(function, "arguments", {})
+            if isinstance(arguments, str):
+                arguments = json.loads(_extract_json(arguments))
+            parsed["tool_calls"].append(
+                {
+                    "name": _response_value(function, "name", ""),
+                    "arguments": arguments,
+                }
+            )
+        return parsed
+
+    async def generate_response(
+        self,
+        messages: list[dict[str, Any]],
+        response_format: Any = None,
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: str = "auto",  # noqa: ARG002
+        **kwargs: Any,  # noqa: ARG002
+    ) -> Any:
+        request_messages = messages
+        params: dict[str, Any] = {
+            "model": self.model,
+            "messages": request_messages,
+        }
+        if response_format and response_format.get("type") == "json_object":
+            params["format"] = "json"
+            request_messages = [dict(message) for message in messages]
+            if request_messages and request_messages[-1]["role"] == "user":
+                request_messages[-1]["content"] += (
+                    "\n\nPlease respond with valid JSON only."
+                )
+            else:
+                request_messages.append(
+                    {
+                        "role": "user",
+                        "content": "Please respond with valid JSON only.",
+                    }
+                )
+            params["messages"] = request_messages
+        params["options"] = {
+            "temperature": self.temperature,
+            "num_predict": self.max_tokens,
+            "top_p": self.top_p,
+        }
+        if tools:
+            params["tools"] = tools
+
+        client = await self._get_client()
+        response = await client.chat(**params)
+        return self._parse_response(response, tools)
+
+    async def close(self) -> None:
+        async with self._initialize_lock:
+            if self._closed:
+                return
+            self._closed = True
+            client = self._client
+            self._client = None
+            if client is not None:
+                await _finish_cleanup(
+                    client.close(),
+                    error_message="Mem0 Ollama LLM cleanup failed during cancellation",
                 )
 
 
