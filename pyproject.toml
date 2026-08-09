@@ -44,6 +44,10 @@ dependencies = [
   # tiktoken BPE. We download its assets with httpx/aiofiles and construct the
   # CPU-only encoder directly, avoiding Transformers' synchronous Hub/file I/O.
   "tiktoken==0.13.0",
+  # Standard custom trajectory tokenizers publish their complete Rust pipeline
+  # as tokenizer.json. Assets are read/downloaded asynchronously, then parsed
+  # from memory without Transformers' synchronous Hub/file-loading path.
+  "tokenizers==0.23.1",
   # Native CDP transport for browser_cdp and the persistent supervisor.
   "websockets==15.0.1",
   "rich==14.3.3",

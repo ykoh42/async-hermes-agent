@@ -59,6 +59,7 @@ from agent.retry_utils import jittered_backoff
 _KIMI_TOKENIZER_NAME = "moonshotai/Kimi-K2-Thinking"
 _KIMI_TOKENIZER_REVISION = "main"
 _KIMI_TOKENIZER_FILES = ("tokenizer_config.json", "tiktoken.model")
+_FAST_TOKENIZER_FILES = ("tokenizer_config.json", "tokenizer.json")
 _KIMI_NUM_RESERVED_SPECIAL_TOKENS = 256
 _KIMI_PAT_STR = "|".join(
     [
@@ -109,6 +110,16 @@ class _KimiTokenizer:
                     self._encoding.encode(substring, allowed_special="all")
                 )
         return token_ids
+
+
+class _FastTokenizer:
+    """Transformers-compatible ``encode`` facade over tokenizer.json."""
+
+    def __init__(self, tokenizer: Any) -> None:
+        self._tokenizer = tokenizer
+
+    def encode(self, text: str) -> List[int]:
+        return self._tokenizer.encode(text, add_special_tokens=True).ids
 
 
 def _parse_tiktoken_ranks(model_bytes: bytes) -> Dict[bytes, int]:
@@ -195,20 +206,68 @@ def _offline_mode_enabled() -> bool:
 
 def _complete_cached_assets(
     cached: Dict[str, bytes | None],
-) -> Tuple[bytes, bytes] | None:
-    config_bytes = cached.get("tokenizer_config.json")
-    model_bytes = cached.get("tiktoken.model")
-    if config_bytes is None or model_bytes is None:
-        return None
-    return config_bytes, model_bytes
+    filenames: Tuple[str, ...],
+) -> Dict[str, bytes] | None:
+    complete: Dict[str, bytes] = {}
+    for name in filenames:
+        content = cached.get(name)
+        if content is None:
+            return None
+        complete[name] = content
+    return complete
 
 
-async def _load_kimi_tokenizer_assets() -> Tuple[bytes, bytes]:
-    """Load Kimi tokenizer files through an async, conditional HTTP cache."""
-    cache_directory = _tokenizer_cache_directory(_KIMI_TOKENIZER_NAME)
+def _validate_hf_repo_id(repo_id: str) -> None:
+    """Apply Hugging Face's repository-id shape constraints before HTTP."""
+    if len(repo_id) > 96 or repo_id.endswith(".git"):
+        raise ValueError(f"Invalid Hugging Face tokenizer repository: {repo_id!r}")
+    parts = repo_id.split("/")
+    allowed = frozenset(
+        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_."
+    )
+    if (
+        not 1 <= len(parts) <= 2
+        or any(
+            not part
+            or part[0] in "-."
+            or part[-1] in "-."
+            or "--" in part
+            or ".." in part
+            or any(character not in allowed for character in part)
+            for part in parts
+        )
+    ):
+        raise ValueError(f"Invalid Hugging Face tokenizer repository: {repo_id!r}")
+
+
+async def _load_hf_tokenizer_assets(
+    tokenizer_name: str,
+    filenames: Tuple[str, ...],
+    *,
+    revision: str = "main",
+) -> Dict[str, bytes]:
+    """Load tokenizer files through native async local or Hub I/O."""
+    local_directory = Path(tokenizer_name)
+    if await aiofiles.os.path.isdir(local_directory):
+        local_assets = {
+            name: await _read_optional_bytes(local_directory / name)
+            for name in filenames
+        }
+        complete_local = _complete_cached_assets(local_assets, filenames)
+        if complete_local is None:
+            missing = [name for name, content in local_assets.items() if content is None]
+            raise FileNotFoundError(
+                f"Tokenizer directory '{tokenizer_name}' is missing: "
+                + ", ".join(missing)
+            )
+        return complete_local
+
+    _validate_hf_repo_id(tokenizer_name)
+
+    cache_directory = _tokenizer_cache_directory(tokenizer_name)
     cached = {
         name: await _read_optional_bytes(cache_directory / name)
-        for name in _KIMI_TOKENIZER_FILES
+        for name in filenames
     }
     metadata_path = cache_directory / "metadata.json"
     metadata_bytes = await _read_optional_bytes(metadata_path)
@@ -217,12 +276,13 @@ async def _load_kimi_tokenizer_assets() -> Tuple[bytes, bytes]:
     except (TypeError, ValueError):
         metadata = {}
 
-    cached_assets = _complete_cached_assets(cached)
+    cached_assets = _complete_cached_assets(cached, filenames)
     if _offline_mode_enabled():
         if cached_assets is not None:
             return cached_assets
         raise RuntimeError(
-            "Kimi tokenizer is not cached and HF_HUB_OFFLINE is enabled."
+            f"Tokenizer '{tokenizer_name}' is not cached and "
+            "HF_HUB_OFFLINE is enabled."
         )
 
     token = os.getenv("HF_TOKEN") or os.getenv("HUGGING_FACE_HUB_TOKEN")
@@ -238,14 +298,14 @@ async def _load_kimi_tokenizer_assets() -> Tuple[bytes, bytes]:
             timeout=httpx.Timeout(60.0),
             headers=common_headers,
         ) as client:
-            for name in _KIMI_TOKENIZER_FILES:
+            for name in filenames:
                 headers = {}
                 previous_etag = (metadata.get("etags") or {}).get(name)
                 if cached[name] is not None and isinstance(previous_etag, str):
                     headers["If-None-Match"] = previous_etag
                 url = (
-                    f"https://huggingface.co/{_KIMI_TOKENIZER_NAME}/resolve/"
-                    f"{_KIMI_TOKENIZER_REVISION}/{name}"
+                    f"https://huggingface.co/{tokenizer_name}/resolve/"
+                    f"{revision}/{name}"
                 )
                 response = await client.get(url, headers=headers)
                 if response.status_code == 304:
@@ -274,14 +334,56 @@ async def _load_kimi_tokenizer_assets() -> Tuple[bytes, bytes]:
         metadata_path,
         json.dumps(
             {
-                "tokenizer": _KIMI_TOKENIZER_NAME,
-                "revision": _KIMI_TOKENIZER_REVISION,
+                "tokenizer": tokenizer_name,
+                "revision": revision,
                 "etags": etags,
             },
             sort_keys=True,
         ).encode("utf-8"),
     )
-    return refreshed["tokenizer_config.json"], refreshed["tiktoken.model"]
+    return refreshed
+
+
+async def _load_kimi_tokenizer_assets() -> Tuple[bytes, bytes]:
+    """Load Kimi tokenizer files through an async, conditional HTTP cache."""
+    assets = await _load_hf_tokenizer_assets(
+        _KIMI_TOKENIZER_NAME,
+        _KIMI_TOKENIZER_FILES,
+        revision=_KIMI_TOKENIZER_REVISION,
+    )
+    return assets["tokenizer_config.json"], assets["tiktoken.model"]
+
+
+async def _load_fast_tokenizer_assets(
+    tokenizer_name: str,
+) -> Tuple[bytes, bytes]:
+    """Load a standard Hugging Face tokenizer.json and its configuration."""
+    assets = await _load_hf_tokenizer_assets(
+        tokenizer_name,
+        _FAST_TOKENIZER_FILES,
+    )
+    return assets["tokenizer_config.json"], assets["tokenizer.json"]
+
+
+def _build_fast_tokenizer(
+    config_bytes: bytes,
+    tokenizer_bytes: bytes,
+) -> _FastTokenizer:
+    """Construct the generic Rust tokenizer from already-loaded JSON bytes."""
+    tokenizer_config = json.loads(config_bytes)
+    if tokenizer_config.get("auto_map", {}).get("AutoTokenizer"):
+        raise ValueError(
+            "the configured tokenizer requires Python remote code, which has "
+            "no native-async file-loading contract"
+        )
+    try:
+        from tokenizers import Tokenizer
+    except ImportError as exc:  # pragma: no cover - pinned core dependency
+        raise RuntimeError(
+            "Trajectory compression requires tokenizers. Reinstall "
+            "async-hermes-agent to restore its pinned dependencies."
+        ) from exc
+    return _FastTokenizer(Tokenizer.from_str(tokenizer_bytes.decode("utf-8")))
 
 
 async def _finish_owned_task(task: asyncio.Task[Any]) -> Any:
@@ -635,18 +737,25 @@ class TrajectoryCompressor:
                 return
             try:
                 tokenizer_name = self.config.tokenizer_name.strip().rstrip("/")
-                if tokenizer_name != _KIMI_TOKENIZER_NAME:
-                    raise ValueError(
-                        "no native-async loader is available; supported "
-                        f"tokenizer: '{_KIMI_TOKENIZER_NAME}'"
+                if tokenizer_name == _KIMI_TOKENIZER_NAME:
+                    if not self.config.trust_remote_code:
+                        raise ValueError(
+                            "trust_remote_code=true is required by the published "
+                            "Kimi tokenizer contract"
+                        )
+                    config_bytes, model_bytes = await _load_kimi_tokenizer_assets()
+                    self.tokenizer = _build_kimi_tokenizer(
+                        config_bytes,
+                        model_bytes,
                     )
-                if not self.config.trust_remote_code:
-                    raise ValueError(
-                        "trust_remote_code=true is required by the published "
-                        "Kimi tokenizer contract"
+                else:
+                    config_bytes, tokenizer_bytes = (
+                        await _load_fast_tokenizer_assets(tokenizer_name)
                     )
-                config_bytes, model_bytes = await _load_kimi_tokenizer_assets()
-                self.tokenizer = _build_kimi_tokenizer(config_bytes, model_bytes)
+                    self.tokenizer = _build_fast_tokenizer(
+                        config_bytes,
+                        tokenizer_bytes,
+                    )
             except asyncio.CancelledError:
                 raise
             except Exception as exc:

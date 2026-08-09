@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, patch, MagicMock
 
 import httpx
 import pytest
+from tokenizers import Tokenizer, models, pre_tokenizers, processors
 
 import trajectory_compressor as trajectory_compressor_module
 from trajectory_compressor import (
@@ -36,6 +37,21 @@ def _minimal_kimi_assets():
         }
     ).encode("utf-8")
     return config, model
+
+
+def _minimal_fast_tokenizer_assets():
+    tokenizer = Tokenizer(
+        models.WordLevel(
+            {"[UNK]": 0, "[BOS]": 1, "hello": 2, "world": 3},
+            unk_token="[UNK]",
+        )
+    )
+    tokenizer.pre_tokenizer = pre_tokenizers.Whitespace()
+    tokenizer.post_processor = processors.TemplateProcessing(
+        single="[BOS] $A",
+        special_tokens=[("[BOS]", 1)],
+    )
+    return b"{}", tokenizer.to_str().encode("utf-8")
 
 
 @pytest.mark.asyncio
@@ -107,6 +123,46 @@ async def test_kimi_tokenizer_offline_cache_miss_fails_without_network(
 
     with pytest.raises(RuntimeError, match="HF_HUB_OFFLINE"):
         await trajectory_compressor_module._load_kimi_tokenizer_assets()
+
+    client.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_custom_fast_tokenizer_loads_local_directory_without_network(
+    tmp_path, monkeypatch
+):
+    config_bytes, tokenizer_bytes = _minimal_fast_tokenizer_assets()
+    tokenizer_directory = tmp_path / "custom-tokenizer"
+    tokenizer_directory.mkdir()
+    (tokenizer_directory / "tokenizer_config.json").write_bytes(config_bytes)
+    (tokenizer_directory / "tokenizer.json").write_bytes(tokenizer_bytes)
+    client = MagicMock(side_effect=AssertionError("network must not be used"))
+    monkeypatch.setattr(trajectory_compressor_module.httpx, "AsyncClient", client)
+
+    with patch.object(TrajectoryCompressor, "_init_summarizer"):
+        compressor = TrajectoryCompressor(
+            CompressionConfig(
+                tokenizer_name=str(tokenizer_directory),
+                trust_remote_code=False,
+            )
+        )
+        assert await compressor.count_tokens("hello world") == 3
+
+    client.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_custom_tokenizer_rejects_invalid_hub_repository_before_network(
+    tmp_path, monkeypatch
+):
+    monkeypatch.chdir(tmp_path)
+    client = MagicMock(side_effect=AssertionError("network must not be used"))
+    monkeypatch.setattr(trajectory_compressor_module.httpx, "AsyncClient", client)
+
+    with pytest.raises(ValueError, match="Invalid Hugging Face"):
+        await trajectory_compressor_module._load_fast_tokenizer_assets(
+            "https://attacker.invalid/tokenizer"
+        )
 
     client.assert_not_called()
 
@@ -414,14 +470,42 @@ class TestTokenCounting:
         load_assets.assert_awaited_once_with()
 
     @pytest.mark.asyncio
-    async def test_unsupported_custom_tokenizer_fails_clearly(self):
-        with patch.object(TrajectoryCompressor, "_init_summarizer"):
+    async def test_custom_fast_tokenizer_uses_native_async_assets(self):
+        config_bytes, tokenizer_bytes = _minimal_fast_tokenizer_assets()
+        with (
+            patch.object(TrajectoryCompressor, "_init_summarizer"),
+            patch(
+                "trajectory_compressor._load_fast_tokenizer_assets",
+                new=AsyncMock(return_value=(config_bytes, tokenizer_bytes)),
+            ) as load_assets,
+        ):
             tc = TrajectoryCompressor(
                 CompressionConfig(tokenizer_name="org/custom-tokenizer")
             )
 
-        with pytest.raises(RuntimeError, match="no native-async loader is available"):
-            await tc.count_tokens("hello")
+            assert await tc.count_tokens("hello world") == 3
+
+        load_assets.assert_awaited_once_with("org/custom-tokenizer")
+
+    @pytest.mark.asyncio
+    async def test_custom_python_tokenizer_fails_instead_of_blocking(self):
+        _, tokenizer_bytes = _minimal_fast_tokenizer_assets()
+        config_bytes = json.dumps(
+            {"auto_map": {"AutoTokenizer": ["tokenization_custom.Custom", None]}}
+        ).encode("utf-8")
+        with (
+            patch.object(TrajectoryCompressor, "_init_summarizer"),
+            patch(
+                "trajectory_compressor._load_fast_tokenizer_assets",
+                new=AsyncMock(return_value=(config_bytes, tokenizer_bytes)),
+            ),
+        ):
+            tc = TrajectoryCompressor(
+                CompressionConfig(tokenizer_name="org/custom-tokenizer")
+            )
+
+            with pytest.raises(RuntimeError, match="requires Python remote code"):
+                await tc.count_tokens("hello")
 
     @pytest.mark.asyncio
     async def test_tokenizer_initialization_preserves_cancellation_and_retries(self):
