@@ -236,6 +236,85 @@ async def test_shutdown_cancels_prefetch_and_closes_backend(monkeypatch, tmp_pat
     assert provider._prefetch_task is None
 
 
+@pytest.mark.asyncio
+async def test_shutdown_collects_prefetch_through_repeated_cancellation(
+    monkeypatch, tmp_path
+):
+    cancellation_started = asyncio.Event()
+    release = asyncio.Event()
+    finished = asyncio.Event()
+
+    class SlowBackend(FakeBackend):
+        async def search(self, query, *, filters, top_k=10, rerank=True):
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                cancellation_started.set()
+                await release.wait()
+            finished.set()
+            return []
+
+    backend = SlowBackend()
+    provider = await _provider(monkeypatch, tmp_path, backend)
+    await provider.on_turn_start(1, "pending")
+
+    shutdown = asyncio.create_task(provider.shutdown())
+    await cancellation_started.wait()
+    shutdown.cancel()
+    await asyncio.sleep(0)
+    shutdown.cancel()
+    await asyncio.sleep(0)
+
+    assert shutdown.done() is False
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await shutdown
+    assert finished.is_set()
+    assert backend.closed is True
+    assert provider._prefetch_task is None
+
+
+@pytest.mark.asyncio
+async def test_prefetch_replacement_collects_previous_task_on_cancellation(
+    monkeypatch, tmp_path
+):
+    first_cancelled = asyncio.Event()
+    release_first = asyncio.Event()
+    first_finished = asyncio.Event()
+    second_started = asyncio.Event()
+
+    class SlowBackend(FakeBackend):
+        async def search(self, query, *, filters, top_k=10, rerank=True):
+            if query == "first":
+                try:
+                    await release_first.wait()
+                except asyncio.CancelledError:
+                    first_cancelled.set()
+                    await release_first.wait()
+                first_finished.set()
+            else:
+                second_started.set()
+            return []
+
+    provider = await _provider(monkeypatch, tmp_path, SlowBackend())
+    await provider.on_turn_start(1, "first")
+
+    replacement = asyncio.create_task(provider.on_turn_start(2, "second"))
+    await first_cancelled.wait()
+    replacement.cancel()
+    await asyncio.sleep(0)
+    replacement.cancel()
+    await asyncio.sleep(0)
+
+    assert replacement.done() is False
+    release_first.set()
+    with pytest.raises(asyncio.CancelledError):
+        await replacement
+    assert first_finished.is_set()
+    assert second_started.is_set() is False
+    await provider.shutdown()
+
+
 def test_schema_and_system_prompt_preserve_public_names():
     provider = Mem0MemoryProvider()
     assert [schema["name"] for schema in provider.get_tool_schemas()] == [

@@ -64,6 +64,35 @@ _CLIENT_ERROR_TYPES = ("MemoryNotFoundError", "ValidationError")
 _DEFAULT_USER_ID = "hermes-user"
 
 
+async def _finish_owned_task(task: asyncio.Task[Any]) -> Any:
+    """Finish one owned Mem0 task through repeated caller cancellation."""
+    cancellation: asyncio.CancelledError | None = None
+    while True:
+        try:
+            result = await asyncio.shield(task)
+            break
+        except asyncio.CancelledError as exc:  # noqa: ASYNC103 - re-raised below
+            if task.cancelled():
+                raise
+            if cancellation is None:
+                cancellation = exc
+        except Exception as exc:
+            if cancellation is not None:
+                raise cancellation from exc
+            raise
+    if cancellation is not None:
+        raise cancellation
+    return result
+
+
+async def _collect_owned_task(task: asyncio.Task[Any]) -> None:
+    """Collect a cancelled Mem0 task without propagating its terminal state."""
+    async def collect() -> None:
+        await asyncio.gather(task, return_exceptions=True)
+
+    await _finish_owned_task(asyncio.create_task(collect()))
+
+
 def _is_client_error(exc: Exception) -> bool:
     """True for user-caused errors (bad ID, not found) that should NOT trip circuit breaker."""
     etype = type(exc).__name__
@@ -411,7 +440,7 @@ class Mem0MemoryProvider(MemoryProvider):
         message: str,
         **kwargs,
     ) -> None:
-        self._start_prefetch(message)
+        await self._start_prefetch(message)
 
     async def _fetch_prefetch(self, query: str) -> str:
         backend = self._backend
@@ -439,13 +468,14 @@ class Mem0MemoryProvider(MemoryProvider):
             logger.debug("Mem0 prefetch failed: %s", exc)
         return ""
 
-    def _start_prefetch(self, query: str) -> None:
+    async def _start_prefetch(self, query: str) -> None:
         if not query or self._backend is None or self._is_breaker_open():
             return
         if self._prefetch_query == query and self._prefetch_task is not None:
             return
         if self._prefetch_task is not None and not self._prefetch_task.done():
             self._prefetch_task.cancel()
+            await _collect_owned_task(self._prefetch_task)
         self._prefetch_query = query
         self._prefetch_task = asyncio.create_task(
             self._fetch_prefetch(query),
@@ -454,7 +484,7 @@ class Mem0MemoryProvider(MemoryProvider):
 
     async def prefetch(self, query: str, *, session_id: str = "") -> str:
         """Recall memories for the CURRENT question with a short hot-path wait."""
-        self._start_prefetch(query)
+        await self._start_prefetch(query)
         task = self._prefetch_task if self._prefetch_query == query else None
         if task is not None:
             try:
@@ -600,9 +630,12 @@ class Mem0MemoryProvider(MemoryProvider):
         return tool_error(f"Unknown tool: {tool_name}")
 
     async def shutdown(self) -> None:
+        await _finish_owned_task(asyncio.create_task(self._shutdown_owned()))
+
+    async def _shutdown_owned(self) -> None:
         if self._prefetch_task is not None:
             self._prefetch_task.cancel()
-            await asyncio.gather(self._prefetch_task, return_exceptions=True)
+            await _collect_owned_task(self._prefetch_task)
             self._prefetch_task = None
         if self._backend is not None:
             await self._backend.close()
