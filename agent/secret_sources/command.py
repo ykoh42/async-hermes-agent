@@ -43,7 +43,12 @@ from typing import Dict, Optional
 
 # Reuse the exact result shape the bitwarden source returns so
 # hermes_cli.env_loader can consume both providers identically.
-from agent.secret_sources.base import ErrorKind, FetchResult, SecretSource
+from agent.secret_sources.base import (
+    ErrorKind,
+    FetchResult,
+    SecretSource,
+    _finish_subprocess_communicate,
+)
 from agent.secret_sources.base import get_source_environment
 
 __all__ = [
@@ -216,9 +221,10 @@ async def _run_helper(
         )
         return None
 
+    communicate_task = asyncio.create_task(proc.communicate())
     try:
         async with asyncio.timeout(timeout_seconds):
-            stdout_bytes, _stderr_discarded = await proc.communicate()
+            stdout_bytes, _stderr_discarded = await asyncio.shield(communicate_task)
     except TimeoutError:
         # Hard timeout: kill the whole process group (a helper script may
         # have forked children that would otherwise keep the pipe open).
@@ -228,7 +234,7 @@ async def _run_helper(
             os.killpg(os.getpgid(proc.pid), _signal.SIGKILL)  # windows-footgun: ok
         except (ProcessLookupError, PermissionError, OSError):
             proc.kill()
-        await proc.wait()
+        await _finish_subprocess_communicate(communicate_task)
         print(
             f"[secrets:command] helper timed out after {timeout_seconds:g}s; "
             f"resolving no value",
@@ -240,7 +246,7 @@ async def _run_helper(
             os.killpg(os.getpgid(proc.pid), _signal.SIGKILL)
         except (ProcessLookupError, PermissionError, OSError):
             proc.kill()
-        await proc.wait()
+        await _finish_subprocess_communicate(communicate_task)
         raise
 
     returncode = proc.returncode

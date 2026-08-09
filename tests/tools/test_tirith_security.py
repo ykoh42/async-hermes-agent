@@ -53,12 +53,16 @@ class _Process:
 
 class _WaitingProcess(_Process):
     def __init__(self):
-        super().__init__()
+        super().__init__(returncode=None)
         self.started = asyncio.Event()
+        self.release_communicate = asyncio.Event()
+        self.communicate_completed = asyncio.Event()
 
     async def communicate(self):
         self.started.set()
-        await asyncio.Event().wait()
+        await self.release_communicate.wait()
+        self.communicate_completed.set()
+        return self._stdout, self._stderr
 
 
 @pytest_asyncio.fixture(autouse=True)
@@ -182,7 +186,7 @@ async def test_timeout_kills_process_and_respects_fail_closed(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_cancellation_kills_and_reaps_scanner(monkeypatch):
+async def test_repeated_cancellation_kills_and_reaps_scanner(monkeypatch):
     process = _WaitingProcess()
     monkeypatch.setattr(tirith, "_load_security_config", AsyncMock(return_value=_CFG))
     monkeypatch.setattr(
@@ -194,11 +198,18 @@ async def test_cancellation_kills_and_reaps_scanner(monkeypatch):
     await process.started.wait()
 
     task.cancel()
+    while not process.killed:
+        await asyncio.sleep(0)
+    task.cancel()
+    await asyncio.sleep(0)
+
+    assert task.done() is False
+    process.release_communicate.set()
     with pytest.raises(asyncio.CancelledError):
         await task
 
     assert process.killed is True
-    assert process.waited is True
+    assert process.communicate_completed.is_set()
 
 
 @pytest.mark.asyncio

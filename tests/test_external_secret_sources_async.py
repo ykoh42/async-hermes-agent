@@ -14,6 +14,7 @@ from agent.secret_sources._cache import CachedFetch, DiskCache
 from agent.secret_sources.base import FetchResult, SecretSource
 from agent.secret_sources.bitwarden import (
     _encrypted_disk_cache_path,
+    _platform_asset_name,
     _read_encrypted_disk_cache,
     _write_encrypted_disk_cache,
     fetch_bitwarden_secrets,
@@ -98,6 +99,52 @@ async def test_bitwarden_fetch_uses_real_async_subprocess(tmp_path, monkeypatch)
 
     assert warnings == []
     assert secrets == {"OPENAI_API_KEY": "sk-bws"}
+
+
+@pytest.mark.asyncio
+async def test_bitwarden_platform_probe_survives_repeated_cancellation(monkeypatch):
+    from agent.secret_sources import bitwarden
+
+    communicate_started = asyncio.Event()
+    release_communicate = asyncio.Event()
+    communicate_completed = asyncio.Event()
+
+    class BlockingProcess:
+        returncode = None
+        killed = False
+
+        async def communicate(self):
+            communicate_started.set()
+            await release_communicate.wait()
+            communicate_completed.set()
+            return b"", b""
+
+        def kill(self):
+            self.killed = True
+            self.returncode = -9
+
+    process = BlockingProcess()
+
+    async def create_process(*_args, **_kwargs):
+        return process
+
+    monkeypatch.setattr(bitwarden.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(bitwarden.platform, "machine", lambda: "x86_64")
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create_process)
+
+    task = asyncio.create_task(_platform_asset_name())
+    await communicate_started.wait()
+    task.cancel()
+    while not process.killed:
+        await asyncio.sleep(0)
+    task.cancel()
+    await asyncio.sleep(0)
+
+    assert task.done() is False
+    release_communicate.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert communicate_completed.is_set()
 
 
 @pytest.mark.asyncio

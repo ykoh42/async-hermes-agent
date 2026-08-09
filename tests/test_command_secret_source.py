@@ -97,6 +97,58 @@ async def test_cancellation_stops_helper_and_propagates(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_repeated_cancellation_finishes_helper_pipe_cleanup(monkeypatch):
+    from agent.secret_sources import command
+
+    communicate_started = asyncio.Event()
+    release_communicate = asyncio.Event()
+    communicate_completed = asyncio.Event()
+
+    class BlockingProcess:
+        pid = 12345
+        returncode = None
+        killed = False
+
+        async def communicate(self):
+            communicate_started.set()
+            await release_communicate.wait()
+            communicate_completed.set()
+            return b"", b""
+
+        def kill(self):
+            self.killed = True
+            self.returncode = -9
+
+    process = BlockingProcess()
+
+    async def create_process(*_args, **_kwargs):
+        return process
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create_process)
+    monkeypatch.setattr(command.os, "getpgid", lambda _pid: process.pid)
+
+    def kill_process_group(_pid, _signal):
+        process.killed = True
+        process.returncode = -9
+
+    monkeypatch.setattr(command.os, "killpg", kill_process_group)
+
+    task = asyncio.create_task(_run_helper("unused", "", 60, 1024))
+    await communicate_started.wait()
+    task.cancel()
+    while not process.killed:
+        await asyncio.sleep(0)
+    task.cancel()
+    await asyncio.sleep(0)
+
+    assert task.done() is False
+    release_communicate.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert communicate_completed.is_set()
+
+
+@pytest.mark.asyncio
 async def test_failure_logging_never_leaks_command_or_secret(tmp_path, capfd):
     secret = "sk-super-secret-value-do-not-log"
     helper = _write_helper(

@@ -62,6 +62,7 @@ from agent.secret_sources._cache import (
 from agent.secret_sources.base import (
     ErrorKind,
     SecretSource,
+    _finish_subprocess_communicate,
     communicate_subprocess,
     get_source_environment,
 )
@@ -213,6 +214,7 @@ async def _platform_asset_name() -> str:
         # don't need bullet-proof detection — getting it wrong falls
         # back to a clear error from the binary loader, which we catch.
         process = None
+        communicate_task = None
         try:
             process = await asyncio.create_subprocess_exec(
                 "ldd",
@@ -221,18 +223,21 @@ async def _platform_asset_name() -> str:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
+            communicate_task = asyncio.create_task(process.communicate())
             async with asyncio.timeout(2):
-                stdout, stderr = await process.communicate()
+                stdout, stderr = await asyncio.shield(communicate_task)
             if "musl" in (stdout + stderr).decode("utf-8", errors="replace").lower():
                 libc = "musl"
         except TimeoutError:
-            if process is not None:
+            if process is not None and process.returncode is None:
                 process.kill()
-                await process.wait()
+            if communicate_task is not None:
+                await _finish_subprocess_communicate(communicate_task)
         except asyncio.CancelledError:
-            if process is not None:
+            if process is not None and process.returncode is None:
                 process.kill()
-                await process.wait()
+            if communicate_task is not None:
+                await _finish_subprocess_communicate(communicate_task)
             raise
         except OSError:
             pass

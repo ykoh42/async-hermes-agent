@@ -113,6 +113,38 @@ _crash_count: int = 0
 _circuit_open: bool = False
 
 
+async def _finish_process_communicate(
+    process: asyncio.subprocess.Process,
+    communicate_task: asyncio.Task[tuple[bytes, bytes]],
+) -> tuple[bytes, bytes]:
+    """Drain and reap one owned security helper through repeated cancellation."""
+    async def drain_or_wait() -> tuple[bytes, bytes]:
+        try:
+            return await communicate_task
+        except BaseException:
+            await process.wait()
+            raise
+
+    cleanup_task = asyncio.create_task(drain_or_wait())
+    cancellation: asyncio.CancelledError | None = None
+    while True:
+        try:
+            output = await asyncio.shield(cleanup_task)
+            break
+        except asyncio.CancelledError as exc:  # noqa: ASYNC103 - re-raised below
+            if cleanup_task.cancelled():
+                raise
+            if cancellation is None:
+                cancellation = exc
+        except Exception as exc:
+            if cancellation is not None:
+                raise cancellation from exc
+            raise
+    if cancellation is not None:
+        raise cancellation
+    return output
+
+
 def _record_tirith_crash() -> None:
     """Increment the crash counter and open the circuit breaker if needed."""
     global _crash_count, _circuit_open
@@ -329,15 +361,32 @@ async def _verify_cosign(
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
+        communicate_task = asyncio.create_task(process.communicate())
+        timeout_error: TimeoutError | None = None
         try:
-            _, stderr = await asyncio.wait_for(process.communicate(), timeout=15)
+            _, stderr = await asyncio.wait_for(
+                asyncio.shield(communicate_task), timeout=15
+            )
         except asyncio.CancelledError:
             process.kill()
-            await process.wait()
+            try:
+                await _finish_process_communicate(process, communicate_task)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.debug("cosign cleanup after cancellation failed", exc_info=True)
             raise
-        except TimeoutError:
+        except TimeoutError as exc:
+            timeout_error = exc
+
+        if timeout_error is not None:
             process.kill()
-            await process.wait()
+            try:
+                await _finish_process_communicate(process, communicate_task)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.debug("cosign cleanup after timeout failed", exc_info=True)
             logger.warning("cosign execution failed: timed out")
             return None
         if process.returncode == 0:
@@ -851,23 +900,34 @@ async def check_command_security(command: str) -> dict:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        timed_out = False
+        communicate_task = asyncio.create_task(process.communicate())
+        timeout_error: TimeoutError | None = None
         try:
             stdout_bytes, _ = await asyncio.wait_for(
-                process.communicate(),
+                asyncio.shield(communicate_task),
                 timeout=timeout,
             )
         except asyncio.CancelledError:
             process.kill()
-            await process.wait()
+            try:
+                await _finish_process_communicate(process, communicate_task)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.debug("tirith cleanup after cancellation failed", exc_info=True)
             raise
-        except TimeoutError:
-            timed_out = True
+        except TimeoutError as exc:
+            timeout_error = exc
 
-        if timed_out:
+        if timeout_error is not None:
             process.kill()
-            await process.wait()
-            raise TimeoutError
+            try:
+                await _finish_process_communicate(process, communicate_task)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.debug("tirith cleanup after timeout failed", exc_info=True)
+            raise TimeoutError from timeout_error
     except OSError as exc:
         # Covers FileNotFoundError, PermissionError, exec format error.
         # Dedupe by ``(errno, exc class)`` so a transient failure mode
