@@ -34,6 +34,38 @@ _REMOTE_BACKENDS = frozenset(
 _which = aiofiles.os.wrap(shutil.which)
 
 
+async def _finish_process_communicate(
+    process: asyncio.subprocess.Process,
+    communicate_task: asyncio.Task[tuple[bytes | None, bytes | None]],
+) -> tuple[bytes | None, bytes | None]:
+    """Drain and reap one owned probe process through repeated cancellation."""
+    async def drain_or_wait() -> tuple[bytes | None, bytes | None]:
+        try:
+            return await communicate_task
+        except BaseException:
+            await process.wait()
+            raise
+
+    cleanup_task = asyncio.create_task(drain_or_wait())
+    cancellation: asyncio.CancelledError | None = None
+    while True:
+        try:
+            output = await asyncio.shield(cleanup_task)
+            break
+        except asyncio.CancelledError as exc:  # noqa: ASYNC103 - re-raised below
+            if cleanup_task.cancelled():
+                raise
+            if cancellation is None:
+                cancellation = exc
+        except Exception as exc:
+            if cancellation is not None:
+                raise cancellation from exc
+            raise
+    if cancellation is not None:
+        raise cancellation
+    return output
+
+
 async def _run(
     command: list[str],
     timeout: float = 3.0,
@@ -51,9 +83,10 @@ async def _run(
     except OSError as exc:
         return -1, "", f"oserror: {exc}"
 
+    communicate_task = asyncio.create_task(process.communicate())
     try:
         stdout, stderr = await asyncio.wait_for(
-            process.communicate(),
+            asyncio.shield(communicate_task),
             timeout=timeout,
         )
     except TimeoutError:
@@ -62,10 +95,7 @@ async def _run(
                 process.kill()
             except ProcessLookupError:
                 pass
-        try:
-            await asyncio.wait_for(process.wait(), timeout=1.0)
-        except TimeoutError:
-            logger.debug("environment probe process did not reap promptly")
+        await _finish_process_communicate(process, communicate_task)
         return -1, "", "timeout"
     except asyncio.CancelledError:
         if process.returncode is None:
@@ -73,10 +103,7 @@ async def _run(
                 process.kill()
             except ProcessLookupError:
                 pass
-        try:
-            await asyncio.wait_for(process.wait(), timeout=1.0)
-        except TimeoutError:
-            logger.debug("cancelled environment probe did not reap promptly")
+        await _finish_process_communicate(process, communicate_task)
         raise
     return (
         int(process.returncode or 0),

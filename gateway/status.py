@@ -13,6 +13,38 @@ if os.name == "nt":  # Imported before the event loop, not on first PID probe.
     from ctypes import wintypes
 
 
+async def _finish_process_communicate(
+    process: asyncio.subprocess.Process,
+    communicate_task: asyncio.Task[tuple[bytes | None, bytes | None]],
+) -> tuple[bytes | None, bytes | None]:
+    """Drain and reap one owned ps process through repeated cancellation."""
+    async def drain_or_wait() -> tuple[bytes | None, bytes | None]:
+        try:
+            return await communicate_task
+        except BaseException:
+            await process.wait()
+            raise
+
+    cleanup_task = asyncio.create_task(drain_or_wait())
+    cancellation: asyncio.CancelledError | None = None
+    while True:
+        try:
+            output = await asyncio.shield(cleanup_task)
+            break
+        except asyncio.CancelledError as exc:  # noqa: ASYNC103 - re-raised below
+            if cleanup_task.cancelled():
+                raise
+            if cancellation is None:
+                cancellation = exc
+        except Exception as exc:
+            if cancellation is not None:
+                raise cancellation from exc
+            raise
+    if cancellation is not None:
+        raise cancellation
+    return output
+
+
 async def _ps_process_status(pid: int) -> str | None:
     """Return the platform ``ps`` status for *pid*, or ``None`` if absent."""
     process = await asyncio.create_subprocess_exec(
@@ -24,13 +56,17 @@ async def _ps_process_status(pid: int) -> str | None:
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.DEVNULL,
     )
+    communicate_task = asyncio.create_task(process.communicate())
     try:
-        stdout, _ = await asyncio.wait_for(process.communicate(), timeout=2.0)
+        stdout, _ = await asyncio.wait_for(
+            asyncio.shield(communicate_task), timeout=2.0
+        )
     except BaseException:
         if process.returncode is None:
             process.kill()
-            await process.wait()
+        await _finish_process_communicate(process, communicate_task)
         raise
+    assert stdout is not None
     status = stdout.decode("utf-8", errors="replace").strip()
     return status or None
 
