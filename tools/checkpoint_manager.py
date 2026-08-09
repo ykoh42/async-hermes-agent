@@ -528,7 +528,7 @@ async def _init_store(store: Path, working_dir: str) -> Optional[str]:
                     process.kill()
                 except ProcessLookupError:
                     pass
-            await process.wait()
+            await _finish_process_wait(process)
             raise
         except TimeoutError:
             if process.returncode is None:
@@ -536,7 +536,7 @@ async def _init_store(store: Path, working_dir: str) -> Optional[str]:
                     process.kill()
                 except ProcessLookupError:
                     pass
-            await process.wait()
+            await _finish_process_wait(process)
             return f"Shadow store init failed: timed out after {_GIT_TIMEOUT}s"
         if process.returncode != 0:
             return (

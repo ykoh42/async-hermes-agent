@@ -109,6 +109,83 @@ class TestCodexAppServerModule:
         assert ok is False
         assert "not found" in msg.lower() or "no such" in msg.lower()
 
+    @pytest.mark.asyncio
+    async def test_check_binary_reaps_process_through_repeated_cancellation(
+        self, monkeypatch
+    ) -> None:
+        from agent.transports.codex_app_server import check_codex_binary
+
+        communicate_started = asyncio.Event()
+        release_communicate = asyncio.Event()
+        communicate_completed = asyncio.Event()
+
+        class BlockingProcess:
+            returncode = None
+            killed = False
+
+            async def communicate(self):
+                communicate_started.set()
+                await release_communicate.wait()
+                communicate_completed.set()
+                return b"", b""
+
+            def kill(self):
+                self.killed = True
+                self.returncode = -9
+
+        process = BlockingProcess()
+
+        async def create_process(*_args, **_kwargs):
+            return process
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", create_process)
+
+        task = asyncio.create_task(check_codex_binary("unused"))
+        await communicate_started.wait()
+        task.cancel()
+        while not process.killed:
+            await asyncio.sleep(0)
+        task.cancel()
+        await asyncio.sleep(0)
+
+        assert task.done() is False
+        release_communicate.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert communicate_completed.is_set()
+
+    @pytest.mark.asyncio
+    async def test_close_finishes_cleanup_through_repeated_cancellation(
+        self, monkeypatch
+    ) -> None:
+        from agent.transports.codex_app_server import CodexAppServerClient
+
+        cleanup_started = asyncio.Event()
+        release_cleanup = asyncio.Event()
+        cleanup_completed = asyncio.Event()
+        client = CodexAppServerClient(codex_bin="unused")
+
+        async def close_owned_resources(_timeout):
+            cleanup_started.set()
+            await release_cleanup.wait()
+            cleanup_completed.set()
+
+        monkeypatch.setattr(client, "_close_owned_resources", close_owned_resources)
+
+        task = asyncio.create_task(client.close())
+        await cleanup_started.wait()
+        task.cancel()
+        await asyncio.sleep(0)
+        task.cancel()
+        await asyncio.sleep(0)
+
+        assert task.done() is False
+        release_cleanup.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert cleanup_completed.is_set()
+        assert client._closed is True
+
     def test_codex_error_class_is_runtimeerror(self) -> None:
         from agent.transports.codex_app_server import CodexAppServerError
 

@@ -49,6 +49,27 @@ class _Pending:
     sent_at: float = field(default_factory=time.time)
 
 
+async def _finish_owned_task(task: asyncio.Task[Any]) -> Any:
+    """Finish one owned cleanup task before propagating cancellation."""
+    cancellation: asyncio.CancelledError | None = None
+    while True:
+        try:
+            result = await asyncio.shield(task)
+            break
+        except asyncio.CancelledError as exc:  # noqa: ASYNC103 - re-raised below
+            if task.cancelled():
+                raise
+            if cancellation is None:
+                cancellation = exc
+        except Exception as exc:
+            if cancellation is not None:
+                raise cancellation from exc
+            raise
+    if cancellation is not None:
+        raise cancellation
+    return result
+
+
 class CodexAppServerClient:
     """Minimal JSON-RPC 2.0 client for `codex app-server` over stdio.
 
@@ -134,6 +155,10 @@ class CodexAppServerClient:
         if self._closed:
             return
         self._closed = True
+        cleanup_task = asyncio.create_task(self._close_owned_resources(timeout))
+        await _finish_owned_task(cleanup_task)
+
+    async def _close_owned_resources(self, timeout: float) -> None:
         error = RuntimeError("codex app-server client is closed")
         for pending in self._pending.values():
             if not pending.future.done():
@@ -393,6 +418,8 @@ async def check_codex_binary(
     """Verify codex CLI is installed and meets minimum version.
 
     Returns (ok, message). Used by setup wizard and runtime startup."""
+    proc: asyncio.subprocess.Process | None = None
+    communicate_task: asyncio.Task[tuple[bytes, bytes]] | None = None
     try:
         proc = await asyncio.create_subprocess_exec(
             codex_bin,
@@ -401,23 +428,28 @@ async def check_codex_binary(
             stderr=asyncio.subprocess.PIPE,
             stdin=asyncio.subprocess.DEVNULL,
         )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=10)
+        communicate_task = asyncio.create_task(proc.communicate())
+        stdout, stderr = await asyncio.wait_for(
+            asyncio.shield(communicate_task), timeout=10
+        )
     except FileNotFoundError:
         return False, (
             f"codex CLI not found at {codex_bin!r}. Install with: "
             f"npm i -g @openai/codex"
         )
     except asyncio.CancelledError:
-        if "proc" in locals() and proc.returncode is None:
+        if proc is not None and proc.returncode is None:
             proc.kill()
-        if "proc" in locals():
-            await proc.wait()
+        if communicate_task is not None:
+            await _finish_owned_task(communicate_task)
         raise
     except TimeoutError:
-        if "proc" in locals() and proc.returncode is None:
+        if proc is not None and proc.returncode is None:
             proc.kill()
-            await proc.wait()
+        if communicate_task is not None:
+            await _finish_owned_task(communicate_task)
         return False, "codex --version timed out"
+    assert proc is not None
     if proc.returncode != 0:
         stderr_text = stderr.decode("utf-8", "replace").strip()
         return False, f"codex --version exited {proc.returncode}: {stderr_text}"

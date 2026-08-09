@@ -503,6 +503,57 @@ class TestErrorResilience:
         assert process.killed is True
         assert process.waited is True
 
+    async def test_init_store_cancellation_reaps_subprocess(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        communicate_started = asyncio.Event()
+        wait_started = asyncio.Event()
+        release_wait = asyncio.Event()
+        wait_completed = asyncio.Event()
+
+        class BlockingProcess:
+            returncode = None
+            killed = False
+
+            async def communicate(self):
+                communicate_started.set()
+                await asyncio.Event().wait()
+
+            def kill(self):
+                self.killed = True
+                self.returncode = -9
+
+            async def wait(self):
+                wait_started.set()
+                await release_wait.wait()
+                wait_completed.set()
+                return self.returncode
+
+        process = BlockingProcess()
+
+        async def create_process(*_args, **_kwargs):
+            return process
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", create_process)
+
+        task = asyncio.create_task(
+            _init_store(tmp_path / "checkpoints" / "store", str(tmp_path))
+        )
+        await communicate_started.wait()
+        task.cancel()
+        await wait_started.wait()
+        task.cancel()
+        await asyncio.sleep(0)
+
+        assert task.done() is False
+        release_wait.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert wait_completed.is_set()
+        assert process.killed is True
+
 
     async def test_checkpoint_failures_never_raise(self, mgr, work_dir, monkeypatch):
         async def broken_run_git(*args, **kwargs):
