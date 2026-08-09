@@ -151,6 +151,38 @@ _ANTHROPIC_SUPPORTED_MEDIA_TYPES = frozenset(
 )
 
 
+async def _finish_process_communicate(
+    process: asyncio.subprocess.Process,
+    communicate_task: asyncio.Task[tuple[bytes, bytes]],
+) -> tuple[bytes, bytes]:
+    """Drain and reap one owned rasterizer through repeated cancellation."""
+    async def drain_or_wait() -> tuple[bytes, bytes]:
+        try:
+            return await communicate_task
+        except BaseException:
+            await process.wait()
+            raise
+
+    cleanup_task = asyncio.create_task(drain_or_wait())
+    cancellation: asyncio.CancelledError | None = None
+    while True:
+        try:
+            output = await asyncio.shield(cleanup_task)
+            break
+        except asyncio.CancelledError as exc:  # noqa: ASYNC103 - re-raised below
+            if cleanup_task.cancelled():
+                raise
+            if cancellation is None:
+                cancellation = exc
+        except Exception as exc:
+            if cancellation is not None:
+                raise cancellation from exc
+            raise
+    if cancellation is not None:
+        raise cancellation
+    return output
+
+
 async def _rasterize_svg_to_png(svg_path: Path, out_path: Path) -> bool:
     """Best-effort SVG → PNG rasterization. Returns True on success.
 
@@ -201,17 +233,32 @@ async def _rasterize_svg_to_png(svg_path: Path, out_path: Path) -> bool:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
+            communicate_task = asyncio.create_task(process.communicate())
+            timeout_error: TimeoutError | None = None
             try:
-                await asyncio.wait_for(process.communicate(), timeout=30)
+                await asyncio.wait_for(
+                    asyncio.shield(communicate_task), timeout=30
+                )
             except asyncio.CancelledError:
                 if process.returncode is None:
                     process.kill()
-                await process.wait()
+                try:
+                    await _finish_process_communicate(process, communicate_task)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.debug(
+                        "Rasterizer cleanup after cancellation failed",
+                        exc_info=True,
+                    )
                 raise
-            except TimeoutError:
+            except TimeoutError as exc:
+                timeout_error = exc
+
+            if timeout_error is not None:
                 if process.returncode is None:
                     process.kill()
-                await process.wait()
+                await _finish_process_communicate(process, communicate_task)
                 continue
             if process.returncode == 0 and bool(
                 (await aiofiles.os.stat(out_path)).st_size

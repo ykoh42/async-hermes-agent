@@ -1,5 +1,6 @@
 """Tests for tools/vision_tools.py — URL validation, type hints, error logging."""
 
+import asyncio
 import base64
 import json
 import logging
@@ -17,6 +18,7 @@ from tools.vision_tools import (
     _determine_mime_type,
     _image_to_base64_data_url,
     _resize_image_for_vision,
+    _rasterize_svg_to_png,
     _image_exceeds_dimension,
     _EMBED_MAX_DIMENSION,
     _is_image_size_error,
@@ -89,6 +91,62 @@ class TestDetermineMimeType:
         assert _determine_mime_type(Path("modern.webp")) == "image/webp"
         # Unknown extensions fall back to JPEG.
         assert _determine_mime_type(Path("file.xyz")) == "image/jpeg"
+
+
+@pytest.mark.asyncio
+async def test_svg_rasterizer_repeated_cancellation_drains_process(
+    tmp_path, monkeypatch
+):
+    import sys
+
+    communicate_started = asyncio.Event()
+    release_communicate = asyncio.Event()
+    communicate_completed = asyncio.Event()
+
+    class BlockingProcess:
+        returncode = None
+        killed = False
+
+        async def communicate(self):
+            communicate_started.set()
+            await release_communicate.wait()
+            communicate_completed.set()
+            return b"", b""
+
+        async def wait(self):
+            return self.returncode
+
+        def kill(self):
+            self.killed = True
+            self.returncode = -9
+
+    process = BlockingProcess()
+
+    async def create_process(*_args, **_kwargs):
+        return process
+
+    svg_path = tmp_path / "input.svg"
+    svg_path.write_text("<svg/>", encoding="utf-8")
+    monkeypatch.setitem(sys.modules, "cairosvg", None)
+    monkeypatch.setitem(sys.modules, "svglib", None)
+    monkeypatch.setitem(sys.modules, "svglib.svglib", None)
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create_process)
+
+    task = asyncio.create_task(
+        _rasterize_svg_to_png(svg_path, tmp_path / "output.png")
+    )
+    await communicate_started.wait()
+    task.cancel()
+    while not process.killed:
+        await asyncio.sleep(0)
+    task.cancel()
+    await asyncio.sleep(0)
+
+    assert task.done() is False
+    release_communicate.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert communicate_completed.is_set()
 
 
 # ---------------------------------------------------------------------------

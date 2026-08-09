@@ -46,6 +46,38 @@ _MIN_QUERY_LEN = 10
 _MIN_OUTPUT_LEN = 20
 
 
+async def _finish_process_communicate(
+    process: asyncio.subprocess.Process,
+    communicate_task: asyncio.Task[tuple[bytes, bytes]],
+) -> tuple[bytes, bytes]:
+    """Drain and reap one owned brv process through repeated cancellation."""
+    async def drain_or_wait() -> tuple[bytes, bytes]:
+        try:
+            return await communicate_task
+        except BaseException:
+            await process.wait()
+            raise
+
+    cleanup_task = asyncio.create_task(drain_or_wait())
+    cancellation: asyncio.CancelledError | None = None
+    while True:
+        try:
+            output = await asyncio.shield(cleanup_task)
+            break
+        except asyncio.CancelledError as exc:  # noqa: ASYNC103 - re-raised below
+            if cleanup_task.cancelled():
+                raise
+            if cancellation is None:
+                cancellation = exc
+        except Exception as exc:
+            if cancellation is not None:
+                raise cancellation from exc
+            raise
+    if cancellation is not None:
+        raise cancellation
+    return output
+
+
 def _coerce_bool(value: Any, default: bool = False) -> bool:
     if isinstance(value, bool):
         return value
@@ -147,17 +179,29 @@ async def _run_brv(
             cwd=effective_cwd,
             env=env,
         )
+        communicate_task = asyncio.create_task(process.communicate())
+        timeout_error: TimeoutError | None = None
         try:
             async with asyncio.timeout(timeout):
-                stdout_bytes, stderr_bytes = await process.communicate()
-        except TimeoutError:
-            process.kill()
-            await process.wait()
-            return {"success": False, "error": f"brv timed out after {timeout}s"}
+                stdout_bytes, stderr_bytes = await asyncio.shield(communicate_task)
+        except TimeoutError as exc:
+            timeout_error = exc
         except asyncio.CancelledError:
-            process.kill()
-            await process.wait()
+            if process.returncode is None:
+                process.kill()
+            try:
+                await _finish_process_communicate(process, communicate_task)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.debug("brv cleanup after cancellation failed", exc_info=True)
             raise
+
+        if timeout_error is not None:
+            if process.returncode is None:
+                process.kill()
+            await _finish_process_communicate(process, communicate_task)
+            return {"success": False, "error": f"brv timed out after {timeout}s"}
 
         stdout = stdout_bytes.decode("utf-8", errors="replace").strip()
         stderr = stderr_bytes.decode("utf-8", errors="replace").strip()
