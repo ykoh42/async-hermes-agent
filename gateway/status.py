@@ -66,7 +66,6 @@ async def _ps_process_status(pid: int) -> str | None:
             process.kill()
         await _finish_process_communicate(process, communicate_task)
         raise
-    assert stdout is not None
     status = stdout.decode("utf-8", errors="replace").strip()
     return status or None
 

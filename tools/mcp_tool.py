@@ -4139,6 +4139,38 @@ _orphan_stdio_pid_servers: Dict[int, str] = {}
 _stdio_pgids: Dict[int, int] = {}  # pid -> pgid
 
 
+async def _finish_snapshot_communicate(
+    process: asyncio.subprocess.Process,
+    communicate_task: asyncio.Task[tuple[bytes | None, bytes | None]],
+) -> tuple[bytes | None, bytes | None]:
+    """Drain and reap one owned ps snapshot through repeated cancellation."""
+    async def drain_or_wait() -> tuple[bytes | None, bytes | None]:
+        try:
+            return await communicate_task
+        except BaseException:
+            await process.wait()
+            raise
+
+    cleanup_task = asyncio.create_task(drain_or_wait())
+    cancellation: asyncio.CancelledError | None = None
+    while True:
+        try:
+            output = await asyncio.shield(cleanup_task)
+            break
+        except asyncio.CancelledError as exc:  # noqa: ASYNC103 - re-raised below
+            if cleanup_task.cancelled():
+                raise
+            if cancellation is None:
+                cancellation = exc
+        except Exception as exc:
+            if cancellation is not None:
+                raise cancellation from exc
+            raise
+    if cancellation is not None:
+        raise cancellation
+    return output
+
+
 async def _snapshot_child_pids() -> set:
     """Return a set of current child process PIDs.
 
@@ -4168,12 +4200,15 @@ async def _snapshot_child_pids() -> set:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
         )
+        communicate_task = asyncio.create_task(process.communicate())
         try:
-            stdout, _ = await asyncio.wait_for(process.communicate(), timeout=2.0)
+            stdout, _ = await asyncio.wait_for(
+                asyncio.shield(communicate_task), timeout=2.0
+            )
         except (asyncio.CancelledError, TimeoutError):
             if process.returncode is None:
                 process.kill()
-            await process.wait()
+            await _finish_snapshot_communicate(process, communicate_task)
             raise
         children_by_parent: dict[int, set[int]] = {}
         for line in stdout.decode("utf-8", errors="replace").splitlines():

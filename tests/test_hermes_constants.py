@@ -1,6 +1,7 @@
 """Tests for hermes_constants module."""
 
 import os
+import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -19,6 +20,58 @@ from hermes_constants import (
     secure_parent_dir,
     set_hermes_home_override,
 )
+
+
+@pytest.mark.asyncio
+async def test_agent_browser_probe_repeated_cancellation_drains_process(
+    tmp_path, monkeypatch
+):
+    executable = tmp_path / "agent-browser"
+    executable.write_text("", encoding="utf-8")
+    executable.chmod(0o755)
+    communicate_started = asyncio.Event()
+    release_communicate = asyncio.Event()
+    communicate_completed = asyncio.Event()
+
+    class BlockingProcess:
+        returncode = None
+        killed = False
+
+        async def communicate(self):
+            communicate_started.set()
+            await release_communicate.wait()
+            communicate_completed.set()
+            self.returncode = -9
+            return b"", b""
+
+        async def wait(self):
+            return self.returncode
+
+        def kill(self):
+            self.killed = True
+
+    process = BlockingProcess()
+
+    async def create_process(*_args, **_kwargs):
+        return process
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create_process)
+
+    task = asyncio.create_task(
+        hermes_constants.agent_browser_runnable(str(executable))
+    )
+    await communicate_started.wait()
+    task.cancel()
+    while not process.killed:
+        await asyncio.sleep(0)
+    task.cancel()
+    await asyncio.sleep(0)
+
+    assert task.done() is False
+    release_communicate.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert communicate_completed.is_set()
 
 
 @pytest.mark.asyncio

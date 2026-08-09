@@ -212,6 +212,38 @@ async def with_hermes_node_path(
     return merged
 
 
+async def _finish_process_communicate(
+    process: asyncio.subprocess.Process,
+    communicate_task: asyncio.Task[tuple[bytes | None, bytes | None]],
+) -> tuple[bytes | None, bytes | None]:
+    """Drain and reap one owned browser probe through repeated cancellation."""
+    async def drain_or_wait() -> tuple[bytes | None, bytes | None]:
+        try:
+            return await communicate_task
+        except BaseException:
+            await process.wait()
+            raise
+
+    cleanup_task = asyncio.create_task(drain_or_wait())
+    cancellation: asyncio.CancelledError | None = None
+    while True:
+        try:
+            output = await asyncio.shield(cleanup_task)
+            break
+        except asyncio.CancelledError as exc:  # noqa: ASYNC103 - re-raised below
+            if cleanup_task.cancelled():
+                raise
+            if cancellation is None:
+                cancellation = exc
+        except Exception as exc:
+            if cancellation is not None:
+                raise cancellation from exc
+            raise
+    if cancellation is not None:
+        raise cancellation
+    return output
+
+
 async def agent_browser_runnable(path: str | None) -> bool:
     """Return whether *path* is an executable agent-browser CLI."""
     if not path:
@@ -225,6 +257,7 @@ async def agent_browser_runnable(path: str | None) -> bool:
         return False
 
     process: asyncio.subprocess.Process | None = None
+    communicate_task: asyncio.Task[tuple[bytes | None, bytes | None]] | None = None
     try:
         process = await asyncio.create_subprocess_exec(
             path,
@@ -233,15 +266,16 @@ async def agent_browser_runnable(path: str | None) -> bool:
             stderr=asyncio.subprocess.PIPE,
             env=await with_hermes_node_path(),
         )
-        await asyncio.wait_for(process.communicate(), timeout=10)
+        communicate_task = asyncio.create_task(process.communicate())
+        await asyncio.wait_for(asyncio.shield(communicate_task), timeout=10)
     except asyncio.CancelledError:
         if process is not None and process.returncode is None:
             try:
                 process.kill()
             except ProcessLookupError:
                 pass
-        if process is not None:
-            await process.wait()
+        if process is not None and communicate_task is not None:
+            await _finish_process_communicate(process, communicate_task)
         raise
     except (OSError, TimeoutError, ValueError):
         if process is not None and process.returncode is None:
@@ -249,7 +283,8 @@ async def agent_browser_runnable(path: str | None) -> bool:
                 process.kill()
             except ProcessLookupError:
                 pass
-            await process.wait()
+        if process is not None and communicate_task is not None:
+            await _finish_process_communicate(process, communicate_task)
         return False
     return process.returncode == 0
 
