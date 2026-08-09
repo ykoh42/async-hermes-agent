@@ -863,8 +863,37 @@ class TestEmptyTextBlockFix:
 
 
 # ---------------------------------------------------------------------------
-# Stale-connection detection
+# Stale-connection detection and per-region client invalidation
 # ---------------------------------------------------------------------------
+
+
+class TestInvalidateRuntimeClient:
+    """Preserve the upstream cache-management surface for provider callers."""
+
+    def test_evicts_only_the_target_region(self):
+        from agent.bedrock_adapter import (
+            _bedrock_runtime_client_cache,
+            invalidate_runtime_client,
+            reset_client_cache,
+        )
+
+        reset_client_cache()
+        _bedrock_runtime_client_cache["us-east-1"] = "dead-client"
+        _bedrock_runtime_client_cache["us-west-2"] = "live-client"
+
+        evicted = invalidate_runtime_client("us-east-1")
+
+        assert evicted is True
+        assert "us-east-1" not in _bedrock_runtime_client_cache
+        assert _bedrock_runtime_client_cache["us-west-2"] == "live-client"
+
+    def test_returns_false_when_region_not_cached(self):
+        from agent.bedrock_adapter import invalidate_runtime_client, reset_client_cache
+
+        reset_client_cache()
+        assert invalidate_runtime_client("eu-west-1") is False
+
+
 class TestIsStaleConnectionError:
     """Classifier that decides whether an exception warrants client eviction."""
 

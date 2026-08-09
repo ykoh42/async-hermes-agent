@@ -45,6 +45,14 @@ logger = logging.getLogger(__name__)
 # This keeps startup fast for users who don't use Bedrock.
 # ---------------------------------------------------------------------------
 
+# Retain upstream's cache-management state and public hooks.  Native async
+# requests intentionally do not put aiobotocore clients here: each request
+# owns an async context manager and closes it before returning.  Keeping the
+# dictionaries preserves the exact reset/invalidation contract for callers
+# and tests without leaking an event-loop-bound SDK client globally.
+_bedrock_runtime_client_cache: Dict[str, Any] = {}
+_bedrock_control_client_cache: Dict[str, Any] = {}
+
 def _require_aiobotocore():
     """Import aiobotocore, raising a clear provider-specific install error."""
     try:
@@ -70,6 +78,19 @@ def _get_bedrock_runtime_client(region: str):
 def _get_bedrock_control_client(region: str):
     """Create a native-async ``bedrock`` control-plane client context manager."""
     return _require_aiobotocore()().create_client("bedrock", region_name=region)
+
+
+def reset_client_cache():
+    """Clear cached AWS clients. Used in tests and profile switches."""
+    _bedrock_runtime_client_cache.clear()
+    _bedrock_control_client_cache.clear()
+
+
+def invalidate_runtime_client(region: str) -> bool:
+    """Evict the cached ``bedrock-runtime`` client for one region."""
+    existed = region in _bedrock_runtime_client_cache
+    _bedrock_runtime_client_cache.pop(region, None)
+    return existed
 
 
 # ---------------------------------------------------------------------------

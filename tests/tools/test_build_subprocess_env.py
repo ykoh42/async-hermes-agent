@@ -142,6 +142,32 @@ async def test_e2e_no_scrub_child_keeps_planted_secret(tmp_path, monkeypatch):
     assert stdout.decode().strip() == "sk-FAKE-planted"
 
 
+@pytest.mark.parametrize("scrub_secrets", [True, False])
+async def test_delegated_child_scrubs_kanban_env_on_both_build_paths(
+    scrub_secrets,
+):
+    from agent.delegation_context import (
+        DELEGATED_CHILD_ENV_MARKER,
+        delegated_child_context,
+    )
+
+    base = {
+        "PATH": "/bin",
+        "HERMES_KANBAN_TASK": "parent-task",
+        "HERMES_KANBAN_RUN_ID": "parent-run",
+    }
+    with delegated_child_context():
+        env = await build_subprocess_env(
+            base,
+            scrub_secrets=scrub_secrets,
+            inherit_profile_home=False,
+        )
+
+    assert "HERMES_KANBAN_TASK" not in env
+    assert "HERMES_KANBAN_RUN_ID" not in env
+    assert env[DELEGATED_CHILD_ENV_MARKER] == "1"
+
+
 async def test_home_application_errors_remain_best_effort(monkeypatch):
     async def fail_home(_env):
         raise RuntimeError("synthetic HOME failure")

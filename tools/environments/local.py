@@ -21,6 +21,8 @@ from typing import Any, Awaitable, Callable
 import aiofiles
 import aiofiles.os
 
+from agent.delegation_context import delegated_child_subprocess_env
+
 
 logger = logging.getLogger(__name__)
 
@@ -232,7 +234,9 @@ async def _sanitize_subprocess_env(
         sanitized.pop(marker, None)
     if _IS_WINDOWS:
         sanitized.setdefault("PYTHONUTF8", "1")
-    return sanitized
+    delegated_env = delegated_child_subprocess_env(sanitized)
+    assert delegated_env is not None
+    return delegated_env
 
 
 async def build_subprocess_env(
@@ -261,7 +265,9 @@ async def build_subprocess_env(
             pass
     if extra:
         source.update(extra)
-    return source
+    delegated_env = delegated_child_subprocess_env(source)
+    assert delegated_env is not None
+    return delegated_env
 
 
 async def hermes_subprocess_env(*, inherit_credentials: bool = False) -> dict[str, str]:
@@ -297,7 +303,9 @@ async def hermes_subprocess_env(*, inherit_credentials: bool = False) -> dict[st
     _inject_session_context_env(env)
     for marker in _ACTIVE_VENV_MARKER_VARS:
         env.pop(marker, None)
-    return env
+    delegated_env = delegated_child_subprocess_env(env)
+    assert delegated_env is not None
+    return delegated_env
 
 
 _sudo_password_callback: contextvars.ContextVar[
