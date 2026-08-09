@@ -36,6 +36,7 @@ from utils import base_url_host_matches, base_url_hostname, env_float, env_int
 
 logger = logging.getLogger(__name__)
 _OPENROUTER_PROVIDER_SORT_VALUES = {"throughput", "latency", "price"}
+_STREAM_HEARTBEAT_INTERVAL = 30.0
 
 # When the fallback chain is fully exhausted on a non-rate-limit failure
 # (e.g. every provider returns a non-retryable client error like HTTP 400),
@@ -473,15 +474,21 @@ def _finalize_chat_stream(accumulator: Any) -> Any:
     )
 
 
-def _partial_stream_stub(agent: Any, error: Exception | None = None) -> Any | None:
+def _partial_stream_stub(
+    agent: Any,
+    error: Exception | None = None,
+    *,
+    delivered: bool = False,
+) -> Any | None:
     """Return upstream's length-truncated stub after visible streamed text."""
-    content = str(
+    raw_content = str(
         getattr(agent, "_current_streamed_assistant_text", "") or ""
-    ).strip()
+    )
+    content = raw_content.strip() or None
     # Upstream only recovers a partial stream after visible text was already
     # delivered.  A tool-only failure is retried/raised; fabricating a warning
     # response for that case would change retry and trajectory behavior.
-    if not content:
+    if not delivered and not raw_content:
         return None
     dropped_tool_names = list(
         dict.fromkeys(
@@ -500,7 +507,7 @@ def _partial_stream_stub(agent: Any, error: Exception | None = None) -> Any | No
             f"\n\n⚠ Stream stalled mid tool-call ({names}); the action was not "
             "executed. Ask me to retry if you want to continue."
         )
-        content += warning
+        content = (content or "") + warning
         fire_delta = getattr(agent, "_fire_stream_delta", None)
         if callable(fire_delta):
             try:
@@ -539,61 +546,345 @@ def _partial_stream_stub(agent: Any, error: Exception | None = None) -> Any | No
     return stub
 
 
+async def _finish_stream_heartbeat(task: asyncio.Task[Any]) -> None:
+    """Finish an owned heartbeat task through repeated caller cancellation."""
+    cancellation: asyncio.CancelledError | None = None
+    while True:
+        try:
+            await asyncio.shield(task)
+            break
+        except asyncio.CancelledError as exc:  # noqa: ASYNC103 - re-raised below
+            if task.cancelled():
+                raise
+            if cancellation is None:
+                cancellation = exc
+        except Exception as exc:
+            if cancellation is not None:
+                raise cancellation from exc
+            raise
+    if cancellation is not None:
+        raise cancellation
+
+
 async def interruptible_streaming_api_call(
     agent: Any,
     api_kwargs: dict,
     *,
     on_first_delta=None,
 ) -> Any:
-    """Execute a native stream with upstream's idle-stale circuit breaker."""
+    """Execute a native stream with upstream retry and stale-call policy."""
     _check_stale_giveup(agent)
     timeout = await _derive_stream_stale_timeout(agent, api_kwargs)
     loop = asyncio.get_running_loop()
-    timeout_scope = asyncio.timeout(
-        timeout if math.isfinite(timeout) else None
-    )
+    max_stream_retries = env_int("HERMES_STREAM_RETRIES", 2)
 
-    def _note_stream_activity() -> None:
-        if math.isfinite(timeout):
-            timeout_scope.reschedule(loop.time() + timeout)
+    for stream_attempt in range(max_stream_retries + 1):
+        if getattr(agent, "_interrupt_requested", False):
+            raise InterruptedError("Agent interrupted before stream retry")
 
-    try:
-        async with timeout_scope:
-            response = await agent._execute_model_request(
-                api_kwargs,
-                use_streaming=True,
-                on_first_delta=on_first_delta,
-                on_stream_activity=_note_stream_activity,
-            )
-    except TimeoutError as exc:
-        if not timeout_scope.expired():
-            partial = _partial_stream_stub(agent, exc)
-            if partial is not None:
-                _reset_stale_streak(agent)
-                return partial
+        init_diag = getattr(agent, "_stream_diag_init", None)
+        diag = init_diag() if callable(init_diag) else None
+        timeout_scope = asyncio.timeout(
+            timeout if math.isfinite(timeout) else None
+        )
+        last_stream_activity = loop.time()
+        heartbeat_stop = asyncio.Event()
+        text_delivery = {"yes": False}
+
+        def _note_stream_activity() -> None:
+            nonlocal last_stream_activity
+            last_stream_activity = loop.time()
+            if math.isfinite(timeout):
+                timeout_scope.reschedule(loop.time() + timeout)
+
+        def _note_stream_text() -> None:
+            text_delivery["yes"] = True
+
+        async def _heartbeat() -> None:
+            while not heartbeat_stop.is_set():
+                try:
+                    async with asyncio.timeout(_STREAM_HEARTBEAT_INTERVAL):
+                        await heartbeat_stop.wait()
+                    return
+                except TimeoutError:
+                    waiting_elapsed = loop.time() - last_stream_activity
+                    waiting_seconds = int(waiting_elapsed)
+                    if waiting_elapsed >= _STREAM_HEARTBEAT_INTERVAL:
+                        recovery = (
+                            f"; auto-reconnect at {int(timeout)}s"
+                            if math.isfinite(timeout)
+                            else ""
+                        )
+                        emit_wait = getattr(agent, "_emit_wait_notice", None)
+                        if callable(emit_wait):
+                            emit_wait(
+                                "⏳ waiting on "
+                                f"{api_kwargs.get('model', 'the provider')} — "
+                                f"{waiting_seconds}s with no output yet "
+                                "(provider may be slow or overloaded, or the "
+                                f"model is thinking{recovery})"
+                            )
+                    else:
+                        touch_activity = getattr(agent, "_touch_activity", None)
+                        if callable(touch_activity):
+                            touch_activity(
+                                "waiting for stream response "
+                                f"({waiting_seconds}s, no chunks yet)"
+                            )
+
+        heartbeat_task = asyncio.create_task(
+            _heartbeat(),
+            name=f"provider-stream-heartbeat-{stream_attempt + 1}",
+        )
+        try:
+            try:
+                async with timeout_scope:
+                    response = await agent._execute_model_request(
+                        api_kwargs,
+                        use_streaming=True,
+                        on_first_delta=on_first_delta,
+                        on_stream_activity=_note_stream_activity,
+                        _on_stream_text=_note_stream_text,
+                        _stream_diag=diag,
+                    )
+            finally:
+                heartbeat_stop.set()
+                await _finish_stream_heartbeat(heartbeat_task)
+        except asyncio.CancelledError:
             raise
-        _bump_stale_streak(agent)
-        touch_activity = getattr(agent, "_touch_activity", None)
-        if callable(touch_activity):
-            touch_activity(
-                f"stale stream detected after {int(timeout)}s, reconnecting"
+        except InterruptedError:
+            raise
+        except Exception as caught:
+            error: Exception = caught
+            watchdog_timeout = (
+                isinstance(caught, TimeoutError) and timeout_scope.expired()
             )
-        partial = _partial_stream_stub(agent, exc)
-        if partial is not None:
-            _reset_stale_streak(agent)
-            return partial
-        raise TimeoutError(
-            f"Streaming API call produced no chunks for {int(timeout)}s "
-            f"(threshold: {int(timeout)}s)."
-        ) from None
-    except Exception as exc:
-        partial = _partial_stream_stub(agent, exc)
-        if partial is not None:
-            _reset_stale_streak(agent)
-            return partial
-        raise
-    _reset_stale_streak(agent)
-    return response
+            if watchdog_timeout:
+                _bump_stale_streak(agent)
+                stale_elapsed = timeout
+                estimated_context = estimate_request_context_tokens(api_kwargs)
+                logger.warning(
+                    "Stream stale for %.0fs (threshold %.0fs) — no chunks "
+                    "received. model=%s context=~%s tokens. Killing "
+                    "connection.",
+                    stale_elapsed,
+                    timeout,
+                    api_kwargs.get("model", "unknown"),
+                    f"{estimated_context:,}",
+                )
+                buffer_status = getattr(agent, "_buffer_status", None)
+                if callable(buffer_status):
+                    buffer_status(
+                        "⚠️ No response from provider for "
+                        f"{int(stale_elapsed)}s (model: "
+                        f"{api_kwargs.get('model', 'unknown')}, context: "
+                        f"~{estimated_context:,} tokens). Reconnecting..."
+                    )
+                emit_wait = getattr(agent, "_emit_wait_notice", None)
+                if callable(emit_wait):
+                    emit_wait(
+                        "⚠ no output from provider for "
+                        f"{int(stale_elapsed)}s — reconnecting..."
+                    )
+                touch_activity = getattr(agent, "_touch_activity", None)
+                if callable(touch_activity):
+                    touch_activity(
+                        f"stale stream detected after {int(timeout)}s, "
+                        "reconnecting"
+                    )
+                error = TimeoutError(
+                    f"Streaming API call produced no chunks for {int(timeout)}s "
+                    f"(threshold: {int(timeout)}s)."
+                )
+
+            import httpx
+            from agent.errors import EmptyStreamError
+
+            is_timeout = watchdog_timeout or isinstance(
+                error,
+                (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.PoolTimeout),
+            )
+            is_connection = isinstance(
+                error,
+                (httpx.ConnectError, httpx.RemoteProtocolError, ConnectionError),
+            )
+            parse_check = getattr(agent, "_is_provider_stream_parse_error", None)
+            is_parse_error = bool(
+                callable(parse_check) and parse_check(error)
+            )
+            is_empty_stream = isinstance(error, EmptyStreamError)
+            is_sse_connection = False
+            if not is_timeout and not is_connection:
+                from openai import APIError
+
+                if isinstance(error, APIError) and not getattr(
+                    error,
+                    "status_code",
+                    None,
+                ):
+                    message = str(error).lower()
+                    is_sse_connection = any(
+                        phrase in message
+                        for phrase in (
+                            "connection lost",
+                            "connection reset",
+                            "connection closed",
+                            "connection terminated",
+                            "network error",
+                            "network connection",
+                            "terminated",
+                            "peer closed",
+                            "broken pipe",
+                            "upstream connect error",
+                        )
+                    )
+            transient = (
+                is_timeout
+                or is_connection
+                or is_sse_connection
+                or is_parse_error
+                or is_empty_stream
+            )
+
+            partial_raw_text = str(
+                getattr(agent, "_current_streamed_assistant_text", "") or ""
+            )
+            partial_text_delivered = (
+                text_delivery["yes"] or bool(partial_raw_text)
+            )
+            partial_tool_names = list(
+                getattr(agent, "_current_stream_partial_tool_names", []) or []
+            )
+            can_retry_partial_tool = (
+                partial_text_delivered
+                and bool(partial_tool_names)
+                and transient
+                and stream_attempt < max_stream_retries
+            )
+            if can_retry_partial_tool:
+                fire_delta = getattr(agent, "_fire_stream_delta", None)
+                if callable(fire_delta):
+                    try:
+                        fire_delta(
+                            "\n\n⚠ Connection dropped mid tool-call; "
+                            "reconnecting…\n\n"
+                        )
+                    except Exception:
+                        pass
+                reset_delivery = getattr(
+                    agent,
+                    "_reset_stream_delivery_tracking",
+                    None,
+                )
+                if callable(reset_delivery):
+                    try:
+                        reset_delivery()
+                    except Exception:
+                        pass
+                emit_drop = getattr(agent, "_emit_stream_drop", None)
+                if callable(emit_drop):
+                    emit_drop(
+                        error=error,
+                        attempt=stream_attempt + 2,
+                        max_attempts=max_stream_retries + 1,
+                        mid_tool_call=True,
+                        diag=diag,
+                    )
+                continue
+
+            if partial_text_delivered:
+                partial = _partial_stream_stub(
+                    agent,
+                    error,
+                    delivered=True,
+                )
+                if partial is not None:
+                    _reset_stale_streak(agent)
+                    return partial
+
+            if transient and stream_attempt < max_stream_retries:
+                emit_drop = getattr(agent, "_emit_stream_drop", None)
+                if callable(emit_drop):
+                    emit_drop(
+                        error=error,
+                        attempt=stream_attempt + 2,
+                        max_attempts=max_stream_retries + 1,
+                        mid_tool_call=False,
+                        diag=diag,
+                    )
+                continue
+
+            if transient:
+                log_retry = getattr(agent, "_log_stream_retry", None)
+                if callable(log_retry):
+                    log_retry(
+                        kind="exhausted",
+                        error=error,
+                        attempt=max_stream_retries + 1,
+                        max_attempts=max_stream_retries + 1,
+                        mid_tool_call=False,
+                        diag=diag,
+                    )
+                if is_parse_error:
+                    status = (
+                        "❌ Provider returned malformed streaming data after "
+                        f"{max_stream_retries + 1} attempts. The provider may "
+                        "be experiencing issues — try again in a moment."
+                    )
+                elif is_empty_stream:
+                    status = (
+                        "❌ Provider returned an empty response stream after "
+                        f"{max_stream_retries + 1} attempts. The provider may "
+                        "be experiencing issues — try again in a moment."
+                    )
+                else:
+                    status = (
+                        "❌ Connection to provider failed after "
+                        f"{max_stream_retries + 1} attempts. The provider may "
+                        "be experiencing issues — try again in a moment."
+                    )
+                buffer_status = getattr(agent, "_buffer_status", None)
+                if callable(buffer_status):
+                    buffer_status(status)
+            else:
+                lowered = str(error).lower()
+                stream_unsupported = (
+                    "stream" in lowered and "not supported" in lowered
+                )
+                bedrock_stream_denied = False
+                if (
+                    not stream_unsupported
+                    and "invokemodelwithresponsestream" in lowered
+                ):
+                    from agent.bedrock_adapter import (
+                        is_streaming_access_denied_error,
+                    )
+
+                    bedrock_stream_denied = is_streaming_access_denied_error(
+                        error
+                    )
+                if stream_unsupported or bedrock_stream_denied:
+                    agent._disable_streaming = True
+                    safe_print = getattr(agent, "_safe_print", None)
+                    if callable(safe_print):
+                        safe_print(
+                            "\n⚠  AWS IAM denied "
+                            "bedrock:InvokeModelWithResponseStream. Switching "
+                            "to non-streaming.\n   Grant that action to restore "
+                            "streaming output.\n"
+                            if bedrock_stream_denied
+                            else "\n⚠  Streaming is not supported for this "
+                            "model/provider. Switching to non-streaming.\n   "
+                            "To avoid this delay, set display.streaming: false "
+                            "in config.yaml\n"
+                        )
+                logger.exception("Streaming failed before delivery: %s", error)
+            raise error
+
+        _reset_stale_streak(agent)
+        return response
+
+    raise AssertionError("unreachable stream retry state")
 
 
 async def _derive_stream_stale_timeout(agent, api_kwargs: dict) -> float:

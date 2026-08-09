@@ -119,7 +119,7 @@ async def test_stream_activity_reschedules_idle_timeout():
 
 
 @pytest.mark.asyncio
-async def test_stream_idle_timeout_cancels_request_and_increments_streak():
+async def test_stream_idle_timeout_retries_and_increments_streak_per_attempt():
     from agent.chat_completion_helpers import interruptible_streaming_api_call
 
     cancelled = asyncio.Event()
@@ -136,7 +136,7 @@ async def test_stream_idle_timeout_cancels_request_and_increments_streak():
         await interruptible_streaming_api_call(agent, {})
 
     assert cancelled.is_set()
-    assert agent._consecutive_stale_streams == 1
+    assert agent._consecutive_stale_streams == 3
 
 
 @pytest.mark.asyncio
@@ -222,11 +222,12 @@ async def test_chat_stream_stale_surfaces_dropped_tool_after_visible_text():
     from agent.chat_completion_helpers import interruptible_streaming_api_call
     from hermes_constants import PARTIAL_STREAM_STUB_ID
 
-    stream_closed = asyncio.Event()
+    streams = []
 
     class StalledToolStream:
         def __init__(self):
             self._index = 0
+            self.closed = False
 
         def __aiter__(self):
             return self
@@ -281,12 +282,12 @@ async def test_chat_stream_stale_surfaces_dropped_tool_after_visible_text():
             raise StopAsyncIteration
 
         async def aclose(self):
-            stream_closed.set()
-
-    stream = StalledToolStream()
+            self.closed = True
 
     class Completions:
         async def create(self, **_kwargs):
+            stream = StalledToolStream()
+            streams.append(stream)
             return stream
 
     agent = AIAgent.__new__(AIAgent)
@@ -328,7 +329,8 @@ async def test_chat_stream_stale_surfaces_dropped_tool_after_visible_text():
     assert response.choices[0].message.content == f"partial answer\n\n{warning}"
     assert response._dropped_tool_names == ["terminal"]
     assert warning in agent._current_streamed_assistant_text
-    assert stream_closed.is_set()
+    assert len(streams) == 3
+    assert all(stream.closed for stream in streams)
     assert agent._consecutive_stale_streams == 0
 
 

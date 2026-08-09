@@ -1188,6 +1188,7 @@ async def run_codex_stream(
     client: Any = None,
     on_first_delta=None,
     on_stream_event=None,
+    on_stream_text=None,
 ):
     """Consume an OpenAI Responses stream through an async client.
 
@@ -1243,6 +1244,8 @@ async def run_codex_stream(
                     if first_text and on_first_delta is not None:
                         first_text = False
                         on_first_delta()
+                    if on_stream_text is not None:
+                        on_stream_text()
                     try:
                         agent._fire_stream_delta(delta)
                     except Exception:

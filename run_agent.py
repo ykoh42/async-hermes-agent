@@ -5106,6 +5106,8 @@ class AIAgent:
         use_streaming: bool = False,
         on_first_delta: Optional[Callable[[], None]] = None,
         on_stream_activity: Optional[Callable[[], None]] = None,
+        _on_stream_text: Optional[Callable[[], None]] = None,
+        _stream_diag: Optional[Dict[str, Any]] = None,
     ):
         """Execute one model request without blocking the event loop.
 
@@ -5118,12 +5120,27 @@ class AIAgent:
             if use_streaming:
                 from agent.codex_runtime import run_codex_stream
 
+                def _on_codex_event() -> None:
+                    if on_stream_activity is not None:
+                        on_stream_activity()
+                    if isinstance(_stream_diag, dict):
+                        now = time.time()
+                        _stream_diag["chunks"] = int(
+                            _stream_diag.get("chunks", 0)
+                        ) + 1
+                        if _stream_diag.get("first_chunk_at") is None:
+                            _stream_diag["first_chunk_at"] = now
+                        _stream_diag["bytes"] = int(
+                            _stream_diag.get("bytes", 0)
+                        ) + 40
+
                 return await run_codex_stream(
                     self,
                     api_kwargs,
                     client=self.client,
                     on_first_delta=on_first_delta,
-                    on_stream_event=on_stream_activity,
+                    on_stream_event=_on_codex_event,
+                    on_stream_text=_on_stream_text,
                 )
 
             request = dict(api_kwargs)
@@ -5208,6 +5225,16 @@ class AIAgent:
                     if on_stream_activity is not None:
                         on_stream_activity()
                     self._touch_activity("receiving stream response")
+                    if isinstance(_stream_diag, dict):
+                        now = time.time()
+                        _stream_diag["chunks"] = int(
+                            _stream_diag.get("chunks", 0)
+                        ) + 1
+                        if _stream_diag.get("first_chunk_at") is None:
+                            _stream_diag["first_chunk_at"] = now
+                        _stream_diag["bytes"] = int(
+                            _stream_diag.get("bytes", 0)
+                        ) + _chat_completion_helpers._estimate_chunk_bytes(event)
                     event_type = getattr(event, "type", None)
                     if event_type == "content_block_start":
                         block = getattr(event, "content_block", None)
@@ -5224,6 +5251,8 @@ class AIAgent:
                             text = getattr(delta, "text", "")
                             if text and not has_tool_use:
                                 _fire_first_delta()
+                                if _on_stream_text is not None:
+                                    _on_stream_text()
                                 self._fire_stream_delta(text)
                         elif delta_type == "thinking_delta":
                             thinking = getattr(delta, "thinking", "")
@@ -5231,13 +5260,21 @@ class AIAgent:
                                 _fire_first_delta()
                                 self._fire_reasoning_delta(thinking)
 
+                def _on_anthropic_response(response: Any) -> None:
+                    self._capture_anthropic_response_headers(response)
+                    if isinstance(_stream_diag, dict):
+                        self._stream_diag_capture_response(
+                            _stream_diag,
+                            response,
+                        )
+
                 return await create_anthropic_message(
                     self._anthropic_client,
                     api_kwargs,
                     log_prefix=getattr(self, "log_prefix", ""),
                     prefer_stream=use_streaming,
                     on_stream_event=_on_anthropic_event if use_streaming else None,
-                    on_response=self._capture_anthropic_response_headers,
+                    on_response=_on_anthropic_response,
                 )
 
         if self.api_mode == "bedrock_converse":
@@ -5304,9 +5341,21 @@ class AIAgent:
                     if on_stream_activity is not None:
                         on_stream_activity()
                     self._touch_activity("receiving stream response")
+                    if isinstance(_stream_diag, dict):
+                        now = time.time()
+                        _stream_diag["chunks"] = int(
+                            _stream_diag.get("chunks", 0)
+                        ) + 1
+                        if _stream_diag.get("first_chunk_at") is None:
+                            _stream_diag["first_chunk_at"] = now
+                        _stream_diag["bytes"] = int(
+                            _stream_diag.get("bytes", 0)
+                        ) + 40
 
                 def _on_text(text: str) -> None:
                     _fire_first_delta()
+                    if _on_stream_text is not None:
+                        _on_stream_text()
                     self._fire_stream_delta(text)
 
                 def _on_tool(name: str) -> None:
@@ -5358,6 +5407,8 @@ class AIAgent:
         self._capture_rate_limits(stream_response)
         self._capture_credits(stream_response)
         self._check_openrouter_cache_status(stream_response)
+        if isinstance(_stream_diag, dict):
+            self._stream_diag_capture_response(_stream_diag, stream_response)
 
         from agent.auxiliary_client import _ChatStreamAccumulator
 
@@ -5383,6 +5434,16 @@ class AIAgent:
                 if on_stream_activity is not None:
                     on_stream_activity()
                 self._touch_activity("receiving stream response")
+                if isinstance(_stream_diag, dict):
+                    now = time.time()
+                    _stream_diag["chunks"] = int(
+                        _stream_diag.get("chunks", 0)
+                    ) + 1
+                    if _stream_diag.get("first_chunk_at") is None:
+                        _stream_diag["first_chunk_at"] = now
+                    _stream_diag["bytes"] = int(
+                        _stream_diag.get("bytes", 0)
+                    ) + _chat_completion_helpers._estimate_chunk_bytes(chunk)
                 # Preserve the existing streaming display contract while the
                 # accumulator reconstructs tool calls/reasoning for the loop.
                 try:
@@ -5407,6 +5468,8 @@ class AIAgent:
                     if isinstance(text, str) and text:
                         if not accumulator.tool_calls_acc:
                             _fire_first_delta()
+                            if _on_stream_text is not None:
+                                _on_stream_text()
                             self._fire_stream_delta(text)
                         elif self.stream_delta_callback is not None:
                             try:
