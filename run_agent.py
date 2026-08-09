@@ -36,6 +36,7 @@ except ModuleNotFoundError:
 import asyncio
 import base64
 import copy
+import contextvars
 import hashlib
 import inspect
 import json
@@ -47,6 +48,7 @@ import sys
 import time
 import uuid
 import warnings
+import weakref
 import aiofiles.os
 import aiofiles.tempfile
 from typing import List, Dict, Any, Optional, Callable
@@ -216,6 +218,11 @@ from agent.tool_guardrails import (
 from agent.tool_result_classification import (
     FILE_MUTATING_TOOL_NAMES as _FILE_MUTATING_TOOLS,
     file_mutation_result_landed,
+)
+from agent.stream_single_writer import (
+    _STREAM_WRITER_TASK_TOKENS,
+    claim_stream_writer,
+    stream_writer_is_current,
 )
 from agent.subagent_lifecycle import bind_subagent_parent
 from agent.trajectory import (
@@ -5362,6 +5369,7 @@ class AIAgent:
 
                 first_delta = True
                 has_tool_use = False
+                writer_token: int | None = None
 
                 def _fire_first_delta() -> None:
                     nonlocal first_delta
@@ -5374,8 +5382,19 @@ class AIAgent:
                         except Exception:
                             pass
 
-                def _on_anthropic_event(event: Any) -> None:
+                def _on_anthropic_event(event: Any) -> bool:
                     nonlocal has_tool_use
+                    if writer_token is not None and not stream_writer_is_current(
+                        self,
+                        writer_token,
+                    ):
+                        logger.warning(
+                            "Anthropic streaming attempt superseded by a newer "
+                            "stream; stopping consumption to preserve the "
+                            "single-writer invariant (model=%s).",
+                            api_kwargs.get("model", "unknown"),
+                        )
+                        return False
                     if on_stream_activity is not None:
                         on_stream_activity()
                     self._touch_activity("receiving stream response")
@@ -5413,8 +5432,11 @@ class AIAgent:
                             if thinking:
                                 _fire_first_delta()
                                 self._fire_reasoning_delta(thinking)
+                    return True
 
                 def _on_anthropic_response(response: Any) -> None:
+                    nonlocal writer_token
+                    writer_token = claim_stream_writer(self)
                     self._capture_anthropic_response_headers(response)
                     if isinstance(_stream_diag, dict):
                         self._stream_diag_capture_response(
@@ -5478,6 +5500,8 @@ class AIAgent:
                         await client.converse(**request)
                     )
 
+                writer_token = claim_stream_writer(self)
+
                 first_delta = True
 
                 def _fire_first_delta() -> None:
@@ -5491,7 +5515,15 @@ class AIAgent:
                         except Exception:
                             pass
 
-                def _on_event() -> None:
+                def _on_event() -> bool:
+                    if not stream_writer_is_current(self, writer_token):
+                        logger.warning(
+                            "Bedrock streaming attempt superseded by a newer "
+                            "stream; stopping consumption to preserve the "
+                            "single-writer invariant (model=%s).",
+                            api_kwargs.get("model", "unknown"),
+                        )
+                        return False
                     if on_stream_activity is not None:
                         on_stream_activity()
                     self._touch_activity("receiving stream response")
@@ -5505,6 +5537,7 @@ class AIAgent:
                         _stream_diag["bytes"] = int(
                             _stream_diag.get("bytes", 0)
                         ) + 40
+                    return True
 
                 def _on_text(text: str) -> None:
                     _fire_first_delta()
@@ -5560,6 +5593,8 @@ class AIAgent:
         if not use_streaming or hasattr(result, "choices"):
             return result
 
+        writer_token = claim_stream_writer(self)
+
         stream_response = getattr(result, "response", None)
         self._capture_rate_limits(stream_response)
         self._capture_credits(stream_response)
@@ -5588,6 +5623,14 @@ class AIAgent:
 
         try:
             async for chunk in result:
+                if not stream_writer_is_current(self, writer_token):
+                    logger.warning(
+                        "Streaming attempt superseded by a newer stream; "
+                        "stopping consumption to preserve the single-writer "
+                        "invariant (model=%s).",
+                        api_kwargs.get("model", "unknown"),
+                    )
+                    break
                 if on_stream_activity is not None:
                     on_stream_activity()
                 self._touch_activity("receiving stream response")
@@ -5741,6 +5784,10 @@ class AIAgent:
 
     def _record_streamed_assistant_text(self, text: str) -> None:
         """Accumulate visible assistant text emitted through stream callbacks."""
+        # A direct accumulator call must obey the same fence as the callback
+        # sinks; the tool-suppressed content path reaches this method directly.
+        if self._stream_writer_superseded():
+            return
         if isinstance(text, str) and text:
             self._current_streamed_assistant_text = (
                 getattr(self, "_current_streamed_assistant_text", "") + text
@@ -5926,8 +5973,79 @@ class AIAgent:
         except Exception:
             logger.debug("interim_assistant_callback error", exc_info=True)
 
+    def _ensure_stream_writer_state(self) -> None:
+        """Lazily create the native-async single-writer guard fields (#65991)."""
+        if not hasattr(self, "_stream_writer_token"):
+            self._stream_writer_token = 0
+        if not isinstance(
+            getattr(self, "_stream_writer_tls", None),
+            contextvars.ContextVar,
+        ):
+            self._stream_writer_tls = _STREAM_WRITER_TASK_TOKENS
+        if not hasattr(self, "_stream_writer_dropped"):
+            self._stream_writer_dropped = 0
+
+    def _claim_stream_writer(self) -> int:
+        """Claim the streaming delta sink for the current async task."""
+        self._ensure_stream_writer_state()
+        # No await can occur between read and write, so this increment is
+        # atomic with respect to other tasks on the owning event loop.
+        self._stream_writer_token += 1
+        token = self._stream_writer_token
+        current_tokens = self._stream_writer_tls.get() or {}
+        next_tokens = {
+            owner_ref: owner_token
+            for owner_ref, owner_token in current_tokens.items()
+            if owner_ref() is not None and owner_ref() is not self
+        }
+        next_tokens[weakref.ref(self)] = token
+        self._stream_writer_tls.set(next_tokens)
+        return token
+
+    def _stream_writer_is_current(self, token: int) -> bool:
+        """Return whether no newer stream attempt superseded ``token``."""
+        return token == getattr(self, "_stream_writer_token", token)
+
+    def _stream_writer_superseded(self) -> bool:
+        """Return whether the calling task owns a provably stale writer token."""
+        writer_context = getattr(self, "_stream_writer_tls", None)
+        if not isinstance(writer_context, contextvars.ContextVar):
+            return False
+        current_tokens = writer_context.get() or {}
+        token = next(
+            (
+                owner_token
+                for owner_ref, owner_token in current_tokens.items()
+                if owner_ref() is self
+            ),
+            None,
+        )
+        if token is None:
+            return False
+        return token != getattr(self, "_stream_writer_token", token)
+
+    def _note_dropped_stream_writer(self, where: str) -> None:
+        """Record and sparsely log a discarded superseded-stream delta."""
+        try:
+            self._stream_writer_dropped = int(
+                getattr(self, "_stream_writer_dropped", 0)
+            ) + 1
+        except Exception:
+            self._stream_writer_dropped = 1
+        dropped = self._stream_writer_dropped
+        if dropped == 1 or (dropped & (dropped - 1)) == 0:
+            logger.warning(
+                "Dropped delta from a superseded stream writer at %s "
+                "(discarded=%d this turn) — a stale stream tried to write into "
+                "the turn after a retry superseded it.",
+                where, dropped,
+            )
+
     def _fire_stream_delta(self, text: str) -> None:
         """Fire all registered stream delta callbacks (display + TTS)."""
+        if self._stream_writer_superseded():
+            self._note_dropped_stream_writer("_fire_stream_delta")
+            return
         # If a tool iteration set the break flag, prepend a single paragraph
         # break before the first real text delta.  This prevents the original
         # problem (text concatenation across tool boundaries) without stacking
@@ -5981,6 +6099,9 @@ class AIAgent:
 
     def _fire_reasoning_delta(self, text: str) -> None:
         """Fire reasoning callback if registered."""
+        if self._stream_writer_superseded():
+            self._note_dropped_stream_writer("_fire_reasoning_delta")
+            return
         cb = self.reasoning_callback
         if cb is not None:
             try:

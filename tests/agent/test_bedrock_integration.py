@@ -593,6 +593,49 @@ class TestAIAgentBedrockDispatch:
         assert context.entered and context.exited
 
     @pytest.mark.asyncio
+    async def test_stream_stops_when_writer_is_superseded(self, monkeypatch):
+        agent = self._agent()
+        text_deltas = []
+        agent._fire_stream_delta = text_deltas.append
+
+        async def events():
+            yield {
+                "contentBlockDelta": {
+                    "contentBlockIndex": 0,
+                    "delta": {"text": "first"},
+                }
+            }
+            agent._claim_stream_writer()
+            yield {
+                "contentBlockDelta": {
+                    "contentBlockIndex": 0,
+                    "delta": {"text": "stale"},
+                }
+            }
+
+        client = SimpleNamespace(
+            converse_stream=AsyncMock(return_value={"stream": events()})
+        )
+        context = _BedrockClientContext(client)
+        monkeypatch.setattr(
+            "agent.bedrock_adapter._get_bedrock_runtime_client",
+            lambda region: context,
+        )
+
+        response = await agent._execute_model_request(
+            {
+                "modelId": "amazon.nova-pro-v1:0",
+                "messages": [],
+                "__bedrock_region__": "us-east-2",
+            },
+            use_streaming=True,
+        )
+
+        assert text_deltas == ["first"]
+        assert response.choices[0].message.content == "first"
+        assert context.entered and context.exited
+
+    @pytest.mark.asyncio
     async def test_stream_access_denied_falls_back_without_holding_exception(
         self, monkeypatch
     ):

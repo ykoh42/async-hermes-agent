@@ -43,6 +43,7 @@ from agent.model_metadata import (
 from agent.process_bootstrap import _install_safe_stdio
 from agent.subdirectory_hints import SubdirectoryHintTracker
 from agent.think_scrubber import StreamingThinkScrubber
+from agent.stream_single_writer import _STREAM_WRITER_TASK_TOKENS
 from agent.tool_guardrails import (
     ToolCallGuardrailConfig,
     ToolCallGuardrailController,
@@ -1371,6 +1372,15 @@ def init_agent(
     # Unlike token-stream tracking, this spans Codex continuation/tool calls so
     # repeated commentary is not re-sent before normalization can deduplicate it.
     agent._delivered_interim_texts: set[str] = set()
+
+    # Single-writer guard for the streaming delta sink (#65991). Native async
+    # attempts share an event-loop thread, so writer identity must be task-local
+    # rather than upstream's thread-local. ContextVar preserves the same
+    # inheritance/isolation semantics across child and concurrent tasks without
+    # a blocking threading.Lock.
+    agent._stream_writer_token = 0
+    agent._stream_writer_tls = _STREAM_WRITER_TASK_TOKENS
+    agent._stream_writer_dropped = 0
 
     # Optional current-turn user-message override used when the API-facing
     # user message intentionally differs from the persisted transcript

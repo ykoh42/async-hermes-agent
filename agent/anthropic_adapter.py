@@ -2777,7 +2777,9 @@ async def create_anthropic_message(
     This uses the Anthropic SDK's native async context manager and iterator;
     it does not run the synchronous Messages adapter in a worker thread.
     Callbacks remain deliberately synchronous because they only update
-    in-memory agent/UI state and are not transport operations.
+    in-memory agent/UI state and are not transport operations. The internal
+    single-writer fence may return ``False`` from ``on_stream_event`` to close
+    a provably superseded stream without materializing its stale response.
     """
     sanitize_anthropic_kwargs(api_kwargs, log_prefix=log_prefix)
     messages_api = getattr(client, "messages", None)
@@ -2801,13 +2803,19 @@ async def create_anthropic_message(
                     saw_stream_event = True
                     if callable(on_stream_event):
                         try:
-                            on_stream_event(event)
+                            accepted = on_stream_event(event)
                         except Exception:
                             logger.debug(
                                 "%son_stream_event callback failed",
                                 log_prefix,
                                 exc_info=True,
                             )
+                        else:
+                            # Internal stream fences return False only after a
+                            # newer physical attempt superseded this one. Do not
+                            # drain or materialize the stale response.
+                            if accepted is False:
+                                return None
                 try:
                     final_message = await stream.get_final_message()
                 except AssertionError:

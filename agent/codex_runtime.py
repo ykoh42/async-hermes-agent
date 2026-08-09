@@ -10,6 +10,8 @@ import time
 from types import SimpleNamespace
 from typing import Any, Callable, Dict, List
 
+from agent.stream_single_writer import claim_stream_writer, stream_writer_is_current
+
 logger = logging.getLogger(__name__)
 
 _TERMINAL_EVENT_TYPES = frozenset({
@@ -1242,12 +1244,22 @@ async def run_codex_stream(
     if not hasattr(stream, "__aiter__"):
         return stream
 
+    writer_token = claim_stream_writer(agent)
+
     events = []
     first_text = True
     active_message_phase: str | None = None
     commentary_text_deltas: list[str] = []
     try:
         async for event in stream:
+            if not stream_writer_is_current(agent, writer_token):
+                logger.warning(
+                    "Codex streaming attempt superseded by a newer stream; "
+                    "stopping consumption to preserve the single-writer "
+                    "invariant (model=%s).",
+                    api_kwargs.get("model", "unknown"),
+                )
+                break
             if on_stream_event is not None:
                 on_stream_event()
             events.append(event)

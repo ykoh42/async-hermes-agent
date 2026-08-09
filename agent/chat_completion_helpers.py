@@ -30,6 +30,10 @@ from agent.message_sanitization import (
     _repair_tool_call_arguments,
     _sanitize_surrogates,
 )
+from agent.stream_single_writer import (  # noqa: F401 - upstream re-export
+    claim_stream_writer,
+    stream_writer_is_current,
+)
 from hermes_constants import FINISH_REASON_LENGTH, PARTIAL_STREAM_STUB_ID
 from tools.terminal_tool import cleanup_vm, is_persistent_env
 from utils import base_url_host_matches, base_url_hostname, env_float, env_int

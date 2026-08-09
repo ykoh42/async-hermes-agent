@@ -184,6 +184,56 @@ async def test_native_anthropic_stream_preserves_delta_callback_order():
 
 
 @pytest.mark.asyncio
+async def test_native_anthropic_stream_stops_when_writer_is_superseded():
+    agent = AIAgent.__new__(AIAgent)
+
+    class _SupersedingStream(_AsyncMessageStream):
+        async def __anext__(self):
+            event = await super().__anext__()
+            text = getattr(getattr(event, "delta", None), "text", None)
+            if text == "stale":
+                agent._claim_stream_writer()
+            return event
+
+    events = [
+        SimpleNamespace(
+            type="content_block_delta",
+            delta=SimpleNamespace(type="text_delta", text="first"),
+        ),
+        SimpleNamespace(
+            type="content_block_delta",
+            delta=SimpleNamespace(type="text_delta", text="stale"),
+        ),
+    ]
+    stream = _SupersedingStream(
+        events,
+        final_message=SimpleNamespace(content=[], stop_reason="end_turn"),
+    )
+    agent.api_mode = "anthropic_messages"
+    agent.provider = "anthropic"
+    agent._anthropic_api_key = "test-key"
+    agent._anthropic_base_url = None
+    agent._oauth_1m_beta_disabled = False
+    agent._anthropic_client = SimpleNamespace(messages=_Messages(stream))
+    agent._anthropic_client_source = ("test-key", None, False)
+    agent.log_prefix = ""
+    agent._capture_anthropic_response_headers = MagicMock()
+    agent._touch_activity = MagicMock()
+    agent._fire_stream_delta = MagicMock()
+    agent._fire_reasoning_delta = MagicMock()
+    agent._fire_tool_gen_started = MagicMock()
+
+    response = await agent._execute_model_request(
+        {"model": "claude-test", "messages": []},
+        use_streaming=True,
+    )
+
+    assert response is None
+    agent._fire_stream_delta.assert_called_once_with("first")
+    assert stream.exited is True
+
+
+@pytest.mark.asyncio
 async def test_eventless_anthropic_stream_raises_empty_stream_error():
     stream = _AsyncMessageStream([], final_error=AssertionError("no message_start"))
     client = SimpleNamespace(messages=_Messages(stream))

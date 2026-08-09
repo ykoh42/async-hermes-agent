@@ -845,9 +845,12 @@ async def stream_converse_with_callbacks(
         # liveness callback must never be able to abort the stream.
         if on_event is not None:
             try:
-                on_event()
+                accepted = on_event()
             except Exception:
                 pass
+            else:
+                if accepted is False:
+                    break
         # Check for interrupt
         if on_interrupt_check and on_interrupt_check():
             break
