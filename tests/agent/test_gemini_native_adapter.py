@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 from types import SimpleNamespace
 
@@ -18,6 +19,115 @@ class DummyResponse:
 
     def json(self):
         return self._payload
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status_code", "headers", "body", "expected"),
+    [
+        (200, {}, "{}", "paid"),
+        (429, {}, '{"error":{"message":"free_tier quota exhausted"}}', "free"),
+        (429, {}, '{"error":{"message":"rate limited"}}', "paid"),
+        (401, {}, "{}", "unknown"),
+        (200, {"x-ratelimit-limit-requests-per-day": "1000"}, "{}", "free"),
+        (429, {"x-ratelimit-limit-requests-per-day": "1501"}, "{}", "paid"),
+    ],
+)
+async def test_probe_gemini_tier_preserves_upstream_classification(
+    monkeypatch, status_code, headers, body, expected
+):
+    from agent.gemini_native_adapter import probe_gemini_tier
+
+    recorded = {}
+
+    class ProbeHTTP:
+        def __init__(self, *, timeout):
+            recorded["timeout"] = timeout
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def post(self, url, *, params, json, headers):
+            recorded.update(
+                url=url,
+                params=params,
+                json=json,
+                headers=headers,
+            )
+            return DummyResponse(
+                status_code=status_code,
+                headers=headers_response,
+                text=body,
+            )
+
+    headers_response = headers
+    monkeypatch.setattr(
+        "agent.gemini_native_adapter.httpx.AsyncClient", ProbeHTTP
+    )
+
+    result = await probe_gemini_tier(
+        " key ",
+        "https://generativelanguage.googleapis.com/v1beta/openai",
+        model="gemini-test",
+        timeout=3.5,
+    )
+
+    assert result == expected
+    assert recorded == {
+        "timeout": 3.5,
+        "url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-test:generateContent",
+        "params": {"key": "key"},
+        "json": {
+            "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
+            "generationConfig": {"maxOutputTokens": 1},
+        },
+        "headers": {
+            "Content-Type": "application/json",
+            "X-Goog-Api-Client": recorded["headers"]["X-Goog-Api-Client"],
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_probe_gemini_tier_returns_unknown_without_io(monkeypatch):
+    from agent.gemini_native_adapter import probe_gemini_tier
+
+    def forbidden_client(*args, **kwargs):
+        raise AssertionError("empty keys must not create an HTTP client")
+
+    monkeypatch.setattr(
+        "agent.gemini_native_adapter.httpx.AsyncClient", forbidden_client
+    )
+
+    assert inspect.iscoroutinefunction(probe_gemini_tier)
+    assert await probe_gemini_tier("  ") == "unknown"
+
+
+@pytest.mark.asyncio
+async def test_probe_gemini_tier_returns_unknown_on_transport_error(monkeypatch):
+    from agent.gemini_native_adapter import probe_gemini_tier
+
+    class BrokenHTTP:
+        def __init__(self, *, timeout):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def post(self, *args, **kwargs):
+            raise OSError("offline")
+
+    monkeypatch.setattr(
+        "agent.gemini_native_adapter.httpx.AsyncClient", BrokenHTTP
+    )
+
+    assert await probe_gemini_tier("key") == "unknown"
 
 
 
@@ -263,6 +373,5 @@ def test_stream_event_translation_emits_tool_call_delta_with_stable_index():
 # ---------------------------------------------------------------------------
 # X-Goog-Api-Client header tests
 # ---------------------------------------------------------------------------
-
 
 
