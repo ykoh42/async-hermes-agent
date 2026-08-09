@@ -1661,6 +1661,7 @@ def init_agent(
     # async discovery before the first tool snapshot is sent to the model.
     agent._mcp_discovery_started = False
     agent._mcp_lifecycle_retained = False
+    agent._lsp_lifecycle_retained = False
 
     # Tool availability and dynamic schemas may require async config or
     # provider checks. The first turn prologue builds the complete snapshot

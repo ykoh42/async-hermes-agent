@@ -141,6 +141,21 @@ DEFAULT_CONFIG = {
         "env_passthrough": [],
     },
 
+    # Language Server Protocol — semantic diagnostics from real language
+    # servers wired into the post-write checks used by write_file and patch.
+    # The subsystem stays dormant outside a detected git worktree.
+    "lsp": {
+        "enabled": True,
+        "wait_mode": "document",
+        "wait_timeout": 5.0,
+        # Missing servers may be installed into <HERMES_HOME>/lsp/bin.
+        "install_strategy": "auto",
+        # Set to 0 to keep spawned servers for the service lifetime.
+        "idle_timeout": 600.0,
+        # Per-server disabled/command/env/initialization_options overrides.
+        "servers": {},
+    },
+
     "web": {
         "backend": "",           # shared fallback — applies to both search and extract
         "search_backend": "",    # per-capability override for web_search (e.g. "searxng")

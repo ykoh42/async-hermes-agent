@@ -376,7 +376,13 @@ async def build_turn_context(
     initial_tool_snapshot = not getattr(
         agent, "_tool_snapshot_initialized", False
     )
+    initial_lsp_lease = not getattr(agent, "_lsp_lifecycle_retained", False)
     try:
+        if initial_lsp_lease:
+            from agent.lsp import _retain_lsp_lifecycle
+
+            await _retain_lsp_lifecycle(agent)
+            agent._lsp_lifecycle_retained = True
         await _plugins.discover_plugins()
         if not getattr(agent, "_skip_mcp_refresh", False):
             # The first discovery is intentionally lazy: ``AIAgent.__init__``
@@ -398,6 +404,13 @@ async def build_turn_context(
                 )
                 agent._tool_snapshot_initialized = True
     except asyncio.CancelledError:
+        if initial_lsp_lease and getattr(
+            agent, "_lsp_lifecycle_retained", False
+        ):
+            from agent.lsp import _release_lsp_lifecycle
+
+            await _release_lsp_lifecycle(agent)  # noqa: ASYNC120
+            agent._lsp_lifecycle_retained = False
         if initial_tool_snapshot:
             if getattr(agent, "_mcp_lifecycle_retained", False):
                 await _mcp_tool._release_mcp_lifecycle(agent)  # noqa: ASYNC120
@@ -405,6 +418,13 @@ async def build_turn_context(
             agent._mcp_discovery_started = False
         raise
     except Exception:
+        if initial_lsp_lease and getattr(
+            agent, "_lsp_lifecycle_retained", False
+        ):
+            from agent.lsp import _release_lsp_lifecycle
+
+            await _release_lsp_lifecycle(agent)  # noqa: ASYNC120
+            agent._lsp_lifecycle_retained = False
         if initial_tool_snapshot:
             if getattr(agent, "_mcp_lifecycle_retained", False):
                 await _mcp_tool._release_mcp_lifecycle(agent)  # noqa: ASYNC120

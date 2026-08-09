@@ -35,6 +35,7 @@ from tools.file_operations import (
     SearchResult,
     WriteResult,
     _FAIL_CLOSED_INPROC_EXTS,
+    _SHELL_LINTER_LSP_REDUNDANT,
     _has_bom,
     _looks_like_linter_unusable,
     _parse_search_context_line,
@@ -1447,6 +1448,11 @@ async def _check_lint(path: Path, content: str | None = None) -> LintResult:
             skipped=True,
             message=f"No linter for {extension} files",
         )
+    if extension in _SHELL_LINTER_LSP_REDUNDANT and await _lsp_will_handle(path):
+        return LintResult(
+            skipped=True,
+            message=f"{extension} diagnostics handled by LSP",
+        )
     argv = [
         str(path) if part == "{file}" else part
         for part in linter_command.split()
@@ -1563,6 +1569,71 @@ async def _check_lint_delta(
     )
 
 
+async def _lsp_will_handle(path: Path) -> bool:
+    """Return whether the native LSP service will inspect ``path``."""
+    try:
+        from agent.lsp import get_service
+
+        service = await get_service()
+        return bool(service and await service.enabled_for(str(path)))
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # noqa: BLE001
+        return False
+
+
+async def _snapshot_lsp_baseline(path: Path) -> None:
+    """Capture pre-write semantic diagnostics without making writes fragile."""
+    try:
+        from agent.lsp import get_service
+
+        service = await get_service()
+        if service is not None:
+            await service.snapshot_baseline(str(path))
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # noqa: BLE001
+        logger.debug("LSP baseline snapshot failed", exc_info=True)
+
+
+async def _maybe_lsp_diagnostics(
+    path: Path,
+    *,
+    pre_content: str | None,
+    post_content: str,
+) -> str:
+    """Return formatted semantic diagnostics introduced by the write."""
+    try:
+        from agent.lsp import get_service
+
+        service = await get_service()
+        if service is None or not await service.enabled_for(str(path)):
+            return ""
+        line_shift = None
+        if pre_content is not None and pre_content != post_content:
+            from agent.lsp.range_shift import build_line_shift
+
+            line_shift = build_line_shift(pre_content, post_content)
+        diagnostics = await service.get_diagnostics_sync(
+            str(path), delta=True, line_shift=line_shift
+        )
+        if not diagnostics:
+            return ""
+        from agent.lsp.reporter import report_for_file, truncate
+
+        block = report_for_file(str(path), diagnostics)
+        return (
+            truncate("LSP diagnostics introduced by this edit:\n" + block)
+            if block
+            else ""
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # noqa: BLE001
+        logger.debug("LSP diagnostics failed", exc_info=True)
+        return ""
+
+
 async def _write_native_result(path: Path, content: str) -> WriteResult:
     """Native-async equivalent of v2026.8.3 ``write_file`` mechanics."""
     extension = path.suffix.lower()
@@ -1598,6 +1669,8 @@ async def _write_native_result(path: Path, content: str) -> WriteResult:
         if _has_bom(existing) and not _has_bom(content):
             content = "\ufeff" + content
 
+    await _snapshot_lsp_baseline(path)
+
     try:
         await _write_native_file(path, content)
     except OSError as exc:
@@ -1621,11 +1694,19 @@ async def _write_native_result(path: Path, content: str) -> WriteResult:
         pre_content=(existing if extension in LINTERS_INPROC else None),
         post_content=content,
     )
+    lsp_diagnostics = ""
+    if lint_result.success or lint_result.skipped:
+        lsp_diagnostics = await _maybe_lsp_diagnostics(
+            path,
+            pre_content=existing,
+            post_content=content,
+        )
     return WriteResult(
         bytes_written=len(content.encode("utf-8")),
         dirs_created=True,
         verified=verified,
         lint=lint_result.to_dict(),
+        lsp_diagnostics=lsp_diagnostics or None,
     )
 
 
@@ -1962,6 +2043,7 @@ async def _handle_patch(args, **kw):
                     )
 
             persisted = "\ufeff" + updated if had_bom and not _has_bom(updated) else updated
+            await _snapshot_lsp_baseline(resolved)
             await _write_native_file(resolved, persisted)
             verified_content = await _read_native_patch_content(resolved)
             verified_content, _ = _strip_bom(verified_content)
@@ -1979,6 +2061,13 @@ async def _handle_patch(args, **kw):
                 pre_content=content,
                 post_content=updated,
             )
+            lsp_diagnostics = ""
+            if lint_result.success or lint_result.skipped:
+                lsp_diagnostics = await _maybe_lsp_diagnostics(
+                    resolved,
+                    pre_content=content,
+                    post_content=updated,
+                )
             await _refresh_read_timestamp(path, task_id)
             await file_state.note_write(task_id, str(resolved))
     except FileNotFoundError:
@@ -2003,6 +2092,8 @@ async def _handle_patch(args, **kw):
         "files_modified": [str(resolved)],
         "lint": lint_result.to_dict(),
     }
+    if lsp_diagnostics:
+        result["lsp_diagnostics"] = lsp_diagnostics
     if cross_warning or stale_warning or cwd_warning:
         result["_warning"] = cross_warning or stale_warning or cwd_warning
     await _mark_verification_stale(

@@ -628,6 +628,11 @@ class AIAgent:
         """Support ``async with AIAgent(...)`` without a separate start API."""
         await self._ensure_provider_runtime()
         await _plugins.discover_plugins()
+        if not getattr(self, "_lsp_lifecycle_retained", False):
+            from agent.lsp import _retain_lsp_lifecycle
+
+            await _retain_lsp_lifecycle(self)
+            self._lsp_lifecycle_retained = True
         if not getattr(self, "_mcp_discovery_started", False):
             self._mcp_discovery_started = True
             try:
@@ -643,6 +648,11 @@ class AIAgent:
                 if self._mcp_lifecycle_retained:
                     await _mcp_tool._release_mcp_lifecycle(self)
                     self._mcp_lifecycle_retained = False
+                if self._lsp_lifecycle_retained:
+                    from agent.lsp import _release_lsp_lifecycle
+
+                    await _release_lsp_lifecycle(self)
+                    self._lsp_lifecycle_retained = False
                 self._mcp_discovery_started = False
                 raise
         return self
@@ -4238,6 +4248,20 @@ class AIAgent:
                 logger.debug("MCP lifecycle release failed", exc_info=True)
             else:
                 self._mcp_lifecycle_retained = False
+
+        # LSP subprocesses are shared on this event loop just like MCP
+        # transports. The final agent lease owns deterministic shutdown.
+        if getattr(self, "_lsp_lifecycle_retained", False):
+            try:
+                from agent.lsp import _release_lsp_lifecycle
+
+                await _release_lsp_lifecycle(self)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.debug("LSP lifecycle release failed", exc_info=True)
+            else:
+                self._lsp_lifecycle_retained = False
 
         # Flush and close external memory-provider state before discarding the
         # transcript it may need for end-of-session extraction.

@@ -4,10 +4,108 @@ from __future__ import annotations
 
 import asyncio
 import json
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from tools.file_tools import PATCH_SCHEMA, READ_FILE_SCHEMA
+
+
+@pytest.mark.asyncio
+async def test_write_file_surfaces_native_lsp_diagnostics_after_write(tmp_path):
+    from tools.file_tools import write_file_tool
+
+    target = tmp_path / "module.py"
+    target.write_text("value = 1\n")
+    service = MagicMock()
+    service.enabled_for = AsyncMock(return_value=True)
+
+    async def snapshot(path):
+        assert path == str(target)
+        assert target.read_text() == "value = 1\n"
+
+    async def diagnostics(path, **kwargs):
+        assert path == str(target)
+        assert target.read_text() == "value = 'wrong'\n"
+        assert kwargs["delta"] is True
+        assert callable(kwargs["line_shift"])
+        return [
+            {
+                "severity": 1,
+                "message": "Type mismatch",
+                "range": {
+                    "start": {"line": 0, "character": 8},
+                    "end": {"line": 0, "character": 15},
+                },
+                "source": "pyright",
+            }
+        ]
+
+    service.snapshot_baseline = AsyncMock(side_effect=snapshot)
+    service.get_diagnostics_sync = AsyncMock(side_effect=diagnostics)
+    with patch(
+        "agent.lsp.get_service", new=AsyncMock(return_value=service)
+    ):
+        result = json.loads(
+            await write_file_tool(str(target), "value = 'wrong'\n")
+        )
+
+    assert "Type mismatch" in result["lsp_diagnostics"]
+    service.snapshot_baseline.assert_awaited_once_with(str(target))
+    service.get_diagnostics_sync.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_write_file_lsp_cancellation_propagates_before_write(tmp_path):
+    from tools.file_tools import write_file_tool
+
+    target = tmp_path / "module.py"
+    target.write_text("value = 1\n")
+    service = MagicMock()
+    service.snapshot_baseline = AsyncMock(side_effect=asyncio.CancelledError)
+    with patch(
+        "agent.lsp.get_service", new=AsyncMock(return_value=service)
+    ):
+        with pytest.raises(asyncio.CancelledError):
+            await write_file_tool(str(target), "value = 2\n")
+
+    assert target.read_text() == "value = 1\n"
+
+
+@pytest.mark.asyncio
+async def test_patch_surfaces_native_lsp_diagnostics(tmp_path):
+    from tools.file_tools import patch_tool
+
+    target = tmp_path / "module.py"
+    target.write_text("value = 1\n")
+    service = MagicMock()
+    service.snapshot_baseline = AsyncMock()
+    service.enabled_for = AsyncMock(return_value=True)
+    service.get_diagnostics_sync = AsyncMock(
+        return_value=[
+            {
+                "severity": 1,
+                "message": "Semantic warning",
+                "range": {
+                    "start": {"line": 0, "character": 0},
+                    "end": {"line": 0, "character": 5},
+                },
+            }
+        ]
+    )
+    with patch(
+        "agent.lsp.get_service", new=AsyncMock(return_value=service)
+    ):
+        result = json.loads(
+            await patch_tool(
+                mode="replace",
+                path=str(target),
+                old_string="value = 1",
+                new_string="value = 2",
+            )
+        )
+
+    assert "Semantic warning" in result["lsp_diagnostics"]
 
 
 @pytest.mark.asyncio
@@ -126,6 +224,36 @@ async def test_python_write_reports_new_syntax_error(tmp_path):
     assert result["lint"]["status"] == "error"
     assert "SyntaxError" in result["lint"]["output"]
     assert target.read_text() == "def broken(:\n"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["write", "patch"])
+async def test_syntax_failure_skips_post_write_lsp_query(tmp_path, operation):
+    from tools.file_tools import patch_tool, write_file_tool
+
+    target = tmp_path / "module.py"
+    target.write_text("value = 1\n")
+    service = MagicMock()
+    service.snapshot_baseline = AsyncMock()
+    service.enabled_for = AsyncMock(return_value=True)
+    service.get_diagnostics_sync = AsyncMock(return_value=[])
+
+    with patch("agent.lsp.get_service", new=AsyncMock(return_value=service)):
+        if operation == "write":
+            result = json.loads(await write_file_tool(str(target), "def broken(:\n"))
+        else:
+            result = json.loads(
+                await patch_tool(
+                    mode="replace",
+                    path=str(target),
+                    old_string="value = 1",
+                    new_string="def broken(:",
+                )
+            )
+
+    assert result["lint"]["status"] == "error"
+    service.snapshot_baseline.assert_awaited_once_with(str(target))
+    service.get_diagnostics_sync.assert_not_awaited()
 
 
 @pytest.mark.asyncio

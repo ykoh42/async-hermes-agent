@@ -1051,6 +1051,8 @@ async def test_async_context_manager_initializes_provider_mcp_and_tools():
     agent.close = AsyncMock()
 
     with (
+        patch("agent.lsp._retain_lsp_lifecycle", new=AsyncMock()) as retain_lsp,
+        patch("agent.lsp._release_lsp_lifecycle", new=AsyncMock()) as release_lsp,
         patch("tools.mcp_tool._retain_mcp_lifecycle", new=AsyncMock()) as retain,
         patch("tools.mcp_tool.discover_mcp_tools", new=AsyncMock()) as discover,
         patch("tools.mcp_tool._release_mcp_lifecycle", new=AsyncMock()) as release,
@@ -1063,6 +1065,8 @@ async def test_async_context_manager_initializes_provider_mcp_and_tools():
             assert agent._tool_snapshot_initialized is True
 
     agent._ensure_provider_runtime.assert_awaited_once()
+    retain_lsp.assert_awaited_once_with(agent)
+    release_lsp.assert_not_awaited()
     retain.assert_awaited_once_with(agent)
     discover.assert_awaited_once()
     refresh.assert_awaited_once_with(agent, quiet_mode=True)
@@ -1083,6 +1087,8 @@ async def test_async_context_manager_rolls_back_failed_mcp_initialization():
     agent._ensure_provider_runtime = AsyncMock()
 
     with (
+        patch("agent.lsp._retain_lsp_lifecycle", new=AsyncMock()),
+        patch("agent.lsp._release_lsp_lifecycle", new=AsyncMock()) as release_lsp,
         patch("tools.mcp_tool._retain_mcp_lifecycle", new=AsyncMock()),
         patch("tools.mcp_tool.discover_mcp_tools", new=AsyncMock()),
         patch("tools.mcp_tool._release_mcp_lifecycle", new=AsyncMock()) as release,
@@ -1095,7 +1101,9 @@ async def test_async_context_manager_rolls_back_failed_mcp_initialization():
         await agent.__aenter__()
 
     release.assert_awaited_once_with(agent)
+    release_lsp.assert_awaited_once_with(agent)
     assert agent._mcp_lifecycle_retained is False
+    assert agent._lsp_lifecycle_retained is False
     assert agent._mcp_discovery_started is False
 
 
@@ -2905,6 +2913,25 @@ async def test_close_releases_retained_mcp_lifecycle(monkeypatch):
 
     assert released == [agent]
     assert agent._mcp_lifecycle_retained is False
+
+
+@pytest.mark.asyncio
+async def test_close_releases_retained_lsp_lifecycle(monkeypatch):
+    from agent import lsp as lsp_module
+
+    agent = AIAgent.__new__(AIAgent)
+    agent._lsp_lifecycle_retained = True
+    released = []
+
+    async def release(owner):
+        released.append(owner)
+
+    monkeypatch.setattr(lsp_module, "_release_lsp_lifecycle", release)
+
+    await agent.close()
+
+    assert released == [agent]
+    assert agent._lsp_lifecycle_retained is False
 
 
 @pytest.mark.asyncio

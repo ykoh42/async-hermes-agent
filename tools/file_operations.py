@@ -1531,7 +1531,7 @@ class ShellFileOperations(FileOperations):
         # by this specific edit.  Mirrors claude-code's
         # ``beforeFileEdited`` pattern but wired to the local LSP
         # rather than an external IDE.
-        self._snapshot_lsp_baseline(path)
+        await self._snapshot_lsp_baseline(path)
 
         # Create parent directories
         parent = os.path.dirname(path)
@@ -1610,7 +1610,7 @@ class ShellFileOperations(FileOperations):
         # Best-effort: ``""`` is returned for any failure path.
         lsp_diagnostics: Optional[str] = None
         if lint_result.success or lint_result.skipped:
-            block = self._maybe_lsp_diagnostics(
+            block = await self._maybe_lsp_diagnostics(
                 path, pre_content=pre_content, post_content=content
             )
             if block:
@@ -1847,7 +1847,7 @@ class ShellFileOperations(FileOperations):
         # The LSP tier runs separately via ``_maybe_lsp_diagnostics`` and
         # carries the real diagnostics in ``lsp_diagnostics`` on the
         # WriteResult / PatchResult.
-        if ext in _SHELL_LINTER_LSP_REDUNDANT and self._lsp_will_handle(path):
+        if ext in _SHELL_LINTER_LSP_REDUNDANT and await self._lsp_will_handle(path):
             return LintResult(
                 skipped=True,
                 message=f"LSP server handles {ext} — shell linter skipped",
@@ -2016,7 +2016,7 @@ class ShellFileOperations(FileOperations):
                 return True
         return False
 
-    def _lsp_will_handle(self, path: str) -> bool:
+    async def _lsp_will_handle(self, path: str) -> bool:
         """Return True iff the LSP service is active AND will lint this file.
 
         Stronger than :meth:`_lsp_handles_extension` — that one only checks
@@ -2040,17 +2040,17 @@ class ShellFileOperations(FileOperations):
         except Exception:  # noqa: BLE001
             return False
         try:
-            svc = get_service()
+            svc = await get_service()
         except Exception:  # noqa: BLE001
             return False
         if svc is None:
             return False
         try:
-            return bool(svc.enabled_for(path))
+            return bool(await svc.enabled_for(path))
         except Exception:  # noqa: BLE001
             return False
 
-    def _snapshot_lsp_baseline(self, path: str) -> None:
+    async def _snapshot_lsp_baseline(self, path: str) -> None:
         """Capture pre-edit LSP diagnostics so the post-write delta is correct.
 
         Best-effort.  Silent on every failure path — LSP is an
@@ -2063,17 +2063,17 @@ class ShellFileOperations(FileOperations):
             return
         try:
             from agent.lsp import get_service
-            svc = get_service()
+            svc = await get_service()
         except Exception:  # noqa: BLE001
             return
         if svc is None:
             return
         try:
-            svc.snapshot_baseline(path)
+            await svc.snapshot_baseline(path)
         except Exception:  # noqa: BLE001
             pass
 
-    def _maybe_lsp_diagnostics(
+    async def _maybe_lsp_diagnostics(
         self,
         path: str,
         *,
@@ -2107,10 +2107,10 @@ class ShellFileOperations(FileOperations):
         except Exception:  # noqa: BLE001
             return ""
         try:
-            svc = get_service()
+            svc = await get_service()
         except Exception:  # noqa: BLE001
             return ""
-        if svc is None or not svc.enabled_for(path):
+        if svc is None or not await svc.enabled_for(path):
             return ""
 
         # Build a line-shift map when we have both pre and post — it
@@ -2125,7 +2125,9 @@ class ShellFileOperations(FileOperations):
                 line_shift = None
 
         try:
-            diagnostics = svc.get_diagnostics_sync(path, delta=True, line_shift=line_shift)
+            diagnostics = await svc.get_diagnostics_sync(
+                path, delta=True, line_shift=line_shift
+            )
         except Exception:  # noqa: BLE001
             return ""
         if not diagnostics:
