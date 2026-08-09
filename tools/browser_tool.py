@@ -2177,7 +2177,16 @@ async def _stop_browser_cleanup_thread() -> None:
         _cleanup_task = None
     if task is not None and task is not asyncio.current_task():
         task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
+
+        async def _collect() -> None:
+            await asyncio.gather(task, return_exceptions=True)
+
+        await _finish_owned_task(
+            asyncio.create_task(
+                _collect(),
+                name="browser-cleanup-stop",
+            )
+        )
 
 
 def _update_session_activity(task_id: str) -> None:

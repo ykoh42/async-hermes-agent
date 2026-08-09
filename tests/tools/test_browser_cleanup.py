@@ -1,5 +1,6 @@
 """Regression tests for browser session cleanup and screenshot recovery."""
 
+import asyncio
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -105,3 +106,48 @@ class TestBrowserCleanup:
         assert browser_tool._session_last_activity == {}
         assert browser_tool._recording_sessions == set()
         assert browser_tool._cleanup_done is True
+
+    async def test_cleanup_task_stop_survives_repeated_cancellation(self):
+        browser_tool = self.browser_tool
+        started = asyncio.Event()
+        cancelled = asyncio.Event()
+        release = asyncio.Event()
+        finished = asyncio.Event()
+
+        async def uncooperative_worker():
+            started.set()
+            try:
+                while not release.is_set():
+                    try:
+                        await release.wait()
+                    except asyncio.CancelledError:  # noqa: ASYNC103 - test stub
+                        cancelled.set()
+            finally:
+                finished.set()
+
+        worker = asyncio.create_task(uncooperative_worker())
+        browser_tool._cleanup_task = worker
+        browser_tool._cleanup_running = True
+        stop = asyncio.create_task(browser_tool._stop_browser_cleanup_thread())
+        try:
+            await started.wait()
+            await cancelled.wait()
+            stop.cancel()
+            await asyncio.sleep(0)
+            stop.cancel()
+            await asyncio.sleep(0)
+
+            assert stop.done() is False
+            release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await stop
+
+            assert finished.is_set()
+            assert worker.done()
+            assert browser_tool._cleanup_task is None
+            assert browser_tool._cleanup_running is False
+        finally:
+            release.set()
+            if not stop.done():
+                stop.cancel()
+            await asyncio.gather(stop, worker, return_exceptions=True)
