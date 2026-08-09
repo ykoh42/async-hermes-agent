@@ -106,7 +106,7 @@ async def test_cancelled_discovery_rolls_back_partial_registry(monkeypatch):
 
     monkeypatch.setattr(
         providers,
-        "_discover_providers_async_impl",
+        "_discover_providers_impl",
         interrupted_discovery,
     )
     task = asyncio.create_task(providers.get_provider_profile("partial"))
@@ -135,7 +135,7 @@ async def test_concurrent_first_lookups_share_one_discovery(monkeypatch):
         providers.register_provider(_profile("shared"))
         providers._discovered = True
 
-    monkeypatch.setattr(providers, "_discover_providers_async", discover_once)
+    monkeypatch.setattr(providers, "_discover_providers", discover_once)
     first, second = await asyncio.gather(
         providers.get_provider_profile("shared"),
         providers.get_provider_profile("shared"),

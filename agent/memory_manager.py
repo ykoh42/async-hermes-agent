@@ -915,13 +915,11 @@ class MemoryManager:
         (transcript misattributed to the new session id, double-ingest of the
         old turn buffer, new-session buffers cleared).
 
-        Submitting BOTH hooks as one task on the manager's single background
-        worker gives both properties at a single chokepoint: the caller returns
-        immediately, and the worker's FIFO order serializes end→switch against
-        every other provider write (per-turn ``sync_all``, prefetches), which
-        already share the same worker. If the executor is unavailable,
-        ``_submit_background`` degrades to inline execution — the pre-#16454
-        synchronous behavior, slow but correct.
+        Submitting BOTH hooks as one owned event-loop task gives both properties
+        at a single chokepoint: the caller returns immediately, and the
+        manager's async FIFO lock serializes end→switch against every other
+        provider write (per-turn ``sync_all``, prefetches). Shutdown tracks and
+        drains the owned task, so no executor or thread fallback is involved.
         """
         if not self._providers:
             return

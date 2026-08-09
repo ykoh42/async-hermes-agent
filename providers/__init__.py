@@ -99,7 +99,7 @@ def _list_providers_cached() -> list[ProviderProfile]:
     return list(result)
 
 
-async def _user_plugins_dir_async() -> Path | None:
+async def _user_plugins_dir() -> Path | None:
     """Return the user provider directory without synchronous stat calls."""
     try:
         from hermes_constants import get_hermes_home
@@ -110,7 +110,7 @@ async def _user_plugins_dir_async() -> Path | None:
         return None
 
 
-async def _import_plugin_dir_async(plugin_dir: Path, source: str) -> None:
+async def _import_plugin_dir(plugin_dir: Path, source: str) -> None:
     """Load one directory provider without blocking on source-file I/O."""
     init_file = plugin_dir / "__init__.py"
     if not await aiofiles.os.path.exists(init_file):
@@ -181,7 +181,7 @@ def _restore_async_discovery_state(
             sys.modules.pop(module_name, None)
 
 
-async def _discover_providers_async() -> None:
+async def _discover_providers() -> None:
     """Populate provider profiles with cancellation-safe rollback."""
     snapshot = (
         dict(_REGISTRY),
@@ -197,13 +197,13 @@ async def _discover_providers_async() -> None:
         },
     )
     try:
-        await _discover_providers_async_impl()
+        await _discover_providers_impl()
     except BaseException:
         _restore_async_discovery_state(*snapshot)
         raise
 
 
-async def _discover_providers_async_impl() -> None:
+async def _discover_providers_impl() -> None:
     """Populate provider profiles through native async discovery."""
     global _discovered
     if _discovered:
@@ -215,16 +215,16 @@ async def _discover_providers_async_impl() -> None:
             if child_name.startswith(("_", ".")):
                 continue
             if await aiofiles.os.path.isdir(child):
-                await _import_plugin_dir_async(child, "bundled")
+                await _import_plugin_dir(child, "bundled")
 
-    user_dir = await _user_plugins_dir_async()
+    user_dir = await _user_plugins_dir()
     if user_dir is not None:
         for child_name in sorted(await aiofiles.os.listdir(user_dir)):
             child = user_dir / child_name
             if child_name.startswith(("_", ".")):
                 continue
             if await aiofiles.os.path.isdir(child):
-                await _import_plugin_dir_async(child, "user")
+                await _import_plugin_dir(child, "user")
 
     # Preserve the legacy single-file extension point. There are no bundled
     # files in the retained tree, but user editable installs may still have
@@ -273,7 +273,7 @@ async def _ensure_provider_profiles_loaded() -> None:
         _ASYNC_DISCOVERY_LOOP = loop
     async with _ASYNC_DISCOVERY_LOCK:
         if not _discovered:
-            await _discover_providers_async()
+            await _discover_providers()
     _refresh_loaded_profile_projections()
 
 
