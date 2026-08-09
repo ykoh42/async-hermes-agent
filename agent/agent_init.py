@@ -3554,7 +3554,14 @@ async def _initialize_deferred_runtime(agent: Any) -> bool:
             agent._anthropic_prompt_cache_policy()
         )
         compressor = getattr(agent, "context_compressor", None)
-        if compressor is not None:
+        # A newly selected plugin is initialized below after its real context
+        # window is resolved. Updating it here would first publish the class
+        # default (usually zero) and execute plugin side effects twice. An
+        # already-started plugin still needs this route refresh on rehydration.
+        if compressor is not None and (
+            not getattr(agent, "_context_engine_is_plugin", False)
+            or getattr(agent, "_context_engine_started", False)
+        ):
             context_length = getattr(compressor, "context_length", None)
             if provider == "lmstudio":
                 context_length = agent._effective_lmstudio_context_length(

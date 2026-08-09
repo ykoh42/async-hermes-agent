@@ -1344,6 +1344,7 @@ async def test_deferred_runtime_starts_native_context_engine_with_tools(monkeypa
     class NativeEngine(ContextEngine):
         def __init__(self):
             self.started = []
+            self.model_updates = []
 
         @property
         def name(self):
@@ -1354,6 +1355,10 @@ async def test_deferred_runtime_starts_native_context_engine_with_tools(monkeypa
 
         def should_compress(self, prompt_tokens=None):
             return False
+
+        def update_model(self, **kwargs):
+            self.model_updates.append(kwargs.copy())
+            return super().update_model(**kwargs)
 
         async def compress(self, messages, **kwargs):
             return messages
@@ -1405,6 +1410,14 @@ async def test_deferred_runtime_starts_native_context_engine_with_tools(monkeypa
     assert agent.context_compressor.name == "native-test"
     assert agent.context_compressor.context_length == 128_000
     assert agent.context_compressor.model_thresholds == {"test-model": 0.42}
+    assert agent.context_compressor.model_updates == [{
+        "model": "test-model",
+        "context_length": 128_000,
+        "base_url": "https://openrouter.ai/api/v1",
+        "api_key": "test-key",
+        "provider": "openrouter",
+        "api_mode": "chat_completions",
+    }]
     assert len(agent.context_compressor.started) == 1
     assert "context_lookup" in agent._context_engine_tool_names
     assert "context_lookup" in agent.valid_tool_names
@@ -1414,6 +1427,54 @@ async def test_deferred_runtime_starts_native_context_engine_with_tools(monkeypa
     )
     context_length.assert_awaited_once()
     await agent.close()
+
+
+@pytest.mark.asyncio
+async def test_plugin_context_engine_suppresses_codex_threshold_autoraise(
+    monkeypatch,
+):
+    """A host-only Codex threshold change must not leak into plugin policy."""
+    from agent.agent_init import _select_context_engine
+    from agent.context_engine import ContextEngine
+
+    class NativeEngine(ContextEngine):
+        @property
+        def name(self):
+            return "native-test"
+
+        def update_from_response(self, usage):
+            return None
+
+        def should_compress(self, prompt_tokens=None):
+            return False
+
+        async def compress(self, messages, **kwargs):
+            return messages
+
+    engine = NativeEngine()
+    monkeypatch.setattr(
+        "plugins.context_engine.load_context_engine",
+        AsyncMock(return_value=engine),
+    )
+    agent = SimpleNamespace(
+        _context_engine_selected=False,
+        context_compressor=object(),
+        _compression_threshold_autoraised={
+            "model": "gpt-5.5",
+            "from": 0.50,
+            "to": 0.85,
+        },
+    )
+
+    await _select_context_engine(
+        agent,
+        {"context": {"engine": "native-test"}},
+    )
+
+    assert agent.context_compressor is engine
+    assert agent._context_engine_is_plugin is True
+    assert agent._compression_threshold_autoraised is None
+    assert engine.threshold_percent == 0.75
 
 
 
