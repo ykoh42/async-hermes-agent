@@ -5,6 +5,7 @@ AsyncOpenAI transport is created lazily by _get_client() so it binds to the
 event loop that performs the first request.
 """
 
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -87,6 +88,36 @@ class TestAsyncClientLazyCreation:
         await comp.close()
 
         client.close.assert_awaited_once_with()
+        assert comp.client is None
+
+    @pytest.mark.asyncio
+    async def test_close_finishes_through_repeated_caller_cancellation(self):
+        from trajectory_compressor import TrajectoryCompressor
+
+        close_started = asyncio.Event()
+        allow_close = asyncio.Event()
+
+        class BlockingClient:
+            async def close(self):
+                close_started.set()
+                await allow_close.wait()
+
+        comp = TrajectoryCompressor.__new__(TrajectoryCompressor)
+        comp.client = BlockingClient()
+
+        close_task = asyncio.create_task(comp.close())
+        await close_started.wait()
+        close_task.cancel()
+        await asyncio.sleep(0)
+        close_task.cancel()
+
+        await asyncio.sleep(0)
+        assert close_task.done() is False
+
+        allow_close.set()
+        with pytest.raises(asyncio.CancelledError):
+            await close_task
+
         assert comp.client is None
 
 

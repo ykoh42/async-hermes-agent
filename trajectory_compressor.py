@@ -52,6 +52,27 @@ from hermes_constants import OPENROUTER_BASE_URL
 from agent.retry_utils import jittered_backoff
 
 
+async def _finish_owned_task(task: asyncio.Task[Any]) -> Any:
+    """Finish one compressor-owned task through repeated cancellation."""
+    cancellation: asyncio.CancelledError | None = None
+    while True:
+        try:
+            result = await asyncio.shield(task)
+            break
+        except asyncio.CancelledError as exc:  # noqa: ASYNC103 - re-raised below
+            if task.cancelled():
+                raise
+            if cancellation is None:
+                cancellation = exc
+        except Exception as exc:
+            if cancellation is not None:
+                raise cancellation from exc
+            raise
+    if cancellation is not None:
+        raise cancellation
+    return result
+
+
 async def _list_jsonl_files(directory: Path) -> List[Path]:
     """Return JSONL files without blocking the event loop on directory I/O."""
     try:
@@ -419,7 +440,11 @@ class TrajectoryCompressor:
         client = self.client
         self.client = None
         if client is not None:
-            await client.close()
+            close_task = asyncio.create_task(
+                client.close(),
+                name="trajectory-compressor-client-close",
+            )
+            await _finish_owned_task(close_task)
 
     def _detect_provider(self) -> str:
         """Detect the provider name from the configured base_url."""
