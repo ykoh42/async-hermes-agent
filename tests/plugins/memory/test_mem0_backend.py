@@ -296,6 +296,31 @@ def test_oss_legacy_base_urls_are_normalized_without_mutating_input():
 
 
 @pytest.mark.asyncio
+async def test_oss_backend_fails_before_mem0_thread_fallback():
+    backend = OSSBackend(
+        {
+            "llm": {
+                "provider": "openai",
+                "config": {"model": "gpt-5-mini"},
+            },
+            "embedder": {
+                "provider": "openai",
+                "config": {"model": "text-embedding-3-small"},
+            },
+            "vector_store": {
+                "provider": "qdrant",
+                "config": {"path": "/tmp/mem0-test"},
+            },
+        }
+    )
+
+    with pytest.raises(RuntimeError, match="has no native-async runtime"):
+        await backend._initialize()
+
+    assert backend._memory is None
+
+
+@pytest.mark.asyncio
 async def test_oss_backend_uses_async_memory_v2_signatures():
     class FakeMemory:
         def __init__(self):

@@ -457,17 +457,14 @@ class OSSBackend(Mem0Backend):
         self._config = config
         self._memory = None
 
-    async def initialize(self) -> None:
+    async def _initialize(self) -> None:
         if self._memory is not None:
             return
-        if self._collection_check is not None:
-            await self._recreate_collection_if_dims_changed(
-                *self._collection_check
-            )
-            self._collection_check = None
-        from mem0 import AsyncMemory
-
-        self._memory = AsyncMemory.from_config(self._config)
+        raise RuntimeError(
+            "Mem0 OSS mode has no native-async runtime: mem0ai==2.0.10 "
+            "AsyncMemory uses asyncio.to_thread internally. Configure MEM0_HOST "
+            "to use the native-async self-hosted HTTP backend."
+        )
 
     @staticmethod
     async def _recreate_collection_if_dims_changed(provider: str, vs_config: dict, expected_dims: int) -> None:
@@ -534,7 +531,7 @@ class OSSBackend(Mem0Backend):
                 pass
 
     async def search(self, query: str, *, filters: dict, top_k: int = 10, rerank: bool = False) -> list[dict]:
-        await self.initialize()
+        await self._initialize()
         memory = self._memory
         assert memory is not None
         response = await memory.search(query, filters=filters, top_k=top_k)
@@ -552,20 +549,20 @@ class OSSBackend(Mem0Backend):
         kwargs: dict[str, Any] = {"user_id": user_id, "agent_id": agent_id, "infer": infer}
         if metadata:
             kwargs["metadata"] = metadata
-        await self.initialize()
+        await self._initialize()
         memory = self._memory
         assert memory is not None
         return await memory.add(messages, **kwargs)
 
     async def update(self, memory_id: str, text: str) -> dict:
-        await self.initialize()
+        await self._initialize()
         memory = self._memory
         assert memory is not None
         await memory.update(memory_id, data=text)
         return {"result": "Memory updated.", "memory_id": memory_id}
 
     async def delete(self, memory_id: str) -> dict:
-        await self.initialize()
+        await self._initialize()
         memory = self._memory
         assert memory is not None
         await memory.delete(memory_id)

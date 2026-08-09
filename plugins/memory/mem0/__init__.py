@@ -400,21 +400,28 @@ class Mem0MemoryProvider(MemoryProvider):
         )
         self._channel = kwargs.get("platform") or "cli"
         self._backend = self._create_backend()
-        if self._backend is not None and self._mode != "oss" and not self._host:
-            from ._backend import PlatformBackend
+        if self._backend is not None:
+            from ._backend import OSSBackend, PlatformBackend
 
-            if isinstance(self._backend, PlatformBackend):
+            backend = self._backend
+            needs_initialization = (
+                isinstance(backend, OSSBackend)
+                or (
+                    isinstance(backend, PlatformBackend)
+                    and self._mode != "oss"
+                    and not self._host
+                )
+            )
+            if needs_initialization:
                 try:
-                    await self._backend._initialize()
+                    await backend._initialize()
                 except asyncio.CancelledError:
-                    backend = self._backend
                     self._backend = None
                     await _finish_owned_task(
                         asyncio.create_task(backend.close())
                     )
                     raise
                 except Exception as exc:
-                    backend = self._backend
                     self._backend = None
                     try:
                         await _finish_owned_task(

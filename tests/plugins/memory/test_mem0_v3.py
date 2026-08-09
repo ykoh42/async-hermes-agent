@@ -270,6 +270,41 @@ async def test_backend_initialization_failure_preserves_provider_contract(
 
 
 @pytest.mark.asyncio
+async def test_oss_thread_fallback_is_rejected_during_provider_initialization(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "mem0.json").write_text(
+        json.dumps(
+            {
+                "mode": "oss",
+                "oss": {
+                    "llm": {
+                        "provider": "openai",
+                        "config": {"model": "gpt-5-mini"},
+                    },
+                    "embedder": {
+                        "provider": "openai",
+                        "config": {"model": "text-embedding-3-small"},
+                    },
+                    "vector_store": {
+                        "provider": "qdrant",
+                        "config": {"path": str(tmp_path / "qdrant")},
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    provider = Mem0MemoryProvider()
+
+    await provider.initialize("test-session")
+
+    assert provider._backend is None
+    assert "has no native-async runtime" in provider._init_error
+
+
+@pytest.mark.asyncio
 async def test_platform_validation_failure_closes_backend_and_preserves_error(
     monkeypatch, tmp_path
 ):
