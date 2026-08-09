@@ -8,6 +8,7 @@ import os
 import pytest
 
 from agent.file_safety import is_write_denied
+import tools.file_operations as file_operations_module
 
 from tools.file_operations import (
     FileOperations,
@@ -20,6 +21,14 @@ from tools.file_operations import (
     WriteResult,
     normalize_read_pagination,
 )
+
+
+def test_module_import_does_not_create_unawaited_coroutines():
+    assert not [
+        name
+        for name, value in vars(file_operations_module).items()
+        if inspect.iscoroutine(value)
+    ]
 
 
 def test_result_dataclasses_preserve_upstream_shapes():

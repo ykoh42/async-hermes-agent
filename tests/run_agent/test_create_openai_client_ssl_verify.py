@@ -9,7 +9,7 @@ import certifi
 import httpx
 import pytest
 
-from agent.ssl_verify import resolve_httpx_verify
+from agent.ssl_verify import _resolve_httpx_client_verify, resolve_httpx_verify
 from agent.process_bootstrap import build_keepalive_http_client
 
 _CA_ENV_VARS = (
@@ -83,12 +83,12 @@ async def test_https_proxy_uses_separate_prebuilt_ssl_context(
     clean_tls_env,
     monkeypatch,
 ):
-    target_context = await resolve_httpx_verify()
-    proxy_context = await resolve_httpx_verify()
+    target_context = await _resolve_httpx_client_verify()
+    proxy_context = await _resolve_httpx_client_verify()
     monkeypatch.setenv("HTTPS_PROXY", "https://proxy.example.com:8443")
 
     with patch(
-        "agent.ssl_verify.resolve_httpx_verify",
+        "agent.ssl_verify._resolve_httpx_client_verify",
         AsyncMock(return_value=proxy_context),
     ) as resolve_proxy_verify:
         client = await build_keepalive_http_client(
@@ -111,7 +111,7 @@ async def test_keepalive_builder_closes_transport_on_client_constructor_failure(
     error,
 ):
     transport = SimpleNamespace(aclose=AsyncMock())
-    target_context = await resolve_httpx_verify()
+    target_context = await _resolve_httpx_client_verify()
 
     with (
         patch("httpx.AsyncHTTPTransport", return_value=transport),

@@ -130,11 +130,11 @@ async def _resolve_aux_verify(
     ``ssl_ca_cert`` / ``ssl_verify`` config and the ``HERMES_CA_BUNDLE`` /
     ``SSL_CERT_FILE`` env conventions.
     """
-    from agent.ssl_verify import resolve_httpx_verify
+    from agent.ssl_verify import _resolve_httpx_client_verify
     from hermes_cli.config import get_custom_provider_tls_settings
 
     tls = get_custom_provider_tls_settings(str(base_url or ""), config=config or {})
-    return await resolve_httpx_verify(
+    return await _resolve_httpx_client_verify(
         ca_bundle=tls.get("ssl_ca_cert"),
         ssl_verify=tls.get("ssl_verify"),
         base_url=str(base_url or ""),

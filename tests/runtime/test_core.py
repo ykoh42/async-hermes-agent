@@ -266,7 +266,7 @@ async def test_create_openai_client_preserves_kwargs_and_owns_async_transport():
             AsyncMock(return_value=http_client),
         ) as build_http_client,
         patch(
-            "agent.ssl_verify.resolve_httpx_verify",
+            "agent.ssl_verify._resolve_httpx_client_verify",
             AsyncMock(return_value=tls_context),
         ) as resolve_verify,
         patch("run_agent.OpenAI", return_value=client) as factory,
@@ -354,7 +354,7 @@ async def test_create_openai_client_closes_owned_transport_on_constructor_failur
 
     with (
         patch(
-            "agent.ssl_verify.resolve_httpx_verify",
+            "agent.ssl_verify._resolve_httpx_client_verify",
             AsyncMock(return_value=object()),
         ),
         patch(
@@ -1864,7 +1864,7 @@ async def test_custom_env_key_preserves_constructor_route_and_tls_snapshot(
             }),
         ),
         patch(
-            "agent.ssl_verify.resolve_httpx_verify",
+            "agent.ssl_verify._resolve_httpx_client_verify",
             AsyncMock(return_value=tls_snapshot),
         ) as resolve_verify,
         patch(

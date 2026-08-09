@@ -182,12 +182,12 @@ async def build_keepalive_http_client(
 
     import httpx
 
-    from agent.ssl_verify import resolve_httpx_verify
+    from agent.ssl_verify import _resolve_httpx_client_verify
 
     if verify is True:
-        target_verify = await resolve_httpx_verify()
+        target_verify = await _resolve_httpx_client_verify()
     elif isinstance(verify, str):
-        target_verify = await resolve_httpx_verify(ca_bundle=verify)
+        target_verify = await _resolve_httpx_client_verify(ca_bundle=verify)
     elif verify is False or isinstance(verify, ssl.SSLContext):
         target_verify = verify
     else:
@@ -198,7 +198,7 @@ async def build_keepalive_http_client(
     if proxy_url and httpx.URL(proxy_url).scheme == "https":
         proxy = httpx.Proxy(
             proxy_url,
-            ssl_context=await resolve_httpx_verify(),
+            ssl_context=await _resolve_httpx_client_verify(),
         )
 
     limits = httpx.Limits(

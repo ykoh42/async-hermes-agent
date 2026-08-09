@@ -22,7 +22,7 @@ import yaml
 
 from utils import base_url_host_matches, base_url_hostname
 
-from agent.ssl_verify import resolve_httpx_verify
+from agent.ssl_verify import _resolve_httpx_client_verify
 from hermes_constants import OPENROUTER_MODELS_URL
 
 logger = logging.getLogger(__name__)
@@ -967,7 +967,7 @@ async def detect_local_server_type(base_url: str, api_key: str = "") -> Optional
         async with httpx.AsyncClient(
             timeout=2.0,
             headers=headers,
-            verify=await resolve_httpx_verify(),
+            verify=await _resolve_httpx_client_verify(),
         ) as client:
             # LM Studio exposes /api/v1/models — check first (most specific)
             try:
@@ -1149,7 +1149,7 @@ async def fetch_model_metadata(
     try:
         async with httpx.AsyncClient(
             timeout=httpx.Timeout(10.0, connect=5.0),
-            verify=await resolve_httpx_verify(),
+            verify=await _resolve_httpx_client_verify(),
         ) as client:
             response = await client.get(OPENROUTER_MODELS_URL)
             response.raise_for_status()
@@ -1227,7 +1227,7 @@ async def fetch_endpoint_model_metadata(
     async with httpx.AsyncClient(
         timeout=httpx.Timeout(10.0, connect=5.0),
         headers=headers,
-        verify=await resolve_httpx_verify(),
+        verify=await _resolve_httpx_client_verify(),
     ) as client:
         if (
             is_local_endpoint(normalized)
@@ -1326,7 +1326,7 @@ async def fetch_endpoint_model_metadata(
         async with httpx.AsyncClient(
             timeout=5.0,
             headers=headers,
-            verify=await resolve_httpx_verify(),
+            verify=await _resolve_httpx_client_verify(),
         ) as client:
             try:
                 response = await client.get(root + "/v1/props")
@@ -1780,7 +1780,7 @@ async def query_ollama_num_ctx(
         async with httpx.AsyncClient(
             timeout=3.0,
             headers=headers,
-            verify=await resolve_httpx_verify(),
+            verify=await _resolve_httpx_client_verify(),
         ) as client:
             response = await client.post(
                 f"{server_url}/api/show", json={"name": bare_model}
@@ -1845,7 +1845,7 @@ async def query_ollama_supports_vision(
         async with httpx.AsyncClient(
             timeout=3.0,
             headers=headers,
-            verify=await resolve_httpx_verify(),
+            verify=await _resolve_httpx_client_verify(),
         ) as client:
             response = await client.post(
                 f"{server_url}/api/show", json={"name": bare_model}
@@ -1938,7 +1938,7 @@ async def _query_ollama_api_show_uncached(
         async with httpx.AsyncClient(
             timeout=5.0,
             headers=headers,
-            verify=await resolve_httpx_verify(),
+            verify=await _resolve_httpx_client_verify(),
         ) as client:
             resp = await client.post(
                 f"{server_url}/api/show", json={"name": model}
@@ -2079,7 +2079,7 @@ async def _query_local_context_length_uncached(
         async with httpx.AsyncClient(
             timeout=3.0,
             headers=headers,
-            verify=await resolve_httpx_verify(),
+            verify=await _resolve_httpx_client_verify(),
         ) as client:
             # Ollama: /api/show returns model details with context info
             if server_type == "ollama":
@@ -2190,7 +2190,7 @@ async def _query_anthropic_context_length(
         async with httpx.AsyncClient(
             timeout=httpx.Timeout(10.0, connect=5.0),
             headers=headers,
-            verify=await resolve_httpx_verify(),
+            verify=await _resolve_httpx_client_verify(),
         ) as client:
             resp = await client.get(url)
         if resp.status_code != 200:
@@ -2304,7 +2304,7 @@ async def _fetch_codex_oauth_context_lengths_with_source(
         async with httpx.AsyncClient(
             timeout=httpx.Timeout(10.0, connect=5.0),
             headers=headers,
-            verify=await resolve_httpx_verify(),
+            verify=await _resolve_httpx_client_verify(),
         ) as client:
             resp = await client.get(
                 "https://chatgpt.com/backend-api/codex/models?client_version=1.0.0"

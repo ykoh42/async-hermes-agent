@@ -2195,7 +2195,7 @@ async def create_openai_client(
     """Build the primary native-async OpenAI-compatible transport."""
     from agent.auxiliary_client import _validate_base_url, _validate_proxy_env_urls
     from agent.process_bootstrap import build_keepalive_http_client
-    from agent.ssl_verify import resolve_httpx_verify
+    from agent.ssl_verify import _resolve_httpx_client_verify
 
     kwargs = dict(client_kwargs)
     ssl_ca_cert = kwargs.pop("ssl_ca_cert", None)
@@ -2231,7 +2231,7 @@ async def create_openai_client(
 
     owned_http_client = None
     if "http_client" not in kwargs:
-        route_verify = await resolve_httpx_verify(
+        route_verify = await _resolve_httpx_client_verify(
             ca_bundle=ssl_ca_cert,
             ssl_verify=ssl_verify,
             base_url=base_url,

@@ -7,7 +7,7 @@ import certifi
 import pytest
 from blockbuster import BlockBuster
 
-from agent.ssl_verify import resolve_httpx_verify
+from agent.ssl_verify import _resolve_httpx_client_verify, resolve_httpx_verify
 
 _CA_ENV_VARS = (
     "HERMES_CA_BUNDLE",
@@ -32,16 +32,31 @@ async def test_hermes_ca_bundle_returns_ssl_context(clean_ca_env, monkeypatch):
     assert isinstance(result, ssl.SSLContext)
 
 
-async def test_default_without_env_returns_fresh_context(clean_ca_env):
-    first = await resolve_httpx_verify()
-    second = await resolve_httpx_verify()
-
-    assert isinstance(first, ssl.SSLContext)
-    assert isinstance(second, ssl.SSLContext)
-    assert first is not second
+async def test_default_without_env_is_true(clean_ca_env):
+    assert await resolve_httpx_verify() is True
 
 
-async def test_ca_directory_uses_capath(clean_ca_env, tmp_path, monkeypatch):
+async def test_ca_directory_falls_back_to_upstream_true(
+    clean_ca_env,
+    tmp_path,
+):
+    assert await resolve_httpx_verify(ca_bundle=str(tmp_path)) is True
+
+
+async def test_ssl_cert_dir_does_not_change_upstream_resolution(
+    clean_ca_env,
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("SSL_CERT_DIR", str(tmp_path))
+    assert await resolve_httpx_verify() is True
+
+
+async def test_client_materializer_preserves_httpx_ssl_cert_dir(
+    clean_ca_env,
+    tmp_path,
+    monkeypatch,
+):
     calls = []
     create_default_context = ssl.create_default_context
 
@@ -49,9 +64,10 @@ async def test_ca_directory_uses_capath(clean_ca_env, tmp_path, monkeypatch):
         calls.append(kwargs)
         return create_default_context(*args, **kwargs)
 
+    monkeypatch.setenv("SSL_CERT_DIR", str(tmp_path))
     monkeypatch.setattr(ssl, "create_default_context", tracked_create_default_context)
 
-    result = await resolve_httpx_verify(ca_bundle=str(tmp_path))
+    result = await _resolve_httpx_client_verify()
 
     assert isinstance(result, ssl.SSLContext)
     assert calls == [{"capath": str(tmp_path)}]
@@ -78,7 +94,7 @@ async def test_default_context_creation_does_not_block_event_loop(
     blocker = BlockBuster()
     blocker.activate()
     try:
-        result = await resolve_httpx_verify()
+        result = await _resolve_httpx_client_verify()
     finally:
         blocker.deactivate()
 
