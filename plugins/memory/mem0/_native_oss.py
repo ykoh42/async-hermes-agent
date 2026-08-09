@@ -10,12 +10,29 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, timezone
 import logging
-from typing import Any
+import os
+from typing import Any, Coroutine
 import uuid
+import warnings
 
 import aiosqlite
 
 logger = logging.getLogger(__name__)
+
+
+async def _finish_cleanup(
+    cleanup: Coroutine[Any, Any, None], *, error_message: str
+) -> None:
+    """Finish one owned-resource cleanup before preserving cancellation."""
+    cleanup_task = asyncio.create_task(cleanup)
+    try:
+        await asyncio.shield(cleanup_task)
+    except asyncio.CancelledError:
+        try:
+            await cleanup_task
+        except Exception:
+            logger.exception(error_message)
+        raise
 
 _HISTORY_COLUMNS = (
     "id",
@@ -55,6 +72,98 @@ _CREATE_MESSAGES = """
         created_at DATETIME
     )
 """
+
+
+class OpenAIEmbedding:
+    """Native-async equivalent of Mem0 2.0.10's OpenAI embedder."""
+
+    def __init__(self, config: dict[str, Any] | None = None) -> None:
+        self.config = dict(config or {})
+        self.model = self.config.get("model") or "text-embedding-3-small"
+        self._pass_dimensions_to_api = self.config.get("embedding_dims") is not None
+        self.embedding_dims = self.config.get("embedding_dims") or 1536
+        self._client: Any = None
+        self._initialize_lock = asyncio.Lock()
+        self._closed = False
+
+    async def _get_client(self) -> Any:
+        if self._client is not None:
+            return self._client
+        async with self._initialize_lock:
+            if self._client is not None:
+                return self._client
+            if self._closed:
+                raise RuntimeError("Cannot use a closed OpenAIEmbedding")
+
+            from openai import AsyncOpenAI
+
+            api_key = self.config.get("api_key") or os.getenv("OPENAI_API_KEY")
+            legacy_base_url = os.getenv("OPENAI_API_BASE")
+            base_url = (
+                self.config.get("openai_base_url")
+                or legacy_base_url
+                or os.getenv("OPENAI_BASE_URL")
+                or "https://api.openai.com/v1"
+            )
+            if legacy_base_url:
+                warnings.warn(
+                    "The environment variable 'OPENAI_API_BASE' is deprecated "
+                    "and will be removed in the 0.1.80. Please use "
+                    "'OPENAI_BASE_URL' instead.",
+                    DeprecationWarning,
+                    stacklevel=2,
+                )
+            self._client = AsyncOpenAI(api_key=api_key, base_url=base_url)
+            return self._client
+
+    async def embed(
+        self, text: str, memory_action: str | None = None  # noqa: ARG002
+    ) -> list[float]:
+        client = await self._get_client()
+        request: dict[str, Any] = {
+            "input": [text.replace("\n", " ")],
+            "model": self.model,
+            "encoding_format": "float",
+        }
+        if self._pass_dimensions_to_api:
+            request["dimensions"] = self.embedding_dims
+        response = await client.embeddings.create(**request)
+        return response.data[0].embedding
+
+    async def embed_batch(
+        self, texts: list[str], memory_action: str = "add"  # noqa: ARG002
+    ) -> list[list[float]]:
+        if not texts:
+            return []
+        client = await self._get_client()
+        normalized = [text.replace("\n", " ") for text in texts]
+        embeddings: list[list[float]] = []
+        for start in range(0, len(normalized), 100):
+            request: dict[str, Any] = {
+                "input": normalized[start : start + 100],
+                "model": self.model,
+                "encoding_format": "float",
+            }
+            if self._pass_dimensions_to_api:
+                request["dimensions"] = self.embedding_dims
+            response = await client.embeddings.create(**request)
+            embeddings.extend(
+                item.embedding for item in sorted(response.data, key=lambda item: item.index)
+            )
+        return embeddings
+
+    async def close(self) -> None:
+        async with self._initialize_lock:
+            if self._closed:
+                return
+            self._closed = True
+            client = self._client
+            self._client = None
+            if client is not None:
+                await _finish_cleanup(
+                    client.close(),
+                    error_message="Mem0 OpenAI embedder cleanup failed during cancellation",
+                )
 
 
 class SQLiteManager:
@@ -346,14 +455,7 @@ class SQLiteManager:
             connection = self.connection
             self.connection = None
             if connection is not None:
-                close_task = asyncio.create_task(connection.close())
-                try:
-                    await asyncio.shield(close_task)
-                except asyncio.CancelledError:
-                    try:
-                        await close_task
-                    except Exception:
-                        logger.exception(
-                            "Mem0 SQLite cleanup failed during cancellation"
-                        )
-                    raise
+                await _finish_cleanup(
+                    connection.close(),
+                    error_message="Mem0 SQLite cleanup failed during cancellation",
+                )
