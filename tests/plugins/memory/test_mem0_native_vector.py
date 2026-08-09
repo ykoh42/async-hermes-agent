@@ -89,11 +89,6 @@ class _FakeAsyncQdrantClient:
         self.close_calls += 1
 
 
-class _FilterBuilder:
-    def _create_filter(self, filters):
-        return ("filter", filters)
-
-
 @pytest.fixture(autouse=True)
 def _fake_qdrant_modules(monkeypatch):
     _FakeAsyncQdrantClient.instances.clear()
@@ -109,6 +104,14 @@ def _fake_qdrant_modules(monkeypatch):
         "QueryRequest",
         "SparseVectorParams",
         "VectorParams",
+        "DatetimeRange",
+        "FieldCondition",
+        "Filter",
+        "MatchAny",
+        "MatchExcept",
+        "MatchText",
+        "MatchValue",
+        "Range",
     ):
         setattr(models, name, type(name, (_Model,), {}))
     models.Distance = SimpleNamespace(COSINE="cosine")
@@ -119,17 +122,6 @@ def _fake_qdrant_modules(monkeypatch):
     qdrant_client.models = models
     monkeypatch.setitem(sys.modules, "qdrant_client", qdrant_client)
     monkeypatch.setitem(sys.modules, "qdrant_client.models", models)
-
-    mem0 = ModuleType("mem0")
-    mem0.__path__ = []
-    vector_stores = ModuleType("mem0.vector_stores")
-    vector_stores.__path__ = []
-    mem0_vector = ModuleType("mem0.vector_stores.qdrant")
-    mem0_vector.Qdrant = _FilterBuilder
-    monkeypatch.setitem(sys.modules, "mem0", mem0)
-    monkeypatch.setitem(sys.modules, "mem0.vector_stores", vector_stores)
-    monkeypatch.setitem(sys.modules, "mem0.vector_stores.qdrant", mem0_vector)
-
 
 @pytest.mark.asyncio
 async def test_qdrant_is_state_only_and_disables_compatibility_thread():
@@ -271,7 +263,7 @@ async def test_qdrant_insert_preserves_named_dense_vector_and_payload():
 
 
 @pytest.mark.asyncio
-async def test_qdrant_search_reuses_mem0_filter_builder():
+async def test_qdrant_search_builds_pinned_mem0_filter_without_runtime_import():
     store = Qdrant(
         {"url": "https://qdrant.test", "collection_name": "mem0", "embedding_model_dims": 2}
     )
@@ -288,12 +280,17 @@ async def test_qdrant_search_reuses_mem0_filter_builder():
         for call in _FakeAsyncQdrantClient.instances[0].calls
         if call[0] == "query_points"
     ][0]
-    assert request == {
-        "collection_name": "mem0",
-        "query": [0.1, 0.2],
-        "query_filter": ("filter", {"user_id": "u1"}),
-        "limit": 7,
+    assert request["collection_name"] == "mem0"
+    assert request["query"] == [0.1, 0.2]
+    assert request["limit"] == 7
+    condition = request["query_filter"].kwargs["must"][0]
+    assert request["query_filter"].kwargs == {
+        "must": [condition],
+        "should": None,
+        "must_not": None,
     }
+    assert condition.kwargs["key"] == "user_id"
+    assert condition.kwargs["match"].kwargs == {"value": "u1"}
     await store.close()
 
 

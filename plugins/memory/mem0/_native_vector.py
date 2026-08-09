@@ -8,6 +8,7 @@ from contextlib import asynccontextmanager
 import inspect
 import json
 import logging
+import re
 from typing import Any
 
 from pydantic import BaseModel
@@ -17,6 +18,14 @@ from ._native_oss import _finish_cleanup
 from ._native_sparse import NativeSparseEncoder, SparseEncoding
 
 logger = logging.getLogger(__name__)
+
+_ISO_DATETIME_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}"
+    r"([T ]\d{2}:\d{2}(:\d{2})?"
+    r"(\.\d+)?"
+    r"(Z|[+-]\d{2}:?\d{2})?"
+    r")?$"
+)
 
 _PGVECTOR_OPERATOR_SQL = {
     "eq": ("payload->>%s = %s", False),
@@ -302,13 +311,163 @@ class Qdrant:
                 )
 
     @staticmethod
-    def _create_filter(filters: dict[str, Any] | None) -> Any:
+    def _is_datetime_range(range_values: dict[str, Any]) -> bool:
+        return all(
+            isinstance(value, str) and _ISO_DATETIME_RE.match(value)
+            for value in range_values.values()
+        )
+
+    def _build_field_condition(self, key: str, value: Any) -> Any:
+        models = self._models
+        if not isinstance(value, dict):
+            if value == "*":
+                return None
+            if isinstance(value, builtins.list):
+                return models.FieldCondition(
+                    key=key,
+                    match=models.MatchAny(any=value),
+                )
+            return models.FieldCondition(
+                key=key,
+                match=models.MatchValue(value=value),
+            )
+
+        operators = set(value)
+        range_operators = {"gt", "gte", "lt", "lte"}
+        non_range_operators = operators - range_operators
+        if operators & range_operators:
+            if non_range_operators:
+                raise ValueError(
+                    f"Cannot mix range operators "
+                    f"({operators & range_operators}) with non-range "
+                    f"operators ({non_range_operators}) for field '{key}'. "
+                    "Use AND to combine them as separate conditions."
+                )
+            range_values = {
+                operator: value[operator]
+                for operator in range_operators
+                if operator in value
+            }
+            range_type = (
+                models.DatetimeRange
+                if self._is_datetime_range(range_values)
+                else models.Range
+            )
+            try:
+                return models.FieldCondition(
+                    key=key,
+                    range=range_type(**range_values),
+                )
+            except (ValueError, TypeError) as exc:
+                if range_type is models.DatetimeRange:
+                    raise ValueError(
+                        f"Invalid datetime value in range filter for field "
+                        f"'{key}': {exc}"
+                    ) from exc
+                raise
+        if "eq" in value:
+            return models.FieldCondition(
+                key=key,
+                match=models.MatchValue(value=value["eq"]),
+            )
+        if "ne" in value:
+            return models.FieldCondition(
+                key=key,
+                match=models.MatchExcept(**{"except": [value["ne"]]}),
+            )
+        if "in" in value:
+            return models.FieldCondition(
+                key=key,
+                match=models.MatchAny(any=value["in"]),
+            )
+        if "nin" in value:
+            return models.FieldCondition(
+                key=key,
+                match=models.MatchExcept(**{"except": value["nin"]}),
+            )
+        if "contains" in value or "icontains" in value:
+            operator = "icontains" if "icontains" in value else "contains"
+            if operator == "icontains":
+                logger.debug(
+                    "icontains on field '%s': Qdrant MatchText case "
+                    "sensitivity depends on full-text index configuration. "
+                    "Without a full-text index this behaves as a "
+                    "case-sensitive substring match (same as 'contains').",
+                    key,
+                )
+            return models.FieldCondition(
+                key=key,
+                match=models.MatchText(text=value[operator]),
+            )
+        supported = {
+            "eq",
+            "ne",
+            "gt",
+            "gte",
+            "lt",
+            "lte",
+            "in",
+            "nin",
+            "contains",
+            "icontains",
+        }
+        raise ValueError(
+            f"Unsupported filter operator(s) for field '{key}': "
+            f"{operators}. Supported operators: {supported}"
+        )
+
+    def _create_filter(self, filters: dict[str, Any] | None) -> Any:
         if not filters:
             return None
-        from mem0.vector_stores.qdrant import Qdrant as SyncQdrant
+        normalized = {}
+        key_map = {"$or": "OR", "$not": "NOT", "$and": "AND"}
+        for key, value in filters.items():
+            normalized.setdefault(key_map.get(key, key), value)
 
-        builder = SyncQdrant.__new__(SyncQdrant)
-        return builder._create_filter(filters)
+        must = []
+        should = []
+        must_not = []
+        for key, value in normalized.items():
+            if key in {"AND", "OR", "NOT"}:
+                if not isinstance(value, builtins.list):
+                    raise ValueError(
+                        f"{key} filter value must be a list of filter dicts, "
+                        f"got {type(value).__name__}"
+                    )
+                for index, item in enumerate(value):
+                    if not isinstance(item, dict):
+                        raise ValueError(
+                            f"{key} filter list item at index {index} must be "
+                            f"a dict, got {type(item).__name__}: {item!r}"
+                        )
+
+            if key == "AND":
+                for nested in value:
+                    condition = self._create_filter(nested)
+                    if condition:
+                        must.append(condition)
+            elif key == "OR":
+                for nested in value:
+                    condition = self._create_filter(nested)
+                    if condition:
+                        should.append(condition)
+            elif key == "NOT":
+                for nested in value:
+                    condition = self._create_filter(nested)
+                    if condition:
+                        must_not.append(condition)
+            else:
+                condition = self._build_field_condition(key, value)
+                if condition is not None:
+                    must.append(condition)
+
+        if not any((must, should, must_not)):
+            return None
+        return self._models.Filter(
+            must=must or None,
+            should=should or None,
+            must_not=must_not or None,
+        )
 
     async def insert(
         self,
