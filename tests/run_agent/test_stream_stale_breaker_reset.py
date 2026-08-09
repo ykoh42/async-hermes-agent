@@ -196,6 +196,9 @@ async def test_chat_stream_stale_returns_partial_stub_and_closes_stream():
     agent._consecutive_stale_streams = 0
     agent._current_streamed_assistant_text = ""
     agent._touch_activity = MagicMock()
+    agent._capture_rate_limits = MagicMock()
+    agent._capture_credits = MagicMock()
+    agent._check_openrouter_cache_status = MagicMock()
 
     def record_delta(text):
         agent._current_streamed_assistant_text += text
@@ -210,6 +213,121 @@ async def test_chat_stream_stale_returns_partial_stub_and_closes_stream():
     assert response.id == PARTIAL_STREAM_STUB_ID
     assert response.choices[0].message.content == "partial answer"
     assert response.choices[0].finish_reason == "length"
+    assert stream_closed.is_set()
+    assert agent._consecutive_stale_streams == 0
+
+
+@pytest.mark.asyncio
+async def test_chat_stream_stale_surfaces_dropped_tool_after_visible_text():
+    from agent.chat_completion_helpers import interruptible_streaming_api_call
+    from hermes_constants import PARTIAL_STREAM_STUB_ID
+
+    stream_closed = asyncio.Event()
+
+    class StalledToolStream:
+        def __init__(self):
+            self._index = 0
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if self._index == 0:
+                self._index += 1
+                return SimpleNamespace(
+                    id="stream-id",
+                    model="test-model",
+                    usage=None,
+                    choices=[
+                        SimpleNamespace(
+                            finish_reason=None,
+                            delta=SimpleNamespace(
+                                content="partial answer",
+                                reasoning=None,
+                                reasoning_content=None,
+                                tool_calls=None,
+                            ),
+                        )
+                    ],
+                )
+            if self._index == 1:
+                self._index += 1
+                return SimpleNamespace(
+                    id="stream-id",
+                    model="test-model",
+                    usage=None,
+                    choices=[
+                        SimpleNamespace(
+                            finish_reason=None,
+                            delta=SimpleNamespace(
+                                content=None,
+                                reasoning=None,
+                                reasoning_content=None,
+                                tool_calls=[
+                                    SimpleNamespace(
+                                        index=0,
+                                        id="call-1",
+                                        function=SimpleNamespace(
+                                            name="terminal", arguments='{"cmd":'
+                                        ),
+                                        extra_content=None,
+                                    )
+                                ],
+                            ),
+                        )
+                    ],
+                )
+            await asyncio.Event().wait()
+            raise StopAsyncIteration
+
+        async def aclose(self):
+            stream_closed.set()
+
+    stream = StalledToolStream()
+
+    class Completions:
+        async def create(self, **_kwargs):
+            return stream
+
+    agent = AIAgent.__new__(AIAgent)
+    agent.api_mode = "chat_completions"
+    agent.provider = "test-provider"
+    agent.model = "test-model"
+    agent.base_url = "https://api.example.test/v1"
+    agent.client = SimpleNamespace(
+        chat=SimpleNamespace(completions=Completions())
+    )
+    agent._provider_stale_timeout = 0.01
+    agent._consecutive_stale_streams = 0
+    agent._current_streamed_assistant_text = ""
+    agent._current_stream_partial_tool_names = []
+    agent._touch_activity = MagicMock()
+    agent._capture_rate_limits = MagicMock()
+    agent._capture_credits = MagicMock()
+    agent._check_openrouter_cache_status = MagicMock()
+    agent.stream_delta_callback = None
+    agent._record_streamed_assistant_text = MagicMock()
+    agent._fire_reasoning_delta = MagicMock()
+    agent._fire_tool_gen_started = MagicMock()
+
+    def record_delta(text):
+        agent._current_streamed_assistant_text += text
+
+    agent._fire_stream_delta = record_delta
+
+    response = await interruptible_streaming_api_call(
+        agent,
+        {"model": "test-model", "messages": []},
+    )
+
+    warning = (
+        "⚠ Stream stalled mid tool-call (terminal); the action was not "
+        "executed. Ask me to retry if you want to continue."
+    )
+    assert response.id == PARTIAL_STREAM_STUB_ID
+    assert response.choices[0].message.content == f"partial answer\n\n{warning}"
+    assert response._dropped_tool_names == ["terminal"]
+    assert warning in agent._current_streamed_assistant_text
     assert stream_closed.is_set()
     assert agent._consecutive_stale_streams == 0
 

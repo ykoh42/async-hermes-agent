@@ -13,6 +13,7 @@ sites remain unchanged.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import math
 import os
@@ -25,8 +26,11 @@ from typing import Any, Dict, Optional
 from agent.error_classifier import FailoverReason, classify_api_error
 from agent.turn_context import substitute_api_content
 from agent.message_content import flatten_message_text
-from agent.message_sanitization import _sanitize_surrogates
-from hermes_constants import PARTIAL_STREAM_STUB_ID
+from agent.message_sanitization import (
+    _repair_tool_call_arguments,
+    _sanitize_surrogates,
+)
+from hermes_constants import FINISH_REASON_LENGTH, PARTIAL_STREAM_STUB_ID
 from tools.terminal_tool import cleanup_vm, is_persistent_env
 from utils import base_url_host_matches, base_url_hostname, env_float, env_int
 
@@ -356,13 +360,153 @@ async def interruptible_api_call(agent: Any, api_kwargs: dict) -> Any:
     return response
 
 
+def _finalize_chat_stream(accumulator: Any) -> Any:
+    """Build upstream's response shape from a native async chat stream."""
+    from agent.errors import EmptyStreamError
+
+    if (
+        accumulator.finish_reason is None
+        and not accumulator.content_parts
+        and not accumulator.reasoning_parts
+        and not accumulator.tool_calls_acc
+    ):
+        raise EmptyStreamError(
+            "Provider returned an empty stream with no finish_reason "
+            "(possible upstream error or malformed SSE response)."
+        )
+
+    tool_calls = None
+    has_truncated_tool_args = False
+    if accumulator.tool_calls_acc:
+        tool_calls = []
+        for index in sorted(accumulator.tool_calls_acc):
+            entry = accumulator.tool_calls_acc[index]
+            arguments = "".join(entry["arguments"])
+            tool_name = entry["name"] or "?"
+            if arguments and arguments.strip():
+                try:
+                    json.loads(arguments)
+                except json.JSONDecodeError:
+                    repaired = _repair_tool_call_arguments(arguments, tool_name)
+                    if repaired != "{}":
+                        arguments = repaired
+                    else:
+                        has_truncated_tool_args = True
+            tool_calls.append(
+                SimpleNamespace(
+                    id=entry["id"],
+                    type="function",
+                    extra_content=entry.get("extra_content"),
+                    function=SimpleNamespace(
+                        name=entry["name"],
+                        arguments=arguments,
+                    ),
+                )
+            )
+
+    content = "".join(accumulator.content_parts) or None
+    reasoning = "".join(accumulator.reasoning_parts) or None
+    dropped_without_finish = (
+        has_truncated_tool_args and accumulator.finish_reason is None
+    )
+    text_without_finish = (
+        accumulator.finish_reason is None
+        and bool(accumulator.content_parts)
+        and not accumulator.tool_calls_acc
+    )
+    if dropped_without_finish or text_without_finish:
+        dropped_names = None
+        if dropped_without_finish:
+            dropped_names = [
+                accumulator.tool_calls_acc[index]["name"] or "?"
+                for index in sorted(accumulator.tool_calls_acc)
+            ]
+            logger.warning(
+                "Stream ended with no finish_reason while a tool call's "
+                "arguments were still incomplete (tools=%s); treating as a "
+                "mid-tool-call stream drop, not an output-length truncation.",
+                dropped_names,
+            )
+        else:
+            logger.warning(
+                "Stream ended with no finish_reason after delivering text "
+                "with no tool calls; treating as a mid-stream drop."
+            )
+        return SimpleNamespace(
+            id=PARTIAL_STREAM_STUB_ID,
+            model=accumulator.resp_model,
+            choices=[
+                SimpleNamespace(
+                    index=0,
+                    message=SimpleNamespace(
+                        role="assistant",
+                        content=content,
+                        tool_calls=None,
+                        reasoning_content=reasoning,
+                    ),
+                    finish_reason=FINISH_REASON_LENGTH,
+                )
+            ],
+            usage=accumulator.usage,
+            _dropped_tool_names=dropped_names,
+        )
+
+    finish_reason = accumulator.finish_reason or "stop"
+    if has_truncated_tool_args:
+        finish_reason = FINISH_REASON_LENGTH
+    return SimpleNamespace(
+        id="stream-" + str(uuid.uuid4()),
+        model=accumulator.resp_model,
+        choices=[
+            SimpleNamespace(
+                index=0,
+                message=SimpleNamespace(
+                    role="assistant",
+                    content=content,
+                    tool_calls=tool_calls,
+                    reasoning_content=reasoning,
+                ),
+                finish_reason=finish_reason,
+            )
+        ],
+        usage=accumulator.usage,
+    )
+
+
 def _partial_stream_stub(agent: Any, error: Exception | None = None) -> Any | None:
     """Return upstream's length-truncated stub after visible streamed text."""
     content = str(
         getattr(agent, "_current_streamed_assistant_text", "") or ""
     ).strip()
+    # Upstream only recovers a partial stream after visible text was already
+    # delivered.  A tool-only failure is retried/raised; fabricating a warning
+    # response for that case would change retry and trajectory behavior.
     if not content:
         return None
+    dropped_tool_names = list(
+        dict.fromkeys(
+            str(name)
+            for name in getattr(
+                agent, "_current_stream_partial_tool_names", []
+            )
+            if name
+        )
+    )
+    if dropped_tool_names:
+        names = ", ".join(dropped_tool_names[:3])
+        if len(dropped_tool_names) > 3:
+            names += f", +{len(dropped_tool_names) - 3} more"
+        warning = (
+            f"\n\n⚠ Stream stalled mid tool-call ({names}); the action was not "
+            "executed. Ask me to retry if you want to continue."
+        )
+        content += warning
+        fire_delta = getattr(agent, "_fire_stream_delta", None)
+        if callable(fire_delta):
+            try:
+                fire_delta(warning)
+            except Exception:
+                pass
     stub = SimpleNamespace(
         id=PARTIAL_STREAM_STUB_ID,
         model=getattr(agent, "model", "unknown"),
@@ -379,7 +523,7 @@ def _partial_stream_stub(agent: Any, error: Exception | None = None) -> Any | No
             )
         ],
         usage=None,
-        _dropped_tool_names=None,
+        _dropped_tool_names=dropped_tool_names or None,
     )
     if error is not None:
         try:

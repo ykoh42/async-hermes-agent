@@ -484,6 +484,7 @@ class TestAIAgentBedrockDispatch:
         agent._fire_stream_delta = lambda _text: None
         agent._fire_tool_gen_started = lambda _name: None
         agent._fire_reasoning_delta = lambda _text: None
+        agent._touch_activity = lambda _message: None
         return agent
 
     @pytest.mark.asyncio
@@ -531,10 +532,19 @@ class TestAIAgentBedrockDispatch:
         text_deltas = []
         reasoning_deltas = []
         first_deltas = []
-        agent._fire_stream_delta = text_deltas.append
-        agent._fire_reasoning_delta = reasoning_deltas.append
+        callback_order = []
+        stream_activity = []
+        agent._fire_stream_delta = lambda text: (
+            text_deltas.append(text),
+            callback_order.append(("text", text)),
+        )
+        agent._fire_reasoning_delta = lambda text: (
+            reasoning_deltas.append(text),
+            callback_order.append(("reasoning", text)),
+        )
 
         async def events():
+            yield {"metadata": {"usage": {"inputTokens": 1}}}
             yield {
                 "contentBlockDelta": {
                     "contentBlockIndex": 0,
@@ -566,7 +576,11 @@ class TestAIAgentBedrockDispatch:
                 "__bedrock_region__": "us-east-2",
             },
             use_streaming=True,
-            on_first_delta=lambda: first_deltas.append(True),
+            on_first_delta=lambda: (
+                first_deltas.append(True),
+                callback_order.append("first"),
+            ),
+            on_stream_activity=lambda: stream_activity.append(True),
         )
 
         assert response.choices[0].message.content == "answer"
@@ -574,6 +588,8 @@ class TestAIAgentBedrockDispatch:
         assert text_deltas == ["answer"]
         assert reasoning_deltas == ["think"]
         assert first_deltas == [True]
+        assert callback_order == ["first", ("reasoning", "think"), ("text", "answer")]
+        assert len(stream_activity) == 5
         assert context.entered and context.exited
 
     @pytest.mark.asyncio

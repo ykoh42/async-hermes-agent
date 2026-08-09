@@ -5189,16 +5189,47 @@ class AIAgent:
                     )
                     self._anthropic_client_source = client_source
 
-                first_event = True
+                first_delta = True
+                has_tool_use = False
 
-                def _on_anthropic_event(_event: Any) -> None:
-                    nonlocal first_event
+                def _fire_first_delta() -> None:
+                    nonlocal first_delta
+                    if not first_delta:
+                        return
+                    first_delta = False
+                    if on_first_delta is not None:
+                        try:
+                            on_first_delta()
+                        except Exception:
+                            pass
+
+                def _on_anthropic_event(event: Any) -> None:
+                    nonlocal has_tool_use
                     if on_stream_activity is not None:
                         on_stream_activity()
-                    if first_event:
-                        first_event = False
-                        if on_first_delta is not None:
-                            on_first_delta()
+                    self._touch_activity("receiving stream response")
+                    event_type = getattr(event, "type", None)
+                    if event_type == "content_block_start":
+                        block = getattr(event, "content_block", None)
+                        if block and getattr(block, "type", None) == "tool_use":
+                            has_tool_use = True
+                            tool_name = getattr(block, "name", None)
+                            if tool_name:
+                                _fire_first_delta()
+                                self._fire_tool_gen_started(tool_name)
+                    elif event_type == "content_block_delta":
+                        delta = getattr(event, "delta", None)
+                        delta_type = getattr(delta, "type", None)
+                        if delta_type == "text_delta":
+                            text = getattr(delta, "text", "")
+                            if text and not has_tool_use:
+                                _fire_first_delta()
+                                self._fire_stream_delta(text)
+                        elif delta_type == "thinking_delta":
+                            thinking = getattr(delta, "thinking", "")
+                            if thinking:
+                                _fire_first_delta()
+                                self._fire_reasoning_delta(thinking)
 
                 return await create_anthropic_message(
                     self._anthropic_client,
@@ -5256,22 +5287,41 @@ class AIAgent:
                         await client.converse(**request)
                     )
 
-                first_event = True
+                first_delta = True
+
+                def _fire_first_delta() -> None:
+                    nonlocal first_delta
+                    if not first_delta:
+                        return
+                    first_delta = False
+                    if on_first_delta is not None:
+                        try:
+                            on_first_delta()
+                        except Exception:
+                            pass
 
                 def _on_event() -> None:
-                    nonlocal first_event
                     if on_stream_activity is not None:
                         on_stream_activity()
-                    if first_event:
-                        first_event = False
-                        if on_first_delta is not None:
-                            on_first_delta()
+                    self._touch_activity("receiving stream response")
+
+                def _on_text(text: str) -> None:
+                    _fire_first_delta()
+                    self._fire_stream_delta(text)
+
+                def _on_tool(name: str) -> None:
+                    _fire_first_delta()
+                    self._fire_tool_gen_started(name)
+
+                def _on_reasoning(text: str) -> None:
+                    _fire_first_delta()
+                    self._fire_reasoning_delta(text)
 
                 return await stream_converse_with_callbacks(
                     response,
-                    on_text_delta=self._fire_stream_delta,
-                    on_tool_start=self._fire_tool_gen_started,
-                    on_reasoning_delta=self._fire_reasoning_delta,
+                    on_text_delta=_on_text,
+                    on_tool_start=_on_tool,
+                    on_reasoning_delta=_on_reasoning,
                     on_interrupt_check=lambda: self._interrupt_requested,
                     on_event=_on_event,
                 )
@@ -5294,12 +5344,20 @@ class AIAgent:
         request = dict(api_kwargs)
         if use_streaming:
             request["stream"] = True
-            request.setdefault("stream_options", {"include_usage": True})
+            from agent.gemini_native_adapter import is_native_gemini_base_url
+
+            if not is_native_gemini_base_url(self.base_url):
+                request.setdefault("stream_options", {"include_usage": True})
 
         result = await create_completion(**request)
 
         if not use_streaming or hasattr(result, "choices"):
             return result
+
+        stream_response = getattr(result, "response", None)
+        self._capture_rate_limits(stream_response)
+        self._capture_credits(stream_response)
+        self._check_openrouter_cache_status(stream_response)
 
         from agent.auxiliary_client import _ChatStreamAccumulator
 
@@ -5307,14 +5365,24 @@ class AIAgent:
             model=str(request.get("model") or self.model or "")
         )
         first_delta = True
+        tool_gen_notified: set[int] = set()
+
+        def _fire_first_delta() -> None:
+            nonlocal first_delta
+            if not first_delta:
+                return
+            first_delta = False
+            if on_first_delta is not None:
+                try:
+                    on_first_delta()
+                except Exception:
+                    pass
+
         try:
             async for chunk in result:
                 if on_stream_activity is not None:
                     on_stream_activity()
-                if first_delta:
-                    first_delta = False
-                    if on_first_delta is not None:
-                        on_first_delta()
+                self._touch_activity("receiving stream response")
                 # Preserve the existing streaming display contract while the
                 # accumulator reconstructs tool calls/reasoning for the loop.
                 try:
@@ -5327,11 +5395,48 @@ class AIAgent:
                         if delta is not None
                         else None
                     )
+                    reasoning = (
+                        getattr(delta, "reasoning_content", None)
+                        or getattr(delta, "reasoning", None)
+                        if delta is not None
+                        else None
+                    )
+                    if isinstance(reasoning, str) and reasoning:
+                        _fire_first_delta()
+                        self._fire_reasoning_delta(reasoning)
                     if isinstance(text, str) and text:
-                        self._fire_stream_delta(text)
+                        if not accumulator.tool_calls_acc:
+                            _fire_first_delta()
+                            self._fire_stream_delta(text)
+                        elif self.stream_delta_callback is not None:
+                            try:
+                                self.stream_delta_callback(text)
+                                self._record_streamed_assistant_text(text)
+                            except Exception:
+                                pass
                 except Exception:
                     pass
-                accumulator.feed(chunk)
+                named_tool_slots = accumulator.feed(chunk)
+                try:
+                    for index, name in named_tool_slots:
+                        if name and index not in tool_gen_notified:
+                            tool_gen_notified.add(index)
+                            _fire_first_delta()
+                            self._fire_tool_gen_started(name)
+                            partial_names = getattr(
+                                self,
+                                "_current_stream_partial_tool_names",
+                                None,
+                            )
+                            if partial_names is None:
+                                partial_names = []
+                                self._current_stream_partial_tool_names = (
+                                    partial_names
+                                )
+                            if name not in partial_names:
+                                partial_names.append(name)
+                except Exception:
+                    pass
         finally:
             close = getattr(result, "aclose", None) or getattr(
                 result, "close", None
@@ -5343,12 +5448,14 @@ class AIAgent:
                         name="chat-completion-stream-close",
                     )
                 )
-        return accumulator.finish()
+
+        return _chat_completion_helpers._finalize_chat_stream(accumulator)
 
     # ── Unified streaming API call ─────────────────────────────────────────
 
     def _reset_stream_delivery_tracking(self) -> None:
         """Reset tracking for text delivered during the current model response."""
+        self._current_stream_partial_tool_names = []
         # Flush any benign partial-tag tail held by the think scrubber
         # first (#17924): an innocent '<' at the end of the stream that
         # turned out not to be a tag prefix should reach the UI.  Then

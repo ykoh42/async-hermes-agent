@@ -7868,12 +7868,19 @@ class _ChatStreamAccumulator:
         self.content_parts: List[str] = []
         self.reasoning_parts: List[str] = []
         self.tool_calls_acc: Dict[int, Dict[str, Any]] = {}
+        # Ollama-compatible endpoints may reuse one raw index for multiple
+        # parallel tool calls and distinguish them only by id.  Preserve the
+        # upstream slot-remapping behavior instead of merging those calls.
+        self._last_id_at_idx: Dict[int, str] = {}
+        self._active_slot_by_idx: Dict[int, int] = {}
         self.finish_reason = None
         self.usage = None
         self.resp_id = ""
         self.resp_model = model or ""
 
-    def feed(self, chunk: Any) -> None:
+    def feed(self, chunk: Any) -> List[tuple[int, str]]:
+        """Accumulate one chunk and return tool slots whose names arrived."""
+        named_tool_slots: List[tuple[int, str]] = []
         _notify_aux_progress()
         if (
             self._total_ceiling is not None
@@ -7890,14 +7897,14 @@ class _ChatStreamAccumulator:
             self.usage = chunk_usage
         choices = getattr(chunk, "choices", None) or []
         if not choices:
-            return
+            return named_tool_slots
         choice = choices[0]
         self.finish_reason = (
             getattr(choice, "finish_reason", None) or self.finish_reason
         )
         delta = getattr(choice, "delta", None)
         if delta is None:
-            return
+            return named_tool_slots
         piece = getattr(delta, "content", None)
         if piece:
             self.content_parts.append(piece)
@@ -7907,18 +7914,52 @@ class _ChatStreamAccumulator:
         if reasoning_piece and isinstance(reasoning_piece, str):
             self.reasoning_parts.append(reasoning_piece)
         for tc in getattr(delta, "tool_calls", None) or []:
-            idx = getattr(tc, "index", 0) or 0
+            raw_idx = getattr(tc, "index", 0)
+            raw_idx = raw_idx if raw_idx is not None else 0
+            delta_id = getattr(tc, "id", None) or ""
+            if isinstance(delta_id, int):
+                delta_id = str(delta_id)
+            if raw_idx not in self._active_slot_by_idx:
+                self._active_slot_by_idx[raw_idx] = raw_idx
+            if (
+                delta_id
+                and raw_idx in self._last_id_at_idx
+                and delta_id != self._last_id_at_idx[raw_idx]
+            ):
+                self._active_slot_by_idx[raw_idx] = (
+                    max(self.tool_calls_acc, default=-1) + 1
+                )
+            if delta_id:
+                self._last_id_at_idx[raw_idx] = delta_id
+            idx = self._active_slot_by_idx[raw_idx]
             acc = self.tool_calls_acc.setdefault(
-                idx, {"id": "", "name": "", "arguments": []}
+                idx,
+                {
+                    "id": "",
+                    "name": "",
+                    "arguments": [],
+                    "extra_content": None,
+                },
             )
-            if getattr(tc, "id", None):
-                acc["id"] = tc.id
+            if delta_id:
+                acc["id"] = delta_id
             fn = getattr(tc, "function", None)
             if fn is not None:
                 if getattr(fn, "name", None):
                     acc["name"] = fn.name
+                    named_tool_slots.append((idx, str(fn.name)))
                 if getattr(fn, "arguments", None):
                     acc["arguments"].append(fn.arguments)
+            extra = getattr(tc, "extra_content", None)
+            if extra is None:
+                model_extra = getattr(tc, "model_extra", None)
+                if isinstance(model_extra, dict):
+                    extra = model_extra.get("extra_content")
+            if hasattr(extra, "model_dump"):
+                extra = extra.model_dump()
+            if extra is not None:
+                acc["extra_content"] = extra
+        return named_tool_slots
 
     def finish(self) -> Any:
         tool_calls = None
@@ -7927,6 +7968,7 @@ class _ChatStreamAccumulator:
                 SimpleNamespace(
                     id=acc["id"],
                     type="function",
+                    extra_content=acc.get("extra_content"),
                     function=SimpleNamespace(
                         name=acc["name"],
                         arguments="".join(acc["arguments"]),

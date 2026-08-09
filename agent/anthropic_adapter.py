@@ -27,6 +27,7 @@ import aiofiles
 import aiofiles.os
 import httpx
 
+from agent.errors import EmptyStreamError
 from hermes_constants import get_hermes_home
 from typing import Any, Dict, List, Optional, Tuple
 from utils import base_url_host_matches, base_url_hostname, normalize_proxy_env_vars
@@ -2786,6 +2787,7 @@ async def create_anthropic_message(
         stream_kwargs.pop("stream", None)
         try:
             async with stream_fn(**stream_kwargs) as stream:
+                saw_stream_event = False
                 if callable(on_response):
                     try:
                         on_response(getattr(stream, "response", None))
@@ -2796,6 +2798,7 @@ async def create_anthropic_message(
                             exc_info=True,
                         )
                 async for event in stream:
+                    saw_stream_event = True
                     if callable(on_stream_event):
                         try:
                             on_stream_event(event)
@@ -2805,7 +2808,25 @@ async def create_anthropic_message(
                                 log_prefix,
                                 exc_info=True,
                             )
-                return await stream.get_final_message()
+                try:
+                    final_message = await stream.get_final_message()
+                except AssertionError:
+                    if not saw_stream_event:
+                        raise EmptyStreamError(
+                            "Provider returned an empty stream with no events "
+                            "(possible upstream error or malformed event stream)."
+                        ) from None
+                    raise
+                if (
+                    final_message is not None
+                    and not getattr(final_message, "content", None)
+                    and getattr(final_message, "stop_reason", None) is None
+                ):
+                    raise EmptyStreamError(
+                        "Provider returned an empty stream with no stop_reason "
+                        "(possible upstream error or malformed event stream)."
+                    )
+                return final_message
         except Exception as exc:
             if not _is_stream_unavailable_error(exc):
                 raise

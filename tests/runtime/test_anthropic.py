@@ -1,5 +1,7 @@
 """Anthropic transport contract tests."""
 
+from types import SimpleNamespace
+
 import pytest
 
 from agent.anthropic_adapter import create_anthropic_message
@@ -23,7 +25,7 @@ class _Stream:
         return events()
 
     async def get_final_message(self):
-        return {"content": "ok"}
+        return SimpleNamespace(content=["ok"], stop_reason="end_turn")
 
 
 class _Messages:
@@ -46,7 +48,8 @@ async def test_anthropic_stream_is_consumed_without_a_thread():
         on_stream_event=events.append,
     )
 
-    assert response == {"content": "ok"}
+    assert response.content == ["ok"]
+    assert response.stop_reason == "end_turn"
     assert len(events) == 2
 
 
