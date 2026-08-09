@@ -149,3 +149,45 @@ async def test_stream_cancellation_propagates_and_closes_response():
     with pytest.raises(asyncio.CancelledError):
         await read_streaming_error_body(response)
     assert response.closed is True
+
+
+@pytest.mark.asyncio
+async def test_response_close_finishes_through_repeated_cancellation():
+    close_started = asyncio.Event()
+    close_release = asyncio.Event()
+    close_finished = asyncio.Event()
+
+    class SlowCloseResponse:
+        async def aiter_bytes(self):
+            while True:
+                await asyncio.sleep(60)
+                yield b""  # pragma: no cover - keeps this an async iterator
+
+        async def aclose(self):
+            close_started.set()
+            try:
+                await close_release.wait()
+            finally:
+                close_finished.set()
+
+    read_task = asyncio.create_task(read_streaming_error_body(SlowCloseResponse()))
+    try:
+        await asyncio.sleep(0)
+        read_task.cancel()
+        await close_started.wait()
+
+        read_task.cancel()
+        await asyncio.sleep(0)
+        read_task.cancel()
+        await asyncio.sleep(0)
+
+        assert read_task.done() is False
+        close_release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await read_task
+        assert close_finished.is_set()
+    finally:
+        close_release.set()
+        if not read_task.done():
+            read_task.cancel()
+        await asyncio.gather(read_task, return_exceptions=True)

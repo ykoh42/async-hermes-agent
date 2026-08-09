@@ -49,6 +49,27 @@ DEFAULT_ERROR_BODY_MAX_BYTES = 64 * 1024
 DEFAULT_ERROR_BODY_TIMEOUT_S = 10.0
 
 
+async def _finish_owned_task(task: asyncio.Task[object]) -> object:
+    """Finish one owned response task through repeated caller cancellation."""
+    cancellation: asyncio.CancelledError | None = None
+    while True:
+        try:
+            result = await asyncio.shield(task)
+            break
+        except asyncio.CancelledError as exc:  # noqa: ASYNC103 - re-raised below
+            if task.cancelled():
+                raise
+            if cancellation is None:
+                cancellation = exc
+        except Exception as exc:
+            if cancellation is not None:
+                raise cancellation from exc
+            raise
+    if cancellation is not None:
+        raise cancellation
+    return result
+
+
 async def read_streaming_error_body(
     response: httpx.Response,
     *,
@@ -92,7 +113,12 @@ async def read_streaming_error_body(
         logger.debug("bounded async error-body read failed: %s", exc)
     finally:
         try:
-            await response.aclose()
+            await _finish_owned_task(
+                asyncio.create_task(
+                    response.aclose(),
+                    name="bounded-error-response-close",
+                )
+            )
         except Exception:
             pass
     return b"".join(chunks).decode("utf-8", errors="replace")
