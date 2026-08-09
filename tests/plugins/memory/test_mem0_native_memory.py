@@ -2,17 +2,26 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import date, datetime, timezone
+import hashlib
+import json
 from types import SimpleNamespace
 
 import pytest
 
 from plugins.memory.mem0 import _native_memory
 from plugins.memory.mem0._native_memory import Memory
+from plugins.memory.mem0._native_oss import SQLiteManager as NativeSQLiteManager
+from plugins.memory.mem0._native_prompts import (
+    ADDITIVE_EXTRACTION_PROMPT,
+    AGENT_CONTEXT_SUFFIX,
+)
 
 
 class _FakeEmbedder:
     instances = []
+    batch_exception = None
 
     def __init__(self, config):
         self.config = config
@@ -24,17 +33,32 @@ class _FakeEmbedder:
         self.calls.append((text, memory_action))
         return [float(len(text)), 1.0]
 
+    async def embed_batch(self, texts, memory_action=None):
+        self.calls.append(("batch", list(texts), memory_action))
+        if self.batch_exception is not None:
+            raise self.batch_exception
+        return [[float(len(text)), 1.0] for text in texts]
+
     async def close(self):
         self.closed = True
 
 
 class _FakeLLM:
     instances = []
+    response = '{"memory": []}'
+    exception = None
 
     def __init__(self, config):
         self.config = config
+        self.calls = []
         self.closed = False
         self.instances.append(self)
+
+    async def generate_response(self, **kwargs):
+        self.calls.append(kwargs)
+        if self.exception is not None:
+            raise self.exception
+        return self.response
 
     async def close(self):
         self.closed = True
@@ -42,6 +66,7 @@ class _FakeLLM:
 
 class _FakeVector:
     instances = []
+    insert_failures = 0
 
     def __init__(self, config):
         self.config = config
@@ -55,6 +80,9 @@ class _FakeVector:
 
     async def insert(self, vectors, payloads=None, ids=None):
         self.calls.append(("insert", vectors, payloads, ids))
+        if self.insert_failures:
+            type(self).insert_failures -= 1
+            raise RuntimeError("batch insert failed")
         for memory_id, vector, payload in zip(ids, vectors, payloads, strict=True):
             self.rows[memory_id] = SimpleNamespace(
                 id=memory_id,
@@ -95,10 +123,14 @@ class _FakeVector:
 
 class _FakeDB:
     instances = []
+    batch_history_exception = None
 
     def __init__(self, path):
         self.path = path
         self.history = []
+        self.last_messages = []
+        self.saved_messages = []
+        self.batch_history_calls = []
         self.closed = False
         self.instances.append(self)
 
@@ -110,6 +142,18 @@ class _FakeDB:
             (memory_id, old_memory, new_memory, event, kwargs)
         )
 
+    async def batch_add_history(self, records):
+        self.batch_history_calls.append(records)
+        if self.batch_history_exception is not None:
+            raise self.batch_history_exception
+
+    async def get_last_messages(self, session_scope, limit=10):
+        assert limit == 10
+        return list(self.last_messages)
+
+    async def save_messages(self, messages, session_scope):
+        self.saved_messages.append((messages, session_scope))
+
     async def close(self):
         self.closed = True
 
@@ -118,6 +162,11 @@ class _FakeDB:
 def _fake_components(monkeypatch):
     for component in (_FakeEmbedder, _FakeLLM, _FakeVector, _FakeDB):
         component.instances.clear()
+    _FakeLLM.response = '{"memory": []}'
+    _FakeLLM.exception = None
+    _FakeEmbedder.batch_exception = None
+    _FakeVector.insert_failures = 0
+    _FakeDB.batch_history_exception = None
     monkeypatch.setattr(_native_memory, "OpenAIEmbedding", _FakeEmbedder)
     monkeypatch.setattr(_native_memory, "OllamaEmbedding", _FakeEmbedder)
     monkeypatch.setattr(_native_memory, "OpenAILLM", _FakeLLM)
@@ -224,20 +273,281 @@ async def test_memory_infer_false_add_preserves_result_payload_and_history(tmp_p
 
 
 @pytest.mark.asyncio
-async def test_memory_infer_true_fails_clearly_without_partial_write(tmp_path):
+async def test_memory_add_preserves_upstream_vision_message_normalization(tmp_path):
+    memory = Memory(_config(tmp_path))
+    result = await memory.add(
+        [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "first"},
+                    {"type": "image_url", "image_url": {"url": "image"}},
+                    {"type": "text", "text": "second"},
+                ],
+            }
+        ],
+        user_id="u1",
+        infer=False,
+    )
+
+    assert result["results"][0]["memory"] == "first second"
+    assert _FakeEmbedder.instances[0].calls[-1] == ("first second", "add")
+    await memory.close()
+
+
+@pytest.mark.asyncio
+async def test_memory_add_awaits_native_llm_for_enabled_vision(tmp_path):
+    config = _config(tmp_path)
+    config["llm"]["config"]["enable_vision"] = True
+    config["llm"]["config"]["vision_details"] = "high"
+    memory = Memory(config)
+    _FakeLLM.response = "image description"
+    message = {
+        "role": "user",
+        "content": {
+            "type": "image_url",
+            "image_url": {"url": "https://image.test/example.png"},
+        },
+    }
+
+    result = await memory.add([message], user_id="u1", infer=False)
+
+    assert result["results"][0]["memory"] == "image description"
+    llm_messages = _FakeLLM.instances[0].calls[0]["messages"]
+    assert llm_messages[0]["content"][1] == {
+        "type": "image_url",
+        "image_url": {
+            "url": "https://image.test/example.png",
+            "detail": "high",
+        },
+    }
+    await memory.close()
+
+
+@pytest.mark.asyncio
+async def test_memory_infer_true_preserves_phased_add_pipeline(tmp_path):
+    memory = Memory(_config(tmp_path))
+    await memory.initialize()
+    vector = _FakeVector.instances[0]
+    existing_text = "already stored"
+    existing_id = "existing-id"
+    vector.rows[existing_id] = SimpleNamespace(
+        id=existing_id,
+        score=0.92,
+        vector=[1.0, 1.0],
+        payload={
+            "data": existing_text,
+            "hash": hashlib.md5(existing_text.encode()).hexdigest(),
+            "user_id": "u1",
+            "agent_id": "hermes",
+        },
+    )
+    database = _FakeDB.instances[0]
+    database.last_messages = [
+        {"role": "user", "content": "prior context", "name": None}
+    ]
+    _FakeLLM.response = json.dumps(
+        {
+            "memory": [
+                {"text": existing_text, "attributed_to": "user"},
+                {"text": "plans a Seoul trip", "attributed_to": "user"},
+                {"text": "plans a Seoul trip", "attributed_to": "user"},
+                {"text": "was recommended tea", "attributed_to": "assistant"},
+            ]
+        }
+    )
+    messages = [
+        {"role": "user", "content": "I plan to visit Seoul"},
+        {"role": "assistant", "content": "Try the tea houses"},
+    ]
+
+    result = await memory.add(
+        messages,
+        user_id="u1",
+        agent_id="hermes",
+        infer=True,
+        metadata={"source": "conversation"},
+        prompt="Keep travel detail",
+    )
+
+    assert [item["memory"] for item in result["results"]] == [
+        "plans a Seoul trip",
+        "was recommended tea",
+    ]
+    search_call = next(call for call in vector.calls if call[0] == "search")
+    assert search_call[1] == (
+        "user: I plan to visit Seoul\nassistant: Try the tea houses\n"
+    )
+    assert search_call[3:] == (10, {"user_id": "u1", "agent_id": "hermes"})
+    llm_call = _FakeLLM.instances[0].calls[0]
+    assert llm_call["response_format"] == {"type": "json_object"}
+    assert llm_call["messages"][0]["content"] == ADDITIVE_EXTRACTION_PROMPT
+    assert "Keep travel detail" in llm_call["messages"][1]["content"]
+    assert '"id": "0", "text": "already stored"' in (
+        llm_call["messages"][1]["content"]
+    )
+    embedder_calls = _FakeEmbedder.instances[0].calls
+    assert embedder_calls[0] == (search_call[1], "search")
+    assert embedder_calls[1] == (
+        "batch",
+        [
+            existing_text,
+            "plans a Seoul trip",
+            "plans a Seoul trip",
+            "was recommended tea",
+        ],
+        "add",
+    )
+    inserted_payloads = next(call[2] for call in vector.calls if call[0] == "insert")
+    assert [payload["data"] for payload in inserted_payloads] == [
+        "plans a Seoul trip",
+        "was recommended tea",
+    ]
+    assert inserted_payloads[0]["attributed_to"] == "user"
+    assert inserted_payloads[1]["attributed_to"] == "assistant"
+    assert all(payload["source"] == "conversation" for payload in inserted_payloads)
+    assert len(database.batch_history_calls) == 1
+    assert database.saved_messages == [(messages, "agent_id=hermes&user_id=u1")]
+    await memory.close()
+
+
+@pytest.mark.asyncio
+async def test_memory_infer_true_saves_messages_for_empty_extraction(tmp_path):
+    memory = Memory(_config(tmp_path))
+    messages = [{"role": "user", "content": "hello"}]
+
+    assert await memory.add(messages, user_id="u1", infer=True) == {"results": []}
+
+    assert _FakeDB.instances[0].saved_messages == [(messages, "user_id=u1")]
+    assert _FakeVector.instances[0].rows == {}
+    await memory.close()
+
+
+@pytest.mark.asyncio
+async def test_memory_infer_true_preserves_agent_only_prompt_context(tmp_path):
     memory = Memory(_config(tmp_path))
 
-    with pytest.raises(RuntimeError, match="infer=True pipeline is not native async"):
-        await memory.add(
-            [{"role": "user", "content": "likes tea"}],
-            user_id="u1",
-            agent_id="hermes",
-            infer=True,
-        )
+    assert await memory.add("fact", agent_id="agent-1", infer=True) == {
+        "results": []
+    }
 
-    assert _FakeVector.instances[0].rows == {}
-    assert _FakeDB.instances[0].history == [("initialize",)]
+    system_prompt = _FakeLLM.instances[0].calls[0]["messages"][0]["content"]
+    assert system_prompt == ADDITIVE_EXTRACTION_PROMPT + AGENT_CONTEXT_SUFFIX
     await memory.close()
+
+
+@pytest.mark.asyncio
+async def test_memory_infer_true_preserves_external_cancellation(tmp_path):
+    memory = Memory(_config(tmp_path))
+    _FakeLLM.exception = asyncio.CancelledError()
+
+    with pytest.raises(asyncio.CancelledError):
+        await memory.add("fact", user_id="u1", infer=True)
+
+    assert _FakeDB.instances[0].saved_messages == []
+    assert _FakeVector.instances[0].rows == {}
+    await memory.close()
+
+
+@pytest.mark.asyncio
+async def test_memory_infer_true_preserves_upstream_batch_fallbacks(tmp_path):
+    memory = Memory(_config(tmp_path))
+    _FakeLLM.response = json.dumps(
+        {"memory": [{"text": "first fact"}, {"text": "second fact"}]}
+    )
+    _FakeEmbedder.batch_exception = RuntimeError("batch embed failed")
+    _FakeVector.insert_failures = 1
+    _FakeDB.batch_history_exception = RuntimeError("batch history failed")
+
+    result = await memory.add("source message", user_id="u1", infer=True)
+
+    assert [item["memory"] for item in result["results"]] == [
+        "first fact",
+        "second fact",
+    ]
+    embedder_calls = _FakeEmbedder.instances[0].calls
+    assert embedder_calls == [
+        ("user: source message\n", "search"),
+        ("batch", ["first fact", "second fact"], "add"),
+        ("first fact", "add"),
+        ("second fact", "add"),
+    ]
+    insert_calls = [
+        call for call in _FakeVector.instances[0].calls if call[0] == "insert"
+    ]
+    assert [len(call[1]) for call in insert_calls] == [2, 1, 1]
+    assert [row[3] for row in _FakeDB.instances[0].history[1:]] == ["ADD", "ADD"]
+    assert _FakeDB.instances[0].saved_messages == [
+        ([{"role": "user", "content": "source message"}], "user_id=u1")
+    ]
+    await memory.close()
+
+
+@pytest.mark.asyncio
+async def test_memory_infer_true_llm_failure_matches_upstream_save_order(tmp_path):
+    memory = Memory(_config(tmp_path))
+    _FakeLLM.exception = RuntimeError("provider failed")
+
+    assert await memory.add("fact", user_id="u1", infer=True) == {"results": []}
+
+    assert _FakeDB.instances[0].saved_messages == []
+    assert _FakeVector.instances[0].rows == {}
+    await memory.close()
+
+
+@pytest.mark.asyncio
+async def test_memory_infer_true_never_uses_asyncio_thread_fallback(
+    monkeypatch,
+    tmp_path,
+):
+    async def forbidden(*args, **kwargs):
+        raise AssertionError("asyncio.to_thread must not be used")
+
+    monkeypatch.setattr(asyncio, "to_thread", forbidden)
+    _FakeLLM.response = json.dumps({"memory": [{"text": "native async fact"}]})
+    memory = Memory(_config(tmp_path))
+
+    result = await memory.add("source", user_id="u1", infer=True)
+
+    assert result["results"][0]["memory"] == "native async fact"
+    await memory.close()
+
+
+@pytest.mark.asyncio
+async def test_memory_infer_true_persists_history_and_restart_context(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setattr(_native_memory, "SQLiteManager", NativeSQLiteManager)
+    config = _config(tmp_path)
+    first_messages = [{"role": "user", "content": "I prefer green tea"}]
+    _FakeLLM.response = json.dumps(
+        {"memory": [{"text": "User prefers green tea"}]}
+    )
+    first_memory = Memory(config)
+
+    first_result = await first_memory.add(
+        first_messages,
+        user_id="u1",
+        infer=True,
+    )
+    memory_id = first_result["results"][0]["id"]
+    history = await first_memory.db.get_history(memory_id)
+    assert history[0]["new_memory"] == "User prefers green tea"
+    assert history[0]["event"] == "ADD"
+    await first_memory.close()
+
+    _FakeLLM.response = '{"memory": []}'
+    restarted_memory = Memory(config)
+    await restarted_memory.add(
+        [{"role": "user", "content": "What do I drink?"}],
+        user_id="u1",
+        infer=True,
+    )
+
+    extraction_prompt = _FakeLLM.instances[-1].calls[0]["messages"][1]["content"]
+    assert "## Last k Messages\nuser: I prefer green tea" in extraction_prompt
+    await restarted_memory.close()
 
 
 @pytest.mark.asyncio
@@ -424,3 +734,5 @@ async def test_memory_close_releases_all_owned_components(tmp_path):
     assert _FakeLLM.instances[0].closed is True
     assert _FakeVector.instances[0].closed is True
     assert _FakeDB.instances[0].closed is True
+    with pytest.raises(RuntimeError, match="closed Mem0 Memory"):
+        await memory.add("fact", user_id="u1", infer=False)

@@ -6,9 +6,11 @@ import asyncio
 from copy import deepcopy
 from datetime import date, datetime, timezone
 import hashlib
+import json
 import logging
 import os
 from pathlib import Path
+import re
 from typing import Any
 import uuid
 
@@ -20,6 +22,12 @@ from ._native_oss import (
     OpenAIEmbedding,
     OpenAILLM,
     SQLiteManager,
+    _extract_json,
+)
+from ._native_prompts import (
+    ADDITIVE_EXTRACTION_PROMPT,
+    AGENT_CONTEXT_SUFFIX,
+    generate_additive_extraction_prompt,
 )
 from ._native_vector import Qdrant
 
@@ -115,6 +123,120 @@ def _normalize_expiration_date(value: Any) -> str | None:
     )
 
 
+def _parse_messages(messages: list[dict[str, Any]]) -> str:
+    parsed = ""
+    for message in messages:
+        content = message.get("content")
+        if content is None:
+            continue
+        role = message.get("role")
+        if role in {"system", "user", "assistant"}:
+            parsed += f"{role}: {content}\n"
+    return parsed
+
+
+def _remove_code_blocks(content: str) -> str:
+    pattern = r"^```[a-zA-Z0-9]*\n([\s\S]*?)\n```$"
+    match = re.match(pattern, content.strip())
+    inner = match.group(1).strip() if match else content.strip()
+    return re.sub(r"<think>.*?</think>", "", inner, flags=re.DOTALL).strip()
+
+
+def _build_session_scope(filters: dict[str, Any]) -> str:
+    parts = [
+        f"{key}={filters[key]}"
+        for key in sorted(("user_id", "agent_id", "run_id"))
+        if filters.get(key)
+    ]
+    return "&".join(parts)
+
+
+async def _describe_image(
+    image: str | dict[str, Any],
+    llm: Any,
+    vision_details: str,
+) -> str:
+    if isinstance(image, str):
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": (
+                            "A user is providing an image. Provide a high level "
+                            "description of the image and do not include any "
+                            "additional text."
+                        ),
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": image,
+                            "detail": vision_details,
+                        },
+                    },
+                ],
+            }
+        ]
+    else:
+        messages = [image]
+    return await llm.generate_response(messages=messages)
+
+
+async def _parse_vision_messages(
+    messages: list[dict[str, Any]],
+    llm: Any = None,
+    vision_details: str = "auto",
+) -> list[dict[str, Any]]:
+    normalized = []
+    for message in messages:
+        role = message.get("role")
+        content = message.get("content")
+        if role == "system":
+            normalized.append(message)
+            continue
+        if content is None:
+            continue
+        if isinstance(content, list):
+            if llm is None:
+                text_parts = [
+                    part["text"]
+                    for part in content
+                    if isinstance(part, dict) and part.get("type") == "text"
+                ]
+                if text_parts:
+                    normalized.append(
+                        {"role": role, "content": " ".join(text_parts)}
+                    )
+            else:
+                normalized.append(
+                    {
+                        "role": role,
+                        "content": await _describe_image(
+                            message,
+                            llm,
+                            vision_details,
+                        ),
+                    }
+                )
+        elif isinstance(content, dict) and content.get("type") == "image_url":
+            if llm is None:
+                continue
+            image_url = content.get("image_url")
+            url = image_url.get("url") if isinstance(image_url, dict) else None
+            if not url:
+                raise ValueError("image_url content part is missing image_url.url")
+            try:
+                description = await _describe_image(url, llm, vision_details)
+            except Exception as exc:
+                raise Exception(f"Error while downloading {url}.") from exc
+            normalized.append({"role": role, "content": description})
+        else:
+            normalized.append(message)
+    return normalized
+
+
 class Memory:
     """Retained Mem0 OSS runtime with native coroutine boundaries."""
 
@@ -127,15 +249,19 @@ class Memory:
         self._initialize_lock = asyncio.Lock()
         self._initialized = False
         self._closed = False
+        self.api_version = self.config.get("version", "v1.1")
+        self.custom_instructions = self.config.get("custom_instructions")
 
     async def initialize(self) -> None:
+        if self._closed:
+            raise RuntimeError("Cannot initialize a closed Mem0 Memory")
         if self._initialized:
             return
         async with self._initialize_lock:
-            if self._initialized:
-                return
             if self._closed:
                 raise RuntimeError("Cannot initialize a closed Mem0 Memory")
+            if self._initialized:
+                return
 
             embedder = self.config.get("embedder") or {}
             embedder_provider = embedder.get("provider")
@@ -242,6 +368,206 @@ class Memory:
         )
         return memory_id
 
+    async def _infer_memories(
+        self,
+        messages: list[dict[str, Any]],
+        metadata: dict[str, Any],
+        filters: dict[str, Any],
+        prompt: str | None,
+    ) -> list[dict[str, str]]:
+        session_scope = _build_session_scope(filters)
+        last_messages = await self.db.get_last_messages(session_scope, limit=10)
+        parsed_messages = _parse_messages(messages)
+
+        search_filters = {
+            key: value
+            for key, value in filters.items()
+            if key in {"user_id", "agent_id", "run_id"} and value
+        }
+        query_embedding = await self.embedding_model.embed(
+            parsed_messages,
+            "search",
+        )
+        existing_results = await self.vector_store.search(
+            query=parsed_messages,
+            vectors=query_embedding,
+            top_k=10,
+            filters=search_filters,
+        )
+        existing_memories = [
+            {"id": str(index), "text": memory.payload.get("data", "")}
+            for index, memory in enumerate(existing_results)
+        ]
+
+        system_prompt = ADDITIVE_EXTRACTION_PROMPT
+        if filters.get("agent_id") and not filters.get("user_id"):
+            system_prompt += AGENT_CONTEXT_SUFFIX
+        user_prompt = generate_additive_extraction_prompt(
+            existing_memories=existing_memories,
+            new_messages=parsed_messages,
+            last_k_messages=last_messages,
+            custom_instructions=prompt or self.custom_instructions,
+        )
+        try:
+            response = await self.llm.generate_response(
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                response_format={"type": "json_object"},
+            )
+        except Exception as exc:
+            logger.error("LLM extraction failed: %s", exc)
+            return []
+
+        try:
+            response = _remove_code_blocks(response)
+            if not response or not response.strip():
+                extracted_memories = []
+            else:
+                try:
+                    extracted_memories = json.loads(response, strict=False).get(
+                        "memory",
+                        [],
+                    )
+                except json.JSONDecodeError:
+                    extracted_memories = json.loads(
+                        _extract_json(response),
+                        strict=False,
+                    ).get("memory", [])
+        except Exception as exc:
+            logger.error("Error parsing extraction response: %s", exc)
+            extracted_memories = []
+
+        if not extracted_memories:
+            await self.db.save_messages(messages, session_scope)
+            return []
+
+        memory_texts = [
+            memory.get("text", "")
+            for memory in extracted_memories
+            if memory.get("text")
+        ]
+        try:
+            embeddings = await self.embedding_model.embed_batch(
+                memory_texts,
+                "add",
+            )
+            embedding_map = dict(zip(memory_texts, embeddings, strict=False))
+        except Exception:
+            embedding_map = {}
+            for text in memory_texts:
+                try:
+                    embedding_map[text] = await self.embedding_model.embed(
+                        text,
+                        "add",
+                    )
+                except Exception as exc:
+                    logger.warning("Failed to embed memory text: %s", exc)
+
+        existing_hashes = {
+            memory.payload.get("hash")
+            for memory in existing_results
+            if getattr(memory, "payload", None) and memory.payload.get("hash")
+        }
+        records: list[tuple[str, str, list[float], dict[str, Any]]] = []
+        seen_hashes: set[str] = set()
+        for memory in extracted_memories:
+            text = memory.get("text")
+            if not text or text not in embedding_map:
+                continue
+            memory_hash = hashlib.md5(text.encode()).hexdigest()
+            if memory_hash in existing_hashes or memory_hash in seen_hashes:
+                logger.debug("Skipping duplicate memory (hash match): %s", text[:50])
+                continue
+            seen_hashes.add(memory_hash)
+
+            memory_id = str(uuid.uuid4())
+            memory_metadata = deepcopy(metadata)
+            memory_metadata["data"] = text
+            # The pinned core extra has no spaCy model, so upstream's
+            # lemmatizer returns the original text at this boundary.
+            memory_metadata["text_lemmatized"] = text
+            memory_metadata["hash"] = memory_hash
+            if "created_at" not in memory_metadata:
+                memory_metadata["created_at"] = datetime.now(
+                    timezone.utc
+                ).isoformat()
+            memory_metadata["updated_at"] = memory_metadata["created_at"]
+            if memory.get("attributed_to"):
+                memory_metadata["attributed_to"] = memory["attributed_to"]
+            records.append(
+                (memory_id, text, embedding_map[text], memory_metadata)
+            )
+
+        if not records:
+            await self.db.save_messages(messages, session_scope)
+            return []
+
+        vectors = [record[2] for record in records]
+        memory_ids = [record[0] for record in records]
+        payloads = [record[3] for record in records]
+        try:
+            await self.vector_store.insert(
+                vectors=vectors,
+                ids=memory_ids,
+                payloads=payloads,
+            )
+        except Exception:
+            for memory_id, vector, payload in zip(
+                memory_ids,
+                vectors,
+                payloads,
+                strict=True,
+            ):
+                try:
+                    await self.vector_store.insert(
+                        vectors=[vector],
+                        ids=[memory_id],
+                        payloads=[payload],
+                    )
+                except Exception as exc:
+                    logger.error("Failed to insert memory %s: %s", memory_id, exc)
+
+        history_records = [
+            {
+                "memory_id": record[0],
+                "old_memory": None,
+                "new_memory": record[1],
+                "event": "ADD",
+                "created_at": record[3].get("created_at"),
+                "is_deleted": 0,
+            }
+            for record in records
+        ]
+        try:
+            await self.db.batch_add_history(history_records)
+        except Exception:
+            for history in history_records:
+                try:
+                    await self.db.add_history(
+                        history["memory_id"],
+                        None,
+                        history["new_memory"],
+                        "ADD",
+                        created_at=history.get("created_at"),
+                    )
+                except Exception as exc:
+                    logger.error(
+                        "Failed to add history for %s: %s",
+                        history["memory_id"],
+                        exc,
+                    )
+
+        # ``mem0ai==2.0.10`` only enables entity linking when its separate NLP
+        # extra and spaCy model are installed. The retained ``mem0`` extra has
+        # the upstream core behavior: extraction yields no entity candidates.
+        await self.db.save_messages(messages, session_scope)
+        return [
+            {"id": record[0], "memory": record[1], "event": "ADD"}
+            for record in records
+        ]
+
     async def add(
         self,
         messages: str | dict[str, Any] | list[dict[str, Any]],
@@ -254,7 +580,7 @@ class Memory:
         expiration_date: Any = None,
         infer: bool = True,
         memory_type: str | None = None,
-        prompt: str | None = None,  # noqa: ARG002
+        prompt: str | None = None,
     ) -> dict[str, Any]:
         await self.initialize()
         if timestamp is not None:
@@ -288,12 +614,13 @@ class Memory:
                 "Mem0 OSS procedural memory pipeline is not native async yet; "
                 "no memory was written."
             )
-        if infer:
-            raise RuntimeError(
-                "Mem0 OSS infer=True pipeline is not native async yet; no memory "
-                "was written."
-            )
-
+        llm_config = (self.config.get("llm") or {}).get("config") or {}
+        vision_llm = self.llm if llm_config.get("enable_vision") else None
+        normalized_messages = await _parse_vision_messages(
+            normalized_messages,
+            vision_llm,
+            llm_config.get("vision_details", "auto"),
+        )
         base_metadata = deepcopy(metadata) if metadata else {}
         if normalized_expiration_date is not None:
             base_metadata["expiration_date"] = normalized_expiration_date
@@ -304,6 +631,24 @@ class Memory:
         ):
             if value:
                 base_metadata[key] = value
+
+        if infer:
+            return {
+                "results": await self._infer_memories(
+                    normalized_messages,
+                    base_metadata,
+                    {
+                        key: value
+                        for key, value in (
+                            ("user_id", user_id),
+                            ("agent_id", agent_id),
+                            ("run_id", run_id),
+                        )
+                        if value
+                    },
+                    prompt,
+                )
+            }
 
         returned_memories = []
         for message in normalized_messages:
