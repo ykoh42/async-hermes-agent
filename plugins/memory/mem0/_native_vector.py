@@ -5,12 +5,14 @@ from __future__ import annotations
 import asyncio
 import builtins
 from contextlib import asynccontextmanager
+import inspect
 import json
 import logging
 from typing import Any
 
 from pydantic import BaseModel
 
+from ._native_local_qdrant import NativeLocalQdrantClient
 from ._native_oss import _finish_cleanup
 from ._native_sparse import NativeSparseEncoder, SparseEncoding
 
@@ -164,7 +166,7 @@ def _vector_literal(vector: builtins.list[float]) -> str:
 
 
 class Qdrant:
-    """Native-async remote Qdrant adapter matching Mem0 2.0.10 contracts."""
+    """Native-async Qdrant adapter matching Mem0 2.0.10 contracts."""
 
     def __init__(self, config: dict[str, Any]) -> None:
         self.config = dict(config)
@@ -177,6 +179,21 @@ class Qdrant:
         self._closed = False
         self._has_bm25_slot = False
         self._bm25_encoder = NativeSparseEncoder()
+        self._configured_client = self.config.get("client")
+        self._remote_options: dict[str, Any] = {}
+        if self.config.get("api_key"):
+            self._remote_options["api_key"] = self.config["api_key"]
+        if self.config.get("url"):
+            self._remote_options["url"] = self.config["url"]
+        if self.config.get("host") and self.config.get("port"):
+            self._remote_options["host"] = self.config["host"]
+            self._remote_options["port"] = self.config["port"]
+        if self.config.get("https") is not None:
+            self._remote_options["https"] = self.config["https"]
+        self._is_local = not self._configured_client and not self._remote_options
+        self._use_embedded = (
+            self._is_local and self.config.get("path") is not None
+        )
 
     @property
     def has_bm25_slot(self) -> bool:
@@ -190,30 +207,29 @@ class Qdrant:
                 return self._client
             if self._closed:
                 raise RuntimeError("Cannot use a closed Qdrant")
-            if self.config.get("path"):
-                raise RuntimeError(
-                    "Mem0 OSS embedded Qdrant is not native async: "
-                    "qdrant-client performs blocking file I/O in local mode."
-                )
             from qdrant_client import AsyncQdrantClient, models
 
-            client_options: dict[str, Any] = {"check_compatibility": False}
-            if self.config.get("api_key"):
-                client_options["api_key"] = self.config["api_key"]
-            if self.config.get("url"):
-                client_options["url"] = self.config["url"]
-            elif self.config.get("host") and self.config.get("port"):
-                client_options["host"] = self.config["host"]
-                client_options["port"] = self.config["port"]
-            else:
-                raise RuntimeError(
-                    "Mem0 OSS Qdrant requires a remote url or host/port for "
-                    "native-async operation."
+            if self._configured_client:
+                client = self._configured_client
+                if not inspect.iscoroutinefunction(
+                    getattr(client, "get_collections", None)
+                ):
+                    raise RuntimeError(
+                        "Mem0 OSS Qdrant requires a native async configured "
+                        "client; synchronous QdrantClient instances are not "
+                        "supported."
+                    )
+            elif self._use_embedded:
+                client = NativeLocalQdrantClient(
+                    self.config.get("path"),
+                    models,
                 )
-            if self.config.get("https") is not None:
-                client_options["https"] = self.config["https"]
-
-            client = AsyncQdrantClient(**client_options)
+            else:
+                client_options: dict[str, Any] = {
+                    **self._remote_options,
+                    "check_compatibility": False,
+                }
+                client = AsyncQdrantClient(**client_options)
             try:
                 await self._initialize_collection(client, models)
             except BaseException:
@@ -269,6 +285,8 @@ class Qdrant:
             )
             self._has_bm25_slot = True
 
+        if self._is_local:
+            return
         for field_name in ("user_id", "agent_id", "run_id", "actor_id"):
             try:
                 await client.create_payload_index(
@@ -522,6 +540,13 @@ class Qdrant:
             with_payload=True,
             with_vectors=False,
         )
+
+    async def reset(self) -> None:
+        client = await self._get_client()
+        logger.warning("Resetting index %s...", self.collection_name)
+        await client.delete_collection(collection_name=self.collection_name)
+        self._has_bm25_slot = False
+        await self._initialize_collection(client, self._models)
 
     async def close(self) -> None:
         async with self._initialize_lock:

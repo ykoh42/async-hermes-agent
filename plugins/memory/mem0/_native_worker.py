@@ -13,12 +13,32 @@ from hermes_cli.async_source_loader import locate_source_module
 
 from ._native_oss import _finish_cleanup
 
+_BUILTIN_WORKER_ERRORS = {
+    error.__name__: error
+    for error in (
+        FileNotFoundError,
+        IndexError,
+        KeyError,
+        LookupError,
+        PermissionError,
+        TimeoutError,
+        TypeError,
+        ValueError,
+    )
+}
+
 
 class NativeWorker:
     """Serialize requests through one optional-dependency transform worker."""
 
-    def __init__(self, dependency: str) -> None:
+    def __init__(
+        self,
+        dependency: str,
+        *,
+        worker_filename: str = "_transform_worker.py",
+    ) -> None:
         self._dependency = dependency
+        self._worker_filename = worker_filename
         self._process: Any = None
         self._available: bool | None = None
         self._initialize_lock = asyncio.Lock()
@@ -50,7 +70,7 @@ class NativeWorker:
             spawn = asyncio.create_task(
                 asyncio.create_subprocess_exec(
                     sys.executable,
-                    str(Path(__file__).with_name("_transform_worker.py")),
+                    str(Path(__file__).with_name(self._worker_filename)),
                     "--stdio",
                     stdin=asyncio.subprocess.PIPE,
                     stdout=asyncio.subprocess.PIPE,
@@ -132,8 +152,17 @@ class NativeWorker:
                 response = json.loads(response_line)
             except (UnicodeDecodeError, json.JSONDecodeError) as exc:
                 raise RuntimeError("Mem0 transform worker returned invalid JSON") from exc
-            if response.get("error"):
-                raise RuntimeError(str(response["error"]))
+            error = response.get("error")
+            if error:
+                if isinstance(error, dict):
+                    error_type = _BUILTIN_WORKER_ERRORS.get(
+                        str(error.get("builtin_type") or "")
+                    )
+                    error_args = error.get("args")
+                    if error_type is not None and isinstance(error_args, list):
+                        raise error_type(*error_args)
+                    raise RuntimeError(str(error.get("message") or error))
+                raise RuntimeError(str(error))
             return response.get("result")
 
     async def close(self) -> None:

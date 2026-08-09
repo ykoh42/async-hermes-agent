@@ -165,15 +165,68 @@ async def test_qdrant_is_state_only_and_disables_compatibility_thread():
 
 
 @pytest.mark.asyncio
-async def test_qdrant_rejects_embedded_path_before_constructing_client():
+async def test_qdrant_remote_options_take_precedence_over_embedded_path():
     store = Qdrant(
-        {"path": "/tmp/mem0", "collection_name": "mem0", "embedding_model_dims": 3}
+        {
+            "path": "/ignored/local/path",
+            "url": "https://qdrant.test",
+            "host": "qdrant.internal",
+            "port": 6333,
+            "api_key": "secret",
+            "https": False,
+        }
     )
 
-    with pytest.raises(RuntimeError, match="embedded Qdrant"):
-        await store.search("query", [1.0, 0.0, 0.0])
+    await store.get("m1")
 
-    assert _FakeAsyncQdrantClient.instances == []
+    assert _FakeAsyncQdrantClient.instances[0].kwargs == {
+        "url": "https://qdrant.test",
+        "host": "qdrant.internal",
+        "port": 6333,
+        "api_key": "secret",
+        "https": False,
+        "check_compatibility": False,
+    }
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_qdrant_none_path_uses_native_async_default_transport():
+    store = Qdrant({"path": None})
+
+    await store.get("m1")
+
+    client = _FakeAsyncQdrantClient.instances[0]
+    assert client.kwargs == {"check_compatibility": False}
+    assert store._is_local is True
+    assert not any(call[0] == "create_payload_index" for call in client.calls)
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_qdrant_uses_configured_native_async_client():
+    client = _FakeAsyncQdrantClient(source="configured")
+    store = Qdrant({"client": client, "path": "/ignored/local/path"})
+
+    await store.get("m1")
+
+    assert store._client is client
+    assert client.kwargs == {"source": "configured"}
+    await store.close()
+    assert client.close_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_qdrant_rejects_configured_synchronous_client():
+    class SyncClient:
+        def get_collections(self):
+            raise AssertionError("synchronous client must not be called")
+
+    store = Qdrant({"client": SyncClient()})
+
+    with pytest.raises(RuntimeError, match="native async configured client"):
+        await store.get("m1")
+
     await store.close()
 
 
@@ -264,6 +317,23 @@ async def test_qdrant_crud_and_list_preserve_upstream_shapes():
     assert "upsert" in names
     assert "delete" in names
     assert "delete_collection" in names
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_qdrant_reset_deletes_and_recreates_hybrid_collection():
+    store = Qdrant(
+        {"url": "https://qdrant.test", "collection_name": "mem0", "embedding_model_dims": 2}
+    )
+    await store.get("m1")
+
+    await store.reset()
+
+    client = _FakeAsyncQdrantClient.instances[0]
+    names = [call[0] for call in client.calls]
+    assert names.count("create_collection") == 2
+    assert names.count("delete_collection") == 1
+    assert store.has_bm25_slot is True
     await store.close()
 
 

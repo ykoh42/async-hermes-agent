@@ -270,10 +270,11 @@ async def test_backend_initialization_failure_preserves_provider_contract(
 
 
 @pytest.mark.asyncio
-async def test_oss_blocking_local_qdrant_is_rejected_during_provider_initialization(
+async def test_oss_local_qdrant_initializes_during_provider_initialization(
     monkeypatch, tmp_path
 ):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("MEM0_DIR", str(tmp_path / "mem0-home"))
     (tmp_path / "mem0.json").write_text(
         json.dumps(
             {
@@ -300,8 +301,9 @@ async def test_oss_blocking_local_qdrant_is_rejected_during_provider_initializat
 
     await provider.initialize("test-session")
 
-    assert provider._backend is None
-    assert "embedded Qdrant" in provider._init_error
+    assert provider._backend is not None
+    assert getattr(provider, "_init_error", None) is None
+    await provider.shutdown()
 
 
 @pytest.mark.asyncio

@@ -298,7 +298,11 @@ def test_oss_legacy_base_urls_are_normalized_without_mutating_input():
 
 
 @pytest.mark.asyncio
-async def test_oss_backend_rejects_blocking_local_qdrant():
+async def test_oss_backend_initializes_embedded_qdrant_natively(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setenv("MEM0_DIR", str(tmp_path / "mem0-home"))
     backend = OSSBackend(
         {
             "llm": {
@@ -311,15 +315,16 @@ async def test_oss_backend_rejects_blocking_local_qdrant():
             },
             "vector_store": {
                 "provider": "qdrant",
-                "config": {"path": "/tmp/mem0-test"},
+                "config": {"path": str(tmp_path / "qdrant")},
             },
         }
     )
 
-    with pytest.raises(RuntimeError, match="embedded Qdrant"):
-        await backend._initialize()
+    await backend._initialize()
 
-    assert backend._memory is None
+    assert backend._memory is not None
+    assert backend._memory.vector_store._is_local is True
+    await backend.close()
 
 
 @pytest.mark.asyncio
@@ -502,21 +507,47 @@ async def test_oss_qdrant_dimension_probe_disables_client_thread(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_oss_qdrant_dimension_probe_rejects_blocking_local_mode(monkeypatch):
+async def test_oss_qdrant_dimension_probe_uses_native_local_proxy(monkeypatch):
+    captured = {}
+
     class ForbiddenClient:
         def __init__(self, **kwargs):
             raise AssertionError("local AsyncQdrantClient must not be constructed")
 
+    class LocalClient:
+        def __init__(self, path, models):
+            captured["path"] = path
+            captured["models"] = models
+
+        async def collection_exists(self, collection_name):
+            captured["collection_name"] = collection_name
+            return False
+
+        async def close(self):
+            captured["closed"] = True
+
+    models = object()
     qdrant_client = types.ModuleType("qdrant_client")
     qdrant_client.AsyncQdrantClient = ForbiddenClient
+    qdrant_client.models = models
     monkeypatch.setitem(sys.modules, "qdrant_client", qdrant_client)
+    monkeypatch.setattr(
+        "plugins.memory.mem0._native_local_qdrant.NativeLocalQdrantClient",
+        LocalClient,
+    )
 
-    with pytest.raises(RuntimeError, match="embedded Qdrant"):
-        await OSSBackend._recreate_collection_if_dims_changed(
-            "qdrant",
-            {"path": "/tmp/mem0-test"},
-            1536,
-        )
+    await OSSBackend._recreate_collection_if_dims_changed(
+        "qdrant",
+        {"path": "/tmp/mem0-test"},
+        1536,
+    )
+
+    assert captured == {
+        "path": "/tmp/mem0-test",
+        "models": models,
+        "collection_name": "mem0",
+        "closed": True,
+    }
 
 
 @pytest.mark.asyncio

@@ -314,11 +314,6 @@ class Memory:
             vector_provider = vector.get("provider")
             vector_config = dict(vector.get("config") or {})
             if vector_provider == "qdrant":
-                if vector_config.get("path"):
-                    raise RuntimeError(
-                        "Mem0 OSS embedded Qdrant is not native async: "
-                        "qdrant-client performs blocking file I/O in local mode."
-                    )
                 vector_store = Qdrant(vector_config)
             elif vector_provider == "pgvector":
                 vector_store = PGVector(vector_config)
