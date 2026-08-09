@@ -764,6 +764,52 @@ class TestGracefulFallback:
 class TestShutdown:
 
     @pytest.mark.asyncio
+    async def test_server_shutdown_finishes_through_repeated_caller_cancellation(self):
+        """Caller cancellation cannot detach transport or refresh cleanup."""
+        from tools.mcp_tool import MCPServerTask
+
+        server = MCPServerTask("owned-cleanup")
+        shutdown_started = asyncio.Event()
+        allow_transport_exit = asyncio.Event()
+        refresh_cancelled = asyncio.Event()
+
+        async def transport_task():
+            await server._shutdown_event.wait()
+            shutdown_started.set()
+            await allow_transport_exit.wait()
+
+        async def refresh_task():
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                refresh_cancelled.set()
+                raise
+
+        server._task = asyncio.create_task(transport_task())
+        refresh = asyncio.create_task(refresh_task())
+        server._pending_refresh_tasks.add(refresh)
+        server.session = object()
+
+        shutdown = asyncio.create_task(server.shutdown())
+        await shutdown_started.wait()
+        shutdown.cancel()
+        await asyncio.sleep(0)
+        shutdown.cancel()
+
+        await asyncio.sleep(0)
+        assert shutdown.done() is False
+
+        allow_transport_exit.set()
+        with pytest.raises(asyncio.CancelledError):
+            await shutdown
+
+        assert server._task.done()
+        assert refresh.cancelled()
+        assert refresh_cancelled.is_set()
+        assert server._pending_refresh_tasks == set()
+        assert server.session is None
+
+    @pytest.mark.asyncio
     async def test_shutdown_cancellation_drains_a_stalled_server(self):
         """Cancelling lifecycle cleanup cancels every native MCP shutdown task."""
         import tools.mcp_tool as mcp_mod

@@ -1814,6 +1814,28 @@ class ElicitationHandler:
 # Server task -- each MCP server lives in one long-lived asyncio Task
 # ---------------------------------------------------------------------------
 
+
+async def _finish_mcp_owned_task(task: asyncio.Task[Any]) -> Any:
+    """Finish one MCP-owned task through repeated caller cancellation."""
+    cancellation: asyncio.CancelledError | None = None
+    while True:
+        try:
+            result = await asyncio.shield(task)
+            break
+        except asyncio.CancelledError as exc:  # noqa: ASYNC103 - re-raised below
+            if task.cancelled():
+                raise
+            if cancellation is None:
+                cancellation = exc
+        except Exception as exc:
+            if cancellation is not None:
+                raise cancellation from exc
+            raise
+    if cancellation is not None:
+        raise cancellation
+    return result
+
+
 class MCPServerTask:
     """Manages a single MCP server connection in a dedicated asyncio Task.
 
@@ -3476,6 +3498,14 @@ class MCPServerTask:
 
     async def shutdown(self):
         """Signal the Task to exit and wait for clean resource teardown."""
+        cleanup_task = asyncio.create_task(
+            self._shutdown_owned(),
+            name=f"mcp-shutdown-{self.name}",
+        )
+        await _finish_mcp_owned_task(cleanup_task)
+
+    async def _shutdown_owned(self) -> None:
+        """Tear down this server as one cancellation-safe operation."""
         self._shutdown_event.set()
         # Defensive: if _wait_for_lifecycle_event is blocking, we need ANY
         # event to unblock it. _shutdown_event alone is sufficient (the
