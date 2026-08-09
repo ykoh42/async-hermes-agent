@@ -446,28 +446,25 @@ class TestErrorResilience:
         work = tmp_path / "work"
         work.mkdir()
         communicate_started = asyncio.Event()
-        wait_started = asyncio.Event()
-        release_wait = asyncio.Event()
-        wait_completed = asyncio.Event()
+        release_communicate = asyncio.Event()
+        communicate_completed = asyncio.Event()
 
         class BlockingProcess:
             returncode = None
             killed = False
-            waited = False
 
             async def communicate(self):
                 communicate_started.set()
-                await asyncio.Event().wait()
+                await release_communicate.wait()
+                communicate_completed.set()
+                self.returncode = -9
+                return b"", b""
 
             def kill(self):
                 self.killed = True
                 self.returncode = -9
 
             async def wait(self):
-                self.waited = True
-                wait_started.set()
-                await release_wait.wait()
-                wait_completed.set()
                 return self.returncode
 
         process = BlockingProcess()
@@ -486,22 +483,24 @@ class TestErrorResilience:
                 )
                 await communicate_started.wait()
                 task.cancel()
-                await wait_started.wait()
+                while not process.killed:
+                    await asyncio.sleep(0)
                 task.cancel()
                 await asyncio.sleep(0)
 
                 try:
                     assert task.done() is False
                 finally:
-                    release_wait.set()
+                    release_communicate.set()
                     with pytest.raises(asyncio.CancelledError):
                         await task
-                    await asyncio.wait_for(wait_completed.wait(), timeout=1.0)
+                    await asyncio.wait_for(
+                        communicate_completed.wait(), timeout=1.0
+                    )
             finally:
                 blockbuster.deactivate()
 
         assert process.killed is True
-        assert process.waited is True
 
     async def test_init_store_cancellation_reaps_subprocess(
         self,
@@ -509,9 +508,8 @@ class TestErrorResilience:
         monkeypatch,
     ):
         communicate_started = asyncio.Event()
-        wait_started = asyncio.Event()
-        release_wait = asyncio.Event()
-        wait_completed = asyncio.Event()
+        release_communicate = asyncio.Event()
+        communicate_completed = asyncio.Event()
 
         class BlockingProcess:
             returncode = None
@@ -519,16 +517,16 @@ class TestErrorResilience:
 
             async def communicate(self):
                 communicate_started.set()
-                await asyncio.Event().wait()
+                await release_communicate.wait()
+                communicate_completed.set()
+                self.returncode = -9
+                return b"", b""
 
             def kill(self):
                 self.killed = True
                 self.returncode = -9
 
             async def wait(self):
-                wait_started.set()
-                await release_wait.wait()
-                wait_completed.set()
                 return self.returncode
 
         process = BlockingProcess()
@@ -543,15 +541,16 @@ class TestErrorResilience:
         )
         await communicate_started.wait()
         task.cancel()
-        await wait_started.wait()
+        while not process.killed:
+            await asyncio.sleep(0)
         task.cancel()
         await asyncio.sleep(0)
 
         assert task.done() is False
-        release_wait.set()
+        release_communicate.set()
         with pytest.raises(asyncio.CancelledError):
             await task
-        assert wait_completed.is_set()
+        assert communicate_completed.is_set()
         assert process.killed is True
 
 

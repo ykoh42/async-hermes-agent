@@ -54,35 +54,36 @@ def substitute_template_vars(
     return _SKILL_TEMPLATE_RE.sub(_replace, content)
 
 
-async def _stop_process(process: asyncio.subprocess.Process) -> None:
-    """Terminate a preprocessing child and always reap it."""
-    if process.returncode is not None:
-        return
-    try:
-        process.kill()
-    except ProcessLookupError:
-        pass
-    await process.wait()
-
-
-async def _finish_cancelled_process_stop(
+async def _finish_process_communicate(
     process: asyncio.subprocess.Process,
-) -> None:
-    """Reap an owned preprocessing child through repeated cancellation."""
-    stop_task = asyncio.create_task(_stop_process(process))
+    communicate_task: asyncio.Task[tuple[bytes | None, bytes | None]],
+) -> tuple[bytes | None, bytes | None]:
+    """Drain and reap one owned inline-shell process through cancellation."""
+    async def drain_or_wait() -> tuple[bytes | None, bytes | None]:
+        try:
+            return await communicate_task
+        except BaseException:
+            await process.wait()
+            raise
+
+    cleanup_task = asyncio.create_task(drain_or_wait())
+    cancellation: asyncio.CancelledError | None = None
     while True:
         try:
-            await asyncio.shield(stop_task)
-            return
-        except asyncio.CancelledError:  # noqa: ASYNC103 - retry unless child cancelled
-            if stop_task.cancelled():
+            output = await asyncio.shield(cleanup_task)
+            break
+        except asyncio.CancelledError as exc:  # noqa: ASYNC103 - re-raised below
+            if cleanup_task.cancelled():
                 raise
-        except Exception:
-            logger.debug(
-                "Inline-shell cleanup after cancellation failed",
-                exc_info=True,
-            )
-            return
+            if cancellation is None:
+                cancellation = exc
+        except Exception as exc:
+            if cancellation is not None:
+                raise cancellation from exc
+            raise
+    if cancellation is not None:
+        raise cancellation
+    return output
 
 
 async def run_inline_shell(command: str, cwd: Path | None, timeout: int) -> str:
@@ -104,18 +105,47 @@ async def run_inline_shell(command: str, cwd: Path | None, timeout: int) -> str:
     except Exception as exc:
         return f"[inline-shell error: {exc}]"
 
+    communicate_task = asyncio.create_task(process.communicate())
     try:
         stdout, stderr = await asyncio.wait_for(
-            process.communicate(), timeout=timeout
+            asyncio.shield(communicate_task), timeout=timeout
         )
     except TimeoutError:
-        await _stop_process(process)
+        if process.returncode is None:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+        await _finish_process_communicate(process, communicate_task)
         return f"[inline-shell timeout after {timeout}s: {command}]"
     except asyncio.CancelledError:
-        await _finish_cancelled_process_stop(process)
+        if process.returncode is None:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+        try:
+            await _finish_process_communicate(process, communicate_task)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.debug(
+                "Inline-shell cleanup after cancellation failed",
+                exc_info=True,
+            )
         raise
     except Exception as exc:
-        await _stop_process(process)
+        if process.returncode is None:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+        try:
+            await _finish_process_communicate(process, communicate_task)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            pass
         return f"[inline-shell error: {exc}]"
 
     output = (stdout or b"").decode("utf-8", errors="replace").rstrip("\n")

@@ -304,16 +304,26 @@ async def _repair_bare_repo_dirs(store: Path) -> None:
                 )
 
 
-async def _finish_process_wait(process: asyncio.subprocess.Process) -> int:
-    """Reap one owned process before propagating caller cancellation."""
-    wait_task = asyncio.create_task(process.wait())
+async def _finish_process_communicate(
+    process: asyncio.subprocess.Process,
+    communicate_task: asyncio.Task[tuple[bytes | None, bytes | None]],
+) -> tuple[bytes | None, bytes | None]:
+    """Drain and reap one owned git process through repeated cancellation."""
+    async def drain_or_wait() -> tuple[bytes | None, bytes | None]:
+        try:
+            return await communicate_task
+        except BaseException:
+            await process.wait()
+            raise
+
+    cleanup_task = asyncio.create_task(drain_or_wait())
     cancellation: asyncio.CancelledError | None = None
     while True:
         try:
-            return_code = await asyncio.shield(wait_task)
+            output = await asyncio.shield(cleanup_task)
             break
         except asyncio.CancelledError as exc:  # noqa: ASYNC103 - re-raised below
-            if wait_task.cancelled():
+            if cleanup_task.cancelled():
                 raise
             if cancellation is None:
                 cancellation = exc
@@ -323,7 +333,7 @@ async def _finish_process_wait(process: asyncio.subprocess.Process) -> int:
             raise
     if cancellation is not None:
         raise cancellation
-    return return_code
+    return output
 
 
 async def _run_git(
@@ -367,9 +377,10 @@ async def _run_git(
             # conhost flash on Windows (no-op on POSIX).
             creationflags=windows_hide_flags(),
         )
+        communicate_task = asyncio.create_task(process.communicate())
         try:
             stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                process.communicate(),
+                asyncio.shield(communicate_task),
                 timeout=timeout,
             )
         except asyncio.CancelledError:
@@ -379,7 +390,7 @@ async def _run_git(
                 except ProcessLookupError:
                     pass
             try:
-                await _finish_process_wait(process)
+                await _finish_process_communicate(process, communicate_task)
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -391,7 +402,7 @@ async def _run_git(
                     process.kill()
                 except ProcessLookupError:
                     pass
-            await _finish_process_wait(process)
+            await _finish_process_communicate(process, communicate_task)
             msg = f"git timed out after {timeout}s: {' '.join(cmd)}"
             logger.error(msg)
             return False, "", msg
@@ -517,9 +528,10 @@ async def _init_store(store: Path, working_dir: str) -> Optional[str]:
             stdin=subprocess.DEVNULL,
             creationflags=windows_hide_flags(),
         )
+        communicate_task = asyncio.create_task(process.communicate())
         try:
             _, stderr_bytes = await asyncio.wait_for(
-                process.communicate(),
+                asyncio.shield(communicate_task),
                 timeout=_GIT_TIMEOUT,
             )
         except asyncio.CancelledError:
@@ -528,7 +540,7 @@ async def _init_store(store: Path, working_dir: str) -> Optional[str]:
                     process.kill()
                 except ProcessLookupError:
                     pass
-            await _finish_process_wait(process)
+            await _finish_process_communicate(process, communicate_task)
             raise
         except TimeoutError:
             if process.returncode is None:
@@ -536,7 +548,7 @@ async def _init_store(store: Path, working_dir: str) -> Optional[str]:
                     process.kill()
                 except ProcessLookupError:
                     pass
-            await _finish_process_wait(process)
+            await _finish_process_communicate(process, communicate_task)
             return f"Shadow store init failed: timed out after {_GIT_TIMEOUT}s"
         if process.returncode != 0:
             return (
