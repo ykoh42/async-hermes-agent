@@ -1784,6 +1784,55 @@ class AIAgent:
         """Forwarder — see ``agent.chat_completion_helpers.cleanup_task_resources``."""
         await _chat_completion_helpers.cleanup_task_resources(self, task_id)
 
+    # ------------------------------------------------------------------
+    # Background memory/skill review — prompts live in agent.background_review
+    # ------------------------------------------------------------------
+    from agent.background_review import (
+        _COMBINED_REVIEW_PROMPT,
+        _MEMORY_REVIEW_PROMPT,
+        _SKILL_REVIEW_PROMPT,
+    )
+
+    @staticmethod
+    def _summarize_background_review_actions(
+        review_messages: List[Dict],
+        prior_snapshot: List[Dict],
+        notification_mode: str = "on",
+    ) -> List[str]:
+        from agent.background_review import summarize_background_review_actions
+
+        return summarize_background_review_actions(
+            review_messages,
+            prior_snapshot,
+            notification_mode=notification_mode,
+        )
+
+    def _spawn_background_review(
+        self,
+        messages_snapshot: List[Dict],
+        review_memory: bool = False,
+        review_skills: bool = False,
+    ) -> None:
+        """Schedule the retained review fork as an owned native async task."""
+        from agent.background_review import spawn_background_review_thread
+
+        target, _prompt = spawn_background_review_thread(
+            self,
+            messages_snapshot,
+            review_memory=review_memory,
+            review_skills=review_skills,
+        )
+        review_task = asyncio.create_task(
+            target(),
+            name="hermes-background-review",
+        )
+        task_set = getattr(self, "_background_review_tasks", None)
+        if task_set is None:
+            task_set = set()
+            self._background_review_tasks = task_set
+        task_set.add(review_task)
+        review_task.add_done_callback(task_set.discard)
+
     def _build_memory_write_metadata(
         self,
         *,
@@ -4060,6 +4109,19 @@ class AIAgent:
             await asyncio.gather(*background_delegations, return_exceptions=True)
         if background_delegation_set is not None:
             background_delegation_set.clear()
+
+        background_review_set = getattr(self, "_background_review_tasks", None)
+        background_reviews = tuple(
+            task
+            for task in background_review_set or ()
+            if task is not current_task and not task.done()
+        )
+        for task in background_reviews:
+            task.cancel()
+        if background_reviews:
+            await asyncio.gather(*background_reviews, return_exceptions=True)
+        if background_review_set is not None:
+            background_review_set.clear()
 
         self._closed = True
 

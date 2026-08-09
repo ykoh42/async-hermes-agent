@@ -1593,6 +1593,17 @@ async def run_conversation(
             except Exception as _step_err:
                 logger.debug("step_callback error (iteration %s): %s", api_call_count, _step_err)
 
+        # Track model iterations for the retained background skill-review
+        # cadence. A successful skill_manage call resets this counter in the
+        # tool executor, matching upstream behavior.
+        if (
+            getattr(agent, "_skill_nudge_interval", 0) > 0
+            and "skill_manage" in getattr(agent, "valid_tool_names", ())
+        ):
+            agent._iters_since_skill = (
+                getattr(agent, "_iters_since_skill", 0) + 1
+            )
+
         # ── Pre-API-call /steer drain ──────────────────────────────────
         # If a /steer arrived during the previous API call (while the model
         # was thinking), drain it now — before we build api_messages — so

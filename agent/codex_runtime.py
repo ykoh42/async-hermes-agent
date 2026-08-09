@@ -830,6 +830,22 @@ async def run_codex_app_server_turn(
     usage_result = await _record_codex_app_server_usage(agent, turn)
     api_calls = 1
 
+    # The Codex app-server owns its internal tool loop, so mirror those
+    # projected tool iterations into the same skill-review cadence used by
+    # the default conversation loop.
+    agent._iters_since_skill = (
+        getattr(agent, "_iters_since_skill", 0)
+        + getattr(turn, "tool_iterations", 0)
+    )
+    should_review_skills = False
+    if (
+        getattr(agent, "_skill_nudge_interval", 0) > 0
+        and agent._iters_since_skill >= agent._skill_nudge_interval
+        and "skill_manage" in getattr(agent, "valid_tool_names", ())
+    ):
+        should_review_skills = True
+        agent._iters_since_skill = 0
+
     # External memory provider sync (mirrors line ~15439). Skipped on
     # interrupt/error to avoid feeding partial transcripts to memory.
     if not turn.interrupted and turn.error is None:
@@ -842,6 +858,20 @@ async def run_codex_app_server_turn(
             )
         except Exception:
             logger.debug("external memory sync raised", exc_info=True)
+
+    if (
+        turn.final_text
+        and not turn.interrupted
+        and (should_review_memory or should_review_skills)
+    ):
+        try:
+            agent._spawn_background_review(
+                messages_snapshot=list(messages),
+                review_memory=should_review_memory,
+                review_skills=should_review_skills,
+            )
+        except Exception:
+            logger.debug("background review spawn raised", exc_info=True)
 
     return {
         "final_response": turn.final_text,

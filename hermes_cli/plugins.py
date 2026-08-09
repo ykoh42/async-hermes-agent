@@ -34,6 +34,7 @@ so plugin-defined tools appear alongside the built-in tools.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import importlib.metadata
 import inspect
 import logging
@@ -1759,6 +1760,29 @@ def has_hook(hook_name: str) -> bool:
     return get_plugin_manager().has_hook(hook_name)
 
 
+_thread_tool_whitelist: contextvars.ContextVar[
+    tuple[Optional[Set[str]], str]
+] = contextvars.ContextVar(
+    "thread_tool_whitelist",
+    default=(None, "Tool '{tool_name}' denied"),
+)
+
+
+def set_thread_tool_whitelist(
+    allowed: Optional[Set[str]],
+    deny_msg_fmt: str = (
+        "Tool '{tool_name}' denied: not in this thread's tool whitelist"
+    ),
+) -> None:
+    """Restrict tool dispatch in the current native async context."""
+    _thread_tool_whitelist.set((allowed, deny_msg_fmt))
+
+
+def clear_thread_tool_whitelist() -> None:
+    """Clear the historical thread-scoped tool restriction."""
+    _thread_tool_whitelist.set((None, "Tool '{tool_name}' denied"))
+
+
 @dataclass(frozen=True)
 class _PreToolCallDirective:
     action: Optional[str] = None
@@ -1800,6 +1824,13 @@ async def _get_pre_tool_call_directive_details(
     middleware_trace: Optional[List[Dict[str, Any]]] = None,
 ) -> _PreToolCallDirective:
     """Check async ``pre_tool_call`` hooks for a policy directive."""
+    allowed, deny_msg_fmt = _thread_tool_whitelist.get()
+    if allowed is not None and tool_name not in allowed:
+        return _PreToolCallDirective(
+            action="block",
+            message=deny_msg_fmt.format(tool_name=tool_name),
+        )
+
     hook_results = await invoke_hook(
         "pre_tool_call",
         tool_name=tool_name,

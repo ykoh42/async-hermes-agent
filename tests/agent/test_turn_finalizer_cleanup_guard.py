@@ -43,6 +43,8 @@ class _StubAgent:
         self._response_was_previewed = False
         self._skill_nudge_interval = 0
         self._iters_since_skill = 0
+        self.valid_tool_names = set()
+        self.background_reviews = []
         for attr in (
             "session_input_tokens",
             "session_output_tokens",
@@ -95,6 +97,9 @@ class _StubAgent:
 
     def clear_interrupt(self):
         pass
+
+    def _spawn_background_review(self, **kwargs):
+        self.background_reviews.append(kwargs)
 
 
 async def _run(
@@ -161,3 +166,29 @@ async def test_clean_turn_has_no_cleanup_errors_key():
     assert result["final_response"] == "PARTIAL SUMMARY FROM MODEL"
     assert result["completed"] is False
     assert "cleanup_errors" not in result
+
+
+@pytest.mark.asyncio
+async def test_finalizer_triggers_background_skill_review_at_cadence():
+    agent = _StubAgent(raise_in=())
+    agent._skill_nudge_interval = 2
+    agent._iters_since_skill = 2
+    agent.valid_tool_names = {"skill_manage"}
+
+    result = await _run(
+        agent,
+        final_response="done",
+        api_call_count=1,
+        turn_exit_reason="text_response(stop)",
+    )
+
+    assert result["final_response"] == "done"
+    assert agent._iters_since_skill == 0
+    assert len(agent.background_reviews) == 1
+    review = agent.background_reviews[0]
+    assert review["review_memory"] is False
+    assert review["review_skills"] is True
+    assert review["messages_snapshot"][-1] == {
+        "role": "assistant",
+        "content": "done",
+    }

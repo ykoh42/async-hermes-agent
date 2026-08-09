@@ -632,6 +632,18 @@ async def finalize_turn(
     # Clear stream callback so it doesn't leak into future calls
     agent._stream_callback = None
 
+    # Check the skill trigger after this turn's model/tool iterations have
+    # been counted. The memory trigger is computed at turn start.
+    _should_review_skills = False
+    if (
+        getattr(agent, "_skill_nudge_interval", 0) > 0
+        and getattr(agent, "_iters_since_skill", 0)
+        >= agent._skill_nudge_interval
+        and "skill_manage" in getattr(agent, "valid_tool_names", ())
+    ):
+        _should_review_skills = True
+        agent._iters_since_skill = 0
+
     # External memory provider: sync the completed turn and warm recall for
     # the next turn. Interrupted/partial turns are intentionally excluded by
     # the helper so aborted state never becomes durable memory.
@@ -645,6 +657,22 @@ async def finalize_turn(
             interrupted=interrupted,
             messages=messages,
         )
+
+    # Preserve upstream's fire-after-response behavior: scheduling is
+    # immediate, while the owned native async task is drained on agent.close().
+    if (
+        final_response
+        and not interrupted
+        and (_should_review_memory or _should_review_skills)
+    ):
+        try:
+            agent._spawn_background_review(
+                messages_snapshot=list(messages),
+                review_memory=_should_review_memory,
+                review_skills=_should_review_skills,
+            )
+        except Exception:
+            logger.debug("background review spawn raised", exc_info=True)
 
     # Plugin hook: on_session_end
     # Fired at the very end of every run_conversation call.

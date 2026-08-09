@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 from typing import Any
@@ -37,7 +38,16 @@ async def test_provider_terminal_session_and_trajectory_form_one_async_chain(
             headers={"Content-Type": "text/event-stream"},
         )
         await response.prepare(request)
-        if len(requests) == 1:
+        if len(requests) in {1, 3}:
+            tool_name = "terminal" if len(requests) == 1 else "skills_list"
+            tool_arguments = (
+                {"command": "printf NATIVE_ASYNC_OBSERVATION"}
+                if tool_name == "terminal"
+                else {}
+            )
+            tool_call_id = (
+                "call-terminal" if tool_name == "terminal" else "call-skills"
+            )
             chunks = [
                 {
                     "id": "tool-request",
@@ -52,15 +62,11 @@ async def test_provider_terminal_session_and_trajectory_form_one_async_chain(
                                 "tool_calls": [
                                     {
                                         "index": 0,
-                                        "id": "call-terminal",
+                                        "id": tool_call_id,
                                         "type": "function",
                                         "function": {
-                                            "name": "terminal",
-                                            "arguments": json.dumps(
-                                                {
-                                                    "command": "printf NATIVE_ASYNC_OBSERVATION"
-                                                }
-                                            ),
+                                            "name": tool_name,
+                                            "arguments": json.dumps(tool_arguments),
                                         },
                                     }
                                 ],
@@ -95,7 +101,11 @@ async def test_provider_terminal_session_and_trajectory_form_one_async_chain(
                             "index": 0,
                             "delta": {
                                 "role": "assistant",
-                                "content": "NATIVE_ASYNC_FINAL",
+                                "content": (
+                                    "Nothing to save."
+                                    if len(requests) == 4
+                                    else "NATIVE_ASYNC_FINAL"
+                                ),
                             },
                             "finish_reason": None,
                         }
@@ -147,7 +157,7 @@ async def test_provider_terminal_session_and_trajectory_form_one_async_chain(
         base_url=f"http://127.0.0.1:{port}/v1",
         model="integration-model",
         max_iterations=4,
-        enabled_toolsets=["terminal"],
+        enabled_toolsets=["terminal", "skills"],
         quiet_mode=True,
         skip_context_files=True,
         skip_memory=True,
@@ -161,6 +171,8 @@ async def test_provider_terminal_session_and_trajectory_form_one_async_chain(
         # measures the provider → subprocess → persistence chain itself.
         await database.session_count()
         await env_probe.warm_environment_probe_async()
+        await agent._ensure_provider_runtime()
+        agent._skill_nudge_interval = 1
         async with (
             no_event_loop_blocking(action=LeakAction.RAISE, threshold=0.1),
             no_task_leaks(action=LeakAction.RAISE),
@@ -169,6 +181,9 @@ async def test_provider_terminal_session_and_trajectory_form_one_async_chain(
             result = await agent.run_conversation(
                 "Run the terminal command and use its observation."
             )
+            review_tasks = tuple(agent._background_review_tasks)
+            assert len(review_tasks) == 1
+            await asyncio.gather(*review_tasks)
             persisted = await database.get_messages(agent.session_id)
     finally:
         await agent.close()
@@ -185,7 +200,7 @@ async def test_provider_terminal_session_and_trajectory_form_one_async_chain(
     ]
     assert "NATIVE_ASYNC_OBSERVATION" in result["messages"][2]["content"]
 
-    assert len(requests) == 2
+    assert len(requests) == 4
     first_messages = requests[0]["messages"]
     second_messages = requests[1]["messages"]
     assert second_messages[: len(first_messages)] == first_messages
@@ -194,6 +209,20 @@ async def test_provider_terminal_session_and_trajectory_form_one_async_chain(
         "tool",
     ]
     assert second_messages[-1]["tool_call_id"] == "call-terminal"
+
+    review_first = requests[2]
+    review_second = requests[3]
+    assert review_first["messages"][0] == requests[0]["messages"][0]
+    assert review_first["tools"] == requests[0]["tools"]
+    assert review_first["messages"][-1]["role"] == "user"
+    assert review_first["messages"][-1]["content"].startswith(
+        "Review the conversation above and update the skill library"
+    )
+    assert [message["role"] for message in review_second["messages"][-2:]] == [
+        "assistant",
+        "tool",
+    ]
+    assert review_second["messages"][-1]["tool_call_id"] == "call-skills"
 
     assert [message["role"] for message in persisted] == [
         "user",

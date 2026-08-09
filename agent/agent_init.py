@@ -149,6 +149,14 @@ def _apply_runtime_config(agent: Any, config: Dict[str, Any]) -> None:
                 user_char_limit=memory_config.get("user_char_limit", 1375),
             )
 
+    skills_config = config.get("skills", {}) or {}
+    try:
+        agent._skill_nudge_interval = int(
+            skills_config.get("creation_nudge_interval", 10)
+        )
+    except (TypeError, ValueError):
+        agent._skill_nudge_interval = 10
+
     compression = config.get("compression", {}) or {}
     agent.compression_enabled = is_truthy_value(
         compression.get("enabled"), default=True
@@ -1224,6 +1232,7 @@ def init_agent(
     agent._delegate_depth = 0        # 0 = top-level agent, incremented for children
     agent._active_children = []      # Running child AIAgents (for interrupt propagation)
     agent._background_delegations: set[asyncio.Task] = set()
+    agent._background_review_tasks: set[asyncio.Task] = set()
     # Async-first runtime ownership. The lock binds to the event loop on first
     # use, keeping construction itself synchronous and side-effect free.
     agent._turn_lock = None
@@ -1844,6 +1853,7 @@ def init_agent(
     agent._memory_nudge_interval = 10
     agent._turns_since_memory = 0
     agent._iters_since_skill = 0
+    agent._skill_nudge_interval = 10
     agent._memory_manager = None
     agent._memory_manager_started = False
     # ``skip_memory`` suppresses the persistent store for isolated batch

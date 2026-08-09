@@ -111,6 +111,34 @@ async def test_codex_user_interrupt_is_reported_and_cleared():
 
 
 @pytest.mark.asyncio
+async def test_codex_tool_iterations_trigger_background_skill_review():
+    agent = _make_agent(session_db=None)
+    turn = _make_turn()
+    turn.tool_iterations = 2
+    agent._codex_session.run_turn.return_value = turn
+    agent._skill_nudge_interval = 2
+    agent.valid_tool_names = {"skill_manage"}
+
+    await run_codex_app_server_turn(
+        agent,
+        user_message="hello",
+        original_user_message="hello",
+        messages=[{"role": "user", "content": "hello"}],
+        effective_task_id="task-1",
+    )
+
+    assert agent._iters_since_skill == 0
+    agent._spawn_background_review.assert_called_once_with(
+        messages_snapshot=[
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "CODEX_ASSISTANT"},
+        ],
+        review_memory=False,
+        review_skills=True,
+    )
+
+
+@pytest.mark.asyncio
 async def test_codex_turn_persists_each_message_exactly_once():
     """The user turn (flushed at turn start) must not be duplicated; the
     projected assistant message must land once.  Uses a real SessionDB and the
