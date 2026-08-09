@@ -48,8 +48,16 @@ from agent.context_engine import (
     sanitize_memory_context,
 )
 from agent.model_metadata import estimate_request_tokens_rough
+from agent.session_activity import ActivityProvenance, normalize_activity_provenance
 
 logger = logging.getLogger(__name__)
+
+_TERMINAL_COMPRESSION_PROVENANCES = frozenset(
+    {
+        ActivityProvenance.AGENT_COMPRESSION_TIMEOUT,
+        ActivityProvenance.AGENT_COMPRESSION_COOLDOWN,
+    }
+)
 
 
 async def _finish_owned_cleanup(cleanup_task: asyncio.Task[Any]) -> Any:
@@ -917,10 +925,17 @@ def _supported_compression_kwargs(
 
 
 class _CompressionActivityHeartbeat:
-    """Event-loop heartbeat for the native async compression path."""
+    """Refresh activity while preserving upstream terminal-state ordering."""
 
-    def __init__(self, agent: Any, interval_seconds: float | None = None) -> None:
+    def __init__(
+        self,
+        agent: Any,
+        interval_seconds: float | None = None,
+        commit_fence: Optional[CompressionCommitFence] = None,
+    ) -> None:
         self._agent = agent
+        self._commit_fence = commit_fence
+        self._suppressed = False
         if interval_seconds is None:
             interval_seconds = getattr(
                 agent, "_compression_activity_heartbeat_interval", 60.0
@@ -935,7 +950,11 @@ class _CompressionActivityHeartbeat:
         self._task: asyncio.Task | None = None
 
     def start(self) -> "_CompressionActivityHeartbeat":
-        self._touch("context compression started")
+        self._suppressed = False
+        self._touch(
+            "context compression started",
+            allow_terminal_overwrite=True,
+        )
         self._task = asyncio.create_task(
             self._run(), name="compression-activity-heartbeat"
         )
@@ -945,24 +964,71 @@ class _CompressionActivityHeartbeat:
         task, self._task = self._task, None
         if task is not None:
             task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
-        self._touch(desc)
+            async def _collect() -> None:
+                await asyncio.gather(task, return_exceptions=True)
 
-    def _touch(self, desc: str) -> None:
+            await _finish_owned_cleanup(
+                asyncio.create_task(
+                    _collect(),
+                    name="compression-activity-heartbeat-stop",
+                )
+            )
+        if self._should_suppress():
+            return
+        self._touch(desc, force_persist=True)
+        drain = getattr(self._agent, "_drain_session_activity_persist", None)
+        if callable(drain):
+            result = drain()
+            if inspect.isawaitable(result):
+                await result
+
+    def _fence_cancelled(self) -> bool:
+        fence = self._commit_fence
+        return fence is not None and fence.is_cancelled
+
+    def _should_suppress(self) -> bool:
+        if self._suppressed:
+            return True
+        if self._fence_cancelled():
+            self._suppressed = True
+            return True
+        return False
+
+    def _touch(
+        self,
+        desc: str,
+        *,
+        allow_terminal_overwrite: bool = False,
+        force_persist: bool = False,
+    ) -> None:
         try:
+            if not allow_terminal_overwrite:
+                if self._should_suppress():
+                    return
+                current = normalize_activity_provenance(
+                    getattr(self._agent, "_last_activity_provenance", None)
+                )
+                if current in _TERMINAL_COMPRESSION_PROVENANCES:
+                    self._suppressed = True
+                    return
             touch = getattr(self._agent, "_touch_activity", None)
             if callable(touch):
-                touch(desc)
+                if not allow_terminal_overwrite and self._should_suppress():
+                    return
+                touch(
+                    desc,
+                    provenance=ActivityProvenance.AGENT_COMPRESSION,
+                    force_persist=force_persist,
+                )
         except Exception:
             logger.debug("compression activity heartbeat touch failed", exc_info=True)
 
     async def _run(self) -> None:
-        try:
-            while True:
-                await asyncio.sleep(self._interval_seconds)
-                self._touch("context compression in progress")
-        except asyncio.CancelledError:
-            raise
+        while True:
+            await asyncio.sleep(self._interval_seconds)
+            if self._should_suppress():
+                return
+            self._touch("context compression in progress")
 
 
 async def check_compression_model_feasibility(agent: Any) -> None:
@@ -2091,7 +2157,10 @@ async def compress_context(
                 )
 
         messages_before_compression = copy.deepcopy(messages)
-        _activity_heartbeat = _CompressionActivityHeartbeat(agent).start()
+        _activity_heartbeat = _CompressionActivityHeartbeat(
+            agent,
+            commit_fence=commit_fence,
+        ).start()
         # Publish forward progress to the commit fence while the summary LLM
         # call streams. Async hosts (gateway session hygiene) poll
         # ``commit_fence.seconds_since_progress()`` to extend their deadline

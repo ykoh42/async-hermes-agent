@@ -25,6 +25,7 @@ import aiosqlite
 
 from agent.memory_manager import sanitize_context
 from agent.message_sanitization import _sanitize_surrogates
+from agent.session_activity import ActivityProvenance
 from agent.skill_commands import describe_skill_invocation
 from hermes_constants import get_hermes_home
 from hermes_state_common import (
@@ -1147,6 +1148,7 @@ class SessionDB:
     """
 
     _WRITE_PATIENCE_S = 60.0
+    _ACTIVITY_WRITE_PATIENCE_S = 0.5
     _COMPRESSION_BUSY_WAIT_S = 5.0
     _WRITE_RETRY_MIN_S = 0.02
     _WRITE_RETRY_MAX_S = 0.15
@@ -2306,9 +2308,11 @@ class SessionDB:
         message = str(exc).lower()
         return "database is locked" in message or "database is busy" in message
 
-    async def _write(self, operation):
+    async def _write(self, operation, *, patience_s: Optional[float] = None):
         """Run one short transaction, yielding between SQLite lock retries."""
-        deadline = time.monotonic() + self._WRITE_PATIENCE_S
+        if patience_s is None:
+            patience_s = self._WRITE_PATIENCE_S
+        deadline = time.monotonic() + patience_s
         compression_deadline: Optional[float] = None
         delay = self._WRITE_RETRY_MIN_S
         while True:
@@ -2355,7 +2359,7 @@ class SessionDB:
                     raise sqlite3.OperationalError(
                         "database is locked by another Hermes process; "
                         "the database appears healthy but remained busy past "
-                        f"the {self._WRITE_PATIENCE_S:g}s write deadline"
+                        f"the {patience_s:g}s write deadline"
                     ) from exc
                 await asyncio.sleep(random.uniform(delay / 2, delay))
                 delay = min(delay * 2, self._WRITE_RETRY_MAX_S)
@@ -2948,6 +2952,92 @@ class SessionDB:
             )
         ).fetchone()
         return row["holder"] if row is not None else None
+
+    async def touch_session_activity(
+        self,
+        session_id: str,
+        ts: Optional[float] = None,
+        *,
+        description: Optional[str] = None,
+        provenance: Optional[ActivityProvenance] = None,
+    ) -> None:
+        """Stamp durable mid-turn activity without moving time backwards."""
+        if not session_id:
+            return
+        from agent.session_activity import (
+            bound_activity_description,
+            normalize_activity_provenance,
+        )
+
+        when = float(ts if ts is not None else time.time())
+        desc = bound_activity_description(description)
+        prov = normalize_activity_provenance(provenance).value
+
+        async def _touch(connection):
+            await connection.execute(
+                "UPDATE sessions SET "
+                "last_activity_at = ?, "
+                "last_activity_description = ?, "
+                "last_activity_provenance = ? "
+                "WHERE id = ? AND (last_activity_at IS NULL OR last_activity_at < ?)",
+                (when, desc, prov, session_id, when),
+            )
+
+        await self._write(
+            _touch,
+            patience_s=self._ACTIVITY_WRITE_PATIENCE_S,
+        )
+
+    async def clear_session_activity_labels(self, session_id: str) -> None:
+        """Clear mid-turn labels while preserving the activity timestamp."""
+        if not session_id:
+            return
+
+        connection = await self._get_connection()
+        row = await (
+            await connection.execute(
+                "SELECT last_activity_description, last_activity_provenance "
+                "FROM sessions WHERE id = ?",
+                (session_id,),
+            )
+        ).fetchone()
+        if row is not None and not row["last_activity_description"] and (
+            not row["last_activity_provenance"]
+            or row["last_activity_provenance"] == ActivityProvenance.UNKNOWN.value
+        ):
+            return
+
+        async def _clear(connection):
+            await connection.execute(
+                "UPDATE sessions SET "
+                "last_activity_description = ?, "
+                "last_activity_provenance = ? "
+                "WHERE id = ?",
+                ("", ActivityProvenance.UNKNOWN.value, session_id),
+            )
+
+        await self._write(
+            _clear,
+            patience_s=self._ACTIVITY_WRITE_PATIENCE_S,
+        )
+
+    async def get_session_activity(
+        self,
+        session_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Return the durable activity snapshot for *session_id*, or None."""
+        if not session_id:
+            return None
+        row = await self.get_session(session_id)
+        if not row:
+            return None
+        from agent.session_activity import build_activity_snapshot
+
+        return build_activity_snapshot(
+            last_activity_at=row.get("last_activity_at"),
+            last_activity_description=row.get("last_activity_description"),
+            last_activity_provenance=row.get("last_activity_provenance"),
+        )
 
     async def archive_and_compact(
         self,

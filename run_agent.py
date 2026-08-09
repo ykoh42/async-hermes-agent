@@ -158,6 +158,7 @@ from agent.memory_manager import sanitize_context
 from agent.error_classifier import FailoverReason
 from agent.redact import redact_sensitive_text
 from agent.message_content import flatten_message_text
+from agent.session_activity import ActivityProvenance
 from agent.model_metadata import (
     estimate_request_tokens_rough,  # noqa: F401  # re-exported for tests that mock.patch("run_agent.estimate_request_tokens_rough")
     is_local_endpoint,
@@ -1063,6 +1064,11 @@ class AIAgent:
             from agent.conversation_compression import (
                 CONTEXT_OVERFLOW_BLOCKED_WARNING_TEMPLATE,
             )
+            if _warn_kind in ("cooldown", "ineffective"):
+                self._touch_activity(
+                    f"compression blocked ({reason})",
+                    provenance=ActivityProvenance.AGENT_COMPRESSION_COOLDOWN,
+                )
             self._emit_warning(
                 CONTEXT_OVERFLOW_BLOCKED_WARNING_TEMPLATE.format(
                     tokens=preflight_tokens,
@@ -3449,10 +3455,128 @@ class AIAgent:
         from agent.agent_runtime_helpers import apply_pending_steer_to_tool_results
         return apply_pending_steer_to_tool_results(self, messages, num_tool_msgs)
 
-    def _touch_activity(self, desc: str) -> None:
-        """Update the last-activity timestamp and description."""
+    def _touch_activity(
+        self,
+        desc: str,
+        *,
+        provenance: Optional[ActivityProvenance] = None,
+        force_persist: bool = False,
+    ) -> None:
+        """Update activity state and queue its native-async DB projection."""
+        from agent.session_activity import (
+            bound_activity_description,
+            normalize_activity_provenance,
+            reset_session_activity_persist_window,
+        )
+
         self._last_activity_ts = time.time()
-        self._last_activity_desc = desc
+        self._last_activity_desc = bound_activity_description(desc)
+        self._last_activity_provenance = normalize_activity_provenance(provenance)
+        if force_persist:
+            reset_session_activity_persist_window(self)
+        self._persist_session_activity_if_due()
+
+    def _persist_session_activity_if_due(self) -> None:
+        """Queue one best-effort activity write at the upstream cadence."""
+        session_id = getattr(self, "session_id", None)
+        session_db = getattr(self, "_session_db", None)
+        if not session_id or session_db is None:
+            return
+        touch = getattr(session_db, "touch_session_activity", None)
+        if not callable(touch) or not inspect.iscoroutinefunction(
+            inspect.unwrap(touch)
+        ):
+            if callable(touch):
+                logger.error(
+                    "Session activity persistence requires a native async "
+                    "touch_session_activity() implementation"
+                )
+            return
+        from agent.session_activity import (
+            SESSION_ACTIVITY_HEARTBEAT_MIN_INTERVAL_SECONDS,
+            normalize_activity_provenance,
+        )
+
+        now_mono = time.monotonic()
+        last_mono = getattr(self, "_session_activity_last_persist_mono", 0.0)
+        if (
+            now_mono - last_mono
+        ) < SESSION_ACTIVITY_HEARTBEAT_MIN_INTERVAL_SECONDS:
+            return
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            logger.debug("session activity heartbeat has no running event loop")
+            return
+
+        self._session_activity_last_persist_mono = now_mono
+        previous = getattr(self, "_session_activity_persist_task", None)
+        timestamp = getattr(self, "_last_activity_ts", None)
+        description = getattr(self, "_last_activity_desc", None)
+        activity_provenance = normalize_activity_provenance(
+            getattr(self, "_last_activity_provenance", None)
+        )
+
+        async def _persist() -> None:
+            if previous is not None and previous is not asyncio.current_task():
+                await asyncio.gather(previous, return_exceptions=True)
+            try:
+                await touch(
+                    session_id,
+                    timestamp,
+                    description=description,
+                    provenance=activity_provenance,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.debug(
+                    "session activity heartbeat write failed (ignored)",
+                    exc_info=True,
+                )
+
+        self._session_activity_persist_task = asyncio.create_task(
+            _persist(),
+            name=f"session-activity:{session_id}",
+        )
+
+    async def _drain_session_activity_persist(self) -> None:
+        """Collect the latest queued activity write in publication order."""
+        task = getattr(self, "_session_activity_persist_task", None)
+        if task is None or task is asyncio.current_task():
+            return
+        await _finish_owned_task(task)
+        if getattr(self, "_session_activity_persist_task", None) is task:
+            self._session_activity_persist_task = None
+
+    async def _reset_activity_labels_after_turn(self) -> None:
+        """Clear mid-turn labels without moving the activity timestamp."""
+        self._last_activity_desc = ""
+        self._last_activity_provenance = ActivityProvenance.UNKNOWN
+        await self._drain_session_activity_persist()
+        session_id = getattr(self, "session_id", None)
+        session_db = getattr(self, "_session_db", None)
+        if not session_id or session_db is None:
+            return
+        clear = getattr(session_db, "clear_session_activity_labels", None)
+        if not callable(clear) or not inspect.iscoroutinefunction(
+            inspect.unwrap(clear)
+        ):
+            if callable(clear):
+                logger.error(
+                    "Session activity cleanup requires a native async "
+                    "clear_session_activity_labels() implementation"
+                )
+            return
+        try:
+            await clear(session_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.debug(
+                "session activity label clear failed (ignored)",
+                exc_info=True,
+            )
 
     def _capture_rate_limits(self, http_response: Any) -> None:
         """Parse x-ratelimit-* headers from an HTTP response and cache the state.
@@ -3660,20 +3784,28 @@ class AIAgent:
     def get_activity_summary(self) -> dict:
         """Return a snapshot of the agent's current activity for diagnostics.
 
-        Called by the gateway timeout handler to report what the agent was doing
-        when it was killed, and by the periodic "still working" notifications.
+        Includes the upstream durable activity field names and compatibility
+        aliases used by existing consumers.
         """
-        elapsed = time.time() - self._last_activity_ts
-        return {
-            "last_activity_ts": self._last_activity_ts,
-            "last_activity_desc": self._last_activity_desc,
-            "seconds_since_activity": round(elapsed, 1),
-            "current_tool": self._current_tool,
-            "api_call_count": self._api_call_count,
-            "max_iterations": self.max_iterations,
-            "budget_used": self.iteration_budget.used,
-            "budget_max": self.iteration_budget.max_total,
-        }
+        from agent.session_activity import build_activity_snapshot
+
+        return build_activity_snapshot(
+            last_activity_at=getattr(self, "_last_activity_ts", None),
+            last_activity_description=getattr(self, "_last_activity_desc", None)
+            or "",
+            last_activity_provenance=getattr(
+                self,
+                "_last_activity_provenance",
+                ActivityProvenance.UNKNOWN,
+            ),
+            extra={
+                "current_tool": self._current_tool,
+                "api_call_count": self._api_call_count,
+                "max_iterations": self.max_iterations,
+                "budget_used": self.iteration_budget.used,
+                "budget_max": self.iteration_budget.max_total,
+            },
+        )
 
     async def shutdown_memory_provider(self, messages: list = None) -> None:
         """Shut down memory and context providers at a real session boundary."""
@@ -4074,6 +4206,7 @@ class AIAgent:
         # must leave it open). end_session() is first-reason-wins and no-ops on
         # an already-ended row, so this never clobbers a 'compression' /
         # 'cron_complete' / 'cli_close' reason set by an earlier terminal path.
+        await self._drain_session_activity_persist()
         try:
             if getattr(self, "_end_session_on_close", True):
                 session_db = self._session_db
@@ -6571,7 +6704,10 @@ class AIAgent:
                 touch = getattr(self, "_touch_activity", None)
                 if callable(touch):
                     try:
-                        touch("context compression timed out")
+                        touch(
+                            "context compression timed out",
+                            provenance=ActivityProvenance.AGENT_COMPRESSION_TIMEOUT,
+                        )
                     except Exception:
                         logger.debug(
                             "compress_context timeout activity touch failed",
@@ -6841,7 +6977,15 @@ class AIAgent:
                 reset_conversation_context(token)
             if getattr(self, "_active_turn_task", None) is asyncio.current_task():
                 self._active_turn_task = None
-            turn_lock.release()
+            try:
+                await _finish_owned_task(
+                    asyncio.create_task(
+                        self._reset_activity_labels_after_turn(),
+                        name="session-activity-turn-reset",
+                    )
+                )
+            finally:
+                turn_lock.release()
 
     async def chat(self, message: str, stream_callback: Optional[callable] = None) -> str:
         """
