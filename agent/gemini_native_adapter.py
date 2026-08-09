@@ -16,6 +16,7 @@ OpenAI-compat layer entirely.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import logging
@@ -46,6 +47,27 @@ DEFAULT_GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 # internal default and truncates output (unlike OpenAI-compat endpoints where
 # an omitted limit means full budget).
 GEMINI_DEFAULT_MAX_OUTPUT_TOKENS = 65535
+
+
+async def _finish_owned_task(task: asyncio.Task[Any]) -> Any:
+    """Finish one Gemini-owned task through repeated caller cancellation."""
+    cancellation: asyncio.CancelledError | None = None
+    while True:
+        try:
+            result = await asyncio.shield(task)
+            break
+        except asyncio.CancelledError as exc:  # noqa: ASYNC103 - re-raised below
+            if task.cancelled():
+                raise
+            if cancellation is None:
+                cancellation = exc
+        except Exception as exc:
+            if cancellation is not None:
+                raise cancellation from exc
+            raise
+    if cancellation is not None:
+        raise cancellation
+    return result
 
 
 def bare_gemini_model_id(model: str) -> str:
@@ -867,7 +889,11 @@ class GeminiNativeClient:
     async def close(self) -> None:
         self.is_closed = True
         try:
-            await self._http.aclose()
+            close_task = asyncio.create_task(
+                self._http.aclose(),
+                name="gemini-native-http-close",
+            )
+            await _finish_owned_task(close_task)
         except Exception:
             pass
 

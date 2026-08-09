@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from types import SimpleNamespace
 
@@ -159,6 +160,35 @@ async def test_native_client_uses_x_goog_api_key_and_native_models_endpoint(monk
     assert client.is_closed is True
 
 
+@pytest.mark.asyncio
+async def test_native_client_close_finishes_through_repeated_cancellation():
+    from agent.gemini_native_adapter import GeminiNativeClient
+
+    close_started = asyncio.Event()
+    allow_close = asyncio.Event()
+
+    class BlockingHTTP:
+        async def aclose(self):
+            close_started.set()
+            await allow_close.wait()
+
+    client = GeminiNativeClient(api_key="AIza-test", http_client=BlockingHTTP())
+    close_task = asyncio.create_task(client.close())
+    await close_started.wait()
+    close_task.cancel()
+    await asyncio.sleep(0)
+    close_task.cancel()
+
+    await asyncio.sleep(0)
+    assert close_task.done() is False
+
+    allow_close.set()
+    with pytest.raises(asyncio.CancelledError):
+        await close_task
+
+    assert client.is_closed is True
+
+
 
 
 
@@ -233,7 +263,6 @@ def test_stream_event_translation_emits_tool_call_delta_with_stable_index():
 # ---------------------------------------------------------------------------
 # X-Goog-Api-Client header tests
 # ---------------------------------------------------------------------------
-
 
 
 
