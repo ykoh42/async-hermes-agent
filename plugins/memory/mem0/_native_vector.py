@@ -12,6 +12,7 @@ from typing import Any
 from pydantic import BaseModel
 
 from ._native_oss import _finish_cleanup
+from ._native_sparse import NativeSparseEncoder, SparseEncoding
 
 logger = logging.getLogger(__name__)
 
@@ -175,6 +176,7 @@ class Qdrant:
         self._initialize_lock = asyncio.Lock()
         self._closed = False
         self._has_bm25_slot = False
+        self._bm25_encoder = NativeSparseEncoder()
 
     @property
     def has_bm25_slot(self) -> bool:
@@ -243,6 +245,14 @@ class Qdrant:
             info = await client.get_collection(self.collection_name)
             sparse = info.config.params.sparse_vectors
             self._has_bm25_slot = bool(sparse and "bm25" in sparse)
+            if not self._has_bm25_slot:
+                logger.warning(
+                    "Collection '%s' predates v3 hybrid search (no 'bm25' "
+                    "sparse slot). BM25 keyword scoring will be disabled for "
+                    "this collection; semantic search works normally. To "
+                    "enable hybrid search, use a fresh collection.",
+                    self.collection_name,
+                )
         else:
             await client.create_collection(
                 collection_name=self.collection_name,
@@ -289,14 +299,52 @@ class Qdrant:
         ids: builtins.list[Any] | None = None,
     ) -> None:
         client = await self._get_client()
+        sparse_vectors: builtins.list[Any | None] = [None] * len(vectors)
+        if self._has_bm25_slot and payloads:
+            texts: builtins.list[str] = []
+            text_indices: builtins.list[int] = []
+            for index, payload in enumerate(payloads):
+                text = payload.get("text_lemmatized") or payload.get("data", "")
+                if text:
+                    texts.append(text)
+                    text_indices.append(index)
+            if texts:
+                try:
+                    encodings = await self._bm25_encoder.encode_batch(texts)
+                    if encodings is not None:
+                        if len(encodings) != len(texts):
+                            logger.warning(
+                                "BM25 batch returned %s results for %s texts; "
+                                "falling back to per-row encoding",
+                                len(encodings),
+                                len(texts),
+                            )
+                            raise ValueError("count mismatch")
+                        for index, encoding in zip(
+                            text_indices,
+                            encodings,
+                            strict=True,
+                        ):
+                            sparse_vectors[index] = self._sparse_vector(encoding)
+                except Exception as exc:
+                    logger.debug(
+                        "Batch BM25 encoding failed, falling back to per-row: %s",
+                        exc,
+                    )
+                    for index, text in zip(text_indices, texts, strict=True):
+                        sparse_vectors[index] = await self._encode_bm25(text)
+
         points = []
         for index, vector in enumerate(vectors):
             payload = payloads[index] if payloads else {}
             point_id = index if ids is None else ids[index]
+            named_vectors: dict[str, Any] = {"": vector}
+            if self._has_bm25_slot and sparse_vectors[index] is not None:
+                named_vectors["bm25"] = sparse_vectors[index]
             points.append(
                 self._models.PointStruct(
                     id=point_id,
-                    vector={"": vector},
+                    vector=named_vectors,
                     payload=payload,
                 )
             )
@@ -355,14 +403,43 @@ class Qdrant:
                 for query, vector in zip(queries, vectors_list, strict=False)
             ]
 
+    def _sparse_vector(self, encoding: SparseEncoding) -> Any:
+        indices, values = encoding
+        return self._models.SparseVector(indices=indices, values=values)
+
+    async def _encode_bm25(self, text: str) -> Any | None:
+        try:
+            encodings = await self._bm25_encoder.encode_batch([text])
+            if encodings:
+                return self._sparse_vector(encodings[0])
+        except Exception as exc:
+            logger.debug("BM25 encoding failed: %s", exc)
+        return None
+
     async def keyword_search(
         self,
-        query: str,  # noqa: ARG002
-        top_k: int = 5,  # noqa: ARG002
-        filters: dict[str, Any] | None = None,  # noqa: ARG002
-    ) -> None:
-        await self._get_client()
-        return None
+        query: str,
+        top_k: int = 5,
+        filters: dict[str, Any] | None = None,
+    ) -> builtins.list[Any] | None:
+        client = await self._get_client()
+        if not self._has_bm25_slot:
+            return None
+        sparse_query = await self._encode_bm25(query)
+        if sparse_query is None:
+            return None
+        try:
+            response = await client.query_points(
+                collection_name=self.collection_name,
+                query=sparse_query,
+                using="bm25",
+                query_filter=self._create_filter(filters),
+                limit=top_k,
+            )
+            return response.points
+        except Exception as exc:
+            logger.debug("BM25 keyword search failed: %s", exc)
+            return None
 
     async def delete(self, vector_id: Any) -> None:
         client = await self._get_client()
@@ -379,12 +456,19 @@ class Qdrant:
     ) -> None:
         client = await self._get_client()
         if vector is not None and payload is not None:
+            named_vectors: dict[str, Any] = {"": vector}
+            if self._has_bm25_slot:
+                text = payload.get("text_lemmatized") or payload.get("data", "")
+                if text:
+                    sparse = await self._encode_bm25(text)
+                    if sparse is not None:
+                        named_vectors["bm25"] = sparse
             await client.upsert(
                 collection_name=self.collection_name,
                 points=[
                     self._models.PointStruct(
                         id=vector_id,
-                        vector={"": vector},
+                        vector=named_vectors,
                         payload=payload,
                     )
                 ],
@@ -445,13 +529,26 @@ class Qdrant:
                 return
             self._closed = True
             client = self._client
+            encoder = self._bm25_encoder
             self._client = None
             self._models = None
+            close_tasks = [asyncio.create_task(encoder.close())]
             if client is not None:
-                await _finish_cleanup(
-                    client.close(),
-                    error_message="Mem0 Qdrant cleanup failed during cancellation",
-                )
+                close_tasks.append(asyncio.create_task(client.close()))
+            close_group = asyncio.gather(*close_tasks, return_exceptions=True)
+            try:
+                results = await asyncio.shield(close_group)
+            except asyncio.CancelledError:
+                results = await close_group
+                for result in results:
+                    if isinstance(result, Exception):
+                        logger.error("Mem0 Qdrant cleanup failed: %s", result)
+                raise
+            errors = [
+                result for result in results if isinstance(result, BaseException)
+            ]
+            if errors:
+                raise errors[0]
 
 
 class PGVector:

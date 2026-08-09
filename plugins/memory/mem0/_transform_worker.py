@@ -2,9 +2,34 @@
 
 from __future__ import annotations
 
+import importlib
 import json
 import sys
 from typing import Any
+
+_bm25_encoder: Any = None
+_bm25_unavailable = False
+
+
+def _encode_bm25_batch(texts: list[str]) -> list[dict[str, Any]] | None:
+    global _bm25_encoder, _bm25_unavailable
+    if _bm25_unavailable:
+        return None
+    if _bm25_encoder is None:
+        try:
+            fastembed = importlib.import_module("fastembed")
+            _bm25_encoder = fastembed.SparseTextEmbedding(model_name="Qdrant/bm25")
+        except Exception:
+            _bm25_unavailable = True
+            return None
+
+    return [
+        {
+            "indices": sparse.indices.tolist(),
+            "values": sparse.values.tolist(),
+        }
+        for sparse in _bm25_encoder.embed(texts)
+    ]
 
 
 def _execute(request: dict[str, Any]) -> Any:
@@ -21,6 +46,8 @@ def _execute(request: dict[str, Any]) -> Any:
         from mem0.utils.entity_extraction import extract_entities_batch
 
         return extract_entities_batch(request["texts"])
+    if operation == "encode_bm25_batch":
+        return _encode_bm25_batch(request["texts"])
     raise ValueError(f"Unsupported Mem0 transform operation: {operation}")
 
 
