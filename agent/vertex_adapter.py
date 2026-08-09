@@ -73,6 +73,38 @@ async def _finish_process_wait(process: asyncio.subprocess.Process) -> int:
     return return_code
 
 
+async def _finish_process_communicate(
+    process: asyncio.subprocess.Process,
+    communicate_task: asyncio.Task[tuple[bytes | None, bytes | None]],
+) -> tuple[bytes | None, bytes | None]:
+    """Drain pipes and reap one owned gcloud process."""
+    async def drain_or_wait() -> tuple[bytes | None, bytes | None]:
+        try:
+            return await communicate_task
+        except BaseException:
+            await _finish_process_wait(process)
+            raise
+
+    cleanup_task = asyncio.create_task(drain_or_wait())
+    cancellation: asyncio.CancelledError | None = None
+    while True:
+        try:
+            output = await asyncio.shield(cleanup_task)
+            break
+        except asyncio.CancelledError as exc:  # noqa: ASYNC103 - re-raised below
+            if cleanup_task.cancelled():
+                raise
+            if cancellation is None:
+                cancellation = exc
+        except Exception as exc:
+            if cancellation is not None:
+                raise cancellation from exc
+            raise
+    if cancellation is not None:
+        raise cancellation
+    return output
+
+
 def _cache_lock() -> asyncio.Lock:
     loop = asyncio.get_running_loop()
     lock = _cache_locks.get(loop)
@@ -186,17 +218,20 @@ async def _gcloud_project_id() -> Optional[str]:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
         )
+        communicate_task = asyncio.create_task(process.communicate())
         try:
-            stdout, _ = await asyncio.wait_for(process.communicate(), timeout=5.0)
+            stdout, _ = await asyncio.wait_for(
+                asyncio.shield(communicate_task), timeout=5.0
+            )
         except asyncio.CancelledError:
             if process.returncode is None:
                 process.kill()
-            await _finish_process_wait(process)
+            await _finish_process_communicate(process, communicate_task)
             raise
         except TimeoutError:
             if process.returncode is None:
                 process.kill()
-            await _finish_process_wait(process)
+            await _finish_process_communicate(process, communicate_task)
             return None
     except (FileNotFoundError, OSError):
         return None

@@ -144,9 +144,8 @@ async def test_gcloud_probe_reaps_process_through_repeated_cancellation(
     vertex_adapter, monkeypatch
 ):
     communicate_started = asyncio.Event()
-    wait_started = asyncio.Event()
-    release_wait = asyncio.Event()
-    wait_completed = asyncio.Event()
+    release_communicate = asyncio.Event()
+    communicate_completed = asyncio.Event()
 
     class BlockingProcess:
         returncode = None
@@ -154,12 +153,12 @@ async def test_gcloud_probe_reaps_process_through_repeated_cancellation(
 
         async def communicate(self):
             communicate_started.set()
-            await asyncio.Event().wait()
+            await release_communicate.wait()
+            communicate_completed.set()
+            self.returncode = -9
+            return b"", None
 
         async def wait(self):
-            wait_started.set()
-            await release_wait.wait()
-            wait_completed.set()
             return self.returncode
 
         def kill(self):
@@ -176,15 +175,16 @@ async def test_gcloud_probe_reaps_process_through_repeated_cancellation(
     task = asyncio.create_task(vertex_adapter._gcloud_project_id())
     await communicate_started.wait()
     task.cancel()
-    await wait_started.wait()
+    while not process.killed:
+        await asyncio.sleep(0)
     task.cancel()
     await asyncio.sleep(0)
 
     assert task.done() is False
-    release_wait.set()
+    release_communicate.set()
     with pytest.raises(asyncio.CancelledError):
         await task
-    assert wait_completed.is_set()
+    assert communicate_completed.is_set()
     assert process.killed is True
 
 

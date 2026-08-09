@@ -391,6 +391,38 @@ async def _finish_process_wait(process: asyncio.subprocess.Process) -> int:
     return return_code
 
 
+async def _finish_process_communicate(
+    process: asyncio.subprocess.Process,
+    communicate_task: asyncio.Task[tuple[bytes | None, bytes | None]],
+) -> tuple[bytes | None, bytes | None]:
+    """Drain pipes and reap one owned Anthropic helper process."""
+    async def drain_or_wait() -> tuple[bytes | None, bytes | None]:
+        try:
+            return await communicate_task
+        except BaseException:
+            await _finish_process_wait(process)
+            raise
+
+    cleanup_task = asyncio.create_task(drain_or_wait())
+    cancellation: asyncio.CancelledError | None = None
+    while True:
+        try:
+            output = await asyncio.shield(cleanup_task)
+            break
+        except asyncio.CancelledError as exc:  # noqa: ASYNC103 - re-raised below
+            if cleanup_task.cancelled():
+                raise
+            if cancellation is None:
+                cancellation = exc
+        except Exception as exc:
+            if cancellation is not None:
+                raise cancellation from exc
+            raise
+    if cancellation is not None:
+        raise cancellation
+    return output
+
+
 async def _detect_claude_code_version() -> str:
     """Detect the installed Claude Code version through async subprocess I/O.
 
@@ -414,12 +446,15 @@ async def _detect_claude_code_version() -> str:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.DEVNULL,
             )
+            communicate_task = asyncio.create_task(process.communicate())
             try:
-                stdout, _ = await asyncio.wait_for(process.communicate(), timeout=5)
+                stdout, _ = await asyncio.wait_for(
+                    asyncio.shield(communicate_task), timeout=5
+                )
             except (asyncio.CancelledError, TimeoutError):
                 if process.returncode is None:
                     process.kill()
-                await _finish_process_wait(process)
+                await _finish_process_communicate(process, communicate_task)
                 raise
             if process.returncode == 0 and stdout.strip():
                 # Output is like "2.1.74 (Claude Code)" or just "2.1.74".
@@ -1029,12 +1064,15 @@ async def _read_claude_code_credentials_from_keychain() -> Optional[Dict[str, An
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
         )
+        communicate_task = asyncio.create_task(process.communicate())
         try:
-            stdout, _ = await asyncio.wait_for(process.communicate(), timeout=5)
+            stdout, _ = await asyncio.wait_for(
+                asyncio.shield(communicate_task), timeout=5
+            )
         except (asyncio.CancelledError, TimeoutError):
             if process.returncode is None:
                 process.kill()
-            await _finish_process_wait(process)
+            await _finish_process_communicate(process, communicate_task)
             raise
     except (OSError, TimeoutError):
         logger.debug("Keychain: security command not available or timed out")

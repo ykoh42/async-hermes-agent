@@ -73,20 +73,19 @@ class TestResolveToken:
         from hermes_cli import copilot_auth
 
         communicate_started = asyncio.Event()
-        wait_started = asyncio.Event()
-        release_wait = asyncio.Event()
-        wait_completed = asyncio.Event()
+        release_communicate = asyncio.Event()
+        communicate_completed = asyncio.Event()
         process = Mock(returncode=None)
 
         async def communicate():
             communicate_started.set()
-            await asyncio.Event().wait()
+            await release_communicate.wait()
+            communicate_completed.set()
+            process.returncode = -9
+            return b"", b""
 
         async def wait():
-            wait_started.set()
-            await release_wait.wait()
-            wait_completed.set()
-            return 0
+            return process.returncode
 
         process.communicate = communicate
         process.wait = wait
@@ -105,17 +104,18 @@ class TestResolveToken:
         task = asyncio.create_task(copilot_auth._try_gh_cli_token())
         await communicate_started.wait()
         task.cancel()
-        await wait_started.wait()
+        while not process.kill.called:
+            await asyncio.sleep(0)
         task.cancel()
         await asyncio.sleep(0)
 
         assert task.done() is False
-        release_wait.set()
+        release_communicate.set()
         with pytest.raises(asyncio.CancelledError):
             await task
 
         process.kill.assert_called_once()
-        assert wait_completed.is_set()
+        assert communicate_completed.is_set()
 
     @pytest.mark.asyncio
     async def test_all_env_vars_invalid_skips_gh_cli_fallback(self, monkeypatch):

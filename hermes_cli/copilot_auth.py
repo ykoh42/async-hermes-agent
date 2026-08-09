@@ -75,6 +75,38 @@ async def _finish_process_wait(process: asyncio.subprocess.Process) -> int:
     return return_code
 
 
+async def _finish_process_communicate(
+    process: asyncio.subprocess.Process,
+    communicate_task: asyncio.Task[tuple[bytes | None, bytes | None]],
+) -> tuple[bytes | None, bytes | None]:
+    """Drain pipes and reap one owned gh process."""
+    async def drain_or_wait() -> tuple[bytes | None, bytes | None]:
+        try:
+            return await communicate_task
+        except BaseException:
+            await _finish_process_wait(process)
+            raise
+
+    cleanup_task = asyncio.create_task(drain_or_wait())
+    cancellation: asyncio.CancelledError | None = None
+    while True:
+        try:
+            output = await asyncio.shield(cleanup_task)
+            break
+        except asyncio.CancelledError as exc:  # noqa: ASYNC103 - re-raised below
+            if cleanup_task.cancelled():
+                raise
+            if cancellation is None:
+                cancellation = exc
+        except Exception as exc:
+            if cancellation is not None:
+                raise cancellation from exc
+            raise
+    if cancellation is not None:
+        raise cancellation
+    return output
+
+
 def validate_copilot_token(token: str) -> tuple[bool, str]:
     """Validate that a token is usable with the Copilot API.
 
@@ -179,6 +211,7 @@ async def _try_gh_cli_token() -> Optional[str]:
         if hostname:
             cmd += ["--hostname", hostname]
         process = None
+        communicate_task = None
         try:
             process = await asyncio.create_subprocess_exec(
                 *cmd,
@@ -186,17 +219,20 @@ async def _try_gh_cli_token() -> Optional[str]:
                 stderr=asyncio.subprocess.PIPE,
                 env=clean_env,
             )
-            stdout, _ = await asyncio.wait_for(process.communicate(), timeout=5)
+            communicate_task = asyncio.create_task(process.communicate())
+            stdout, _ = await asyncio.wait_for(
+                asyncio.shield(communicate_task), timeout=5
+            )
         except asyncio.TimeoutError:
             process.kill()
-            await _finish_process_wait(process)
+            await _finish_process_communicate(process, communicate_task)
             logger.debug("gh CLI token lookup timed out (%s)", gh_path)
             continue
         except asyncio.CancelledError:
             if process is not None and process.returncode is None:
                 process.kill()
-            if process is not None:
-                await _finish_process_wait(process)
+            if process is not None and communicate_task is not None:
+                await _finish_process_communicate(process, communicate_task)
             raise
         except FileNotFoundError as exc:
             logger.debug("gh CLI token lookup failed (%s): %s", gh_path, exc)

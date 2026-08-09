@@ -61,6 +61,58 @@ async def test_claude_code_version_probe_uses_async_subprocess(monkeypatch):
         adapter._claude_code_version_cache = None
 
 
+async def test_claude_code_version_probe_drains_on_repeated_cancellation(
+    monkeypatch,
+):
+    import agent.anthropic_adapter as adapter
+
+    communicate_started = asyncio.Event()
+    release_communicate = asyncio.Event()
+    communicate_completed = asyncio.Event()
+
+    class BlockingProcess:
+        returncode = None
+        killed = False
+
+        async def communicate(self):
+            communicate_started.set()
+            await release_communicate.wait()
+            communicate_completed.set()
+            self.returncode = -9
+            return b"", None
+
+        async def wait(self):
+            return self.returncode
+
+        def kill(self):
+            self.killed = True
+
+    process = BlockingProcess()
+
+    async def which(_command):
+        return "/usr/local/bin/claude"
+
+    async def spawn(*_args, **_kwargs):
+        return process
+
+    monkeypatch.setattr(adapter.aiofiles.os, "wrap", lambda _fn: which)
+    monkeypatch.setattr(adapter.asyncio, "create_subprocess_exec", spawn)
+
+    task = asyncio.create_task(adapter._detect_claude_code_version())
+    await communicate_started.wait()
+    task.cancel()
+    while not process.killed:
+        await asyncio.sleep(0)
+    task.cancel()
+    await asyncio.sleep(0)
+
+    assert task.done() is False
+    release_communicate.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert communicate_completed.is_set()
+
+
 # ---------------------------------------------------------------------------
 # Auth helpers
 # ---------------------------------------------------------------------------
