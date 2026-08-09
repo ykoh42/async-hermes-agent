@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -313,6 +314,101 @@ async def test_native_chat_stream_preserves_reused_tool_index_and_extra_content(
     assert response.id.startswith("stream-")
     assert response.choices[0].message.content is None
     assert stream.closed is True
+
+
+@pytest.mark.asyncio
+async def test_native_chat_stream_close_failure_preserves_response_and_rebuilds_client():
+    class _CloseFailingStream(_AsyncChatStream):
+        async def aclose(self):
+            self.closed = True
+            raise RuntimeError("stream close failed")
+
+    stream = _CloseFailingStream([
+        _chat_chunk(content="complete", finish="stop")
+    ])
+    agent = _native_chat_agent(stream)
+    agent._fire_reasoning_delta = MagicMock()
+    agent._fire_stream_delta = MagicMock()
+    agent._fire_tool_gen_started = MagicMock()
+    agent._replace_primary_openai_client = AsyncMock(return_value=True)
+
+    response = await agent._execute_model_request(
+        {"model": "test-model", "messages": []},
+        use_streaming=True,
+    )
+
+    assert response.choices[0].message.content == "complete"
+    assert stream.closed is True
+    agent._replace_primary_openai_client.assert_awaited_once_with(
+        reason="chat_stream_close_failed"
+    )
+
+
+@pytest.mark.asyncio
+async def test_native_chat_stream_close_failure_poisons_unrebuildable_client():
+    class _CloseFailingStream(_AsyncChatStream):
+        async def aclose(self):
+            raise RuntimeError("stream close failed")
+
+    stream = _CloseFailingStream([
+        _chat_chunk(content="complete", finish="stop")
+    ])
+    agent = _native_chat_agent(stream)
+    agent._fire_reasoning_delta = MagicMock()
+    agent._fire_stream_delta = MagicMock()
+    agent._fire_tool_gen_started = MagicMock()
+    agent._replace_primary_openai_client = AsyncMock(return_value=False)
+
+    response = await agent._execute_model_request(
+        {"model": "test-model", "messages": []},
+        use_streaming=True,
+    )
+
+    assert response.choices[0].message.content == "complete"
+    assert agent.client is None
+
+
+@pytest.mark.asyncio
+async def test_native_chat_stream_close_finishes_before_cancellation_propagates():
+    close_started = asyncio.Event()
+    allow_close = asyncio.Event()
+    close_finished = asyncio.Event()
+
+    class _SlowCloseStream(_AsyncChatStream):
+        async def aclose(self):
+            close_started.set()
+            await allow_close.wait()
+            self.closed = True
+            close_finished.set()
+
+    stream = _SlowCloseStream([
+        _chat_chunk(content="complete", finish="stop")
+    ])
+    agent = _native_chat_agent(stream)
+    agent._fire_reasoning_delta = MagicMock()
+    agent._fire_stream_delta = MagicMock()
+    agent._fire_tool_gen_started = MagicMock()
+    agent._replace_primary_openai_client = AsyncMock(return_value=True)
+
+    request = asyncio.create_task(
+        agent._execute_model_request(
+            {"model": "test-model", "messages": []},
+            use_streaming=True,
+        )
+    )
+    await close_started.wait()
+    request.cancel()
+    await asyncio.sleep(0)
+    request.cancel()
+    assert request.done() is False
+
+    allow_close.set()
+    with pytest.raises(asyncio.CancelledError):
+        await request
+
+    assert close_finished.is_set()
+    assert stream.closed is True
+    agent._replace_primary_openai_client.assert_not_awaited()
 
 
 @pytest.mark.asyncio

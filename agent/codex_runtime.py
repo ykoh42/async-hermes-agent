@@ -1289,12 +1289,45 @@ async def run_codex_stream(
     finally:
         close = getattr(stream, "aclose", None) or getattr(stream, "close", None)
         if inspect.iscoroutinefunction(close):
-            await _finish_owned_task(
-                asyncio.create_task(
-                    close(),
-                    name="codex-response-stream-close",
+            try:
+                await _finish_owned_task(
+                    asyncio.create_task(
+                        close(),
+                        name="codex-response-stream-close",
+                    )
                 )
-            )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning(
+                    "Codex response stream close failed (%s)",
+                    type(exc).__name__,
+                )
+                if active_client is getattr(agent, "client", None):
+                    rebuild = getattr(
+                        agent,
+                        "_replace_primary_openai_client",
+                        None,
+                    )
+                    if callable(rebuild):
+                        try:
+                            rebuilt = await rebuild(
+                                reason="codex_stream_close_failed"
+                            )
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as rebuild_exc:
+                            logger.warning(
+                                "Codex client rebuild failed after stream "
+                                "close failure (%s)",
+                                type(rebuild_exc).__name__,
+                            )
+                            rebuilt = False
+                        if (
+                            not rebuilt
+                            and getattr(agent, "client", None) is active_client
+                        ):
+                            agent.client = None
 
     return _consume_codex_event_stream(events, model=request.get("model"))
 
