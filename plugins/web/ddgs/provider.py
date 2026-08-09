@@ -91,26 +91,26 @@ async def _finish_worker_cleanup(
     """Reap one owned DDGS worker before propagating caller cancellation."""
 
     async def _cleanup() -> None:
+        async def drain_or_wait() -> tuple[bytes, bytes | None]:
+            try:
+                return await communicate_task
+            except BaseException:
+                if proc.returncode is None:
+                    proc.kill()
+                await proc.wait()
+                raise
+
+        drain_task = asyncio.create_task(drain_or_wait())
         if proc.returncode is None:
             proc.terminate()
         try:
-            await asyncio.wait_for(proc.wait(), timeout=_TERMINATE_GRACE_SECS)
+            await asyncio.wait_for(
+                asyncio.shield(drain_task), timeout=_TERMINATE_GRACE_SECS
+            )
         except asyncio.TimeoutError:
             if proc.returncode is None:
                 proc.kill()
-            try:
-                await asyncio.wait_for(proc.wait(), timeout=_TERMINATE_GRACE_SECS)
-            except asyncio.TimeoutError:
-                logger.warning("DDGS worker pid=%s did not exit after kill", proc.pid)
-        if not communicate_task.done():
-            communicate_task.cancel()
-            (communicate_result,) = await asyncio.gather(
-                communicate_task, return_exceptions=True
-            )
-            if isinstance(communicate_result, BaseException) and not isinstance(
-                communicate_result, asyncio.CancelledError
-            ):
-                raise communicate_result
+            await drain_task
 
     cleanup_task = asyncio.create_task(_cleanup())
     cancellation: asyncio.CancelledError | None = None

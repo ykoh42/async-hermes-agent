@@ -184,9 +184,8 @@ class TestDDGSProcessIsolation:
         import plugins.web.ddgs.provider as prov
 
         communicate_started = asyncio.Event()
-        wait_started = asyncio.Event()
-        release_wait = asyncio.Event()
-        wait_completed = asyncio.Event()
+        terminate_started = asyncio.Event()
+        release_communicate = asyncio.Event()
         communicate_completed = asyncio.Event()
 
         class ControlledProcess:
@@ -195,21 +194,18 @@ class TestDDGSProcessIsolation:
 
             async def communicate(self, _request):
                 communicate_started.set()
-                try:
-                    await asyncio.Event().wait()
-                finally:
-                    communicate_completed.set()
+                await release_communicate.wait()
+                communicate_completed.set()
+                self.returncode = -15
+                return b"", None
 
             def terminate(self):
-                self.returncode = -15
+                terminate_started.set()
 
             def kill(self):
                 self.returncode = -9
 
             async def wait(self):
-                wait_started.set()
-                await release_wait.wait()
-                wait_completed.set()
                 return self.returncode
 
         process = ControlledProcess()
@@ -221,17 +217,16 @@ class TestDDGSProcessIsolation:
         search = asyncio.create_task(prov._run_ddgs_search_bounded("query", 1))
         await communicate_started.wait()
         search.cancel()
-        await wait_started.wait()
+        await terminate_started.wait()
         search.cancel()
         await asyncio.sleep(0)
 
         try:
             assert search.done() is False
         finally:
-            release_wait.set()
+            release_communicate.set()
             with pytest.raises(asyncio.CancelledError):
                 await search
-            await asyncio.wait_for(wait_completed.wait(), timeout=1.0)
             await asyncio.wait_for(communicate_completed.wait(), timeout=1.0)
 
     @pytest.mark.asyncio
