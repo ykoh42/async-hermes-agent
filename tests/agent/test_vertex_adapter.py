@@ -140,6 +140,55 @@ async def test_authorized_user_adc_uses_async_refresh_and_gcloud_project(
 
 
 @pytest.mark.asyncio
+async def test_gcloud_probe_reaps_process_through_repeated_cancellation(
+    vertex_adapter, monkeypatch
+):
+    communicate_started = asyncio.Event()
+    wait_started = asyncio.Event()
+    release_wait = asyncio.Event()
+    wait_completed = asyncio.Event()
+
+    class BlockingProcess:
+        returncode = None
+        killed = False
+
+        async def communicate(self):
+            communicate_started.set()
+            await asyncio.Event().wait()
+
+        async def wait(self):
+            wait_started.set()
+            await release_wait.wait()
+            wait_completed.set()
+            return self.returncode
+
+        def kill(self):
+            self.killed = True
+            self.returncode = -9
+
+    process = BlockingProcess()
+
+    async def create_process(*_args, **_kwargs):
+        return process
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create_process)
+
+    task = asyncio.create_task(vertex_adapter._gcloud_project_id())
+    await communicate_started.wait()
+    task.cancel()
+    await wait_started.wait()
+    task.cancel()
+    await asyncio.sleep(0)
+
+    assert task.done() is False
+    release_wait.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert wait_completed.is_set()
+    assert process.killed is True
+
+
+@pytest.mark.asyncio
 async def test_metadata_adc_is_cached_with_refresh_margin(vertex_adapter, monkeypatch):
     calls = 0
 

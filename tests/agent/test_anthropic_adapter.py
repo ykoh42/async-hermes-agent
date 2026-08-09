@@ -1,5 +1,6 @@
 """Tests for agent/anthropic_adapter.py — Anthropic Messages API adapter."""
 
+import asyncio
 import json
 import sys
 import time
@@ -522,6 +523,54 @@ class TestResolveWithRefresh:
 
 
 class TestRunOauthSetupToken:
+
+    async def test_cancellation_reaps_process_through_repeated_cancellation(
+        self, monkeypatch
+    ):
+        initial_wait_started = asyncio.Event()
+        cleanup_wait_started = asyncio.Event()
+        release_cleanup = asyncio.Event()
+        cleanup_completed = asyncio.Event()
+
+        class BlockingProcess:
+            returncode = None
+            killed = False
+            wait_calls = 0
+
+            async def wait(self):
+                self.wait_calls += 1
+                if self.wait_calls == 1:
+                    initial_wait_started.set()
+                    await asyncio.Event().wait()
+                cleanup_wait_started.set()
+                await release_cleanup.wait()
+                cleanup_completed.set()
+                return self.returncode
+
+            def kill(self):
+                self.killed = True
+                self.returncode = -9
+
+        process = BlockingProcess()
+        monkeypatch.setattr("shutil.which", lambda _: "/usr/bin/claude")
+        monkeypatch.setattr(
+            "agent.anthropic_adapter.asyncio.create_subprocess_exec",
+            AsyncMock(return_value=process),
+        )
+
+        task = asyncio.create_task(run_oauth_setup_token())
+        await initial_wait_started.wait()
+        task.cancel()
+        await cleanup_wait_started.wait()
+        task.cancel()
+        await asyncio.sleep(0)
+
+        assert task.done() is False
+        release_cleanup.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert cleanup_completed.is_set()
+        assert process.killed is True
 
     async def test_returns_token_from_credential_files(self, monkeypatch, tmp_path):
         """After subprocess completes, reads credentials from Claude Code files."""

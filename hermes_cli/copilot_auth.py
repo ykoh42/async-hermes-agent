@@ -53,6 +53,28 @@ _DEVICE_CODE_POLL_INTERVAL = 5  # seconds
 _DEVICE_CODE_POLL_SAFETY_MARGIN = 3  # seconds
 
 
+async def _finish_process_wait(process: asyncio.subprocess.Process) -> int:
+    """Reap one owned gh process before propagating cancellation."""
+    wait_task = asyncio.create_task(process.wait())
+    cancellation: asyncio.CancelledError | None = None
+    while True:
+        try:
+            return_code = await asyncio.shield(wait_task)
+            break
+        except asyncio.CancelledError as exc:  # noqa: ASYNC103 - re-raised below
+            if wait_task.cancelled():
+                raise
+            if cancellation is None:
+                cancellation = exc
+        except Exception as exc:
+            if cancellation is not None:
+                raise cancellation from exc
+            raise
+    if cancellation is not None:
+        raise cancellation
+    return return_code
+
+
 def validate_copilot_token(token: str) -> tuple[bool, str]:
     """Validate that a token is usable with the Copilot API.
 
@@ -167,13 +189,14 @@ async def _try_gh_cli_token() -> Optional[str]:
             stdout, _ = await asyncio.wait_for(process.communicate(), timeout=5)
         except asyncio.TimeoutError:
             process.kill()
-            await process.wait()
+            await _finish_process_wait(process)
             logger.debug("gh CLI token lookup timed out (%s)", gh_path)
             continue
         except asyncio.CancelledError:
             if process is not None and process.returncode is None:
                 process.kill()
-                await process.wait()
+            if process is not None:
+                await _finish_process_wait(process)
             raise
         except FileNotFoundError as exc:
             logger.debug("gh CLI token lookup failed (%s): %s", gh_path, exc)
