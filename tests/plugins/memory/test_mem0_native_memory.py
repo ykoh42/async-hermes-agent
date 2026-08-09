@@ -64,6 +64,32 @@ class _FakeLLM:
         self.closed = True
 
 
+class _FakeNLP:
+    instances = []
+    entities = {}
+    lemmas = {}
+
+    def __init__(self):
+        self.calls = []
+        self.closed = False
+        self.instances.append(self)
+
+    async def lemmatize(self, text):
+        self.calls.append(("lemmatize", text))
+        return self.lemmas.get(text, text)
+
+    async def extract(self, text):
+        self.calls.append(("extract", text))
+        return list(self.entities.get(text, []))
+
+    async def extract_batch(self, texts):
+        self.calls.append(("extract_batch", list(texts)))
+        return [list(self.entities.get(text, [])) for text in texts]
+
+    async def close(self):
+        self.closed = True
+
+
 class _FakeVector:
     instances = []
     insert_failures = 0
@@ -72,6 +98,7 @@ class _FakeVector:
         self.config = config
         self.calls = []
         self.rows = {}
+        self.keyword_rows = []
         self.closed = False
         self.instances.append(self)
 
@@ -101,7 +128,28 @@ class _FakeVector:
 
     async def keyword_search(self, query, top_k=5, filters=None):
         self.calls.append(("keyword_search", query, top_k, filters))
-        return None
+        return list(self.keyword_rows)[:top_k] if self.keyword_rows else None
+
+    async def search_batch(self, queries, vectors_list, top_k=1, filters=None):
+        self.calls.append(
+            ("search_batch", queries, vectors_list, top_k, filters)
+        )
+        return [
+            await self.search(query, vector, top_k=top_k, filters=filters)
+            for query, vector in zip(queries, vectors_list, strict=True)
+        ]
+
+    async def list(self, filters=None, top_k=100):
+        self.calls.append(("list", filters, top_k))
+        rows = [
+            row
+            for row in self.rows.values()
+            if all(
+                row.payload.get(key) == value
+                for key, value in (filters or {}).items()
+            )
+        ][:top_k]
+        return [rows]
 
     async def get(self, vector_id):
         self.calls.append(("get", vector_id))
@@ -160,17 +208,20 @@ class _FakeDB:
 
 @pytest.fixture(autouse=True)
 def _fake_components(monkeypatch):
-    for component in (_FakeEmbedder, _FakeLLM, _FakeVector, _FakeDB):
+    for component in (_FakeEmbedder, _FakeLLM, _FakeNLP, _FakeVector, _FakeDB):
         component.instances.clear()
     _FakeLLM.response = '{"memory": []}'
     _FakeLLM.exception = None
     _FakeEmbedder.batch_exception = None
+    _FakeNLP.entities = {}
+    _FakeNLP.lemmas = {}
     _FakeVector.insert_failures = 0
     _FakeDB.batch_history_exception = None
     monkeypatch.setattr(_native_memory, "OpenAIEmbedding", _FakeEmbedder)
     monkeypatch.setattr(_native_memory, "OllamaEmbedding", _FakeEmbedder)
     monkeypatch.setattr(_native_memory, "OpenAILLM", _FakeLLM)
     monkeypatch.setattr(_native_memory, "OllamaLLM", _FakeLLM)
+    monkeypatch.setattr(_native_memory, "NativeNLP", _FakeNLP)
     monkeypatch.setattr(_native_memory, "Qdrant", _FakeVector)
     monkeypatch.setattr(_native_memory, "PGVector", _FakeVector)
     monkeypatch.setattr(_native_memory, "SQLiteManager", _FakeDB)
@@ -453,6 +504,146 @@ async def test_memory_infer_true_preserves_phased_add_pipeline(tmp_path):
     assert all(payload["source"] == "conversation" for payload in inserted_payloads)
     assert len(database.batch_history_calls) == 1
     assert database.saved_messages == [(messages, "agent_id=hermes&user_id=u1")]
+    await memory.close()
+
+
+@pytest.mark.asyncio
+async def test_memory_infer_true_batch_links_entities_like_upstream(tmp_path):
+    _FakeLLM.response = json.dumps(
+        {
+            "memory": [
+                {"text": "Plans a Seoul trip"},
+                {"text": "Will visit Seoul cafes"},
+            ]
+        }
+    )
+    _FakeNLP.entities = {
+        "Plans a Seoul trip": [("PROPER", "Seoul")],
+        "Will visit Seoul cafes": [
+            ("PROPER", "Seoul"),
+            ("TOPIC", "Seoul cafes"),
+        ],
+    }
+    memory = Memory(_config(tmp_path))
+
+    result = await memory.add("travel", user_id="u1", infer=True)
+
+    main_store, entity_store = _FakeVector.instances
+    assert entity_store.config["collection_name"] == "mem0_entities"
+    assert len(entity_store.rows) == 2
+    result_ids = {item["id"] for item in result["results"]}
+    seoul = next(
+        row for row in entity_store.rows.values() if row.payload["data"] == "Seoul"
+    )
+    assert set(seoul.payload["linked_memory_ids"]) == result_ids
+    assert seoul.payload["entity_type"] == "PROPER"
+    assert seoul.payload["user_id"] == "u1"
+    assert len(main_store.rows) == 2
+    await memory.close()
+
+
+@pytest.mark.asyncio
+async def test_memory_search_applies_upstream_bm25_and_entity_boosts(tmp_path):
+    _FakeNLP.lemmas = {"tea Seoul": "tea seoul"}
+    _FakeNLP.entities = {"tea Seoul": [("PROPER", "Seoul")]}
+    memory = Memory(_config(tmp_path))
+    await memory.initialize()
+    main_store = _FakeVector.instances[0]
+    main_store.rows["memory-1"] = SimpleNamespace(
+        id="memory-1",
+        score=0.4,
+        vector=[1.0, 1.0],
+        payload={"data": "Seoul tea", "user_id": "u1"},
+    )
+    main_store.keyword_rows = [
+        SimpleNamespace(id="memory-1", score=5.0, payload={})
+    ]
+    entity_store = await memory._get_entity_store()
+    entity_store.rows["entity-1"] = SimpleNamespace(
+        id="entity-1",
+        score=0.8,
+        vector=[1.0, 1.0],
+        payload={
+            "data": "Seoul",
+            "linked_memory_ids": ["memory-1"],
+            "user_id": "u1",
+        },
+    )
+
+    result = await memory.search(
+        "tea Seoul",
+        filters={"user_id": "u1"},
+        top_k=5,
+        explain=True,
+    )
+
+    assert result["results"][0]["score"] == pytest.approx(0.52)
+    assert result["results"][0]["score_details"] == {
+        "semantic_score": 0.4,
+        "bm25_score": 0.5,
+        "entity_boost": pytest.approx(0.4),
+        "raw_score": pytest.approx(1.3),
+        "max_possible_score": 2.5,
+        "final_score": pytest.approx(0.52),
+        "threshold": 0.1,
+    }
+    keyword_call = next(
+        call for call in main_store.calls if call[0] == "keyword_search"
+    )
+    assert keyword_call[1] == "tea seoul"
+    entity_search = next(
+        call for call in entity_store.calls if call[0] == "search"
+    )
+    assert entity_search[3:] == (500, {"user_id": "u1"})
+    await memory.close()
+
+
+@pytest.mark.asyncio
+async def test_memory_entity_boost_preserves_external_cancellation(tmp_path):
+    _FakeNLP.entities = {"Seoul": [("PROPER", "Seoul")]}
+    memory = Memory(_config(tmp_path))
+    await memory.initialize()
+    entity_store = await memory._get_entity_store()
+
+    async def cancelled_search(*args, **kwargs):
+        raise asyncio.CancelledError
+
+    entity_store.search = cancelled_search
+
+    with pytest.raises(asyncio.CancelledError):
+        await memory.search("Seoul", filters={"user_id": "u1"})
+
+    await memory.close()
+
+
+@pytest.mark.asyncio
+async def test_memory_update_and_delete_relink_entities(tmp_path):
+    _FakeNLP.entities = {"new text": [("TOPIC", "new topic")]}
+    memory = Memory(_config(tmp_path))
+    added = await memory.add("old text", user_id="u1", infer=False)
+    memory_id = added["results"][0]["id"]
+    entity_store = await memory._get_entity_store()
+    entity_store.rows["old-entity"] = SimpleNamespace(
+        id="old-entity",
+        score=1.0,
+        vector=[1.0, 1.0],
+        payload={
+            "data": "old topic",
+            "linked_memory_ids": [memory_id],
+            "user_id": "u1",
+        },
+    )
+
+    await memory.update(memory_id, data="new text")
+
+    assert "old-entity" not in entity_store.rows
+    new_entity = next(iter(entity_store.rows.values()))
+    assert new_entity.payload["data"] == "new topic"
+    assert new_entity.payload["linked_memory_ids"] == [memory_id]
+
+    await memory.delete(memory_id)
+
+    assert entity_store.rows == {}
     await memory.close()
 
 
@@ -771,13 +962,15 @@ async def test_memory_update_and_delete_preserve_history(tmp_path):
 async def test_memory_close_releases_all_owned_components(tmp_path):
     memory = Memory(_config(tmp_path))
     await memory.initialize()
+    await memory._get_entity_store()
 
     await memory.close()
     await memory.close()
 
     assert _FakeEmbedder.instances[0].closed is True
     assert _FakeLLM.instances[0].closed is True
-    assert _FakeVector.instances[0].closed is True
+    assert all(vector.closed for vector in _FakeVector.instances)
     assert _FakeDB.instances[0].closed is True
+    assert _FakeNLP.instances[0].closed is True
     with pytest.raises(RuntimeError, match="closed Mem0 Memory"):
         await memory.add("fact", user_id="u1", infer=False)

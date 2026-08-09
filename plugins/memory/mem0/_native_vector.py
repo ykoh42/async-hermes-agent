@@ -742,6 +742,18 @@ class PGVector:
             for row in rows
         ]
 
+    async def search_batch(
+        self,
+        queries: builtins.list[str],
+        vectors_list: builtins.list[builtins.list[float]],
+        top_k: int = 1,
+        filters: dict[str, Any] | None = None,
+    ) -> builtins.list[builtins.list[OutputData]]:
+        return [
+            await self.search(query, vector, top_k=top_k, filters=filters)
+            for query, vector in zip(queries, vectors_list, strict=False)
+        ]
+
     async def keyword_search(
         self,
         query: str,

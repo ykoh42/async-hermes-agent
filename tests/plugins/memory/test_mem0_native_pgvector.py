@@ -345,6 +345,12 @@ async def test_pgvector_crud_search_and_result_shapes():
         top_k=4,
         filters={"user_id": "u1"},
     )
+    batches = await store.search_batch(
+        ["fact", "fact again"],
+        [[1.0, 2.0, 3.0], [3.0, 2.0, 1.0]],
+        top_k=4,
+        filters={"user_id": "u1"},
+    )
     keyword = await store.keyword_search(
         "fact",
         top_k=4,
@@ -353,6 +359,10 @@ async def test_pgvector_crud_search_and_result_shapes():
     assert semantic[0].id == "id-1"
     assert semantic[0].score == 0.75
     assert semantic[0].payload == {"data": "fact"}
+    assert [[item.id for item in batch] for batch in batches] == [
+        ["id-1"],
+        ["id-1"],
+    ]
     assert keyword[0].score == 2.5
 
     assert (await store.get("id-1")).id == "id-1"

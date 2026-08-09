@@ -16,6 +16,8 @@ import uuid
 
 import aiofiles.os
 
+from ._native_entities import NativeEntities
+from ._native_nlp import NativeNLP
 from ._native_oss import (
     OllamaEmbedding,
     OllamaLLM,
@@ -29,6 +31,7 @@ from ._native_prompts import (
     AGENT_CONTEXT_SUFFIX,
     generate_additive_extraction_prompt,
 )
+from ._native_scoring import get_bm25_params, normalize_bm25, score_and_rank
 from ._native_vector import PGVector, Qdrant
 
 logger = logging.getLogger(__name__)
@@ -264,6 +267,8 @@ class Memory:
         self.llm: Any = None
         self.vector_store: Any = None
         self.db: Any = None
+        self.nlp: Any = None
+        self.entities: Any = None
         self._initialize_lock = asyncio.Lock()
         self._initialized = False
         self._closed = False
@@ -334,6 +339,14 @@ class Memory:
                 await aiofiles.os.makedirs(parent, exist_ok=True)
 
             database = SQLiteManager(history_path)
+            nlp = NativeNLP()
+            entities = NativeEntities(
+                vector_provider,
+                vector_config,
+                embedding_model,
+                nlp,
+                {"qdrant": Qdrant, "pgvector": PGVector},
+            )
             try:
                 await vector_store._initialize()
                 await database._initialize()
@@ -341,6 +354,8 @@ class Memory:
                 await asyncio.gather(
                     vector_store.close(),
                     database.close(),
+                    entities.close(),
+                    nlp.close(),
                     return_exceptions=True,
                 )
                 raise
@@ -349,6 +364,8 @@ class Memory:
             self.llm = llm_client
             self.vector_store = vector_store
             self.db = database
+            self.nlp = nlp
+            self.entities = entities
             self._initialized = True
 
     async def _create_memory(
@@ -364,9 +381,7 @@ class Memory:
         if "created_at" not in payload:
             payload["created_at"] = datetime.now(timezone.utc).isoformat()
         payload["updated_at"] = payload["created_at"]
-        # ``mem0ai`` returns the original text when its optional spaCy extra is
-        # absent.  The pinned ``mem0`` extra intentionally has that core shape.
-        payload["text_lemmatized"] = text
+        payload["text_lemmatized"] = await self.nlp.lemmatize(text)
         await self.vector_store.insert(
             vectors=[embedding],
             ids=[memory_id],
@@ -501,9 +516,7 @@ class Memory:
             memory_id = str(uuid.uuid4())
             memory_metadata = deepcopy(metadata)
             memory_metadata["data"] = text
-            # The pinned core extra has no spaCy model, so upstream's
-            # lemmatizer returns the original text at this boundary.
-            memory_metadata["text_lemmatized"] = text
+            memory_metadata["text_lemmatized"] = await self.nlp.lemmatize(text)
             memory_metadata["hash"] = memory_hash
             if "created_at" not in memory_metadata:
                 memory_metadata["created_at"] = datetime.now(
@@ -575,9 +588,7 @@ class Memory:
                         exc,
                     )
 
-        # ``mem0ai==2.0.10`` only enables entity linking when its separate NLP
-        # extra and spaCy model are installed. The retained ``mem0`` extra has
-        # the upstream core behavior: extraction yields no entity candidates.
+        await self.entities.link_batch(records, search_filters)
         await self.db.save_messages(messages, session_scope)
         return [
             {"id": record[0], "memory": record[1], "event": "ADD"}
@@ -752,6 +763,8 @@ class Memory:
                 "Example: filters={'user_id': 'u1'}"
             )
 
+        query_lemmatized = await self.nlp.lemmatize(query)
+        query_entities = await self.nlp.extract(query)
         embedding = await self.embedding_model.embed(query, "search")
         internal_limit = max(top_k * 4, 60)
         semantic_results = await self.vector_store.search(
@@ -760,31 +773,55 @@ class Memory:
             top_k=internal_limit,
             filters=effective_filters,
         )
-        await self.vector_store.keyword_search(
-            query=query,
+        keyword_results = await self.vector_store.keyword_search(
+            query=query_lemmatized,
             top_k=internal_limit,
             filters=effective_filters,
         )
 
+        bm25_scores: dict[str, float] = {}
+        if keyword_results is not None:
+            midpoint, steepness = get_bm25_params(
+                query,
+                lemmatized=query_lemmatized,
+            )
+            for memory in keyword_results:
+                memory_id = str(getattr(memory, "id", ""))
+                raw_score = getattr(memory, "score", 0.0)
+                if raw_score and raw_score > 0:
+                    bm25_scores[memory_id] = normalize_bm25(
+                        raw_score,
+                        midpoint,
+                        steepness,
+                    )
+        entity_boosts = (
+            await self.entities.boosts(query_entities, effective_filters)
+            if query_entities
+            else {}
+        )
         candidates = []
         for memory in semantic_results:
             payload = getattr(memory, "payload", None) or {}
             if not show_expired and _is_expired(payload):
                 continue
-            score = getattr(memory, "score", None) or 0.0
-            if score < threshold:
-                continue
             candidates.append(
                 {
                     "id": str(memory.id),
-                    "score": min(score, 1.0),
+                    "score": getattr(memory, "score", None) or 0.0,
                     "payload": payload,
                 }
             )
-        candidates.sort(key=lambda candidate: candidate["score"], reverse=True)
+        scored_results = score_and_rank(
+            semantic_results=candidates,
+            bm25_scores=bm25_scores,
+            entity_boosts=entity_boosts,
+            threshold=threshold,
+            top_k=top_k,
+            explain=explain,
+        )
 
         results = []
-        for candidate in candidates[:top_k]:
+        for candidate in scored_results:
             payload = candidate["payload"]
             if not payload.get("data"):
                 continue
@@ -807,16 +844,8 @@ class Memory:
             }
             if additional_metadata:
                 item["metadata"] = additional_metadata
-            if explain:
-                item["score_details"] = {
-                    "semantic_score": candidate["score"],
-                    "bm25_score": 0.0,
-                    "entity_boost": 0.0,
-                    "raw_score": candidate["score"],
-                    "max_possible_score": 1.0,
-                    "final_score": candidate["score"],
-                    "threshold": threshold,
-                }
+            if explain and "score_details" in candidate:
+                item["score_details"] = candidate["score_details"]
             results.append(item)
         return {"results": results}
 
@@ -850,12 +879,13 @@ class Memory:
             raise ValueError(
                 f"Memory with id {memory_id} does not have text content to update"
             )
+        text_changed = data != previous
         payload = deepcopy(existing.payload)
         if update_metadata is not None:
             payload.update(update_metadata)
         payload["data"] = data
         payload["hash"] = hashlib.md5(data.encode()).hexdigest()
-        payload["text_lemmatized"] = data
+        payload["text_lemmatized"] = await self.nlp.lemmatize(data)
         payload["created_at"] = existing.payload.get("created_at")
         payload["updated_at"] = datetime.now(timezone.utc).isoformat()
         if "actor_id" in existing.payload:
@@ -876,6 +906,14 @@ class Memory:
             actor_id=payload.get("actor_id"),
             role=payload.get("role"),
         )
+        if text_changed:
+            session_filters = {
+                key: payload[key]
+                for key in ("user_id", "agent_id", "run_id")
+                if payload.get(key)
+            }
+            await self.entities.remove_memory(memory_id, session_filters)
+            await self.entities.link_memory(memory_id, data, session_filters)
         return {"message": "Memory updated successfully!"}
 
     async def delete(self, memory_id: str) -> dict[str, str]:
@@ -896,7 +934,17 @@ class Memory:
             role=payload.get("role"),
             is_deleted=1,
         )
+        session_filters = {
+            key: payload[key]
+            for key in ("user_id", "agent_id", "run_id")
+            if payload.get(key)
+        }
+        await self.entities.remove_memory(memory_id, session_filters)
         return {"message": "Memory deleted successfully!"}
+
+    async def _get_entity_store(self) -> Any:
+        await self.initialize()
+        return await self.entities.get_store()
 
     async def close(self) -> None:
         async with self._initialize_lock:
@@ -910,6 +958,8 @@ class Memory:
                     self.llm,
                     self.vector_store,
                     self.db,
+                    self.entities,
+                    self.nlp,
                 )
                 if resource is not None
             ]
@@ -917,6 +967,8 @@ class Memory:
             self.llm = None
             self.vector_store = None
             self.db = None
+            self.entities = None
+            self.nlp = None
             close_tasks = [
                 asyncio.create_task(resource.close()) for resource in resources
             ]
