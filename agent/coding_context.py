@@ -778,16 +778,25 @@ async def project_facts_for(
 
 
 async def _finish_git_communicate(
+    process: asyncio.subprocess.Process,
     communicate: asyncio.Task[tuple[bytes, bytes | None]],
 ) -> tuple[bytes, bytes | None]:
     """Finish one owned git communicate task before propagating cancellation."""
+    async def drain_or_wait() -> tuple[bytes, bytes | None]:
+        try:
+            return await communicate
+        except BaseException:
+            await process.wait()
+            raise
+
+    cleanup_task = asyncio.create_task(drain_or_wait())
     cancellation: asyncio.CancelledError | None = None
     while True:
         try:
-            result = await asyncio.shield(communicate)
+            result = await asyncio.shield(cleanup_task)
             break
         except asyncio.CancelledError as exc:  # noqa: ASYNC103 - re-raised below
-            if communicate.cancelled():
+            if cleanup_task.cancelled():
                 raise
             if cancellation is None:
                 cancellation = exc
@@ -807,6 +816,7 @@ async def _git(cwd: Path, *args: str) -> str:
         stderr=asyncio.subprocess.DEVNULL,
     )
     communicate = asyncio.create_task(process.communicate())
+    communication_error: Exception | None = None
     try:
         stdout, _ = await asyncio.wait_for(
             asyncio.shield(communicate), timeout=_GIT_TIMEOUT
@@ -816,7 +826,7 @@ async def _git(cwd: Path, *args: str) -> str:
             process.kill()
         except ProcessLookupError:
             pass
-        await _finish_git_communicate(communicate)
+        await _finish_git_communicate(process, communicate)
         return ""
     except asyncio.CancelledError:
         try:
@@ -824,12 +834,26 @@ async def _git(cwd: Path, *args: str) -> str:
         except ProcessLookupError:
             pass
         try:
-            await _finish_git_communicate(communicate)
+            await _finish_git_communicate(process, communicate)
         except asyncio.CancelledError:
             raise
         except Exception:
             logger.debug("Git probe cleanup after cancellation failed", exc_info=True)
         raise
+    except Exception as exc:
+        communication_error = exc
+    if communication_error is not None:
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
+        try:
+            await _finish_git_communicate(process, communicate)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            pass
+        raise communication_error
     return stdout.decode("utf-8", errors="replace").strip()
 
 

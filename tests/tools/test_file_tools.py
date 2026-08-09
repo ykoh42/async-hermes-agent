@@ -385,6 +385,40 @@ async def test_search_cancellation_kills_and_drains_process(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_search_communicate_failure_reaps_process(monkeypatch):
+    from tools.file_tools import _run_rg
+
+    waited = asyncio.Event()
+
+    class FakeProcess:
+        returncode = None
+        killed = False
+
+        async def communicate(self):
+            raise RuntimeError("pipe failed")
+
+        def kill(self):
+            self.killed = True
+            self.returncode = -9
+
+        async def wait(self):
+            waited.set()
+            return self.returncode
+
+    process = FakeProcess()
+
+    async def fake_create_subprocess_exec(*_args, **_kwargs):
+        return process
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    with pytest.raises(RuntimeError, match="pipe failed"):
+        await _run_rg(["needle", "."])
+    assert process.killed is True
+    assert waited.is_set()
+
+
+@pytest.mark.asyncio
 async def test_relative_write_uses_recorded_session_cwd(tmp_path):
     import tools.terminal_tool as terminal
     from tools.file_tools import write_file_tool

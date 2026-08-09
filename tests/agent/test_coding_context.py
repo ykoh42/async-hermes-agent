@@ -60,6 +60,37 @@ async def test_git_probe_repeated_cancellation_waits_for_communicate(monkeypatch
         await asyncio.wait_for(cleanup_completed.wait(), timeout=1.0)
 
 
+async def test_git_probe_communicate_failure_reaps_process(monkeypatch):
+    waited = asyncio.Event()
+
+    class FailedProcess:
+        returncode = None
+        killed = False
+
+        async def communicate(self):
+            raise RuntimeError("pipe failed")
+
+        def kill(self):
+            self.killed = True
+            self.returncode = -9
+
+        async def wait(self):
+            waited.set()
+            return self.returncode
+
+    process = FailedProcess()
+
+    async def create_process(*_args, **_kwargs):
+        return process
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create_process)
+
+    with pytest.raises(RuntimeError, match="pipe failed"):
+        await cc._git(Path.cwd(), "status")
+    assert process.killed is True
+    assert waited.is_set()
+
+
 async def test_coding_guidance_advertises_persistent_terminal_state():
     assert "Terminal state persists across calls" in cc.CODING_AGENT_GUIDANCE
     assert "Activate a virtualenv" in cc.CODING_AGENT_GUIDANCE

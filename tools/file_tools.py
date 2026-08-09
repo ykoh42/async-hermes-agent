@@ -1389,16 +1389,25 @@ async def _verify_native_file(path: Path, expected: str) -> bool:
 
 
 async def _finish_subprocess_communicate(
+    process: asyncio.subprocess.Process,
     communicate: asyncio.Task[tuple[bytes, bytes | None]],
 ) -> tuple[bytes, bytes | None]:
     """Finish one owned communicate task before propagating cancellation."""
+    async def drain_or_wait() -> tuple[bytes, bytes | None]:
+        try:
+            return await communicate
+        except BaseException:
+            await process.wait()
+            raise
+
+    cleanup_task = asyncio.create_task(drain_or_wait())
     cancellation: asyncio.CancelledError | None = None
     while True:
         try:
-            result = await asyncio.shield(communicate)
+            result = await asyncio.shield(cleanup_task)
             break
         except asyncio.CancelledError as exc:  # noqa: ASYNC103 - re-raised below
-            if communicate.cancelled():
+            if cleanup_task.cancelled():
                 raise
             if cancellation is None:
                 cancellation = exc
@@ -1454,6 +1463,7 @@ async def _check_lint(path: Path, content: str | None = None) -> LintResult:
         return LintResult(skipped=True, message=f"{base_command} not available")
 
     communicate = asyncio.create_task(process.communicate())
+    communication_error: Exception | None = None
     try:
         async with asyncio.timeout(30):
             stdout, _ = await asyncio.shield(communicate)
@@ -1466,7 +1476,7 @@ async def _check_lint(path: Path, content: str | None = None) -> LintResult:
         # so its pipe readers can drain and reap the child.  Shield cleanup
         # from a second caller cancellation; otherwise the killed process can
         # still leave a detached communicate task behind.
-        stdout, _ = await _finish_subprocess_communicate(communicate)
+        stdout, _ = await _finish_subprocess_communicate(process, communicate)
         output = stdout.decode(errors="replace").strip()
         return LintResult(
             success=False,
@@ -1478,12 +1488,26 @@ async def _check_lint(path: Path, content: str | None = None) -> LintResult:
         except ProcessLookupError:
             pass
         try:
-            await _finish_subprocess_communicate(communicate)
+            await _finish_subprocess_communicate(process, communicate)
         except asyncio.CancelledError:
             raise
         except Exception:
             logger.debug("Lint cleanup after cancellation failed", exc_info=True)
         raise
+    except Exception as exc:
+        communication_error = exc
+    if communication_error is not None:
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
+        try:
+            await _finish_subprocess_communicate(process, communicate)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            pass
+        raise communication_error
 
     output = stdout.decode(errors="replace").strip()
     if process.returncode and _looks_like_linter_unusable(base_command, output):
@@ -2031,6 +2055,7 @@ async def _run_rg(arguments: list[str]) -> tuple[int, str, str]:
         stderr=asyncio.subprocess.PIPE,
     )
     communicate = asyncio.create_task(process.communicate())
+    communication_error: Exception | None = None
     try:
         async with asyncio.timeout(60):
             stdout, stderr = await asyncio.shield(communicate)
@@ -2039,7 +2064,9 @@ async def _run_rg(arguments: list[str]) -> tuple[int, str, str]:
             process.kill()
         except ProcessLookupError:
             pass
-        stdout, stderr = await _finish_subprocess_communicate(communicate)
+        stdout, stderr = await _finish_subprocess_communicate(
+            process, communicate
+        )
         return 124, stdout.decode(errors="replace"), stderr.decode(errors="replace")
     except asyncio.CancelledError:
         try:
@@ -2047,12 +2074,26 @@ async def _run_rg(arguments: list[str]) -> tuple[int, str, str]:
         except ProcessLookupError:
             pass
         try:
-            await _finish_subprocess_communicate(communicate)
+            await _finish_subprocess_communicate(process, communicate)
         except asyncio.CancelledError:
             raise
         except Exception:
             logger.debug("Search cleanup after cancellation failed", exc_info=True)
         raise
+    except Exception as exc:
+        communication_error = exc
+    if communication_error is not None:
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
+        try:
+            await _finish_subprocess_communicate(process, communicate)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            pass
+        raise communication_error
     return (
         process.returncode or 0,
         stdout.decode(errors="replace"),
