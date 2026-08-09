@@ -1187,8 +1187,6 @@ async def run_codex_stream(
     api_kwargs: dict,
     client: Any = None,
     on_first_delta=None,
-    on_stream_event=None,
-    on_stream_text=None,
 ):
     """Consume an OpenAI Responses stream through an async client.
 
@@ -1200,6 +1198,12 @@ async def run_codex_stream(
     active_client = client or getattr(agent, "client", None)
     if active_client is None:
         raise RuntimeError("Async Codex client is not initialized")
+
+    # These callbacks are request-local state installed by
+    # AIAgent._execute_model_request. Keep them off this upstream-public
+    # function's signature so callers migrate by adding only ``await``.
+    on_stream_event = getattr(agent, "_codex_stream_event_callback", None)
+    on_stream_text = getattr(agent, "_codex_stream_text_callback", None)
 
     request = dict(api_kwargs)
     request["stream"] = True

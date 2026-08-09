@@ -1,6 +1,7 @@
 """Tests for the Hermes plugin system (hermes_cli.plugins)."""
 
 import asyncio
+import inspect
 import logging
 import sys
 import textwrap
@@ -730,8 +731,17 @@ class TestGetPreVerifyContinueMessage:
 class TestPluginContext:
     """Tests for the PluginContext facade."""
 
+    def test_constructor_preserves_upstream_signature(self):
+        parameters = list(inspect.signature(PluginContext).parameters.values())
 
-
+        assert [parameter.name for parameter in parameters] == ["manifest", "manager"]
+        assert all(
+            parameter.kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
+            for parameter in parameters
+        )
+        assert all(
+            parameter.default is inspect.Parameter.empty for parameter in parameters
+        )
 
     @pytest.mark.asyncio
     async def test_register_tool_override_blocked_without_operator_opt_in(self, tmp_path, monkeypatch):

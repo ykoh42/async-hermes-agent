@@ -2,7 +2,7 @@ import asyncio
 import sys
 import types
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -90,6 +90,83 @@ def _build_copilot_agent(monkeypatch, *, model="gpt-5.4"):
     agent._persist_session = AsyncMock()
     agent._save_trajectory = AsyncMock()
     return agent
+
+
+@pytest.mark.asyncio
+async def test_execute_codex_stream_keeps_internal_callbacks_off_public_signature(
+    monkeypatch,
+):
+    agent = _build_agent(monkeypatch)
+    events = [
+        SimpleNamespace(
+            type="response.output_item.added",
+            item=SimpleNamespace(type="message", phase="final"),
+        ),
+        SimpleNamespace(type="response.output_text.delta", delta="hello"),
+        SimpleNamespace(
+            type="response.completed",
+            response=SimpleNamespace(status="completed", usage={}),
+        ),
+    ]
+
+    async def create(**kwargs):
+        assert kwargs["stream"] is True
+        return _FakeCreateStream(events)
+
+    client = SimpleNamespace(responses=SimpleNamespace(create=create))
+    agent._ensure_primary_openai_client = AsyncMock(return_value=client)
+    activity = MagicMock()
+    text = MagicMock()
+
+    response = await agent._execute_model_request(
+        {"model": "gpt-5-codex", "input": "hi"},
+        use_streaming=True,
+        on_stream_activity=activity,
+        _on_stream_text=text,
+    )
+
+    assert response.status == "completed"
+    assert activity.call_count == len(events)
+    text.assert_called_once_with()
+    assert not hasattr(agent, "_codex_stream_event_callback")
+    assert not hasattr(agent, "_codex_stream_text_callback")
+
+
+@pytest.mark.asyncio
+async def test_execute_codex_stream_restores_internal_callbacks_when_cancelled(
+    monkeypatch,
+):
+    agent = _build_agent(monkeypatch)
+    create_started = asyncio.Event()
+
+    async def create(**kwargs):
+        assert kwargs["stream"] is True
+        create_started.set()
+        await asyncio.Future()
+
+    client = SimpleNamespace(responses=SimpleNamespace(create=create))
+    agent._ensure_primary_openai_client = AsyncMock(return_value=client)
+    previous_activity = MagicMock()
+    previous_text = MagicMock()
+    agent._codex_stream_event_callback = previous_activity
+    agent._codex_stream_text_callback = previous_text
+
+    request = asyncio.create_task(
+        agent._execute_model_request(
+            {"model": "gpt-5-codex", "input": "hi"},
+            use_streaming=True,
+            on_stream_activity=MagicMock(),
+            _on_stream_text=MagicMock(),
+        )
+    )
+    await create_started.wait()
+    request.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await request
+
+    assert agent._codex_stream_event_callback is previous_activity
+    assert agent._codex_stream_text_callback is previous_text
 
 
 @pytest.mark.asyncio

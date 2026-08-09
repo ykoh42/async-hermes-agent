@@ -295,23 +295,16 @@ class LoadedPlugin:
 class PluginContext:
     """Facade given to plugins so they can register tools and hooks."""
 
-    def __init__(
-        self,
-        manifest: PluginManifest,
-        manager: "PluginManager",
-        *,
-        _profile_context: tuple[Path | None, Path | None] | None = None,
-        _defer_skill_validation: bool = False,
-    ):
+    def __init__(self, manifest: PluginManifest, manager: "PluginManager"):
         self.manifest = manifest
         self._manager = manager
-        self._profile_context = _profile_context
+        self._profile_context: tuple[Path | None, Path | None] | None = None
         # ``register_skill`` is intentionally kept synchronous for the public
         # plugin contract.  The manager marks its async discovery contexts so
         # validation can cross an awaited filesystem boundary after the
         # callback returns; direct compatibility callers retain the upstream
         # immediate validation behaviour.
-        self._defer_skill_validation = _defer_skill_validation
+        self._defer_skill_validation = False
         self._deferred_skill_paths: list[tuple[str, Path]] = []
         # Lazy-built host-owned LLM facade — see ctx.llm property below.
         self._llm: Any = None
@@ -1373,11 +1366,8 @@ class PluginManager:
         from tools.registry import registry as _registry
         _plugin_id = manifest.key or manifest.name
         _slug = _plugin_id.replace("/", "__").replace("-", "_")
-        override_context = PluginContext(
-            manifest,
-            self,
-            _profile_context=self._profile_context,
-        )
+        override_context = PluginContext(manifest, self)
+        override_context._profile_context = self._profile_context
         _registry.register_plugin_override_policy(
             f"{_NS_PARENT}.{_slug}",
             override_context._tool_override_allowed(""),
@@ -1396,12 +1386,9 @@ class PluginManager:
                 loaded.error = "no register() function"
                 logger.warning("Plugin '%s' has no register() function", manifest.name)
             else:
-                ctx = PluginContext(
-                    manifest,
-                    self,
-                    _profile_context=self._profile_context,
-                    _defer_skill_validation=True,
-                )
+                ctx = PluginContext(manifest, self)
+                ctx._profile_context = self._profile_context
+                ctx._defer_skill_validation = True
                 # Snapshot registry state BEFORE register() so each registry's
                 # attribution counts only what THIS plugin actually added.
                 # The previous approach diffed names against all already-loaded

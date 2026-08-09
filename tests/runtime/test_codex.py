@@ -1,10 +1,32 @@
 """Responses API stream contract tests."""
 
+import inspect
 from types import SimpleNamespace
 
 import pytest
 
 from agent.codex_runtime import run_codex_stream
+
+
+def test_run_codex_stream_preserves_upstream_signature():
+    parameters = list(inspect.signature(run_codex_stream).parameters.values())
+
+    assert [parameter.name for parameter in parameters] == [
+        "agent",
+        "api_kwargs",
+        "client",
+        "on_first_delta",
+    ]
+    assert all(
+        parameter.kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
+        for parameter in parameters
+    )
+    assert [parameter.default for parameter in parameters] == [
+        inspect.Parameter.empty,
+        inspect.Parameter.empty,
+        None,
+        None,
+    ]
 
 
 class _Stream:

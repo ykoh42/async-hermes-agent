@@ -5185,14 +5185,31 @@ class AIAgent:
                             _stream_diag.get("bytes", 0)
                         ) + 40
 
-                return await run_codex_stream(
-                    self,
-                    api_kwargs,
-                    client=request_client,
-                    on_first_delta=on_first_delta,
-                    on_stream_event=_on_codex_event,
-                    on_stream_text=_on_stream_text,
+                unset = object()
+                previous_event_callback = getattr(
+                    self, "_codex_stream_event_callback", unset
                 )
+                previous_text_callback = getattr(
+                    self, "_codex_stream_text_callback", unset
+                )
+                self._codex_stream_event_callback = _on_codex_event
+                self._codex_stream_text_callback = _on_stream_text
+                try:
+                    return await run_codex_stream(
+                        self,
+                        api_kwargs,
+                        client=request_client,
+                        on_first_delta=on_first_delta,
+                    )
+                finally:
+                    if previous_event_callback is unset:
+                        del self._codex_stream_event_callback
+                    else:
+                        self._codex_stream_event_callback = previous_event_callback
+                    if previous_text_callback is unset:
+                        del self._codex_stream_text_callback
+                    else:
+                        self._codex_stream_text_callback = previous_text_callback
 
             request = dict(api_kwargs)
             request.pop("stream", None)
