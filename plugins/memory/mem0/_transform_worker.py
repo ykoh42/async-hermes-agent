@@ -1,4 +1,4 @@
-"""Stdio worker for the pinned Mem0 spaCy transformations."""
+"""Stdio worker for the pinned Mem0 transformations."""
 
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ def _execute(request: dict[str, Any]) -> Any:
         from mem0.utils.entity_extraction import extract_entities_batch
 
         return extract_entities_batch(request["texts"])
-    raise ValueError(f"Unsupported Mem0 NLP operation: {operation}")
+    raise ValueError(f"Unsupported Mem0 transform operation: {operation}")
 
 
 def _serve_stdio() -> None:
