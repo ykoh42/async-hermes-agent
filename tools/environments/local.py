@@ -44,6 +44,26 @@ def _msys_to_windows_path(path: str) -> str:
     return f"{drive}:{tail or chr(92)}"
 
 
+def _windows_to_msys_path(path: str) -> str:
+    """Translate a native Windows drive path to its Git Bash form."""
+    if not _IS_WINDOWS or not path:
+        return path
+    match = re.match(r"^([a-zA-Z]):[\\/]*(.*)$", path)
+    if not match:
+        return path
+    drive = match.group(1).lower()
+    tail = (match.group(2) or "").replace("\\", "/").lstrip("/")
+    return f"/{drive}/{tail}" if tail else f"/{drive}/"
+
+
+def _bash_safe_path(path: str) -> str:
+    """Return *path* in the form expected by Git Bash on Windows."""
+    if not _IS_WINDOWS or not path:
+        return path
+    path = _windows_to_msys_path(path)
+    return path.replace("\\", "/")
+
+
 async def _resolve_local_initial_cwd(cwd: str) -> str:
     """Resolve the local backend's initial cwd to an absolute host path."""
     if cwd:

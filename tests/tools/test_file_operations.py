@@ -1,5 +1,7 @@
 """Contracts retained from the v2026.8.3 file-operations implementation."""
 
+import asyncio
+import inspect
 import json
 import os
 
@@ -8,11 +10,13 @@ import pytest
 from agent.file_safety import is_write_denied
 
 from tools.file_operations import (
+    FileOperations,
     LintResult,
     PatchResult,
     ReadResult,
     SearchMatch,
     SearchResult,
+    ShellFileOperations,
     WriteResult,
     normalize_read_pagination,
 )
@@ -49,6 +53,132 @@ def test_read_pagination_clamps_invalid_values():
     offset, limit = normalize_read_pagination("bad", -5)
     assert offset == 1
     assert limit == 1
+
+
+def test_upstream_file_operations_surface_is_native_async():
+    method_names = {
+        "read_file",
+        "read_file_raw",
+        "write_file",
+        "patch_replace",
+        "patch_v4a",
+        "delete_file",
+        "delete_path",
+        "move_file",
+        "search",
+    }
+
+    for cls in (FileOperations, ShellFileOperations):
+        for method_name in method_names:
+            assert inspect.iscoroutinefunction(getattr(cls, method_name)), (
+                cls.__name__,
+                method_name,
+            )
+
+    assert str(inspect.signature(ShellFileOperations.read_file)) == (
+        "(self, path: str, offset: int = 1, limit: int = 2000) -> "
+        "tools.file_operations.ReadResult"
+    )
+    assert str(inspect.signature(ShellFileOperations.search)) == (
+        "(self, pattern: str, path: str = '.', target: str = 'content', "
+        "file_glob: Optional[str] = None, limit: int = 50, offset: int = 0, "
+        "output_mode: str = 'content', context: int = 0) -> "
+        "tools.file_operations.SearchResult"
+    )
+
+
+@pytest.mark.asyncio
+async def test_shell_file_operations_real_native_async_workflow(tmp_path):
+    from tools.environments.local import LocalEnvironment
+
+    env = LocalEnvironment(cwd=str(tmp_path))
+    ops = ShellFileOperations(env)
+    try:
+        write = await ops.write_file("notes.txt", "old value\n")
+        assert write.error is None
+        assert write.verified is True
+
+        read = await ops.read_file("notes.txt")
+        assert read.to_dict()["content"] == "1|old value"
+
+        patch = await ops.patch_replace("notes.txt", "old value", "new value")
+        assert patch.success is True
+        assert patch.files_modified == ["notes.txt"]
+
+        search = await ops.search("new value", path="notes.txt")
+        assert search.to_dict()["matches"] == [
+            {"path": "notes.txt", "line": 1, "content": "new value"}
+        ]
+
+        delete = await ops.delete_file("notes.txt")
+        assert delete.error is None
+        assert not (tmp_path / "notes.txt").exists()
+    finally:
+        await env.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_shell_file_operations_tracks_live_environment_cwd(tmp_path):
+    from tools.environments.local import LocalEnvironment
+
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    (first / "target.txt").write_text("first\n")
+    (second / "target.txt").write_text("second\n")
+
+    env = LocalEnvironment(cwd=str(first))
+    ops = ShellFileOperations(env, cwd=str(first))
+    try:
+        result = await env.execute(f"cd {second}")
+        assert result["returncode"] == 0
+        assert env.cwd == str(second)
+        assert ops.cwd == str(first)
+
+        read = await ops.read_file("target.txt")
+        assert read.content == "1|second"
+    finally:
+        await env.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_shell_file_operations_preserves_external_cancellation():
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    class BlockingEnvironment:
+        cwd = "/"
+
+        async def execute(self, command, **kwargs):
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+    task = asyncio.create_task(
+        ShellFileOperations(BlockingEnvironment()).read_file("x")
+    )
+    await started.wait()
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert cancelled.is_set()
+
+
+@pytest.mark.asyncio
+async def test_shell_file_operations_rejects_sync_backend_without_thread_fallback():
+    class SyncEnvironment:
+        cwd = "/"
+
+        def execute(self, command, **kwargs):
+            return {"output": "", "returncode": 0}
+
+    with pytest.raises(TypeError, match="can't be used in 'await' expression"):
+        await ShellFileOperations(SyncEnvironment()).read_file("x")
 
 
 @pytest.mark.asyncio
