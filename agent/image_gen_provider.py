@@ -293,7 +293,9 @@ async def save_url_image(
     network / HTTP / oversize / non-image-content-type error so callers can
     fall back to returning the bare URL with a clear error message.
     """
-    async with httpx.AsyncClient(timeout=timeout) as client:
+    from agent.ssl_verify import _create_httpx_client
+
+    async with (await _create_httpx_client(timeout=timeout)) as client:
         async with client.stream("GET", url) as response:
             response.raise_for_status()
 

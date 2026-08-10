@@ -28,6 +28,7 @@ import os
 from typing import Any, Dict, List
 
 from agent.web_search_provider import WebSearchProvider
+from agent.ssl_verify import _create_httpx_client
 
 logger = logging.getLogger(__name__)
 
@@ -56,7 +57,7 @@ async def _tavily_request(endpoint: str, payload: Dict[str, Any]) -> Dict[str, A
     url = f"{base_url}/{endpoint.lstrip('/')}"
     logger.info("Tavily %s request to %s", endpoint, url)
 
-    async with httpx.AsyncClient(timeout=60) as client:
+    async with (await _create_httpx_client(timeout=60)) as client:
         response = await client.post(url, json=payload)
         response.raise_for_status()
         return response.json()

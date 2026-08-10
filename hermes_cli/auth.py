@@ -63,7 +63,11 @@ from hermes_cli.config import (
 )
 from hermes_constants import OPENROUTER_BASE_URL, secure_parent_dir
 from agent.credential_persistence import sanitize_borrowed_credential_payload
-from agent.ssl_verify import _resolve_httpx_client_verify, resolve_httpx_verify
+from agent.ssl_verify import (
+    _create_httpx_client,
+    _resolve_httpx_client_verify,
+    resolve_httpx_verify,
+)
 from utils import env_float, is_truthy_value
 
 logger = logging.getLogger(__name__)
@@ -754,10 +758,10 @@ async def detect_zai_endpoint(
     first working endpoint, or None if all fail.  For endpoints with multiple
     candidate models, tries each in order and returns the first that succeeds.
     """
-    async with httpx.AsyncClient(
+    async with (await _create_httpx_client(
         timeout=timeout,
         verify=await _resolve_httpx_client_verify(),
-    ) as client:
+    )) as client:
         for ep_id, base_url, probe_models, label in ZAI_ENDPOINTS:
             for model in probe_models:
                 try:
@@ -2306,14 +2310,14 @@ async def _refresh_qwen_cli_tokens(
         )
 
     try:
-        async with httpx.AsyncClient(
+        async with (await _create_httpx_client(
             timeout=timeout_seconds,
             headers={
                 "Content-Type": "application/x-www-form-urlencoded",
                 "Accept": "application/json",
             },
             verify=await _resolve_httpx_client_verify(),
-        ) as client:
+        )) as client:
             response = await client.post(
                 QWEN_OAUTH_TOKEN_URL,
                 data={
@@ -2439,14 +2443,14 @@ async def refresh_codex_oauth_pure(
         )
 
     timeout = httpx.Timeout(max(5.0, float(timeout_seconds)))
-    async with httpx.AsyncClient(
+    async with (await _create_httpx_client(
         timeout=timeout,
         headers={
             "Accept": "application/json",
             "User-Agent": CODEX_OAUTH_USER_AGENT,
         },
         verify=await _resolve_httpx_client_verify(),
-    ) as client:
+    )) as client:
         response = await client.post(
             CODEX_OAUTH_TOKEN_URL,
             headers={"Content-Type": "application/x-www-form-urlencoded"},
@@ -2651,10 +2655,10 @@ async def _probe_codex_quota_restored(
         )
         if isinstance(account_id, str) and account_id.strip():
             headers["ChatGPT-Account-Id"] = account_id.strip()
-        async with httpx.AsyncClient(
+        async with (await _create_httpx_client(
             timeout=10.0,
             verify=await _resolve_httpx_client_verify(),
-        ) as client:
+        )) as client:
             response = await client.get(
                 _codex_usage_probe_url(base_url),
                 headers=headers,
@@ -3077,11 +3081,11 @@ def _xai_validate_inference_base_url(value: str, *, fallback: str) -> str:
 
 async def _xai_oauth_discovery(timeout_seconds: float = 15.0) -> Dict[str, str]:
     try:
-        async with httpx.AsyncClient(
+        async with (await _create_httpx_client(
             timeout=httpx.Timeout(timeout_seconds),
             headers={"Accept": "application/json"},
             verify=await _resolve_httpx_client_verify(),
-        ) as client:
+        )) as client:
             response = await client.get(XAI_OAUTH_DISCOVERY_URL)
     except Exception as exc:
         raise AuthError(
@@ -3150,11 +3154,11 @@ async def refresh_xai_oauth_pure(
         endpoint = (await _xai_oauth_discovery(timeout_seconds))["token_endpoint"]
     _xai_validate_oauth_endpoint(endpoint, field="token_endpoint")
     timeout = httpx.Timeout(max(5.0, float(timeout_seconds)))
-    async with httpx.AsyncClient(
+    async with (await _create_httpx_client(
         timeout=timeout,
         headers={"Accept": "application/json"},
         verify=await _resolve_httpx_client_verify(),
-    ) as client:
+    )) as client:
         response = await client.post(
             endpoint,
             headers={"Content-Type": "application/x-www-form-urlencoded"},
@@ -3752,11 +3756,11 @@ async def refresh_nous_oauth_pure(
         auth_state=state,
     )
     timeout = httpx.Timeout(timeout_seconds if timeout_seconds else 15.0)
-    async with httpx.AsyncClient(
+    async with (await _create_httpx_client(
         timeout=timeout,
         headers={"Accept": "application/json"},
         verify=verify,
-    ) as client:
+    )) as client:
         invoke_status = _nous_invoke_jwt_status(
             state.get("access_token"),
             scope=state.get("scope"),
@@ -4177,11 +4181,11 @@ async def resolve_nous_access_token(
                         relogin_required=True,
                     )
                 timeout = httpx.Timeout(timeout_seconds if timeout_seconds else 15.0)
-                async with httpx.AsyncClient(
+                async with (await _create_httpx_client(
                     timeout=timeout,
                     headers={"Accept": "application/json"},
                     verify=verify,
-                ) as client:
+                )) as client:
                     refresh_error: AuthError | None = None
                     try:
                         refreshed = await _refresh_access_token(
@@ -4443,11 +4447,11 @@ async def _refresh_minimax_oauth_state(
                 relogin_required=True,
             )
 
-        async with httpx.AsyncClient(
+        async with (await _create_httpx_client(
             timeout=httpx.Timeout(timeout_seconds),
             follow_redirects=True,
             verify=await _resolve_httpx_client_verify(),
-        ) as client:
+        )) as client:
             response = await _minimax_post_form(
                 client,
                 f"{portal_base_url}/oauth/token",

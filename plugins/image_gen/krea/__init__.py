@@ -31,6 +31,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import httpx
 
 from agent.secret_scope import get_secret
+from agent.ssl_verify import _create_httpx_client
 from agent.image_gen_provider import (
     DEFAULT_ASPECT_RATIO,
     ImageGenProvider,
@@ -351,7 +352,7 @@ class KreaImageGenProvider(ImageGenProvider):
         # 1. Submit job.
         submit_url = f"{base_url}/generate/image/krea/krea-2/{meta['path']}"
         try:
-            async with httpx.AsyncClient(timeout=30) as client:
+            async with (await _create_httpx_client(timeout=30)) as client:
                 response = await client.post(
                     submit_url,
                     headers=headers,
@@ -436,7 +437,7 @@ class KreaImageGenProvider(ImageGenProvider):
             interval = min(interval * _POLL_BACKOFF, _POLL_MAX_INTERVAL)
 
             try:
-                async with httpx.AsyncClient(timeout=30) as client:
+                async with (await _create_httpx_client(timeout=30)) as client:
                     poll_resp = await client.get(job_url, headers=poll_headers)
                     poll_resp.raise_for_status()
             except httpx.HTTPStatusError as exc:

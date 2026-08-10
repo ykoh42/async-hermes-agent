@@ -78,8 +78,7 @@ class TestResolveClientCert:
 
 class TestHTTPClientCert:
     def test_cert_forwarded_to_async_client(self, tmp_path):
-        """When client_cert is set, the new-SDK HTTP path passes ``cert=``
-        into ``httpx.AsyncClient``."""
+        """The new-SDK HTTP path forwards ``client_cert`` to TLS setup."""
         from tools.mcp_tool import MCPServerTask
 
         cert = tmp_path / "client.pem"
@@ -87,6 +86,10 @@ class TestHTTPClientCert:
 
         server = MCPServerTask("remote")
         captured: dict = {}
+
+        async def materialize_verify(verify, *, cert=None, trust_env=True):
+            captured["cert"] = cert
+            return False
 
         class DummyAsyncClient:
             def __init__(self, **kwargs):
@@ -124,6 +127,10 @@ class TestHTTPClientCert:
         async def _drive():
             with patch("tools.mcp_tool._MCP_HTTP_AVAILABLE", True), \
                  patch("tools.mcp_tool._MCP_NEW_HTTP", True), \
+                 patch(
+                     "agent.ssl_verify._materialize_httpx_verify",
+                     materialize_verify,
+                 ), \
                  patch("httpx.AsyncClient", DummyAsyncClient), \
                  patch("tools.mcp_tool.streamable_http_client",
                        return_value=DummyTransportCtx()), \
@@ -135,7 +142,8 @@ class TestHTTPClientCert:
                 })
 
         asyncio.run(_drive())
-        assert captured.get("cert") == str(cert)
+        assert captured["cert"] == str(cert)
+        assert captured["verify"] is False
 
 
     def test_missing_cert_file_surfaces_clear_error(self, tmp_path):

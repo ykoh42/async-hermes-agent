@@ -68,7 +68,15 @@ def camofox_http(monkeypatch) -> _CamofoxHTTP:
     real_async_client = httpx.AsyncClient
 
     def client_factory(**kwargs):
-        return real_async_client(transport=httpx.MockTransport(backend.handle), **kwargs)
+        forwarded = {
+            key: value
+            for key, value in kwargs.items()
+            if key not in {"transport", "mounts"}
+        }
+        return real_async_client(
+            transport=httpx.MockTransport(backend.handle),
+            **forwarded,
+        )
 
     monkeypatch.setattr(camofox.httpx, "AsyncClient", client_factory)
     return backend

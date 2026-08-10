@@ -76,7 +76,14 @@ async def test_resolve_qwen_runtime_credentials_refreshes_and_persists(
     monkeypatch.setattr(
         auth.httpx,
         "AsyncClient",
-        lambda **kwargs: async_client(transport=transport, **kwargs),
+        lambda **kwargs: async_client(
+            transport=transport,
+            **{
+                key: value
+                for key, value in kwargs.items()
+                if key not in {"transport", "mounts"}
+            },
+        ),
     )
     resolve_task = asyncio.create_task(auth.resolve_qwen_runtime_credentials())
     await asyncio.wait_for(request_seen.wait(), timeout=1)
@@ -104,7 +111,14 @@ async def test_qwen_refresh_preserves_upstream_error_contract(
     monkeypatch.setattr(
         auth.httpx,
         "AsyncClient",
-        lambda **kwargs: async_client(transport=transport, **kwargs),
+        lambda **kwargs: async_client(
+            transport=transport,
+            **{
+                key: value
+                for key, value in kwargs.items()
+                if key not in {"transport", "mounts"}
+            },
+        ),
     )
 
     with pytest.raises(auth.AuthError) as exc_info:

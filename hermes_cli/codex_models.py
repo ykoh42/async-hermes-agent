@@ -13,6 +13,8 @@ import aiofiles
 import aiofiles.os
 import httpx
 
+from agent.ssl_verify import _create_httpx_client
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_CODEX_MODELS: List[str] = [
@@ -134,7 +136,7 @@ async def _fetch_models_from_api(access_token: str) -> List[str]:
         acct_id = _extract_chatgpt_account_id(access_token)
         if acct_id:
             headers["ChatGPT-Account-Id"] = acct_id
-        async with httpx.AsyncClient(timeout=10) as client:
+        async with (await _create_httpx_client(timeout=10)) as client:
             resp = await client.get(
                 "https://chatgpt.com/backend-api/codex/models?client_version=1.0.0",
                 headers=headers,

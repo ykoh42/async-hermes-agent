@@ -19,6 +19,7 @@ from agent.credential_pool import (
     load_pool,
 )
 from agent.secret_scope import get_secret as _get_secret
+from agent.ssl_verify import _create_httpx_client
 from hermes_cli.auth import (
     AuthError,
     DEFAULT_CODEX_BASE_URL,
@@ -290,7 +291,11 @@ async def _auto_detect_local_model(base_url: str) -> str:
         url = base_url.rstrip("/")
         if not url.endswith("/v1"):
             url += "/v1"
-        async with httpx.AsyncClient(timeout=httpx.Timeout(3.0, connect=2.0)) as client:
+        async with (
+            await _create_httpx_client(
+                timeout=httpx.Timeout(3.0, connect=2.0)
+            )
+        ) as client:
             response = await client.get(f"{url}/models")
             if response.is_success:
                 models = response.json().get("data", [])

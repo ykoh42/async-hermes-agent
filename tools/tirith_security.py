@@ -37,6 +37,8 @@ import aiofiles.os
 import aiofiles.tempfile
 import httpx
 
+from agent.ssl_verify import _create_httpx_client
+
 from hermes_constants import get_hermes_home
 
 logger = logging.getLogger(__name__)
@@ -312,11 +314,11 @@ async def _download_file(url: str, dest: str, timeout: int = 10):
 
     token = get_secret("GITHUB_TOKEN")
     headers = {"Authorization": f"token {token}"} if token else None
-    async with httpx.AsyncClient(
+    async with (await _create_httpx_client(
         follow_redirects=True,
         timeout=timeout,
         headers=headers,
-    ) as client:
+    )) as client:
         async with client.stream("GET", url) as response:
             response.raise_for_status()
             async with aiofiles.open(dest, "wb") as handle:

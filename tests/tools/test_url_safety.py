@@ -1,5 +1,6 @@
 """Tests for SSRF protection in url_safety module."""
 
+import asyncio
 import socket
 from unittest.mock import AsyncMock, patch
 
@@ -193,13 +194,54 @@ class TestSSRFGuardedHttpxClient:
         with pytest.raises(SSRFConnectionBlocked, match="Unix socket"):
             await backend.connect_unix_socket("/tmp/hermes.sock")
 
-    def test_async_client_rejects_unpatchable_custom_transport(self):
+    @pytest.mark.asyncio
+    async def test_async_client_rejects_unpatchable_custom_transport(self):
         class CustomTransport(httpx.AsyncBaseTransport):
             async def handle_async_request(self, request):
                 return httpx.Response(200, request=request)
 
         with pytest.raises(SSRFConnectionBlocked, match="Unsupported async httpx transport"):
-            create_ssrf_safe_client(transport=CustomTransport())
+            await create_ssrf_safe_client(transport=CustomTransport())
+
+    @pytest.mark.asyncio
+    async def test_async_client_setup_cleanup_survives_repeated_cancellation(
+        self,
+        monkeypatch,
+    ):
+        close_started = asyncio.Event()
+        release_close = asyncio.Event()
+        close_finished = asyncio.Event()
+
+        class Client:
+            async def aclose(self):
+                close_started.set()
+                await release_close.wait()
+                close_finished.set()
+
+        async def create_client(**_kwargs):
+            return Client()
+
+        monkeypatch.setattr(
+            "agent.ssl_verify._create_httpx_client",
+            create_client,
+        )
+        monkeypatch.setattr(
+            "tools.url_safety._install_ssrf_guard_on_client",
+            lambda _client: (_ for _ in ()).throw(RuntimeError("setup failed")),
+        )
+
+        create = asyncio.create_task(create_ssrf_safe_client())
+        await close_started.wait()
+        create.cancel()
+        await asyncio.sleep(0)
+        create.cancel()
+        await asyncio.sleep(0)
+
+        assert create.done() is False
+        release_close.set()
+        with pytest.raises(asyncio.CancelledError):
+            await create
+        assert close_finished.is_set()
 
     @pytest.mark.asyncio
     async def test_async_client_preserves_env_proxy_mounts(self, monkeypatch):
@@ -217,7 +259,7 @@ class TestSSRFGuardedHttpxClient:
             monkeypatch.delenv(proxy_var, raising=False)
         monkeypatch.setenv("HTTPS_PROXY", "http://proxy.example:8080")
 
-        client = create_ssrf_safe_client(timeout=0.01)
+        client = await create_ssrf_safe_client(timeout=0.01)
         try:
             proxy_transports = [
                 transport

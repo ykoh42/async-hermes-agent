@@ -1180,8 +1180,10 @@ async def refresh_anthropic_oauth_pure(
         }
         request_kwargs = {"data": payload}
 
+    from agent.ssl_verify import _create_httpx_client
+
     last_error: Optional[Exception] = None
-    async with httpx.AsyncClient(timeout=10.0) as client:
+    async with (await _create_httpx_client(timeout=10.0)) as client:
         for endpoint in (
             "https://platform.claude.com/v1/oauth/token",
             "https://console.anthropic.com/v1/oauth/token",

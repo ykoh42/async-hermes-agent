@@ -36,6 +36,7 @@ from agent.image_gen_provider import (
     save_b64_image,
     success_response,
 )
+from agent.ssl_verify import _create_httpx_client
 
 logger = logging.getLogger(__name__)
 
@@ -436,7 +437,9 @@ async def _collect_image_b64(
     timeout = httpx.Timeout(300.0, connect=30.0, read=300.0, write=30.0, pool=30.0)
 
     image_b64: Optional[str] = None
-    async with httpx.AsyncClient(timeout=timeout, headers=headers) as http:
+    async with (
+        await _create_httpx_client(timeout=timeout, headers=headers)
+    ) as http:
         async with http.stream(
             "POST",
             f"{_CODEX_BASE_URL}/responses",

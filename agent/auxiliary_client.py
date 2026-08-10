@@ -177,14 +177,14 @@ async def _openai_http_client_kwargs(
                 "back to a native async HTTP client. Run `hermes update` (or "
                 "reinstall the Desktop app) to resync the runtime."
             )
-        import httpx
+        from agent.ssl_verify import _create_httpx_client
 
-        client = httpx.AsyncClient(verify=verify)
+        client = await _create_httpx_client(verify=verify)
 
     if client is None:
-        import httpx
+        from agent.ssl_verify import _create_httpx_client
 
-        client = httpx.AsyncClient(verify=verify)
+        client = await _create_httpx_client(verify=verify)
     return {"http_client": client}
 
 

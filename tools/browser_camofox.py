@@ -39,6 +39,7 @@ import aiofiles.os
 import httpx
 
 from agent.secret_scope import get_secret
+from agent.ssl_verify import _create_httpx_client
 from hermes_cli.config import cfg_get, load_config_readonly
 from tools.browser_camofox_state import get_camofox_identity
 from tools.registry import tool_error
@@ -138,7 +139,7 @@ async def check_camofox_available() -> bool:
     if not url:
         return False
     try:
-        async with httpx.AsyncClient(timeout=5) as client:
+        async with (await _create_httpx_client(timeout=5)) as client:
             resp = await client.get(f"{url}/health")
         if resp.status_code == 200 and not _vnc_url_checked:
             try:
@@ -428,7 +429,9 @@ async def _ensure_tab(
     if session["tab_id"]:
         return session
     base = get_camofox_url()
-    async with httpx.AsyncClient(timeout=await _get_command_timeout()) as client:
+    async with (
+        await _create_httpx_client(timeout=await _get_command_timeout())
+    ) as client:
         resp = await client.post(
             f"{base}/tabs",
             json={
@@ -480,7 +483,7 @@ async def _post(path: str, body: dict, timeout: Optional[int] = None) -> dict:
     if timeout is None:
         timeout = await _get_command_timeout()
     url = f"{get_camofox_url()}{path}"
-    async with httpx.AsyncClient(timeout=timeout) as client:
+    async with (await _create_httpx_client(timeout=timeout)) as client:
         resp = await client.post(url, json=body, headers=_auth_headers())
     resp.raise_for_status()
     return resp.json()
@@ -493,7 +496,7 @@ async def _get(
     if timeout is None:
         timeout = await _get_command_timeout()
     url = f"{get_camofox_url()}{path}"
-    async with httpx.AsyncClient(timeout=timeout) as client:
+    async with (await _create_httpx_client(timeout=timeout)) as client:
         resp = await client.get(url, params=params, headers=_auth_headers())
     resp.raise_for_status()
     return resp.json()
@@ -506,7 +509,7 @@ async def _get_raw(
     if timeout is None:
         timeout = await _get_command_timeout()
     url = f"{get_camofox_url()}{path}"
-    async with httpx.AsyncClient(timeout=timeout) as client:
+    async with (await _create_httpx_client(timeout=timeout)) as client:
         resp = await client.get(url, params=params, headers=_auth_headers())
     resp.raise_for_status()
     return resp
@@ -519,7 +522,7 @@ async def _delete(
     if timeout is None:
         timeout = await _get_command_timeout()
     url = f"{get_camofox_url()}{path}"
-    async with httpx.AsyncClient(timeout=timeout) as client:
+    async with (await _create_httpx_client(timeout=timeout)) as client:
         resp = await client.request("DELETE", url, json=body, headers=_auth_headers())
     resp.raise_for_status()
     return resp.json()

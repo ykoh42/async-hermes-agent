@@ -2670,7 +2670,9 @@ class MCPServerTask:
 
         probe_headers = dict(headers) if headers else {}
         try:
-            async with _httpx.AsyncClient(**client_kwargs) as client:
+            from agent.ssl_verify import _create_httpx_client
+
+            async with (await _create_httpx_client(**client_kwargs)) as client:
                 # HEAD is cheapest; fall back to GET if the server doesn't
                 # implement it (405 Method Not Allowed / 501 Not Implemented).
                 resp = await client.head(url, headers=probe_headers)
@@ -2956,7 +2958,11 @@ class MCPServerTask:
             # Caller owns the client lifecycle — the SDK skips cleanup when
             # http_client is provided, so we wrap in async-with.
             try:
-                async with httpx.AsyncClient(**client_kwargs) as http_client:
+                from agent.ssl_verify import _create_httpx_client
+
+                async with (
+                    await _create_httpx_client(**client_kwargs)
+                ) as http_client:
                     async with streamable_http_client(url, http_client=http_client) as (
                         read_stream, write_stream, _get_session_id,
                     ):

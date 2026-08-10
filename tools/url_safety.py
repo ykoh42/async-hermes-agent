@@ -648,7 +648,7 @@ def _install_ssrf_guard_on_client(client: Any) -> None:
     )
 
 
-def create_ssrf_safe_client(**kwargs: Any) -> Any:
+async def create_ssrf_safe_client(**kwargs: Any) -> Any:
     """Create an ``httpx.AsyncClient`` with connect-time SSRF validation.
 
     Direct HTTP(S) connections are resolved, validated, and dialed by IP at
@@ -657,10 +657,30 @@ def create_ssrf_safe_client(**kwargs: Any) -> Any:
     target resolution is delegated to that configured proxy; treat the proxy as
     a trusted egress boundary.
     """
-    import httpx
+    from agent.ssl_verify import _create_httpx_client
 
-    client = httpx.AsyncClient(**kwargs)
-    _install_ssrf_guard_on_client(client)
+    client = await _create_httpx_client(**kwargs)
+    try:
+        _install_ssrf_guard_on_client(client)
+    except BaseException as setup_error:
+        close_task = asyncio.create_task(
+            client.aclose(),
+            name="ssrf-safe-http-client-setup-cleanup",
+        )
+        cancellation: asyncio.CancelledError | None = None
+        while True:
+            try:
+                await asyncio.shield(close_task)
+                break
+            except asyncio.CancelledError as exc:  # noqa: ASYNC103
+                if close_task.cancelled():
+                    break  # noqa: ASYNC104 - owned cleanup reached a terminal state
+                if cancellation is None:
+                    cancellation = exc
+                continue  # noqa: ASYNC104 - finish closing the owned client
+        if cancellation is not None:
+            raise cancellation from setup_error  # noqa: ASYNC104
+        raise
     return client
 
 

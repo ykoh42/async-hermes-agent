@@ -21,6 +21,7 @@ from difflib import get_close_matches
 from pathlib import Path
 from typing import Any, NamedTuple, Optional
 
+from agent.ssl_verify import _create_httpx_client
 from hermes_cli import __version__ as _HERMES_VERSION
 
 logger = logging.getLogger(__name__)
@@ -723,7 +724,9 @@ async def fetch_nous_recommended_models(
 
     url = f"{base}{NOUS_RECOMMENDED_MODELS_PATH}"
     try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(timeout)) as client:
+        async with (
+            await _create_httpx_client(timeout=httpx.Timeout(timeout))
+        ) as client:
             response = await client.get(url, headers={"Accept": "application/json"})
             response.raise_for_status()
             data = response.json()
@@ -1484,10 +1487,10 @@ async def _lmstudio_fetch_raw_models(
     from hermes_cli.auth import AuthError
 
     try:
-        async with httpx.AsyncClient(
+        async with (await _create_httpx_client(
             timeout=timeout,
             headers=_lmstudio_request_headers(api_key),
-        ) as client:
+        )) as client:
             response = await client.get(f"{server_root}/api/v1/models")
             if response.status_code in {401, 403}:
                 raise AuthError(
@@ -1655,10 +1658,10 @@ async def ensure_lmstudio_model_loaded(
     if explicit_context is not None:
         load_payload["context_length"] = explicit_context
     try:
-        async with httpx.AsyncClient(
+        async with (await _create_httpx_client(
             timeout=timeout,
             headers=_lmstudio_request_headers(api_key),
-        ) as client:
+        )) as client:
             response = await client.post(
                 f"{server_root}/api/v1/models/load",
                 json=load_payload,
@@ -1777,7 +1780,9 @@ async def ollama_model_supports_thinking(
     headers = {"Authorization": f"Bearer {token}"} if token else {}
 
     try:
-        async with httpx.AsyncClient(timeout=timeout, headers=headers) as client:
+        async with (
+            await _create_httpx_client(timeout=timeout, headers=headers)
+        ) as client:
             resp = await client.post(
                 f"{server_url}/api/show",
                 json={"name": bare_model},
@@ -2228,7 +2233,9 @@ async def _fetch_deepinfra_catalog(
         headers["Authorization"] = f"Bearer {api_key}"
 
     try:
-        async with httpx.AsyncClient(timeout=timeout, headers=headers) as client:
+        async with (
+            await _create_httpx_client(timeout=timeout, headers=headers)
+        ) as client:
             response = await client.get(url)
             response.raise_for_status()
             payload = response.json()

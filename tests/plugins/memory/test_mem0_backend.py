@@ -57,12 +57,55 @@ class _StubServer:
         return httpx.Response(404, json={"detail": "not found"})
 
 
+def test_http_backend_constructors_are_state_only(monkeypatch):
+    def fail_if_constructed(*args, **kwargs):
+        raise AssertionError("HTTP resources must be created at an awaited boundary")
+
+    monkeypatch.setattr(httpx, "AsyncClient", fail_if_constructed)
+    monkeypatch.setattr(httpx, "AsyncHTTPTransport", fail_if_constructed)
+
+    platform = PlatformBackend("secret")
+    self_hosted = SelfHostedBackend("secret", "https://mem0.example")
+
+    assert platform._client is None
+    assert self_hosted._client is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "backend",
+    [
+        pytest.param(PlatformBackend("secret"), id="platform"),
+        pytest.param(
+            SelfHostedBackend("secret", "https://mem0.example"),
+            id="self-hosted",
+        ),
+    ],
+)
+async def test_http_backend_does_not_open_after_concurrent_close(backend):
+    await backend._client_lock.acquire()
+    ensure_task = asyncio.create_task(backend._ensure_client())
+    await asyncio.sleep(0)
+    close_task = asyncio.create_task(backend.close())
+    await asyncio.sleep(0)
+
+    assert backend._closed is True
+    backend._client_lock.release()
+
+    with pytest.raises(RuntimeError, match="client has been closed"):
+        await ensure_task
+    await close_task
+    assert backend._client is None
+
+
 @pytest.mark.asyncio
 async def test_platform_backend_preserves_cloud_request_contract(monkeypatch):
     server = _StubServer()
     async_client = httpx.AsyncClient
 
     def build_client(*args, **kwargs):
+        kwargs.pop("transport", None)
+        kwargs.pop("mounts", None)
         return async_client(
             *args,
             **kwargs,
@@ -121,6 +164,8 @@ async def test_platform_search_trims_and_validates_like_memory_client(monkeypatc
     async_client = httpx.AsyncClient
 
     def build_client(*args, **kwargs):
+        kwargs.pop("transport", None)
+        kwargs.pop("mounts", None)
         return async_client(
             *args,
             **kwargs,
@@ -151,6 +196,8 @@ async def test_platform_404_uses_mem0_client_exception_contract(monkeypatch):
     async_client = httpx.AsyncClient
 
     def build_client(*args, **kwargs):
+        kwargs.pop("transport", None)
+        kwargs.pop("mounts", None)
         return async_client(
             *args,
             **kwargs,
@@ -179,6 +226,8 @@ async def test_platform_generic_http_error_matches_mem0_base_exception(monkeypat
     async_client = httpx.AsyncClient
 
     def build_client(*args, **kwargs):
+        kwargs.pop("transport", None)
+        kwargs.pop("mounts", None)
         return async_client(
             *args,
             **kwargs,
@@ -208,6 +257,8 @@ async def test_platform_ping_requires_complete_org_project_pair(monkeypatch):
     async_client = httpx.AsyncClient
 
     def build_client(*args, **kwargs):
+        kwargs.pop("transport", None)
+        kwargs.pop("mounts", None)
         return async_client(
             *args,
             **kwargs,
@@ -667,6 +718,8 @@ async def test_http_backends_never_call_asyncio_to_thread(monkeypatch):
     async_client = httpx.AsyncClient
 
     def build_client(*args, **kwargs):
+        kwargs.pop("transport", None)
+        kwargs.pop("mounts", None)
         return async_client(
             *args,
             **kwargs,

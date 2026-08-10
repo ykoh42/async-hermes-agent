@@ -241,11 +241,16 @@ async def _gcloud_project_id() -> Optional[str]:
 
 
 async def _metadata_credentials() -> Tuple[Optional[str], Optional[str]]:
+    from agent.ssl_verify import _create_httpx_client
+
     metadata_host = os.getenv("GCE_METADATA_HOST", "metadata.google.internal").strip()
     base_url = f"http://{metadata_host}/computeMetadata/v1"
     headers = {"Metadata-Flavor": "Google"}
     timeout = httpx.Timeout(3.0)
-    async with httpx.AsyncClient(timeout=timeout, trust_env=False) as client:
+    async with (await _create_httpx_client(
+        timeout=timeout,
+        trust_env=False,
+    )) as client:
         project_response, token_response = await asyncio.gather(
             client.get(f"{base_url}/project/project-id", headers=headers),
             client.get(

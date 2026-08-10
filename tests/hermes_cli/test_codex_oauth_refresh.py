@@ -18,7 +18,14 @@ def _install_transport(monkeypatch, handler) -> None:
     monkeypatch.setattr(
         auth.httpx,
         "AsyncClient",
-        lambda **kwargs: async_client(transport=transport, **kwargs),
+        lambda **kwargs: async_client(
+            transport=transport,
+            **{
+                key: value
+                for key, value in kwargs.items()
+                if key not in {"transport", "mounts"}
+            },
+        ),
     )
 
 

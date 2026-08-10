@@ -35,6 +35,7 @@ import httpx
 
 from agent.browser_provider import BrowserProvider
 from agent.secret_scope import get_secret
+from agent.ssl_verify import _create_httpx_client
 
 logger = logging.getLogger(__name__)
 
@@ -87,7 +88,7 @@ class FirecrawlBrowserProvider(BrowserProvider):
         body: Dict[str, object] = {"ttl": ttl}
 
         try:
-            async with httpx.AsyncClient(timeout=30) as client:
+            async with (await _create_httpx_client(timeout=30)) as client:
                 response = await client.post(
                     f"{self._api_url()}/v2/browser",
                     headers=self._headers(),
@@ -118,7 +119,7 @@ class FirecrawlBrowserProvider(BrowserProvider):
 
     async def close_session(self, session_id: str) -> bool:
         try:
-            async with httpx.AsyncClient(timeout=10) as client:
+            async with (await _create_httpx_client(timeout=10)) as client:
                 response = await client.delete(
                     f"{self._api_url()}/v2/browser/{session_id}",
                     headers=self._headers(),
@@ -146,7 +147,7 @@ class FirecrawlBrowserProvider(BrowserProvider):
             )
             return
         try:
-            async with httpx.AsyncClient(timeout=5) as client:
+            async with (await _create_httpx_client(timeout=5)) as client:
                 await client.delete(
                     f"{self._api_url()}/v2/browser/{session_id}",
                     headers=self._headers(),

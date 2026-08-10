@@ -29,6 +29,7 @@ import logging
 from typing import Any, Dict, List, Optional
 
 from agent.web_search_provider import WebSearchProvider
+from agent.ssl_verify import _create_httpx_client
 from tools.url_safety import is_safe_url
 from tools.website_policy import check_website_access
 
@@ -189,7 +190,7 @@ class FirecrawlWebSearchProvider(WebSearchProvider):
         origin, token = await cls._request_config()
         if not origin.endswith("/v1"):
             origin = f"{origin}/v1"
-        async with httpx.AsyncClient(timeout=60) as client:
+        async with (await _create_httpx_client(timeout=60)) as client:
             response = await client.post(
                 f"{origin}/{endpoint.lstrip('/')}",
                 headers={

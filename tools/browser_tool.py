@@ -69,6 +69,7 @@ import aiofiles.os
 import httpx
 
 from agent.redact import redact_cdp_url
+from agent.ssl_verify import _create_httpx_client
 from hermes_constants import (
     agent_browser_runnable,
     get_hermes_home,
@@ -520,7 +521,7 @@ async def _resolve_cdp_override(cdp_url: str) -> str:
         version_url = discovery_url.rstrip("/") + "/json/version"
 
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
+        async with (await _create_httpx_client(timeout=10)) as client:
             response = await client.get(version_url)
         response.raise_for_status()
         payload = response.json()

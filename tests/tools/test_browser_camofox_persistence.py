@@ -59,6 +59,8 @@ def camofox_requests(monkeypatch) -> list[httpx.Request]:
         return httpx.Response(200, json=payload, request=request)
 
     def client_factory(**kwargs):
+        kwargs.pop("transport", None)
+        kwargs.pop("mounts", None)
         return real_async_client(transport=httpx.MockTransport(handle), **kwargs)
 
     monkeypatch.setattr(camofox.httpx, "AsyncClient", client_factory)

@@ -97,7 +97,14 @@ async def test_resolve_minimax_oauth_refreshes_without_blocking_event_loop(
     monkeypatch.setattr(
         auth.httpx,
         "AsyncClient",
-        lambda **kwargs: async_client(transport=transport, **kwargs),
+        lambda **kwargs: async_client(
+            transport=transport,
+            **{
+                key: value
+                for key, value in kwargs.items()
+                if key not in {"transport", "mounts"}
+            },
+        ),
     )
 
     task = asyncio.create_task(auth.resolve_minimax_oauth_runtime_credentials())
@@ -127,7 +134,14 @@ async def test_terminal_minimax_refresh_failure_quarantines_tokens(
     monkeypatch.setattr(
         auth.httpx,
         "AsyncClient",
-        lambda **kwargs: async_client(transport=transport, **kwargs),
+        lambda **kwargs: async_client(
+            transport=transport,
+            **{
+                key: value
+                for key, value in kwargs.items()
+                if key not in {"transport", "mounts"}
+            },
+        ),
     )
 
     with pytest.raises(auth.AuthError) as exc_info:
@@ -200,7 +214,14 @@ async def test_minimax_pool_refreshes_the_selected_singleton(
     monkeypatch.setattr(
         auth.httpx,
         "AsyncClient",
-        lambda **kwargs: async_client(transport=transport, **kwargs),
+        lambda **kwargs: async_client(
+            transport=transport,
+            **{
+                key: value
+                for key, value in kwargs.items()
+                if key not in {"transport", "mounts"}
+            },
+        ),
     )
 
     refreshed = await pool.try_refresh_current()

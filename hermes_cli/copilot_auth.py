@@ -31,6 +31,8 @@ import aiofiles
 import aiofiles.os
 import httpx
 
+from agent.ssl_verify import _create_httpx_client
+
 logger = logging.getLogger(__name__)
 
 # OAuth device code flow constants — VS Code's GitHub App client ID.
@@ -267,7 +269,7 @@ async def copilot_device_code_login(
     }
 
     try:
-        async with httpx.AsyncClient(timeout=15) as client:
+        async with (await _create_httpx_client(timeout=15)) as client:
             response = await client.post(
                 device_code_url,
                 data={"client_id": COPILOT_OAUTH_CLIENT_ID, "scope": "read:user"},
@@ -300,7 +302,7 @@ async def copilot_device_code_login(
     print("  Waiting for authorization...", end="", flush=True)
 
     deadline = time.monotonic() + timeout_seconds
-    async with httpx.AsyncClient(timeout=10) as client:
+    async with (await _create_httpx_client(timeout=10)) as client:
         while time.monotonic() < deadline:
             await asyncio.sleep(interval + _DEVICE_CODE_POLL_SAFETY_MARGIN)
             try:
@@ -573,7 +575,7 @@ async def exchange_copilot_token(
     data = None
     last_exc: Optional[Exception] = None
     permanent_failure = False
-    async with httpx.AsyncClient(timeout=timeout) as client:
+    async with (await _create_httpx_client(timeout=timeout)) as client:
         for attempt in range(_EXCHANGE_MAX_ATTEMPTS):
             try:
                 response = await client.get(_TOKEN_EXCHANGE_URL, headers=headers)

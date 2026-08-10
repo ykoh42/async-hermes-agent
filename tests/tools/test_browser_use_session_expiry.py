@@ -46,6 +46,8 @@ async def test_browser_use_preserves_provider_timeout(monkeypatch):
         )
 
     def client_factory(**kwargs):
+        kwargs.pop("transport", None)
+        kwargs.pop("mounts", None)
         return real_async_client(transport=httpx.MockTransport(handler), **kwargs)
 
     monkeypatch.setattr(browser_use_provider.httpx, "AsyncClient", client_factory)

@@ -315,12 +315,14 @@ async def install_bws(*, force: bool = False) -> Path:
 
 
 async def _http_download(url: str, dest: Path) -> None:
+    from agent.ssl_verify import _create_httpx_client
+
     try:
-        async with httpx.AsyncClient(
+        async with (await _create_httpx_client(
             headers={"User-Agent": "hermes-agent"},
             timeout=_BWS_DOWNLOAD_TIMEOUT,
             follow_redirects=True,
-        ) as client:
+        )) as client:
             async with client.stream("GET", url) as response:
                 response.raise_for_status()
                 async with aiofiles.open(dest, "wb") as file:

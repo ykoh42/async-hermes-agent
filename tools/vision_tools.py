@@ -406,11 +406,11 @@ async def _download_image(image_url: str, destination: Path, max_retries: int = 
             # Enable follow_redirects to handle image CDNs that redirect (e.g., Imgur, Picsum)
             # SSRF: the client validates DNS at TCP connect time; event_hooks
             # validate each redirect target against private IP ranges.
-            async with create_ssrf_safe_client(
+            async with (await create_ssrf_safe_client(
                 timeout=download_timeout,
                 follow_redirects=True,
                 event_hooks={"response": [_ssrf_redirect_guard]},
-            ) as client:
+            )) as client:
                 response = await client.get(
                     image_url,
                     headers={
@@ -1508,11 +1508,11 @@ async def _download_video(video_url: str, destination: Path, max_retries: int = 
 
             from tools.url_safety import create_ssrf_safe_client
 
-            async with create_ssrf_safe_client(
+            async with (await create_ssrf_safe_client(
                 timeout=60.0,
                 follow_redirects=True,
                 event_hooks={"response": [_ssrf_redirect_guard]},
-            ) as client:
+            )) as client:
                 response = await client.get(
                     video_url,
                     headers={

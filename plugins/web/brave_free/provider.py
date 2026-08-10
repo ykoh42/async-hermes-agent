@@ -24,6 +24,7 @@ import os
 from typing import Any, Dict
 
 from agent.web_search_provider import WebSearchProvider
+from agent.ssl_verify import _create_httpx_client
 
 logger = logging.getLogger(__name__)
 
@@ -77,7 +78,7 @@ class BraveFreeWebSearchProvider(WebSearchProvider):
         count = max(1, min(int(limit), 20))
 
         try:
-            async with httpx.AsyncClient(timeout=15) as client:
+            async with (await _create_httpx_client(timeout=15)) as client:
                 resp = await client.get(
                     _BRAVE_ENDPOINT,
                     params={"q": query, "count": count},

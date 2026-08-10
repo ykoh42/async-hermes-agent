@@ -26,6 +26,7 @@ import logging
 from typing import Any, Dict, List
 
 from agent.web_search_provider import WebSearchProvider
+from agent.ssl_verify import _create_httpx_client
 
 logger = logging.getLogger(__name__)
 
@@ -48,7 +49,7 @@ class ExaWebSearchProvider(WebSearchProvider):
             )
         import httpx
 
-        async with httpx.AsyncClient(timeout=60) as client:
+        async with (await _create_httpx_client(timeout=60)) as client:
             response = await client.post(
                 f"https://api.exa.ai/{endpoint.lstrip('/')}",
                 headers={

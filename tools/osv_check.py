@@ -17,6 +17,8 @@ from typing import Optional, Tuple
 
 import httpx
 
+from agent.ssl_verify import _create_httpx_client
+
 logger = logging.getLogger(__name__)
 
 _OSV_ENDPOINT = os.getenv("OSV_ENDPOINT", "https://api.osv.dev/v1/query")
@@ -145,7 +147,7 @@ async def _query_osv(
     payload = {"package": {"name": package, "ecosystem": ecosystem}}
     if version:
         payload["version"] = version
-    async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+    async with (await _create_httpx_client(timeout=_TIMEOUT)) as client:
         response = await client.post(
             _OSV_ENDPOINT,
             json=payload,

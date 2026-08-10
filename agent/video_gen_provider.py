@@ -277,7 +277,9 @@ async def save_url_video(
     Raises on any network / HTTP / oversize error so callers can fall back to
     returning the bare URL.
     """
-    async with httpx.AsyncClient(timeout=timeout) as client:
+    from agent.ssl_verify import _create_httpx_client
+
+    async with (await _create_httpx_client(timeout=timeout)) as client:
         async with client.stream("GET", url) as response:
             response.raise_for_status()
             content_type = (response.headers.get("Content-Type") or "").split(

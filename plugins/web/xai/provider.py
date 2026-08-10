@@ -38,6 +38,7 @@ import re
 from typing import Any, Dict, List, Optional
 
 from agent.web_search_provider import WebSearchProvider
+from agent.ssl_verify import _create_httpx_client
 from tools.xai_http import (
     has_xai_credentials,
     hermes_xai_user_agent,
@@ -252,7 +253,7 @@ class XAIWebSearchProvider(WebSearchProvider):
         # can't refresh those and an immediate retry would just burn quota.
         is_oauth_path = (creds.get("provider") == "xai-oauth")
         resp = None
-        async with httpx.AsyncClient(timeout=timeout) as client:
+        async with (await _create_httpx_client(timeout=timeout)) as client:
             for attempt in range(2):
                 try:
                     resp = await client.post(

@@ -37,6 +37,7 @@ from agent.image_gen_provider import (
     save_url_image,
     success_response,
 )
+from agent.ssl_verify import _create_httpx_client
 
 logger = logging.getLogger(__name__)
 
@@ -356,7 +357,9 @@ class OpenRouterCompatImageProvider(ImageGenProvider):
             }
             is_last = i == len(model_chain) - 1
             try:
-                async with httpx.AsyncClient(timeout=_REQUEST_TIMEOUT) as client:
+                async with (
+                    await _create_httpx_client(timeout=_REQUEST_TIMEOUT)
+                ) as client:
                     response = await client.post(
                         f"{base_url}/chat/completions",
                         headers=headers,

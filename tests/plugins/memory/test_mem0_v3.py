@@ -318,6 +318,8 @@ async def test_platform_validation_failure_closes_backend_and_preserves_error(
         return httpx.Response(401, json={"detail": "Invalid API key"})
 
     def build_client(*args, **kwargs):
+        kwargs.pop("transport", None)
+        kwargs.pop("mounts", None)
         return async_client(
             *args,
             **kwargs,
@@ -382,6 +384,8 @@ async def test_platform_failure_cleanup_survives_repeated_cancellation(
         return httpx.Response(401, json={"detail": "Invalid API key"})
 
     def build_client(*args, **kwargs):
+        kwargs.pop("transport", None)
+        kwargs.pop("mounts", None)
         return async_client(
             *args,
             **kwargs,

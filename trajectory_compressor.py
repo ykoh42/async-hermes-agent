@@ -319,11 +319,13 @@ async def _load_hf_tokenizer_assets(
     refreshed: Dict[str, bytes] = {}
     etags: Dict[str, str] = {}
     try:
-        async with httpx.AsyncClient(
+        from agent.ssl_verify import _create_httpx_client
+
+        async with (await _create_httpx_client(
             follow_redirects=True,
             timeout=httpx.Timeout(60.0),
             headers=common_headers,
-        ) as client:
+        )) as client:
             for name in filenames:
                 headers = {}
                 previous_etag = (metadata.get("etags") or {}).get(name)

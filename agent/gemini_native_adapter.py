@@ -122,7 +122,9 @@ async def probe_gemini_tier(
     }
 
     try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
+        from agent.ssl_verify import _create_httpx_client
+
+        async with (await _create_httpx_client(timeout=timeout)) as client:
             resp = await client.post(
                 url,
                 params={"key": key},
@@ -959,15 +961,41 @@ class GeminiNativeClient:
         self._default_headers = dict(default_headers or {})
         self.chat = _GeminiChatNamespace(self)
         self.is_closed = False
-        self._http = http_client or httpx.AsyncClient(
-            timeout=timeout or httpx.Timeout(connect=15.0, read=600.0, write=30.0, pool=30.0)
+        self._http = http_client
+        self._http_timeout = timeout or httpx.Timeout(
+            connect=15.0,
+            read=600.0,
+            write=30.0,
+            pool=30.0,
         )
+        self._http_init_lock = asyncio.Lock()
+
+    async def _get_http(self) -> httpx.AsyncClient:
+        if self._http is not None:
+            return self._http
+        async with self._http_init_lock:
+            if self._http is None:
+                if self.is_closed:
+                    raise RuntimeError(
+                        "Cannot send a request, as the client has been closed."
+                    )
+                from agent.ssl_verify import _create_httpx_client
+
+                self._http = await _create_httpx_client(
+                    timeout=self._http_timeout,
+                )
+            return self._http
 
     async def close(self) -> None:
         self.is_closed = True
+        async with self._http_init_lock:
+            client = self._http
+            self._http = None
+        if client is None:
+            return
         try:
             close_task = asyncio.create_task(
-                self._http.aclose(),
+                client.aclose(),
                 name="gemini-native-http-close",
             )
             await _finish_owned_task(close_task)
@@ -1031,7 +1059,13 @@ class GeminiNativeClient:
             return self._stream_completion(model=model, request=request, timeout=timeout)
 
         url = f"{self.base_url}/models/{model}:generateContent"
-        response = await self._http.post(url, json=request, headers=self._headers(), timeout=timeout)
+        client = await self._get_http()
+        response = await client.post(
+            url,
+            json=request,
+            headers=self._headers(),
+            timeout=timeout,
+        )
         if response.status_code != 200:
             raise gemini_http_error(response)
         try:
@@ -1057,7 +1091,8 @@ class GeminiNativeClient:
         stream_headers["Accept"] = "text/event-stream"
 
         try:
-            async with self._http.stream(
+            client = await self._get_http()
+            async with client.stream(
                 "POST", url, json=request, headers=stream_headers, timeout=timeout
             ) as response:
                 if response.status_code != 200:

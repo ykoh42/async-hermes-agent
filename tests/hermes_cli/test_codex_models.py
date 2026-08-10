@@ -43,7 +43,14 @@ async def test_fetch_from_api_keeps_supported_in_api_false_models(
     monkeypatch.setattr(
         codex_models.httpx,
         "AsyncClient",
-        lambda **kwargs: async_client(transport=transport, **kwargs),
+        lambda **kwargs: async_client(
+            transport=transport,
+            **{
+                key: value
+                for key, value in kwargs.items()
+                if key not in {"transport", "mounts"}
+            },
+        ),
     )
 
     models = await codex_models._fetch_models_from_api(access_token="tok")

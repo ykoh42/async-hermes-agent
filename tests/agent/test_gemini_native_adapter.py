@@ -5,8 +5,10 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import ssl
 from types import SimpleNamespace
 
+import httpx
 import pytest
 
 
@@ -41,8 +43,11 @@ async def test_probe_gemini_tier_preserves_upstream_classification(
     recorded = {}
 
     class ProbeHTTP:
-        def __init__(self, *, timeout):
+        def __init__(self, *, timeout, verify, transport, mounts):
             recorded["timeout"] = timeout
+            assert isinstance(verify, ssl.SSLContext)
+            assert isinstance(transport, httpx.AsyncHTTPTransport)
+            assert isinstance(mounts, dict)
 
         async def __aenter__(self):
             return self
@@ -313,6 +318,22 @@ def test_native_client_accepts_injected_http_client():
     assert client._http is injected
 
 
+def test_native_client_constructor_is_state_only(monkeypatch):
+    from agent.gemini_native_adapter import GeminiNativeClient
+
+    def fail_if_constructed(*args, **kwargs):
+        raise AssertionError("HTTP client must be created at an awaited boundary")
+
+    monkeypatch.setattr(
+        "agent.gemini_native_adapter.httpx.AsyncClient",
+        fail_if_constructed,
+    )
+
+    client = GeminiNativeClient(api_key="AIza-test")
+
+    assert client._http is None
+
+
 def test_native_client_rejects_empty_api_key_with_actionable_message():
     """Empty/whitespace api_key must raise at construction, not produce a cryptic
     Google GFE 'Error 400 (Bad Request)!!1' HTML page on the first request."""
@@ -373,5 +394,3 @@ def test_stream_event_translation_emits_tool_call_delta_with_stable_index():
 # ---------------------------------------------------------------------------
 # X-Goog-Api-Client header tests
 # ---------------------------------------------------------------------------
-
-

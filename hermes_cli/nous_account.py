@@ -13,6 +13,8 @@ from weakref import WeakKeyDictionary
 
 import httpx
 
+from agent.ssl_verify import _create_httpx_client
+
 
 NousAccountInfoSource = Literal["jwt", "account_api", "inference_key", "none", "error"]
 
@@ -563,7 +565,9 @@ async def _fetch_nous_account_info(
         "Authorization": f"Bearer {access_token}",
         "Accept": "application/json",
     }
-    async with httpx.AsyncClient(timeout=httpx.Timeout(8)) as client:
+    async with (
+        await _create_httpx_client(timeout=httpx.Timeout(8))
+    ) as client:
         response = await client.get(url, headers=headers)
         response.raise_for_status()
         payload = response.json()

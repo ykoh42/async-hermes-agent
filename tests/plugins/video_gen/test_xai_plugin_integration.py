@@ -68,7 +68,7 @@ def xai_provider(monkeypatch):
 
     captured: Dict[str, _FakeAsyncClient] = {}
 
-    def _client_factory():
+    def _client_factory(**_kwargs):
         captured["client"] = _FakeAsyncClient()
         return captured["client"]
 

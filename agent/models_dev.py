@@ -379,9 +379,12 @@ async def fetch_models_dev(
             return _models_dev_cache
 
         import httpx
+        from agent.ssl_verify import _create_httpx_client
 
         try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=5.0)) as client:
+            async with (await _create_httpx_client(
+                timeout=httpx.Timeout(10.0, connect=5.0),
+            )) as client:
                 response = await client.get(MODELS_DEV_URL)
                 response.raise_for_status()
                 data = response.json()

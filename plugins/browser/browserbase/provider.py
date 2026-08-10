@@ -40,6 +40,7 @@ import httpx
 
 from agent.browser_provider import BrowserProvider
 from agent.secret_scope import get_secret
+from agent.ssl_verify import _create_httpx_client
 
 logger = logging.getLogger(__name__)
 
@@ -141,7 +142,7 @@ class BrowserbaseBrowserProvider(BrowserProvider):
         }
 
         try:
-            async with httpx.AsyncClient(timeout=30) as client:
+            async with (await _create_httpx_client(timeout=30)) as client:
                 response = await client.post(
                     f"{config['base_url']}/v1/sessions",
                     headers=headers,
@@ -223,7 +224,7 @@ class BrowserbaseBrowserProvider(BrowserProvider):
             return False
 
         try:
-            async with httpx.AsyncClient(timeout=10) as client:
+            async with (await _create_httpx_client(timeout=10)) as client:
                 response = await client.post(
                     f"{config['base_url']}/v1/sessions/{session_id}",
                     headers={
@@ -259,7 +260,7 @@ class BrowserbaseBrowserProvider(BrowserProvider):
             )
             return
         try:
-            async with httpx.AsyncClient(timeout=5) as client:
+            async with (await _create_httpx_client(timeout=5)) as client:
                 await client.post(
                     f"{config['base_url']}/v1/sessions/{session_id}",
                     headers={

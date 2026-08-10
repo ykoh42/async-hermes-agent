@@ -44,6 +44,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
+from agent.ssl_verify import _create_httpx_client
+
 import aiofiles.os
 
 logger = logging.getLogger(__name__)
@@ -247,7 +249,7 @@ def _make_hermes_provider_class() -> Optional[type]:
             )
 
             server_url = self.context.server_url
-            async with httpx.AsyncClient(timeout=10.0) as client:
+            async with (await _create_httpx_client(timeout=10.0)) as client:
                 # Step 1: PRM discovery to learn the authorization_server URL.
                 for url in build_protected_resource_metadata_discovery_urls(
                     None, server_url

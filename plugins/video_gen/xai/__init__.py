@@ -36,6 +36,7 @@ from agent.video_gen_provider import (
     error_response,
     success_response,
 )
+from agent.ssl_verify import _create_httpx_client
 
 logger = logging.getLogger(__name__)
 
@@ -820,7 +821,7 @@ async def _submit_xai_video_payload(
     if storage_options is not None:
         payload["storage_options"] = storage_options
 
-    async with httpx.AsyncClient() as client:
+    async with (await _create_httpx_client()) as client:
         try:
             request_id = await _submit(
                 client, payload, api_key=api_key, base_url=base_url,

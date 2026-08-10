@@ -18,7 +18,15 @@ def _client_factory(handler):
     real_async_client = httpx.AsyncClient
 
     def factory(**kwargs):
-        return real_async_client(transport=httpx.MockTransport(handler), **kwargs)
+        forwarded = {
+            key: value
+            for key, value in kwargs.items()
+            if key not in {"transport", "mounts"}
+        }
+        return real_async_client(
+            transport=httpx.MockTransport(handler),
+            **forwarded,
+        )
 
     return factory
 

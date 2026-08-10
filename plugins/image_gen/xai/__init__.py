@@ -36,6 +36,7 @@ from agent.image_gen_provider import (
     save_url_image,
     success_response,
 )
+from agent.ssl_verify import _create_httpx_client
 from tools.xai_http import (
     build_xai_storage_options,
     hermes_xai_user_agent,
@@ -339,7 +340,7 @@ class XAIImageGenProvider(ImageGenProvider):
             payload["storage_options"] = storage_options
 
         try:
-            async with httpx.AsyncClient(timeout=120) as client:
+            async with (await _create_httpx_client(timeout=120)) as client:
                 response = await client.post(
                     endpoint_url,
                     headers=headers,

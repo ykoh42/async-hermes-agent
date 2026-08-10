@@ -229,16 +229,37 @@ class PlatformBackend(Mem0Backend):
             "Authorization": f"Token {api_key}",
             "Mem0-User-ID": user_id,
         }
-        self._client = httpx.AsyncClient(
-            base_url="https://api.mem0.ai",
-            headers=headers,
-            timeout=300.0,
-        )
+        self._client: httpx.AsyncClient | None = None
+        self._client_headers = headers
+        self._client_lock = asyncio.Lock()
+        self._closed = False
         self._initialize_lock = asyncio.Lock()
         self._initialized = False
         self.org_id: str | None = None
         self.project_id: str | None = None
         self.user_email: str | None = None
+
+    async def _ensure_client(self) -> httpx.AsyncClient:
+        if self._closed:
+            raise RuntimeError(
+                "Cannot send a request, as the client has been closed."
+            )
+        if self._client is not None:
+            return self._client
+        async with self._client_lock:
+            if self._closed:
+                raise RuntimeError(
+                    "Cannot send a request, as the client has been closed."
+                )
+            if self._client is None:
+                from agent.ssl_verify import _create_httpx_client
+
+                self._client = await _create_httpx_client(
+                    base_url="https://api.mem0.ai",
+                    headers=self._client_headers,
+                    timeout=300.0,
+                )
+            return self._client
 
     async def _initialize(self) -> None:
         """Validate the API key at the same lifecycle boundary as the SDK."""
@@ -248,7 +269,8 @@ class PlatformBackend(Mem0Backend):
             if self._initialized:
                 return
             try:
-                response = await self._client.get("/v1/ping/")
+                client = await self._ensure_client()
+                response = await client.get("/v1/ping/")
                 response.raise_for_status()
                 data = response.json()
             except httpx.HTTPStatusError as exc:
@@ -267,7 +289,8 @@ class PlatformBackend(Mem0Backend):
 
     async def _json(self, method: str, path: str, **kwargs) -> Any:
         try:
-            response = await self._client.request(method, path, **kwargs)
+            client = await self._ensure_client()
+            response = await client.request(method, path, **kwargs)
             response.raise_for_status()
             return response.json() if response.content else {}
         except httpx.HTTPStatusError as exc:
@@ -325,7 +348,12 @@ class PlatformBackend(Mem0Backend):
         return {"result": "Memory deleted.", "memory_id": memory_id}
 
     async def close(self) -> None:
-        await self._client.aclose()
+        self._closed = True
+        async with self._client_lock:
+            client = self._client
+            self._client = None
+        if client is not None:
+            await client.aclose()
 
 
 class SelfHostedBackend(Mem0Backend):
@@ -340,23 +368,56 @@ class SelfHostedBackend(Mem0Backend):
     """
 
     def __init__(self, api_key: str, host: str, transport=None):
-        import httpx
-
         headers = {"Content-Type": "application/json"}
         if api_key:
             headers["X-API-Key"] = api_key  # omitted only for AUTH_DISABLED servers
-        # Connect-level retries smooth over transient blips so a single
-        # dropped SYN doesn't count toward the provider failure breaker.
-        # ``transport`` is injectable for tests (httpx.MockTransport).
-        if transport is None:
-            transport = httpx.AsyncHTTPTransport(retries=2)
-        self._client = httpx.AsyncClient(
-            base_url=host.rstrip("/"), headers=headers, timeout=30.0,
-            transport=transport,
-        )
+        self._client: httpx.AsyncClient | None = None
+        self._client_base_url = host.rstrip("/")
+        self._client_headers = headers
+        self._client_transport = transport
+        self._client_lock = asyncio.Lock()
+        self._closed = False
+
+    async def _ensure_client(self) -> httpx.AsyncClient:
+        if self._closed:
+            raise RuntimeError(
+                "Cannot send a request, as the client has been closed."
+            )
+        if self._client is not None:
+            return self._client
+        async with self._client_lock:
+            if self._closed:
+                raise RuntimeError(
+                    "Cannot send a request, as the client has been closed."
+                )
+            if self._client is None:
+                transport = self._client_transport
+                if transport is None:
+                    from agent.ssl_verify import _materialize_httpx_verify
+
+                    verify = await _materialize_httpx_verify()
+                    # Connect-level retries smooth over transient blips so a
+                    # single dropped SYN does not trip the provider breaker.
+                    transport = httpx.AsyncHTTPTransport(
+                        retries=2,
+                        verify=verify,
+                    )
+                try:
+                    self._client = httpx.AsyncClient(
+                        base_url=self._client_base_url,
+                        headers=self._client_headers,
+                        timeout=30.0,
+                        transport=transport,
+                    )
+                except BaseException:
+                    if self._client_transport is None:
+                        await transport.aclose()
+                    raise
+            return self._client
 
     async def _json(self, method: str, path: str, **kwargs) -> Any:
-        resp = await self._client.request(method, path, **kwargs)
+        client = await self._ensure_client()
+        resp = await client.request(method, path, **kwargs)
         resp.raise_for_status()
         return resp.json() if resp.content else {}
 
@@ -395,8 +456,14 @@ class SelfHostedBackend(Mem0Backend):
         return {"result": "Memory deleted.", "memory_id": memory_id}
 
     async def close(self) -> None:
+        self._closed = True
+        async with self._client_lock:
+            client = self._client
+            self._client = None
+        if client is None:
+            return
         try:
-            await self._client.aclose()
+            await client.aclose()
         except Exception:
             pass
 

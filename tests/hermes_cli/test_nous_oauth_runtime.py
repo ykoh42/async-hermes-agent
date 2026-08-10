@@ -90,7 +90,14 @@ async def test_resolve_nous_access_token_returns_portal_token_not_agent_key(
     monkeypatch.setattr(
         auth.httpx,
         "AsyncClient",
-        lambda **kwargs: async_client(transport=transport, **kwargs),
+        lambda **kwargs: async_client(
+            transport=transport,
+            **{
+                key: value
+                for key, value in kwargs.items()
+                if key not in {"transport", "mounts"}
+            },
+        ),
     )
 
     resolved = await auth.resolve_nous_access_token()
@@ -128,7 +135,14 @@ async def test_resolve_nous_access_token_refreshes_and_returns_portal_token(
     monkeypatch.setattr(
         auth.httpx,
         "AsyncClient",
-        lambda **kwargs: async_client(transport=transport, **kwargs),
+        lambda **kwargs: async_client(
+            transport=transport,
+            **{
+                key: value
+                for key, value in kwargs.items()
+                if key not in {"transport", "mounts"}
+            },
+        ),
     )
 
     resolved = await auth.resolve_nous_access_token()
@@ -156,7 +170,14 @@ async def test_resolve_nous_uses_fresh_invoke_jwt_and_preserves_metadata(
     monkeypatch.setattr(
         auth.httpx,
         "AsyncClient",
-        lambda **kwargs: async_client(transport=transport, **kwargs),
+        lambda **kwargs: async_client(
+            transport=transport,
+            **{
+                key: value
+                for key, value in kwargs.items()
+                if key not in {"transport", "mounts"}
+            },
+        ),
     )
 
     credentials = await auth.resolve_nous_runtime_credentials()
@@ -206,7 +227,14 @@ async def test_resolve_nous_refreshes_without_blocking_and_persists_rotation(
     monkeypatch.setattr(
         auth.httpx,
         "AsyncClient",
-        lambda **kwargs: async_client(transport=transport, **kwargs),
+        lambda **kwargs: async_client(
+            transport=transport,
+            **{
+                key: value
+                for key, value in kwargs.items()
+                if key not in {"transport", "mounts"}
+            },
+        ),
     )
 
     task = asyncio.create_task(auth.resolve_nous_runtime_credentials())
@@ -247,7 +275,14 @@ async def test_nous_refresh_rejects_network_supplied_inference_host(
     monkeypatch.setattr(
         auth.httpx,
         "AsyncClient",
-        lambda **kwargs: async_client(transport=transport, **kwargs),
+        lambda **kwargs: async_client(
+            transport=transport,
+            **{
+                key: value
+                for key, value in kwargs.items()
+                if key not in {"transport", "mounts"}
+            },
+        ),
     )
 
     credentials = await auth.resolve_nous_runtime_credentials()
@@ -289,7 +324,14 @@ async def test_terminal_nous_refresh_quarantines_singleton_and_shared_store(
     monkeypatch.setattr(
         auth.httpx,
         "AsyncClient",
-        lambda **kwargs: async_client(transport=transport, **kwargs),
+        lambda **kwargs: async_client(
+            transport=transport,
+            **{
+                key: value
+                for key, value in kwargs.items()
+                if key not in {"transport", "mounts"}
+            },
+        ),
     )
 
     with pytest.raises(auth.AuthError) as exc_info:
@@ -335,7 +377,14 @@ async def test_nous_pool_refreshes_selected_singleton(
     monkeypatch.setattr(
         auth.httpx,
         "AsyncClient",
-        lambda **kwargs: async_client(transport=transport, **kwargs),
+        lambda **kwargs: async_client(
+            transport=transport,
+            **{
+                key: value
+                for key, value in kwargs.items()
+                if key not in {"transport", "mounts"}
+            },
+        ),
     )
 
     refreshed = await pool.try_refresh_current()

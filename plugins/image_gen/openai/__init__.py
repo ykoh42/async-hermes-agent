@@ -28,6 +28,7 @@ import os
 from typing import Any, Dict, List, Optional, Tuple
 
 from agent.secret_scope import get_secret
+from agent.ssl_verify import _create_httpx_client
 from agent.image_gen_provider import (
     DEFAULT_ASPECT_RATIO,
     ImageGenProvider,
@@ -135,7 +136,7 @@ async def _load_image_bytes(ref: str) -> Tuple[bytes, str]:
     if lower.startswith(("http://", "https://")):
         import httpx
 
-        async with httpx.AsyncClient(timeout=60) as client:
+        async with (await _create_httpx_client(timeout=60)) as client:
             resp = await client.get(ref)
             resp.raise_for_status()
         name = ref.split("?", 1)[0].rsplit("/", 1)[-1] or "image.png"
