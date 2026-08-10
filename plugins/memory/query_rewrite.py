@@ -106,7 +106,7 @@ def _normalize_rewrite(text: str) -> str:
     return candidate
 
 
-def rewrite_memory_query(user_message: str) -> str:
+async def rewrite_memory_query(user_message: str) -> str:
     """Return a retrieval-only question, or ``""`` to preserve old behavior."""
     bounded = _bounded_user_message(user_message)
     if not bounded:
@@ -115,7 +115,7 @@ def rewrite_memory_query(user_message: str) -> str:
     try:
         from agent.auxiliary_client import call_llm
 
-        response = call_llm(
+        response = await call_llm(
             task=TASK_KEY,
             messages=[
                 {"role": "system", "content": _SYSTEM_PROMPT},

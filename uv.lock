@@ -263,6 +263,9 @@ fal = [
 hindsight = [
     { name = "hindsight-client" },
 ]
+honcho = [
+    { name = "honcho-ai" },
+]
 mem0 = [
     { name = "mem0ai" },
     { name = "ollama" },
@@ -293,6 +296,7 @@ requires-dist = [
     { name = "flake8-async", marker = "extra == 'dev'", specifier = "==26.6.1" },
     { name = "google-auth", extras = ["aiohttp"], marker = "extra == 'vertex'", specifier = "==2.56.2" },
     { name = "hindsight-client", marker = "extra == 'hindsight'", specifier = "==0.6.1" },
+    { name = "honcho-ai", marker = "extra == 'honcho'", specifier = "==2.2.0" },
     { name = "httpx", extras = ["socks"], specifier = "==0.28.1" },
     { name = "mcp", specifier = "==1.28.1" },
     { name = "mem0ai", marker = "extra == 'mem0'", specifier = "==2.0.10" },
@@ -320,7 +324,7 @@ requires-dist = [
     { name = "tzdata", marker = "sys_platform == 'win32'", specifier = "==2025.3" },
     { name = "websockets", specifier = "==15.0.1" },
 ]
-provides-extras = ["anthropic", "vertex", "azure-identity", "parallel-web", "fal", "dev", "mcp", "bedrock", "mem0", "supermemory", "hindsight"]
+provides-extras = ["anthropic", "vertex", "azure-identity", "parallel-web", "fal", "dev", "mcp", "bedrock", "mem0", "supermemory", "hindsight", "honcho"]
 
 [[package]]
 name = "attrs"
@@ -891,6 +895,20 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/33/26/8b8efa4be21fc3ba12ade3b1353d87f9837ec0d3ec2607e8adbf85bc9c63/hindsight_client-0.6.1.tar.gz", hash = "sha256:314d0bb9e13622e15586ba1586a799726d405b27bc20d78872474b5d6d96cd51", size = 99833, upload-time = "2026-05-08T13:01:23.537Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/24/4f/a1d0bc33ef933ecc52e76dc1514163594d25836a5d303c256a61bb61445d/hindsight_client-0.6.1-py3-none-any.whl", hash = "sha256:9fdda176ab50f7cec8d7339c6608c148f0cd9ad7e65d9d76192f2db730bc330a", size = 249379, upload-time = "2026-05-08T13:01:22.035Z" },
+]
+
+[[package]]
+name = "honcho-ai"
+version = "2.2.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "httpx" },
+    { name = "pydantic" },
+    { name = "typing-extensions", marker = "python_full_version < '3.12'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/f2/1d/322649dbc8e9b21726a3a3e9b6a4975f2d122ca4b2450612f9ff2a9023b6/honcho_ai-2.2.0.tar.gz", hash = "sha256:16e16825afac51f2fdd59670dd4a6e44d04a3fa2c8eb466b1767dcc96706b7a0", size = 49979, upload-time = "2026-07-02T17:04:33.13Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/d0/c6/66af5f7ba3d75796f4523eac1e069fbdc759c3f0b8adab9fb7ae04e15784/honcho_ai-2.2.0-py3-none-any.whl", hash = "sha256:32f098a4c8bcfe4288f0994ddab0bc52a68dc87069d0f2ce2c8758ee2a1761f2", size = 60305, upload-time = "2026-07-02T17:04:33.967Z" },
 ]
 
 [[package]]

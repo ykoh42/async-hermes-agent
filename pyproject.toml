@@ -148,6 +148,10 @@ supermemory = ["supermemory==3.50.0"]
 # operations and deterministic ``aclose()``; local embedded mode additionally
 # needs the separately installed ``hindsight-all`` runtime.
 hindsight = ["hindsight-client==0.6.1"]
+# Honcho 2.2 exposes provider, peer, session, and conclusion operations through
+# its native coroutine ``.aio`` views. The plugin never instantiates the SDK's
+# synchronous HTTP transport.
+honcho = ["honcho-ai==2.2.0"]
 
 [build-system]
 requires = ["setuptools>=77.0,<83"]

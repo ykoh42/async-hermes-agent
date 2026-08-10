@@ -72,11 +72,17 @@ uv sync --extra vertex
 uv sync --extra azure-identity
 uv sync --extra supermemory
 uv sync --extra hindsight
+uv sync --extra honcho
 ```
 
 The Hindsight extra covers cloud and local-external modes. Its
 `local_embedded` mode additionally requires the upstream `hindsight-all`
 runtime.
+
+The Honcho extra pins the native-async SDK version validated by this package.
+Select `memory.provider: honcho` in `config.yaml`; connection, identity,
+cadence, and session settings are documented in the
+[Honcho provider guide](plugins/memory/honcho/README.md).
 
 ## Skills, MCP, and memory
 

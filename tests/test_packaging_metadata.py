@@ -182,10 +182,12 @@ def test_provider_extras_only_publish_native_async_dependencies():
         "aiohttp==3.14.3",
     ]
     assert extras["hindsight"] == ["hindsight-client==0.6.1"]
+    assert extras["honcho"] == ["honcho-ai==2.2.0"]
     assert "google-auth" in declared
     assert "azure-identity" in declared
     assert "aiobotocore" in declared
     assert "hindsight-client" in declared
+    assert "honcho-ai" in declared
     assert "boto3" not in declared
 
 
