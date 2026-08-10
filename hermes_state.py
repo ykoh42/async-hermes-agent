@@ -51,6 +51,7 @@ from hermes_state_common import (
     _sql_session_last_active,
     _sql_session_last_active_by_id,
 )
+from hermes_state_portability import SessionPortabilityMixin
 
 logger = logging.getLogger(__name__)
 _COMPRESSION_LOCK_HOLDER_PID_RE = re.compile(r"(?:^|:)pid=(\d+)(?::|$)")
@@ -1123,7 +1124,7 @@ class SessionCompressionInProgressError(CompressionSessionBusyError):
     """A normal writer collided with another writer's live compression lease."""
 
 
-class SessionDB:
+class SessionDB(SessionPortabilityMixin):
     """Native-async session store used by the agent turn path.
 
     The constructor accepts a database path. The SQLite connection and schema
@@ -1148,6 +1149,12 @@ class SessionDB:
     _FTS_MERGE_EVERY_N_WRITES = 1000
     _FTS_MERGE_MAX_PAGES_PER_INDEX = 500
     _FTS_MERGE_COMMANDS_PER_PASS = 4
+
+    _IMPORT_MAX_SESSIONS = 500
+    _IMPORT_MAX_MESSAGES_PER_SESSION = 10_000
+    _IMPORT_MAX_TOTAL_MESSAGES = 50_000
+    _IMPORT_MAX_SESSION_BYTES = 5 * 1024 * 1024
+    _IMPORT_MAX_TOTAL_BYTES = 25 * 1024 * 1024
 
     _FTS_REBUILD_CHUNK_ROWS = 500
     _FTS_REBUILD_DUTY_FACTOR = 4.0
@@ -6198,18 +6205,6 @@ class SessionDB:
     _SESSION_COMPACT_EXCLUDED = frozenset({"system_prompt", "system_prompt_hash"})
     _session_compact_cols_sql: Optional[str] = None
 
-    @classmethod
-    async def _compact_session_cols(cls) -> str:
-        """Return the upstream compact projection without blocking SQLite."""
-        if cls._session_compact_cols_sql is None:
-            declared = (await cls._parse_schema_columns(SCHEMA_SQL))["sessions"]
-            cls._session_compact_cols_sql = ", ".join(
-                f"s.{name}"
-                for name in declared
-                if name not in cls._SESSION_COMPACT_EXCLUDED
-            )
-        return cls._session_compact_cols_sql
-
     async def get_compression_tip(self, session_id: str) -> Optional[str]:
         """Walk a compression-continuation chain and return its live tip."""
         connection = await self._get_connection()
@@ -6415,78 +6410,6 @@ class SessionDB:
                 # requested session itself was compacted.
                 continue
         return lineage if session_id in lineage else [session_id]
-
-    async def _get_session_rich_rows_batch(
-        self, session_ids, compact_rows: bool = False
-    ) -> Dict[str, Dict[str, Any]]:
-        """Fetch enriched session rows in bounded native-async batches."""
-        ids = [session_id for session_id in session_ids if session_id]
-        if not ids:
-            return {}
-        chunk_size = 900
-        if len(ids) > chunk_size:
-            result: Dict[str, Dict[str, Any]] = {}
-            for start in range(0, len(ids), chunk_size):
-                result.update(
-                    await self._get_session_rich_rows_batch(
-                        ids[start : start + chunk_size],
-                        compact_rows=compact_rows,
-                    )
-                )
-            return result
-
-        await self.flush_token_counts()
-        select = await self._compact_session_cols() if compact_rows else "s.*"
-        placeholders = ",".join("?" for _ in ids)
-        prompt_select = (
-            ""
-            if compact_rows
-            else ", COALESCE(sp.prompt, s.system_prompt) AS _system_prompt_resolved"
-        )
-        prompt_join = (
-            ""
-            if compact_rows
-            else "LEFT JOIN system_prompts sp ON sp.hash = s.system_prompt_hash"
-        )
-        query = f"""
-            SELECT {select}{prompt_select},
-                COALESCE(
-                    (SELECT {_PREVIEW_RAW_SELECT}
-                     FROM messages m
-                     WHERE m.session_id = s.id AND m.role = 'user' AND m.content IS NOT NULL
-                     ORDER BY m.timestamp, m.id LIMIT 1),
-                    ''
-                ) AS _preview_raw,
-                {_sql_session_last_active("s")} AS last_active
-            FROM sessions s
-            {prompt_join}
-            WHERE s.id IN ({placeholders})
-        """
-        rows = await self._read_fetchall(query, ids)
-        result = {}
-        for row in rows:
-            session = self._session_row_dict(row)
-            session["preview"] = _shape_preview(session.pop("_preview_raw", ""))
-            result[session["id"]] = session
-        return result
-
-    async def _get_session_rich_row(
-        self, session_id: str, compact_rows: bool = False
-    ) -> Optional[Dict[str, Any]]:
-        """Return one enriched row with the same shape as session listings."""
-        return (
-            await self._get_session_rich_rows_batch(
-                [session_id], compact_rows=compact_rows
-            )
-        ).get(session_id)
-
-    async def get_session_rich_row(
-        self, session_id: str, compact_rows: bool = False
-    ) -> Optional[Dict[str, Any]]:
-        """Public wrapper for the upstream single-session rich-row API."""
-        return await self._get_session_rich_row(
-            session_id, compact_rows=compact_rows
-        )
 
     async def list_sessions_rich(
         self,

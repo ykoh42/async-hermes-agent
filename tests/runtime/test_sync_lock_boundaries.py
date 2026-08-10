@@ -21,6 +21,7 @@ _SOURCE_FILES = (
     "mini_swe_runner.py",
     "batch_runner.py",
     "hermes_state.py",
+    "hermes_state_portability.py",
     "trajectory_compressor.py",
 )
 

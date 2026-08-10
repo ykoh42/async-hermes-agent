@@ -33,6 +33,7 @@ from agent.tool_executor import (
     execute_tool_calls_segmented,
 )
 from hermes_state import SessionDB
+from hermes_state_portability import SessionPortabilityMixin
 from run_agent import AIAgent
 from model_tools import get_tool_definitions, handle_function_call
 from tools.registry import ToolRegistry, check_fn_cache_scope, registry
@@ -159,6 +160,11 @@ def test_conversation_and_chat_are_coroutines():
     assert inspect.iscoroutinefunction(TrajectoryCompressor.close)
     assert inspect.iscoroutinefunction(trajectory_main)
     assert inspect.iscoroutinefunction(SessionDB._parse_schema_columns)
+    assert issubclass(SessionDB, SessionPortabilityMixin)
+    assert inspect.iscoroutinefunction(SessionDB.export_session)
+    assert inspect.iscoroutinefunction(SessionDB.export_session_lineage)
+    assert inspect.iscoroutinefunction(SessionDB.export_all)
+    assert inspect.iscoroutinefunction(SessionDB.import_sessions)
     assert inspect.iscoroutinefunction(get_default_hermes_root)
     assert inspect.iscoroutinefunction(_get_profiles_root)
     assert inspect.iscoroutinefunction(get_profile_dir)

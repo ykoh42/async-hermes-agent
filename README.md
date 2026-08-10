@@ -89,6 +89,29 @@ extra. Server setup, provider configuration, async lifecycle, recall, and tool
 behavior are documented in the
 [OpenViking provider guide](plugins/memory/openviking/README.md).
 
+## Sessions
+
+`SessionDB` keeps the upstream export and import names under the original
+`hermes_state.py` path. SQLite reads, writes, lineage reconstruction, and
+resource cleanup are awaited directly:
+
+```python
+from hermes_state import SessionDB
+
+source = SessionDB("state.db")
+restored = SessionDB("restored-state.db")
+try:
+    exported = await source.export_all()
+    result = await restored.import_sessions(exported)
+finally:
+    await source.close()
+    await restored.close()
+```
+
+`export_all()`, `export_session()`, and `import_sessions()` preserve the
+upstream dictionaries and validation limits. Import restores conversation
+history but deliberately clears stale live-activity fields.
+
 ## Skills, MCP, and memory
 
 Skills follow the existing Hermes layout. `HERMES_HOME` defaults to
@@ -236,6 +259,7 @@ silently running synchronous work in a thread.
 uv run pytest -q
 uv run ruff check agent tools hermes_cli plugins providers \
   run_agent.py model_tools.py mini_swe_runner.py batch_runner.py hermes_state.py \
+  hermes_state_portability.py \
   trajectory_compressor.py
 uv build
 ```
