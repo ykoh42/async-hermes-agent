@@ -15,10 +15,11 @@ import sqlite3
 import stat
 import sys
 import time
+from collections import deque
 from collections.abc import Collection
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Awaitable, Any, Callable, Dict, List, Optional, Tuple, TypeVar
 
 import aiofiles
 import aiofiles.os
@@ -53,6 +54,7 @@ from hermes_state_schema import SessionSchemaMixin
 from hermes_state_search import SessionSearchMixin
 
 logger = logging.getLogger(__name__)
+T = TypeVar("T")
 _COMPRESSION_LOCK_HOLDER_PID_RE = re.compile(r"(?:^|:)pid=(\d+)(?::|$)")
 _chmod = aiofiles.os.wrap(os.chmod)
 _realpath = aiofiles.os.wrap(os.path.realpath)
@@ -1135,11 +1137,15 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     work into a thread pool.
     """
 
-    _WRITE_PATIENCE_S = 60.0
+    _WRITE_PATIENCE_S = 20.0
+    _TRANSCRIPT_WRITE_PATIENCE_S = 60.0
     _ACTIVITY_WRITE_PATIENCE_S = 0.5
     _COMPRESSION_BUSY_WAIT_S = 5.0
     _WRITE_RETRY_MIN_S = 0.02
     _WRITE_RETRY_MAX_S = 0.15
+    _WRITE_RETRY_SLOW_AFTER_S = 2.0
+    _WRITE_RETRY_SLOW_MIN_S = 0.25
+    _WRITE_RETRY_SLOW_MAX_S = 1.0
 
     # Keep upstream's bounded maintenance cadence. PASSIVE checkpoints do
     # not require the exclusive lock that TRUNCATE does, while incremental
@@ -1167,6 +1173,24 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         "finish_reason, reasoning, reasoning_content, reasoning_details, "
         "codex_reasoning_items, codex_message_items, platform_message_id, observed, timestamp, "
         "api_content, display_kind, display_metadata"
+    )
+    _TOKEN_DELTA_SUM_FIELDS = (
+        "input_tokens",
+        "output_tokens",
+        "cache_read_tokens",
+        "cache_write_tokens",
+        "reasoning_tokens",
+        "api_call_count",
+    )
+    _TOKEN_DELTA_COST_FIELDS = ("estimated_cost_usd", "actual_cost_usd")
+    _TOKEN_DELTA_ROUTE_FIELDS = (
+        "model",
+        "cost_status",
+        "cost_source",
+        "pricing_version",
+        "billing_provider",
+        "billing_base_url",
+        "billing_mode",
     )
 
     @staticmethod
@@ -1465,6 +1489,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         self._write_count = 0
         self._fts_usermerge_floor_applied = False
         self._closed = False
+        self._close_task: Optional[asyncio.Task[None]] = None
         self._fts_enabled = False
         self._trigram_available = False
         self._fts_cjk_loaded = False
@@ -1472,6 +1497,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         self._fts_runtime_rebuild_attempted = False
         self._fts_unavailable_warned = False
         self._trigram_unavailable_warned = False
+        self._token_queue: deque[Tuple[str, Dict[str, Any]]] = deque()
+        self._token_queue_cond = asyncio.Condition()
+        self._token_writer_task: Optional[asyncio.Task[None]] = None
+        self._token_writer_stop = False
+        self._token_writer_busy = False
 
     def _get_connect_lock(self) -> asyncio.Lock:
         if self._connect_lock is None:
@@ -1493,7 +1523,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             self._read_lock = asyncio.Lock()
         return self._read_lock
 
-    async def _get_connection(self):
+    async def _get_connection(self, patience_s: Optional[float] = None):
         if self._closed:
             raise RuntimeError("SessionDB is closed")
         if self._connection is not None:
@@ -1605,7 +1635,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     if not initialized and connection is not None:
                         await _close_owned_connection(connection)
 
-            deadline = time.monotonic() + self._WRITE_PATIENCE_S
+            connection_patience = (
+                self._WRITE_PATIENCE_S
+                if patience_s is None
+                else patience_s
+            )
+            deadline = time.monotonic() + connection_patience
             while True:
                 database_error: Optional[sqlite3.DatabaseError] = None
                 try:
@@ -1904,19 +1939,21 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         if system_prompt is None:
             return None
         prompt_hash = _system_prompt_hash(system_prompt)
-        await connection.execute(
+        cursor = await connection.execute(
             "INSERT OR IGNORE INTO system_prompts (hash, prompt) VALUES (?, ?)",
             (prompt_hash, system_prompt),
         )
+        await cursor.close()
         return prompt_hash
 
     @staticmethod
     async def _delete_unreferenced_system_prompts(connection) -> None:
-        await connection.execute(
+        cursor = await connection.execute(
             "DELETE FROM system_prompts WHERE NOT EXISTS ("
             "SELECT 1 FROM sessions "
             "WHERE sessions.system_prompt_hash = system_prompts.hash)"
         )
+        await cursor.close()
 
     @staticmethod
     def _session_row_dict(row) -> Dict[str, Any]:
@@ -1926,25 +1963,28 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             data["system_prompt"] = resolved
         return data
 
-    @staticmethod
-    def _is_retryable_lock_error(exc: Exception) -> bool:
-        message = str(exc).lower()
-        return "database is locked" in message or "database is busy" in message
-
-    async def _write(self, operation, *, patience_s: Optional[float] = None):
-        """Run one short transaction, yielding between SQLite lock retries."""
+    async def _execute_write(
+        self,
+        fn: Callable[[aiosqlite.Connection], Awaitable[T]],
+        patience_s: Optional[float] = None,
+    ) -> T:
+        """Execute one native-async write transaction with jitter retries."""
         if patience_s is None:
             patience_s = self._WRITE_PATIENCE_S
         deadline = time.monotonic() + patience_s
         compression_deadline: Optional[float] = None
-        delay = self._WRITE_RETRY_MIN_S
+
+        def _is_no_more_rows(exc: sqlite3.Error) -> bool:
+            return "no more rows available" in str(exc).lower()
+
         while True:
             try:
                 async with self._get_write_lock():
-                    connection = await self._get_connection()
+                    connection = await self._get_connection(patience_s=patience_s)
                     try:
-                        await connection.execute("BEGIN IMMEDIATE")
-                        result = await operation(connection)
+                        cursor = await connection.execute("BEGIN IMMEDIATE")
+                        await cursor.close()
+                        result = await fn(connection)
                         await connection.commit()
                     except BaseException:
                         await _finish_connection_rollback(connection)
@@ -1963,34 +2003,71 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         time.monotonic() + self._COMPRESSION_BUSY_WAIT_S,
                         deadline,
                     )
-                remaining = compression_deadline - time.monotonic()
-                if remaining <= 0:
-                    raise
-                await asyncio.sleep(min(delay, remaining))
-                delay = min(delay * 2, self._WRITE_RETRY_MAX_S)
-            except Exception as exc:
-                if (
-                    isinstance(exc, sqlite3.DatabaseError)
-                    # A new caller cancellation must supersede this stale DB error.
-                    and await self._try_runtime_fts_rebuild(exc)  # noqa: ASYNC120
+                if await self._sleep_before_write_retry(  # noqa: ASYNC120
+                    compression_deadline,
+                    self._COMPRESSION_BUSY_WAIT_S,
                 ):
                     continue
-                no_more_rows = (
-                    isinstance(exc, sqlite3.Error)
-                    and "no more rows available" in str(exc).lower()
-                )
-                if not no_more_rows and not self._is_retryable_lock_error(exc):
-                    raise
-                if time.monotonic() >= deadline:
-                    if no_more_rows:
-                        raise
+                raise
+            except sqlite3.OperationalError as exc:
+                message = str(exc).lower()
+                if "locked" in message or "busy" in message:
+                    if await self._sleep_before_write_retry(  # noqa: ASYNC120
+                        deadline,
+                        patience_s,
+                    ):
+                        continue
                     raise sqlite3.OperationalError(
-                        "database is locked by another Hermes process; "
-                        "the database appears healthy but remained busy past "
-                        f"the {patience_s:g}s write deadline"
+                        "database is locked (another Hermes process held the "
+                        f"state.db write lock for over {patience_s:.0f}s — "
+                        "likely a long maintenance operation such as VACUUM, "
+                        "a large WAL checkpoint, or an older pre-update "
+                        "process; the database itself is healthy)"
                     ) from exc
-                await asyncio.sleep(random.uniform(delay / 2, delay))
-                delay = min(delay * 2, self._WRITE_RETRY_MAX_S)
+                if _is_no_more_rows(exc) and await self._sleep_before_write_retry(  # noqa: ASYNC120
+                    deadline,
+                    patience_s,
+                ):
+                    continue
+                raise
+            except sqlite3.DatabaseError as exc:
+                if _is_no_more_rows(exc) and await self._sleep_before_write_retry(  # noqa: ASYNC120
+                    deadline,
+                    patience_s,
+                ):
+                    continue
+                if not await self._try_runtime_fts_rebuild(exc):  # noqa: ASYNC120
+                    raise
+            except sqlite3.Error as exc:
+                if _is_no_more_rows(exc) and await self._sleep_before_write_retry(  # noqa: ASYNC120
+                    deadline,
+                    patience_s,
+                ):
+                    continue
+                raise
+
+    async def _sleep_before_write_retry(
+        self,
+        deadline: float,
+        patience_s: float,
+    ) -> bool:
+        """Await one upstream jitter interval without blocking the event loop."""
+        now = time.monotonic()
+        if now >= deadline:
+            return False
+        elapsed = now - (deadline - patience_s)
+        if elapsed >= self._WRITE_RETRY_SLOW_AFTER_S:
+            jitter = random.uniform(
+                self._WRITE_RETRY_SLOW_MIN_S,
+                self._WRITE_RETRY_SLOW_MAX_S,
+            )
+        else:
+            jitter = random.uniform(
+                self._WRITE_RETRY_MIN_S,
+                self._WRITE_RETRY_MAX_S,
+            )
+        await asyncio.sleep(min(jitter, max(deadline - now, 0.001)))
+        return True
 
     async def _try_wal_checkpoint(self) -> None:
         """Best-effort PASSIVE WAL checkpoint matching upstream cadence."""
@@ -2049,16 +2126,29 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         ):
             raise CompressionSessionClosedError(session_id)
 
-    async def create_session(self, session_id: str, source: str, **kwargs) -> str:
-        """Create or enrich the turn's session row without blocking the loop."""
-        model_config = kwargs.get("model_config")
-        parent_session_id = kwargs.get("parent_session_id")
-
+    async def _insert_session_row(
+        self,
+        session_id: str,
+        source: str,
+        model: str = None,
+        model_config: Dict[str, Any] = None,
+        system_prompt: str = None,
+        user_id: str = None,
+        session_key: Optional[str] = None,
+        chat_id: str = None,
+        chat_type: str = None,
+        thread_id: str = None,
+        parent_session_id: str = None,
+        cwd: str = None,
+        profile_name: str = None,
+        git_repo_root: str = None,
+    ) -> None:
+        """Insert or enrich one session row through the async writer."""
         async def _create(connection):
             system_prompt_hash = await self._store_system_prompt(
-                connection, kwargs.get("system_prompt")
+                connection, system_prompt
             )
-            await connection.execute(
+            cursor = await connection.execute(
                 """INSERT INTO sessions (
                    id, source, user_id, session_key, chat_id, chat_type, thread_id,
                    model, model_config, system_prompt, system_prompt_hash,
@@ -2090,25 +2180,26 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 (
                     session_id,
                     source,
-                    kwargs.get("user_id"),
-                    kwargs.get("session_key"),
-                    kwargs.get("chat_id"),
-                    kwargs.get("chat_type"),
-                    kwargs.get("thread_id"),
-                    kwargs.get("model"),
+                    user_id,
+                    session_key,
+                    chat_id,
+                    chat_type,
+                    thread_id,
+                    model,
                     json.dumps(model_config) if model_config else None,
                     system_prompt_hash,
                     parent_session_id,
-                    kwargs.get("cwd"),
-                    kwargs.get("profile_name"),
-                    kwargs.get("git_repo_root"),
+                    cwd,
+                    profile_name,
+                    git_repo_root,
                     time.time(),
                 ),
             )
+            await cursor.close()
             if system_prompt_hash is not None:
                 await self._delete_unreferenced_system_prompts(connection)
             if parent_session_id:
-                await connection.execute(
+                cursor = await connection.execute(
                     """UPDATE sessions
                        SET cwd = COALESCE(sessions.cwd,
                                  (SELECT p.cwd FROM sessions p
@@ -2125,7 +2216,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                      WHERE id = ? AND parent_session_id IS NOT NULL""",
                     (session_id,),
                 )
-                await connection.execute(
+                await cursor.close()
+                cursor = await connection.execute(
                     """UPDATE sessions
                        SET user_id = COALESCE(sessions.user_id,
                                      (SELECT p.user_id FROM sessions p
@@ -2156,8 +2248,16 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                        )""",
                     (session_id,),
                 )
+                await cursor.close()
 
-        await self._write(_create)
+        await self._execute_write(
+            _create,
+            patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S,
+        )
+
+    async def create_session(self, session_id: str, source: str, **kwargs) -> str:
+        """Create a new session record. Returns the session_id."""
+        await self._insert_session_row(session_id, source, **kwargs)
         return session_id
 
     async def ensure_session(
@@ -2168,12 +2268,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         **kwargs,
     ) -> str:
         """Ensure a session row exists and preserve the upstream return value."""
-        return await self.create_session(
+        await self._insert_session_row(
             session_id,
             source,
             model=model,
             **kwargs,
         )
+        return session_id
 
     async def update_session_cwd(
         self,
@@ -2204,7 +2305,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 parameters,
             )
 
-        await self._write(_update)
+        await self._execute_write(_update)
 
     async def append_message(
         self,
@@ -2289,7 +2390,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 )
             return cursor.lastrowid
 
-        return await self._write(_append)
+        return await self._execute_write(
+            _append,
+            patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S,
+        )
 
     async def _insert_message_rows(
         self,
@@ -2422,7 +2526,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 )
             return inserted
 
-        return await self._write(_append_batch)
+        return await self._execute_write(
+            _append_batch,
+            patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S,
+        )
 
     async def replace_messages(
         self,
@@ -2466,7 +2573,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 (total_messages, total_tool_calls, session_id),
             )
 
-        await self._write(_replace)
+        await self._execute_write(_replace)
 
     async def has_archived_messages(self, session_id: str) -> bool:
         """Return True if the session has any soft-archived (``active = 0``) rows.
@@ -2493,7 +2600,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 (time.time(), end_reason, session_id),
             )
 
-        await self._write(_end)
+        await self._execute_write(_end)
 
     async def reopen_session(self, session_id: str) -> None:
         """Clear ended_at/end_reason so a session can be resumed."""
@@ -2503,7 +2610,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 (session_id,),
             )
 
-        await self._write(_reopen)
+        await self._execute_write(_reopen)
 
     async def try_acquire_compression_lock(
         self,
@@ -2545,7 +2652,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return owner is not None and owner["holder"] == holder
 
         try:
-            return bool(await self._write(_acquire))
+            return bool(await self._execute_write(_acquire))
         except sqlite3.Error as exc:
             logger.warning("try_acquire_compression_lock(%s) failed: %s", session_id, exc)
             return False
@@ -2569,7 +2676,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return cursor.rowcount > 0
 
         try:
-            return bool(await self._write(_refresh))
+            return bool(await self._execute_write(_refresh))
         except sqlite3.Error as exc:
             logger.warning("refresh_compression_lock(%s) failed: %s", session_id, exc)
             return False
@@ -2586,7 +2693,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
 
         try:
-            await self._write(_release)
+            await self._execute_write(_release)
         except sqlite3.Error as exc:
             logger.warning("release_compression_lock(%s) failed: %s", session_id, exc)
 
@@ -2634,7 +2741,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 (when, desc, prov, session_id, when),
             )
 
-        await self._write(
+        await self._execute_write(
             _touch,
             patience_s=self._ACTIVITY_WRITE_PATIENCE_S,
         )
@@ -2667,7 +2774,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 ("", ActivityProvenance.UNKNOWN.value, session_id),
             )
 
-        await self._write(
+        await self._execute_write(
             _clear,
             patience_s=self._ACTIVITY_WRITE_PATIENCE_S,
         )
@@ -2778,7 +2885,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
             return len(compacted_messages)
 
-        return await self._write(_archive)
+        return await self._execute_write(_archive)
 
     async def update_system_prompt(
         self, session_id: str, system_prompt: Optional[str]
@@ -2795,7 +2902,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
             await self._delete_unreferenced_system_prompts(connection)
 
-        await self._write(_update)
+        await self._execute_write(_update)
 
     async def update_session_runtime_lock(
         self,
@@ -2842,7 +2949,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
             await self._delete_unreferenced_system_prompts(connection)
 
-        await self._write(_update)
+        await self._execute_write(_update)
 
     async def update_session_meta(
         self,
@@ -2860,7 +2967,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 (model_config_json, model, session_id),
             )
 
-        await self._write(_update)
+        await self._execute_write(_update)
 
     async def backfill_repo_roots(self, cwd_to_root: Dict[str, str]) -> None:
         """Persist resolved git repo roots for cwds that don't have one yet.
@@ -2881,7 +2988,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     (root, cwd),
                 )
 
-        await self._write(_backfill)
+        await self._execute_write(_backfill)
 
     async def update_session_model(self, session_id: str, model: str) -> None:
         """Persist a mid-session model switch and clear its stale runtime lock."""
@@ -2904,7 +3011,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
             await self._delete_unreferenced_system_prompts(connection)
 
-        await self._write(_update)
+        await self._execute_write(_update)
 
     async def set_latest_user_api_content(
         self, session_id: str, content: Any, api_content: str
@@ -2923,7 +3030,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
             return cursor.rowcount
 
-        return await self._write(_update)
+        return await self._execute_write(_update)
 
     async def record_auxiliary_usage(
         self,
@@ -2940,50 +3047,33 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         reasoning_tokens: int = 0,
         estimated_cost_usd: Optional[float] = None,
     ) -> None:
-        """Persist one auxiliary-model usage delta without sync SQLite I/O."""
+        """Record one auxiliary-model usage delta for the session."""
         if not session_id or not task:
             return
-        await self.create_session(session_id, "unknown")
-        now = time.time()
+        await self._insert_session_row(session_id, "unknown")
 
         async def _record(connection):
-            await connection.execute(
-                """INSERT INTO session_model_usage (
-                       session_id, model, billing_provider, billing_base_url,
-                       billing_mode, task, api_call_count, input_tokens,
-                       output_tokens, cache_read_tokens, cache_write_tokens,
-                       reasoning_tokens, estimated_cost_usd, actual_cost_usd,
-                       cost_status, cost_source, first_seen, last_seen
-                   ) VALUES (?, ?, ?, ?, '', ?, 1, ?, ?, ?, ?, ?, ?, 0, NULL, NULL, ?, ?)
-                   ON CONFLICT(session_id, model, billing_provider, billing_base_url,
-                               billing_mode, task)
-                   DO UPDATE SET
-                       api_call_count = api_call_count + 1,
-                       input_tokens = input_tokens + excluded.input_tokens,
-                       output_tokens = output_tokens + excluded.output_tokens,
-                       cache_read_tokens = cache_read_tokens + excluded.cache_read_tokens,
-                       cache_write_tokens = cache_write_tokens + excluded.cache_write_tokens,
-                       reasoning_tokens = reasoning_tokens + excluded.reasoning_tokens,
-                       estimated_cost_usd = estimated_cost_usd + excluded.estimated_cost_usd,
-                       last_seen = excluded.last_seen""",
-                (
-                    session_id,
-                    model or "unknown",
-                    billing_provider or "",
-                    billing_base_url or "",
-                    task,
-                    input_tokens or 0,
-                    output_tokens or 0,
-                    cache_read_tokens or 0,
-                    cache_write_tokens or 0,
-                    reasoning_tokens or 0,
-                    float(estimated_cost_usd or 0.0),
-                    now,
-                    now,
-                ),
+            await self._record_model_usage(
+                connection,
+                session_id,
+                model=model,
+                billing_provider=billing_provider,
+                billing_base_url=billing_base_url,
+                billing_mode=None,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                cache_read_tokens=cache_read_tokens,
+                cache_write_tokens=cache_write_tokens,
+                reasoning_tokens=reasoning_tokens,
+                estimated_cost_usd=estimated_cost_usd,
+                actual_cost_usd=None,
+                cost_status=None,
+                cost_source=None,
+                api_call_count=1,
+                task=task,
             )
 
-        await self._write(_record)
+        await self._execute_write(_record)
 
     async def update_token_counts(
         self,
@@ -3005,8 +3095,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         api_call_count: int = 0,
         absolute: bool = False,
     ) -> None:
-        """Persist one token-accounting update through the async connection."""
-        await self.create_session(session_id, "unknown", model=model)
+        """Update aggregate and per-model token accounting."""
+        await self._insert_session_row(session_id, "unknown", model=model)
         has_accounted_usage = bool(
             input_tokens or output_tokens or cache_read_tokens
             or cache_write_tokens or reasoning_tokens or api_call_count
@@ -3065,65 +3155,359 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             api_call_count,
             session_id,
         )
+        record_model_usage = (not absolute) and bool(
+            input_tokens
+            or output_tokens
+            or cache_read_tokens
+            or cache_write_tokens
+            or reasoning_tokens
+            or api_call_count
+            or estimated_cost_usd
+        )
 
         async def _update(connection):
-            await connection.execute(sql, params)
-            if absolute or not has_accounted_usage:
-                return
-            await connection.execute(
-                """INSERT INTO session_model_usage (
-                       session_id, model, billing_provider, billing_base_url,
-                       billing_mode, task, api_call_count, input_tokens,
-                       output_tokens, cache_read_tokens, cache_write_tokens,
-                       reasoning_tokens, estimated_cost_usd, actual_cost_usd,
-                       cost_status, cost_source, first_seen, last_seen
-                   ) VALUES (?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                   ON CONFLICT(session_id, model, billing_provider, billing_base_url,
-                               billing_mode, task)
-                   DO UPDATE SET
-                       api_call_count = api_call_count + excluded.api_call_count,
-                       input_tokens = input_tokens + excluded.input_tokens,
-                       output_tokens = output_tokens + excluded.output_tokens,
-                       cache_read_tokens = cache_read_tokens + excluded.cache_read_tokens,
-                       cache_write_tokens = cache_write_tokens + excluded.cache_write_tokens,
-                       reasoning_tokens = reasoning_tokens + excluded.reasoning_tokens,
-                       estimated_cost_usd = estimated_cost_usd + excluded.estimated_cost_usd,
-                       actual_cost_usd = actual_cost_usd + excluded.actual_cost_usd,
-                       cost_status = COALESCE(excluded.cost_status, cost_status),
-                       cost_source = COALESCE(excluded.cost_source, cost_source),
-                       last_seen = excluded.last_seen""",
-                (
-                    session_id,
-                    model or "unknown",
-                    billing_provider or "",
-                    billing_base_url or "",
-                    billing_mode or "",
-                    api_call_count or 0,
-                    input_tokens or 0,
-                    output_tokens or 0,
-                    cache_read_tokens or 0,
-                    cache_write_tokens or 0,
-                    reasoning_tokens or 0,
-                    float(estimated_cost_usd or 0.0),
-                    float(actual_cost_usd or 0.0),
-                    cost_status,
-                    cost_source,
-                    time.time(),
-                    time.time(),
-                ),
+            async with connection.execute(
+                "SELECT model, billing_provider, api_call_count "
+                "FROM sessions WHERE id = ?",
+                (session_id,),
+            ) as cursor:
+                row = await cursor.fetchone()
+            existing_model = row["model"] if row is not None else None
+            existing_provider = (
+                row["billing_provider"] if row is not None else None
             )
+            existing_api_calls = int(
+                (row["api_call_count"] if row is not None else 0) or 0
+            )
+            first_accounted_route = (
+                existing_api_calls == 0
+                and has_accounted_usage
+                and bool(model)
+                and bool(billing_provider)
+                and (
+                    existing_model != model
+                    or existing_provider != billing_provider
+                )
+            )
+            if first_accounted_route:
+                cursor = await connection.execute(
+                    """UPDATE sessions
+                       SET model = ?, billing_provider = ?,
+                           billing_base_url = ?, billing_mode = ?
+                       WHERE id = ?""",
+                    (
+                        model,
+                        billing_provider,
+                        billing_base_url,
+                        billing_mode,
+                        session_id,
+                    ),
+                )
+                await cursor.close()
+            cursor = await connection.execute(sql, params)
+            await cursor.close()
+            if record_model_usage:
+                await self._record_model_usage(
+                    connection,
+                    session_id,
+                    model=model,
+                    billing_provider=billing_provider,
+                    billing_base_url=billing_base_url,
+                    billing_mode=billing_mode,
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                    cache_read_tokens=cache_read_tokens,
+                    cache_write_tokens=cache_write_tokens,
+                    reasoning_tokens=reasoning_tokens,
+                    estimated_cost_usd=estimated_cost_usd,
+                    actual_cost_usd=actual_cost_usd,
+                    cost_status=cost_status,
+                    cost_source=cost_source,
+                    api_call_count=api_call_count,
+                )
 
-        await self._write(_update)
+        await self._execute_write(_update)
+
+    async def _record_model_usage(
+        self,
+        conn,
+        session_id: str,
+        *,
+        model: Optional[str],
+        billing_provider: Optional[str],
+        billing_base_url: Optional[str],
+        billing_mode: Optional[str],
+        input_tokens: int,
+        output_tokens: int,
+        cache_read_tokens: int,
+        cache_write_tokens: int,
+        reasoning_tokens: int,
+        estimated_cost_usd: Optional[float],
+        actual_cost_usd: Optional[float],
+        cost_status: Optional[str],
+        cost_source: Optional[str],
+        api_call_count: int,
+        task: str = "",
+    ) -> None:
+        """Accumulate one usage delta inside the caller's transaction."""
+        async with conn.execute(
+            "SELECT model, billing_provider, billing_base_url, billing_mode "
+            "FROM sessions WHERE id = ?",
+            (session_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        session_model = row["model"] if row is not None else None
+        session_provider = row["billing_provider"] if row is not None else None
+        session_base_url = row["billing_base_url"] if row is not None else None
+        session_billing_mode = row["billing_mode"] if row is not None else None
+
+        if task:
+            effective_model = model or "unknown"
+            effective_provider = billing_provider or ""
+            effective_base_url = billing_base_url or ""
+            effective_billing_mode = billing_mode or ""
+        else:
+            effective_model = model or session_model or "unknown"
+            effective_provider = billing_provider or session_provider or ""
+            effective_base_url = billing_base_url or session_base_url or ""
+            effective_billing_mode = billing_mode or session_billing_mode or ""
+        now = time.time()
+        cursor = await conn.execute(
+            """INSERT INTO session_model_usage (
+                   session_id, model, billing_provider, billing_base_url,
+                   billing_mode, task, api_call_count, input_tokens,
+                   output_tokens, cache_read_tokens, cache_write_tokens,
+                   reasoning_tokens, estimated_cost_usd, actual_cost_usd,
+                   cost_status, cost_source, first_seen, last_seen
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(session_id, model, billing_provider,
+                           billing_base_url, billing_mode, task)
+               DO UPDATE SET
+                   api_call_count = api_call_count + excluded.api_call_count,
+                   input_tokens = input_tokens + excluded.input_tokens,
+                   output_tokens = output_tokens + excluded.output_tokens,
+                   cache_read_tokens = cache_read_tokens + excluded.cache_read_tokens,
+                   cache_write_tokens = cache_write_tokens + excluded.cache_write_tokens,
+                   reasoning_tokens = reasoning_tokens + excluded.reasoning_tokens,
+                   estimated_cost_usd = estimated_cost_usd + excluded.estimated_cost_usd,
+                   actual_cost_usd = actual_cost_usd + excluded.actual_cost_usd,
+                   cost_status = COALESCE(excluded.cost_status, cost_status),
+                   cost_source = COALESCE(excluded.cost_source, cost_source),
+                   last_seen = excluded.last_seen""",
+            (
+                session_id,
+                effective_model,
+                effective_provider,
+                effective_base_url,
+                effective_billing_mode,
+                task or "",
+                api_call_count or 0,
+                input_tokens or 0,
+                output_tokens or 0,
+                cache_read_tokens or 0,
+                cache_write_tokens or 0,
+                reasoning_tokens or 0,
+                float(estimated_cost_usd or 0.0),
+                float(actual_cost_usd or 0.0),
+                cost_status,
+                cost_source,
+                now,
+                now,
+            ),
+        )
+        await cursor.close()
 
     async def queue_token_counts(self, session_id: str, **kwargs) -> None:
-        """Persist a token/cost update through the native async writer.
+        """Enqueue a token delta for the native-async background writer."""
+        writer_stopped = False
+        async with self._token_queue_cond:
+            task = self._token_writer_task
+            writer_stopped = self._token_writer_stop and (
+                task is None or task.done()
+            )
+            if not writer_stopped:
+                self._token_queue.append((session_id, kwargs))
+                if task is None or task.done():
+                    if task is not None and not task.cancelled():
+                        exception = task.exception()
+                        if exception is not None:
+                            logger.warning(
+                                "async token accounting: writer exited: %s",
+                                exception,
+                            )
+                    self._token_writer_task = asyncio.create_task(
+                        self._token_writer_loop(),
+                        name="session-db-token-writer",
+                    )
+                self._token_queue_cond.notify_all()
+        if writer_stopped:
+            await self.update_token_counts(session_id, **kwargs)
 
-        Accepts the same keyword arguments as :meth:`update_token_counts`.
-        The synchronous implementation needed a background thread to move
-        SQLite work off the turn thread; the async implementation awaits the
-        non-blocking database operation directly and preserves enqueue order.
-        """
-        await self.update_token_counts(session_id, **kwargs)
+    async def flush_token_counts(self, timeout: float = 5.0) -> bool:
+        """Wait until every queued token delta has been applied."""
+        deadline = time.monotonic() + timeout
+        async with self._token_queue_cond:
+            while self._token_queue or self._token_writer_busy:
+                task = self._token_writer_task
+                if self._token_queue and (task is None or task.done()):
+                    if task is not None and not task.cancelled():
+                        exception = task.exception()
+                        if exception is not None:
+                            logger.warning(
+                                "async token accounting: writer exited: %s",
+                                exception,
+                            )
+                    self._token_writer_task = asyncio.create_task(
+                        self._token_writer_loop(),
+                        name="session-db-token-writer",
+                    )
+                    self._token_queue_cond.notify_all()
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                try:
+                    await asyncio.wait_for(
+                        self._token_queue_cond.wait(),
+                        timeout=remaining,
+                    )
+                except TimeoutError:
+                    return False
+        return True
+
+    async def _token_writer_loop(self) -> None:
+        """Drain queued deltas in order without a worker thread."""
+        writer_task = asyncio.current_task()
+        try:
+            while True:
+                async with self._token_queue_cond:
+                    if not self._token_queue:
+                        if self._token_writer_task is writer_task:
+                            self._token_writer_task = None
+                        self._token_queue_cond.notify_all()
+                        return
+                    self._token_writer_busy = True
+                    batch = list(self._token_queue)
+                    self._token_queue.clear()
+                try:
+                    await self._apply_token_batch(batch)
+                finally:
+                    async with self._token_queue_cond:
+                        self._token_writer_busy = False
+                        drained = not self._token_queue
+                        if drained and self._token_writer_task is writer_task:
+                            self._token_writer_task = None
+                        self._token_queue_cond.notify_all()
+                    if drained:
+                        return
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("async token accounting: writer exited: %s", exc)
+            async with self._token_queue_cond:
+                self._token_writer_busy = False
+                if self._token_writer_task is writer_task:
+                    self._token_writer_task = None
+                self._token_queue_cond.notify_all()
+
+    async def _apply_token_batch(
+        self,
+        batch: List[Tuple[str, Dict[str, Any]]],
+    ) -> None:
+        """Apply queued deltas in order, coalescing where safe."""
+        try:
+            coalesced = self._coalesce_token_deltas(batch)
+        except Exception as exc:
+            logger.warning(
+                "async token accounting: coalesce failed, applying raw "
+                "batch: %s",
+                exc,
+            )
+            coalesced = batch
+        for queued_session_id, queued_kwargs in coalesced:
+            try:
+                await self.update_token_counts(
+                    queued_session_id,
+                    **queued_kwargs,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning(
+                    "async token accounting: apply failed (session=%s): %s",
+                    queued_session_id,
+                    exc,
+                )
+
+    def _coalesce_token_deltas(
+        self,
+        batch: List[Tuple[str, Dict[str, Any]]],
+    ) -> List[Tuple[str, Dict[str, Any]]]:
+        """Merge adjacent incremental deltas with an identical route."""
+        groups: List[Tuple[Optional[tuple], str, Dict[str, Any]]] = []
+        for queued_session_id, queued_kwargs in batch:
+            key = None
+            if not queued_kwargs.get("absolute"):
+                key = (queued_session_id,) + tuple(
+                    queued_kwargs.get(field)
+                    for field in self._TOKEN_DELTA_ROUTE_FIELDS
+                )
+            if groups and key is not None and groups[-1][0] == key:
+                merged = groups[-1][2]
+                for field in self._TOKEN_DELTA_SUM_FIELDS:
+                    merged[field] = merged.get(field, 0) + queued_kwargs.get(
+                        field,
+                        0,
+                    )
+                for field in self._TOKEN_DELTA_COST_FIELDS:
+                    value = queued_kwargs.get(field)
+                    if value is not None:
+                        merged[field] = (merged.get(field) or 0.0) + value
+            else:
+                groups.append((key, queued_session_id, dict(queued_kwargs)))
+        return [
+            (queued_session_id, queued_kwargs)
+            for _, queued_session_id, queued_kwargs in groups
+        ]
+
+    async def _stop_token_writer(self, join_timeout: float = 10.0) -> None:
+        """Stop the writer task after draining queued deltas."""
+        async with self._token_queue_cond:
+            self._token_writer_stop = True
+            task = self._token_writer_task
+            if self._token_queue and (task is None or task.done()):
+                self._token_writer_task = asyncio.create_task(
+                    self._token_writer_loop(),
+                    name="session-db-token-writer",
+                )
+                task = self._token_writer_task
+            self._token_queue_cond.notify_all()
+        if task is None:
+            return
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(task),
+                timeout=join_timeout,
+            )
+        except TimeoutError:
+            logger.warning(
+                "async token accounting: writer did not stop within %.0fs; "
+                "%d queued delta(s) not yet persisted",
+                join_timeout,
+                len(self._token_queue),
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("async token accounting: writer stop failed: %s", exc)
+
+    async def _drain_token_queue_at_exit(self) -> None:
+        """Best-effort async drain used by the owned close lifecycle."""
+        try:
+            await self._stop_token_writer()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            pass
 
     async def update_session_billing_route(
         self,
@@ -3147,7 +3531,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
             await self._delete_unreferenced_system_prompts(connection)
 
-        await self._write(_update_route)
+        await self._execute_write(_update_route)
 
     async def get_meta(self, key: str) -> Optional[str]:
         """Read a value from the durable ``state_meta`` store."""
@@ -3176,7 +3560,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 (key, value),
             )
 
-        await self._write(_set)
+        await self._execute_write(_set)
 
     async def delete_meta(self, key: str) -> bool:
         """Delete one metadata key and report whether a row was removed."""
@@ -3187,7 +3571,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
             return cursor.rowcount > 0
 
-        return await self._write(_delete)
+        return await self._execute_write(_delete)
 
     async def get_session(self, session_id: str) -> Optional[Dict[str, Any]]:
         """Return one session row through the adapter's async connection."""
@@ -3327,7 +3711,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             await self._delete_unreferenced_system_prompts(connection)
             return True
 
-        deleted = bool(await self._write(_delete))
+        deleted = bool(await self._execute_write(_delete))
         if deleted:
             for delegate_id in removed_delegate_ids:
                 await self._remove_session_files(sessions_dir, delegate_id)
@@ -3358,7 +3742,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 await self._delete_unreferenced_system_prompts(connection)
             return cursor.rowcount > 0
 
-        deleted = bool(await self._write(_delete))
+        deleted = bool(await self._execute_write(_delete))
         if deleted:
             await self._remove_session_files(sessions_dir, session_id)
         return deleted
@@ -3412,7 +3796,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             removed_ids.extend(existing)
             return len(existing)
 
-        count = int(await self._write(_delete))
+        count = int(await self._execute_write(_delete))
         for delegate_id in removed_delegate_ids:
             await self._remove_session_files(sessions_dir, delegate_id)
         for removed_id in removed_ids:
@@ -3452,7 +3836,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             removed_ids.extend(session_ids)
             return len(session_ids)
 
-        count = int(await self._write(_delete))
+        count = int(await self._execute_write(_delete))
         for removed_id in removed_ids:
             await self._remove_session_files(sessions_dir, removed_id)
         return count
@@ -3695,7 +4079,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             removed_ids.extend(session_ids)
             return len(session_ids)
 
-        count = int(await self._write(_delete))
+        count = int(await self._execute_write(_delete))
         for removed_id in removed_ids:
             await self._remove_session_files(sessions_dir, removed_id)
         return count
@@ -3728,7 +4112,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             removed_ids.extend(session_ids)
             return len(session_ids)
 
-        count = int(await self._write(_delete))
+        count = int(await self._execute_write(_delete))
         for removed_id in removed_ids:
             await self._remove_session_files(sessions_dir, removed_id)
         return count
@@ -3770,7 +4154,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
             return result.rowcount
 
-        return int(await self._write(_finalize) or 0)
+        return int(await self._execute_write(_finalize) or 0)
 
     @staticmethod
     def _decode_message_row(row) -> Dict[str, Any]:
@@ -3892,7 +4276,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 (session_id,),
             )
 
-        await self._write(_clear)
+        await self._execute_write(_clear)
 
     async def rewind_to_message(
         self, session_id: str, target_message_id: int
@@ -3943,7 +4327,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             ).fetchone()
             return ids, head[0] if head and head[0] is not None else None
 
-        rewound, new_head_id = await self._write(_rewind)
+        rewound, new_head_id = await self._execute_write(_rewind)
         return {
             "rewound_count": len(rewound),
             "target_message": target,
@@ -3976,7 +4360,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 )
             return len(ids)
 
-        return await self._write(_do)
+        return await self._execute_write(_do)
 
     async def get_messages_around(
         self,
@@ -4873,7 +5257,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     f"compression cooldown rollback session missing: {session_id}"
                 )
 
-        await self._write(_restore)
+        await self._execute_write(_restore)
         actual = await self.get_compression_failure_cooldown_row(session_id)
         expected = {
             "session_exists": True,
@@ -4899,7 +5283,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 (cooldown_until, error, session_id),
             )
 
-        await self._write(_record)
+        await self._execute_write(_record)
 
     async def clear_compression_failure_cooldown(self, session_id: str) -> None:
         if not session_id:
@@ -4912,7 +5296,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 (session_id,),
             )
 
-        await self._write(_clear)
+        await self._execute_write(_clear)
 
     async def get_compression_fallback_streak(self, session_id: str) -> int:
         if not session_id:
@@ -4941,7 +5325,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 (max(0, int(streak)), session_id),
             )
 
-        await self._write(_set)
+        await self._execute_write(_set)
 
     async def get_compression_ineffective_count(self, session_id: str) -> int:
         if not session_id:
@@ -4970,7 +5354,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 (max(0, int(count)), session_id),
             )
 
-        await self._write(_set)
+        await self._execute_write(_set)
 
     async def get_conversation_root(self, session_id: str) -> str:
         """Resolve a session lineage root without using ``SessionDB``'s lock."""
@@ -5370,7 +5754,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
             return cursor.rowcount
 
-        rowcount = await self._write(_do)
+        rowcount = await self._execute_write(_do)
         return rowcount > 0
 
     async def set_session_title(self, session_id: str, title: str) -> bool:
@@ -5436,7 +5820,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 )[0]
             return rowcount
 
-        rowcount = await self._write(_do)
+        rowcount = await self._execute_write(_do)
         return rowcount > 0
 
     async def set_session_pinned(
@@ -5487,7 +5871,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 )[0]
             return rowcount
 
-        rowcount = await self._write(_do)
+        rowcount = await self._execute_write(_do)
         return rowcount > 0
 
     async def publish_compression_child(
@@ -5646,7 +6030,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     f"Compression parent changed during publication: {parent_session_id}"
                 )
 
-        await self._write(_publish)
+        await self._execute_write(_publish)
 
     async def logical_size_bytes(self) -> Optional[int]:
         """Return SQLite's logical database size in bytes."""
@@ -5796,16 +6180,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             result["error"] = str(exc)
         return result
 
-    async def flush_token_counts(self, timeout: float = 5.0) -> bool:
-        """Token deltas still use their own async accounting path; no turn-blocking drain."""
-        del timeout
-        return True
-
     async def close(self) -> None:
-        self._closed = True
-        cleanup_task = asyncio.create_task(
-            self._close_owned(), name="session-db-close"
-        )
+        if self._close_task is None:
+            self._close_task = asyncio.create_task(
+                self._close_owned(),
+                name="session-db-close",
+            )
+        cleanup_task = self._close_task
         cancellation: asyncio.CancelledError | None = None
         while True:
             try:
@@ -5824,6 +6205,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             raise cancellation
 
     async def _close_owned(self) -> None:
+        await self._drain_token_queue_at_exit()
+        writer_task = self._token_writer_task
+        if writer_task is not None and not writer_task.done():
+            await asyncio.shield(writer_task)
+        self._closed = True
         async with self._get_write_lock():
             async with self._get_read_connect_lock():
                 async with self._get_read_lock():

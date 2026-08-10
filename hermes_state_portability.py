@@ -178,17 +178,14 @@ class SessionPortabilityMixin:
     async def get_first_assistant_text(self, session_id: str) -> str:
         """Return the session's first assistant reply as plain text."""
         async with self._read_ctx() as connection:  # type: ignore[unresolved-attribute]
-            cursor = await connection.execute(
+            async with connection.execute(
                 "SELECT content FROM messages "
                 "WHERE session_id = ? AND role = 'assistant' "
                 "AND content IS NOT NULL "
                 "ORDER BY timestamp, id LIMIT 1",
                 (session_id,),
-            )
-            try:
+            ) as cursor:
                 row = await cursor.fetchone()
-            finally:
-                await cursor.close()
         if not row:
             return ""
         decoded = self._decode_content(  # type: ignore[unresolved-attribute]
@@ -698,4 +695,4 @@ class SessionPortabilityMixin:
                 "errors": [],
             }
 
-        return await self._write(_import)  # type: ignore[unresolved-attribute]
+        return await self._execute_write(_import)  # type: ignore[unresolved-attribute]

@@ -691,7 +691,7 @@ async def test_real_lock_api_internal_errors_fail_closed_skips_compression(
     async def _fail_lock_write(_self, _fn):
         raise error
 
-    monkeypatch.setattr(SessionDB, "_write", _fail_lock_write)
+    monkeypatch.setattr(SessionDB, "_execute_write", _fail_lock_write)
     agent = _build_agent_with_db(db, parent_sid)
     messages = [{"role": "user", "content": f"m{i}"} for i in range(20)]
 

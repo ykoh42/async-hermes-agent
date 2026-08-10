@@ -63,7 +63,7 @@ async def test_wal_read_completes_during_write_and_hides_uncommitted_rows(
         write_started.set()
         await release_write.wait()
 
-    write_task = asyncio.create_task(db._write(held_write))
+    write_task = asyncio.create_task(db._execute_write(held_write))
     await write_started.wait()
     try:
         committed = await asyncio.wait_for(db.get_session("committed"), 0.5)

@@ -44,7 +44,7 @@ async def test_repeated_cancellation_rolls_back_begin_before_unlock(
             ("cancelled", "test", 0.0),
         )
 
-    writing = asyncio.create_task(database._write(write_row))
+    writing = asyncio.create_task(database._execute_write(write_row))
     await begin_executed.wait()
     writing.cancel()
     await rollback_started.wait()

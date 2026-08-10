@@ -144,7 +144,7 @@ class SessionSearchMixin:
             )
             await cursor.close()
 
-        await self._write(_finish)
+        await self._execute_write(_finish)
         logger.info("Deferred FTS rebuild complete — all messages indexed.")
 
     async def _fts_teardown_trash_step(self) -> bool:
@@ -188,7 +188,7 @@ class SessionSearchMixin:
             return True
 
         try:
-            return bool(await self._write(_teardown))
+            return bool(await self._execute_write(_teardown))
         except sqlite3.OperationalError as exc:
             logger.debug("FTS trash teardown chunk failed (will retry): %s", exc)
             return True
@@ -242,7 +242,7 @@ class SessionSearchMixin:
             return upper < high_water
 
         try:
-            more = await self._write(_backfill)
+            more = await self._execute_write(_backfill)
         except sqlite3.OperationalError as exc:
             logger.debug("FTS rebuild chunk failed (will retry): %s", exc)
             return True
@@ -313,7 +313,7 @@ class SessionSearchMixin:
             return upper < high_water
 
         try:
-            more = await self._write(_backfill)
+            more = await self._execute_write(_backfill)
         except sqlite3.OperationalError as exc:
             logger.debug("CJK FTS rebuild chunk failed (will retry): %s", exc)
             return True
@@ -354,7 +354,7 @@ class SessionSearchMixin:
             )
             await cursor.close()
 
-        await self._write(_finish)
+        await self._execute_write(_finish)
         self._fts_cjk_available = True
         logger.info("CJK FTS index backfill complete — serving CJK search.")
 
@@ -392,7 +392,7 @@ class SessionSearchMixin:
             await cursor.close()
             return True
 
-        if await self._write(_reset):
+        if await self._execute_write(_reset):
             async with self._get_write_lock():
                 connection = await self._get_connection()
                 await self._ensure_fts_cjk_schema(connection)
@@ -512,7 +512,7 @@ class SessionSearchMixin:
                 await cursor.close()
                 await self._seed_fts_rebuild_markers(connection, force=True)
 
-        await self._write(_repair)
+        await self._execute_write(_repair)
 
     async def fts_optimize_available(self) -> bool:
         """Return whether storage migration, backfill, or teardown is pending."""
@@ -592,7 +592,7 @@ class SessionSearchMixin:
             await cursor.close()
             return high_water
 
-        high_water = int(await self._write(_stage))
+        high_water = int(await self._execute_write(_stage))
         async with self._get_write_lock():
             connection = await self._get_connection()
             base_ok = await self._ensure_fts_schema(
@@ -778,7 +778,7 @@ class SessionSearchMixin:
             await cursor.close()
             return None
 
-        refusal = await self._write(_settle)
+        refusal = await self._execute_write(_settle)
         if refusal is not None:
             logger.warning("FTS storage optimization settle refused (%s)", refusal)
             return {"ok": False, "reason": refusal, "vacuumed": vacuum_ok}

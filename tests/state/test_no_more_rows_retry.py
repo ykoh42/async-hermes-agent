@@ -50,7 +50,7 @@ class TestNoMoreRowsRetry:
             )
             return "done"
 
-        assert await db._write(flaky) == "done"
+        assert await db._execute_write(flaky) == "done"
         assert calls["n"] == 4
         assert await db.get_meta("nmr") == "ok"
 
@@ -64,7 +64,7 @@ class TestNoMoreRowsRetry:
             raise sqlite3.InterfaceError("bad parameter or other API misuse")
 
         with pytest.raises(sqlite3.InterfaceError, match="bad parameter"):
-            await db._write(broken)
+            await db._execute_write(broken)
         assert calls["n"] == 1
 
     async def test_no_more_rows_via_database_error_is_retried(self, db):
@@ -79,7 +79,7 @@ class TestNoMoreRowsRetry:
                 raise sqlite3.DatabaseError("no more rows available")
             return "ok"
 
-        assert await db._write(flaky) == "ok"
+        assert await db._execute_write(flaky) == "ok"
         assert calls["n"] == 3
 
     async def test_exhausted_patience_propagates_the_transient_error(self, db, monkeypatch):
@@ -91,4 +91,4 @@ class TestNoMoreRowsRetry:
             raise sqlite3.InterfaceError("no more rows available")
 
         with pytest.raises(sqlite3.InterfaceError, match="no more rows"):
-            await db._write(always)
+            await db._execute_write(always)
