@@ -1831,6 +1831,192 @@ class TestConcurrentToolExecution:
         assert "result_fast" in messages[1]["content"]
 
     @pytest.mark.asyncio
+    async def test_concurrent_batch_enforces_upstream_worker_limit(
+        self, agent
+    ):
+        from agent.tool_executor import execute_tool_calls_concurrent
+
+        active = 0
+        peak = 0
+
+        async def fake_handle(*_args, **_kwargs):
+            nonlocal active, peak
+            active += 1
+            peak = max(peak, active)
+            try:
+                await asyncio.sleep(0.02)
+                return "ok"
+            finally:
+                active -= 1
+
+        tool_calls = [
+            _mock_tool_call(
+                name="web_search", arguments="{}", call_id=f"c{index}"
+            )
+            for index in range(12)
+        ]
+        message = _mock_assistant_msg(content="", tool_calls=tool_calls)
+
+        with (
+            patch("model_tools.handle_function_call", side_effect=fake_handle),
+            patch(
+                "tools.registry.registry.get_entry",
+                return_value=SimpleNamespace(
+                    is_async=True, max_result_size_chars=None
+                ),
+            ),
+        ):
+            await execute_tool_calls_concurrent(
+                agent, message, [], "task-1"
+            )
+
+        assert peak == 8
+
+    @pytest.mark.asyncio
+    async def test_concurrent_batch_timeout_cancels_and_records_results(
+        self, agent, monkeypatch
+    ):
+        from agent.tool_executor import execute_tool_calls_concurrent
+
+        monkeypatch.setenv("HERMES_CONCURRENT_TOOL_TIMEOUT_S", "0.02")
+        cancelled = []
+
+        async def never_returns(*_args, **kwargs):
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.append(kwargs["tool_call_id"])
+
+        tool_calls = [
+            _mock_tool_call(name="web_search", arguments="{}", call_id="c1"),
+            _mock_tool_call(name="web_search", arguments="{}", call_id="c2"),
+        ]
+        message = _mock_assistant_msg(content="", tool_calls=tool_calls)
+        messages = []
+
+        with (
+            patch("model_tools.handle_function_call", side_effect=never_returns),
+            patch(
+                "tools.registry.registry.get_entry",
+                return_value=SimpleNamespace(
+                    is_async=True, max_result_size_chars=None
+                ),
+            ),
+        ):
+            await execute_tool_calls_concurrent(
+                agent, message, messages, "task-1"
+            )
+
+        assert sorted(cancelled) == ["c1", "c2"]
+        assert [message["tool_call_id"] for message in messages] == ["c1", "c2"]
+        assert all(
+            "Error executing tool 'web_search': timed out after 0.0s"
+            in message["content"]
+            for message in messages
+        )
+        assert all(
+            message.get("effect_disposition") == "unknown"
+            for message in messages
+        )
+
+    @pytest.mark.asyncio
+    async def test_parallel_tool_start_callbacks_preserve_emission_order(
+        self, agent, monkeypatch
+    ):
+        from agent.tool_executor import execute_tool_calls_concurrent
+        from hermes_cli.middleware import RequestMiddlewareResult
+
+        starts = []
+        agent.tool_start_callback = (
+            lambda call_id, *_args: starts.append(call_id)
+        )
+
+        async def delayed_request(_name, args, **_kwargs):
+            if args["order"] == 0:
+                await asyncio.sleep(0.02)
+            return RequestMiddlewareResult(
+                payload=args,
+                original_payload=args,
+                trace=[],
+            )
+
+        monkeypatch.setattr(
+            "hermes_cli.middleware.apply_tool_request_middleware",
+            delayed_request,
+        )
+        tool_calls = [
+            _mock_tool_call(
+                name="web_search",
+                arguments=json.dumps({"order": index}),
+                call_id=f"c{index}",
+            )
+            for index in range(3)
+        ]
+        message = _mock_assistant_msg(content="", tool_calls=tool_calls)
+
+        with (
+            patch(
+                "model_tools.handle_function_call",
+                new_callable=AsyncMock,
+                return_value="ok",
+            ),
+            patch(
+                "tools.registry.registry.get_entry",
+                return_value=SimpleNamespace(
+                    is_async=True, max_result_size_chars=None
+                ),
+            ),
+        ):
+            await execute_tool_calls_concurrent(
+                agent, message, [], "task-1"
+            )
+
+        assert starts == ["c0", "c1", "c2"]
+
+    @pytest.mark.asyncio
+    async def test_parallel_authorization_wait_is_excluded_from_batch_timeout(
+        self, agent, monkeypatch
+    ):
+        from agent.tool_executor import execute_tool_calls_concurrent
+
+        monkeypatch.setenv("HERMES_CONCURRENT_TOOL_TIMEOUT_S", "0.01")
+
+        async def slow_authorization(*_args, **_kwargs):
+            await asyncio.sleep(0.02)
+            return None
+
+        monkeypatch.setattr(
+            "hermes_cli.plugins.resolve_pre_tool_block",
+            slow_authorization,
+        )
+        tool_calls = [
+            _mock_tool_call(name="web_search", arguments="{}", call_id="c1"),
+            _mock_tool_call(name="web_search", arguments="{}", call_id="c2"),
+        ]
+        message = _mock_assistant_msg(content="", tool_calls=tool_calls)
+        messages = []
+
+        with (
+            patch(
+                "model_tools.handle_function_call",
+                new_callable=AsyncMock,
+                return_value="ok",
+            ),
+            patch(
+                "tools.registry.registry.get_entry",
+                return_value=SimpleNamespace(
+                    is_async=True, max_result_size_chars=None
+                ),
+            ),
+        ):
+            await execute_tool_calls_concurrent(
+                agent, message, messages, "task-1"
+            )
+
+        assert len(messages) == 2
+        assert all("timed out" not in message["content"] for message in messages)
+
+    @pytest.mark.asyncio
     async def test_concurrent_batches_keep_approval_context_isolated(self, agent):
         from tools.approval import (
             _approval_session_key,
@@ -1944,8 +2130,10 @@ class TestConcurrentToolExecution:
         messages = []
         starts = []
         completes = []
+        progress = []
         agent.tool_start_callback = lambda tool_call_id, function_name, function_args: starts.append((tool_call_id, function_name, function_args))
         agent.tool_complete_callback = lambda tool_call_id, function_name, function_args, function_result: completes.append((tool_call_id, function_name, function_args, function_result))
+        agent.tool_progress_callback = lambda *args, **kwargs: progress.append((args, kwargs))
 
         with (
             patch(
@@ -1962,6 +2150,9 @@ class TestConcurrentToolExecution:
 
         assert starts == [("c1", "web_search", {"query": "hello"})]
         assert completes == [("c1", "web_search", {"query": "hello"}, '{"success": true}')]
+        completed_event = next(item for item in progress if item[0][0] == "tool.completed")
+        assert isinstance(completed_event[1]["duration"], float)
+        assert completed_event[1]["duration"] >= 0
 
     @pytest.mark.parametrize("quiet_mode", [True, False])
     @pytest.mark.asyncio
@@ -2249,6 +2440,94 @@ class TestConcurrentToolExecution:
         assert dispatched == [{"command": "true"}]
         assert errors == ["Hermes tool execution callback invoked more than once"]
         assert outcome.blocked is False
+
+    @pytest.mark.asyncio
+    async def test_managed_tool_pipeline_pre_tool_failure_is_fail_open(
+        self,
+        agent,
+        monkeypatch,
+    ):
+        from agent import tool_executor
+        from hermes_cli.middleware import RequestMiddlewareResult
+
+        async def apply_request_middleware(_name, args, **_kwargs):
+            return RequestMiddlewareResult(
+                payload=args,
+                original_payload=args,
+                trace=[],
+            )
+
+        async def fail_pre_tool(*_args, **_kwargs):
+            raise RuntimeError("plugin unavailable")
+
+        monkeypatch.setattr(
+            "hermes_cli.middleware.apply_tool_request_middleware",
+            apply_request_middleware,
+        )
+        monkeypatch.setattr(
+            "hermes_cli.plugins.resolve_pre_tool_block",
+            fail_pre_tool,
+        )
+        monkeypatch.setattr(
+            tool_executor,
+            "_begin_tool_execution",
+            AsyncMock(return_value=None),
+        )
+
+        outcome = await tool_executor._run_agent_tool_execution_middleware(
+            agent,
+            function_name="terminal",
+            function_args={"command": "true"},
+            effective_task_id="task-1",
+            tool_call_id="call-1",
+            execute=AsyncMock(return_value="ok"),
+        )
+
+        assert outcome.result == "ok"
+        assert outcome.blocked is False
+
+    @pytest.mark.asyncio
+    async def test_managed_skill_write_resets_skill_nudge_counter(
+        self,
+        agent,
+        monkeypatch,
+    ):
+        from agent import tool_executor
+        from hermes_cli.middleware import RequestMiddlewareResult
+
+        async def apply_request_middleware(_name, args, **_kwargs):
+            return RequestMiddlewareResult(
+                payload=args,
+                original_payload=args,
+                trace=[],
+            )
+
+        monkeypatch.setattr(
+            "hermes_cli.middleware.apply_tool_request_middleware",
+            apply_request_middleware,
+        )
+        monkeypatch.setattr(
+            "hermes_cli.plugins.resolve_pre_tool_block",
+            AsyncMock(return_value=None),
+        )
+        monkeypatch.setattr(
+            tool_executor,
+            "_begin_tool_execution",
+            AsyncMock(return_value=None),
+        )
+        agent._iters_since_skill = 7
+
+        outcome = await tool_executor._run_agent_tool_execution_middleware(
+            agent,
+            function_name="skill_manage",
+            function_args={"action": "create", "name": "example"},
+            effective_task_id="task-1",
+            tool_call_id="call-1",
+            execute=AsyncMock(return_value="ok"),
+        )
+
+        assert outcome.result == "ok"
+        assert agent._iters_since_skill == 0
 
 
 class TestAgentRuntimePostHookOwnershipSync:

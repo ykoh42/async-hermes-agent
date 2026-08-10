@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -34,6 +35,27 @@ from tools.tool_result_storage import (
 from tools.budget_config import BudgetConfig, DEFAULT_BUDGET, budget_for_context_window
 
 logger = logging.getLogger(__name__)
+
+_MAX_TOOL_WORKERS = 8
+_DEFAULT_CONCURRENT_TOOL_TIMEOUT_S = 420.0
+
+
+def _resolve_concurrent_tool_timeout() -> float | None:
+    raw = os.getenv("HERMES_CONCURRENT_TOOL_TIMEOUT_S", "").strip()
+    if not raw:
+        return _DEFAULT_CONCURRENT_TOOL_TIMEOUT_S
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning(
+            "invalid HERMES_CONCURRENT_TOOL_TIMEOUT_S=%r; using %.0fs",
+            raw,
+            _DEFAULT_CONCURRENT_TOOL_TIMEOUT_S,
+        )
+        return _DEFAULT_CONCURRENT_TOOL_TIMEOUT_S
+    if value <= 0:
+        return None
+    return value
 
 
 async def _ensure_file_checkpoint(
@@ -230,6 +252,58 @@ class _ManagedToolResult:
     blocked: bool
 
 
+class _ConcurrentToolAuthorizationGate:
+    """Serialize policy prompts and exclude their queue from batch deadlines."""
+
+    def __init__(self) -> None:
+        self._serialization_lock = asyncio.Lock()
+        self._pending = 0
+        self._window_started: float | None = None
+        self._excluded_seconds = 0.0
+
+    async def run(self, callback):
+        now = time.monotonic()
+        if self._pending == 0:
+            self._window_started = now
+        self._pending += 1
+        try:
+            async with self._serialization_lock:
+                return await callback()
+        finally:
+            now = time.monotonic()
+            self._pending -= 1
+            if self._pending == 0:
+                if self._window_started is not None:
+                    self._excluded_seconds += max(
+                        0.0, now - self._window_started
+                    )
+                self._window_started = None
+
+    def excluded_seconds(self) -> float:
+        excluded = self._excluded_seconds
+        if self._window_started is not None:
+            excluded += max(0.0, time.monotonic() - self._window_started)
+        return excluded
+
+
+class _OrderedToolStartGate:
+    """Run parallel tool preflight callbacks in model emission order."""
+
+    def __init__(self) -> None:
+        self._condition = asyncio.Condition()
+        self._next_order = 0
+
+    async def advance(self, order: int, callback=None) -> None:
+        async with self._condition:
+            await self._condition.wait_for(lambda: order == self._next_order)
+            try:
+                if callback is not None:
+                    await callback()
+            finally:
+                self._next_order += 1
+                self._condition.notify_all()
+
+
 
 
 
@@ -246,6 +320,10 @@ async def _run_agent_tool_execution_middleware(
     execute,
     scope_block: str | None = None,
     display_index: int | None = None,
+    middleware_trace: list[dict[str, Any]] | None = None,
+    begin_execution=None,
+    start_order: int = 0,
+    authorization_gate: _ConcurrentToolAuthorizationGate | None = None,
 ) -> _ManagedToolResult:
     """Execute one native tool without bypassing the established policy path.
 
@@ -259,7 +337,7 @@ async def _run_agent_tool_execution_middleware(
         run_tool_execution_middleware,
     )
 
-    trace: list[dict[str, Any]] = []
+    trace = middleware_trace if middleware_trace is not None else []
     request_result = await apply_tool_request_middleware(
         function_name,
         function_args,
@@ -293,17 +371,31 @@ async def _run_agent_tool_execution_middleware(
             block_error_type = "plugin_block"
             from hermes_cli.plugins import resolve_pre_tool_block
 
-            block_message = await resolve_pre_tool_block(
-                function_name,
-                next_args,
-                task_id=effective_task_id or "",
-                session_id=getattr(agent, "session_id", "") or "",
-                tool_call_id=tool_call_id or "",
-                turn_id=getattr(agent, "_current_turn_id", "") or "",
-                api_request_id=getattr(agent, "_current_api_request_id", "")
-                or "",
-                middleware_trace=list(trace),
-            )
+            async def _resolve_pre_tool_block():
+                return await resolve_pre_tool_block(
+                    function_name,
+                    next_args,
+                    task_id=effective_task_id or "",
+                    session_id=getattr(agent, "session_id", "") or "",
+                    tool_call_id=tool_call_id or "",
+                    turn_id=getattr(agent, "_current_turn_id", "") or "",
+                    api_request_id=getattr(
+                        agent, "_current_api_request_id", ""
+                    )
+                    or "",
+                    middleware_trace=list(trace),
+                )
+
+            try:
+                block_message = (
+                    await authorization_gate.run(_resolve_pre_tool_block)
+                    if authorization_gate is not None
+                    else await _resolve_pre_tool_block()
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                block_message = None
 
         guardrail_decision = None
         if block_message is None:
@@ -314,6 +406,8 @@ async def _run_agent_tool_execution_middleware(
                 guardrail_decision = None
 
         if block_message is not None or guardrail_decision is not None:
+            if begin_execution is not None:
+                await begin_execution(start_order)
             state["blocked"] = True
             if block_message is not None:
                 result = json.dumps({"error": block_message}, ensure_ascii=False)
@@ -342,28 +436,37 @@ async def _run_agent_tool_execution_middleware(
 
         if function_name == "memory":
             agent._turns_since_memory = 0
+        elif function_name == "skill_manage":
+            agent._iters_since_skill = 0
 
-        await _begin_tool_execution(
-            agent,
-            function_name=function_name,
-            function_args=next_args,
-            effective_task_id=effective_task_id,
-            tool_call_id=tool_call_id,
-            display_index=display_index,
-        )
-        started = time.monotonic()
-        try:
-            result = await execute(next_args, trace)
-        except asyncio.CancelledError:
-            await _emit_cancelled_terminal_post_tool_call(
+        async def _begin() -> None:
+            await _begin_tool_execution(
                 agent,
                 function_name=function_name,
                 function_args=next_args,
                 effective_task_id=effective_task_id,
                 tool_call_id=tool_call_id,
-                start_time=started,
-                middleware_trace=list(trace),
+                display_index=display_index,
             )
+
+        if begin_execution is None:
+            await _begin()
+        else:
+            await begin_execution(start_order, _begin)
+        started = time.monotonic()
+        try:
+            result = await execute(next_args, trace)
+        except asyncio.CancelledError as exc:
+            if not exc.args or exc.args[0] != "tool timeout":
+                await _emit_cancelled_terminal_post_tool_call(
+                    agent,
+                    function_name=function_name,
+                    function_args=next_args,
+                    effective_task_id=effective_task_id,
+                    tool_call_id=tool_call_id,
+                    start_time=started,
+                    middleware_trace=list(trace),
+                )
             raise
         except Exception as exc:
             result = json.dumps(
@@ -506,6 +609,7 @@ def _emit_tool_completion(
     function_args: dict[str, Any],
     result: Any,
     failed: bool,
+    duration: float,
     risk_metadata: dict[str, Any] | None = None,
 ) -> None:
     """Notify observers only after the corresponding result is durable."""
@@ -516,6 +620,7 @@ def _emit_tool_completion(
                 function_name,
                 None,
                 None,
+                duration=duration,
                 is_error=failed,
                 result=result,
             )
@@ -609,7 +714,18 @@ async def _execute_tool_calls_native(
                 logger.warning("Incremental cancelled tool persistence failed: %s", exc)
         return
 
-    async def _one(index, tc, result_sink, completion_sink):
+    async def _one(
+        index,
+        tc,
+        result_sink,
+        completion_sink,
+        *,
+        begin_execution=None,
+        authorization_gate=None,
+        runtime_sink=None,
+    ):
+        tool_started = time.monotonic()
+        middleware_trace: list[dict[str, Any]] = []
         name = getattr(tc.function, "name", "")
         args, malformed_args_result = _parse_tool_arguments(
             getattr(tc.function, "arguments", "")
@@ -638,6 +754,8 @@ async def _execute_tool_calls_native(
                             )
             except Exception:
                 pass
+        if runtime_sink is not None:
+            runtime_sink[index] = (name, args, middleware_trace)
         if malformed_args_result is None:
             async def _dispatch(next_args, middleware_trace):
                 if name in (
@@ -722,10 +840,15 @@ async def _execute_tool_calls_native(
                 display_index=index + 1,
                 execute=_dispatch,
                 scope_block=scope_block,
+                middleware_trace=middleware_trace,
+                begin_execution=begin_execution,
+                start_order=index,
+                authorization_gate=authorization_gate,
             )
             result = managed.result
             blocked = managed.blocked
             failed, _ = _detect_tool_failure(name, result)
+            duration = time.monotonic() - tool_started
             if not managed.blocked:
                 memory_manager = getattr(agent, "_memory_manager", None)
                 if name == "memory" and memory_manager:
@@ -758,7 +881,9 @@ async def _execute_tool_calls_native(
             status_suffix = " (error)" if failed else ""
             touch_activity = getattr(agent, "_touch_activity", None)
             if callable(touch_activity):
-                touch_activity(f"tool completed: {name}{status_suffix}")
+                touch_activity(
+                    f"tool completed: {name} ({duration:.1f}s){status_suffix}"
+                )
             display_result = result
             if isinstance(result, str) and not _is_multimodal_tool_result(result):
                 result = await maybe_persist_tool_result(
@@ -803,12 +928,85 @@ async def _execute_tool_calls_native(
                     managed.args,
                     display_result,
                     failed,
+                    duration,
                     tool_message.get("_tool_output_risk"),
                 )
         else:
+            if begin_execution is not None:
+                await begin_execution(index)
             result_sink[index] = make_tool_result_message(
                 name, malformed_args_result, getattr(tc, "id", "") or ""
             )
+
+    async def _store_timeout_result(
+        index,
+        tc,
+        name,
+        args,
+        timeout_s,
+        middleware_trace,
+        result_sink,
+        completion_sink,
+    ) -> None:
+        result = (
+            f"Error executing tool '{name}': timed out after {timeout_s:.1f}s"
+        )
+        await _emit_terminal_post_tool_call(
+            agent,
+            function_name=name,
+            function_args=args,
+            result=result,
+            effective_task_id=effective_task_id,
+            tool_call_id=getattr(tc, "id", "") or "",
+            status="timeout",
+            error_type="tool_timeout",
+            error_message=result,
+            middleware_trace=middleware_trace,
+        )
+        agent._current_tool = None
+        touch_activity = getattr(agent, "_touch_activity", None)
+        if callable(touch_activity):
+            touch_activity(
+                f"tool completed: {name} ({timeout_s:.1f}s) (error)"
+            )
+        display_result = result
+        result = await maybe_persist_tool_result(
+            content=result,
+            tool_name=name,
+            tool_use_id=getattr(tc, "id", "") or "tool_result",
+            env=active_env,
+            config=tool_budget,
+        )
+        subdirectory_hints = getattr(agent, "_subdirectory_hints", None)
+        if subdirectory_hints is not None:
+            check_hints = getattr(subdirectory_hints, "check_tool_call", None)
+            hints = await check_hints(name, args) if callable(check_hints) else ""
+            if hints:
+                result += hints
+        format_for_model = getattr(
+            agent, "_tool_result_content_for_active_model", None
+        )
+        content_for_model = (
+            await format_for_model(name, result)
+            if callable(format_for_model)
+            else result
+        )
+        tool_message = make_tool_result_message(
+            name,
+            content_for_model,
+            getattr(tc, "id", "") or "",
+            effect_disposition="unknown",
+        )
+        result_sink[index] = tool_message
+        completion_sink[index] = (
+            getattr(tc, "id", "") or "",
+            name,
+            args,
+            display_result,
+            True,
+            float(timeout_s),
+            tool_message.get("_tool_output_risk"),
+        )
 
     execution_cwd = None
     if active_env is not None and getattr(active_env, "cwd", None):
@@ -903,18 +1101,98 @@ async def _execute_tool_calls_native(
                         logger.warning("Incremental cancelled tool persistence failed: %s", exc)
                 raise
         else:
+            start_gate = _OrderedToolStartGate()
+            authorization_gate = _ConcurrentToolAuthorizationGate()
+            semaphore = asyncio.Semaphore(_MAX_TOOL_WORKERS)
+            runtime_state = [None] * len(calls)
+
+            async def _run_parallel(index, tool_call):
+                async with semaphore:
+                    await _one(
+                        index,
+                        tool_call,
+                        segment_results,
+                        segment_completions,
+                        begin_execution=start_gate.advance,
+                        authorization_gate=authorization_gate,
+                        runtime_sink=runtime_state,
+                    )
+
+            tasks = [
+                asyncio.create_task(
+                    _run_parallel(index, tool_call),
+                    name=f"hermes-tool:{getattr(tool_call.function, 'name', '')}",
+                )
+                for index, tool_call in enumerate(calls)
+            ]
+            timeout_s = _resolve_concurrent_tool_timeout()
+            started = time.monotonic()
+            pending = set(tasks)
+            timed_out: set[asyncio.Task] = set()
             try:
-                async with asyncio.TaskGroup() as group:
-                    for index, tool_call in enumerate(calls):
-                        group.create_task(
-                            _one(
-                                index,
-                                tool_call,
-                                segment_results,
-                                segment_completions,
+                while pending:
+                    remaining = None
+                    if timeout_s is not None:
+                        deadline = (
+                            started
+                            + timeout_s
+                            + authorization_gate.excluded_seconds()
+                        )
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            timed_out = set(pending)
+                            break
+                    done, pending = await asyncio.wait(
+                        pending,
+                        timeout=(
+                            None if remaining is None else min(5.0, remaining)
+                        ),
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    for task in done:
+                        if task.cancelled():
+                            continue
+                        task_error = task.exception()
+                        if task_error is not None:
+                            for sibling in pending:
+                                sibling.cancel()
+                            await asyncio.gather(
+                                *pending, return_exceptions=True
                             )
+                            raise task_error
+                if not timed_out:
+                    await asyncio.gather(*tasks)
+                else:
+                    for task in timed_out:
+                        task.cancel("tool timeout")
+                    await asyncio.gather(*timed_out, return_exceptions=True)
+                    for index, (task, tool_call) in enumerate(zip(tasks, calls)):
+                        if task not in timed_out or segment_results[index] is not None:
+                            continue
+                        runtime = runtime_state[index]
+                        if runtime is None:
+                            name = getattr(tool_call.function, "name", "")
+                            args, _ = _parse_tool_arguments(
+                                getattr(tool_call.function, "arguments", "")
+                            )
+                            middleware_trace = []
+                        else:
+                            name, args, middleware_trace = runtime
+                        await _store_timeout_result(
+                            index,
+                            tool_call,
+                            name,
+                            args,
+                            float(timeout_s),
+                            middleware_trace,
+                            segment_results,
+                            segment_completions,
                         )
             except asyncio.CancelledError:
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
                 for index, tool_call in enumerate(calls):
                     if segment_results[index] is None:
                         name = getattr(tool_call.function, "name", "")
@@ -961,7 +1239,15 @@ async def _execute_tool_calls_native(
         for completion in segment_completions:
             if completion is None:
                 continue
-            tool_call_id, name, args, result, failed, risk_metadata = completion
+            (
+                tool_call_id,
+                name,
+                args,
+                result,
+                failed,
+                duration,
+                risk_metadata,
+            ) = completion
             _emit_tool_completion(
                 agent,
                 tool_call_id=tool_call_id,
@@ -969,6 +1255,7 @@ async def _execute_tool_calls_native(
                 function_args=args,
                 result=result,
                 failed=failed,
+                duration=duration,
                 risk_metadata=risk_metadata,
             )
 
