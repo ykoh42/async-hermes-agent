@@ -16,7 +16,6 @@ logger = logging.getLogger(__name__)
 _CA_BUNDLE_ENV_VARS = (
     "HERMES_CA_BUNDLE",
     "SSL_CERT_FILE",
-    "SSL_CERT_DIR",
     "REQUESTS_CA_BUNDLE",
     "CURL_CA_BUNDLE",
 )
@@ -47,22 +46,17 @@ async def _validate_bundle_path(
     path = await aiofiles.os.wrap(Path.expanduser)(Path(value))
     if not await aiofiles.os.path.exists(path):
         raise _ssl_err(f"{label} points to a missing CA bundle: {value}")
-    is_file = await aiofiles.os.path.isfile(path)
-    is_dir = await aiofiles.os.path.isdir(path)
-    if not is_file and not is_dir:
+    if not await aiofiles.os.path.isfile(path):
         raise _ssl_err(f"{label} does not point to a CA bundle file: {value}")
-    if require_substantial and (
-        not is_file or (await aiofiles.os.stat(path)).st_size < 1024
-    ):
+    if require_substantial and (await aiofiles.os.stat(path)).st_size < 1024:
         raise _ssl_err(f"{label} at {value} appears corrupted (too small)")
     try:
-        context_kwargs = {"cafile" if is_file else "capath": str(path)}
-        context = await aiofiles.os.wrap(ssl.create_default_context)(**context_kwargs)
+        context = await aiofiles.os.wrap(ssl.create_default_context)(cafile=str(path))
     except Exception as exc:
         raise _ssl_err(
             f"{label} CA bundle at {value} cannot be loaded: {exc}"
         ) from exc
-    if is_file and not context.get_ca_certs():
+    if not context.get_ca_certs():
         raise _ssl_err(f"{label} CA bundle at {value} did not load certificates")
 
 

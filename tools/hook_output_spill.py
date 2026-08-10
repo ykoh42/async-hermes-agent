@@ -158,10 +158,10 @@ async def spill_if_oversized(
 
 
 __all__ = [
-    "DEFAULT_ENABLED",
     "DEFAULT_MAX_CHARS",
     "DEFAULT_PREVIEW_HEAD",
     "DEFAULT_PREVIEW_TAIL",
+    "DEFAULT_ENABLED",
     "get_spill_config",
     "spill_if_oversized",
 ]

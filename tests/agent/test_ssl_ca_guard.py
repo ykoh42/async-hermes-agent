@@ -72,7 +72,6 @@ async def test_empty_certifi_bundle_raises_ssl_error(monkeypatch, tmp_path):
     [
         "HERMES_CA_BUNDLE",
         "SSL_CERT_FILE",
-        "SSL_CERT_DIR",
         "REQUESTS_CA_BUNDLE",
         "CURL_CA_BUNDLE",
     ],
@@ -90,3 +89,17 @@ async def test_missing_explicit_ca_bundle_raises_before_client(
     assert env_var in message
     assert str(fake) in message
     assert "Repair" in message
+
+
+async def test_ssl_cert_dir_is_not_an_explicit_bundle_guard_input(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setenv("SSL_CERT_DIR", str(tmp_path / "missing-directory"))
+    await verify_ca_bundle()
+
+
+async def test_explicit_ca_bundle_must_be_a_file(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_CA_BUNDLE", str(tmp_path))
+    with pytest.raises(SSLConfigurationError, match="bundle file"):
+        await verify_ca_bundle()

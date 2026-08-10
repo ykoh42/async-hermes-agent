@@ -266,7 +266,7 @@ def set_secret_capture_callback(callback) -> None:
     _secret_capture_callback = callback
 
 
-_INJECTION_PATTERNS = (
+_INJECTION_PATTERNS = [
     "ignore previous instructions",
     "ignore all previous",
     "you are now",
@@ -276,7 +276,7 @@ _INJECTION_PATTERNS = (
     "system prompt:",
     "<system>",
     "]]>",
-)
+]
 
 
 def skill_matches_platform(frontmatter: Dict[str, Any]) -> bool:
