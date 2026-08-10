@@ -37,7 +37,7 @@ async def _finish_cleanup(
             if cleanup_task.cancelled():
                 if cancellation is None:
                     raise
-                break
+                break  # noqa: ASYNC104 - prior caller cancellation is preserved
             if cancellation is None:
                 cancellation = exc
             continue  # noqa: ASYNC104 - finish closing the owned client

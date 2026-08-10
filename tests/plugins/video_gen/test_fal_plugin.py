@@ -159,6 +159,106 @@ class TestFamilyRouting:
         assert with_fake_fal["arguments"]["image_url"] == "https://example.com/dog.png"
 
 
+@pytest.mark.asyncio
+async def test_managed_video_submit_preserves_gateway_request_and_result(
+    monkeypatch,
+):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from plugins.video_gen import fal as fal_plugin
+
+    handle = SimpleNamespace(
+        get=AsyncMock(return_value={"video": {"url": "https://out.test/v.mp4"}})
+    )
+    managed_client = SimpleNamespace(
+        submit=AsyncMock(return_value=handle),
+        close=AsyncMock(),
+    )
+    monkeypatch.setattr(fal_plugin, "_load_fal_client", lambda: object())
+    monkeypatch.setattr(
+        fal_plugin,
+        "_resolve_managed_fal_video_gateway",
+        AsyncMock(return_value=SimpleNamespace()),
+    )
+    monkeypatch.setattr(
+        fal_plugin,
+        "_get_managed_fal_video_client",
+        lambda managed_gateway: managed_client,
+    )
+    monkeypatch.setattr(fal_plugin.uuid, "uuid4", lambda: "video-call-123")
+
+    result = await fal_plugin._submit_fal_video_request(
+        "fal-ai/model/text-to-video",
+        {"prompt": "a running horse"},
+    )
+
+    assert result == {"video": {"url": "https://out.test/v.mp4"}}
+    managed_client.submit.assert_awaited_once_with(
+        "fal-ai/model/text-to-video",
+        arguments={"prompt": "a running horse"},
+        headers={"x-idempotency-key": "video-call-123"},
+    )
+    handle.get.assert_awaited_once_with()
+    managed_client.close.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_managed_video_submit_translates_upstream_4xx(monkeypatch):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from plugins.video_gen import fal as fal_plugin
+
+    error = RuntimeError("not allowed")
+    error.status_code = 404
+    managed_client = SimpleNamespace(
+        submit=AsyncMock(side_effect=error),
+        close=AsyncMock(),
+    )
+    monkeypatch.setattr(fal_plugin, "_load_fal_client", lambda: object())
+    monkeypatch.setattr(
+        fal_plugin,
+        "_resolve_managed_fal_video_gateway",
+        AsyncMock(return_value=SimpleNamespace()),
+    )
+    monkeypatch.setattr(
+        fal_plugin,
+        "_get_managed_fal_video_client",
+        lambda managed_gateway: managed_client,
+    )
+
+    with pytest.raises(ValueError, match="HTTP 404"):
+        await fal_plugin._submit_fal_video_request(
+            "fal-ai/missing",
+            {"prompt": "x"},
+        )
+    managed_client.close.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_video_availability_includes_managed_gateway(monkeypatch):
+    from unittest.mock import AsyncMock
+
+    from plugins.video_gen import fal as fal_plugin
+    from tools import tool_backend_helpers
+
+    monkeypatch.setattr(
+        tool_backend_helpers,
+        "fal_key_is_configured",
+        AsyncMock(return_value=False),
+    )
+    managed = AsyncMock(return_value=object())
+    monkeypatch.setattr(
+        fal_plugin,
+        "_resolve_managed_fal_video_gateway",
+        managed,
+    )
+
+    assert await fal_plugin._check_fal_video_available() is True
+    managed.assert_awaited_once_with()
+
+
 class TestPayloadBuilder:
     def test_drops_unsupported_keys(self):
         """Veo enum-clamps duration, supports aspect+resolution+audio+neg."""

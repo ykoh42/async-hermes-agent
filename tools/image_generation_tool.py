@@ -56,7 +56,14 @@ def _load_fal_client() -> Any:
 
 
 from tools.debug_helpers import DebugSession
-from tools.tool_backend_helpers import fal_key_is_configured
+from tools.fal_common import _ManagedFalClient, _extract_http_status
+from tools.managed_tool_gateway import resolve_managed_tool_gateway
+from tools.tool_backend_helpers import (
+    fal_key_is_configured,
+    managed_nous_tools_enabled,
+    nous_tool_gateway_unavailable_message,
+    prefers_gateway,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -443,23 +450,76 @@ _debug = DebugSession("image_tools", env_var="IMAGE_TOOLS_DEBUG")
 
 
 # ---------------------------------------------------------------------------
+async def _resolve_managed_fal_gateway():
+    """Resolve managed FAL when requested or direct credentials are absent."""
+    if await fal_key_is_configured() and not await prefers_gateway("image_gen"):
+        return None
+    return await resolve_managed_tool_gateway("fal-queue")
+
+
+def _get_managed_fal_client(managed_gateway):
+    """Create an owned native-async client for one managed FAL request."""
+    _load_fal_client()
+    return _ManagedFalClient(
+        fal_client,
+        key=managed_gateway.nous_user_token,
+        queue_run_origin=managed_gateway.gateway_origin,
+    )
+
+
 async def _submit_fal_request(model: str, arguments: Dict[str, Any]):
-    """Submit a FAL request and await its queue result."""
+    """Submit through direct FAL or the managed queue and await its result."""
     # Trigger the lazy import on first call. Idempotent.
     _load_fal_client()
     from tools.fal_common import _close_fal_client, _create_fal_client
 
     request_headers = {"x-idempotency-key": str(uuid.uuid4())}
-    client = await _create_fal_client(fal_client)
+    managed_gateway = await _resolve_managed_fal_gateway()
+    if managed_gateway is None:
+        client = await _create_fal_client(fal_client)
+        try:
+            handler = await client.submit(
+                model,
+                arguments=arguments,
+                headers=request_headers,
+            )
+            return await handler.get()
+        finally:
+            await _close_fal_client(client)
+
+    managed_client = _get_managed_fal_client(managed_gateway)
     try:
-        handler = await client.submit(
-            model,
-            arguments=arguments,
-            headers=request_headers,
-        )
+        try:
+            handler = await managed_client.submit(
+                model,
+                arguments=arguments,
+                headers=request_headers,
+            )
+        except Exception as exc:
+            status = _extract_http_status(exc)
+            if status is not None and 400 <= status < 500:
+                gateway_message = ""
+                if status in {401, 402, 403}:
+                    gateway_message = (
+                        "\n\n"
+                        + await nous_tool_gateway_unavailable_message(  # noqa: ASYNC120 -- caller cancellation supersedes the gateway error
+                            "managed FAL image generation",
+                            force_fresh=True,
+                        )
+                    )
+                raise ValueError(
+                    f"Nous Subscription gateway rejected model '{model}' "
+                    f"(HTTP {status}). This model may not yet be enabled on "
+                    f"the Nous Portal's FAL proxy. Either:\n"
+                    f"  • Set FAL_KEY in your environment to use FAL.ai "
+                    f"directly, or\n"
+                    f"  • Configure a different image_gen.model in "
+                    f"config.yaml.{gateway_message}"
+                ) from exc
+            raise
         return await handler.get()
     finally:
-        await _close_fal_client(client)
+        await managed_client.close()
 
 
 # ---------------------------------------------------------------------------
@@ -730,7 +790,10 @@ async def image_generate_tool(
         if not prompt or not isinstance(prompt, str) or len(prompt.strip()) == 0:
             raise ValueError("Prompt is required and must be a non-empty string")
 
-        if not await fal_key_is_configured():
+        if not (
+            await fal_key_is_configured()
+            or await _resolve_managed_fal_gateway()
+        ):
             raise ValueError(await _build_no_backend_setup_message())
 
         # If the caller supplied source images but the active model has no
@@ -869,28 +932,42 @@ async def image_generate_tool(
 
 
 async def check_fal_api_key() -> bool:
-    """True if the direct FAL.ai API key is available."""
-    return await fal_key_is_configured()
+    """True if direct FAL or the managed gateway is available."""
+    return bool(
+        await fal_key_is_configured()
+        or await _resolve_managed_fal_gateway()
+    )
 
 
 async def _build_no_backend_setup_message() -> str:
     """Build an actionable error string when no FAL backend is reachable.
 
-    Used by the in-tree FAL path and points to direct credentials or another
-    registered image provider.
+    Used by the in-tree FAL path and distinguishes direct and managed setup.
     """
     lines = ["Image generation is unavailable in this environment.", ""]
     lines.append("Missing requirements:")
-    lines.append("  - FAL_KEY environment variable is not set")
+    if await managed_nous_tools_enabled():
+        lines.append(
+            "  - FAL_KEY is not set and the managed FAL gateway is unreachable"
+        )
+    else:
+        lines.append("  - FAL_KEY environment variable is not set")
+        gateway_message = await nous_tool_gateway_unavailable_message(
+            "managed FAL image generation",
+        )
+        if gateway_message:
+            lines.append(f"  - {gateway_message}")
     lines.append("")
     lines.append("To enable image generation, do one of:")
     lines.append(
         "  1. Get a free API key at https://fal.ai and set "
         "FAL_KEY=<your-key> (then restart the session)"
     )
-    lines.append(
-        "  2. Configure a different image_gen provider in config.yaml"
-    )
+    if await managed_nous_tools_enabled():
+        lines.append(
+            "  2. Sign in to a Nous account with managed FAL access"
+        )
+    lines.append("  3. Configure a different image_gen provider in config.yaml")
     return "\n".join(lines)
 
 

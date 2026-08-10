@@ -26,7 +26,8 @@ Selection precedence for the active family:
     4. ``video_gen.model`` in ``config.yaml`` (when it's one of our family IDs)
     5. ``DEFAULT_MODEL``
 
-Authentication uses ``FAL_KEY``. Output is an HTTPS URL from FAL's CDN.
+Authentication uses ``FAL_KEY`` or the Nous-managed FAL gateway. Output is an
+HTTPS URL from FAL's CDN.
 """
 
 from __future__ import annotations
@@ -313,32 +314,88 @@ def _load_fal_client() -> Any:
 
 
 # ---------------------------------------------------------------------------
+async def _resolve_managed_fal_video_gateway():
+    """Resolve managed FAL when requested or direct credentials are absent."""
+    from tools.tool_backend_helpers import fal_key_is_configured, prefers_gateway
+
+    if await fal_key_is_configured() and not await prefers_gateway("video_gen"):
+        return None
+    from tools.managed_tool_gateway import resolve_managed_tool_gateway
+
+    return await resolve_managed_tool_gateway("fal-queue")
+
+
+def _get_managed_fal_video_client(managed_gateway):
+    """Create an owned native-async client for one managed FAL request."""
+    from tools.fal_common import _ManagedFalClient
+
+    _load_fal_client()
+    return _ManagedFalClient(
+        _fal_client,
+        key=managed_gateway.nous_user_token,
+        queue_run_origin=managed_gateway.gateway_origin,
+    )
+
+
 async def _submit_fal_video_request(endpoint: str, arguments: Dict[str, Any]):
-    """Submit a FAL video request using direct credentials.
+    """Submit through direct FAL or the managed queue.
 
     Returns the completed queue result without blocking the event loop.
     """
     _load_fal_client()
-    from tools.fal_common import _close_fal_client, _create_fal_client
+    from tools.fal_common import (
+        _close_fal_client,
+        _create_fal_client,
+        _extract_http_status,
+    )
 
     request_headers = {"x-idempotency-key": str(uuid.uuid4())}
-    client = await _create_fal_client(_fal_client)
+    managed_gateway = await _resolve_managed_fal_video_gateway()
+    if managed_gateway is None:
+        client = await _create_fal_client(_fal_client)
+        try:
+            handle = await client.submit(
+                endpoint,
+                arguments=arguments,
+                headers=request_headers,
+            )
+            return await handle.get()
+        finally:
+            await _close_fal_client(client)
+
+    managed_client = _get_managed_fal_video_client(managed_gateway)
     try:
-        handle = await client.submit(
-            endpoint,
-            arguments=arguments,
-            headers=request_headers,
-        )
+        try:
+            handle = await managed_client.submit(
+                endpoint,
+                arguments=arguments,
+                headers=request_headers,
+            )
+        except Exception as exc:
+            status = _extract_http_status(exc)
+            if status is not None and 400 <= status < 500:
+                raise ValueError(
+                    f"Nous Subscription gateway rejected endpoint '{endpoint}' "
+                    f"(HTTP {status}). This model may not yet be enabled on "
+                    f"the Nous Portal's FAL proxy. Either:\n"
+                    f"  • Set FAL_KEY in your environment to use FAL.ai "
+                    f"directly, or\n"
+                    f"  • Configure a different video_gen.model in "
+                    f"config.yaml."
+                ) from exc
+            raise
         return await handle.get()
     finally:
-        await _close_fal_client(client)
+        await managed_client.close()
 
 
 async def _check_fal_video_available() -> bool:
-    """True if the direct FAL.ai credential is configured."""
+    """True if direct FAL or the managed gateway is available."""
     from tools.tool_backend_helpers import fal_key_is_configured
 
-    return await fal_key_is_configured()
+    if await fal_key_is_configured():
+        return True
+    return await _resolve_managed_fal_video_gateway() is not None
 
 
 # ---------------------------------------------------------------------------
