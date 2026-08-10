@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import inspect
 import json
+import urllib.request
+import urllib.response
 from contextlib import asynccontextmanager
+from email.message import Message
 
 import httpx
 import pytest
@@ -196,10 +200,11 @@ async def test_anthropic_fetch_models_preserves_native_catalog_contract(monkeypa
     async def open_catalog(request, *, timeout):
         captured["request"] = request
         captured["timeout"] = timeout
-        return httpx.Response(
+        return urllib.response.addinfourl(
+            io.BytesIO(b'{"data":[{"id":"claude-test"}]}'),
+            Message(),
+            request.full_url,
             200,
-            json={"data": [{"id": "claude-test"}]},
-            request=request,
         )
 
     monkeypatch.setattr(
@@ -212,11 +217,12 @@ async def test_anthropic_fetch_models_preserves_native_catalog_contract(monkeypa
         "claude-test"
     ]
     request = captured["request"]
-    assert isinstance(request, httpx.Request)
-    assert str(request.url) == "https://api.anthropic.com/v1/models"
-    assert request.headers["x-api-key"] == "anthropic-secret"
-    assert request.headers["anthropic-version"] == "2023-06-01"
-    assert "authorization" not in request.headers
+    assert isinstance(request, urllib.request.Request)
+    assert request.full_url == "https://api.anthropic.com/v1/models"
+    headers = {name.lower(): value for name, value in request.header_items()}
+    assert headers["x-api-key"] == "anthropic-secret"
+    assert headers["anthropic-version"] == "2023-06-01"
+    assert "authorization" not in headers
     assert captured["timeout"] == 3.0
 
 

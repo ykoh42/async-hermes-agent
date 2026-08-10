@@ -191,20 +191,26 @@ class ProviderProfile:
                 return None
             url = effective_base.rstrip("/") + "/models"
 
-        headers = httpx.Headers()
+        import json
+        import urllib.request
+
+        request = urllib.request.Request(url)
         if api_key:
-            headers["Authorization"] = f"Bearer {api_key}"
-        headers["Accept"] = "application/json"
-        headers["User-Agent"] = _profile_user_agent()
-        headers.update(self.default_headers)
+            request.add_header("Authorization", f"Bearer {api_key}")
+        request.add_header("Accept", "application/json")
+        request.add_header("User-Agent", _profile_user_agent())
+        for name, value in self.default_headers.items():
+            request.add_header(name, value)
 
         from hermes_cli.urllib_security import open_credentialed_url
 
         try:
             response = await open_credentialed_url(
-                httpx.Request("GET", url, headers=headers), timeout=timeout
+                request,
+                timeout=timeout,
             )
-            data = response.json()
+            with response:
+                data = json.loads(response.read().decode())
             items = data if isinstance(data, list) else data.get("data", [])
             return [
                 model["id"]

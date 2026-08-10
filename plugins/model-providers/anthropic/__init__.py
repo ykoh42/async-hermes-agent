@@ -1,8 +1,8 @@
 """Native Anthropic provider profile."""
 
+import json
 import logging
-
-import httpx
+import urllib.request
 
 from providers import register_provider
 from providers.base import ProviderProfile
@@ -27,19 +27,18 @@ class AnthropicProfile(ProviderProfile):
         from hermes_cli.urllib_security import open_credentialed_url
 
         try:
+            request = urllib.request.Request(
+                "https://api.anthropic.com/v1/models"
+            )
+            request.add_header("x-api-key", api_key)
+            request.add_header("anthropic-version", "2023-06-01")
+            request.add_header("Accept", "application/json")
             response = await open_credentialed_url(
-                httpx.Request(
-                    "GET",
-                    "https://api.anthropic.com/v1/models",
-                    headers={
-                        "x-api-key": api_key,
-                        "anthropic-version": "2023-06-01",
-                        "Accept": "application/json",
-                    },
-                ),
+                request,
                 timeout=timeout,
             )
-            data = response.json()
+            with response:
+                data = json.loads(response.read().decode())
             return [
                 model["id"]
                 for model in data.get("data", [])
