@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 import json
 import os
 import stat
@@ -22,6 +23,13 @@ from plugins.memory.supermemory import (
     _probe_supermemory_connection,
     _save_supermemory_config,
 )
+
+
+async def test_memory_write_hook_preserves_upstream_arguments():
+    parameters = list(
+        inspect.signature(SupermemoryMemoryProvider.on_memory_write).parameters
+    )
+    assert parameters == ["self", "action", "target", "content"]
 
 pytestmark = pytest.mark.asyncio
 
@@ -210,6 +218,10 @@ async def test_shutdown_flushes_buffer_and_closes_client(provider):
     await provider.shutdown()
 
     assert len(client.add_calls) == 1
+    assert client.add_calls[0]["metadata"] == {
+        "target": "memory",
+        "type": "explicit_memory",
+    }
     assert len(client.ingest_calls) == 1
     payload = client.ingest_calls[0]
     assert payload["session_id"] == "session-1"

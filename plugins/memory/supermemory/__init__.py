@@ -893,22 +893,16 @@ class SupermemoryMemoryProvider(MemoryProvider):
         action: str,
         target: str,
         content: str,
-        metadata: Optional[Dict[str, Any]] = None,
     ) -> None:
         if not self._active or not self._write_enabled or not self._client:
             return
         if action != "add" or not (content or "").strip():
             return
 
-        write_metadata = {
-            **dict(metadata or {}),
-            "target": target,
-            "type": "explicit_memory",
-        }
         try:
             await self._client.add_memory(
                 content.strip(),
-                metadata=write_metadata,
+                metadata={"target": target, "type": "explicit_memory"},
                 entity_context=self._entity_context,
             )
         except Exception:
