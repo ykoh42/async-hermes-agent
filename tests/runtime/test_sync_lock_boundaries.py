@@ -23,6 +23,7 @@ _SOURCE_FILES = (
     "hermes_state.py",
     "hermes_state_portability.py",
     "hermes_state_schema.py",
+    "hermes_state_search.py",
     "trajectory_compressor.py",
 )
 

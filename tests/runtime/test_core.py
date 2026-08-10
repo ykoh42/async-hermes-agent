@@ -35,6 +35,7 @@ from agent.tool_executor import (
 from hermes_state import SessionDB
 from hermes_state_portability import SessionPortabilityMixin
 from hermes_state_schema import SessionSchemaMixin
+from hermes_state_search import SessionSearchMixin
 from run_agent import AIAgent
 from model_tools import get_tool_definitions, handle_function_call
 from tools.registry import ToolRegistry, check_fn_cache_scope, registry
@@ -163,10 +164,18 @@ def test_conversation_and_chat_are_coroutines():
     assert inspect.iscoroutinefunction(SessionDB._parse_schema_columns)
     assert issubclass(SessionDB, SessionPortabilityMixin)
     assert issubclass(SessionDB, SessionSchemaMixin)
+    assert issubclass(SessionDB, SessionSearchMixin)
+    assert SessionDB.__mro__[1:4] == (
+        SessionSearchMixin,
+        SessionSchemaMixin,
+        SessionPortabilityMixin,
+    )
     assert inspect.iscoroutinefunction(
         SessionDB._migrate_broad_fts_update_triggers
     )
     assert inspect.iscoroutinefunction(SessionDB._init_schema)
+    assert inspect.iscoroutinefunction(SessionDB.search_messages)
+    assert inspect.iscoroutinefunction(SessionDB.fts_rebuild_step)
     assert inspect.iscoroutinefunction(SessionDB.export_session)
     assert inspect.iscoroutinefunction(SessionDB.export_session_lineage)
     assert inspect.iscoroutinefunction(SessionDB.export_all)
