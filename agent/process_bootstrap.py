@@ -35,6 +35,12 @@ from typing import Any, Optional
 from openai import AsyncOpenAI as OpenAI
 from openai.resources.chat import AsyncChat as _AsyncChatBootstrap  # noqa: F401
 
+# ``httpx.AsyncHTTPTransport`` imports httpcore synchronously from its
+# constructor.  The transport is created at the first awaited provider
+# boundary, so preload the mandatory httpx transport dependency beside the
+# other SDK bootstraps rather than letting importlib pause that first turn.
+import httpcore as _HttpcoreBootstrap  # noqa: F401
+
 # Anthropic's SDK also performs a sizeable lazy import graph.  The retained
 # runtime reaches ``build_anthropic_client`` from an awaited turn, so loading
 # the optional SDK here keeps that first-use import out of the event loop.
