@@ -33,6 +33,9 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Any, ClassVar
 from pathlib import Path
+
+import aiofiles.os
+
 from tools.binary_extensions import BINARY_EXTENSIONS
 
 from agent.file_safety import (
@@ -2393,11 +2396,12 @@ class ShellFileOperations(FileOperations):
         # file under the hidden path. Apply descendant filtering after command
         # execution so only the explicit root ancestry is bypassed.
         if has_hidden_path_ancestor:
-            normalized_root = search_root.resolve()
+            normalized_root = await aiofiles.os.wrap(search_root.resolve)()
             filtered_files = []
             for file_path in files:
                 try:
-                    rel_parts = Path(file_path).resolve().relative_to(normalized_root).parts
+                    resolved_file = await aiofiles.os.wrap(Path(file_path).resolve)()
+                    rel_parts = resolved_file.relative_to(normalized_root).parts
                 except ValueError:
                     rel_parts = Path(file_path).parts
                 if any(part not in {".", ".."} and part.startswith(".") for part in rel_parts):

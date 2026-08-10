@@ -52,11 +52,6 @@ from hermes_state_common import (
     _sql_session_last_active_by_id,
 )
 
-try:
-    import psutil
-except ImportError:  # pragma: no cover - minimal installs
-    psutil = None
-
 logger = logging.getLogger(__name__)
 _COMPRESSION_LOCK_HOLDER_PID_RE = re.compile(r"(?:^|:)pid=(\d+)(?::|$)")
 _chmod = aiofiles.os.wrap(os.chmod)
@@ -952,7 +947,7 @@ def is_disk_full_error(exc: BaseException | str | None) -> bool:
     return any(marker in text.lower() for marker in _DISK_FULL_MARKERS)
 
 
-def _compression_lock_holder_process_is_dead(holder: str) -> bool:
+async def _compression_lock_holder_process_is_dead(holder: str) -> bool:
     """Return true only when a structured local compression owner is gone."""
     match = _COMPRESSION_LOCK_HOLDER_PID_RE.search(holder or "")
     if match is None:
@@ -963,20 +958,12 @@ def _compression_lock_holder_process_is_dead(holder: str) -> bool:
         return False
     if pid <= 0 or pid == os.getpid():
         return False
-    if psutil is not None:
-        try:
-            return not psutil.pid_exists(pid)
-        except Exception:
-            return False
-    if os.name == "nt":
-        return False
     try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return True
-    except (PermissionError, OSError, OverflowError):
+        from gateway.status import _pid_exists_including_zombie
+
+        return not await _pid_exists_including_zombie(pid)
+    except Exception:
         return False
-    return False
 
 
 def _scrub_surrogates(value: Any) -> Any:
@@ -3056,7 +3043,7 @@ class SessionDB:
             ).fetchone()
             if row is not None and (
                 float(row["expires_at"]) < now
-                or _compression_lock_holder_process_is_dead(row["holder"])
+                or await _compression_lock_holder_process_is_dead(row["holder"])
             ):
                 await connection.execute(
                     "DELETE FROM compression_locks WHERE session_id = ? AND holder = ?",

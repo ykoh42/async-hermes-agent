@@ -1247,7 +1247,7 @@ async def _run_chrome_fallback_command(
     base_args = cmd_prefix + ["--engine", "chrome", "--session", tmp_session, "--json"]
 
     task_socket_dir = os.path.join(
-        _socket_safe_tmpdir(), f"agent-browser-{tmp_session}"
+        await _socket_safe_tmpdir(), f"agent-browser-{tmp_session}"
     )
     await aiofiles.os.makedirs(task_socket_dir, mode=0o700, exist_ok=True)
     browser_env = await _build_browser_env()
@@ -1629,7 +1629,7 @@ async def _resolve_allow_private_urls() -> bool:
     return False
 
 
-def _socket_safe_tmpdir() -> str:
+async def _socket_safe_tmpdir() -> str:
     """Return a short temp directory path suitable for Unix domain sockets.
 
     macOS sets ``TMPDIR`` to ``/var/folders/xx/.../T/`` (~51 chars).  When we
@@ -1643,7 +1643,7 @@ def _socket_safe_tmpdir() -> str:
     """
     if sys.platform == "darwin":
         return "/tmp"
-    return tempfile.gettempdir()
+    return await aiofiles.os.wrap(tempfile.gettempdir)()
 
 
 # Track active sessions per "session key".
@@ -1868,33 +1868,27 @@ async def _remove_tree(root: str) -> None:
 
 async def _terminate_host_pid(pid: int) -> None:
     """Terminate a verified process tree without a blocking wait call."""
-    import psutil
+    from gateway.status import (
+        _process_tree_identities,
+        _running_process_identities,
+        _signal_process_identities,
+    )
 
-    try:
-        parent = psutil.Process(pid)
-        processes = [*parent.children(recursive=True), parent]
-    except psutil.NoSuchProcess:
+    processes = await _process_tree_identities(pid)
+    if not processes:
         return
-    for process in reversed(processes):
-        try:
-            process.terminate()
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            pass
+    await _signal_process_identities(reversed(processes), "terminate")
 
     deadline = asyncio.get_running_loop().time() + 3.0
     remaining = processes
     while remaining and asyncio.get_running_loop().time() < deadline:
-        remaining = [process for process in remaining if process.is_running()]
+        remaining = await _running_process_identities(remaining)
         if remaining:
             await asyncio.sleep(0.05)
-    for process in remaining:
-        try:
-            process.kill()
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            pass
+    await _signal_process_identities(remaining, "kill")
 
 
-def _verify_reapable_browser_daemon(
+async def _verify_reapable_browser_daemon(
     daemon_pid: int, socket_dir: str, session_name: str
 ) -> bool:
     """Confirm a live PID is genuinely *this* session's agent-browser daemon.
@@ -1925,33 +1919,27 @@ def _verify_reapable_browser_daemon(
 
     Returns ``True`` only when both checks pass.
     """
-    try:
-        import psutil
-    except ImportError:  # psutil is a hard dep; defensive only
-        logger.warning(
-            "Refusing to reap browser daemon PID %d (session %s): "
-            "psutil unavailable for identity verification",
-            daemon_pid,
-            session_name,
-        )
-        return False
+    from gateway.status import _inspect_processes
 
     try:
-        proc = psutil.Process(daemon_pid)
-        name = (proc.name() or "").lower()
-        cmdline = " ".join(proc.cmdline() or []).lower()
-    except psutil.NoSuchProcess:
-        # Vanished between the liveness check and now — nothing to reap.
-        return False
-    except (psutil.AccessDenied, OSError) as exc:
+        snapshot = (
+            await _inspect_processes(
+                (daemon_pid,), env_keys=("AGENT_BROWSER_SOCKET_DIR",)
+            )
+        ).get(daemon_pid)
+    except (FileNotFoundError, OSError, RuntimeError, TimeoutError):
+        snapshot = None
+    if snapshot is None:
         logger.warning(
             "Refusing to reap browser daemon PID %d (session %s): "
-            "could not read process identity (%s)",
+            "could not read process identity",
             daemon_pid,
             session_name,
-            exc,
         )
         return False
+    name = str(snapshot.get("name") or "").lower()
+    raw_cmdline = snapshot.get("cmdline")
+    cmdline = " ".join(raw_cmdline if isinstance(raw_cmdline, list) else []).lower()
 
     looks_like_browser = "agent-browser" in name or "agent-browser" in cmdline
     if not looks_like_browser:
@@ -1969,15 +1957,13 @@ def _verify_reapable_browser_daemon(
     socket_base_l = os.path.basename(socket_dir).lower()
     bound = socket_dir_l in cmdline or (socket_base_l and socket_base_l in cmdline)
     if not bound:
-        try:
-            env_dir = (proc.environ() or {}).get("AGENT_BROWSER_SOCKET_DIR", "")
-            bound = bool(env_dir) and os.path.normpath(env_dir) == os.path.normpath(
-                socket_dir
-            )
-        except (psutil.AccessDenied, psutil.NoSuchProcess, OSError):
-            # environ() can be denied even same-user on some platforms.
-            # cmdline already failed to bind — fail closed.
-            bound = False
+        raw_environ = snapshot.get("environ")
+        environ = raw_environ if isinstance(raw_environ, dict) else {}
+        env_dir = str(environ.get("AGENT_BROWSER_SOCKET_DIR") or "")
+        bound = (
+            bool(env_dir)
+            and os.path.normpath(env_dir) == os.path.normpath(socket_dir)  # noqa: ASYNC240 - lexical only
+        )
 
     if not bound:
         logger.warning(
@@ -2014,7 +2000,7 @@ async def _reap_orphaned_browser_sessions() -> None:
 
     Safe to call from the owning event loop's cleanup task or on demand.
     """
-    tmpdir = _socket_safe_tmpdir()
+    tmpdir = await _socket_safe_tmpdir()
     try:
         entries = await aiofiles.os.listdir(tmpdir)
     except OSError:
@@ -2102,7 +2088,9 @@ async def _reap_orphaned_browser_sessions() -> None:
         # otherwise (don't touch the process, leave the socket dir for a later
         # sweep once the imposter PID is gone).  Fixes the arbitrary same-user
         # process DoS in issue #14073.
-        if not _verify_reapable_browser_daemon(daemon_pid, socket_dir, session_name):
+        if not await _verify_reapable_browser_daemon(
+            daemon_pid, socket_dir, session_name
+        ):
             continue
 
         # Daemon is alive and its owner is dead (or legacy + untracked).  Reap.
@@ -2774,7 +2762,8 @@ async def _run_browser_command(
         # Without this, parallel workers fight over the same default socket path,
         # causing "Failed to create socket directory: Permission denied" errors.
         task_socket_dir = os.path.join(
-            _socket_safe_tmpdir(), f"agent-browser-{session_info['session_name']}"
+            await _socket_safe_tmpdir(),
+            f"agent-browser-{session_info['session_name']}",
         )
         await aiofiles.os.makedirs(task_socket_dir, mode=0o700, exist_ok=True)
         # Record this hermes PID as the session owner (cross-process safe
@@ -5150,7 +5139,7 @@ async def _cleanup_single_browser_session(task_id: str) -> None:
         session_name = session_info.get("session_name", "")
         if session_name:
             socket_dir = os.path.join(
-                _socket_safe_tmpdir(), f"agent-browser-{session_name}"
+                await _socket_safe_tmpdir(), f"agent-browser-{session_name}"
             )
             if await aiofiles.os.path.exists(socket_dir):
                 # agent-browser writes {session}.pid in the socket dir

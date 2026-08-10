@@ -12,9 +12,15 @@ Fix: _search_files (find) and _search_with_grep both now exclude hidden
 directories, matching ripgrep's default behavior.
 """
 
+import asyncio
+from pathlib import Path
 import subprocess
+import time
+from unittest.mock import AsyncMock
 
 import pytest
+
+from tools.file_operations import ExecuteResult, ShellFileOperations
 
 
 @pytest.fixture
@@ -60,6 +66,55 @@ class TestFindExcludesHiddenDirs:
         )
         result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
         assert "SKILL.md" in result.stdout
+
+    @pytest.mark.asyncio
+    async def test_explicit_hidden_root_resolution_does_not_block_event_loop(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        hidden_root = tmp_path / ".workspace"
+        visible_file = hidden_root / "visible" / "keep.txt"
+        hidden_file = hidden_root / "visible" / ".cache" / "skip.txt"
+        visible_file.parent.mkdir(parents=True)
+        hidden_file.parent.mkdir(parents=True)
+        visible_file.write_text("keep")
+        hidden_file.write_text("skip")
+
+        original_resolve = Path.resolve
+
+        def slow_resolve(path, *args, **kwargs):
+            time.sleep(0.15)
+            return original_resolve(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "resolve", slow_resolve)
+
+        operations = ShellFileOperations(AsyncMock())
+
+        async def has_command(command):
+            return command == "find"
+
+        operations._has_command = has_command
+        operations._exec = AsyncMock(
+            side_effect=[
+                ExecuteResult(
+                    stdout=(
+                        f"2 {visible_file}\n"
+                        f"1 {hidden_file}\n"
+                    ),
+                    exit_code=0,
+                )
+            ]
+        )
+
+        search_task = asyncio.create_task(
+            operations._search_files("*.txt", str(hidden_root), 50, 0)
+        )
+        await asyncio.sleep(0.02)
+
+        assert not search_task.done()
+        result = await search_task
+        assert result.files == [str(visible_file)]
 
 
 class TestGrepExcludesHiddenDirs:

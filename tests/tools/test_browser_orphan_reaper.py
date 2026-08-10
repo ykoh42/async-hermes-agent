@@ -16,7 +16,10 @@ pytestmark = pytest.mark.asyncio
 @pytest.fixture
 def fake_tmpdir(tmp_path):
     """Patch _socket_safe_tmpdir to return a temp dir we control."""
-    with patch("tools.browser_tool._socket_safe_tmpdir", return_value=str(tmp_path)):
+    with patch(
+        "tools.browser_tool._socket_safe_tmpdir",
+        new=AsyncMock(return_value=str(tmp_path)),
+    ):
         yield tmp_path
 
 
@@ -88,7 +91,7 @@ class TestReapOrphanedBrowserSessions:
             terminate_calls.append(pid)
 
         with patch("gateway.status._pid_exists", new=AsyncMock(return_value=True)), \
-             patch("tools.browser_tool._verify_reapable_browser_daemon", return_value=True), \
+             patch("tools.browser_tool._verify_reapable_browser_daemon", new=AsyncMock(return_value=True)), \
              patch("tools.browser_tool._terminate_host_pid", new_callable=AsyncMock, side_effect=mock_terminate):
             await _reap_orphaned_browser_sessions()
 
@@ -225,7 +228,10 @@ class TestOwnerPidCrossProcess:
 
         monkeypatch.setattr(bt, "_write_owner_pid", _spy)
 
-        with patch("tools.browser_tool._socket_safe_tmpdir", return_value=str(fake_tmpdir)):
+        with patch(
+            "tools.browser_tool._socket_safe_tmpdir",
+            new=AsyncMock(return_value=str(fake_tmpdir)),
+        ):
             try:
                 await bt._run_browser_command(task_id="test_task", command="goto", args=[])
             except Exception:
@@ -267,20 +273,29 @@ class TestReaperIdentityGuard:
                 raise psutil.AccessDenied()
             return self._environ
 
-    def _run(self, fake_proc, socket_dir, session_name="h_sess123456",
-             daemon_pid=12345, no_such=False, access_denied=False):
-        import psutil
+    async def _run(self, fake_proc, socket_dir, session_name="h_sess123456",
+                   daemon_pid=12345, no_such=False, access_denied=False):
         from tools.browser_tool import _verify_reapable_browser_daemon
 
-        def _factory(pid):
-            if no_such:
-                raise psutil.NoSuchProcess(pid)
-            if access_denied:
-                raise psutil.AccessDenied(pid)
-            return fake_proc
+        snapshots = {}
+        if not no_such and not access_denied:
+            try:
+                socket_binding = fake_proc.environ().get(
+                    "AGENT_BROWSER_SOCKET_DIR", ""
+                )
+            except Exception:
+                socket_binding = ""
+            snapshots[daemon_pid] = {
+                "name": fake_proc.name(),
+                "cmdline": fake_proc.cmdline(),
+                "environ": {"AGENT_BROWSER_SOCKET_DIR": socket_binding},
+            }
 
-        with patch("psutil.Process", side_effect=_factory):
-            return _verify_reapable_browser_daemon(
+        with patch(
+            "gateway.status._inspect_processes",
+            new=AsyncMock(return_value=snapshots),
+        ):
+            return await _verify_reapable_browser_daemon(
                 daemon_pid, socket_dir, session_name)
 
     async def test_real_daemon_bound_via_cmdline_is_reapable(self):
@@ -290,7 +305,7 @@ class TestReaperIdentityGuard:
             cmdline=["agent-browser", "open", "--session", "h_sess123456",
                      "--socket-dir", socket_dir],
         )
-        assert self._run(proc, socket_dir) is True
+        assert await self._run(proc, socket_dir) is True
 
     async def test_daemon_bound_via_environ_is_reapable(self):
         socket_dir = "/tmp/agent-browser-h_sess123456"
@@ -299,7 +314,7 @@ class TestReaperIdentityGuard:
             cmdline=["agent-browser-linux-x64", "daemon"],  # no dir in cmd
             environ={"AGENT_BROWSER_SOCKET_DIR": socket_dir},
         )
-        assert self._run(proc, socket_dir) is True
+        assert await self._run(proc, socket_dir) is True
 
 
     async def test_recycled_pid_browser_not_bound_to_our_dir_is_refused(self):
@@ -316,7 +331,7 @@ class TestReaperIdentityGuard:
             environ={"AGENT_BROWSER_SOCKET_DIR":
                      "/tmp/agent-browser-h_OTHER999"},
         )
-        assert self._run(proc, socket_dir) is False
+        assert await self._run(proc, socket_dir) is False
 
 
     async def test_planted_pid_survives_full_reaper_path(self, fake_tmpdir):
@@ -334,7 +349,18 @@ class TestReaperIdentityGuard:
         proc = self._FakeProc(name="sleep", cmdline=["/bin/sleep", "600"])
 
         with patch("gateway.status._pid_exists", new=AsyncMock(return_value=True)), \
-             patch("psutil.Process", return_value=proc), \
+             patch(
+                 "gateway.status._inspect_processes",
+                 new=AsyncMock(
+                     return_value={
+                         12345: {
+                             "name": proc.name(),
+                             "cmdline": proc.cmdline(),
+                             "environ": {"AGENT_BROWSER_SOCKET_DIR": ""},
+                         }
+                     }
+                 ),
+             ), \
              patch(
                  "tools.browser_tool._terminate_host_pid",
                  new_callable=AsyncMock,

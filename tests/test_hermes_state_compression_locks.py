@@ -4,7 +4,7 @@ import asyncio
 import os
 import sys
 from pathlib import Path
-from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 import pytest_asyncio
@@ -12,7 +12,6 @@ from blockbuster import BlockBuster
 from pyleak import no_event_loop_blocking, no_task_leaks
 from pyleak.eventloop import LeakAction
 
-import hermes_state
 from hermes_state import SessionDB
 
 
@@ -53,9 +52,8 @@ async def test_dead_pid_lease_is_reclaimed(db, monkeypatch):
     holder = "pid=424242:tid=1:agent=a:nonce=dead"
     assert await db.try_acquire_compression_lock("s1", holder, ttl_seconds=300)
     monkeypatch.setattr(
-        hermes_state,
-        "psutil",
-        SimpleNamespace(pid_exists=lambda pid: pid != 424242),
+        "gateway.status._pid_exists_including_zombie",
+        AsyncMock(side_effect=lambda pid: pid != 424242),
     )
     assert await db.try_acquire_compression_lock("s1", "fresh", ttl_seconds=300)
 

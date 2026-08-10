@@ -51,10 +51,9 @@ def _make_mock_server(name, session=None, tools=None):
 
 
 class TestFilterMCPChildren:
-    def test_filters_gateway_children_by_argv_marker(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_filters_gateway_children_by_argv_marker(self, monkeypatch):
         """Non-MCP children start with an interpreter/binary, not the marker."""
-        import sys
-
         import tools.mcp_tool as mcp_tool
 
         cmdlines = {
@@ -73,21 +72,17 @@ class TestFilterMCPChildren:
             103: ["/usr/bin/node", "server.js"],
         }
 
-        class FakeProcess:
-            def __init__(self, pid):
-                self.pid = pid
-
-            def cmdline(self):
-                return cmdlines[self.pid]
-
-        fake_psutil = SimpleNamespace(
-            Process=FakeProcess,
-            NoSuchProcess=ProcessLookupError,
-            AccessDenied=PermissionError,
+        monkeypatch.setattr(
+            "gateway.status._inspect_processes",
+            AsyncMock(
+                return_value={
+                    pid: {"cmdline": command}
+                    for pid, command in cmdlines.items()
+                }
+            ),
         )
-        monkeypatch.setitem(sys.modules, "psutil", fake_psutil)
 
-        assert mcp_tool._filter_mcp_children({101, 102, 103}) == {103}
+        assert await mcp_tool._filter_mcp_children({101, 102, 103}) == {103}
 
 
 # ---------------------------------------------------------------------------

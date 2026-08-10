@@ -2501,7 +2501,7 @@ class MCPServerTask:
                 # equals the TUI parent PID. If they leak into _stdio_pgids, the
                 # shutdown sweep's killpg() kills the TUI parent itself.
                 # See agent/lsp/client.py for the complementary start_new_session fix.
-                new_pids = _filter_mcp_children(
+                new_pids = await _filter_mcp_children(
                     await _snapshot_child_pids() - pids_before
                 )
                 if new_pids:
@@ -4285,7 +4285,7 @@ _NON_MCP_CHILD_CMDLINE_MARKERS: tuple[str, ...] = (
 )
 
 
-def _filter_mcp_children(pids: set) -> set:
+async def _filter_mcp_children(pids: set) -> set:
     """Remove non-MCP children from a PID snapshot delta.
 
     _snapshot_child_pids() returns *all* direct children of the gateway. When
@@ -4297,19 +4297,22 @@ def _filter_mcp_children(pids: set) -> set:
     """
     if not pids:
         return pids
+    from gateway.status import _inspect_processes
+
     try:
-        import psutil
-    except ImportError:
+        snapshots = await _inspect_processes(pids)
+    except (FileNotFoundError, OSError, RuntimeError, TimeoutError):
         # psutil unavailable — keep all PIDs (preserves prior behavior).
         return pids
     filtered: set = set()
     for pid in pids:
-        try:
-            argv = psutil.Process(pid).cmdline()
-        except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+        snapshot = snapshots.get(pid)
+        if snapshot is None:
             # Process raced away or is a zombie — skip it; it cannot be the
             # MCP server we just spawned and is not safe to track.
             continue
+        raw_argv = snapshot.get("cmdline")
+        argv = raw_argv if isinstance(raw_argv, list) else []
         if any(
             marker in arg
             for arg in argv[1:]

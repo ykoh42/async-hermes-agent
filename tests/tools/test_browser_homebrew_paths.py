@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 from pathlib import Path
+import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -31,6 +32,22 @@ def _clear_browser_caches():
     _bt._cached_homebrew_node_dirs = None
     _bt._cached_agent_browser = None
     _bt._agent_browser_resolved = False
+
+
+async def test_socket_safe_tmpdir_resolves_off_event_loop(monkeypatch, tmp_path):
+    monkeypatch.setattr(_bt.sys, "platform", "linux")
+
+    def slow_gettempdir():
+        time.sleep(0.15)
+        return str(tmp_path)
+
+    monkeypatch.setattr(_bt.tempfile, "gettempdir", slow_gettempdir)
+
+    resolution = asyncio.create_task(_bt._socket_safe_tmpdir())
+    await asyncio.sleep(0.02)
+
+    assert not resolution.done()
+    assert await resolution == str(tmp_path)
 
 
 class TestSanePath:
@@ -197,7 +214,9 @@ async def test_run_browser_command_repeated_cancellation_reaps_and_unlinks(
     monkeypatch.setattr(
         _bt, "_needs_chromium_sandbox_bypass", AsyncMock(return_value=False)
     )
-    monkeypatch.setattr(_bt, "_socket_safe_tmpdir", lambda: str(tmp_path))
+    monkeypatch.setattr(
+        _bt, "_socket_safe_tmpdir", AsyncMock(return_value=str(tmp_path))
+    )
     monkeypatch.setattr(asyncio, "create_subprocess_exec", create_process)
     monkeypatch.setattr("tools.interrupt.is_interrupted", lambda: False)
 
@@ -252,7 +271,7 @@ class TestRunBrowserCommandPathConstruction:
              patch("tools.browser_tool._get_browser_engine", new_callable=AsyncMock, return_value="auto"), \
              patch("tools.browser_tool._is_camofox_mode", new_callable=AsyncMock, return_value=False), \
              patch("tools.browser_tool._needs_chromium_sandbox_bypass", new_callable=AsyncMock, return_value=False), \
-             patch("tools.browser_tool._socket_safe_tmpdir", return_value=str(tmp_path)), \
+             patch("tools.browser_tool._socket_safe_tmpdir", new=AsyncMock(return_value=str(tmp_path))), \
              patch("tools.browser_tool._discover_homebrew_node_dirs", new=AsyncMock(return_value=[])), \
              patch("hermes_constants.Path.home", return_value=tmp_path), \
              patch("asyncio.create_subprocess_exec", side_effect=capture_popen), \
@@ -315,7 +334,7 @@ class TestRunBrowserCommandPathConstruction:
              patch("tools.browser_tool._get_browser_engine", new_callable=AsyncMock, return_value="auto"), \
              patch("tools.browser_tool._is_camofox_mode", new_callable=AsyncMock, return_value=False), \
              patch("tools.browser_tool._needs_chromium_sandbox_bypass", new_callable=AsyncMock, return_value=False), \
-             patch("tools.browser_tool._socket_safe_tmpdir", return_value=str(tmp_path)), \
+             patch("tools.browser_tool._socket_safe_tmpdir", new=AsyncMock(return_value=str(tmp_path))), \
              patch("tools.browser_tool._discover_homebrew_node_dirs", new=AsyncMock(return_value=[])), \
              patch("aiofiles.os.path.isdir", new=AsyncMock(side_effect=selective_isdir)), \
              patch("asyncio.create_subprocess_exec", side_effect=capture_popen), \
