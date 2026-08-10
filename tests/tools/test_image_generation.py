@@ -292,3 +292,114 @@ class TestFalKreaCatalog:
     )
     def test_non_native_krea_model_detection(self, image_tool, model_id):
         assert image_tool.is_krea_model(model_id) is False
+
+
+class TestKreaModelNormalization:
+    """Native ``krea-2-*`` detection for managed Krea routing."""
+
+    def test_native_models_normalized(self, image_tool):
+        for model_id in ("krea-2-medium", "krea-2-large", "krea-2-medium-turbo"):
+            assert image_tool._normalize_krea_model(model_id) == model_id
+
+    def test_non_krea_models_are_not_normalized(self, image_tool):
+        for model_id in (
+            "fal-ai/flux-2/klein/9b",
+            "fal-ai/nano-banana-pro",
+            None,
+            "",
+            123,
+        ):
+            assert image_tool._normalize_krea_model(model_id) is None
+
+
+class TestManagedKreaRouting:
+    """``_maybe_route_managed_krea`` only fires in managed Krea mode."""
+
+    @pytest.mark.asyncio
+    async def test_no_route_when_model_not_krea(self, image_tool, monkeypatch):
+        monkeypatch.setattr(
+            image_tool,
+            "_read_configured_image_provider",
+            AsyncMock(return_value=None),
+        )
+        monkeypatch.setattr(
+            image_tool,
+            "_read_configured_image_model",
+            AsyncMock(return_value="fal-ai/flux-2/klein/9b"),
+        )
+
+        assert await image_tool._maybe_route_managed_krea("p", "square") is None
+
+    @pytest.mark.asyncio
+    async def test_routes_native_krea_model_to_plugin_in_managed_mode(
+        self, image_tool, monkeypatch
+    ):
+        import json
+        from types import SimpleNamespace
+
+        monkeypatch.setattr(
+            image_tool,
+            "_read_configured_image_provider",
+            AsyncMock(return_value=None),
+        )
+        monkeypatch.setattr(
+            image_tool,
+            "_read_configured_image_model",
+            AsyncMock(return_value="krea-2-large"),
+        )
+        import plugins.image_gen.krea as krea_mod
+
+        monkeypatch.setattr(
+            krea_mod,
+            "_resolve_managed_krea_gateway",
+            AsyncMock(
+                return_value=SimpleNamespace(
+                    vendor="krea",
+                    gateway_origin="https://krea-gateway.example.com",
+                    nous_user_token="tok",
+                    managed_mode=True,
+                )
+            ),
+        )
+        fake_provider = AsyncMock()
+        fake_provider.generate.return_value = {
+            "success": True,
+            "image": "/tmp/x.png",
+        }
+        monkeypatch.setattr(
+            "agent.image_gen_registry.get_provider", lambda name: fake_provider
+        )
+        monkeypatch.setattr(
+            "hermes_cli.plugins._ensure_plugins_discovered", AsyncMock()
+        )
+
+        out = await image_tool._maybe_route_managed_krea("a cat", "portrait")
+
+        assert out is not None
+        assert json.loads(out)["success"] is True
+        kwargs = fake_provider.generate.await_args.kwargs
+        assert kwargs["model"] == "krea-2-large"
+        assert kwargs["prompt"] == "a cat"
+        assert kwargs["aspect_ratio"] == "portrait"
+
+    @pytest.mark.asyncio
+    async def test_handler_routes_managed_krea_before_fal(
+        self, image_tool, monkeypatch
+    ):
+        monkeypatch.setattr(
+            image_tool,
+            "_dispatch_to_plugin_provider",
+            AsyncMock(return_value=None),
+        )
+        routed = AsyncMock(return_value='{"success": true, "provider": "krea"}')
+        monkeypatch.setattr(image_tool, "_maybe_route_managed_krea", routed)
+        fal = AsyncMock()
+        monkeypatch.setattr(image_tool, "image_generate_tool", fal)
+
+        result = await image_tool._handle_image_generate(
+            {"prompt": "cat", "aspect_ratio": "square"}
+        )
+
+        assert result == '{"success": true, "provider": "krea"}'
+        routed.assert_awaited_once()
+        fal.assert_not_awaited()

@@ -106,6 +106,16 @@ class TestKreaImageGenProvider:
 
         assert await KreaImageGenProvider().is_available() is True
 
+    async def test_is_available_with_managed_gateway(self, http_calls, monkeypatch):
+        monkeypatch.delenv("KREA_API_KEY", raising=False)
+        from plugins.image_gen.krea import KreaImageGenProvider
+
+        with patch(
+            "plugins.image_gen.krea._managed_krea_gateway_ready",
+            new=AsyncMock(return_value=True),
+        ):
+            assert await KreaImageGenProvider().is_available() is True
+
 
     async def test_list_models(self, http_calls):
         from plugins.image_gen.krea import KreaImageGenProvider
@@ -275,6 +285,7 @@ class TestGenerate:
         headers = mock_post.call_args.kwargs["headers"]
         assert headers["Authorization"] == "Bearer test-key-12345"
         assert headers["Content-Type"] == "application/json"
+        assert "x-idempotency-key" not in headers
 
     async def test_passthrough_seed_styles_moodboards(self, http_calls):
         from plugins.image_gen.krea import KreaImageGenProvider
@@ -516,6 +527,175 @@ class TestPollRetryPolicy:
         assert "401" in result["error"]
         # One call — no retry on permanent auth failure.
         assert mock_get.call_count == 1
+
+
+# ---------------------------------------------------------------------------
+# Managed Nous gateway path
+# ---------------------------------------------------------------------------
+
+
+def _managed_cfg(
+    origin: str = "https://krea-gateway.example.com",
+    token: str = "nous-tok-abc",
+):
+    return SimpleNamespace(
+        vendor="krea",
+        gateway_origin=origin,
+        nous_user_token=token,
+        managed_mode=True,
+    )
+
+
+class TestManagedGateway:
+    async def test_managed_submit_uses_gateway_origin_and_nous_token(
+        self, http_calls, monkeypatch
+    ):
+        """Managed mode submits to the gateway origin with the Nous token."""
+        import plugins.image_gen.krea as krea_mod
+        from plugins.image_gen.krea import KreaImageGenProvider
+
+        monkeypatch.setattr(
+            krea_mod,
+            "_resolve_managed_krea_gateway",
+            AsyncMock(return_value=_managed_cfg()),
+        )
+
+        submit = _submit_response()
+        poll = _poll_response(_completed_job())
+        with patch.object(
+            http_calls, "post", new_callable=AsyncMock, return_value=submit
+        ) as mock_post, patch.object(
+            http_calls, "get", new_callable=AsyncMock, return_value=poll
+        ) as mock_get, patch(
+            "plugins.image_gen.krea.save_url_image",
+            new_callable=AsyncMock,
+            return_value=Path("/tmp/x.png"),
+        ):
+            result = await KreaImageGenProvider().generate(prompt="A managed lamp")
+
+        assert result["success"] is True
+        assert mock_post.call_args[0][0] == (
+            "https://krea-gateway.example.com/generate/image/krea/krea-2/medium"
+        )
+        headers = mock_post.call_args.kwargs["headers"]
+        assert headers["Authorization"] == "Bearer nous-tok-abc"
+        assert headers["x-idempotency-key"]
+        assert mock_get.call_args[0][0].startswith(
+            "https://krea-gateway.example.com/jobs/"
+        )
+        poll_headers = mock_get.call_args.kwargs["headers"]
+        assert poll_headers["Authorization"] == "Bearer nous-tok-abc"
+
+    async def test_managed_429_concurrency_hint(self, http_calls, monkeypatch):
+        import httpx
+        import plugins.image_gen.krea as krea_mod
+        from plugins.image_gen.krea import KreaImageGenProvider
+
+        monkeypatch.setattr(
+            krea_mod,
+            "_resolve_managed_krea_gateway",
+            AsyncMock(return_value=_managed_cfg()),
+        )
+        response = httpx.Response(
+            429,
+            json={"error": {"message": "maximum number of concurrent jobs"}},
+            request=httpx.Request(
+                "POST",
+                "https://krea-gateway.example.com/generate/image/krea/krea-2/medium",
+            ),
+        )
+
+        with patch.object(
+            http_calls, "post", new_callable=AsyncMock, return_value=response
+        ):
+            result = await KreaImageGenProvider().generate(prompt="test")
+
+        assert result["success"] is False
+        assert "429" in result["error"]
+        assert "concurrency" in result["error"].lower()
+
+    @pytest.mark.parametrize(
+        ("argument", "value", "message"),
+        [
+            ("styles", [{"id": "lora-1"}], "trained styles"),
+            ("moodboards", [{"url": "https://x.com/mood.png"}], "moodboards"),
+        ],
+    )
+    async def test_managed_rejects_unpriced_features(
+        self, http_calls, monkeypatch, argument, value, message
+    ):
+        import plugins.image_gen.krea as krea_mod
+        from plugins.image_gen.krea import KreaImageGenProvider
+
+        monkeypatch.setattr(
+            krea_mod,
+            "_resolve_managed_krea_gateway",
+            AsyncMock(return_value=_managed_cfg()),
+        )
+
+        result = await KreaImageGenProvider().generate(
+            prompt="test", **{argument: value}
+        )
+
+        assert result["success"] is False
+        assert result["error_type"] == "unsupported_argument"
+        assert message in result["error"]
+        http_calls.post.assert_not_awaited()
+
+    async def test_direct_key_wins_without_gateway_preference(
+        self, http_calls, monkeypatch
+    ):
+        import plugins.image_gen.krea as krea_mod
+
+        gateway = AsyncMock(return_value=_managed_cfg())
+        monkeypatch.setattr(
+            "tools.managed_tool_gateway.resolve_managed_tool_gateway", gateway
+        )
+        monkeypatch.setattr(
+            "tools.tool_backend_helpers.prefers_gateway",
+            AsyncMock(return_value=False),
+        )
+
+        assert await krea_mod._resolve_managed_krea_gateway() is None
+        gateway.assert_not_awaited()
+
+
+class TestCancellation:
+    async def test_submit_cancellation_closes_http_client(self, monkeypatch):
+        import asyncio
+        import plugins.image_gen.krea as krea_mod
+        from plugins.image_gen.krea import KreaImageGenProvider
+
+        entered = asyncio.Event()
+        exited = asyncio.Event()
+
+        class Client:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                exited.set()
+                return False
+
+            async def post(self, *_args, **_kwargs):
+                entered.set()
+                await asyncio.Event().wait()
+
+        monkeypatch.setattr(
+            krea_mod, "_create_httpx_client", AsyncMock(return_value=Client())
+        )
+        monkeypatch.setattr(
+            krea_mod,
+            "_resolve_managed_krea_gateway",
+            AsyncMock(return_value=_managed_cfg()),
+        )
+
+        task = asyncio.create_task(KreaImageGenProvider().generate(prompt="test"))
+        await entered.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert exited.is_set()
 
 
 class TestExplicitModelOverride:
