@@ -166,6 +166,7 @@ def test_conversation_and_chat_are_coroutines():
     assert inspect.iscoroutinefunction(
         SessionDB._migrate_broad_fts_update_triggers
     )
+    assert inspect.iscoroutinefunction(SessionDB._init_schema)
     assert inspect.iscoroutinefunction(SessionDB.export_session)
     assert inspect.iscoroutinefunction(SessionDB.export_session_lineage)
     assert inspect.iscoroutinefunction(SessionDB.export_all)

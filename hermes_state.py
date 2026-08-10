@@ -30,15 +30,12 @@ from agent.session_activity import ActivityProvenance
 from agent.skill_commands import describe_skill_invocation
 from hermes_constants import get_hermes_home
 from hermes_state_common import (
-    DEFERRED_INDEX_SQL,
     FTS_CJK_STALE_KEY,
     FTS_CJK_TABLE_SQL,
     FTS_CJK_TRIGGER_SQL,
     FTS_SQL,
     FTS_STORAGE_VERSION,
     FTS_TRIGRAM_SQL,
-    LEGACY_FTS_SQL,
-    LEGACY_FTS_TRIGRAM_SQL,
     MAX_FTS5_QUERY_CHARS,
     SCHEMA_VERSION,
     SCHEMA_SQL,
@@ -1609,51 +1606,6 @@ class SessionDB(SessionSchemaMixin, SessionPortabilityMixin):
         return bool(tokens) and all(len(token) >= 3 for token in tokens)
 
 
-    @staticmethod
-    async def _parse_schema_columns(schema_sql: str) -> Dict[str, Dict[str, str]]:
-        """Extract expected columns per table from SCHEMA_SQL.
-
-        Uses an in-memory SQLite database to parse the SQL — SQLite itself
-        handles all syntax (DEFAULT expressions with commas, inline
-        REFERENCES, CHECK constraints, etc.) so there are zero regex
-        edge cases.  The in-memory DB is opened, the schema DDL is
-        executed, and PRAGMA table_info extracts the column metadata.
-
-        Adding a column to SCHEMA_SQL is all that's needed; the
-        reconciliation loop picks it up automatically.
-        """
-        ref = await aiosqlite.connect(":memory:")
-        try:
-            await ref.executescript(schema_sql)
-            table_columns: Dict[str, Dict[str, str]] = {}
-            cursor = await ref.execute(
-                "SELECT name FROM sqlite_master "
-                "WHERE type='table' AND name NOT LIKE 'sqlite_%'"
-            )
-            for (tbl,) in await cursor.fetchall():
-                cols: Dict[str, str] = {}
-                column_cursor = await ref.execute(
-                    f'PRAGMA table_info("{tbl}")'
-                )
-                for row in await column_cursor.fetchall():
-                    # row: (cid, name, type, notnull, dflt_value, pk)
-                    col_name = row[1]
-                    col_type = row[2] or ""
-                    notnull = row[3]
-                    default = row[4]
-                    pk = row[5]
-                    # Reconstruct the type expression for ALTER TABLE ADD COLUMN
-                    parts = [col_type] if col_type else []
-                    if notnull and not pk:
-                        parts.append("NOT NULL")
-                    if default is not None:
-                        parts.append(f"DEFAULT {default}")
-                    cols[col_name] = " ".join(parts)
-                table_columns[tbl] = cols
-            return table_columns
-        finally:
-            await ref.close()
-
     def __init__(
         self,
         db_path: "os.PathLike[str] | str" = None,
@@ -1663,6 +1615,7 @@ class SessionDB(SessionSchemaMixin, SessionPortabilityMixin):
         self._db_path = self.db_path
         self.read_only = bool(read_only)
         self._connection = None
+        self._initializing_connection = None
         self._connection_tracking_key = None
         self._read_connection = None
         self._read_connection_tracking_key = None
@@ -1789,7 +1742,11 @@ class SessionDB(SessionSchemaMixin, SessionPortabilityMixin):
                         self._fts_cjk_loaded = await load_fts5_cjk_extension(
                             connection
                         )
-                        await self._ensure_schema(connection)
+                        self._initializing_connection = connection
+                        try:
+                            await self._init_schema()
+                        finally:
+                            self._initializing_connection = None
                     else:
                         self._fts_enabled = (
                             await self._fts_table_probe(
@@ -1946,114 +1903,6 @@ class SessionDB(SessionSchemaMixin, SessionPortabilityMixin):
             finally:
                 await cursor.close()
 
-    async def _ensure_schema(self, connection) -> None:
-        """Create/reconcile the transcript tables without a sync DB hop.
-
-        Column reconciliation and FTS initialization are deliberately
-        performed through ``aiosqlite`` so a first turn against a fresh or
-        older database never executes synchronous SQLite I/O.
-        """
-        if self._schema_ready:
-            return
-        await connection.executescript(SCHEMA_SQL)
-        expected = await self._parse_schema_columns(SCHEMA_SQL)
-        for table_name, declared_columns in expected.items():
-            cursor = await connection.execute(
-                f'PRAGMA table_info("{table_name}")'
-            )
-            live_columns = {row[1] for row in await cursor.fetchall()}
-            for column_name, column_type in declared_columns.items():
-                if column_name in live_columns:
-                    continue
-                safe_name = column_name.replace('"', '""')
-                await connection.execute(
-                    f'ALTER TABLE "{table_name}" ADD COLUMN "{safe_name}" {column_type}'
-                )
-        await self._heal_session_model_usage_pk(connection)
-        await self._migrate_inline_system_prompts(connection)
-        await connection.executescript(DEFERRED_INDEX_SQL)
-        await connection.execute(
-            "UPDATE messages SET active = 1 WHERE active IS NULL"
-        )
-        if await self._sqlite_supports_fts5(connection):
-            legacy_layout = await self._db_has_legacy_inline_fts(connection)
-            triggers_need_repair = (
-                await self._fts_trigger_count(connection) < len(_FTS_TRIGGERS)
-            )
-            if legacy_layout:
-                self._fts_enabled = await self._ensure_fts_schema(
-                    connection, "messages_fts", LEGACY_FTS_SQL
-                )
-                if self._fts_enabled:
-                    self._trigram_available = await self._ensure_fts_schema(
-                        connection,
-                        "messages_fts_trigram",
-                        LEGACY_FTS_TRIGRAM_SQL,
-                    )
-                    if triggers_need_repair:
-                        await self._rebuild_legacy_fts_indexes(
-                            connection,
-                            include_trigram=self._trigram_available,
-                        )
-            else:
-                self._fts_enabled = await self._ensure_fts_schema(
-                    connection, "messages_fts", FTS_SQL
-                )
-                if self._fts_enabled:
-                    self._trigram_available = await self._ensure_fts_schema(
-                        connection, "messages_fts_trigram", FTS_TRIGRAM_SQL
-                    )
-                    await self._ensure_fts_cjk_schema(connection)
-                    if triggers_need_repair:
-                        await self._rebuild_fts_indexes(
-                            connection,
-                            include_trigram=self._trigram_available,
-                        )
-            if self._fts_enabled:
-                await self._migrate_broad_fts_update_triggers(connection)
-        else:
-            await self._drop_fts_triggers(connection)
-        version_row = await (
-            await connection.execute("SELECT version FROM schema_version LIMIT 1")
-        ).fetchone()
-        if version_row is None:
-            await connection.execute(
-                "INSERT INTO schema_version (version) VALUES (?)", (SCHEMA_VERSION,)
-            )
-        else:
-            await connection.execute(
-                "UPDATE schema_version SET version = ?", (SCHEMA_VERSION,)
-            )
-        await connection.commit()
-        self._schema_ready = True
-
-    async def _sqlite_supports_fts5(self, connection) -> bool:
-        try:
-            await connection.execute(
-                "CREATE VIRTUAL TABLE temp._hermes_fts5_probe USING fts5(x)"
-            )
-            await connection.execute("DROP TABLE temp._hermes_fts5_probe")
-            return True
-        except sqlite3.OperationalError as exc:
-            if not self._is_fts5_unavailable_error(exc):
-                raise
-            self._warn_fts5_unavailable(exc)
-            return False
-
-    @staticmethod
-    async def _fts_trigger_count(connection) -> int:
-        placeholders = ",".join("?" for _ in _FTS_TRIGGERS)
-        cursor = await connection.execute(
-            "SELECT COUNT(*) FROM sqlite_master "
-            f"WHERE type = 'trigger' AND name IN ({placeholders})",
-            _FTS_TRIGGERS,
-        )
-        try:
-            row = await cursor.fetchone()
-        finally:
-            await cursor.close()
-        return int(row[0])
-
     @staticmethod
     async def _db_has_legacy_inline_fts(connection) -> bool:
         cursor = await connection.execute(
@@ -2067,24 +1916,6 @@ class SessionDB(SessionSchemaMixin, SessionPortabilityMixin):
         if row is None:
             return False
         return "tool_name" not in (row[0] or "")
-
-    async def _fts_table_probe(self, connection, table_name: str) -> Optional[bool]:
-        try:
-            cursor = await connection.execute(
-                f"SELECT * FROM {table_name} LIMIT 0"
-            )
-            await cursor.close()
-            return True
-        except sqlite3.OperationalError as exc:
-            if self._is_fts5_unavailable_error(exc):
-                if self._is_trigram_unavailable_error(exc):
-                    self._warn_trigram_unavailable(exc)
-                else:
-                    self._warn_fts5_unavailable(exc)
-                return None
-            if "no such table" in str(exc).lower():
-                return False
-            raise
 
     async def _ensure_fts_schema(
         self,
@@ -2202,47 +2033,6 @@ class SessionDB(SessionSchemaMixin, SessionPortabilityMixin):
             )
             self._fts_cjk_available = False
 
-    @staticmethod
-    async def _rebuild_fts_indexes(
-        connection,
-        *,
-        include_trigram: bool = True,
-    ) -> None:
-        await connection.execute(
-            "INSERT INTO messages_fts(messages_fts) VALUES('rebuild')"
-        )
-        if include_trigram:
-            await connection.execute(
-                "INSERT INTO messages_fts_trigram(messages_fts_trigram) "
-                "VALUES('rebuild')"
-            )
-        await connection.execute(
-            "DELETE FROM state_meta WHERE key IN "
-            "('fts_rebuild_high_water', 'fts_rebuild_progress')"
-        )
-
-    @staticmethod
-    async def _rebuild_legacy_fts_indexes(
-        connection,
-        *,
-        include_trigram: bool = True,
-    ) -> None:
-        await connection.execute("DELETE FROM messages_fts")
-        await connection.execute(
-            "INSERT INTO messages_fts(rowid, content) "
-            "SELECT id, COALESCE(content, '') || ' ' || "
-            "COALESCE(tool_name, '') || ' ' || COALESCE(tool_calls, '') "
-            "FROM messages"
-        )
-        if include_trigram:
-            await connection.execute("DELETE FROM messages_fts_trigram")
-            await connection.execute(
-                "INSERT INTO messages_fts_trigram(rowid, content) "
-                "SELECT id, COALESCE(content, '') || ' ' || "
-                "COALESCE(tool_name, '') || ' ' || COALESCE(tool_calls, '') "
-                "FROM messages"
-            )
-
     async def _drop_fts_triggers(self, connection) -> None:
         for trigger in _FTS_TRIGGERS:
             try:
@@ -2292,25 +2082,6 @@ class SessionDB(SessionSchemaMixin, SessionPortabilityMixin):
             "WHERE sessions.system_prompt_hash = system_prompts.hash)"
         )
 
-    async def _migrate_inline_system_prompts(self, connection) -> None:
-        rows = await (
-            await connection.execute(
-                "SELECT id, system_prompt FROM sessions "
-                "WHERE system_prompt IS NOT NULL AND system_prompt_hash IS NULL"
-            )
-        ).fetchall()
-        for row in rows:
-            prompt_hash = await self._store_system_prompt(
-                connection, row["system_prompt"]
-            )
-            await connection.execute(
-                "UPDATE sessions SET system_prompt = NULL, system_prompt_hash = ? "
-                "WHERE id = ?",
-                (prompt_hash, row["id"]),
-            )
-        if rows:
-            await self._delete_unreferenced_system_prompts(connection)
-
     @staticmethod
     def _session_row_dict(row) -> Dict[str, Any]:
         data = dict(row)
@@ -2318,88 +2089,6 @@ class SessionDB(SessionSchemaMixin, SessionPortabilityMixin):
         if "system_prompt" in data:
             data["system_prompt"] = resolved
         return data
-
-    async def _heal_session_model_usage_pk(self, connection) -> None:
-        """Rebuild legacy usage tables whose composite key omits ``task``."""
-        rows = await (
-            await connection.execute('PRAGMA table_info("session_model_usage")')
-        ).fetchall()
-        if not rows:
-            return
-        pk_columns = {row["name"] for row in rows if row["pk"]}
-        if "task" in pk_columns:
-            return
-
-        logger.info(
-            "session_model_usage has legacy primary key %r; rebuilding",
-            sorted(pk_columns),
-        )
-        await connection.execute("PRAGMA foreign_keys=OFF")
-        try:
-            await connection.execute("BEGIN IMMEDIATE")
-            await connection.execute(
-                "ALTER TABLE session_model_usage "
-                "RENAME TO session_model_usage_legacy_pk"
-            )
-            await connection.execute(
-                """CREATE TABLE session_model_usage (
-                    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-                    model TEXT NOT NULL,
-                    billing_provider TEXT NOT NULL DEFAULT '',
-                    billing_base_url TEXT NOT NULL DEFAULT '',
-                    billing_mode TEXT NOT NULL DEFAULT '',
-                    task TEXT NOT NULL DEFAULT '',
-                    api_call_count INTEGER NOT NULL DEFAULT 0,
-                    input_tokens INTEGER NOT NULL DEFAULT 0,
-                    output_tokens INTEGER NOT NULL DEFAULT 0,
-                    cache_read_tokens INTEGER NOT NULL DEFAULT 0,
-                    cache_write_tokens INTEGER NOT NULL DEFAULT 0,
-                    reasoning_tokens INTEGER NOT NULL DEFAULT 0,
-                    estimated_cost_usd REAL NOT NULL DEFAULT 0,
-                    actual_cost_usd REAL NOT NULL DEFAULT 0,
-                    cost_status TEXT,
-                    cost_source TEXT,
-                    first_seen REAL,
-                    last_seen REAL,
-                    PRIMARY KEY (
-                        session_id, model, billing_provider,
-                        billing_base_url, billing_mode, task
-                    )
-                )"""
-            )
-            await connection.execute(
-                """INSERT OR IGNORE INTO session_model_usage (
-                       session_id, model, billing_provider, billing_base_url,
-                       billing_mode, task, api_call_count, input_tokens,
-                       output_tokens, cache_read_tokens, cache_write_tokens,
-                       reasoning_tokens, estimated_cost_usd, actual_cost_usd,
-                       cost_status, cost_source, first_seen, last_seen
-                   )
-                   SELECT session_id, model,
-                          COALESCE(billing_provider, ''),
-                          COALESCE(billing_base_url, ''),
-                          COALESCE(billing_mode, ''), COALESCE(task, ''),
-                          api_call_count, input_tokens, output_tokens,
-                          cache_read_tokens, cache_write_tokens,
-                          reasoning_tokens, estimated_cost_usd, actual_cost_usd,
-                          cost_status, cost_source, first_seen, last_seen
-                   FROM session_model_usage_legacy_pk"""
-            )
-            await connection.execute("DROP TABLE session_model_usage_legacy_pk")
-            await connection.execute(
-                "CREATE INDEX IF NOT EXISTS idx_session_model_usage_session "
-                "ON session_model_usage(session_id)"
-            )
-            await connection.execute(
-                "CREATE INDEX IF NOT EXISTS idx_session_model_usage_model "
-                "ON session_model_usage(model)"
-            )
-            await connection.commit()
-        except sqlite3.OperationalError as exc:
-            await connection.rollback()
-            logger.debug("session_model_usage PK heal skipped: %s", exc)
-        finally:
-            await connection.execute("PRAGMA foreign_keys=ON")
 
     @staticmethod
     def _is_retryable_lock_error(exc: Exception) -> bool:
