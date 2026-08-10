@@ -24,6 +24,7 @@ file to the allowlist without a reason of the same class.
 
 from __future__ import annotations
 
+import inspect
 import re
 from pathlib import Path
 
@@ -105,5 +106,6 @@ def test_read_user_config_raw_exists_and_documented():
     from hermes_cli.config import read_user_config_raw
 
     doc = read_user_config_raw.__doc__ or ""
+    assert inspect.iscoroutinefunction(read_user_config_raw)
     assert "ONLY legal for write-back round-trips and raw-file diagnostics" in doc
     assert "load_config()" in doc

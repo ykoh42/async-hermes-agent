@@ -2660,7 +2660,9 @@ def read_raw_config() -> Dict[str, Any]:
         return data
 
 
-def read_user_config_raw(config_path: Optional[Path] = None) -> Dict[str, Any]:
+async def read_user_config_raw(
+    config_path: Optional[Path] = None,
+) -> Dict[str, Any]:
     """Read a user ``config.yaml`` EXACTLY as written on disk.
 
     No DEFAULT_CONFIG merge, no managed-scope overlay, no ``${ENV_VAR}``
@@ -2701,9 +2703,11 @@ def read_user_config_raw(config_path: Optional[Path] = None) -> Dict[str, Any]:
     """
     if config_path is None:
         config_path = get_config_path()
+    import aiofiles
+
     try:
-        with open(config_path, encoding="utf-8") as f:
-            data = fast_safe_load(f) or {}
+        async with aiofiles.open(config_path, encoding="utf-8") as handle:
+            data = fast_safe_load(await handle.read()) or {}
     except FileNotFoundError:
         return {}
     return data if isinstance(data, dict) else {}

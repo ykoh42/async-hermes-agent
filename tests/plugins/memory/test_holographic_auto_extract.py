@@ -1,0 +1,147 @@
+"""Regression tests for #57682 — holographic auto_extract harvested
+context-compaction handoff summaries into fact_store, and ran even when
+configured off.
+
+Two compounding defects:
+
+1. Gate: the plugin's config schema declares ``auto_extract`` as a string enum
+   (``"false"``/``"true"``), and the ``on_session_end`` gate used plain
+   truthiness — ``not "false"`` is ``False`` — so extraction ran despite being
+   explicitly configured off.
+
+2. Eligibility: ``_auto_extract_facts`` scanned every ``role == "user"``
+   message. Compaction handoff summaries can be inserted as ``role="user"``
+   messages, and their prose reliably matches the decision patterns
+   (``we decided/agreed/chose``, ``the project uses/needs/requires``), so the
+   compactor's own output was stored as a durable ``project`` fact on every
+   session rollover that followed a compaction.
+"""
+
+import pytest
+
+from agent.context_compressor import (
+    COMPRESSED_SUMMARY_METADATA_KEY,
+    SUMMARY_PREFIX,
+    _MERGED_PRIOR_CONTEXT_HEADER,
+    _MERGED_SUMMARY_DELIMITER,
+    is_compaction_summary_message,
+)
+from plugins.memory.holographic import HolographicMemoryProvider
+
+
+async def _make_provider(tmp_path, **config):
+    base = {"db_path": str(tmp_path / "memory_store.db"), "hrr_dim": 64}
+    base.update(config)
+    provider = HolographicMemoryProvider(config=base)
+    await provider.initialize(session_id="test-session")
+    return provider
+
+
+async def _fact_contents(provider):
+    return [
+        fact["content"]
+        for fact in await provider._store.list_facts(limit=100)
+    ]
+
+
+def _user(content, **extra):
+    msg = {"role": "user", "content": content}
+    msg.update(extra)
+    return msg
+
+
+DECISION_MSG = "we decided to use PostgreSQL for the persistence layer"
+SUMMARY_MSG = (
+    f"{SUMMARY_PREFIX}\n## Historical Task Snapshot\n"
+    "The project uses a kanban board for all dispatch. "
+    "We agreed to route reviews through the fan-in consumer."
+)
+
+
+# ---------------------------------------------------------------------------
+# Defect 1 — string-boolean gate
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("off_value", [False, "false", "False", "no", "off", "0", None, ""])
+@pytest.mark.asyncio
+async def test_auto_extract_off_values_disable_extraction(tmp_path, off_value):
+    provider = await _make_provider(tmp_path, auto_extract=off_value)
+    await provider.on_session_end([_user(DECISION_MSG)])
+    assert await _fact_contents(provider) == []
+    await provider.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# Defect 2 — compaction summaries harvested as facts
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_compaction_summary_not_harvested(tmp_path):
+    """The exact failure mode from #57682: summary prose matches the decision
+    patterns but must not become a fact."""
+    provider = await _make_provider(tmp_path, auto_extract=True)
+    await provider.on_session_end([_user(SUMMARY_MSG)])
+    assert await _fact_contents(provider) == []
+    await provider.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_metadata_marked_summary_not_harvested(tmp_path):
+    """In-process summaries carry COMPRESSED_SUMMARY_METADATA_KEY even if a
+    future prefix rewrite changes the content sentinel."""
+    provider = await _make_provider(tmp_path, auto_extract=True)
+    marked = _user(DECISION_MSG, **{COMPRESSED_SUMMARY_METADATA_KEY: True})
+    await provider.on_session_end([marked])
+    assert await _fact_contents(provider) == []
+    await provider.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_merged_into_tail_summary_suffix_not_harvested_prefix_content_ignored(tmp_path):
+    """Merge-into-tail summaries embed the handoff prefix after the delimiter,
+    not at the start of the message. The wrapped pre-delimiter segment here has
+    no fact-pattern match, so nothing is harvested from either side."""
+    provider = await _make_provider(tmp_path, auto_extract=True)
+    merged = _user(
+        f"{_MERGED_PRIOR_CONTEXT_HEADER}\nplease fix the login bug\n"
+        f"{_MERGED_SUMMARY_DELIMITER}\n{SUMMARY_MSG}"
+    )
+    await provider.on_session_end([merged])
+    assert await _fact_contents(provider) == []
+    await provider.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_real_user_messages_still_extracted_alongside_summary(tmp_path):
+    """The guard must skip only the summary, not suppress extraction for the
+    genuine user turns around it."""
+    provider = await _make_provider(tmp_path, auto_extract=True)
+    await provider.on_session_end(
+        [
+            _user(SUMMARY_MSG),
+            _user("I prefer tabs over spaces for indentation"),
+        ]
+    )
+    facts = await _fact_contents(provider)
+    assert len(facts) == 1
+    assert "tabs over spaces" in facts[0]
+    await provider.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# is_compaction_summary_message — public helper contract
+# ---------------------------------------------------------------------------
+
+
+def test_helper_detects_prefix_metadata_and_merged_forms():
+    assert is_compaction_summary_message(_user(SUMMARY_MSG))
+    assert is_compaction_summary_message(
+        _user("anything", **{COMPRESSED_SUMMARY_METADATA_KEY: True})
+    )
+    assert is_compaction_summary_message(
+        _user(f"prior tail\n{_MERGED_SUMMARY_DELIMITER}\n{SUMMARY_MSG}")
+    )
+    assert not is_compaction_summary_message(_user(DECISION_MSG))
+    assert not is_compaction_summary_message(_user(""))
