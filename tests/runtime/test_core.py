@@ -78,6 +78,7 @@ def test_conversation_and_chat_are_coroutines():
     )
     from tools.session_search_tool import check_session_search_requirements
     from batch_runner import BatchRunner, main as batch_main
+    from mini_swe_runner import MiniSWERunner
     from trajectory_compressor import (
         CompressionConfig,
         TrajectoryCompressor,
@@ -152,6 +153,8 @@ def test_conversation_and_chat_are_coroutines():
     assert inspect.iscoroutinefunction(check_fn_cache_scope)
     assert inspect.iscoroutinefunction(BatchRunner.run)
     assert inspect.iscoroutinefunction(batch_main)
+    assert inspect.iscoroutinefunction(MiniSWERunner.run_task)
+    assert inspect.iscoroutinefunction(MiniSWERunner.run_batch)
     assert inspect.iscoroutinefunction(CompressionConfig.from_yaml)
     assert inspect.iscoroutinefunction(TrajectoryCompressor.close)
     assert inspect.iscoroutinefunction(trajectory_main)

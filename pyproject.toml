@@ -163,6 +163,7 @@ py-modules = [
   "run_agent",
   "model_tools",
   "toolsets",
+  "mini_swe_runner",
   "batch_runner",
   "trajectory_compressor",
   "toolset_distributions",

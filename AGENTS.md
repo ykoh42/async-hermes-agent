@@ -79,6 +79,7 @@ agent/                       conversation, transport, memory, and trajectory int
 model_tools.py               tool dispatch
 tools/                       retained tool implementations and MCP client
 hermes_state.py              async SQLite-backed session state
+mini_swe_runner.py           single-task trajectory runner
 batch_runner.py              bounded concurrent dataset runner
 trajectory_compressor.py     trajectory post-processing
 providers/                   provider profiles and registry

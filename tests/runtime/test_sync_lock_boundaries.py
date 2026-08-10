@@ -18,6 +18,7 @@ _SOURCE_DIRECTORIES = (
 _SOURCE_FILES = (
     "run_agent.py",
     "model_tools.py",
+    "mini_swe_runner.py",
     "batch_runner.py",
     "hermes_state.py",
     "trajectory_compressor.py",

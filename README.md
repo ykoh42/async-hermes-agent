@@ -151,6 +151,22 @@ saved sequence preserves reasoning, tool calls, observations, and the final
 answer for interleaved-thinking fine-tuning. Completed samples append to
 `trajectory_samples.jsonl` in the process working directory.
 
+The upstream single-task training runner is retained at the same
+`mini_swe_runner.py` import path. Its provider, terminal execution, cleanup,
+and JSONL batch methods are native coroutines; the trajectory conversion and
+return shapes remain unchanged:
+
+```python
+from mini_swe_runner import MiniSWERunner
+
+runner = MiniSWERunner(
+    model="openai/gpt-oss-20b:free",
+    env_type="local",
+    cwd="/workspace",
+)
+result = await runner.run_task("Inspect and repair the project")
+```
+
 For datasets, use `BatchRunner` from the unchanged `batch_runner.py` module and
 await its existing `run()` method. It retains bounded concurrency, checkpoints,
 resume support, and JSONL output. `trajectory_compressor.py` remains available
@@ -219,7 +235,7 @@ silently running synchronous work in a thread.
 ```bash
 uv run pytest -q
 uv run ruff check agent tools hermes_cli plugins providers \
-  run_agent.py model_tools.py batch_runner.py hermes_state.py \
+  run_agent.py model_tools.py mini_swe_runner.py batch_runner.py hermes_state.py \
   trajectory_compressor.py
 uv build
 ```
