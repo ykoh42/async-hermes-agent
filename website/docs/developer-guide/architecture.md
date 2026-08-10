@@ -162,19 +162,18 @@ HERMES_LIVE_TESTS=1 HERMES_LIVE_PROVIDER=copilot \
     tests/e2e/test_live_provider_concurrency_path.py \
     tests/e2e/test_live_provider_subagent_path.py \
     tests/e2e/test_live_provider_compression_path.py \
-    tests/e2e/test_live_batch_runner_path.py \
     tests/e2e/test_live_single_runner_path.py
 ```
 
 These tests cover provider-to-tool observations and trajectory ordering, a real
 stdio MCP server and skill loading, persistent memory and cross-instance
-session resume, timeout cleanup and next-turn recovery, and batch checkpoint
-resume. They also verify native streaming, live context compression and
-continuation, the retained single-task runner, overlapping requests across
-agent instances, per-agent turn serialization, and background subagent
-reinjection and cleanup. Every path fails on event-loop blocking or leaked
-tasks. Set `HERMES_LIVE_MODEL` to override the provider's test default;
-OpenRouter runs also require `OPENROUTER_API_KEY`.
+session resume, timeout cleanup and next-turn recovery. They also verify native
+streaming, live context compression and continuation, the retained single-task
+runner, overlapping requests across agent instances, per-agent turn
+serialization, and background subagent reinjection and cleanup. Every path
+fails on event-loop blocking or leaked tasks. Set `HERMES_LIVE_MODEL` to
+override the provider's test default; OpenRouter runs also require
+`OPENROUTER_API_KEY`.
 
 A reasoning-capable provider is a separate release gate because the default
 Copilot acceptance model does not expose reasoning. Point this test at an
@@ -185,12 +184,16 @@ already-running provider and model; for example, an LM Studio model loaded as
 HERMES_LIVE_REASONING_TESTS=1 \
 HERMES_LIVE_REASONING_PROVIDER=lmstudio \
 HERMES_LIVE_REASONING_MODEL=async-hermes-reasoning \
-  uv run pytest -q tests/e2e/test_live_reasoning_trajectory_path.py
+  uv run pytest -q \
+    tests/e2e/test_live_reasoning_trajectory_path.py \
+    tests/e2e/test_live_batch_runner_path.py
 ```
 
-That path requires reasoning on both model turns and verifies the saved
+Those paths require reasoning on both model turns and verify the saved
 `reasoning → tool call → observation → reasoning → final answer` trajectory,
-as well as event-loop and task cleanup.
+BatchRunner checkpoint/resume and merged JSONL output, and event-loop and task
+cleanup. The BatchRunner gate intentionally has no non-reasoning default:
+upstream data-generation behavior discards samples with zero reasoning.
 
 ## Persistence and ownership
 

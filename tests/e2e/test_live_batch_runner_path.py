@@ -1,4 +1,4 @@
-"""Opt-in live acceptance test for BatchRunner trajectory and resume."""
+"""Opt-in reasoning-provider acceptance test for BatchRunner and resume."""
 
 from __future__ import annotations
 
@@ -12,16 +12,14 @@ from pyleak import no_event_loop_blocking, no_task_leaks
 from pyleak.eventloop import LeakAction
 
 
-LIVE = os.environ.get("HERMES_LIVE_TESTS") == "1"
-PROVIDER = (os.environ.get("HERMES_LIVE_PROVIDER") or "copilot").strip().lower()
-DEFAULT_MODELS = {
-    "copilot": "gpt-4.1",
-    "openrouter": "google/gemini-2.5-flash",
-}
+LIVE = os.environ.get("HERMES_LIVE_REASONING_TESTS") == "1"
+PROVIDER = (
+    os.environ.get("HERMES_LIVE_REASONING_PROVIDER") or "lmstudio"
+).strip().lower()
 
 pytestmark = pytest.mark.skipif(
     not LIVE,
-    reason="live-only — set HERMES_LIVE_TESTS=1",
+    reason="reasoning-live-only — set HERMES_LIVE_REASONING_TESTS=1",
 )
 
 
@@ -36,11 +34,9 @@ async def test_live_batch_runner_checkpoint_resume_and_ordered_trajectory(
     hermes_home = tmp_path / "hermes-home"
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
     hermes_home.mkdir(parents=True)
-    model = os.environ.get("HERMES_LIVE_MODEL") or DEFAULT_MODELS.get(PROVIDER)
+    model = (os.environ.get("HERMES_LIVE_REASONING_MODEL") or "").strip()
     if not model:
-        pytest.fail(
-            f"No default model for live provider {PROVIDER!r}; set HERMES_LIVE_MODEL"
-        )
+        pytest.fail("HERMES_LIVE_REASONING_MODEL is required")
     (hermes_home / "config.yaml").write_text(
         f"model:\n  provider: {PROVIDER}\n  default: {model}\n",
         encoding="utf-8",
@@ -49,8 +45,6 @@ async def test_live_batch_runner_checkpoint_resume_and_ordered_trajectory(
     dataset = tmp_path / "dataset.jsonl"
     prompt = (
         "Call terminal exactly once with `printf LIVE_BATCH_OBSERVATION`. "
-        "Before the tool call include "
-        "<REASONING_SCRATCHPAD>live batch reasoning</REASONING_SCRATCHPAD>. "
         "After reading the observation reply exactly LIVE_BATCH_FINAL."
     )
     dataset.write_text(json.dumps({"prompt": prompt}) + "\n", encoding="utf-8")
@@ -62,19 +56,23 @@ async def test_live_batch_runner_checkpoint_resume_and_ordered_trajectory(
         "model": model,
         "num_workers": 1,
         "max_iterations": 4,
-        "ephemeral_system_prompt": (
-            "For this evaluation, include a <REASONING_SCRATCHPAD> block in "
-            "the assistant tool-call turn before using a tool."
-        ),
+        "reasoning_config": {"enabled": True, "effort": "high"},
     }
-    if PROVIDER == "openrouter":
-        api_key = os.environ.get("OPENROUTER_API_KEY", "")
+
+    base_url = (os.environ.get("HERMES_LIVE_REASONING_BASE_URL") or "").strip()
+    api_key = (os.environ.get("HERMES_LIVE_REASONING_API_KEY") or "").strip()
+    if PROVIDER == "lmstudio":
+        base_url = base_url or "http://127.0.0.1:1234/v1"
+        api_key = api_key or "lm-studio"
+    elif PROVIDER == "openrouter":
+        base_url = base_url or "https://openrouter.ai/api/v1"
+        api_key = api_key or os.environ.get("OPENROUTER_API_KEY", "").strip()
         if not api_key:
             pytest.fail("OPENROUTER_API_KEY is required for the live OpenRouter test")
-        runner_kwargs.update(
-            api_key=api_key,
-            base_url="https://openrouter.ai/api/v1",
-        )
+    if base_url:
+        runner_kwargs["base_url"] = base_url
+    if api_key:
+        runner_kwargs["api_key"] = api_key
     runner = BatchRunner(**runner_kwargs)
 
     async with (
@@ -104,9 +102,10 @@ async def test_live_batch_runner_checkpoint_resume_and_ordered_trajectory(
         "tool",
         "gpt",
     ]
-    assert "<think>\nlive batch reasoning\n</think>" in conversations[2]["value"]
+    assert conversations[2]["value"].startswith("<think>\n")
     assert '"name": "terminal"' in conversations[2]["value"]
     assert "LIVE_BATCH_OBSERVATION" in conversations[3]["value"]
+    assert conversations[4]["value"].startswith("<think>\n")
     assert conversations[4]["value"].endswith("LIVE_BATCH_FINAL")
 
     merged_rows = [
@@ -115,7 +114,7 @@ async def test_live_batch_runner_checkpoint_resume_and_ordered_trajectory(
     ]
     assert merged_rows == shard_rows
     statistics = json.loads((output_dir / "statistics.json").read_text())
-    assert statistics["reasoning_statistics"]["turns_with_reasoning"] >= 1
+    assert statistics["reasoning_statistics"]["turns_with_reasoning"] >= 2
     assert statistics["tool_statistics"]["terminal"]["count"] == 1
     assert statistics["tool_statistics"]["terminal"]["success"] == 1
     assert statistics["tool_statistics"]["terminal"]["failure"] == 0
