@@ -1634,7 +1634,7 @@ class BedrockAuxiliaryClient:
         self.base_url = f"https://bedrock-runtime.{region}.amazonaws.com"
 
     async def close(self):
-        return None
+        pass
 
 
 def _endpoint_speaks_anthropic_messages(base_url: str) -> bool:
