@@ -136,6 +136,14 @@ def _reset_fake_ollama(monkeypatch):
     module.AsyncClient = _FakeAsyncOllama
     monkeypatch.setitem(sys.modules, "ollama", module)
 
+    async def create_client(client_class, *, host=None):
+        return client_class(host=host)
+
+    monkeypatch.setattr(
+        "plugins.memory.mem0._native_oss._create_ollama_client",
+        create_client,
+    )
+
 
 @pytest.mark.asyncio
 async def test_openai_embedder_is_state_only_until_first_await(monkeypatch):
@@ -269,6 +277,8 @@ async def test_openai_embedder_close_finishes_before_reraising_cancellation(
     task = asyncio.create_task(embedder.close())
     await entered.wait()
 
+    task.cancel()
+    await asyncio.sleep(0)
     task.cancel()
     await asyncio.sleep(0)
     assert task.done() is False

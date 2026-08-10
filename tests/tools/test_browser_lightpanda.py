@@ -110,26 +110,44 @@ class TestNeedsLightpandaFallback:
     async def test_non_lightpanda_never_falls_back(self):
         from tools.browser_tool import _needs_lightpanda_fallback
         result = {"success": False, "error": "timeout"}
-        assert _needs_lightpanda_fallback("chrome", "open", result) is False
-        assert _needs_lightpanda_fallback("auto", "open", result) is False
+        assert await _needs_lightpanda_fallback("chrome", "open", result) is False
+        assert await _needs_lightpanda_fallback("auto", "open", result) is False
 
     async def test_failed_command_triggers_fallback(self):
         from tools.browser_tool import _needs_lightpanda_fallback
         result = {"success": False, "error": "page.goto: Timeout"}
-        assert _needs_lightpanda_fallback("lightpanda", "open", result) is True
+        assert await _needs_lightpanda_fallback("lightpanda", "open", result) is True
 
 
     async def test_empty_snapshot_triggers_fallback(self):
         from tools.browser_tool import _needs_lightpanda_fallback
         result = {"success": True, "data": {"snapshot": ""}}
-        assert _needs_lightpanda_fallback("lightpanda", "snapshot", result) is True
+        assert await _needs_lightpanda_fallback("lightpanda", "snapshot", result) is True
 
 
     async def test_unknown_command_does_not_trigger_fallback(self):
         """Commands not in the whitelist should not trigger fallback."""
         from tools.browser_tool import _needs_lightpanda_fallback
         result = {"success": False, "error": "nope"}
-        assert _needs_lightpanda_fallback("lightpanda", "some_future_cmd", result) is False
+        assert await _needs_lightpanda_fallback("lightpanda", "some_future_cmd", result) is False
+
+    async def test_small_screenshot_probe_does_not_block(self, tmp_path):
+        from tools.browser_tool import _lightpanda_fallback_reason
+
+        screenshot = tmp_path / "lightpanda.png"
+        screenshot.write_bytes(b"x" * 1024)
+        result = {"success": True, "data": {"path": str(screenshot)}}
+
+        blocker = BlockBuster()
+        blocker.activate()
+        try:
+            reason = await _lightpanda_fallback_reason(
+                "lightpanda", "screenshot", result
+            )
+        finally:
+            blocker.deactivate()
+
+        assert "suspiciously small" in reason
 
 
 # ---------------------------------------------------------------------------

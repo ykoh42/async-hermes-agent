@@ -28,14 +28,26 @@ async def _finish_cleanup(
 ) -> None:
     """Finish one owned-resource cleanup before preserving cancellation."""
     cleanup_task = asyncio.create_task(cleanup)
-    try:
-        await asyncio.shield(cleanup_task)
-    except asyncio.CancelledError:
+    cancellation: asyncio.CancelledError | None = None
+    while True:
         try:
-            await cleanup_task
-        except Exception:
+            await asyncio.shield(cleanup_task)
+            break
+        except asyncio.CancelledError as exc:  # noqa: ASYNC103
+            if cleanup_task.cancelled():
+                if cancellation is None:
+                    raise
+                break
+            if cancellation is None:
+                cancellation = exc
+            continue  # noqa: ASYNC104 - finish closing the owned client
+        except Exception as exc:
+            if cancellation is None:
+                raise
             logger.exception(error_message)
-        raise
+            raise cancellation from exc  # noqa: ASYNC104
+    if cancellation is not None:
+        raise cancellation  # noqa: ASYNC104
 
 
 def _extract_json(text: str) -> str:
@@ -55,6 +67,47 @@ def _response_value(response: Any, key: str, default: Any = None) -> Any:
     if isinstance(response, dict):
         return response.get(key, default)
     return getattr(response, key, default)
+
+
+async def _create_ollama_client(client_class: Any, *, host: Any = None) -> Any:
+    """Create Ollama's async SDK client with awaited httpx setup."""
+    base_classes = getattr(client_class, "__mro__", ())
+    if len(base_classes) < 2:
+        raise RuntimeError(
+            "The installed Ollama runtime does not expose its client base. "
+            "Reinstall async-hermes-agent with the mem0 extra."
+        )
+    base_init = getattr(base_classes[1], "__init__", None)
+    if not callable(base_init):
+        raise RuntimeError(
+            "The installed Ollama runtime does not expose its client initializer. "
+            "Reinstall async-hermes-agent with the mem0 extra."
+        )
+
+    captured_kwargs: dict[str, Any] = {}
+    marker = object()
+
+    def capture_client(*args: Any, **kwargs: Any) -> object:
+        if args:
+            raise RuntimeError(
+                "The installed Ollama runtime uses unsupported positional HTTP "
+                "client arguments. Reinstall async-hermes-agent with the mem0 extra."
+            )
+        captured_kwargs.update(kwargs)
+        return marker
+
+    client = client_class.__new__(client_class)
+    base_init(client, capture_client, host)
+    if getattr(client, "_client", None) is not marker:
+        raise RuntimeError(
+            "The installed Ollama runtime did not expose its HTTP client setup. "
+            "Reinstall async-hermes-agent with the mem0 extra."
+        )
+
+    from agent.ssl_verify import _create_httpx_client
+
+    client._client = await _create_httpx_client(**captured_kwargs)
+    return client
 
 _HISTORY_COLUMNS = (
     "id",
@@ -224,7 +277,10 @@ class OllamaEmbedding:
                     "The 'ollama' library is required. Install the mem0 extra."
                 ) from exc
 
-            client = AsyncClient(host=self.config.get("ollama_base_url"))
+            client = await _create_ollama_client(
+                AsyncClient,
+                host=self.config.get("ollama_base_url"),
+            )
             try:
                 response = await client.list()
                 models = _response_value(response, "models", []) or []
@@ -490,7 +546,10 @@ class OllamaLLM:
                 raise ImportError(
                     "The 'ollama' library is required. Install the mem0 extra."
                 ) from exc
-            self._client = AsyncClient(host=self.config.get("ollama_base_url"))
+            self._client = await _create_ollama_client(
+                AsyncClient,
+                host=self.config.get("ollama_base_url"),
+            )
             return self._client
 
     @staticmethod

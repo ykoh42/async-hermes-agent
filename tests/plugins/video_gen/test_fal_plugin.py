@@ -83,6 +83,14 @@ class TestFamilyRouting:
         fake.AsyncClient = FakeAsyncClient  # type: ignore
         monkeypatch.setitem(sys.modules, "fal_client", fake)
 
+        async def create_client(fal_client):
+            return fal_client.AsyncClient()
+
+        monkeypatch.setattr(
+            "tools.fal_common._create_fal_client",
+            create_client,
+        )
+
         # Reset the lazy global so it picks up our stub
         from plugins.video_gen import fal as fal_plugin
         fal_plugin._fal_client = None

@@ -1060,7 +1060,7 @@ async def _using_lightpanda_engine() -> bool:
     return await _get_browser_engine() == "lightpanda"
 
 
-def _lightpanda_fallback_reason(
+async def _lightpanda_fallback_reason(
     engine: str, command: str, result: Dict[str, Any]
 ) -> Optional[str]:
     """Return the user-visible reason a Lightpanda result needs Chrome fallback.
@@ -1113,7 +1113,7 @@ def _lightpanda_fallback_reason(
         path = data.get("path", "")
         if path:
             try:
-                size = os.path.getsize(path)
+                size = await aiofiles.os.path.getsize(path)
                 if size < 20480:
                     logger.debug(
                         "Lightpanda screenshot is suspiciously small (%d bytes), "
@@ -1130,11 +1130,11 @@ def _lightpanda_fallback_reason(
     return None
 
 
-def _needs_lightpanda_fallback(
+async def _needs_lightpanda_fallback(
     engine: str, command: str, result: Dict[str, Any]
 ) -> bool:
     """Check if a Lightpanda result should trigger an automatic Chrome fallback."""
-    return _lightpanda_fallback_reason(engine, command, result) is not None
+    return await _lightpanda_fallback_reason(engine, command, result) is not None
 
 
 def _annotate_lightpanda_fallback(
@@ -3030,7 +3030,7 @@ async def _run_browser_command(
     # --- Lightpanda automatic Chrome fallback ---
     # If engine is lightpanda and the result looks broken, retry with Chrome.
     # This runs for ALL exit paths (timeout, empty, non-JSON, nonzero rc, parsed).
-    fallback_reason = _lightpanda_fallback_reason(engine, command, result)
+    fallback_reason = await _lightpanda_fallback_reason(engine, command, result)
     if fallback_reason:
         logger.info(
             "Lightpanda fallback: retrying '%s' with Chrome (task=%s): %s",

@@ -98,6 +98,7 @@ import sys
 import threading
 import time
 import weakref
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from typing import Callable
 from datetime import datetime
@@ -2889,7 +2890,17 @@ class MCPServerTask:
                         kwargs["auth"] = auth
                     if _cert_for_factory is not None:
                         kwargs["cert"] = _cert_for_factory
-                    return _httpx_mod.AsyncClient(**kwargs)
+
+                    @asynccontextmanager
+                    async def _client_context():
+                        from agent.ssl_verify import _create_httpx_client
+
+                        async with (
+                            await _create_httpx_client(**kwargs)
+                        ) as client:
+                            yield client
+
+                    return _client_context()
 
                 _sse_kwargs["httpx_client_factory"] = _mcp_http_client_factory
             try:

@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+from blockbuster import BlockBuster
 
 from agent.image_routing import (
     _coerce_capability_bool,
@@ -291,35 +292,41 @@ class TestLargeImageHandling:
 # ─── extract_image_refs ──────────────────────────────────────────────────────
 
 
+@pytest.mark.asyncio
 class TestExtractImageRefs:
     """Scan task body / inbound text for image paths and URLs (kanban worker
     enrichment, issue raised May 2026)."""
 
-    def test_empty_or_none_returns_empty(self):
-        assert extract_image_refs("") == ([], [])
-        assert extract_image_refs(None) == ([], [])  # type: ignore[arg-type]
+    async def test_empty_or_none_returns_empty(self):
+        assert await extract_image_refs("") == ([], [])
+        assert await extract_image_refs(None) == ([], [])  # type: ignore[arg-type]
 
-    def test_finds_absolute_path(self, tmp_path: Path):
+    async def test_finds_absolute_path_without_blocking(self, tmp_path: Path):
         img = tmp_path / "screenshot.png"
         img.write_bytes(_png_bytes())
         body = f"Look at {img} and tell me what's wrong."
-        paths, urls = extract_image_refs(body)
+        blocker = BlockBuster()
+        blocker.activate()
+        try:
+            paths, urls = await extract_image_refs(body)
+        finally:
+            blocker.deactivate()
         assert paths == [str(img)]
         assert urls == []
 
-    def test_finds_home_relative_path(self, tmp_path: Path, monkeypatch):
+    async def test_finds_home_relative_path(self, tmp_path: Path, monkeypatch):
         # Simulate ~/foo.png by pointing HOME at tmp_path and creating the file
         monkeypatch.setenv("HOME", str(tmp_path))
         img = tmp_path / "foo.png"
         img.write_bytes(_png_bytes())
-        paths, urls = extract_image_refs("see ~/foo.png please")
+        paths, urls = await extract_image_refs("see ~/foo.png please")
         assert paths == [str(img)]
         assert urls == []
 
 
-    def test_finds_http_image_url(self):
+    async def test_finds_http_image_url(self):
         body = "Check out https://example.com/photos/cat.png — cute right?"
-        paths, urls = extract_image_refs(body)
+        paths, urls = await extract_image_refs(body)
         assert paths == []
         assert urls == ["https://example.com/photos/cat.png"]
 

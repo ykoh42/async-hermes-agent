@@ -44,12 +44,18 @@ async def open_credentialed_url(
             if name.lower() not in _CROSS_ORIGIN_SAFE_HEADERS:
                 del outgoing.headers[name]
 
-    client_factory = opener_factory or httpx.AsyncClient
-    async with client_factory(
-        timeout=timeout,
-        follow_redirects=True,
-        event_hooks={"request": [strip_cross_origin_credentials]},
-    ) as client:
+    client_kwargs = {
+        "timeout": timeout,
+        "follow_redirects": True,
+        "event_hooks": {"request": [strip_cross_origin_credentials]},
+    }
+    if opener_factory is None:
+        from agent.ssl_verify import _create_httpx_client
+
+        client_context = await _create_httpx_client(**client_kwargs)
+    else:
+        client_context = opener_factory(**client_kwargs)
+    async with client_context as client:
         response = await client.send(request)
         response.raise_for_status()
         return response

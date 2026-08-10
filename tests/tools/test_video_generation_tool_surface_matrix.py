@@ -49,18 +49,18 @@ async def matrix_env(tmp_path, monkeypatch):
         async def get(self):
             return self._result
 
-    class _FalHTTPClient:
-        async def aclose(self): return None
-
     class _FalAsyncClient:
-        def __init__(self):
-            self._client = _FalHTTPClient()
+        default_timeout = 120.0
+
+        def _get_auth(self):
+            return types.SimpleNamespace(header_value="Key test-key")
 
         async def submit(self, endpoint, arguments=None, headers=None):
             fal_calls.append({"endpoint": endpoint, "arguments": arguments})
             return _FalHandle({"video": {"url": f"https://fake-fal/{endpoint.replace('/','_')}.mp4"}})
 
     fake_fal.AsyncClient = _FalAsyncClient  # type: ignore
+    fake_fal.client = types.SimpleNamespace(USER_AGENT="fal-client/test")  # type: ignore
 
     monkeypatch.setitem(__import__("sys").modules, "fal_client", fake_fal)
 
@@ -99,12 +99,9 @@ async def matrix_env(tmp_path, monkeypatch):
                 },
                 "model": payload.get("model", "grok-imagine-video"),
             })
-    import plugins.video_gen.xai as xai_plugin
-    monkeypatch.setattr(
-        xai_plugin.httpx,
-        "AsyncClient",
-        lambda **_kwargs: _Client(),
-    )
+    async def _create_xai_client(**_kwargs):
+        return _Client()
+
     async def _no_sleep(*a, **k): return None
     monkeypatch.setattr(asyncio, "sleep", _no_sleep)
 
@@ -115,6 +112,10 @@ async def matrix_env(tmp_path, monkeypatch):
     # Force discovery
     from hermes_cli.plugins import _ensure_plugins_discovered
     await _ensure_plugins_discovered(force=True)
+    import sys
+
+    xai_plugin = sys.modules["hermes_plugins.video_gen__xai"]
+    monkeypatch.setattr(xai_plugin, "_create_httpx_client", _create_xai_client)
 
     return tmp_path, fal_calls, xai_calls
 

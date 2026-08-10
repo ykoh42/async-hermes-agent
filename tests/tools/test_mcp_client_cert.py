@@ -272,17 +272,36 @@ class TestSSEClientCert:
         factory = patch_sse_client.get("httpx_client_factory")
         assert factory is not None, "expected httpx_client_factory to be injected"
 
-        # Invoke the factory the way the SDK would; capture the resulting
-        # httpx.AsyncClient kwargs.
+        # Enter the factory result the way the SDK does; capture the awaited
+        # httpx client-builder kwargs.
         captured_client_kwargs: dict = {}
 
         class DummyAsyncClient:
-            def __init__(self, **kwargs):
-                captured_client_kwargs.update(kwargs)
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
 
         import httpx
-        with patch.object(httpx, "AsyncClient", DummyAsyncClient):
-            factory(headers={"x": "y"}, timeout=httpx.Timeout(30.0), auth=None)
+
+        async def enter_factory():
+            async def create_client(**kwargs):
+                captured_client_kwargs.update(kwargs)
+                return DummyAsyncClient()
+
+            with patch(
+                "agent.ssl_verify._create_httpx_client",
+                side_effect=create_client,
+            ):
+                async with factory(
+                    headers={"x": "y"},
+                    timeout=httpx.Timeout(30.0),
+                    auth=None,
+                ):
+                    pass
+
+        asyncio.run(enter_factory())
 
         assert captured_client_kwargs["cert"] == str(cert)
         assert captured_client_kwargs["verify"] is True
@@ -324,12 +343,73 @@ class TestSSEClientCert:
         captured_client_kwargs: dict = {}
 
         class DummyAsyncClient:
-            def __init__(self, **kwargs):
-                captured_client_kwargs.update(kwargs)
+            async def __aenter__(self):
+                return self
 
-        import httpx
-        with patch.object(httpx, "AsyncClient", DummyAsyncClient):
-            factory(headers=None, timeout=None, auth=None)
+            async def __aexit__(self, *args):
+                return False
+
+        async def enter_factory():
+            async def create_client(**kwargs):
+                captured_client_kwargs.update(kwargs)
+                return DummyAsyncClient()
+
+            with patch(
+                "agent.ssl_verify._create_httpx_client",
+                side_effect=create_client,
+            ):
+                async with factory(headers=None, timeout=None, auth=None):
+                    pass
+
+        asyncio.run(enter_factory())
 
         assert captured_client_kwargs["verify"] == str(ca_bundle)
         assert "cert" not in captured_client_kwargs
+
+    def test_factory_enters_http_client_without_blocking(self, patch_sse_client):
+        from blockbuster import BlockBuster
+        from tools.mcp_tool import MCPServerTask
+
+        server = MCPServerTask("sse-test")
+        server._auth_type = ""
+        server._sampling = None
+
+        async def drive():
+            with patch.object(
+                MCPServerTask,
+                "_wait_for_lifecycle_event",
+                new=AsyncMock(return_value="shutdown"),
+            ), patch.object(
+                MCPServerTask,
+                "_discover_tools",
+                new=AsyncMock(),
+            ):
+                await server._run_http(
+                    {
+                        "url": "https://example.com/mcp/sse",
+                        "transport": "sse",
+                        "ssl_verify": False,
+                    }
+                )
+
+        asyncio.run(drive())
+        factory = patch_sse_client.get("httpx_client_factory")
+        assert factory is not None
+
+        async def enter_factory():
+            import httpx
+
+            blocker = BlockBuster()
+            blocker.activate()
+            try:
+                async with factory(
+                    headers={"x-test": "value"},
+                    timeout=httpx.Timeout(30.0),
+                    auth=None,
+                ) as client:
+                    assert client.headers["x-test"] == "value"
+                    assert client.follow_redirects is True
+            finally:
+                blocker.deactivate()
+
+        asyncio.run(enter_factory())

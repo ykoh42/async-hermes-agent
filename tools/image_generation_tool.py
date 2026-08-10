@@ -447,8 +447,10 @@ async def _submit_fal_request(model: str, arguments: Dict[str, Any]):
     """Submit a FAL request and await its queue result."""
     # Trigger the lazy import on first call. Idempotent.
     _load_fal_client()
+    from tools.fal_common import _close_fal_client, _create_fal_client
+
     request_headers = {"x-idempotency-key": str(uuid.uuid4())}
-    client = fal_client.AsyncClient()
+    client = await _create_fal_client(fal_client)
     try:
         handler = await client.submit(
             model,
@@ -457,7 +459,7 @@ async def _submit_fal_request(model: str, arguments: Dict[str, Any]):
         )
         return await handler.get()
     finally:
-        await client._client.aclose()
+        await _close_fal_client(client)
 
 
 # ---------------------------------------------------------------------------

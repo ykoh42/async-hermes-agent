@@ -82,7 +82,7 @@ _IMAGE_URL_RE = re.compile(
 )
 
 
-def extract_image_refs(text: str) -> Tuple[List[str], List[str]]:
+async def extract_image_refs(text: str) -> Tuple[List[str], List[str]]:
     """Scan free-form text for image references the model should see.
 
     Returns ``(local_paths, urls)``:
@@ -124,7 +124,7 @@ def extract_image_refs(text: str) -> Tuple[List[str], List[str]]:
         raw = match.group(0)
         expanded = os.path.expanduser(raw)
         try:
-            if not os.path.isfile(expanded):
+            if not await aiofiles.os.path.isfile(expanded):
                 continue
         except OSError:
             # ENAMETOOLONG / EINVAL on pathological inputs — skip rather than crash.
