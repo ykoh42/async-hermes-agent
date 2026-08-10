@@ -27,6 +27,15 @@ from tools.registry import tool_error
 
 logger = logging.getLogger(__name__)
 
+# Import the optional SDK with the plugin module, normally during application
+# bootstrap.  ``initialize()`` still resolves the class dynamically so tests
+# and plugin hosts can replace the module, but it never pays this import cost
+# in the first memory turn.
+try:
+    import supermemory as _SupermemoryBootstrap  # noqa: F401
+except Exception:
+    _SupermemoryBootstrap = None
+
 _DEFAULT_CONTAINER_TAG = "hermes"
 _DEFAULT_MAX_RECALL_RESULTS = 10
 _DEFAULT_PROFILE_FREQUENCY = 50

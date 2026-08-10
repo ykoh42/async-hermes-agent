@@ -19,6 +19,15 @@ from ._native_sparse import NativeSparseEncoder, SparseEncoding
 
 logger = logging.getLogger(__name__)
 
+# PGVector remains optional, but importing psycopg on the first awaited store
+# operation blocks the event loop while its native package graph is loaded.
+try:
+    import psycopg as _PsycopgBootstrap  # noqa: F401
+    import psycopg_pool as _PsycopgPoolBootstrap  # noqa: F401
+except Exception:
+    _PsycopgBootstrap = None
+    _PsycopgPoolBootstrap = None
+
 _ISO_DATETIME_RE = re.compile(
     r"^\d{4}-\d{2}-\d{2}"
     r"([T ]\d{2}:\d{2}(:\d{2})?"

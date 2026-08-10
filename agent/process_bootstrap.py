@@ -76,6 +76,26 @@ except Exception:
     _GoogleCredentialsBootstrap = None
     _GoogleServiceAccountBootstrap = None
 
+# Installed memory-provider extras have the same first-use import hazard.
+# Their clients still initialize lazily at an awaited boundary; only Python's
+# synchronous module loading is moved to process bootstrap.
+try:
+    import supermemory as _SupermemoryBootstrap  # noqa: F401
+except Exception:
+    _SupermemoryBootstrap = None
+
+try:
+    import honcho as _HonchoBootstrap  # noqa: F401
+except Exception:
+    _HonchoBootstrap = None
+
+try:
+    import psycopg as _PsycopgBootstrap  # noqa: F401
+    import psycopg_pool as _PsycopgPoolBootstrap  # noqa: F401
+except Exception:
+    _PsycopgBootstrap = None
+    _PsycopgPoolBootstrap = None
+
 # MCP OAuth is optional, but its SDK auth modules are imported lazily by the
 # OAuth storage/manager.  Resolve those imports beside the other provider SDK
 # bootstraps so the first OAuth-backed MCP connection cannot perform an

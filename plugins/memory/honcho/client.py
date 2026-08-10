@@ -36,6 +36,13 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Keep client construction lazy while ensuring the installed SDK itself is
+# loaded before an awaited memory operation begins.
+try:
+    import honcho as _HonchoBootstrap  # noqa: F401
+except Exception:
+    _HonchoBootstrap = None
+
 HOST = "hermes"
 
 

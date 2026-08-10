@@ -38,6 +38,10 @@ names = (
     "aiobotocore.session",
     "azure.identity.aio",
     "google.auth.transport.aiohttp_requests",
+    "supermemory",
+    "honcho",
+    "psycopg",
+    "psycopg_pool",
 )
 available = {name for name in names if present(name)}
 import agent.process_bootstrap
@@ -64,5 +68,30 @@ import agent.bedrock_adapter
 import agent.azure_identity_adapter
 assert not bedrock or "aiobotocore.session" in sys.modules
 assert not entra or "azure.identity.aio" in sys.modules
+"""
+    )
+
+
+def test_memory_plugins_do_not_defer_installed_sdk_imports():
+    _run_fresh_interpreter(
+        """
+import importlib.util
+import sys
+
+def present(name):
+    try:
+        return importlib.util.find_spec(name) is not None
+    except (ImportError, AttributeError, ValueError):
+        return False
+
+expected = {
+    name
+    for name in ("supermemory", "honcho", "psycopg", "psycopg_pool")
+    if present(name)
+}
+import plugins.memory.supermemory
+import plugins.memory.honcho.client
+import plugins.memory.mem0._native_vector
+assert expected <= sys.modules.keys()
 """
     )
