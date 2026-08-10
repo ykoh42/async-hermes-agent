@@ -41,9 +41,18 @@ import aiofiles
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Lazy aiobotocore import — only loaded when Bedrock is actually used.
-# This keeps startup fast for users who don't use Bedrock.
+# Optional aiobotocore import.  Resolve it while this module is imported,
+# before callers enter their event loop; importing botocore lazily from the
+# first awaited Bedrock request performs a sizeable synchronous filesystem
+# walk and stalls every request sharing that loop.
 # ---------------------------------------------------------------------------
+
+try:
+    from aiobotocore.session import get_session as _aiobotocore_get_session
+    _aiobotocore_import_error: Exception | None = None
+except Exception as exc:
+    _aiobotocore_get_session = None
+    _aiobotocore_import_error = exc
 
 # Retain upstream's cache-management state and public hooks.  Native async
 # requests intentionally do not put aiobotocore clients here: each request
@@ -54,15 +63,18 @@ _bedrock_runtime_client_cache: Dict[str, Any] = {}
 _bedrock_control_client_cache: Dict[str, Any] = {}
 
 def _require_aiobotocore():
-    """Import aiobotocore, raising a clear provider-specific install error."""
-    try:
-        from aiobotocore.session import get_session
-    except ImportError:
+    """Return aiobotocore's cached session factory or a clear install error."""
+    if _aiobotocore_get_session is None:
+        if _aiobotocore_import_error is not None and not isinstance(
+            _aiobotocore_import_error,
+            ImportError,
+        ):
+            raise _aiobotocore_import_error
         raise ImportError(
             "The 'aiobotocore' package is required for the AWS Bedrock provider. "
             "Install Hermes with Bedrock support: pip install 'async-hermes-agent[bedrock]'"
-        )
-    return get_session
+        ) from _aiobotocore_import_error
+    return _aiobotocore_get_session
 
 
 def _get_bedrock_runtime_client(region: str):

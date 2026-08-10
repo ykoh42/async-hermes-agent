@@ -50,6 +50,32 @@ try:
 except ImportError:
     _AnthropicBootstrap = None
 
+# Provider-specific SDKs are optional, but their import graphs are synchronous
+# and sizeable.  Preload installed extras at the same process boundary so the
+# first Bedrock, Vertex, or Entra-backed request only performs native async I/O.
+try:
+    from aiobotocore import session as _AiobotocoreBootstrap  # noqa: F401
+except Exception:
+    _AiobotocoreBootstrap = None
+
+try:
+    import azure.identity.aio as _AzureIdentityBootstrap  # noqa: F401
+except Exception:
+    _AzureIdentityBootstrap = None
+
+try:
+    from google.auth import _cloud_sdk as _GoogleCloudSdkBootstrap  # noqa: F401
+    from google.auth.transport import (  # noqa: F401
+        aiohttp_requests as _GoogleAuthTransportBootstrap,
+    )
+    from google.oauth2 import _credentials_async as _GoogleCredentialsBootstrap  # noqa: F401
+    from google.oauth2 import _service_account_async as _GoogleServiceAccountBootstrap  # noqa: F401
+except Exception:
+    _GoogleCloudSdkBootstrap = None
+    _GoogleAuthTransportBootstrap = None
+    _GoogleCredentialsBootstrap = None
+    _GoogleServiceAccountBootstrap = None
+
 # MCP OAuth is optional, but its SDK auth modules are imported lazily by the
 # OAuth storage/manager.  Resolve those imports beside the other provider SDK
 # bootstraps so the first OAuth-backed MCP connection cannot perform an

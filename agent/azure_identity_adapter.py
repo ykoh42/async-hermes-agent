@@ -13,6 +13,13 @@ logger = logging.getLogger(__name__)
 
 SCOPE_AI_AZURE_DEFAULT = "https://ai.azure.com/.default"
 
+try:
+    import azure.identity.aio as _azure_identity
+    _azure_identity_import_error: Exception | None = None
+except Exception as exc:
+    _azure_identity = None
+    _azure_identity_import_error = exc
+
 _credential_caches: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, dict[EntraIdentityConfig, Any]]" = (
     weakref.WeakKeyDictionary()
 )
@@ -22,25 +29,22 @@ _issued_providers: "weakref.WeakSet[Any]" = weakref.WeakSet()
 
 def has_azure_identity_installed() -> bool:
     """Return whether the optional async Azure Identity SDK is installed."""
-    try:
-        import azure.identity.aio  # noqa: F401
-
-        return True
-    except Exception:
-        return False
+    return _azure_identity is not None
 
 
 def _require_azure_identity():
-    try:
-        import azure.identity.aio as identity
-
-        return identity
-    except ImportError as exc:
+    if _azure_identity is None:
+        if _azure_identity_import_error is not None and not isinstance(
+            _azure_identity_import_error,
+            ImportError,
+        ):
+            raise _azure_identity_import_error
         raise ImportError(
             "The 'azure-identity' package is required for Azure AI Foundry "
             "Entra ID authentication. Install it with: "
             "pip install 'async-hermes-agent[azure-identity]'"
-        ) from exc
+        ) from _azure_identity_import_error
+    return _azure_identity
 
 
 @dataclass(frozen=True)
